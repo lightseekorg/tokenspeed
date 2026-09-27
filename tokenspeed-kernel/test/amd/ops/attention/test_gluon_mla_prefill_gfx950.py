@@ -339,17 +339,18 @@ def test_mla_prefill_gluon_scheduler_coverage(
 
 
 @pytest.mark.parametrize("kernel", _KERNELS)
-@pytest.mark.parametrize("dtype", _FP8_DTYPES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, *_FP8_DTYPES])
 @pytest.mark.parametrize("q_len,kv_len", [(129, 65), (65, 129), (257, 193), (65, 0)])
-def test_mla_prefill_gluon_causal_cutoff(device, require, kernel, dtype, q_len, kv_len):
-    require("attention", "mla_prefill", "gluon", dtype, "q")
+def test_mla_prefill_gluon_causal_cutoff(device, kernel, dtype, q_len, kv_len):
+    launcher = getattr(_kernel_module(kernel), f"launch_{kernel}")
+    storage_dtype = torch.float16 if dtype == torch.float16 else torch.bfloat16
     q = torch.zeros((q_len, 12, 192), dtype=dtype, device=device)
     # Poison the backing tail; masked loads must not admit keys past KV length.
     k_storage = torch.full(
-        (kv_len + 64, 12, 192), float("nan"), dtype=torch.bfloat16, device=device
+        (kv_len + 64, 12, 192), float("nan"), dtype=storage_dtype, device=device
     )
     v_storage = torch.full(
-        (kv_len + 64, 12, 128), float("nan"), dtype=torch.bfloat16, device=device
+        (kv_len + 64, 12, 128), float("nan"), dtype=storage_dtype, device=device
     )
     k_storage[:kv_len] = 0
     values = (torch.arange(kv_len, device=device) % 31 - 15).float() / 16
@@ -358,7 +359,7 @@ def test_mla_prefill_gluon_causal_cutoff(device, require, kernel, dtype, q_len, 
     v = v_storage.to(dtype)[:kv_len]
     cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=device)
     cu_kv = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
-    out, lse = mla_prefill(
+    out, lse = launcher(
         q=q,
         k=k,
         v=v,
@@ -369,7 +370,7 @@ def test_mla_prefill_gluon_causal_cutoff(device, require, kernel, dtype, q_len, 
         softmax_scale=192**-0.5,
         is_causal=True,
         return_lse=True,
-        override=kernel,
+        logit_cap=0.0,
     )
     # Zero logits give the exact prefix mean, capped at the last real key.
     visible = (torch.arange(q_len, device=device) + max(kv_len - q_len, 0) + 1).clamp(

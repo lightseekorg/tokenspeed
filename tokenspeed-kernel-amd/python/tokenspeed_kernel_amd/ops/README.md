@@ -292,7 +292,8 @@ MFMAs with the next tile's row maximum. The two waves on a SIMD run one
 cluster apart, so one wave's MFMAs overlap the other's memory work.
 
 K and V stream into 4-slot LDS rings by asynchronous copies, K four tiles
-ahead and V three. Tiles past the visible range load fully masked (zero-filled),
+ahead and V three. Tiles past the visible range explicitly load zeros for
+masked rows in every input dtype,
 so the loop needs no drain, and only tiles crossing the causal diagonal or the
 key tail apply a score mask. For 16-bit inputs the running maximum moves only
 when a tile maximum exceeds it by more than 8 (base 2); FP8 keeps the exact

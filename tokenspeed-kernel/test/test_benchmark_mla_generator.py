@@ -402,7 +402,7 @@ def test_mla_prefill_generator_reports_executed_kernel_on_cdna4(
 def test_mla_prefill_traits_preserve_minimum_key_length(batch, avg_kv_len):
     from tokenspeed_kernel.ops.attention.mla import mla_prefill_traits
     from tokenspeed_kernel.registry import KernelSpec
-    from tokenspeed_kernel.selection import spec_matches_traits
+    from tokenspeed_kernel.selection import spec_matches_shape_traits
 
     spec = KernelSpec(
         name="prefill",
@@ -421,11 +421,11 @@ def test_mla_prefill_traits_preserve_minimum_key_length(batch, avg_kv_len):
         logit_cap=0.0,
         return_lse=True,
     )
-    assert spec_matches_traits(spec, traits) == (batch > 0 and avg_kv_len >= 1024)
+    assert spec_matches_shape_traits(spec, traits) == (batch > 0 and avg_kv_len >= 1024)
     assert traits["avg_kv_len"] <= avg_kv_len
     bucket = traits["avg_kv_len"]
     assert bucket == 0 or bucket & (bucket - 1) == 0
     # A backend without this bound remains eligible.
-    assert spec_matches_traits(
+    assert spec_matches_shape_traits(
         KernelSpec(name="base", family="attention", mode="mla_prefill"), traits
     )
