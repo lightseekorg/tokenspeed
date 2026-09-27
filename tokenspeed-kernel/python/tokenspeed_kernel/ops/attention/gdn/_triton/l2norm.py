@@ -64,8 +64,10 @@ def l2norm_fwd_kernel(
     x,
     y,
     eps,
-    NB: tl.constexpr,
-    T: tl.constexpr,
+    # Row counts follow the batch; runtime so every batch shape shares one
+    # binary (block pointer shapes accept runtime values).
+    NB,
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,

@@ -31,7 +31,9 @@ def _packed_qkv_complex_rotary_kernel(
     Q_OUT,
     K_OUT,
     V_OUT,
-    total_tokens: tl.constexpr,
+    # Per-forward token count; a compile-time value would recompile the
+    # kernel for every new batch shape.
+    total_tokens,
     packed_stride: tl.constexpr,
     q_offset: tl.constexpr,
     k_offset: tl.constexpr,
@@ -177,7 +179,9 @@ def _packed_qkv_neox_rotary_kernel(
     Q_OUT,
     K_OUT,
     V_OUT,
-    total_tokens: tl.constexpr,
+    # Per-forward token count; a compile-time value would recompile the
+    # kernel for every new batch shape.
+    total_tokens,
     packed_stride: tl.constexpr,
     q_offset: tl.constexpr,
     k_offset: tl.constexpr,

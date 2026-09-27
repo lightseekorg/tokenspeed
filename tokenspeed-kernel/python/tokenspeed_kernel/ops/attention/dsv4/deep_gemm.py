@@ -24,6 +24,7 @@ import logging
 from math import ceil
 
 import torch
+from tokenspeed_kernel.ops.residual.triton import compute_mhc_num_splits
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -479,14 +480,6 @@ def _warmup_m_values(max_tokens: int) -> list[int]:
     return sorted(values)
 
 
-def _compute_num_split(block_k: int, k: int, grid_size: int) -> int:
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    split_k = num_sms // grid_size
-    num_block_k = ceil(k / block_k)
-    split_k = min(split_k, num_block_k // 4)
-    return max(split_k, 1)
-
-
 def _warmup_tf32_hc_prenorm_gemm(
     shapes: list[dict],
     max_tokens: int,
@@ -508,7 +501,9 @@ def _warmup_tf32_hc_prenorm_gemm(
         fn = torch.ones(mix_hc, hc_dim, dtype=torch.float32, device=device)
         for num_tokens in _warmup_m_values(max_tokens):
             grid_size = ceil(num_tokens / block_m)
-            n_splits = _compute_num_split(block_k, hc_hidden_size, grid_size)
+            n_splits = compute_mhc_num_splits(
+                device, block_k, hc_hidden_size, grid_size
+            )
             x = torch.zeros(
                 num_tokens,
                 hc_hidden_size,

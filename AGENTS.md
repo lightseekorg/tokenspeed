@@ -177,13 +177,16 @@ Inside the root `tokenspeed-kernel/` directory:
   a new binary on the forward thread and stalls serving for 100+ ms. Make a
   parameter compile-time only when its value set is small and fixed once the
   server starts: model dimensions, block sizes, feature flags, pool geometry.
-  Values that vary per batch or request (token, request, or row counts,
-  `shape[0]`, `numel()`, sequence lengths, block-table widths) must be runtime
-  arguments, or be bucketed first (e.g. `next_power_of_2`) when the kernel
-  needs a compile-time bound. Reviews must check every new or changed kernel
-  signature and launch site for this. Kernels launched with batch-varying
-  shapes need a test that warms the kernel, then sweeps those shapes inside
-  `assert_no_triton_compile` from `test/utils.py`.
+  Values that vary per batch or request must be runtime arguments, or be
+  bucketed first (e.g. `next_power_of_2`) when the kernel needs a compile-time
+  bound. That includes values derived from them: token, request, or row
+  counts, `shape[0]`, `numel()`, sequence lengths, block-table and score
+  widths and the strides that follow them, and split or worker counts computed
+  from the batch size. The same holds for template arguments of other JITs
+  (DeepGEMM compiles a kernel per new value). Reviews must check every new or
+  changed kernel signature and launch site for this. Kernels launched with
+  batch-varying shapes need a test that warms the kernel, then sweeps those
+  shapes inside `assert_no_triton_compile` from `test/utils.py`.
 
 ## tokenspeed-kernel-amd
 

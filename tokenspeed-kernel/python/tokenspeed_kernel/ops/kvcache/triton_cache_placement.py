@@ -145,9 +145,11 @@ def _compact_owned_pages(
     Lens,
     Out,
     LocalLens,
-    TSTRIDE: tl.constexpr,
-    OSTRIDE: tl.constexpr,
-    COLS: tl.constexpr,
+    # Table geometry follows the batch; runtime so every batch shape shares
+    # one binary. BLOCK buckets COLS for the column range.
+    TSTRIDE,
+    OSTRIDE,
+    COLS,
     PAGE: tl.constexpr,
     SUBPAGES: tl.constexpr,
     VIRTUAL_COUNT: tl.constexpr,
