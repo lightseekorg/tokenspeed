@@ -42,9 +42,6 @@ if _IS_HOPPER_PLUS:
     import deep_ep  # noqa: F401
     import deep_gemm
     import trtllm_kernel  # noqa: F401
-    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
-        prepare_mega_moe_bf16_jit,
-    )
     from tokenspeed_kernel.ops.attention.dsv4.cuda import (
         has_indexer_mxfp4_paged_gather,
         has_indexer_topk_prefill,
@@ -53,8 +50,6 @@ if _IS_HOPPER_PLUS:
         indexer_topk_prefill,
         persistent_topk,
     )
-
-    prepare_mega_moe_bf16_jit()
 
 _MXFP4_BLOCK_SIZE = 32
 _MXFP4_VALUE_BYTES_PER_BLOCK = _MXFP4_BLOCK_SIZE // 2
@@ -454,7 +449,6 @@ def _register(format_name: str, min_arch: ArchVersion) -> None:
             "index_k_format": frozenset({format_name}),
         },
         priority=Priority.SPECIALIZED,
-        tags={"nvidia", "sparse", "latency"},
     )
     register_kernel(
         "attention",
@@ -695,7 +689,7 @@ def _warmup_prefill_jit(
         warmup_count += 1
 
     if warmup_count > 0:
-        logger.info("Warmed up %d deep_gemm prefill kernel families", warmup_count)
+        logger.info(f"Warmed up {warmup_count:d} deep_gemm prefill kernel families")
         torch.cuda.synchronize()
 
 

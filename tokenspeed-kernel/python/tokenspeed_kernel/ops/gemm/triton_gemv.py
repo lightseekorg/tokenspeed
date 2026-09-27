@@ -132,8 +132,8 @@ _BF16_SIG = frozenset(
     signatures=_BF16_SIG,
     traits={
         "m": frozenset({1}),
-        "n_min_128": frozenset({True}),
-        "k_min_128": frozenset({True}),
+        "n_min": frozenset({128}),
+        "k_min": frozenset({128}),
     },
     priority=Priority.SPECIALIZED,
 )
@@ -179,8 +179,8 @@ def triton_rowcta_gemv(
     signatures=_BF16_SIG,
     traits={
         "m": frozenset(range(2, 33)),
-        "k_align_128": frozenset({True}),
-        "n_align_16": frozenset({True}),
+        "n_align": frozenset({16}),
+        "k_align": frozenset({128}),
     },
     priority=Priority.SPECIALIZED,
 )
@@ -237,11 +237,12 @@ def _select(m: int, n: int, k: int, on_cuda: bool):
     reg = KernelRegistry.get()
     # platform= makes the registry honor each spec's capability gate; without
     # it an arch-gated spec (the measured sm103 route) would match anywhere.
+    traits = {"m": m, "n": n, "k": k}
     for spec in reg.get_for_operator(
         "gemm", "decode_gemv", platform=current_platform()
     ):
-        if spec_matches_traits(spec, {"m": m}) and spec_matches_shape_traits(
-            spec, {"N": n, "K": k}
+        if spec_matches_traits(spec, traits) and spec_matches_shape_traits(
+            spec, traits
         ):
             return reg.get_impl(spec.name)
     return torch_decode_gemv
@@ -330,9 +331,9 @@ def rowcta_gemv_add3(
         "m": frozenset({1}),
         "n": frozenset({1024}),
         "k": frozenset({4096}),
-        "is_cuda": frozenset({True}),
         "a_inner_stride_one": frozenset({True}),
         "b_inner_stride_one": frozenset({True}),
+        "is_cuda": frozenset({True}),
     },
     priority=Priority.SPECIALIZED,
 )

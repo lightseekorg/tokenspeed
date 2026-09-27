@@ -218,14 +218,13 @@ if gemm_fp8_nt_groupwise is not error_fn:
         ),
         signatures=_MXFP8_FORMAT_SIGNATURES,
         traits={
-            "n_align_128": frozenset({True}),
-            "k_align_128": frozenset({True}),
+            "n_align": frozenset({128}),
+            "k_align": frozenset({128}),
             "block_scale_layout": frozenset(
                 {"canonical", "canonical_blackwell", "flashinfer_mn"}
             ),
         },
         priority=Priority.SPECIALIZED + 3,
-        tags={"throughput"},
     )
     def flashinfer_mm_fp8_blockscale(
         A: torch.Tensor,
@@ -355,14 +354,14 @@ if mm_mxfp8 is not error_fn:
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 3),
+            max_arch_version=ArchVersion(10, 7),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=_MXFP8_1X32_FORMAT_SIGNATURES,
         traits={
-            "k_align_32": frozenset({True}),
-            "n_min_128": frozenset({True}),
-            "k_min_128": frozenset({True}),
+            "k_align": frozenset({32}),
+            "n_min": frozenset({128}),
+            "k_min": frozenset({128}),
             "pdl_enabled": frozenset({True}),
         },
         priority=Priority.SPECIALIZED + 2,
@@ -579,7 +578,7 @@ if has_flashinfer_cute_dsl_nvfp4_a16():
             vendors=frozenset({"nvidia"}),
         ),
         signatures=_NVFP4_A16_FORMAT_SIGNATURES,
-        traits={"k_align_16": frozenset({True})},
+        traits={"k_align": frozenset({16})},
         priority=Priority.SPECIALIZED + 2,
     )
     def flashinfer_cute_dsl_mm_nvfp4_a16(

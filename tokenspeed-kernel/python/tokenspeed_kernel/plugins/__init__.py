@@ -169,7 +169,7 @@ def discover_plugins(*, force: bool = False) -> list[PluginInfo]:
     eps = sorted(_entry_points(ENTRY_POINT_GROUP), key=lambda ep: ep.name)
     for ep in eps:
         if ep.name in disabled:
-            logger.info("Skipping disabled kernel plugin %r", ep.name)
+            logger.info(f"Skipping disabled kernel plugin {ep.name!r}")
             continue
         if ep.name in _loaded_plugins and not force:
             continue
@@ -198,11 +198,8 @@ def discover_plugins(*, force: bool = False) -> list[PluginInfo]:
         _loaded_plugins[ep.name] = info
         loaded.append(info)
         logger.info(
-            "Loaded kernel plugin %r (%s %s) registering %d kernels",
-            ep.name,
-            package,
-            version,
-            len(new_names),
+            f"Loaded kernel plugin {ep.name!r} ({package!s} {version!s}) registering "
+            f"{len(new_names):d} kernels",
         )
 
     return loaded

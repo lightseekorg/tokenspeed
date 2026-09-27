@@ -35,9 +35,11 @@ their component explicitly: ``Backend(config, spec)``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import ClassVar, TypeVar
 
 import torch
+from tokenspeed_kernel.ops.attention.dsv4 import dsv4_decode_supports_partials
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
@@ -98,9 +100,7 @@ def resolve_cache_layer_types(
 
 
 def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
-    if kv_cache_dtype_str == "auto":
-        return torch.bfloat16
-    elif kv_cache_dtype_str == "bfloat16":
+    if kv_cache_dtype_str == "auto" or kv_cache_dtype_str == "bfloat16":
         return torch.bfloat16
     elif kv_cache_dtype_str in ("fp8", "fp8_e4m3"):
         return torch.float8_e4m3fn
@@ -127,6 +127,8 @@ class AttnComponentSpec:
 @dataclass(kw_only=True)
 class SoftmaxAttnConfig(AttnComponentSpec):
     """Base of the softmax-attention families (MHA / MLA / DSA / MSA)."""
+
+    is_dsa: ClassVar[bool] = False
 
     num_attention_heads: int
     num_kv_heads: int
@@ -195,6 +197,10 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # One topology for target and continuation/MTP views; DCP does not add ranks.
+    dcp_size: int = 1
+    dcp_rank: int = 0
+    dcp_group: tuple[int, ...] = (0,)
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):
@@ -206,6 +212,42 @@ class AttnConfig:
                 "AttnConfig requires exactly one softmax-family component, got "
                 f"{[type(c).__name__ for c in self.components] or 'none'}"
             )
+        if self.dcp_size > 1:
+            softmax = softmax_components[0]
+            if softmax.backend_name == "flashmla":
+                if torch.device(self.device).type != "cuda":
+                    raise ValueError("FlashMLA DCP requires CUDA")
+                if (
+                    self.speculative_num_steps > 0
+                    or self.speculative_num_draft_tokens > 1
+                    or self.is_draft
+                ):
+                    raise ValueError("FlashMLA DCP does not yet support speculation")
+            elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
+                if torch.device(self.device).type != "cuda":
+                    raise ValueError("GPU DSA DCP requires CUDA")
+                if (
+                    self.speculative_num_steps > 0
+                    or self.speculative_num_draft_tokens > 1
+                    or self.is_draft
+                ):
+                    raise ValueError("GPU DSA DCP does not yet support speculation")
+            elif softmax.backend_name == "hybrid_linear_attn":
+                # The registry resolves the user's full-attention leaf after
+                # composing the hybrid components, and validates it before
+                # cache allocation. The composite name is not a capability.
+                pass
+            elif softmax.backend_name != "deepseek_v4":
+                raise ValueError(
+                    "DCP currently requires DeepSeek V4, GPU DSA or FlashMLA attention"
+                )
+            else:
+                platform = current_platform()
+                if not dsv4_decode_supports_partials(platform):
+                    raise ValueError(
+                        "DCP requires a DeepSeek V4 decode kernel that returns a "
+                        f"no-sink LSE; none is registered for {platform.device_name}"
+                    )
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
         """The first component that is a ``cls``, or None.
@@ -251,6 +293,12 @@ def model_wide_kwargs(
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,
+    )
+    attn_mapping = server_args.mapping.attn
+    kwargs.update(
+        dcp_size=attn_mapping.dcp_size,
+        dcp_rank=attn_mapping.dcp_rank,
+        dcp_group=attn_mapping.dcp_group,
     )
     if server_args.speculative_algorithm is not None:
         kwargs.update(

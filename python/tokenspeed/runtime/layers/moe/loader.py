@@ -125,25 +125,25 @@ def _build_global_expert_name_plan(
         expert_plan.extend(
             (
                 CheckpointPlanEntry(
-                    param_name="",
+                    param_name="experts.w13_",
                     checkpoint_weight_name=schema.make_expert_weight_name(
                         expert_id, "gate_proj"
                     ),
-                    shard_id="",
+                    shard_id="w1",
                 ),
                 CheckpointPlanEntry(
-                    param_name="",
+                    param_name="experts.w13_",
                     checkpoint_weight_name=schema.make_expert_weight_name(
                         expert_id, "up_proj"
                     ),
-                    shard_id="",
+                    shard_id="w3",
                 ),
                 CheckpointPlanEntry(
-                    param_name="",
+                    param_name="experts.w2_",
                     checkpoint_weight_name=schema.make_expert_weight_name(
                         expert_id, "down_proj"
                     ),
-                    shard_id="",
+                    shard_id="w2",
                 ),
             )
         )
@@ -307,8 +307,13 @@ class MoECheckpointLoader:
         return any(plan_entry.matches(name) for plan_entry in plan)
 
     def matches(self, name: str) -> bool:
+        plan = (
+            self._global_expert_plan
+            if name.endswith(".input_scale")
+            else self._expert_plan
+        )
         return self._matches_plan(self._fused_plan, name) or self._matches_plan(
-            self._expert_plan, name
+            plan, name
         )
 
     def is_expert_checkpoint_weight(self, name: str) -> bool:
@@ -327,8 +332,10 @@ class MoECheckpointLoader:
         )
 
     def _load_expert(self, name: str, loaded_weight: torch.Tensor) -> str | None:
+        input_scale = name.endswith(".input_scale")
+        plan = self._global_expert_plan if input_scale else self._expert_plan
         mapped_name: str | None = None
-        for plan_entry in self._expert_plan:
+        for plan_entry in plan:
             if not plan_entry.matches(name):
                 continue
 
@@ -341,7 +348,7 @@ class MoECheckpointLoader:
                 param,
                 loaded_weight,
                 shard_id=plan_entry.shard_id,
-                local_expert_id=plan_entry.local_expert_id,
+                local_expert_id=None if input_scale else plan_entry.local_expert_id,
             )
             return mapped_name
 
@@ -388,6 +395,16 @@ class MoECheckpointLoader:
             mapped_name = plan_entry.resolve_param_name(name)
             param = self._params_dict.get(mapped_name)
             if param is None:
+                continue
+
+            if mapped_name.endswith("_input_scale"):
+                param.weight_loader(
+                    param,
+                    loaded_weight,
+                    shard_id=plan_entry.shard_id,
+                    local_expert_id=None,
+                )
+                loaded_any = True
                 continue
 
             tensor_to_load = loaded_weight

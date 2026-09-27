@@ -338,13 +338,11 @@ class EncoderForwardStepRunner:
             )
         )
         logger.info(
-            "EncoderForwardStepRunner initialized: modality=%s, budgets=%s, "
-            "max_batch_size=%d, max_metadata_sequences_per_batch=%s, encoder_tp=%d",
-            self.modality_name,
-            self.encoder_output_token_budgets,
-            self.max_batch_size,
-            metadata_sequence_budget_log_value,
-            self.capture_tp_size,
+            f"EncoderForwardStepRunner initialized: modality={self.modality_name!s}, "
+            f"budgets={self.encoder_output_token_budgets!s}, "
+            f"max_batch_size={self.max_batch_size:d}, max_metadata_sequences_per_batch="
+            f"{metadata_sequence_budget_log_value!s}, encoder_tp="
+            f"{self.capture_tp_size:d}",
         )
 
     def __call__(self, items: list[Any]) -> torch.Tensor:
@@ -381,9 +379,8 @@ class EncoderForwardStepRunner:
         for encoder_output_token_budget in self.encoder_output_token_budgets:
             self._capture_one(encoder_output_token_budget)
         logger.info(
-            "Encoder CUDA graph capture complete: modality=%s, %d budget graphs.",
-            self.modality_name,
-            len(self.budget_graphs),
+            f"Encoder CUDA graph capture complete: modality={self.modality_name!s}, "
+            f"{len(self.budget_graphs):d} budget graphs.",
         )
 
     def _capture_one(self, encoder_output_token_budget: int) -> None:
@@ -435,13 +432,11 @@ class EncoderForwardStepRunner:
             output_buffer=output_buffer,
         )
         logger.debug(
-            "Captured encoder cudagraph: modality=%s, budget=%d, "
-            "max_batch_size=%d, metadata_sequence_budget=%d, buffers=%s",
-            self.modality_name,
-            encoder_output_token_budget,
-            self.max_batch_size,
-            metadata_sequence_budget,
-            {k: (v.dtype, tuple(v.shape)) for k, v in metadata_buffers.items()},
+            f"Captured encoder cudagraph: modality={self.modality_name!s}, budget="
+            f"{encoder_output_token_budget:d}, "
+            f"max_batch_size={self.max_batch_size:d}, metadata_sequence_budget="
+            f"{metadata_sequence_budget:d}, buffers="
+            f"{ {k: (v.dtype, tuple(v.shape)) for k, v in metadata_buffers.items()}!s}",
         )
 
     def _smallest_fitting_budget(

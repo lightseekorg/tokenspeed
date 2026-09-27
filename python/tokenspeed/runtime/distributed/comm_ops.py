@@ -159,6 +159,7 @@ def prepare_all_reduce_buffers(
     producer_direct_max_numel: int,
     attnres_max_numel: int,
     attnres_max_rows: int,
+    enable_lamport: bool,
     dtype: torch.dtype,
     backend: CommBackend | None,
 ) -> bool:
@@ -170,6 +171,7 @@ def prepare_all_reduce_buffers(
         producer_direct_max_numel: Maximum producer-direct payload in elements.
         attnres_max_numel: Maximum fused AttnRes payload in elements.
         attnres_max_rows: Maximum fused AttnRes payload in rows.
+        enable_lamport: Allow Lamport for eligible producer-direct payloads.
         dtype: Element type shared by the prepared paths.
         backend: Backend to prepare, or ``None`` to use the global backend.
 
@@ -185,6 +187,7 @@ def prepare_all_reduce_buffers(
         producer_direct_max_numel=producer_direct_max_numel,
         attnres_max_numel=attnres_max_numel,
         attnres_max_rows=attnres_max_rows,
+        enable_lamport=enable_lamport,
         dtype=dtype,
     )
 
@@ -283,7 +286,7 @@ def all_gather(
     return backend.all_gather(tensor, group, dim)
 
 
-def all_gather_into_tensor(
+def all_gather_single(
     output: torch.Tensor,
     input: torch.Tensor,
     group: Group,
@@ -292,7 +295,7 @@ def all_gather_into_tensor(
     """All-gather input into a pre-allocated output buffer."""
     if backend is None:
         backend = get_global_backend()
-    backend.all_gather_into_tensor(output, input, group)
+    backend.all_gather_single(output, input, group)
 
 
 def reduce_scatter(

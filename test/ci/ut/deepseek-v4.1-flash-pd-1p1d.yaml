@@ -1,0 +1,21 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-runtime-deepseek-v41-flash-pd-1p1d
+type: ut
+workflow_stage: unit-test
+triggers:
+  - manual
+runner:
+  labels:
+    - b200-4gpu
+env:
+  CI: "true"
+  # P and D each take two GPUs of the four-GPU runner.
+  WORLD_SIZE: "2"
+  PREFILL_GPUS: "0,1"
+  DECODE_GPUS: "2,3"
+  MOE_BACKEND: mega_moe
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 -m pytest test/runtime/distributed/test_deepseek_v41_pd_1p1d.py -v -s

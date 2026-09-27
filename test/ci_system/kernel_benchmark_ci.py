@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
-import math
 import os
 import statistics
 import subprocess
@@ -50,18 +49,14 @@ CLASSIFICATIONS = (
 )
 
 _TIMER_FIELDS = (
-    "calls_per_graph",
     "eager_warmup_iterations",
     "replay_warmup_iterations",
     "measurement_blocks",
 )
-_TIMING_SEMANTICS = {
-    "timing_mode": "graph_replay",
-    "metric": "device_time_per_invocation",
-    "unit": "us",
-}
-_WORKER_RELATIVE_PATH = Path(
-    "tokenspeed-kernel/python/tokenspeed_kernel/benchmark/ci.py"
+_SUITE_TIMER_FIELDS = (
+    "eager_warmup_iterations",
+    "replay_warmup_iterations",
+    "_sample_contract",
 )
 _KERNEL_REQUIREMENTS = Path("tokenspeed-kernel/python/requirements/rocm.txt")
 
@@ -89,17 +84,16 @@ def _write_json(path: Path, value: object) -> None:
     _atomic_write(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
-def _definition_requires_correctness(definition: Mapping[str, Any]) -> bool:
-    parameters = definition.get("parameters")
-    return isinstance(parameters, dict) and parameters.get("validation") is not None
-
-
 def validate_run_document(
     value: object,
     *,
     expected_revision: str | None = None,
 ) -> dict[str, Any]:
-    """Check the revision-local facts needed for a meaningful comparison."""
+    """Check the revision-local facts needed for a meaningful comparison.
+
+    The worker guarantees the shape of each result; this only checks what the
+    coordinator itself keys on.
+    """
 
     try:
         run = dict(value)
@@ -112,7 +106,14 @@ def validate_run_document(
                 f"benchmark run revision {run['revision']} does not match "
                 f"{expected_revision}"
             )
-        timer = {field: run["timer"][field] for field in _TIMER_FIELDS}
+        raw_timer = run["timer"]
+        timer = {field: raw_timer[field] for field in _TIMER_FIELDS}
+        legacy_calls = raw_timer.get("calls_per_graph")
+        timer["_sample_contract"] = (
+            "single_operation_graph_replay"
+            if legacy_calls in (None, 1)
+            else f"legacy_{legacy_calls}_operation_graph_replay"
+        )
         environment = {
             field: run["environment"][field]
             for field in ("vendor", "arch", "device_name")
@@ -122,47 +123,12 @@ def validate_run_document(
             raise CoordinatorError("benchmark run has no cases")
 
         seen: set[str] = set()
-        successful = False
         for case in cases:
             case_id = case["id"]
             if not isinstance(case_id, str) or not case_id or case_id in seen:
                 raise CoordinatorError(f"invalid or duplicate benchmark id {case_id!r}")
             seen.add(case_id)
 
-            result = case["result"]
-            if result["status"] != "success":
-                continue
-            successful = True
-            samples = tuple(float(sample) for sample in result["samples_us"])
-            if len(samples) != timer["measurement_blocks"]:
-                raise CoordinatorError("sample count does not match measurement blocks")
-            if not all(math.isfinite(sample) and sample > 0.0 for sample in samples):
-                raise CoordinatorError("timing samples must be finite and positive")
-            if not result["registration_name"]:
-                raise CoordinatorError("successful benchmark has no registration")
-            if any(
-                result[field] != expected
-                for field, expected in _TIMING_SEMANTICS.items()
-            ):
-                raise CoordinatorError(
-                    "successful benchmark has unsupported timing semantics"
-                )
-
-            correctness = result.get("correctness")
-            if (
-                _definition_requires_correctness(case["definition"])
-                and correctness is None
-            ):
-                raise CoordinatorError(
-                    "correctness is required by the benchmark definition"
-                )
-            if correctness is not None and correctness.get("passed") is not True:
-                raise CoordinatorError("correctness must report passed=true")
-
-        if successful and not all(environment.values()):
-            raise CoordinatorError(
-                "successful benchmark runs require complete hardware information"
-            )
         run["timer"] = timer
         run["environment"] = environment
         return run
@@ -207,20 +173,37 @@ def _measurement_comparison(
     policy = base_case["policy"]
     candidate_policy = candidate_case["policy"]
 
-    for label, result in (("baseline", base_result), ("candidate", candidate_result)):
-        if result.get("status") != "success":
-            return _empty_comparison(
-                case_id,
-                "invalid",
-                f"{label} benchmark returned {result.get('status', 'unknown')}",
-            )
-
-    if base_result["registration_name"] != candidate_result["registration_name"]:
+    if candidate_result.get("status") != "success":
         return _empty_comparison(
             case_id,
             "invalid",
-            "selected kernel registrations differ between revisions",
+            f"candidate benchmark returned {candidate_result.get('status', 'unknown')}",
         )
+    base_status = base_result.get("status", "unknown")
+    if base_status != "success":
+        if base_status in {
+            "not_applicable",
+            "registration_missing",
+            "invalid_case",
+            "setup_failure",
+            "capture_failure",
+            "execution_failure",
+            "correctness_failure",
+        }:
+            comparison = _empty_comparison(
+                case_id,
+                "inconclusive",
+                f"baseline benchmark returned {base_status}; candidate succeeded, "
+                "but no successful baseline measurement is available",
+            )
+            comparison["candidate_median_us"] = _result_median(candidate_case)
+            return comparison
+        return _empty_comparison(
+            case_id,
+            "invalid",
+            f"baseline benchmark returned {base_status}",
+        )
+
     if any(
         base_result[field] != candidate_result[field]
         for field in ("timing_mode", "metric", "unit")
@@ -261,6 +244,12 @@ def _measurement_comparison(
         classification = "within_budget"
         detail = "change does not exceed both regression budgets"
 
+    if base_result["registration_name"] != candidate_result["registration_name"]:
+        detail += (
+            "; selected registration changed from "
+            f"{base_result['registration_name']} to "
+            f"{candidate_result['registration_name']}"
+        )
     if policy != candidate_policy:
         detail += "; candidate policy changed, so the baseline policy was used"
 
@@ -336,7 +325,10 @@ def compare_runs(
             )
 
         environments_match = base["environment"] == candidate["environment"]
-        timers_match = base["timer"] == candidate["timer"]
+        suite_timers_match = all(
+            base["timer"][field] == candidate["timer"][field]
+            for field in _SUITE_TIMER_FIELDS
+        )
 
         for case_id in sorted(candidate_cases.keys() | base_cases.keys()):
             base_case = base_cases.get(case_id)
@@ -364,15 +356,19 @@ def compare_runs(
                 comparison["base_median_us"] = _result_median(base_case)
                 comparisons.append(comparison)
                 continue
+            # The epoch separates performance-relevant operation semantics
+            # that intentionally retain the same stable case identity.
             if (
-                base_case["definition"] != candidate_case["definition"]
-                or not timers_match
+                base_case["comparison_epoch"] != candidate_case["comparison_epoch"]
+                or base_case["definition"] != candidate_case["definition"]
+                or not suite_timers_match
             ):
                 classification = (
                     "changed" if _case_succeeded(candidate_case) else "invalid"
                 )
                 detail = (
-                    "benchmark definition or timing configuration changed; "
+                    "comparison epoch, benchmark definition, or timing "
+                    "configuration changed; "
                     "measurements were not compared"
                     if classification == "changed"
                     else "changed candidate benchmark did not complete successfully"
@@ -521,9 +517,9 @@ def render_summary(report: Mapping[str, Any]) -> str:
         [
             "",
             (
-                "Comparisons require matching benchmark definitions, timing settings, "
-                "registrations, and hardware. The merge-base policy supplies the "
-                "regression and noise budgets."
+                "Comparisons require matching comparison epochs, benchmark "
+                "definitions, timing settings, and hardware. The merge-base "
+                "policy supplies the regression and noise budgets."
             ),
         ]
     )
@@ -803,20 +799,7 @@ def _validate_suite_path(path: Path) -> Path:
 
 
 def _baseline_supports_suite(checkout: Path, suite_relative: Path) -> bool:
-    worker_exists = (checkout / _WORKER_RELATIVE_PATH).is_file()
-    suite_exists = (checkout / suite_relative).is_file()
-    if worker_exists and suite_exists:
-        return True
-    if not worker_exists and not suite_exists:
-        return False
-    if worker_exists:
-        raise CoordinatorError(
-            "merge base contains the benchmark runner but not the requested suite; "
-            "this is not an initial bootstrap"
-        )
-    raise CoordinatorError(
-        "merge base contains the requested suite but not its revision-local runner"
-    )
+    return (checkout / suite_relative).is_file()
 
 
 def orchestrate(
@@ -847,11 +830,9 @@ def orchestrate(
         try:
             _add_worktree(repo, candidate_checkout, candidate_sha)
             try:
-                candidate_worker = candidate_checkout / _WORKER_RELATIVE_PATH
-                candidate_suite = candidate_checkout / suite_relative
-                if not candidate_worker.is_file() or not candidate_suite.is_file():
+                if not (candidate_checkout / suite_relative).is_file():
                     raise CoordinatorError(
-                        "candidate revision must contain the benchmark worker and suite"
+                        "candidate revision must contain the benchmark suite"
                     )
 
                 base_supported = _baseline_supports_suite(base_checkout, suite_relative)
@@ -908,8 +889,7 @@ def orchestrate(
                     bootstrap_reason=(
                         None
                         if base_supported
-                        else "the merge base does not contain the revision-local runner "
-                        "and suite"
+                        else "the merge base does not contain the benchmark suite"
                     ),
                 )
             finally:

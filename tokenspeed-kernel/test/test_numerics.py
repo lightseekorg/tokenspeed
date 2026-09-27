@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
-from tokenspeed_kernel.numerics.inputs import get_input_generator
+from tokenspeed_kernel.numerics.inputs import get_input_generator, shape_traits
 from tokenspeed_kernel.numerics.reference.gemm import (
     torch_bmm_fp8_blockscale,
     torch_bmm_fp8_scaled,
@@ -155,6 +155,18 @@ def test_bmm_input_generator_honors_n_contiguous_weight_trait() -> None:
 
     assert inputs["B"].shape == (12, 512, 128)
     assert inputs["B"].stride(1) == 1
+
+
+def test_shape_traits_lowercases_gemm_dimensions() -> None:
+    assert shape_traits({"M": 16, "N": 32, "K": 64}) == {"m": 16, "n": 32, "k": 64}
+    assert shape_traits({"batch": 2, "M": 4, "N": 8, "K": 16}) == {
+        "batch": 2,
+        "m": 4,
+        "n": 8,
+        "k": 16,
+    }
+    assert shape_traits({"B": 2, "M": 4}) == {"batch": 2, "m": 4}
+    assert shape_traits({"seq_len": 128, "num_heads": 8}) == {}
 
 
 def test_quantized_reference_gemm_supports_out() -> None:

@@ -7011,22 +7011,9 @@ def run_standalone(
         print("PASS (reference check skipped)")
         return float("nan")
 
-    import torch._inductor.config as inductor_config
-
-    with inductor_config.patch(
-        {
-            "triton.cudagraphs": False,
-            "max_autotune_gemm_backends": "ATEN",
-        }
-    ):
-        reference_fn = torch.compile(
-            _torch_reference_attention,
-            mode="max-autotune",
-            dynamic=True,
-        )
-        actual, reference = _runner_reference_rows(
-            inputs, output, softmax_scale, reference_fn
-        )
+    actual, reference = _runner_reference_rows(
+        inputs, output, softmax_scale, _torch_reference_attention
+    )
     torch.cuda.synchronize()
     output_fp32 = actual.float()
     max_error = (output_fp32 - reference).abs().max().item()

@@ -292,16 +292,10 @@ def load_per_tensor_input_scale(
     param: torch.nn.Parameter,
     loaded_weight: torch.Tensor,
     shard_id: str,
-    local_expert_id: int,
+    local_expert_id: int | None,
 ) -> None:
-    value = loaded_weight.detach().to(torch.float32).reshape(())
-    if shard_id in {"w1", "w3"}:
-        prev = param.data[local_expert_id]
-        param.data[local_expert_id] = torch.maximum(prev, value)
-    elif shard_id == "w2":
-        param.data[local_expert_id] = value
-    else:
-        raise ValueError(f"Unknown shard_id for input scale: {shard_id}")
+    value = loaded_weight.detach().to(torch.float32).amax().to(param.device)
+    torch.maximum(param.data, value, out=param.data)
 
 
 def make_weight_loader(
@@ -334,18 +328,14 @@ def make_group_scale_loader(
     )
 
 
-def per_tensor_scale_loader() -> Callable:
-    return load_per_tensor_weight_scale
-
-
 def round_up(value: int, multiple: int) -> int:
     return (value + multiple - 1) // multiple * multiple
 
 
 __all__ = [
     "load_per_tensor_input_scale",
+    "load_per_tensor_weight_scale",
     "make_group_scale_loader",
     "make_weight_loader",
-    "per_tensor_scale_loader",
     "round_up",
 ]

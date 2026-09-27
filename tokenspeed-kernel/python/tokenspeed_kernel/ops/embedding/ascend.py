@@ -49,7 +49,6 @@ if current_platform().is_npu:
             "has_q_out": frozenset({True, False}),
             "has_k_out": frozenset({True, False}),
         },
-        tags={"portability"},
     )
     def torch_npu_embedding_rope(
         *,

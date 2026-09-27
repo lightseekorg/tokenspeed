@@ -56,6 +56,7 @@ from tokenspeed.runtime.layers.attention.chunk import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TOKENSPEED_MLA_DEFAULT_PAGE_SIZE,
     TOKENSPEED_MLA_SUPPORTED_PAGE_SIZES,
@@ -374,14 +375,11 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             return
         self._logged_block_layouts.add(key)
         logger.info(
-            "CuteDSL MLA block decode uses the %s layout "
-            "(heads=%d, block=%d, page=%d, dtype=%s, window=%s).",
-            "query-axis" if q_len == self.spec_num_tokens else "flattened",
-            num_q_heads,
-            q_len,
-            self.kernel_page_size,
-            self.data_type,
-            sliding_window,
+            "CuteDSL MLA block decode uses the "
+            f"{('query-axis' if q_len == self.spec_num_tokens else 'flattened')!s} "
+            "layout "
+            f"(heads={num_q_heads:d}, block={q_len:d}, page={self.kernel_page_size:d}, "
+            f"dtype={self.data_type!s}, window={sliding_window!s}).",
         )
 
     def _decode_views(self, bs: int) -> CuteDSLMLADecodeMetadata:
@@ -481,11 +479,15 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # q is whole Q [T, H, head_dim]; k is whole latent [T, 1, head_dim].
         if save_kv_cache:
             assert k is not None
+            local_slots, write_mask = resolve_cache_slots(
+                out_cache_loc, self.cache_placement(layer)
+            )
             token_to_kv_pool.set_mla_kv_buffer(
                 layer,
-                out_cache_loc,
+                local_slots,
                 k[..., : self.kv_lora_rank],
                 k[..., self.kv_lora_rank :],
+                write_mask=write_mask,
             )
 
         metadata = self.forward_decode_metadata
@@ -542,9 +544,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
         if not CuteDSLMLABackend._logged_decode:
             logger.info(
-                "CuteDSL MLA decode kernel invoked (tokenspeed_mla_decode, query_dtype=%s, kv_dtype=%s)",
-                query.dtype,
-                kv_cache.dtype,
+                "CuteDSL MLA decode kernel invoked (tokenspeed_mla_decode, query_dtype="
+                f"{query.dtype!s}, kv_dtype={kv_cache.dtype!s})",
             )
             CuteDSLMLABackend._logged_decode = True
 

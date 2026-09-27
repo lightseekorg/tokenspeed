@@ -85,8 +85,8 @@ class LoadConfig:
 
         if self.ignore_patterns is not None and len(self.ignore_patterns) > 0:
             logger.info(
-                "Ignoring the following patterns when downloading weights: %s",
-                self.ignore_patterns,
+                "Ignoring the following patterns when downloading weights: "
+                f"{self.ignore_patterns!s}",
             )
         else:
             self.ignore_patterns = ["original/**/*"]

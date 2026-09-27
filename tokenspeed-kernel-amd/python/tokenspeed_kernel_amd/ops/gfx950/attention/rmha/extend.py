@@ -492,7 +492,7 @@ class ExtendProgram:
 
 
 @gluon.jit
-def _rel_mha_extend_fp16(
+def gluon_rel_mha_extend_gfx950(
     q_ptr,
     rel_logits_ptr,
     k_cache_ptr,
@@ -638,7 +638,7 @@ def _rel_mha_extend_fp16(
     program.store_lse(l_i, m_i)
 
 
-def gluon_rel_mha_extend_gfx950(
+def launch_gluon_rel_mha_extend_gfx950(
     q: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,
@@ -684,7 +684,7 @@ def gluon_rel_mha_extend_gfx950(
         lse = None
         lse_arg = q
     grid = (blocks_per_req, batch, n_heads)
-    _rel_mha_extend_fp16[grid](
+    gluon_rel_mha_extend_gfx950[grid](
         q,
         rel_logits,
         k_cache,

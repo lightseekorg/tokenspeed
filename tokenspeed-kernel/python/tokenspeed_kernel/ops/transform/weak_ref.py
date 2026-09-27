@@ -78,11 +78,10 @@ def _load():
     except Exception as exc:  # pragma: no cover - host without a C++ toolchain
         _load_failed = True
         logger.warning(
-            "weak_ref_tensor extension unavailable (%s: %s); falling back to "
+            f"weak_ref_tensor extension unavailable ({type(exc).__name__!s}: {exc!s}); "
+            "falling back to "
             "identity (strong refs pin graph-pool blocks -- correct, but "
             "breakable-graph capture memory scales with the bucket sum).",
-            type(exc).__name__,
-            exc,
         )
     return _module
 

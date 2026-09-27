@@ -104,6 +104,7 @@ def worker_main(rank: int, world_size: int, port: int, hidden_size: int) -> None
         cases = token_cases(world_size)
         max_tokens = max(sum(tokens) for tokens in cases)
         rsag = create_state(
+            enable_lamport=False,
             group=dist.group.WORLD,
             rank_in_group=rank,
             attnres_max_numel=0,
@@ -154,6 +155,7 @@ def check_all_gather(
 def check_all_reduce(rank: int, world_size: int, device) -> None:
     max_numel = 512 * 1024 // torch.empty((), dtype=torch.bfloat16).element_size()
     state = create_state(
+        enable_lamport=False,
         group=dist.group.WORLD,
         rank_in_group=rank,
         attnres_max_numel=0,

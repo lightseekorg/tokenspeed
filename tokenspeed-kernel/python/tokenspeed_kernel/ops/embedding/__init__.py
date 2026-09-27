@@ -486,6 +486,8 @@ __all__ = [
     "apply_rope_mla",
     "apply_rope_mla_set_kv",
     "supports_fused_mla_kv_write",
+    "vocab_shard_embedding",
+    "engram_hash",
 ]
 
 
@@ -617,3 +619,137 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
         solution=None,
     )
     return kernel(weight, scales, indices, row_start, row_end)
+
+
+def vocab_shard_embedding(
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    org_range: tuple[int, int],
+    num_org_padding: int,
+    added_range: tuple[int, int],
+) -> torch.Tensor:
+    """Gather one vocabulary shard's embeddings, zeroing IDs of other shards.
+
+    The shard holds its original-vocabulary rows ``org_range`` (global
+    ``[start, end)``), ``num_org_padding`` padding rows, then its added
+    (LoRA) rows ``added_range``. IDs outside both ranges produce zero rows,
+    so summing every shard's output over the model-parallel group yields the
+    full embedding; the caller owns that collective.
+
+    Args:
+        weight: Floating ``[local_capacity, D]`` shard with contiguous columns.
+        indices: Contiguous integer IDs of any shape, on the shard's GPU.
+        org_range: Global ``(start, end)`` of the shard's original rows.
+        num_org_padding: Padding rows between the original and added rows.
+        added_range: Global ``(start, end)`` of the shard's added rows.
+
+    Returns:
+        ``[*indices.shape, D]`` embeddings in the weight's dtype.
+    """
+    org_start, org_end = org_range
+    added_start, added_end = added_range
+    if weight.ndim != 2 or weight.stride(1) != 1 or not weight.is_floating_point():
+        raise ValueError(
+            "vocabulary shard weight must be floating [rows, D] with contiguous columns"
+        )
+    if not (0 <= org_start <= org_end and 0 <= added_start <= added_end):
+        raise ValueError("vocabulary shard ranges must be ordered and non-negative")
+    if (org_end - org_start) + num_org_padding + (
+        added_end - added_start
+    ) > weight.shape[0]:
+        raise ValueError("vocabulary shard ranges exceed the weight's rows")
+    if (
+        not indices.is_cuda
+        or indices.dtype not in (torch.int32, torch.int64)
+        or not indices.is_contiguous()
+        or weight.device != indices.device
+    ):
+        raise ValueError(
+            "vocabulary shard gather requires colocated GPU tensors and contiguous IDs"
+        )
+    kernel = select_kernel(
+        "embedding",
+        "vocab_shard_embedding",
+        format_signature(weight=dense_tensor_format(weight.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(weight, indices, org_range, num_org_padding, added_range)
+
+
+def engram_hash(
+    input_ids: torch.Tensor,
+    previous_token_ids: torch.Tensor,
+    token_mask: torch.Tensor,
+    token_map: torch.Tensor,
+    multipliers: torch.Tensor,
+    primes: torch.Tensor,
+    offsets: torch.Tensor,
+    pad_id: int,
+    dead_id: int,
+) -> torch.Tensor:
+    """Hash every token's 2/3/4-gram windows into Engram table rows.
+
+    For each token the current id and its three predecessors are mapped to
+    the compressed vocabulary; a predecessor that is ``dead_id`` (a barrier
+    or the sequence start), or a current token whose mask is false, and every
+    older predecessor hash as ``pad_id``. Per layer, the rolling XOR of the
+    mapped tokens times the layer's multipliers is reduced modulo each head's
+    prime and shifted by that bucket's offset into the layer's table.
+
+    Args:
+        input_ids: ``[tokens]`` int32/int64 current ids.
+        previous_token_ids: ``[tokens, 3]`` int32/int64 predecessors, newest
+            first, ``dead_id`` where none exists.
+        token_mask: ``[tokens]`` bool, false for padding or image placeholders
+            whose ids may lie outside the vocabulary.
+        token_map: ``[vocab]`` int64 raw-to-compressed id map.
+        multipliers: ``[layers, 4]`` int64 odd hash multipliers.
+        primes: ``[layers, 3, heads]`` int64 bucket sizes per n-gram order.
+        offsets: ``[layers, 3 * heads]`` int64 first row of every bucket.
+        pad_id: Compressed id hashed for blocked positions.
+        dead_id: Raw id marking a missing predecessor.
+
+    Returns:
+        ``[tokens, layers, 3 * heads]`` int64 table rows.
+    """
+    tokens = input_ids.shape[0]
+    layers, orders, heads = primes.shape
+    if orders != 3 or multipliers.shape != (layers, 4):
+        raise ValueError("Engram hash expects three lookbacks per layer")
+    if previous_token_ids.shape != (tokens, 3) or token_mask.shape != (tokens,):
+        raise ValueError("Engram IDs, previous-three window and mask shapes disagree")
+    if offsets.shape != (layers, 3 * heads):
+        raise ValueError("Engram offsets must cover every layer's buckets")
+    if (
+        token_mask.dtype != torch.bool
+        or input_ids.dtype not in (torch.int32, torch.int64)
+        or previous_token_ids.dtype not in (torch.int32, torch.int64)
+    ):
+        raise TypeError("Engram expects int32/int64 IDs and a bool token mask")
+    constants = (token_map, multipliers, primes, offsets)
+    if any(t.dtype != torch.int64 for t in constants):
+        raise TypeError("Engram hash constants must be int64")
+    everything = (input_ids, previous_token_ids, token_mask, *constants)
+    if not all(t.is_cuda and t.is_contiguous() for t in everything):
+        raise ValueError("Engram hash requires contiguous GPU tensors")
+    kernel = select_kernel(
+        "embedding",
+        "engram_hash",
+        format_signature(indices=dense_tensor_format(torch.int64)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(
+        input_ids,
+        previous_token_ids,
+        token_mask,
+        token_map,
+        multipliers,
+        primes,
+        offsets,
+        pad_id,
+        dead_id,
+    )

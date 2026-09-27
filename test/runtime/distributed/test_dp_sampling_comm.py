@@ -368,9 +368,9 @@ class _CountingNcclBackend:
         self._inner = inner
         self.all_gather_calls = 0
 
-    def all_gather_into_tensor(self, output, input, group):
+    def all_gather_single(self, output, input, group):
         self.all_gather_calls += 1
-        return self._inner.all_gather_into_tensor(output, input, group)
+        return self._inner.all_gather_single(output, input, group)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)

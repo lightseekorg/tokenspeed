@@ -60,7 +60,9 @@ def one_group(group_id: str, *fields, **spec_kwargs):
     if "checkpoint_granularity" not in spec_kwargs:
         spec_kwargs.setdefault("rows_per_page", spec_kwargs.pop("page_size", 1))
         spec_kwargs.setdefault("entry_stride_tokens", 1)
-    return spec.CacheGroupSpec(group_id=group_id, **spec_kwargs), tuple(fields)
+    return spec.CacheGroupSpec(
+        group_id=group_id, **spec_kwargs, replayable=False
+    ), tuple(fields)
 
 
 def plan_group_specs(plan) -> tuple[spec.CacheGroupSpec, ...]:
@@ -79,6 +81,7 @@ def plan_group_specs(plan) -> tuple[spec.CacheGroupSpec, ...]:
             retention="full_history",
             rows_per_page=plan.prefix_granularity // group.cache_blocks_per_lcm_block,
             entry_stride_tokens=1,
+            replayable=False,
         )
         for group in plan.groups
     )

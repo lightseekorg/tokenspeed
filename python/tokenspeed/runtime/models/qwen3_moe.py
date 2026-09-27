@@ -77,6 +77,7 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayer):
             )
         elif isinstance(self.mlp, Qwen3MLP):
             self.mlp = Qwen3_5MoeMLP(
+                parallelism="dense",
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,

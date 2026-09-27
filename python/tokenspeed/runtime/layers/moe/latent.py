@@ -44,7 +44,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     COMM_ONESHOT_MAX_BYTES,
     acquire_all_reduce_outputs,
     all_gather,
-    all_gather_into_tensor,
+    all_gather_single,
     all_reduce,
     all_reduce_latent_norm,
     prepare_all_reduce_fusion,
@@ -230,6 +230,7 @@ class Kimi3MoEExecutionPlan:
 
     use_native: bool
     use_trtllm: bool
+    use_mega_moe: bool
     overlap_shared_experts: bool
     joint_moe_reduce: bool
     use_marlin: bool = False
@@ -249,35 +250,37 @@ class Kimi3MoEExecutionPlan:
         mapping,
         moe_backend,
         alt_stream: torch.cuda.Stream | None,
-        *,
-        enforce_eager: bool,
     ) -> "Kimi3MoEExecutionPlan":
-        """Select orchestration without exposing platform policy to the model."""
+        """Select orchestration from the backend, streams, and parallel layout."""
 
-        use_native = native_latent_moe_available()
+        use_mega_moe = moe_backend.value == "mega_moe"
+        use_native = not use_mega_moe and native_latent_moe_available()
         # Hopper (SM90) has no native FP4 tensor cores and no flashinfer SiTU
         # cubin, so K3's MXFP4 SiTU MoE runs weight-only through the Marlin
         # W4A16 GEMM with a fused Triton SiTU epilogue. AUTO picks it whenever
         # neither the AMD-native nor the (Blackwell) TRT-LLM path is available;
         # it can also be forced with ``--moe-backend marlin``.
-        use_marlin = not use_native and (
-            moe_backend.is_marlin()
-            or (moe_backend.is_auto() and _marlin_moe_available())
+        use_marlin = (
+            not use_mega_moe
+            and not use_native
+            and (
+                moe_backend.is_marlin()
+                or (moe_backend.is_auto() and _marlin_moe_available())
+            )
         )
         use_trtllm = (
-            not use_native
+            not use_mega_moe
+            and not use_native
             and not use_marlin
             and (moe_backend.is_auto() or moe_backend.is_flashinfer_trtllm())
         )
         return cls(
             use_native=use_native,
             use_trtllm=use_trtllm,
+            use_mega_moe=use_mega_moe,
             use_marlin=use_marlin,
             overlap_shared_experts=(
-                use_native
-                and enforce_eager
-                and alt_stream is not None
-                and mapping.moe.tp_ep_size == 1
+                use_native and alt_stream is not None and mapping.moe.tp_ep_size == 1
             ),
             joint_moe_reduce=(
                 use_native
@@ -443,6 +446,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
             prefix=prefix,
         )
         self.solution = solution
+        self.register_buffer("_nvfp4_output_scale", None, persistent=False)
 
     def weight_loader(self, param, loaded_weight, shard_id=None, begin_size=None):
         """Take this rank's column block; replicated instances load full width."""
@@ -509,7 +513,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
                 dtype=local.dtype,
                 device=local.device,
             )
-            all_gather_into_tensor(stacked, local.contiguous(), self.shard_group)
+            all_gather_single(stacked, local.contiguous(), self.shard_group)
             return stacked.permute(1, 0, 2).reshape(num_tokens, self.output_size_full)
         if not self.narrowed or self.column_group is None:
             return local
@@ -557,10 +561,31 @@ class Kimi3LatentProjection(ReplicatedLinear):
         rows = self.multicast_down.shard_dim
         return self.weight[self.shard_rank * rows : (self.shard_rank + 1) * rows]
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, None]:
+    def prepare_nvfp4_output(self, output_scale: torch.Tensor) -> None:
+        """Prepare fused NVFP4 output using the expert's loaded encoding scale.
+
+        Unsupported mailboxes retain BF16 output for the expert to quantize.
+        Preparation must finish before CUDA graph capture.
+        """
+        if self.multicast_down is None or not self.multicast_down.nvfp4_available():
+            return
+        self.multicast_down.prepare_nvfp4()
+        self._nvfp4_output_scale = output_scale.detach()
+
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, torch.Tensor], None]:
+        """Return (BF16 latent or packed NVFP4 values/scales, None)."""
         num_tokens = hidden_states.shape[0]
         if self.multicast_down is not None and self.multicast_down.handles(num_tokens):
-            return self.multicast_down(hidden_states, self._multicast_block()), None
+            return (
+                self.multicast_down(
+                    hidden_states,
+                    self._multicast_block(),
+                    output_scale=self._nvfp4_output_scale,
+                ),
+                None,
+            )
         if self.narrowed and self.column_group is not None:
             return self._gather_shards(self.project_shard(hidden_states)), None
         return self._gather_shards(self._project_replicated(hidden_states)), None

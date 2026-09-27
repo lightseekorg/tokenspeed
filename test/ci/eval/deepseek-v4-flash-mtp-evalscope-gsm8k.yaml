@@ -3,7 +3,6 @@ name: eval-deepseek-v4-flash-mtp-gsm8k
 type: eval
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
 runner:
   labels:
@@ -30,7 +29,7 @@ server:
     --speculative-algorithm MTP
     --speculative-num-steps 3
     --disable-overlap-schedule
-    --no-enable-prefix-caching
+    --disable-prefix-caching
     --host 127.0.0.1
     --port 8000
   ready:

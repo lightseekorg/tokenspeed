@@ -230,11 +230,8 @@ class CachePool(ABC):
         # default state for optional layer-wise transfer control
         self.layerwise_load_tracker = None
         logger.info(
-            "Initialized cache view over %d slots as %s, layers from %d, rank %d",
-            arena.size,
-            dtype,
-            self._field_layer_offset,
-            rank,
+            f"Initialized cache view over {arena.size:d} slots as {dtype!s}, layers "
+            f"from {self._field_layer_offset:d}, rank {rank:d}",
         )
 
     @property

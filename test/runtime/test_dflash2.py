@@ -511,6 +511,7 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
     drafter._write_native_cache = lambda *args, **kwargs: written.append(kwargs)
 
     ctx = SimpleNamespace(
+        dspark_context_producer=None,
         bs=3,
         num_extends=1,
         input_num_tokens=positions.numel(),

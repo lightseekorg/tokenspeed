@@ -103,12 +103,14 @@ class _ForwardOp:
         self,
         request_ids,
         extend_prefix_lens,
+        extend_replay_lens,
         input_lengths,
         num_extends,
         prefill_lengths,
     ):
         self.request_ids = request_ids
         self.extend_prefix_lens = extend_prefix_lens
+        self.extend_replay_lens = extend_replay_lens
         self.input_lengths = input_lengths
         self.request_pool_indices = list(range(len(request_ids)))
         self._num_extends = num_extends
@@ -147,6 +149,7 @@ def test_mid_chunk_readmit_slot_reports_empty_and_streams_nothing():
     op = _ForwardOp(
         request_ids=["victim"],
         extend_prefix_lens=[4],
+        extend_replay_lens=[0],
         input_lengths=[4],
         num_extends=1,
         prefill_lengths=[9],
@@ -177,6 +180,7 @@ def test_final_chunk_readmit_slot_emits_result():
     op = _ForwardOp(
         request_ids=["victim"],
         extend_prefix_lens=[8],
+        extend_replay_lens=[0],
         input_lengths=[1],
         num_extends=1,
         prefill_lengths=[9],
@@ -201,6 +205,7 @@ def test_decode_slot_unaffected_by_prefill_lengths():
     op = _ForwardOp(
         request_ids=["dec"],
         extend_prefix_lens=[],
+        extend_replay_lens=[],
         input_lengths=[1],
         num_extends=0,
         prefill_lengths=[],

@@ -24,7 +24,7 @@ import math
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -32,17 +32,19 @@ from tokenspeed_scheduler import (
     Cache,
     CacheGroupConfig,
     CacheGroupFamily,
-    CacheRetention,
-    CacheTransferPolicy,
     ExecutionEvent,
     ForwardEvent,
     RequestSpec,
     SchedulerConfig,
 )
 
-from tokenspeed.runtime.execution.types import NGramInputs
+from tokenspeed.runtime.execution.types import NGramInputs, RequestHistorySeeds
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+    cache_group_config,
+    scheduler_role,
 )
 
 _CACHE_EVENT_TYPES = {
@@ -53,20 +55,6 @@ _CACHE_EVENT_TYPES = {
 if hasattr(Cache, "LoadBackDoneEvent"):
     _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
-
-# Pool-spec string -> scheduler enum (pool_to_cache_groups).
-_RETENTION_MAP = {
-    "full_history": CacheRetention.FullHistory,
-    "sliding_window": CacheRetention.SlidingWindow,
-}
-_FAMILY_MAP = {
-    "history": CacheGroupFamily.History,
-    "state": CacheGroupFamily.State,
-}
-_TRANSFER_POLICY_MAP = {
-    "full_suffix": CacheTransferPolicy.FullSuffix,
-    "latest_snapshot": CacheTransferPolicy.LatestSnapshot,
-}
 
 
 def engram_context_len(text_config) -> int:
@@ -119,6 +107,53 @@ def ngram_inputs_for_forward(
         )
         positions.append(start)
     return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
+
+
+def request_history_seeds_for_forward(
+    forward_op, rid_to_state: Mapping
+) -> RequestHistorySeeds | None:
+    """Snapshot the committed prefix of every extend that resumes one.
+
+    An extend with a non-empty prefix resumes tokens its slot's history row
+    may not hold: a prefix-cache hit, a PD landing, a retraction recovery or
+    a chunk after the slot changed hands. Prompt/output lists hold physical
+    IDs. Returns None when no extend in the batch resumes a prefix.
+
+    TODO(perf): this also reseeds consecutive chunks of one chunked prefill
+    whose slot never changed hands, moving O(N*k) tokens host->device for an
+    N-token prompt in k chunks. Tracking (request id, held length) per slot —
+    as the bounded n-gram path does — would let the gather skip prefixes the
+    slot demonstrably still holds without weakening the recovery and
+    PD-landing cases.
+    """
+    slots: list[int] = []
+    prefix_lengths: list[int] = []
+    tokens: list[tuple[int, ...]] = []
+    for i in range(forward_op.num_extends()):
+        boundary = int(forward_op.extend_prefix_lens[i])
+        if boundary == 0:
+            continue
+        state = rid_to_state[forward_op.request_ids[i]]
+        prompt, output = state.prompt_input_ids, state.output_ids
+        if boundary > len(prompt) + len(output):
+            raise ValueError(
+                f"Request history prefix {boundary} exceeds the physical tokens "
+                f"of {forward_op.request_ids[i]}"
+            )
+        if boundary <= len(prompt):
+            prefix = tuple(prompt[:boundary])
+        else:
+            prefix = tuple(prompt) + tuple(output[: boundary - len(prompt)])
+        slots.append(int(forward_op.request_pool_indices[i]))
+        prefix_lengths.append(boundary)
+        tokens.append(prefix)
+    if not slots:
+        return None
+    return RequestHistorySeeds(
+        slots=tuple(slots),
+        prefix_lengths=tuple(prefix_lengths),
+        tokens=tuple(tokens),
+    )
 
 
 @dataclass(frozen=True)
@@ -210,12 +245,13 @@ def make_config(
     prefix_granularity: int,
     num_host_pages: int,
     disable_l2_cache: bool,
+    enable_l3_storage: bool,
     role: str,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
     disable_prefix_cache: bool = False,
-    cache_groups: Sequence["CacheGroupConfig"] | None = None,
+    cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
 ) -> SchedulerConfig:
@@ -231,16 +267,10 @@ def make_config(
     cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages
-    # The runtime cache executor supports device and host tiers only.
-    cfg.enable_l3_storage = False
+    cfg.enable_l3_storage = enable_l3_storage
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
-    if role == "prefill":
-        cfg.role = SchedulerConfig.Role.P
-    elif role == "decode":
-        cfg.role = SchedulerConfig.Role.D
-    else:
-        cfg.role = SchedulerConfig.Role.Fused
+    cfg.role = scheduler_role(role)
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
@@ -258,46 +288,16 @@ def pool_to_cache_groups(pool: Any) -> list:
     # The arena is the sole publisher, so there is exactly one source here --
     # no fallback to pool-side copies of the same specs.
     contract = pool.arena.runtime_contract
-    specs = contract.group_specs
-    counts = contract.group_page_counts
-    packing = contract.group_packing
-    out = []
-    for spec in specs:
-        retention = _RETENTION_MAP.get(spec.retention)
-        if retention is None:
-            raise ValueError(
-                f"pool_to_cache_groups: unsupported retention "
-                f"{spec.retention!r} for group {spec.group_id!r}"
-            )
-        family = _FAMILY_MAP.get(spec.family)
-        if family is None:
-            raise ValueError(
-                f"pool_to_cache_groups: unsupported family "
-                f"{spec.family!r} for group {spec.group_id!r}"
-            )
-        # The declaration shape (row geometry or state checkpoint) stops here:
-        # the scheduler only learns how many tokens one block-table slot spans.
-        kwargs = dict(
-            group_id=spec.group_id,
-            block_granularity=int(spec.block_granularity),
-            total_pages=int(counts[spec.group_id]),
-            retention=retention,
-            family=family,
-            cache_blocks_per_lcm_block=int(packing[spec.group_id]),
+    counts = contract.virtual_block_counts
+    packing = contract.virtual_packing
+    return [
+        cache_group_config(
+            spec,
+            total_pages=counts[spec.group_id],
+            cache_blocks_per_lcm_block=packing[spec.group_id],
         )
-        transfer_policy = spec.transfer_policy
-        if transfer_policy is not None:
-            mapped_policy = _TRANSFER_POLICY_MAP.get(transfer_policy)
-            if mapped_policy is None:
-                raise ValueError(
-                    "pool_to_cache_groups: unsupported transfer policy "
-                    f"{transfer_policy!r} for group {spec.group_id!r}"
-                )
-            kwargs["transfer_policy"] = mapped_policy
-        if spec.retention == "sliding_window":
-            kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
-        out.append(CacheGroupConfig(**kwargs))
-    return out
+        for spec in contract.group_specs
+    ]
 
 
 def should_use_overlap_schedule(
@@ -327,39 +327,44 @@ def resolve_dspark_prefix_replay_tokens(
     """Resolve the prompt tail needed to rebuild DSpark runtime state.
 
     DeepSeek V4 DSpark advertises the requirement through its draft
-    ``ModelConfig``. Same-checkpoint DSpark configurations without that
-    capability remain fail-closed. External generic DSpark configurations keep
-    their existing scheduler behavior until they advertise an equivalent
-    contract.
+    ``ModelConfig``; V4.1 advertises zero because its windows are cache
+    resident. Same-checkpoint DSpark configurations without that capability
+    remain fail-closed. External generic DSpark configurations keep their
+    existing scheduler behavior until they advertise an equivalent contract.
     """
 
-    if not enable_prefix_caching or speculative_algorithm != "DSPARK":
+    if speculative_algorithm != "DSPARK":
         return 0
     if draft_model_config is None:
-        raise ValueError(
-            "DSPARK prefix caching requires a resolved draft model configuration."
-        )
+        raise ValueError("DSPARK requires a resolved draft model configuration.")
 
     replay_tokens = getattr(draft_model_config, "dspark_prefix_replay_tokens", None)
     if replay_tokens is None:
         if draft_model_path_use_base:
             raise ValueError(
-                "DSPARK same-checkpoint prefix caching requires a draft model "
-                "that advertises captured-context replay support."
+                "DSPARK same-checkpoint decoding requires a draft model that "
+                "advertises captured-context replay support."
             )
         return 0
 
     replay_tokens = int(replay_tokens)
-    if not 0 < replay_tokens <= (1 << 31) - 1:
+    if not 0 <= replay_tokens <= (1 << 31) - 1:
         raise ValueError(
-            "DSPARK captured-context replay requirement must fit a positive int32; "
-            f"got {replay_tokens}."
+            "DSPARK captured-context replay requirement must fit a non-negative "
+            f"int32; got {replay_tokens}."
         )
+    if replay_tokens == 0:
+        # The draft's context lives in the KV cache and follows the prefix.
+        return 0
+    # A drafter-private context cannot be restored from the host tier, with or
+    # without prefix reuse.
     if enable_kvstore:
         raise ValueError(
             "DSPARK captured-context replay does not support KVStore; "
             "use --disable-kvstore."
         )
+    if not enable_prefix_caching:
+        return 0
     if disaggregation_mode != "null":
         raise ValueError(
             "DSPARK captured-context replay does not support disaggregated "
@@ -400,11 +405,45 @@ def make_abort_event(request_id: str) -> "ForwardEvent.Abort":
     return fe
 
 
+def make_retract_event(request_id: str) -> "ForwardEvent.Retract":
+    """Release pages and requeue as prefill without finishing the client.
+
+    Snapshot-less: dest pages were not filled. The next admit recomputes
+    missing prefix tokens from Device/Host plus remaining L3 keys.
+    """
+    fe = ForwardEvent.Retract()
+    fe.request_id = request_id
+    return fe
+
+
 def make_update_reserve_tokens_event(request_id: str, new_reserve_num_tokens: int):
     fe = ForwardEvent.UpdateReserveNumTokens()
     fe.request_id = request_id
     fe.reserve_num_tokens_in_next_schedule_event = new_reserve_num_tokens
     return fe
+
+
+def scheduler_pd_lifecycle(scheduler):
+    """Return a query for the PD request lifecycle counts.
+
+    ``(bootstrapping, prefilling, remote_prefilling, decoding, pd_pinned)``
+    -- five state counts over the request table, bound to the scheduler once
+    so the batch logger reads them only when it emits a line.
+
+    Args:
+        scheduler: The engine's C++ scheduler.
+    """
+
+    def lifecycle() -> tuple[int, int, int, int, int]:
+        return (
+            scheduler.bootstrapping_size(),
+            scheduler.prefilling_size(),
+            scheduler.remote_prefilling_size(),
+            scheduler.decoding_size(),
+            scheduler.pd_transfer_size(),
+        )
+
+    return lifecycle
 
 
 def scheduler_cache_group_pages(scheduler):
@@ -449,16 +488,21 @@ def cache_event_to_payload(event) -> dict:
     kind = type(event).__name__
     if kind not in _CACHE_EVENT_TYPES:
         raise ValueError(f"Unsupported cache event type: {kind}")
-    return {
+    payload = {
         "kind": kind,
         "op_id": int(event.op_id),
     }
+    if kind == "LoadBackDoneEvent":
+        payload["success"] = bool(event.success)
+    return payload
 
 
 def cache_event_from_payload(payload: dict):
     kind = payload["kind"]
     if kind not in _CACHE_EVENT_TYPES:
         raise ValueError(f"Unsupported cache event type: {kind}")
+    if kind == "LoadBackDoneEvent":
+        return _CACHE_EVENT_TYPES[kind](int(payload["op_id"]), bool(payload["success"]))
     event = _CACHE_EVENT_TYPES[kind]()
     event.op_id = int(payload["op_id"])
     return event
@@ -495,6 +539,19 @@ def cache_sync_debug_enabled() -> bool:
     return value.strip().lower() in _TRUTHY_ENV_VALUES
 
 
+class PackedBlockTables(NamedTuple):
+    """One batch's per-group block tables, staged once and uploaded once.
+
+    Attributes:
+        tables: Per-group int32 views into the one device storage.
+        tables_cpu: The same tables as views into the pinned host stage they
+            were uploaded from, for planning that must not wait on the device.
+    """
+
+    tables: dict[str, torch.Tensor]
+    tables_cpu: dict[str, torch.Tensor]
+
+
 def block_tables_from_forward_op(
     forward_op: Any,
     device: "torch.device | str",
@@ -504,6 +561,26 @@ def block_tables_from_forward_op(
     max_page_id: int | None = None,
     max_page_ids: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
+    """The device tables of :func:`packed_block_tables_from_forward_op`."""
+    return packed_block_tables_from_forward_op(
+        forward_op,
+        device,
+        num_reqs=num_reqs,
+        expected_group_ids=expected_group_ids,
+        max_page_id=max_page_id,
+        max_page_ids=max_page_ids,
+    ).tables
+
+
+def packed_block_tables_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    num_reqs: int | None = None,
+    expected_group_ids: tuple[str, ...] | None = None,
+    max_page_id: int | None = None,
+    max_page_ids: Mapping[str, int] | None = None,
+) -> PackedBlockTables:
     """Bridge the per-group block tables to GPU int32 tensors: absolute
     page indices, null hole = 0 preserved, ragged-row padding -1. No
     base-offset companion -- the cache path never compacts.
@@ -513,7 +590,8 @@ def block_tables_from_forward_op(
     precondition of the backends' one-launch packed replay fill
     (``_try_packed_group_unpack``). Per-group uploads would fail its
     same-storage check and fall back to per-group copy/fill chains
-    (~40 tiny transfers per decode step).
+    (~40 tiny transfers per decode step). The host stage is returned too,
+    so a backend planning from the tables reads them without a D2H sync.
 
     Args:
         forward_op: Scheduler forward operation exporting CPU NumPy tables.
@@ -524,8 +602,8 @@ def block_tables_from_forward_op(
         max_page_ids: Optional per-group inclusive upper bounds.
 
     Returns:
-        Per-group tensor views in ``expected_group_ids`` order when supplied,
-        otherwise preserving producer order.
+        Device and host per-group tensor views in ``expected_group_ids``
+        order when supplied, otherwise preserving producer order.
 
     Raises:
         ValueError: If strict contract validation fails before device transfer.
@@ -606,6 +684,7 @@ def block_tables_from_forward_op(
                     )
     device = torch.device(device) if isinstance(device, str) else device
     out: dict[str, torch.Tensor] = {}
+    out_cpu: dict[str, torch.Tensor] = {}
     packable: list[tuple[str, Any, int]] = []
     total = 0
     for key, arr in ordered_items:
@@ -620,11 +699,12 @@ def block_tables_from_forward_op(
             # Kept out of the pack: a zero-width table must stay loud in the
             # replay fill's cols >= 1 assert, not be silently tail-padded.
             out[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32, device=device)
+            out_cpu[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32)
             continue
         packable.append((key, arr, total))
         total += arr.shape[0] * arr.shape[1]
     if not packable:
-        return out
+        return PackedBlockTables(out, out_cpu)
     # Fresh pinned stage per step (event-fenced; reuse races overlap).
     # arr is a read-only zero-copy view over the C++ buffer; np.copyto
     # reads it into our own writable pinned tensor (never writes back).
@@ -635,12 +715,17 @@ def block_tables_from_forward_op(
     packed = staged.to(device, non_blocking=True)
     for key, arr, offset in packable:
         out[key] = packed[offset : offset + arr.size].view(arr.shape[0], arr.shape[1])
-    return out
+        out_cpu[key] = staged[offset : offset + arr.size].view(
+            arr.shape[0], arr.shape[1]
+        )
+    return PackedBlockTables(out, out_cpu)
 
 
 def _classify_param(name: str) -> str:
     """Bucket a parameter/buffer name into a weight group for the memory
     summary. Names follow the Kimi-K3 / DeepSeek module layout."""
+    if ".engram." in name:
+        return "engram_weights"
     if "self_attn" in name or ".attn." in name or "kv_a" in name or "q_a" in name:
         return "attention_weights"
     if (
@@ -725,6 +810,7 @@ def log_gpu_memory_summary(
             "attention_weights": 0,
             "moe_weights": 0,
             "dense_mlp_weights": 0,
+            "engram_weights": 0,
             "other_weights": 0,
         }
         seen: set[int] = set()
@@ -781,6 +867,10 @@ def log_gpu_memory_summary(
             ("Dense/MLP weights", groups["dense_mlp_weights"] / GB),
             ("Other weights (embed/head/norm)", groups["other_weights"] / GB),
         ]
+        # Engram tables are only listed when resident on the device; with
+        # --engram-host-table they live in host memory and are not counted.
+        if groups["engram_weights"]:
+            rows.append(("Engram weights (tables/wkv)", groups["engram_weights"] / GB))
         if draft_model is not None:
             rows.append(("Draft model weights", draft_gb))
         rows += [

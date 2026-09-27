@@ -22,10 +22,9 @@ from dataclasses import dataclass
 from functools import cached_property
 
 import torch
-import triton
-import triton.language as tl
 
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.triton import tl, triton
 
 
 @triton.jit

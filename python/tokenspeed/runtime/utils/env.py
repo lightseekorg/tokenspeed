@@ -41,6 +41,8 @@ global_server_args_dict: dict = {
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "mapping": ServerArgs.mapping,
     "force_deterministic_rsag": ServerArgs.force_deterministic_rsag,
+    "batch_invariant_collectives": ServerArgs.batch_invariant_collectives,
+    "numerics": ServerArgs.numerics,
     "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,
     "device": ServerArgs.device,
     "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
@@ -60,6 +62,8 @@ global_server_args_dict: dict = {
     "max_model_len": ServerArgs.max_model_len,
     "max_num_seqs": ServerArgs.max_num_seqs,
     "moe_backend": ServerArgs.moe_backend,
+    "moe_mxfp4_fp8_activation": ServerArgs.moe_mxfp4_fp8_activation,
+    "dense_gemm_backend": ServerArgs.dense_gemm_backend,
     "enforce_eager": ServerArgs.enforce_eager,
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
     "cudagraph_capture_sizes": ServerArgs.cudagraph_capture_sizes,
@@ -87,6 +91,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "enable_nan_detection": server_args.enable_nan_detection,
             "mapping": server_args.mapping,
             "force_deterministic_rsag": server_args.force_deterministic_rsag,
+            "batch_invariant_collectives": server_args.batch_invariant_collectives,
+            "numerics": server_args.numerics,
             "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
             "device": server_args.device,
             "draft_model_path_use_base": server_args.draft_model_path_use_base,
@@ -108,6 +114,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "max_model_len": server_args.max_model_len,
             "max_num_seqs": server_args.max_num_seqs,
             "moe_backend": server_args.moe_backend,
+            "moe_mxfp4_fp8_activation": server_args.moe_mxfp4_fp8_activation,
+            "dense_gemm_backend": server_args.dense_gemm_backend,
             "enforce_eager": server_args.enforce_eager,
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
             "cudagraph_capture_sizes": server_args.cudagraph_capture_sizes,
@@ -236,6 +244,7 @@ class Envs:
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
 
+
     # Test and debug
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
@@ -244,9 +253,19 @@ class Envs:
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
+    # torch.cuda sync-debug mode armed once serving starts (after capture and
+    # tuning, which synchronize legitimately): "warn" reports every host
+    # synchronization on a serving path with its Python location, "error"
+    # raises. Any such synchronization on the data plane stalls the forward
+    # thread until the in-flight step drains and defeats overlap scheduling.
+    TOKENSPEED_DATA_PLANE_SYNC_DEBUG = EnvStr("default")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
+
+    # Shared-expert parallelism. Keep raw strings so every rank can agree
+    # before strict validation; EnvInt would silently default malformed input.
+    TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvStr("1")
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)

@@ -485,6 +485,18 @@ def merge_env(task_env: Dict[str, Any]) -> Dict[str, str]:
     return env
 
 
+def get_stage_command_env(stage_name: str, env: Dict[str, str]) -> Dict[str, str]:
+    """Route evaluation-tool installs to their dedicated package cache."""
+    if stage_name not in {"eval.install", "perf.install"}:
+        return env
+    evalscope_cache = env.get("EVALSCOPE_UV_CACHE_DIR")
+    if not evalscope_cache:
+        return env
+    stage_env = env.copy()
+    stage_env["UV_CACHE_DIR"] = evalscope_cache
+    return stage_env
+
+
 def get_default_runner_env(runner: str) -> Dict[str, str]:
     for prefixes, sm in RUNNER_SM_PREFIXES:
         if runner.startswith(prefixes):
@@ -827,14 +839,14 @@ def setup_runner(
             cwd=cwd,
             dry_run=dry_run,
         )
+    # Runner images normally provide ninja. Avoid refreshing every apt index on
+    # each ephemeral runner when the required executable is already available;
+    # slow package mirrors otherwise hold GPUs idle before task installation.
     shell_run(
-        "sudo apt-get -o Acquire::Retries=5 update -q",
-        env=local_env,
-        cwd=cwd,
-        dry_run=dry_run,
-    )
-    shell_run(
-        "sudo apt-get install -y ninja-build",
+        "if ! command -v ninja >/dev/null 2>&1; then "
+        "sudo apt-get -o Acquire::Retries=5 update -q && "
+        "sudo apt-get install -y ninja-build; "
+        "fi",
         env=local_env,
         cwd=cwd,
         dry_run=dry_run,
@@ -1957,16 +1969,17 @@ def execute_task(
                     run_perf_diagnostics(
                         "before perf command", runner_env, repo_root, dry_run
                     )
+                command_env = get_stage_command_env(stage_name, runner_env)
                 if pgm is not None:
                     command_result = pgm.run(
                         command,
                         cwd=repo_root,
-                        env=runner_env,
+                        env=command_env,
                         dry_run=dry_run,
                     )
                 else:
                     command_result = shell_run(
-                        command, env=runner_env, cwd=repo_root, dry_run=dry_run
+                        command, env=command_env, cwd=repo_root, dry_run=dry_run
                     )
                 command_result["stage"] = stage_name
                 command_result.update(
@@ -2075,6 +2088,11 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     scan_parser = subparsers.add_parser("scan", help="Scan CI task specs into a matrix")
     scan_parser.add_argument("--root", default="test/ci", help="Task root directory")
     scan_parser.add_argument(
+        "--changed-files",
+        type=Path,
+        help="Optional changed-path list; only task-YAML-only diffs narrow the matrix",
+    )
+    scan_parser.add_argument(
         "--trigger",
         choices=sorted(SUPPORTED_TRIGGERS),
         default=None,
@@ -2181,6 +2199,16 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.workflow_stage,
             args.multi_node,
         )
+        if args.changed_files is not None:
+            changed = args.changed_files.read_text(encoding="utf-8").splitlines()
+            # GitHub comparisons may truncate the file list at 300 entries.
+            if 0 < len(changed) < 300 and all(
+                path.startswith("test/ci/") and path.endswith(".yaml")
+                for path in changed
+            ):
+                matrix["include"] = [
+                    entry for entry in matrix["include"] if entry["config"] in changed
+                ]
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 

@@ -15,12 +15,13 @@ install:
   - bash test/ci_system/install_deps.sh
 server:
   # Temporary NFS cold-load headroom; revert after the startup bottleneck is fixed.
+  # Leave 6 positions below the model's 262144 limit for EAGLE3 overlap overshoot.
   command: >-
     ts serve
     --disable-kvstore
     --model nvidia/Kimi-K2.5-NVFP4
     --tp 4
-    --max-model-len 80000
+    --max-model-len 262138
     --enable-mixed-batch
     --trust-remote-code
     --attention-backend tokenspeed_mla
@@ -44,6 +45,7 @@ eval:
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
+    --work-dir .ci-artifacts/published/evalscope-results
     --model nvidia/Kimi-K2.5-NVFP4
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
@@ -52,7 +54,7 @@ eval:
     --dataset-args '{"aime25":{"dataset_id":"math-ai/aime25"}}'
     --eval-batch-size 16
     --stream
-    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":65536}'
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":131072}'
 report:
   github_step_summary: true
 score_threshold: 0.93

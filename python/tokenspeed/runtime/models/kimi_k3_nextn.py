@@ -54,7 +54,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 )
 from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMLAAttention,
-    KimiLinearMoE,
+    create_kimi_linear_moe,
     sigmoid_mul,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -144,7 +144,7 @@ class KimiK3DraftDecoderLayer(nn.Module):
             reduce_attn_results=True,
             alt_stream=alt_stream,
         )
-        self.block_sparse_moe = KimiLinearMoE(
+        self.block_sparse_moe = create_kimi_linear_moe(
             config=config,
             mapping=mapping,
             layer_index=0,

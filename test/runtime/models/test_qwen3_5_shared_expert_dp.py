@@ -11,7 +11,9 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
+import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -36,6 +38,7 @@ def _mlp(world_size: int, replicate: bool) -> Qwen3_5MoeMLP:
         quant_config=None,
         reduce_results=False,
         replicate_weights=replicate,
+        parallelism="moe_shared",
     )
 
 
@@ -67,7 +70,7 @@ class TestSharedExpertReplication(unittest.TestCase):
             mlp = _mlp(world_size=world_size, replicate=True)
             self.assertEqual(mlp.gate_up_proj.weight.shape, (2 * INTERMEDIATE, HIDDEN))
 
-    def test_replicated_deep_gemm_fuses_swiglu_quant_with_pdl(self):
+    def test_replicated_deep_gemm_fuses_swiglu_quant(self):
         class FakeGateUp(nn.Module):
             _use_deep_gemm_fp8 = True
 
@@ -107,7 +110,6 @@ class TestSharedExpertReplication(unittest.TestCase):
         scales = torch.empty((3, INTERMEDIATE // 512), dtype=torch.int32)
         with (
             mock.patch.object(qwen3_5_moe, "_is_blackwell", True),
-            mock.patch.object(qwen3_5_moe, "pdl_enabled", return_value=True),
             mock.patch.object(
                 qwen3_5_moe,
                 "fused_swiglu_fp8_ue8m0",
@@ -116,13 +118,79 @@ class TestSharedExpertReplication(unittest.TestCase):
         ):
             output = mlp(torch.randn((3, HIDDEN), dtype=torch.bfloat16))
 
-        fused_args, fused_kwargs = fused.call_args
-        self.assertIs(fused_args[0], gate_up.output)
-        self.assertEqual(fused_kwargs, {"enable_pdl": True})
+        fused.assert_called_once_with(gate_up.output)
         self.assertIs(down.call[0], quantized)
         self.assertIs(down.call[1], scales)
         self.assertIs(down.call[2], torch.bfloat16)
         self.assertEqual(output.shape, (3, HIDDEN))
+
+
+@pytest.mark.parametrize("moe_tp,moe_ep", [(4, 1), (1, 4), (2, 2)])
+@pytest.mark.parametrize("stage", [0, 1])
+def test_shared_expert_shards_match_moe_reduction(moe_tp, moe_ep, stage):
+    torch.manual_seed(42)
+    gate = torch.randn(INTERMEDIATE, HIDDEN) * 0.02
+    up = torch.randn(INTERMEDIATE, HIDDEN) * 0.02
+    down = torch.randn(HIDDEN, INTERMEDIATE) * 0.02
+    x = torch.randn(7, HIDDEN)
+    expected = F.linear(F.silu(F.linear(x, gate)) * F.linear(x, up), down)
+    partials = []
+    for local_rank in range(4):
+        mapping = Mapping(
+            rank=stage * 4 + local_rank,
+            world_size=8,
+            pp_size=2,
+            attn_tp_size=1,
+            attn_dp_size=4,
+            dense_tp_size=1,
+            moe_tp_size=moe_tp,
+            moe_ep_size=moe_ep,
+        )
+        mlp = Qwen3_5MoeMLP(
+            HIDDEN,
+            INTERMEDIATE,
+            "silu",
+            mapping,
+            reduce_results=False,
+            replicate_weights=False,
+            parallelism="moe_shared",
+        )
+        assert mlp.gate_up_proj.tp_group == mapping.moe.tp_ep_group
+        assert mlp.gate_up_proj.tp_size == 4
+        assert mlp.gate_up_proj.tp_rank == local_rank
+        assert mlp.down_proj.tp_group == mapping.moe.tp_ep_group
+        assert not mlp.down_proj.reduce_results
+        with torch.no_grad():
+            mlp.gate_up_proj.weight_loader(mlp.gate_up_proj.weight, gate, 0)
+            mlp.gate_up_proj.weight_loader(mlp.gate_up_proj.weight, up, 1)
+            mlp.down_proj.weight_loader(mlp.down_proj.weight, down)
+        local_gate, local_up = F.linear(x, mlp.gate_up_proj.weight).chunk(2, dim=-1)
+        partials.append(F.linear(F.silu(local_gate) * local_up, mlp.down_proj.weight))
+    torch.testing.assert_close(sum(partials), expected, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("scope,replicate", [("dense", False), ("moe_shared", True)])
+def test_dense_dp_and_deepep_shared_still_replicate(scope, replicate):
+    mapping = Mapping(
+        rank=2,
+        world_size=4,
+        attn_tp_size=1,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=4,
+    )
+    mlp = Qwen3_5MoeMLP(
+        HIDDEN,
+        INTERMEDIATE,
+        "silu",
+        mapping,
+        reduce_results=False,
+        replicate_weights=replicate,
+        parallelism=scope,
+    )
+    assert isinstance(mlp.gate_up_proj, ReplicatedLinear)
+    assert isinstance(mlp.down_proj, ReplicatedLinear)
+    assert mlp.down_proj.weight.shape == (HIDDEN, INTERMEDIATE)
 
 
 if __name__ == "__main__":

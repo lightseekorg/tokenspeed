@@ -28,19 +28,18 @@ byte width so no parent is wasted.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
+from dataclasses import replace
 from functools import cached_property
 
 import torch
 from typing_extensions import override
 
-from tokenspeed.runtime.layers.attention.configs.linear_attn import (
-    LinearAttnConfig,
-)
+from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
+    kda_verify_scratch_in_pool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
@@ -85,6 +84,7 @@ class KimiK3Recipe(CacheRecipe):
     """
 
     family = "kimi_k3"
+    uses_paged_state_verify = True
 
     # ---- layer vocabulary ----
 
@@ -167,6 +167,21 @@ class KimiK3Recipe(CacheRecipe):
         return tuple(
             FULL_ATTENTION if group_id == FULL_ATTENTION else LINEAR_ATTENTION
             for group_id in self.group_ids
+        )
+
+    @override
+    def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        shard_count = self.attn_config.dcp_size
+        return tuple(
+            (
+                (
+                    replace(spec, shard_count=shard_count)
+                    if spec.group_id == FULL_ATTENTION
+                    else spec
+                ),
+                fields,
+            )
+            for spec, fields in super().groups()
         )
 
     # ---- geometry ----
@@ -318,9 +333,18 @@ class KimiK3Recipe(CacheRecipe):
         )
 
     @override
+    def verify_scratch_in_pool(self) -> bool:
+        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
+
+    @override
     def workspace_bytes(self) -> int:
         """KDA verify staging reserved outside the cache arena."""
-        if self.server_args.speculative_algorithm is None:
+        if (
+            self.server_args.speculative_algorithm is None
+            or self.server_args.disaggregation_mode == "prefill"
+        ):
+            # Verify staging exists for the target's verify step; the prefill
+            # role only ever writes committed prompt state.
             return 0
         if self.replay_kda:
             conv_shape, recurrent_shape = self._kda_shapes
@@ -382,51 +406,27 @@ class KimiK3Recipe(CacheRecipe):
     # ---- capacity: the scheduler's concurrency decides, then a search ----
 
     @override
+    def num_lcm_blocks(self, layout: CacheLayout) -> int:
+        budgeted = self._budgeted_parents(
+            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
+        )
+        if self.token_limit is None:
+            return budgeted
+        # A token limit caps history, not the unsharded KDA working set.
+        # Use the same per-group demand as the inverse capacity calculation.
+        return min(budgeted, self.parents_needed(layout, self.token_limit))
+
+    @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:
         upper = self.token_limit
         if upper is None:
+            # Search bound in logical tokens, not per-rank physical rows.
+            # parents_needed still accounts for unsharded KDA state/reservations.
             full_packing = dict(layout.group_packing)[FULL_ATTENTION]
-            upper = num_lcm_blocks * full_packing * layout.prefix_granularity
+            upper = (
+                num_lcm_blocks
+                * full_packing
+                * self._shard_counts[FULL_ATTENTION]
+                * layout.prefix_granularity
+            )
         return self._capacity_from_parents(layout, num_lcm_blocks, upper_bound=upper)
-
-    @override
-    def parents_needed(self, layout: CacheLayout, token_capacity: int) -> int:
-        """Physical parents this capacity needs at the configured concurrency.
-
-        K3's KDA state rides inside the MLA planes, so its demand is a pair of
-        closed forms (history pages for MLA, a fixed working set for the state
-        groups) rather than the contract's per-retention page-count formula.
-        """
-        page_tokens = layout.prefix_granularity
-        limits = self.scheduler_limits
-        max_live_requests = limits["max_live_requests"]
-        depth = limits["overlap_schedule_depth"]
-        if depth not in (0, 1):
-            raise ValueError(f"overlap_schedule_depth must be 0 or 1, got {depth}")
-        if depth and limits["decode_input_tokens"] == 0:
-            raise ValueError("overlapped cache sizing requires decode_input_tokens > 0")
-        protected_pages = max_live_requests * math.ceil(
-            depth * limits["decode_input_tokens"] / page_tokens
-        )
-        parents = 0
-        for group_id, packing in layout.group_packing:
-            if group_id == FULL_ATTENTION:
-                child_pages = (
-                    math.ceil(token_capacity / page_tokens)
-                    + max_live_requests
-                    - 1
-                    + protected_pages
-                )
-            else:
-                # A finishing off-page prefill holds its input snapshot and
-                # aligned checkpoint, plus the final tail AND banked decode
-                # growth. Overlap protects one more decode reservation. With
-                # ordinary decode this is four state blocks per live request.
-                growth_tokens = max(
-                    page_tokens, (1 + depth) * limits["decode_input_tokens"]
-                )
-                child_pages = max_live_requests * (
-                    2 + math.ceil((page_tokens - 1 + growth_tokens) / page_tokens)
-                )
-            parents += math.ceil(child_pages / packing)
-        return parents

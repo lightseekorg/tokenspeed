@@ -69,7 +69,7 @@ def find_nccl_library() -> str:
     # manually load the nccl library
     if so_file:
         logger.info(
-            "Found nccl from environment variable TOKENSPEED_NCCL_SO_PATH=%s", so_file
+            f"Found nccl from environment variable TOKENSPEED_NCCL_SO_PATH={so_file!s}",
         )
     else:
         platform = current_platform()
@@ -79,7 +79,7 @@ def find_nccl_library() -> str:
             so_file = "librccl.so.1"
         else:
             raise ValueError("NCCL only supports CUDA and ROCm backends.")
-        logger.debug("Found nccl from library %s", so_file)
+        logger.debug(f"Found nccl from library {so_file!s}")
     return so_file
 
 
@@ -320,15 +320,13 @@ class NCCLLibrary:
             self.lib = NCCLLibrary.path_to_library_cache[so_file]
         except Exception as e:
             logger.error(
-                "Failed to load NCCL library from %s ."
+                f"Failed to load NCCL library from {so_file!s} ."
                 "It is expected if you are not running on NVIDIA/AMD GPUs."
                 "Otherwise, the nccl library might not exist, be corrupted "
-                "or it does not support the current platform %s."
+                f"or it does not support the current platform {platform.platform()!s}."
                 "If you already have the library, please set the "
                 "environment variable TOKENSPEED_NCCL_SO_PATH"
                 " to point to the correct nccl library path.",
-                so_file,
-                platform.platform(),
             )
             raise e
 

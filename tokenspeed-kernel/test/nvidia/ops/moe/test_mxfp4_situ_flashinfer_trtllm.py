@@ -27,8 +27,6 @@ apply -- against ``mxfp4_moe_reference`` on the same MXFP4 weights.
 
 from __future__ import annotations
 
-from importlib.util import find_spec
-
 import pytest
 import torch
 from kimi3_reference import mxfp4_moe_reference
@@ -48,13 +46,7 @@ def _situ_runtime_reason() -> str | None:
         return "requires CUDA"
     if not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3):
         return "flashinfer TRTLLM-Gen SiTU targets the sm_100 family"
-    if find_spec("flashinfer") is None:
-        return "requires flashinfer"
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
-        situ_moe_unavailable_reason,
-    )
-
-    return situ_moe_unavailable_reason()
+    return None
 
 
 _reason = _situ_runtime_reason()
@@ -247,6 +239,11 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
         ispp=ISPP,
         internal_activation_dtype="fp8",
         solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_situ_moe_apply"
     assert plan["support_routing"] is True

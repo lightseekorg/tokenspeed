@@ -282,7 +282,6 @@ class _IdentityDecoderLayer(nn.Module):
         positions,
         hidden_states,
         ctx,
-        out_cache_loc,
         residual,
         cos_sin=None,
     ):
@@ -306,7 +305,6 @@ class TestQwen3OmniModelHelpers(unittest.TestCase):
                 ctx,
                 torch.tensor([0]),
                 torch.tensor([0]),
-                torch.tensor([0]),
                 multimodal_context=multimodal_context,
             )
 
@@ -323,7 +321,6 @@ class TestQwen3OmniModelHelpers(unittest.TestCase):
             input_ids=torch.tensor([0]),
             positions=torch.tensor([0]),
             ctx=ctx,
-            out_cache_loc=torch.tensor([0]),
             input_embeds=torch.zeros(1, 2),
             input_deepstack_embeds=torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
         )

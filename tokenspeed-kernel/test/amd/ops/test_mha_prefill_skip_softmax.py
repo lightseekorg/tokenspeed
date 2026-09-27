@@ -58,7 +58,7 @@ if not is_cdna4():
     )
 
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.prefill import (  # noqa: E402
-    gluon_mha_prefill_gfx950,
+    launch_gluon_mha_prefill_gfx950,
 )
 
 _SEQLEN = 4096
@@ -105,7 +105,7 @@ def _cu_seqlens():
 
 def _run(q, k, v, skip_softmax_threshold: float, **kwargs):
     cu_seqlens, cu_seqlens_cpu = _cu_seqlens()
-    return gluon_mha_prefill_gfx950(
+    return launch_gluon_mha_prefill_gfx950(
         q=q,
         k=k,
         v=v,
@@ -163,7 +163,7 @@ def test_skip_softmax_ragged_seqlen_stays_bounded(threshold: float) -> None:
     dense = _dense_ref(q, k, v)
 
     cu_seqlens = torch.tensor([0, seqlen], device="cuda", dtype=torch.int32)
-    out = gluon_mha_prefill_gfx950(
+    out = launch_gluon_mha_prefill_gfx950(
         q=q,
         k=k,
         v=v,

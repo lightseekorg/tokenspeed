@@ -19,8 +19,10 @@
 # SOFTWARE.
 
 
+import math
 import socket
 import sys
+import time
 import traceback
 from dataclasses import replace
 from types import SimpleNamespace
@@ -74,7 +76,8 @@ def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
-def test_iris_state_uses_path_capacities(monkeypatch):
+@pytest.mark.parametrize("enable_lamport", [False, True])
+def test_iris_state_uses_path_capacities(monkeypatch, enable_lamport):
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     created = []
@@ -94,6 +97,7 @@ def test_iris_state_uses_path_capacities(monkeypatch):
         max_bytes=64,
         attnres_max_numel=55,
         max_token_num=5,
+        enable_lamport=enable_lamport,
         device=torch.device("cpu"),
     )
 
@@ -103,11 +107,23 @@ def test_iris_state_uses_path_capacities(monkeypatch):
     assert iris_state.producer_direct_max_numel == 32
     assert iris_state.attnres_max_numel == 55
     assert iris_state.attnres_max_rows == 5
+    assert iris_state.enable_lamport is enable_lamport
     assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is iris_state
     assert len(created) == 1
 
+    state.enable_lamport = not enable_lamport
+    other = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
+    assert other is not iris_state
+    assert other.enable_lamport is not enable_lamport
+    assert len(created) == 2
 
-def test_iris_state_reuses_prepared_capacity(monkeypatch):
+
+@pytest.mark.parametrize("prepared_lamport", [False, True])
+@pytest.mark.parametrize("requested_lamport", [False, True])
+@pytest.mark.parametrize("max_bytes", [0, 64])
+def test_iris_state_reuses_prepared_capacity(
+    monkeypatch, prepared_lamport, requested_lamport, max_bytes
+):
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     group = object()
@@ -121,10 +137,11 @@ def test_iris_state_reuses_prepared_capacity(monkeypatch):
         producer_direct_max_numel=128,
         attnres_max_numel=32,
         attnres_max_rows=4,
+        enable_lamport=prepared_lamport,
     )
     iris_ops = SimpleNamespace(
         IRIS_AR_STATES={"prepared": prepared},
-        create_iris_state=lambda **_: pytest.fail("must reuse prepared state"),
+        create_iris_state=lambda **kwargs: SimpleNamespace(**kwargs),
     )
     monkeypatch.setitem(
         sys.modules, "tokenspeed_kernel.ops.communication.iris", iris_ops
@@ -133,13 +150,18 @@ def test_iris_state_reuses_prepared_capacity(monkeypatch):
         group=group,
         rank_in_group=0,
         max_numel=16,
-        max_bytes=64,
+        max_bytes=max_bytes,
         attnres_max_numel=8,
         max_token_num=1,
+        enable_lamport=requested_lamport,
         device=device,
     )
 
-    assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is prepared
+    actual = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
+    can_reuse = max_bytes == 0 or prepared_lamport == requested_lamport
+    assert (actual is prepared) is can_reuse
+    if not can_reuse:
+        assert actual.enable_lamport is requested_lamport
 
 
 def test_iris_context_rejects_late_heap_growth(monkeypatch):
@@ -451,6 +473,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         # process (which has no distributed context).
         from tokenspeed_kernel.ops.communication.iris import (
             IRIS_ALL_REDUCE_KERNEL_CONFIG,
+            _select_staged_all_reduce_path,
             create_iris_state,
         )
 
@@ -469,6 +492,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         attnres_max_numel = attnres_max_rows * attnres_config.hidden_size
         staged_max_numel = max(staged_max_numel, attnres_max_numel)
         state = create_iris_state(
+            enable_lamport=False,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=staged_max_numel,
@@ -544,22 +568,39 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             assert state._staged_two_stage_input_buf is None
             assert state._staged_two_stage_scratch_buf is None
             assert state._staged_two_stage_ready_flags is None
-        output_max_numel = max(
-            producer_direct_max_numel,
-            staged_max_numel if state._staged_two_stage_supported else 0,
-        )
-        assert state._reduced_output_buf.numel() == output_max_numel
+        assert state._reduced_output_buf.numel() == producer_direct_max_numel
         if attnres_max_numel:
-            assert state._attnres_input_buf.shape == (
+            assert state._attnres_push_inbox.shape == (
                 2,
+                world_size,
                 attnres_max_numel,
             )
-            assert state._attnres_ready_flags.shape == (
+            assert state._attnres_push_epochs.shape == (attnres_max_rows,)
+            assert state._attnres_push_ready_flags.shape == (
+                2,
                 attnres_max_rows,
                 world_size,
             )
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
+        if state._staged_two_stage_supported:
+            _, use_two_stage = _select_staged_all_reduce_path(
+                numel=1024,
+                world_size=world_size,
+                dtype=torch.bfloat16,
+                two_stage_supported=True,
+            )
+            assert use_two_stage
+            for safe in (False, True):
+                _check_all_reduce_graph_replay(
+                    state,
+                    rank,
+                    world_size,
+                    (1024,),
+                    device,
+                    storage_offset=rank % 2,
+                    safe=safe,
+                )
         if world_size == 4:
             for shape in _ar_graph_shape_cases():
                 _check_all_reduce_graph_replay(
@@ -568,6 +609,8 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                     world_size,
                     shape,
                     device,
+                    storage_offset=0,
+                    safe=False,
                 )
             if current_platform().is_cdna4:
                 _check_mixed_geometry_graph_replay(
@@ -586,6 +629,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             )
 
         fp16_state = create_iris_state(
+            enable_lamport=False,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
@@ -613,6 +657,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             )
 
         fp32_state = create_iris_state(
+            enable_lamport=False,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
@@ -668,12 +713,25 @@ def _check_all_reduce_graph_replay(
     world_size: int,
     shape,
     device,
+    storage_offset: int,
+    safe: bool,
 ) -> None:
     from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
 
-    local = torch.full(shape, rank + 1, dtype=torch.bfloat16, device=device)
-    result = iris_all_reduce(state, local, safe=False)
+    # Odd ranks can start one BF16 element into storage; retain guard elements.
+    numel = math.prod(shape)
+    storage = torch.full(
+        (numel + storage_offset + 1,), -1, dtype=torch.bfloat16, device=device
+    )
+    local = storage[storage_offset : storage_offset + numel].view(shape)
+    assert local.is_contiguous() and local.data_ptr() % 8 == 2 * storage_offset
+    local.fill_(rank + 1)
+    result = iris_all_reduce(
+        state, local, op=dist.ReduceOp.SUM, safe=safe, async_op=False
+    )
+    assert (result.data_ptr() == local.data_ptr()) == (not safe)
     expected_value = world_size * (world_size + 1) // 2
+    torch.testing.assert_close(local, result, atol=0, rtol=0)
     torch.testing.assert_close(
         result,
         torch.full_like(result, expected_value),
@@ -686,7 +744,10 @@ def _check_all_reduce_graph_replay(
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_result = iris_all_reduce(state, local, safe=False)
+        graph_result = iris_all_reduce(
+            state, local, op=dist.ReduceOp.SUM, safe=safe, async_op=False
+        )
+    assert (graph_result.data_ptr() == local.data_ptr()) == (not safe)
 
     for replay_index in range(1, 5):
         scale = replay_index + 1
@@ -695,12 +756,16 @@ def _check_all_reduce_graph_replay(
         dist.barrier()
         graph.replay()
         torch.cuda.synchronize()
+        torch.testing.assert_close(local, graph_result, atol=0, rtol=0)
         torch.testing.assert_close(
             graph_result,
             torch.full_like(graph_result, scale * expected_value),
             atol=0,
             rtol=0,
         )
+    assert storage[-1].item() == -1
+    if storage_offset:
+        assert storage[0].item() == -1
 
 
 def _check_mixed_geometry_graph_replay(
@@ -891,6 +956,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             )
 
         graph = torch.cuda.CUDAGraph()
+        dist.barrier()
         with torch.cuda.graph(graph):
             graph_hidden, graph_residual = allreduce_residual_attnres_combine(
                 local,
@@ -903,10 +969,42 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
                 local_world_size=8,
                 eps=1e-6,
             )
-        graph.replay()
-        torch.cuda.synchronize()
-        torch.testing.assert_close(graph_residual, expected_residual, atol=0, rtol=0)
-        torch.testing.assert_close(graph_hidden, expected_hidden, atol=2e-2, rtol=2e-2)
+        dist.barrier()
+        expected_rank_sum = sum(range(1, 9))
+        for replay, scale in enumerate((2, -3, 5)):
+            local.fill_(scale * (rank + 1) / 128.0)
+            expected_reduced = torch.full_like(
+                local,
+                scale * expected_rank_sum / 128.0,
+            )
+            expected_residual = (residual.float() + expected_reduced.float()).to(
+                torch.bfloat16
+            )
+            expected_hidden = attnres_combine(
+                expected_residual,
+                score_weight,
+                output_weight,
+                1e-6,
+                scratch,
+                torch.empty_like(residual),
+            )
+            dist.barrier()
+            if rank == replay:
+                time.sleep(0.005)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                graph_residual,
+                expected_residual,
+                atol=0,
+                rtol=0,
+            )
+            torch.testing.assert_close(
+                graph_hidden,
+                expected_hidden,
+                atol=2e-2,
+                rtol=2e-2,
+            )
 
 
 def _run_ar_test(world_size: int) -> None:
@@ -949,6 +1047,7 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
         from tokenspeed_kernel.ops.communication.iris import create_iris_state
 
         state = create_iris_state(
+            enable_lamport=False,
             group=group,
             rank_in_group=group_rank,
             staged_max_numel=4 * 7,

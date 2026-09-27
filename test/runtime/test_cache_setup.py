@@ -141,6 +141,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
         windows=None,
         extra_state_group=None,
         cache_budget_bytes=2_048,
+        probe_batch_rows=None,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -154,6 +155,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
             draft_model_config=None,
             draft_attn_config=None,
             cache_budget_bytes=cache_budget_bytes,
+            probe_batch_rows=probe_batch_rows,
             decode_input_tokens=1,
             overlap_schedule_depth=0,
             **kwargs,
@@ -200,6 +202,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
                     sliding_window_tokens=None,
                     family="state",
                     checkpoint_granularity=self.prefix_granularity,
+                    replayable=False,
                 ),
                 (CacheFieldSpec("layer.0.state", "slot.0", (128,), "uint8"),),
             ),
@@ -293,6 +296,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=16_384,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -371,6 +375,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         draft_model_config=SimpleNamespace(num_attention_layers=1),
         draft_attn_config=draft_config,
         cache_budget_bytes=16_384,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -436,6 +441,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         ),
         draft_attn_config=draft_config,
         cache_budget_bytes=1 << 20,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -490,6 +496,7 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget() -> None:
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=16_384,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -527,6 +534,7 @@ def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=24_576,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -568,6 +576,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
         draft_model_config=draft_model_config,
         draft_attn_config=draft_attn_config,
         cache_budget_bytes=65_536,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -680,12 +689,21 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         _resolve_heterogeneous_draft_family,
     )
 
-    assert _resolve_heterogeneous_draft_family("mla", "mha") == "mha"
-    assert _resolve_heterogeneous_draft_family("kimi_k3", "mla") == "mla"
+    assert (
+        _resolve_heterogeneous_draft_family("mla", "mha", draft_family_declared=False)
+        == "mha"
+    )
+    assert (
+        _resolve_heterogeneous_draft_family(
+            "kimi_k3", "mla", draft_family_declared=False
+        )
+        == "mla"
+    )
     with pytest.raises(RuntimeError, match="require an MHA draft"):
-        _resolve_heterogeneous_draft_family("mha", "mla")
+        _resolve_heterogeneous_draft_family("mha", "mla", draft_family_declared=False)
     with pytest.raises(RuntimeError, match="support ordinary drafts only"):
         _create_draft_components(
+            backend=None,
             server_args=None,
             model_config=SimpleNamespace(num_attention_layers=1),
             config=object(),
@@ -694,8 +712,7 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
             num_target_layers=1,
             full_attn_backend_name=None,
             is_heterogeneous=True,
-            is_hybrid_linear=True,
-            is_kda=False,
+            linear_attention="gdn",
             is_inkling=False,
         )
 
@@ -719,13 +736,15 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
         hf_config=SimpleNamespace(
             architectures=("LlamaForCausalLM",),
             is_deepseek_v4=False,
-        )
+        ),
+        model_profile=None,
     )
     draft = SimpleNamespace(
         hf_config=SimpleNamespace(
             architectures=("DeepseekV4ForCausalLMNextN",),
             is_deepseek_v4=True,
-        )
+        ),
+        model_profile=None,
     )
 
     with pytest.raises(NotImplementedError, match="target-only"):
@@ -736,6 +755,11 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
             rank=0,
             gpu_memory=0,
             draft_model_config=draft,
+            graph_reserve_bytes=0,
+            probe_batch_rows=None,
+            profiled_cache_bytes=None,
+            reuse_target_backend=None,
+            reuse_draft_backend=None,
         )
 
 
@@ -778,6 +802,7 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
         num_draft_layers=2,
         windows=(None, None, 8),
         cache_budget_bytes=4_096,
+        probe_batch_rows=None,
     ).setup()
 
     # One big model: both draft layers are continuation layers (global
@@ -800,8 +825,9 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
     conversion carry them with their natural retention — the C++ side
     instantiates its existing SwaManager for them, no draft concept
     anywhere."""
+    from test.runtime.cache_pool_test_utils import MinimalCacheView
+
     import torch
-    from cache_pool_test_utils import MinimalCacheView
 
     from tokenspeed.runtime.engine.scheduler_utils import pool_to_cache_groups
 
@@ -811,6 +837,7 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
         num_draft_layers=2,
         windows=(None, None, 8),
         cache_budget_bytes=4_096,
+        probe_batch_rows=None,
     ).setup()
     pool = MinimalCacheView(
         CacheArena(
@@ -844,7 +871,7 @@ def test_draft_view_maps_local_layer_ids_to_continuation_planes() -> None:
     REJECTED rather than offset a second time -- silently addressing another
     model's planes is how the KV of two models gets crossed.
     """
-    from cache_pool_test_utils import MinimalCacheView
+    from test.runtime.cache_pool_test_utils import MinimalCacheView
 
     class _Window(MinimalCacheView):
         """Just a layer window: the subject is _field_layer_id's arithmetic."""

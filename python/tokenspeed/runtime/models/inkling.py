@@ -65,7 +65,7 @@ the text-token embedding for that path so tower outputs are never re-normed
 (reference parity).
 
 Prefix caching is supported under the paged-conv defaults; only the rolling
-conv-state fallback requires ``--no-enable-prefix-caching`` (asserted at
+conv-state fallback requires ``--disable-prefix-caching`` (asserted at
 init). Weight loading supports dummy, real BF16, Quark MXFP4, and ModelOpt
 NVFP4 checkpoints (routed experts quantized, quant-exclusion lists translated
 to this module tree). MTP speculative decoding is served by the NextN draft
@@ -2087,9 +2087,8 @@ class InklingForConditionalGeneration(nn.Module):
 
         if dropped:
             logger.warning(
-                "Inkling load_weights dropped %d checkpoint tensors (first: %s)",
-                len(dropped),
-                dropped[:8],
+                f"Inkling load_weights dropped {len(dropped):d} checkpoint tensors "
+                f"(first: {dropped[:8]!s})",
             )
         if not loaded:
             raise RuntimeError("Inkling load_weights consumed no checkpoint tensors")

@@ -1,0 +1,102 @@
+name: Build and Release tokenspeed-mla
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tokenspeed-mla
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build universal wheel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require main
+        env:
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          if [ "$SOURCE_REF" != "refs/heads/main" ]; then
+            echo "Release tokenspeed-mla from main after merging its version bump." >&2
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build and validation tools
+        run: python -m pip install --upgrade build packaging pytest twine
+
+      - name: Test release validation
+        working-directory: tokenspeed-mla
+        run: python -m pytest tests/test_release.py -q
+
+      - name: Refuse an already-published version
+        working-directory: tokenspeed-mla
+        run: |
+          python - <<'PY'
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          from scripts.check_release import read_version
+
+          version = read_version(Path.cwd())
+          print(f"Package version: {version}")
+          try:
+              with urllib.request.urlopen(
+                  f"https://pypi.org/pypi/tokenspeed-mla/{version}/json", timeout=30
+              ):
+                  pass
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404:
+                  raise
+          else:
+              raise SystemExit(
+                  f"tokenspeed-mla {version} is already on PyPI; merge a version "
+                  "bump in tokenspeed-mla/pyproject.toml before releasing."
+              )
+          PY
+
+      - name: Build and inspect wheel
+        run: |
+          python -m build tokenspeed-mla --wheel --outdir dist
+          python -m twine check --strict dist/*
+          python tokenspeed-mla/scripts/check_release.py \
+            --package-dir tokenspeed-mla --dist-dir dist
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenspeed-mla-dist
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: tokenspeed-mla-dist
+          path: dist
+
+      - name: Publish wheel to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

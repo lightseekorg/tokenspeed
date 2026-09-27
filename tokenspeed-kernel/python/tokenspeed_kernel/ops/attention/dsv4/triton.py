@@ -68,8 +68,8 @@ _INDEXER_SIGNATURE = format_signature(
 _INDEXER_TRAITS = {
     "index_heads": frozenset({32, 64}),
     "head_dim": frozenset({128}),
-    "topk": frozenset({512, 1024, 2048}),
     "page_size": frozenset({64}),
+    "topk": frozenset({512, 1024, 2048}),
     "index_k_format": frozenset({"mxfp4"}),
 }
 
@@ -83,7 +83,6 @@ _INDEXER_TRAITS = {
     traits=_INDEXER_TRAITS,
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
-    tags={"portability", "mxfp4", "sparse"},
 )
 def triton_dsv4_prefill_topk_mxfp4(
     index_q: tuple[torch.Tensor, torch.Tensor],
@@ -133,7 +132,6 @@ def triton_dsv4_prefill_topk_mxfp4(
     traits=_INDEXER_TRAITS,
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
-    tags={"portability", "mxfp4", "sparse"},
 )
 def triton_dsv4_decode_topk_mxfp4(
     index_q: tuple[torch.Tensor, torch.Tensor],
@@ -177,7 +175,6 @@ def triton_dsv4_decode_topk_mxfp4(
     traits={"page_size": frozenset({64})},
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
-    tags={"portability", "cuda_graph"},
 )
 def triton_dsv4_plan(
     *,
@@ -395,13 +392,12 @@ def _dsv4_qnorm_rope_kv_insert_kernel(
     ),
     traits={
         "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
-        "rope_dim": frozenset({DEEPSEEK_V4_ROPE_DIM}),
         "quant_block_size": frozenset({DEEPSEEK_V4_FP8_QUANT_BLOCK}),
+        "rope_dim": frozenset({DEEPSEEK_V4_ROPE_DIM}),
         "cache_layout": frozenset({"fp8_swa_page_planar"}),
         "has_q_out": frozenset({True, False}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability", "cache_insert"},
 )
 def triton_dsv4_swa_cache_insert(
     q: torch.Tensor,
@@ -551,11 +547,10 @@ def _dsv4_sparse_attention_kernel(
     traits={
         "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
         "cache_layout": frozenset({"dense_workspace"}),
-        "support_sink": frozenset({True}),
         "metadata_dtypes": frozenset({torch.int32, torch.int64}),
+        "sinks": frozenset({True}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_dsv4_prefill(
     q: torch.Tensor,
@@ -750,13 +745,12 @@ def _dsv4_dequantize_selected_cache_segment(
     traits={
         "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
         "cache_layout": frozenset({"fp8_swa_page_planar"}),
-        "topk_layout": frozenset({"global_slots"}),
-        "support_sink": frozenset({True}),
         "has_extra_segment": frozenset({False, True}),
         "metadata_dtypes": frozenset({torch.int32, torch.int64}),
+        "sinks": frozenset({True}),
+        "topk_layout": frozenset({"global_slots"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability", "paged_cache", "selected_attention"},
 )
 def triton_dsv4_decode(
     q: torch.Tensor,
@@ -1121,8 +1115,7 @@ def _dsv4_indexer_q_cuda_capability(
 def _log_serial_four_block_indexer_q_selection(capability: tuple[int, int]) -> None:
     logger.info(
         "DeepSeek V4 Indexer-Q launch selection: serial_four_block=True "
-        "tokens=8192 capability=%s",
-        capability,
+        f"tokens=8192 capability={capability!s}",
     )
 
 
@@ -1288,6 +1281,7 @@ def _dsv4_fused_sparse_compress_cache_kernel(
     TOKEN_STRIDE: tl.constexpr,
     SCALE_DIM: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
+    kv_write_mask_ptr=None,
 ):
     token_idx = tl.program_id(0)
 
@@ -1300,8 +1294,12 @@ def _dsv4_fused_sparse_compress_cache_kernel(
         return
 
     kv_slot = tl.load(kv_slot_mapping_ptr + token_idx)
-    if kv_slot < 0:
+    write_valid = kv_slot >= 0
+    if kv_write_mask_ptr is not None:
+        write_valid = write_valid & tl.load(kv_write_mask_ptr + token_idx)
+    if not write_valid:
         return
+    kv_slot = tl.maximum(kv_slot, 0)
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
     if block_table_base_offsets_ptr is not None:
@@ -1401,7 +1399,7 @@ def _dsv4_fused_sparse_compress_cache_kernel(
     tl.store(
         rope_ptr + rope_local,
         rotated.to(tl.bfloat16),
-        mask=(block >= NOPE_HEAD_DIM) & mask,
+        mask=(block >= NOPE_HEAD_DIM) & mask & write_valid,
     )
 
 
@@ -1415,9 +1413,8 @@ def _wide_compress_launch_supported(device: torch.device | int | None) -> bool:
         capability = torch.cuda.get_device_capability(device)
         supported = capability == (10, 0)
         logger.info(
-            "DeepSeek V4 sparse-compress launch selection: capability=%s num_warps=%d",
-            capability,
-            16 if supported else 4,
+            f"DeepSeek V4 sparse-compress launch selection: capability={capability!s} "
+            f"num_warps={(16 if supported else 4):d}",
         )
         return supported
     except (AssertionError, RuntimeError, TypeError, ValueError):
@@ -1440,8 +1437,22 @@ def dsv4_fused_sparse_compress_cache_insert(
     kv_cache_block_size: int,
     compress_ratio: int,
     overlap: bool,
-    block_table_base_offsets: torch.Tensor | None = None,
+    block_table_base_offsets: torch.Tensor | None,
+    kv_write_mask: torch.Tensor | None,
 ) -> None:
+    """Compress replicated state and store owned FP8 payload, scale and RoPE.
+
+    Args:
+        block_table_base_offsets: Optional per-request base offsets added to
+            the compressor block-table row before it is indexed.
+        kv_write_mask: Optional contiguous boolean vector covering the input
+            slots on the KV slot device. False entries suppress every store,
+            including scale padding, and may safely address reserved page 0.
+            None preserves the unmasked compression path.
+
+    Returns:
+        None. Selected cache rows are updated in place.
+    """
     num_actual = min(
         compressor_slot_mapping.numel(),
         positions.numel(),
@@ -1449,6 +1460,17 @@ def dsv4_fused_sparse_compress_cache_insert(
     )
     if num_actual == 0:
         return
+    if kv_write_mask is not None and (
+        kv_write_mask.ndim != 1
+        or kv_write_mask.dtype != torch.bool
+        or kv_write_mask.device != kv_slot_mapping.device
+        or kv_write_mask.numel() < num_actual
+        or not kv_write_mask.is_contiguous()
+    ):
+        raise ValueError(
+            "compressed cache write mask must be a contiguous bool vector "
+            "on the KV slot device and cover all slots"
+        )
     block_table_i32 = _as_int32_block_table(block_table)
     _dsv4_fused_sparse_compress_cache_kernel[(num_actual,)](
         state_cache,
@@ -1484,6 +1506,9 @@ def dsv4_fused_sparse_compress_cache_insert(
         TOKEN_STRIDE=DEEPSEEK_V4_SWA_TOKEN_STRIDE,
         SCALE_DIM=DEEPSEEK_V4_SWA_SCALE_DIM,
         KV_BLOCK_STRIDE=kv_cache_2d.stride(0),
+        kv_write_mask_ptr=(
+            kv_write_mask[:num_actual] if kv_write_mask is not None else None
+        ),
         num_warps=(
             16
             if compress_ratio >= 128
@@ -1659,12 +1684,11 @@ def _dsv4_fused_csa_indexer_fp8_cache_kernel(
     ),
     traits={
         "index_head_dim": frozenset({DEEPSEEK_V4_INDEXER_DIM}),
-        "compress_ratio": frozenset({4}),
         "page_size": frozenset({64}),
+        "compress_ratio": frozenset({4}),
         "cache_format": frozenset({"fp8_scaled_page_planar"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability", "cache_insert"},
 )
 def triton_dsv4_csa_indexer_fp8_cache_insert(
     *,
@@ -2429,35 +2453,51 @@ def _dsv4_compute_global_topk_indices_and_lens_kernel(
     block_table_ptr,
     block_table_stride,
     is_valid_token_ptr,
-    has_valid_token: tl.constexpr,
+    base_offsets_ptr,
+    valid_lens_ptr,
+    num_requests,
+    table_width,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
-    if has_valid_token:
-        is_valid_token = tl.load(is_valid_token_ptr + token_idx)
-        if not is_valid_token:
-            tl.store(topk_lens_ptr + token_idx, 0)
-            return
-    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
-    count = tl.zeros((), dtype=tl.int32)
+    token_idx = tl.program_id(0).to(tl.int64)
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx).to(tl.int64)
+    query_valid = (req_idx >= 0) & (req_idx < num_requests)
+    if is_valid_token_ptr is not None:
+        query_valid &= tl.load(is_valid_token_ptr + token_idx)
+    base = tl.full((), 0, tl.int64)
+    if base_offsets_ptr is not None:
+        base = tl.load(base_offsets_ptr + req_idx, mask=query_valid, other=0).to(
+            tl.int64
+        )
+    local_count = tl.zeros((), dtype=tl.int32)
+    scan_end = tl.zeros((), dtype=tl.int32)
 
     for i in range(0, topk, TRITON_BLOCK_SIZE):
-        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+        offset = i + tl.arange(0, TRITON_BLOCK_SIZE).to(tl.int64)
         mask = offset < topk
-        local_idx = tl.load(
+        selected = tl.load(
             topk_indices_ptr + token_idx * topk_indices_stride + offset,
             mask=mask,
             other=-1,
         )
-        valid = local_idx >= 0
+        candidates_valid = mask & (selected >= 0) & query_valid
+        # Trim only upstream padding. Base/owner filtering may leave holes,
+        # and its per-layer readable count must not shorten the scan prefix.
+        scan_end = tl.maximum(
+            scan_end,
+            tl.max(tl.where(candidates_valid, offset + 1, 0).to(tl.int32), axis=0),
+        )
+        local_idx = selected.to(tl.int64) - base * block_size
         block_indices = local_idx // block_size
+        valid = candidates_valid & (local_idx >= 0) & (block_indices < table_width)
         block_numbers = tl.load(
             block_table_ptr + req_idx * block_table_stride + block_indices,
-            mask=mask & valid,
-            other=0,
-        )
+            mask=valid,
+            other=-1,
+        ).to(tl.int64)
+        valid &= block_numbers >= 0
         block_offsets = local_idx % block_size
         slot_ids = block_numbers * block_size + block_offsets
         slot_ids = tl.where(valid, slot_ids, -1)
@@ -2466,9 +2506,12 @@ def _dsv4_compute_global_topk_indices_and_lens_kernel(
             slot_ids,
             mask=mask,
         )
-        count += tl.sum(valid.to(tl.int32), axis=0)
+        if valid_lens_ptr is not None:
+            local_count += tl.sum(valid.to(tl.int32), axis=0)
 
-    tl.store(topk_lens_ptr + token_idx, count)
+    tl.store(topk_lens_ptr + token_idx, scan_end)
+    if valid_lens_ptr is not None:
+        tl.store(valid_lens_ptr + token_idx, local_count)
 
 
 def dsv4_compute_global_topk_indices_and_lens(
@@ -2478,54 +2521,109 @@ def dsv4_compute_global_topk_indices_and_lens(
     block_table: torch.Tensor,
     block_size: int,
     is_valid_token: torch.Tensor | None = None,
+    block_table_base_offsets: torch.Tensor | None = None,
+    out_valid_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map local CSA top-k indices to global KV slots in one Triton kernel."""
+    """Map CSA top-k entries through a physical page table in one kernel.
+
+    Args:
+        topk_indices: Int32 compressed entry IDs [queries, width], padded by -1.
+            The upstream indexer must enforce each query's causal bound and
+            keep the candidate prefix length unchanged across layers within a
+            forward when the attention backend reuses its schedule.
+        token_to_req_indices: Int32/int64 vector covering every query's request
+            row. Noncontiguous metadata vectors are copied to contiguous storage.
+        block_table: Int32/int64 physical page IDs [requests, pages]; negative
+            pages are unreadable. DCP callers prepare local pages before this op.
+            Physical slots must fit int32. Both tables allow strided rows, with
+            unit column stride. All input tensors must share a device.
+        block_size: Positive number of compressed entries per physical page.
+        is_valid_token: Optional boolean vector covering every query; false
+            entries identify padded queries.
+        block_table_base_offsets: Optional int32/int64 vector of absolute first
+            logical pages [requests]. Top-k IDs stay absolute when supplied.
+        out_valid_lens: Optional contiguous int32 [queries] output receiving
+            the number of readable slots after all filtering, on the same device.
+
+    Returns:
+        Int32 physical slots [queries, width], with invalid entries set to -1,
+        and int32 scan lengths [queries]: one past the last nonnegative input
+        candidate, zero for empty, masked or out-of-range queries. For upstream
+        candidates with trailing padding this equals their valid count. Base
+        and page filtering preserve this prefix even when every output is -1.
+        Every slot is written, preserving candidate order, holes and duplicates.
+
+    Callers provide metadata with the documented shapes, dtypes and device.
+    Validation covers the top-k tensor, column strides and output count buffer.
+    """
 
     if topk_indices.dtype != torch.int32:
         raise TypeError(f"topk_indices must be int32, got {topk_indices.dtype}")
     if topk_indices.dim() != 2:
         raise ValueError(f"topk_indices must be 2-D, got {tuple(topk_indices.shape)}")
     num_tokens = topk_indices.shape[0]
-    global_topk_indices = torch.empty_like(topk_indices)
+    if topk_indices.stride(1) != 1 or block_table.stride(1) != 1:
+        raise ValueError("top-k mapping requires contiguous rows")
+    if out_valid_lens is not None and (
+        out_valid_lens.shape != (num_tokens,)
+        or out_valid_lens.dtype != torch.int32
+        or out_valid_lens.device != topk_indices.device
+        or not out_valid_lens.is_contiguous()
+    ):
+        raise ValueError("local counts must be contiguous int32 on the query device")
+    global_topk_indices = torch.empty_like(
+        topk_indices, memory_format=torch.contiguous_format
+    )
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
-    if num_tokens == 0:
+    rows, cols = block_table.shape
+    if num_tokens == 0 or topk_indices.shape[1] == 0 or rows == 0:
+        global_topk_indices.fill_(-1)
+        topk_lens.zero_()
+        if out_valid_lens is not None:
+            out_valid_lens.zero_()
         return global_topk_indices, topk_lens
     if is_valid_token is not None:
-        is_valid_token = is_valid_token[:num_tokens].to(
-            device=topk_indices.device,
-            dtype=torch.bool,
-        )
+        is_valid_token = is_valid_token[:num_tokens].contiguous()
+    token_to_req_indices = token_to_req_indices[:num_tokens].contiguous()
+    if block_table_base_offsets is not None:
+        block_table_base_offsets = block_table_base_offsets[:rows].contiguous()
     if not topk_indices.is_cuda:
-        valid = topk_indices >= 0
-        if is_valid_token is not None:
-            valid = valid & is_valid_token[:, None]
-        req_idx = token_to_req_indices[:num_tokens].to(torch.int64)
-        rows = int(block_table.shape[0]) if block_table.dim() >= 1 else 0
-        cols = int(block_table.shape[1]) if block_table.dim() >= 2 else 0
-        if rows <= 0 or cols <= 0:
-            global_topk_indices.fill_(-1)
-            topk_lens.zero_()
-            return global_topk_indices, topk_lens
-        safe_local = torch.where(valid, topk_indices, torch.zeros_like(topk_indices))
-        block_indices = torch.div(safe_local, block_size, rounding_mode="floor")
-        block_offsets = safe_local % block_size
+        req_idx = token_to_req_indices.to(torch.int64)
         req_valid = (req_idx >= 0) & (req_idx < rows)
-        block_valid = (block_indices >= 0) & (block_indices < cols)
-        valid = valid & req_valid[:, None] & block_valid
+        if is_valid_token is not None:
+            req_valid &= is_valid_token
+        candidates_valid = (topk_indices >= 0) & req_valid[:, None]
+        candidate_ends = torch.arange(
+            1, topk_indices.shape[1] + 1, dtype=torch.int32, device=topk_indices.device
+        )
+        topk_lens.copy_(torch.where(candidates_valid, candidate_ends, 0).amax(dim=1))
+        if cols == 0:
+            global_topk_indices.fill_(-1)
+            if out_valid_lens is not None:
+                out_valid_lens.zero_()
+            return global_topk_indices, topk_lens
         safe_req = req_idx.clamp(0, rows - 1)
+        local = topk_indices.to(torch.int64)
+        if block_table_base_offsets is not None:
+            local = (
+                local
+                - block_table_base_offsets.to(torch.int64)[safe_req, None] * block_size
+            )
+        block_indices = torch.div(local, block_size, rounding_mode="floor")
+        valid = candidates_valid & (block_indices >= 0) & (block_indices < cols)
         safe_block = block_indices.long().clamp(0, cols - 1)
         block_numbers = block_table[safe_req[:, None], safe_block]
+        valid &= block_numbers >= 0
         global_topk_indices.copy_(
             torch.where(
                 valid,
-                block_numbers.to(torch.int32) * block_size + block_offsets,
-                torch.full_like(topk_indices, -1),
+                block_numbers.to(torch.int64) * block_size + local % block_size,
+                -1,
             )
         )
-        topk_lens.copy_(valid.sum(dim=1, dtype=torch.int32))
+        if out_valid_lens is not None:
+            out_valid_lens.copy_(valid.sum(dim=1, dtype=torch.int32))
         return global_topk_indices, topk_lens
-    if is_valid_token is None:
-        is_valid_token = torch.empty(0, dtype=torch.bool, device=topk_indices.device)
 
     _dsv4_compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
         global_topk_indices,
@@ -2533,11 +2631,14 @@ def dsv4_compute_global_topk_indices_and_lens(
         topk_lens,
         topk_indices,
         topk_indices.stride(0),
-        token_to_req_indices.to(torch.int32),
-        block_table.to(torch.int32),
+        token_to_req_indices,
+        block_table,
         block_table.stride(0),
         is_valid_token,
-        is_valid_token.numel() != 0,
+        block_table_base_offsets,
+        out_valid_lens,
+        rows,
+        cols,
         block_size=block_size,
         topk=topk_indices.shape[-1],
         TRITON_BLOCK_SIZE=1024,
@@ -4115,3 +4216,47 @@ def dsv4_fused_inv_rope_fp8_quant(
         num_warps=1,
     )
     return fp8_buf.transpose(0, 1), scale_buf.transpose(0, 1)
+
+
+def triton_dsv4_index_candidates(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return MXFP4 local logical candidates and scores for global DCP Top-K.
+
+    Index-K pages use -1 holes in global request order. Queries may belong to
+    arbitrary requests, covering both prefill and decode. The caller bounds
+    query tiles; only candidates and scores are communicated across ranks.
+    """
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import triton_topk_from_logits
+    from tokenspeed_kernel.ops.attention.dsv4._triton.indexer import _indexer_logits
+
+    if local_page_table.shape[0] == 0 or local_page_table.shape[1] == 0:
+        raise ValueError("Index candidates require a nonempty page table")
+    valid_requests = (query_requests >= 0) & (
+        query_requests < local_page_table.shape[0]
+    )
+    query_requests = query_requests.clamp(0, local_page_table.shape[0] - 1)
+    causal_lens = torch.where(valid_requests, causal_lens, 0)
+    logits, _ = _indexer_logits(
+        index_q,
+        weights.contiguous(),
+        index_k_cache,
+        causal_lens.to(torch.int32).contiguous(),
+        local_page_table.index_select(0, query_requests.long()),
+        page_size=page_size,
+        max_candidates=local_page_table.shape[1] * page_size,
+        cu_seq_lens=None,
+        starts=None,
+    )
+    offsets = triton_topk_from_logits(logits, topk)
+    scores = logits.gather(1, offsets.clamp_min(0).long())
+    valid = (offsets >= 0) & (scores > -float("inf"))
+    return torch.where(valid, offsets, -1), torch.where(valid, scores, -float("inf"))
