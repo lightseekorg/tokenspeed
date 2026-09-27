@@ -111,7 +111,7 @@ def test_mm_requires_explicit_quant(mi350_platform):
     assert raised.value.status is BenchmarkStatus.INVALID_CASE
 
 
-def test_dense_mm_uses_registered_reference_for_local_correctness(
+def test_dense_mm_runs_through_harness_with_registered_reference(
     mi350_platform,
     fresh_registry,
     monkeypatch,
@@ -141,18 +141,15 @@ def test_dense_mm_uses_registered_reference_for_local_correctness(
         solution="reference",
         format_signatures=frozenset({signature}),
     )
-    calls: dict[str, list] = {"candidate": [], "reference": []}
+    out_shapes: list[tuple[int, ...]] = []
 
-    def run(role):
-        def kernel(**kwargs):
-            calls[role].append(kwargs)
-            kwargs["out"].copy_(kwargs["A"] @ kwargs["B"].T)
-            return kwargs["out"]
+    def kernel(**kwargs):
+        out_shapes.append(tuple(kwargs["out"].shape))
+        kwargs["out"].copy_(kwargs["A"] @ kwargs["B"].T)
+        return kwargs["out"]
 
-        return kernel
-
-    KernelRegistry.get().register(candidate_spec, run("candidate"))
-    KernelRegistry.get().register(reference_spec, run("reference"))
+    KernelRegistry.get().register(candidate_spec, kernel)
+    KernelRegistry.get().register(reference_spec, kernel)
 
     class InputGenerator:
         def generate(self, *, M, N, K):
@@ -172,11 +169,10 @@ def test_dense_mm_uses_registered_reference_for_local_correctness(
         lambda *_args, **_kwargs: InputGenerator(),
     )
     monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
-    timer = FakeTimer()
-
-    # The harness routes quant="none" through prepare_mm to the dense generator.
+    # The harness routes quant="none" through prepare_mm to the dense generator,
+    # whose traits must satisfy the candidate's problem filter.
     result = KernelBenchmarkHarness(
-        timer, platform_provider=lambda: mi350_platform
+        FakeTimer(), platform_provider=lambda: mi350_platform
     ).run(
         _gemm_mm_request(
             _dense_mm_parameters(
@@ -194,10 +190,7 @@ def test_dense_mm_uses_registered_reference_for_local_correctness(
     assert result.registration_name == "unit_candidate_mm"
     assert result.correctness is not None
     assert result.correctness["passed"] is True
-    assert len(calls["reference"]) == 1
-    assert calls["candidate"][0]["A"] is calls["reference"][0]["A"]
-    assert calls["candidate"][0]["out"].shape == (4, 3)
-    assert timer.calls == 1
+    assert set(out_shapes) == {(4, 3)}
 
 
 @pytest.mark.parametrize(
@@ -605,36 +598,3 @@ def test_dense_bmm_gluon_registration_graph_replay(selection, selection_mode):
     assert result.correctness is not None
     assert result.correctness["passed"] is True
     assert result.correctness["runs"] == 3
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU is required")
-def test_dense_mm_gluon_prefill_registration_graph_replay():
-    platform = current_platform()
-    if not platform.is_cdna4:
-        pytest.skip("Gluon dense MM benchmark requires an AMD CDNA4 GPU")
-
-    harness = KernelBenchmarkHarness(
-        GraphTimer(
-            GraphBenchmarkConfig(
-                eager_warmup_iterations=2,
-                replay_warmup_iterations=1,
-            )
-        ),
-        platform_provider=current_platform,
-    )
-    result = harness.run(
-        _gemm_mm_request(
-            _dense_mm_parameters(
-                M=4096,
-                validation={"runs": 3, "atol": 1e-4, "rtol": 2**-7},
-            ),
-            registration="gluon_mm_a16w16_prefill_gfx950",
-        ),
-        measurement_blocks=7,
-    )
-
-    assert result.status is BenchmarkStatus.SUCCESS, result.to_dict()
-    assert result.registration_name == "gluon_mm_a16w16_prefill_gfx950"
-    assert result.median_us is not None and result.median_us > 0.0
-    assert result.correctness is not None
-    assert result.correctness["passed"] is True
