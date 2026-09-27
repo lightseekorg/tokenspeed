@@ -314,7 +314,8 @@ present. Suffixing remains only for unmigrated in-tree models.
 Each registered drafter also declares required, non-defaulted class traits:
 `requires_target_capture: ClassVar[bool]`,
 `block_decode: ClassVar[bool]`,
-`writes_target_cache_locations: ClassVar[bool]`, and
+`writes_target_cache_locations: ClassVar[bool]`,
+`supports_pd_layerwise_finalization: ClassVar[bool]`, and
 `draft_query_count: ClassVar[Callable[[int], int]]` (verify width to draft
 query count). These traits are resolved before attention/cache construction
 and stored on the resolved target/draft configuration, passed explicitly
@@ -325,6 +326,74 @@ trait combinations fail setup. In-tree DFLASH uses the verify width; DSPARK
 uses width minus one. Storage remains declared through cache recipes and
 LCM groups, owned by the cache subsystem and scheduler; these traits do not
 create drafter-private per-request state or a second execution path.
+
+PP context production is also an explicit drafter contract. Every registered
+class supplies `create_context_producer: ClassVar[ContextProducerFactory]`,
+including an explicit factory returning `None` when no stage-local target
+capture/context writes are needed. Extract the structural producer interface
+used by `DSparkContextProducer` into the common contract; that class remains
+a reference implementation, not a required plugin base class:
+
+```python
+from tokenspeed.runtime.distributed.mapping import Mapping as ParallelMapping
+
+
+class DraftContextProducer(Protocol):
+    supports_pd_layerwise_finalization: bool  # required, no inherited fallback
+
+    def set_cache_pool(self, pool: CachePool | None) -> None: ...
+    def begin_stage(self, hidden: torch.Tensor, inbound: torch.Tensor | None) -> torch.Tensor: ...
+    def add_capture(self, projected: torch.Tensor, capture_idx: int, hidden: torch.Tensor) -> None: ...
+    def write_context(self, projected: torch.Tensor, positions: torch.Tensor, cache_locs: torch.Tensor) -> None: ...
+
+
+class ContextProducerFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        target_model: nn.Module,
+        draft_model: nn.Module,
+        server_args: ServerArgs,
+        target_attn_config: AttnConfig,
+        draft_attn_config: AttnConfig | None,
+        pp_mapping: ParallelMapping,
+        draft_pool: CachePool | None,
+    ) -> DraftContextProducer | None: ...
+```
+
+For `pp_size > 1`, the common executor invokes this factory once on every PP
+stage after `configure_draft_target` and cache binding, before graph capture or any
+forward, even where no `BaseDrafter` instance is constructed. The final
+stage gets its draft-pool view; other stages get explicit `None`. Returning
+`None` when the configured target-capture contract requires stage-local
+production is a startup error. For `pp_size == 1`, the factory is not invoked:
+the drafter retains its existing context production, without a second writer.
+The existing target-forward protocol calls `begin_stage` for the
+chunk, sends owned taps to `add_capture`, carries the partial accumulator in
+PP state, and calls `write_context` only on the owning final stage. Models
+implement the projection/write protocol consumed by their chosen producer,
+as `DSparkContextModel` does today. Accumulators are per chunk; the producer
+keeps no cross-forward mutable accumulator. Bind it through the common
+forward-context slot, and rebind its pool on arena replacement. With a
+producer present, the drafter must not repeat its context writes; proposal
+writes still occur in their existing order before final readiness.
+
+`supports_pd_layerwise_finalization` is required on both registered drafters
+and their producers. `True` promises that the existing proposal/producer
+completion path enqueues **all** context and proposal cache writes, with
+side-stream dependencies joined before
+`ModelExecutor._record_draft_final_cache_step` publishes readiness. Use that
+existing finalization path, not a new event loop or an early target-tap
+completion signal. Both `DeviceSpecs.supports_pd_layerwise_finalization` and
+`ModelExecutor.register_draft_final_step_counter` check all active writers,
+not just a producer when a drafter also writes. An
+explicit `False` rejects speculative layerwise PD at startup through the
+existing gate; ordinary PD support alone does not imply this guarantee.
+Where a stage has no producer, only the drafter's declaration applies.
+Missing declarations on plugin implementations are errors rather than the
+legacy `getattr(..., False)` fallback. Fixtures must exercise every PP stage,
+producer/drafter single-writer behavior, delayed side-stream writes and the
+final readiness counter, including rejection of missing/false capabilities.
 
 **CLI.** `--attention-backend`, `--drafter-attention-backend`,
 `--speculative-algorithm` already accept plugin names and validate after
@@ -408,6 +477,14 @@ class ModelProfile:
     default_prefix_granularity: int | None
     request_token_history: bool              # model reads committed tokens
     tokenizer_kwargs: Mapping[str, object]
+    is_generation: bool
+    is_multimodal: bool
+    is_multimodal_gen: bool
+    is_image_gen: bool
+    is_audio_model: bool
+    encoder_roles: frozenset[Literal["encode", "item_dp"]]
+    encoder_model_facts: Callable[[nn.Module, torch.device], EncoderModelFacts] | None
+    multimodal_encoder_dtype: Callable[[nn.Module], str | None] | None
 
 class FooForCausalLM(nn.Module):
     @classmethod
@@ -428,6 +505,14 @@ class FooForCausalLM(nn.Module):
             default_prefix_granularity=64,
             request_token_history=False,
             tokenizer_kwargs={},
+            is_generation=True,
+            is_multimodal=False,
+            is_multimodal_gen=False,
+            is_image_gen=False,
+            is_audio_model=False,
+            encoder_roles=frozenset(),
+            encoder_model_facts=None,
+            multimodal_encoder_dtype=None,
         )
 ```
 
@@ -474,6 +559,39 @@ profile. A registered (plugin) class without a profile is an error at
 registration, not a fallback to MHA.
 
 Profile field contracts:
+
+- The five modality/task booleans replace the corresponding architecture-list
+  lookups for registered models. Resolve the profile at model-config time,
+  before loader construction, and populate the existing `ModelConfig`
+  fields, not a second set of runtime gates. `is_multimodal_active` remains
+  derived from `is_multimodal` and the explicit language-model-only choice.
+  Loader VLM kwargs, multimodal request contexts and encoder/prefill paths
+  continue to consume those existing fields. The wrapper owns the profile
+  and forwards the resolved facts to its text model where needed.
+- `encoder_roles` is an explicit capability set: empty forbids encode-only
+  and item-DP launches; `"encode"` permits the existing encoder-only role,
+  and `"item_dp"` permits `mm_encoder_tp_mode="data"`. Validate these at
+  model-config time before the loader, alongside existing role checks; PD
+  prefill/decode compatibility still uses the separate common PD gate. Keep
+  existing exclusions (encode versus language-model-only, active encoder
+  required for item-DP, and no audio encode-only support). A profile cannot
+  bypass them by claiming a role. Nonempty encoder roles require an
+  `encoder_model_facts` callback. After model construction, the device builder
+  calls it only when the existing EPD admission path needs
+  `EncoderModelFacts`, passing the built model and execution device; it must
+  return the same device/hidden/deepstack/dtype facts that interface expects.
+  A registered multimodal model also supplies `multimodal_encoder_dtype`,
+  which returns the loaded encoder dtype in the same string form as
+  `infer_multimodal_encoder_dtype`; the model runner uses it instead of
+  probing conventional attribute names. Text-only profiles set it to `None`.
+  An `"encode"` model must honor the existing `hf_config.encoder_only` flag
+  by omitting the language model during encode-only construction. These
+  callbacks replace attribute-name probing for plugin encoders, not the encoder
+  execution or transport path. A plugin must implement the existing input
+  processing and model/encoder interfaces for its declared modalities;
+  declaration alone does not add support for a new modality. Add fixture
+  coverage for an unlisted vision/text architecture, VLM loader kwargs,
+  multimodal request handling, encoder facts, and unsupported role rejection.
 
 - Both forced-backend fields are required, with explicit `None` meaning no
   constraint for that role. `_apply_backend_overrides` applies the target
@@ -845,7 +963,8 @@ plugin exists. Three measures:
    functions, `AttentionBackend`, `CacheRecipe`, `CachePool`,
    `PagedAttention`, `QuantizationConfig` / `QuantizeMethodBase`,
    `CacheLayerLayout`, `CheckpointMetadata`, `AttentionConfigInputs`,
-   `BackendCompositionInputs`, `BaseDrafter`, `TargetCaptureConfigurator`,
+   `BackendCompositionInputs`, `DraftContextProducer`, `ContextProducerFactory`,
+   `EncoderModelFacts`, `BaseDrafter`, `TargetCaptureConfigurator`,
    and the forward-metadata
    protocol they receive. A change to one of these bumps
    `PLUGIN_API_VERSION` and gets a line in the release notes. Everything not
@@ -915,15 +1034,19 @@ tests and documentation before it is independently mergeable.
    layout, after checkpoint metadata is available. Add the typed config and
    composition factories at the common construction points above, preserving
    specialized components, DSpark's config-less draft and model results. Pass
-   finalized cache layouts and bindings to model constructors in this phase. Draft
+   finalized cache layouts and bindings to model constructors, and feed the
+   existing modality and encoder gates from the profile in this phase. Draft
    mappings/target sets are explicit but unused until phase 2. These breaking
    changes bump `PLUGIN_API_VERSION` to 2 together with plugin migrations;
    API-1 packages are not silently interpreted as API-2 declarations. Begin
    the installable fixture and design-contract document here.
 2. **Complete remaining dispatch contracts.** Add quantization registration
    and `get_quant_method` unification; unify the existing plugin and in-tree
-   drafter resolvers with geometry/storage traits and profile draft routing;
-   add `register_mha_kernel_solution` and remaining CLI validation. Preserve
+   drafter resolvers with geometry/storage traits, per-stage context-producer
+   factories, layerwise-PD finalization guarantees and profile draft routing;
+   remove the base drafter's default `False` finalization flag so migrated
+   implementations must declare it. Add `register_mha_kernel_solution` and
+   remaining CLI validation. Preserve
    existing drafter checkpoint-selection arguments during migration.
 3. **In-tree profile migration.** Give every entry class a profile and remove
    architecture-name tables only after forced-backend and PD restrictions,
@@ -962,9 +1085,9 @@ tests and documentation before it is independently mergeable.
    architecture name and rely on `architectures=`? Allowing it is more
    useful for downstream fixes; forbidding it keeps "which code served this
    architecture" unambiguous from the architecture string alone.
-3. **Profile placement for multimodal wrappers.** Some entry classes wrap a
-   text model; whether `profile` lives on the wrapper, the text model, or is
-   forwarded is a detail of the P3 migration.
+3. **Multimodal migration coverage.** Wrappers own the profile and forward
+   resolved facts as specified in P3. Which wrapper/encoder combinations
+   should the fixture matrix cover before their architecture tables retire?
 4. **Kernel-package parity.** Should `tokenspeed_kernel.plugins` grow the
    same `PLUGIN_API_VERSION` constant and a fixture plugin in its own CI, so
    both halves of the contract are tested where they live?
