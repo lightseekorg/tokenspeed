@@ -30,7 +30,7 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compute_global_topk_indices_and_lens,
 )
 from tokenspeed_kernel.ops.moe import moe_topk
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
@@ -6823,7 +6823,15 @@ class TestDeepseekV4Config(unittest.TestCase):
         topk_ids = torch.empty(3, 6, device="cuda", dtype=torch.int32)
 
         try:
-            softplus_sqrt_topk_flash(logits, bias, topk_ids, topk_weights, 1.0, True)
+            softplus_sqrt_topk_flash(
+                logits,
+                bias,
+                topk_ids,
+                topk_weights,
+                1.0,
+                True,
+                enable_pdl=pdl_enabled(),
+            )
         except (AttributeError, RuntimeError) as exc:
             self.skipTest(f"fused DeepSeek V4 router op unavailable: {exc}")
         torch.cuda.synchronize()
@@ -6877,7 +6885,14 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         try:
             hash_softplus_sqrt_topk_flash(
-                logits, input_ids, table, topk_ids, topk_weights, 1.0, True
+                logits,
+                input_ids,
+                table,
+                topk_ids,
+                topk_weights,
+                1.0,
+                True,
+                enable_pdl=pdl_enabled(),
             )
         except (AttributeError, RuntimeError) as exc:
             self.skipTest(f"fused DeepSeek V4 hash router op unavailable: {exc}")
