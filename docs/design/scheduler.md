@@ -144,26 +144,22 @@ An aligned endpoint is itself the checkpoint; an extent crossing no boundary
 needs only its final output. Only materialized aligned checkpoints are cached;
 an off-boundary endpoint is never keyed as a complete prefix.
 
-`CacheProgress::materialized_state_boundaries` holds the aligned boundaries
-whose state is written but not yet hashed. Two events add to it, each at the
-moment it becomes true: admitting a prefill window records the checkpoint that
-window materializes (local prefill its latest internal aligned boundary; a
-remote landing only its endpoint, when aligned), and a landed result records
-its accepted endpoint, `TokenSize() - 1`, when aligned. Recording at landing
-rather than at the next admission matters under the overlap schedule, which
-plans a step before the previous one commits: two results can land back to
-back, and the second must not erase the first. Merely crossing a boundary adds
-nothing — speculative decode commits only its accepted endpoint.
+`CacheProgress::materialized_state_boundaries` records the aligned checkpoints
+produced by admitted prefill windows: local prefill records its last aligned
+boundary, and a remote landing records only an aligned endpoint. Publication
+uses the preceding window's record before the next prefill advances it.
+Only recorded boundaries within the newly hashed range are eligible. A
+successful admission discards the covered records; a failed one leaves them
+for retry.
 
-Admission, finish and retraction hand the list to the coordinator, which
-publishes every recorded boundary inside the newly hashed range — several at
-once when results landed back to back. A successful admission then drops the
-boundaries its hashes covered; a failed one leaves them for the retry. The
-hashed range comes from the same `Request::NumComputedTokens()` that drives
-retention (§5): the frontier is exact under any verify width, so the page
-holding an aligned accepted endpoint is hashed — and its checkpoint published —
-at the very next admission, and the list normally holds at most the last
-landing and the checkpoint of the chunk in flight.
+Only materialized State Endpoint/Promoted boundaries are published; ordinary
+Chunks remain request-owned. For newly completed prefix hashes, the last aligned
+prompt checkpoint is an Endpoint unless already Promoted, including before a
+short final tail. A step with no newly completed hashes does not publish or
+upgrade state. Admission from `PrefillDone` can publish pending prefill state
+before local decode or PD handoff; decode itself records and publishes no state
+checkpoints. History publication and working-state retention use the exact
+`Request::NumComputedTokens()` frontier (§5).
 
 One forward means one model dispatch, not one kernel launch. The state backend
 handles checkpoint outputs within it: the example's recurrent scan evaluates
@@ -196,6 +192,12 @@ The capacity guarantees are retention-specific:
   admission back-pressure.
   The P role and intermediate local chunks reserve no growth block (the next
   sparse re-shaping requires `AvailableTokens() == 0`).
+
+Finish can publish a pending prefill checkpoint, then queues existing prefill
+cache for L2 without upgrading its kind. With L2, prefill retraction may publish
+a materialized recovery Endpoint at the completed window boundary; `Prefilling`
+and `PrefillDone` both use their actual prefill window. Decode retraction adds
+no state checkpoint. Missing cache is recomputed through ordinary prefill.
 
 ### 1.3 Bounded replay
 
@@ -408,9 +410,8 @@ admission — which publishes the newly completed pages — and written back to
 the request only after it succeeds. A failed admission therefore leaves both
 untouched, and the retry re-derives the same completed pages and asks for
 their publication again. Committing progress before admission would record
-the pages as hashed while never publishing them. A landed result is the one
-other writer: it appends its accepted endpoint to the pending state
-checkpoints as evidence (§1.2), but advances no hash and consumes nothing.
+the pages as hashed while never publishing them. Landed results advance token
+progress but add no reusable state checkpoints (§1.2).
 The scheduling events carry nothing but the shape of the next state (chunk
 size, decode reserve). An intermediate prefill chunk produces no token but
 does write KV, so it reports back with an empty `ExtendResult`: the arrival
@@ -419,8 +420,8 @@ engine does not perform — the peer's decode on a P node, the peer's prefill on
 a D node — is not counted here; those are fenced by the PD transfer ack.
 
 **Victim choice** (`chooseVictim`, shared by D and fused): an incomplete
-prefill first — it has produced no output a client is reading, and its
-computed chunks survive as a prefix for the retry — largest first, freeing the
+prefill first — it has produced no output a client is reading, and L2 writeback
+may preserve a computed checkpoint for the retry — largest first, freeing the
 most at once; then decode work by most newly releasable LCM blocks and fewest
 tokens — the most capacity for the least lost work. Exempt in both tiers: a
 request whose reserve already covers its whole generation
@@ -466,6 +467,10 @@ candidate block there before the remote decode carries it to the peer. The
 growth reserves stay off: no admission headroom (nothing is ever retracted),
 no snapshot-state growth block (the peer banks its own), no overlap protection
 (no local decode is ever in flight).
+
+Preparing the handoff can publish a newly completed prefill boundary. The
+transfer ACK releases request ownership without further publication; cached
+entries remain subject to normal eviction.
 
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a

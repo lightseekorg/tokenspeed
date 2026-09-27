@@ -29,7 +29,7 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 __all__ = [
     "argmax",
-    "gluon_argmax_gfx1250",
+    "launch_gluon_argmax_gfx1250",
 ]
 
 cdna5 = gl.amd.cdna5
@@ -73,7 +73,7 @@ def _argmax_accumulate_tile(best_val, best_idx, vals, cols, N: gl.constexpr):
 
 
 @gluon.jit
-def _argmax_one_stage_kernel(
+def gluon_argmax_gfx1250(
     logits,
     out,
     stride_m: gl.constexpr,
@@ -161,7 +161,7 @@ def _argmax_tile(
 
 
 @gluon.jit
-def _argmax_split_atomic_kernel(
+def gluon_argmax_split_gfx1250(
     logits,
     partial_values,
     partial_indices,
@@ -308,7 +308,7 @@ def _select_config(M: int, N: int, dtype: torch.dtype) -> tuple[int, int, int]:
     return block, 8, splits
 
 
-def gluon_argmax_gfx1250(
+def launch_gluon_argmax_gfx1250(
     logits: torch.Tensor,
     *,
     out: torch.Tensor | None,
@@ -343,7 +343,7 @@ def gluon_argmax_gfx1250(
         partial_values, partial_indices, counters = _get_atomic_scratch(
             M, num_splits, logits.device
         )
-        _argmax_split_atomic_kernel[(M, num_splits)](
+        gluon_argmax_split_gfx1250[(M, num_splits)](
             logits,
             partial_values,
             partial_indices,
@@ -360,7 +360,7 @@ def gluon_argmax_gfx1250(
             num_warps=num_warps,
         )
     else:
-        _argmax_one_stage_kernel[(M,)](
+        gluon_argmax_gfx1250[(M,)](
             logits,
             out,
             stride_m=logits.stride(0),
@@ -373,4 +373,4 @@ def gluon_argmax_gfx1250(
     return out
 
 
-argmax = gluon_argmax_gfx1250
+argmax = launch_gluon_argmax_gfx1250

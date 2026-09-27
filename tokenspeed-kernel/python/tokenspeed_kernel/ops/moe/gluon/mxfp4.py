@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import torch
-
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -69,11 +68,15 @@ def _use_gfx1250_moe_decode(num_routed_rows: int, num_experts: int) -> bool:
     )
 
 
-def _use_gfx1250_persistent_moe(num_routed_rows: int, num_experts: int) -> bool:
+def _use_gfx1250_persistent_moe(
+    num_routed_rows: int, num_experts: int, output_width: int
+) -> bool:
     # The persistent combine is tuned for at most two routed rows per expert.
     return (
         0 < num_routed_rows
         and num_routed_rows <= _GFX1250_PERSISTENT_MAX_AVERAGE_BPE * num_experts
+        and output_width > 0
+        and output_width % 128 == 0
     )
 
 
@@ -658,7 +661,9 @@ if platform.is_amd:
         num_routed_rows = topk_ids.numel()
         num_experts = w.w13_weight_triton_tensor.shape[0]
         decode = _use_gfx1250_moe_decode(num_routed_rows, num_experts)
-        persistent = _use_gfx1250_persistent_moe(num_routed_rows, num_experts)
+        persistent = _use_gfx1250_persistent_moe(
+            num_routed_rows, num_experts, w.w2_weight_triton_tensor.shape[-1]
+        )
 
         kwargs = {
             "w13_bias": (
@@ -748,13 +753,15 @@ if platform.is_amd:
             )
 
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
-        activation = plan.get("activation") or getattr(w, "activation", "silu")
+        activation = plan["activation"]
         w13_pc = w.w13_precision_config
         w2_pc = w.w2_precision_config
         num_routed_rows = topk_ids.numel()
         num_experts = w.w13_weight_triton_tensor.shape[0]
         decode = _use_gfx1250_moe_decode(num_routed_rows, num_experts)
-        persistent = _use_gfx1250_persistent_moe(num_routed_rows, num_experts)
+        persistent = _use_gfx1250_persistent_moe(
+            num_routed_rows, num_experts, w.w2_weight_triton_tensor.shape[-1]
+        )
 
         kwargs = {
             "w13_bias": (

@@ -847,8 +847,8 @@ def _rel_mha_decode_fwd(
     ),
     priority=Priority.PORTABLE,
     traits={
-        "sliding_window": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
+        "sliding_window": frozenset({False, True}),
     },
 )
 def triton_rel_mha_prefill(
@@ -913,8 +913,8 @@ def triton_rel_mha_prefill(
     ),
     priority=Priority.PORTABLE,
     traits={
-        "sliding_window": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
+        "sliding_window": frozenset({False, True}),
     },
 )
 def triton_rel_mha_extend_with_kvcache(
@@ -995,8 +995,8 @@ def triton_rel_mha_extend_with_kvcache(
     ),
     priority=Priority.PORTABLE,
     traits={
-        "sliding_window": frozenset({False, True}),
         "return_lse": frozenset({False}),
+        "sliding_window": frozenset({False, True}),
     },
 )
 def triton_rel_mha_decode_with_kvcache(

@@ -78,6 +78,7 @@ def test_gluon_bf16_moe_apply_matches_reference(num_tokens):
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     assert plan["apply_kernel_name"] == "gluon_bf16_precomputed_moe_apply"
     assert plan["support_routing"] is False  # precomputed_topk

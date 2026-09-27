@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -114,6 +115,8 @@ class RequestHandler:
         can_clear_cache_fn,
         clear_cache_fn=None,
         architectures: list[str] | None = None,
+        *,
+        tokenizer_kwargs: Mapping[str, object],
         pause_controller=None,
         memory_controller=None,
         device=None,
@@ -224,6 +227,7 @@ class RequestHandler:
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             architectures=architectures,
+            **tokenizer_kwargs,
         )
 
         self.recv_func = recv_func

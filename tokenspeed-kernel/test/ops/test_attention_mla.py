@@ -998,7 +998,7 @@ def test_mla_decode_with_kvcache_composes_projected_value_fallback(
         if args[1] == "mla_project_value":
             raise NoKernelFoundError
         if args[1] == "mla_decode_projected_value":
-            assert kwargs["traits"]["support_logit_cap"] is True
+            assert kwargs["traits"]["logit_cap"] is True
             raise NoKernelFoundError
         assert args[1] == "mla_decode_with_kvcache"
         split_decode.name = "split_decode"

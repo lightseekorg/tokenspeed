@@ -23,7 +23,6 @@
 #include <algorithm>
 #include <concepts>
 #include <cstdint>
-#include <memory>
 #include <span>
 #include <string>
 #include <utility>
@@ -46,11 +45,9 @@ struct CacheProgress {
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
-    // Aligned state boundaries written but not yet hashed, in token order:
-    // the checkpoint a scheduled prefill materializes, and every accepted
-    // endpoint landed since the last admission -- more than one when the
-    // overlap schedule lands two results back to back. Crossing a boundary
-    // is not evidence of a written state; only an exact endpoint is.
+    // Aligned prefill checkpoints written but not yet hashed, in token order.
+    // Scheduled prefill windows record their materialized checkpoint;
+    // decode results keep working state only and add no reusable boundary.
     std::vector<std::int32_t> materialized_state_boundaries;
 
     void RecordMaterializedStateBoundary(std::int32_t boundary, std::int32_t prefix_granularity) {
@@ -109,7 +106,7 @@ private:
 struct ForwardResources {
     TokenContainer* token_container{};
     std::int32_t prefix_granularity{};
-    std::unique_ptr<ReqPoolIndex> req_pool_index;
+    ReqPoolIndex req_pool_index;
     std::vector<BlockTable> block_tables;
     CacheProgress cache_progress;
     // Forwards scheduled for this request whose results have not come back.
@@ -123,22 +120,13 @@ struct ForwardResources {
     // and the write lands on pages someone else now owns.
     std::int32_t results_in_flight{0};
 
-    std::int32_t RequestPoolIndex() const { return req_pool_index ? req_pool_index->slot_ : -1; }
+    std::int32_t RequestPoolIndex() const { return req_pool_index.valid() ? req_pool_index.slot_ : -1; }
     void TrackScheduledForward() { ++results_in_flight; }
     void ResultLanded() {
         FatalCheck(results_in_flight > 0, "a forward result landed for a request with no forward in flight");
         --results_in_flight;
     }
-    void ExtendTokens(const std::vector<std::int32_t>& tokens) {
-        token_container->Extend(tokens);
-        // Feedback ends with the sampled token the next forward computes, so
-        // the accepted endpoint is one short of the container. An aligned
-        // endpoint is a written state: record it here, at landing, because
-        // the next admission may see more than one result.
-        if (!tokens.empty()) {
-            cache_progress.RecordMaterializedStateBoundary(token_container->Size() - 1, prefix_granularity);
-        }
-    }
+    void ExtendTokens(const std::vector<std::int32_t>& tokens) { token_container->Extend(tokens); }
 };
 
 template <typename State>

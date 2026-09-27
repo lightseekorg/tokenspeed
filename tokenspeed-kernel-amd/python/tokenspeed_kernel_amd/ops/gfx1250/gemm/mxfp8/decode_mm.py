@@ -60,14 +60,14 @@ def _kernel_repr(base_name: str):
 
 
 def _fp32_kernel_repr(specialization):
-    base = _kernel_repr("fp8_blockscale_gemv_gfx1250")(specialization)
+    base = _kernel_repr("gluon_mm_fp8_blockscale_gfx1250")(specialization)
     return f"{base}_tdmf{specialization.constants.get('TDM_FUSION')}"
 
 
 def _split_reduce_repr(specialization):
     constants = specialization.constants
     return (
-        f"mxfp8_split_reduce_gfx1250_bn{constants.get('BLOCK_N')}_"
+        f"_mxfp8_split_reduce_gfx1250_bn{constants.get('BLOCK_N')}_"
         f"sk{constants.get('SPLIT_K')}"
     )
 
@@ -292,9 +292,9 @@ def _issue_fp32_tdm_loads(
 
 @gluon.jit(
     launch_metadata=_ue8m0_launch_metadata,
-    repr=_kernel_repr("mxfp8_ue8m0_gemv_gfx1250"),
+    repr=_kernel_repr("gluon_mm_mxfp8_ue8m0_gfx1250"),
 )
-def _mxfp8_ue8m0_gemv_kernel(
+def gluon_mm_mxfp8_ue8m0_gfx1250(
     a,
     b,
     a_scales,
@@ -330,7 +330,7 @@ def _mxfp8_ue8m0_gemv_kernel(
     The runtime main loop overlaps the next four TDM transfers with LDS reads
     and WMMA for the current tile, followed by a two-tile static drain. Direct
     execution converts the FP32 accumulator to BF16; split execution stores
-    FP32 partials for ``_split_reduce_kernel``.
+    FP32 partials for ``_mxfp8_split_reduce_gfx1250``.
     """
     BLOCK_M: gl.constexpr = 16
     gl.static_assert(BLOCK_N == 16)
@@ -556,7 +556,7 @@ def _mxfp8_ue8m0_gemv_kernel(
     launch_metadata=_fp32_scale_launch_metadata,
     repr=_fp32_kernel_repr,
 )
-def _fp8_blockscale_gemv_kernel(
+def gluon_mm_fp8_blockscale_gfx1250(
     a,
     b,
     a_scales,
@@ -841,7 +841,7 @@ def _fp8_blockscale_gemv_kernel(
     launch_metadata=_split_reduce_launch_metadata,
     repr=_split_reduce_repr,
 )
-def _split_reduce_kernel(
+def _mxfp8_split_reduce_gfx1250(
     partials,
     out,
     stride_pk,
@@ -931,7 +931,7 @@ def _validate_common(
     return m, n, k, A_scales, B_scales, out
 
 
-def gluon_mm_mxfp8_ue8m0_gfx1250(
+def launch_gluon_mm_mxfp8_ue8m0_gfx1250(
     A: torch.Tensor,
     B: torch.Tensor,
     A_scales: torch.Tensor | None,
@@ -1008,7 +1008,7 @@ def gluon_mm_mxfp8_ue8m0_gfx1250(
         kernel_out = torch.empty((split_k, m, n), dtype=torch.float32, device=A.device)
         stride_ok = kernel_out.stride(0)
 
-    _mxfp8_ue8m0_gemv_kernel[(n // _BLOCK_N * split_k,)](
+    gluon_mm_mxfp8_ue8m0_gfx1250[(n // _BLOCK_N * split_k,)](
         A,
         B,
         A_scales,
@@ -1036,7 +1036,9 @@ def gluon_mm_mxfp8_ue8m0_gfx1250(
         waves_per_eu=_WAVES_PER_EU,
     )
     if split_k > 1:
-        _split_reduce_kernel[(m * ((n + _REDUCE_BLOCK_N - 1) // _REDUCE_BLOCK_N),)](
+        _mxfp8_split_reduce_gfx1250[
+            (m * ((n + _REDUCE_BLOCK_N - 1) // _REDUCE_BLOCK_N),)
+        ](
             kernel_out,
             out,
             kernel_out.stride(0),
@@ -1054,7 +1056,7 @@ def gluon_mm_mxfp8_ue8m0_gfx1250(
     return out
 
 
-def gluon_mm_fp8_blockscale_gfx1250(
+def launch_gluon_mm_fp8_blockscale_gfx1250(
     A: torch.Tensor,
     B: torch.Tensor,
     A_scales: torch.Tensor | None,
@@ -1136,7 +1138,7 @@ def gluon_mm_fp8_blockscale_gfx1250(
     block_n = _tdm_block_n(tdm_fusion)
     if n % block_n != 0:
         raise RuntimeError(f"TDM fusion mode {tdm_fusion} requires N % {block_n} == 0")
-    _fp8_blockscale_gemv_kernel[(n // block_n * split_k,)](
+    gluon_mm_fp8_blockscale_gfx1250[(n // block_n * split_k,)](
         A,
         B,
         A_scales,
@@ -1165,7 +1167,9 @@ def gluon_mm_fp8_blockscale_gfx1250(
         waves_per_eu=_WAVES_PER_EU,
     )
     if split_k > 1:
-        _split_reduce_kernel[(m * ((n + _REDUCE_BLOCK_N - 1) // _REDUCE_BLOCK_N),)](
+        _mxfp8_split_reduce_gfx1250[
+            (m * ((n + _REDUCE_BLOCK_N - 1) // _REDUCE_BLOCK_N),)
+        ](
             kernel_out,
             out,
             kernel_out.stride(0),

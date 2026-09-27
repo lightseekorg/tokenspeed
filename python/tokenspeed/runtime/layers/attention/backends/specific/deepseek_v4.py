@@ -72,6 +72,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4.slot_mappings import (
 )
 from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     DEEPSEEK_V4_SPARSE_PREFILL_TOPK_ALIGNMENT,
+    V4_INDEXER_KV_GROUP_ID,
     V4_SWA_KV_GROUP_ID,
     first_v4_compressed_kv_group_id,
     parse_v4_compressed_kv_group_id,
@@ -474,7 +475,10 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         for spec in runtime_contract.group_specs:
             expected_shards = (
                 self.dcp_size
-                if parse_v4_compressed_kv_group_id(spec.group_id) is not None
+                if (
+                    parse_v4_compressed_kv_group_id(spec.group_id) is not None
+                    or spec.group_id == V4_INDEXER_KV_GROUP_ID
+                )
                 else 1
             )
             if spec.shard_count != expected_shards:

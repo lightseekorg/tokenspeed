@@ -393,6 +393,40 @@ class TestSpecMatchesShapeTraits:
         assert spec_matches_shape_traits(spec, {"m": 1})
         assert spec_matches_shape_traits(spec, {"m": 1, "n": 30, "k": 70})
 
+    def test_bounds_apply_to_any_request_dimension(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "batch_size_align": frozenset({64}),
+                "num_q_heads_min": frozenset({16}),
+            },
+        )
+
+        assert spec_matches_shape_traits(spec, {"batch_size": 128, "num_q_heads": 64})
+        assert not spec_matches_shape_traits(
+            spec, {"batch_size": 96, "num_q_heads": 64}
+        )
+        assert not spec_matches_shape_traits(
+            spec, {"batch_size": 128, "num_q_heads": 12}
+        )
+        assert not spec_matches_shape_traits(spec, {"batch_size": 128})
+        assert not spec_matches_shape_traits(spec, {"num_q_heads": 64})
+
+    def test_exact_non_gemm_dimension_is_left_to_value_matching(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"batch_size": frozenset({1})},
+        )
+
+        assert spec_matches_shape_traits(spec, {})
+        assert spec_matches_shape_traits(spec, {"batch_size": 2})
+        assert not spec_matches_traits(spec, {"batch_size": 2})
+        assert not _filter_by_traits([spec], {"batch_size": 2})
+
     def test_uppercase_shape_keys_are_not_traits(self):
         spec = KernelSpec(
             name="k",

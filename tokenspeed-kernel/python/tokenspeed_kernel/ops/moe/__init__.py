@@ -18,8 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
@@ -33,25 +32,18 @@ import torch
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import SelectedKernel, select_kernel
+from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
-    "dsv4_mega_moe_apply",
-    "dsv4_mega_moe_plan",
-    "dsv4_mega_moe_process_weights",
-    "dsv4_mega_moe_warmup",
-    "dsv4_select_experts",
     "native_latent_moe_available",
     "latent_moe_decode_pipeline_available",
     "latent_moe_expert_shared",
     "latent_moe_input_projections",
     "moe_apply",
     "moe_plan",
-    "pack_topk_router_logits",
     "moe_process_weights",
-    "moe_sigmoid_bias_topk",
-    "moe_softmax_topk",
+    "moe_topk",
 ]
 
 from tokenspeed_kernel.ops.moe.latent_decode import (  # noqa: E402
@@ -62,268 +54,10 @@ from tokenspeed_kernel.ops.moe.latent_input import (  # noqa: E402
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe.native import native_latent_moe_available  # noqa: E402
-from tokenspeed_kernel.ops.moe.pack_topk import pack_topk_router_logits  # noqa: E402
-from tokenspeed_kernel.ops.moe.sigmoid_topk import moe_sigmoid_bias_topk  # noqa: E402
-from tokenspeed_kernel.ops.moe.softmax_topk import moe_softmax_topk  # noqa: E402
-
-
-@dataclass(frozen=True)
-class _MegaMoEPlan:
-    kernel: SelectedKernel
-    weight_preprocessor: Callable
-    warmup: Callable | None
-    input_dtype: torch.dtype
-    num_experts: int
-    num_local_experts: int
-    top_k: int
-    hidden_size: int
-    intermediate_size: int
-    max_num_tokens: int
-    process_group: object | None
-    activation_clamp: float | None
-
-
-@dataclass(frozen=True)
-class _MegaMoEState:
-    plan: _MegaMoEPlan
-    backend_state: object
-
-
-def dsv4_mega_moe_plan(
-    *,
-    num_experts: int,
-    num_local_experts: int,
-    top_k: int,
-    hidden_size: int,
-    intermediate_size: int,
-    max_num_tokens: int,
-    process_group: object | None = None,
-    activation_clamp: float | None = None,
-    input_dtype: torch.dtype = torch.bfloat16,
-    solution: str | None = None,
-) -> object:
-    """Create an opaque DeepSeek V4 MegaMoE execution plan.
-
-    Kernel selection applies registry capability requirements. The currently
-    registered implementation requires NVIDIA SM100 and optional DeepGEMM
-    MegaMoE symbols, so planning fails cleanly when either is unavailable.
-
-    Args:
-        num_experts: Total number of routed experts across the EP group.
-        num_local_experts: Number of checkpoint experts held by this rank.
-        top_k: Number of experts selected per token.
-        hidden_size: Model hidden dimension.
-        intermediate_size: Per-expert intermediate dimension.
-        max_num_tokens: Per-rank token capacity of the symmetric input buffer.
-        process_group: Optional expert-parallel process group. When omitted, the
-            backend uses the default initialized distributed process group.
-        activation_clamp: Optional SwiGLU activation clamp compiled into the
-            MegaMoE kernel. The same value is used for execution and warmup.
-        input_dtype: Hidden-state dtype consumed by the implementation.
-        solution: Optional implementation family selected through the registry.
-
-    Returns:
-        An opaque plan accepted by the related process, apply, and warmup APIs.
-    """
-    dimensions = {
-        "num_experts": num_experts,
-        "num_local_experts": num_local_experts,
-        "top_k": top_k,
-        "hidden_size": hidden_size,
-        "intermediate_size": intermediate_size,
-        "max_num_tokens": max_num_tokens,
-    }
-    invalid = [name for name, value in dimensions.items() if int(value) <= 0]
-    if invalid:
-        raise ValueError(f"MegaMoE dimensions must be positive: {', '.join(invalid)}")
-    if num_local_experts > num_experts:
-        raise ValueError("num_local_experts cannot exceed num_experts")
-    if top_k > num_experts:
-        raise ValueError("top_k cannot exceed num_experts")
-    if hidden_size % 128 or intermediate_size % 128:
-        raise ValueError(
-            "DeepSeek V4 MegaMoE hidden and intermediate sizes must be "
-            "multiples of 128"
-        )
-
-    kernel = select_kernel(
-        "moe",
-        "dsv4_mega_moe",
-        format_signature(hidden_states=dense_tensor_format(input_dtype)),
-        traits={
-            "weight_dtype": "mxfp4",
-            "scale_format": "ue8m0",
-            "scale_block_size": 32,
-            "supports_ep": True,
-        },
-        solution=solution,
-    )
-    spec = KernelRegistry.get().get_by_name(kernel.name)
-    if spec is None or spec.weight_preprocessor is None:
-        raise RuntimeError(f"MegaMoE kernel {kernel.name!r} has no weight preprocessor")
-    return _MegaMoEPlan(
-        kernel=kernel,
-        weight_preprocessor=spec.weight_preprocessor,
-        warmup=getattr(kernel.impl, "_tokenspeed_warmup", None),
-        input_dtype=input_dtype,
-        num_experts=int(num_experts),
-        num_local_experts=int(num_local_experts),
-        top_k=int(top_k),
-        hidden_size=int(hidden_size),
-        intermediate_size=int(intermediate_size),
-        max_num_tokens=int(max_num_tokens),
-        process_group=process_group,
-        activation_clamp=activation_clamp,
-    )
-
-
-def _require_mega_moe_plan(plan: object) -> _MegaMoEPlan:
-    if not isinstance(plan, _MegaMoEPlan):
-        raise TypeError("plan must be returned by dsv4_mega_moe_plan")
-    return plan
-
-
-def _require_mega_moe_state(plan: _MegaMoEPlan, state: object) -> _MegaMoEState:
-    if not isinstance(state, _MegaMoEState):
-        raise TypeError("state must be returned by dsv4_mega_moe_process_weights")
-    if state.plan is not plan:
-        raise ValueError("MegaMoE state was created by a different plan")
-    return state
-
-
-def dsv4_mega_moe_process_weights(
-    plan: object,
-    w13_weight: torch.Tensor,
-    w13_weight_scale: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w2_weight_scale: torch.Tensor,
-) -> object:
-    """Process canonical checkpoint tensors into opaque MegaMoE state.
-
-    Callers may retain ordinary checkpoint tensors while loading and replace
-    them with the returned state only after all shards are populated. Scale
-    conversion and implementation-specific weight layouts are backend-owned.
-
-    Args:
-        plan: Opaque plan returned by :func:`dsv4_mega_moe_plan`.
-        w13_weight: Packed canonical gate/up weight tensor.
-        w13_weight_scale: Canonical gate/up UE8M0 scale tensor.
-        w2_weight: Packed canonical down-projection weight tensor.
-        w2_weight_scale: Canonical down-projection UE8M0 scale tensor.
-
-    Returns:
-        Opaque processed state accepted by apply and warmup.
-    """
-    typed_plan = _require_mega_moe_plan(plan)
-    backend_state = typed_plan.weight_preprocessor(
-        w13_weight=w13_weight,
-        w13_weight_scale=w13_weight_scale,
-        w2_weight=w2_weight,
-        w2_weight_scale=w2_weight_scale,
-        num_local_experts=typed_plan.num_local_experts,
-        hidden_size=typed_plan.hidden_size,
-        intermediate_size=typed_plan.intermediate_size,
-    )
-    return _MegaMoEState(plan=typed_plan, backend_state=backend_state)
-
-
-def dsv4_mega_moe_apply(
-    plan: object,
-    state: object,
-    hidden_states: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    *,
-    fast_math: bool = True,
-) -> torch.Tensor:
-    """Execute DeepSeek V4 MegaMoE using opaque processed state.
-
-    Args:
-        plan: Opaque plan returned by :func:`dsv4_mega_moe_plan`.
-        state: Opaque state returned by
-            :func:`dsv4_mega_moe_process_weights` for the same plan.
-        hidden_states: Input activations shaped ``[tokens, hidden_size]``.
-        topk_weights: Routing weights shaped ``[tokens, top_k]``.
-        topk_ids: Global expert ids shaped ``[tokens, top_k]``.
-        fast_math: Whether the backend may use its fast-math execution path.
-
-    Returns:
-        BF16 routed-expert output shaped like ``hidden_states``.
-    """
-    typed_plan = _require_mega_moe_plan(plan)
-    typed_state = _require_mega_moe_state(typed_plan, state)
-    if hidden_states.ndim != 2 or hidden_states.shape[1] != typed_plan.hidden_size:
-        raise ValueError(
-            "MegaMoE hidden_states must have shape "
-            f"[tokens, {typed_plan.hidden_size}], got {tuple(hidden_states.shape)}"
-        )
-    if hidden_states.dtype != typed_plan.input_dtype:
-        raise ValueError(
-            f"MegaMoE expected hidden dtype {typed_plan.input_dtype}, "
-            f"got {hidden_states.dtype}"
-        )
-    expected_routing_shape = (hidden_states.shape[0], typed_plan.top_k)
-    if tuple(topk_weights.shape) != expected_routing_shape:
-        raise ValueError(
-            f"topk_weights must have shape {expected_routing_shape}, "
-            f"got {tuple(topk_weights.shape)}"
-        )
-    if tuple(topk_ids.shape) != expected_routing_shape:
-        raise ValueError(
-            f"topk_ids must have shape {expected_routing_shape}, "
-            f"got {tuple(topk_ids.shape)}"
-        )
-    if hidden_states.shape[0] > typed_plan.max_num_tokens:
-        raise ValueError(
-            f"DeepSeek V4 MegaMoE got {hidden_states.shape[0]} tokens, but the "
-            f"symmetric buffer was sized for {typed_plan.max_num_tokens}"
-        )
-
-    return typed_plan.kernel(
-        hidden_states=hidden_states,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        state=typed_state.backend_state,
-        process_group=typed_plan.process_group,
-        num_experts=typed_plan.num_experts,
-        top_k=typed_plan.top_k,
-        hidden_size=typed_plan.hidden_size,
-        intermediate_size=typed_plan.intermediate_size,
-        max_num_tokens=typed_plan.max_num_tokens,
-        activation_clamp=typed_plan.activation_clamp,
-        fast_math=fast_math,
-    )
-
-
-def dsv4_mega_moe_warmup(plan: object, state: object) -> None:
-    """Warm all serving token shapes for an opaque MegaMoE plan and state.
-
-    The backend performs the EP barrier, reuses its symmetric buffer, and uses
-    the plan's token capacity and activation clamp so compiled variants match
-    serving.
-
-    Args:
-        plan: Opaque plan returned by :func:`dsv4_mega_moe_plan`.
-        state: Opaque state returned by
-            :func:`dsv4_mega_moe_process_weights` for the same plan.
-
-    Returns:
-        None.
-    """
-    typed_plan = _require_mega_moe_plan(plan)
-    typed_state = _require_mega_moe_state(typed_plan, state)
-    if typed_plan.warmup is None:
-        return
-    typed_plan.warmup(
-        state=typed_state.backend_state,
-        process_group=typed_plan.process_group,
-        num_experts=typed_plan.num_experts,
-        top_k=typed_plan.top_k,
-        hidden_size=typed_plan.hidden_size,
-        intermediate_size=typed_plan.intermediate_size,
-        max_num_tokens=typed_plan.max_num_tokens,
-        activation_clamp=typed_plan.activation_clamp,
-    )
+from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
+    _moe_sigmoid_bias_topk,
+)
+from tokenspeed_kernel.ops.moe.softmax_topk import _moe_softmax_topk  # noqa: E402
 
 
 def _assert_indices_in_range(
@@ -351,18 +85,23 @@ def _routing_kind(
     return "plain"
 
 
-def dsv4_select_experts(
+def moe_topk(
     router_logits: torch.Tensor,
     top_k: int,
+    score_function: Literal["softmax", "sigmoid", "sqrt_softplus"],
+    selection_method: Literal["topk", "hash"],
     renormalize: bool,
+    routed_scaling_factor: float | None,
     correction_bias: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
-    need_scores: bool = True,
+    logical_to_physical_map: torch.Tensor | None = None,
+    topk_indices_dtype: torch.dtype = torch.int32,
+    topk_weights_dtype: torch.dtype = torch.float32,
     override: str | None = None,
     solution: str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select DeepSeek V4 experts from sqrt-softplus router scores.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Produce expert weights and ids using a registered MoE TopK kernel.
 
     Correction bias affects selection only; returned weights are gathered from
     the unbiased scores. Hash routing uses the checkpoint table for expert ids.
@@ -370,20 +109,78 @@ def dsv4_select_experts(
     Args:
         router_logits: Router logits shaped [tokens, experts].
         top_k: Number of experts selected for each token.
-        renormalize: Normalize selected weights to sum to one when true.
-        correction_bias: Optional selection-only bias shaped [experts].
+        score_function: Transformation from router logits to routing scores.
+        selection_method: Select experts by score or token hash.
+        renormalize: Whether selected routing weights sum to one.
+        routed_scaling_factor: Optional scale applied to selected weights.
+        correction_bias: Optional selection-only bias shaped [experts] or
+            [tokens, experts].
         hash_indices_table: Optional token-id to expert-id table.
         input_ids: Token ids used with hash_indices_table.
-        need_scores: Whether callers consume the full score tensor. Specialized
-            kernels avoid materializing it when false.
+        logical_to_physical_map: Optional expert-id map for sigmoid routing.
+        topk_indices_dtype: Integer dtype for returned expert ids.
+        topk_weights_dtype: Floating-point dtype for returned routing weights.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
     Returns:
-        FP32 weights, INT32 expert ids, and a tensor shaped [tokens, experts].
-        The first two tensors have shape [tokens, top_k]. When need_scores is
-        false, a specialized kernel may return router_logits as the ignored
-        third value instead of materializing scores.
+        Weights and expert ids shaped [tokens, top_k], using the requested
+        output dtypes (FP32 weights and INT32 ids by default).
     """
+    if selection_method not in {"topk", "hash"}:
+        raise ValueError(f"unsupported MoE selection method: {selection_method!r}")
+    if selection_method == "hash":
+        if correction_bias is not None:
+            raise ValueError("hash selection does not accept correction_bias")
+        if hash_indices_table is None or input_ids is None:
+            raise ValueError("hash selection requires hash_indices_table and input_ids")
+    elif hash_indices_table is not None or input_ids is not None:
+        raise ValueError("hash routing inputs require hash selection")
+    if topk_indices_dtype not in (torch.int32, torch.int64):
+        raise ValueError("topk_indices_dtype must be torch.int32 or torch.int64")
+    if not topk_weights_dtype.is_floating_point:
+        raise ValueError("topk_weights_dtype must be a floating-point dtype")
+
+    scaling_factor = 1.0 if routed_scaling_factor is None else routed_scaling_factor
+    if score_function == "softmax":
+        if selection_method != "topk":
+            raise ValueError("softmax routing only supports topk selection")
+        if correction_bias is not None:
+            raise ValueError("softmax routing does not accept correction_bias")
+        if logical_to_physical_map is not None:
+            raise ValueError("softmax routing does not accept an expert-id map")
+        topk_weights, topk_ids = _moe_softmax_topk(
+            router_logits,
+            top_k,
+            topk_indices_dtype=topk_indices_dtype,
+            renormalize=renormalize,
+            routed_scaling_factor=scaling_factor,
+            override=override,
+            solution=solution,
+        )
+        return topk_weights.to(topk_weights_dtype), topk_ids
+
+    if score_function == "sigmoid":
+        if selection_method != "topk":
+            raise ValueError("sigmoid routing only supports topk selection")
+        if correction_bias is None:
+            raise ValueError("sigmoid routing requires correction_bias")
+        topk_weights, topk_ids = _moe_sigmoid_bias_topk(
+            router_logits,
+            correction_bias,
+            top_k,
+            routed_scaling_factor=scaling_factor,
+            normalize_topk_weights=renormalize,
+            logical_to_physical_map=logical_to_physical_map,
+            weights_dtype=topk_weights_dtype,
+            override=override,
+            solution=solution,
+        )
+        return topk_weights, topk_ids.to(topk_indices_dtype)
+
+    if score_function != "sqrt_softplus":
+        raise ValueError(f"unsupported MoE score function: {score_function!r}")
+    if logical_to_physical_map is not None:
+        raise ValueError("sqrt_softplus routing does not accept an expert-id map")
     if router_logits.ndim != 2:
         raise ValueError("router_logits must have shape [tokens, experts]")
     if not router_logits.is_floating_point():
@@ -391,11 +188,15 @@ def dsv4_select_experts(
     tokens, experts = router_logits.shape
     if not 0 < top_k <= experts:
         raise ValueError(f"top_k must be in [1, {experts}], got {top_k}")
-    if correction_bias is not None and correction_bias.shape != (experts,):
-        raise ValueError(f"correction_bias must have shape [{experts}]")
+    valid_bias_shapes = {(experts,), (tokens, experts)}
+    if (
+        correction_bias is not None
+        and tuple(correction_bias.shape) not in valid_bias_shapes
+    ):
+        raise ValueError(
+            f"correction_bias must have shape [{experts}] or [{tokens}, {experts}]"
+        )
     if hash_indices_table is not None:
-        if input_ids is None:
-            raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
         if (
             hash_indices_table.ndim != 2
             or hash_indices_table.shape[0] == 0
@@ -427,15 +228,30 @@ def dsv4_select_experts(
         "top_k": int(top_k),
         "renormalize": bool(renormalize),
         "routing_kind": routing_kind,
+        "score_function": score_function,
     }
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
+    per_token_bias = correction_bias is not None and correction_bias.ndim == 2
+    if per_token_bias and solution not in {None, "torch"}:
+        raise ValueError(
+            f"per-token correction bias does not support solution {solution!r}"
+        )
+    if per_token_bias and override not in {
+        None,
+        "torch",
+        "torch_sqrt_softplus_topk",
+    }:
+        raise ValueError(
+            f"per-token correction bias does not support override {override!r}"
+        )
+    routing_solution = "torch" if per_token_bias else solution
     kernel = select_kernel(
         "moe",
-        "dsv4_select_experts",
+        "topk",
         signature,
         traits=traits,
         override=override,
-        solution=solution,
+        solution=routing_solution,
     )
     shape_params = {
         "tokens": int(tokens),
@@ -443,31 +259,43 @@ def dsv4_select_experts(
         "top_k": int(top_k),
         "renormalize": bool(renormalize),
         "routing_kind": routing_kind,
-        "need_scores": bool(need_scores),
+        "score_function": score_function,
     }
     ShapeCapture.get().record(
         "moe",
-        "dsv4_select_experts",
+        "topk",
         kernel.name,
         router_logits.dtype,
         shape_params,
     )
     with kernel_scope(
         "moe",
-        "dsv4_select_experts",
+        "topk",
         router_logits.dtype,
         kernel_name=kernel.name,
         **shape_params,
     ):
-        return kernel(
+        if tokens == 0:
+            return (
+                torch.empty(
+                    (0, top_k), dtype=topk_weights_dtype, device=router_logits.device
+                ),
+                torch.empty(
+                    (0, top_k), dtype=topk_indices_dtype, device=router_logits.device
+                ),
+            )
+        topk_weights, topk_ids, _ = kernel(
             router_logits,
             top_k,
             renormalize,
             correction_bias,
             hash_indices_table,
             input_ids,
-            need_scores,
+            False,
         )
+        if scaling_factor != 1.0:
+            topk_weights = topk_weights * scaling_factor
+        return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
 
 
 def _normalize_weight_dtype(weight_dtype: str) -> str:
@@ -621,6 +449,8 @@ def moe_plan(
     process_group: object | None = None,
     deepep_mode: str | None = None,
     deepep_low_latency_max_num_tokens_per_gpu: int | None = None,
+    persistent_max_num_tokens_per_gpu: int | None = None,
+    fast_math: bool,
     solution: str | None = None,
 ) -> dict:
     """Create a MoE execution plan.
@@ -675,6 +505,11 @@ def moe_plan(
         deepep_low_latency_max_num_tokens_per_gpu: Per-GPU token capacity the
             DeepEP low-latency buffer is sized for. Required whenever the mode
             can run the low-latency legs; batches above it must use normal mode.
+        persistent_max_num_tokens_per_gpu: Optional fixed per-GPU capacity for
+            implementations that own persistent communication buffers.
+        fast_math: Whether the selected implementation may use fast math.
+            Implementations without a fast-math path always compute precisely.
+            Required keyword.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
 
@@ -709,6 +544,7 @@ def moe_plan(
         internal_activation_dtype=internal_activation_dtype,
         with_bias=with_bias,
     )
+    traits["persistent_workspace"] = persistent_max_num_tokens_per_gpu is not None
 
     kernel = select_kernel(
         "moe",
@@ -727,6 +563,12 @@ def moe_plan(
         apply_spec.name,
         apply_spec.traits,
     )
+    if persistent_max_num_tokens_per_gpu is not None and True not in (
+        apply_spec.traits.get("persistent_workspace", frozenset())
+    ):
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} does not support persistent workspace"
+        )
 
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
     support_routing = "kernel_routing" in routing_modes
@@ -739,12 +581,15 @@ def moe_plan(
         "activation": activation,
         "apply_kernel_name": apply_spec.name,
         "weight_preprocessor": apply_spec.weight_preprocessor,
+        "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
         "a2a_backend": a2a_backend,
         "process_group": process_group,
         "deepep_mode": deepep_mode or "auto",
         "deepep_low_latency_max_num_tokens_per_gpu": (
             deepep_low_latency_max_num_tokens_per_gpu
         ),
+        "persistent_max_num_tokens_per_gpu": persistent_max_num_tokens_per_gpu,
+        "fast_math": fast_math,
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,

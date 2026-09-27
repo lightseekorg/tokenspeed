@@ -1,6 +1,6 @@
 # TokenSpeed-MLA
 
-Speed-of-light TokenSpeed MLA kernels for Blackwell (`SM100/SM103`) with:
+Speed-of-light TokenSpeed MLA kernels for `SM100/SM103/SM107` with:
 
 - `MLA prefill`:
   - CuTe DSL JIT backend for ragged varlen FMHA (no padding)
@@ -20,6 +20,8 @@ requirements. For MLA decode kernel, small `q_len * num_heads`
 configurations can fold a query-token group (`fold_sq_factor`) into heads for
 better tile utilization; remaining query groups are scheduled across the query
 sequence dimension.
+
+SM107 support requires CuTe DSL 4.8.0 or newer and a compatible CUDA toolkit.
 
 ## Performance Numbers
 
@@ -116,8 +118,19 @@ From the repository root, select this checkout's sources explicitly:
 PYTHONPATH=tokenspeed-mla/python python -m pytest -q tokenspeed-mla/tests/test_mla_decode.py
 ```
 
-GPU cases require Blackwell SM100/SM103 and are skipped on other devices.
-Add `-k 'not TestGPU'` to run only CPU checks, or `-k TestGPU` for GPU checks.
+GPU cases require SM100, SM103 or SM107 and are skipped on other devices.
+Add `-k 'not TestGPU and not TestCompile'` for CPU checks, `-k TestCompile`
+for compilation checks across all three architectures, or `-k TestGPU` for
+GPU checks. Compilation checks require a CuTe DSL and CUDA toolchain that
+support the target architecture, even when no GPU is visible.
+
+### SM107 decode
+
+FP8 and FP16/BF16 decode share the existing kernel classes, scheduler,
+split-KV reducer and masking logic across SM100, SM103 and SM107. The public
+wrapper selects the architecture from `query.device` and includes it in the
+compile cache key and compiler target. Direct kernel construction requires
+an explicit `compute_capability=(10, 0)`, `(10, 3)` or `(10, 7)`.
 
 Other optimizations include:
 

@@ -22,7 +22,7 @@ def _next_pow2(value: int) -> int:
 
 
 @gluon.jit
-def _sigmoid_bias_topk_route_prefill_kernel(
+def gluon_sigmoid_bias_topk_gfx1250(
     logits_ptr,
     bias_ptr,
     topk_ids_ptr,
@@ -145,7 +145,7 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
     )
     # Two wave32 warps preserve the gfx950 kernel's 64-thread reduction width.
     num_warps = 2
-    _sigmoid_bias_topk_route_prefill_kernel[(tokens,)](
+    gluon_sigmoid_bias_topk_gfx1250[(tokens,)](
         router_logits,
         correction_bias,
         topk_ids,

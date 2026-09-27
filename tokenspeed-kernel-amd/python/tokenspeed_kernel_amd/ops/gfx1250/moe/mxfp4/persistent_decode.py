@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import torch
-
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx1250.moe._common import (
     FP4,
@@ -700,16 +699,17 @@ def gluon_mxfp4_a8w4_persistent_decode(
             f"'swiglu', or 'situ', got {activation!r}"
         )
 
-    intermediate = fused.gluon_mxfp_ragged_matmul(
+    intermediate_fp8 = fused.gluon_mxfp_ragged_matmul(
         hidden_fp8,
         w13_weight,
         w13_bias,
         w_mx_scale=w13_mx_scale,
         x_format="e4m3",
         x_global_scale=w13_weight.act_scale,
+        y_global_scale=w2_weight.act_scale,
         a_ragged_metadata=ragged_metadata,
         gather_indx=gather_indx,
-        out_dtype=out_dtype,
+        out_dtype=torch.float8_e4m3fn,
         fused_activation=fused_activation,
         scale_preshuffle=True,
         block_m=_BLOCK_M,
@@ -719,10 +719,6 @@ def gluon_mxfp4_a8w4_persistent_decode(
         num_buffers=3,
         decode=True,
         partial_tdm=False,
-    )
-    intermediate_fp8 = fused._quantize_fp8_activation(
-        intermediate,
-        w2_weight.act_scale,
     )
     flat, _ = _persistent_a8w4_combine(
         intermediate_fp8,

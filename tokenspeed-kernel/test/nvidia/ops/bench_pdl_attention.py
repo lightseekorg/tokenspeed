@@ -133,6 +133,7 @@ def _qsa(rows, solution):
             complete,
             page_size=page_size,
             block_topk=512,
+            queries_per_request=1,
             max_partial_bytes=32 * 1024 * 1024,
             solution=solution,
             persistent_topk_workspace=None,

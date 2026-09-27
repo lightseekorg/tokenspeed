@@ -1186,7 +1186,7 @@ class ProgramScheduler:
 
 
 @gluon.jit
-def _mla_prefill_kernel(
+def gluon_mla_prefill_gfx950(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -1308,7 +1308,7 @@ def get_config(*, q: torch.Tensor, k: torch.Tensor) -> LaunchConfig:
     )
 
 
-def gluon_mla_prefill_gfx950(
+def launch_gluon_mla_prefill_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1387,7 +1387,7 @@ def gluon_mla_prefill_gfx950(
         # runtime bound so varying prompt lengths do not each compile a kernel.
         max_seqlen_q = min(max_seqlen_q, total_tokens)
 
-    _mla_prefill_kernel[config.grid](
+    gluon_mla_prefill_gfx950[config.grid](
         q,
         k,
         v,

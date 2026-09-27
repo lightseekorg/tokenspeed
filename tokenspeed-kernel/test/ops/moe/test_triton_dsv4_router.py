@@ -27,19 +27,19 @@ import torch
 import torch.nn.functional as F
 from kimi3_reference import dequantize_mxfp4
 from tokenspeed_kernel import (
-    dsv4_select_experts,
     moe_apply,
     moe_plan,
     moe_process_weights,
+    moe_topk,
 )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("kind", ["plain", "bias", "hash"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("renormalize,need_scores", [(False, True), (True, False)])
+@pytest.mark.parametrize("renormalize", [False, True])
 def test_router_matches_reference(
-    kind: str, dtype: torch.dtype, renormalize: bool, need_scores: bool
+    kind: str, dtype: torch.dtype, renormalize: bool
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(35)
     # Non-contiguous logits also cover a prefill batch beyond the gfx950 specialization.
@@ -67,16 +67,17 @@ def test_router_matches_reference(
         if table is not None
         else None
     )
-    weights, ids, scores = dsv4_select_experts(
+    weights, ids = moe_topk(
         logits,
         top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="hash" if kind == "hash" else "topk",
         renormalize=renormalize,
+        routed_scaling_factor=1.0,
         correction_bias=bias,
         hash_indices_table=table,
         input_ids=input_ids,
-        need_scores=need_scores,
-        override="triton_dsv4_select_experts",
-        solution=None,
+        override="triton_sqrt_softplus_topk",
     )
     expected_scores = F.softplus(logits.float()).sqrt()
     expected_ids = (
@@ -93,10 +94,6 @@ def test_router_matches_reference(
         )
     torch.testing.assert_close(ids.long(), expected_ids)
     torch.testing.assert_close(weights, expected_weights, atol=1e-6, rtol=2e-6)
-    if need_scores:
-        torch.testing.assert_close(scores, expected_scores, atol=1e-6, rtol=2e-6)
-    else:
-        assert scores is logits
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -104,19 +101,17 @@ def test_router_ties_and_graph_replay() -> None:
     logits = torch.zeros((2, 256), device="cuda", dtype=torch.float32)
 
     def run():
-        return dsv4_select_experts(
+        return moe_topk(
             logits,
             top_k=6,
+            score_function="sqrt_softplus",
+            selection_method="topk",
             renormalize=True,
-            correction_bias=None,
-            hash_indices_table=None,
-            input_ids=None,
-            need_scores=True,
-            override="triton_dsv4_select_experts",
-            solution=None,
+            routed_scaling_factor=1.0,
+            override="triton_sqrt_softplus_topk",
         )
 
-    weights, ids, _ = run()
+    weights, ids = run()
     torch.testing.assert_close(
         ids, torch.arange(6, device="cuda", dtype=torch.int32).repeat(2, 1)
     )
@@ -148,16 +143,15 @@ def test_router_nan_logits_keep_expert_ids_in_range(with_bias: bool) -> None:
     )
 
     def run() -> torch.Tensor:
-        _, ids, _ = dsv4_select_experts(
+        _, ids = moe_topk(
             logits,
             top_k=6,
+            score_function="sqrt_softplus",
+            selection_method="topk",
             renormalize=True,
+            routed_scaling_factor=1.0,
             correction_bias=bias,
-            hash_indices_table=None,
-            input_ids=None,
-            need_scores=False,
-            override="triton_dsv4_select_experts",
-            solution=None,
+            override="triton_sqrt_softplus_topk",
         )
         return ids
 
@@ -240,6 +234,7 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     moe_process_weights(plan, weights)
@@ -247,16 +242,14 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
     w2 = dequantize_mxfp4(weights.w2_weight, weights.w2_weight_scale, group_size=32)
 
     def run() -> torch.Tensor:
-        route_weights, route_ids, _ = dsv4_select_experts(
+        route_weights, route_ids = moe_topk(
             logits,
             top_k=top_k,
+            score_function="sqrt_softplus",
+            selection_method="topk",
             renormalize=True,
+            routed_scaling_factor=1.0,
             correction_bias=bias,
-            hash_indices_table=None,
-            input_ids=None,
-            need_scores=False,
-            override="triton_dsv4_select_experts",
-            solution=None,
         )
         return moe_apply(
             plan,

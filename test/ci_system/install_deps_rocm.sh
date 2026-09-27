@@ -70,7 +70,14 @@ pip_install_with_retry pip3 install tokenspeed-kernel/python/ \
 
 echo "=== Step 5: Install TokenSpeed Scheduler ==="
 pip_install_with_retry pip3 install cmake ninja
-pip_install_with_retry pip3 install tokenspeed-scheduler/
+# Scheduler changes intentionally accumulate without a version bump. Build in
+# a fresh directory so a persistent runner cannot reuse a same-version native
+# extension left by an earlier checkout.
+SCHEDULER_BUILD_DIR="$(mktemp -d)"
+pip_install_with_retry pip3 install --force-reinstall --no-deps \
+    tokenspeed-scheduler/ \
+    --config-settings="build-dir=${SCHEDULER_BUILD_DIR}"
+rm -rf "${SCHEDULER_BUILD_DIR}"
 
 echo "=== Step 6: Install TokenSpeed ==="
 # tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in

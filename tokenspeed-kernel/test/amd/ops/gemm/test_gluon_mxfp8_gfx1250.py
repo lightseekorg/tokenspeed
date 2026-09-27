@@ -37,8 +37,8 @@ from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8 import (  # noqa: E402
     decode_mm as mxfp8_mm,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8 import (  # noqa: E402
-    gluon_mm_fp8_blockscale_gfx1250,
-    gluon_mm_mxfp8_ue8m0_gfx1250,
+    launch_gluon_mm_fp8_blockscale_gfx1250,
+    launch_gluon_mm_mxfp8_ue8m0_gfx1250,
 )
 
 # Inputs dequantize exactly; leave a small margin above BF16's worst-case
@@ -78,7 +78,7 @@ def test_mxfp8_ue8m0_gemv_matches_dequantized_reference(
     a_scales = torch.randint(124, 130, (m, k // 32), device="cuda", dtype=torch.uint8)
     b_scales = torch.randint(124, 130, (n, k // 32), device="cuda", dtype=torch.uint8)
 
-    actual = gluon_mm_mxfp8_ue8m0_gfx1250(
+    actual = launch_gluon_mm_mxfp8_ue8m0_gfx1250(
         a,
         b,
         a_scales,
@@ -114,7 +114,7 @@ def test_fp8_blockscale_gemv_matches_dequantized_reference(
     a_scales = torch.rand((m, k // 128), device="cuda") + 0.5
     b_scales = torch.rand((n // 128, k // 128), device="cuda") + 0.5
 
-    actual = gluon_mm_fp8_blockscale_gfx1250(
+    actual = launch_gluon_mm_fp8_blockscale_gfx1250(
         a,
         b,
         a_scales,
@@ -148,7 +148,7 @@ def test_mxfp8_split_k_matches_direct(
     a = _random_fp8((m, k))
     b = _random_fp8((n, k))
     if contract == "ue8m0":
-        implementation = gluon_mm_mxfp8_ue8m0_gfx1250
+        implementation = launch_gluon_mm_mxfp8_ue8m0_gfx1250
         block_size = [1, 32]
         a_scales = torch.randint(
             124, 130, (m, k // 32), device="cuda", dtype=torch.uint8
@@ -157,7 +157,7 @@ def test_mxfp8_split_k_matches_direct(
             124, 130, (n, k // 32), device="cuda", dtype=torch.uint8
         )
     else:
-        implementation = gluon_mm_fp8_blockscale_gfx1250
+        implementation = launch_gluon_mm_fp8_blockscale_gfx1250
         block_size = [128, 128]
         a_scales = torch.rand((m, k // 128), device="cuda") + 0.5
         b_scales = torch.rand((n // 128, k // 128), device="cuda") + 0.5
@@ -252,7 +252,7 @@ def test_fp8_blockscale_fused_tdm_matches_single_wave(monkeypatch) -> None:
     b_scales = torch.rand((n // 128, k // 128), device="cuda") + 0.5
 
     compiled_calls = []
-    kernel = mxfp8_mm._fp8_blockscale_gemv_kernel
+    kernel = mxfp8_mm.gluon_mm_fp8_blockscale_gfx1250
     run = kernel.run
 
     def record_compiled(*args, **kwargs):
@@ -266,7 +266,7 @@ def test_fp8_blockscale_fused_tdm_matches_single_wave(monkeypatch) -> None:
         "_select_tdm_fusion",
         lambda contract, selected_m, selected_n, selected_k, split_k: mxfp8_mm._TDM_FUSION_NONE,
     )
-    expected = gluon_mm_fp8_blockscale_gfx1250(
+    expected = launch_gluon_mm_fp8_blockscale_gfx1250(
         a,
         b,
         a_scales,
@@ -281,7 +281,7 @@ def test_fp8_blockscale_fused_tdm_matches_single_wave(monkeypatch) -> None:
         "_select_tdm_fusion",
         lambda contract, selected_m, selected_n, selected_k, split_k: mxfp8_mm._TDM_FUSION_PAIR_2W,
     )
-    actual = gluon_mm_fp8_blockscale_gfx1250(
+    actual = launch_gluon_mm_fp8_blockscale_gfx1250(
         a,
         b,
         a_scales,
@@ -326,14 +326,14 @@ def test_gfx1250_gemv_uses_native_pipeline(
     a = _random_fp8((m, k))
     b = _random_fp8((n, k))
     if contract == "ue8m0":
-        kernel = mxfp8_mm._mxfp8_ue8m0_gemv_kernel
-        implementation = gluon_mm_mxfp8_ue8m0_gfx1250
+        kernel = mxfp8_mm.gluon_mm_mxfp8_ue8m0_gfx1250
+        implementation = launch_gluon_mm_mxfp8_ue8m0_gfx1250
         block_size = [1, 32]
         a_scales = torch.full((m, k // 32), 127, device="cuda", dtype=torch.uint8)
         b_scales = torch.full((n, k // 32), 127, device="cuda", dtype=torch.uint8)
     else:
-        kernel = mxfp8_mm._fp8_blockscale_gemv_kernel
-        implementation = gluon_mm_fp8_blockscale_gfx1250
+        kernel = mxfp8_mm.gluon_mm_fp8_blockscale_gfx1250
+        implementation = launch_gluon_mm_fp8_blockscale_gfx1250
         block_size = [128, 128]
         a_scales = torch.ones((m, k // 128), device="cuda")
         b_scales = torch.ones((n // 128, k // 128), device="cuda")
@@ -374,7 +374,7 @@ def test_mxfp8_ue8m0_gemv_preserves_strided_out() -> None:
     backing = torch.empty((m, n + 17), device="cuda", dtype=torch.bfloat16)
     out = backing[:, :n]
 
-    actual = gluon_mm_mxfp8_ue8m0_gfx1250(
+    actual = launch_gluon_mm_mxfp8_ue8m0_gfx1250(
         a,
         b,
         a_scales,
@@ -411,7 +411,7 @@ def test_mxfp8_launch_metadata_models_reread_traffic() -> None:
         + m * n * 2
     )
     assert (
-        mxfp8_mm._mxfp8_ue8m0_gemv_kernel.launch_metadata
+        mxfp8_mm.gluon_mm_mxfp8_ue8m0_gfx1250.launch_metadata
         is mxfp8_mm._ue8m0_launch_metadata
     )
 
@@ -460,7 +460,7 @@ def test_mxfp8_ue8m0_gemv_rejects_unsupported_arguments(kwargs, match: str) -> N
     call_kwargs = {"block_size": [1, 32], **kwargs}
 
     with pytest.raises(ValueError, match=match):
-        gluon_mm_mxfp8_ue8m0_gfx1250(
+        launch_gluon_mm_mxfp8_ue8m0_gfx1250(
             a,
             b,
             a_scales,

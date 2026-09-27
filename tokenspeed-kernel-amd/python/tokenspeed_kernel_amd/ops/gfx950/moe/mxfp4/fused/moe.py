@@ -1337,8 +1337,11 @@ def _maybe_gluon_package_mxfp4_prefill(
     s2_sorted_expert_ids = sorted_expert_ids
     s2_num_valid_ids = num_valid_ids
 
+    # Keep the physical A/W/scale buffers; skip only whole padded BK128
+    # tiles. Short intermediates still need the two-tile stage2 prologue.
+    stage2_logical_k = max(256, triton.cdiv(inter_dim, 128) * 128)
     invoke_gluon_mxfp4_moe_stage2_1x2(
-        q_inter,
+        q_inter[:, : stage2_logical_k // inter_div],
         None,
         package_w2.view(torch.uint8),
         s2_sorted_ids,

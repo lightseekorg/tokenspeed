@@ -31,14 +31,14 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
-    _dsa_decode_logits_fp8_kernel,
-    _dsa_prefill_logits_fp8_kernel,
+    gluon_dsa_decode_topk_fp8_gfx950,
+    gluon_dsa_prefill_topk_fp8_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import (
-    _dsa_kpool_prefill_logits_kernel,
-    _dsa_kpool_prefill_plan_logits_kernel,
-    _dsa_standard_decode_logits_kernel,
-    _dsa_standard_prefill_logits_kernel,
+    gluon_dsa_decode_topk_standard_gfx950,
+    gluon_dsa_prefill_topk_standard_gfx950,
+    gluon_kpool_prefill_topk_fp8_gfx950,
+    gluon_kpool_prefill_topk_fp8_plan_gfx950,
 )
 
 _ONEBLOCK_RADIX_SCHEDULE = (12, 12, 8)
@@ -76,13 +76,13 @@ _persistent_topk_graph_workspace_keys: set[tuple[int, int, int]] = set()
 _persistent_topk_workspace_lock = Lock()
 
 __all__ = [
-    "gluon_dsa_decode_topk_fp8_gfx950",
-    "gluon_dsa_decode_topk_standard_gfx950",
+    "launch_gluon_dsa_decode_topk_fp8_gfx950",
+    "launch_gluon_dsa_decode_topk_standard_gfx950",
     "gluon_dsa_kpool_prefill_logits_gfx950",
     "gluon_dsa_kpool_prefill_plan_logits_gfx950",
     "gluon_dsa_logical_topk_gfx950",
-    "gluon_dsa_prefill_topk_fp8_gfx950",
-    "gluon_dsa_prefill_topk_standard_gfx950",
+    "launch_gluon_dsa_prefill_topk_fp8_gfx950",
+    "launch_gluon_dsa_prefill_topk_standard_gfx950",
 ]
 
 
@@ -2183,7 +2183,7 @@ def gluon_dsa_kpool_prefill_logits_gfx950(
 
     block_n = 128
     num_warps = 4
-    _dsa_kpool_prefill_logits_kernel[(tokens, 1)](
+    gluon_kpool_prefill_topk_fp8_gfx950[(tokens, 1)](
         q,
         weights,
         pooled_k_cache.view(torch.float8_e4m3fn),
@@ -2364,7 +2364,7 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx950(
 
     block_n = 128
     num_warps = 4
-    _dsa_kpool_prefill_plan_logits_kernel[(tokens, 1)](
+    gluon_kpool_prefill_topk_fp8_plan_gfx950[(tokens, 1)](
         q,
         weights,
         pooled_k_cache.view(torch.float8_e4m3fn),
@@ -2403,7 +2403,7 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx950(
     return out, row_ends_out
 
 
-def gluon_dsa_decode_topk_fp8_gfx950(
+def launch_gluon_dsa_decode_topk_fp8_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2479,7 +2479,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     )
     block_n = 32
     score_grid = (q.shape[0], triton.cdiv(max_seq_len, block_n))
-    _dsa_decode_logits_fp8_kernel[score_grid](
+    gluon_dsa_decode_topk_fp8_gfx950[score_grid](
         q,
         index_k_cache.view(torch.float8_e4m3fn),
         index_k_cache.view(torch.float32),
@@ -2514,7 +2514,7 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     )
 
 
-def gluon_dsa_prefill_topk_fp8_gfx950(
+def launch_gluon_dsa_prefill_topk_fp8_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_workspace_slots: torch.Tensor,
@@ -2596,7 +2596,7 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
         logits = torch.empty(
             (end - start, seq_len_sum), dtype=torch.float32, device=q.device
         )
-        _dsa_prefill_logits_fp8_kernel[
+        gluon_dsa_prefill_topk_fp8_gfx950[
             (end - start, triton.cdiv(seq_len_sum, block_n))
         ](
             q[start:end],
@@ -2707,7 +2707,7 @@ def _check_standard_scorer_inputs(
     return row_bytes, page_stride_bytes, q_is_fp8
 
 
-def gluon_dsa_decode_topk_standard_gfx950(
+def launch_gluon_dsa_decode_topk_standard_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -2771,7 +2771,7 @@ def gluon_dsa_decode_topk_standard_gfx950(
     num_warps = 1
     q_scale_arg = q_scales if q_scales is not None else weights
     grid = (q.shape[0], triton.cdiv(max_candidates, chunk_n))
-    _dsa_standard_decode_logits_kernel[grid](
+    gluon_dsa_decode_topk_standard_gfx950[grid](
         q,
         q_scale_arg,
         index_k_cache.view(torch.float8_e4m3fn),
@@ -2822,7 +2822,7 @@ def gluon_dsa_decode_topk_standard_gfx950(
     )
 
 
-def gluon_dsa_prefill_topk_standard_gfx950(
+def launch_gluon_dsa_prefill_topk_standard_gfx950(
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_workspace_slots: torch.Tensor,
@@ -2896,7 +2896,7 @@ def gluon_dsa_prefill_topk_standard_gfx950(
         logits = torch.empty(
             (end - start, workspace_rows), dtype=torch.float32, device=q.device
         )
-        _dsa_standard_prefill_logits_kernel[(end - start, 1)](
+        gluon_dsa_prefill_topk_standard_gfx950[(end - start, 1)](
             q[start:end],
             q_scale_arg[start:end],
             index_k_cache.view(torch.float8_e4m3fn),

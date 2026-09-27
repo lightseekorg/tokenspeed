@@ -635,7 +635,7 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
 
 
 @gluon.jit
-def _mha_prefill_gfx1250(
+def gluon_mha_prefill_gfx1250(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -849,7 +849,7 @@ def _count_live_workgroups(
     )
 
 
-def gluon_mha_prefill_gfx1250(
+def launch_gluon_mha_prefill_gfx1250(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -914,7 +914,7 @@ def gluon_mha_prefill_gfx1250(
         ),
     )
 
-    _mha_prefill_gfx1250[config.grid](
+    gluon_mha_prefill_gfx1250[config.grid](
         q,
         k,
         v,

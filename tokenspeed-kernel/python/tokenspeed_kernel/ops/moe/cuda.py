@@ -9,6 +9,7 @@ from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.cuda.routing import (
     hash_softplus_sqrt_topk_flash,
+    routing_available,
     softplus_sqrt_topk_flash,
 )
 
@@ -18,25 +19,7 @@ except ImportError:
     moe_finalize_fuse_shared = error_fn
 
 
-@register_kernel(
-    "moe",
-    "dsv4_select_experts",
-    name="cuda_dsv4_select_experts",
-    solution="cuda",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=frozenset(
-        format_signature(router_logits=dense_tensor_format(dtype))
-        for dtype in (torch.float16, torch.bfloat16, torch.float32)
-    ),
-    traits={
-        "experts": frozenset({256, 384}),
-        "top_k": frozenset({6}),
-        "renormalize": frozenset({True}),
-        "routing_kind": frozenset({"bias", "hash"}),
-    },
-    priority=Priority.SPECIALIZED,
-)
-def cuda_dsv4_select_experts(
+def cuda_sqrt_softplus_topk(
     router_logits: torch.Tensor,
     top_k: int,
     renormalize: bool,
@@ -94,4 +77,26 @@ def cuda_dsv4_select_experts(
     return topk_weights, topk_ids, scores
 
 
-__all__ = ["cuda_dsv4_select_experts", "moe_finalize_fuse_shared"]
+if routing_available():
+    cuda_sqrt_softplus_topk = register_kernel(
+        "moe",
+        "topk",
+        name="cuda_sqrt_softplus_topk",
+        solution="cuda",
+        capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+        signatures=frozenset(
+            format_signature(router_logits=dense_tensor_format(dtype))
+            for dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ),
+        traits={
+            "experts": frozenset({256, 384}),
+            "top_k": frozenset({6}),
+            "renormalize": frozenset({True}),
+            "routing_kind": frozenset({"bias", "hash"}),
+            "score_function": frozenset({"sqrt_softplus"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )(cuda_sqrt_softplus_topk)
+
+
+__all__ = ["cuda_sqrt_softplus_topk", "moe_finalize_fuse_shared"]

@@ -20,8 +20,8 @@
 
 """Golden selection tests for top-level tokenspeed-kernel public APIs.
 
-Each case invokes a real public API (``mm``, ``moe_plan``/``moe_apply``,
-attention, sampling) with :class:`SelectedKernel` calls intercepted by a spy,
+Each case invokes a real API or an internal registry facade used by a public
+API with :class:`SelectedKernel` calls intercepted by a spy,
 and asserts the auto-selected kernel name.  Cases run on every host: the
 platform each case targets is injected via ``Platform.override`` with the
 fixture platforms from ``conftest.py``, so an NVIDIA CI machine also checks
@@ -88,16 +88,17 @@ import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
-import tokenspeed_kernel.ops.moe.gluon.dsv4 as _moe_gluon_dsv4
 import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
+import tokenspeed_kernel.ops.moe.gluon.sqrt_softplus_topk as _moe_gluon_sqrt_softplus
 import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
 import tokenspeed_kernel.ops.moe.marlin as _moe_marlin
+import tokenspeed_kernel.ops.moe.native as _moe_native
 import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
 import tokenspeed_kernel.ops.moe.softmax_topk as _moe_softmax_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
-import tokenspeed_kernel.ops.moe.triton.dsv4 as _moe_triton_dsv4
 import tokenspeed_kernel.ops.moe.triton.softmax_topk as _moe_triton_softmax_topk
+import tokenspeed_kernel.ops.moe.triton.sqrt_softplus_topk as _moe_triton_sqrt_softplus
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
 import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
@@ -145,6 +146,7 @@ from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
     SelectedKernel,
     select_kernel,
+    spec_matches_shape_traits,
     spec_matches_traits,
 )
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -220,7 +222,7 @@ _RELOAD_MODULES = [
     _moe_trtllm_nvfp4,
     _moe_trtllm_unquant,
     _moe_flashinfer,
-    _moe_gluon_dsv4,
+    _moe_gluon_sqrt_softplus,
     _moe_gluon_fp8,
     _moe_gluon_mxfp4,
     _moe_sigmoid_topk,
@@ -230,9 +232,10 @@ _RELOAD_MODULES = [
     _moe_marlin_deepep_mxfp4,
     _moe_marlin_mxfp4,
     _moe_marlin,
+    _moe_native,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
-    _moe_triton_dsv4,
+    _moe_triton_sqrt_softplus,
     _moe_triton_mxfp4,
     _moe_triton_softmax_topk,
     _moe_triton,
@@ -2647,6 +2650,7 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -2687,10 +2691,41 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
                 swiglu_form=None,
                 activation_clamped=False,
                 expert_id_repeats=False,
+                fast_math=True,
             )
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
+
+
+def test_moe_plan_rejects_persistent_workspace_for_ordinary_kernel(
+    h100_platform,
+) -> None:
+    real_platform = Platform.get()
+    try:
+        Platform.override(h100_platform)
+        KernelRegistry.get().clear_cache()
+        with pytest.raises(ValueError, match="does not support persistent workspace"):
+            tokenspeed_kernel.moe_plan(
+                "unquant",
+                input_dtype=torch.bfloat16,
+                activation="silu",
+                routing_mode="precomputed_topk",
+                a2a_backend=None,
+                ep_size=1,
+                ispp=128,
+                internal_activation_dtype="input",
+                persistent_max_num_tokens_per_gpu=16,
+                solution="triton",
+                hidden=128,
+                swiglu_form=None,
+                activation_clamped=False,
+                expert_id_repeats=False,
+                fast_math=True,
+            )
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry.get().clear_cache()
 
 
 @pytest.mark.parametrize(
@@ -2740,6 +2775,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -2763,6 +2799,7 @@ def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] is None
@@ -2792,6 +2829,7 @@ def test_moe_plan_rejects_invalid_deepep_mode(
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
 
 
@@ -3054,6 +3092,7 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
             swiglu_form="standard",
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3089,6 +3128,7 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             swiglu_form="standard",
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
         assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     finally:
@@ -3150,6 +3190,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3194,6 +3235,7 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
             swiglu_form="standard",
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3227,6 +3269,7 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3317,6 +3360,7 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
             swiglu_form=None,
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
     finally:
         Platform.override(real_platform)
@@ -3413,15 +3457,19 @@ def test_gluon_mxfp4_dynamic_apply_forwards_precomputed_topk_by_batch_size(
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "expected_implementation", "expected_decode"),
+    ("num_tokens", "output_width", "expected_implementation", "expected_decode"),
     [
-        pytest.param(4, "persistent", None, id="bpe-2"),
-        pytest.param(32, "regular", True, id="bpe-16"),
-        pytest.param(33, "regular", False, id="bpe-16.5"),
+        pytest.param(4, 128, "persistent", None, id="bpe-2"),
+        pytest.param(4, 2880, "regular", True, id="tail-width"),
+        pytest.param(32, 128, "regular", True, id="bpe-16"),
+        pytest.param(33, 128, "regular", False, id="bpe-16.5"),
     ],
 )
+@pytest.mark.parametrize("activation", ["silu", "swiglu"])
 def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
+    activation: str,
     num_tokens: int,
+    output_width: int,
     expected_implementation: str,
     expected_decode: bool | None,
     monkeypatch: pytest.MonkeyPatch,
@@ -3456,19 +3504,21 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
     num_experts = 4
     top_k = 2
     w = torch.nn.Module()
+    w.swiglu_arg = SimpleNamespace(alpha=1.702, limit=7.0)
+    w.swiglu_beta = 1.0
     w.w13_weight_triton_tensor = torch.empty((num_experts, 0, 0))
-    w.w2_weight_triton_tensor = object()
+    w.w2_weight_triton_tensor = torch.empty((num_experts, 64, output_width))
     w.w13_precision_config = type("PC", (), {"b_mx_scale": object()})()
     w.w2_precision_config = type(
         "PC", (), {"b_mx_scale": object(), "out_dtype": torch.bfloat16}
     )()
-    x = torch.empty((num_tokens, 16), dtype=torch.bfloat16)
+    x = torch.empty((num_tokens, output_width), dtype=torch.bfloat16)
     router_logits = torch.empty((num_tokens, num_experts), dtype=torch.float32)
     topk_weights = torch.ones((num_tokens, top_k), dtype=torch.float32)
     topk_ids = torch.zeros((num_tokens, top_k), dtype=torch.int32)
 
     out = _moe_gluon_mxfp4.gluon_mxfp4_gfx1250_precomputed_moe_apply(
-        {},
+        {"activation": activation},
         x,
         w,
         router_logits,
@@ -3478,23 +3528,33 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
 
     assert out == "sentinel"
     assert captured["implementation"] == expected_implementation
-    assert captured["activation"] == "silu"
+    assert captured["activation"] == activation
+    assert captured["swiglu_alpha"] == 1.702
+    assert captured["swiglu_limit"] == 7.0
+    assert captured["swiglu_beta"] == 1.0
     if expected_implementation == "regular":
         assert captured["decode"] is expected_decode
     else:
         assert "decode" not in captured
 
+    with pytest.raises(KeyError, match="activation"):
+        _moe_gluon_mxfp4.gluon_mxfp4_gfx1250_precomputed_moe_apply(
+            {}, x, w, router_logits, topk_weights=topk_weights, topk_ids=topk_ids
+        )
+
 
 @pytest.mark.parametrize(
-    ("num_tokens", "expected_implementation", "expected_decode"),
+    ("num_tokens", "output_width", "expected_implementation", "expected_decode"),
     [
-        (1, "persistent", None),
-        (3, "regular", True),
-        (17, "regular", False),
+        (1, 128, "persistent", None),
+        (1, 2880, "regular", True),
+        (3, 128, "regular", True),
+        (17, 128, "regular", False),
     ],
 )
 def test_gluon_mxfp4_gfx1250_situ_apply_selects_decode_implementation(
     num_tokens: int,
+    output_width: int,
     expected_implementation: str,
     expected_decode: bool | None,
     monkeypatch: pytest.MonkeyPatch,
@@ -3531,12 +3591,12 @@ def test_gluon_mxfp4_gfx1250_situ_apply_selects_decode_implementation(
     w.activation_situ_beta = 4.0
     w.activation_situ_linear_beta = 25.0
     w.w13_weight_triton_tensor = torch.empty((num_experts, 0, 0))
-    w.w2_weight_triton_tensor = object()
+    w.w2_weight_triton_tensor = torch.empty((num_experts, 64, output_width))
     w.w13_precision_config = type("PC", (), {"b_mx_scale": object()})()
     w.w2_precision_config = type(
         "PC", (), {"b_mx_scale": object(), "out_dtype": torch.bfloat16}
     )()
-    output = torch.empty((num_tokens, 16), dtype=torch.bfloat16)
+    output = torch.empty((num_tokens, output_width), dtype=torch.bfloat16)
     w._situ_output_buffer = output
     x = torch.empty_like(output)
     router_logits = torch.empty((num_tokens, num_experts), dtype=torch.float32)
@@ -3578,6 +3638,7 @@ def _moe_apply_unquant_trtllm() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3595,31 +3656,32 @@ def _moe_apply_unquant_trtllm() -> object:
     )
 
 
-def _dsv4_select_experts_bias(tokens: int) -> object:
+def _moe_topk_bias(tokens: int) -> object:
     """Exercise bias-router selection across specialized and portable batches."""
     router_logits = torch.empty((tokens, 256), dtype=torch.float32)
     correction_bias = torch.empty((256,), dtype=torch.float32)
-    return tokenspeed_kernel.dsv4_select_experts(
+    return tokenspeed_kernel.moe_topk(
         router_logits,
-        6,
-        True,
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="topk",
+        renormalize=True,
+        routed_scaling_factor=1.0,
         correction_bias=correction_bias,
-        hash_indices_table=None,
-        input_ids=None,
-        need_scores=False,
-        override=None,
-        solution=None,
     )
 
 
-def _dsv4_select_experts_hash() -> object:
+def _moe_topk_hash() -> object:
     router_logits = torch.empty((2, 384), dtype=torch.bfloat16)
     hash_indices_table = torch.zeros((8, 6), dtype=torch.int32)
     input_ids = torch.zeros((2,), dtype=torch.int64)
-    return tokenspeed_kernel.dsv4_select_experts(
+    return tokenspeed_kernel.moe_topk(
         router_logits,
-        6,
-        True,
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="hash",
+        renormalize=True,
+        routed_scaling_factor=1.0,
         hash_indices_table=hash_indices_table,
         input_ids=input_ids,
     )
@@ -3637,6 +3699,7 @@ def _moe_apply_unquant_cutlass() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3661,6 +3724,7 @@ def _moe_apply_fp8_cutlass() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3701,6 +3765,7 @@ def _moe_apply_mxfp4_plan(
         expert_id_repeats=expert_id_repeats,
         internal_activation_dtype=internal_activation_dtype,
         solution=solution,
+        fast_math=True,
     )
 
 
@@ -3881,6 +3946,7 @@ def _moe_apply_fp8_trtllm() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3905,6 +3971,7 @@ def _moe_apply_nvfp4_trtllm() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3935,6 +4002,7 @@ def _moe_apply_nvfp4_cutlass() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3960,6 +4028,7 @@ def _moe_apply_nvfp4_trtllm_routed() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -3997,6 +4066,7 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4023,6 +4093,7 @@ def _moe_apply_unquant_trtllm_routed() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4060,6 +4131,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4088,6 +4160,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4122,6 +4195,7 @@ def _moe_apply_mxfp4_trtllm() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4147,6 +4221,7 @@ def _moe_apply_mxfp4_triton() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4181,6 +4256,7 @@ def _moe_apply_unquant_triton() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4213,6 +4289,7 @@ def _moe_apply_mxfp4_gluon() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4236,6 +4313,7 @@ def _moe_apply_mxint4_trtllm() -> object:
         swiglu_form="standard",
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -4259,6 +4337,7 @@ def _moe_apply_mxfp4_dynamic_tp() -> object:
         swiglu_form=None,
         activation_clamped=False,
         expert_id_repeats=False,
+        fast_math=True,
     )
     _assert_moe_plan(
         plan,
@@ -5336,9 +5415,9 @@ _CASES = [
             _is_cdna5,
             "cdna5",
             "moe",
-            "dsv4_select_experts",
-            "triton_dsv4_select_experts",
-            partial(_dsv4_select_experts_bias, tokens=tokens),
+            "topk",
+            "triton_sqrt_softplus_topk",
+            partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens in (1, 2, 17)
@@ -5347,27 +5426,27 @@ _CASES = [
         _is_cdna5,
         "cdna5",
         "moe",
-        "dsv4_select_experts",
-        "triton_dsv4_select_experts",
-        _dsv4_select_experts_hash,
+        "topk",
+        "triton_sqrt_softplus_topk",
+        _moe_topk_hash,
         id_suffix="hash",
     ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "dsv4_select_experts",
-        "cuda_dsv4_select_experts",
-        partial(_dsv4_select_experts_bias, tokens=2),
+        "topk",
+        "cuda_sqrt_softplus_topk",
+        partial(_moe_topk_bias, tokens=2),
         id_suffix="bias",
     ),
     _case(
         _is_hopper_plus,
         "hopper-plus",
         "moe",
-        "dsv4_select_experts",
-        "cuda_dsv4_select_experts",
-        _dsv4_select_experts_hash,
+        "topk",
+        "cuda_sqrt_softplus_topk",
+        _moe_topk_hash,
         id_suffix="hash",
     ),
     *[
@@ -5375,15 +5454,15 @@ _CASES = [
             _is_cdna4,
             "cdna4",
             "moe",
-            "dsv4_select_experts",
+            "topk",
             expected,
-            partial(_dsv4_select_experts_bias, tokens=tokens),
+            partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
         for tokens, expected in (
-            (1, "gluon_dsv4_select_experts_gfx950"),
-            (2, "gluon_dsv4_select_experts_gfx950"),
-            (17, "triton_dsv4_select_experts"),
+            (1, "gluon_sqrt_softplus_topk_gfx950"),
+            (2, "gluon_sqrt_softplus_topk_gfx950"),
+            (17, "triton_sqrt_softplus_topk"),
         )
     ],
     _case(
@@ -5690,7 +5769,7 @@ def selected_kernel_spy(monkeypatch):
             )
 
         if case.family == "moe":
-            if case.mode == "dsv4_select_experts":
+            if case.mode == "topk":
                 router_logits, top_k = args[:2]
                 shape = (router_logits.shape[0], top_k)
                 return (
@@ -5804,6 +5883,7 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
             swiglu_form="standard",
             activation_clamped=False,
             expert_id_repeats=False,
+            fast_math=True,
         )
 
         assert plan["apply_kernel_name"] == ("flashinfer_trtllm_fp8_routed_moe_apply")
@@ -6142,17 +6222,17 @@ def test_gluon_dsa_prefill_fp8_dense_traits(
     if spec is None:
         pytest.skip("gfx950 Gluon DSA registration is unavailable")
     traits = {
-        "page_size": 64,
-        "q_len_per_req": 1,
+        "q_len": 1,
         "qk_nope_head_dim": qk_nope_head_dim,
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
+        "page_size": 64,
         "topk": 2051,
-        "kv_cache_available": True,
-        "sparse_kv_cache_available": False,
-        "topk_layout": "global_slots",
-        "support_logit_cap": False,
+        "has_kv_cache": True,
+        "has_sparse_kv_cache": False,
+        "logit_cap": False,
         "return_lse": False,
+        "topk_layout": "global_slots",
     }
     assert spec_matches_traits(spec, traits) is matches
 
@@ -6174,7 +6254,7 @@ _GLUON_MLA_FIXED_KERNELS = (
         pytest.param("batch_size", 16, False, id="batch16"),
         pytest.param("value_head_dim", 64, False, id="unsupported-value"),
         pytest.param("page_size", 128, False, id="unsupported-page"),
-        pytest.param("support_logit_cap", True, False, id="unsupported-logit-cap"),
+        pytest.param("logit_cap", True, False, id="unsupported-logit-cap"),
     ],
 )
 def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
@@ -6189,12 +6269,12 @@ def test_gluon_mla_projected_value_gfx1250_traits_are_narrow(
         "batch_size": 1,
         "q_len": 1,
         "num_q_heads": 12,
-        "page_size": 64,
+        "value_head_dim": 128,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
-        "value_head_dim": 128,
+        "page_size": 64,
         "gate_kind": "sigmoid",
-        "support_logit_cap": False,
+        "logit_cap": False,
     }
     traits[trait] = value
     assert spec_matches_traits(spec, traits) is matches
@@ -6217,9 +6297,9 @@ def test_gluon_mla_project_value_gfx1250_batch_traits(
         pytest.skip("gfx1250 Gluon MLA projection registration is unavailable")
     traits = {
         "batch_size": batch_size,
-        "num_heads": 12,
-        "latent_dim": 512,
-        "value_dim": 128,
+        "num_q_heads": 12,
+        "value_head_dim": 128,
+        "kv_lora_rank": 512,
         "gate_kind": "sigmoid",
         "inputs_contiguous": True,
     }
@@ -6253,10 +6333,15 @@ def test_gluon_mla_fixed_entrypoints_are_registered(name: str) -> None:
             frozenset({2, 4}),
             id="bh64-small",
         ),
+        pytest.param(
+            "gluon_mla_decode_bf16xbf16_gfx950_bh64",
+            frozenset({64, 128}),
+            id="bh64",
+        ),
     ],
 )
-@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64])
-def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
+@pytest.mark.parametrize("batch", [1, 2, 3, 4, 64, 96, 128])
+def test_gluon_mla_batch_registrations_have_disjoint_traits(
     name: str,
     expected_batches: frozenset[int],
     batch: int,
@@ -6265,16 +6350,18 @@ def test_gluon_mla_small_batch_registrations_have_disjoint_traits(
 
     traits = {
         "batch_size": batch,
-        "batch_size_div_64": batch % 64 == 0,
         "q_len": 1,
         "num_q_heads": 64,
-        "page_size": 64,
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
-        "support_logit_cap": False,
+        "page_size": 64,
+        "logit_cap": False,
         "return_lse": False,
     }
-    assert spec_matches_traits(spec, traits) is (batch in expected_batches)
+    matches = spec_matches_traits(spec, traits) and spec_matches_shape_traits(
+        spec, traits
+    )
+    assert matches is (batch in expected_batches)
 
 
 @pytest.mark.parametrize(

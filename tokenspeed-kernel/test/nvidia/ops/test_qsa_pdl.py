@@ -126,6 +126,7 @@ def _check_replays(forward, sources, targets, enabled):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("queries_per_request", [1, 3, 4])
 @pytest.mark.parametrize(
     ("solution", "blocks", "topk"),
     [
@@ -135,26 +136,29 @@ def _check_replays(forward, sources, targets, enabled):
     ],
 )
 def test_qsa_selection_waits_for_query_cache_and_metadata(
-    enabled, solution, blocks, topk, restore_pdl
+    enabled, queries_per_request, solution, blocks, topk, restore_pdl
 ):
     torch.manual_seed(311)
-    rows, heads, dim, page_size, ratio = 3, 4, 32, 64, 4
+    batch, heads, dim, page_size, ratio = 3, 4, 32, 64, 4
+    rows = batch * queries_per_request
     pages = blocks // page_size
     query = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16)
     cache = torch.randn(blocks + page_size, 1, dim, device="cuda", dtype=query.dtype)
-    table = torch.arange(1, pages + 1, device="cuda", dtype=torch.int32).repeat(rows, 1)
+    table = torch.arange(1, pages + 1, device="cuda", dtype=torch.int32).repeat(
+        batch, 1
+    )
     complete = torch.tensor([0, 35, blocks], device="cuda", dtype=torch.int32)
     sources = (query, cache, table, complete * ratio + 2)
     targets = tuple(torch.empty_like(t) for t in sources)
     full_table = torch.arange(
         1, pages * ratio + 2, device="cuda", dtype=torch.int32
-    ).repeat(rows, 1)
+    ).repeat(batch, 1)
 
     def forward(enable_pdl):
         _publish(sources, targets)
         logical, requests, _, _, complete_blocks = qwen4_exp_qsa_prepare_metadata(
             targets[3],
-            1,
+            queries_per_request,
             rows,
             full_table,
             page_size * ratio,
@@ -170,6 +174,7 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
             complete_blocks,
             page_size=page_size,
             block_topk=topk,
+            queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
             solution=solution,
             persistent_topk_workspace=None,

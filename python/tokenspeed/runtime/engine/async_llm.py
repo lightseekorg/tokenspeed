@@ -166,6 +166,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
                 architectures=self.model_config.hf_config.architectures,
+                **self.model_config.tokenizer_kwargs,
             )
             if self.model_config.is_multimodal:
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
