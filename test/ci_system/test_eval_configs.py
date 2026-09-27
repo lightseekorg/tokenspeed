@@ -3,6 +3,7 @@ import shlex
 from collections import Counter
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +74,27 @@ def flag_value(tokens: list[str], flag: str) -> str:
     assert tokens.count(flag) == 1, f"expected one {flag}, found {tokens.count(flag)}"
     index = tokens.index(flag)
     return tokens[index + 1]
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted((REPO_ROOT / "test" / "ci").rglob("*.yaml")),
+    ids=lambda path: path.stem,
+)
+def test_model_configs_reuse_shared_downloads(path):
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    server_tokens = shlex.split(task.get("server", {}).get("command", ""))
+    assert not any(
+        token.split("=", 1)[0] == "--download-dir" for token in server_tokens
+    ), path
+
+    perf_command = task.get("perf", {}).get("command", "")
+    if "--tokenizer-path" in perf_command:
+        perf_tokens = shlex.split(perf_command)
+        assert flag_value(perf_tokens, "--tokenizer-path") == "$TOKENIZER_PATH", path
+        assert "TOKENIZER_PATH=$OUTPUTS_DIR/tokenizer" in perf_tokens, path
+        assert "AutoTokenizer.from_pretrained" in perf_command, path
+        assert ".save_pretrained(" in perf_command, path
 
 
 def test_fork_pr_context_is_exposed_to_ci_tasks():
