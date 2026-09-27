@@ -20,8 +20,8 @@
 
 """TS input producers for the FlashInfer KDA state/layout contract.
 
-Single-token preparation publishes convolution history to destination slots.
-Multi-token preparation gathers frozen state and can capture replay inputs.
+Decode preparation publishes convolution history to destination slots.
+Frozen verification gathers state and can capture replay inputs at any width.
 The compact SM103 path preserves the generic producer's reduction order.
 """
 
@@ -32,7 +32,7 @@ from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["ROWS"], do_not_specialize_on_alignment=["ROWS"])
 def _compact_decode_producer(
     raw_qkv,
     gate_input,
@@ -46,7 +46,7 @@ def _compact_decode_producer(
     gate_out,
     beta_out,
     state_pool,
-    ROWS: gl.constexpr,
+    ROWS,
     HEADS: gl.constexpr,
     RAW_STRIDE: gl.constexpr,
     GATE_INPUT_STRIDE: gl.constexpr,
@@ -169,7 +169,7 @@ def _compact_decode_producer(
         gl.store(beta_out + row * HEADS + head, b)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"], do_not_specialize_on_alignment=["ROWS"])
 def _kda_recurrent_producer(
     raw,
     fa,
@@ -192,7 +192,7 @@ def _kda_recurrent_producer(
     REPLAY_FA_STRIDE: tl.constexpr,
     REPLAY_BETA_STRIDE: tl.constexpr,
     CAPTURE_REPLAY: tl.constexpr,
-    ROWS: tl.constexpr,
+    ROWS,
     H: tl.constexpr,
     K: tl.constexpr,
     DFA: tl.constexpr,
@@ -483,8 +483,8 @@ def prepare_kda_recurrent_inputs(
     else:
         state, slots = state_pool, None
     enable_pdl = not frozen_state and pdl_enabled()
-    # Use one producer for compatible single-token calls regardless of batch
-    # size. Multi-token verification keeps its existing preparation contract.
+    # Use one producer for compatible decode calls regardless of batch size.
+    # Frozen verification uses the generic producer even at single-token width.
     if (
         not frozen_state
         and rows > 0

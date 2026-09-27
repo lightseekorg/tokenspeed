@@ -20,6 +20,7 @@
 
 """FlashInfer KDA preparation, indexed state and dependent-launch contracts."""
 
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import pytest
@@ -41,6 +42,7 @@ from tokenspeed_kernel.thirdparty.flashinfer.kda import (
     flashinfer_kda_recurrent_available,
 )
 from tokenspeed_kernel.thirdparty.flashinfer.kda._epilogue import _gated_rmsnorm_bf16
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not current_platform().is_blackwell,
@@ -722,3 +724,66 @@ def test_epilogue_early_signal_waits_for_source_and_publishes_result(batch, fp8)
         expected = norm(source, False)
         for actual, reference in zip(copies, expected):
             assert torch.equal(actual.view(torch.uint8), reference.view(torch.uint8))
+
+
+@pytest.mark.parametrize("tokens,frozen_state", [(0, False), (0, True), (3, False)])
+def test_invalid_preparation_width_is_rejected(tokens, frozen_state):
+    case = _make_inputs(2, max(tokens, 1), False, True)
+    with pytest.raises(ValueError, match="one token"):
+        _prepare(case, tokens, None, frozen_state=frozen_state)
+
+
+@pytest.mark.parametrize("tokens,frozen_state", [(1, False), (1, True), (3, True)])
+@pytest.mark.parametrize("generic_decode", [False, True])
+def test_preparation_reuses_compilation(
+    tokens, frozen_state, generic_decode, monkeypatch
+):
+    if generic_decode and frozen_state:
+        pytest.skip("frozen verification always uses the generic producer")
+    monkeypatch.setattr(prepare_api, "pdl_enabled", lambda: False)
+    if generic_decode:
+        monkeypatch.setattr(
+            prepare_api,
+            "current_platform",
+            lambda: SimpleNamespace(arch_version=ArchVersion(10, 7)),
+        )
+
+    def run(batch):
+        case = _make_inputs(batch, tokens, False, True)
+        _prepare(case, tokens, None, frozen_state=frozen_state)
+
+    # Cover every fixed launch bucket before sweeping new row counts.
+    for batch in (1, 4, 16, 32, 64, 80):
+        run(batch)
+    with ExitStack() as stack:
+        for kernel in (
+            prepare_api._compact_decode_producer,
+            prepare_api._kda_recurrent_producer,
+        ):
+            stack.enter_context(assert_no_triton_compile(kernel))
+        for batch in (2, 3, 5, 7, 15, 17, 21, 22, 31, 33, 48, 63, 65, 81):
+            run(batch)
+
+
+def test_fp8_epilogue_reuses_compilation():
+    weight = torch.ones(D, device="cuda", dtype=torch.bfloat16)
+
+    def run(rows):
+        x, gate = rnd(rows, P), rnd(rows, P)
+        return epilogue_api.gated_rmsnorm_fp8_prepacked(
+            x,
+            gate,
+            weight,
+            eps=1e-5,
+            num_heads=H,
+            head_dim=D,
+            enable_pdl=False,
+        )
+
+    for rows in (1, 4, 16):
+        run(rows)
+    with assert_no_triton_compile(epilogue_api._gated_rmsnorm_fp8_kernel):
+        for rows in (2, 3, 5, 7, 15, 17, 31, 32, 33, 63, 64, 65):
+            values, scales = run(rows)
+            assert torch.isfinite(values.float()).all()
+            assert torch.isfinite(scales).all()

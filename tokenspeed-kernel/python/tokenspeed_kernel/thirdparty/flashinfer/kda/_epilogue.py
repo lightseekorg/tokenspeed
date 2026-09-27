@@ -97,7 +97,10 @@ def _gated_rmsnorm_bf16(
     return out
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["ROWS", "PADDED_ROWS"],
+    do_not_specialize_on_alignment=["ROWS", "PADDED_ROWS"],
+)
 def _gated_rmsnorm_fp8_kernel(
     x,
     gate,
@@ -106,8 +109,8 @@ def _gated_rmsnorm_fp8_kernel(
     scales,
     fp8_max,
     EPS: tl.constexpr,
-    ROWS: tl.constexpr,
-    PADDED_ROWS: tl.constexpr,
+    ROWS,
+    PADDED_ROWS,
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
     GATE_STRIDE: tl.constexpr,
