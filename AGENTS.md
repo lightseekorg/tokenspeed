@@ -20,6 +20,8 @@ best people and average people is more than tenfold.
 ## Code changes
 
 * Add tests and update docs for the changed code.
+* For code comments, use common/existing terms for easy human understanding;
+  avoid obsecure terms or coining unnecessary new concepts.
 * Parameters that select execution paths, algorithms, or correctness-critical
   behavior must be explicit and have no defaults. This includes execution modes,
   backend selection, and flags that switch between implementations.
@@ -45,6 +47,17 @@ best people and average people is more than tenfold.
   committing. Always run the exact `pre-commit run --all-files` command and
   commit any formatter changes it makes.
 * When creating commits, perform sign off on behalf of the author.
+
+## Code review
+
+When Codex or Claude Code reviews code changes, consult these references for
+the languages involved:
+
+* For C++ changes, consult the
+  [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html) and
+  the [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines).
+* For Python changes, consult the
+  [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html).
 
 ## Design principles
 
@@ -82,6 +95,11 @@ change.
 * Keep PR titles, descriptions, commit messages, diffs, comments, logs, and
   artifacts limited to public information. Never include private repository
   names or links, private dates, or any other private or internal information.
+* When opening a pull request, if you have write access to this repository,
+  push the head branch to this repository rather than to a fork. Only
+  same-repository branches receive repository secrets such as `HF_TOKEN`
+  (higher Hugging Face rate limits), get the automated Claude code review, and
+  run CI jobs that skip fork pull requests.
 
 ## Dependency boundaries
 
@@ -138,15 +156,34 @@ Inside the root `tokenspeed-kernel/` directory:
   `gemm/trtllm.py`. Attention adds its variant before the solution, for example
   `attention/mha/triton.py`; multi-file implementations keep helpers under a
   private directory such as `attention/mha/_triton/`.
+* For op traits, use existing ones if there are. If needing to create new ones,
+  name it consistently with existing ones.
 * Top-level `README.md` should only contain high-level kernel system designs
   geared for human understanding. For per-op details, use `README.md` files
   under corresponding `ops/` directory.
 * Prefer to `@register_kernel` with the name as the Python `def` function
   attached to, prefixed with its solution (e.g, `triton_mha_prefill`).
 * When defining new public APIs, explain arguments and returns in docstring.
+* Keep vendor-only code in files or private directories named after its
+  vendor-specific solution (`cute_dsl`, `gluon`, ...). CI skips the other
+  vendor's GPU jobs based on these names. Code that serves both vendors belongs
+  in a shared solution (`triton`).
 * Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
   Tests for common infra and covering multi-vendors reside under `test/`
   directly.
+* Use tight atol/rtol in correctness comparison tests.
+* Compile-time kernel parameters (`tl.constexpr`, Gluon `gl.constexpr`,
+  `cutlass.Constexpr`) are part of the JIT cache key: every new value compiles
+  a new binary on the forward thread and stalls serving for 100+ ms. Make a
+  parameter compile-time only when its value set is small and fixed once the
+  server starts: model dimensions, block sizes, feature flags, pool geometry.
+  Values that vary per batch or request (token, request, or row counts,
+  `shape[0]`, `numel()`, sequence lengths, block-table widths) must be runtime
+  arguments, or be bucketed first (e.g. `next_power_of_2`) when the kernel
+  needs a compile-time bound. Reviews must check every new or changed kernel
+  signature and launch site for this. Kernels launched with batch-varying
+  shapes need a test that warms the kernel, then sweeps those shapes inside
+  `assert_no_triton_compile` from `test/utils.py`.
 
 ## tokenspeed-kernel-amd
 
@@ -156,5 +193,15 @@ Inside the root `tokenspeed-kernel-amd/` directory:
 * Add jit `launch_metadata` for Proton use along the Triton/Gluon kernels.
 * AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
+* The compile-time parameter rule in the `tokenspeed-kernel` section applies
+  to these kernels too.
 * For per kernel contract and algorithm details, put in
   `python/tokenspeed_kernel_amd/ops/README.md`.
+* For Triton/Gluon kernels, one name should thread the whole stack: the
+  `register_kernel(name=...)` value, the registered Python `def` it decorates,
+  and the `@gluon.jit` (or `@triton.jit`) kernel that does the op's work all
+  share it. The AMD Python launcher should be called as `launch_<name>`.
+  Extra kernels launched only by that op insert a role before the arch suffix
+  (`gluon_mha_decode_reduce_gfx950`). Kernels shared by several registered ops
+  keep descriptive names. A `repr=` on the jit decorator replaces the compiled
+  symbol, so its base string must be the kernel's `def` name as well.

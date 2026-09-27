@@ -16,6 +16,13 @@ the cross-rank collectives that keep the redundant schedulers aligned always
 find every rank promptly, however deep the GPUs are in queued work — a stage's
 launch-queue backpressure stalls only its own forward thread, never the round.
 
+FIFO describes submission ownership, not a promise that every model kernel
+uses one CUDA stream. Main-stream scratch and persistent kernel protocol state
+may be shared across calls only while those calls are ordered on that stream.
+Work deliberately forked to a side stream must use private storage or establish
+an ordering edge before touching a shared layout; joining the side stream later
+does not make concurrent reuse safe.
+
 This is enforced by **visibility**, not by discipline. `build_device_side`
 (`execution/device.py`) constructs the model runners, attention backends, KV
 pools and executor as its own locals, and returns one `DeviceBuild`, split by
@@ -131,6 +138,23 @@ broadcasts on the same issuing thread as the model's collectives, restoring
 the cross-rank launch-order guarantee the old non-overlap-loop assumption
 provided.
 
+The symmetric rule holds on the data plane: **the forward thread never
+synchronizes with the device on the per-round path.** Every host
+synchronization it performs — `.cpu()`, `.item()`, `.tolist()`,
+`bool(tensor)`, `nonzero`, a copy from or to pageable host memory,
+`stream.synchronize()` — waits for the whole stream, and the stream holds
+the step in flight, so the next step's prologue and graph launch slip
+behind the current step's completion and `in_flight_depth` degrades to 0
+however it is configured. Results cross back through pinned non-blocking
+copies and an event the control plane waits on. This rule is enforced by
+torch's sync-debug mode, armed by `run_event_loop` as its last step before
+entering the round loop (weight loading, tuning, capture, the transfer and
+L2 builders and `EventLoop.__init__` all synchronize on purpose):
+`TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` reports each offending site with its
+Python location, `error` raises there. CI runs the serving paths with
+`error`; the control plane's event wait and non-blocking copies are not
+flagged, so a report is always a real stall.
+
 ### The capture contract
 
 Information crosses to the data plane **only** inside the submitted closure,
@@ -153,8 +177,9 @@ whose overlap is instead broken by the drain registry in Principle 4.
 
 `EventLoop.event_loop` sequences components; it does not implement them.
 Domain logic — pause/resume semantics, EPD admission, PD transfer handling,
-L2 cache-op tracking, wire handshakes, multimodal batch assembly — lives in
-its own module and enters the loop as a **single-line hook**. The loop body
+L2 cache-op tracking, L3 admission/recovery, wire handshakes, multimodal batch
+assembly — lives in its own module and enters the loop as a **single-line hook**.
+The loop body
 should read, top to bottom, as the schedule of one scheduling round, with no
 feature's internals inlined into it.
 
@@ -182,9 +207,10 @@ There are exactly two call sites, each with a documented reason:
   (`_cache_hooks.poll_ready_events()`). These must advance *before*
   `next_execution_plan`, otherwise cache-gated admissions are delayed by a
   full round.
-* **Tail of the round** — forward results and PD transfer events, funneled
-  through the single `request_changes` list. These can only exist after
-  dispatch/commit, and must advance before the *next* round plans.
+* **Tail of the round** — forward results, PD transfer events and L3 prefetch
+  recovery retracts, funneled through the single `request_changes` list.
+  Recovery retracts follow commits of older in-flight forwards; all events
+  must advance before the *next* round plans.
 
 Anything that produces scheduler events (a new transfer backend, a new async
 op kind) either returns events into one of these two points or adds a new
@@ -223,11 +249,13 @@ behind the forward that captured it, not inline.
 
 ## Principle 5: publishing drains, once per round
 
-`_publish_scheduler_kv_events` has drain semantics: KV events accumulate
-inside the C++ scheduler across any number of mutations (advance,
+`_publish_scheduler_kv_events` has drain semantics: cache mutations
+accumulate inside the C++ scheduler across any number of calls (advance,
 `next_execution_plan`), so a single unconditional call at the loop tail
-publishes everything the round produced, in order, as one batch. Do not add
-per-mutation publish calls; they only fragment batches.
+publishes everything the round produced, in order, as one batch. The batch
+is the round's net change: a block evicted and cached again within the round
+produces no event. Do not add per-mutation publish calls; they only fragment
+batches.
 
 The same reasoning fixes the metrics call: scheduler iteration metrics are
 recorded once per round, from the same pre-dispatch snapshot as the
@@ -264,6 +292,7 @@ Current inventory:
 | `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
 | `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries) | `count_plan_ops`, `poll_ready_events` |
+| `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests`, `revalidate_queued_hits`, `prepare_forward` |
 
 `_pause_hooks` and `_pd_hooks` are also handed the `DeviceHandle`: both have
 work that must land on the data plane — the DP idle forward and the KV repair
@@ -271,6 +300,16 @@ after a memory-saver wake, and the device writes a completed remote prefill
 lands. `PauseHooks` additionally supplies `reset_caches_for_release` and
 `kv_repair_after_wake` to the memory-occupation controller as callbacks; those
 are not loop entry points, they fire on release/wake.
+
+`L3CacheHooks` owns prefix registration at submission, candidate revalidation
+before planning, and replica-wide prefetch recovery. It returns the safe forward
+and recovery events, never advancing the scheduler. A miss suppresses the
+model batch and remote-prefill submission while the plan's cache ops still
+execute. The loop drains older forwards before applying recovery at its tail.
+With L3 disabled, the same hooks submit requests without token hashing, storage
+probes or replica collectives. Storage state and per-plan prefetch snapshots
+remain behind `DeviceHandle`; namespace deletion and flush coordination stay
+in `RequestHandler`.
 
 Per-round dispatch needs no hooks class at all: the loop hands
 `DeviceHandle.execute` the plan and the round's `PlannedForward`, and the
@@ -337,6 +376,8 @@ For orientation, one iteration of `event_loop`:
 * Never call `scheduler.advance`, `advance_scheduler`, or the KV event
   publisher from a helper or hooks class.
 * Never issue CUDA work, or hold something that can, from the control plane.
+* Never synchronize with the device from the data plane's per-round path;
+  run with `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error` while developing on it.
 * L3 `batch_exists` registration is on the admit path, but only when
   `--kvstore-storage-backend` is set. Hashing every admitted prefix on the
   default (`--disable-kvstore`) path is a control-plane cost the loop must

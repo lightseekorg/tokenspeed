@@ -34,9 +34,9 @@ from tokenspeed_kernel.selection import is_ground_truth
 @pytest.mark.parametrize(
     "name,band",
     [
-        ("torch_pack_topk_router_logits", Priority.PORTABLE),
         ("torch_softmax_topk", Priority.PORTABLE),
         ("torch_sigmoid_bias_topk", Priority.PORTABLE),
+        ("torch_sqrt_softplus_topk", Priority.PORTABLE),
         ("torch_precomputed_moe_apply", Priority.REFERENCE),
     ],
 )
@@ -52,9 +52,11 @@ def test_moe_reference_bands(name: str, band: Priority) -> None:
 def test_softmax_topk_reference_matches_torch_on_cpu() -> None:
     torch.manual_seed(0)
     logits = torch.randn(5, 16, dtype=torch.float32)
-    weights, ids = tokenspeed_kernel.moe_softmax_topk(
+    weights, ids = tokenspeed_kernel.moe_topk(
         logits,
         4,
+        score_function="softmax",
+        selection_method="topk",
         topk_indices_dtype=torch.int64,
         renormalize=False,
         routed_scaling_factor=1.5,
@@ -102,6 +104,11 @@ def test_precomputed_moe_apply_matches_per_token_oracle(
         routing_mode="precomputed_topk",
         ispp=intermediate,
         solution="reference",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     assert plan["apply_kernel_name"] == "torch_precomputed_moe_apply"
     out = tokenspeed_kernel.moe_apply(
@@ -127,3 +134,25 @@ def test_precomputed_moe_apply_matches_per_token_oracle(
                 inter @ w2[expert].float().T
             )
     torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("solution", ["torch", "reference"])
+@pytest.mark.parametrize("per_token_bias", [False, True])
+def test_sqrt_softplus_reference_preserves_bias(solution, per_token_bias) -> None:
+    torch.manual_seed(3)
+    logits = torch.randn(3, 16)
+    bias = torch.randn(3, 16) if per_token_bias else torch.randn(16)
+    weights, ids = tokenspeed_kernel.moe_topk(
+        logits,
+        4,
+        score_function="sqrt_softplus",
+        selection_method="topk",
+        correction_bias=bias,
+        renormalize=False,
+        routed_scaling_factor=1.0,
+        solution=solution,
+    )
+    scores = F.softplus(logits).sqrt()
+    expected_ids = (scores + bias).topk(4, dim=-1).indices
+    assert torch.equal(ids.long(), expected_ids)
+    torch.testing.assert_close(weights, scores.gather(1, expected_ids))

@@ -94,7 +94,7 @@ def test_mla_prefill(
         solution=solution,
     )
     out, lse = mla_prefill(**kwargs)
-    out_ref, lse_ref = mla_prefill(**{**kwargs, "solution": "reference"})
+    out_ref, lse_ref = mla_prefill(**{**kwargs, "solution": "torch"})
 
     assert out.shape == (q.shape[0], q.shape[1], v.shape[-1])
     assert lse.shape == (q.shape[0], q.shape[1])
@@ -392,7 +392,7 @@ def test_mla_decode_with_kvcache(
         return_lse=True,
     )
     out, lse = mla_decode_with_kvcache(**kwargs, solution=solution)
-    out_ref, lse_ref = mla_decode_with_kvcache(**kwargs, solution="reference")
+    out_ref, lse_ref = mla_decode_with_kvcache(**kwargs, solution="torch")
 
     assert out.shape == (batch_size, q_len, num_heads, kv_lora_rank)
     if q_dtype in _FP8_DTYPES:
@@ -443,7 +443,7 @@ def test_mla_decode_noncausal_block_sliding_window_matches_reference_and_capture
     )
     softmax_scale = 1.0 / math.sqrt(qk_head_dim)
 
-    def run(query: torch.Tensor, solution: str | None = None) -> torch.Tensor:
+    def run(query: torch.Tensor, solution: str | None) -> torch.Tensor:
         return mla_decode_with_kvcache(
             q=query,
             kv_cache=kv_cache,
@@ -459,8 +459,8 @@ def test_mla_decode_noncausal_block_sliding_window_matches_reference_and_capture
             solution=solution,
         )
 
-    output = run(q)
-    expected_output = run(q, solution="reference")
+    output = run(q, solution=None)
+    expected_output = run(q, solution="torch")
     torch.testing.assert_close(
         output.float(), expected_output.float(), rtol=8e-2, atol=8e-2
     )
@@ -468,7 +468,7 @@ def test_mla_decode_noncausal_block_sliding_window_matches_reference_and_capture
     graph_output = torch.empty_like(output)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_output.copy_(run(q))
+        graph_output.copy_(run(q, solution=None))
     eager_output = output.clone()
     graph.replay()
     torch.cuda.synchronize()
@@ -547,7 +547,7 @@ def test_mla_extend_with_kvcache(device: str, dtype: torch.dtype, require) -> No
     out = mla_extend_with_kvcache(**kwargs, solution="gluon")
     assert out.dtype == torch.bfloat16
 
-    expected = mla_extend_with_kvcache(**kwargs, solution="reference")
+    expected = mla_extend_with_kvcache(**kwargs, solution="torch")
     tol = 1.5e-1 if dtype in _FP8_DTYPES else 8e-2
     torch.testing.assert_close(out.float(), expected.float(), rtol=tol, atol=tol)
 
@@ -688,7 +688,7 @@ def _run_fixed_bf16_mla_decode_case(
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
         return_lse=True,
-        solution="reference",
+        solution="torch",
     )
 
     assert out.shape == (batch_size, 1, num_heads, kv_lora_rank)
@@ -937,7 +937,7 @@ def test_mla_decode_with_kvcache_composes_projected_value_fallback(
         if args[1] == "mla_project_value":
             raise NoKernelFoundError
         if args[1] == "mla_decode_projected_value":
-            assert kwargs["traits"]["support_logit_cap"] is True
+            assert kwargs["traits"]["logit_cap"] is True
             raise NoKernelFoundError
         assert args[1] == "mla_decode_with_kvcache"
         split_decode.name = "split_decode"

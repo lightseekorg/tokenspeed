@@ -35,7 +35,7 @@ _NUM_WARPS = 8
 
 
 @gluon.jit
-def _mla_normalize_project_query_kernel(
+def gluon_mla_normalize_project_query_gfx1250(
     q_ptr,
     kv_ptr,
     q_norm_weight_ptr,
@@ -137,7 +137,7 @@ def _mla_normalize_project_query_kernel(
     )
 
 
-def gluon_mla_normalize_project_query_gfx1250(
+def launch_gluon_mla_normalize_project_query_gfx1250(
     query: torch.Tensor,
     kv: torch.Tensor,
     query_norm_weight: torch.Tensor,
@@ -205,7 +205,7 @@ def gluon_mla_normalize_project_query_gfx1250(
         raise ValueError("MLA norm epsilon must be positive")
 
     tail_output = out if tail_out is None else tail_out
-    _mla_normalize_project_query_kernel[(output_width // _BLOCK_N + 1,)](
+    gluon_mla_normalize_project_query_gfx1250[(output_width // _BLOCK_N + 1,)](
         query,
         kv,
         query_norm_weight,
@@ -229,4 +229,4 @@ def gluon_mla_normalize_project_query_gfx1250(
     return out
 
 
-__all__ = ["gluon_mla_normalize_project_query_gfx1250"]
+__all__ = ["launch_gluon_mla_normalize_project_query_gfx1250"]

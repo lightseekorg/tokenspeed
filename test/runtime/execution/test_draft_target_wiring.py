@@ -55,6 +55,14 @@ def _server_args(algo: str, capture_ids=None) -> SimpleNamespace:
     )
 
 
+def _draft_runner(model) -> SimpleNamespace:
+    """A draft model runner whose model reads no request-token history."""
+    return SimpleNamespace(
+        model=model,
+        model_config=SimpleNamespace(requires_request_token_history=False),
+    )
+
+
 def test_get_drafter_impl_routing():
     from tokenspeed.runtime.models.deepseek_v4_dspark import (
         DeepseekV4ForCausalLMDSpark,
@@ -141,7 +149,7 @@ def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
         )
     )
     draft_model = _ModuleSharingDraft()
-    draft = SimpleNamespace(model=draft_model)
+    draft = _draft_runner(draft_model)
 
     with mock.patch.object(factory, "get_drafter_impl", return_value=Mtp):
         factory.configure_draft_target(_server_args("MTP"), target, draft)
@@ -154,7 +162,7 @@ def test_wire_mtp_module_sharing_requires_target_lm_head():
     target = SimpleNamespace(
         model=SimpleNamespace(get_embed_and_head=lambda: ("EMBED", "HEAD_WEIGHT"))
     )
-    draft = SimpleNamespace(model=_ModuleSharingDraft())
+    draft = _draft_runner(_ModuleSharingDraft())
 
     with (
         mock.patch.object(factory, "get_drafter_impl", return_value=Mtp),
@@ -183,6 +191,7 @@ def test_wire_dflash_keeps_own_embed_head():
 
     target, draft = mock.MagicMock(), mock.MagicMock()
     draft.model = mock.MagicMock(spec=TargetCaptureConfigurator)
+    draft.model_config.requires_request_token_history = False
     with mock.patch.object(factory, "get_drafter_impl", return_value=DFlash):
         factory.configure_draft_target(_server_args("DFLASH"), target, draft)
     draft.model.configure_target.assert_called_once_with(
@@ -249,18 +258,17 @@ def test_deepseek_dspark_wire_target_only_binds_resources():
     target.set_dspark_layers_to_capture.assert_not_called()
 
 
-def test_dspark_weight_update_forces_cached_head_refresh():
-    drafter = mock.MagicMock(spec=DeepseekV4DSpark)
-    head = mock.MagicMock()
-    drafter.lm_head = mock.MagicMock(weight=head)
-    drafter.model = mock.MagicMock()
-
-    DeepseekV4DSpark.on_target_weights_updated(drafter)
-
-    drafter.model.refresh_local_base_logits_head.assert_called_once_with(
-        head,
-        force=True,
+@pytest.mark.parametrize("drafter_cls", [DeepseekV4DSpark, DeepseekV41DSpark])
+def test_dspark_weight_update_needs_no_derived_head_refresh(drafter_cls):
+    # The draft reads the target's BF16 head in place, so an in-place target
+    # weight update needs no drafter-side refresh: the base no-op applies.
+    assert (
+        drafter_cls.on_target_weights_updated is BaseDrafter.on_target_weights_updated
     )
+    drafter = mock.MagicMock(spec=drafter_cls)
+    drafter.model = mock.MagicMock()
+    drafter_cls.on_target_weights_updated(drafter)
+    assert drafter.model.mock_calls == []
 
 
 def test_device_weight_update_notifies_drafter_before_returning():
@@ -526,7 +534,7 @@ def test_k3_setup_capture_survives_resource_binding(monkeypatch, has_pp):
         SimpleNamespace(
             model=target, model_config=SimpleNamespace(hf_text_config=target_config)
         ),
-        SimpleNamespace(model=draft),
+        _draft_runner(draft),
     )
     validation.assert_called_once_with(draft.config, target_config)
     if has_pp:
@@ -600,7 +608,7 @@ def test_deepseek_block_models_configure_capture_through_common_setup(
         SimpleNamespace(
             model=target, model_config=SimpleNamespace(hf_text_config=object())
         ),
-        SimpleNamespace(model=draft),
+        _draft_runner(draft),
     )
     target.set_dspark_layers_to_capture.assert_called_once_with([10, 20])
     target.set_dspark_layers_to_capture.side_effect = AssertionError(
@@ -662,7 +670,7 @@ def test_setup_configures_every_stage_without_creating_a_drafter(
         SimpleNamespace(
             model=target, model_config=SimpleNamespace(hf_text_config=target_config)
         ),
-        SimpleNamespace(model=draft),
+        _draft_runner(draft),
     )
     assert draft.calls == [(target, target_config)]
     implementation.assert_not_called()
@@ -679,7 +687,7 @@ def test_method_name_alone_does_not_opt_a_model_into_capture_setup(monkeypatch):
         factory.configure_draft_target(
             SimpleNamespace(speculative_algorithm="DSPARK"),
             SimpleNamespace(model=object()),
-            SimpleNamespace(model=draft),
+            _draft_runner(draft),
         )
     draft.configure_target.assert_not_called()
 

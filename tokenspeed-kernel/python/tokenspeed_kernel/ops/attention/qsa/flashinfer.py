@@ -204,7 +204,6 @@ if _IS_NVIDIA:
             "value_head_dim": _SUPPORTED_HEAD_DIMS,
         },
         priority=Priority.PERFORMANT,
-        tags={"fallback", "fa2", "fp8", "sparse"},
     )(flashinfer_fa2_qsa_sparse_attention)
     register_kernel(
         "attention",
@@ -221,7 +220,6 @@ if _IS_NVIDIA:
             "value_head_dim": _SUPPORTED_HEAD_DIMS,
         },
         priority=Priority.PERFORMANT,
-        tags={"fallback", "fa2", "sparse"},
     )(flashinfer_fa2_qsa_sparse_attention)
     __all__ = ["flashinfer_fa2_qsa_sparse_attention"]
 else:

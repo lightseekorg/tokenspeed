@@ -21,10 +21,13 @@
 """Routing ops: routing_flash (softmax + topk with correction bias)."""
 
 import functools
+import logging
 from pathlib import Path
 
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
+
+logger = logging.getLogger(__name__)
 
 
 @functools.cache
@@ -39,6 +42,18 @@ def _load_routing_module():
             "Run: pip install -e tokenspeed_kernel/python/"
         )
     return tvm_ffi.load_module(str(so_path))
+
+
+def routing_available() -> bool:
+    so_path = Path(__file__).parent / "objs" / "routing" / "routing.so"
+    if not so_path.exists():
+        return False
+    try:
+        _load_routing_module()
+    except (ImportError, OSError, RuntimeError) as error:
+        logger.warning(f"Failed to load CUDA routing library {so_path}: {error}")
+        return False
+    return True
 
 
 def routing_flash(

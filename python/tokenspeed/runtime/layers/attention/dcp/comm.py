@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
 
 from tokenspeed.runtime.distributed.comm_ops import (
     all_gather,
+    all_reduce,
     reduce_scatter,
 )
 
@@ -56,7 +57,7 @@ def combine_attention_partials(
     *,
     group: tuple[int, ...],
     rank: int,
-    sink: torch.Tensor,
+    sink: torch.Tensor | None,
 ) -> torch.Tensor:
     """Gather LSE and reduce-scatter weighted partials to the TP head owner.
 
@@ -65,7 +66,8 @@ def combine_attention_partials(
         local_lse: Natural-log FP32 LSE [tokens, gathered_heads].
         group: Consecutive DCP subgroup of attention TP.
         rank: This process's position in group.
-        sink: Original TP-local sink logits.
+        sink: Required keyword: TP-local sink logits, or explicitly None for
+            attention without a sink. There is no implicit sink policy.
 
     Returns:
         Original-dtype output [tokens, TP-local heads, head_dim], with the
@@ -77,9 +79,35 @@ def combine_attention_partials(
     if local_lse.shape != local_output.shape[:-1]:
         raise ValueError("DCP combine output and LSE shapes disagree")
     heads = local_output.shape[1] // degree
-    if sink.numel() < heads:
+    if sink is not None and sink.numel() < heads:
         raise ValueError("DCP sink must cover the TP-local heads")
     gathered_lse = all_gather(local_lse.float().unsqueeze(0).contiguous(), group, dim=0)
     weighted, lse = dcp_weight_for_reduce_scatter(local_output, gathered_lse, rank)
     output = reduce_scatter(weighted, group).movedim(0, 1)
+    if sink is None:
+        return output.to(local_output.dtype).contiguous()
     return dcp_apply_sink(output, lse, sink, dtype=local_output.dtype)
+
+
+def gather_owned_rows(
+    local_rows: torch.Tensor,
+    owned: torch.Tensor,
+    group: tuple[int, ...],
+) -> torch.Tensor:
+    """Reconstruct aligned rows with one owner per row through a sum reduction.
+
+    Args:
+        local_rows: Local values [rows, ...], in identical logical order on all ranks.
+        owned: Boolean vector [rows]; false rows must contribute zero, even if NaN.
+        group: DCP ranks collectively owning those rows, or a singleton group.
+
+    Returns:
+        Contiguous reconstructed rows with the original shape and dtype.
+    """
+    if owned.shape != local_rows.shape[:1] or owned.dtype != torch.bool:
+        raise ValueError("DCP owner mask must be bool [rows]")
+    mask = owned.reshape((-1,) + (1,) * (local_rows.ndim - 1))
+    rows = torch.where(mask, local_rows, 0).contiguous()
+    if len(group) == 1:
+        return rows
+    return all_reduce(rows, group).contiguous()

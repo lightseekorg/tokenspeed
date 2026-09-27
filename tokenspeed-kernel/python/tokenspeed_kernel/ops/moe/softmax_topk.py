@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Softmax top-k routing entry point."""
+"""Softmax top-k routing implementations and internal dispatch."""
 
 from __future__ import annotations
 
@@ -43,13 +43,14 @@ def _triton_eligible(router_logits: torch.Tensor, topk: int) -> bool:
     )
 
 
-def moe_softmax_topk(
+def _moe_softmax_topk(
     router_logits: torch.Tensor,
     topk: int,
     *,
     topk_indices_dtype: torch.dtype,
     renormalize: bool = True,
     routed_scaling_factor: float = 1.0,
+    override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using softmax routing in one fused launch when supported.
@@ -63,6 +64,7 @@ def moe_softmax_topk(
         renormalize: Normalize the selected weights to sum to one. When false,
             return probabilities from the softmax over all experts.
         routed_scaling_factor: Scale applied to every selected route weight.
+        override: Optional exact registered kernel name.
         solution: Optional implementation override, such as ``"triton"``,
             ``"torch"`` or the ``"reference"`` meta solution.
 
@@ -90,7 +92,11 @@ def moe_softmax_topk(
             ),
         )
 
-    if solution is None and not _triton_eligible(router_logits, topk):
+    if (
+        override is None
+        and solution is None
+        and not _triton_eligible(router_logits, topk)
+    ):
         solution = "torch"
     kernel = select_kernel(
         "moe",
@@ -99,6 +105,7 @@ def moe_softmax_topk(
             router_logits=dense_tensor_format(router_logits.dtype),
         ),
         traits={"tokens": int(tokens), "experts": int(experts), "topk": int(topk)},
+        override=override,
         solution=solution,
     )
     return kernel(
@@ -109,6 +116,3 @@ def moe_softmax_topk(
         routed_scaling_factor=routed_scaling_factor,
         enable_pdl=pdl_enabled(),
     )
-
-
-__all__ = ["moe_softmax_topk"]

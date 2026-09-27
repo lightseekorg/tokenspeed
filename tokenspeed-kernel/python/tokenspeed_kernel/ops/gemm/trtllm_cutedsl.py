@@ -45,8 +45,8 @@ from tokenspeed_kernel.signature import ScaleFormat, format_signatures
         ),
     ),
     traits={
-        "n_align_128": frozenset({True}),
-        "k_align_128": frozenset({True}),
+        "n_align": frozenset({128}),
+        "k_align": frozenset({128}),
         "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
     },
     priority=Priority.REFERENCE,

@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
-from tokenspeed_kernel.numerics.inputs import get_input_generator
+from tokenspeed_kernel.numerics.inputs import get_input_generator, shape_traits
 from tokenspeed_kernel.numerics.reference.gemm import (
     torch_bmm_fp8_blockscale,
     torch_bmm_fp8_scaled,
@@ -155,6 +155,18 @@ def test_bmm_input_generator_honors_n_contiguous_weight_trait() -> None:
 
     assert inputs["B"].shape == (12, 512, 128)
     assert inputs["B"].stride(1) == 1
+
+
+def test_shape_traits_lowercases_gemm_dimensions() -> None:
+    assert shape_traits({"M": 16, "N": 32, "K": 64}) == {"m": 16, "n": 32, "k": 64}
+    assert shape_traits({"batch": 2, "M": 4, "N": 8, "K": 16}) == {
+        "batch": 2,
+        "m": 4,
+        "n": 8,
+        "k": 16,
+    }
+    assert shape_traits({"B": 2, "M": 4}) == {"batch": 2, "m": 4}
+    assert shape_traits({"seq_len": 128, "num_heads": 8}) == {}
 
 
 def test_quantized_reference_gemm_supports_out() -> None:
@@ -333,6 +345,18 @@ def test_verification_uses_signature_with_compatible_reference(fresh_registry) -
     registry = KernelRegistry.get()
     registry.register(ref_spec, lambda **_kwargs: None)
     registry.register(test_spec, lambda **_kwargs: None)
+    # A Triton fallback for another signature must not displace PyTorch.
+    registry.register(
+        KernelSpec(
+            name="test_channel_scale_triton_reference",
+            family="gemm",
+            mode="mm",
+            solution="triton",
+            format_signatures=frozenset({channel_signature}),
+            traits={"b_layout": frozenset({"KN"})},
+        ),
+        lambda **_kwargs: None,
+    )
 
     signature, reference = _verification_signature_and_reference(
         registry, test_spec, _fp8_dtype, "a"
@@ -473,3 +497,28 @@ class TestNumericsVerification:
     )
     def test_moe_int32(self, spec: KernelSpec):
         self._verify(spec, torch.int32, "indices")
+
+
+def test_reference_alias_tries_triton_after_incompatible_torch(fresh_registry):
+    signature = next(iter(format_signatures(("a", "b"), "dense", {torch.bfloat16})))
+    registry = KernelRegistry.get()
+    for name, solution, traits in [
+        ("incompatible_torch", "torch", {"b_layout": frozenset({"KN"})}),
+        ("compatible_triton", "triton", {"b_layout": frozenset({"NK"})}),
+        ("candidate", "unit", {"b_layout": frozenset({"NK"})}),
+    ]:
+        registry.register(
+            KernelSpec(
+                name=name,
+                family="gemm",
+                mode="mm",
+                solution=solution,
+                format_signatures=frozenset({signature}),
+                traits=traits,
+            ),
+            lambda **kwargs: None,
+        )
+    _, reference = _verification_signature_and_reference(
+        registry, registry.get_by_name("candidate"), torch.bfloat16, "a"
+    )
+    assert reference.name == "compatible_triton"

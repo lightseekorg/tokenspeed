@@ -188,7 +188,7 @@ class KernelSpec:
     features: frozenset[str] = (
         frozenset()
     )  # Orthogonal features, e.g., {"paged", "mla"}
-    solution: str = ""  # "triton", "flashinfer", "cutlass", "reference", etc.
+    solution: str = ""  # "triton", "flashinfer", "cutlass", "torch", etc.
 
     # Capabilities
     capability: CapabilityRequirement = field(default_factory=CapabilityRequirement)
@@ -201,9 +201,6 @@ class KernelSpec:
     # places unannotated kernels in PERFORMANT so they win against PORTABLE but
     # lose to SPECIALIZED. Selection scoring clamps out-of-range values.
     priority: int = int(Priority.PERFORMANT) + 2
-    tags: frozenset[str] = (
-        frozenset()
-    )  # Standard tags: "throughput", "latency", "determinism", "portability"
     weight_preprocessor: Callable | None = None
 
     def __post_init__(self) -> None:
@@ -341,7 +338,6 @@ class KernelRegistry:
         features: frozenset[str] | None = None,
         platform: PlatformInfo | None = None,
         format_signature: FormatSignature | None = None,
-        tags: set[str] | None = None,
         solution: str | None = None,
     ) -> list[KernelSpec]:
         """Get all kernels for an operator, optionally filtered.
@@ -358,8 +354,6 @@ class KernelRegistry:
             specs = [s for s in specs if s.capability.satisfied_by(platform)]
         if format_signature:
             specs = [s for s in specs if s.supports_format_signature(format_signature)]
-        if tags:
-            specs = [s for s in specs if tags.issubset(s.tags)]
         if solution:
             for concrete in resolve_solutions(solution):
                 matched = [s for s in specs if s.solution == concrete]
@@ -422,7 +416,6 @@ def register_kernel(
     signatures: set[FormatSignature] | frozenset[FormatSignature],
     traits: dict[str, frozenset[Any]] | None = None,
     priority: Priority | int = Priority.PERFORMANT + 2,
-    tags: set[str] | None = None,
     weight_preprocessor: Callable | None = None,
 ) -> Callable:
     """Decorator to register a kernel function.
@@ -453,7 +446,6 @@ def register_kernel(
             ),
             # Narrowly gated on SM100 + tcgen05 → SPECIALIZED band.
             priority=Priority.SPECIALIZED + 1,
-            tags={"latency", "determinism"},
         )
         def triton_attention_decode(query, key_cache, value_cache, ...):
             ...
@@ -474,7 +466,6 @@ def register_kernel(
             capability=capability or CapabilityRequirement(),
             traits=traits or {},
             priority=priority_int,
-            tags=frozenset(tags or set()),
             weight_preprocessor=normalized_weight_preprocessor,
         )
 
@@ -502,7 +493,6 @@ def describe_kernel(name: str) -> str:
         "  Format signatures: "
         + ("; ".join(str(p) for p in spec.format_signatures) or "none"),
         f"  Platform: {spec.capability}",
-        f"  Tags: {', '.join(spec.tags) or 'none'}",
     ]
     if spec.weight_preprocessor is None:
         lines.append("  Weight preprocessor: none")

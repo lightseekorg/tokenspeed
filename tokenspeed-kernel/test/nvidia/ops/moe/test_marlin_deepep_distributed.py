@@ -147,6 +147,11 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
             num_tokens if mode == "low_latency" else None
         ),
         solution="marlin",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     assert plan["apply_kernel_name"] == "marlin_mxfp4_deepep_moe_apply"
     tokenspeed_kernel.moe_process_weights(plan, module)

@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING
 
 import torch
@@ -32,6 +33,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
+    dspark_greedy_workspace,
     sample_dspark_block_greedy,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -179,12 +181,11 @@ class DeepseekV4DSpark(BaseDrafter):
             * self.spec_num_tokens
         )
 
-        tp_size = int(self.draft_model.mapping.attn.tp_size)
-        self.gathered_values = torch.empty(
-            (tp_size, max_bs), dtype=torch.float32, device=self.device
-        )
-        self.gathered_ids = torch.empty(
-            (tp_size, max_bs), dtype=torch.int64, device=self.device
+        self.candidates, self.partials = dspark_greedy_workspace(
+            int(self.draft_model.mapping.attn.tp_size),
+            max_bs,
+            int(self.draft_model.lm_head.num_embeddings_per_partition),
+            self.device,
         )
 
     def wire_target(self, target_model) -> None:
@@ -200,12 +201,6 @@ class DeepseekV4DSpark(BaseDrafter):
         num_extends: int,
     ) -> None:
         """Refresh request-to-window slots outside CUDA Graph replay."""
-
-        if hasattr(self, "lm_head"):
-            self.model.refresh_local_base_logits_head(
-                self.lm_head.weight,
-                force=False,
-            )
 
         if len(request_ids) != len(request_pool_indices):
             raise ValueError("DSPARK request IDs and pool indices must align.")
@@ -233,7 +228,11 @@ class DeepseekV4DSpark(BaseDrafter):
                 changed_slots.append(pool_slot)
 
         if changed_slots:
-            changed = torch.tensor(changed_slots, dtype=torch.int64, device=self.device)
+            # Pinned staging keeps the upload stream-ordered instead of waiting
+            # for the round in flight (a pageable copy would).
+            changed = torch.tensor(
+                changed_slots, dtype=torch.int64, pin_memory=self.device.type == "cuda"
+            ).to(self.device, non_blocking=True)
             self.kv_windows.index_fill_(0, changed, 0)
             self.context_lengths.index_fill_(0, changed, 0)
 
@@ -249,13 +248,6 @@ class DeepseekV4DSpark(BaseDrafter):
         )
         if active_bs < self.input_buffers.max_bs:
             self.slot_indices_buf[active_bs:].copy_(self.padding_slots[active_bs:])
-
-    def on_target_weights_updated(self) -> None:
-        """Refresh target-derived weights after an in-place target reload."""
-        self.model.refresh_local_base_logits_head(
-            self.lm_head.weight,
-            force=True,
-        )
 
     @staticmethod
     def _bonus_tokens_from_output(
@@ -284,8 +276,18 @@ class DeepseekV4DSpark(BaseDrafter):
             out[num_extends:].copy_(output_tokens[offsets + accepted - 1])
         return out
 
+    @property
+    def captures_prefill_graph(self) -> bool:
+        return True
+
+    def release_prefill_graph(self) -> None:
+        """Drop the graph and the private pool it holds before the arena is replaced."""
+        self._prefill_graph = None
+
     @torch.inference_mode()
-    def capture_prefill_graph(self, stream: torch.cuda.Stream) -> None:
+    def capture_prefill_graph(
+        self, stream: torch.cuda.Stream, observer: AbstractContextManager[None]
+    ) -> None:
         """Capture one request's bounded context seeding in a private graph pool."""
         window = int(self.model.window_size)
         self._prefill_hidden = torch.zeros(
@@ -326,7 +328,7 @@ class DeepseekV4DSpark(BaseDrafter):
         graph = torch.cuda.CUDAGraph()
         # Own pool: target prefill and decode graphs must not recycle these
         # intermediates, including any pointers memoized by quantized GEMMs.
-        with torch.cuda.graph(graph, stream=stream):
+        with observer, torch.cuda.graph(graph, stream=stream):
             run_once()
         graph.replay()
         torch.cuda.synchronize(self.device)
@@ -489,15 +491,15 @@ class DeepseekV4DSpark(BaseDrafter):
             slots,
             draft_ctx,
         )
-        local_logits = self.model.local_base_logits(draft_hidden, None)
+        local_logits = self.model.local_base_logits(draft_hidden, self.lm_head.weight)
         sample_dspark_block_greedy(
             local_logits,
             bonus,
             self.model.markov_head,
             self.lm_head,
             self.tp_group,
-            self.gathered_values,
-            self.gathered_ids,
+            self.candidates,
+            self.partials,
             self.draft_tokens_buf[:num_decodes],
         )
         next_tokens[num_extends:, 1:].copy_(self.draft_tokens_buf[:num_decodes])

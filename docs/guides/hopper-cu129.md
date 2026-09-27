@@ -53,8 +53,11 @@ The installer does not patch DeepEP or add development-version exceptions.
 Update the official dependency pin after the upstream changes are released.
 
 The explicit `CUDA_VARIANT=cu129` value dispatches to
-`test/ci_system/install_deps_cu129.py`. The recipe pins Torch/torchvision to
-cu129 and obtains native TokenSpeed wheels from the LightSeek cu129 index.
+`test/ci_system/install_deps_cu129.py`. The recipe uses Torch `2.14.0+cu126` and
+torchvision `0.29.0+cu126` from the PyTorch cu126 index because this Torch release
+has no cu129 wheels. Its Python CUDA runtime packages use CUDA 12.6.3, while
+`CUDA_HOME` and the native kernel compiler remain on CUDA Toolkit 12.9.
+Native TokenSpeed wheels still come from the LightSeek cu129 index.
 It uses the existing checkout's kernel versions, switches the CuTe runtime
 to cu12, and omits the CUDA-13-only CuteDSL KDA AOT package.
 `requirements/nvidia-cu129-constraints.txt` contains the additional version

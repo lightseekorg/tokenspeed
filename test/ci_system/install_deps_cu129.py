@@ -32,7 +32,7 @@ import tomllib
 from pathlib import Path
 
 PYPI = "https://pypi.org/simple"
-PYTORCH = "https://download.pytorch.org/whl/cu129"
+PYTORCH = "https://download.pytorch.org/whl/cu126"
 WHEELS = "https://lightseek.org/whl/cu129/"
 NATIVE_PACKAGES = {
     "tokenspeed-deepep",
@@ -218,8 +218,13 @@ def main() -> None:
         PYPI,
     )
     with tempfile.TemporaryDirectory(prefix="tokenspeed-cu129-scheduler-") as build_dir:
+        # Scheduler changes intentionally accumulate without a version bump.
+        # Rebuild and reinstall the checkout instead of accepting a native
+        # extension left by an earlier run of a persistent worker.
         pip_install(
             [
+                "--force-reinstall",
+                "--no-deps",
                 str(workspace / "tokenspeed-scheduler"),
                 f"--config-settings=build-dir={build_dir}",
             ],

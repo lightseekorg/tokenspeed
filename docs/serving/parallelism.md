@@ -85,6 +85,13 @@ packed weights and block scales in the padded tail are zero-filled, so the
 extra dimensions do not change the MoE result. For example, a 640-wide expert
 under MoE TP4 is padded from 160 to 192 values per rank.
 
+On Hopper, MXFP4 routed experts with a SiLU/SwiGLU activation and dense EP
+(`--all2all-backend none`) default to the FlashInfer CUTLASS mixed-input
+kernel (`flashinfer_cutlass`), which needs the per-rank intermediate size and
+the hidden size to be multiples of 128. Other widths, SiTU experts and DeepEP
+all-to-all layouts keep `marlin`. `--moe-mxfp4-fp8-activation` selects its
+W4A8 variant.
+
 ### Kimi-K3 attention DP with MoE EP
 
 With `none`, `agrs`, or `flashinfer` transport and attention DP greater than one,
@@ -113,6 +120,14 @@ dispatch, SiTU expert computation, and combine with MegaMoE. It requires
 
 The AG/RS and FlashInfer transports quantize NVFP4 activations before dispatch and transfer their
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
+
+Kimi-K3 can independently shard its BF16 shared-expert MLP with
+`TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE` (unset or `1` preserves existing
+behavior). The size must divide world size and be strictly smaller than it;
+DEP16 supports TP2, TP4 and TP8, with matching intermediate-channel divisibility.
+AllGather and ReduceScatter restore local token ownership around
+the sharded MLP. Attention and caches remain TP1/DP16; routed MoE remains EP16.
+See the [shared-expert TP runbook](../recipes/kimi-k3-shared-expert-tp.md).
 
 ### DeepEP all-to-all
 

@@ -33,7 +33,7 @@ import os
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
-__all__ = ["gluon_dsv41_selected_attention_gfx950"]
+__all__ = ["launch_gluon_dsv41_selected_attention_gfx950"]
 
 _SWA_ROW_BYTES = 528
 _GLOBAL_ROW_BYTES = 288
@@ -135,7 +135,7 @@ def _load_v41_tile(
 
 
 @gluon.jit
-def _dsv41_fused_selected_kernel(
+def gluon_dsv41_selected_attention_gfx950(
     q,
     swa_cache,
     swa_slots,
@@ -437,7 +437,7 @@ def _integers(x, shape, name):
         raise ValueError(f"{name} must be int32/int64 with shape {shape}")
 
 
-def gluon_dsv41_selected_attention_gfx950(
+def launch_gluon_dsv41_selected_attention_gfx950(
     q,
     swa_cache,
     swa_slots,
@@ -553,7 +553,7 @@ def gluon_dsv41_selected_attention_gfx950(
         global_cb = 1
 
     grid = (q.shape[0], triton.cdiv(q.shape[1], 16))
-    _dsv41_fused_selected_kernel[grid](
+    gluon_dsv41_selected_attention_gfx950[grid](
         q,
         swa_cache,
         swa_slots_i,

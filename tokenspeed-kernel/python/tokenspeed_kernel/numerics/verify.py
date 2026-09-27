@@ -31,6 +31,7 @@ from tokenspeed_kernel.numerics.comparison import (
 from tokenspeed_kernel.numerics.inputs import (
     get_input_generator,
     get_standard_shapes,
+    shape_traits,
 )
 from tokenspeed_kernel.numerics.tolerance import (
     Tolerance,
@@ -38,7 +39,12 @@ from tokenspeed_kernel.numerics.tolerance import (
     ToleranceOverride,
     get_family_tolerance,
 )
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+    load_builtin_kernels,
+    resolve_solutions,
+)
 from tokenspeed_kernel.selection import (
     ref_compatible_with_spec,
     spec_matches_shape_traits,
@@ -70,12 +76,14 @@ def _compatible_reference_for_signature(
     registry: KernelRegistry,
     spec: KernelSpec,
     signature: FormatSignature,
+    *,
+    solution: str,
 ) -> KernelSpec | None:
     ref_specs = registry.get_for_operator(
         spec.family,
         spec.mode,
         format_signature=signature,
-        solution="reference",
+        solution=solution,
     )
     for ref in ref_specs:
         if ref.name == spec.name:
@@ -92,10 +100,15 @@ def _verification_signature_and_reference(
     dtype_role: str | Iterable[str],
 ) -> tuple[FormatSignature | None, KernelSpec | None]:
     signatures = spec.format_signatures_for_storage_dtype(dtype, dtype_role)
-    for signature in signatures:
-        ref_spec = _compatible_reference_for_signature(registry, spec, signature)
-        if ref_spec is not None:
-            return signature, ref_spec
+    # Prefer a PyTorch-covered executable signature before considering Triton.
+    # Some kernel signatures exist only for dispatch before input conversion.
+    for solution in resolve_solutions("reference"):
+        for signature in signatures:
+            ref_spec = _compatible_reference_for_signature(
+                registry, spec, signature, solution=solution
+            )
+            if ref_spec is not None:
+                return signature, ref_spec
     return (signatures[0], None) if signatures else (None, None)
 
 
@@ -153,7 +166,7 @@ def verify_kernel(
 
     results: list[ComparisonResult] = []
     for shape in test_shapes:
-        if not spec_matches_shape_traits(spec, shape):
+        if not spec_matches_shape_traits(spec, shape_traits(shape)):
             if verbose:
                 print(f"[SKIP] {kernel_name} shape={shape} incompatible with traits")
             continue

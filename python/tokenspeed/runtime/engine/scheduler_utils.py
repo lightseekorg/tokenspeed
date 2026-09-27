@@ -38,7 +38,7 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
-from tokenspeed.runtime.execution.types import NGramInputs
+from tokenspeed.runtime.execution.types import NGramInputs, RequestHistorySeeds
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
@@ -107,6 +107,53 @@ def ngram_inputs_for_forward(
         )
         positions.append(start)
     return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
+
+
+def request_history_seeds_for_forward(
+    forward_op, rid_to_state: Mapping
+) -> RequestHistorySeeds | None:
+    """Snapshot the committed prefix of every extend that resumes one.
+
+    An extend with a non-empty prefix resumes tokens its slot's history row
+    may not hold: a prefix-cache hit, a PD landing, a retraction recovery or
+    a chunk after the slot changed hands. Prompt/output lists hold physical
+    IDs. Returns None when no extend in the batch resumes a prefix.
+
+    TODO(perf): this also reseeds consecutive chunks of one chunked prefill
+    whose slot never changed hands, moving O(N*k) tokens host->device for an
+    N-token prompt in k chunks. Tracking (request id, held length) per slot —
+    as the bounded n-gram path does — would let the gather skip prefixes the
+    slot demonstrably still holds without weakening the recovery and
+    PD-landing cases.
+    """
+    slots: list[int] = []
+    prefix_lengths: list[int] = []
+    tokens: list[tuple[int, ...]] = []
+    for i in range(forward_op.num_extends()):
+        boundary = int(forward_op.extend_prefix_lens[i])
+        if boundary == 0:
+            continue
+        state = rid_to_state[forward_op.request_ids[i]]
+        prompt, output = state.prompt_input_ids, state.output_ids
+        if boundary > len(prompt) + len(output):
+            raise ValueError(
+                f"Request history prefix {boundary} exceeds the physical tokens "
+                f"of {forward_op.request_ids[i]}"
+            )
+        if boundary <= len(prompt):
+            prefix = tuple(prompt[:boundary])
+        else:
+            prefix = tuple(prompt) + tuple(output[: boundary - len(prompt)])
+        slots.append(int(forward_op.request_pool_indices[i]))
+        prefix_lengths.append(boundary)
+        tokens.append(prefix)
+    if not slots:
+        return None
+    return RequestHistorySeeds(
+        slots=tuple(slots),
+        prefix_lengths=tuple(prefix_lengths),
+        tokens=tuple(tokens),
+    )
 
 
 @dataclass(frozen=True)
@@ -677,6 +724,8 @@ def packed_block_tables_from_forward_op(
 def _classify_param(name: str) -> str:
     """Bucket a parameter/buffer name into a weight group for the memory
     summary. Names follow the Kimi-K3 / DeepSeek module layout."""
+    if ".engram." in name:
+        return "engram_weights"
     if "self_attn" in name or ".attn." in name or "kv_a" in name or "q_a" in name:
         return "attention_weights"
     if (
@@ -761,6 +810,7 @@ def log_gpu_memory_summary(
             "attention_weights": 0,
             "moe_weights": 0,
             "dense_mlp_weights": 0,
+            "engram_weights": 0,
             "other_weights": 0,
         }
         seen: set[int] = set()
@@ -817,6 +867,10 @@ def log_gpu_memory_summary(
             ("Dense/MLP weights", groups["dense_mlp_weights"] / GB),
             ("Other weights (embed/head/norm)", groups["other_weights"] / GB),
         ]
+        # Engram tables are only listed when resident on the device; with
+        # --engram-host-table they live in host memory and are not counted.
+        if groups["engram_weights"]:
+            rows.append(("Engram weights (tables/wkv)", groups["engram_weights"] / GB))
         if draft_model is not None:
             rows.append(("Draft model weights", draft_gb))
         rows += [

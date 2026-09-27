@@ -23,6 +23,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.engine import event_loop as event_loop_module  # noqa: E402
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
+from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks  # noqa: E402
 
 
 class _PauseHarness:
@@ -68,6 +69,16 @@ class _EventLoopHarness:
         self._pause = _PauseHarness(self.trace)
         self.scheduler = _SchedulerHarness(self.trace)
         self._device = _DeviceHarness(self.trace)
+        self._l3_hooks = L3CacheHooks(
+            self.scheduler,
+            None,
+            attn_tp_size=1,
+            attn_tp_cpu_group=None,
+            attn_cp_size=1,
+            attn_cp_cpu_group=None,
+            pp_size=1,
+            pp_cpu_group=None,
+        )
         self.output_processor = SimpleNamespace(rid_to_state={})
         self.has_dp = False
         self.kv_transfer = None
@@ -115,12 +126,6 @@ class _EventLoopHarness:
         self, _stats, _num_iter_tokens: int
     ) -> None:
         self.trace.append("metrics")
-
-    def _revalidate_queued_l3_hits(self) -> None:
-        return
-
-    def _recover_if_l3_prefetch_failed(self, _execution_plan, _forward_op) -> list:
-        return []
 
 
 def test_event_loop_returns_without_work_when_shutdown_is_pre_set() -> None:
@@ -257,6 +262,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
     )
     server_args = SimpleNamespace(
         mapping=mapping,
+        device="cpu",
         base_gpu_id=0,
         disaggregation_mode="decode",
         max_num_seqs=8,
@@ -264,6 +270,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
     )
     pipe_writer = _PipeWriter()
 
+    monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "default")
     monkeypatch.setattr(event_loop_module, "EventLoop", _FakeEventLoop)
     monkeypatch.setattr(event_loop_module.psutil, "Process", _Process)
     monkeypatch.setattr(

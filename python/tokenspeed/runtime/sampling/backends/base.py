@@ -146,6 +146,52 @@ class SamplingBackend(ABC):
             self._tp_pg = pg_manager.get_device_process_group(config.tp_group)
             self._tp_src_global_rank = config.tp_group[0]
 
+        # Verify outputs live in one packed int32 buffer so a single broadcast
+        # syncs predict, accept_length and accept_index across TP ranks.
+        # Backends with DP padding re-carve it for their padded batch.
+        self._predict_max: int = 0
+        self._output_pack_buf: torch.Tensor = torch.empty(
+            (0,), dtype=torch.int32, device=config.device
+        )
+        self._predict_buf: torch.Tensor = self._output_pack_buf
+        self._accept_length_buf: torch.Tensor = self._output_pack_buf
+        self._accept_index_buf: torch.Tensor = self._output_pack_buf
+        self._allocate_verify_outputs(config.max_bs, config.max_draft_tokens_per_req)
+
+    def _allocate_verify_outputs(self, max_rows: int, max_n: int) -> None:
+        """Carve predict / accept_length / accept_index out of one buffer.
+
+        Layout: ``[0, max_rows * max_n)`` predict, then ``max_rows``
+        accept_length entries, then ``max_rows * max_n`` accept_index entries.
+        Each region is flat so ``[:bs * n].view(bs, n)`` is contiguous for
+        any bs/n, and the whole buffer is what ``broadcast_verify_outputs``
+        sends.
+        """
+        self._predict_max = max_rows * max_n
+        self._output_pack_buf = torch.zeros(
+            (2 * self._predict_max + max_rows,),
+            dtype=torch.int32,
+            device=self.config.device,
+        )
+        self._predict_buf = self._output_pack_buf[: self._predict_max]
+        self._accept_length_buf = self._output_pack_buf[
+            self._predict_max : self._predict_max + max_rows
+        ]
+        self._accept_index_buf = self._output_pack_buf[self._predict_max + max_rows :]
+
+    def broadcast_verify_outputs(self) -> None:
+        """Broadcast the packed verify triple from tp_group[0] in one collective.
+
+        Rank 0 wins on predict, accept_length and accept_index together,
+        including stale rows past the live batch. No-op when sync is off or
+        tp_size <= 1. Graph-safe.
+        """
+        if self._tp_pg is None:
+            return
+        dist.broadcast(
+            self._output_pack_buf, src=self._tp_src_global_rank, group=self._tp_pg
+        )
+
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
         """Configure optional DP sampling state.
 

@@ -44,8 +44,14 @@ from tokenspeed_kernel.ops.attention.mla import (
     mla_extend_with_kvcache,
     mla_prefill,
 )
-from tokenspeed_kernel.registry import KernelRegistry, Priority, load_builtin_kernels
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+    Priority,
+    load_builtin_kernels,
+)
 from tokenspeed_kernel.selection import is_ground_truth
+from tokenspeed_kernel.signature import format_signatures
 
 _NUM_Q_HEADS = 8
 _NUM_KV_HEADS = 2
@@ -149,7 +155,8 @@ def test_prefill_matches_sdpa_per_sequence(device: str, window_left: int) -> Non
         )
 
 
-def test_prefill_sinks_and_logit_cap(device: str) -> None:
+@pytest.mark.parametrize("sink_offset", [0.0, 100.0])
+def test_prefill_sinks_and_logit_cap(device: str, sink_offset: float) -> None:
     torch.manual_seed(1)
     seqlen = 13
     q = torch.randn(seqlen, _NUM_Q_HEADS, _HEAD_DIM, device=device, dtype=torch.float32)
@@ -157,7 +164,7 @@ def test_prefill_sinks_and_logit_cap(device: str) -> None:
         seqlen, _NUM_KV_HEADS, _HEAD_DIM, device=device, dtype=torch.float32
     )
     v = torch.randn_like(k)
-    sinks = torch.randn(_NUM_Q_HEADS, device=device)
+    sinks = torch.randn(_NUM_Q_HEADS, device=device) + sink_offset
     logit_cap = 3.0
     out, lse = torch_mha_prefill(
         q=q,
@@ -425,10 +432,17 @@ def _mla_expected(q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("q_len", [1, 3], ids=["q1", "q3"])
-def test_mla_decode_is_the_causal_tail(device: str, q_len: int) -> None:
+@pytest.mark.parametrize(
+    "kv_dtype", [torch.bfloat16, torch.float32, torch.float8_e4m3fn]
+)
+def test_mla_decode_is_the_causal_tail(
+    device: str, q_len: int, kv_dtype: torch.dtype
+) -> None:
     torch.manual_seed(5)
     cache_lens = [37, 5, 20]
     kv_cache, page_table, flat = _mla_cache(device, cache_lens)
+    kv_cache = kv_cache.to(kv_dtype)
+    flat = [rows.to(kv_dtype) for rows in flat]
     q = torch.randn(
         len(cache_lens),
         q_len,
@@ -504,10 +518,15 @@ def test_mla_decode_proposal_block_window(device: str) -> None:
         )
 
 
-def test_mla_extend_is_the_causal_suffix(device: str) -> None:
+@pytest.mark.parametrize(
+    "kv_dtype", [torch.bfloat16, torch.float32, torch.float8_e4m3fn]
+)
+def test_mla_extend_is_the_causal_suffix(device: str, kv_dtype: torch.dtype) -> None:
     torch.manual_seed(7)
     query_lens, cache_lens = [3, 2, 1], [3, 21, 40]
     kv_cache, page_table, flat = _mla_cache(device, cache_lens)
+    kv_cache = kv_cache.to(kv_dtype)
+    flat = [rows.to(kv_dtype) for rows in flat]
     cu_q = [0, *torch.tensor(query_lens).cumsum(0).tolist()]
     q = torch.randn(
         cu_q[-1],
@@ -600,3 +619,35 @@ def test_gdn_chunk_prefill_reference_is_the_token_recurrence(device: str) -> Non
         torch.testing.assert_close(
             result.final_state[seq_idx], state.transpose(-2, -1), rtol=1e-4, atol=1e-4
         )
+
+
+def test_reference_does_not_enable_absorbed_extend(
+    fresh_registry, monkeypatch, h100_platform
+) -> None:
+    import tokenspeed_kernel.ops.attention.mla as mla
+
+    KernelRegistry.get().register(
+        KernelSpec(
+            name="reference_only_extend",
+            family="attention",
+            mode="mla_extend_with_kvcache",
+            solution="torch",
+            priority=Priority.REFERENCE,
+            format_signatures=format_signatures(
+                ("q", "kv_cache"), "dense", {torch.bfloat16}
+            ),
+        ),
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(mla, "current_platform", lambda: h100_platform)
+    kwargs = dict(
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_q_heads=8,
+        page_size=16,
+        qk_nope_head_dim=128,
+        kv_lora_rank=128,
+        qk_rope_head_dim=64,
+    )
+    assert not mla.mla_use_absorbed_extend(**kwargs)
+    assert mla.mla_use_absorbed_extend(**kwargs, solution="reference")

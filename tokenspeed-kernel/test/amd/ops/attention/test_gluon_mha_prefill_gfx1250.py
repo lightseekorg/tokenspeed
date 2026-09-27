@@ -101,7 +101,7 @@ def test_mha_prefill_tile_shapes(block_m, num_warps, head_dim, window_left):
 
     prefill.get_config = forced
     try:
-        out = prefill.gluon_mha_prefill_gfx1250(
+        out = prefill.launch_gluon_mha_prefill_gfx1250(
             q, k, v, cu, cu_cpu, max_seqlen, window_left=window_left
         )
     finally:
@@ -195,7 +195,7 @@ def test_mha_prefill_reverse_counts_live_ragged_workgroups():
 
     prefill._select_reverse_q_blocks = capture_workgroups
     try:
-        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
     finally:
         prefill._select_reverse_q_blocks = original_order
 
@@ -229,9 +229,11 @@ def test_mha_prefill_tdm_warp_hint_remainder():
     prefill.get_config = forced_config
     try:
         prefill._select_tdm_warp_hint = lambda **_kwargs: False
-        control = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        control = prefill.launch_gluon_mha_prefill_gfx1250(
+            q, k, v, cu, cu_cpu, max_seqlen
+        )
         prefill._select_tdm_warp_hint = lambda **_kwargs: True
-        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
     finally:
         prefill.get_config = original_config
         prefill._select_tdm_warp_hint = original_hint
@@ -266,9 +268,11 @@ def test_mha_prefill_reverse_q_blocks_ragged():
     prefill.get_config = forced_config
     try:
         prefill._select_reverse_q_blocks = lambda **_kwargs: False
-        control = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        control = prefill.launch_gluon_mha_prefill_gfx1250(
+            q, k, v, cu, cu_cpu, max_seqlen
+        )
         prefill._select_reverse_q_blocks = lambda **_kwargs: True
-        out = prefill.gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
     finally:
         prefill.get_config = original_config
         prefill._select_reverse_q_blocks = original_order

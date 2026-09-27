@@ -20,6 +20,7 @@
 
 #include "scheduler/scheduler.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -107,8 +108,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         progress.prefix_hashes.insert(progress.prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                                       std::make_move_iterator(new_hashes.end()));
 
-        std::vector<CacheKey> event_keys =
-            registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
+        registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
         coordinator_.CacheCompletedBlocks(
             request.BlockTablesRef(),
             RequestProgress{
@@ -123,13 +123,15 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
                 .num_computed_tokens = request.TokenSize() - 1,
             },
             progress.access_epoch);
-        discardUncachedKvEventPages(event_keys);
     }
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
     coordinator_.QueueCachedBlocksForStore(progress.prefix_hashes);
-    coordinator_.QueueLatestSnapshotBlocksForStore(progress.prefix_hashes);
+    const auto prefill_hashes = std::span<const std::string>{progress.prefix_hashes}.first(
+        std::min(progress.prefix_hashes.size(),
+                 static_cast<std::size_t>(request.PrefillSize() / coordinator_.PrefixGranularity())));
+    coordinator_.QueueLatestSnapshotBlocksForStore(prefill_hashes);
     // The request's pages are released right after this (FinishEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);

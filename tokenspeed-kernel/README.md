@@ -61,9 +61,8 @@ choices (still evolving; subject to change):
   non-format traits (head dim, GQA factor, ...), and a priority band.
 - **Auto-selection** — `select_kernel` filters by capability and traits,
   ranks the survivors with an optional per-family `SelectionOracle` and
-  priority, and returns a callable. Selection accepts an objective (latency,
-  throughput, determinism, portability) and supports per-call `override=` plus
-  config-file overrides for development.
+  priority, and returns a callable. Selection supports per-call `solution=`
+  and `override=` plus config-file overrides for development.
 
 ### Directory structure
 
@@ -114,7 +113,8 @@ folder.
   references (dense GEMM, MoE routing, AttnRes) are the last-resort path
   when no fused kernel covers an input and lose to every real backend;
   REFERENCE-band references (attention) are ground truth only and are
-  never auto-selected. `reference` is a meta solution, never a registered
+  never auto-selected or counted as serving support by attention planning.
+  `reference` is a meta solution, never a registered
   one: `solution="reference"` resolves to `torch` when a PyTorch reference
   covers the call and to the portable `triton` kernel otherwise, so every
   op with a Triton solution has a ground truth. Public APIs forward
@@ -151,8 +151,10 @@ iteration.
   traces with `tokenspeed merge-traces`.
 
 Registration-level benchmarks combine operation-owned input and correctness
-logic with graph-replay device timing. Pull request CI can compare compatible
-cases from the merge base and candidate revision. See the
+logic with graph-replay device timing. Each operation family and mode
+contributes one benchmark generator; suites reference them by family, mode,
+and parameters. Pull request CI compares compatible cases between the merge
+base and candidate revision. See the
 [benchmark documentation](benchmarks/README.md) for the harness and suite
 contract, and the [CI documentation](../test/ci/README.md#registration-level-kernel-benchmarks)
 for workflow behavior and runner requirements.
@@ -170,7 +172,7 @@ backends. See `tokenspeed_kernel/plugins/README.md`.
 from tokenspeed_kernel import (
     gated_residual_mix, gated_residual_combine, grouped_gemma_rmsnorm,
     mm,
-    moe_softmax_topk,
+    moe_topk,
     moe_route, moe_dispatch, moe_experts, moe_combine, moe_fused,
     ...
 )

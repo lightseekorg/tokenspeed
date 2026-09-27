@@ -37,7 +37,11 @@ import math
 import torch
 from tokenspeed_kernel.ops.attention.gdn import GdnChunkPrefillResult
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
 _ATTENTION_DTYPES = frozenset(
@@ -101,6 +105,8 @@ def _attend(
     scores = scores.masked_fill(~mask[None, :, :], float("-inf"))
 
     row_max = scores.amax(dim=-1, keepdim=True)
+    if sinks is not None:
+        row_max = torch.maximum(row_max, sinks.float()[:, None, None])
     row_max = torch.where(torch.isinf(row_max), torch.zeros_like(row_max), row_max)
     probs = torch.exp(scores - row_max)
     denominator = probs.sum(dim=-1, keepdim=True)
@@ -160,7 +166,6 @@ def _gather_paged_kv(
     signatures=format_signatures(("q", "k", "v"), "dense", _ATTENTION_DTYPES),
     traits={},
     priority=Priority.REFERENCE,
-    tags={"determinism", "portability"},
 )
 def torch_mha_prefill(
     q: torch.Tensor,
@@ -232,7 +237,6 @@ def torch_mha_prefill(
     ),
     traits={},
     priority=Priority.REFERENCE,
-    tags={"determinism", "portability"},
 )
 def torch_mha_extend_with_kvcache(
     q: torch.Tensor,
@@ -324,7 +328,6 @@ def torch_mha_extend_with_kvcache(
     ),
     traits={},
     priority=Priority.REFERENCE,
-    tags={"determinism", "portability"},
 )
 def torch_mha_decode_with_kvcache(
     q: torch.Tensor,
@@ -408,7 +411,6 @@ def torch_mha_decode_with_kvcache(
     signatures=format_signatures(("q", "k", "v"), "dense", _ATTENTION_DTYPES),
     traits={},
     priority=Priority.REFERENCE,
-    tags={"determinism", "portability"},
 )
 def torch_mla_prefill(
     q: torch.Tensor,
@@ -487,10 +489,15 @@ def torch_mla_prefill(
     "mla_extend_with_kvcache",
     name="torch_mla_extend_with_kvcache",
     solution="torch",
-    signatures=format_signatures(("q", "kv_cache"), "dense", _ATTENTION_DTYPES),
+    signatures=frozenset(
+        format_signature(
+            q=dense_tensor_format(q_dtype), kv_cache=dense_tensor_format(kv_dtype)
+        )
+        for q_dtype in _ATTENTION_DTYPES
+        for kv_dtype in _ATTENTION_DTYPES
+    ),
     traits={},
     priority=Priority.REFERENCE,
-    tags={"determinism", "portability"},
 )
 def torch_mla_extend_with_kvcache(
     q: torch.Tensor,
@@ -610,10 +617,15 @@ def _mla_decode_visible_range(
     "mla_decode_with_kvcache",
     name="torch_mla_decode_with_kvcache",
     solution="torch",
-    signatures=format_signatures(("q", "kv_cache"), "dense", _ATTENTION_DTYPES),
+    signatures=frozenset(
+        format_signature(
+            q=dense_tensor_format(q_dtype), kv_cache=dense_tensor_format(kv_dtype)
+        )
+        for q_dtype in _ATTENTION_DTYPES
+        for kv_dtype in _ATTENTION_DTYPES
+    ),
     traits={},
     priority=Priority.REFERENCE,
-    tags={"determinism", "portability"},
 )
 def torch_mla_decode_with_kvcache(
     q: torch.Tensor,
@@ -720,7 +732,6 @@ def _l2norm(x: torch.Tensor, eps: float) -> torch.Tensor:
         "output_h": frozenset({False}),
     },
     priority=Priority.REFERENCE,
-    tags={"determinism", "portability"},
 )
 def torch_gdn_chunk_prefill(
     q: torch.Tensor,

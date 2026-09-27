@@ -95,8 +95,12 @@ P arguments:
 --chunked-prefill-size 8192
 ```
 
-P is eager by role. Its layer windows partition the target decoder layers,
-excluding draft layers. The automatic split of 93 layers is `24,23,23,23`.
+P runs eager in this configuration: the chunk pipeline
+(`--pipeline-parallel-size 4`) forces `--enforce-eager`, and DeepEP keeps the
+prefill graph off regardless. A prefill node without PP or DeepEP captures
+prefill CUDA graphs like any server; only the decode graph is skipped there,
+since the role never decodes. Its layer windows partition the target decoder
+layers, excluding draft layers. The automatic split of 93 layers is `24,23,23,23`.
 `--pp-layer-partition 24,24,24,21` is another candidate: its first three
 boundaries align with the standard AttnRes blocks and the last stage owns
 fewer target layers alongside context writing and draft execution. Measure

@@ -46,6 +46,11 @@ def test_triton_bf16_moe_matches_reference(activation: str) -> None:
             routing_mode="precomputed_topk",
             ispp=32,
             solution=solution,
+            hidden=None,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
         )
         return tokenspeed_kernel.moe_apply(
             plan,

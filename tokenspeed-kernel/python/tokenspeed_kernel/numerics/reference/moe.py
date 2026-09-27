@@ -34,53 +34,15 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 _ROUTER_LOGITS_DTYPES = frozenset(
     {torch.float16, torch.bfloat16, torch.float32, torch.float64}
 )
-
-
-@register_kernel(
-    "moe",
-    "pack_topk_router_logits",
-    name="torch_pack_topk_router_logits",
-    solution="torch",
-    signatures=format_signatures("topk_weights", "dense", {torch.float32}),
-    traits={},
-    priority=Priority.PORTABLE,
-    tags={"determinism", "portability"},
-)
-def torch_pack_topk_router_logits(
-    *,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    num_experts: int,
-) -> torch.Tensor:
-    """Pack selected routes as dense FP32 log-probabilities.
-
-    Args:
-        topk_weights: FP32 route weights shaped ``[num_tokens, top_k]``.
-        topk_ids: Expert indices shaped ``[num_tokens, top_k]``.
-        num_experts: Width of the dense output.
-
-    Returns:
-        FP32 ``[num_tokens, num_experts]`` holding the log weight of every
-        selected expert and a large negative value elsewhere.
-    """
-    tokens = topk_weights.shape[0]
-    output = torch.full(
-        (tokens, num_experts),
-        -1.0e20,
-        dtype=torch.float32,
-        device=topk_weights.device,
-    )
-    output.scatter_(
-        1,
-        topk_ids.long(),
-        topk_weights.clamp_min(torch.finfo(torch.float32).tiny).log(),
-    )
-    return output
 
 
 @register_kernel(
@@ -91,7 +53,6 @@ def torch_pack_topk_router_logits(
     signatures=format_signatures("router_logits", "dense", _ROUTER_LOGITS_DTYPES),
     traits={},
     priority=Priority.PORTABLE,
-    tags={"determinism", "portability"},
 )
 def torch_softmax_topk(
     *,
@@ -137,7 +98,6 @@ def torch_softmax_topk(
     signatures=format_signatures("router_logits", "dense", _ROUTER_LOGITS_DTYPES),
     traits={},
     priority=Priority.PORTABLE,
-    tags={"determinism", "portability"},
 )
 def torch_sigmoid_bias_topk(
     *,
@@ -175,6 +135,60 @@ def torch_sigmoid_bias_topk(
     return topk_weights.to(weights_dtype), topk_ids.to(torch.int32)
 
 
+@register_kernel(
+    "moe",
+    "topk",
+    name="torch_sqrt_softplus_topk",
+    solution="torch",
+    signatures=frozenset(
+        format_signature(router_logits=dense_tensor_format(dtype))
+        for dtype in (torch.float16, torch.bfloat16, torch.float32)
+    ),
+    traits={
+        "routing_kind": frozenset({"plain", "bias", "hash"}),
+        "score_function": frozenset({"sqrt_softplus"}),
+    },
+    priority=Priority.PORTABLE,
+)
+def torch_sqrt_softplus_topk(
+    router_logits: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+    correction_bias: torch.Tensor | None,
+    hash_indices_table: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    need_scores: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    scores = torch.sqrt(F.softplus(router_logits.float()))
+    if hash_indices_table is not None:
+        if input_ids is None:
+            raise ValueError("hash routing requires input_ids")
+        table = hash_indices_table.to(device=scores.device, dtype=torch.int64)
+        ids = input_ids.reshape(-1).to(device=scores.device, dtype=torch.int64)
+        topk_ids = table[ids]
+    else:
+        selection_scores = scores
+        if correction_bias is not None:
+            bias = correction_bias.to(device=scores.device, dtype=scores.dtype)
+            if bias.ndim == 1:
+                bias = bias.unsqueeze(0)
+            selection_scores = selection_scores + bias
+        topk_ids = torch.topk(
+            selection_scores,
+            k=top_k,
+            dim=-1,
+            sorted=True,
+        ).indices
+    topk_weights = scores.gather(1, topk_ids.long())
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(torch.finfo(topk_weights.dtype).tiny)
+    output_scores = scores if need_scores else router_logits
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32), output_scores
+
+
 def _activate(
     gate_up: torch.Tensor,
     *,
@@ -210,6 +224,8 @@ def _activate(
         "weight_dtype": frozenset({"unquant"}),
         "activation": frozenset({"silu", "situ", "swiglu"}),
         "routing_mode": frozenset({"precomputed_topk"}),
+        "swiglu_form": frozenset({"standard"}),
+        "activation_clamped": frozenset({False}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({False}),
         "supports_all_to_all_ep": frozenset({False}),
@@ -217,7 +233,6 @@ def _activate(
         "supports_bias": frozenset({False}),
     },
     priority=Priority.REFERENCE,
-    tags={"determinism", "portability"},
 )
 def torch_precomputed_moe_apply(
     plan: dict,
@@ -239,7 +254,7 @@ def torch_precomputed_moe_apply(
 
     Args:
         plan: MoE plan; its ``activation`` selects SiLU/SwiGLU or SiTU, with
-            ``w.activation`` as the fallback.
+            only standard, unclamped SwiGLU supported.
         x: ``[tokens, hidden]`` FP16/BF16 hidden states.
         w: Module with ``w13_weight`` ``[E, 2I, H]`` (gate rows first) and
             ``w2_weight`` ``[E, H, I]``; SiTU reads ``activation_situ_beta``
@@ -261,7 +276,7 @@ def torch_precomputed_moe_apply(
         raise ValueError("the MoE reference always finalizes")
     if topk_weights is None or topk_ids is None:
         raise ValueError("the MoE reference requires precomputed topk weights and ids")
-    activation = plan.get("activation") or getattr(w, "activation", "silu")
+    activation = plan["activation"]
     if activation not in {"silu", "situ", "swiglu"}:
         raise ValueError(
             f"the MoE reference does not support activation {activation!r}"
@@ -269,8 +284,8 @@ def torch_precomputed_moe_apply(
     w13 = w.w13_weight
     w2 = w.w2_weight
     num_experts = w13.shape[0]
-    situ_beta = float(getattr(w, "activation_situ_beta", 1.0) or 1.0)
-    situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
+    situ_beta = float(w.activation_situ_beta) if activation == "situ" else 1.0
+    situ_linear_beta = w.activation_situ_linear_beta if activation == "situ" else None
 
     output = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
     for expert_id in range(num_experts):
@@ -296,8 +311,8 @@ def torch_precomputed_moe_apply(
 
 
 __all__ = [
-    "torch_pack_topk_router_logits",
     "torch_precomputed_moe_apply",
     "torch_sigmoid_bias_topk",
     "torch_softmax_topk",
+    "torch_sqrt_softplus_topk",
 ]

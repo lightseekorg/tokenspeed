@@ -119,7 +119,6 @@ def _reference_mxfp8_quantize(
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 2,
-    tags={"portability"},
 )
 def torch_mm_fp8_blockscale(
     A: torch.Tensor,
@@ -183,7 +182,6 @@ def torch_mm_fp8_blockscale(
         "b_layout": frozenset({"NK"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def torch_mm_fp8_scaled_mnk(
     A: torch.Tensor,
@@ -232,7 +230,6 @@ def torch_mm_fp8_scaled_mnk(
         "b_layout": frozenset({"KN"}),
     },
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def torch_mm_fp8_scaled_nkm(
     A: torch.Tensor,
@@ -277,7 +274,6 @@ def torch_mm_fp8_scaled_nkm(
     signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 3,
-    tags={"determinism", "portability"},
 )
 def torch_mm(
     A: torch.Tensor,
@@ -324,7 +320,6 @@ def torch_mm(
     signatures=_MXFP8_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 2,
-    tags={"portability"},
 )
 def torch_bmm_fp8_blockscale(
     A: torch.Tensor,
@@ -405,7 +400,6 @@ def _bmm_scaled_fp8_scale(
     signatures=_FP8_SCALED_BMM_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def torch_bmm_fp8_scaled(
     A: torch.Tensor,
@@ -448,7 +442,6 @@ def torch_bmm_fp8_scaled(
     solution="torch",
     signatures=_DENSE_GEMM_FORMAT_SIGNATURES,
     priority=Priority.PORTABLE + 3,
-    tags={"determinism", "portability"},
 )
 def torch_bmm(
     A: torch.Tensor,
@@ -548,7 +541,6 @@ _BF16_X_WEIGHT_FORMAT_SIGNATURES = frozenset(
     signatures=_BF16_X_WEIGHT_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def torch_decode_gemv(
     x: torch.Tensor,
@@ -569,7 +561,6 @@ def torch_decode_gemv(
     signatures=_BF16_X_WEIGHT_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def torch_grouped_bf16_projection(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None

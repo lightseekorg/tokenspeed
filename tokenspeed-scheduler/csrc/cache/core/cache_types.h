@@ -138,13 +138,14 @@ struct CompletedPages {
     std::int32_t first_new_prefix_page{0};
     // Which kind of resumable boundary the newly completed range ends on.
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
-    // Prefill publication streams newly completed history and snapshot-state
-    // blocks to Host. Decode publication leaves this false so only sliding
-    // windows keep streaming; finish/retract persist the remaining groups.
+    // State may retain an aligned checkpoint before an unaligned endpoint.
+    // Its classification must not promote the History or sliding groups.
+    std::optional<CacheBoundaryKind> state_boundary_kind{};
+    // Prefill streams newly published history and retained state to Host.
+    // Decode leaves this false; only sliding windows keep streaming.
     bool stream_completed_to_host{false};
-    // Exact snapshot provenance: aligned boundaries a prefill materialized or
-    // an accepted endpoint landed on, not yet hashed. Allocation and token
-    // progress are not proof; a boundary absent here is not published.
+    // Exact prefill checkpoint provenance. Allocation and token progress are
+    // not proof. An empty span disables state publication for this range.
     std::span<const std::int32_t> materialized_state_boundaries{};
 };
 

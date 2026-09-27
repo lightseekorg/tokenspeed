@@ -38,18 +38,18 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
-        gluon_dsv41_selected_attention_gfx950 as _dsv41_selected_gfx950,
+        launch_gluon_dsv41_selected_attention_gfx950 as _dsv41_selected_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import (
-        gluon_dsv41_selected_attention_gfx1250 as _dsv41_selected_gfx1250,
+        launch_gluon_dsv41_selected_attention_gfx1250 as _dsv41_selected_gfx1250,
     )
 
     _SIGNATURES = frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))})
     _INDEX_TRAITS = {
-        "native_indexer": frozenset({False}),
         "index_heads": frozenset(range(1, 33)),
         "index_k_format": frozenset({"mxfp4"}),
         "index_shards": frozenset({1}),
+        "native_indexer": frozenset({False}),
     }
 
     @register_kernel(
@@ -64,7 +64,6 @@ if current_platform().is_amd:
         ),
         signatures=_SIGNATURES,
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx950", "paged_cache", "selected_attention", "fusion"},
     )
     def gluon_dsv41_selected_attention_gfx950(*args, **kwargs):
         return _dsv41_selected_gfx950(*args, **kwargs)
@@ -82,7 +81,6 @@ if current_platform().is_amd:
         signatures=_SIGNATURES,
         traits=_INDEX_TRAITS,
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx950", "indexer", "fusion"},
     )
     def gluon_dsv41_index_topk_gfx950(*args, **kwargs):
         return run_dsv41_csa2_index_topk(
@@ -101,7 +99,6 @@ if current_platform().is_amd:
         ),
         signatures=_SIGNATURES,
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx1250", "paged_cache", "selected_attention", "fusion"},
     )
     def gluon_dsv41_selected_attention_gfx1250(*args, **kwargs):
         return _dsv41_selected_gfx1250(*args, **kwargs)
@@ -119,7 +116,6 @@ if current_platform().is_amd:
         signatures=_SIGNATURES,
         traits=_INDEX_TRAITS,
         priority=Priority.SPECIALIZED,
-        tags={"amd", "gfx1250", "indexer", "fusion"},
     )
     def gluon_dsv41_index_topk_gfx1250(*args, **kwargs):
         return run_dsv41_csa2_index_topk(

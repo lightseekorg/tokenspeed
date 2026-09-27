@@ -62,11 +62,6 @@ if platform.is_hopper_plus:
         set_pdl,
         transform_sf_into_required_layout,
     )
-    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
-        prepare_mega_moe_bf16_jit,
-    )
-
-    prepare_mega_moe_bf16_jit()
 else:
     ceil_to_ue8m0 = None
     transform_sf_into_required_layout = None
@@ -252,7 +247,6 @@ if platform.is_hopper_plus:
             "weight_scale_dtype": frozenset({torch.float32}),
         },
         priority=Priority.SPECIALIZED + 2,
-        tags={"throughput"},
         weight_preprocessor=_deep_gemm_dsv4_grouped_output_projection_weights,
     )
     def deep_gemm_dsv4_grouped_output_projection(
@@ -321,14 +315,13 @@ if platform.is_hopper_plus:
         ),
         signatures=_MXFP8_FORMAT_SIGNATURES,
         traits={
-            "n_align_64": frozenset({True}),
-            "k_align_128": frozenset({True}),
+            "n_align": frozenset({64}),
+            "k_align": frozenset({128}),
             # On Blackwell, the installed 1d1d kernel consumes transformed
             # UE8M0 scales and is reached through an explicit runtime override.
             "block_scale_layout": frozenset({"canonical"}),
         },
         priority=Priority.SPECIALIZED + 2,
-        tags={"throughput"},
     )
     def deep_gemm_mm_fp8_blockscale(
         A: torch.Tensor,

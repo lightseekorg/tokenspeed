@@ -44,6 +44,7 @@ def _matmul_decode(
     stride_y_z,
     stride_y_m,
     stride_y_n,
+    YGlobalScale,
     XGlobalScale,
     X,
     stride_x_z,
@@ -327,6 +328,8 @@ def _matmul_decode(
     BLOCKED_LAYOUT_Y: gl.constexpr = get_blocked_layout(
         [BLOCK_M, OUT_BLOCK_N], Y.dtype, cfg.NUM_WARPS
     )
+    if YGlobalScale is not None:
+        out = out * (1.0 / gl.load(YGlobalScale).to(gl.float32))
     out = out.to(Y.dtype.element_ty)
     out = gl.convert_layout(out, BLOCKED_LAYOUT_Y)
 

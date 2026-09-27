@@ -229,7 +229,9 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         "ngram_accepted_tokens",
         "ngram_needs_seed",
         "ngram_request_ids",
+        "request_token_history_ids",
     }
+    assert not runtime.has_request_token_history
     assert runtime.ngram_accepted_tokens.shape == (6, 3)
     assert runtime.ngram_accepted_tokens[2].tolist() == [18, 17, 16]
 
@@ -661,7 +663,8 @@ def test_executor_input_capacity_covers_decode_capture(
     runner = SimpleNamespace(
         mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(engram_layer_ids=[1], ngram_context_len=3)
+            hf_text_config=SimpleNamespace(engram_layer_ids=[1], ngram_context_len=3),
+            requires_request_token_history=False,
         ),
     )
     unsupported = pp_size != 1 or depth > 1
@@ -690,7 +693,7 @@ def test_executor_input_capacity_covers_decode_capture(
     [ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.MIXED, ForwardMode.IDLE],
 )
 def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
-    ib, _ = buffers
+    ib, runtime = buffers
     num_tokens = 0 if mode == ForwardMode.IDLE else 2
 
     class Model:
@@ -705,6 +708,7 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.model_runner = runner
     executor.input_buffers = ib
+    executor.runtime_states = runtime
     executor.config = SimpleNamespace(
         model_is_mrope=False, pp_size=1, data_parallel_size=1
     )
@@ -732,7 +736,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     buffers, monkeypatch, context_len, lengths
 ):
     """Run the startup forward, not just its serving-path counterpart."""
-    ib, _ = buffers
+    ib, runtime = buffers
     num_tokens = min(7, context_len * 2)
     bs = len(lengths)
     events = []
@@ -805,7 +809,9 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         device=ib.device,
     )
     executor.input_buffers = ib
+    executor.runtime_states = runtime
     executor.model_runner = runner
+    executor.drafter = None
     pg = PrefillGraph.__new__(PrefillGraph)
     pg.config = executor.config
     pg.input_buffers = ib
@@ -829,7 +835,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         model_executor.dist, "barrier", lambda: events.append("barrier")
     )
 
-    executor._autotune()
+    executor.autotune()
 
     assert (ib.ngram_previous_tokens_buf == -1).all()
     assert not ib.ngram_token_mask_buf.any()
@@ -844,6 +850,63 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         ("group", None),
         "barrier",
     ]
+
+
+def test_autotune_covers_the_draft_experts_once_per_geometry(monkeypatch):
+    """The tuning prefill drives the target only; the draft's own expert
+    geometry (DSpark: 128 experts) is tuned by one apply per distinct plan."""
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+
+    def moe_layer(prefix, num_experts, a2a="none", solution="flashinfer_cutlass"):
+        layer = MoELayer.__new__(MoELayer)
+        torch.nn.Module.__init__(layer)
+        layer.prefix = prefix
+        layer.hidden_size, layer.intermediate_size = 64, 32
+        layer.num_experts, layer.top_k = num_experts, 3
+        layer.input_dtype = torch.float16
+        layer.plan = {
+            "apply_kernel_name": "fake_apply",
+            "a2a_backend": a2a,
+            "solution": solution,
+            "support_routing": False,
+            "supports_precomputed_topk": True,
+        }
+        return layer
+
+    class Draft(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = moe_layer("draft.a", 128)
+            self.b = moe_layer("draft.b", 128)  # same geometry: tuned once
+            self.c = moe_layer("draft.c", 64)  # different geometry
+            self.d = moe_layer("draft.d", 128, a2a="deepep")  # collective: skipped
+
+    calls = []
+
+    def fake_apply(plan, x, layer, router_logits, **kwargs):
+        calls.append((layer.prefix, tuple(x.shape), kwargs["topk_ids"]))
+        # Synthetic activations must carry the dtype the plan was signed for
+        # (--dtype float16 drafts plan FP16 inputs, not BF16).
+        assert x.dtype == layer.input_dtype
+        return x
+
+    monkeypatch.setattr(model_executor.tokenspeed_kernel, "moe_apply", fake_apply)
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device = torch.device("cpu")
+    executor.drafter = SimpleNamespace(
+        draft_model_runner=SimpleNamespace(model=Draft())
+    )
+
+    executor._autotune_draft_experts(16)
+
+    assert [(c[0], c[1]) for c in calls] == [
+        ("draft.a", (16, 64)),
+        ("draft.c", (16, 64)),
+    ]
+    for _, _, ids in calls:
+        assert ids.dtype == torch.int32
+        # Distinct ids per token: FlashInfer's permutation rejects repeats.
+        assert all(len(set(row.tolist())) == 3 for row in ids)
 
 
 def test_execute_idle_forward_passes_empty_engram_views(buffers):
@@ -938,6 +1001,7 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         grammar_inputs=None,
         multimodal_context=None,
         ngram_inputs=snapshot,
+        request_history_seeds=None,
     )
     pending = handle._submit_forward(planned, capture_next_input_ids=False)
     states["a"].prompt_input_ids.clear()
@@ -1005,6 +1069,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
     config = SimpleNamespace(
         dtype=torch.bfloat16,
         hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"]),
+        tokenizer_kwargs={},
     )
     result = WeightLoader.load_model(
         model_config=config,

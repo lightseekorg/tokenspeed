@@ -61,6 +61,11 @@ def _torch_moe_ref(hidden, w13, w2, topk_ids, topk_weights) -> torch.Tensor:
         routing_mode="precomputed_topk",
         ispp=I_R,
         solution="reference",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     w = torch.nn.Module()
     w.w13_weight = w13

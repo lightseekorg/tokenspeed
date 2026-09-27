@@ -171,6 +171,7 @@ class KimiLinearMoEDeepEP(nn.Module):
             tp_rank=tp.tp_rank,
             tp_size=tp.tp_size,
             tp_group=tp.tp_group,
+            shared_parallel=None,
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
             reduce_results=False,

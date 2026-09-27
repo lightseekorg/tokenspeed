@@ -29,10 +29,10 @@ from tokenspeed_kernel.signature import format_signatures
 
 try:
     from tokenspeed_kernel_amd.ops.gfx950.sampling.argmax import (
-        gluon_argmax_gfx950 as _argmax_gfx950_impl,
+        launch_gluon_argmax_gfx950 as _argmax_gfx950_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.sampling.argmax import (
-        gluon_argmax_gfx1250 as _argmax_gfx1250_impl,
+        launch_gluon_argmax_gfx1250 as _argmax_gfx1250_impl,
     )
 except ImportError as exc:
     # Keep the message only: an exception object carries its traceback, which
@@ -60,7 +60,6 @@ if _IMPORT_ERROR_MESSAGE is None:
             "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
         ),
         priority=Priority.SPECIALIZED,
-        tags={"latency", "throughput"},
     )
     def gluon_argmax_gfx950(
         logits: torch.Tensor,
@@ -83,7 +82,6 @@ if _IMPORT_ERROR_MESSAGE is None:
             "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
         ),
         priority=Priority.SPECIALIZED,
-        tags={"latency", "throughput"},
     )
     def gluon_argmax_gfx1250(
         logits: torch.Tensor,

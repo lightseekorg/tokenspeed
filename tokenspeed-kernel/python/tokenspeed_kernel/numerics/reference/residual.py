@@ -50,7 +50,6 @@ from tokenspeed_kernel.signature import (
     ),
     traits={},
     priority=Priority.PORTABLE,
-    tags={"determinism", "portability"},
 )
 def torch_attn_res_fwd(
     *,
@@ -140,7 +139,6 @@ def torch_attn_res_fwd(
     ),
     traits={},
     priority=Priority.REFERENCE,
-    tags={"determinism", "portability"},
 )
 def torch_mhc_pre(
     residual: torch.Tensor,

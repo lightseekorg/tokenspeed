@@ -161,16 +161,15 @@ def gdn_chunk_prefill(
         checkpoints (also K-last).
     """
     head_dim = q.shape[-1]
-    head_v_dim = v.shape[-1]
+    value_head_dim = v.shape[-1]
     num_q_heads = q.shape[-2]
     num_v_heads = v.shape[-2]
     traits = {
         "head_dim": head_dim,
-        "head_v_dim": head_v_dim,
-        "head_v_eq_head_k": head_v_dim == k.shape[-1],
+        "value_head_dim": value_head_dim,
         "num_v_gte_num_q": num_v_heads >= num_q_heads,
-        "qk_l2norm": qk_l2norm,
         "output_h": output_h,
+        "qk_l2norm": qk_l2norm,
     }
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
@@ -188,7 +187,7 @@ def gdn_chunk_prefill(
         "num_q_heads": num_q_heads,
         "num_v_heads": num_v_heads,
         "head_dim": head_dim,
-        "head_v_dim": head_v_dim,
+        "head_v_dim": value_head_dim,
     }
     ShapeCapture.get().record(
         "attention",

@@ -28,7 +28,6 @@ if platform.is_nvidia and platform.is_hopper_plus:
         ),
         priority=Priority.SPECIALIZED + 2,
         traits={},
-        tags={"throughput"},
     )
     def cuda_attn_merge_state(
         out_a: torch.Tensor,

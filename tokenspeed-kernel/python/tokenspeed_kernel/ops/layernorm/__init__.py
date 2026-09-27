@@ -30,6 +30,9 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     grouped_gemma_rmsnorm as _grouped_gemma_rmsnorm,
 )
 from tokenspeed_kernel.ops.layernorm.triton import grouped_rmsnorm as _grouped_rmsnorm
+from tokenspeed_kernel.ops.layernorm.triton import (
+    reference_rmsnorm,
+)
 from tokenspeed_kernel.platform import current_platform
 
 _platform = current_platform()
@@ -217,5 +220,6 @@ __all__ = [
     "grouped_gemma_rmsnorm",
     "grouped_rmsnorm",
     "qk_rmsnorm",
+    "reference_rmsnorm",
     "rmsnorm",
 ]

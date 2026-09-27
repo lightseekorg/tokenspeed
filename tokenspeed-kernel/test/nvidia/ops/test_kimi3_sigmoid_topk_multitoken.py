@@ -46,8 +46,10 @@ if is_amd():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk  # noqa: E402
 from tokenspeed_kernel.ops.moe import sigmoid_topk as sigmoid_topk_mod  # noqa: E402
+from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
+    _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
+)
 from tokenspeed_kernel.ops.moe.triton.kimi3_sigmoid_topk import (  # noqa: E402
     kimi3_sigmoid_bias_topk,
 )

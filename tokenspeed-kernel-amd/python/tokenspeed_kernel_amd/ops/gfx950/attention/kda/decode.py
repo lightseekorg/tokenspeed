@@ -105,7 +105,7 @@ def _kda_value_panels(vectors, D: gl.constexpr, VALUE_LAYOUT: gl.constexpr):
 
 
 @gluon.jit
-def _kda_recurrent_decode_kernel(
+def gluon_kda_paged_decode_gfx950(
     q,
     k,
     v,
@@ -264,7 +264,7 @@ def _kda_recurrent_decode_kernel(
 
 
 @gluon.jit
-def _kda_fused_decode_kernel(
+def gluon_kda_fused_paged_decode_vmajor_gfx950(
     mixed_qkv,
     conv_weights,
     conv_states,
@@ -487,7 +487,7 @@ def _kda_fused_decode_kernel(
 
 
 @gluon.jit
-def _kda_fused_verify_kernel(
+def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     mixed_qkv: tl.const,
     conv_weights: tl.const,
     conv_pool: tl.const,
@@ -742,7 +742,7 @@ def _kda_fused_verify_kernel(
 
 
 @gluon.jit
-def _kda_fused_replay_kernel(
+def gluon_kda_fused_replay_gfx950(
     descriptors,
     group_indices,
     read_indices,
@@ -1077,7 +1077,9 @@ def gluon_kda_recurrent_decode_gfx950(
     output = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     block_key = triton.next_power_of_2(key_dim)
     block_value = min(32, triton.next_power_of_2(value_dim))
-    _kda_recurrent_decode_kernel[(triton.cdiv(value_dim, block_value), tokens * heads)](
+    gluon_kda_paged_decode_gfx950[
+        (triton.cdiv(value_dim, block_value), tokens * heads)
+    ](
         q,
         k,
         v,
@@ -1247,7 +1249,7 @@ def gluon_kda_fused_decode_gfx950(
     )
     # Beyond one CTA per CU, reduce VGPR pressure to favor higher occupancy.
     pipeline_depth = 1 if num_heads * tokens > _CDNA4_NUM_CUS else 8
-    _kda_fused_decode_kernel[(num_heads, tokens)](
+    gluon_kda_fused_paged_decode_vmajor_gfx950[(num_heads, tokens)](
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -1398,7 +1400,9 @@ def gluon_kda_fused_verify_gfx950(
         device=mixed_qkv.device,
     )
     value_splits = _kda_value_splits(batch)
-    _kda_fused_verify_kernel[(num_heads * value_splits, batch)](
+    gluon_kda_fused_paged_verify_nostore_vmajor_gfx950[
+        (num_heads * value_splits, batch)
+    ](
         mixed_qkv,
         conv_weights,
         conv_pool,
@@ -1438,7 +1442,7 @@ def gluon_kda_fused_verify_gfx950(
     return output
 
 
-def gluon_kda_fused_replay_gfx950(
+def launch_gluon_kda_fused_replay_gfx950(
     descriptors: torch.Tensor,
     group_indices: torch.Tensor,
     read_indices: torch.Tensor,
@@ -1484,7 +1488,7 @@ def gluon_kda_fused_replay_gfx950(
     batch = accepted_length.numel()
     if read_indices.shape[1] != batch:
         raise ValueError("accepted_length must match the replay batch")
-    _kda_fused_replay_kernel[(num_heads, batch, descriptors.shape[0])](
+    gluon_kda_fused_replay_gfx950[(num_heads, batch, descriptors.shape[0])](
         descriptors,
         group_indices,
         read_indices,
@@ -1512,7 +1516,7 @@ def gluon_kda_fused_replay_gfx950(
 
 __all__ = [
     "gluon_kda_fused_decode_gfx950",
-    "gluon_kda_fused_replay_gfx950",
+    "launch_gluon_kda_fused_replay_gfx950",
     "gluon_kda_fused_verify_gfx950",
     "gluon_kda_recurrent_decode_gfx950",
 ]

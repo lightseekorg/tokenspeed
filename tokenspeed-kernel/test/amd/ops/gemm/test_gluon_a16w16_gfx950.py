@@ -33,7 +33,7 @@ if not is_cdna4():
 
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     _supports_largem_shape,
-    gluon_mm_a16w16_largem_gfx950,
+    launch_gluon_mm_a16w16_prefill_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _choose_mfma_lds_mediumm_config,
@@ -43,31 +43,31 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _use_mfma_lds_mediumm,
     _use_mfma_lds_smallm,
     _use_warp_reduce_smallm,
-    gluon_bmm_a16w16_gfx950,
     gluon_mm_a16w16_gfx950,
-    gluon_mm_a16w16_mfma_lds_mediumm_gfx950,
-    gluon_mm_a16w16_mfma_lds_smallm_gfx950,
-    gluon_mm_a16w16_warp_reduce_smallm_gfx950,
+    launch_gluon_bmm_a16w16_gfx950,
+    launch_gluon_mm_a16w16_medium_gfx950,
+    launch_gluon_mm_a16w16_splitk_gfx950,
+    launch_gluon_mm_a16w16_warp_gfx950,
 )
 
 _CORRECTNESS_CASES = [
     pytest.param(
-        gluon_mm_a16w16_warp_reduce_smallm_gfx950,
+        launch_gluon_mm_a16w16_warp_gfx950,
         (2, 128, 1024),
         id="warp-reduce",
     ),
     pytest.param(
-        gluon_mm_a16w16_mfma_lds_smallm_gfx950,
+        launch_gluon_mm_a16w16_splitk_gfx950,
         (4, 256, 2048),
         id="splitk-smallm",
     ),
     pytest.param(
-        gluon_mm_a16w16_mfma_lds_mediumm_gfx950,
+        launch_gluon_mm_a16w16_medium_gfx950,
         (8, 128, 64),
         id="mediumm",
     ),
     pytest.param(
-        gluon_mm_a16w16_largem_gfx950,
+        launch_gluon_mm_a16w16_prefill_gfx950,
         (256, 256, 256),
         id="largem",
     ),
@@ -120,7 +120,7 @@ def test_dense16_bmm_writes_strided_out(batch: int) -> None:
     backing = torch.empty((m, batch, n + 17), device="cuda", dtype=dtype)
     out = backing[..., :n].transpose(0, 1)
 
-    actual = gluon_bmm_a16w16_gfx950(a, b, dtype, out=out)
+    actual = launch_gluon_bmm_a16w16_gfx950(a, b, dtype, out=out)
 
     assert actual is out
     torch.testing.assert_close(out, torch.bmm(a, weight), atol=1e-2, rtol=1e-2)
@@ -130,7 +130,7 @@ def test_dense16_bmm_rejects_unsupported_shape() -> None:
     a = torch.empty((12, 2, 128), device="cuda", dtype=torch.bfloat16)
     b = torch.empty((12, 512, 128), device="cuda", dtype=torch.bfloat16)
 
-    assert gluon_bmm_a16w16_gfx950(a, b, torch.bfloat16) is None
+    assert launch_gluon_bmm_a16w16_gfx950(a, b, torch.bfloat16) is None
 
 
 def test_splitk_smallm_out_handles_padded_reducer_rows() -> None:
@@ -142,7 +142,7 @@ def test_splitk_smallm_out_handles_padded_reducer_rows() -> None:
     backing = torch.empty((m, n + 17), device="cuda", dtype=dtype)
     out = backing[:, :n]
 
-    actual = gluon_mm_a16w16_mfma_lds_smallm_gfx950(a, b, dtype, out=out)
+    actual = launch_gluon_mm_a16w16_splitk_gfx950(a, b, dtype, out=out)
 
     assert actual is out
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)

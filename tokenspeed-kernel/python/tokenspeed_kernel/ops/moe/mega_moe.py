@@ -97,7 +97,8 @@ def trtllm_mega_moe_process_weights(plan: dict, w: torch.nn.Module) -> None:
         "internal_activation_dtype": frozenset({"input"}),
         "supports_bias": frozenset({False}),
     },
-    priority=Priority.PORTABLE - 1,
+    # Keep this production fallback outside the ground-truth-only band.
+    priority=Priority.PORTABLE,
 )
 def trtllm_nvfp4_mega_moe_apply(
     plan: dict,
