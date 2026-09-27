@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 from hashlib import sha256
@@ -20,6 +21,7 @@ def run_bash(command: str, env: dict[str, str]) -> subprocess.CompletedProcess[s
 
 def test_other_clusters_do_not_enable_package_cache(tmp_path: Path):
     env = os.environ.copy()
+    env.pop("RUNNER_NAME", None)
     env.update(
         {
             "CI_RUNNER_LABEL": "gb200-4gpu",
@@ -62,7 +64,8 @@ def test_slurm_uses_mounted_persistent_cache(tmp_path: Path):
     env = os.environ.copy()
     env.update(
         {
-            "CI_RUNNER_LABEL": "slurm-gb300-4gpu",
+            "CI_RUNNER_LABEL": "b200-4gpu",
+            "RUNNER_NAME": "slurm-123",
             "XDG_CACHE_HOME": str(tmp_path),
         }
     )
@@ -138,7 +141,7 @@ def test_nvcc_cache_normalizes_checkout_and_isolates_fork_writes(
             "100G",
             "002",
             read_only,
-            str(workspace / ".ci-artifacts" / "ccache-stats.log"),
+            str(workspace / ".ccache-tmp" / "ccache-stats.log"),
             "",
         ]
     )
@@ -210,3 +213,27 @@ exit 1
     assert (tmp_path / "curl-calls").read_text().splitlines() == ["called"]
     assert (cache_dir / "pkg.whl").read_text() == "complete wheel"
     assert not list(cache_dir.glob("*.tmp.*"))
+
+
+@pytest.mark.parametrize(
+    ("version", "origin", "matches"),
+    [
+        ("1.0", {"archive_info": {"hashes": {"sha256": "expected"}}}, True),
+        ("1.0", {"archive_info": {"hashes": {"sha256": "different"}}}, False),
+        ("2.0", {"archive_info": {"hashes": {"sha256": "expected"}}}, False),
+    ],
+)
+def test_installed_wheel_requires_matching_version_and_archive(
+    tmp_path: Path, version: str, origin: dict, matches: bool
+):
+    dist = tmp_path / "cache_test-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(f"Name: cache-test\nVersion: {version}\n")
+    (dist / "direct_url.json").write_text(json.dumps(origin))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(tmp_path)
+    result = run_bash(
+        "if installed_wheel_matches cache-test 1.0 expected; then echo reuse; else echo install; fi",
+        env,
+    )
+    assert result.stdout.strip() == ("reuse" if matches else "install")
