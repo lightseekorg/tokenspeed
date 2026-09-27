@@ -92,7 +92,9 @@ def test_canonical_and_prepacked_gemm_match(device: str, m: int) -> None:
     )
 
     torch.testing.assert_close(prepacked, expected, atol=0, rtol=0)
-    torch.testing.assert_close(canonical, prepacked, atol=5e-4, rtol=2e-3)
+    # Canonical quantizes the activation with another kernel and may take the
+    # K-major scale path, so it can differ by a few bf16 ulps; |out| ~ 5e-3.
+    torch.testing.assert_close(canonical, prepacked, atol=1e-4, rtol=1e-2)
 
 
 def test_prepacked_gemm_rejects_canonical_weight_scales(device: str) -> None:
@@ -242,5 +244,4 @@ def test_prepared_plan_is_exact_for_partial_row_tiles(device: str, m: int) -> No
     ).repeat_interleave(128, dim=1)
     reference = activation @ dequantized.t()
 
-    error = (got.float() - reference).abs().max()
-    assert error < 0.01 * reference.abs().max()
+    torch.testing.assert_close(got.float(), reference, atol=1e-3, rtol=1e-2)
