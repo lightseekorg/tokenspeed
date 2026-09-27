@@ -1,8 +1,13 @@
+import os
+import sys
 from dataclasses import fields, replace
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
 
 import tokenspeed.runtime.layers.attention.kv_cache.mha as mha_cache
 from tokenspeed.runtime.cache.transfer.layout import (
@@ -44,6 +49,15 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.registry import _prepare_verify_workspace
+
+register_cuda_ci(
+    est_time=10,
+    suite="runtime-1gpu",
+    nightly=False,
+    disabled=None,
+    disabled_on_runners=None,
+    disabled_on_runners_reason=None,
+)
 
 
 def _pool_over_new_arena(spec, config, *, num_layers: int, rank: int = 0):
@@ -972,3 +986,7 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
 
     assert usable_pages == 15
     assert (usable_pages + 1) * 64 * 16 <= 16_384
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
