@@ -149,10 +149,9 @@ def gluon_latent_input_mediumm_gfx950(
     pid_n = gl.program_id(1)
     xcd = 0
     if XCD_SCHEDULE:
-        # Assume round-robin XCD dispatch with program_id(0) varying fastest
-        # in the (num_m, num_n) grid. Contiguous runs balance workgroup counts
-        # to within one while keeping most weight tiles' row tiles on one XCD.
-        # Run boundaries can split a weight tile's row tiles across two XCDs.
+        # Workgroup w runs on XCD w % NUM_XCDS. Give each XCD a contiguous run
+        # of column tiles with all their row tiles, so each weight tile is
+        # fetched into one XCD's L2 instead of one per row tile.
         num_m = gl.num_programs(0)
         num_tiles = num_m * gl.num_programs(1)
         wid = pid_n * num_m + pid_m
