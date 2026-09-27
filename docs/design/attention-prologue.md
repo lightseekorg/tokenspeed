@@ -175,7 +175,8 @@ rows past the real tokens land in the dummy slot 0, which the span keeps in
 its tail and which page-table holes already use. A MIXED round's decode rows
 follow the span in that buffer (`GroupTableStacks.append_decode_rows`), so
 every row of the forward has its slot. A forward wider than the buffer never
-replays a graph, so it gets a fresh padded tensor.
+replays a graph, so it gets a fresh padded tensor containing both the extend and decode
+rows.
 Padding costs only the masked programs of the tile past the real tokens. Core
 attention stays the eager break (`PagedAttention.attend`). A model that overlaps
 work on an auxiliary stream runs `prologue` inside its fork scope and calls

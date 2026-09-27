@@ -353,16 +353,14 @@ class GroupTableStacks:
 
     def append_decode_rows(self, first_token: int, count: int) -> None:
         """Place a MIXED round's decode rows, ``decode_locs[:, first:first + count]``
-        after its extend span, so one padded span covers every row of the forward."""
+        after its extend span, retaining the tail for padding past the buffer."""
         total = self._extend_total
         self._forward_total = total + count
         tail = self.decode_locs[:, first_token : first_token + count]
+        self._decode_tail = tail
         if self._forward_total <= self.extend_locs.shape[1]:
             self.extend_locs[:, total : self._forward_total].copy_(tail)
             self.extend_locs[:, self._forward_total :].zero_()
-            self._decode_tail = None
-        else:
-            self._decode_tail = tail
 
     def padded_extend_span(self, group_id: str, rows: int) -> torch.Tensor:
         """The forward's rows (the extend span, then a MIXED round's decode rows)

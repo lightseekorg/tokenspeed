@@ -240,6 +240,11 @@ class PersistentExtendSpanTest(unittest.TestCase):
         self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 14])
         with self.assertRaisesRegex(ValueError, "cannot pad to 3 rows"):
             stacks.padded_extend_span(FULL, 3)
+        # Widening past capacity preserves the decode row as well.
+        self.assertEqual(
+            stacks.padded_extend_span(FULL, 9).tolist(),
+            [36, 37, 38, 14, 0, 0, 0, 0, 0],
+        )
         # A new pure extend drops the decode rows again.
         stacks.extend_locations(
             torch.tensor([4], dtype=torch.int32),

@@ -2149,3 +2149,75 @@ def test_prologue_kernels_constrain_only_traits_the_entries_state(monkeypatch):
         for spec in KernelRegistry.get().list_kernels("attention", mode):
             bounds = {f"{key}{end}" for key in keys for end in ("_min", "_max")}
             assert set(spec.traits) <= keys | bounds, spec.name
+
+
+@pytest.mark.parametrize("mrope", [None, MRope((16, 8, 8), False)])
+def test_gqa_token_count_reuses_compiled_tiles(mrope):
+    """Warm each tile size and runtime integer class before varying batch sizes."""
+    from tokenspeed_kernel.ops.attention.prologue.triton import _gqa_prologue_kernel
+    from utils import assert_no_triton_compile
+
+    hq, hkv, dim = 4, 2, 64
+    table = cos_sin_cache(dim)
+    norm = head_norm(dim, 1.0, seed=201)
+    k_cache, v_cache = gqa_cache(2048, hkv, dim, BF16)
+
+    def run(count):
+        q, k, v = split(qkv(count, hq, hkv, dim, seed=202), hq, hkv, dim)
+        positions = torch.arange(count, device="cuda")
+        if mrope is not None:
+            positions = positions.repeat(3, 1)
+        out = gqa_prologue(
+            q,
+            k,
+            v,
+            norm=norm,
+            rotary=Rotary(table, positions, RopeStyle.NEOX, mrope),
+            cache=HeadKVCache(
+                k_cache, v_cache, None, torch.arange(count, device="cuda")
+            ),
+            return_kv=True,
+            solution="triton",
+            override=None,
+        )
+        assert bytes_equal(k_cache[:count].flatten(1), out.k)
+        assert bytes_equal(v_cache[:count].flatten(1), v)
+
+    for count in (1, 32, 33, 128, 129, 512, 513):
+        run(count)
+    with assert_no_triton_compile(_gqa_prologue_kernel):
+        for count in (7, 48, 63, 97, 192, 255, 320, 777, 1024):
+            run(count)
+
+
+def test_mla_token_count_reuses_compiled_tiles():
+    """The six token tile sizes cover new batch counts without new binaries."""
+    from tokenspeed_kernel.ops.embedding.triton import _mla_rope_set_kv_buffer_kernel
+    from utils import assert_no_triton_compile
+
+    heads, rank, rope = 4, 512, 64
+    table = cos_sin_cache(rope)
+    cache = poisoned_latent(2048, rank + rope, BF16)
+
+    def run(count):
+        q_nope, q_pe, latent = mla_inputs(count, heads, rank, rope, seed=203)
+        out = mla_prologue(
+            mla_query(q_nope, rope),
+            q_pe,
+            latent,
+            expanded=None,
+            rotary=Rotary(
+                table, torch.arange(count, device="cuda"), RopeStyle.NEOX, None
+            ),
+            cache=latent_target(cache, torch.arange(count, device="cuda")),
+            solution="triton",
+            override=None,
+        )
+        assert bytes_equal(out.query[..., :rank], q_nope)
+        assert bytes_equal(cache[:count, 0, :rank], latent[:, :rank])
+
+    for count in (1, 32, 33, 256, 257, 448, 449, 672, 673, 896, 897, 1120, 1121):
+        run(count)
+    with assert_no_triton_compile(_mla_rope_set_kv_buffer_kernel):
+        for count in (7, 48, 97, 320, 333, 512, 555, 768, 777, 960, 999, 1280, 1483):
+            run(count)

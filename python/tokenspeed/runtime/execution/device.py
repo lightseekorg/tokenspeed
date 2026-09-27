@@ -829,22 +829,15 @@ def arm_data_plane_sync_debug(device: str) -> None:
 
 
 def _cudagraph_probe_refusal(
-    server_args: ServerArgs, model_config: ModelConfig, model: torch.nn.Module
+    server_args: ServerArgs, model: torch.nn.Module
 ) -> str | None:
     """Why this boot cannot use a probe, or None when it can.
 
-    ``enforce_eager`` captures nothing to measure. A family that stages
-    speculative verify scratch in the bound pool needs a row per request at
-    the serving concurrency, which a probe arena can only supply by growing
-    to serving size -- measured at 31 GiB for Kimi-K3 at ``--max-num-seqs
-    256``, for four captures it then throws away. A narrowing model's decoder
+    ``enforce_eager`` captures nothing to measure. A narrowing model's decoder
     ladder fabricates a request per ``max_decoder_rows_per_request`` rows,
     which the floor cannot bound before the model is built.
     """
     from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
-    from tokenspeed.runtime.layers.attention.registry import (
-        cudagraph_probe_supported,
-    )
 
     if server_args.disable_cudagraph_memory_reserve:
         return "--disable-cudagraph-memory-reserve is set"
@@ -852,8 +845,6 @@ def _cudagraph_probe_refusal(
         return "--enforce-eager captures no graphs"
     if narrowing_prefill_model(model) is not None:
         return "a narrowing prefill model's decoder ladder is unbounded before build"
-    if not cudagraph_probe_supported(server_args, model_config):
-        return "this cache family cannot bind a probe-sized arena"
     return None
 
 
@@ -1057,7 +1048,7 @@ def build_device_side(
         server_args.attention_backend,
         server_args.drafter_attention_backend,
     )
-    refusal = _cudagraph_probe_refusal(server_args, model_config, target.model)
+    refusal = _cudagraph_probe_refusal(server_args, target.model)
     if refusal is not None:
         logger.info(f"CUDA-graph memory reserve off: {refusal}")
     probing = refusal is None
