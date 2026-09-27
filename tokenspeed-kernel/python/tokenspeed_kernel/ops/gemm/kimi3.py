@@ -1034,7 +1034,9 @@ def kimi3_shared_down_projection(
                 gluon_wmma_tdm_dense_gfx1250,
             )
 
-            return gluon_wmma_tdm_dense_gfx1250(hidden_states, weight, out=out)
+            return gluon_wmma_tdm_dense_gfx1250(
+                hidden_states, weight, out=out, split_k=None
+            )
         return torch.mm(hidden_states, weight.T, out=out)
     expected_output = (m, output_width)
     if out is None:
