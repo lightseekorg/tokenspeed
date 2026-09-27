@@ -263,8 +263,15 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia(
     topk: int,
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
-    weights_dtype: torch.dtype = torch.float32,
+    weights_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return packed top-16 weights and ids for FP32 ``[tokens, 896]`` logits.
+
+    Arguments follow ``kimi3_sigmoid_bias_topk`` with explicit ``topk=16``.
+    Layouts are made contiguous and correction bias is widened to FP32.
+    Returns ``[tokens, 16]`` weights in ``weights_dtype`` and INT32 ids;
+    mapped variants translate ids through ``logical_to_physical_map``.
+    """
     return _invoke_packed(
         router_logits=router_logits,
         correction_bias=correction_bias,
@@ -293,8 +300,15 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
     logical_to_physical_map: torch.Tensor,
-    weights_dtype: torch.dtype = torch.float32,
+    weights_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return packed top-16 weights and ids for FP32 ``[tokens, 896]`` logits.
+
+    Arguments follow ``kimi3_sigmoid_bias_topk`` with explicit ``topk=16``.
+    Layouts are made contiguous and correction bias is widened to FP32.
+    Returns ``[tokens, 16]`` weights in ``weights_dtype`` and INT32 ids;
+    mapped variants translate ids through ``logical_to_physical_map``.
+    """
     return _invoke_packed(
         router_logits=router_logits,
         correction_bias=correction_bias,
@@ -327,8 +341,15 @@ def triton_kimi3_packed_sigmoid_bias_topk_gfx1250(
     topk: int,
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
-    weights_dtype: torch.dtype = torch.float32,
+    weights_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return packed top-16 weights and ids for FP32 ``[tokens, 896]`` logits.
+
+    Arguments follow ``kimi3_sigmoid_bias_topk`` with explicit ``topk=16``.
+    Layouts are made contiguous and correction bias is widened to FP32.
+    Returns ``[tokens, 16]`` weights in ``weights_dtype`` and INT32 ids;
+    mapped variants translate ids through ``logical_to_physical_map``.
+    """
     return _invoke_packed(
         router_logits=router_logits,
         correction_bias=correction_bias,
@@ -361,8 +382,15 @@ def triton_kimi3_packed_sigmoid_bias_topk_gfx1250_mapped(
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
     logical_to_physical_map: torch.Tensor,
-    weights_dtype: torch.dtype = torch.float32,
+    weights_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return packed top-16 weights and ids for FP32 ``[tokens, 896]`` logits.
+
+    Arguments follow ``kimi3_sigmoid_bias_topk`` with explicit ``topk=16``.
+    Layouts are made contiguous and correction bias is widened to FP32.
+    Returns ``[tokens, 16]`` weights in ``weights_dtype`` and INT32 ids;
+    mapped variants translate ids through ``logical_to_physical_map``.
+    """
     return _invoke_packed(
         router_logits=router_logits,
         correction_bias=correction_bias,

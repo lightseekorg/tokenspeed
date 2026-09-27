@@ -2,16 +2,30 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
 import pytest
 import torch
 from tokenspeed_kernel.platform import current_platform
 
-if not current_platform().is_cdna4:
-    pytest.skip("AMD CDNA4 is required for Kimi routing tests", allow_module_level=True)
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
+
+pytestmark = pytest.mark.skipif(
+    not current_platform().is_cdna4,
+    reason="AMD CDNA4 is required for Kimi routing tests",
+)
 
 
-from tokenspeed_kernel.ops.moe import sigmoid_topk as packed_topk_module  # noqa: E402
 from tokenspeed_kernel.ops.moe.gluon import sigmoid_topk as routing_module  # noqa: E402
+from tokenspeed_kernel.ops.moe.triton import (  # noqa: E402
+    decode_sigmoid_topk as decode_topk_module,
+)
 from tokenspeed_kernel.ops.moe.triton.minimax_topk import (  # noqa: E402
     minimax_biased_grouped_topk,
 )
@@ -66,9 +80,9 @@ def test_generic_topk_uses_k3_decode_or_small_m_gluon_route(
     )
     route_calls = 0
     if num_tokens == 1:
-        original_route = packed_topk_module.kimi3_sigmoid_bias_topk
-        patch_target = packed_topk_module
-        patch_name = "kimi3_sigmoid_bias_topk"
+        original_route = decode_topk_module._decode_sigmoid_bias_topk
+        patch_target = decode_topk_module
+        patch_name = "_decode_sigmoid_bias_topk"
     else:
         original_route = routing_module.invoke_sigmoid_bias_topk_route_gluon
         patch_target = routing_module
@@ -186,3 +200,7 @@ def test_generic_topk_uses_prefill_gluon_route(
         rtol=5e-3,
         atol=5e-3,
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

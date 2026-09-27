@@ -101,11 +101,13 @@ def _moe_sigmoid_bias_topk(
 
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
     traits = {"tokens": tokens, "experts": experts, "topk": topk}
-    if (
-        logical_to_physical_map is not None
-        and logical_to_physical_map.dtype == torch.int32
-        and solution is None
-        and (override is None or override.endswith("_mapped"))
+    if logical_to_physical_map is not None and (
+        (override is not None and override.endswith("_mapped"))
+        or (
+            logical_to_physical_map.dtype == torch.int32
+            and solution is None
+            and override is None
+        )
     ):
         try:
             mapped_kernel = select_kernel(

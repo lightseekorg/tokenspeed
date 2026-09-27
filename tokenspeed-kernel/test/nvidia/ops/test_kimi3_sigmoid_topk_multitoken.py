@@ -254,6 +254,7 @@ def test_packed_wrapper_rejects_a_non_k3_topk():
             topk=8,
             routed_scaling_factor=2.5,
             normalize_topk_weights=True,
+            weights_dtype=torch.float32,
         )
 
 
@@ -278,6 +279,7 @@ def test_packed_mapped_wrapper_keeps_an_int64_dispatch_map(monkeypatch):
         routed_scaling_factor=2.5,
         normalize_topk_weights=True,
         logical_to_physical_map=dispatch,
+        weights_dtype=torch.float32,
     )
     assert seen == [torch.int64]
 
@@ -380,3 +382,36 @@ def test_packed_drops_nan_rows_like_the_grouped_kernel():
     # A NaN weight in a kept row would poison that row's normalizing sum.
     assert torch.isfinite(pw[finite]).all()
     assert ((pi >= 0) & (pi < EXPERTS)).all()
+
+
+@pytest.mark.parametrize("map_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("solution", [None, "triton"])
+def test_dispatcher_packed_mapped_override_preserves_physical_ids(map_dtype, solution):
+    torch.manual_seed(19)
+    logits = torch.randn(4, EXPERTS, device="cuda", dtype=torch.float32) * 0.2
+    bias = torch.randn(EXPERTS, device="cuda", dtype=torch.float32) * 0.01
+    dispatch = torch.randperm(EXPERTS, device="cuda").to(map_dtype)
+    ref_weights, ref_ids = moe_sigmoid_bias_topk(
+        logits,
+        bias,
+        TOPK,
+        routed_scaling_factor=2.5,
+        normalize_topk_weights=True,
+        weights_dtype=torch.float32,
+        override="triton_kimi3_packed_sigmoid_bias_topk_nvidia",
+    )
+    weights, ids = moe_sigmoid_bias_topk(
+        logits,
+        bias,
+        TOPK,
+        routed_scaling_factor=2.5,
+        normalize_topk_weights=True,
+        weights_dtype=torch.float32,
+        logical_to_physical_map=dispatch,
+        solution=solution,
+        override="triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped",
+    )
+    torch.testing.assert_close(
+        ids, dispatch[ref_ids.long()].to(torch.int32), rtol=0, atol=0
+    )
+    torch.testing.assert_close(weights, ref_weights, rtol=0, atol=0)
