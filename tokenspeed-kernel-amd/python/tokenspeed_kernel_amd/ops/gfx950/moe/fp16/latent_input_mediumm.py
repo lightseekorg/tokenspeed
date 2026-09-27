@@ -30,12 +30,13 @@ projection as BF16. Each shared-expert tile reads 64 gate rows and the
 matching 64 up rows, so SiTU is applied in the epilogue and no gate/up
 intermediate or second launch is needed.
 
-The 256-row tile also schedules per XCD: program ids are remapped so the row
-tiles sharing a weight tile share one L2, and each XCD starts its K loop at a
-different eighth of K and wraps around, so the XCDs do not all read the same
-activation columns at the same time. Its leftover K tiles run inside the
-pipeline rather than after the drain. The 128-row tile keeps the plain launch
-order and an unpipelined tail.
+The 256-row tile also schedules per XCD. Assuming round-robin dispatch,
+program ids give each XCD a contiguous run of output tiles, so most weight
+tiles keep all their row tiles on one XCD. A run boundary can split a weight
+tile's row tiles across two XCDs. Each XCD starts its K loop at a different
+eighth of K and wraps around to spread activation reads. The 256-row tile
+runs leftover K tiles inside the pipeline rather than after the drain. The
+128-row tile keeps the plain launch order and an unpipelined tail.
 """
 
 from __future__ import annotations
@@ -148,9 +149,10 @@ def gluon_latent_input_mediumm_gfx950(
     pid_n = gl.program_id(1)
     xcd = 0
     if XCD_SCHEDULE:
-        # Workgroup w runs on XCD w % NUM_XCDS. Give each XCD a contiguous run
-        # of column tiles with all their row tiles, so each weight tile is
-        # fetched into one XCD's L2 instead of one per row tile.
+        # Assume round-robin XCD dispatch with program_id(0) varying fastest
+        # in the (num_m, num_n) grid. Contiguous runs balance workgroup counts
+        # to within one while keeping most weight tiles' row tiles on one XCD.
+        # Run boundaries can split a weight tile's row tiles across two XCDs.
         num_m = gl.num_programs(0)
         num_tiles = num_m * gl.num_programs(1)
         wid = pid_n * num_m + pid_m
