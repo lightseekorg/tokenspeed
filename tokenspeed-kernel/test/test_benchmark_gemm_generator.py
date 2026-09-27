@@ -193,6 +193,138 @@ def test_dense_mm_runs_through_harness_with_registered_reference(
     assert set(out_shapes) == {(4, 3)}
 
 
+def _run_timing_case(
+    monkeypatch,
+    platform,
+    spec: KernelSpec,
+    mode: str,
+    parameters: dict,
+) -> tuple[object, list[dict]]:
+    """Run a timing-only GEMM case against a fake registration on CPU."""
+    calls: list[dict] = []
+
+    def kernel(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+
+    KernelRegistry.get().register(spec, kernel)
+    monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(
+        gemm_generator,
+        "_random_tensors",
+        lambda _seed, dtype, *shapes: [torch.zeros(s, dtype=dtype) for s in shapes],
+    )
+    result = KernelBenchmarkHarness(
+        FakeTimer(), platform_provider=lambda: platform
+    ).run(
+        BenchmarkRequest(
+            family="gemm",
+            mode=mode,
+            parameters=parameters,
+            solution=None,
+            registration=spec.name,
+            cold_cache=True,
+            seed=42,
+        ),
+        measurement_blocks=3,
+    )
+    return result, calls
+
+
+def test_decode_gemv_passes_x_weight_and_out(
+    mi350_platform, fresh_registry, monkeypatch
+):
+    _ = fresh_registry
+    spec = KernelSpec(
+        name="unit_decode_gemv",
+        family="gemm",
+        mode="decode_gemv",
+        solution="unit",
+        format_signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        traits={
+            "m": frozenset({1}),
+            "n_min": frozenset({128}),
+            "k_min": frozenset({128}),
+        },
+    )
+
+    result, calls = _run_timing_case(
+        monkeypatch,
+        mi350_platform,
+        spec,
+        "decode_gemv",
+        {"M": 1, "N": 3648, "K": 7168, "dtype": "bfloat16"},
+    )
+
+    assert result.status is BenchmarkStatus.SUCCESS, result.to_dict()
+    x, weight, out = calls[0]["args"]
+    assert (x.shape, weight.shape, out.shape) == ((1, 7168), (3648, 7168), (1, 3648))
+
+
+def test_linear_attnres_partials_passes_projection_and_scratch(
+    mi350_platform, fresh_registry, monkeypatch
+):
+    _ = fresh_registry
+    roles = (
+        "hidden_states",
+        "weight",
+        "blocks",
+        "score_weight_a",
+        "score_weight_b",
+        "out",
+    )
+    spec = KernelSpec(
+        name="unit_linear_attnres_partials",
+        family="gemm",
+        mode="linear_attnres_partials",
+        solution="unit",
+        format_signatures=frozenset(
+            {
+                format_signature(
+                    **{r: dense_tensor_format(torch.bfloat16) for r in roles}
+                )
+            }
+        ),
+        traits={
+            "tokens": frozenset({1, 2, 4}),
+            "input_size": frozenset({7168}),
+            "output_size": frozenset({6288}),
+            "num_blocks": frozenset(range(1, 12)),
+            "inputs_contiguous": frozenset({True}),
+        },
+    )
+    parameters = {
+        "tokens": 4,
+        "input_size": 7168,
+        "output_size": 6288,
+        "num_blocks": 8,
+        "dtype": "bfloat16",
+        "eps": 1e-5,
+    }
+
+    result, calls = _run_timing_case(
+        monkeypatch, mi350_platform, spec, "linear_attnres_partials", parameters
+    )
+
+    assert result.status is BenchmarkStatus.SUCCESS, result.to_dict()
+    kwargs = calls[0]["kwargs"]
+    assert kwargs["blocks"].shape == (8, 4, 7168)
+    assert kwargs["out"].shape == (4, 6288)
+    assert kwargs["eps"] == 1e-5
+    for scratch in (kwargs["scratch_a"], kwargs["scratch_b"]):
+        assert [(t.shape, t.dtype) for t in scratch] == [
+            ((4,), torch.float32),
+            ((4,), torch.float32),
+            ((4, 7168), torch.float32),
+        ]
+
+
 @pytest.mark.parametrize(
     "parameters, match",
     [
