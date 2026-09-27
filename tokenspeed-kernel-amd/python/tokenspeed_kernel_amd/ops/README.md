@@ -282,6 +282,65 @@ or out-of-range cache pages never contribute rows or blocks, including the
 newest visible block. A valid newest block remains eligible regardless of its
 score.
 
+### gfx950 MLA prefill
+
+Two kernels compute dense, non-absorbed MLA prefill attention over ragged
+sequences, `gluon_mla_prefill_gfx950` and `gluon_mla_prefill_8wave_gfx950`.
+The 8-wave kernel handles 16-bit inputs as well, but is registered for FP8
+only for now.
+
+#### Contract
+
+- Queries are `(tokens, heads, 192)` and keys are `(tokens, kv_heads, 192)`
+  (128 no-PE plus 64 RoPE dimensions); values are `(tokens, kv_heads, 128)`,
+  all FP16, BF16, FP8 E4M3, or FP8 E5M2 with one shared dtype and a contiguous
+  last dimension. Query heads must be a multiple of KV heads.
+- `cu_seqlens_q` and `cu_seqlens_kv` delimit the sequences. Causal masking
+  aligns each query block to the end of its keys. `logit_cap` is unsupported.
+- The output may be any caller-owned floating dtype with a contiguous last
+  dimension; the optional log-sum-exp is FP32 in natural-log units.
+- For FP8 inputs the 8-wave kernel requires `avg_kv_len_min=1024`: at least
+  1024 key tokens per sequence on average, measured on Kimi-K3 prefill shapes.
+  Selection rounds the average down to a power of two to bound its cache;
+  this preserves the 1024-token cutoff exactly, including ragged batches.
+- Both launch a persistent grid of 512 workgroups. Batch sizes, sequence
+  lengths, and scheduler slots are runtime values, so varying ragged batches
+  reuse the warmed binaries.
+- Low-level launchers require explicit `is_causal`, `logit_cap`, and
+  `return_lse`. `seq_lens_kv` and `max_seqlen_kv` are redundant hints that must
+  agree with the authoritative `cu_seqlens_kv` lengths.
+- Both share launch metadata that reports attention FLOPs and each tensor's
+  bytes once without reading device-resident sequence lengths: FLOPs assume
+  every sequence has the batch's average query and key length.
+
+#### Algorithm
+
+All paths use base-2 online softmax. `gluon_mla_prefill_gfx950` runs 16-bit
+inputs with four wave64s over 128-row query blocks and 64-key tiles: fully
+visible tiles double-buffer their asynchronous copies, and the diagonal band
+and key tail run masked and unpipelined. Its FP8 path uses eight wave64s over
+256-row blocks, 64-key tiles with the unscaled K=64 FP8 MFMA, splits each score
+tile into two 32-column halves, and overlaps a tile's QK MFMA with the previous
+tile's softmax and PV MFMA.
+
+`gluon_mla_prefill_8wave_gfx950` follows the 8-wave warp-pipeline design:
+each of eight wave64s owns 32 query rows of a 256-row block. Key tiles are 32
+rows for 16-bit inputs and 64 for FP8, which keeps the working set within 256
+VGPRs. Each loop iteration runs four clusters: K reads with the rescale, the
+next tile's QK MFMAs with the current tile's softmax, V reads, and the PV
+MFMAs with the next tile's row maximum. The two waves on a SIMD run one
+cluster apart, so one wave's MFMAs overlap the other's memory work.
+
+K and V stream into 4-slot LDS rings by asynchronous copies, K four tiles
+ahead and V three. Tiles past the visible range load fully masked; buffer
+loads zero-fill masked rows in LDS, so the loop needs no drain, and only tiles
+crossing the causal diagonal or the key tail apply a score mask. For 16-bit
+inputs the running maximum moves only when a tile maximum exceeds it by more
+than 8 (base 2); FP8 keeps the exact maximum so P stays at most 1 before its
+FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
+asm statements keep LLVM from moving each cluster's results across cluster
+barriers.
+
 ## Sampling
 
 ### Argmax
