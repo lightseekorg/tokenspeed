@@ -15,32 +15,26 @@ cache recipe, a quantization method or a drafter, to an unmodified mainline
 `tokenspeed`, and have that model scheduled, cached, disaggregated and
 speculated on exactly like an in-tree one.
 
-The scheduler already needs nothing for this: the C++ scheduler and the event
-loop see cache groups, block granularity and a capacity model, never a model
-class. What is closed today is the runtime's *discovery* layer — the model
-registry scans only its own package, architecture names are matched against
-hard-coded tables to pick the attention family, and several CLI arguments are
-closed `choices=` lists. The kernel package already ships an entry-point
-plugin system designed for this, but the runtime never invokes it.
+The scheduler and event loop see cache groups, block granularity and a
+capacity model, never a model class. Mainline already has runtime plugins:
+`ModelConfig.__init__` calls `tokenspeed.runtime.plugins.ensure_loaded()`,
+which invokes kernel `discover_plugins()` before runtime entry points.
+Models, configs, attention and linear-attention backends, cache recipes,
+cache pools and drafters have registration APIs, and registered models
+already resolve through `ModelProfile`.
 
-The proposal is therefore small in mechanism and mostly a matter of turning
-closed tables into registries and moving one piece of knowledge to where it
-belongs:
+This RFC builds on that implemented baseline. The remaining work is to:
 
-1. A `tokenspeed.plugins` entry-point group and one idempotent
-   `ensure_loaded()` call, made in every process before a `ModelConfig` is
-   built. It also runs `tokenspeed_kernel.plugins.discover_plugins()`.
-2. One `register_*` function per dispatch point that is a closed container
-   today (models, configs, cache recipes and pools, quantization
-   methods, drafters); attention backends already have one.
-3. A declarative `ModelProfile` on the model class that states its attention
-   arch, cache family and forced/default backends, replacing the
-   architecture-name tables. In-tree models migrate onto it, so plugin and
-   in-tree models resolve through the same path.
-4. CLI validation of backend/quantization/algorithm names moves from
-   argparse `choices=` to a post-discovery registry check.
-5. A fixture plugin under `test/` that exercises the whole surface end to end,
-   so mainline refactors that break the plugin contract fail CI.
+1. Harden discovery ordering, failure handling and paired disabling without
+   introducing a second loader.
+2. Make behavioral registration arguments explicit, complete quantization
+   and kernel-solution registration, and unify drafter resolution.
+3. Extend the existing profile with forced-backend and PD compatibility
+   facts, complete the other profile contracts below, then migrate in-tree
+   architecture tables onto the same path.
+4. Complete post-discovery validation for the remaining closed CLI names.
+5. Extend the existing runtime plugin tests with an installable fixture and
+   end-to-end coverage of the supported execution and transfer contracts.
 
 ## Motivation
 
@@ -48,7 +42,7 @@ Downstream deployers commonly have a model or a set of kernels they cannot
 publish — a proprietary architecture, a vendor-restricted kernel, an
 in-flight research variant — and still want the scheduler, the cache
 subsystem, PD disaggregation and speculative decoding from mainline, tracked
-closely. Today their options are:
+closely. Before the current registration APIs, their options were:
 
 - **Fork and rebase.** Every mainline refactor of the touched registries is a
   conflict; the fork drifts and stops contributing back.
@@ -59,7 +53,9 @@ closely. Today their options are:
 - **Re-implement the serving loop** around the kernel package. Discards the
   part they actually wanted.
 
-None of these is a design. The project's own collaboration principle — core
+The implemented registries avoid these workarounds for supported extensions;
+the remaining gaps below still need a complete contract. The project's
+own collaboration principle — core
 features are designed and implemented by the core team — is served, not
 undermined, by a supported extension surface: it lets downstream code stay
 downstream instead of arriving as forks or as pressure to upstream models the
@@ -94,28 +90,29 @@ owns them.
 So the contract between "a model" and "the scheduler" is already inverted:
 the scheduler depends on the `CacheSetup` abstraction, and models depend on
 `PagedAttention` / `AttentionBackend` / `CacheRecipe`. A plugin model that
-expresses its state as cache groups gets scheduling, PD transfer, retraction
-and prefix caching for free. This RFC does not change that contract; it only
-lets a model that lives outside `tokenspeed.runtime.models` reach it.
+expresses its state as cache groups uses the common scheduling, retraction
+and prefix-cache path. PD additionally requires a supported transfer
+contract; registration alone does not establish that support. This RFC
+extends the existing out-of-tree integration without changing ownership.
 
 ## Current state: inventory of dispatch points
 
-Paths are relative to `python/tokenspeed/runtime/` unless noted. "Open" means
-an out-of-tree package can reach it today without patching; "closed" means it
-cannot.
+Paths are relative to `python/tokenspeed/runtime/` unless noted. This table
+describes current code; the proposal below distinguishes retained behavior
+from contract changes.
 
-| Dispatch point | Where | Mechanism today | State |
-| --- | --- | --- | --- |
-| Kernel implementation selection | `tokenspeed_kernel/registry.py`, `tokenspeed_kernel/plugins/` | `@register_kernel`, `KernelRegistry.register` allows re-registration by name, `Priority.PLUGIN` band 16–19 reserved for plugins, `TOKENSPEED_KERNEL_OVERRIDE_<FAMILY>_<MODE>` env override, entry-point group `tokenspeed_kernel.plugins` with `discover_plugins()` | Open on the kernel side; **the runtime never calls `discover_plugins()`** |
-| HF `architectures[...]` → model class | `models/registry.py` `import_model_classes` | `pkgutil.iter_modules` over `tokenspeed.runtime.models` only, collecting `EntryClass`; `ModelRegistry.models` is a plain dict on a module singleton | Closed (patchable, unsupported) |
-| Architecture → attention arch, default backend, default prefix granularity | `configs/model_config.py` `_ATTENTION_FAMILY_SPECS`, `_resolve_attention_family`, `_apply_attention_family_defaults` | Tuple of `_AttentionFamilySpec(architectures=frozenset(...))`; an architecture in no spec **silently resolves to MHA** | Closed |
-| Architecture → hybrid/linear/DSpark/Inkling facts, forced backend, cache family | `layers/attention/registry.py` `_HYBRID_*_ARCHITECTURES`, `_INKLING_ARCHITECTURES`, `_DSPARK_DRAFT_ARCHITECTURES`, `_resolve_attn_side`, `_apply_backend_overrides`, `_resolve_cache_family` | Architecture-name sets → `_AttnSideProfile` booleans → if-chains | Closed |
-| Attention backend name → class | `layers/attention/registry.py` `register_backend`, `_BACKEND_REGISTRY` | Module-level dict; every in-tree backend module registers itself at import | Open dict, but `--attention-backend` / `--drafter-attention-backend` are closed `choices=` lists (`utils/server_args.py`), and `backends/paged/mha.py` `_KERNEL_SOLUTION_BY_BACKEND` is a closed name → solution map |
-| Cache family → recipe / pool | `layers/attention/kv_cache/recipes/setup.py` `CacheModelFamily` (a `Literal`), `_RECIPES`; `layers/attention/kv_cache/factory.py` `_mha_pool_class`, `create_cache_pool` | Closed dict + if-chain on the family string | Closed; `CacheRecipe` itself is a well-shaped ABC |
-| Quantization method name → config class | `layers/quantization/__init__.py` `QUANTIZATION_METHODS`; `layers/linear.py` `LinearBase.__init__` | Closed dict; per-layer method chosen by an `isinstance` chain over config classes, bypassing `QuantizationConfig.get_quant_method` for most of them | Closed |
-| Speculative algorithm → drafter | `execution/drafter/__init__.py` `get_drafter_impl`; `execution/factory.py` `configure_draft_target`; `utils/hf_transformers_utils.py` draft architecture rewrite | Local dict plus `isinstance` special cases on the draft model class; `("DFLASH", "DSPARK")` hard-coded as the algorithms needing `TargetCaptureConfigurator`; draft architecture derived by string suffixing | Closed |
-| Sampling backend name → class | `sampling/registry.py` `register_backend` | Module-level dict | Open |
-| Process-level startup hook for third-party code | — | None. `ExtensibleLM`'s `ext_def_file` (`models/extensible.py`) is a user-pointed import but is scoped to input/output processors and runs in the loader, after `ModelConfig` has already resolved the attention family | Missing |
+| Dispatch point | Where | Implemented baseline and remaining gap |
+| --- | --- | --- |
+| Kernel selection and discovery | `tokenspeed_kernel/registry.py`, `tokenspeed_kernel/plugins/`; runtime `plugins/__init__.py` | Open kernel registry and entry points; runtime `ensure_loaded()` already calls `discover_plugins()`. Strict failure and shared disable policy below are proposed changes. |
+| HF architecture → model/config class | `models/registry.py`, `plugins/registry.py` | `register_model` and `register_config` exist; the model registry combines built-in classes and plugin registrations. |
+| Attention geometry and defaults | `configs/model_config.py`, `configs/model_profile.py` | Registered models use `ModelProfile.configure_attention` and defaults; unprofiled in-tree models still use `_ATTENTION_FAMILY_SPECS`. |
+| Family facts, forced backend and PD support | `layers/attention/registry.py` | Profiles already select cache families and linear attention. `_apply_backend_overrides` and `_check_pd_support` still use architecture facts for V4/V4.1 and Inkling constraints; profiles cannot declare those constraints. |
+| Attention backend and kernel solution | `plugins/registry.py`, `layers/attention/registry.py`, `backends/paged/mha.py` | Attention registration and post-discovery name validation exist; the MHA name → kernel-solution map remains closed. |
+| Cache family → recipe/pool | `plugins/registry.py`, `layers/attention/kv_cache/recipes/setup.py`, `kv_cache/factory.py` | `CacheModelFamily` is already `str`; recipe and pool registration and profile-based family selection exist. |
+| Quantization method → config class | `layers/quantization/__init__.py`, `layers/linear.py` | Closed method table; linear dispatch still mixes class checks with `get_quant_method` calls. |
+| Algorithm → drafter | `execution/drafter/__init__.py`, `plugins/registry.py` | Plugin algorithm/default and model-class-scoped registration exists, ahead of the in-tree resolver. Target capture, block geometry and draft-architecture routing still need the unified contract below. |
+| Sampling backend | `sampling/registry.py` | Open registry. |
+| Process startup | `plugins/__init__.py`, `configs/model_config.py` | `tokenspeed.plugins` entry points, `ensure_loaded()`, `list_plugins()` and `PLUGIN_API_VERSION = 1` exist. `test/runtime/test_runtime_plugins.py` covers loader and registry behavior. |
 
 One process-boundary fact shapes the design: `ModelConfig` is constructed
 independently in the frontend (`engine/async_llm.py`), the scheduler process
@@ -128,18 +125,30 @@ it has to run in every process, before the first `ModelConfig`.
 
 ### P1. `tokenspeed.runtime.plugins`: discovery
 
-A new module mirroring `tokenspeed_kernel.plugins`:
+The existing module already exposes the following names at API version 1.
+The declarations and examples below describe the proposed next contract,
+not the currently implemented signatures; incompatible changes require an
+API-version bump and updated exact dependency pins:
+
 
 ```python
 ENTRY_POINT_GROUP = "tokenspeed.plugins"
 DISABLE_ENV_VAR = "TOKENSPEED_DISABLE_PLUGINS"
-PLUGIN_API_VERSION = 1
+PLUGIN_API_VERSION = 2
 
 def ensure_loaded() -> list[PluginInfo]: ...
 def list_plugins() -> list[PluginInfo]: ...
 ```
 
-Semantics:
+Today `ensure_loaded()` loads kernel plugins first, skips runtime entry
+points named by `TOKENSPEED_DISABLE_PLUGINS`, and warns and continues after a
+failed runtime registration. The `recording()` context undoes recorded runtime
+registrations on failure. `register_attention_backend` already imports built-in
+backends before inserting a plugin override. The geometry callback is also
+implemented: `ModelConfig` invokes `profile.configure_attention(self)`.
+These guarantees must be preserved; they are not missing APIs.
+
+Proposed hardening of that same loader:
 
 - `ensure_loaded()` is idempotent per process. It first imports
   every built-in registry, including attention backends and model classes,
@@ -181,11 +190,13 @@ allowlist as an alternative is discussed under Open questions.
 
 ### P2. Registration surface
 
-Each closed container in the inventory becomes a registry with one
-registration function. The in-tree content is the registry's initial state;
-nothing about in-tree resolution changes. All functions live in
-`tokenspeed.runtime.plugins.registry` and are the plugin author's whole
-import surface for registration.
+The model/config, attention/linear-attention, cache and drafter registration
+functions already live in `tokenspeed.runtime.plugins.registry`. The target
+API below retains that surface, makes behavioral choices explicit and adds
+quantization registration. In-tree results must stay unchanged during the
+migration. Existing defaulted `override` arguments become required under the
+new API version; the drafter migration must also preserve its existing
+checkpoint-selection argument.
 
 ```python
 def register_model(cls: type[nn.Module], *, architectures: tuple[str, ...] = (), override: bool) -> None
@@ -195,7 +206,7 @@ def register_linear_attention_backend(name: str, factory: Callable[..., Attentio
 def register_cache_recipe(family: str, recipe: Callable[..., CacheRecipe], *, override: bool) -> None
 def register_cache_pool(family: str, factory: Callable[..., CachePool], *, override: bool) -> None
 def register_quantization_method(name: str, cls: type[QuantizationConfig], *, override: bool) -> None
-def register_drafter(algorithm: str, cls: type[BaseDrafter], *, draft_model_cls: type[nn.Module] | None, override: bool) -> None
+def register_drafter(algorithm: str, drafter_cls: type[BaseDrafter], *, model_cls: type[nn.Module] | None, defaults_to_base_checkpoint: bool, override: bool) -> None
 ```
 
 `override` is a required keyword argument. With `override=False`, a name
@@ -207,8 +218,12 @@ a visible decision in the plugin's source, and it is logged.
 Omitting `architectures` means the model class name alone (or no architecture
 aliases for a config); omitting `model_type` uses the config class's declared
 model type. A config with neither a model type nor architecture aliases is
-invalid. `draft_model_cls` must be explicit: `None` selects the algorithm
+invalid. `model_cls` must be explicit: `None` selects the algorithm
 catch-all, while a class selects only that class and its subclasses.
+`defaults_to_base_checkpoint` also becomes explicit. Today it is recorded
+for introspection and callers still pass `--draft-model-path-use-base`;
+the migration must preserve explicit checkpoint choices and define its
+post-discovery use before removing that launch requirement.
 
 Per registry:
 
@@ -234,31 +249,30 @@ MHA by fallback. The in-tree architecture tables stay as the seed for
 in-tree models until the P3 migration deletes them.
 
 **Linear-attention backends.** `_create_hybrid_linear_attn_backend` chose
-between the KDA and GDN backends by architecture name. That table becomes a
-registry seeded with `"kda"` and `"gdn"`;
+between the KDA and GDN backends by architecture name. The implemented registry is seeded with `"kda"` and `"gdn"`;
 `register_linear_attention_backend` adds a name, and
 `ModelProfile.linear_attention` selects it. This is how Flash-Lite runs
 FGBKDA (featurewise beta) as a subclass of the in-tree KDA backend with only
 the recurrence seams overridden.
 
-**Attention backends.** `register_backend` already exists; the public wrapper
-adds the explicit collision policy and preserves every supplied argument.
+**Attention backends.** The existing public wrapper already checks collisions
+and seeds built-ins. Its proposed signature makes the policy explicit and
+continues to preserve every supplied argument.
 `_KERNEL_SOLUTION_BY_BACKEND` in `backends/paged/mha.py` becomes a
 `register_mha_kernel_solution(backend_name, solution, *, override: bool)`
 on the same module,
 so a plugin can add a backend name that routes MHA leaves to its own
 `solution` string.
 
-**Cache recipes and pools.** `CacheModelFamily` changes from `Literal[...]`
-to `str`. `_RECIPES` and the family dispatch in `create_cache_pool` /
-`_mha_pool_class` become registries. A plugin with a non-standard KV layout
+**Cache recipes and pools.** `CacheModelFamily` is already `str`, and recipe
+and pool registration is implemented alongside the built-in family dispatch. A plugin with a non-standard KV layout
 subclasses `CacheRecipe` (the seams are `layer_types`, `group_ids`,
 `fields_for_layer`, `groups`, `packing`, `workspace_bytes`, `pool_options`)
 and registers the recipe and the pool under a new family name. A plugin with
 a standard layout registers nothing here and names an existing family.
-Family-string property tables elsewhere in the runtime (e.g. which families
-use paged state during verify) become class attributes on the recipe, so a
-new family never has to edit a second table.
+Recipe facts already describe paged state during verify. Remaining family
+constraints, including PD compatibility below, must likewise be declared so
+a new family never has to edit a second architecture table.
 
 **Quantization.** `QUANTIZATION_METHODS` becomes a registry. The
 `isinstance` chain in `LinearBase.__init__` is replaced by one call,
@@ -268,8 +282,9 @@ in-tree config class implementing the branch that today lives in
 `QuantizationConfig` subclass that is not one of the listed classes falls
 through the chain with no `quant_method` set.
 
-**Drafters.** `DRAFTER_MAPPING` and the `isinstance` special cases become a
-registry keyed `(algorithm, draft_model_cls | None)`; resolution picks the
+**Drafters.** Plugin entries already precede `DRAFTER_MAPPING` and the
+in-tree `isinstance` special cases, with the most recently registered class
+match winning. The proposed unified registry uses `(algorithm, model_cls)`; resolution picks the
 most specific matching class, falling back to `(algorithm, None)`.
 Resolve using the registered draft model class before model instantiation;
 ambiguous incomparable class matches are errors.
@@ -295,8 +310,9 @@ LCM groups, owned by the cache subsystem and scheduler; these traits do not
 create drafter-private per-request state or a second execution path.
 
 **CLI.** `--attention-backend`, `--drafter-attention-backend`,
-`--quantization` and `--speculative-algorithm` drop argparse `choices=`
-and are validated against the corresponding registry after `ensure_loaded()`, producing the
+`--speculative-algorithm` already accept plugin names and validate after
+discovery. `--quantization` must also drop its closed choices and validate
+against the corresponding registry after `ensure_loaded()`, producing the
 same "unknown X, available: [...]" error a user gets today. The help text
 lists the in-tree names and says plugins may add more. `--moe-backend`
 retains its existing enum and validation; extending MoE dispatch is outside
@@ -311,11 +327,23 @@ plugin-owned argument namespace.
 
 ### P3. `ModelProfile`: the model declares its own family facts
 
-Registered models use this profile from phase 1, as required by P2. The
+Registered models already use `configs/model_profile.py::ModelProfile`.
+Its current fields are `configure_attention`, `cache_family`,
+`linear_attention`, `default_attention_backend`, `default_prefix_granularity`,
+`request_token_history`, `tokenizer_kwargs` and `attention_instances_per_layer`
+(the last currently defaults to 1). Tokenizer kwargs are already passed to
+frontend, scheduler and worker loads; request token history is implemented.
+
+The schema below is the proposed next version: it retains those contracts,
+replaces the defaulted multiplicity with an explicit resolved layer count,
+and adds draft routing, forced-backend and PD compatibility declarations. The
 in-tree migration later removes the remaining architecture-name tables,
 so all model-family knowledge lives on the model class:
 
 ```python
+PDRole = Literal["target", "speculative_target", "draft"]
+
+
 @dataclass(frozen=True, kw_only=True)
 class ModelProfile:
     configure_attention: Callable[[ModelConfig], None]  # writes arch + geometry
@@ -325,6 +353,9 @@ class ModelProfile:
     cache_family: str                        # a registered recipe/pool family
     linear_attention: str | None             # a registered linear-attn backend
     default_attention_backend: str | None    # used only if the user passed none
+    forced_attention_backend: str | None    # when this model is the target
+    forced_drafter_attention_backend: str | None  # when this model is the draft
+    pd_roles: frozenset[PDRole]              # supported PD roles; empty forbids PD
     default_prefix_granularity: int | None
     request_token_history: bool              # model reads committed tokens
     tokenizer_kwargs: Mapping[str, object]
@@ -340,6 +371,9 @@ class FooForCausalLM(nn.Module):
             cache_family="mla",
             linear_attention=None,
             default_attention_backend="flashmla",
+            forced_attention_backend=None,
+            forced_drafter_attention_backend=None,
+            pd_roles=frozenset({"target", "speculative_target", "draft"}),
             default_prefix_granularity=64,
             request_token_history=False,
             tokenizer_kwargs={},
@@ -366,13 +400,42 @@ registration, not a fallback to MHA.
 
 Profile field contracts:
 
+- Both forced-backend fields are required, with explicit `None` meaning no
+  constraint for that role. `_apply_backend_overrides` applies the target
+  profile's `forced_attention_backend` to `attention_backend` and the draft
+  profile's `forced_drafter_attention_backend` to `drafter_attention_backend`,
+  after user/default selection but before `_create_attn_config` and cache
+  construction. Validate the forced names through the same backend registry
+  and log any overridden user choice. V4 targets require `deepseek_v4`,
+  V4.1 targets require `deepseek_v41`, and ordinary V4/V4.1 draft profiles
+  require `deepseek_v4`, preserving today's role-specific behavior. With
+  linear attention, the forced name selects the full-attention leaf; the
+  existing `hybrid_linear_attn` wrapper still composes it with the linear
+  backend. The original user request remains available for diagnostics,
+  but must not overwrite the resolved forced leaf.
+- `pd_roles` declares compatibility of this profile's selected cache layout.
+  The existing common `_check_pd_support` gate consumes both resolved profiles
+  in prefill/decode disaggregation, before attention/cache allocation. The
+  target must permit `"target"`; if a draft model exists **or** a speculative
+  algorithm is selected, it must also permit `"speculative_target"`. A draft
+  profile must permit `"draft"`. Missing permission fails startup, and an
+  empty set forbids PD. Non-PD execution is unaffected. V4/V4.1 ordinary
+  cache profiles permit target and speculative-target roles but not draft;
+  Inkling permits target only, preserving both existing rejection cases.
+  DSpark profiles are separate: do not infer ordinary V4 draft restrictions
+  from their architecture names (the current resolver explicitly excludes
+  them). Profile declarations cannot bypass recipe/layout compatibility or
+  transfer checks, and recipe constraints must also be satisfied. Unprofiled
+  in-tree models retain their existing gates until migration. Today profiled
+  models clear the architecture booleans those gates inspect, so this closes
+  an existing gap as well as making table removal safe.
+
 - `tokenizer_kwargs` exists because a released tokenizer may need
   construction arguments (`fix_mistral_regex=True` for LongCat's Bloom-style
-  tokenizer). `ModelConfig` stores a resolved copy as its explicitly
-  initialized `tokenizer_kwargs` field. Every tokenizer load, including
+  tokenizer). The existing `ModelConfig.tokenizer_kwargs` property reads
+  the resolved profile mapping; retain that single source. Every tokenizer load, including
   frontend `AsyncLLM`, scheduler-side `RequestHandler` and worker weight
-  loading, receives these
-  values explicitly; none reconstructs a config-dependent profile from only
+  loading, receives these values explicitly; none reconstructs a config-dependent profile from only
   an architecture list. Explicit caller kwargs win on conflicts; profile
   values do not override explicit tokenizer mode or trust settings.
 - A profile field may gate a generic runtime capability rather than a
@@ -382,7 +445,8 @@ Profile field contracts:
   once; the profile only switches it on. This is the pattern for future
   model needs that are state, not dispatch.
 - `num_attention_layers` is computed from the checkpoint by the profile
-  factory and assigned to `ModelConfig` before cache setup. It replaces
+  factory and assigned to `ModelConfig` before cache setup. The migration
+  replaces the existing `attention_instances_per_layer` multiplication and
   `_derive_num_attention_layers` and architecture-name multipliers: a block
   with two attention instances declares twice its block count. Draft profiles
   declare their own count; cache recipes still determine whether a draft
@@ -487,8 +551,8 @@ from tokenspeed.runtime.plugins import PLUGIN_API_VERSION
 from tokenspeed.runtime.plugins.registry import register_model
 
 def register() -> None:
-    if PLUGIN_API_VERSION != 1:
-        raise RuntimeError(f"my_plugin targets plugin API 1, host has {PLUGIN_API_VERSION}")
+    if PLUGIN_API_VERSION != 2:
+        raise RuntimeError(f"my_plugin targets plugin API 2, host has {PLUGIN_API_VERSION}")
     from my_plugin.models import FooForCausalLM, FooForCausalLMNextN
     register_model(FooForCausalLM, override=False)
     register_model(FooForCausalLMNextN, override=False)
@@ -584,7 +648,8 @@ Launching is unchanged: `python -m tokenspeed.launch_server --model-path
 What the plugin author must do for the model to be scheduled like an in-tree
 one is exactly what an in-tree author must do: express per-request state as
 cache groups. If the model has a standard KV layout, it names an existing
-`cache_family` and inherits PD transfer, prefix caching and retraction. If it
+`cache_family` and inherits prefix caching and retraction; PD additionally
+requires the declared role and transfer compatibility. If it
 has a novel layout, it ships a `CacheRecipe`, not backend-private state —
 the same rule `AGENTS.md` states for in-tree attention backends.
 
@@ -615,7 +680,11 @@ plugin exists. Three measures:
    paired disable handling, explicit collision policy, MLA/DSA geometry,
    nonstandard cache families, multiple attention instances, config-dependent
    tokenizer options in every process, and draft routing/geometry/storage
-   under both eager execution and CUDA graphs. Negative cases must fail
+   under both eager execution and CUDA graphs. Add forced-backend tests with
+   conflicting user choices on both model sides, hybrid leaf composition, and
+   PD role tests covering V4 draft rejection, Inkling with either a draft or
+   an algorithm alone, target-only acceptance and separate DSpark profiles.
+   Negative cases must fail
    startup before any request can run.
 3. **Exact pins.** Plugins pin `tokenspeed` and `tokenspeed_kernel` exactly,
    as the kernel plugin README already requires. The RFC does not promise
@@ -637,37 +706,33 @@ plugin exists. Three measures:
 
 ## Phasing
 
-All phases are planned; this PR contains the RFC only, not a runtime
-implementation or fixture plugin. Each phase must include its contract tests
-and documentation before it is independently mergeable.
+This PR changes only the RFC. The implemented baseline is the inventory
+above, including API version 1 and `test/runtime/test_runtime_plugins.py`;
+the work below is planned on top of it. Each phase includes its contract
+tests and documentation before it is independently mergeable.
 
-1. **Discovery and the registrations that make a private model runnable**
-   *(planned)*.
-   `tokenspeed.runtime.plugins` with `ensure_loaded()` (calling the kernel
-   discovery with strict failure handling and shared disable policy),
-   `register_model` + `ModelProfile` resolution for registered classes,
-   `register_config`, the `register_attention_backend` wrapper,
-   `register_linear_attention_backend`, `register_cache_recipe` /
-   `register_cache_pool`, CLI attention-backend validation moved after
-   discovery. Cache registries moved up from phase 2 because a hybrid model
-   is not runnable without its state layout; the linear-attention registry
-   was pulled in for the same reason. All profile fields shown in P3 ship
-   here, including resolved tokenizer-kwargs transport and the generic token
-   history capability with prefix-resume and graph-stability tests. Empty
-   draft mappings/target sets are explicit until phase 2 adds drafter use;
-   there are no fields added implicitly between phases. Any subsequent
-   required-field or semantic change bumps `PLUGIN_API_VERSION`.
-2. **Remaining registries.** Quantization (including the `get_quant_method`
-   unification), drafter (including geometry/storage traits and the
-   profile's `draft_architecture` / `is_draft_of`),
-   `register_mha_kernel_solution`,
-   validation of the remaining CLI names.
-3. **In-tree `ModelProfile` migration.** Give every in-tree entry class a
-   profile, switch the resolvers to read only profiles, delete the
-   architecture-name tables.
+1. **Harden the existing plugin contract.** Keep the current discovery and
+   registrations; add strict kernel/runtime failure handling, shared disable
+   policy and explicit registration arguments. Introduce the next profile
+   schema, forced target/draft backend selection and common PD-role checks.
+   Preserve geometry initialization, tokenizer transport and token-history
+   behavior already implemented. Replace the multiplicity field with the
+   explicit layer count while preserving existing model results. Draft
+   mappings/target sets are explicit but unused until phase 2. These breaking
+   changes bump `PLUGIN_API_VERSION` to 2 together with plugin migrations;
+   API-1 packages are not silently interpreted as API-2 declarations. Begin
+   the installable fixture and design-contract document here.
+2. **Complete remaining dispatch contracts.** Add quantization registration
+   and `get_quant_method` unification; unify the existing plugin and in-tree
+   drafter resolvers with geometry/storage traits and profile draft routing;
+   add `register_mha_kernel_solution` and remaining CLI validation. Preserve
+   existing drafter checkpoint-selection arguments during migration.
+3. **In-tree profile migration.** Give every entry class a profile and remove
+   architecture-name tables only after forced-backend and PD restrictions,
+   geometry, cache ownership and tokenizer behavior have equivalent coverage.
 4. **Contract consolidation.** Complete `docs/design/plugins.md` and the
-   fixture CI matrix begun in phase 1. `PLUGIN_API_VERSION` and the fixture
-   package exist from phase 1 so each phase can enforce its own contract.
+   installable fixture's end-to-end CI matrix, extending the existing unit
+   coverage. Any further incompatible contract change bumps the API version.
 
 ## Alternatives considered
 
