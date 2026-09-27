@@ -404,6 +404,7 @@ def test_standard_cache_decode_accepts_block_split_writer_output() -> None:
         page_size=_PAGE_SIZE,
         head_dim=_HEAD_DIM,
         group_size=_HEAD_DIM,
+        write_mask=None,
     )
     key_reference = torch.empty_like(source_reference)
     key_reference[locations] = source_reference

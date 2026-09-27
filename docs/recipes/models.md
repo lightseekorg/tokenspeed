@@ -750,7 +750,7 @@ ts serve \
 
 ### Optional `--hf-overrides`
 
-Both keys are optional and can be combined in a single `--hf-overrides` JSON
+All keys are optional and can be combined in a single `--hf-overrides` JSON
 object:
 
 ```bash
@@ -761,6 +761,9 @@ object:
 - `ple_embed_dtype: "float8_e4m3fn"`: store the PLE n-gram embedding table in
   FP8 to save memory. Omit it to store the table in the model's compute
   dtype.
+- `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
+  or GPU memory when `false`. When omitted, offloading is enabled on NVIDIA CUDA
+  and disabled on other platforms.
 - `index_share_for_mtp_iteration: true`: reuse the QSA top-k selection across
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.
@@ -1052,7 +1055,11 @@ prefill chunk. Two consequences:
   path once to discover the draft model's other operators; prefill-only roles
   skip that traversal because they do not allocate decode/verify scratch.
   `--disable-autotune` loads a matching persistent cache and uses heuristic
-  tactics for uncovered shapes, which is fine for bring-up.
+  tactics for uncovered shapes, which is fine for bring-up. Pipeline-parallel
+  launches skip tuning but can reuse a cache from a full-model run with the
+  same engine role, tensor/expert parallel layout and environment. Independent
+  prefill and decode roles keep separate caches. Cache directories are
+  created on the first successful save.
 - `--moe-mxfp4-fp8-activation` switches to the W4A8 variant (FP8 activations,
   Humming residual scales): 282/338/380/2195 µs at the same token counts,
   another 1.8x, at a few percent of relative error on the expert outputs

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Large-prefill Kimi K3 latent-MoE input projections for gfx950.
+"""Large-M Kimi K3 latent-MoE input projections for gfx950.
 
 The GEMM main loop intentionally follows ``gluon_mm_a16w16_prefill_gfx950``:
 an eight-wave 256x256x64, double-buffered MFMA/LDS pipeline.  K3's packed
@@ -169,7 +169,7 @@ def _store_latent_input_half(
 
 
 @gluon.jit(launch_metadata=_prefill_launch_metadata)
-def gluon_latent_input_prefill_gfx950(
+def gluon_latent_input_largem_gfx950(
     a_ptr,
     b_ptr,
     router_ptr,
@@ -280,7 +280,7 @@ def gluon_latent_input_prefill_gfx950(
 
 
 @gluon.jit(launch_metadata=_situ_launch_metadata)
-def gluon_latent_input_prefill_situ_gfx950(
+def gluon_latent_input_largem_situ_gfx950(
     shared_raw_ptr,
     shared_ptr,
     beta,
@@ -331,7 +331,7 @@ def gluon_latent_input_prefill_situ_gfx950(
     )
 
 
-def launch_gluon_latent_input_prefill_gfx950(
+def validate_k3_latent_input_gfx950(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
     routed_weight: torch.Tensor,
@@ -340,23 +340,8 @@ def launch_gluon_latent_input_prefill_gfx950(
     *,
     beta: float,
     linear_beta: float | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Project the K3 prefill input from one packed weight pass.
-
-    Args:
-        hidden_states: Contiguous BF16 activation shaped ``[tokens, 7168]``.
-            Any positive ``tokens`` works; a partial final row tile is masked.
-            Automatic dispatch uses this kernel from 4096 tokens.
-        router_weight: Packed weight view shaped ``[896, 7168]``.
-        routed_weight: Packed weight view shaped ``[3584, 7168]``.
-        shared_gate_up_weight: Packed weight view shaped ``[1536, 7168]``.
-        packed_weight: Consecutive row view covering all three weights.
-        beta: Positive SiTU gate clipping scale.
-        linear_beta: Optional positive SiTU linear-branch clipping scale.
-
-    Returns:
-        FP32 router logits, BF16 routed latent, and BF16 shared-expert input.
-    """
+) -> None:
+    """Validate the packed K3 projection contract shared by prefill tiles."""
     expected = (
         (router_weight, (_K3_ROUTER, _K3_HIDDEN), "router weight"),
         (routed_weight, (_K3_ROUTED, _K3_HIDDEN), "routed weight"),
@@ -391,6 +376,43 @@ def launch_gluon_latent_input_prefill_gfx950(
     if beta <= 0.0 or (linear_beta is not None and linear_beta <= 0.0):
         raise ValueError("SiTU beta values must be positive")
 
+
+def launch_gluon_latent_input_largem_gfx950(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    routed_weight: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    packed_weight: torch.Tensor,
+    *,
+    beta: float,
+    linear_beta: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project the K3 prefill input from one packed weight pass.
+
+    Args:
+        hidden_states: Contiguous BF16 activation shaped ``[tokens, 7168]``.
+            Any positive ``tokens`` works; a partial final row tile is masked.
+            Automatic dispatch uses this kernel from 1281 tokens.
+        router_weight: Packed weight view shaped ``[896, 7168]``.
+        routed_weight: Packed weight view shaped ``[3584, 7168]``.
+        shared_gate_up_weight: Packed weight view shaped ``[1536, 7168]``.
+        packed_weight: Consecutive row view covering all three weights.
+        beta: Positive SiTU gate clipping scale.
+        linear_beta: Optional positive SiTU linear-branch clipping scale.
+
+    Returns:
+        FP32 router logits, BF16 routed latent, and BF16 shared-expert input.
+    """
+    validate_k3_latent_input_gfx950(
+        hidden_states,
+        router_weight,
+        routed_weight,
+        shared_gate_up_weight,
+        packed_weight,
+        beta=beta,
+        linear_beta=linear_beta,
+    )
+
     tokens = hidden_states.shape[0]
     device = hidden_states.device
     router_out = torch.empty((tokens, _K3_ROUTER), dtype=torch.float32, device=device)
@@ -401,7 +423,7 @@ def launch_gluon_latent_input_prefill_gfx950(
     shared_out = torch.empty((tokens, _K3_SHARED), dtype=torch.bfloat16, device=device)
 
     grid_mn = triton.cdiv(tokens, _BLOCK_M) * triton.cdiv(_K3_TOTAL, _BLOCK_N)
-    gluon_latent_input_prefill_gfx950[(grid_mn,)](
+    gluon_latent_input_largem_gfx950[(grid_mn,)](
         hidden_states,
         packed_weight,
         router_out,
@@ -431,7 +453,7 @@ def launch_gluon_latent_input_prefill_gfx950(
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     situ_grid = (triton.cdiv(tokens, _SITU_BLOCK_M), _K3_SHARED // _SITU_BLOCK_N)
-    gluon_latent_input_prefill_situ_gfx950[situ_grid](
+    gluon_latent_input_largem_situ_gfx950[situ_grid](
         shared_raw,
         shared_out,
         float(beta),
@@ -450,4 +472,4 @@ def launch_gluon_latent_input_prefill_gfx950(
     return router_out, routed_out, shared_out
 
 
-__all__ = ["launch_gluon_latent_input_prefill_gfx950"]
+__all__ = ["launch_gluon_latent_input_largem_gfx950"]

@@ -173,13 +173,36 @@ def _measurement_comparison(
     policy = base_case["policy"]
     candidate_policy = candidate_case["policy"]
 
-    for label, result in (("baseline", base_result), ("candidate", candidate_result)):
-        if result.get("status") != "success":
-            return _empty_comparison(
+    if candidate_result.get("status") != "success":
+        return _empty_comparison(
+            case_id,
+            "invalid",
+            f"candidate benchmark returned {candidate_result.get('status', 'unknown')}",
+        )
+    base_status = base_result.get("status", "unknown")
+    if base_status != "success":
+        if base_status in {
+            "not_applicable",
+            "registration_missing",
+            "invalid_case",
+            "setup_failure",
+            "capture_failure",
+            "execution_failure",
+            "correctness_failure",
+        }:
+            comparison = _empty_comparison(
                 case_id,
-                "invalid",
-                f"{label} benchmark returned {result.get('status', 'unknown')}",
+                "inconclusive",
+                f"baseline benchmark returned {base_status}; candidate succeeded, "
+                "but no successful baseline measurement is available",
             )
+            comparison["candidate_median_us"] = _result_median(candidate_case)
+            return comparison
+        return _empty_comparison(
+            case_id,
+            "invalid",
+            f"baseline benchmark returned {base_status}",
+        )
 
     if any(
         base_result[field] != candidate_result[field]

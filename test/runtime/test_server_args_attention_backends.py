@@ -1,8 +1,9 @@
-"""Regression tests for --attention-backend / --drafter-attention-backend choices.
+"""Regression tests for --attention-backend / --drafter-attention-backend names.
 
 Guards against the bug where --drafter-attention-backend rejected valid main-model
 backends (e.g. trtllm_mla) because its argparse `choices` was a narrower subset
-of --attention-backend's.
+of --attention-backend's. Both flags are now validated against one backend
+registry after plugin discovery, so they accept exactly the same names.
 """
 
 import os
@@ -15,8 +16,6 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 import argparse
-import contextlib
-import io
 import pickle
 import unittest
 from types import SimpleNamespace
@@ -68,10 +67,14 @@ class TestAttentionBackendChoices(unittest.TestCase):
             self.assertEqual(args.attention_backend, backend)
 
     def test_attention_backend_uses_generic_mha_for_ascend(self):
-        choices = set(self._action(self._build_parser(), "attention_backend").choices)
-        self.assertIn("mha", choices)
-        self.assertNotIn("ascend_mha", choices)
-        self.assertNotIn("npu", choices)
+        import tokenspeed.runtime.layers.attention.backends  # noqa: F401
+
+        registry.validate_attention_backend_name("mha", flag="--attention-backend")
+        for name in ("ascend_mha", "npu"):
+            with self.assertRaisesRegex(ValueError, "Unknown --attention-backend"):
+                registry.validate_attention_backend_name(
+                    name, flag="--attention-backend"
+                )
 
     def test_drafter_attention_backend_accepts_trtllm_mla(self):
         """Regression: trtllm_mla must be accepted here too."""
@@ -86,20 +89,24 @@ class TestAttentionBackendChoices(unittest.TestCase):
         )
         self.assertEqual(args.drafter_attention_backend, "gluon")
 
-    def test_drafter_choices_match_main_choices(self):
+    def test_flags_defer_backend_names_to_the_registry(self):
         parser = self._build_parser()
-        main = set(self._action(parser, "attention_backend").choices)
-        drafter = set(self._action(parser, "drafter_attention_backend").choices)
-        self.assertEqual(main, drafter)
+        # Plugins register backends after argument parsing, so neither flag
+        # may carry a closed argparse choice list.
+        self.assertIsNone(self._action(parser, "attention_backend").choices)
+        self.assertIsNone(self._action(parser, "drafter_attention_backend").choices)
 
     def test_invalid_backend_rejected_on_both_flags(self):
+        import tokenspeed.runtime.layers.attention.backends  # noqa: F401
+
         for flag in ("--attention-backend", "--drafter-attention-backend"):
-            parser = self._build_parser()
-            with (
-                contextlib.redirect_stderr(io.StringIO()),
-                self.assertRaises(SystemExit),
-            ):
-                parser.parse_args(["--model", "x", flag, "bogus"])
+            registry.validate_attention_backend_name("trtllm_mla", flag=flag)
+            registry.validate_attention_backend_name(
+                registry.HYBRID_LINEAR_ATTN_BACKEND, flag=flag
+            )
+            registry.validate_attention_backend_name(None, flag=flag)
+            with self.assertRaisesRegex(ValueError, f"Unknown {flag} 'bogus'"):
+                registry.validate_attention_backend_name("bogus", flag=flag)
 
     def test_inline_detokenizer_is_forced_on(self):
         args = prepare_server_args(["--model", "x"])
@@ -158,7 +165,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
                         config,
                         pool=SimpleNamespace(state_group_by_layer={0: "state"}),
                         full_attn_backend_name="mla",
-                        is_kda=True,
+                        linear_attention="kda",
                     )
                     self.assertIs(
                         backend.linear_attn_backend._prefill_graph_enabled, not disabled

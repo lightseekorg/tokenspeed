@@ -20,7 +20,6 @@
 
 #include "fsm/forward_events.h"
 
-#include <memory>
 #include <utility>
 
 #include "scheduler/operations/cache.h"
@@ -40,7 +39,7 @@ SchedulePrefillFirstChunkEvent::scheduleFirstChunk(TokenContainer* token_contain
     ForwardResources resources{
         .token_container = token_container,
         .prefix_granularity = prefix_granularity,
-        .req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate()),
+        .req_pool_index = req_pool_allocator_->Allocate(),
         .block_tables = std::move(block_tables_),
         .cache_progress = std::move(cache_progress_),
         .results_in_flight = 0,

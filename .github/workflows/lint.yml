@@ -2,6 +2,10 @@ name: Lint
 
 on: [pull_request]
 
+permissions:
+  contents: read
+  pull-requests: read
+
 concurrency:
   group: lint-${{ github.ref }}
   cancel-in-progress: true
@@ -11,6 +15,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
+
+      - name: Detect scheduler C++ changes
+        id: scheduler_cpp_changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          changed_files="$RUNNER_TEMP/tokenspeed-lint-changed-files.txt"
+          scheduler_cpp_files='^tokenspeed-scheduler/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$'
+          scheduler_cpp_config='^tokenspeed-scheduler/(\.clang-(format|tidy)|(.*/)?CMakeLists\.txt|.*\.cmake)$'
+
+          if ! gh api \
+            "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --paginate \
+            -q '.[] | .filename, (.previous_filename // empty)' \
+            > "$changed_files" || [[ ! -s "$changed_files" ]]; then
+            echo "::warning::Unable to classify changed files; running scheduler C++ lint"
+            changed=true
+          elif grep -Eq \
+            -e "$scheduler_cpp_files" \
+            -e "$scheduler_cpp_config" \
+            "$changed_files"; then
+            changed=true
+          else
+            changed=false
+          fi
+
+          if [[ "$changed" == "true" ]]; then
+            pre_commit_skip=
+          else
+            pre_commit_skip=clang-format
+          fi
+          {
+            echo "changed=$changed"
+            echo "pre_commit_skip=$pre_commit_skip"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -23,6 +63,8 @@ jobs:
           pre-commit install
 
       - name: Linting
+        env:
+          SKIP: ${{ steps.scheduler_cpp_changes.outputs.pre_commit_skip }}
         run: pre-commit run --all-files
 
       - name: Lint runtime Python with ruff
@@ -32,11 +74,13 @@ jobs:
             python/tokenspeed/runtime
 
       - name: Install scheduler C++ lint tools
+        if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-format clang-tidy cmake ninja-build
 
       - name: Configure scheduler compile database
+        if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |
           cmake -S tokenspeed-scheduler -B tokenspeed-scheduler/build \
             -G Ninja \
@@ -74,6 +118,7 @@ jobs:
           PY
 
       - name: Lint scheduler C++
+        if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |
           cpp_files="$(git ls-files tokenspeed-scheduler | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$')"
           jobs="$(nproc)"

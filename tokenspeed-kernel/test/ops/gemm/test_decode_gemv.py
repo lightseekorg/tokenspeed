@@ -35,7 +35,7 @@ def _is_joint_fi_arch() -> bool:
     # Joint FI tuning covers supported Blackwell devices, not just sm103.
     return (
         current_platform().vendor == "nvidia"
-        and torch.cuda.get_device_capability() >= (10, 0)
+        and torch.cuda.get_device_capability() in {(10, 0), (10, 3)}
     )
 
 

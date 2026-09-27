@@ -51,7 +51,6 @@ class _FakeTuner:
 
     def save_configs(self, path: str) -> None:
         target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"tactics")
 
     def clear_cache(self) -> None:
@@ -315,8 +314,12 @@ def test_peer_cache_failure_discards_local_results(monkeypatch, tmp_path):
         tuning.dist, "broadcast_object_list", lambda *args, **kwargs: None
     )
 
+    gathers = 0
+
     def disagree(states, loaded, *, group):
-        states[:] = [loaded, False]
+        nonlocal gathers
+        gathers += 1
+        states[:] = [loaded, loaded if gathers == 1 else False]
 
     monkeypatch.setattr(tuning.dist, "all_gather_object", disagree)
     assert not load_autotune_cache(path, object(), 0)
@@ -384,3 +387,32 @@ def test_read_only_cache_load_does_not_rewrite_files(
         directory.chmod(0o755)
         if path.exists():
             path.chmod(0o644)
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_mixed_flashinfer_availability_fails_before_cache_broadcast(
+    monkeypatch, available
+):
+    _install_fake_flashinfer(monkeypatch, metadata={})
+    if not available:
+        monkeypatch.setattr(tuning, "_autotuner", None)
+    monkeypatch.setattr(tuning.dist, "get_world_size", lambda group: 2)
+
+    def gather(states, local, *, group):
+        assert local is available
+        states[:] = [True, False]
+
+    monkeypatch.setattr(tuning.dist, "all_gather_object", gather)
+    broadcast = Mock(side_effect=AssertionError("must fail before broadcasting"))
+    monkeypatch.setattr(tuning.dist, "broadcast_object_list", broadcast)
+    with pytest.raises(RuntimeError, match="availability differs"):
+        load_autotune_cache(None, object(), 0)
+    broadcast.assert_not_called()
+
+
+def test_legacy_bundled_configs_do_not_bypass_tuning(monkeypatch):
+    _install_fake_flashinfer(monkeypatch, metadata={})
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "1")
+    original = tuning._autotuner.AutoTuner.search_cache
+    with tuning._reuse_autotune_cache():
+        assert tuning._autotuner.AutoTuner.search_cache is original

@@ -47,6 +47,7 @@ from tokenspeed_kernel import (
     moe_topk,
 )
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
+from tokenspeed_kernel.ops.attention.dsa.triton import triton_dsa_index_candidates
 from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode_topk,
     dsv4_indexer_cache_format,
@@ -58,6 +59,7 @@ from tokenspeed_kernel.ops.attention.dsv4 import (
 from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_group_slot_mapping,
     dsv4_indexer_decode_metadata_compute,
+    triton_dsv4_index_candidates,
 )
 from torch import nn
 from transformers import PretrainedConfig
@@ -77,6 +79,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.dcp.indexer import merge_index_candidates
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
     DeepseekV4ForwardMetadata,
     DeepseekV4IndexerBatchMetadata,
@@ -2374,6 +2377,73 @@ class DeepseekV4Indexer(nn.Module):
         )
         return topk_out
 
+    def _forward_sharded_indexer(
+        self,
+        packed_q: tuple[torch.Tensor, torch.Tensor],
+        weights: torch.Tensor,
+        indexer_cache: torch.Tensor,
+        page_size: int,
+        positions: torch.Tensor,
+        metadata: DeepseekV4ForwardMetadata,
+        group: tuple[int, ...],
+    ) -> torch.Tensor:
+        table = metadata.cache.indexer_page_table()
+        requests = metadata.token_to_req_indices[: positions.numel()]
+        lengths = ((positions + 1) // self.compress_ratio).to(torch.int32)
+        if metadata.is_valid_token is not None:
+            lengths = torch.where(
+                metadata.is_valid_token[: positions.numel()], lengths, 0
+            )
+        tile = max(
+            1,
+            _deepseek_v4_indexer_prefill_max_logits_bytes(None)
+            // (table.shape[1] * page_size * 4),
+        )
+        output = (
+            self.topk_buffer.get(positions.numel(), positions.device)
+            if self.topk_buffer is not None
+            else torch.empty(
+                (positions.numel(), self.topk_tokens),
+                device=positions.device,
+                dtype=torch.int32,
+            )
+        )
+        for start in range(0, positions.numel(), tile):
+            end = min(positions.numel(), start + tile)
+            if self.use_fp4_cache:
+                offsets, scores = triton_dsv4_index_candidates(
+                    (
+                        packed_q[0][start:end].contiguous(),
+                        packed_q[1][start:end].contiguous(),
+                    ),
+                    weights[start:end],
+                    indexer_cache,
+                    table,
+                    requests[start:end],
+                    lengths[start:end],
+                    page_size=page_size,
+                    topk=self.topk_tokens,
+                )
+            else:
+                offsets, scores = triton_dsa_index_candidates(
+                    packed_q[0][start:end],
+                    weights[start:end],
+                    indexer_cache,
+                    table,
+                    requests[start:end],
+                    lengths[start:end],
+                    page_size=page_size,
+                    topk=self.topk_tokens,
+                    softmax_scale=self.softmax_scale,
+                    initial_tokens=0,
+                    local_tokens=0,
+                )
+            indices, _ = merge_index_candidates(
+                offsets, scores, topk=self.topk_tokens, group=group
+            )
+            output[start:end].copy_(indices)
+        return output[: positions.numel()]
+
     def _forward_sparse_indexer_custom_op(
         self,
         *,
@@ -2428,6 +2498,17 @@ class DeepseekV4Indexer(nn.Module):
                     softmax_scale=self.softmax_scale,
                     head_scale=self.n_head**-0.5,
                 )
+
+        if metadata.cache.dcp_size > 1:
+            return self._forward_sharded_indexer(
+                packed_index_q,
+                packed_weights,
+                indexer_cache,
+                indexer_block_size,
+                positions,
+                metadata,
+                tuple(ctx.attn_backend.dcp_group),
+            )
 
         empty_cpu = torch.empty(0, dtype=torch.int32, device="cpu")
         seq_lens_cpu = (
@@ -2626,6 +2707,10 @@ class DeepseekV4Indexer(nn.Module):
                 ),
                 is_valid_token=valid_token,
                 indexer=True,
+            )
+        if cache_metadata.dcp_size > 1:
+            compressed_slots = cache_metadata.local_indexer_write_slots(
+                compressed_slots, indexer_block_size
             )
         with nvtx_range("indexer_cache_insert"):
             deepseek_v4_csa_indexer_cache_insert(

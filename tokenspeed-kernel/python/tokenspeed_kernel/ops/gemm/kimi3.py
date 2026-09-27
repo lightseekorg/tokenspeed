@@ -654,7 +654,7 @@ def _skinny_add3_arch_supported(device_index: int) -> bool:
     """Keep the fused tile configurations on their measured architecture."""
     if Platform.get().vendor != "nvidia":
         return False
-    return torch.cuda.get_device_capability(device_index) >= (10, 3)
+    return torch.cuda.get_device_capability(device_index) == (10, 3)
 
 
 def _skinny_add3_supported(m: int, n: int, k: int, device: torch.device) -> bool:

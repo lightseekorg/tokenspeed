@@ -60,6 +60,10 @@ _autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
 @contextlib.contextmanager
 def _reuse_autotune_cache():
     """Reuse compatible FlashInfer entries regardless of measurement policy."""
+    # Legacy bundled entries are not validated or included in saved configs.
+    if os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE") == "1":
+        yield
+        return
     AutoTuner = _autotuner.AutoTuner
     original_search = AutoTuner.search_cache
 
@@ -231,7 +235,8 @@ def autotune(
         yield
         return
     if tune_mode:
-        # TGV's 2-CTA tactics can fail during sustained graph execution.
+        # FI 0.6.18: TGV tactics 16-28 are 2-CTA and can fail during replay.
+        # The heuristic uses 1-CTA tactic 1. Keep this blocklist after tuning.
         tuner = _autotuner.AutoTuner.get()
         tuner._blocklist._invalid.setdefault("bf16_gemm::TGVRunner", set()).update(
             range(16, 29)
@@ -292,6 +297,16 @@ def _mirror_autotune_cache(
     return True
 
 
+def _autotuner_available(process_group: dist.ProcessGroup | None) -> bool:
+    available = _autotuner is not None
+    if process_group is not None:
+        rank_states = [False] * dist.get_world_size(process_group)
+        dist.all_gather_object(rank_states, available, group=process_group)
+        if any(rank_states) and not all(rank_states):
+            raise RuntimeError("FlashInfer availability differs across tuning ranks")
+    return available
+
+
 def load_autotune_cache(
     path: str | None,
     process_group: dist.ProcessGroup | None,
@@ -307,7 +322,7 @@ def load_autotune_cache(
     Returns:
         Whether every rank loaded the cache. Otherwise all ranks tune cold.
     """
-    if _autotuner is None:
+    if not _autotuner_available(process_group):
         return False
     try:
         tuner = _autotuner.AutoTuner.get()
@@ -373,13 +388,14 @@ def save_autotune_cache(
     """
     if path is None:
         return False
-    if _autotuner is None:
+    if not _autotuner_available(process_group):
         return False
     if process_group is not None:
         dist.barrier(group=process_group)
     payload = None
     if process_group is None or dist.get_rank() == owner_rank:
         try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
             _autotuner.AutoTuner.get().save_configs(path)
             payload = Path(path).read_bytes()
         except Exception:

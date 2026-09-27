@@ -34,7 +34,7 @@ def _is_add3_arch() -> bool:
     # it would run another architecture's tuning parameters unmeasured.
     return (
         current_platform().vendor == "nvidia"
-        and torch.cuda.get_device_capability() >= (10, 3)
+        and torch.cuda.get_device_capability() == (10, 3)
     )
 
 

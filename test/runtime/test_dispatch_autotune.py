@@ -85,8 +85,14 @@ def _functions(path, owner, names, namespace):
             )
         ]
     module = ast.Module(body=body, type_ignores=[])
+    # A class method can share a name with a module-level dependency.
+    # Preserve that dependency when compiling the method as a standalone function.
+    previous = {name: namespace[name] for name in names if name in namespace}
     exec(compile(module, str(path), "exec", dont_inherit=False), namespace)
-    return SimpleNamespace(**{name: namespace[name] for name in names})
+    functions = SimpleNamespace(**{name: namespace[name] for name in names})
+    if owner is not None:
+        namespace.update(previous)
+    return functions
 
 
 @pytest.mark.parametrize("chunk_size", [-1, 16, 17])
@@ -128,11 +134,12 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     def prefill_batch(num_tokens, batch_size):
         assert batch_size == -(-num_tokens // 4)
         assert 0 < batch_size <= 8
-        return object()
+        return SimpleNamespace(bs=batch_size)
 
     policy = Mock(return_value=nullcontext())
     namespace = dict(
         torch=torch,
+        dummy_batch_size=lambda n, context: -(-n // context),
         time=time,
         logger=logging.getLogger(__name__),
         autotune=policy,
@@ -165,11 +172,11 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             max_bs=8,
             max_num_tokens=32,
             fill_dummy_decode_buffers=scrub,
-            ngram_model_kwargs=lambda n: {
-                "engram_previous_tokens": ngram_history[:n],
-                "engram_token_mask": ngram_mask[:n],
-            },
         ),
+        _model_input_kwargs=lambda n, bs: {
+            "engram_previous_tokens": ngram_history[:n],
+            "engram_token_mask": ngram_mask[:n],
+        },
         prefill_graph=SimpleNamespace(make_dummy_batch=prefill_batch),
         # Deliberately no capture_bs or graph-enabled flag: neither controls tuning.
         forward_step=SimpleNamespace(warmup_decode_path=draft),
@@ -180,12 +187,12 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     method = _functions(
         RUNTIME / "execution/model_executor.py",
         "ModelExecutor",
-        ("_autotune",),
+        ("autotune",),
         namespace,
     )
     if failure and not disabled:
         with pytest.raises(RuntimeError, match="profiling failed"):
-            method._autotune(executor)
+            method.autotune(executor)
         assert events == [
             "load",
             ("group", None),
@@ -193,7 +200,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             ("target", (32 if chunk_size < 0 else chunk_size)),
         ]
         return
-    method._autotune(executor)
+    method.autotune(executor)
     if disabled:
         assert events == ["load"]
         policy.assert_not_called()
@@ -562,19 +569,19 @@ def test_capture_lifecycle_preserves_main_order(
     step = SimpleNamespace(
         disable=decode_disabled,
         stream=object(),
-        capture=lambda: events.append("decode"),
+        capture=lambda **kwargs: events.append("decode"),
     )
 
-    def capture_prefill(runner):
+    def capture_prefill(runner, **kwargs):
         assert runner is step
         events.append("prefill")
 
-    def capture_draft(stream):
+    def capture_draft(stream, observer):
         assert stream is step.stream
         events.append("draft")
 
     executor = SimpleNamespace(
-        _autotune=lambda: events.append("tune"),
+        captures_drafter_prefill_graph=not prefill_disabled and has_drafter,
         device="cpu",
         forward_step=step,
         prefill_graph=SimpleNamespace(
@@ -596,9 +603,12 @@ def test_capture_lifecycle_preserves_main_order(
             )
         },
     )
-    methods.capture_graphs(executor)
+    methods.capture_graphs(
+        executor,
+        entries=None,
+        observer=SimpleNamespace(measure=lambda name: nullcontext()),
+    )
     assert events == [
-        "tune",
         "freeze",
         *([] if decode_disabled else ["decode"]),
         *([] if prefill_disabled else ["prefill"]),
@@ -616,7 +626,7 @@ def test_executor_construction_does_not_capture_or_tune():
     init = next(
         n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"
     )
-    forbidden = {"_autotune", "capture", "capture_graphs", "capture_prefill_graph"}
+    forbidden = {"autotune", "capture", "capture_graphs", "capture_prefill_graph"}
     assert not [
         n
         for n in ast.walk(init)
@@ -1081,3 +1091,96 @@ def test_skinny_add3_preserves_capture_trust(capturing, warmed, failure):
         kernel.assert_called_once()
         fallback.assert_not_called()
         assert key in known
+
+
+def test_pipeline_stages_share_shape_keyed_cache_identity():
+    mapping = SimpleNamespace(
+        attn=SimpleNamespace(tp_size=2, cp_size=1, dp_size=1),
+        dense=SimpleNamespace(tp_size=2, dp_size=1),
+        moe=SimpleNamespace(tp_size=2, ep_size=1, dp_size=1),
+        linear_attn=SimpleNamespace(tp_size=2),
+        pp_size=1,
+    )
+    args = SimpleNamespace(
+        mapping=mapping,
+        disaggregation_mode="null",
+        dtype="bfloat16",
+        moe_backend="auto",
+        attention_backend="auto",
+        speculative_algorithm=None,
+        speculative_num_draft_tokens=None,
+    )
+    model = SimpleNamespace(
+        model_path="model",
+        revision=None,
+        hf_config=SimpleNamespace(architectures=["Model"]),
+        quantization=None,
+    )
+    api = _functions(
+        RUNTIME / "execution/model_executor.py", None, ("_autotune_cache_key",), {}
+    )
+    full_model = api._autotune_cache_key(args, model)
+    mapping.pp_size = 2
+    assert api._autotune_cache_key(args, model) == full_model
+    args.disaggregation_mode = "prefill"
+    prefill = api._autotune_cache_key(args, model)
+    args.disaggregation_mode = "decode"
+    assert api._autotune_cache_key(args, model) != prefill
+    args.disaggregation_mode = "null"
+    mapping.moe.ep_size = 2
+    assert api._autotune_cache_key(args, model) != full_model
+
+
+@pytest.mark.parametrize(
+    "capability,expected", [((10, 0), False), ((10, 3), True), ((10, 7), False)]
+)
+def test_skinny_add3_uses_only_measured_architecture(capability, expected):
+    api = _functions(
+        KERNEL / "ops/gemm/kimi3.py",
+        None,
+        ("_skinny_add3_arch_supported",),
+        dict(
+            lru_cache=functools.lru_cache,
+            Platform=SimpleNamespace(get=lambda: SimpleNamespace(vendor="nvidia")),
+            torch=SimpleNamespace(
+                cuda=SimpleNamespace(get_device_capability=lambda index: capability)
+            ),
+        ),
+    )
+    assert api._skinny_add3_arch_supported(0) is expected
+
+
+@pytest.mark.parametrize("kind", ["environment", "context"])
+@pytest.mark.parametrize("numerics", ["default", "rl-bitwise"])
+def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics):
+    from tokenspeed_kernel.selection import kernel_override, resolve_kernel_override
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed.runtime.utils.env",
+        SimpleNamespace(global_server_args_dict={"numerics": numerics}),
+    )
+    if kind == "environment":
+        monkeypatch.setenv("TOKENSPEED_KERNEL_OVERRIDE_GEMM_MM", "forced")
+    mm = Mock(return_value=object())
+    shortcut = Mock(side_effect=AssertionError("override must precede shortcuts"))
+    api = _functions(
+        RUNTIME / "layers/dense/unquant.py",
+        "UnquantizedLinearMethod",
+        ("apply",),
+        dict(
+            tokenspeed_kernel=SimpleNamespace(mm=mm),
+            resolve_kernel_override=resolve_kernel_override,
+            use_decode_gemv=shortcut,
+        ),
+    )
+    x, weight = object(), object()
+    with (
+        kernel_override("gemm", "mm", "forced") if kind == "context" else nullcontext()
+    ):
+        assert api.apply(None, SimpleNamespace(weight=weight), x) is mm.return_value
+    expected = {"bias": None}
+    if numerics == "rl-bitwise":
+        expected["override"] = "aok"
+    mm.assert_called_once_with(x, weight, **expected)
+    shortcut.assert_not_called()

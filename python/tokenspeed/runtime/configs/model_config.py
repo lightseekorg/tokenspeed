@@ -24,7 +24,7 @@ import copy
 import json
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import IntEnum, auto
 
@@ -32,10 +32,13 @@ import torch
 import yaml
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
+from tokenspeed.runtime.plugins import ensure_loaded
+from tokenspeed.runtime.plugins.registry import resolve_model_profile
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import (
@@ -187,7 +190,8 @@ def configure_deepseek_v41_attention(model_config) -> None:
     model_config.scaling = hf.head_dim**-0.5
 
 
-def configure_glm_attention(model_config) -> None:
+def configure_dsa_attention(model_config) -> None:
+    """Derive MLA latent plus DSA indexer geometry (GLM-DSA, DeepSeek-V3.2)."""
     mla_config = (
         model_config.hf_text_config
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
@@ -207,7 +211,7 @@ def configure_glm_attention(model_config) -> None:
     ]
     if missing_fields:
         raise ValueError(
-            "GLM attention config is missing required fields: "
+            "DSA attention config is missing required fields: "
             + ", ".join(missing_fields)
         )
 
@@ -287,7 +291,7 @@ _ATTENTION_FAMILY_SPECS = (
     _AttentionFamilySpec(
         name="GLM",
         architectures=_DSA_ARCHITECTURES,
-        configure=configure_glm_attention,
+        configure=configure_dsa_attention,
         default_backend="dsa",
     ),
     _AttentionFamilySpec(
@@ -376,29 +380,47 @@ def _apply_block_spec_widths(
     return block_size
 
 
-def _apply_attention_family_defaults(
+def _apply_attention_defaults(
     server_args: ServerArgs,
-    spec: _AttentionFamilySpec,
+    *,
+    name: str,
+    default_backend: str | None,
+    default_prefix_granularity: int | None,
+    is_draft_worker: bool,
 ) -> None:
-    if spec.default_prefix_granularity is not None:
+    """Fill launch arguments the user left at their defaults."""
+    if default_prefix_granularity is not None:
         granularity_default = ServerArgs.__dataclass_fields__[
             "prefix_granularity"
         ].default
         if server_args.prefix_granularity == granularity_default:
             logger.info(
-                f"{spec.name!s} default prefix_granularity="
-                f"{spec.default_prefix_granularity:d}; pass --prefix-granularity "
+                f"{name!s} default prefix_granularity="
+                f"{default_prefix_granularity:d}; pass --prefix-granularity "
                 f"with a value other than {granularity_default:d} to keep that value.",
             )
-            server_args.prefix_granularity = spec.default_prefix_granularity
-    if spec.default_backend is not None and server_args.attention_backend is None:
-        server_args.attention_backend = spec.default_backend
+            server_args.prefix_granularity = default_prefix_granularity
+    if default_backend is None:
+        return
+    # A draft model's default belongs to the drafter's backend selection;
+    # writing the target field would either be discarded (already set) or
+    # hijack the target's own default.
+    if is_draft_worker:
+        if server_args.drafter_attention_backend is None:
+            server_args.drafter_attention_backend = default_backend
+    elif server_args.attention_backend is None:
+        server_args.attention_backend = default_backend
 
 
 def _derive_num_attention_layers(
     hf_config: PretrainedConfig,
     num_hidden_layers: int,
+    model_profile: ModelProfile | None = None,
 ) -> int:
+    # A registered model declares its own attention-instance count; the
+    # architecture-name tables below stay as the in-tree seed.
+    if model_profile is not None:
+        return num_hidden_layers * model_profile.attention_instances_per_layer
     architectures = getattr(hf_config, "architectures", None) or []
     num_attention_layers = num_hidden_layers
     if is_deepseek_v4_nextn(hf_config):
@@ -422,6 +444,17 @@ class ModelConfig:
         is_draft_worker: bool | None = False,
         server_args: ServerArgs = None,
     ) -> None:
+        # Plugins may register the architecture, its config class and its
+        # profile; every resolution below must see them.
+        ensure_loaded()
+        if server_args is not None and server_args.speculative_algorithm is not None:
+            # Post-discovery replacement for the CLI choices= this flag no
+            # longer carries: plugins may have added algorithms.
+            from tokenspeed.runtime.execution.drafter import (
+                validate_drafter_algorithm,
+            )
+
+            validate_drafter_algorithm(server_args.speculative_algorithm)
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
@@ -454,6 +487,12 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        # A registered model states its own family facts; in-tree models
+        # without a profile still resolve through the architecture tables.
+        self.model_profile: ModelProfile | None = resolve_model_profile(
+            _model_architectures(self.hf_config, self.hf_text_config),
+            self.hf_config,
+        )
         self.spec_block_size: int | None = None
         if is_draft_worker:
             self.spec_block_size = _apply_block_spec_widths(
@@ -637,8 +676,25 @@ class ModelConfig:
             self.hf_config,
             self.hf_text_config,
         )
-        if attention_family is not None:
-            _apply_attention_family_defaults(server_args, attention_family)
+        if self.model_profile is not None:
+            _apply_attention_defaults(
+                server_args,
+                name=resolve_architecture(self.hf_config),
+                default_backend=self.model_profile.default_attention_backend,
+                default_prefix_granularity=(
+                    self.model_profile.default_prefix_granularity
+                ),
+                is_draft_worker=bool(is_draft_worker),
+            )
+            self.model_profile.configure_attention(self)
+        elif attention_family is not None:
+            _apply_attention_defaults(
+                server_args,
+                name=attention_family.name,
+                default_backend=attention_family.default_backend,
+                default_prefix_granularity=attention_family.default_prefix_granularity,
+                is_draft_worker=bool(is_draft_worker),
+            )
             attention_family.configure(self)
         elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
             configure_mla_attention(self)
@@ -670,6 +726,7 @@ class ModelConfig:
         self.num_attention_layers = _derive_num_attention_layers(
             self.hf_config,
             self.num_hidden_layers,
+            self.model_profile,
         )
         if is_draft_worker:
             dspark_layers = getattr(self.hf_text_config, "dspark_num_stages", None)
@@ -695,6 +752,20 @@ class ModelConfig:
 
         if server_args is not None and server_args.load_format == "extensible":
             override_model_config(self, server_args.ext_yaml)
+
+    @property
+    def tokenizer_kwargs(self) -> Mapping[str, object]:
+        """Extra tokenizer keyword arguments the model's profile declares."""
+        if self.model_profile is None:
+            return {}
+        return self.model_profile.tokenizer_kwargs
+
+    @property
+    def requires_request_token_history(self) -> bool:
+        """Whether the model reads each request's committed token history."""
+        return (
+            self.model_profile is not None and self.model_profile.request_token_history
+        )
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)

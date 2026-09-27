@@ -7,8 +7,8 @@ torch==2.14.0
 apache-tvm-ffi==0.1.13.post3
 tokenspeed-proton>=3.8.10.post20260920
 tokenspeed-triton>=3.8.10.post20260920
-nvidia-cutlass-dsl[cu13]==4.7.1
-nvidia-cutlass-dsl-libs-cu13==4.7.1
+nvidia-cutlass-dsl[cu13]==4.8.0
+nvidia-cutlass-dsl-libs-cu13==4.8.0
 flashinfer-python==0.7.0
 # FlashInfer tactic-cache metadata includes the frontend version; keep it stable.
 nvidia-cudnn-frontend==1.29.0

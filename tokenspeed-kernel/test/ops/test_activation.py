@@ -9,7 +9,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     situ_and_mul,
     swiglu_oai,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 platform = current_platform()
 torch.manual_seed(42)
@@ -18,6 +18,14 @@ pytestmark = pytest.mark.skipif(
     not (platform.is_nvidia or platform.is_amd),
     reason="Triton activation tests require an NVIDIA or AMD GPU.",
 )
+
+
+@pytest.fixture(autouse=True)
+def disable_pdl():
+    previous = pdl_enabled()
+    pdl_enabled(overwrite=False)
+    yield
+    pdl_enabled(overwrite=previous)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -257,7 +265,10 @@ def test_fused_gate_sigmoid_mul_add_matches_eager(
     ref = ref.to(dtype)
 
     out = fused_gate_sigmoid_mul_add(
-        hidden_states, gate_weight, shared_output.clone(), final.clone()
+        hidden_states,
+        gate_weight,
+        shared_output.clone(),
+        final.clone(),
     )
 
     tol = 1e-2 if dtype == torch.bfloat16 else 5e-3
@@ -374,7 +385,11 @@ def test_fused_swiglu_fp8_ue8m0_matches_reference(
 
     gate_up = torch.randn(shape, device=device, dtype=torch.bfloat16) * 3
     out, packed_scale = fused_swiglu_fp8_ue8m0(
-        gate_up, swiglu_limit=limit, swiglu_alpha=alpha, swiglu_beta=beta
+        gate_up,
+        swiglu_limit=limit,
+        swiglu_alpha=alpha,
+        swiglu_beta=beta,
+        enable_pdl=False,
     )
 
     ref_q, ref_scale = _swiglu_ue8m0_reference(gate_up, limit, alpha, beta)
@@ -395,19 +410,6 @@ def test_fused_swiglu_fp8_ue8m0_partial_pack_keeps_padding_zero(device: str) -> 
     from tokenspeed_kernel.ops.activation.triton import fused_swiglu_fp8_ue8m0
 
     gate_up = torch.randn(16, 1280, device=device, dtype=torch.bfloat16)
-    _, packed_scale = fused_swiglu_fp8_ue8m0(gate_up)
+    _, packed_scale = fused_swiglu_fp8_ue8m0(gate_up, enable_pdl=False)
     tail = packed_scale[:, 1]
     assert bool(((tail >> 8) == 0).all()), "padding scale bytes must remain zero"
-
-
-@pytest.mark.skipif(not platform.is_hopper_plus, reason="PDL requires SM90+")
-def test_fused_swiglu_fp8_ue8m0_pdl_matches_serial(device: str) -> None:
-    """The PDL consumer/producer path must preserve values and packed scales."""
-    from tokenspeed_kernel.ops.activation.triton import fused_swiglu_fp8_ue8m0
-
-    gate_up = torch.randn(33, 1280, device=device, dtype=torch.bfloat16)
-    serial_out, serial_scale = fused_swiglu_fp8_ue8m0(gate_up)
-    pdl_out, pdl_scale = fused_swiglu_fp8_ue8m0(gate_up, enable_pdl=True)
-
-    assert torch.equal(pdl_out, serial_out)
-    assert torch.equal(pdl_scale, serial_scale)

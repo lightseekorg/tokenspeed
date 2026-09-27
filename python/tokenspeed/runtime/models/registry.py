@@ -28,6 +28,10 @@ from functools import lru_cache
 
 import torch.nn as nn
 
+from tokenspeed.runtime.plugins.registry import (
+    registered_architectures,
+    registered_model,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -39,7 +43,7 @@ class _ModelRegistry:
     models: dict[str, type[nn.Module] | str] = field(default_factory=dict)
 
     def get_supported_archs(self) -> Set[str]:
-        return self.models.keys()
+        return self.models.keys() | registered_architectures()
 
     def _raise_for_unsupported(self, architectures: list[str]):
         all_supported_archs = self.get_supported_archs()
@@ -56,10 +60,17 @@ class _ModelRegistry:
         )
 
     def _try_load_model_cls(self, model_arch: str) -> type[nn.Module] | None:
-        if model_arch not in self.models:
-            return None
-
-        return self.models[model_arch]
+        registered = registered_model(model_arch)
+        in_tree = self.models.get(model_arch)
+        if registered is None:
+            return in_tree
+        if in_tree is not None and not registered.override:
+            raise ValueError(
+                f"Plugin model {registered.cls.__name__} registers architecture "
+                f"{model_arch!r}, which the in-tree {in_tree.__name__} already "
+                "serves; register it with override=True to replace it"
+            )
+        return registered.cls
 
     def _normalize_archs(
         self,

@@ -79,6 +79,13 @@ class InputBuffers:
             # Used in draft prefill
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
             self.input_lengths_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
+            # Packed request layout read by request-token history; see
+            # prepare_request_token_history_inputs.
+            self.request_token_history_input_lengths_buf = torch.ones(
+                (max_bs,), dtype=torch.int32
+            )
+            self.input_start_offsets_buf = torch.zeros(max_bs + 1, dtype=torch.int32)
+            self.active_request_mask_buf = torch.zeros(max_bs, dtype=torch.bool)
             # Zero (not arange) so padded positions read a consistent, in-range
             # value; the tail is re-zeroed every iteration by fill_input_buffers.
             self.positions_buf = torch.zeros(max_num_tokens, dtype=torch.int64)
@@ -103,6 +110,55 @@ class InputBuffers:
         self.extend_replay_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self.extend_prompt_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._pad_tape = self._record_pad_tape()
+
+    def prepare_request_token_history_inputs(
+        self,
+        *,
+        batch_size: int,
+        num_extends: int,
+        decode_width: int,
+    ) -> None:
+        """Publish the packed batch layout request-token history reads.
+
+        Args:
+            batch_size: Rows the layout covers, graph padding included.
+            num_extends: Leading rows whose widths are their input lengths.
+            decode_width: Packed width of every remaining (decode) row.
+        """
+        if not 0 <= num_extends <= batch_size <= self.max_bs:
+            raise ValueError(
+                "request-token history batch sizes must satisfy "
+                f"0 <= num_extends <= batch_size <= {self.max_bs}"
+            )
+        if decode_width <= 0:
+            raise ValueError("request-token history decode width must be positive")
+        lengths = self.request_token_history_input_lengths_buf[:batch_size]
+        lengths.copy_(self.input_lengths_buf[:batch_size])
+        lengths[num_extends:].fill_(decode_width)
+        offsets = self.input_start_offsets_buf[: batch_size + 1]
+        offsets[0].zero_()
+        torch.cumsum(lengths, dim=0, out=offsets[1:])
+        self.active_request_mask_buf[:batch_size].fill_(True)
+
+    def prepare_request_token_history_graph_inputs(
+        self, *, active_bs: int, padded_bs: int, decode_width: int
+    ) -> None:
+        """Lay out a fixed-width decode graph batch; padding rows are inactive."""
+        if not 0 <= active_bs <= padded_bs <= self.max_bs:
+            raise ValueError(
+                "request-token history graph batch sizes must satisfy "
+                f"0 <= active_bs <= padded_bs <= {self.max_bs}"
+            )
+        torch.arange(
+            0,
+            padded_bs * decode_width + 1,
+            decode_width,
+            dtype=torch.int32,
+            device=self.device,
+            out=self.input_start_offsets_buf[: padded_bs + 1],
+        )
+        self.active_request_mask_buf[:active_bs].fill_(True)
+        self.active_request_mask_buf[active_bs:padded_bs].fill_(False)
 
     def init_ngram_buffers(self, context_len: int) -> None:
         """Allocate forward-sized, pointer-stable Engram inputs; no request cache."""
@@ -306,6 +362,12 @@ class InputBuffers:
             input_lengths_cpu,
             non_blocking=True,
         )
+        if runtime_states.has_request_token_history:
+            self.prepare_request_token_history_inputs(
+                batch_size=batch_size,
+                num_extends=num_extends,
+                decode_width=runtime_states.future_input_map.shape[1],
+            )
 
         self.all_extends_mid_chunk = (
             num_extends > 0
