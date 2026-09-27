@@ -106,7 +106,7 @@ class TritonAllReduceBackend(CommBackend):
             attnres_max_numel: Maximum fused AttnRes payload in elements.
             attnres_max_rows: Maximum fused AttnRes payload in rows.
             enable_lamport: Allow Lamport for eligible producer-direct payloads.
-            moe_tail_max_rows: Capacity of the borrowed K3 MoE result; zero disables it.
+            moe_tail_max_rows: Capacity of the borrowed MoE result; zero disables it.
             dtype: Element type shared by the prepared paths.
 
         Returns:

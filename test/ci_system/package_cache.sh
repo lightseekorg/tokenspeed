@@ -15,8 +15,60 @@ configure_package_cache() {
 
     export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${cache_root}/pip}"
     export CI_WHEEL_CACHE_DIR="${CI_WHEEL_CACHE_DIR:-${cache_root}/wheelhouse}"
+    export CI_CCACHE_DIR="${CI_CCACHE_DIR:-${cache_root}/ccache}"
     mkdir -p "${PIP_CACHE_DIR}" "${CI_WHEEL_CACHE_DIR}"
-    echo "Package cache: pip=${PIP_CACHE_DIR}, wheels=${CI_WHEEL_CACHE_DIR}"
+    echo "Package cache: pip=${PIP_CACHE_DIR}, wheels=${CI_WHEEL_CACHE_DIR}, ccache=${CI_CCACHE_DIR}"
+}
+
+configure_nvcc_cache() {
+    if [ -z "${CI_CCACHE_DIR:-}" ] || ! command -v ccache >/dev/null 2>&1; then
+        return 0
+    fi
+
+    export TOKENSPEED_KERNEL_NVCC_LAUNCHER="${TOKENSPEED_KERNEL_NVCC_LAUNCHER:-ccache}"
+    export CCACHE_DIR="${CCACHE_DIR:-${CI_CCACHE_DIR}}"
+    export CCACHE_BASEDIR="${CCACHE_BASEDIR:-${WORKSPACE:?WORKSPACE is required}}"
+    # Checkout paths are unique per matrix job. No debug flags are used for
+    # these objects, so the working directory must not split identical keys.
+    export CCACHE_NOHASHDIR="${CCACHE_NOHASHDIR:-1}"
+    export CCACHE_COMPILERTYPE="${CCACHE_COMPILERTYPE:-nvcc}"
+    export CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-%compiler% --version; g++ --version}"
+    # Fresh checkouts give headers new timestamps even though their content is
+    # immutable during the build. Keep content hashing while allowing caching.
+    export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS:-include_file_ctime,include_file_mtime}"
+    export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-100G}"
+    export CCACHE_UMASK="${CCACHE_UMASK:-002}"
+    export CCACHE_TEMPDIR="${CCACHE_TEMPDIR:-${WORKSPACE}/.ccache-tmp}"
+    export CCACHE_STATSLOG="${CCACHE_STATSLOG:-${WORKSPACE}/.ci-artifacts/ccache-stats.log}"
+    if [ "${TOKENSPEED_CI_FORK_PR:-false}" = "true" ]; then
+        export CCACHE_READONLY=1
+    fi
+
+    local stats_dir
+    stats_dir=$(dirname "${CCACHE_STATSLOG}")
+    if ! mkdir -p "${CCACHE_DIR}" "${CCACHE_TEMPDIR}" "${stats_dir}" \
+        || [ ! -w "${CCACHE_DIR}" ] \
+        || [ ! -w "${CCACHE_TEMPDIR}" ] \
+        || [ ! -w "${stats_dir}" ]; then
+        echo "NVCC cache directory is unavailable; continuing without ccache" >&2
+        unset CI_CCACHE_DIR TOKENSPEED_KERNEL_NVCC_LAUNCHER
+        return 0
+    fi
+    echo "NVCC cache: dir=${CCACHE_DIR}, base=${CCACHE_BASEDIR}, read_only=${CCACHE_READONLY:-0}"
+}
+
+show_nvcc_cache_stats() {
+    local phase="$1"
+    if [ -z "${CI_CCACHE_DIR:-}" ] || ! command -v ccache >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "=== NVCC cache stats (${phase}) ==="
+    ccache --show-stats || true
+    if [ "${phase}" = "after" ] && [ -s "${CCACHE_STATSLOG:-}" ]; then
+        echo "=== NVCC cache stats for this build ==="
+        ccache --show-log-stats || true
+    fi
 }
 
 cache_remote_wheel() {

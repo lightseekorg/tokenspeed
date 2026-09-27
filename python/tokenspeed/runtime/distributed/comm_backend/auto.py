@@ -44,6 +44,19 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
+def ordered_fold_sum(parts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Fold ``[world, ...]`` partial sums left to right in fp32 into ``out``.
+
+    The association order depends only on the rank axis, never on the payload
+    shape, so a row's folded value is bitwise identical at any batch size.
+    """
+    accumulator = parts[0].to(torch.float32)
+    for rank in range(1, parts.shape[0]):
+        accumulator = accumulator + parts[rank].to(torch.float32)
+    out.copy_(accumulator.to(out.dtype))
+    return out
+
+
 class AutoBackend(CommBackend):
     """Composite backend that selects the best strategy per call."""
 
@@ -67,6 +80,29 @@ class AutoBackend(CommBackend):
     @staticmethod
     def _force_deterministic_rsag() -> bool:
         return bool(global_server_args_dict.get("force_deterministic_rsag", False))
+
+    @staticmethod
+    def _batch_invariant_collectives() -> bool:
+        return bool(global_server_args_dict.get("batch_invariant_collectives", False))
+
+    def _ordered_fold_all_reduce(
+        self, tensor: torch.Tensor, group: Group, op
+    ) -> torch.Tensor:
+        """All-gather the partials and fold them in fixed rank order.
+
+        Every element folds rank 0..n-1 left to right in fp32 with one final
+        rounding, independent of the tensor's shape -- unlike a ring
+        all-reduce, whose per-element association order follows the
+        size-dependent chunking. In-place like the NCCL all-reduce.
+        """
+        if op is not None and op != torch.distributed.ReduceOp.SUM:
+            raise ValueError("batch-invariant collectives fold SUM reductions only")
+        world_size = len(group)
+        if world_size == 1:
+            return tensor
+        gathered = self._nccl.all_gather(tensor, group, dim=0)
+        parts = gathered.view((world_size, *tensor.shape))
+        return ordered_fold_sum(parts, tensor)
 
     @staticmethod
     def _group_spans_nodes(group: Group) -> bool:
@@ -131,6 +167,12 @@ class AutoBackend(CommBackend):
         group: Group,
         op=None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if self._batch_invariant_collectives():
+            if isinstance(tensor, torch.Tensor):
+                return self._ordered_fold_all_reduce(tensor, group, op)
+            return tuple(
+                self._ordered_fold_all_reduce(value, group, op) for value in tensor
+            )
         if not isinstance(tensor, torch.Tensor):
             tensors = tensor
             if len(tensors) == 0:

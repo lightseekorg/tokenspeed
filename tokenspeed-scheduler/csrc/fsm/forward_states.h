@@ -23,7 +23,6 @@
 #include <algorithm>
 #include <concepts>
 #include <cstdint>
-#include <memory>
 #include <span>
 #include <string>
 #include <utility>
@@ -107,7 +106,7 @@ private:
 struct ForwardResources {
     TokenContainer* token_container{};
     std::int32_t prefix_granularity{};
-    std::unique_ptr<ReqPoolIndex> req_pool_index;
+    ReqPoolIndex req_pool_index;
     std::vector<BlockTable> block_tables;
     CacheProgress cache_progress;
     // Forwards scheduled for this request whose results have not come back.
@@ -121,7 +120,7 @@ struct ForwardResources {
     // and the write lands on pages someone else now owns.
     std::int32_t results_in_flight{0};
 
-    std::int32_t RequestPoolIndex() const { return req_pool_index ? req_pool_index->slot_ : -1; }
+    std::int32_t RequestPoolIndex() const { return req_pool_index.valid() ? req_pool_index.slot_ : -1; }
     void TrackScheduledForward() { ++results_in_flight; }
     void ResultLanded() {
         FatalCheck(results_in_flight > 0, "a forward result landed for a request with no forward in flight");

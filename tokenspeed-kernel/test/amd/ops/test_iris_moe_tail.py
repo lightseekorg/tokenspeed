@@ -21,6 +21,7 @@
 """Producer ownership, lifetime and ordering of the token-sharded K3 tail."""
 
 import socket
+from contextlib import ExitStack
 from datetime import timedelta
 
 import pytest
@@ -28,6 +29,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_triton_compile
 
 
 def _moe_tail_worker(rank: int, port: int) -> None:
@@ -51,6 +53,10 @@ def _moe_tail_worker(rank: int, port: int) -> None:
 
 def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -> None:
     from tokenspeed_kernel.ops.communication import triton as comm
+    from tokenspeed_kernel.ops.communication._iris.prefill import (
+        iris_moe_add_push_gather_gluon_kernel,
+        iris_moe_reduce_scatter_gluon_kernel,
+    )
     from tokenspeed_kernel.ops.communication.iris import create_iris_ar_rmsnorm_state
     from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_latent_projection_add3
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
@@ -125,16 +131,29 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
             solution="auto",
         )
 
+    tail_kernels_warmed = False
+
     def projected(inputs, prefix, norm_weight):
-        output = iris_kimi3_moe_tail(
-            *inputs,
-            prefix,
-            weight,
-            norm_weight=norm_weight,
-            eps=1e-5 if norm_weight is not None else None,
-            group=group,
-        )
+        nonlocal tail_kernels_warmed
+        # Warm once, then exercise changing row counts without recompiling
+        # either collective. Projection and normalization have separate kernels.
+        with ExitStack() as stack:
+            if tail_kernels_warmed:
+                for kernel in (
+                    iris_moe_reduce_scatter_gluon_kernel,
+                    iris_moe_add_push_gather_gluon_kernel,
+                ):
+                    stack.enter_context(assert_no_triton_compile(kernel))
+            output = iris_kimi3_moe_tail(
+                *inputs,
+                prefix,
+                weight,
+                norm_weight=norm_weight,
+                eps=1e-5 if norm_weight is not None else None,
+                group=group,
+            )
         assert output is not None
+        tail_kernels_warmed = True
         return output
 
     held = None
