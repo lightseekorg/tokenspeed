@@ -714,6 +714,57 @@ def test_slurm_runner_override_keeps_task_env_and_uses_gb300_hardware(
     assert captured["env"]["LOGICAL_RUNNER_ENV"] == "preserved"
 
 
+@pytest.mark.parametrize(
+    ("task_type", "task_env", "expected"),
+    [
+        ("eval", {}, "error"),
+        ("perf", {}, "error"),
+        ("server_smoke", {}, "error"),
+        ("eval", {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("ut", {}, None),
+    ],
+)
+def test_serving_tasks_arm_the_jit_compile_check(
+    monkeypatch, tmp_path, task_type, task_env, expected
+):
+    monkeypatch.delenv("TOKENSPEED_JIT_COMPILE_CHECK", raising=False)
+    task = {
+        "name": "jit-check",
+        "type": task_type,
+        "runner": {"labels": ["b200-1gpu"]},
+        "env": task_env,
+        "ut": {"commands": ["run test"]},
+    }
+    captured = {}
+
+    class FakeProcessGroupManager:
+        def run(self, command, *, cwd, env, dry_run):
+            return {"returncode": 0, "output": ""}
+
+        def terminate_all(self, *, dry_run):
+            return None
+
+    def capture_setup(runner, env, cwd, dry_run, reuse_state, setup_mode):
+        captured.update(env=env.copy())
+        return env, FakeProcessGroupManager()
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "setup_runner", capture_setup)
+    monkeypatch.setattr(pipeline, "get_stage_commands", lambda task: [])
+
+    pipeline.execute_task(
+        config="task.yaml",
+        runner="b200-1gpu",
+        runner_override=None,
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=None,
+        setup_mode="ci",
+    )
+    assert captured["env"].get("TOKENSPEED_JIT_COMPILE_CHECK") == expected
+
+
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
     monkeypatch.setenv("TOKENSPEED_B200_RUNNER_LABEL", "b200v2")
     task = {

@@ -186,7 +186,11 @@ Inside the root `tokenspeed-kernel/` directory:
   (DeepGEMM compiles a kernel per new value). Reviews must check every new or
   changed kernel signature and launch site for this. Kernels launched with
   batch-varying shapes need a test that warms the kernel, then sweeps those
-  shapes inside `assert_no_triton_compile` from `test/utils.py`.
+  shapes inside `assert_no_triton_compile` from `test/utils.py`. At runtime
+  `tokenspeed_kernel.compile_monitor` logs every Triton compilation after
+  startup and names a parameter that keeps taking new values;
+  CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a parameter
+  fails the model tests.
 
 ## tokenspeed-kernel-amd
 

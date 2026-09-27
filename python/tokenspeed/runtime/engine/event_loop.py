@@ -31,6 +31,7 @@ import setproctitle
 import torch
 import torch.distributed as dist
 import zmq
+from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -93,6 +94,10 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
+from tokenspeed.runtime.utils.jit_compile_check import (
+    install_jit_compile_check,
+    mark_jit_compile_serving,
+)
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.process import register_usr_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
@@ -940,6 +945,7 @@ class EventLoop:
             num_total_pages=self._scheduler_cache_geometry.num_usable_pages,
             num_iteration_tokens=num_iteration_tokens,
         )
+        self.metrics.record_jit_compiles(compile_stats())
 
     # ------------------------------------------------------------------
     # Event loops
@@ -1259,6 +1265,9 @@ def run_event_loop(
 
     prefix = f" ATTN TP RANK {attn_tp_rank}"
     configure_logger(server_args, prefix=prefix)
+    # Before anything builds, so startup compilations are told apart from
+    # the serving ones reported after mark_jit_compile_serving().
+    install_jit_compile_check()
 
     event_loop = None
     shutdown_event = threading.Event()
@@ -1318,9 +1327,11 @@ def run_event_loop(
             # the loop and starts the first DP metadata collective.
             dist.barrier(group=event_loop.world_cpu_group)
 
-        # Everything before this point is startup and may synchronize; from
-        # here on a host synchronization on the data plane is a stall.
+        # Everything before this point is startup and may synchronize or
+        # JIT-compile; from here on a host synchronization or a kernel
+        # compilation on the data plane is a stall.
         arm_data_plane_sync_debug(server_args.device)
+        mark_jit_compile_serving()
         event_loop.event_loop()
 
     except Exception:  # noqa: BLE001 - process boundary; report and signal parent
