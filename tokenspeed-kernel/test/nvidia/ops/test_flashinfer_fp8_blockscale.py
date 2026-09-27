@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import fp8_linear, mm, prepare_fp8_linear
+from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8
 from tokenspeed_kernel.ops.gemm.flashinfer import (
     gemm_fp8_nt_groupwise,
     has_flashinfer_fp8_blockscale,
@@ -19,6 +20,11 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not has_flashinfer_fp8_blockscale(),
     reason="requires SM100 CUDA and FlashInfer FP8 block-scale GEMM",
 )
+
+
+def _dequantize_weight(weight: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    blocks = scales.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    return weight.float() * blocks
 
 
 @pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 8])
@@ -92,9 +98,18 @@ def test_canonical_and_prepacked_gemm_match(device: str, m: int) -> None:
     )
 
     torch.testing.assert_close(prepacked, expected, atol=0, rtol=0)
-    # Canonical quantizes the activation with another kernel and may take the
-    # K-major scale path, so it can differ by a few bf16 ulps; |out| ~ 5e-3.
-    torch.testing.assert_close(canonical, prepacked, atol=1e-4, rtol=1e-2)
+
+    # Canonical quantizes the activation with TRT-LLM's kernel, prepacked with a
+    # Triton one when M % 4 != 0; they can round an FP8 value differently, which
+    # shifts a whole output row. Check canonical against its own quantized
+    # operands instead: only the bf16 output rounding remains (|out| ~ 5e-3).
+    q_x, x_scales = _online_quantize_mxfp8(
+        x, [128, 128], "flashinfer_mm_fp8_blockscale"
+    )
+    # TRT-LLM pads the scale rows to a multiple of four.
+    activation = q_x[:m].float() * x_scales[:m].repeat_interleave(128, dim=1)
+    reference = activation @ _dequantize_weight(weight, weight_scales).t()
+    torch.testing.assert_close(canonical.float(), reference, atol=3e-5, rtol=1e-2)
 
 
 def test_prepacked_gemm_rejects_canonical_weight_scales(device: str) -> None:
@@ -239,9 +254,6 @@ def test_prepared_plan_is_exact_for_partial_row_tiles(device: str, m: int) -> No
     activation = quantized_x[:m].float() * activation_scales[:, :m].transpose(
         0, 1
     ).repeat_interleave(128, dim=1)
-    dequantized = weight.float() * weight_scales.repeat_interleave(
-        128, dim=0
-    ).repeat_interleave(128, dim=1)
-    reference = activation @ dequantized.t()
+    reference = activation @ _dequantize_weight(weight, weight_scales).t()
 
     torch.testing.assert_close(got.float(), reference, atol=1e-3, rtol=1e-2)
