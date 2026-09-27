@@ -22,6 +22,7 @@
 
 import math
 import os
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -121,12 +122,16 @@ class RequestHistoryRows:
     first local forward is a decode over a remotely prefilled prompt. Later
     chunks of one prefill and ordinary decode steps never reseed.
 
+    Ownership is recorded per admission — the request's state object, held
+    weakly — not per request id: clients may reuse a finished request's id,
+    and a later request landing in the same slot must not inherit the row.
+
     Call :meth:`seeds_for_forward` exactly once per forward the executor
     runs, in dispatch order (the executor runs forwards in that order).
     """
 
     def __init__(self) -> None:
-        self._owners: dict[int, str] = {}
+        self._owners: dict[int, weakref.ref] = {}
 
     def seeds_for_forward(
         self, forward_op, rid_to_state: Mapping
@@ -143,9 +148,10 @@ class RequestHistoryRows:
         num_extends = forward_op.num_extends()
         for i, rid in enumerate(forward_op.request_ids):
             slot = int(forward_op.request_pool_indices[i])
-            held = self._owners.get(slot) == rid
-            self._owners[slot] = rid
             state = rid_to_state[rid]
+            owner = self._owners.get(slot)
+            held = owner is not None and owner() is state
+            self._owners[slot] = weakref.ref(state)
             prompt, output = state.prompt_input_ids, state.output_ids
             total = len(prompt) + len(output)
             boundary = (

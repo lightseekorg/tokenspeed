@@ -45,9 +45,17 @@ class _ForwardOp(SimpleNamespace):
         return len(self.extend_prefix_lens)
 
 
+class _State:
+    """A request state: weak-referenceable, like the output processor's."""
+
+    def __init__(self, prompt_input_ids: list[int], output_ids: list[int]) -> None:
+        self.prompt_input_ids = prompt_input_ids
+        self.output_ids = output_ids
+
+
 _STATES = {
-    "a": SimpleNamespace(prompt_input_ids=[10, 11, 12, 13], output_ids=[20, 21]),
-    "b": SimpleNamespace(prompt_input_ids=[30, 31], output_ids=[]),
+    "a": _State(prompt_input_ids=[10, 11, 12, 13], output_ids=[20, 21]),
+    "b": _State(prompt_input_ids=[30, 31], output_ids=[]),
 }
 
 
@@ -90,7 +98,7 @@ def test_remote_prefill_landing_seeds_its_first_decode() -> None:
     landing = _ForwardOp(
         request_ids=["b"], request_pool_indices=[2], extend_prefix_lens=[]
     )
-    states = {"b": SimpleNamespace(prompt_input_ids=[30, 31, 32], output_ids=[40])}
+    states = {"b": _State(prompt_input_ids=[30, 31, 32], output_ids=[40])}
     assert rows.seeds_for_forward(landing, states) == RequestHistorySeeds(
         slots=(2,), prefix_lengths=(3,), tokens=((30, 31, 32),)
     )
@@ -113,6 +121,24 @@ def test_slot_handoff_and_recovery_reseed() -> None:
         request_ids=["a"], request_pool_indices=[1], extend_prefix_lens=[4]
     )
     assert rows.seeds_for_forward(recovery, _STATES).prefix_lengths == (4,)
+
+
+def test_a_reused_request_id_does_not_inherit_the_row() -> None:
+    # Clients may reuse a finished request's id; at bs=1 the new request
+    # lands in the same slot. Ownership follows the admission, not the id.
+    rows = RequestHistoryRows()
+    first = {"a": _State(prompt_input_ids=[10, 11, 12, 13], output_ids=[])}
+    rows.seeds_for_forward(
+        _ForwardOp(request_ids=["a"], request_pool_indices=[1], extend_prefix_lens=[0]),
+        first,
+    )
+    again = {"a": _State(prompt_input_ids=[50, 51, 52, 53], output_ids=[])}
+    hit = _ForwardOp(
+        request_ids=["a"], request_pool_indices=[1], extend_prefix_lens=[3]
+    )
+    assert rows.seeds_for_forward(hit, again) == RequestHistorySeeds(
+        slots=(1,), prefix_lengths=(3,), tokens=((50, 51, 52),)
+    )
 
 
 def test_seed_prefix_must_exist() -> None:
