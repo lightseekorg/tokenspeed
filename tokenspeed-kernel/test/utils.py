@@ -343,3 +343,35 @@ def register_all_samples(
         raise ValueError("sample registrations must target the active KernelRegistry")
     for options, impl in samples.values():
         register_kernel(**options)(impl)
+
+
+class FakeTimer:
+    """Benchmark timer that invokes the operation once and reports fixed samples."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.cold_cache: list[bool] = []
+        self.measurement_blocks: list[int] = []
+
+    def measure(self, prepared, *, cold_cache: bool, measurement_blocks: int):
+        # Imported lazily: conftest imports this module for every test.
+        from tokenspeed_kernel.benchmark.graph import GraphMeasurement
+
+        self.calls += 1
+        self.cold_cache.append(cold_cache)
+        self.measurement_blocks.append(measurement_blocks)
+        prepared.invoke()
+        return GraphMeasurement(
+            samples_us=(2.0, 3.0, 4.0),
+            median_us=3.0,
+            p90_us=3.8,
+            min_us=2.0,
+            max_us=4.0,
+            relative_mad=1.0 / 3.0,
+            eager_warmup_iterations=5,
+            replay_warmup_iterations=3,
+            warmup_time_ms=1.0,
+            capture_time_ms=2.0,
+            first_replay_time_ms=3.0,
+            measurement_time_ms=4.0,
+        )
