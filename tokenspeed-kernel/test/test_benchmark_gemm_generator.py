@@ -723,7 +723,7 @@ def test_dense_mm_gluon_prefill_registration_graph_replay(M):
         _gemm_mm_request(
             _dense_mm_parameters(
                 M=M,
-                validation={"runs": 3, "atol": 0.01, "rtol": 0.01},
+                validation={"runs": 3, "atol": 1e-4, "rtol": 2**-7},
             ),
             registration="gluon_mm_a16w16_prefill_gfx950",
         ),

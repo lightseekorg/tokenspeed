@@ -16,8 +16,8 @@
           "dtype": "bfloat16",
           "validation": {
             "runs": 3,
-            "atol": 0.01,
-            "rtol": 0.01
+            "atol": 0.0001,
+            "rtol": 0.0078125
           }
         },
         "registration": "gluon_mm_a16w16_prefill_gfx950",
