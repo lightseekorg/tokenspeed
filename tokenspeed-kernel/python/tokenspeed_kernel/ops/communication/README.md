@@ -47,9 +47,10 @@ snapshots. At 7680 tokens and above they also fuse seven or eight snapshots.
 The 1024–4088 range and other history depths use the separate mixer.
 
 The reduction uses 24 workgroups, four subgroups per workgroup and 2048-element
-tiles. The fused mixer uses up to 128 workgroups and four or eight subgroups; the
-separate gather uses 32 workgroups. Small partitions cap the grids to useful
-work. These launches fit the flags already reserved for the MoE tail.
+tiles. The fused mixer uses 128 workgroups and four or eight subgroups; the
+separate gather uses 32 workgroups. Row and partition counts are non-specializing runtime arguments, and grids stay
+fixed so new prefill lengths reuse the warmed collective binaries. These launches
+fit the flags already reserved for the MoE tail.
 
 ### Ownership and synchronization
 

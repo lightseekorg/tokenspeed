@@ -34,6 +34,10 @@ from tokenspeed_kernel._triton import (
     tl,
     triton,
 )
+from tokenspeed_kernel.ops.communication._iris import (
+    MOE_GATHER_PROGRAMS,
+    MOE_REDUCE_PROGRAMS,
+)
 from tokenspeed_kernel.ops.communication._iris.sync import _iris_drain_subgroup_vmem
 
 # iris does plain ``import triton`` at module load time; route those bindings
@@ -883,6 +887,7 @@ class IrisAllReduce(object):
             else 0
         )
         self._producer_direct_max_programs = max(
+            MOE_REDUCE_PROGRAMS if moe_tail_max_rows else 0,
             producer_config.one_stage_max_programs,
             (
                 two_stage_config.max_programs
@@ -961,7 +966,7 @@ class IrisAllReduce(object):
             if moe_tail_max_rows:
                 heap_size += (
                     moe_tail_max_rows * moe_config.hidden_size * dtype.itemsize
-                    + 128 * self.world_size * torch.int32.itemsize
+                    + MOE_GATHER_PROGRAMS * self.world_size * torch.int32.itemsize
                 )
 
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
@@ -982,7 +987,7 @@ class IrisAllReduce(object):
             else None
         )
         self._moe_tail_ready_flags = (
-            self._ctx.zeros((128, self.world_size), dtype=torch.int32)
+            self._ctx.zeros((MOE_GATHER_PROGRAMS, self.world_size), dtype=torch.int32)
             if moe_tail_max_rows
             else None
         )

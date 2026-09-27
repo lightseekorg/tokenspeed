@@ -104,7 +104,7 @@ def _peer_flags(pointer, heaps, RANK: gl.constexpr, NUM_WARPS: gl.constexpr):
     return (bases + offset).to(gl.pointer_type(gl.uint32))
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["ROWS"])
 def iris_moe_reduce_scatter_gluon_kernel(
     input_ptr,
     scratch_ptr,
@@ -118,14 +118,13 @@ def iris_moe_reduce_scatter_gluon_kernel(
     heap_base_6,
     heap_base_7,
     RANK: gl.constexpr,
-    ROWS: gl.constexpr,
+    ROWS,
     FIRST_WIDTH: gl.constexpr,
     SECOND_WIDTH: gl.constexpr,
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    gl.static_assert(ROWS % 8 == 0)
     heaps = (
         heap_base_0,
         heap_base_1,
@@ -144,9 +143,9 @@ def iris_moe_reduce_scatter_gluon_kernel(
         gl.atomic_add(flags + block_id * 8 + RANK, 1, sem="relaxed", scope="gpu") + 1
     )
     _prefill_entry_barrier(flags, peer_flags, block_id, epoch, RANK, NUM_WARPS)
-    FIRST_ELEMENTS: gl.constexpr = ROWS // 8 * FIRST_WIDTH
-    SECOND_ELEMENTS: gl.constexpr = ROWS // 8 * SECOND_WIDTH
-    PARTITION_ELEMENTS: gl.constexpr = FIRST_ELEMENTS + SECOND_ELEMENTS
+    FIRST_ELEMENTS = ROWS // 8 * FIRST_WIDTH
+    SECOND_ELEMENTS = ROWS // 8 * SECOND_WIDTH
+    PARTITION_ELEMENTS = FIRST_ELEMENTS + SECOND_ELEMENTS
     layout: gl.constexpr = gl.BlockedLayout([8], [64], [NUM_WARPS], [0])
     lanes = gl.arange(0, BLOCK_ELEMENTS, layout=layout)
     for tile in range(
@@ -154,6 +153,9 @@ def iris_moe_reduce_scatter_gluon_kernel(
     ):
         offsets = tile * BLOCK_ELEMENTS + lanes
         mask = offsets < PARTITION_ELEMENTS
+        # Each rank owns rows [RANK * ROWS/8, (RANK + 1) * ROWS/8).
+        # Input packs all routed rows, then all shared rows; scratch packs
+        # this rank's routed rows, then this rank's shared rows.
         source = gl.where(
             offsets < FIRST_ELEMENTS,
             RANK * FIRST_ELEMENTS + offsets,
@@ -177,8 +179,11 @@ def iris_moe_reduce_scatter_gluon_kernel(
         reduced = ((sums[0] + sums[1]) + (sums[2] + sums[3])).to(gl.bfloat16)
         gl.amd.cdna4.buffer_store(reduced, scratch_ptr, offsets, mask, cache=".wt")
 
+    # The following gather completion waits for every rank after its entire
+    # reduction kernel. Producers cannot reuse input until that gather returns.
 
-@gluon.jit
+
+@gluon.jit(do_not_specialize=["PARTITION_ELEMENTS"])
 def iris_moe_add_push_gather_gluon_kernel(
     projection_ptr,
     shared_ptr,
@@ -194,7 +199,7 @@ def iris_moe_add_push_gather_gluon_kernel(
     heap_base_6,
     heap_base_7,
     RANK: gl.constexpr,
-    PARTITION_ELEMENTS: gl.constexpr,
+    PARTITION_ELEMENTS,
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
@@ -225,10 +230,7 @@ def iris_moe_add_push_gather_gluon_kernel(
         block_id, gl.cdiv(PARTITION_ELEMENTS, BLOCK_ELEMENTS), NUM_PROGRAMS
     ):
         offsets = tile * BLOCK_ELEMENTS + lanes
-        if PARTITION_ELEMENTS % BLOCK_ELEMENTS == 0:
-            mask = gl.full((BLOCK_ELEMENTS,), True, gl.int1, layout)
-        else:
-            mask = offsets < PARTITION_ELEMENTS
+        mask = offsets < PARTITION_ELEMENTS
         prefix_offsets = offsets
         if not PREFIX_IS_SHARDED:
             prefix_offsets += RANK * PARTITION_ELEMENTS
@@ -241,6 +243,9 @@ def iris_moe_add_push_gather_gluon_kernel(
         c = gl.amd.cdna4.buffer_load(shared_ptr, offsets, mask, 0, cache=".cg").to(
             gl.float32
         )
+        # For global row r owned by this rank:
+        # y[r] = prefix[r] + W * RMSNorm(sum_peer routed_peer[r])
+        #        + sum_peer shared_peer[r]. Publish y[r] to every rank.
         result = (a + b + c).to(gl.bfloat16)
         # Precomputed peer bases keep stores consecutive without VMEM drains.
         for step in gl.static_range(8):

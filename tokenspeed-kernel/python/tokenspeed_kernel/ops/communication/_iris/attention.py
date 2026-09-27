@@ -53,7 +53,7 @@ def _mix_gather_metadata(grid, kernel, args):
     }
 
 
-@gluon.jit(launch_metadata=_reduce_metadata)
+@gluon.jit(launch_metadata=_reduce_metadata, do_not_specialize=["PARTITION_ELEMENTS"])
 def iris_attention_reduce_scatter_gluon_kernel(
     input_ptr,
     residual_ptr,
@@ -68,7 +68,7 @@ def iris_attention_reduce_scatter_gluon_kernel(
     heap_base_6,
     heap_base_7,
     RANK: gl.constexpr,
-    PARTITION_ELEMENTS: gl.constexpr,
+    PARTITION_ELEMENTS,
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
@@ -129,7 +129,7 @@ def iris_attention_reduce_scatter_gluon_kernel(
     # rank's input reads before the next producer reuses the symmetric input.
 
 
-@gluon.jit(launch_metadata=_gather_metadata)
+@gluon.jit(launch_metadata=_gather_metadata, do_not_specialize=["PARTITION_ELEMENTS"])
 def iris_attention_push_gather_gluon_kernel(
     mixed_ptr,
     output_ptr,
@@ -143,7 +143,7 @@ def iris_attention_push_gather_gluon_kernel(
     heap_base_6,
     heap_base_7,
     RANK: gl.constexpr,
-    PARTITION_ELEMENTS: gl.constexpr,
+    PARTITION_ELEMENTS,
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
@@ -181,7 +181,7 @@ def iris_attention_push_gather_gluon_kernel(
     _prefill_store_completion(flags, peers, pid, epoch, RANK, NUM_WARPS)
 
 
-@gluon.jit(launch_metadata=_mix_gather_metadata)
+@gluon.jit(launch_metadata=_mix_gather_metadata, do_not_specialize=["LOCAL_ROWS"])
 def iris_attention_mix_push_gluon_kernel(
     prefix_ptr,
     output_ptr,
@@ -199,7 +199,7 @@ def iris_attention_mix_push_gluon_kernel(
     heap_base_6,
     heap_base_7,
     RANK: gl.constexpr,
-    LOCAL_ROWS: gl.constexpr,
+    LOCAL_ROWS,
     STRIDE_BLOCK_T: gl.constexpr,
     STRIDE_BLOCK_N,
     NUM_VALID_BLOCKS: gl.constexpr,

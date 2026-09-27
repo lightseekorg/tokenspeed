@@ -24,6 +24,10 @@ import math
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication._iris import (
+    MOE_GATHER_PROGRAMS,
+    MOE_REDUCE_PROGRAMS,
+)
 from tokenspeed_kernel.platform import current_platform
 
 
@@ -150,9 +154,9 @@ def iris_attention_prefill_mix(
         output_buffer is None
         or output_buffer.shape[0] < partial.shape[0]
         or flags is None
-        or flags.shape[0] < 24
+        or flags.shape[0] < MOE_REDUCE_PROGRAMS
         or gather_flags is None
-        or gather_flags.shape[0] < 128
+        or gather_flags.shape[0] < MOE_GATHER_PROGRAMS
     ):
         return None
     protected = (state._input_buf, state._producer_direct_scratch_buf, output_buffer)
@@ -200,7 +204,7 @@ def iris_attention_prefill_mix(
 
     prefix = torch.empty_like(partial[:rows])
     output = output_buffer[: partial.shape[0]]
-    programs = min(24, (partition + 2047) // 2048)
+    programs = MOE_REDUCE_PROGRAMS
     iris_attention_reduce_scatter_gluon_kernel[(programs,)](
         partial,
         residual,
@@ -221,7 +225,7 @@ def iris_attention_prefill_mix(
         num_valid_blocks <= 6 or (partial.shape[0] >= 7680 and num_valid_blocks <= 8)
     )
     if fuse_mix:
-        gather_programs = min(128, rows)
+        gather_programs = MOE_GATHER_PROGRAMS
         num_subgroups = 8 if num_valid_blocks <= 7 else 4
         iris_attention_mix_push_gluon_kernel[(gather_programs,)](
             prefix,
@@ -258,7 +262,7 @@ def iris_attention_prefill_mix(
             num_valid_blocks=num_valid_blocks,
             block_write_idx=-1,
         )
-        gather_programs = min(32, (partition + 2047) // 2048)
+        gather_programs = 32
         iris_attention_push_gather_gluon_kernel[(gather_programs,)](
             mixed,
             output,

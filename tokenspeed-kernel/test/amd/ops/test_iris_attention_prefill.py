@@ -21,6 +21,7 @@
 """Attention producer ownership and reuse of the existing MoE communication state."""
 
 import socket
+from contextlib import ExitStack
 from datetime import timedelta
 from itertools import product
 
@@ -29,6 +30,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_triton_compile
 
 
 def _reference_mix(prefix, history, score, norm, valid_blocks):
@@ -65,6 +67,11 @@ def _attention_worker(rank: int, port: int) -> None:
     )
     group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
     from tokenspeed_kernel.ops.communication import triton as comm
+    from tokenspeed_kernel.ops.communication._iris.attention import (
+        iris_attention_mix_push_gluon_kernel,
+        iris_attention_push_gather_gluon_kernel,
+        iris_attention_reduce_scatter_gluon_kernel,
+    )
     from tokenspeed_kernel.ops.communication.iris_prefill import (
         iris_attention_prefill_mix,
     )
@@ -97,6 +104,7 @@ def _attention_worker(rank: int, port: int) -> None:
     pointers = tuple(t.data_ptr() for t in buffers)
     gen = torch.Generator(device=device)
     held_mix = None
+    warmed_variants = set()
     for m in (512, 513, 520, 848, 1024, 2048, 4096, 6224, 8144, 8192):
         partial = comm.acquire_symm_outputs(backing, ((m, 7168),), torch.bfloat16)[0]
         gen.manual_seed(31729 + rank)
@@ -146,18 +154,33 @@ def _attention_worker(rank: int, port: int) -> None:
                     expected, history, score, norm, valid_blocks
                 )
                 partial.copy_(source)
-                mixed = iris_attention_prefill_mix(
-                    partial,
-                    prefix,
-                    history,
-                    score,
-                    norm,
-                    eps=1e-6,
-                    out_norm_weight=norm,
-                    out_norm_eps=1e-6,
-                    num_valid_blocks=valid_blocks,
-                    group=group,
+                # Warm each algorithm/history/layout variant, then ensure new
+                # token counts reuse its collective binaries.
+                fused = (m < 1024 or m >= 4096) and (
+                    valid_blocks <= 6 or (m >= 7680 and valid_blocks <= 8)
                 )
+                variant = (fused, valid_blocks, prefix is not None, history.stride(1))
+                with ExitStack() as stack:
+                    if variant in warmed_variants:
+                        for kernel in (
+                            iris_attention_reduce_scatter_gluon_kernel,
+                            iris_attention_push_gather_gluon_kernel,
+                            iris_attention_mix_push_gluon_kernel,
+                        ):
+                            stack.enter_context(assert_no_triton_compile(kernel))
+                    mixed = iris_attention_prefill_mix(
+                        partial,
+                        prefix,
+                        history,
+                        score,
+                        norm,
+                        eps=1e-6,
+                        out_norm_weight=norm,
+                        out_norm_eps=1e-6,
+                        num_valid_blocks=valid_blocks,
+                        group=group,
+                    )
+                warmed_variants.add(variant)
                 assert mixed is not None
                 shard, activation = mixed
                 assert shard.shape == (m // 8, 7168)

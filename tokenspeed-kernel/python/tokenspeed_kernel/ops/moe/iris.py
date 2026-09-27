@@ -24,6 +24,10 @@ import math
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication._iris import (
+    MOE_GATHER_PROGRAMS,
+    MOE_REDUCE_PROGRAMS,
+)
 from tokenspeed_kernel.platform import current_platform
 
 
@@ -132,8 +136,8 @@ def iris_kimi3_moe_tail(
     shared_elements = local_rows * 7168
     scratch = state._producer_direct_scratch_buf
     flags = state._producer_direct_ready_flags
-    programs = 24
-    gather_programs = 128
+    programs = MOE_REDUCE_PROGRAMS
+    gather_programs = MOE_GATHER_PROGRAMS
     result_buffer = state._moe_tail_output_buf
     gather_flags = state._moe_tail_ready_flags
     if (
@@ -147,7 +151,8 @@ def iris_kimi3_moe_tail(
         or result_buffer.shape[0] < rows
     ):
         return None
-    # Reject unsafe overlaps before launching either collective.
+    # owns_outputs already checks tensors[:2] against the producer allocation.
+    # Reject unsafe overlaps of residual and weights before either collective.
     for tensor in tensors[2:]:
         start = tensor.data_ptr()
         end = start + tensor.numel() * tensor.element_size()
@@ -155,7 +160,8 @@ def iris_kimi3_moe_tail(
             buffer_start = buffer.data_ptr()
             buffer_end = buffer_start + buffer.numel() * buffer.element_size()
             if start < buffer_end and buffer_start < end:
-                # Only exact prefix aliasing preserves row ownership.
+                # Prefix may be a shorter view of the capacity-sized result;
+                # matching its start preserves row ownership.
                 if not (
                     buffer is result_buffer
                     and tensor is prefix
@@ -164,6 +170,8 @@ def iris_kimi3_moe_tail(
                 ):
                     return None
 
+    # Keep AMD JIT and projection imports behind the eligibility checks so
+    # importing this wrapper does not require optional AMD dependencies.
     from tokenspeed_kernel.ops.communication._iris.prefill import (
         iris_moe_add_push_gather_gluon_kernel,
         iris_moe_reduce_scatter_gluon_kernel,
