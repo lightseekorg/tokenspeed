@@ -68,7 +68,10 @@ def _wmma_tdm_dense_m16_launch_metadata(grid, kernel, args):
     }
 
 
-@gluon.jit(launch_metadata=_wmma_tdm_dense_m16_launch_metadata)
+@gluon.jit(
+    launch_metadata=_wmma_tdm_dense_m16_launch_metadata,
+    do_not_specialize=["ACTUAL_M", "split_stride"],
+)
 def _wmma_tdm_dense_m16_kernel(
     a_ptr,
     b_ptr,
@@ -82,7 +85,7 @@ def _wmma_tdm_dense_m16_kernel(
     partial_ptr,
     split_stride,
     partial_row_stride,
-    ACTUAL_M: gl.constexpr,
+    ACTUAL_M,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
@@ -98,7 +101,6 @@ def _wmma_tdm_dense_m16_kernel(
         BLOCK_N == 16 or BLOCK_N == 64,
         "candidate supports one or four WMMA output tiles",
     )
-    gl.static_assert(0 < ACTUAL_M and ACTUAL_M <= M)
     gl.static_assert(BLOCK_K == 128, "candidate is tuned for 128-wide K tiles")
     gl.static_assert(K % BLOCK_K == 0, "K must tile exactly into BLOCK_K")
     gl.static_assert((K // BLOCK_K) % SPLIT_K == 0, "split-K must divide the K tiles")
@@ -244,7 +246,10 @@ def _gluon_wmma_dense_reduce_gfx1250_launch_metadata(grid, kernel, args):
     }
 
 
-@gluon.jit(launch_metadata=_gluon_wmma_dense_reduce_gfx1250_launch_metadata)
+@gluon.jit(
+    launch_metadata=_gluon_wmma_dense_reduce_gfx1250_launch_metadata,
+    do_not_specialize=["split_stride"],
+)
 def gluon_wmma_dense_reduce_gfx1250(
     partial_ptr,
     out_ptr,
@@ -258,18 +263,26 @@ def gluon_wmma_dense_reduce_gfx1250(
     """Sum split-K fp32 partials and store one bf16 row tile."""
     row = gl.program_id(0)
     tile = gl.program_id(1)
-    layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
+    # 4 warps x 32 threads x 4 elements = 512 columns, one 16-byte buffer load.
+    gl.static_assert(BLOCK == 512, "vectorized reduction tile is 512 columns")
+    layout: gl.constexpr = gl.BlockedLayout([4], [32], [4], [0])
     offs = tile * BLOCK + gl.arange(0, BLOCK, layout=layout)
     mask = offs < n
     acc = gl.zeros([BLOCK], gl.float32, layout)
     base = row * row_stride
     for split in range(0, SPLIT_K):
-        acc += gl.load(
-            partial_ptr + split * split_stride + base + offs,
+        acc += gl.amd.cdna5.buffer_load(
+            partial_ptr + split * split_stride + base,
+            offs.to(gl.int32),
             mask=mask,
             other=0.0,
         )
-    gl.store(out_ptr + row * out_stride + offs, acc.to(gl.bfloat16), mask=mask)
+    gl.amd.cdna5.buffer_store(
+        acc.to(gl.bfloat16),
+        out_ptr + row * out_stride,
+        offs.to(gl.int32),
+        mask=mask,
+    )
 
 
 def _dense_m16_split_k(
@@ -277,22 +290,20 @@ def _dense_m16_split_k(
     block_n: int,
     k_tiles: int,
     num_buffers: int,
-    device: torch.device,
 ) -> int:
-    """Return the largest split that divides the K tiles and stays within the CU count.
+    """Return the largest split that divides the K tiles and fits on 256 CUs.
 
     Each split keeps at least eight K tiles, and at least one full buffer pipeline.
-    ``device`` is the tensor's CUDA device, whose CU count bounds the split.
+    This package runs on gfx1250, and that part has 256 CUs.
     """
 
     ctas = n // block_n
-    cus = torch.cuda.get_device_properties(device).multi_processor_count
     min_tiles = max(num_buffers, 8)
     for split in (8, 4, 2):
         if (
             k_tiles % split == 0
             and k_tiles // split >= min_tiles
-            and ctas * split <= cus
+            and ctas * split <= 256
         ):
             return split
     return 1
@@ -311,9 +322,7 @@ def _launch_wmma_tdm_dense_tiles(
     block_k = 128
     k_tiles = A.shape[1] // block_k
     if split_k is None:
-        split_k = _dense_m16_split_k(
-            B.shape[0], block_n, k_tiles, num_buffers, A.device
-        )
+        split_k = _dense_m16_split_k(B.shape[0], block_n, k_tiles, num_buffers)
     if split_k not in (1, 2, 4, 8):
         raise ValueError("split_k must be one of 1, 2, 4, or 8")
     if k_tiles % split_k != 0:
@@ -358,7 +367,7 @@ def _launch_wmma_tdm_dense_tiles(
             waves_per_eu=1,
         )
         if split_k > 1:
-            block = 256
+            block = 512
             gluon_wmma_dense_reduce_gfx1250[(actual_m, triton.cdiv(n, block))](
                 partial,
                 out_tile,

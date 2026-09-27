@@ -154,8 +154,7 @@ decode, including the KDA QKVFAB shape.
   `N = 6288`.
 - Callers must supply `split_k`; `None` selects the largest of 8, 4, or 2 that
   divides the K tiles, leaves each split at least eight K tiles and one full
-  TDM pipeline, and keeps `N`-tile count times the split within the CU count
-  of `A.device`.
+  TDM pipeline, and keeps `N`-tile count times the split within 256 CUs.
   Otherwise the launch is direct. An explicit `split_k` must be one of
   1, 2, 4, or 8 and divide the K tiles. A split greater than 1 must also leave
   each split at least one full TDM pipeline.
@@ -178,7 +177,15 @@ valid tiles and drain each remaining pair before reading it.
 Both paths accumulate in FP32 and round to BF16 once. Direct launches store
 that conversion from the producer. Split-K launches write one FP32 partial
 matrix per K partition, then a separate reduction sums those partials in FP32
-and stores BF16.
+and stores BF16. The live row count and split-buffer stride are runtime
+arguments that do not specialize the producer or reduction, so warming a
+projection covers other batch sizes with the same model dimensions.
+
+The gfx1250 AttnRes launch has two fixed warp configurations: eight warps
+below 256 tokens when mixing snapshots, and four otherwise. Normal startup's
+prefill and decode warmups compile both before serving. Direct kernel callers
+must warm both token ranges; disabling startup warmups can defer compilation
+until the first call in an unwarmed range.
 
 ## Attention
 
