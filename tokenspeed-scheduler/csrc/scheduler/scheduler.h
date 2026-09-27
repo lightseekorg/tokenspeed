@@ -176,10 +176,9 @@ private:
     bool admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request,
                                   const fsm::CacheProgress& cache_progress, std::span<const GroupDemand> demands,
                                   const RequestProgress& progress);
-    std::vector<CacheKey> registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
-                                                     std::int32_t first_page);
-    void discardUncachedKvEventPages(std::span<const CacheKey> keys);
-    void handleCacheMutation(const CacheKey& key, CacheCoordinator::CacheMutation mutation);
+    void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
+                                    std::int32_t first_page);
+    void markKvEventBoundaryForReconcile(const CacheKey& boundary);
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
 
     std::size_t groupIndex(const std::string& group_id) const;
@@ -328,18 +327,30 @@ private:
     // vector reshuffles, so the id index below never dangles.
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
-    std::vector<KvCacheEvent> kv_events_;
     std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
     // What the prefix index cannot tell us about a boundary: the token
     // descriptor the external event carries, and whether that event is
     // currently out (a BlockStored not yet followed by its BlockRemoved).
-    // Residency itself is the coordinator's answer, never mirrored here. A
-    // descriptor lives exactly as long as the boundary has a cached child.
+    // Residency itself is the coordinator's answer, never mirrored here.
+    // Cache mutations and registrations only mark a boundary for reconcile;
+    // DrainKvEvents reconciles each marked boundary against its residency, so
+    // the order of evictions and publications inside one admission does not
+    // matter. After a drain, a descriptor exists exactly for the boundaries
+    // with a cached child.
     struct KvEventBoundary {
         KvBlockStoredEvent stored;
+        // Position in the prefix chain (page index). Consumers resolve a
+        // Stored event's parent_block_hash on receipt, so DrainKvEvents
+        // orders each batch by depth rather than by mutation order.
+        std::int32_t depth{0};
         bool published{false};
+        bool needs_reconcile{false};
     };
     std::unordered_map<CacheKey, KvEventBoundary, CacheKeyHash> kv_event_boundaries_;
+    // The boundaries marked for reconcile. Mutations mark them in whatever
+    // order the coordinator touches pages (evictions run suffix-first), so
+    // this order carries no meaning; DrainKvEvents sorts the batch.
+    std::vector<CacheKey> kv_event_boundaries_to_reconcile_;
 };
 
 }  // namespace tokenspeed

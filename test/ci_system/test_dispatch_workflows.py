@@ -1005,6 +1005,8 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
     assert cleanup["if"] == "always()"
     shared_cache = tmp_path / "shared-uv"
     shared_cache.mkdir()
+    persistent_hf_home = tmp_path / "shared-huggingface"
+    persistent_hf_home.mkdir()
     sentinel = shared_cache / "another-job"
     sentinel.touch()
     cache_variables = (
@@ -1027,7 +1029,7 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
             "github.run_id": "1234",
             "github.run_attempt": str(attempt),
             "matrix.name": "eval-cache-test",
-            "matrix.runner": "amd-mi35x-2gpu-test",
+            "matrix.runner": "model-runner",
             "matrix.workflow_stage": workflow_stage,
             "matrix.type": task_type,
         }.items():
@@ -1037,6 +1039,7 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
             env={
                 **os.environ,
                 "GITHUB_ENV": str(env_file),
+                "HF_HOME": str(persistent_hf_home),
                 **{variable: str(shared_cache) for variable in cache_variables},
             },
             check=True,
@@ -1047,7 +1050,11 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
         assert "MIOPEN_FIND_ENFORCE" not in job_env
         if workflow_stage != "model-test":
             assert all(variable not in job_env for variable in cache_variables)
+            assert "EVALSCOPE_UV_CACHE_DIR" not in job_env
             continue
+        assert job_env["EVALSCOPE_UV_CACHE_DIR"] == str(
+            persistent_hf_home / ".uv-cache" / "evalscope"
+        )
         if task_type == "perf":
             assert "TRITON_CACHE_DIR" not in job_env
         for variable in isolated_variables:
@@ -1064,7 +1071,7 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
     first, second = job_envs
     assert all(first[variable] != second[variable] for variable in isolated_variables)
     script = cleanup["run"].replace("${{ env.WORK_DIR }}", first["WORK_DIR"])
-    script = script.replace("${{ matrix.runner }}", "amd-mi35x-2gpu-test")
+    script = script.replace("${{ matrix.runner }}", "model-runner")
     subprocess.run(["bash", "-c", script], check=True)
     for variable in isolated_variables:
         assert not Path(first[variable]).exists()
