@@ -233,16 +233,24 @@ def test_qsa_preallocation_preserves_workspace_and_budget(state) -> None:
     assert state._verify_workspace is workspace
 
 
-def test_qsa_indexer_workspace_cannot_be_rebound(state) -> None:
+def test_qsa_indexer_rebind_moves_its_verify_state_to_the_new_pool(state) -> None:
     _, backend = _root_with_indexer(
         _qsa_config(max_bs=8, is_draft=False, device="cpu"), state.cache_pool
     )
     backend.preallocate_verify_workspace(8, 4)
+    backend.init_cuda_graph_state(8)
     workspace = backend._verify_state._verify_workspace
+    tables = backend._tables
     backend.set_cache_pool(state.cache_pool)
-    with pytest.raises(RuntimeError, match="cannot be rebound"):
-        backend.set_cache_pool(_qsa_pool(device="cpu", layer_offset=0))
     assert backend._verify_state._verify_workspace is workspace
+
+    replacement = _qsa_pool(device="cpu", layer_offset=0)
+    backend.set_cache_pool(replacement)
+    assert backend._verify_state.cache_pool is replacement
+    assert backend.preallocate_verify_workspace(8, 4) > 0
+    assert backend._verify_state._verify_workspace is not workspace
+    # Same table geometry: the graph-visible tables keep their addresses.
+    assert backend._tables is tables
 
 
 def test_qsa_rebind_rejection_leaves_the_entire_tree_unchanged() -> None:
@@ -250,11 +258,20 @@ def test_qsa_rebind_rejection_leaves_the_entire_tree_unchanged() -> None:
     root, indexer = _root_with_indexer(
         _qsa_config(max_bs=4, is_draft=False, device="cpu"), pool
     )
+    indexer.init_cuda_graph_state(4)
     router = root.attention_backend
     leaves = tuple(router.leaves.values())
     replacement = _qsa_pool(device="cpu", layer_offset=0)
+    replacement.arena.cache_group_specs = tuple(
+        (
+            SimpleNamespace(**{**vars(spec), "block_granularity": 128})
+            if spec.group_id == QWEN4_EXP_QSA_RECENT_CACHE_GROUP
+            else spec
+        )
+        for spec in replacement.arena.cache_group_specs
+    )
 
-    with pytest.raises(RuntimeError, match="cannot be rebound"):
+    with pytest.raises(RuntimeError, match="different geometry"):
         root.set_cache_pool(replacement)
 
     for backend in (root, router, indexer, *leaves):

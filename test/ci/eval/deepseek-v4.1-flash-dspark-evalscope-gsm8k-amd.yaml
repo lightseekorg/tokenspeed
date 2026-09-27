@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: eval-deepseek-v4.1-flash-gsm8k-amd
+name: eval-deepseek-v4.1-flash-dspark-gsm8k-amd
 type: eval
 workflow_stage: model-test
 triggers:
@@ -16,6 +16,7 @@ server:
   command: >-
     ts serve
     --model deepseek-ai/DeepSeek-V4.1-Flash
+    --speculative-algorithm DSPARK
     --download-dir "${PWD}/.hf-model-cache"
     --tensor-parallel-size 4
     --dtype bfloat16

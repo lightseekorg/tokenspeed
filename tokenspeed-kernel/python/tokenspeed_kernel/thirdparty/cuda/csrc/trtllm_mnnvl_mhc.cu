@@ -33,6 +33,7 @@ void trtllm_mnnvl_mhc(
     bool pdl) {
   TVM_FFI_ICHECK(x.ndim() == 2);
   int64_t tokens = x.size(0), hidden = x.size(1), nranks = peers.numel();
+  TVM_FFI_ICHECK(nranks == 2 || nranks == 4 || nranks == 8 || nranks == 16);
   TVM_FFI_ICHECK(hidden == 5120 && tokens > 0 && tokens <= details::kMnnvlTwoShotMaxToken);
   TVM_FFI_ICHECK(rank >= 0 && rank < nranks && multicast_ptr && local_ptr);
   for (auto t : {x, residual, weight, residual_out, norm_out}) {
@@ -51,6 +52,12 @@ void trtllm_mnnvl_mhc(
   TVM_FFI_ICHECK(post.numel() == tokens * 4 && pre.numel() == tokens * 4);
   TVM_FFI_ICHECK(comb.numel() == tokens * 16 && eps > 0);
   TVM_FFI_ICHECK(peers.ndim() == 1 && peers.IsContiguous() && flags.numel() >= 9);
+  TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(flags.dtype()), encode_dlpack_dtype(dl_uint32));
+  TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(peers.dtype()), encode_dlpack_dtype(dl_int64));
+  for (auto t : {peers, flags}) {
+    TVM_FFI_ICHECK(t.IsContiguous() && t.device().device_type == kDLCUDA);
+    TVM_FFI_ICHECK(t.device().device_id == x.device().device_id);
+  }
   // Communication slots scale with group size, independently of HC's four streams.
   int64_t const lane_tokens = use_oneshot ? tokens * nranks
       : 2 * ((tokens + nranks - 1) / nranks) * nranks;

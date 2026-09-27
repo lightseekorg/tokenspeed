@@ -15,7 +15,7 @@ from tokenspeed.runtime.configs.glm53_flash_config import (
 )
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
-    configure_glm_attention,
+    configure_dsa_attention,
 )
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (
     LinearAttnConfig,
@@ -59,7 +59,7 @@ class Glm53FlashConfigTests(unittest.TestCase):
             hf_config=SimpleNamespace(),
         )
 
-        configure_glm_attention(model_config)
+        configure_dsa_attention(model_config)
 
         self.assertEqual(model_config.attention_arch, AttentionArch.DSA)
         self.assertEqual(model_config.index_kpool, 4)

@@ -1029,7 +1029,8 @@ class V41HCPost:
     def finish(self, residual: torch.Tensor) -> torch.Tensor:
         """Materialize the HC stream at a stage end or before Engram."""
         # These boundaries prohibit deferral before the producer is run.
-        assert self.reduce_group is None
+        if self.reduce_group is not None:
+            raise RuntimeError("HC post with a deferred reduction cannot be finished")
         return v41_hc_post(self.x, residual, self.post, self.comb)
 
 
@@ -1187,6 +1188,8 @@ class DeepseekV41DecoderLayer(nn.Module):
         allow_ffn_reduce_fusion: bool,
         capture_input: bool,
     ):
+        if ctx.forward_mode is None:
+            raise ValueError("V4.1 attention requires an explicit forward mode")
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         decode_hc = ctx.forward_mode.is_decode()
         can_overlap = (

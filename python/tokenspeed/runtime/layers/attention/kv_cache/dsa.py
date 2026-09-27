@@ -62,6 +62,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
         layer_id: int,
         loc: torch.Tensor,
         index_k: torch.Tensor,
+        *,
+        write_mask: torch.Tensor | None,
     ) -> None:
         if index_k.dtype != self.model_dtype:
             index_k = index_k.to(self.model_dtype)
@@ -83,4 +85,5 @@ class DSATokenToKVPool(MLATokenToKVPool):
             page_size=self.arena.kv_page_size,
             head_dim=self.index_head_dim,
             group_size=_INDEX_K_FP8_GROUP_SIZE,
+            write_mask=write_mask,
         )

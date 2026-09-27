@@ -662,18 +662,14 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
     events = []
     backend = object.__new__(dsa_backend.DSABackend)
     backend.index_topk = 2
+    backend.dcp_group = (0,)
+    backend.v_head_dim = 1
     backend.data_type = torch.bfloat16
     backend.qk_nope_head_dim = 1
     backend.kv_lora_rank = 1
     backend.qk_rope_head_dim = 0
     backend.kernel_page_size = 64
     backend.step_counter = SimpleNamespace(record_cache=lambda: events.append("ready"))
-
-    monkeypatch.setattr(
-        dsa_backend,
-        "workspace_topk_to_global_slots",
-        lambda **_kwargs: torch.zeros((1, 2), dtype=torch.int64),
-    )
 
     def fake_dsa_prefill(**_kwargs):
         events.append("attention")
@@ -695,12 +691,9 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
             quant_method=None,
             get_key_buffer=lambda _layer_id: torch.zeros(1),
         ),
-        page_table=torch.zeros((1, 1), dtype=torch.int32),
-        seq_lens=torch.ones(1, dtype=torch.int32),
         kv_seq_lens=torch.ones(1, dtype=torch.int32),
-        workspace_indices=torch.zeros((1, 2), dtype=torch.int64),
+        topk_slots=torch.zeros((1, 2), dtype=torch.int64),
         topk_lens=torch.ones(1, dtype=torch.int32),
-        kv_workspace_slots=torch.zeros(1, dtype=torch.int64),
         max_seq_len=1,
     )
 

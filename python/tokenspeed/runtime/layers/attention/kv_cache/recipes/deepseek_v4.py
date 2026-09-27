@@ -117,7 +117,7 @@ def v4_compressed_kv_spec(ratio: int) -> CacheGroupSpec:
 
 
 def v4_indexer_kv_spec() -> CacheGroupSpec:
-    """Indexer K: a replicated full-history chain over the ratio-4 layers."""
+    """Indexer K: an independent full-history chain over the ratio-4 layers."""
     return CacheGroupSpec(
         group_id=V4_INDEXER_KV_GROUP_ID,
         retention="full_history",
@@ -336,10 +336,10 @@ class DeepseekV4Recipe(CacheRecipe):
             if ratio != 4:
                 continue
 
-            # The indexer's K is its own replicated full-history group: the
-            # indexer reads every rank's rows, so it never follows the
-            # compressed chain's sharding. Its state is its own group too.
-            indexer_spec = v4_indexer_kv_spec()
+            # Index-K shares the DCP topology, but owns an independent cache
+            # group: its virtual IDs need not match compressed attention KV.
+            # Compressor state remains replicated.
+            indexer_spec = replace(v4_indexer_kv_spec(), shard_count=self.dcp_size)
             indexer_slot = occurrences[indexer_spec.group_id]
             occurrences[indexer_spec.group_id] += 1
             indexer_state_spec = v4_indexer_state_spec()

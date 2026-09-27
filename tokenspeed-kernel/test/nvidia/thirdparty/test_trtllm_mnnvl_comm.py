@@ -676,7 +676,7 @@ def test_mhc_post_norm_shared_workspace_graph(monkeypatch, entrypoint, pdl):
         updated, normalized = torch.empty_like(residual), torch.empty_like(x)
         use_oneshot = ws.resolve_use_oneshot(tokens, None, 5120)
 
-        def native(capacity_bytes):
+        def native(capacity_bytes, *, peers, flags):
             _load_trtllm_mhc_module().trtllm_mnnvl_mhc(
                 x,
                 residual,
@@ -690,8 +690,8 @@ def test_mhc_post_norm_shared_workspace_graph(monkeypatch, entrypoint, pdl):
                 rank,
                 ws.multicast_ptr,
                 ws.local_ptr,
-                ws.peer_ptrs,
-                ws.buffer_flags,
+                peers,
+                flags,
                 capacity_bytes,
                 use_oneshot,
                 pdl,
@@ -700,24 +700,39 @@ def test_mhc_post_norm_shared_workspace_graph(monkeypatch, entrypoint, pdl):
 
         if not 0 < tokens <= MNNVL_TWOSHOT_MAX_TOKEN:
             with pytest.raises(RuntimeError, match="tokens"):
-                native(ws.buffer_size_bytes)
+                native(ws.buffer_size_bytes, peers=ws.peer_ptrs, flags=ws.buffer_flags)
             assert not comm.supports_allreduce_mhc_post_norm(
                 x, weight, dist.group.WORLD
             )
             continue
 
+        if tokens == 1:
+            for peers, flags, match in (
+                (ws.peer_ptrs, ws.buffer_flags.to(torch.int64), "flags.dtype"),
+                (ws.peer_ptrs.to(torch.int32), ws.buffer_flags, "peers.dtype"),
+                (ws.peer_ptrs.cpu(), ws.buffer_flags, "device_type"),
+            ):
+                with pytest.raises(RuntimeError, match=match):
+                    native(ws.buffer_size_bytes, peers=peers, flags=flags)
+
         # All ranks pass real workspace pointers; an undersized capacity must
         # be rejected before launching or advancing the shared rotation state.
         lane_tokens = tokens * world if use_oneshot else 2 * -(-tokens // world) * world
         with pytest.raises(RuntimeError, match="capacity_bytes"):
-            native(lane_tokens * 5120 * x.element_size() - 1)
+            native(
+                lane_tokens * 5120 * x.element_size() - 1,
+                peers=ws.peer_ptrs,
+                flags=ws.buffer_flags,
+            )
 
         if entrypoint == "ops":
             assert comm.supports_allreduce_mhc_post_norm(x, weight, dist.group.WORLD)
 
         def fused():
             if entrypoint == "native":
-                return native(ws.buffer_size_bytes)
+                return native(
+                    ws.buffer_size_bytes, peers=ws.peer_ptrs, flags=ws.buffer_flags
+                )
             return comm.allreduce_mhc_post_norm(
                 x, residual, post, comb, pre, weight, EPS, dist.group.WORLD
             )

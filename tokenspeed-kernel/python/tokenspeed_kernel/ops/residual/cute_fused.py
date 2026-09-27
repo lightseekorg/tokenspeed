@@ -44,7 +44,7 @@ try:
     from tokenspeed_kernel.thirdparty.cute_dsl.hc_fused import FusedGatedResidualKernel
 
     _AVAILABLE = True
-except ImportError:
+except (ImportError, NotImplementedError):
     _AVAILABLE = False
 
 _CACHE_LOCK = threading.Lock()

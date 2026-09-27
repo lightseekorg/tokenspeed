@@ -476,6 +476,7 @@ class DFlash2DraftModel(DFlashDraftModel):
                 cache_locs,
                 latent[..., : attn.kv_lora_rank].contiguous(),
                 latent[..., attn.kv_lora_rank :].contiguous(),
+                write_mask=None,
             )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

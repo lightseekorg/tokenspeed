@@ -51,6 +51,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     engram_context_len,
     make_config,
     ngram_inputs_for_forward,
+    request_history_seeds_for_forward,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
     scheduler_pd_lifecycle,
@@ -476,6 +477,7 @@ class EventLoop:
             clear_cache_fn=self.scheduler.clear_cache,
             can_clear_cache_fn=self.scheduler.can_clear_cache,
             architectures=self.model_config.hf_config.architectures,
+            tokenizer_kwargs=self.model_config.tokenizer_kwargs,
             pause_controller=self._pause,
             memory_controller=self._memory,
             device=self._device,
@@ -1081,6 +1083,13 @@ class EventLoop:
                             self.output_processor.rid_to_state,
                             self._ngram_context_len,
                         )
+                        request_history_seeds = (
+                            request_history_seeds_for_forward(
+                                forward_op, self.output_processor.rid_to_state
+                            )
+                            if self.model_config.requires_request_token_history
+                            else None
+                        )
                         self._batch_logger.log_dispatch(forward_op, stats)
 
                         if in_flight and self._dispatch_depends_on_pending_commit(
@@ -1095,6 +1104,7 @@ class EventLoop:
                             dp_metadata=dp_metadata,
                             grammar_inputs=grammar_inputs,
                             ngram_inputs=ngram_inputs,
+                            request_history_seeds=request_history_seeds,
                             multimodal_context=(
                                 multimodal_context_for_forward(
                                     forward_op, self.output_processor.rid_to_state

@@ -380,6 +380,31 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     assert output.next_token_logits.argmax(-1).item() == expected_token
 
 
+def test_hc_post_rejects_unfinished_reduction():
+    x = torch.zeros(1, 4)
+    pending = v41.V41HCPost(x, x, x, object())
+    with pytest.raises(RuntimeError, match="deferred reduction"):
+        pending.finish(x)
+
+
+def test_decoder_layer_requires_explicit_forward_mode():
+    layer = DeepseekV41DecoderLayer.__new__(DeepseekV41DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.layer_id = 0
+    layer.ced_decoder_start = 20
+    with pytest.raises(ValueError, match="requires an explicit forward mode"):
+        layer(
+            torch.zeros(1, 4, 128),
+            None,
+            torch.zeros(1),
+            None,
+            _ctx(None, 1, None),
+            pending_post=None,
+            allow_ffn_reduce_fusion=False,
+            capture_input=False,
+        )
+
+
 def test_reference_fp8_floor_and_rounding():
     levels = [0.0, 1e-7, 1e-4, 448.0 / 64, 449.0 / 64, 448.0, 896.0]
     x = torch.tensor(levels, dtype=torch.float32).unsqueeze(-1).expand(-1, 32).clone()

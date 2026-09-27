@@ -15,10 +15,11 @@ env:
   CUDA_HOME: /usr/local/cuda-13.4
   PATH: /usr/local/cuda-13.4/bin:/home/runner/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   LD_LIBRARY_PATH: /usr/local/cuda-13.4/lib64:/opt/tokenspeed-cuda-runtime:/usr/lib/aarch64-linux-gnu
-  LD_PRELOAD: /usr/local/cuda-13.4/lib64/libnvrtc.so.13
+  LD_PRELOAD: /usr/local/cuda-13.4/lib64/libcupti.so.13:/usr/local/cuda-13.4/lib64/libnvrtc.so.13
   TRITON_PTXAS_PATH: /usr/local/cuda-13.4/bin/ptxas
 install:
-  - python3 -m pip install --break-system-packages pytest==9.1.1 -r tokenspeed-kernel/python/requirements/cuda.txt -r tokenspeed-kernel/python/requirements/cuda-thirdparty.txt
+  - python3 -m pip install --break-system-packages pytest==9.1.1 pytest-xdist -r tokenspeed-kernel/python/requirements/cuda.txt -r tokenspeed-kernel/python/requirements/cuda-thirdparty.txt compressed-tensors pybase64 pyzmq pillow fastapi
+  - TOKENSPEED_KERNEL_BACKEND=cuda python3 tokenspeed-kernel/python/setup.py build_ext
 ut:
   commands:
     - python3 -c 'import torch; assert torch.cuda.get_device_capability() == (10, 7)'
@@ -32,5 +33,9 @@ ut:
       assert [int(c["tests"]) for c in counts[:2]] == [2, 4]
       and int(counts[2]["tests"]) > 0
       and all(int(c["skipped"]) == 0 for c in counts)'
+    - python3 -m pytest tokenspeed-kernel/test/test_numerics.py -v --junitxml=/tmp/kernel-numerics.xml
+    - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py -v --junitxml=/tmp/kernel-trtllm-comm.xml
+    - PYTHONPATH="python${PYTHONPATH:+:$PYTHONPATH}" python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py -v --junitxml=/tmp/kernel-cuda.xml
+    - bash test/ci_system/run_kernel_gpu_ut.sh
 report:
   github_step_summary: true

@@ -60,7 +60,9 @@ git -C "${SOURCE_ROOT}" checkout --detach "${ROCM_SYSTEMS_REF}"
 
 # HIP initialization needs the KMD simulator to remain alive for the full
 # process lifetime. The upstream gfx1250 functional config has a finite limit.
-python3 - "${ROCJITSU_SOURCE_DIR}/configs/gfx1250_mi455x.json" <<'PY'
+python3 - \
+    "${ROCJITSU_SOURCE_DIR}/configs/gfx1250_mi455x.json" \
+    "${MI450_SIM_THREADS_PER_WORKER:-2}" <<'PY'
 import json
 import pathlib
 import sys
@@ -68,6 +70,13 @@ import sys
 path = pathlib.Path(sys.argv[1])
 config = json.loads(path.read_text())
 config["max_ticks"] = 0
+# Kubernetes enforces the runner's CPU limit through cgroup quota without
+# narrowing CPU affinity. Keep one simulator within the lane's per-worker CPU
+# allocation instead of letting rocJITsu select a host-wide thread preset.
+thread_budget = int(sys.argv[2])
+if thread_budget < 1:
+    raise ValueError("MI450_SIM_THREADS_PER_WORKER must be positive")
+config["cpu_thread_budget"] = thread_budget
 path.write_text(json.dumps(config, indent=2) + "\n")
 PY
 

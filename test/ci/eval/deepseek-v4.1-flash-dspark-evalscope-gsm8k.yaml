@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: eval-deepseek-v4.1-flash-gsm8k
+name: eval-deepseek-v4.1-flash-dspark-gsm8k
 type: eval
 workflow_stage: model-test
 triggers:
@@ -16,6 +16,7 @@ server:
   command: >-
     ts serve
     --model deepseek-ai/DeepSeek-V4.1-Flash
+    --speculative-algorithm DSPARK
     --tensor-parallel-size 4
     --enable-expert-parallel
     --moe-backend mega_moe

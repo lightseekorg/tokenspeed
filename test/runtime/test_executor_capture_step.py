@@ -46,7 +46,7 @@ _RUNTIME = (
     / "runtime"
     / "execution"
 )
-_STEP_OPERATIONS = frozenset({"_autotune", "freeze", "capture", "capture_graphs"})
+_STEP_OPERATIONS = frozenset({"autotune", "freeze", "capture", "capture_graphs"})
 
 
 def _tree(name: str) -> ast.Module:
@@ -156,14 +156,26 @@ def test_nothing_the_constructor_reaches_tunes_freezes_or_captures():
 
 
 def test_the_step_names_every_operation_the_constructor_gave_up():
-    """The move must be complete, not partial: all four land in the step."""
+    """The move must be complete, not partial: tuning left, the rest stayed.
+
+    Tuning left ``capture_graphs`` when the probe made it run twice -- a
+    captured graph keeps the tactic it was captured with, and the tuner's
+    token bound is a once-per-process call -- so the boot path now names it
+    directly, alongside the step that freezes and captures.
+    """
     step = _function(_tree("model_executor.py"), "capture_graphs")
     names = {call.func.attr for call in _attribute_calls(step)}
-    assert _STEP_OPERATIONS - {"capture_graphs"} <= names, names
+    builder = _function(_tree("device.py"), "build_device_side")
+    boot_names = {call.func.attr for call in _attribute_calls(builder)}
+
+    # Only tuning moved; freeze and capture stay where the constructor left them.
+    assert {"freeze", "capture"} <= names, names
+    assert "autotune" in boot_names, boot_names
+    assert "autotune" not in names, names
 
 
 def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
-    """Tune, freeze, capture decode, capture prefill; the caller seeds after.
+    """Freeze, capture decode, capture prefill; the boot tunes before and seeds after.
 
     Tuning and capture draw from the generator, so the boot path seeds once
     they are done, exactly where the constructor used to.
@@ -174,20 +186,39 @@ def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
         for call in _attribute_calls(step)
         if call.func.attr in _STEP_OPERATIONS
     ]
-    assert sequence == ["_autotune", "freeze", "capture", "capture"]
+    assert sequence == ["freeze", "capture", "capture"]
 
     builder = _function(_tree("device.py"), "build_device_side")
+    tune = [
+        call.lineno
+        for call in _attribute_calls(builder)
+        if call.func.attr == "autotune"
+    ]
+    capture = [
+        call.lineno
+        for call in _attribute_calls(builder)
+        if call.func.attr == "capture_graphs"
+    ]
+    assert len(tune) == 1, tune
+    assert max(tune) < min(capture), (tune, capture)
+
+    # Mutation-checked: a probe on untuned graphs prices kernels that never serve.
+    rebind = [
+        call.lineno
+        for call in ast.walk(builder)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "_rebind_under_reserve"
+    ]
+    assert len(rebind) == 1, rebind
+    assert max(tune) < min(rebind), (tune, rebind)
+
     seed = [
         call.lineno
         for call in ast.walk(builder)
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Name)
         and call.func.id == "set_random_seed"
-    ]
-    capture = [
-        call.lineno
-        for call in _attribute_calls(builder)
-        if call.func.attr == "capture_graphs"
     ]
     assert seed and capture and max(capture) < min(seed), (capture, seed)
 
