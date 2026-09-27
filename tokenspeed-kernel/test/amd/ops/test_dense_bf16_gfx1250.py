@@ -22,13 +22,16 @@
 
 import pytest
 import torch
-from utils import is_cdna5
+from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
     pytest.skip("AMD CDNA5 is required", allow_module_level=True)
 
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+    _wmma_tdm_dense_m16_kernel,
+    gluon_wmma_dense_reduce_gfx1250,
     gluon_wmma_tdm_dense_gfx1250,
+    gluon_wmma_tdm_kda_qkvfab_gfx1250,
 )
 
 
@@ -74,3 +77,25 @@ def test_dense_rejects_invalid_split(k, split_k):
     b = torch.empty(64, k, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="one of|divide|full TDM pipeline"):
         gluon_wmma_tdm_dense_gfx1250(a, b, split_k=split_k)
+
+
+@pytest.mark.parametrize("kda", [False, True])
+def test_dense_batch_sizes_reuse_compilation(kda):
+    k, n = (7168, 6288) if kda else (1024, 128)
+    torch.manual_seed(1250)
+    a = torch.randn(32, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+
+    def project(rows):
+        if kda:
+            return gluon_wmma_tdm_kda_qkvfab_gfx1250(a[:rows], b)
+        return gluon_wmma_tdm_dense_gfx1250(a[:rows], b, split_k=2)
+
+    project(2)
+    with (
+        assert_no_triton_compile(_wmma_tdm_dense_m16_kernel),
+        assert_no_triton_compile(gluon_wmma_dense_reduce_gfx1250),
+    ):
+        for rows in (1, 4, 8, 16, 32):
+            actual = project(rows)
+            torch.testing.assert_close(actual, a[:rows] @ b.T, atol=1e-2, rtol=1e-2)

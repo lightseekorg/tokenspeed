@@ -171,7 +171,15 @@ valid tiles and drain each remaining pair before reading it.
 Both paths accumulate in FP32 and round to BF16 once. Direct launches store
 that conversion from the producer. Split-K launches write one FP32 partial
 matrix per K partition, then a separate reduction sums those partials in FP32
-and stores BF16.
+and stores BF16. The live row count and split-buffer stride are runtime
+arguments that do not specialize the producer or reduction, so warming a
+projection covers other batch sizes with the same model dimensions.
+
+The gfx1250 AttnRes launch has two fixed warp configurations: eight warps
+below 256 tokens when mixing snapshots, and four otherwise. Normal startup's
+prefill and decode warmups compile both before serving. Direct kernel callers
+must warm both token ranges; disabling startup warmups can defer compilation
+until the first call in an unwarmed range.
 
 ## Attention
 

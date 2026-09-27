@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_cdna4, is_cdna5
+from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
     pytest.skip(
@@ -537,3 +537,48 @@ def test_kimi_topk_prefill_ties_choose_smaller_expert_id() -> None:
     expected_ids = torch.arange(16, device="cuda", dtype=torch.int32).expand(3, -1)
     assert torch.equal(ids, expected_ids)
     torch.testing.assert_close(weights, torch.full_like(weights, 1 / 16))
+
+
+@pytest.mark.skipif(not is_cdna5(), reason="gfx1250 launch variants")
+def test_attn_res_warmed_launch_variants_reuse_compilation():
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.attn_res import (
+        gluon_attn_res_fwd_gfx1250,
+    )
+
+    torch.manual_seed(1250)
+    hidden, valid_blocks = 4096, 1
+    prefix = torch.randn(1000, hidden, device="cuda", dtype=torch.bfloat16)
+    blocks = torch.randn(
+        valid_blocks, 1000, hidden, device="cuda", dtype=torch.bfloat16
+    )
+    weight = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
+
+    def project(tokens):
+        return attn_res_fwd(
+            prefix[:tokens],
+            blocks[:, :tokens],
+            weight,
+            weight,
+            eps=1e-6,
+            out_norm_weight=weight,
+            out_norm_eps=1e-6,
+            num_valid_blocks=valid_blocks,
+        )
+
+    # Startup prefill and decode warmups cover the two fixed launch variants.
+    project(256)
+    project(1)
+    with assert_no_triton_compile(gluon_attn_res_fwd_gfx1250):
+        for tokens in (2, 7, 128, 255, 256, 257, 1000):
+            actual = project(tokens)
+            expected = _attn_res_reference(
+                prefix[:tokens],
+                blocks[:, :tokens].transpose(0, 1),
+                weight,
+                weight,
+                weight,
+                valid_blocks,
+                1e-6,
+                1e-6,
+            )
+            torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)

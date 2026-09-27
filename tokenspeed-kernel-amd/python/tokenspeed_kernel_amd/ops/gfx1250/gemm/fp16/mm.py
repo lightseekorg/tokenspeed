@@ -68,7 +68,10 @@ def _wmma_tdm_dense_m16_launch_metadata(grid, kernel, args):
     }
 
 
-@gluon.jit(launch_metadata=_wmma_tdm_dense_m16_launch_metadata)
+@gluon.jit(
+    launch_metadata=_wmma_tdm_dense_m16_launch_metadata,
+    do_not_specialize=["ACTUAL_M", "split_stride"],
+)
 def _wmma_tdm_dense_m16_kernel(
     a_ptr,
     b_ptr,
@@ -82,7 +85,7 @@ def _wmma_tdm_dense_m16_kernel(
     partial_ptr,
     split_stride,
     partial_row_stride,
-    ACTUAL_M: gl.constexpr,
+    ACTUAL_M,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
@@ -98,7 +101,6 @@ def _wmma_tdm_dense_m16_kernel(
         BLOCK_N == 16 or BLOCK_N == 64,
         "candidate supports one or four WMMA output tiles",
     )
-    gl.static_assert(0 < ACTUAL_M and ACTUAL_M <= M)
     gl.static_assert(BLOCK_K == 128, "candidate is tuned for 128-wide K tiles")
     gl.static_assert(K % BLOCK_K == 0, "K must tile exactly into BLOCK_K")
     gl.static_assert((K // BLOCK_K) % SPLIT_K == 0, "split-K must divide the K tiles")
@@ -244,7 +246,10 @@ def _gluon_wmma_dense_reduce_gfx1250_launch_metadata(grid, kernel, args):
     }
 
 
-@gluon.jit(launch_metadata=_gluon_wmma_dense_reduce_gfx1250_launch_metadata)
+@gluon.jit(
+    launch_metadata=_gluon_wmma_dense_reduce_gfx1250_launch_metadata,
+    do_not_specialize=["split_stride"],
+)
 def gluon_wmma_dense_reduce_gfx1250(
     partial_ptr,
     out_ptr,
