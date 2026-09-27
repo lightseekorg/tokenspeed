@@ -63,6 +63,7 @@ from tokenspeed_kernel.ops.transform.weak_ref import weak_ref_tensor as _kernel_
 
 __all__ = [
     "BreakableCapture",
+    "HandoffSlot",
     "active_forward",
     "break_here",
     "break_point",
@@ -74,6 +75,11 @@ __all__ = [
     "weak_ref_tensor",
 ]
 
+
+# A break output's shape, dtype and device.
+HandoffKey = tuple[tuple[int, ...], torch.dtype, torch.device]
+# Trailing shape, dtype, device, and the output's ordinal among a capture's handoffs with them.
+HandoffSlot = tuple[tuple[int, ...], torch.dtype, torch.device, int]
 
 # Ambient per-forward ctx; plain module state (one launch thread per rank).
 _ambient_ctx: Any = None
@@ -168,13 +174,18 @@ class BreakableCapture:
             2478MB -> 564MB for buckets [8192,4096,2048,1024] on the repro). This
             mirrors ``torch.cuda.graph``'s shared ``default_capture_stream`` and
             its documented "pass the same stream for effective memory sharing".
+        handoff_storage: An optional handoff storage map shared with captures that
+            never replay while this one's handoffs are live; see ``_handoff_view``.
     """
 
     _active: BreakableCapture | None = None
     _default_capture_stream: torch.cuda.Stream | None = None
 
     def __init__(
-        self, pool: Any | None = None, stream: torch.cuda.Stream | None = None
+        self,
+        pool: Any | None = None,
+        stream: torch.cuda.Stream | None = None,
+        handoff_storage: dict[HandoffSlot, torch.Tensor] | None = None,
     ) -> None:
         self.pool = pool
         self.segments: list[Callable[[], Any]] = []
@@ -187,7 +198,10 @@ class BreakableCapture:
         self._stream = stream
         self._stream_ctx: Any | None = None
         # Break-output handoff buffers keyed by (shape, dtype, device); see break_point.
-        self._handoff: dict[Any, torch.Tensor] = {}
+        self._handoff: dict[HandoffKey, torch.Tensor] = {}
+        self._handoff_storage: dict[HandoffSlot, torch.Tensor] = (
+            {} if handoff_storage is None else handoff_storage
+        )
 
     @classmethod
     def current(cls) -> BreakableCapture | None:
@@ -347,6 +361,28 @@ def _record_break(
     return cap.add_eager(replay_fn)
 
 
+def _handoff_view(cap: BreakableCapture, key: HandoffKey) -> torch.Tensor:
+    """Leading rows of the shared storage slot for this capture's new handoff ``key``.
+
+    The slot is the trailing shape, dtype and device plus how many of this
+    capture's handoffs already have them, so one capture's distinct shapes stay
+    in distinct storage. Storage too short for ``key`` is replaced; captures that
+    already hold the old storage keep it alive.
+    """
+    shape, dtype, device = key
+    if not shape:
+        return torch.empty(shape, dtype=dtype, device=device)
+    trailing = (shape[1:], dtype, device)
+    rank = sum(1 for s, d, v in cap._handoff if s and (s[1:], d, v) == trailing)
+    slot = (*trailing, rank)
+    storage = cap._handoff_storage.get(slot)
+    if storage is None or storage.shape[0] < shape[0]:
+        storage = cap._handoff_storage[slot] = torch.empty(
+            shape, dtype=dtype, device=device
+        )
+    return storage[: shape[0]]
+
+
 def break_here(
     fn: Callable[..., torch.Tensor],
     dst: torch.Tensor,
@@ -422,9 +458,7 @@ def break_point(method: Callable | None = None) -> Callable:
                 key = (tuple(result.shape), result.dtype, result.device)
                 dst = cap._handoff.get(key)
                 if dst is None:
-                    dst = cap._handoff[key] = torch.empty(
-                        result.shape, dtype=result.dtype, device=result.device
-                    )
+                    dst = cap._handoff[key] = _handoff_view(cap, key)
                 return dst
 
             return _record_break(cap, method, resolve_dst, args, kwargs)
