@@ -17,6 +17,7 @@ from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     combine_topk_weights,
     local_topk_to_global_slots,
+    mark_forced_initial_local_logits,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 from tokenspeed_kernel.platform import (
@@ -67,6 +68,23 @@ def _prepare_logits_for_topk(logits: torch.Tensor) -> torch.Tensor:
             full = logits.as_strided((rows, stride0), (stride0, 1))
     full.nan_to_num_(nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf"))
     return full
+
+
+def _pad_index_heads(
+    q: torch.Tensor, weights: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Adapt 16-head index scoring to DeepGEMM's 32/64-head ABI.
+
+    Added heads carry zero queries and weights, leaving the caller's score
+    scale and real-head contributions unchanged.
+    """
+    if q.shape[1] != 16:
+        return q, weights
+    padded_q = q.new_zeros((q.shape[0], 32, q.shape[2]))
+    padded_weights = weights.new_zeros((weights.shape[0], 32))
+    padded_q[:, :16].copy_(q)
+    padded_weights[:, :16].copy_(weights)
+    return padded_q, padded_weights
 
 
 def _check_out(
@@ -194,6 +212,7 @@ if platform.is_hopper_plus:
         "dsa_decode_topk",
         name="deep_gemm_dsa_decode_topk",
         solution="deep_gemm",
+        features={"forced_initial_local"},
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
@@ -213,6 +232,7 @@ if platform.is_hopper_plus:
         ),
         traits={
             "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "index_heads": frozenset({16, 32, 64}),
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
             "topk": frozenset({512, 1024, 2048}),
@@ -236,6 +256,8 @@ if platform.is_hopper_plus:
         plan: object | None = None,
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
+        initial_tokens: int = 0,
+        local_tokens: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert weights.dtype in (torch.float32, torch.bfloat16)
         # Raw weights may be a column-split view of the fused wk_weights_proj
@@ -254,6 +276,7 @@ if platform.is_hopper_plus:
             device=q.device,
         )
 
+        q, weights = _pad_index_heads(q, weights)
         q_2d = q.view(-1, q.shape[-1])
         q_fp8, q_scale = quantize_fp8_with_scale(
             q_2d,
@@ -315,6 +338,16 @@ if platform.is_hopper_plus:
         # Compact widened view with non-finite scores scrubbed; the
         # length-aware CuTe DSL top-k below consumes it without a copy.
         logits_full = _prepare_logits_for_topk(logits)
+        offsets = torch.arange(
+            1 - q_len_per_req, 1, device=seq_lens.device, dtype=torch.int32
+        )
+        seq_lens_per_token = (seq_lens.unsqueeze(1) + offsets).reshape(-1)
+        mark_forced_initial_local_logits(
+            logits_full,
+            seq_lens_per_token,
+            initial_tokens=initial_tokens,
+            local_tokens=local_tokens,
+        )
         local_topk_offsets = torch.empty_like(out)
         if _use_cute_dsl_decode_topk():
             # CuTe DSL cluster radix top-k: length-aware via seq_lens/q_len_per_req,
@@ -344,12 +377,8 @@ if platform.is_hopper_plus:
         else:
             # No ragged CUDA top-k: mask each row to its causal window first.
             # seq_lens_2d is a full-length broadcast (only its last column is
-            # read on the hot path), so derive the per-token bound from the
-            # per-request seq_lens: seq_lens[req] - (q_len_per_req - 1) + j.
-            offsets = torch.arange(
-                1 - q_len_per_req, 1, device=seq_lens.device, dtype=torch.int32
-            )
-            seq_lens_per_token = (seq_lens.unsqueeze(1) + offsets).reshape(-1)
+            # read on the hot path); seq_lens_per_token above carries the
+            # per-token bound seq_lens[req] - (q_len_per_req - 1) + j.
             col_ids = torch.arange(logits.shape[1], dtype=torch.int32, device=q.device)
             logits.masked_fill_(
                 col_ids.view(1, -1) >= seq_lens_per_token.view(-1, 1), float("-inf")
@@ -371,6 +400,7 @@ if platform.is_hopper_plus:
         "dsa_prefill_topk",
         name="deep_gemm_dsa_prefill_topk",
         solution="deep_gemm",
+        features={"forced_initial_local"},
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
@@ -389,6 +419,7 @@ if platform.is_hopper_plus:
             }
         ),
         traits={
+            "index_heads": frozenset({16, 32, 64}),
             "head_dim": frozenset({128}),
             "topk": frozenset({512, 1024, 2048}),
             "index_k_format": frozenset({"fp8_scaled"}),
@@ -414,6 +445,8 @@ if platform.is_hopper_plus:
         max_seqlen_k: int | None = None,
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
+        initial_tokens: int = 0,
+        local_tokens: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         q = q.contiguous()
@@ -429,6 +462,7 @@ if platform.is_hopper_plus:
         )
         out.fill_(-1)
 
+        q, weights = _pad_index_heads(q, weights)
         q_2d = q.view(-1, q.shape[-1])
         q_fp8, q_scale = quantize_fp8_with_scale(
             q_2d,
@@ -507,6 +541,12 @@ if platform.is_hopper_plus:
             logits.nan_to_num_(
                 nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
             )
+            mark_forced_initial_local_logits(
+                logits,
+                candidate_lens[start:end],
+                initial_tokens=initial_tokens,
+                local_tokens=local_tokens,
+            )
             torch.ops.trtllm.indexer_topk_prefill(
                 logits.contiguous(),
                 local_starts_i32[start:end],
@@ -517,3 +557,98 @@ if platform.is_hopper_plus:
         valid = out >= 0
         out.copy_(torch.where(valid, out + row_starts.unsqueeze(1), out))
         return out, lens_out
+
+
+if platform.is_hopper_plus:
+
+    @register_kernel(
+        "attention",
+        "dsa_index_candidates",
+        name="deep_gemm_dsa_index_candidates",
+        solution="deep_gemm",
+        priority=Priority.PERFORMANT,
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0), vendors=frozenset({"nvidia"})
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    weights=dense_tensor_format(dtype),
+                )
+                for dtype in (torch.bfloat16, torch.float32)
+            }
+        ),
+        traits={
+            "index_heads": frozenset({16, 32, 64}),
+            "head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
+            "index_k_layout": frozenset({"packed"}),
+        },
+    )
+    def deep_gemm_dsa_index_candidates(
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        local_page_table: torch.Tensor,
+        query_requests: torch.Tensor,
+        causal_lens: torch.Tensor,
+        *,
+        page_size: int,
+        topk: int,
+        softmax_scale: float,
+        initial_tokens: int,
+        local_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
+            candidate_topk_offsets,
+            compact_index_pages,
+            gather_index_candidates,
+            mask_index_scores,
+        )
+
+        pages, positions, lengths = compact_index_pages(
+            local_page_table,
+            query_requests,
+            causal_lens,
+            page_size,
+        )
+        q, weights = _pad_index_heads(q.contiguous(), weights)
+        q_fp8, scale = quantize_fp8_with_scale(
+            q.reshape(-1, q.shape[-1]),
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="float32",
+        )
+        scale = scale[: q.shape[0] * q.shape[1]].contiguous()
+        weights = combine_topk_weights(weights, scale, softmax_scale)
+        if deep_gemm.get_pdl() != pdl_enabled():
+            deep_gemm.set_pdl(pdl_enabled())
+        # DeepGEMM's scheduler requires nonempty work even when this rank
+        # owns no rows. Read the reserved null page for empty rows, then mask
+        # every dummy score using the original (zero) lengths below.
+        scoring_lengths = lengths.clamp_min(1)
+        plan = deep_gemm.get_paged_mqa_logits_metadata(
+            scoring_lengths, page_size, deep_gemm.get_num_sms()
+        )
+        logits = deep_gemm.fp8_paged_mqa_logits(
+            q_fp8.view(q.shape[0], 1, q.shape[1], q.shape[2]),
+            index_k_cache.view(-1, page_size, 1, index_k_cache.shape[-1]),
+            weights,
+            scoring_lengths,
+            pages,
+            plan,
+            pages.shape[1] * page_size,
+            clean_logits=False,
+        )
+        mask_index_scores(
+            logits,
+            positions,
+            lengths,
+            causal_lens,
+            page_size,
+            initial_tokens,
+            local_tokens,
+        )
+        offsets = candidate_topk_offsets(logits, topk)
+        return gather_index_candidates(offsets, logits, positions, page_size)

@@ -350,6 +350,14 @@ def test_residual_fusion_gather_boundaries_match_communication(
     assert residual is x and (result is x) == (not expected_final)
 
 
+class _TailFusionPLE:
+    def start_prefetch(self, input_ids, ctx):
+        pass
+
+    def __call__(self, value, ids, ctx):
+        return torch.tanh(value)
+
+
 class _TailFusionLayer(torch.nn.Module, _Qwen4ExpDecoderMixin):
     """Exercise the real residual chain around small deterministic sublayers."""
 
@@ -372,7 +380,7 @@ class _TailFusionLayer(torch.nn.Module, _Qwen4ExpDecoderMixin):
         self.mlp = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.is_moe = False
         self.materialize_tail = False
-        self.ple = (lambda value, ids, ctx: torch.tanh(value)) if ple else None
+        self.ple = _TailFusionPLE() if ple else None
         self.comm_manager = SimpleNamespace(
             needs_pre_attn_all_gather=lambda: pre_gather,
             needs_final_all_gather=lambda: final_gather,
@@ -428,8 +436,6 @@ def _tail_fusion_model(
         )
         for index in range(layer_count)
     )
-    # The fake PLE has no cache state; the residual ordering is exercised above.
-    model.ple_layers = ()
     model.hyper_connection_mixer = GatedResidualSimple(
         config, use_mix=True, use_combine=False
     )

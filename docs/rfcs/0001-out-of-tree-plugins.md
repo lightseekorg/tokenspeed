@@ -31,7 +31,7 @@ belongs:
    `ensure_loaded()` call, made in every process before a `ModelConfig` is
    built. It also runs `tokenspeed_kernel.plugins.discover_plugins()`.
 2. One `register_*` function per dispatch point that is a closed container
-   today (models, attention families, cache recipes and pools, quantization
+   today (models, configs, cache recipes and pools, quantization
    methods, drafters); attention backends already have one.
 3. A declarative `ModelProfile` on the model class that states its attention
    arch, cache family and forced/default backends, replacing the
@@ -142,21 +142,39 @@ def list_plugins() -> list[PluginInfo]: ...
 Semantics:
 
 - `ensure_loaded()` is idempotent per process. It first imports
-  `tokenspeed_kernel` (built-in kernels register at import) and calls
-  `tokenspeed_kernel.plugins.discover_plugins()`, then walks the
+  every built-in registry, including attention backends and model classes,
+  before any plugin registration. Seeding must be idempotent and must not
+  overwrite a later plugin entry. It imports `tokenspeed_kernel`, applies
+  the shared disable set below, and calls kernel discovery with explicit
+  `force=False, strict=True`, then walks the
   `tokenspeed.plugins` group sorted by entry-point name and calls each
-  `register()`.
-- The single call site is the top of `ModelConfig.__init__`, before
+  `register()`. Built-in seeding must stay safe in CPU-only frontend
+  processes: retain platform-gated/lazy backend imports, do not allocate
+  device memory or compile kernels, and test startup without GPU libraries.
+- The configuration call site is the top of `ModelConfig.__init__`, before
   `_resolve_attention_family`. That covers every process that builds a
   config. `build_device_side` needs no call of its own because it receives
-  an already-built `ModelConfig`.
-- A plugin whose `register()` raises is reported with a `UserWarning` and
-  skipped; the host keeps starting. This matches the kernel side.
+  an already-built `ModelConfig`. CLI registry validation has a second,
+  idempotent call before validating names in argument handling; it cannot
+  rely on a later `ModelConfig` construction.
+- A runtime plugin load or registration failure aborts startup. Discovery
+  records a terminal failed state: subsequent calls raise rather than using
+  partially registered entries. The kernel loader must add an explicit
+  `strict: bool` parameter with the same failure behavior; existing callers
+  choose `strict=False` to retain warning-and-continue behavior. The runtime
+  uses `strict=True`. This is a proposed kernel API change, not behavior
+  available today. A failed process must restart before serving requests.
 - Every loaded plugin logs its distribution, version and the names it
   registered in each registry, at `INFO`, once, so a serving log always
   shows what out-of-tree code is active.
-- `TOKENSPEED_DISABLE_PLUGINS=a,b` skips entry points by name, as the kernel
-  side does.
+- Before either group loads, the runtime unions `TOKENSPEED_DISABLE_PLUGINS`
+  and `TOKENSPEED_KERNEL_DISABLE_PLUGINS` and applies that set to both groups,
+  calling kernel `disable_plugin(name)` before discovery. Paired entry points
+  must use the same name, as in the example below; packages with different
+  names must be rejected before either entry point executes. This changes
+  runtime integration of the existing kernel-only switch; standalone kernel
+  hosts retain their own disable policy. The runtime must own first discovery
+  and reject a startup where an excluded entry point has already loaded.
 
 Plugins are activated by installation. The existence of a `--plugins`
 allowlist as an alternative is discussed under Open questions.
@@ -170,26 +188,33 @@ nothing about in-tree resolution changes. All functions live in
 import surface for registration.
 
 ```python
-def register_model(cls: type[nn.Module], *, architectures: tuple[str, ...] = (), override: bool = False) -> None
-def register_config(cls: type[PretrainedConfig], *, model_type: str | None = None, architectures: tuple[str, ...] = (), override: bool = False) -> None
-def register_attention_backend(name: str, archs: set[AttentionArch], cls: type[AttentionBackend], *, override: bool = False) -> None
-def register_linear_attention_backend(name: str, factory: Callable[..., AttentionBackend], *, override: bool = False) -> None
-def register_cache_recipe(family: str, recipe: Callable[..., CacheRecipe], *, override: bool = False) -> None
-def register_cache_pool(family: str, factory: Callable[..., CachePool], *, override: bool = False) -> None
-def register_quantization_method(name: str, cls: type[QuantizationConfig], *, override: bool = False) -> None
-def register_drafter(algorithm: str, cls: type[BaseDrafter], *, draft_model_cls: type[nn.Module] | None = None, override: bool = False) -> None
+def register_model(cls: type[nn.Module], *, architectures: tuple[str, ...] = (), override: bool) -> None
+def register_config(cls: type[PretrainedConfig], *, model_type: str | None = None, architectures: tuple[str, ...] = (), override: bool) -> None
+def register_attention_backend(name: str, archs: set[AttentionArch], cls: type[AttentionBackend], *, override: bool) -> None
+def register_linear_attention_backend(name: str, factory: Callable[..., AttentionBackend], *, override: bool) -> None
+def register_cache_recipe(family: str, recipe: Callable[..., CacheRecipe], *, override: bool) -> None
+def register_cache_pool(family: str, factory: Callable[..., CachePool], *, override: bool) -> None
+def register_quantization_method(name: str, cls: type[QuantizationConfig], *, override: bool) -> None
+def register_drafter(algorithm: str, cls: type[BaseDrafter], *, draft_model_cls: type[nn.Module] | None, override: bool) -> None
 ```
 
-`override` defaults to `False` and a name collision with an in-tree entry
-raises. Replacing an in-tree model, recipe or method is legitimate — that is
+`override` is a required keyword argument. With `override=False`, a name
+collision with any existing entry raises. Replacing an in-tree model, recipe
+or method is legitimate — that is
 how a downstream package ships a fixed or specialized variant — but it must be
 a visible decision in the plugin's source, and it is logged.
+
+Omitting `architectures` means the model class name alone (or no architecture
+aliases for a config); omitting `model_type` uses the config class's declared
+model type. A config with neither a model type nor architecture aliases is
+invalid. `draft_model_cls` must be explicit: `None` selects the algorithm
+catch-all, while a class selects only that class and its subclasses.
 
 Per registry:
 
 **Models.** `import_model_classes()` keeps scanning `tokenspeed.runtime.models`
-for `EntryClass`; its result seeds the registry. `register_model(cls)` keys
-by `cls.__name__` unless `architectures` is given (a plugin may need to claim
+for `EntryClass`; its result seeds the registry.
+`register_model(cls, override=False)` keys by `cls.__name__` unless `architectures` is given (a plugin may need to claim
 an HF architecture string that differs from its class name).
 
 **Configs.** A released checkpoint may carry no `model_type` (LongCat
@@ -216,9 +241,11 @@ registry seeded with `"kda"` and `"gdn"`;
 FGBKDA (featurewise beta) as a subclass of the in-tree KDA backend with only
 the recurrence seams overridden.
 
-**Attention backends.** `register_backend` already exists; it is re-exported.
+**Attention backends.** `register_backend` already exists; the public wrapper
+adds the explicit collision policy and preserves every supplied argument.
 `_KERNEL_SOLUTION_BY_BACKEND` in `backends/paged/mha.py` becomes a
-`register_mha_kernel_solution(backend_name, solution)` on the same module,
+`register_mha_kernel_solution(backend_name, solution, *, override: bool)`
+on the same module,
 so a plugin can add a backend name that routes MHA leaves to its own
 `solution` string.
 
@@ -243,19 +270,37 @@ through the chain with no `quant_method` set.
 
 **Drafters.** `DRAFTER_MAPPING` and the `isinstance` special cases become a
 registry keyed `(algorithm, draft_model_cls | None)`; resolution picks the
-most specific match by `isinstance`, falling back to `(algorithm, None)`.
+most specific matching class, falling back to `(algorithm, None)`.
+Resolve using the registered draft model class before model instantiation;
+ambiguous incomparable class matches are errors.
 The `("DFLASH", "DSPARK")` check in `configure_draft_target` becomes a class
 attribute on the drafter, `requires_target_capture: ClassVar[bool]`, which is
 what the check is actually asking. The draft-architecture rewrite in
 `hf_transformers_utils.py` reads `ModelProfile.draft_architecture` (P3) when
-present and keeps its suffixing fallback otherwise.
+present. Suffixing remains only for unmigrated in-tree models.
+
+Each registered drafter also declares required, non-defaulted class traits:
+`requires_target_capture: ClassVar[bool]`,
+`block_decode: ClassVar[bool]`,
+`writes_target_cache_locations: ClassVar[bool]`, and
+`draft_query_count: ClassVar[Callable[[int], int]]` (verify width to draft
+query count). These traits are resolved before attention/cache construction
+and stored on the resolved target/draft configuration, passed explicitly
+to attention-config construction and the executor. They replace
+`is_block_drafter()` and algorithm-name geometry checks at every
+consumer, including the executor. Nonpositive query counts and unsupported
+trait combinations fail setup. In-tree DFLASH uses the verify width; DSPARK
+uses width minus one. Storage remains declared through cache recipes and
+LCM groups, owned by the cache subsystem and scheduler; these traits do not
+create drafter-private per-request state or a second execution path.
 
 **CLI.** `--attention-backend`, `--drafter-attention-backend`,
-`--quantization`, `--speculative-algorithm` and `--moe-backend` drop
-argparse `choices=` (or the `MoeBackend` enum coercion) and are validated
-against the corresponding registry after `ensure_loaded()`, producing the
+`--quantization` and `--speculative-algorithm` drop argparse `choices=`
+and are validated against the corresponding registry after `ensure_loaded()`, producing the
 same "unknown X, available: [...]" error a user gets today. The help text
-lists the in-tree names and says plugins may add more.
+lists the in-tree names and says plugins may add more. `--moe-backend`
+retains its existing enum and validation; extending MoE dispatch is outside
+this RFC.
 
 There is deliberately no plugin CLI extension point. A plugin's deployment
 knobs (e.g. where Flash-Lite's over-embedding tables live) are explicit
@@ -266,15 +311,17 @@ plugin-owned argument namespace.
 
 ### P3. `ModelProfile`: the model declares its own family facts
 
-P2 makes the tables extensible, but a plugin would still be registering
-*its architecture name into central tables* — knowledge about the model
-living away from the model. The intended end state moves that knowledge onto
-the class:
+Registered models use this profile from phase 1, as required by P2. The
+in-tree migration later removes the remaining architecture-name tables,
+so all model-family knowledge lives on the model class:
 
 ```python
 @dataclass(frozen=True, kw_only=True)
 class ModelProfile:
     configure_attention: Callable[[ModelConfig], None]  # writes arch + geometry
+    num_attention_layers: int                # cache-layer count for this model side
+    draft_architecture: Mapping[str, str]    # algorithm -> registered draft architecture
+    is_draft_of: frozenset[str]              # accepted target architecture names
     cache_family: str                        # a registered recipe/pool family
     linear_attention: str | None             # a registered linear-attn backend
     default_attention_backend: str | None    # used only if the user passed none
@@ -287,6 +334,9 @@ class FooForCausalLM(nn.Module):
     def model_profile(cls, hf_config) -> ModelProfile:
         return ModelProfile(
             configure_attention=configure_mla_attention,
+            num_attention_layers=hf_config.num_hidden_layers,
+            draft_architecture={},
+            is_draft_of=frozenset(),
             cache_family="mla",
             linear_attention=None,
             default_attention_backend="flashmla",
@@ -314,19 +364,40 @@ seed; the tables are deleted once every in-tree entry class carries a
 profile. A registered (plugin) class without a profile is an error at
 registration, not a fallback to MHA.
 
-Two field-set notes from the reference implementation:
+Profile field contracts:
 
 - `tokenizer_kwargs` exists because a released tokenizer may need
   construction arguments (`fix_mistral_regex=True` for LongCat's Bloom-style
-  tokenizer), and every `get_tokenizer` site must apply them.
+  tokenizer). `ModelConfig` stores a resolved copy as its explicitly
+  initialized `tokenizer_kwargs` field. Every tokenizer load, including
+  frontend `AsyncLLM`, scheduler-side `RequestHandler` and worker weight
+  loading, receives these
+  values explicitly; none reconstructs a config-dependent profile from only
+  an architecture list. Explicit caller kwargs win on conflicts; profile
+  values do not override explicit tokenizer mode or trust settings.
 - A profile field may gate a generic runtime capability rather than a
   resolver: `request_token_history` makes the executor keep each slot's
   committed tokens (seeded on prefix resume, graph-stable views), which the
   model receives as a forward argument. The capability lives in the runtime,
   once; the profile only switches it on. This is the pattern for future
   model needs that are state, not dispatch.
-- `draft_architecture` / `is_draft_of` join the profile together with the
-  drafter registry (deferred; see Phasing).
+- `num_attention_layers` is computed from the checkpoint by the profile
+  factory and assigned to `ModelConfig` before cache setup. It replaces
+  `_derive_num_attention_layers` and architecture-name multipliers: a block
+  with two attention instances declares twice its block count. Draft profiles
+  declare their own count; cache recipes still determine whether a draft
+  shares target storage. PP execution-to-cache windows must use the same
+  mapping, rather than assuming one cache layer per execution block.
+- `draft_architecture` maps each supported algorithm to a registered draft
+  architecture name. An explicit draft checkpoint selects its registered
+  class first; otherwise the target profile mapping selects it. The selected
+  draft profile must list the resolved target architecture in `is_draft_of`,
+  and the drafter registry must support that algorithm/class pair. Missing
+  mappings, unknown classes and incompatible target/draft pairs are startup
+  errors for profiled models, never suffix fallbacks. Empty mappings/sets
+  explicitly mean no implicit draft/no supported target respectively. These
+  fields are required from phase 1, with empty values until a model supports
+  the phase-2 drafter contract; their types do not change between phases.
 
 This is the actual dependency inversion in the RFC: after it, there is one
 resolution path shared by in-tree and out-of-tree models, which is the
@@ -336,7 +407,9 @@ migration.
 
 ### P4. Kernel side
 
-No new mechanism. Three clarifications become documentation:
+The runtime integration requires strict kernel discovery as specified in P1
+and shared disable handling before discovery. Other kernel selection
+mechanisms remain unchanged. Three clarifications become documentation:
 
 - The runtime calls `discover_plugins()` (via `ensure_loaded()`), which the
   kernel plugin README has always required of the host.
@@ -417,8 +490,8 @@ def register() -> None:
     if PLUGIN_API_VERSION != 1:
         raise RuntimeError(f"my_plugin targets plugin API 1, host has {PLUGIN_API_VERSION}")
     from my_plugin.models import FooForCausalLM, FooForCausalLMNextN
-    register_model(FooForCausalLM)
-    register_model(FooForCausalLMNextN)
+    register_model(FooForCausalLM, override=False)
+    register_model(FooForCausalLMNextN, override=False)
 ```
 
 ```python
@@ -537,7 +610,13 @@ plugin exists. Three measures:
    method and a drafter. A test installs it and runs an end-to-end generation
    with CUDA graphs, PD and speculative decoding on a tiny config. Mainline
    refactors that break the contract fail here rather than in a downstream
-   deployment.
+   deployment. Each phase ships its relevant fixture cases before merging:
+   built-in override ordering, failed partial registration and repeated calls,
+   paired disable handling, explicit collision policy, MLA/DSA geometry,
+   nonstandard cache families, multiple attention instances, config-dependent
+   tokenizer options in every process, and draft routing/geometry/storage
+   under both eager execution and CUDA graphs. Negative cases must fail
+   startup before any request can run.
 3. **Exact pins.** Plugins pin `tokenspeed` and `tokenspeed_kernel` exactly,
    as the kernel plugin README already requires. The RFC does not promise
    compatibility across versions; it promises that breaking the contract is
@@ -550,35 +629,45 @@ plugin exists. Three measures:
   names and one for everything else defaulting to MHA.
 - *Cache groups own per-request state.* Plugins are held to the same rule as
   in-tree code, and the `CacheRecipe` seam is how they comply.
-- *Explicit parameters, no hidden behavioral defaults.* `override=False`
-  makes replacing in-tree entries a visible decision; a missing `profile` is
-  an error, not a fallback; loaded plugins are always logged.
+- *Explicit parameters, no hidden behavioral defaults.* Required `override`
+  makes replacement a visible decision; missing profiles and plugin load
+  failures abort startup; loaded plugins are always logged.
 - *Dependency boundaries.* Runtime code still reaches kernels only through
   `tokenspeed_kernel`; a plugin's own kernels are its own dependency.
 
 ## Phasing
 
-Each phase is independently mergeable and useful.
+All phases are planned; this PR contains the RFC only, not a runtime
+implementation or fixture plugin. Each phase must include its contract tests
+and documentation before it is independently mergeable.
 
 1. **Discovery and the registrations that make a private model runnable**
-   *(implemented; the reference plugin exercises all of it)*.
+   *(planned)*.
    `tokenspeed.runtime.plugins` with `ensure_loaded()` (calling the kernel
-   discovery), `register_model` + `ModelProfile` resolution for registered
-   classes, `register_config`, re-exported `register_attention_backend`,
+   discovery with strict failure handling and shared disable policy),
+   `register_model` + `ModelProfile` resolution for registered classes,
+   `register_config`, the `register_attention_backend` wrapper,
    `register_linear_attention_backend`, `register_cache_recipe` /
    `register_cache_pool`, CLI attention-backend validation moved after
    discovery. Cache registries moved up from phase 2 because a hybrid model
    is not runnable without its state layout; the linear-attention registry
-   was pulled in for the same reason.
+   was pulled in for the same reason. All profile fields shown in P3 ship
+   here, including resolved tokenizer-kwargs transport and the generic token
+   history capability with prefix-resume and graph-stability tests. Empty
+   draft mappings/target sets are explicit until phase 2 adds drafter use;
+   there are no fields added implicitly between phases. Any subsequent
+   required-field or semantic change bumps `PLUGIN_API_VERSION`.
 2. **Remaining registries.** Quantization (including the `get_quant_method`
-   unification), drafter (including `requires_target_capture` and the
-   profile's `draft_architecture`), `register_mha_kernel_solution`,
+   unification), drafter (including geometry/storage traits and the
+   profile's `draft_architecture` / `is_draft_of`),
+   `register_mha_kernel_solution`,
    validation of the remaining CLI names.
 3. **In-tree `ModelProfile` migration.** Give every in-tree entry class a
    profile, switch the resolvers to read only profiles, delete the
    architecture-name tables.
-4. **Contract.** `docs/design/plugins.md`, `PLUGIN_API_VERSION`, the fixture
-   plugin and its CI job.
+4. **Contract consolidation.** Complete `docs/design/plugins.md` and the
+   fixture CI matrix begun in phase 1. `PLUGIN_API_VERSION` and the fixture
+   package exist from phase 1 so each phase can enforce its own contract.
 
 ## Alternatives considered
 

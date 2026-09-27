@@ -28,9 +28,12 @@ K3 DSpark is currently the model using this production path.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 
 class _DSparkContextStage(Protocol):
@@ -77,6 +80,12 @@ class DSparkContextProducer:
             raise ValueError(
                 "Only the final pipeline stage may own the draft context cache"
             )
+
+    def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
+        """Take the replacement pool the prompt context is written into."""
+        if (self.token_to_kv_pool is None) != (token_to_kv_pool is None):
+            raise ValueError("Draft context cache ownership cannot change")
+        self.token_to_kv_pool = token_to_kv_pool
 
     def begin_stage(
         self, hidden: torch.Tensor, inbound: torch.Tensor | None

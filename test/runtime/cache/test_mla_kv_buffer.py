@@ -156,7 +156,7 @@ def test_set_matches_torch_reference(n_loc, dtype, pattern):
     kv = _empty_kv(dtype)
     ref = _torch_set_reference(kv, loc, k_nope, k_rope)
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=None)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(kv, ref)
@@ -174,7 +174,7 @@ def test_set_casts_bf16_sources_into_fp8_buffer(n_loc, pattern):
         kv, loc, k_nope.to(torch.float8_e4m3fn), k_rope.to(torch.float8_e4m3fn)
     )
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=None)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(kv, ref)
@@ -200,7 +200,7 @@ def test_set_casts_mixed_sources_into_fp8_buffer(n_loc, nope_dtype, rope_dtype):
         k_rope.to(torch.float8_e4m3fn),
     )
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=None)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(kv, ref)
@@ -232,7 +232,7 @@ def test_pool_scatter_quantizes_without_materializing_fp8_sources(monkeypatch):
 
     monkeypatch.setattr(mla_pool_module, "set_mla_kv_buffer_triton", capture)
     layer = type("Layer", (), {"layer_id": 0})()
-    pool.set_mla_kv_buffer(layer, loc, k_nope, k_rope)
+    pool.set_mla_kv_buffer(layer, loc, k_nope, k_rope, write_mask=None)
 
     assert captured["kv_buffer"].dtype == torch.float8_e4m3fn
     assert captured["kv_buffer"].untyped_storage().data_ptr() == storage.data_ptr()
@@ -250,7 +250,7 @@ def test_set_supports_zero_width_rope_with_int32_locations(n_loc):
     ref = kv.clone()
     ref[loc.long()] = k_nope[:, 0]
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope)
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, write_mask=None)
     torch.cuda.synchronize()
 
     assert loc.dtype == torch.int32
@@ -276,7 +276,7 @@ def test_set_squashes_nan_and_inf(n_loc):
         ),
     )
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, sanitize=True)
+    set_mla_kv_buffer_triton(kv, loc, k_nope, k_rope, sanitize=True, write_mask=None)
     torch.cuda.synchronize()
 
     assert _bitwise_equal(kv, ref)
@@ -291,8 +291,12 @@ def test_set_pdl_invariant(n_loc, dtype):
     kv_off = _empty_kv(dtype)
     kv_on = _empty_kv(dtype)
 
-    set_mla_kv_buffer_triton(kv_off, loc, k_nope, k_rope, enable_pdl=False)
-    set_mla_kv_buffer_triton(kv_on, loc, k_nope, k_rope, enable_pdl=True)
+    set_mla_kv_buffer_triton(
+        kv_off, loc, k_nope, k_rope, enable_pdl=False, write_mask=None
+    )
+    set_mla_kv_buffer_triton(
+        kv_on, loc, k_nope, k_rope, enable_pdl=True, write_mask=None
+    )
     torch.cuda.synchronize()
 
     assert _bitwise_equal(kv_off, kv_on)
@@ -365,7 +369,7 @@ def test_set_then_get_round_trip(n_loc, dtype):
     loc, k_nope_in, k_rope_in = _make_inputs(n_loc, dtype, "rand")
     kv = _empty_kv(dtype)
 
-    set_mla_kv_buffer_triton(kv, loc, k_nope_in, k_rope_in)
+    set_mla_kv_buffer_triton(kv, loc, k_nope_in, k_rope_in, write_mask=None)
 
     k_nope_out = torch.empty_like(k_nope_in)
     k_rope_out = torch.empty_like(k_rope_in)
@@ -588,6 +592,7 @@ def test_fused_sanitize_matches_the_split_path(n_loc: int, has_rope: bool) -> No
         key_ref[:, :, :NOPE_DIM],
         key_ref[:, :, NOPE_DIM:],
         sanitize=True,
+        write_mask=None,
     )
 
     kv = _empty_kv(torch.float8_e4m3fn)

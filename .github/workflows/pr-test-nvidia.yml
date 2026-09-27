@@ -131,6 +131,7 @@ jobs:
             workflow_stage=${stage#*:}
             matrix=$(python3 test/ci_system/pipeline.py scan \
               --root test/ci \
+              --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
               --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
               --runner-group "nvidia-x86" \
               --workflow-stage "$workflow_stage")
