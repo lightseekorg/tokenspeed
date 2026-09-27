@@ -58,6 +58,22 @@ def test_dense_split_k_strided_output_and_replay(split_k, m, n):
     assert torch.isnan(storage[:, n:]).all()
 
 
+def test_dense_split_k_reduction_multiple_tiles():
+    """Cover three reducer tiles, including a masked 16-column tail."""
+    torch.manual_seed(1250)
+    m, n, k = 2, 1040, 1024
+    a_cpu = torch.randn(m, k, dtype=torch.bfloat16) / k**0.5
+    b_cpu = torch.randn(n, k, dtype=torch.bfloat16)
+    a, b = a_cpu.to("cuda"), b_cpu.to("cuda")
+    storage = torch.full((m, n + 16), float("nan"), dtype=a.dtype).to("cuda")
+    out = storage[:, :n]
+    actual = gluon_wmma_tdm_dense_gfx1250(a, b, out=out, split_k=2)
+    assert actual.data_ptr() == out.data_ptr()
+    expected = (a_cpu.float() @ b_cpu.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(actual.cpu(), expected, atol=1e-2, rtol=1e-2)
+    assert torch.isnan(storage.cpu()[:, n:]).all()
+
+
 @pytest.mark.parametrize("k", [128, 256, 384])
 def test_dense_short_k_drains_tdm(k):
     torch.manual_seed(k)
