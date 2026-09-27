@@ -159,6 +159,33 @@ def torch_sqrt_softplus_topk(
     input_ids: torch.Tensor | None,
     need_scores: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Route tokens using FP32 ``sqrt(softplus(router_logits))`` scores.
+
+    Plain routing selects the largest scores; bias routing selects the largest
+    scores plus ``correction_bias``. Both return ids in descending selection-score
+    order. Hash routing takes precedence and looks up expert ids instead. Route
+    weights always come from the unbiased scores.
+
+    Args:
+        router_logits: Floating-point logits shaped ``[tokens, experts]``.
+        top_k: Number of routes per token for plain or bias routing.
+        renormalize: Divide selected weights by their sum, clamped to the
+            smallest positive normal FP32 value to avoid division by zero.
+        correction_bias: Selection-only bias shaped ``[experts]`` or
+            ``[tokens, experts]``; ignored for hash routing. None selects plain
+            routing when no hash table is supplied.
+        hash_indices_table: Optional ``[vocabulary, top_k]`` expert-id table.
+            Its row width determines the number of routes for hash routing.
+        input_ids: Token ids indexing the hash table, required for hash routing
+            and ignored otherwise; flattened to one id per token.
+        need_scores: Return all FP32 sqrt-softplus scores when true; otherwise
+            return the original logits as the third result.
+
+    Returns:
+        ``(weights, ids, scores_or_logits)``: FP32 route weights and INT32 expert
+        ids shaped ``[tokens, top_k]``, followed by FP32 scores shaped
+        ``[tokens, experts]`` or the unchanged input logits.
+    """
     scores = torch.sqrt(F.softplus(router_logits.float()))
     if hash_indices_table is not None:
         if input_ids is None:
