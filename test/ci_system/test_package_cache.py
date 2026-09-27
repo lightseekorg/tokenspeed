@@ -141,7 +141,7 @@ def test_nvcc_cache_normalizes_checkout_and_isolates_fork_writes(
             "100G",
             "002",
             read_only,
-            str(workspace / ".ci-artifacts" / "ccache-stats.log"),
+            str(workspace / ".ccache-tmp" / "ccache-stats.log"),
             "",
         ]
     )

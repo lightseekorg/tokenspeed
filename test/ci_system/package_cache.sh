@@ -41,7 +41,8 @@ configure_nvcc_cache() {
     export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-100G}"
     export CCACHE_UMASK="${CCACHE_UMASK:-002}"
     export CCACHE_TEMPDIR="${CCACHE_TEMPDIR:-${WORKSPACE}/.ccache-tmp}"
-    export CCACHE_STATSLOG="${CCACHE_STATSLOG:-${WORKSPACE}/.ci-artifacts/ccache-stats.log}"
+    # Each compiler locks this log; keep concurrent writes off shared artifacts.
+    export CCACHE_STATSLOG="${CCACHE_STATSLOG:-${CCACHE_TEMPDIR}/ccache-stats.log}"
     if [ "${TOKENSPEED_CI_FORK_PR:-false}" = "true" ]; then
         export CCACHE_READONLY=1
     fi
@@ -70,6 +71,11 @@ show_nvcc_cache_stats() {
     if [ "${phase}" = "after" ] && [ -s "${CCACHE_STATSLOG:-}" ]; then
         echo "=== NVCC cache stats for this build ==="
         ccache --show-log-stats || true
+        local artifact_dir="${WORKSPACE}/.ci-artifacts"
+        if [ "${CCACHE_STATSLOG}" != "${artifact_dir}/ccache-stats.log" ]; then
+            mkdir -p "${artifact_dir}" \
+                && cp "${CCACHE_STATSLOG}" "${artifact_dir}/ccache-stats.log" || true
+        fi
     fi
 }
 
