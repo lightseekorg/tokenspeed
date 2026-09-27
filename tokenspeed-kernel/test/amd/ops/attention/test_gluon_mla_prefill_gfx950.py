@@ -263,12 +263,13 @@ def test_mla_prefill_gluon_reuses_kernel_across_batch_and_query_sizes(
         expected_lse = visible.float().log().repeat(batch)[:, None].expand_as(lse)
         torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=1e-5)
 
-    # Compile once and check small shapes, including a one-row query.
-    # batch_size and max_seqlen_q are not specialized, so crossing scheduler
-    # slot boundaries below must reuse the same binary.
-    for batch, q_len in ((1, 1), (2, 16), (16, 17), (16, 16), (2, 17)):
-        invoke(batch, q_len)
+    # Warm with one shape whose batch_size and max_seqlen_q are neither 1 nor
+    # multiples of 16. Both are excluded from Triton's integer specialization,
+    # so the values that would otherwise specialize must reuse this binary.
+    invoke(2, 17)
     with assert_no_triton_compile(getattr(module, kernel)):
+        for batch, q_len in ((1, 1), (1, 17), (2, 16), (16, 17), (16, 16)):
+            invoke(batch, q_len)
         # Cross 512 // 12 batch slots and the compact/full query-slot boundary.
         for batch, q_len in (
             (3, 257),
