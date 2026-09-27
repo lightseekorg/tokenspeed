@@ -799,6 +799,8 @@ tokenspeed serve openai/gpt-oss-120b \
 
 ## DeepSeek V4-Flash / V4-Pro
 
+<a id="deepseek-thinking-mode"></a>
+
 With `tokenspeed-smg==1.11.0.post20260924`, DeepSeek V4 and V4.1 chat
 requests enable thinking by default. Reasoning consumes the output token
 budget, so set an explicit `max_tokens` large enough for reasoning and the
@@ -1016,6 +1018,9 @@ then check completion, speculative acceptance, and cache-hit metrics with fixed
 prompts and package/model revisions.
 
 ## DeepSeek V4.1-Flash
+
+Chat requests enable thinking by default; see the
+[thinking-mode defaults and request overrides](#deepseek-thinking-mode).
 
 DeepSeek V4.1 (`deepseek_v41`) is served by its own FlatKV attention backend
 with a four-group KV cache: the global KV chains, the SWA rows and the
