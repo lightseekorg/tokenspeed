@@ -118,6 +118,7 @@ distributed update mode until that implementation is added.
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
+| `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost. |
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
@@ -166,8 +167,8 @@ different process groups.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. |
-| `--drafter-attention-backend` | Attention backend for speculative decoding drafter model. |
+| `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. |
+| `--drafter-attention-backend` | Attention backend for speculative decoding drafter model; accepts the same names as `--attention-backend`. |
 | `--moe-backend` | MoE backend. |
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
@@ -464,7 +465,11 @@ in the hashed namespace. Without PP, only `cp_rank==0` owns the request
 socket and load reporting, and `recv_reqs` broadcasts across CP so exists
 MIN is rank-identical. GQA with TP above the KV-head count assigns
 different heads to the same `r{tp_rank}`, so `attn_tp_size` (resolved
-`mapping.attn.tp_size`) is also in the namespace.
+`mapping.attn.tp_size`) is also in the namespace. Resolved target and draft
+attention backends, including the full-attention sub-backend of a hybrid model,
+are isolated too: different implementations can produce different downstream
+KV even with identical cache layouts. This namespace extension intentionally
+starts a cold L3 cache instead of reusing objects written without backend identity.
 `global_segment_size` is split across
 attention-TP × context-parallel × pipeline-parallel ranks so the
 mounted total matches the configured size. Use the resolved mapping

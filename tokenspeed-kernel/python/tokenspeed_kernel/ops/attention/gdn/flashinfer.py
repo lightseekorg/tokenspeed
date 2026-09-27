@@ -248,6 +248,9 @@ if is_available():
             # upstream. Disabling CP can slow long-context GDN prefill but
             # does not change correctness.
             use_cp=False,
+            # Keep the CuTe implementation wrapped by our PDL adapter; 0.7.0's
+            # default auto backend may otherwise bypass it through Cake GDN.
+            backend="flashinfer",
             enable_pdl=pdl_enabled(),
         )
 
@@ -331,6 +334,7 @@ if is_decode_available():
         dt_bias = dt_bias.detach().float()
         out, _ = _gated_delta_rule_decode_pretranspose(
             enable_pdl=pdl_enabled(),
+            backend="flashinfer",
             q=q,
             k=k,
             v=v,

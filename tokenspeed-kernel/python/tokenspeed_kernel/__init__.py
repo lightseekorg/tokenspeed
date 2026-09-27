@@ -57,18 +57,11 @@ from tokenspeed_kernel.ops.layernorm import (
     grouped_gemma_rmsnorm,
 )
 from tokenspeed_kernel.ops.moe import (
-    dsv4_mega_moe_apply,
-    dsv4_mega_moe_plan,
-    dsv4_mega_moe_process_weights,
-    dsv4_mega_moe_warmup,
-    dsv4_select_experts,
     moe_apply,
     moe_plan,
     moe_process_weights,
-    moe_sigmoid_bias_topk,
-    moe_softmax_topk,
+    moe_topk,
     native_latent_moe_available,
-    pack_topk_router_logits,
 )
 from tokenspeed_kernel.ops.quantization import (
     fp8_quantize_dequantize,
@@ -137,18 +130,11 @@ __all__ = [
     "silu_and_mul",
     "situ_and_mul",
     # moe
-    "dsv4_mega_moe_apply",
-    "dsv4_mega_moe_plan",
-    "dsv4_mega_moe_process_weights",
-    "dsv4_mega_moe_warmup",
-    "dsv4_select_experts",
     "native_latent_moe_available",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
-    "moe_sigmoid_bias_topk",
-    "pack_topk_router_logits",
-    "moe_softmax_topk",
+    "moe_topk",
     # quantization
     "fp8_quantize_dequantize",
     "quantize_fp8",

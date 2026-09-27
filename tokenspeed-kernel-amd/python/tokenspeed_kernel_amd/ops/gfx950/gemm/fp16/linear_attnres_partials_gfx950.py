@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import _mfma_lds_mediumm_kernel
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+    gluon_mm_a16w16_medium_gfx950,
+)
 
 _INPUT_SIZE = gl.constexpr(7168)
 _BLOCK_N_SIZE = 16
@@ -229,7 +231,7 @@ def gluon_linear_attnres_partials_m4_gfx950(
     """Run an M=4 MFMA projection alongside dual-AttnRes CTAs."""
     pid = gl.program_id(0)
     if pid >= 4:
-        _mfma_lds_mediumm_kernel(
+        gluon_mm_a16w16_medium_gfx950(
             hidden_ptr,
             weight_ptr,
             output_ptr,

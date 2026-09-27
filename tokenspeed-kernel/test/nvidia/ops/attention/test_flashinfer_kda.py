@@ -131,9 +131,20 @@ def check(actual, ref, label):
 
 @requires_flashinfer
 @pytest.mark.parametrize(
-    "batch,tokens", [(1, 1), (5, 1), (129, 1), (5, 3), (16, 4), (16, 8)]
+    "batch,tokens,frozen_state",
+    [
+        (1, 1, False),
+        (5, 1, False),
+        (129, 1, False),
+        (5, 1, True),
+        (5, 3, True),
+        (16, 4, True),
+        (16, 8, True),
+    ],
 )
-def test_registered_paths_and_refreshed_graph_indices(batch, tokens, monkeypatch):
+def test_registered_paths_and_refreshed_graph_indices(
+    batch, tokens, frozen_state, monkeypatch
+):
     selected = []
     real_select = facade.select_kernel
 
@@ -188,7 +199,7 @@ def test_registered_paths_and_refreshed_graph_indices(batch, tokens, monkeypatch
     payload = tuple(torch.empty_like(value) for value in (raw, fa, beta))
 
     def run(c, s, solution):
-        if tokens == 1:
+        if not frozen_state:
             result = try_kda_fused_paged_decode(
                 raw,
                 weights,
@@ -254,12 +265,12 @@ def test_registered_paths_and_refreshed_graph_indices(batch, tokens, monkeypatch
 
     live = (
         writes >= 0
-        if tokens == 1
+        if not frozen_state
         else torch.ones(rows, device="cuda", dtype=torch.bool)
     )
     actual, expected = run(conv, state, None), run(cref, sref, "triton")
     assert selected[0].startswith("flashinfer_kda_recurrent_producer_")
-    if tokens > 1:
+    if frozen_state:
         for src, dst in zip((raw, fa, beta), payload):
             assert torch.equal(src.view(torch.int16), dst.view(torch.int16))
     check(
@@ -267,7 +278,7 @@ def test_registered_paths_and_refreshed_graph_indices(batch, tokens, monkeypatch
         expected.view(rows, H, D)[live],
         "registered output",
     )
-    if tokens == 1:
+    if not frozen_state:
         torch.testing.assert_close(conv, cref, atol=0, rtol=0)
         check(state, sref, "registered state")
     else:
@@ -288,14 +299,14 @@ def test_registered_paths_and_refreshed_graph_indices(batch, tokens, monkeypatch
     graph.replay()
     expected = run(cref, sref, "triton")
     check(captured, expected, "registered graph output")
-    if tokens == 1:
+    if not frozen_state:
         torch.testing.assert_close(conv, cref, atol=0, rtol=0)
         check(state, sref, "registered graph state")
     else:
         torch.testing.assert_close(conv, c0, atol=0, rtol=0)
         torch.testing.assert_close(state, s0, atol=0, rtol=0)
 
-    if tokens > 1:
+    if frozen_state:
         for src, dst in zip((raw, fa, beta), payload):
             assert torch.equal(src.view(torch.int16), dst.view(torch.int16))
 
@@ -351,11 +362,12 @@ def _run_generic(raw, fa, fb, beta, cw, conv, state, reads, writes):
     return qkv, gate, logits
 
 
-def _prepare(case, tokens, payload):
+def _prepare(case, tokens, payload, *, frozen_state):
     return prepare_api.prepare_kda_recurrent_inputs(
         *case.args,
         tokens=tokens,
-        state_scratch=None if tokens == 1 else case.scratch,
+        frozen_state=frozen_state,
+        state_scratch=case.scratch if frozen_state else None,
         replay_payload=payload,
     )
 
@@ -403,10 +415,10 @@ def test_compact_matches_generic(batch, pattern, state_aligned, monkeypatch):
         protected[writes[writes >= 0].long()] = False
         assert torch.equal(conv[protected], before[protected])
 
-    compare(_prepare(case, 1, None))
+    compare(_prepare(case, 1, None, frozen_state=False))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _prepare(case, 1, None)
+        captured = _prepare(case, 1, None, frozen_state=False)
     reads.fill_(1)
     writes.copy_(
         torch.arange(batch + 1, 2 * batch + 1, device="cuda", dtype=torch.int32)
@@ -421,6 +433,8 @@ def test_compact_matches_generic(batch, pattern, state_aligned, monkeypatch):
 @pytest.mark.parametrize(
     "batch,tokens,opaque",
     [
+        (1, 1, False),
+        (5, 1, True),
         (1, 2, False),
         (5, 3, True),
         (5, 4, False),
@@ -468,14 +482,14 @@ def test_verify_staging_and_payload_are_bitwise(batch, tokens, opaque):
         assert torch.equal(conv.view(torch.int16), before_c)
         assert torch.equal(state.view(torch.int16), before_s)
 
-    actual = _prepare(case, tokens, case.payload)
+    actual = _prepare(case, tokens, case.payload, frozen_state=True)
     check(actual)
-    expected = _prepare(case, tokens, None)
+    expected = _prepare(case, tokens, None, frozen_state=True)
     for a, b in zip(actual[:3], expected[:3]):
         assert torch.equal(a.view(torch.int16), b.view(torch.int16))
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _prepare(case, tokens, case.payload)
+        captured = _prepare(case, tokens, case.payload, frozen_state=True)
     case.packed.normal_(0, 0.1)
     reads.fill_(1)
     for dest in case.payload:
@@ -487,12 +501,12 @@ def test_verify_staging_and_payload_are_bitwise(batch, tokens, opaque):
 def test_invalid_replay_capture_is_rejected():
     case = _make_inputs(2, 1, False, True)
     with pytest.raises(ValueError, match="frozen verification"):
-        _prepare(case, 1, case.payload)
+        _prepare(case, 1, case.payload, frozen_state=False)
     case = _make_inputs(2, 3, False, True)
     with pytest.raises(ValueError, match="three destination"):
-        _prepare(case, 3, case.payload[:2])
+        _prepare(case, 3, case.payload[:2], frozen_state=True)
     with pytest.raises(ValueError, match="Invalid replay"):
-        _prepare(case, 3, (case.payload[0][:1], *case.payload[1:]))
+        _prepare(case, 3, (case.payload[0][:1], *case.payload[1:]), frozen_state=True)
 
 
 @triton.jit
@@ -557,12 +571,12 @@ def test_decode_pdl_waits_for_projected_inputs_and_indices(monkeypatch):
     )
     # Warm both flag values before capture; no state contents enter a cache key.
     monkeypatch.setattr(prepare_api, "pdl_enabled", lambda: False)
-    _prepare(reference_inputs, 1, None)
+    _prepare(reference_inputs, 1, None, frozen_state=False)
     staging.copy_(wide)
     staged_reads.copy_(reads)
     staged_writes.copy_(writes)
     monkeypatch.setattr(prepare_api, "pdl_enabled", lambda: True)
-    _prepare(candidate_inputs, 1, None)
+    _prepare(candidate_inputs, 1, None, frozen_state=False)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         _publish_projected_inputs[(triton.cdiv(wide.numel(), 256),)](
@@ -578,7 +592,7 @@ def test_decode_pdl_waits_for_projected_inputs_and_indices(monkeypatch):
             num_warps=4,
             launch_pdl=True,
         )
-        captured = _prepare(candidate_inputs, 1, None)
+        captured = _prepare(candidate_inputs, 1, None, frozen_state=False)
     for step in range(4):
         wide.copy_(torch.randn_like(wide) * 0.1)
         reads.fill_(1 if step % 2 else -1)
@@ -586,7 +600,7 @@ def test_decode_pdl_waits_for_projected_inputs_and_indices(monkeypatch):
         reference_conv.copy_(original_conv)
         graph.replay()
         monkeypatch.setattr(prepare_api, "pdl_enabled", lambda: False)
-        expected = _prepare(reference_inputs, 1, None)
+        expected = _prepare(reference_inputs, 1, None, frozen_state=False)
         for index in (0, 1, 2):
             assert torch.equal(
                 captured[index].view(torch.int16), expected[index].view(torch.int16)

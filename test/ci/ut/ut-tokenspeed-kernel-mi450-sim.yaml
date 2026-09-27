@@ -15,7 +15,10 @@ env:
   GFX_ARCH: gfx1250
   # Keep emulation within the PR lane's ten-minute execution budget.
   MI450_SIM_RUN_TIMEOUT: "600"
-  # A ceiling on concurrent simulators. A simulator takes two CPU threads.
+  # Keep rocJITsu from selecting host-wide thread presets: the pod's 32-CPU
+  # cgroup quota does not narrow the host affinity visible inside the runner.
+  MI450_SIM_THREADS_PER_WORKER: "2"
+  # A ceiling on concurrent simulators. Each simulator uses the budget above.
   MI450_SIM_WORKERS: "16"
   # rocJITsu is a functional simulator, so run architecture-specific compile and
   # launch coverage here. Generic tests and the production-sized MXFP4 MoE test
@@ -78,19 +81,19 @@ env:
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv4_indexer_gfx1250.py::test_decode_tdm_threshold_logits
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv4_indexer_gfx1250.py::test_decode_graph_refresh_and_plan_aliasing
     tokenspeed-kernel/test/ops/attention/test_triton_dsv4_attention.py::test_selected_attention_and_graph_replay[True-64]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype0-plain]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype1-bias]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-False-dtype2-hash]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-True-dtype0-hash]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-True-dtype1-plain]
-    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-True-dtype2-bias]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-dtype0-plain]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-dtype1-bias]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[True-dtype2-hash]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-dtype0-hash]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-dtype1-plain]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_matches_reference[False-dtype2-bias]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_ties_and_graph_replay
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_nan_logits_keep_expert_ids_in_range[True]
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_router_to_mxfp4_experts[17]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv4_prefill_topk/gluon_dsv4_prefill_topk_mxfp4_gfx1250/mxfp4@mi450]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv4_decode_topk/gluon_dsv4_decode_topk_mxfp4_gfx1250/mxfp4@mi450]
-    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.dsv4_select_experts/triton_dsv4_select_experts/bias-tokens17@mi450]
-    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.dsv4_select_experts/triton_dsv4_select_experts/hash@mi450]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.topk/triton_sqrt_softplus_topk/bias-tokens17@mi450]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.topk/triton_sqrt_softplus_topk/hash@mi450]
     # DeepSeek V4 Gluon paged decode, one case per host-side specialization:
     # the Pro TP8 shape (16 heads, 4-warp head block, split KV plus reduce),
     # a 16-row page with a padded stride, ragged widths and a BF16 sink,
@@ -143,10 +146,10 @@ env:
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_m16_add3_auto_matches_composed_and_captures
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches
     tokenspeed-kernel/test/ops/gemm/test_routed_gemv.py::test_cdna5_route_admits_decode_shapes[7168-1536-17]
-    # Kimi K3 MoE front end: the single-token latent-input decode specialist
-    # under graph replay, prefill sigmoid-bias routing with and without weight
+    # Kimi K3 MoE front end: the latent-input decode pipeline at reduced
+    # scale, prefill sigmoid-bias routing with and without weight
     # normalization, and the fused softmax top-k.
-    tokenspeed-kernel/test/ops/moe/test_latent_input.py::test_gfx1250_latent_input_decode_matches_and_replays
+    tokenspeed-kernel/test/amd/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_pipeline[sim]
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[1.0-False]
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[2.5-True]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[2-896-16-dtype4-True]
@@ -166,10 +169,13 @@ env:
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_tdm_fusion_selection[fp32-16-2048-7168-1-0]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-gluon_mm_mxfp8_ue8m0_gfx1250]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-True-gluon_mm_fp8_blockscale_gfx1250]
-  TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.14.0+rocm10.1.0a20260822
-  TORCH_INDEX_URL: https://rocm.nightlies.amd.com/whl-multi-arch/
-  TORCH_VERSION: 2.14.0+rocm10.1.0a20260822
-  TORCHVISION_VERSION: 0.29.0a0+rocm10.1.0a20260822
+  ROCM_NIGHTLY_INDEX: https://nightly.repo.amd.com/rocm/whl-next/
+  ROCM_SDK_VERSION: 10.2.0a20260923
+  ROCM_SYSTEMS_REF: f9ba16bbe70e365b2f59b268e847bef19ad9db6e
+  TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.14.0+rocm10.2.0a20260923
+  TORCH_INDEX_URL: https://nightly.repo.amd.com/rocm/whl-next/
+  TORCH_VERSION: 2.14.0+rocm10.2.0a20260923
+  TORCHVISION_VERSION: 0.29.0a0+rocm10.2.0a20260923
 install:
   - bash test/ci_system/setup_mi450_sim.sh
   - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh

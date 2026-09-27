@@ -422,11 +422,13 @@ def prepare_kda_recurrent_inputs(
     write_indices: torch.Tensor,
     *,
     tokens: int,
+    frozen_state: bool,
     state_scratch: torch.Tensor | None,
     replay_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Compose convolution, gate GEMM, input packing and frozen-state gathering.
 
+    ``frozen_state`` selects read-only verification independently of window width.
     Ordinary decode publishes convolution to the TS destination index while
     recurrence consumes the same independent read/write indices. Frozen verify gathers
     active state rows and leaves both persistent pools untouched. Optional
@@ -435,11 +437,15 @@ def prepare_kda_recurrent_inputs(
     """
     assert state_pool.dtype == torch.bfloat16
     assert conv_pool.stride(1) == 3 and conv_pool.stride(2) == 1
+    if tokens < 1 or (not frozen_state and tokens != 1):
+        raise ValueError(
+            "Decode requires one token; frozen verify requires positive width"
+        )
     rows = raw.shape[0]
     # These views refer to existing persistent replay buffers. No allocation,
     # cache ownership or accepted-prefix commit semantics are changed.
     if replay_payload is not None:
-        if tokens <= 1:
+        if not frozen_state:
             raise ValueError("Replay capture is only valid for frozen verification")
         if len(replay_payload) != 3:
             raise ValueError("Replay capture requires three destination tensors")
@@ -458,7 +464,7 @@ def prepare_kda_recurrent_inputs(
     qkv = torch.empty((3, rows, heads, dim), device=raw.device, dtype=raw.dtype)
     gate = torch.empty((rows, heads, dim), device=raw.device, dtype=raw.dtype)
     beta_dense = torch.empty((rows, heads), device=raw.device, dtype=raw.dtype)
-    if tokens > 1:
+    if frozen_state:
         if state_scratch is None:
             state = torch.empty(
                 (rows // tokens, heads, dim, dim),
@@ -476,11 +482,11 @@ def prepare_kda_recurrent_inputs(
         slots = torch.empty(rows // tokens, device=raw.device, dtype=torch.int32)
     else:
         state, slots = state_pool, None
-    enable_pdl = tokens == 1 and pdl_enabled()
+    enable_pdl = not frozen_state and pdl_enabled()
     # Use one producer for compatible single-token calls regardless of batch
     # size. Multi-token verification keeps its existing preparation contract.
     if (
-        tokens == 1
+        not frozen_state
         and rows > 0
         and heads == 12
         and fa.shape[1] == 128
@@ -523,7 +529,7 @@ def prepare_kda_recurrent_inputs(
             **({"launch_pdl": True} if enable_pdl else {}),
         )
         return qkv, gate, beta_dense, state, slots
-    if tokens == 1:
+    if not frozen_state:
         if rows <= 4:
             bt, bk, warps = 1, 8, 1
         elif rows <= 16:
@@ -569,8 +575,8 @@ def prepare_kda_recurrent_inputs(
         STATE_OUT_STRIDE=state.stride(0),
         BT=bt,
         BK=bk,
-        STORE_CONV=tokens == 1,
-        GATHER_STATE=tokens > 1,
+        STORE_CONV=not frozen_state,
+        GATHER_STATE=frozen_state,
         DOT=bt >= 16,
         PDL=enable_pdl,
         num_warps=warps,

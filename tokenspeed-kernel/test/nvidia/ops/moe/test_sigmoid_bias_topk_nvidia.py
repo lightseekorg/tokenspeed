@@ -23,8 +23,8 @@ reference (same expert set, same weights) and win selection on NVIDIA."""
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.moe.sigmoid_topk import (
-    moe_sigmoid_bias_topk,
     torch_sigmoid_bias_topk,
     triton_minimax_sigmoid_bias_topk,
 )
@@ -34,6 +34,28 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 if not Platform.get().is_nvidia:
     pytest.skip("NVIDIA-only registration under test", allow_module_level=True)
+
+
+def _sigmoid_topk(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk: int,
+    routed_scaling_factor: float = 1.0,
+    normalize_topk_weights: bool = True,
+    logical_to_physical_map: torch.Tensor | None = None,
+    weights_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return moe_topk(
+        router_logits,
+        topk,
+        score_function="sigmoid",
+        selection_method="topk",
+        renormalize=normalize_topk_weights,
+        routed_scaling_factor=routed_scaling_factor,
+        correction_bias=correction_bias,
+        logical_to_physical_map=logical_to_physical_map,
+        topk_weights_dtype=weights_dtype,
+    )
 
 
 @pytest.mark.parametrize("tokens", [1, 3, 8, 64])
@@ -73,7 +95,7 @@ def test_entry_point_selects_fused_kernel():
         routed_scaling_factor=1.0,
         normalize_topk_weights=True,
     )
-    got_w, got_i = moe_sigmoid_bias_topk(
+    got_w, got_i = _sigmoid_topk(
         logits, bias, 16, routed_scaling_factor=1.0, normalize_topk_weights=True
     )
     torch.testing.assert_close(got_w, ref_w)
@@ -100,7 +122,7 @@ def test_decode_shape_uses_lean_kernel_and_is_exact(normalize, scale):
 
     # Each scale/normalization pair is a distinct Triton specialization.
     # Keep its JIT and module initialization outside graph capture.
-    moe_sigmoid_bias_topk(
+    _sigmoid_topk(
         logits,
         bias,
         16,
@@ -110,7 +132,7 @@ def test_decode_shape_uses_lean_kernel_and_is_exact(normalize, scale):
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        weights, ids = moe_sigmoid_bias_topk(
+        weights, ids = _sigmoid_topk(
             logits,
             bias,
             16,
@@ -139,10 +161,10 @@ def test_static_dispatch_map_and_weights_dtype(tokens, map_dtype):
     bias = torch.randn(896, dtype=torch.float32, device="cuda")
     dispatch = torch.randperm(896, dtype=map_dtype, device="cuda")
 
-    ref_w, ref_i = moe_sigmoid_bias_topk(
+    ref_w, ref_i = _sigmoid_topk(
         logits, bias, 16, routed_scaling_factor=1.0, normalize_topk_weights=True
     )
-    got_w, got_i = moe_sigmoid_bias_topk(
+    got_w, got_i = _sigmoid_topk(
         logits,
         bias,
         16,

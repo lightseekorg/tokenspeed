@@ -142,6 +142,7 @@ def flashinfer_kda_producer_decode(
         write_indices,
         replay_payload=None,
         tokens=1,
+        frozen_state=False,
         state_scratch=None,
     )
     q, k, v = [value.view(1, batch, num_heads, head_dim) for value in qkv.unbind()]
@@ -221,6 +222,7 @@ def flashinfer_kda_producer_verify(
         read_indices,
         write_indices,
         tokens=draft_token_num,
+        frozen_state=True,
         state_scratch=state_scratch,
         replay_payload=replay_payload,
     )

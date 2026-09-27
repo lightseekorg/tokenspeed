@@ -717,7 +717,17 @@ class LogitsProcessor(nn.Module):
         if should_apply_lm_head_quant_method(lm_head, quant_method):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
-            if self._use_fused_lm_head:
+            from tokenspeed.runtime.utils.env import global_server_args_dict
+
+            if global_server_args_dict["numerics"] == "rl-bitwise":
+                import tokenspeed_kernel
+
+                logits = tokenspeed_kernel.mm(
+                    hidden_states.to(lm_head.weight.dtype),
+                    lm_head.weight,
+                    override="aok",
+                )
+            elif self._use_fused_lm_head:
                 logits = _lm_head_matmul(hidden_states, lm_head.weight)
             else:
                 logits = torch.matmul(

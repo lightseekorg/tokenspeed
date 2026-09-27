@@ -1310,6 +1310,34 @@ class GroupAwareWireTest(unittest.TestCase):
 
 
 class L3FlatKvExecutorTest(unittest.TestCase):
+    def test_wait_l3_backups_snapshots_under_lock_and_waits_outside(self):
+        module = _load_executor_module_without_triton(force_isolated=True)
+        lock = threading.Lock()
+        observed = []
+
+        class PendingBackups(list):
+            def __iter__(self):
+                self_test.assertTrue(lock.locked())
+                return super().__iter__()
+
+        def completed():
+            self.assertFalse(lock.locked())
+            observed.append("done")
+
+        self_test = self
+        future = Mock()
+        future.result.side_effect = completed
+        executor = SimpleNamespace(
+            _ack_lock=lock,
+            _backup_futures=PendingBackups([(future, [7], [(0, 1, "h0", 0)])]),
+        )
+        module.L2CacheExecutor._wait_l3_backups(executor)
+        self.assertEqual(observed, ["done"])
+        future.result.side_effect = RuntimeError("backup failed")
+        with self.assertRaisesRegex(RuntimeError, "backup failed"):
+            module.L2CacheExecutor._wait_l3_backups(executor)
+        self.assertFalse(lock.locked())
+
     def test_storage_pages_skip_non_prefetch_sources(self):
         try:
             from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor

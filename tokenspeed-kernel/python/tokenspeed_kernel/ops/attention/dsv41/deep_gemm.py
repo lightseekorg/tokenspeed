@@ -27,6 +27,10 @@ from tokenspeed_kernel.ops.attention.dsv4.deep_gemm import (
     _mxfp4_cache_view,
     warmup_mqa_logits,
 )
+from tokenspeed_kernel.ops.attention.dsv41.cute_dsl import (
+    sparse_index_scores,
+    sparse_index_scores_supported,
+)
 from tokenspeed_kernel.ops.attention.dsv41.deep_select import (
     select_candidates,
     select_topk,
@@ -63,7 +67,9 @@ if platform.is_blackwell:
 if platform.is_hopper:
     prepare_cuda_toolkit_env()
     import deep_gemm
-    import flashinfer
+
+    # The selector compiles with nvidia-cutlass-dsl, a CUDA-only dependency.
+    from tokenspeed_kernel.ops.attention.dsa._cute_dsl import deep_select as row_select
 
 
 def is_native_indexer_available() -> bool:
@@ -272,8 +278,8 @@ def index_topk(
 # It does carry DeepGEMM's DeepSeek-V3.2 logits kernels, which read index rows
 # as 128 E4M3 values followed by one FP32 scale, page-planar. The "v4" cache
 # format stores exactly those rows, so scoring moves onto tensor cores; the
-# selection that follows runs on FlashInfer's radix top-k, DeepSelect being
-# sm100-only.
+# selection that follows runs on the in-tree CuTe DSL DeepSelect kernel, the
+# upstream DeepSelect package being sm100-only.
 # ---------------------------------------------------------------------------
 
 _INDEX_ROW_BYTES = _LAYOUTS["index_v4"][3]
@@ -318,17 +324,9 @@ def _warmup_hopper_indexer(heads: int, device: torch.device, enable_pdl: bool) -
         64,
         clean_logits=False,
     )
-    # The selector JITs and autotunes on its first call. dsa_graph_safe only
-    # makes the kernel replayable; it does not make that first call safe, so
-    # force it here rather than inside a capture.
-    for columns in (64, 2048):
-        _select(
-            torch.zeros((1, columns), dtype=torch.float32, device=device),
-            min(64, columns),
-            True,
-            torch.full((1, min(64, columns)), -1, dtype=torch.int32, device=device),
-            torch.zeros(1, dtype=torch.int32, device=device),
-        )
+    # The selector compiles on first use, which cannot happen inside a capture:
+    # compile every cluster variant of both selection capacities up front.
+    row_select.warmup((_ROW_CAPACITY, _BLOCK_CAPACITY), device)
 
 
 def _hopper_api(queries):
@@ -446,50 +444,62 @@ def _block_maxima(logits, visible):
     return blocks
 
 
-def _select(scores, k, graph_safe, destination, lengths, candidates=None):
-    """Take the k best columns per row with FlashInfer's radix selector.
+# V4.1 selects at most 512 rows and at most 2048 candidate blocks per query;
+# each selection binds to one compiled survivor capacity so that warmup knows
+# exactly which variants a capture may replay.
+_ROW_CAPACITY = 512
+_BLOCK_CAPACITY = 2048
 
-    ``tie_break`` matches the portable path's packed ordering, which breaks
-    equal scores toward the smaller row id, and costs nothing. ``graph_safe``
-    does cost: it is ~1.7x slower on prefill-sized rows, so only the captured
-    decode path asks for it. V4.1 never captures a prefill graph.
 
-    ``candidates`` marks ``scores`` as candidate-compacted and maps the winning
-    columns back to row ids. Ties then break toward the smaller candidate
-    column, which is the smaller row id whenever the block ids ascend, as a
-    produced pool's do; the op guarantees no particular tie order regardless.
+def _select(scores, k, capacity, destination, lengths, candidates=None, ends=None):
+    """Take the k best columns per row with the CuTe DSL DeepSelect kernel.
+
+    ``ends`` bounds each row (default: the whole row); a row shorter than
+    ``k`` is taken whole. ``candidates`` marks ``scores`` as
+    candidate-compacted and maps the winning columns back to row ids. Ties at
+    the k-th score break arbitrarily but deterministically; the op guarantees
+    no particular tie order.
     """
     width = min(k, scores.shape[1])
     if width == 0:
         destination.fill_(-1)
         lengths.zero_()
         return
-    values, indices = flashinfer.top_k(
-        scores,
-        width,
-        sorted=False,
-        deterministic=False,
-        tie_break=flashinfer.TopKTieBreak.SMALL,
-        dsa_graph_safe=graph_safe,
+    if ends is None:
+        ends = torch.full(
+            (scores.shape[0],), scores.shape[1], dtype=torch.int32, device=scores.device
+        )
+    cluster_size = row_select.choose_cluster_size(
+        scores.shape[0], scores.shape[1], capacity, platform.sm_count
+    )
+    indices, values = row_select.deepselect_topk(
+        scores, ends, width, capacity=capacity, cluster_size=cluster_size
     )
     # Null blocks resolve to negative ids; their -inf score drops them below.
     _finish_topk(values, indices, destination, lengths, candidates)
 
 
-def _flashinfer_select(
-    logits, visible, candidates, topk, candidate_topk, graph_safe, out
-):
+def _native_select(logits, visible, candidates, topk, candidate_topk, out, scores):
+    """Select rows, and blocks when this pass sources the candidate pool.
+
+    ``scores`` is the candidate-compacted score matrix when it was produced
+    directly, or None to gather it here from the dense ``logits``. A pass that
+    sources candidates always needs the dense row, so it never supplies it.
+    """
     rows, lengths, blocks, block_lengths = out
     if candidates is None:
-        _select(logits, topk, graph_safe, rows, lengths)
+        # Columns past a query's visible length are -inf; skipping them keeps
+        # short contexts in a wide capacity cheap.
+        _select(logits, topk, _ROW_CAPACITY, rows, lengths, ends=visible)
     else:
-        scores = candidate_scores(logits, candidates)
-        _select(scores, topk, graph_safe, rows, lengths, candidates)
+        if scores is None:
+            scores = candidate_scores(logits, candidates)
+        _select(scores, topk, _ROW_CAPACITY, rows, lengths, candidates)
     if candidate_topk:
         _select(
             _block_maxima(logits, visible),
             candidate_topk,
-            graph_safe,
+            _BLOCK_CAPACITY,
             blocks,
             block_lengths,
         )
@@ -529,7 +539,7 @@ def hopper_index_topk(
     process_group,
     out,
 ):
-    """Score FP8 index rows on tensor cores; selection and outputs stay caller owned."""
+    """Score FP8 index rows on tensor cores, select with CuTe DSL DeepSelect."""
     if process_group is not None or candidate_block_size != 8:
         raise ValueError(
             "Native CSA2 selection requires replicated heads and 8-row blocks"
@@ -571,10 +581,44 @@ def hopper_index_topk(
             (pages < 0) | (pages >= index_cache.shape[0]), -1
         )
         keys = _gather_index_fp8(index_cache, slots)
+    # A Reindex pass reads only its candidate pool, so scoring the whole
+    # history and discarding the rest is pure waste. DeepGEMM has no sm90
+    # sparse kernel, so the pool is scored by the CuTe DSL one. A pass that
+    # also sources candidates still needs every row for the block maxima.
+    sparse = (
+        candidate_blocks is not None
+        and not candidate_topk
+        and not dense
+        and sparse_index_scores_supported(queries, folded, page_table, candidate_blocks)
+    )
+    planes = None
+    if sparse:
+        values, scales = _index_planes(index_cache)
+        planes = (values.view(torch.float8_e4m3fn), scales)
     for begin in range(0, n, tile):
         end = min(begin + tile, n)
         visible = visible_lens[begin:end].clamp(0, capacity).to(torch.int32)
         packed = (queries[begin:end],)
+        if sparse:
+            _native_select(
+                None,
+                visible,
+                candidate_blocks[begin:end],
+                topk,
+                candidate_topk,
+                tuple(tensor[begin:end] for tensor in out),
+                sparse_index_scores(
+                    queries[begin:end],
+                    folded[begin:end],
+                    planes[0],
+                    planes[1],
+                    page_table[begin:end],
+                    visible,
+                    candidate_blocks[begin:end],
+                    pdl_enabled(),
+                ),
+            )
+            continue
         if dense:
             logits = _hopper_dense_scores(
                 packed,
@@ -595,15 +639,13 @@ def hopper_index_topk(
                 capacity,
             )
         candidates = None if candidate_blocks is None else candidate_blocks[begin:end]
-        # DeepSelect ships no sm90 cubin, so selection runs on FlashInfer's
-        # radix Top-K -- the same backend SGLang's DSA indexer uses.
-        _flashinfer_select(
+        _native_select(
             logits,
             visible,
             candidates,
             topk,
             candidate_topk,
-            not dense,
             tuple(tensor[begin:end] for tensor in out),
+            None,
         )
     return out

@@ -44,8 +44,13 @@ MERGE_SHA = "4" * 40
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _samples(center: float, spread: float = 0.02) -> list[float]:
-    return [center + spread * offset for offset in (-4, -3, -2, -1, 0, 1, 2, 3, 4)]
+def _samples(
+    center: float,
+    spread: float = 0.02,
+    measurement_blocks: int = 9,
+) -> list[float]:
+    midpoint = (measurement_blocks - 1) / 2
+    return [center + spread * (index - midpoint) for index in range(measurement_blocks)]
 
 
 def _result(
@@ -54,6 +59,7 @@ def _result(
     status: str = "success",
     spread: float = 0.02,
     validated: bool = True,
+    measurement_blocks: int = 9,
 ) -> dict:
     if status != "success":
         return {
@@ -62,7 +68,7 @@ def _result(
             "error_type": "RuntimeError",
             "error_message": "test failure",
         }
-    samples = _samples(center, spread)
+    samples = _samples(center, spread, measurement_blocks)
     return {
         "status": "success",
         "samples_us": samples,
@@ -96,6 +102,7 @@ def _case(
     spread: float = 0.02,
     policy: dict | None = None,
     validated: bool = True,
+    measurement_blocks: int | None = None,
 ) -> dict:
     definition = {
         "family": "gemm",
@@ -116,7 +123,7 @@ def _case(
             "atol": 0.015,
             "rtol": 0.015,
         }
-    return {
+    case = {
         "id": case_id,
         "comparison_epoch": comparison_epoch,
         "definition": definition,
@@ -126,8 +133,12 @@ def _case(
             status=status,
             spread=spread,
             validated=validated,
+            measurement_blocks=measurement_blocks or 9,
         ),
     }
+    if measurement_blocks is not None:
+        case["measurement_blocks"] = measurement_blocks
+    return case
 
 
 def _run(revision: str, cases: list[dict]) -> dict:
@@ -141,7 +152,6 @@ def _run(revision: str, cases: list[dict]) -> dict:
             "device_name": "AMD Instinct MI350X",
         },
         "timer": {
-            "calls_per_graph": 100,
             "eager_warmup_iterations": 5,
             "replay_warmup_iterations": 3,
             "measurement_blocks": 9,
@@ -241,19 +251,54 @@ def test_compare_uses_merge_base_policy():
     assert "baseline policy was used" in comparison["detail"]
 
 
-def test_compare_bootstrap_requires_candidate_success():
-    report = _compare(None, _run(CANDIDATE_SHA, [_case(10.0)]), merge_sha=None)
+@pytest.mark.parametrize(
+    ("base_status", "classification"),
+    [
+        (None, "added"),
+        ("success", "within_budget"),
+        ("not_applicable", "inconclusive"),
+        ("registration_missing", "inconclusive"),
+        ("invalid_case", "inconclusive"),
+        ("setup_failure", "inconclusive"),
+        ("capture_failure", "inconclusive"),
+        ("execution_failure", "inconclusive"),
+        ("correctness_failure", "inconclusive"),
+        ("environment_invalid", "invalid"),
+        ("unknown", "invalid"),
+    ],
+)
+def test_compare_requires_candidate_success(base_status, classification):
+    base = (
+        _run(BASE_SHA, [_case(10.0, status=base_status)])
+        if base_status is not None
+        else None
+    )
+    report = _compare(base, _run(CANDIDATE_SHA, [_case(10.0)]), merge_sha=None)
 
-    assert report["comparisons"][0]["classification"] == "added"
-    assert report["comparisons"][0]["candidate_median_us"] == 10.0
-    assert comparison_exit_code(report) == 0
+    comparison = report["comparisons"][0]
+    assert comparison["classification"] == classification
+    if classification == "invalid":
+        assert comparison_exit_code(report) == 2
+    else:
+        assert comparison["candidate_median_us"] == 10.0
+        assert comparison_exit_code(report) == 0
+    if classification == "inconclusive":
+        assert comparison["base_median_us"] is None
+        assert comparison["delta_us"] is None
+        assert comparison["delta_percent"] is None
+        assert f"baseline benchmark returned {base_status}" in comparison["detail"]
+        assert "candidate succeeded" in comparison["detail"]
+        assert "**Inconclusive:**" in render_summary(report)
 
     failed = _run(
         CANDIDATE_SHA,
         [_case(10.0, status="capture_failure")],
     )
-    failed_report = _compare(None, failed, merge_sha=None)
+    failed_report = _compare(base, failed, merge_sha=None)
     assert failed_report["comparisons"][0]["classification"] == "invalid"
+    assert "candidate benchmark returned capture_failure" in (
+        failed_report["comparisons"][0]["detail"]
+    )
     assert comparison_exit_code(failed_report) == 2
 
 
@@ -283,21 +328,32 @@ def test_compare_reports_added_changed_and_missing_cases():
     assert comparison_exit_code(report) == 0
 
 
-@pytest.mark.parametrize("context", ["environment", "timer", "registration"])
-def test_compare_requires_matching_measurement_context(context):
-    base = _run(BASE_SHA, [_case(10.0)])
+@pytest.mark.parametrize("context", ["environment", "timer"])
+@pytest.mark.parametrize("base_status", ["success", "setup_failure"])
+def test_compare_requires_matching_measurement_context(context, base_status):
+    base = _run(BASE_SHA, [_case(10.0, status=base_status)])
     candidate = _run(CANDIDATE_SHA, [_case(10.0)])
     if context == "environment":
         candidate["environment"]["device_name"] = "AMD Instinct MI355X"
-    elif context == "timer":
-        candidate["timer"]["calls_per_graph"] += 1
     else:
-        candidate["cases"][0]["result"]["registration_name"] = "different"
+        candidate["timer"]["eager_warmup_iterations"] += 1
 
     report = _compare(base, candidate)
 
     expected = "changed" if context == "timer" else "invalid"
     assert report["comparisons"][0]["classification"] == expected
+
+
+def test_compare_allows_registration_and_measurement_count_changes():
+    base = _run(BASE_SHA, [_case(10.0, measurement_blocks=10)])
+    candidate = _run(CANDIDATE_SHA, [_case(10.0, measurement_blocks=50)])
+    candidate["cases"][0]["result"]["registration_name"] = "new_registration"
+
+    report = _compare(base, candidate)
+
+    comparison = report["comparisons"][0]
+    assert comparison["classification"] == "within_budget"
+    assert "selected registration changed" in comparison["detail"]
 
 
 def test_validate_run_requires_identity_and_unique_case_ids():

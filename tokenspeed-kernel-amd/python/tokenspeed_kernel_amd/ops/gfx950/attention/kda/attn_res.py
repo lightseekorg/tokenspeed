@@ -144,9 +144,7 @@ def gluon_attn_res_fwd_gfx950(
                 N,
             )
             square_sum = gl.sum(value * value, axis=0)
-            # Keep the established high-precision score reduction while the
-            # candidate values and softmax state remain FP32.
-            dot = gl.sum((value * scorer).to(gl.float64), axis=0).to(gl.float32)
+            dot = gl.sum(value * scorer, axis=0)
             score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
             next_max = gl.maximum(max_logit, score)
             old_scale = gl.exp(max_logit - next_max)

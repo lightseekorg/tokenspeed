@@ -95,9 +95,9 @@ from one first bound to that pool:
   policy may change. Paged leaves own kernel geometry only; the router
   validates group geometry for them.
   Qwen4-Exp's PLE and QSA indexer children validate their local fields during
-  this same pass. Their verify workspaces remain tied to one pool: publishing
-  that pool again preserves their buffers; a different pool is rejected before
-  any child publishes. Replacing such a pool requires rebuilding the composite.
+  this same pass. Publishing the same pool again preserves their verify
+  buffers; a different pool drops them (PLE's commit pointer tables, QSA's
+  verify state); the router's geometry check covers the indexer's tables.
 * For nodes accepting pool replacement, binding drops every pool-derived latch:
   pointer tables, scratch and views,
   per-forward metadata, the paged leaves' graph buffers, Inkling's ShortConv
@@ -116,12 +116,13 @@ from one first bound to that pool:
   model are the caller's to re-publish, as are the graph owners' own pool
   references and the placeholder tables the decode runner sizes from the
   arena. Of the sequence above only `init_prefill_graph_state` runs inside
-  `capture_graphs()`: `configure_runtime`, `init_cuda_graph_state` and
-  `preallocate_verify_workspace` all ran before the executor was returned,
-  so the orchestrator re-runs them itself.
-* A rebind is an operation between the executor's construction and
-  `ModelExecutor.capture_graphs()`, owned by the orchestrator a later change
-  adds; nothing in the backend tree guards against a rebind at another time.
+  `capture_graphs()`: `configure_runtime` and `init_cuda_graph_state` ran
+  before the executor was returned, so `set_cache_pool` re-publishes them.
+  `preallocate_verify_workspace` is the factory's, re-issued when the rebind
+  rebuilds through it -- a rebind that skipped the factory would strand it.
+* A rebind is an operation between the probe's `capture_graphs()` and the
+  serving one, owned by `reserve_and_rebind`; nothing in the backend tree
+  guards against a rebind at another time.
   That orchestrator releases both graph owners' captures first (the captured
   graphs record the buffers a publish drops, and eager kernels cache
   pointers they allocated inside a capture, such as flashinfer's trtllm-gen
@@ -129,6 +130,39 @@ from one first bound to that pool:
   global workspace pool the executor froze before capturing, rebinds the
   trees, re-runs `bind_cache_groups` and the initialisation sequence above,
   freezes the workspace again and captures again.
+* The KV budget reserves what the graphs will cost: a probe binds the
+  smallest arena the family can run on and captures a few entries of each
+  ladder -- the widest three, then one a third and one two thirds of the
+  way down -- with a driver-memory delta around each capture. The widest
+  samples form a window priced at its positive bytes, plus one granule the
+  window may hide (readings move in 2 MiB, from the driver's graph memory
+  and the allocator's segments alike), over every marginal; each sample
+  further down anchors its width at its reading plus that granule, capped at
+  the window's rate when the reading is within three granules of it (one
+  reading is lumpy) and at the reading less those three granules further
+  above (a dearer entry stays dearer, and a granule more in any reading never
+  lowers the reserve), and a skipped entry is priced on the line between the
+  anchors around its width, or at the narrowest anchor below it. Every ladder
+  is sampled and priced the same
+  way, whatever shape its cost takes down the ladder: flat, falling with the
+  entry's width, or lumpy. That is not a bound: a cost that drops between
+  two anchors is priced short over that stretch.
+  The result is reduced across ranks with MAX. The orchestrator
+  releases the probe's graphs and collects the cycles they sit in, then
+  rebuilds on the memory profile the probe build took -- where a boot without
+  a reserve takes it -- minus the projection. The reserve covers the bytes
+  inside the capture windows as projected -- what a boot without a probe
+  captures there, one-time bytes the first captures take included; the
+  probe releases them and the serving capture pays them again. The
+  utilization headroom covers everything else: activations, fragmentation,
+  the warmups and workspaces a capture allocates around its windows, and any
+  shortfall of the projection, as it covers every graph on a boot without a
+  reserve. Profiling again after the probe would charge the cache a second
+  time for what tuning and the probe left allocated. The deltas read the
+  whole device, so the probe assumes no other process allocates on it during
+  startup. Not covered: a ladder every one of whose sampled marginals was
+  served from slack, which is priced at nothing and says so in the
+  log.
 
 ### Padding contract
 
@@ -152,9 +186,9 @@ pointer-stable: a captured graph holds their addresses forever.
 Helpers that memoize tensors created inside capture must not return those
 tensors to eager callers. Keeping a Python reference preserves the allocation,
 but an earlier graph sharing the same private pool can overwrite its contents
-on replay. PLE's uniform index bundles are reused during capture only; eager
-prefill and decode construct their indices through the same builder outside
-the capture pool.
+on replay. PLE's uniform index bundles are reused during capture only; the
+eager n-gram kernel writes uniform request indices alongside hash IDs, while
+ragged batches construct their indices outside the capture pool.
 
 GDN verify shares memoized scratch seed indices (`i * (T + 1)`) between conv
 and recurrent reads in eager and captured forwards. FlashInfer FP32 MTP may
@@ -183,11 +217,34 @@ setup, never publishes results; each kernel may delay it for performance.
 Streaming top-k, for example, avoids delaying scoring waves with waiting
 merge CTAs. Graphs retain their captured PDL setting; recapture to change it.
 
+`fused_gate_sigmoid_mul_add`, `sigmoid_mul`, `silu_and_mul`, `swiglu_oai`,
+`situ_and_mul`, `add3`, and split AttnRes launchers read `pdl_enabled()`
+themselves. They use that same value for `ENABLE_PDL` and `launch_pdl`; model
+layers do not pass the platform PDL setting through their calls.
+
+AttnRes partial kernels may trigger their successors before writing partial
+scratch. `attnres_combine` may preload only weights known to be independent of
+its predecessor; it waits before loading the prefix and the partial scratch
+(`m`, `s`, `acc`). A PDL trigger permits early launch but does not publish
+stores, and a later wait cannot repair values already loaded into registers.
+
 Gated RMSNorm preloads weights only with `weights_independent`; a contiguous
 copy disables this preload. At RSAG-to-AR boundaries the next combine-norm
 preloads the all-gathered residual before its wait, so that collective must
 not trigger early. FlashInfer adapters preserve the upstream CuTe body and
 keep PDL compilation caches separate.
+
+QSA logits scoring uses the same paged kernel for every query layout. A batch
+whose request lengths are all available on the host may shorten its compressed
+block-table view to the maximum prefix-plus-query length, rounded to the cache
+group's logical block granularity. This changes neither the allocation nor the
+page mapping. Mixed batches with device-only decode lengths, and persistent
+decode views, retain the capacity bound; decode graph shapes stay fixed.
+Uniform query runs may share a K tile, but groups must never cross requests.
+A single-request forward is uniform regardless of its forward mode. Long runs
+use larger query groups; ragged layouts retain independent rows. A score tile
+beyond all of its queries' complete-block frontiers must write `-inf` without
+reading K or executing its dot, including padded graph requests.
 
 ### `for_graph_replay` is for graph-mechanics asymmetries only
 
@@ -389,6 +446,32 @@ installs that window before its first ordinary verify round. Stage ownership
 changes where context and proposals are produced; candidate handoff and
 verification follow the same path as other speculative prefills.
 
+### PD prefill nodes
+
+The prefill role is not an eager role; it is a role with no decode step.
+`ModelExecutorConfig.prefill_only` turns the decode graph off
+(`ForwardStepRunner.disable`) because there is nothing for it to capture —
+the role's attention is configured at verify width one and allocates no
+verify scratch for a DECODE-shaped dummy — while the prefill graph keeps the
+same gating as any server (`--enforce-eager`, `--disable-prefill-graph`,
+`--prefill-graph-max-tokens`, the backend's declared support). Its extend
+forwards, chunked or prefix-hit, replay the breakable prefill graph through
+the same `_run_target_forward` dispatch; the KV handoff to decode is ordered
+behind the forward exactly as behind an eager one (the plan's remote-decode
+batch is emitted only once the final chunk's result has landed). Layerwise
+transfer keeps working under replay because the cache-step record lives
+inside the eager attention break (`record_pd_cache_step`,
+`record_layer_cache_ready`), after the layer's KV write on the same stream.
+
+Pipeline parallelism is the one prefill configuration that forces eager:
+each stage threads its boundary state through an eager stage forward
+(`ModelExecutor._run_target_forward`), so `ServerArgs.resolve_disaggregation`
+sets `enforce_eager` for `--pipeline-parallel-size > 1`, not for the role.
+The DeepSeek-V4.1 Flash PD gate
+(`test/ci_system/serve_deepseek_v41_flash_pd_1p1d.sh`) runs the prefill
+role with its graphs and passes `--disable-prefill-graph` to the decode role
+only.
+
 ### Sampling has no greedy branch
 
 Greedy requests normalize to `top_k=1` in `SamplingParams.__post_init__`; the
@@ -513,6 +596,22 @@ and kernel page size from
 with the existing forward and MTP reuse boundaries. The router clears this
 share before the root prepares its indexer child; the indexer does not clear it again.
 
+QSA block selection carries the same uniform query width from
+`decode_query_lengths` into its kernel API, using `None` for ragged or mixed
+queries. Materialized scoring may group a divisor of that width to share K
+within a request; it must retain each query's complete-block frontier and
+selection. Group size one and larger groups use the same scoring kernel, in
+both eager and captured forwards. Grouping must not be inferred from the total
+row count or page-table batch size for a ragged layout.
+
+Different query groups can produce slightly different FP32 scores because
+their dot/reduction layouts differ; cross-layout bitwise equality is not a
+contract. Tests check each layout against the FP32 reference with
+`rtol=1e-5, atol=1e-4`, and validate selection exactly against that layout's
+own scores and tie-breaking rule. Near-ties may select different block IDs
+across layouts. Graph replay is compared with eager execution of the same
+layout so metadata-refresh checks do not depend on cross-layout rounding.
+
 Qwen4-Exp attention callers pass `topk_indices` explicitly, using `None` for
 dense attention. Sparse QSA requires `save_kv_cache=True` because it always
 writes the full KV cache; the dense fallback honors the caller's flag.
@@ -521,7 +620,8 @@ and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
 
 The QSA API preserves `decode_query_lengths`: uniform decode/verification
-uses a positive width, while prefill and mixed/ragged queries use `None`.
+uses a positive width, as does every single-request forward. Multi-request
+prefill and mixed/ragged queries use `None`.
 Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
 single-token prefill. Adapting ragged rows to one-token queries must retain
 this distinction. Both use the same cache writer and sparse-attention call.
@@ -850,6 +950,10 @@ The same metadata contract controls scan capacity, checkpoint packing and
 output restoration in every case; there is no temporary metadata binding or
 mutable inline flag. Only startup capture retains the metadata's addresses.
 Uncaptured shapes use temporary storage through the same builder.
+Whether a shape can be captured is also asked on its own, through
+`admits_prefill_graph`, which reads no forward context and writes nothing; the
+seam must return the same answer, and startup capture raises when a backend
+admits a shape and then refuses to prepare it.
 
 For retained shapes, the hybrid wrapper can omit the KDA attention break and
 capture neighboring projections, KDA kernels and post-attention compute together.

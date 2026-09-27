@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
 from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_tp8_layout
 
+import pytest
 import torch
 
 
@@ -347,4 +348,29 @@ def test_kda_state_dtype_cli_defaults_to_fp32() -> None:
     assert (
         parser.parse_args(["--mamba-ssm-dtype", "bfloat16"]).mamba_ssm_dtype
         == "bfloat16"
+    )
+
+
+@pytest.mark.parametrize("limit", [1, 16384])
+@pytest.mark.parametrize("dcp_size", [1, 4])
+def test_token_limit_retains_kda_working_set(limit, dcp_size):
+    from dataclasses import replace
+
+    recipe, _, layout = kimi_tp8_layout(max_bs=4)
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        device="cuda",
+        dcp_size=dcp_size,
+        dcp_group=tuple(range(dcp_size)),
+        components=(
+            replace(recipe.attn_config.components[0], backend_name="flashmla"),
+            recipe.attn_config.components[1],
+        ),
+    )
+    recipe.server_args.max_total_tokens = limit
+    setup = recipe.setup()
+    assert setup.spec.token_capacity == limit
+    assert setup.spec.memory_plan.num_lcm_blocks == recipe.parents_needed(layout, limit)
+    assert recipe.parents_needed(layout, limit) > (
+        limit // (recipe._max_packing(layout) * layout.prefix_granularity)
     )

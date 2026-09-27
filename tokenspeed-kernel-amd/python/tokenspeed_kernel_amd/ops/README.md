@@ -48,6 +48,34 @@ regress perf even when the generated kernel remains correct.
 
 ## GEMM
 
+### gfx950 dense BF16 projections
+
+The gfx950 package provides dense BF16 projection kernels, including an
+eight-wave prefill kernel adapted from the gfx950 Gluon tutorials.
+
+#### Contract
+
+- The operation computes `A @ B.T` from K-contiguous BF16 matrices shaped
+  `[M, K]` and `[N, K]`, producing BF16 output.
+- Padded row strides and caller-owned outputs are supported when their inner
+  stride is one. Quantization scales and block sizes are not supported.
+- Automatic selection uses the prefill kernel when `2816 <= M <= 4096`, `M` is
+  divisible by 256, and `(N, K) = (3072, 512)`. Other shapes retain the default
+  PyTorch path. The small- and medium-M kernels remain available for direct use
+  but are not registered for automatic selection.
+
+#### Algorithm
+
+One workgroup computes a `256 x 256` output tile in 64-wide K steps with eight
+wave64s. Four `128 x 128` accumulator quadrants use native BF16 MFMA. The waves
+divide both the global-to-LDS loads and the output quadrants.
+
+Vectorized asynchronous copies stage A and B into padded, double-buffered LDS.
+MFMA work on one buffer overlaps loading the next K tile into the other buffer.
+The epilogue converts each accumulator quadrant to BF16 and stores it with
+vectorized buffer operations. XCD-aware grouped tile ordering distributes
+adjacent output tiles across the eight XCDs.
+
 ### gfx950 MXFP8 projection
 
 The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1
@@ -256,6 +284,94 @@ and batch size to limit shared-memory usage.
 
 ## MoE
 
+### gfx950 latent input projection
+
+The Kimi K3 prefill path projects one packed BF16 input weight into router,
+routed-latent, and shared-expert inputs. Automatic selection uses the small-batch
+Gluon kernel through 320 tokens, a medium-M Gluon tile for 321--640, the packed
+Triton kernel for 641--1280, and the large-M Gluon tile from 1281 tokens.
+
+#### Contract
+
+- The input is contiguous BF16 with shape `[M, 7168]` for any `M >= 1`.
+- Router `[896, 7168]`, routed `[3584, 7168]`, and shared gate/up
+  `[1536, 7168]` weights must be consecutive row views of one packed allocation.
+- Outputs are FP32 router logits, BF16 routed latents, and a BF16 768-wide
+  shared input after SiTU. Positive gate clamp and optional linear clamp values
+  are applied in FP32.
+
+#### Algorithm
+
+The medium path uses a `128 x 128 x 64` BF16 MFMA tile with eight waves,
+vectorized global-to-LDS copies, padded shared layouts, and a three-buffer K
+pipeline. Two K-tile copies stay in flight while a two-stage warp pipeline
+alternates each 16-MFMA block with the next tile's LDS reads and copy issue, so
+the MFMAs issue back to back instead of waiting on individual LDS reads. Its 47
+column tiles preserve the packed router/routed/shared boundary, so the FP32
+router and BF16 latent/shared values use different stores in the same projection
+launch. BF16 results are regrouped to eight columns per lane so every store is a
+dwordx4. Each of the 12 shared-expert column tiles gathers 64 gate rows and the
+matching 64 up rows of the packed weight; the MFMA layout places gate column `c`
+and up column `c + 64` in the same lane, so the epilogue applies SiTU in
+registers and stores the 768-wide shared input directly, with no gate/up
+intermediate or separate SiTU launch. A row tile past the end of the activation
+clamps its loads onto the last valid row and masks its stores. At 321--640
+tokens the grid has 141--235 workgroups, avoiding the partially filled second
+wave that slows this tile above 640 tokens. Because the grid never needs a
+second workgroup on any CU, the third LDS buffer costs no occupancy.
+
+The large path uses an eight-wave `256 x 256 x 64` double-buffered MFMA/LDS
+warp pipeline. Each 128-column accumulator half is routed independently because
+the packed output boundaries are only 128-column aligned. The unused final
+half-tile safely rereads the last valid weight half and is not stored. A row
+tile past the end of the activation clamps onto the last valid row and masks
+its stores, so any positive token count is accepted.
+
+All final MFMAs complete before the mixed-dtype stores, keeping dot operands
+out of the epilogue live range. Router halves remain FP32 while routed and
+shared gate/up halves convert to BF16. A companion Gluon kernel reads the
+materialized BF16 gate/up values, applies SiTU in FP32, and writes BF16 shared
+input.
+
+### gfx1250 latent input projection
+
+The same Kimi K3 packed projection as the gfx950 entry above, split into two
+kernels because the shape changes character with the batch. Decode streams the
+whole 86 MB weight past a handful of rows and is bound by memory; prefill is
+bound by arithmetic.
+
+#### Contract
+
+Input, weight, and output shapes and dtypes are the gfx950 entry's. Two
+things differ:
+
+- Automatic dispatch selects the decode kernel for 1 to 32 tokens and the
+  prefill kernel from 1536; the range between them retains the Triton kernel.
+- The packed tensor passed alongside the three weights must be their
+  consecutive view. The kernels read only it, so the launchers reject a
+  packed tensor the weights do not live inside.
+
+#### Algorithm
+
+Decode splits the reduction across workgroups, eight ways to 16 tokens and
+four above, because tiling the output alone leaves a 6016-column projection
+with too few workgroups to keep the device busy. Each writes FP32 partials
+that a companion kernel reduces and fans out to the three consumers. The
+split is what bounds the kernel: its partial traffic scales with the token
+count while the weight traffic does not.
+
+Prefill instead runs the wide large-M WMMA schedule from
+`gfx1250/gemm/fp16/mm.py`, a `256 x 256` tile on eight warps in 128-wide K
+steps through a double-buffered TDM pipeline, with no split at all. The three
+regions are written straight from the accumulator by one masked store each,
+so FP32 router logits reach memory without a round trip through BF16. A tile
+can straddle a region boundary, because the boundaries are 128-column aligned
+while the tile is 256 wide, so the masks rather than the tile index decide
+where a column belongs. SiTU is a second launch, as on gfx950: the gate and
+up halves sit 768 columns apart, so no tile holds both.
+
+Partial row tiles are masked in both kernels, so any token count is accepted.
+
 ### MXFP8 SiTU Experts
 
 On gfx950, the MoE API selects Gluon kernels with MXFP8 activations and MXFP4
@@ -292,3 +408,46 @@ route sets use four phases. Blocks beyond the valid routed prefix skip work.
 Both GEMMs overlap loads with matrix computation using double-buffered shared
 memory. Phased operand loading and scheduling barriers limit live registers;
 compiler-inserted shared-memory barriers provide inter-wave synchronization.
+
+### gfx1250 MXFP4 Experts
+
+On gfx1250, the MoE API selects Gluon kernels with FP8 activations and MXFP4
+weights for precomputed top-k routing. Two expert GEMMs run per layer: a
+gate/up GEMM with a fused SwiGLU or SiTU activation, then a down GEMM that
+combines into each token's output row.
+
+#### Contract
+
+- Activations enter both GEMMs as E4M3 divided by a per-tensor FP32 scale,
+  which the GEMM multiplies back into its FP32 accumulator. Weights are packed
+  MXFP4 with one UE8M0 scale per 32 values.
+- `y_global_scale` divides the result by a scalar before the epilogue casts it
+  to the output dtype. It applies after bias and after the fused activation,
+  so combining it with an FP8 `out_dtype` produces an activation the next GEMM
+  can consume directly. The scale is a one-element FP32 tensor or a float, and
+  is applied as a reciprocal multiply.
+- Neither the epilogue nor the standalone activation quantizer clamps before
+  the FP8 cast, so out-of-range values saturate the same way in both.
+- `y_global_scale` is rejected on the combine path, which has no output-scale
+  epilogue and would otherwise drop it silently.
+
+#### Algorithm
+
+Starting from BF16 or FP16 activations and precomputed top-k expert IDs and
+weights:
+
+1. **Route** the top-k selections into per-expert row slices, producing ragged
+   metadata plus gather and scatter indices.
+2. **Quantize inputs** to E4M3 by the gate/up activation scale, in one pass
+   over the layer input.
+3. **Gate/up GEMM** gathers routed rows, accumulates in FP32, applies bias and
+   the fused activation, then divides by the down GEMM's activation scale and
+   casts to E4M3 in the same epilogue. The intermediate therefore never lands
+   in memory at a wider dtype, and rounds once rather than twice.
+4. **Down GEMM + weighted combine** consumes that E4M3 intermediate,
+   accumulates in FP32, and scatters into each token's output row, followed by
+   the weighted top-k reduction.
+
+The row tile is resolved from the gathered row count and expert count unless
+the caller pins it. Ragged M and N edges are masked rather than peeled, so a
+trailing partial tile loads only the rows that exist.

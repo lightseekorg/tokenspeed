@@ -94,17 +94,29 @@ def backend():
     return _make_backend(3, False, "cpu")
 
 
-def test_ple_rebind_rejection_preserves_verify_workspace(backend):
+def test_ple_rebind_rebuilds_the_commit_tables_on_the_new_arena(backend):
     pool = backend.cache_pool
     scratch = backend._ple_verify_scratch
     replacement = _make_backend(3, False, "cpu").cache_pool
+    backend.preallocate_verify_workspace(4, 3)
+    tables = backend._ple_verify_tables
 
     backend.set_cache_pool(pool)
-    with pytest.raises(RuntimeError, match="cannot be rebound"):
-        backend.set_cache_pool(replacement)
-
-    assert backend.cache_pool is pool
     assert backend._ple_verify_scratch is scratch
+    assert backend._ple_verify_tables is tables is not None
+
+    backend.set_cache_pool(replacement)
+    assert backend.cache_pool is replacement
+    assert backend._ple_verify_tables is None
+    backend.preallocate_verify_workspace(4, 3)
+
+    context = replacement.arena.field(qwen4_exp_ple_context_field(0))
+    tables = backend._ple_verify_tables
+    assert tables["context_dst"].tolist() == [context.data_ptr()]
+    assert tables["conv_dst"].tolist() == [
+        replacement.arena.field(qwen4_exp_ple_conv_field(layer)).data_ptr()
+        for layer in (0, 2)
+    ]
 
 
 def test_ple_invalid_fields_do_not_publish_a_pool(backend):

@@ -33,6 +33,7 @@ import functools
 import inspect
 import types
 import typing
+from pathlib import Path
 
 import cutlass
 import cutlass.cute as cute
@@ -124,6 +125,23 @@ def _clone_function(function, namespace):
     return clone
 
 
+def _build_and_load_pdl_kernel(
+    module_name, kernel_name, compile_fn, *, extra_key_files, original_builder
+):
+    # FlashInfer's persistent key describes the unmodified upstream kernel.
+    # PDL changes both its device body and launch, so it needs its own artifacts.
+    return original_builder(
+        f"tokenspeed_pdl_{module_name}",
+        kernel_name,
+        compile_fn,
+        extra_key_files=(
+            *extra_key_files,
+            __file__,
+            str(Path(__file__).with_name("adapter.py")),
+        ),
+    )
+
+
 def _adapt_module(module, *, kernels, launchers, entrypoints, caches, overrides):
     """Bind explicit upstream symbols into a private PDL compilation namespace.
 
@@ -131,6 +149,10 @@ def _adapt_module(module, *, kernels, launchers, entrypoints, caches, overrides)
     without dependency synchronization after an incompatible FlashInfer update.
     """
     namespace = dict(vars(module))
+    namespace["build_and_load_cute_dsl_kernel"] = functools.partial(
+        _build_and_load_pdl_kernel,
+        original_builder=module.build_and_load_cute_dsl_kernel,
+    )
     namespace.update(overrides)
     for name in kernels:
         namespace[name] = _PdlKernel(getattr(module, name))
