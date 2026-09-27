@@ -47,11 +47,11 @@ from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationControll
 from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
+    RequestHistoryRows,
     advance_scheduler,
     engram_context_len,
     make_config,
     ngram_inputs_for_forward,
-    request_history_seeds_for_forward,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
     scheduler_pd_lifecycle,
@@ -198,6 +198,11 @@ class EventLoop:
             raise NotImplementedError(
                 "Engram input history requires PP=1 and in-flight depth <= 1"
             )
+        self._request_history_rows: RequestHistoryRows | None = (
+            RequestHistoryRows()
+            if self.model_config.requires_request_token_history
+            else None
+        )
 
         decode_input_tokens = (
             server_args.speculative_num_draft_tokens
@@ -1084,10 +1089,10 @@ class EventLoop:
                             self._ngram_context_len,
                         )
                         request_history_seeds = (
-                            request_history_seeds_for_forward(
+                            self._request_history_rows.seeds_for_forward(
                                 forward_op, self.output_processor.rid_to_state
                             )
-                            if self.model_config.requires_request_token_history
+                            if self._request_history_rows is not None
                             else None
                         )
                         self._batch_logger.log_dispatch(forward_op, stats)
