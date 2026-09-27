@@ -232,6 +232,8 @@ fi
 
 # ============================================================
 # Step 8: Pin critical kernel deps to exact versions
+# Published packages can be reused when their pins are already satisfied.
+# Source installs above still need rebuilding even without a version bump.
 # ============================================================
 echo "=== Step 8: Pin critical kernel deps ==="
 pin_version() {
@@ -249,9 +251,9 @@ if [ -n "${CUTLASS_DSL_SPEC}" ]; then
         "nvidia-cutlass-dsl-libs-core==${CUTLASS_DSL_VERSION}"
         "nvidia-cutlass-dsl-libs-cu${CUDA_MAJOR}==${CUTLASS_DSL_VERSION}"
     )
-    echo "Force-reinstalling pinned Cutlass DSL packages: ${CUTLASS_DSL_DEPS[*]}"
+    echo "Ensuring pinned Cutlass DSL packages: ${CUTLASS_DSL_DEPS[*]}"
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${CUTLASS_DSL_DEPS[@]}"
+        --no-deps "${CUTLASS_DSL_DEPS[@]}"
 fi
 
 FLASHINFER_PYTHON_SPEC="$(pin_version flashinfer-python)"
@@ -272,13 +274,17 @@ if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
         FLASHINFER_RELEASE_TAG="v${FLASHINFER_VERSION}"
     fi
     FLASHINFER_CUBIN_WHEEL_URL="${FLASHINFER_RELEASE_BASE}/${FLASHINFER_RELEASE_TAG}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl"
-    FLASHINFER_CUBIN_WHEEL_SOURCE="$(cache_remote_wheel "${FLASHINFER_CUBIN_WHEEL_URL}" "${FLASHINFER_CUBIN_SHA256}")"
-    echo "Force-reinstalling pinned FlashInfer Python: ${FLASHINFER_PYTHON_SPEC}"
+    echo "Ensuring pinned FlashInfer Python: ${FLASHINFER_PYTHON_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${FLASHINFER_PYTHON_SPEC}"
-    echo "Installing FlashInfer cubin from GitHub Release: ${FLASHINFER_CUBIN_WHEEL_URL}"
-    pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${FLASHINFER_CUBIN_WHEEL_SOURCE}"
+        --no-deps "${FLASHINFER_PYTHON_SPEC}"
+    if installed_wheel_matches flashinfer-cubin "${FLASHINFER_VERSION}" "${FLASHINFER_CUBIN_SHA256}"; then
+        echo "Pinned FlashInfer cubin is already installed; skipping reinstall."
+    else
+        FLASHINFER_CUBIN_WHEEL_SOURCE="$(cache_remote_wheel "${FLASHINFER_CUBIN_WHEEL_URL}" "${FLASHINFER_CUBIN_SHA256}")"
+        echo "Installing FlashInfer cubin from GitHub Release: ${FLASHINFER_CUBIN_WHEEL_URL}"
+        pip_install_with_retry pip3 install --break-system-packages \
+            --force-reinstall --no-deps "${FLASHINFER_CUBIN_WHEEL_SOURCE}"
+    fi
 else
     echo "No FlashInfer Python pin found in ${CUDA_REQ}; skipping FlashInfer installs."
 fi
@@ -286,9 +292,9 @@ fi
 THIRDPARTY_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"
 FA4_SPEC="$(grep -E '^tokenspeed-fa4(\[[^]]+\])?==' "${THIRDPARTY_REQ}" | head -n1 | tr -d '[:space:]')"
 if [ -n "${FA4_SPEC}" ]; then
-    echo "Force-reinstalling pinned FA4: ${FA4_SPEC}"
+    echo "Ensuring pinned FA4: ${FA4_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${FA4_SPEC}"
+        --no-deps "${FA4_SPEC}"
 else
     echo "No tokenspeed-fa4 pin found in ${THIRDPARTY_REQ}; skipping FA4 reinstall."
 fi
