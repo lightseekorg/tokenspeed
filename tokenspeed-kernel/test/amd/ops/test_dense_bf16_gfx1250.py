@@ -66,9 +66,11 @@ def test_dense_short_k_drains_tdm(k):
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("split_k", [0, 3, 8])
-def test_dense_rejects_invalid_split(split_k):
-    a = torch.empty(2, 1024, device="cuda", dtype=torch.bfloat16)
-    b = torch.empty(64, 1024, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="divide|full TDM pipeline"):
+@pytest.mark.parametrize(
+    "k,split_k", [(1024, 0), (1024, 3), (1024, 8), (8192, 16), (1536, 8)]
+)
+def test_dense_rejects_invalid_split(k, split_k):
+    a = torch.empty(2, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.empty(64, k, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="one of|divide|full TDM pipeline"):
         gluon_wmma_tdm_dense_gfx1250(a, b, split_k=split_k)

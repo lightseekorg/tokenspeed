@@ -156,8 +156,8 @@ decode, including the KDA QKVFAB shape.
   divides the K tiles, leaves each split at least eight K tiles and one full
   TDM pipeline,
   and keeps `N`-tile count times the split within the CU count of `A.device`.
-  Otherwise the launch is direct. An explicit `split_k` must be at least 1
-  and divide the K tiles. A split greater than 1 must also leave each split
+  Otherwise the launch is direct. An explicit `split_k` must be one of
+  1, 2, 4, or 8 and divide the K tiles. A split greater than 1 must also leave each split
   at least one full TDM pipeline.
 
 The K3 shared-down facade preserves a caller-owned row-strided output. Its
