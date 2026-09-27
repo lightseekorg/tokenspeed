@@ -314,7 +314,9 @@ def _launch_wmma_tdm_dense_tiles(
         split_k = _dense_m16_split_k(
             B.shape[0], block_n, k_tiles, num_buffers, A.device
         )
-    if split_k < 1 or k_tiles % split_k != 0:
+    if split_k not in (1, 2, 4, 8):
+        raise ValueError("split_k must be one of 1, 2, 4, or 8")
+    if k_tiles % split_k != 0:
         raise ValueError(f"split_k={split_k} must divide K/{block_k}={k_tiles}")
     if split_k > 1 and k_tiles // split_k < num_buffers:
         raise ValueError("each split needs at least one full TDM pipeline")
@@ -396,7 +398,7 @@ def gluon_wmma_tdm_dense_gfx1250(
         A: Contiguous BF16 activations shaped ``[M, K]``.
         B: Contiguous BF16 weights shaped ``[N, K]`` on A's device.
         out: Optional BF16 destination with contiguous columns.
-        split_k: Explicit partition count, or ``None`` for CU-based selection.
+        split_k: One of 1, 2, 4, or 8 partitions, or ``None`` for CU-based selection.
 
     Returns:
         The BF16 ``[M, N]`` projection, using ``out`` when supplied.
