@@ -138,6 +138,49 @@ one-wave direct path when extra partitions or fusion do not pay for their
 overhead. The kernel docstrings record the exact tiling, pipeline, and routing
 decisions.
 
+### gfx1250 dense BF16 decode projection
+
+The gfx1250 package provides a small-M dense BF16 WMMA projection for K3
+decode, including the KDA QKVFAB shape.
+
+#### Contract
+
+- The operation computes `A @ B.T` from contiguous BF16 matrices shaped
+  `[M, K]` and `[N, K]`, with `1 <= M <= 32`, `K` divisible by 128, and `N`
+  divisible by 16. A and B must share one CUDA device.
+- Output is BF16. A caller-owned output must be on that device, with a unit
+  inner stride and a row stride of at least `N`.
+- KDA QKVFAB is the fixed shape `M` in `{1, 2, 4, 8, 16, 32}`, `K = 7168`,
+  `N = 6288`.
+- Callers must supply `split_k`; `None` selects the largest of 8, 4, or 2 that divides the K
+  tiles, leaves each split at least eight K tiles and one full TDM pipeline,
+  and keeps `N`-tile count times the split within 256 CUs.
+  Otherwise the launch is direct. An explicit `split_k` must be one of
+  1, 2, 4, or 8 and divide the K tiles. A split greater than 1 must also leave each split
+  at least one full TDM pipeline.
+
+#### Algorithm
+
+M is consumed in 16-row chunks, and each chunk re-reads B. `N` divisible by
+64 uses a four-warp `16 x 64` tile; other accepted `N` uses one warp and a
+`16 x 16` tile. The dense path triple-buffers TDM loads. KDA QKVFAB uses
+seven buffers. Once the K tiles fill that pipeline, the tail lowers the TDM
+wait before each remaining LDS read. Short K dimensions prefetch only
+valid tiles and drain each remaining pair before reading it.
+
+Both paths accumulate in FP32 and round to BF16 once. Direct launches store
+that conversion from the producer. Split-K launches write one FP32 partial
+matrix per K partition, then a separate reduction sums those partials in FP32
+and stores BF16. The live row count and split-buffer stride are runtime
+arguments that do not specialize the producer or reduction, so warming a
+projection covers other batch sizes with the same model dimensions.
+
+The gfx1250 AttnRes launch has two fixed warp configurations: eight warps
+below 256 tokens when mixing snapshots, and four otherwise. Normal startup's
+prefill and decode warmups compile both before serving. Direct kernel callers
+must warm both token ranges; disabling startup warmups can defer compilation
+until the first call in an unwarmed range.
+
 ## Attention
 
 ### DeepSeek V4 attention
@@ -238,6 +281,65 @@ between page bytes is normalized to contiguous storage before scoring. Missing
 or out-of-range cache pages never contribute rows or blocks, including the
 newest visible block. A valid newest block remains eligible regardless of its
 score.
+
+### gfx950 MLA prefill
+
+Two kernels compute dense, non-absorbed MLA prefill attention over ragged
+sequences, `gluon_mla_prefill_gfx950` and `gluon_mla_prefill_8wave_gfx950`.
+The 8-wave kernel handles 16-bit inputs as well, but is registered for FP8
+only for now.
+
+#### Contract
+
+- Queries are `(tokens, heads, 192)` and keys are `(tokens, kv_heads, 192)`
+  (128 no-PE plus 64 RoPE dimensions); values are `(tokens, kv_heads, 128)`,
+  all FP16, BF16, FP8 E4M3, or FP8 E5M2 with one shared dtype and a contiguous
+  last dimension. Query heads must be a multiple of KV heads.
+- `cu_seqlens_q` and `cu_seqlens_kv` delimit the sequences. Causal masking
+  aligns each query block to the end of its keys. `logit_cap` is unsupported.
+- The output may be any caller-owned floating dtype with a contiguous last
+  dimension; the optional log-sum-exp is FP32 in natural-log units.
+- For FP8 inputs the 8-wave kernel requires `avg_kv_len_min=1024`: at least
+  1024 key tokens per sequence on average, measured on Kimi-K3 prefill shapes.
+  Selection rounds the average down to a power of two to bound its cache;
+  this preserves the 1024-token cutoff exactly, including ragged batches.
+- Both launch a persistent grid of 512 workgroups. Batch sizes, sequence
+  lengths, and scheduler slots are runtime values, so varying ragged batches
+  reuse the warmed binaries.
+- Low-level launchers require explicit `is_causal`, `logit_cap`, and
+  `return_lse`. `seq_lens_kv` and `max_seqlen_kv` are redundant hints that must
+  agree with the authoritative `cu_seqlens_kv` lengths.
+- Both share launch metadata that reports attention FLOPs and each tensor's
+  bytes once without reading device-resident sequence lengths: FLOPs assume
+  every sequence has the batch's average query and key length.
+
+#### Algorithm
+
+All paths use base-2 online softmax. `gluon_mla_prefill_gfx950` runs 16-bit
+inputs with four wave64s over 128-row query blocks and 64-key tiles: fully
+visible tiles double-buffer their asynchronous copies, and the diagonal band
+and key tail run masked and unpipelined. Its FP8 path uses eight wave64s over
+256-row blocks, 64-key tiles with the unscaled K=64 FP8 MFMA, splits each score
+tile into two 32-column halves, and overlaps a tile's QK MFMA with the previous
+tile's softmax and PV MFMA.
+
+`gluon_mla_prefill_8wave_gfx950` follows the 8-wave warp-pipeline design:
+each of eight wave64s owns 32 query rows of a 256-row block. Key tiles are 32
+rows for 16-bit inputs and 64 for FP8, which keeps the working set within 256
+VGPRs. Each loop iteration runs four clusters: K reads with the rescale, the
+next tile's QK MFMAs with the current tile's softmax, V reads, and the PV
+MFMAs with the next tile's row maximum. The two waves on a SIMD run one
+cluster apart, so one wave's MFMAs overlap the other's memory work.
+
+K and V stream into 4-slot LDS rings by asynchronous copies, K four tiles
+ahead and V three. Tiles past the visible range load fully masked; buffer
+loads zero-fill masked rows in LDS, so the loop needs no drain, and only tiles
+crossing the causal diagonal or the key tail apply a score mask. For 16-bit
+inputs the running maximum moves only when a tile maximum exceeds it by more
+than 8 (base 2); FP8 keeps the exact maximum so P stays at most 1 before its
+FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
+asm statements keep LLVM from moving each cluster's results across cluster
+barriers.
 
 ## Sampling
 

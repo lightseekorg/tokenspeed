@@ -497,9 +497,15 @@ def mla_normalize_project_query(
                 )
                 is None
             ):
-                from tokenspeed_kernel.ops.gemm import mm
+                from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
+                from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
-                mm(query_norm, projection_weight, out=projection_out)
+                if decode_gemv_routed(query_norm, projection_weight):
+                    decode_gemv(query_norm, projection_weight, out=projection_out)
+                else:
+                    from tokenspeed_kernel.ops.gemm import mm
+
+                    mm(query_norm, projection_weight, out=projection_out)
         else:
             from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
@@ -517,6 +523,47 @@ def mla_normalize_project_query(
         kv.copy_((kv_norm * kv_norm_weight.float()).to(kv.dtype))
         torch.mm(query_norm, projection_weight.t(), out=projection_out)
     return out, None
+
+
+def mla_prefill_traits(
+    *,
+    batch_size: int,
+    total_kv: int,
+    head_dim: int,
+    value_head_dim: int,
+    is_causal: bool,
+    logit_cap: float,
+    return_lse: bool,
+) -> dict[str, object]:
+    """Build the kernel selection traits for one mla_prefill problem.
+
+    mla_prefill selects with these traits, and callers that pre-select the
+    kernel without tensors, such as benchmark generators, must use the same
+    traits so both pick the same kernel.
+
+    Args:
+        batch_size: Number of sequences.
+        total_kv: KV tokens summed over all sequences.
+        head_dim: Query/key head dimension.
+        value_head_dim: Value head dimension.
+        is_causal: Whether a causal mask is applied.
+        logit_cap: Soft cap on attention logits; 0.0 means no cap.
+        return_lse: Whether the log-sum-exp values are returned.
+
+    Returns:
+        Traits for select_kernel("attention", "mla_prefill", ...).
+    """
+    # A downward power-of-two bucket preserves power-of-two minimum cutoffs
+    # exactly, including ragged/non-power-of-two batches, and bounds the cache.
+    avg_kv_len = total_kv // batch_size if batch_size > 0 else 0
+    return {
+        "avg_kv_len": 1 << (avg_kv_len.bit_length() - 1) if avg_kv_len else 0,
+        "head_dim": head_dim,
+        "value_head_dim": value_head_dim,
+        "is_causal": is_causal,
+        "logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
 
 
 def mla_prefill(
@@ -578,14 +625,18 @@ def mla_prefill(
         Attention output with shape [total_q, num_q_heads, v_head_dim], or
         (output, lse) when return_lse is True.
     """
+    # Problem sizes are read from shapes so selection never syncs and also
+    # works under graph capture.
     batch_size = cu_seqlens_q.shape[0] - 1
-    traits = {
-        "head_dim": q.shape[-1],
-        "value_head_dim": v.shape[-1],
-        "is_causal": is_causal,
-        "logit_cap": logit_cap != 0.0,
-        "return_lse": return_lse,
-    }
+    traits = mla_prefill_traits(
+        batch_size=batch_size,
+        total_kv=k.shape[0],
+        head_dim=q.shape[-1],
+        value_head_dim=v.shape[-1],
+        is_causal=is_causal,
+        logit_cap=logit_cap,
+        return_lse=return_lse,
+    )
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
         "attention",
@@ -1222,6 +1273,7 @@ __all__ = [
     "mla_project_value",
     "mla_normalize_project_query",
     "mla_prefill",
+    "mla_prefill_traits",
     "mla_use_absorbed_extend",
     "mla_extend_with_kvcache",
     "supports_mla_decode_query_blocks",
