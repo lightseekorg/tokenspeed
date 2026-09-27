@@ -184,12 +184,18 @@ predictions and scoring records under
 misses without changing the full 30-question workload, generation settings, or
 score threshold.
 
-The AMD DeepSeek-V4.1-Flash GSM8K task downloads its weights into
-`.hf-model-cache` in the job's work directory. Its uncached checkpoint can exceed
-the remaining capacity of the shared model volume; the job filesystem provides
-separate writable storage, cleaned up with the work directory. The model ID,
-precision, evaluation workload, and score threshold stay the same. This task
-downloads a fresh checkpoint for each job, so startup includes the download time.
+Model jobs load weights from the runner's shared Hugging Face cache
+(`HF_HOME`) and must not pass `--download-dir` into the job's work directory.
+The work directory is deleted after every job, so a per-job download fetches
+the full checkpoint again on every run. On the AMD runners the work directory
+and the shared cache sit on the same node filesystem, so a per-job copy does
+not add capacity either.
+
+EvalScope perf jobs pass a local tokenizer directory to `--tokenizer-path`.
+EvalScope loads a remote tokenizer ID through ModelScope into the job's
+ephemeral home directory, which downloads it again for every job. The jobs
+instead save the tokenizer from the shared Hugging Face cache into their
+output directory before running the benchmark.
 
 The same model jobs isolate MIOpen's writable user database and kernel cache
 under `.miopen-db` and `.miopen-kernels` in their work directory. This avoids

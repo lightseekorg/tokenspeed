@@ -3,6 +3,7 @@ import shlex
 from collections import Counter
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +74,27 @@ def flag_value(tokens: list[str], flag: str) -> str:
     assert tokens.count(flag) == 1, f"expected one {flag}, found {tokens.count(flag)}"
     index = tokens.index(flag)
     return tokens[index + 1]
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted((REPO_ROOT / "test" / "ci").rglob("*.yaml")),
+    ids=lambda path: path.stem,
+)
+def test_model_configs_reuse_shared_downloads(path):
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    server_tokens = shlex.split(task.get("server", {}).get("command", ""))
+    assert not any(
+        token.split("=", 1)[0] == "--download-dir" for token in server_tokens
+    ), path
+
+    perf_command = task.get("perf", {}).get("command", "")
+    if "--tokenizer-path" in perf_command:
+        perf_tokens = shlex.split(perf_command)
+        assert flag_value(perf_tokens, "--tokenizer-path") == "$TOKENIZER_PATH", path
+        assert "TOKENIZER_PATH=$OUTPUTS_DIR/tokenizer" in perf_tokens, path
+        assert "AutoTokenizer.from_pretrained" in perf_command, path
+        assert ".save_pretrained(" in perf_command, path
 
 
 def test_fork_pr_context_is_exposed_to_ci_tasks():
@@ -206,18 +228,16 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert flag_value(eval_tokens, "--datasets") == "gsm8k"
         assert flag_value(eval_tokens, "--eval-batch-size") == "32"
         assert task["score_threshold"] == 0.90
+        # Both runners load weights from their shared Hugging Face cache.
+        assert "--download-dir" not in server_tokens
 
         if label == "b200-4gpu":
-            assert "--download-dir" not in server_tokens
             assert "--enable-expert-parallel" in server_tokens
             assert flag_value(server_tokens, "--moe-backend") == "mega_moe"
             # The NVIDIA gate exercises the split prefill graph (encoder and
             # decoder graphs around the eager narrowing layer).
             assert "--disable-prefill-graph" not in server_tokens
         else:
-            assert (
-                flag_value(server_tokens, "--download-dir") == "${PWD}/.hf-model-cache"
-            )
             assert "--enable-expert-parallel" not in server_tokens
             assert "--moe-backend" not in server_tokens
             # Not yet exercised on AMD; keep that gate on eager prefill.
@@ -346,6 +366,7 @@ def test_kimi_k25_amd_accuracy_gate_preserves_question_outputs():
 
 
 def test_deepseek_gsm8k_has_bounded_thinking_output():
+    """Keep DeepSeek evaluation output and request time budgets finite."""
     paths = sorted(EVAL_CONFIG_DIR.glob("deepseek-v4*gsm8k*.yaml"))
     assert paths
     for path in paths:
@@ -359,5 +380,5 @@ def test_deepseek_gsm8k_has_bounded_thinking_output():
             context_len = int(task["env"]["MAX_MODEL_LEN"])
         assert 0 < generation["max_tokens"] < context_len, path
         assert 0 < generation["timeout"] <= 1800, path
-        # Exercise the gateway's thinking default without an override.
+        # These configs omit extra_body overrides.
         assert "extra_body" not in generation, path
