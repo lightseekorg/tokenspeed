@@ -28,6 +28,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+from utils import assert_no_triton_compile
 
 _LAYOUTS = {
     "global": (512, 16, 256, 288),
@@ -1000,6 +1001,40 @@ def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
     assert not torch.any(actual[~active])
 
 
+def test_compressor_pool_token_count_does_not_recompile(device):
+    """Every prefill brings a new token count; the kernel must not key its
+    compile cache on the row count."""
+    tail = torch.randn(5, 2, 2, 512, device=device)
+
+    def run(count):
+        projection = torch.randn(count, 1024, device=device)
+        content, scores = projection[:, :512], projection[:, 512:]
+        previous = torch.arange(count, device=device) - 1
+        slots = torch.full((count,), 2, device=device, dtype=torch.int32)
+        active = torch.arange(count, device=device) % 2 == 1
+        pooled = dsv41.compressor_pool(
+            content, scores, previous, tail, slots, active, None, None, 0.0
+        )
+        # Row 0 pairs with the tail slot; every later active row pairs with
+        # its predecessor in this forward.
+        prior_content = torch.cat([tail[1, 0, 0][None], content[:-1]])
+        prior_scores = torch.cat([tail[1, 0, 1][None], scores[:-1]])
+        maximum = torch.maximum(prior_scores, scores)
+        old_exp = torch.exp(prior_scores - maximum)
+        new_exp = torch.exp(scores - maximum)
+        expected = (prior_content * old_exp + content * new_exp) / (old_exp + new_exp)
+        expected[~active] = 0
+        torch.testing.assert_close(pooled, expected, rtol=1e-6, atol=1e-6)
+
+    # Warm both integer-specialization classes (16-divisible and not); Triton
+    # still keys on those two properties for runtime scalars.
+    run(32)
+    run(33)
+    with assert_no_triton_compile(implementation._compressor_pool):
+        for count in (48, 97, 130, 1483, 4096):
+            run(count)
+
+
 def _native_available():
     from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
         is_flash_mla_v41_available,
@@ -1282,14 +1317,9 @@ def test_compressor_metadata_table_width_does_not_recompile():
     # still keys on those two properties for runtime scalars.
     run(64, 128)
     run(64, 132)
-    with patch.object(
-        implementation._compressor_metadata,
-        "_do_compile",
-        wraps=implementation._compressor_metadata._do_compile,
-    ) as compiles:
+    with assert_no_triton_compile(implementation._compressor_metadata):
         for rows, width in ((64, 192), (128, 196), (96, 388), (64, 1024)):
             run(rows, width)
-    assert compiles.call_count == 0
 
 
 @pytest.mark.parametrize("target", ["cpu", "cuda"])

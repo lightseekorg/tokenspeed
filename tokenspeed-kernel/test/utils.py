@@ -20,7 +20,10 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from typing import Any
+from unittest.mock import patch
 
 import torch
 from tokenspeed_kernel.platform import (
@@ -66,6 +69,24 @@ def is_cdna4() -> bool:
 def is_cdna5() -> bool:
     platform = detected_platform()
     return platform is not None and platform.is_cdna5
+
+
+@contextmanager
+def assert_no_triton_compile(kernel: Any) -> Iterator[None]:
+    """Fail if the Triton ``kernel`` compiles a new specialization in the block.
+
+    Every ``tl.constexpr`` value is part of the compile-cache key, so a
+    per-batch quantity passed as a constexpr recompiles the kernel on every new
+    shape. Warm the kernel before entering, covering each integer
+    specialization class Triton still keys on for runtime scalars (divisible by
+    16 or not), then launch it with shapes that vary the way serving does.
+    """
+    with patch.object(kernel, "_do_compile", wraps=kernel._do_compile) as compiles:
+        yield
+    assert compiles.call_count == 0, (
+        f"{kernel.fn.__name__} compiled {compiles.call_count} new "
+        f"specialization(s); a per-batch value is likely passed as tl.constexpr"
+    )
 
 
 def make_mxfp4_moe_weights(

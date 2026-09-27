@@ -151,7 +151,7 @@ def _wmma_tdm_dense_m16_kernel(
 
     num_k_tiles: gl.constexpr = K // BLOCK_K // SPLIT_K
     k_base = pid_split * num_k_tiles
-    for tile in gl.static_range(NUM_BUFFERS - 1):
+    for tile in gl.static_range(min(NUM_BUFFERS - 1, num_k_tiles)):
         offset = (k_base + tile) * BLOCK_K
         gl.amd.cdna5.tdm.async_load(a_desc, [0, offset], a_smem.index(tile))
         gl.amd.cdna5.tdm.async_load(b_desc, [0, offset], b_smem.index(tile))
@@ -196,31 +196,11 @@ def _wmma_tdm_dense_m16_kernel(
             )
             acc = gl.amd.cdna5.wmma(a, b, acc)
     else:
-        gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
         for tile in gl.static_range(num_k_tiles):
-            with gl.amd.warp_pipeline_stage("tdm+lds", priority=1):
-                a = a_smem.index(tile % NUM_BUFFERS).load(layout=dot_layout_a)
-                b = (
-                    b_smem.index(tile % NUM_BUFFERS)
-                    .permute([1, 0])
-                    .load(layout=dot_layout_b)
-                )
-                prefetch = (k_base + tile + NUM_BUFFERS - 1) * BLOCK_K
-                gl.amd.cdna5.tdm.async_load(
-                    a_desc,
-                    [0, prefetch],
-                    a_smem.index((tile + NUM_BUFFERS - 1) % NUM_BUFFERS),
-                    pred=tile + NUM_BUFFERS - 1 < num_k_tiles,
-                )
-                gl.amd.cdna5.tdm.async_load(
-                    b_desc,
-                    [0, prefetch],
-                    b_smem.index((tile + NUM_BUFFERS - 1) % NUM_BUFFERS),
-                    pred=tile + NUM_BUFFERS - 1 < num_k_tiles,
-                )
-            gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
-            with gl.amd.warp_pipeline_stage("wmma", priority=0):
-                acc = gl.amd.cdna5.wmma(a, b, acc)
+            gl.amd.cdna5.tdm.async_wait(2 * (num_k_tiles - 1 - tile))
+            a = a_smem.index(tile).load(layout=dot_layout_a)
+            b = b_smem.index(tile).permute([1, 0]).load(layout=dot_layout_b)
+            acc = gl.amd.cdna5.wmma(a, b, acc)
     gl.amd.cdna5.tdm.async_wait(0)
 
     offs_m = gl.arange(0, M, gl.SliceLayout(1, wmma_layout))
@@ -325,8 +305,8 @@ def _launch_wmma_tdm_dense_tiles(
     *,
     block_n: int,
     num_warps: int,
-    split_k: int | None = None,
-    num_buffers: int = 3,
+    split_k: int | None,
+    num_buffers: int,
 ) -> None:
     block_k = 128
     k_tiles = A.shape[1] // block_k
@@ -408,9 +388,19 @@ def gluon_wmma_tdm_dense_gfx1250(
     B: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
-    split_k: int | None = None,
+    split_k: int | None,
 ) -> torch.Tensor:
-    """Run the CDNA5 dense projection candidate on any accepted shape."""
+    """Compute a small-M dense BF16 projection on CDNA5.
+
+    Args:
+        A: Contiguous BF16 activations shaped ``[M, K]``.
+        B: Contiguous BF16 weights shaped ``[N, K]`` on A's device.
+        out: Optional BF16 destination with contiguous columns.
+        split_k: Explicit partition count, or ``None`` for CU-based selection.
+
+    Returns:
+        The BF16 ``[M, N]`` projection, using ``out`` when supplied.
+    """
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError("A and B must be 2D")
     m, k = A.shape
@@ -448,7 +438,7 @@ def gluon_wmma_tdm_dense_gfx1250(
     # BLOCK_N selects the WMMA warp bases, so the warp count follows from it.
     block_n, num_warps = (64, 4) if n % 64 == 0 else (16, 1)
     _launch_wmma_tdm_dense_tiles(
-        A, B, out, block_n=block_n, num_warps=num_warps, split_k=split_k
+        A, B, out, block_n=block_n, num_warps=num_warps, split_k=split_k, num_buffers=3
     )
     return out
 
@@ -482,6 +472,8 @@ def gluon_wmma_tdm_mla_qkv_gate_gfx1250(
         out,
         block_n=64,
         num_warps=4,
+        split_k=None,
+        num_buffers=3,
     )
     return out
 
@@ -528,6 +520,7 @@ def gluon_wmma_tdm_kda_qkvfab_gfx1250(
         out,
         block_n=16,
         num_warps=1,
+        split_k=None,
         num_buffers=7,
     )
     return out

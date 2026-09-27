@@ -225,8 +225,8 @@ def attn_res_rmsnorm_gfx1250(
         raise ValueError("gfx1250 AttnRes requires a contiguous hidden dimension")
 
     output = torch.empty_like(layer_residual)
-    # 8 warps and waves_per_eu=2 is the measured launch under 256 tokens.
-    # Larger grids stay at 4 warps and leave waves_per_eu unset.
+    # Use 8 warps and waves_per_eu=2 under 256 tokens with snapshots to mix.
+    # Larger grids and the no-snapshot case keep 4 warps and default waves.
     eight_warps = tokens < 256 and num_valid_blocks >= 1
     num_warps = 8 if eight_warps else 4
     delta_tensor = layer_residual if delta is None else delta
