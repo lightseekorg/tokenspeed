@@ -81,6 +81,7 @@ def _get_workspaces():
     individually; mnnvl-only tests still run.
     """
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
+        MNNVL_TWOSHOT_MAX_TOKEN,
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
     )
@@ -96,7 +97,14 @@ def _get_workspaces():
         mnnvl_ws = trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
             rank, world, MAXTOK, H + L, group=dist.group.WORLD
         )
-        _workspaces.update(rank=rank, dev=dev, world=world, ipc=ipc_ws, mnnvl=mnnvl_ws)
+        # Allocate all WORLD workspaces before subgroup tests advance symmetric
+        # allocation counters on only their participating ranks.
+        mhc_ws = trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
+            rank, world, MNNVL_TWOSHOT_MAX_TOKEN, 5120, group=dist.group.WORLD
+        )
+        _workspaces.update(
+            rank=rank, dev=dev, world=world, ipc=ipc_ws, mnnvl=mnnvl_ws, mhc=mhc_ws
+        )
     return _workspaces
 
 
@@ -632,15 +640,12 @@ def test_mhc_post_norm_shared_workspace_graph(monkeypatch, entrypoint, pdl):
         MNNVL_TWOSHOT_MAX_TOKEN,
         _load_trtllm_mhc_module,
         trtllm_allreduce_fusion,
-        trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
     )
 
     workspace = _skip_unless_mnnvl()
     rank, device = workspace["rank"], workspace["dev"]
     world = workspace["world"]
-    ws = trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
-        rank, world, MNNVL_TWOSHOT_MAX_TOKEN, 5120, group=dist.group.WORLD
-    )
+    ws = workspace["mhc"]
     # Exercise the public capability check and launch with the same workspace
     # as ordinary AR, without changing managers captured by other tests.
     manager = comm.TrtllmFusionWorkspaceManager()

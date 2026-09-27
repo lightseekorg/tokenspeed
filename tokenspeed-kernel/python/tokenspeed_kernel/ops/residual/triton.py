@@ -702,6 +702,8 @@ def _mhc_post_hc4_triton_kernel(
     acc2 = tl.load(post + post_base + 2).to(tl.float32) * hidden_values
     acc3 = tl.load(post + post_base + 3).to(tl.float32) * hidden_values
 
+    # Match the fused CUDA post-mapping before the BF16 materialization.
+    # Explicit FMA prevents compiler-dependent contraction of separate products.
     comb_base = token_id * 16
     for in_hc in tl.static_range(0, 4):
         residual_values = tl.load(
@@ -710,10 +712,16 @@ def _mhc_post_hc4_triton_kernel(
             other=0.0,
         ).to(tl.float32)
         comb_row = comb_base + in_hc * 4
-        acc0 += tl.load(comb + comb_row).to(tl.float32) * residual_values
-        acc1 += tl.load(comb + comb_row + 1).to(tl.float32) * residual_values
-        acc2 += tl.load(comb + comb_row + 2).to(tl.float32) * residual_values
-        acc3 += tl.load(comb + comb_row + 3).to(tl.float32) * residual_values
+        acc0 = tl.fma(tl.load(comb + comb_row).to(tl.float32), residual_values, acc0)
+        acc1 = tl.fma(
+            tl.load(comb + comb_row + 1).to(tl.float32), residual_values, acc1
+        )
+        acc2 = tl.fma(
+            tl.load(comb + comb_row + 2).to(tl.float32), residual_values, acc2
+        )
+        acc3 = tl.fma(
+            tl.load(comb + comb_row + 3).to(tl.float32), residual_values, acc3
+        )
 
     tl.store(out + token_residual_offset + hidden_offsets, acc0, mask=hidden_mask)
     tl.store(
@@ -1085,7 +1093,12 @@ def triton_mhc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
 ) -> torch.Tensor:
-    """Run the portable Triton mHC post-mapping."""
+    """Run the portable Triton mHC post-mapping.
+
+    For hc=4, round the FP32 post product, then accumulate residual streams
+    in input order with FP32 fused multiply-adds before casting the output.
+    This preserves the materialized residual of the fused CUDA path.
+    """
     if not hidden_states.is_cuda:
         raise RuntimeError("fast mHC requires CUDA tensors")
     if residual.numel() == 0:
