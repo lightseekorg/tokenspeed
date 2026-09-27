@@ -66,7 +66,9 @@ def test_dense_short_k_drains_tdm(k):
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("k,split_k", [(1024, 0), (1024, 3), (1024, 8), (8192, 16)])
+@pytest.mark.parametrize(
+    "k,split_k", [(1024, 0), (1024, 3), (1024, 8), (8192, 16), (1536, 8)]
+)
 def test_dense_rejects_invalid_split(k, split_k):
     a = torch.empty(2, k, device="cuda", dtype=torch.bfloat16)
     b = torch.empty(64, k, device="cuda", dtype=torch.bfloat16)
