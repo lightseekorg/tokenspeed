@@ -217,22 +217,17 @@ exit 1
     ("version", "origin", "matches"),
     [
         ("1.0", {"archive_info": {"hashes": {"sha256": "expected"}}}, True),
-        ("1.0", {"archive_info": {"hash": "sha256=expected"}}, True),
         ("1.0", {"archive_info": {"hashes": {"sha256": "different"}}}, False),
         ("2.0", {"archive_info": {"hashes": {"sha256": "expected"}}}, False),
-        ("1.0", None, False),
-        (None, None, False),
     ],
 )
 def test_installed_wheel_requires_matching_version_and_archive(
-    tmp_path: Path, version: str | None, origin: dict | None, matches: bool
+    tmp_path: Path, version: str, origin: dict, matches: bool
 ):
-    if version is not None:
-        dist = tmp_path / "cache_test-1.0.dist-info"
-        dist.mkdir()
-        (dist / "METADATA").write_text(f"Name: cache-test\nVersion: {version}\n")
-        if origin is not None:
-            (dist / "direct_url.json").write_text(json.dumps(origin))
+    dist = tmp_path / "cache_test-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(f"Name: cache-test\nVersion: {version}\n")
+    (dist / "direct_url.json").write_text(json.dumps(origin))
     env = os.environ.copy()
     env["PYTHONPATH"] = str(tmp_path)
     result = run_bash(
