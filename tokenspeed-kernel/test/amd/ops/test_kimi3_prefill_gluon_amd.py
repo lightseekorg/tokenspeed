@@ -546,7 +546,7 @@ def test_attn_res_warmed_launch_variants_reuse_compilation():
     )
 
     torch.manual_seed(1250)
-    hidden, valid_blocks = 4096, 1
+    hidden, valid_blocks = 7168, 1
     # Keep the oracle and input generation outside the GPU simulator.
     prefix_cpu = torch.randn(1000, hidden, dtype=torch.bfloat16)
     blocks_cpu = torch.randn(valid_blocks, 1000, hidden, dtype=torch.bfloat16)
@@ -556,9 +556,21 @@ def test_attn_res_warmed_launch_variants_reuse_compilation():
     weight = weight_cpu.to("cuda")
 
     def project(tokens):
+        layer = prefix[:tokens]
+        history = blocks[:, :tokens]
+        assert attn_res_fwd_available(
+            layer,
+            history,
+            weight,
+            weight,
+            eps=1e-6,
+            out_norm_weight=weight,
+            out_norm_eps=1e-6,
+            num_valid_blocks=valid_blocks,
+        )
         return attn_res_fwd(
-            prefix[:tokens],
-            blocks[:, :tokens],
+            layer,
+            history,
             weight,
             weight,
             eps=1e-6,
