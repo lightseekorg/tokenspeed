@@ -455,8 +455,11 @@ def test_nvfp4_trtllm_registry_declares_ispp_alignment(kernel_name: str) -> None
         ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (9, 0), False),
         ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (10, 7), True),
         ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (10, 8), False),
-        # Keep sibling NVFP4 paths capped until they are validated on SM107.
-        ("flashinfer_trtllm_nvfp4_routed_moe_apply", (10, 7), False),
+        # The plain and routed paths share the sm_100a/103a/107a cubins (MiniMax-M3 on sm_107).
+        ("flashinfer_trtllm_nvfp4_routed_moe_apply", (10, 7), True),
+        ("flashinfer_trtllm_nvfp4_routed_moe_apply", (10, 8), False),
+        ("flashinfer_trtllm_nvfp4_moe_apply", (10, 7), True),
+        ("flashinfer_trtllm_nvfp4_moe_apply", (10, 8), False),
     ],
 )
 def test_nvfp4_trtllm_capability_range(
