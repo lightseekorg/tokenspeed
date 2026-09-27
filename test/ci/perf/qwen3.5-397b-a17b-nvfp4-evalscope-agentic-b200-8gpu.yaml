@@ -43,10 +43,12 @@ perf:
   install:
     - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
     - >-
-      test -f /tmp/agentic_dataset.json ||
-      curl -fL
-      https://huggingface.co/datasets/lightseekorg/agentic-dataset/resolve/main/agentic_dataset.json
-      -o /tmp/agentic_dataset.json
+      /tmp/evalscope-perf/bin/python -c
+      'from huggingface_hub import hf_hub_download;
+      hf_hub_download(repo_id="lightseekorg/agentic-dataset",
+      filename="agentic_dataset.json", repo_type="dataset",
+      revision="2779acd48a05c211f2f82eee71bdbdf688d984ca", local_dir="/tmp")'
+      && test -s /tmp/agentic_dataset.json
   command: >-
     REPO_ROOT=$PWD &&
     OUTPUTS_DIR=/tmp/tokenspeed-agentic-perf &&

@@ -32,7 +32,7 @@ namespace tokenspeed {
 
 // Keep concrete events grouped by CacheEvent, ForwardEvent, and PDEvent.
 using Event = std::variant<cache::WriteBackDone, cache::LoadBackDone, forward::ExtendResult, forward::Finish,
-                           forward::Abort, forward::UpdateReserveNumTokens, pd::BootstrappedEvent, pd::FailedEvent,
-                           pd::SucceededEvent, pd::RemotePrefillDoneEvent>;
+                           forward::Abort, forward::Retract, forward::UpdateReserveNumTokens, pd::BootstrappedEvent,
+                           pd::FailedEvent, pd::SucceededEvent, pd::RemotePrefillDoneEvent>;
 
 }  // namespace tokenspeed

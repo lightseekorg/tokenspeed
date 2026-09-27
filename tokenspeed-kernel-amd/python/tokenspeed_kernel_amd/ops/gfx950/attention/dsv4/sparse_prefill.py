@@ -45,7 +45,7 @@ __all__ = ["gluon_dsv4_sparse_prefill_gfx950"]
 # Production H64/D512 sparse-attention path builds on the ROCm/AITER PR #3456
 # pipeline (MIT) with TokenSpeed ABI, lens, masking, and BLOCK_K=32 support.
 @gluon.jit
-def _sparse_attn_k64_kernel(
+def gluon_dsv4_prefill_sparse_k64_gfx950(
     q,
     kv,
     o,
@@ -435,7 +435,7 @@ def _sparse_attn_k64_kernel(
 
 
 @gluon.jit
-def _sparse_attn_k32_kernel(
+def gluon_dsv4_prefill_sparse_k32_gfx950(
     q,
     kv,
     o,
@@ -853,7 +853,11 @@ def gluon_dsv4_sparse_prefill_gfx950(
 
     num_xcds = 8
     grid = (num_xcds, triton.cdiv(h, 64), triton.cdiv(s, num_xcds))
-    kernel = _sparse_attn_k64_kernel if block_k == 64 else _sparse_attn_k32_kernel
+    kernel = (
+        gluon_dsv4_prefill_sparse_k64_gfx950
+        if block_k == 64
+        else gluon_dsv4_prefill_sparse_k32_gfx950
+    )
     kernel[grid](
         q4,
         kv3,

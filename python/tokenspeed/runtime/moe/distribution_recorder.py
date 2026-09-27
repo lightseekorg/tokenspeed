@@ -602,15 +602,14 @@ class _UtilizationRateAccumulator(_Accumulator):
 
             gpu_physical_count_sum = gpu_physical_count.sum().item()
 
+            history_summary = "".join(
+                f"last_{size}_average_balancedness={value:.03f} "
+                for size, value in self._history.mean().items()
+            )
             logger.info(
-                "[Expert Balancedness] forward_pass_id=%s current_pass_balancedness=%.03f %s gpu_physical_count_sum=%s",
-                forward_pass_id,
-                utilization_rate,
-                "".join(
-                    f"last_{size}_average_balancedness={value:.03f} "
-                    for size, value in self._history.mean().items()
-                ),
-                gpu_physical_count_sum,
+                f"[Expert Balancedness] forward_pass_id={forward_pass_id!s} "
+                f"current_pass_balancedness={utilization_rate:.03f} "
+                f"{history_summary} gpu_physical_count_sum={gpu_physical_count_sum!s}",
                 # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
             )
 
@@ -743,7 +742,7 @@ class _StatAccumulator(_UtilizationRateAccumulator):
 def _dump_to_file(name, data):
     save_dir = Path(envs.TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR.get())
     path_output = save_dir / name
-    logger.info("Write expert distribution to %s", path_output)
+    logger.info(f"Write expert distribution to {path_output!s}")
     if not save_dir.exists():
         save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(data, str(path_output))

@@ -184,5 +184,66 @@ def test_eager_serving_leaves_the_fork_disabled():
     assert call["enable"] is False
 
 
+@pytest.mark.parametrize("prequantized", [False, True])
+def test_moe_passes_projection_payload_to_experts(prequantized):
+    hidden = torch.zeros(8, 4)
+    payload = (
+        (torch.empty(8, 2, dtype=torch.uint8), torch.empty(8, 1))
+        if prequantized
+        else hidden
+    )
+    projection = mock.Mock(spec=["__call__"], return_value=(payload, None))
+    moe = _make_moe(_SpyFork())
+    moe.routed_expert_down_proj = projection
+    moe._routed_experts = mock.Mock(return_value=hidden)
+    with (
+        mock.patch(
+            "tokenspeed.runtime.models.kimi_k3.get_is_cuda_graph_phase",
+            return_value=False,
+        ),
+        mock.patch(
+            "tokenspeed.runtime.models.kimi_k3.get_is_capture_mode", return_value=False
+        ),
+    ):
+        KimiLinearMoE.forward(
+            moe,
+            hidden,
+            hidden,
+            num_global_tokens=8,
+            max_num_tokens_per_gpu=8,
+        )
+    projection.assert_called_once_with(hidden)
+    assert moe._routed_experts.call_args.args[0] is payload
+
+
+@pytest.mark.parametrize(
+    "weight_dtype,solution,enabled",
+    [
+        ("nvfp4", "flashinfer_trtllm", True),
+        ("mxfp4", "flashinfer_trtllm", False),
+        ("nvfp4", "flashinfer_cutlass", False),
+    ],
+)
+def test_nvfp4_projection_setup_uses_processed_expert_scale(
+    weight_dtype, solution, enabled
+):
+    experts = SimpleNamespace(plan={"weight_dtype": weight_dtype, "solution": solution})
+    scale = torch.nn.Parameter(torch.tensor(128.0), requires_grad=False)
+
+    def process_weights(module):
+        module.w13_input_scale_quant = scale
+
+    experts.process_weights_after_loading = mock.Mock(side_effect=process_weights)
+    projection = mock.Mock(spec=["prepare_nvfp4_output"])
+    moe = SimpleNamespace(experts=experts, routed_expert_down_proj=projection)
+    KimiLinearMoE.process_weights_after_loading(moe, moe)
+    if enabled:
+        experts.process_weights_after_loading.assert_called_once_with(experts)
+        projection.prepare_nvfp4_output.assert_called_once_with(scale)
+    else:
+        experts.process_weights_after_loading.assert_not_called()
+        projection.prepare_nvfp4_output.assert_not_called()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

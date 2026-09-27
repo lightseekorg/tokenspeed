@@ -62,7 +62,13 @@ public:
     // Public flush operation. A successful return means both Device L1 and
     // Host L2 prefix indexes were removed.
     bool ClearCache();
+    // Same in-flight and pin checks as ClearCache, with no mutation. Weight
+    // updates MIN-reduce this across the replica before any rank clears.
+    bool CanClearCache() const;
 
+    // Lifecycle counters read the current FSM state; they do not schedule work.
+    std::size_t BootstrappingSize() const;
+    // Submitted plus Retracted requests waiting for admission/readmission.
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
@@ -75,6 +81,10 @@ public:
     // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
     std::int32_t EmptyLcmBlocks() const { return coordinator_.NumEmptyLcmBlocks(); }
     std::int32_t ActiveLcmBlocks() const;
+    // RemotePrefilling only: a subset of PrefillSize(), never an extra total.
+    std::size_t RemotePrefillSize() const;
+    // Requests whose pages PD still pins. This resource count overlaps FSM states.
+    std::size_t PdTransferSize() const;
     std::int32_t RequestTokenSize(const std::string& id) const;
     // Maximum logical request extent that one request can reserve in an
     // otherwise reclaimable device pool. The runtime must enforce this limit
@@ -90,8 +100,27 @@ public:
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
 
+    // L3 storage (Mooncake Store, etc.) sits below Host. Python queries the
+    // backend for existing objects, then registers the matching CacheKeys so
+    // ProbePrefix can treat them as Host hits that require prefetch.
+    std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const;
+    // Prefix hashes of Submitted/Retracted requests the scheduler can admit
+    // this round. The event loop revalidates these against L3 immediately
+    // before NextExecutionPlan so a queued hit cannot survive deletion.
+    // Requests that cannot take a batch slot (full decode batch, HOL
+    // incomplete prefill) or cannot obtain Device pages (pool exhausted)
+    // are skipped so a long waiter is not rehashed and remotely probed on
+    // every decode step.
+    std::vector<std::string> WaitingPrefixHashes() const;
+    std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const {
+        return coordinator_.ExpandPrefixKeys(content_hashes);
+    }
+    void RegisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.RegisterStorageKeys(keys); }
+    void UnregisterStorageKeys(std::span<const CacheKey> keys) { coordinator_.UnregisterStorageKeys(keys); }
+
 private:
     bool clearCache(bool include_host);
+    bool cacheIsClearable(bool include_host) const;
     struct AdmissionMatch {
         CacheCoordinator::PrefixProbe probe;
         std::vector<std::string> candidate_prefix_hashes;
@@ -142,17 +171,14 @@ private:
     std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            CacheCoordinator::PrefixProbe&& prefix,
                                                            std::span<const GroupDemand> demands,
+                                                           const RequestProgress& progress,
                                                            std::optional<std::uint64_t> request_access_epoch);
-    std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
-                                                           std::span<const GroupDemand> demands,
-                                                           std::uint64_t request_access_epoch);
     bool admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request,
-                                  const fsm::CacheProgress& cache_progress, std::int32_t new_prefix_hash_begin,
-                                  std::span<const GroupDemand> demands);
-    std::vector<CacheKey> registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
-                                                     std::int32_t first_page);
-    void discardUncachedKvEventPages(std::span<const CacheKey> keys);
-    void handleCacheMutation(const CacheKey& key, CacheCoordinator::CacheMutation mutation);
+                                  const fsm::CacheProgress& cache_progress, std::span<const GroupDemand> demands,
+                                  const RequestProgress& progress);
+    void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
+                                    std::int32_t first_page);
+    void markKvEventBoundaryForReconcile(const CacheKey& boundary);
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
 
     std::size_t groupIndex(const std::string& group_id) const;
@@ -173,6 +199,7 @@ private:
     void handleEvent(const pd::RemotePrefillDoneEvent& event);
     void handleEvent(const forward::ExtendResult& event);
     void handleEvent(const forward::Abort& event);
+    void handleEvent(const forward::Retract& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
@@ -196,9 +223,9 @@ private:
         // the same candidates -- its first decode is next round's work).
         std::unordered_set<const Request*> scheduled;
         std::int32_t token_budget{0};
-        // Budget the decode batch must leave untouched: one state-checkpoint
-        // page for a pending local mamba prefill, which cannot advance in
-        // sub-page chunks (fused mixed mode only).
+        // Budget the decode batch must leave untouched for a pending local
+        // prefill that cannot advance in smaller chunks (MinPrefillChunkTokens;
+        // fused mixed mode only).
         std::int32_t state_prefill_reserve{0};
         bool pushed_prefill{false};
         bool pushed_decode{false};
@@ -278,9 +305,6 @@ private:
                                   Request* readmission, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
-    std::int32_t calculateMaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
-    std::int64_t singleRequestLcmBlocksRequired(std::int32_t token_limit) const;
-
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;
 
@@ -303,18 +327,30 @@ private:
     // vector reshuffles, so the id index below never dangles.
     std::vector<std::unique_ptr<Request>> requests_;
     std::unordered_map<std::string, Request*> requests_by_id_;
-    std::vector<KvCacheEvent> kv_events_;
     std::unordered_map<std::string, KvEventHashProgress> kv_event_hash_progress_;
     // What the prefix index cannot tell us about a boundary: the token
     // descriptor the external event carries, and whether that event is
     // currently out (a BlockStored not yet followed by its BlockRemoved).
-    // Residency itself is the coordinator's answer, never mirrored here. A
-    // descriptor lives exactly as long as the boundary has a cached child.
+    // Residency itself is the coordinator's answer, never mirrored here.
+    // Cache mutations and registrations only mark a boundary for reconcile;
+    // DrainKvEvents reconciles each marked boundary against its residency, so
+    // the order of evictions and publications inside one admission does not
+    // matter. After a drain, a descriptor exists exactly for the boundaries
+    // with a cached child.
     struct KvEventBoundary {
         KvBlockStoredEvent stored;
+        // Position in the prefix chain (page index). Consumers resolve a
+        // Stored event's parent_block_hash on receipt, so DrainKvEvents
+        // orders each batch by depth rather than by mutation order.
+        std::int32_t depth{0};
         bool published{false};
+        bool needs_reconcile{false};
     };
     std::unordered_map<CacheKey, KvEventBoundary, CacheKeyHash> kv_event_boundaries_;
+    // The boundaries marked for reconcile. Mutations mark them in whatever
+    // order the coordinator touches pages (evictions run suffix-first), so
+    // this order carries no meaning; DrainKvEvents sorts the batch.
+    std::vector<CacheKey> kv_event_boundaries_to_reconcile_;
 };
 
 }  // namespace tokenspeed

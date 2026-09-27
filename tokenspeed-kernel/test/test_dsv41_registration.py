@@ -42,7 +42,8 @@ operations = (
     "cache_pack", "cache_unpack", "cache_scatter", "cache_gather",
     "index_q_quantize", "selected_attention", "index_score", "index_topk",
     "compressor_tail_scatter", "compressor_pool", "swa_rope_scatter",
-    "rope_inplace", "rope_pad_query",
+    "rope_inplace", "rope_pad_query", "dspark_rows", "dspark_anchors",
+    "dspark_block",
 )
 registrations = [
     ("triton_dsv41_" + op, "dsv41_" + op, "triton", "triton")

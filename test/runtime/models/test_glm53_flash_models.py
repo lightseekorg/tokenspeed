@@ -54,7 +54,7 @@ class _FakeLanguageModel(nn.Module):
         self.forward_kwargs = None
         self.loaded_weights = None
 
-    def forward(self, _ctx, _input_ids, _positions, _out_cache_loc, **kwargs):
+    def forward(self, _ctx, _input_ids, _positions, **kwargs):
         self.forward_kwargs = kwargs
         return kwargs.get("input_embeds")
 
@@ -191,7 +191,7 @@ def test_glm53_flash_decode_topk_skips_only_overwritten_workspace_fills(
     topk_indices = torch.empty((4, 15), dtype=torch.int32)
     topk_lens = torch.empty(4, dtype=torch.int32)
 
-    def get_indices(_name, _rows, _width, _device, *, fill_value=-1):
+    def get_indices(_rows, _width, _device, *, fill_value):
         captured["fill_value"] = fill_value
         return topk_indices
 
@@ -302,7 +302,6 @@ def test_glm53_flash_forward_splices_prefill_and_skips_decode(monkeypatch) -> No
     )
     args = (
         torch.tensor([1, 2, 3]),
-        torch.arange(3),
         torch.arange(3),
     )
 
@@ -446,6 +445,38 @@ def test_text_and_nextn_model_hierarchies(monkeypatch) -> None:
         nextn.model.decoder.self_attn.kv_b_proj.prefix
         == "model.layers.4.self_attn.kv_b_proj"
     )
+
+
+def test_decode_topk_workspaces_reuse_storage_and_retain_grown_buffers() -> None:
+    with torch.device("meta"):
+        attention = Glm53FlashAttention(
+            _tiny_text_config(),
+            Mapping(rank=0, world_size=1),
+            layer_id=3,
+            quant_config=None,
+            prefix="model.layers.3.self_attn",
+        )
+    device = torch.device("cpu")
+    indices = attention._get_decode_topk_workspace(2, 3, device, fill_value=-1)
+    lengths = attention._get_decode_topk_lens_workspace(2, device, fill=True)
+
+    assert (
+        attention._get_decode_topk_workspace(1, 3, device, fill_value=None).data_ptr()
+        == indices.data_ptr()
+    )
+    assert (
+        attention._get_decode_topk_lens_workspace(1, device, fill=False).data_ptr()
+        == lengths.data_ptr()
+    )
+    assert attention._retired_decode_workspaces == []
+
+    grown_indices = attention._get_decode_topk_workspace(4, 3, device, fill_value=-1)
+    grown_lengths = attention._get_decode_topk_lens_workspace(4, device, fill=True)
+    assert len(attention._retired_decode_workspaces) == 2
+    assert attention._retired_decode_workspaces[0].data_ptr() == indices.data_ptr()
+    assert attention._retired_decode_workspaces[1].data_ptr() == lengths.data_ptr()
+    torch.testing.assert_close(grown_indices, torch.full((4, 3), -1, dtype=torch.int32))
+    torch.testing.assert_close(grown_lengths, torch.zeros(4, dtype=torch.int32))
 
 
 def test_nextn_checkpoint_prefix_preserves_bf16_kv_b_projection() -> None:

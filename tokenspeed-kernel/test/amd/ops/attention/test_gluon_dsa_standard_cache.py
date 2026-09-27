@@ -40,19 +40,19 @@ from tokenspeed_kernel.ops.kvcache.triton import (  # isort: skip
 
 if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # isort: skip
-        gluon_dsa_decode_topk_standard_gfx950 as _decode_topk,
-        gluon_dsa_prefill_topk_standard_gfx950 as _prefill_topk,
+        launch_gluon_dsa_decode_topk_standard_gfx950 as _decode_topk,
+        launch_gluon_dsa_prefill_topk_standard_gfx950 as _prefill_topk,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import (  # isort: skip
-        _dsa_standard_decode_logits_kernel,
+        gluon_dsa_decode_topk_standard_gfx950 as _decode_logits_kernel,
     )
 else:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.sparse_mla import (  # isort: skip
-        gluon_dsa_decode_topk_standard_gfx1250 as _decode_topk,
-        gluon_dsa_prefill_topk_standard_gfx1250 as _prefill_topk,
+        launch_gluon_dsa_decode_topk_standard_gfx1250 as _decode_topk,
+        launch_gluon_dsa_prefill_topk_standard_gfx1250 as _prefill_topk,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits import (  # isort: skip
-        _dsa_standard_decode_logits_kernel,
+        gluon_dsa_decode_topk_standard_gfx1250 as _decode_logits_kernel,
     )
 
 _DEVICE = "cuda"
@@ -404,6 +404,7 @@ def test_standard_cache_decode_accepts_block_split_writer_output() -> None:
         page_size=_PAGE_SIZE,
         head_dim=_HEAD_DIM,
         group_size=_HEAD_DIM,
+        write_mask=None,
     )
     key_reference = torch.empty_like(source_reference)
     key_reference[locations] = source_reference
@@ -490,7 +491,7 @@ def test_standard_cache_decode_logits_cover_empty_and_short_spans() -> None:
         dtype=torch.float32,
     )
 
-    _dsa_standard_decode_logits_kernel[(seq_lens.numel(), 1)](
+    _decode_logits_kernel[(seq_lens.numel(), 1)](
         query,
         weights,
         cache.view(torch.float8_e4m3fn),

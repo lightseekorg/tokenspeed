@@ -980,7 +980,7 @@ def process_sliding_attention_tile(
 
 
 @gluon.jit
-def _mha_prefill(
+def gluon_mha_prefill_gfx950(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -1079,7 +1079,7 @@ def _mha_prefill(
 
 
 @gluon.jit
-def _mha_prefill_sliding(
+def gluon_mha_prefill_sliding_gfx950(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -1227,7 +1227,7 @@ def get_config(
     )
 
 
-def gluon_mha_prefill_gfx950(
+def launch_gluon_mha_prefill_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1306,7 +1306,9 @@ def gluon_mha_prefill_gfx950(
         torch.zeros(1, device=q.device, dtype=torch.int32) if dynamic_sched else q
     )
 
-    kernel = _mha_prefill_sliding if is_sliding else _mha_prefill
+    kernel = (
+        gluon_mha_prefill_sliding_gfx950 if is_sliding else gluon_mha_prefill_gfx950
+    )
     kernel[config.grid](
         q,
         k,

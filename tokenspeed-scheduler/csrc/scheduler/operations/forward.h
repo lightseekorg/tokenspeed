@@ -46,6 +46,11 @@ struct PrefillOperation : public ForwardOperationBase {
     std::vector<std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
     std::int32_t extend_prefix_len{0};
+    // Leading input rows that re-feed already computed prompt tokens
+    // (bounded replay). Positions [extend_prefix_len, extend_prefix_len +
+    // extend_replay_len) regenerate replayable cache groups only; every
+    // other group already holds their rows and must not be rewritten.
+    std::int32_t extend_replay_len{0};
 };
 
 struct DecodeOperation : public ForwardOperationBase {
@@ -67,6 +72,8 @@ struct ForwardBatch {
     std::vector<std::int32_t> input_ids;
     std::vector<std::int32_t> shifted_input_ids;
     std::vector<std::int32_t> extend_prefix_lens;
+    // Parallel to extend_prefix_lens: PrefillOperation::extend_replay_len.
+    std::vector<std::int32_t> extend_replay_lens;
     std::vector<std::int32_t> decode_input_ids;
     // Parallel to decode_input_ids (one entry per decode row); rows without
     // candidates hold an empty vector.
@@ -100,6 +107,7 @@ struct ForwardBatch {
                 shifted_input_ids.insert(shifted_input_ids.end(), prefill->shifted_input_ids.begin(),
                                          prefill->shifted_input_ids.end());
                 extend_prefix_lens.push_back(prefill->extend_prefix_len);
+                extend_replay_lens.push_back(prefill->extend_replay_len);
             } else if (auto* decode = std::get_if<DecodeOperation>(&op)) {
                 decode_input_ids.push_back(decode->decode_input_id);
                 spec_candidate_ids.push_back(std::move(decode->spec_candidate_ids));

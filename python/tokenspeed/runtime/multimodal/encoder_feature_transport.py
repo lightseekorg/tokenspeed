@@ -200,12 +200,9 @@ class EncoderFeatureTransport:
 
         if LOG_MM_TIMING and started is not None:
             logger.info(
-                "mm_timing shm_owner_route_ms transfers=%d handles=%d bytes=%d "
-                "elapsed=%.3f",
-                len(transfers),
-                transferred_handles,
-                transferred_bytes,
-                (time.perf_counter() - started) * 1000,
+                f"mm_timing shm_owner_route_ms transfers={len(transfers):d} handles="
+                f"{transferred_handles:d} bytes={transferred_bytes:d} "
+                f"elapsed={(time.perf_counter() - started) * 1000:.3f}",
             )
 
     def move_to_device(
@@ -449,11 +446,8 @@ class EncoderFeatureTransport:
 
         if LOG_MM_TIMING and started is not None:
             logger.info(
-                "mm_timing shm_tp_broadcast_ms mode=%s groups=%d handles=%d "
-                "bytes=%d elapsed=%.3f",
-                mode,
-                len(batches),
-                sum(len(batch.entries) for batch in batches),
-                sum(batch.nbytes for batch in batches),
-                (time.perf_counter() - started) * 1000,
+                f"mm_timing shm_tp_broadcast_ms mode={mode!s} groups={len(batches):d} "
+                f"handles={sum((len(batch.entries) for batch in batches)):d} "
+                f"bytes={sum((batch.nbytes for batch in batches)):d} elapsed="
+                f"{(time.perf_counter() - started) * 1000:.3f}",
             )

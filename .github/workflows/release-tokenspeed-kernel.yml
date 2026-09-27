@@ -109,7 +109,7 @@ jobs:
           fi
 
           cuda_cu130='{"variant":"cu130","package_version":"13-0","torch_index_url":"https://download.pytorch.org/whl/cu130"}'
-          cuda_cu129='{"variant":"cu129","package_version":"12-9","torch_index_url":"https://download.pytorch.org/whl/cu129"}'
+          cuda_cu129='{"variant":"cu129","package_version":"12-9","torch_index_url":"https://download.pytorch.org/whl/cu126"}'
 
           case "$CUDA_VARIANT" in
             all)
@@ -230,7 +230,7 @@ jobs:
 
               "${PYBIN}/python" -m pip install --upgrade \
                 pip "setuptools<82" wheel build twine packaging "apache-tvm-ffi==0.1.13.post3"
-              "${PYBIN}/python" -m pip install --no-cache-dir "torch==2.13.0" --index-url "${TORCH_INDEX_URL}"
+              "${PYBIN}/python" -m pip install --no-cache-dir "torch==2.14.0" --index-url "${TORCH_INDEX_URL}"
 
               rm -rf build *.egg-info
               PIP_EXTRA_INDEX_URL="${TORCH_INDEX_URL}" \

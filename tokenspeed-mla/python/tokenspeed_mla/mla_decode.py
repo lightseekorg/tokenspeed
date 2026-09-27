@@ -22,7 +22,7 @@
 CuTe DSL MLA Decode Kernel Integration
 =======================================
 
-Wraps NVIDIA's CuTe DSL MLA decode kernels (FP16/BF16/FP8) for Blackwell SM100
+Wraps CuTe DSL MLA decode kernels (FP16/BF16/FP8) for SM100, SM103 and SM107
 and exposes them via a PyTorch API compatible with FlashInfer's MLA backend.
 """
 
@@ -33,15 +33,12 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
-from tokenspeed_mla.mla_decode_fp8 import (
-    BlackwellMultiHeadLatentAttentionForwardFP8,
-)
-from tokenspeed_mla.mla_decode_fp16 import (
-    BlackwellMultiHeadLatentAttentionForwardFP16,
-)
+from tokenspeed_mla.mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
+from tokenspeed_mla.mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from tokenspeed_mla.mla_helpers import (
     ceil_div,
     compute_q_tile_layout,
+    get_mla_decode_arch,
     get_mla_decode_fold_sq_factor,
     select_mla_decode_tilers,
 )
@@ -87,6 +84,7 @@ def _get_split_kv_and_workspace_size(
     max_seq_len: int,
     torch_dtype: torch.dtype,
     mma_qk_tiler_mn: tuple[int, int],
+    min_split_kv: int = 1,
 ) -> Tuple[int, int]:
     """Return cached split count and workspace bytes for the effective Q layout.
 
@@ -110,6 +108,7 @@ def _get_split_kv_and_workspace_size(
         split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
             B, q_len, max_active_blocks
         )
+    split_kv = max(split_kv, min_split_kv)
     if is_fp8:
         # The occupancy candidate may contain empty final partitions (e.g.
         # 32 splits for only 8 K tiles). Preserve the uniform chunk width while
@@ -120,6 +119,10 @@ def _get_split_kv_and_workspace_size(
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
         H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
     )
+    if min_split_kv > 1 and workspace_size >= 1 << 31:
+        raise ValueError(
+            "min_split_kv requires workspace beyond the Int32 offset limit"
+        )
     return split_kv, workspace_size
 
 
@@ -185,6 +188,7 @@ def _get_compiled_mla_kernel(
     is_persistent: bool,
     is_var_seq: bool,
     is_var_split_kv: bool,
+    compute_capability: tuple[int, int],
     skip_correction_threshold: float = 0.0,
     is_workspace_size_zero: bool = False,
     fold_sq_factor: int = 1,
@@ -193,9 +197,10 @@ def _get_compiled_mla_kernel(
     seq_len_q: int = 1,
     window_left: int = -1,  # sliding-window span; -1 compiles the full-history kernel
     cp_world: int = 1,  # DCP world size; >1 enables strided global-coord causal masking
+    cp_rank: int = 0,
+    cp_interleave_size: int = 1,
     use_pdl: bool = False,
     return_lse: bool = False,  # DCP: enable LSE output
-    compute_capability: tuple[int, int] = (0, 0),
     reducer_d_tiles: int = 1,
     reducer_max_splits: int = 256,
     pack_q: bool = False,
@@ -226,6 +231,7 @@ def _get_compiled_mla_kernel(
     cutlass_out_dtype = cutlass.BFloat16 if is_fp8 else cutlass_dtype
 
     kernel_kwargs = dict(
+        compute_capability=compute_capability,
         acc_dtype=cutlass.Float32,
         lse_dtype=cutlass.Float32,
         mma_qk_tiler_mn=mma_qk_tiler_mn,
@@ -247,8 +253,10 @@ def _get_compiled_mla_kernel(
     kernel_kwargs["window_left"] = window_left
     kernel_kwargs["pack_q"] = pack_q
     if is_fp8:
-        # DCP (cp_world) strided global-coordinate causal masking is fp8-only.
+        # DCP global-coordinate causal masking is fp8-only.
         kernel_kwargs["cp_world"] = cp_world
+        kernel_kwargs["cp_rank"] = cp_rank
+        kernel_kwargs["cp_interleave_size"] = cp_interleave_size
         kernel_kwargs["reducer_d_tiles"] = reducer_d_tiles
         kernel_kwargs["reducer_max_splits"] = reducer_max_splits
     kernel_obj = KernelClass(**kernel_kwargs)
@@ -387,7 +395,11 @@ def _get_compiled_mla_kernel(
         use_pdl,
     ]
     compiled_kernel = cute.compile(
-        *compile_args, options="--enable-tvm-ffi --opt-level 2"
+        *compile_args,
+        options=(
+            "--enable-tvm-ffi --opt-level 2 "
+            f"--gpu-arch={get_mla_decode_arch(compute_capability)}a"
+        ),
     )
 
     return compiled_kernel
@@ -414,10 +426,13 @@ def tokenspeed_mla_decode(
         torch.Tensor
     ] = None,  # per-request global causal bound; None = local (non-DCP)
     cp_world: int = 1,  # decode-context-parallel world size (1 = no DCP)
-    cp_rank: int = 0,  # this rank's index in [0, cp_world); subtracted from causal_seqs
+    cp_rank: int = 0,  # this rank's index in [0, cp_world)
+    cp_interleave_size: int = 1,
     enable_packed_q: bool = False,
+    *,
+    min_split_kv: int = 1,
 ) -> torch.Tensor:
-    """CuTe DSL MLA decode kernel for Blackwell SM100.
+    """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
 
     Parameters
     ----------
@@ -482,27 +497,31 @@ def tokenspeed_mla_decode(
         LSE code in the compiled kernel.
     causal_seqs : Optional[torch.Tensor]
         DCP support. Per-request *global* causal bound [B] (int32) -- the full
-        context length, the SAME value on every rank. Under DCP each rank holds a
-        strided 1/cp_world slice of the context, so the causal cutoff is expressed
-        in global coordinates; this function subtracts ``cp_rank`` and the kernel
-        divides by ``cp_world`` to recover this rank's local bound. Required when
-        ``cp_world > 1``. ``None`` (default, non-DCP) uses the local ``seq_lens``.
+        context length, the SAME value on every rank. The kernel maps that global
+        cutoff to the local prefix using ``cp_rank`` and
+        ``cp_interleave_size``. Required when ``cp_world > 1``. ``None``
+        (default, non-DCP) uses the local ``seq_lens``.
     cp_world : int
         DCP world size. ``1`` (default) is the non-DCP path and compiles to the
-        original masking with no extra work. ``>1`` enables strided
+        original masking with no extra work. ``>1`` enables DCP
         global-coordinate causal masking (``causal_seqs`` is then required).
     cp_rank : int
-        This rank's index in ``[0, cp_world)``. Local key ``c`` on this rank maps
-        to global position ``c*cp_world + cp_rank``, so the rank-local causal
-        bound is ``ceil((causal_seqs - cp_rank) / cp_world)``; the wrapper folds
-        ``cp_rank`` in for you, so callers pass the same global ``causal_seqs`` on
-        every rank. Must be 0 when ``cp_world == 1``.
+        This rank's index in ``[0, cp_world)``. Must be 0 when
+        ``cp_world == 1``.
+    cp_interleave_size : int
+        Number of consecutive global KV positions assigned to each DCP rank
+        before ownership advances to the next rank. ``1`` is token-striped DCP;
+        values greater than one are block-interleaved DCP.
     enable_packed_q : bool
         Opt into continuous query/head packing on FP8 and FP16/BF16 M128
         kernels. Default False preserves the existing folded-query path.
         M64 and token-gapped Q/output views retain that path even when True.
         Packed split-KV workspace uses ``B * 128 * ceil(H*q_len/128) *
         split_kv * (kv_lora_rank + 1) * 4`` bytes (zero for split_kv=1).
+    min_split_kv : int
+        Minimum number of KV splits used by the decode kernel, in [1, 256].
+        The effective value is capped to avoid creating empty partitions.
+        Defaults to 1, which enables automatic split selection.
 
     Returns
     -------
@@ -510,6 +529,8 @@ def tokenspeed_mla_decode(
         Output tensor [B, q_len, H, kv_lora_rank]. When ``return_lse=True``,
         returns ``(output, lse)`` with ``lse`` of shape [B, q_len, H] (fp32).
     """
+    if type(min_split_kv) is not int or not 1 <= min_split_kv <= 256:
+        raise ValueError("min_split_kv must be an integer in [1, 256]")
     supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     assert (
         query.dtype in supported_dtypes
@@ -601,7 +622,18 @@ def tokenspeed_mla_decode(
         max_seq_len,
         q_dtype,
         mma_qk_tiler_mn,
+        min_split_kv,
     )
+
+    # Public FP8 auto-splitting is bounded by 64 (M64) or 32 (M128).
+    # Both values are in the compile cache key, including across batches.
+    reducer_max_splits = 256
+    if is_fp8:
+        reducer_max_splits = 64 if mma_m_tile == 64 else 32
+        if min_split_kv > reducer_max_splits:
+            reducer_max_splits = 64
+        if min_split_kv > 64:
+            reducer_max_splits = 256
 
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
     assert (
@@ -635,6 +667,11 @@ def tokenspeed_mla_decode(
     # self.cp_world -> div-by-zero / nonsensical local bounds deep in JIT.
     if cp_world < 1:
         raise ValueError(f"cp_world must be >= 1, got cp_world={cp_world}")
+    if cp_interleave_size < 1:
+        raise ValueError(
+            "cp_interleave_size must be >= 1, got "
+            f"cp_interleave_size={cp_interleave_size}"
+        )
     # DCP (strided global-coordinate causal masking) is implemented on the fp8
     # decode kernel only; the fp16 kernel masks against the local cache length.
     is_fp8 = q_dtype == torch.float8_e4m3fn
@@ -657,12 +694,7 @@ def tokenspeed_mla_decode(
             f"cp_rank must be in [0, cp_world), got cp_rank={cp_rank} "
             f"cp_world={cp_world}"
         )
-    # DCP: derive this rank's local causal bound from the global one. causal_seqs
-    # is the global cutoff (same on every rank); local key c maps to global
-    # position c*cp_world + cp_rank, so the kernel computes
-    # k_bound = ceil((causal_seqs - cp_rank - (q_len-1) + q_tok) / cp_world). We
-    # fold cp_rank in here so callers pass the same global bound on every rank.
-    # None (non-DCP) => cache_seqs (local_K, cp_world==1 => bound unchanged).
+
     if causal_seqs is None:
         causal_seqs_dev = cache_seqs
     else:
@@ -671,8 +703,6 @@ def tokenspeed_mla_decode(
             if causal_seqs.dtype == torch.int32
             else causal_seqs.to(torch.int32)
         )
-        if cp_rank:
-            causal_seqs_dev = causal_seqs_dev - cp_rank
 
     is_var_split_kv = False
     block_split_kvs = None
@@ -714,6 +744,8 @@ def tokenspeed_mla_decode(
         seq_len_q=q_len,
         window_left=window_left,
         cp_world=cp_world,
+        cp_rank=cp_rank,
+        cp_interleave_size=cp_interleave_size,
         use_pdl=enable_pdl,
         return_lse=return_lse,
         compute_capability=compute_capability,
@@ -722,9 +754,7 @@ def tokenspeed_mla_decode(
             if is_fp8
             else 1
         ),
-        # Public FP8 auto-splitting is bounded by 64 (M64) or 32 (M128).
-        # Both values are in the compile cache key, including across batches.
-        reducer_max_splits=(64 if mma_m_tile == 64 else 32) if is_fp8 else 256,
+        reducer_max_splits=reducer_max_splits,
         pack_q=pack_q,
     )
 

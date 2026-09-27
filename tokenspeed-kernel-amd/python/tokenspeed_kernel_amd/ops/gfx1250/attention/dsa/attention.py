@@ -37,8 +37,8 @@ from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx1250.attention._common import _INV_LN2
 
 __all__ = [
-    "gluon_dsa_decode_gfx1250",
-    "gluon_dsa_prefill_gfx1250",
+    "launch_gluon_dsa_decode_gfx1250",
+    "launch_gluon_dsa_prefill_gfx1250",
 ]
 
 _REGISTERED_TOPK_WIDTHS = (512, 1024, 2048, 2049, 2050, 2051)
@@ -1351,7 +1351,7 @@ def _finish(result: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
     return out
 
 
-def gluon_dsa_decode_gfx1250(
+def launch_gluon_dsa_decode_gfx1250(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
     sparse_kv_cache: torch.Tensor | None,
@@ -1427,7 +1427,7 @@ def gluon_dsa_decode_gfx1250(
     return _finish(result, out)
 
 
-def gluon_dsa_prefill_gfx1250(
+def launch_gluon_dsa_prefill_gfx1250(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
     sparse_kv_cache: torch.Tensor | None,

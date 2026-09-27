@@ -37,7 +37,6 @@ from tokenspeed_kernel.benchmark.harness import (
     set_benchmark_generator,
 )
 from tokenspeed_kernel.benchmark.validation import (
-    MAX_VALIDATION_RUNS,
     OutputValidationSpec,
     ValidationDatum,
     ValidationOutcome,
@@ -56,7 +55,6 @@ __all__ = [
     "GraphTimer",
     "KernelBenchmarkHarness",
     "KernelBenchmarkResult",
-    "MAX_VALIDATION_RUNS",
     "OutputValidationSpec",
     "PreparedBenchmark",
     "PreparedInvocation",

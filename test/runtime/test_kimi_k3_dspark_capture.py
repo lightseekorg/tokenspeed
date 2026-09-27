@@ -129,3 +129,105 @@ def test_latent_rope_is_a_noop_on_an_empty_batch() -> None:
     attn.rotary_emb = None  # must not be reached
     empty = torch.zeros((0, 12))
     assert attn.apply_latent_rope(torch.zeros(0), empty).shape == (0, 12)
+
+
+@pytest.mark.parametrize("windows", [((0, 4),), ((0, 2), (2, 4))])
+def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
+    monkeypatch, windows
+):
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.execution.dspark_context import DSparkContextProducer
+    from tokenspeed.runtime.models import kimi_k3
+
+    events = []
+    writes = []
+
+    class Layer:
+        def __init__(self, index):
+            self.index = index
+
+        def capture_attnres(self, prefix, residual):
+            events.append(("capture", self.index - 1))
+            return prefix + 100 * (self.index + 1)
+
+        def __call__(self, positions, prefix, ctx, residual):
+            events.append(("layer", self.index))
+            residual[self.index // 2].fill_(self.index)
+            return prefix + self.index + 1, residual
+
+    def mix(prefix, residual, proj, norm, num_blocks, **kwargs):
+        if "out_norm" not in kwargs:
+            events.append(("capture", 3))
+        return prefix + 1000
+
+    monkeypatch.setattr(kimi_k3, "_apply_attn_res", mix)
+    inbound = None
+    for stage, (start, end) in enumerate(windows):
+        mapping = SimpleNamespace(
+            is_first_pp_rank=stage == 0, is_last_pp_rank=stage == len(windows) - 1
+        )
+        projector = SimpleNamespace(
+            hidden_size=3,
+            mapping=mapping,
+            project_target_tap=lambda index, rows: rows,
+            finalize_target_projection=lambda rows: rows,
+            write_context_kv=lambda rows, positions, locations, pool: writes.append(
+                (rows.clone(), locations)
+            ),
+        )
+        producer = DSparkContextProducer(
+            projector, object() if mapping.is_last_pp_rank else None
+        )
+        model = SimpleNamespace(
+            config=SimpleNamespace(num_hidden_layers=4, attn_res_block_size=2),
+            mapping=mapping,
+            pp_start_layer=start,
+            pp_end_layer=end,
+            layers=[Layer(i) if start <= i < end else None for i in range(4)],
+            layers_to_capture=[1, 3],
+            _dflash_capture_idx_map={1: 0, 3: 1},
+            eagle3_layers_to_capture=(),
+            dflash_aux_stream="attn_res",
+            output_attn_res_proj=None,
+            output_attn_res_norm=None,
+            norm=None,
+        )
+        model._dspark_capture_stream = lambda index, prefix, residual: kimi_k3.KimiLinearModel._dspark_capture_stream(
+            model, index, prefix, residual
+        )
+        locations = torch.tensor([9, 10])
+        ctx = SimpleNamespace(
+            dspark_context_producer=producer,
+            target_capture_sink=None,
+            num_extends=1,
+            bs=1,
+            input_num_tokens=2,
+            attn_backend=SimpleNamespace(
+                decode_window_locations=lambda: torch.empty(0, dtype=torch.int64),
+                extend_span_locations=lambda: locations,
+            ),
+        )
+        output, aux = kimi_k3.KimiLinearModel.forward(
+            model,
+            input_ids=torch.tensor([1, 2]),
+            positions=torch.tensor([7, 8]),
+            ctx=ctx,
+            input_embeds=torch.ones(2, 3) if stage == 0 else None,
+            pp_inbound=inbound,
+        )
+        assert aux is None
+        assert len(writes) == int(mapping.is_last_pp_rank)
+        if not mapping.is_last_pp_rank:
+            inbound = output
+    assert events == [
+        ("layer", 0),
+        ("layer", 1),
+        ("capture", 1),
+        ("layer", 2),
+        ("layer", 3),
+        ("capture", 3),
+    ]
+    assert len(writes) == 1
+    torch.testing.assert_close(writes[0][0], torch.full((2, 3), 1315.0))
+    torch.testing.assert_close(writes[0][1], torch.tensor([9, 10]))

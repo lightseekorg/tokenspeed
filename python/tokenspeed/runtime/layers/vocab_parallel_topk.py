@@ -109,10 +109,10 @@ class VocabParallelTopK:
         num_org = int(shard.num_org_elements)
         if self.vocab_size > _MAX_EXACT_ID:
             logger.info(
-                "Vocab-parallel top-k disabled: a token id in a %d-token "
+                f"Vocab-parallel top-k disabled: a token id in a {self.vocab_size:d}"
+                "-token "
                 "vocabulary is not exact in the fp32 the packed all-gather "
                 "carries it in.",
-                self.vocab_size,
             )
             return
         if (
@@ -122,10 +122,10 @@ class VocabParallelTopK:
             or int(shard.org_vocab_start_index) != num_org * tp_rank
         ):
             logger.info(
-                "Vocab-parallel top-k disabled: this %d-way vocabulary shard "
+                f"Vocab-parallel top-k disabled: this {self.tp_size:d}-way vocabulary "
+                "shard "
                 "is padded or carries added tokens, so a shard-local index is "
                 "not a global token id.",
-                self.tp_size,
             )
             return
         self._enabled = True
@@ -165,15 +165,14 @@ class VocabParallelTopK:
                 probe, lens, self.top_k, 1, return_val=True
             )
         except Exception as exc:  # noqa: BLE001
-            logger.info("Radix top-k unavailable (%s); using torch.topk", exc)
+            logger.info(f"Radix top-k unavailable ({exc!s}); using torch.topk")
             return None
         if indices is None or values is None:
             # Cluster capacity refused the shape; the base runner does not
             # earn a second code path here.
             logger.info(
-                "Radix top-k declined rows=%d cols=%d; using torch.topk",
-                self.max_rows,
-                num_cols,
+                f"Radix top-k declined rows={self.max_rows:d} cols={num_cols:d}; using "
+                "torch.topk",
             )
             return None
         return runner

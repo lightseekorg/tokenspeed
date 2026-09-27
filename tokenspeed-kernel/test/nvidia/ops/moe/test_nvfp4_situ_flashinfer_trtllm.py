@@ -33,6 +33,7 @@ registry resolves the (nvfp4, situ, precomputed_topk) plan to this kernel.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -55,8 +56,15 @@ _E2M1_VALUES = torch.tensor(_E2M1_LUT + [-v for v in _E2M1_LUT])
 def _situ_runtime_reason() -> str | None:
     if not torch.cuda.is_available():
         return "requires CUDA"
-    if not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3):
-        return "flashinfer TRTLLM-Gen SiTU targets the sm_100 family"
+    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    spec = KernelRegistry.get().get_by_name(
+        "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
+    )
+    if spec is None or not spec.capability.satisfied_by(current_platform()):
+        return "outside the kernel's registered capability range"
     return None
 
 
@@ -375,6 +383,11 @@ def test_moe_plan_selects_nvfp4_situ_routed_kernel(
         ep_size=1,
         ispp=ISPP,
         internal_activation_dtype="input",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
     assert plan["support_routing"] is False
@@ -434,6 +447,36 @@ def test_nvfp4_trtllm_registry_declares_ispp_alignment(kernel_name: str) -> None
     if spec is None:
         pytest.skip("nvfp4 TRT-LLM kernel not registered on this platform")
     assert spec.traits["ispp_alignment"] == frozenset({64})
+
+
+@pytest.mark.parametrize(
+    ("kernel_name", "arch_version", "expected"),
+    [
+        ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (9, 0), False),
+        ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (10, 7), True),
+        ("flashinfer_trtllm_nvfp4_situ_routed_moe_apply", (10, 8), False),
+        # Keep sibling NVFP4 paths capped until they are validated on SM107.
+        ("flashinfer_trtllm_nvfp4_routed_moe_apply", (10, 7), False),
+    ],
+)
+def test_nvfp4_trtllm_capability_range(
+    b300_platform,
+    kernel_name: str,
+    arch_version: tuple[int, int],
+    expected: bool,
+) -> None:
+    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4  # noqa: F401
+    from tokenspeed_kernel.platform import ArchVersion
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    spec = KernelRegistry.get().get_by_name(kernel_name)
+    if spec is None:
+        pytest.skip("nvfp4 TRT-LLM kernel not registered on this platform")
+    platform = replace(
+        b300_platform,
+        arch_version=ArchVersion(*arch_version),
+    )
+    assert spec.capability.satisfied_by(platform) is expected
 
 
 @requires_flashinfer_situ
@@ -518,3 +561,147 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
     manual = acc.to(torch.bfloat16)
 
     assert _rel_l2(manual, finalized) < 5e-3, f"{_rel_l2(manual, finalized)=}"
+
+
+@requires_flashinfer_situ
+@pytest.mark.parametrize(
+    "num_tokens,top_k,local_count,routed,enable_pdl",
+    [
+        (1, 2, 16, False, False),
+        (17, 8, 16, False, True),
+        (129, 2, 8, True, False),
+        (257, 8, 16, True, True),
+    ],
+)
+def test_nvfp4_route_padding_is_initialized_on_every_replay(
+    num_tokens: int,
+    top_k: int,
+    local_count: int,
+    routed: bool,
+    enable_pdl: bool,
+    monkeypatch,
+) -> None:
+    """Poison native map padding, change routing, and replay without Python.
+
+    The allocation observer is test-only: it retains the guarded int32 routing
+    map so the test can inspect padding and corrupt it between replays. Product
+    initialization occurs in the native launcher, without allocation interception.
+    """
+    from flashinfer.fused_moe import core
+    from flashinfer.tllm_enums import ActivationType
+    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as impl
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    generator = torch.Generator().manual_seed(401)
+    raw = _make_nvfp4_moe_weights(generator, logical_ispp=ISPP)
+    local_offset = NUM_EXPERTS - local_count
+    # Activation input scales are global scalars, not expert-sharded weights.
+    w = _MoEWeights(
+        {
+            k: (
+                v if k in ("w13_input_scale", "w2_input_scale") else v[local_offset:]
+            ).clone()
+            for k, v in raw.items()
+        }
+    ).cuda()
+    w._spec.top_k = top_k
+    w._spec.num_local_experts = local_count
+    w._spec.ep_rank = local_offset // local_count
+    impl.flashinfer_trtllm_nvfp4_situ_moe_weights({}, w)
+    x = (torch.randn(num_tokens, HIDDEN, generator=generator) * 0.2).bfloat16().cuda()
+    logits = torch.randn(num_tokens, NUM_EXPERTS, generator=generator).bfloat16().cuda()
+    values, ids = logits.float().softmax(-1).topk(top_k, dim=-1)
+    ids = ids.int()
+    weights = values.bfloat16()
+
+    def apply(finalize):
+        return impl._flashinfer_trtllm_nvfp4_moe_apply(
+            x,
+            w,
+            router_logits=logits,
+            topk_weights=weights,
+            topk_ids=ids,
+            do_finalize=finalize,
+            enable_pdl=enable_pdl,
+            routed=routed,
+            activation_type=ActivationType.Situ,
+            output=None,
+        )
+
+    class ObserveMap(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.maps = []
+
+        def __torch_dispatch__(self, func, types, args, kwargs):
+            result = func(*args, **kwargs)
+            if (
+                func == torch.ops.aten.empty.memory_format
+                and isinstance(result, torch.Tensor)
+                and result.is_cuda
+                and result.dtype == torch.int32
+                and result.ndim == 1
+                # Native expert tiles are multiples of eight, plus one guard.
+                # All other workspace sizes for these geometries are even or
+                # smaller than the expanded assignment count.
+                and result.numel() > num_tokens * top_k
+                and result.numel() % 8 == 1
+            ):
+                result.zero_()
+                self.maps.append(result)
+            return result
+
+    def check_map(route_map, expanded):
+        inverse = expanded.long().flatten()
+        live = inverse >= 0
+        expected = torch.full_like(route_map, -1)
+        tokens = torch.arange(num_tokens, device="cuda").repeat_interleave(top_k)
+        expected[inverse[live]] = tokens[live].int()
+        torch.testing.assert_close(route_map, expected, rtol=0, atol=0)
+        if routed:
+            local = (ids >= local_offset) & (ids < local_offset + local_count)
+            torch.testing.assert_close(live.view_as(ids), local, rtol=0, atol=0)
+
+    # Warm both module/tactic paths before capture. No initialization or JIT is
+    # allowed to rely on capture-time Python during the replay checks below.
+    apply(False)
+    apply(True)
+    observer = ObserveMap()
+    with observer:
+        _, _, expanded = apply(False)
+    assert len(observer.maps) == 1
+    check_map(observer.maps[0], expanded)
+
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    observer = ObserveMap()
+    with torch.cuda.graph(graph), observer:
+        _, _, graph_expanded = apply(False)
+    assert len(observer.maps) == 1
+    route_map = observer.maps[0]
+    output_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(output_graph):
+        graph_output = apply(True)
+    for shift in (0, 3, 7, 0):
+        # Move between expert distributions, including empty local experts.
+        logits.copy_(logits.roll(shift, dims=-1))
+        next_weights, next_ids = logits.float().softmax(-1).topk(top_k, dim=-1)
+        ids.copy_(next_ids)
+        weights.copy_(next_weights)
+        route_map.zero_()
+        graph.replay()
+        check_map(route_map, graph_expanded)
+        actual = apply(True)
+        output_graph.replay()
+        torch.testing.assert_close(graph_output, actual, rtol=0, atol=0)
+        with monkeypatch.context() as context:
+            context.setattr(
+                impl, "trtllm_fp4_block_scale_moe", core.trtllm_fp4_block_scale_moe
+            )
+            context.setattr(
+                impl,
+                "trtllm_fp4_block_scale_routed_moe",
+                core.trtllm_fp4_block_scale_routed_moe,
+            )
+            reference = apply(True)
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)

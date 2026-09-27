@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-TORCH_VERSION=${TORCH_VERSION:-2.13.0}
+TORCH_VERSION=${TORCH_VERSION:-2.14.0}
 TORCH_INDEX_URL=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/rocm7.2}
 
 pip_install_with_retry() {
@@ -41,11 +41,9 @@ pip_install_with_retry() {
     done
 }
 
-if ! python3 -c 'import torch; assert torch.cuda.is_available(); assert torch.version.hip'; then
-    pip_install_with_retry \
-        python3 -m pip install --force-reinstall "torch==${TORCH_VERSION}" \
-        --index-url "${TORCH_INDEX_URL}"
-fi
+pip_install_with_retry \
+    python3 -m pip install --upgrade "torch==${TORCH_VERSION}" \
+    --index-url "${TORCH_INDEX_URL}"
 
 python3 -c 'import torch; assert torch.cuda.is_available(); assert torch.version.hip; print(torch.__version__, torch.cuda.get_device_name(0))'
 python3 -m venv --help >/dev/null

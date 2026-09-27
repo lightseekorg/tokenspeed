@@ -50,10 +50,9 @@ def _rms_norm_fwd_kernel(
     NORM_BEFORE_GATE: tl.constexpr,
     SIGMOID_GATE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    WEIGHTS_INDEPENDENT: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     group = tl.program_id(1)
     X += row * stride_x_row + group * N
@@ -63,6 +62,13 @@ def _rms_norm_fwd_kernel(
     W += group * N
     cols = tl.arange(0, BLOCK_N)
     mask = cols < N
+    if WEIGHTS_INDEPENDENT:
+        w = tl.load(W + cols, mask=mask).to(tl.float32)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    if not WEIGHTS_INDEPENDENT:
+        w = tl.load(W + cols, mask=mask).to(tl.float32)
     x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
     if HAS_Z and not NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
@@ -70,14 +76,11 @@ def _rms_norm_fwd_kernel(
     xbar = tl.where(mask, x, 0.0)
     var = tl.sum(xbar * xbar, axis=0) / N
     rstd = 1 / tl.sqrt(var + eps)
-    w = tl.load(W + cols, mask=mask).to(tl.float32)
     y = x * rstd * w
     if HAS_Z and NORM_BEFORE_GATE:
         z = tl.load(Z + cols, mask=mask).to(tl.float32)
         y *= tl.sigmoid(z) if SIGMOID_GATE else z * tl.sigmoid(z)
     tl.store(Y + cols, y, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def rmsnorm_fn(
@@ -88,11 +91,18 @@ def rmsnorm_fn(
     group_size=None,
     norm_before_gate=True,
     sigmoid_gate=False,
+    *,
+    weights_independent: bool,
 ):
     """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else
     norm(x * silu(z)); ``sigmoid_gate`` swaps silu(z) for sigmoid(z). With
     ``group_size`` set, each group of that many features is normalized on its
-    own (``None`` means one group over the whole last dim)."""
+    own (``None`` means one group over the whole last dim).
+
+    ``weights_independent`` promises the weight is already visible before the
+    preceding PDL producer starts, permitting its load before the input wait.
+    Pass False for producer-written weights. Returns a tensor shaped like x.
+    """
     enable_pdl = pdl_enabled()
     x_shape_og = x.shape
     x = x.reshape(-1, x.shape[-1])
@@ -103,6 +113,7 @@ def rmsnorm_fn(
         z = z.reshape(-1, z.shape[-1])
         if z.stride(-1) != 1:
             z = z.contiguous()
+    weights_independent = weights_independent and weight.is_contiguous()
     weight = weight.contiguous()
 
     M, N = x.shape
@@ -136,6 +147,7 @@ def rmsnorm_fn(
             SIGMOID_GATE=sigmoid_gate,
             num_warps=num_warps,
             ENABLE_PDL=enable_pdl,
+            WEIGHTS_INDEPENDENT=weights_independent,
             **({"launch_pdl": True} if enable_pdl else {}),
         )
     return out.reshape(x_shape_og)
@@ -179,4 +191,5 @@ class RMSNorm(torch.nn.Module):
             group_size=self.group_size,
             norm_before_gate=self.norm_before_gate,
             sigmoid_gate=self.sigmoid_gate,
+            weights_independent=True,
         )

@@ -283,7 +283,7 @@ def test_public_kpool_prefill_dispatch_forwards_complete_plan(
     traits = captured["selection"][1]["traits"]
     assert traits["index_heads"] == 32
     assert traits["topk_pools"] == 512
-    assert traits["prefill_plan"] is True
+    assert traits["has_prefill_plan"] is True
     forwarded = captured["kwargs"]
     assert forwarded["pool_workspace_slots"] is pool_workspace_slots
     assert forwarded["row_starts"] is row_starts
@@ -298,7 +298,7 @@ def test_gluon_registration_covers_both_addressing_modes() -> None:
     if spec is None:
         pytest.skip("gfx950 Gluon registrations are unavailable")
 
-    assert spec.traits["prefill_plan"] == frozenset({False, True})
+    assert spec.traits["has_prefill_plan"] == frozenset({False, True})
     assert spec.traits["index_heads"] == frozenset({32})
     assert spec.traits["topk_pools"] == frozenset({512})
 
@@ -319,7 +319,7 @@ def test_registry_supports_both_modes_and_geometry_fallback() -> None:
         "index_k_format": "fp8_scaled",
         "score_activation": "relu",
         "topk_layout": "global_slots",
-        "prefill_plan": True,
+        "has_prefill_plan": True,
     }
     signature = format_signature(q=dense_tensor_format(torch.bfloat16))
 
@@ -331,7 +331,7 @@ def test_registry_supports_both_modes_and_geometry_fallback() -> None:
     )
     assert selected.name == "gluon_kpool_prefill_topk_fp8_gfx950"
 
-    traits["prefill_plan"] = False
+    traits["has_prefill_plan"] = False
     selected_without_plan = select_kernel(
         "attention",
         "kpool_prefill_topk",

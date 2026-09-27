@@ -38,6 +38,10 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from tokenspeed.runtime.cache.l3.backend import (
+    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+    resolve_l3_weight_version,
+)
 from tokenspeed.runtime.engine.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -163,15 +167,32 @@ async def update_weights_from_distributed(request: Request) -> JSONResponse:
         shapes = [list(s) for s in body["shapes"]]
         if not (len(names) == len(dtypes) == len(shapes)):
             raise ValueError("names, dtypes, shapes must have equal length")
+        flush_cache = bool(body.get("flush_cache", False))
+        llm = _llm(request)
+        requested_version = body.get("weight_version")
+        if requested_version is not None:
+            requested_version = str(requested_version)
+        storage_backend = getattr(llm.server_args, "kvstore_storage_backend", None)
+        if flush_cache and requested_version is None and storage_backend is not None:
+            return {
+                "success": False,
+                "message": L3_FLUSH_REQUIRES_WEIGHT_VERSION,
+            }
+        weight_version = resolve_l3_weight_version(
+            llm.server_args.weight_version,
+            requested_version,
+            flush_cache=flush_cache,
+            storage_backend=storage_backend,
+        )
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
             dtype_names=dtypes,  # translate dtypes -> dtype_names
             shapes=shapes,
             group_name=str(body.get("group_name", "weight_update_group")),
-            flush_cache=bool(body.get("flush_cache", False)),
-            weight_version=body.get("weight_version"),
+            flush_cache=flush_cache,
+            weight_version=weight_version,
         )
-        success, message = await _llm(request).update_weights_from_distributed(obj)
+        success, message = await llm.update_weights_from_distributed(obj)
         if success:
             message = _stamp_weight_version(request, obj.weight_version, message)
         return {"success": success, "message": message}
@@ -365,6 +386,12 @@ async def update_weight_version(request: Request) -> JSONResponse:
         if new_version is None:
             raise ValueError("Missing 'new_version' in request body")
         llm = _llm(request)
+        if getattr(llm.server_args, "kvstore_storage_backend", None) is not None:
+            raise ValueError(
+                "Direct weight-version changes are not supported with L3 storage; "
+                "use /update_weights_from_distributed with an explicit "
+                "weight_version and flush_cache=True"
+            )
         llm.server_args.weight_version = str(new_version)
         return {
             "success": True,

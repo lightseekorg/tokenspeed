@@ -74,6 +74,7 @@ class TritonAllReduceBackend(CommBackend):
             rank_in_group=group.index(dist.get_rank()),
             attnres_max_numel=0,
             attnres_max_rows=0,
+            enable_lamport=False,
             max_tokens=0,
             hidden_size=0,
             max_numel=self._max_numel,
@@ -91,6 +92,7 @@ class TritonAllReduceBackend(CommBackend):
         producer_direct_max_numel: int,
         attnres_max_numel: int,
         attnres_max_rows: int,
+        enable_lamport: bool,
         dtype: torch.dtype,
     ) -> bool:
         """Allocate or reuse an Iris state with the requested path capacities.
@@ -101,6 +103,7 @@ class TritonAllReduceBackend(CommBackend):
             producer_direct_max_numel: Requested producer-direct payload in elements.
             attnres_max_numel: Maximum fused AttnRes payload in elements.
             attnres_max_rows: Maximum fused AttnRes payload in rows.
+            enable_lamport: Allow Lamport for eligible producer-direct payloads.
             dtype: Element type shared by the prepared paths.
 
         Returns:
@@ -127,6 +130,10 @@ class TritonAllReduceBackend(CommBackend):
 
         state = self._instances.get(group)
         if state is not None:
+            if state.enable_lamport != enable_lamport:
+                raise RuntimeError(
+                    "all-reduce buffers were initialized with a different Lamport policy"
+                )
             available = (
                 state.max_numel,
                 state.max_bytes,
@@ -151,6 +158,7 @@ class TritonAllReduceBackend(CommBackend):
             max_bytes=producer_direct_max_numel * dtype.itemsize,
             attnres_max_numel=attnres_max_numel,
             attnres_max_rows=attnres_max_rows,
+            enable_lamport=enable_lamport,
         )
         initialize_all_reduce_state(state, dtype)
         self._instances[group] = state

@@ -120,14 +120,12 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
 
     def process_weights_after_loading(self, layer):
         """Compute alpha and input_scale_inv, swizzle block scales."""
-        logger.debug(
-            "[FP4_DENSE_POSTLOAD] w=%s(%s) ws=%s is=%s ws2=%s",
-            layer.weight.shape,
-            layer.weight.dtype,
-            layer.weight_scale.shape,
-            layer.input_scale,
-            layer.weight_scale_2,
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"[FP4_DENSE_POSTLOAD] w={layer.weight.shape!s}({layer.weight.dtype!s}) "
+                f"ws={layer.weight_scale.shape!s} is={layer.input_scale!s} "
+                f"ws2={layer.weight_scale_2!s}"
+            )
         input_scale = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
         layer.input_scale = Parameter(input_scale, requires_grad=False)

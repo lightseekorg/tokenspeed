@@ -532,7 +532,7 @@ def _prewarm_hf_tokenizer(model_id: str) -> None:
             ],
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("HF tokenizer prewarm failed for %s: %s", model_id, exc)
+        logger.warning(f"HF tokenizer prewarm failed for {model_id!s}: {exc!s}")
 
 
 def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
@@ -598,7 +598,7 @@ async def _start_control_server(
         if loop.time() >= deadline:
             return False
         await asyncio.sleep(0.05)
-    logger.info("control server bound in %.2fs", loop.time() - start)
+    logger.info(f"control server bound in {loop.time() - start:.2f}s")
     return True
 
 
@@ -764,13 +764,13 @@ async def run_smg(
         return 0
 
     except _ChildExitedDuringStartup as exc:
-        logger.error("startup failed: %s", exc)
+        logger.error(f"startup failed: {exc!s}")
         return 1
     except _ShutdownDuringStartup:
         logger.info("shutdown signal received during startup; exiting cleanly")
         return 0
     except TimeoutError as exc:
-        logger.error("startup failed: %s", exc)
+        logger.error(f"startup failed: {exc!s}")
         return 1
     except KeyboardInterrupt:
         logger.info("interrupted; exiting cleanly")

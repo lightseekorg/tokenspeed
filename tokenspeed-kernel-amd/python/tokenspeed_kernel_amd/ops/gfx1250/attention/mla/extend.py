@@ -93,7 +93,7 @@ class AttentionConfig:
 
 
 _mla_extend_fwd_kernel_repr = make_kernel_repr(
-    "_mla_extend_fwd_kernel",
+    "gluon_mla_extend_gfx1250",
     [
         "num_query_heads",
         "num_queries_per_kv",
@@ -111,7 +111,7 @@ _mla_extend_fwd_kernel_repr = make_kernel_repr(
 
 
 @gluon.jit(repr=_mla_extend_fwd_kernel_repr)
-def _mla_extend_fwd_kernel(
+def gluon_mla_extend_gfx1250(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
     kv_buffer_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
@@ -495,7 +495,7 @@ def _mla_extend_fwd_kernel(
     )
 
 
-def gluon_mla_extend_gfx1250(
+def launch_gluon_mla_extend_gfx1250(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -597,7 +597,7 @@ def gluon_mla_extend_gfx1250(
     if num_kv_heads > 2**16 - 1:
         raise ValueError(f"KV-head grid Y exceeds the HIP limit: {num_kv_heads}")
 
-    _mla_extend_fwd_kernel[(total_num_q_blocks, num_kv_heads)](
+    gluon_mla_extend_gfx1250[(total_num_q_blocks, num_kv_heads)](
         output_ptr=out,
         query_ptr=q,
         kv_buffer_ptr=kv_cache,
@@ -636,4 +636,4 @@ def gluon_mla_extend_gfx1250(
     return out
 
 
-__all__ = ["gluon_mla_extend_gfx1250"]
+__all__ = ["launch_gluon_mla_extend_gfx1250"]

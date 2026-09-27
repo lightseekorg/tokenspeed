@@ -25,7 +25,7 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk, moe_softmax_topk
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
@@ -306,6 +306,7 @@ class StandardTopKOutput(NamedTuple):
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
     router_logits: torch.Tensor | None
+    output_scale: float | torch.Tensor = 1.0
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -320,6 +321,7 @@ class BypassedTopKOutput(NamedTuple):
     topk_config: TopKConfig
     num_token_non_padded: torch.Tensor | None = None
     expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None
+    output_scale: float | torch.Tensor = 1.0
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -329,6 +331,11 @@ class BypassedTopKOutput(NamedTuple):
 @runtime_checkable
 class TopKOutput(Protocol):
     """Protocol for top-k outputs in different formats."""
+
+    @property
+    def output_scale(self) -> float | torch.Tensor:
+        """Post-kernel scale to apply to the routed output."""
+        ...
 
     @property
     def format(self) -> TopKOutputFormat:
@@ -525,14 +532,16 @@ def select_experts(
                 )
             )
             if use_sigmoid_bias_topk:
-                topk_weights, topk_ids = moe_sigmoid_bias_topk(
+                topk_weights, topk_ids = moe_topk(
                     router_logits,
-                    correction_bias,
                     top_k,
+                    score_function="sigmoid",
+                    selection_method="topk",
+                    renormalize=renormalize,
                     routed_scaling_factor=float(routed_scaling_factor),
-                    normalize_topk_weights=renormalize,
+                    correction_bias=correction_bias,
                     logical_to_physical_map=logical_to_physical_map,
-                    weights_dtype=topk_config.topk_weights_dtype,
+                    topk_weights_dtype=topk_config.topk_weights_dtype,
                 )
             else:
                 topk_weights, topk_ids = minimax_biased_grouped_topk(
@@ -597,15 +606,16 @@ def select_experts(
         assert (
             hidden_states.shape[0] == router_logits.shape[0]
         ), f"Number of tokens mismatch, {hidden_states.shape=} vs {router_logits.shape=}"
-        topk_weights, topk_ids = moe_softmax_topk(
+        topk_weights, topk_ids = moe_topk(
             router_logits,
             top_k,
-            topk_indices_dtype=topk_config.topk_indices_dtype,
+            score_function="softmax",
+            selection_method="topk",
             renormalize=renormalize,
             routed_scaling_factor=(
                 1.0 if routed_scaling_factor is None else routed_scaling_factor
             ),
-            solution=None,
+            topk_indices_dtype=topk_config.topk_indices_dtype,
         )
         topk_ids = topk_ids_logical_to_physical(
             topk_ids,

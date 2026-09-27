@@ -80,6 +80,10 @@ class MoeBackend(Enum):
     DEEP_GEMM_MEGA_MOE = "deep_gemm_mega_moe"
     MEGA_MOE = "mega_moe"
 
+    # The batch-invariant fixed-reduction-order leaves (plugin-provided);
+    # --numerics rl-bitwise folds the auto default to this solution.
+    AOK = "aok"
+
     def is_auto(self):
         return self == MoeBackend.AUTO
 
@@ -105,10 +109,10 @@ class MoeBackend(Enum):
         return self == MoeBackend.DEEP_GEMM
 
     def is_deep_gemm_mega_moe(self):
-        return self in (MoeBackend.DEEP_GEMM_MEGA_MOE, MoeBackend.MEGA_MOE)
+        return self == MoeBackend.DEEP_GEMM_MEGA_MOE
 
     def is_mega_moe(self):
-        return self.is_deep_gemm_mega_moe()
+        return self in (MoeBackend.MEGA_MOE, MoeBackend.DEEP_GEMM_MEGA_MOE)
 
 
 class DeepEPMode(Enum):

@@ -55,7 +55,7 @@ CANDIDATE_SHA = "3" * 40
 
 
 def comparison(
-    benchmark_id: str = "gemm.bmm/gluon/b12-m1-n512-k128-bfloat16/v1",
+    benchmark_id: str = "gemm.bmm/gluon/b12-m1-n512-k128-bfloat16",
     classification: str = "regression",
     delta_percent: float | None = 12.5,
 ) -> dict[str, Any]:

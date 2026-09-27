@@ -69,6 +69,7 @@ class _ForwardOp:
     # it: for a fresh request this equals prefix + input.
     prefill_lengths = [4]
     extend_prefix_lens = [0]
+    extend_replay_lens = [0]
 
     def num_extends(self):
         return 1
@@ -114,6 +115,22 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     assert len(reserve_events) == 1
     assert reserve_events[0].request_id == "decode"
     assert reserve_events[0].reserve_num_tokens_in_next_schedule_event == 1
+
+
+def test_cached_tokens_count_the_replayed_window_as_a_hit():
+    """A bounded-replay chunk starts its model input below the prefix hit;
+    the request still hit through the end of the replayed window, and a
+    later chunk of the same request adds nothing."""
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    processor.rid_to_state["hit"] = _state(list(range(20)))
+    processor.rid_to_state["fresh"] = _state(list(range(5)))
+    # "hit": hit at 8, window 4 -> input starts at 4 with 4 replayed rows.
+    processor.add_cached_tokens(["hit", "fresh"], [4, 0], [4, 0])
+    assert processor.rid_to_state["hit"].cached_tokens == 8
+    assert processor.rid_to_state["fresh"].cached_tokens == 0
+    processor.rid_to_state["hit"].computed_length = 12
+    processor.add_cached_tokens(["hit"], [12], [0])
+    assert processor.rid_to_state["hit"].cached_tokens == 8
 
 
 def test_mark_abort_notify_client_flag():
@@ -202,6 +219,7 @@ def test_nan_flag_keeps_single_sanitized_token():
         input_lengths = [1]
         prefill_lengths = []
         extend_prefix_lens = []
+        extend_replay_lens = []
 
         def num_extends(self):
             return 0
@@ -328,6 +346,7 @@ def test_log_request_stats_disabled_by_default():
             input_lengths = [1]
             prefill_lengths = []
             extend_prefix_lens = []
+            extend_replay_lens = []
 
             def num_extends(self):
                 return 0
@@ -500,6 +519,7 @@ def test_log_request_stats_records_timestamps_through_forward():
             input_lengths = [1]
             prefill_lengths = []
             extend_prefix_lens = []
+            extend_replay_lens = []
 
             def num_extends(self):
                 return 0
@@ -561,6 +581,7 @@ class _PrefillForwardOp:
     input_lengths = [4]
     prefill_lengths = [4]
     extend_prefix_lens = [0]
+    extend_replay_lens = [0]
 
     def num_extends(self):
         return 1
@@ -662,7 +683,7 @@ def test_pd_one_token_request_finishes_at_remote_prefill_done():
     state.sampling_params.max_new_tokens = 1
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", 101)
+    processor.on_remote_prefill_done("decode", 101, 2)
     events = processor.finish_remote_prefill_only_request("decode")
 
     assert state.output_ids == [101]
@@ -675,6 +696,7 @@ def test_pd_one_token_request_finishes_at_remote_prefill_done():
     assert output.rids == ["decode"]
     assert output.output_ids == [[101]]
     assert output.completion_tokens == [1]
+    assert output.cached_tokens == [2]
     assert output.finished_reasons[0] == {"type": "length", "length": 1}
 
 
@@ -700,7 +722,7 @@ def test_pd_decode_matcher_accepts_the_prefill_nodes_token():
     state.grammar = _Matcher()
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", 101)
+    processor.on_remote_prefill_done("decode", 101, 2)
 
     assert state.output_ids == [101]
     assert state.grammar.accepted == [101]
@@ -714,7 +736,7 @@ def test_pd_decode_drops_the_grammar_when_the_bootstrap_token_is_lost():
     state.grammar = _Matcher()
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", -1)
+    processor.on_remote_prefill_done("decode", -1, 2)
 
     assert state.output_ids == []
     assert state.grammar is None
@@ -727,7 +749,7 @@ def test_pd_multi_token_request_continues_after_remote_prefill_done():
     state.sampling_params.max_new_tokens = 2
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", 101)
+    processor.on_remote_prefill_done("decode", 101, 2)
     events = processor.finish_remote_prefill_only_request("decode")
 
     assert state.output_ids == [101]
@@ -770,3 +792,32 @@ def test_spec_decode_metrics_count_mixed_rounds_and_proposed_drafts():
         forward_op=_ForwardOp(), model_execution_results=_SpecResult()
     )
     assert metrics.steps == [(1, 2, 3)]
+
+
+@pytest.mark.parametrize(
+    "local_hits,remote_hits,expected",
+    [(0, 1280, 1280), (256, 1280, 1280), (1280, 256, 1280)],
+)
+def test_remote_prefill_usage_merges_overlapping_prefixes(
+    local_hits, remote_hits, expected
+):
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    state = _state(list(range(2048)), computed_length=2048)
+    state.cached_tokens = local_hits
+    processor.rid_to_state["decode"] = state
+    processor.on_remote_prefill_done("decode", 101, remote_hits)
+    assert state.cached_tokens == expected
+
+
+def test_non_pd_cached_tokens_reach_output():
+    from tokenspeed.runtime.engine.request_types import FINISH_LENGTH
+
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state(list(range(2048)))
+    processor.rid_to_state["local"] = state
+    processor.add_cached_tokens(["local"], [1024], [256])
+    state.output_ids = [101]
+    state.finished_reason = FINISH_LENGTH(length=1)
+    processor.stream_output(["local"], [state])
+    assert sender.items[0].cached_tokens == [1280]

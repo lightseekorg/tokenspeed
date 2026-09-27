@@ -131,7 +131,6 @@ def _softmax_topk_kernel(
         "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
     ),
     priority=Priority.PERFORMANT,
-    tags={"gfx1250", "routing", "latency"},
 )
 @register_kernel(
     "moe",
@@ -143,7 +142,6 @@ def _softmax_topk_kernel(
         "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
     ),
     priority=Priority.PERFORMANT,
-    tags={"nvidia", "cuda_graph", "latency"},
 )
 def triton_softmax_topk(
     *,

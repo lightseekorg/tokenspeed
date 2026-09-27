@@ -46,6 +46,16 @@ class PdTransferHooks:
         # Injected, not reached through the loop — see PauseHooks.
         self._device = device
 
+    def record_prefill_usage(self, request_ids: list[str]) -> None:
+        """Forward committed host-side usage before remote-decode dispatch."""
+        loop = self._loop
+        if not isinstance(loop.kv_transfer, DisaggPrefillExecutor):
+            return
+        for request_id in request_ids:
+            state = loop.output_processor.rid_to_state.get(request_id)
+            if state is not None:
+                loop.kv_transfer.record_cached_tokens(request_id, state.cached_tokens)
+
     def poll_transfer_events(self) -> list:
         """Poll the KV transfer executor, act on its events, and return the
         (possibly enriched) event list for the scheduler advance. Empty when
@@ -66,10 +76,11 @@ class PdTransferHooks:
             elif isinstance(event, PD.RemotePrefillDoneEvent):
                 req_id = event.request_id
                 bootstrap_token = event.bootstrap_token
+                cached_tokens = loop.kv_transfer.pop_remote_cached_tokens(req_id)
                 state = loop.output_processor.rid_to_state.get(req_id)
                 if state is None or not state.to_abort:
                     loop.output_processor.on_remote_prefill_done(
-                        req_id, bootstrap_token
+                        req_id, bootstrap_token, cached_tokens
                     )
                 processed.extend(
                     loop.output_processor.finish_remote_prefill_only_request(req_id)

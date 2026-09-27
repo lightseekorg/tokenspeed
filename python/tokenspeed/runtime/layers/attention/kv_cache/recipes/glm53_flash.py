@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
@@ -36,6 +35,7 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnCo
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheGroupDeclaration,
     CacheRecipe,
+    kda_verify_scratch_in_pool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
@@ -122,47 +122,6 @@ def glm53_flash_packing_counts(
     packing = {FULL_ATTENTION: full}
     packing.update(dict.fromkeys(state_group_ids, 1))
     return packing
-
-
-def glm53_flash_parents_needed(
-    layout: CacheLayout,
-    *,
-    token_capacity: int,
-    max_scheduled_tokens: int,
-    max_live_requests: int,
-    decode_input_tokens: int = 1,
-    overlap_schedule_depth: int = 0,
-) -> int:
-    """Physical parents needed at the configured concurrency."""
-    require_positive_int("token_capacity", token_capacity)
-    _require_non_negative_int("max_scheduled_tokens", max_scheduled_tokens)
-    require_positive_int("max_live_requests", max_live_requests)
-    _require_non_negative_int("decode_input_tokens", decode_input_tokens)
-    if overlap_schedule_depth not in (0, 1):
-        raise ValueError(
-            f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
-        )
-    if overlap_schedule_depth and decode_input_tokens == 0:
-        raise ValueError("overlapped cache sizing requires decode_input_tokens > 0")
-
-    page_tokens = layout.prefix_granularity
-    protected_pages = max_live_requests * math.ceil(
-        overlap_schedule_depth * decode_input_tokens / page_tokens
-    )
-    scheduled_pages = math.ceil(min(max_scheduled_tokens, token_capacity) / page_tokens)
-    parents = 0
-    for group_id, packing in layout.group_packing:
-        if group_id == FULL_ATTENTION:
-            child_pages = (
-                math.ceil(token_capacity / page_tokens)
-                + max_live_requests
-                - 1
-                + protected_pages
-            )
-        else:
-            child_pages = max_live_requests + scheduled_pages + protected_pages
-        parents += math.ceil(child_pages / packing)
-    return parents
 
 
 def _require_dsa_config(config: AttnConfig, role: str) -> DSAConfig:
@@ -379,6 +338,10 @@ class Glm53FlashRecipe(CacheRecipe):
         )
 
     @override
+    def verify_scratch_in_pool(self) -> bool:
+        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
+
+    @override
     def workspace_bytes(self) -> int:
         """Bounded raw KPool tails kept once per request and DSA layer."""
         return self.pool_options().workspace_bytes
@@ -437,15 +400,3 @@ class Glm53FlashRecipe(CacheRecipe):
             full_packing = dict(layout.group_packing)[FULL_ATTENTION]
             upper = num_lcm_blocks * full_packing * layout.prefix_granularity
         return self._capacity_from_parents(layout, num_lcm_blocks, upper_bound=upper)
-
-    @override
-    def parents_needed(self, layout: CacheLayout, token_capacity: int) -> int:
-        limits = self.scheduler_limits
-        return glm53_flash_parents_needed(
-            layout,
-            token_capacity=token_capacity,
-            max_scheduled_tokens=limits["max_scheduled_tokens"],
-            max_live_requests=limits["max_live_requests"],
-            decode_input_tokens=limits["decode_input_tokens"],
-            overlap_schedule_depth=limits["overlap_schedule_depth"],
-        )

@@ -66,6 +66,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
+    reject_bounded_replay,
 )
 
 if TYPE_CHECKING:
@@ -319,9 +320,9 @@ class InklingAttnBackend(AttentionBackend):
         self.conv_columns = conv_columns_for_pool(cache_pool)
         self._conv_geometry_latched = self._conv_geometry(cache_pool)
         logger.info(
-            "Inkling ShortConv boundary checkpoints: P=%d, groups=%s",
-            cache_pool.arena.plan.prefix_granularity,
-            tuple(self.conv_columns["group_block_tokens"]),
+            "Inkling ShortConv boundary checkpoints: P="
+            f"{cache_pool.arena.plan.prefix_granularity:d}, groups="
+            f"{tuple(self.conv_columns['group_block_tokens'])!s}",
         )
 
     @property
@@ -486,9 +487,12 @@ class InklingAttnBackend(AttentionBackend):
         extend_seq_lens_cpu: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
+        extend_replay_lens_cpu: torch.Tensor,
+        extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         **kwargs,
     ):
+        reject_bounded_replay(extend_replay_lens_cpu, "InklingAttentionBackend")
         if forward_mode.is_mixed():
             raise RuntimeError(
                 "Inkling sconv does not support MIXED batches: the prefill "
@@ -537,6 +541,8 @@ class InklingAttnBackend(AttentionBackend):
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_replay_lens_cpu=extend_replay_lens_cpu,
+            extend_prompt_lens_cpu=extend_prompt_lens_cpu,
             extend_with_prefix=extend_with_prefix,
             **kwargs,
         )

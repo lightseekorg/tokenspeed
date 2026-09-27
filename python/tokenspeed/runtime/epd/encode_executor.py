@@ -294,7 +294,7 @@ class DisaggEncodeExecutor:
             return
         self._conclude_room_failed(sender.bootstrap_room, exc)
         logger.error(
-            "encode staging failed for room %s: %s", sender.bootstrap_room, exc
+            f"encode staging failed for room {sender.bootstrap_room!s}: {exc!s}",
         )
 
     def fail_rooms(self, request_ids, exc: Exception) -> int:

@@ -71,7 +71,6 @@ def _next_power_of_2(n: int) -> int:
     capability=_CAPABILITY,
     signatures=_SIGNATURES,
     priority=Priority.PORTABLE,
-    tags={"portability"},
 )
 def triton_host_uint8_row_gather(
     table: torch.Tensor,

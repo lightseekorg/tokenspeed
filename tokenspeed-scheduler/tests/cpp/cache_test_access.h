@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -28,6 +29,7 @@
 #include <vector>
 
 #include "cache/coordinator/cache_coordinator.h"
+#include "utils.h"
 
 namespace tokenspeed {
 
@@ -37,6 +39,10 @@ struct CacheCoordinatorTestAccess {
     }
 
     static std::uint64_t NextAccessEpoch(CacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
+
+    static std::size_t NumStorageKeyOrder(const CacheCoordinator& coordinator) {
+        return coordinator.storage_key_order_.size();
+    }
 };
 
 inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
@@ -49,29 +55,69 @@ inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<Bloc
                                 first_slot, CacheBoundaryKind::kChunk);
 }
 
+inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
+                                        std::span<const std::string> prefix_hashes, std::uint64_t access_epoch,
+                                        std::int32_t first_new_prefix_page, std::int32_t num_computed_tokens,
+                                        CacheBoundaryKind boundary_kind, bool stream_completed_to_host,
+                                        std::span<const std::int32_t> materialized_state_boundaries) {
+    _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()), "tables/groups size mismatch");
+    _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
+            "completed page range must be non-empty");
+    const RequestProgress progress{
+        .completed_pages =
+            CompletedPages{
+                .prefix_hashes = prefix_hashes,
+                .first_new_prefix_page = first_new_prefix_page,
+                .boundary_kind = boundary_kind,
+                .stream_completed_to_host = stream_completed_to_host,
+                .materialized_state_boundaries = materialized_state_boundaries,
+            },
+        .num_computed_tokens = num_computed_tokens,
+    };
+    coordinator.CacheCompletedBlocks(tables, progress, access_epoch);
+}
+
+// Admits every group with the same demand prototype as a new request.
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
                                                                      std::vector<BlockTable>& tables,
                                                                      CacheCoordinator::PrefixProbe&& prefix,
-                                                                     GroupDemand prototype) {
+                                                                     GroupDemand prototype,
+                                                                     const RequestProgress& progress) {
     std::vector<GroupDemand> demands;
     demands.reserve(tables.size());
     for (BlockTable& table : tables) {
         prototype.table = &table;
         demands.push_back(prototype);
     }
-    return coordinator.Admit(std::move(prefix), demands, std::nullopt);
+    return coordinator.Admit(std::move(prefix), demands, progress, std::nullopt);
+}
+
+// The overloads without progress admit a request that has computed nothing
+// yet: nothing to publish, nothing for retention to reclaim.
+inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
+                                                                     std::vector<BlockTable>& tables,
+                                                                     CacheCoordinator::PrefixProbe&& prefix,
+                                                                     GroupDemand prototype) {
+    return AdmitForTest(coordinator, tables, std::move(prefix), prototype, RequestProgress{});
+}
+
+inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
+                                                                     std::vector<BlockTable>& tables,
+                                                                     GroupDemand prototype,
+                                                                     const RequestProgress& progress) {
+    return AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}), prototype, progress);
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
                                                                      std::vector<BlockTable>& tables,
                                                                      GroupDemand prototype) {
-    return AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}), prototype);
+    return AdmitForTest(coordinator, tables, prototype, RequestProgress{});
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(CacheCoordinator& coordinator,
                                                                      std::vector<BlockTable>& tables,
                                                                      std::int32_t num_tokens) {
-    return AdmitForTest(coordinator, tables, GroupDemand{.num_tokens = num_tokens});
+    return AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{num_tokens}});
 }
 
 }  // namespace tokenspeed

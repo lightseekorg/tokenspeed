@@ -61,9 +61,8 @@ choices (still evolving; subject to change):
   non-format traits (head dim, GQA factor, ...), and a priority band.
 - **Auto-selection** — `select_kernel` filters by capability and traits,
   ranks the survivors with an optional per-family `SelectionOracle` and
-  priority, and returns a callable. Selection accepts an objective (latency,
-  throughput, determinism, portability) and supports per-call `override=` plus
-  config-file overrides for development.
+  priority, and returns a callable. Selection supports per-call `solution=`
+  and `override=` plus config-file overrides for development.
 
 ### Directory structure
 
@@ -125,8 +124,7 @@ iteration.
   (FLOPs / bytes) per op family, tabular reports, and Proton integration.
 - `KernelBenchmarkHarness` — registration-level device timing through warmed
   graph replay, with raw samples, resolved registration metadata, and explicit
-  failure outcomes. The first operation-owned generator covers dense BF16
-  batched GEMM.
+  failure outcomes.
 - Runtime shape capture feeds replay and tuning workflows; `kernel_scope`
   scopes are visible in Proton/Chrome traces.
 - End-to-end serving: POST `/start_profile` with
@@ -143,8 +141,10 @@ iteration.
   traces with `tokenspeed merge-traces`.
 
 Registration-level benchmarks combine operation-owned input and correctness
-logic with graph-replay device timing. Pull request CI can compare compatible
-cases from the merge base and candidate revision. See the
+logic with graph-replay device timing. Each operation family and mode
+contributes one benchmark generator; suites reference them by family, mode,
+and parameters. Pull request CI compares compatible cases between the merge
+base and candidate revision. See the
 [benchmark documentation](benchmarks/README.md) for the harness and suite
 contract, and the [CI documentation](../test/ci/README.md#registration-level-kernel-benchmarks)
 for workflow behavior and runner requirements.
@@ -162,7 +162,7 @@ backends. See `tokenspeed_kernel/plugins/README.md`.
 from tokenspeed_kernel import (
     gated_residual_mix, gated_residual_combine, grouped_gemma_rmsnorm,
     mm,
-    moe_softmax_topk,
+    moe_topk,
     moe_route, moe_dispatch, moe_experts, moe_combine, moe_fused,
     ...
 )

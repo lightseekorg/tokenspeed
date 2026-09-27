@@ -188,9 +188,9 @@ if platform.is_nvidia:
 
         dispatcher = plan.get("_deepep_dispatcher")
         if dispatcher is None:
-            group = plan.get("deepep_group")
+            group = plan.get("process_group")
             if group is None:
-                raise ValueError("DeepEP MoE plan is missing deepep_group")
+                raise ValueError("DeepEP MoE plan is missing process_group")
             capacity = plan.get("deepep_low_latency_max_num_tokens_per_gpu")
             if not capacity:
                 raise ValueError(

@@ -21,13 +21,16 @@
 from __future__ import annotations
 
 import inspect
+from dataclasses import replace
+from functools import partial
 
 import pytest
+import tokenspeed_kernel.ops.attention.qsa as qsa_module
 import torch
 from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.selection import SelectedKernel, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_nvidia:
@@ -90,6 +93,7 @@ def test_qsa_sparse_attention_selects_fa2_fallback(
     traits = {
         "batch_size": 1,
         "q_len": 1,
+        "is_decode": True,
         "head_dim": 256,
         "value_head_dim": 256,
         "num_q_heads": 6,
@@ -123,6 +127,111 @@ def test_qsa_sparse_attention_selects_fa2_fallback(
         traits=traits,
     )
     assert fp8_kernel.name == "flashinfer_fa2_fp8_qsa_sparse_attention"
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("q_len", [1, 4])
+def test_qsa_sparse_attention_selects_cute_on_b200_and_b300(
+    b200_platform,
+    b300_platform,
+    cache_dtype: torch.dtype,
+    q_len: int,
+) -> None:
+    if not current_platform().is_nvidia:
+        pytest.skip("CuTe DSL QSA requires NVIDIA")
+    signature = format_signature(
+        q=dense_tensor_format(torch.bfloat16),
+        k_cache=dense_tensor_format(cache_dtype),
+        v_cache=dense_tensor_format(cache_dtype),
+    )
+    traits = {
+        "batch_size": 1,
+        "q_len": q_len,
+        "is_decode": True,
+        "head_dim": 256,
+        "value_head_dim": 256,
+        "num_q_heads": 6,
+        "num_kv_heads": 1,
+        "selected_width": 2051,
+    }
+    for platform in (b200_platform, b300_platform):
+        kernel = select_kernel(
+            "attention",
+            "qsa_sparse_attention",
+            signature,
+            features=None,
+            platform=platform,
+            traits=traits,
+            solution=None,
+            override=None,
+        )
+        assert kernel.name == "cute_dsl_blackwell_qsa_sparse_attention"
+
+    kernel = select_kernel(
+        "attention",
+        "qsa_sparse_attention",
+        signature,
+        features=None,
+        platform=replace(b300_platform, arch_version=ArchVersion(12, 0)),
+        traits=traits,
+        solution=None,
+        override=None,
+    )
+    assert kernel.name == (
+        "flashinfer_fa2_fp8_qsa_sparse_attention"
+        if cache_dtype is torch.float8_e4m3fn
+        else "flashinfer_fa2_qsa_sparse_attention"
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_seqlen_q", "expected_kernel"),
+    [
+        (None, "flashinfer_fa2_qsa_sparse_attention"),
+        (1, "cute_dsl_blackwell_qsa_sparse_attention"),
+        (4, "cute_dsl_blackwell_qsa_sparse_attention"),
+    ],
+)
+def test_qsa_sparse_attention_routes_prefill_and_uniform_decode(
+    monkeypatch,
+    b200_platform,
+    max_seqlen_q,
+    expected_kernel,
+) -> None:
+    if not current_platform().is_blackwell:
+        pytest.skip("real CuTe QSA registration requires a Blackwell host")
+    rows = 1 if max_seqlen_q is None else max_seqlen_q
+    q = torch.empty((rows, 6, 256), dtype=torch.bfloat16, device="cpu")
+    cache = torch.empty((16, 1, 256), dtype=torch.bfloat16, device="cpu")
+    slots = torch.ones((rows, 2051), dtype=torch.int32, device="cpu")
+
+    def run(kernel, *args, **kwargs):
+        assert kernel.name == expected_kernel
+        return q
+
+    monkeypatch.setattr(
+        qsa_module,
+        "select_kernel",
+        partial(
+            select_kernel,
+            features=None,
+            platform=b200_platform,
+        ),
+    )
+    monkeypatch.setattr(SelectedKernel, "__call__", run)
+    qsa_sparse_attention(
+        q,
+        cache,
+        cache,
+        slots,
+        scale=1 / 16,
+        max_seqlen_q=max_seqlen_q,
+        metadata_capacity_rows=None,
+        k_scale=None,
+        v_scale=None,
+        override=None,
+        solution=None,
+    )
 
 
 def test_qsa_sparse_attention_validates_uniform_query_length(device: str) -> None:
@@ -174,8 +283,10 @@ def test_qsa_sparse_attention_blackwell_cluster_matches_reference(
     kv_heads: int,
 ) -> None:
     platform = current_platform()
-    if platform.arch_version != ArchVersion(10, 0):
-        pytest.skip("cluster QSA sparse attention is specialized for NVIDIA SM100")
+    if platform.arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip(
+            "cluster QSA sparse attention is specialized for NVIDIA SM100 or SM103"
+        )
 
     torch.manual_seed(67 + rows)
     cache_slots, head_dim, width = 4096, 256, 2051
@@ -282,8 +393,8 @@ def test_qsa_sparse_attention_blackwell_preserves_other_head_dispatch(
     cache_dtype: torch.dtype,
 ) -> None:
     platform = current_platform()
-    if platform.arch_version != ArchVersion(10, 0):
-        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100")
+    if platform.arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
     selected_kernel = select_kernel(
         "attention",
         "qsa_sparse_attention",
@@ -311,8 +422,8 @@ def test_qsa_sparse_attention_blackwell_preserves_other_head_dispatch(
 
 
 def test_qsa_sparse_attention_blackwell_rejects_single_head_groups(device: str) -> None:
-    if current_platform().arch_version != ArchVersion(10, 0):
-        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100")
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import kernel
 
     q = torch.empty((1, 1, 256), dtype=torch.bfloat16, device=device)
@@ -328,6 +439,7 @@ def test_qsa_sparse_attention_blackwell_rejects_single_head_groups(device: str) 
             max_seqlen_q=1,
             k_scale=None,
             v_scale=None,
+            enable_pdl=False,
         )
 
 
@@ -340,8 +452,10 @@ def test_qsa_sparse_attention_blackwell_cluster_supports_graph_replay(
     kv_heads: int,
 ) -> None:
     platform = current_platform()
-    if platform.arch_version != ArchVersion(10, 0):
-        pytest.skip("cluster QSA sparse attention is specialized for NVIDIA SM100")
+    if platform.arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip(
+            "cluster QSA sparse attention is specialized for NVIDIA SM100 or SM103"
+        )
     if (
         KernelRegistry.get().get_by_name("cute_dsl_blackwell_qsa_sparse_attention")
         is None
@@ -461,8 +575,8 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
     kv_heads: int,
 ) -> None:
     """Exercise every compression phase, empty splits and tail-only attention."""
-    if current_platform().arch_version != ArchVersion(10, 0):
-        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100")
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
     torch.manual_seed(83)
     seq_len, page_size, num_pages = 65539, 256, 1024
     cache_slots = (num_pages + 1) * page_size
@@ -535,6 +649,108 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
 
 
 @pytest.mark.parametrize(
+    ("cache_dtype", "splits", "query_rows_per_cta"),
+    [
+        (torch.bfloat16, 4, 1),
+        (torch.bfloat16, 8, 1),
+        (torch.bfloat16, 16, 1),
+        (torch.float8_e4m3fn, 4, 1),
+        (torch.float8_e4m3fn, 8, 1),
+        (torch.float8_e4m3fn, 16, 1),
+        (torch.bfloat16, 1, 2),
+        (torch.bfloat16, 1, 4),
+    ],
+)
+def test_qsa_sparse_attention_blackwell_changed_kv_replay(
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+    cache_dtype: torch.dtype,
+    splits: int,
+    query_rows_per_cta: int,
+) -> None:
+    """KV staging and partial query tiles must observe changes on graph replay."""
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
+    import tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse as sparse_module
+
+    if (
+        splits == 16
+        and sparse_module._wide_cluster_capacity(torch.cuda.current_device()) == 0
+    ):
+        pytest.skip("the device cannot launch a sixteen-CTA cluster")
+
+    def select_config(
+        num_rows: int,
+        head_tiles_per_row: int,
+        bf16_kv: bool,
+        sm_count: int,
+        wide_cluster_capacity: int,
+    ) -> tuple[int, int, int, bool]:
+        del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
+        slots = 2 if splits == 1 else (3 if splits == 16 else 1)
+        return query_rows_per_cta, splits, slots, splits == 1
+
+    monkeypatch.setattr(sparse_module, "_select_launch_config", select_config)
+    torch.manual_seed(217 + splits)
+    rows, q_heads, kv_heads, cache_slots = 3, 24, 2, 4096
+    q = torch.randn(rows, q_heads, 512, device=device, dtype=torch.bfloat16)[..., ::2]
+    k_cache = (
+        torch.randn(cache_slots, kv_heads, 256, device=device, dtype=torch.bfloat16)
+        * 0.25
+    ).to(cache_dtype)
+    v_cache = (torch.randn_like(k_cache, dtype=torch.bfloat16) * 0.25).to(cache_dtype)
+    selected = torch.randint(
+        1, cache_slots, (rows, 4102), device=device, dtype=torch.int32
+    )[:, ::2]
+    selected[:, 7::11] = -1
+    selected[:, 9::17] = 0
+    selected[:, 19] = selected[:, 20]
+    selected[-1].fill_(-1)
+    v_cache[0].fill_(256)
+    kwargs = {
+        "scale": 1 / 16,
+        "max_seqlen_q": 1,
+        "metadata_capacity_rows": None,
+        "k_scale": 1.75,
+        "v_scale": 0.25,
+        "override": "cute_dsl_blackwell_qsa_sparse_attention",
+        "solution": None,
+    }
+    qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+    previous = output.clone()
+    for update in range(2):
+        # Keep query and indices fixed so the output change must come from KV.
+        k_cache.copy_(
+            (torch.randn_like(k_cache, dtype=torch.bfloat16) * 0.35).to(cache_dtype)
+        )
+        v_cache.copy_(
+            (
+                torch.randn_like(v_cache, dtype=torch.bfloat16) * 0.35
+                + 0.5 * (update + 1)
+            ).to(cache_dtype)
+        )
+        v_cache[0].fill_(256)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = _reference(q, k_cache, v_cache, selected, 1 / 16, 1.75, 0.25)
+        torch.testing.assert_close(output, expected, rtol=0.02, atol=0.002)
+        assert torch.isfinite(output).all()
+        assert not torch.equal(output[:-1], previous[:-1])
+        assert torch.count_nonzero(output[-1]).item() == 0
+        previous.copy_(output)
+    selected.fill_(-1)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(output).item() == 0
+
+
+@pytest.mark.parametrize(
     ("num_clusters", "capacity", "splits"),
     [(1, 7, 16), (7, 7, 16), (8, 7, 8), (1, 0, 8), (9, 7, 4)],
 )
@@ -543,19 +759,49 @@ def test_qsa_sparse_attention_blackwell_cluster_capacity(
     capacity: int,
     splits: int,
 ) -> None:
-    if current_platform().arch_version != ArchVersion(10, 0):
-        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100")
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("cluster QSA sparse attention requires NVIDIA SM100 or SM103")
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import _num_splits
 
     assert _num_splits(num_clusters, capacity) == splits
 
 
+@pytest.mark.parametrize(
+    ("rows", "head_tiles", "bf16", "sm_count", "expected"),
+    [
+        (32, 1, True, 152, (1, 4, 2, True)),
+        (64, 1, True, 152, (1, 2, 2, True)),
+        (128, 1, True, 152, (1, 1, 2, True)),
+        (256, 1, True, 152, (1, 1, 2, True)),
+        (512, 1, True, 152, (2, 1, 2, True)),
+        (513, 1, True, 152, (2, 1, 2, True)),
+        (128, 4, True, 152, (2, 1, 2, True)),
+        (512, 1, True, 80, (4, 1, 2, True)),
+        (512, 1, False, 152, (1, 4, 1, False)),
+    ],
+)
+def test_qsa_sparse_attention_blackwell_output_tiling(
+    rows: int,
+    head_tiles: int,
+    bf16: bool,
+    sm_count: int,
+    expected: tuple[int, int, int, bool],
+) -> None:
+    if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        pytest.skip("CTA tiling requires NVIDIA SM100 or SM103")
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import _select_launch_config
+
+    assert _select_launch_config(rows, head_tiles, bf16, sm_count, 7) == expected
+
+
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("rows", [1, 4])
+@pytest.mark.parametrize("is_prefill", [False, True])
 def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
     device: str,
     rows: int,
     cache_dtype: torch.dtype,
+    is_prefill: bool,
 ) -> None:
     platform = current_platform()
     if not platform.is_nvidia or platform.arch_version < ArchVersion(8, 0):
@@ -606,12 +852,12 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         v_cache,
         selected,
         scale=scale,
-        max_seqlen_q=(4 if rows == 4 else 1),
+        max_seqlen_q=None if is_prefill else (4 if rows == 4 else 1),
         metadata_capacity_rows=None,
         k_scale=k_scale,
         v_scale=v_scale,
         override=None,
-        solution="flashinfer",
+        solution=None if is_prefill else "flashinfer",
     )
     selected[:, :256] = torch.randint(
         1, cache_slots, (rows, 256), dtype=torch.int32, device=device
@@ -624,12 +870,12 @@ def test_qsa_sparse_attention_flashinfer_fa2_matches_reference_and_reuses_plan(
         v_cache,
         selected,
         scale=scale,
-        max_seqlen_q=(4 if rows == 4 else 1),
+        max_seqlen_q=None if is_prefill else (4 if rows == 4 else 1),
         metadata_capacity_rows=None,
         k_scale=k_scale,
         v_scale=v_scale,
         override=None,
-        solution="flashinfer",
+        solution=None if is_prefill else "flashinfer",
     )
 
     assert (
