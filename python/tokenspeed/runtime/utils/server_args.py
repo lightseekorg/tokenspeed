@@ -31,6 +31,10 @@ from typing import Literal
 from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.numerics import (
+    NUMERICS_ENVELOPES,
+    RL_BITWISE_SAMPLING_BACKENDS,
+)
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
@@ -795,16 +799,21 @@ class ServerArgs:
         ``rl-bitwise`` is the RL rollout contract: within one deployment the
         same request produces bitwise-identical tokens and logprobs across
         runs and regardless of batch composition. The umbrella only ever
-        tightens settings — a switch a user already set stays set — and each
-        derived switch remains individually available for auto mode.
+        tightens: it sets every switch it governs to its tight value and
+        refuses explicit choices it cannot tighten (a named MoE or sampling
+        backend without the guarantee). Each derived switch remains
+        individually available for auto mode. Whether the served model is
+        verified under the envelope is checked once its profile is known
+        (``require_verified_numerics``).
         Runs after ``resolve_communication`` so it can veto the fused
         all-reduce that resolver auto-enables.
         """
         if self.numerics == "auto":
             return
-        if self.numerics != "rl-bitwise":
+        if self.numerics not in NUMERICS_ENVELOPES:
             raise ValueError(
-                f"--numerics must be auto or rl-bitwise, got {self.numerics!r}"
+                f"--numerics must be one of {list(NUMERICS_ENVELOPES)}, got "
+                f"{self.numerics!r}"
             )
         # Collectives: rank-ordered NCCL instead of the symmetric-memory and
         # trtllm fused paths, and the all-reduce becomes an all-gather with a
@@ -819,11 +828,30 @@ class ServerArgs:
         self.disable_autotune = True
         self.disable_tf32 = True
         self.disable_pdl = True
-        # MoE: the batch-invariant grouped leaves. Only the auto default is
-        # folded; an explicitly chosen backend stands (and must then honour
-        # the contract itself).
+        # MoE: the batch-invariant grouped leaves. An explicitly chosen
+        # backend cannot honour the contract, so it is refused rather than
+        # kept (a draft left unset inherits the target's).
         if self.moe_backend == "auto":
             self.moe_backend = "aok"
+        elif self.moe_backend != "aok":
+            raise ValueError(
+                f"--numerics rl-bitwise needs the batch-invariant MoE solution "
+                f"'aok'; --moe-backend {self.moe_backend} makes no such claim"
+            )
+        if self.draft_moe_backend not in (None, "aok"):
+            raise ValueError(
+                f"--numerics rl-bitwise needs the batch-invariant MoE solution "
+                f"'aok'; --draft-moe-backend {self.draft_moe_backend} makes no "
+                "such claim"
+            )
+        # Sampling: greedy rows must break exact logit ties canonically.
+        if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
+            raise ValueError(
+                f"--numerics rl-bitwise needs a sampling backend with canonical "
+                f"greedy tie-breaking ({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); "
+                f"--sampling-backend {self.sampling_backend} resolves exact "
+                "ties in reduction order"
+            )
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -2179,7 +2207,7 @@ class ServerArgs:
         parser.add_argument(
             "--numerics",
             type=str,
-            choices=["auto", "rl-bitwise"],
+            choices=list(NUMERICS_ENVELOPES),
             default=ServerArgs.numerics,
             help="Numerics envelope. rl-bitwise folds the determinism "
             "switches (deterministic collectives, no autotune/TF32/PDL, no "

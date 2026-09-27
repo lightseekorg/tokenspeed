@@ -60,6 +60,7 @@ def _profile(**overrides) -> ModelProfile:
         request_token_history=True,
         tokenizer_kwargs={"fix_mistral_regex": True},
         attention_instances_per_layer=1,
+        numerics_envelopes=frozenset({"auto"}),
     )
     fields.update(overrides)
     return ModelProfile(**fields)
@@ -646,7 +647,7 @@ def test_attention_instances_per_layer_has_no_fallback() -> None:
         tokenizer_kwargs={},
     )
     with pytest.raises(TypeError, match="attention_instances_per_layer"):
-        ModelProfile(**fields)
+        ModelProfile(**fields, numerics_envelopes=frozenset({"auto"}))
 
 
 def test_loader_rejects_a_profile_from_another_architecture(
