@@ -19,7 +19,26 @@ env:
   TRITON_PTXAS_PATH: /usr/local/cuda-13.4/bin/ptxas
 install:
   - python3 -m pip install --break-system-packages pytest==9.1.1 pytest-xdist -r tokenspeed-kernel/python/requirements/cuda.txt -r tokenspeed-kernel/python/requirements/cuda-thirdparty.txt compressed-tensors pybase64 pyzmq pillow fastapi
-  - TOKENSPEED_KERNEL_BACKEND=cuda python3 tokenspeed-kernel/python/setup.py build_ext
+  - |
+    bash -ec '
+      export WORKSPACE="$PWD"
+      source test/ci_system/package_cache.sh
+      configure_package_cache
+      if ! command -v ccache >/dev/null 2>&1; then
+        archive=$(cache_remote_wheel \
+          https://github.com/ccache/ccache/releases/download/v4.14/ccache-4.14-linux-aarch64-musl-static.tar.gz \
+          2218884d62433c416d5bc33cabba3d8bf7a410bd94dc4950e2625ddbd1eafd1d)
+        mkdir -p "$WORKSPACE/.ccache-bin"
+        tar -xzf "$archive" -C "$WORKSPACE/.ccache-bin" --strip-components=1 \
+          ccache-4.14-linux-aarch64-musl-static/ccache
+        export PATH="$WORKSPACE/.ccache-bin:$PATH"
+      fi
+      configure_nvcc_cache
+      show_nvcc_cache_stats before
+      TOKENSPEED_KERNEL_BACKEND=cuda python3 tokenspeed-kernel/python/setup.py build_ext
+      show_nvcc_cache_stats after
+    '
+
 ut:
   commands:
     - python3 -c 'import torch; assert torch.cuda.get_device_capability() == (10, 7)'
