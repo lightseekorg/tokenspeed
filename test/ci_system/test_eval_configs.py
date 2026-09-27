@@ -206,18 +206,16 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert flag_value(eval_tokens, "--datasets") == "gsm8k"
         assert flag_value(eval_tokens, "--eval-batch-size") == "32"
         assert task["score_threshold"] == 0.90
+        # Both runners load weights from their shared Hugging Face cache.
+        assert "--download-dir" not in server_tokens
 
         if label == "b200-4gpu":
-            assert "--download-dir" not in server_tokens
             assert "--enable-expert-parallel" in server_tokens
             assert flag_value(server_tokens, "--moe-backend") == "mega_moe"
             # The NVIDIA gate exercises the split prefill graph (encoder and
             # decoder graphs around the eager narrowing layer).
             assert "--disable-prefill-graph" not in server_tokens
         else:
-            assert (
-                flag_value(server_tokens, "--download-dir") == "${PWD}/.hf-model-cache"
-            )
             assert "--enable-expert-parallel" not in server_tokens
             assert "--moe-backend" not in server_tokens
             # Not yet exercised on AMD; keep that gate on eager prefill.
