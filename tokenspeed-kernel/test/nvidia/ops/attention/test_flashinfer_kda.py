@@ -271,7 +271,19 @@ def test_registered_paths_and_refreshed_graph_indices(
         else torch.ones(rows, device="cuda", dtype=torch.bool)
     )
     actual, expected = run(conv, state, None), run(cref, sref, "triton")
-    assert selected[0].startswith("flashinfer_kda_recurrent_producer_")
+    if current_platform().arch_version in (ArchVersion(10, 0), ArchVersion(10, 3)):
+        expected_kernel = (
+            "flashinfer_kda_recurrent_producer_verify"
+            if frozen_state
+            else "flashinfer_kda_recurrent_producer_decode"
+        )
+    else:
+        expected_kernel = (
+            "triton_nvidia_kda_fused_paged_verify_no_store"
+            if frozen_state
+            else "triton_nvidia_kda_fused_paged_decode"
+        )
+    assert selected[0] == expected_kernel
     if frozen_state:
         for src, dst in zip((raw, fa, beta), payload):
             assert torch.equal(src.view(torch.int16), dst.view(torch.int16))

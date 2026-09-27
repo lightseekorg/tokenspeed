@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from inspect import signature
 from types import SimpleNamespace
 
@@ -22,7 +23,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     try_kda_fused_paged_verify,
     try_kda_replay_commit,
 )
-from tokenspeed_kernel.platform import Platform, current_platform
+from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
@@ -1623,7 +1624,9 @@ def test_verify_payload_capture_dispatch(monkeypatch, fused, provide):
             assert torch.equal(source, dest)
 
 
-@pytest.mark.parametrize("platform_fixture", ["b200_platform", "b300_platform"])
+@pytest.mark.parametrize(
+    "platform_fixture", ["b200_platform", "b300_platform", "unsupported_blackwell"]
+)
 @pytest.mark.parametrize("fi_available", [False, True])
 def test_kda_state_dtype_selects_compatible_backend(
     monkeypatch, request, platform_fixture, fi_available
@@ -1649,7 +1652,13 @@ def test_kda_state_dtype_selects_compatible_backend(
         adapter, "flashinfer_kda_recurrent_available", lambda: fi_available
     )
     runpy.run_path(registration.__file__)
-    platform = request.getfixturevalue(platform_fixture)
+    platform = (
+        replace(
+            request.getfixturevalue("b300_platform"), arch_version=ArchVersion(10, 7)
+        )
+        if platform_fixture == "unsupported_blackwell"
+        else request.getfixturevalue(platform_fixture)
+    )
     real_platform = Platform.get()
     try:
         Platform.override(platform)
@@ -1687,6 +1696,7 @@ def test_kda_state_dtype_selects_compatible_backend(
                 expected = (
                     f"flashinfer_kda_recurrent_producer_{'verify' if verify else 'decode'}"
                     if fi_available
+                    and platform.arch_version <= ArchVersion(10, 3)
                     and state_dtype == torch.bfloat16
                     and draft_token_num <= 16
                     else native
