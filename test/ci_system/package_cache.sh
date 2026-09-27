@@ -115,3 +115,26 @@ cache_remote_wheel() {
 
     printf '%s\n' "${cache_path}"
 }
+
+# A version alone cannot identify a wheel downloaded outside the package index.
+# pip records the installed archive hash in direct_url.json (PEP 610).
+installed_wheel_matches() {
+    python3 - "$@" <<'PYTHON'
+import json
+import sys
+from importlib import metadata
+
+try:
+    dist = metadata.distribution(sys.argv[1])
+    origin = json.loads(dist.read_text("direct_url.json") or "{}")
+    archive = origin["archive_info"]
+    digest = archive.get("hashes", {}).get("sha256")
+    if digest is None:
+        legacy_hash = archive.get("hash", "")
+        digest = legacy_hash[7:] if legacy_hash.startswith("sha256=") else None
+    matches = dist.version == sys.argv[2] and digest == sys.argv[3]
+except (metadata.PackageNotFoundError, ValueError, KeyError, TypeError, AttributeError):
+    matches = False
+sys.exit(0 if matches else 1)
+PYTHON
+}
