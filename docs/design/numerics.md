@@ -48,12 +48,15 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   ├── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
 │   │   NCCL_PROTO=Simple           size changes association order
 │   └── batch_invariant_collectives all-reduce = all-gather + fixed-rank-order
-│                                   fp32 fold; a ring all-reduce chunks by
-│                                   message size, so its per-element order is
-│                                   run-stable but not batch-size-invariant
-│                                   (world_size x traffic; the NVLS multimem
-│                                   in-switch reduction is the faster future
-│                                   citizen of this slot)
+│                                   fp32 fold, reduce-scatter (plain and
+│                                   token) = all-to-all + the same fold; a
+│                                   ring reduction chunks by message size, so
+│                                   its per-element order is run-stable but
+│                                   not batch-size-invariant (all-reduce pays
+│                                   world_size x traffic, reduce-scatter
+│                                   none; the NVLS multimem in-switch
+│                                   reduction is the faster future citizen of
+│                                   this slot)
 ├── sampling.deterministic          per-request Philox (seed=crc32(rid),
 │                                   offset=position) is run- and
 │                                   batch-invariant by construction; greedy
@@ -69,6 +72,12 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   ├── no split-KV attention       decode kernels whose split count scales
 │   │                               with batch/SM occupancy are excluded by
 │   │                               the batch_invariant feature
+│   ├── row-local top-k             the DSA indexer's selection resolves
+│   │                               equal scores toward the lowest candidate
+│   │                               within each row (dsa_*_topk
+│   │                               batch_invariant=True); the tuned top-k
+│   │                               kernels switch algorithm and CTA split
+│   │                               with the row count, which moves ties
 │   └── per-row GEMMs               fixed-order GEMM leaves (see aok below)
 ├── logprob.topology-invariant      (deferred) vocab-block fixed-tree
 │                                   log-softmax, TP-count-invariant

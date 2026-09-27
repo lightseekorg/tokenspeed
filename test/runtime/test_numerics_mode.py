@@ -90,6 +90,47 @@ class TestNumericsMode(unittest.TestCase):
         ordered_fold_sum(wide, wide_out)
         self.assertTrue(torch.equal(wide_out[300], out[2]))
 
+    def test_token_reduce_scatter_folds_each_slice_in_rank_order(self):
+        from unittest import mock
+
+        import torch
+
+        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+
+        group = (0, 1, 2)
+        counts = [2, 1, 3]
+        width = max(counts)
+        torch.manual_seed(3)
+        inputs = [torch.randn(sum(counts), 4) for _ in group]
+        offsets = [0, 2, 3]
+        padded = []
+        for full in inputs:
+            rows = torch.zeros(len(group) * width, 4)
+            for i, (offset, count) in enumerate(zip(offsets, counts)):
+                rows[i * width : i * width + count] = full[offset : offset + count]
+            padded.append(rows)
+
+        for rank in group:
+
+            def exchange(out, inp, grp, rank=rank):
+                out.copy_(
+                    torch.cat([p[rank * width : (rank + 1) * width] for p in padded])
+                )
+
+            backend = AutoBackend.__new__(AutoBackend)
+            backend._nccl = mock.Mock(all_to_all_single=exchange)
+            with mock.patch("torch.distributed.get_rank", return_value=rank):
+                got = backend._ordered_fold_token_reduce_scatter(
+                    inputs[rank], group, counts
+                )
+            expected = inputs[0][offsets[rank] : offsets[rank] + counts[rank]].clone()
+            for other in group[1:]:
+                expected = (
+                    expected
+                    + inputs[other][offsets[rank] : offsets[rank] + counts[rank]]
+                )
+            self.assertTrue(torch.equal(got, expected))
+
 
 class TestModelVerificationGate(unittest.TestCase):
     def _profile(self, envelopes):

@@ -2050,6 +2050,7 @@ def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) ->
         page_size=64,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k,
     )
 
@@ -2068,6 +2069,7 @@ def _attention_dsa_decode_topk_logical() -> object:
         page_size=64,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
         topk_layout="logical_offsets",
         block_table_base_offsets=torch.tensor([3, 5], dtype=torch.int32),
@@ -2095,6 +2097,7 @@ def _attention_dsa_prefill_topk(
         row_ends,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k,
         page_size=page_size,
         solution=solution,
@@ -2181,6 +2184,7 @@ def _attention_dsa_decode_topk_standard(
         page_size=64,
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k_cache,
         q_scales=q_scales,
     )
@@ -2210,6 +2214,7 @@ def _attention_dsa_prefill_topk_standard(
         torch.tensor([8, 16], dtype=torch.int32),
         topk=512,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=index_k_cache,
         page_size=64,
         q_scales=q_scales,
@@ -2255,6 +2260,7 @@ def test_dsa_topk_selection_receives_index_heads(
             page_size=64,
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=index_k_cache,
         )
     else:
@@ -2266,6 +2272,7 @@ def test_dsa_topk_selection_receives_index_heads(
             torch.tensor([1], dtype=torch.int32),
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=index_k_cache,
             page_size=64,
         )
@@ -2304,6 +2311,7 @@ def test_dsa_prefill_topk_forwards_cpu_candidate_lens_to_deep_gemm(
         torch.tensor([8, 16], dtype=torch.int32),
         topk=1,
         softmax_scale=1.0,
+        batch_invariant=False,
         index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
         page_size=64,
         candidate_lens_cpu=candidate_lens_cpu,
@@ -2396,6 +2404,7 @@ def test_dsa_topk_selection_receives_cache_layout(
             page_size=64,
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=cache,
         )
     else:
@@ -2407,6 +2416,7 @@ def test_dsa_topk_selection_receives_cache_layout(
             torch.tensor([1], dtype=torch.int32),
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             index_k_cache=cache,
             page_size=64,
         )
@@ -2431,6 +2441,7 @@ def test_dsa_prefill_topk_rejects_incomplete_workspace_rows(missing: str) -> Non
             torch.tensor([1], dtype=torch.int32),
             topk=1,
             softmax_scale=1.0,
+            batch_invariant=False,
             page_size=64,
             **inputs,
         )
