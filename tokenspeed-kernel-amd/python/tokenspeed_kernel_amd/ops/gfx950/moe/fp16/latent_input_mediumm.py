@@ -390,7 +390,7 @@ def gluon_latent_input_mediumm_gfx950(
             [BLOCK_M // (8 * num_warps), 8], [8, 8], [num_warps, 1], [1, 0]
         )
         gl.static_assert(
-            BLOCK_M >= 8 * num_warps and half_n == 8 * 8,
+            BLOCK_M % (8 * num_warps) == 0 and half_n == 8 * 8,
             "the SiTU store layout covers exactly one output tile",
         )
         # Round to BF16 first, matching the unfused projection's output.

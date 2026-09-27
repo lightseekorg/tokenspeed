@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import assert_no_triton_compile, is_cdna4
 
 pytest.importorskip(
     "tokenspeed_kernel_amd.ops.gfx950.moe.fp16",
@@ -145,6 +145,39 @@ def test_medium_routes_packed_projection_and_applies_situ(
     torch.testing.assert_close(actual[0], expected_router, atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(actual[1], expected_routed, atol=8e-3, rtol=8e-3)
     torch.testing.assert_close(actual[2], expected_shared, atol=1.5e-4, rtol=1e-3)
+
+
+@requires_cdna4
+@pytest.mark.parametrize("linear_beta", [None, 25.0])
+def test_medium_batch_sizes_do_not_recompile(linear_beta: float | None) -> None:
+    hidden_size = 7168
+    widths = (896, 3584, 1536)
+    packed = torch.zeros(
+        (sum(widths), hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
+    router_weight, routed_weight, shared_weight = packed.split(widths)
+    hidden = torch.zeros((1280, hidden_size), dtype=torch.bfloat16, device="cuda")
+
+    def launch(tokens: int) -> None:
+        latent_input_mediumm.launch_gluon_latent_input_mediumm_gfx950(
+            hidden[:tokens],
+            router_weight,
+            routed_weight,
+            shared_weight,
+            packed,
+            beta=4.0,
+            linear_beta=linear_beta,
+        )
+
+    # Warm both row tiles and both runtime integer alignment specializations.
+    for tokens in (336, 337, 656, 657):
+        launch(tokens)
+    with assert_no_triton_compile(
+        latent_input_mediumm.gluon_latent_input_mediumm_gfx950
+    ):
+        for tokens in (321, 383, 512, 639, 640, 641, 767, 768, 896, 1023, 1279, 1280):
+            launch(tokens)
+    torch.cuda.synchronize()
 
 
 @requires_cdna4

@@ -314,7 +314,9 @@ pipeline. The 128-row tile keeps the plain launch order and an unpipelined K
 tail, which measured faster on MI355X. Column tiles follow the packed output
 boundaries: router logits are stored as FP32, routed latents as BF16, and shared
 gate/up pairs apply SiTU in registers before writing the BF16 shared input. Tail
-rows are masked.
+rows are masked. Token count stays a runtime input; the two row tiles are the
+only batch-size-dependent compile-time choices. The no-recompile regression
+sweeps both ranges after warming each tile's aligned and unaligned token counts.
 
 The large path uses an eight-wave `256 x 256 x 64` double-buffered MFMA/LDS
 warp pipeline. Its 128-column accumulator halves route FP32 router and BF16
