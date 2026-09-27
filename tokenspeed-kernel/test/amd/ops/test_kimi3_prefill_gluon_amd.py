@@ -547,11 +547,13 @@ def test_attn_res_warmed_launch_variants_reuse_compilation():
 
     torch.manual_seed(1250)
     hidden, valid_blocks = 4096, 1
-    prefix = torch.randn(1000, hidden, device="cuda", dtype=torch.bfloat16)
-    blocks = torch.randn(
-        valid_blocks, 1000, hidden, device="cuda", dtype=torch.bfloat16
-    )
-    weight = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
+    # Keep the oracle and input generation outside the GPU simulator.
+    prefix_cpu = torch.randn(1000, hidden, dtype=torch.bfloat16)
+    blocks_cpu = torch.randn(valid_blocks, 1000, hidden, dtype=torch.bfloat16)
+    weight_cpu = torch.ones(hidden, dtype=torch.bfloat16)
+    prefix = prefix_cpu.to("cuda")
+    blocks = blocks_cpu.to("cuda")
+    weight = weight_cpu.to("cuda")
 
     def project(tokens):
         return attn_res_fwd(
@@ -572,13 +574,13 @@ def test_attn_res_warmed_launch_variants_reuse_compilation():
         for tokens in (2, 7, 128, 255, 256, 257, 1000):
             actual = project(tokens)
             expected = _attn_res_reference(
-                prefix[:tokens],
-                blocks[:, :tokens].transpose(0, 1),
-                weight,
-                weight,
-                weight,
+                prefix_cpu[:tokens],
+                blocks_cpu[:, :tokens].transpose(0, 1),
+                weight_cpu,
+                weight_cpu,
+                weight_cpu,
                 valid_blocks,
                 1e-6,
                 1e-6,
             )
-            torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
+            torch.testing.assert_close(actual.cpu(), expected, rtol=5e-3, atol=1.6e-2)
