@@ -150,6 +150,16 @@ These guarantees must be preserved; they are not missing APIs.
 
 Proposed hardening of that same loader:
 
+- Before loading either entry-point group, inspect metadata only (no
+  `ep.load()` or plugin imports). Reject duplicate names within each group,
+  including duplicates from the same distribution discovered on two paths.
+  A name shared across the runtime and kernel groups must belong to the same
+  distribution: compare PEP 503-canonicalized distribution names and versions,
+  and reject ambiguous or missing distribution metadata. Also reject multiple
+  discovered installations of the same distribution, even if versions differ.
+  Perform this validation before applying the disable set; disabling then
+  removes both halves of a validated pair without importing either one.
+
 - `ensure_loaded()` is idempotent per process. It first imports
   every built-in registry, including attention backends and model classes,
   before any plugin registration. Seeding must be idempotent and must not
@@ -237,8 +247,15 @@ Flash-Lite ships only `architectures`), and `get_config` must construct the
 plugin's config class before any other resolution can happen.
 `register_config` keys the class by `model_type` and by each architecture
 string; `hf_transformers_utils.get_config` consults the registry before the
-HF auto classes. Strict released-schema validation belongs in the config
-class itself, where constructor defaults would otherwise hide an omitted
+HF auto classes. The next contract scans every architecture alias in
+checkpoint order, together with an explicitly supplied `model_type`, before
+falling back. All matching registrations must identify the same config class;
+conflicting classes are an error, not a first-match choice. Unknown aliases
+are skipped, a checkpoint without `model_type` resolves through aliases alone,
+and HF fallback occurs only when no registration matches. A registered class
+wins over HF's class subject to the registration's explicit override policy;
+no implicit `"llama"` type is invented during plugin lookup. Strict
+released-schema validation belongs in the config class itself, where constructor defaults would otherwise hide an omitted
 field.
 
 **Attention families.** No `AttentionFamilySpec` registry: a registered
@@ -523,6 +540,25 @@ Profile field contracts:
   depth, not target hidden layers or capture taps. Cache recipes remain the
   authority on target sharing versus independent draft storage: a shared
   draft contributes no extra independent cache layers.
+- The resolved layout must reach model construction, not just cache setup.
+  Extend the plugin/migrated model constructor with required
+  `cache_layout: CacheLayerLayout` and `cache_layer_window: tuple[int, int]`
+  keyword inputs. `_initialize_model` supplies the finalized object from
+  `ModelConfig` and the already-resolved local cache window alongside config,
+  mapping and quantization. Compute that logical window from the layout and
+  PP execution partition before constructing models; it needs no arena,
+  memory profiling or loaded weights. Cache construction later consumes the
+  same window. The value is the layout, never the profile's callable. Model wrappers forward both unchanged; each attention module
+  takes its model-side cache-layer ID from the supplied hidden-layer/branch entry
+  and validates that it belongs to the supplied window. Do not rederive IDs
+  with multipliers, mutate `hf_config`, or rebuild stage windows in the model.
+  A draft receives its own side-local resolved layout. The recipe later
+  binds those logical IDs to independent draft fields or target-owned fields;
+  shared drafts allocate no independent storage. Constructors do not require
+  the physical cache binding before the existing cache-construction phase. This constructor change is part of the version-2 contract;
+  migrate each in-tree constructor explicitly rather than silently dropping
+  the keywords. Extend PP tests to compare IDs actually assigned to model
+  attention modules against the cache ownership plan.
 - PP remains owned by `pp_stage_windows`: it partitions target hidden-layer
   IDs, then the common model/cache boundary concatenates the corresponding
   layout entries to obtain each stage's cache-ID window. It validates complete,
@@ -604,7 +640,17 @@ migration.
 ### P4. Kernel side
 
 The runtime integration requires strict kernel discovery as specified in P1
-and shared disable handling before discovery. Other kernel selection
+and shared disable handling before discovery. The future kernel contract
+also makes `priority` a required keyword of `register_kernel`, removing its
+current `Priority.PERFORMANT + 2` default. Migrate existing in-tree calls to
+explicit values equal to their current effective priorities; this RFC does
+not itself change that API. Plugin examples must state their priorities.
+A replacement uses a value strictly above the matching candidate it intends
+to replace, in the `Priority.PLUGIN` band. Reject equal-priority competing
+plugin registrations for overlapping capability/signature/trait domains,
+rather than choosing by discovery order. Disjoint vendor candidates may use
+the same priority, as below. Capability and trait filtering still applies;
+priority never makes an unsupported kernel eligible. Other kernel selection
 mechanisms remain unchanged. Three clarifications become documentation:
 
 - The runtime calls `discover_plugins()` (via `ensure_loaded()`), which the
@@ -693,7 +739,7 @@ def register() -> None:
 ```python
 # my_plugin/kernels/__init__.py
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, current_platform
-from tokenspeed_kernel.registry import register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 
 from my_plugin.kernels.foo import FOO_SIGNATURES
 
@@ -709,6 +755,7 @@ def register() -> None:
 
         register_kernel(
             "my_plugin", "foo", name="cute_my_plugin_foo", solution="cute",
+            priority=Priority.PLUGIN,
             capability=CapabilityRequirement(
                 vendors=frozenset({"nvidia"}), min_arch_version=ArchVersion(9, 0)
             ),
@@ -719,6 +766,7 @@ def register() -> None:
 
         register_kernel(
             "my_plugin", "foo", name="torch_npu_my_plugin_foo", solution="torch_npu",
+            priority=Priority.PLUGIN,
             capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
             signatures=FOO_SIGNATURES, traits=_ASCEND_OPTIONS,
         )(ascend_foo)
@@ -824,6 +872,11 @@ plugin exists. Three measures:
    composition with explicit leaf selection on target and draft views. Cover
    identity and hybrid composition, config-less draft construction, arena
    rebinding without duplicate wrappers, and eager/graph lifecycle forwarding.
+   Add model-constructor layout forwarding and actual attention-ID checks;
+   duplicate/cross-distribution entry-point rejection without imports;
+   non-first config aliases, conflicting aliases/types and HF fallback; and
+   explicit kernel priority, replacement of a specialized candidate, equal
+   priority ambiguity and disjoint-vendor registration cases.
    Negative cases must fail
    startup before any request can run.
 3. **Exact pins.** Plugins pin `tokenspeed` and `tokenspeed_kernel` exactly,
@@ -853,14 +906,16 @@ tests and documentation before it is independently mergeable.
 
 1. **Harden the existing plugin contract.** Keep the current discovery and
    registrations; add strict kernel/runtime failure handling, shared disable
-   policy and explicit registration arguments. Introduce the next profile
+   policy, entry-point identity validation, all-alias config lookup and explicit
+   runtime/kernel registration arguments. Introduce the next profile
    schema, forced target/draft backend selection and common PD-role checks.
    Preserve geometry initialization, tokenizer transport and token-history
    behavior already implemented. Replace the multiplicity field with the
    late layout resolver and derive counts and PP cache windows from its one
    layout, after checkpoint metadata is available. Add the typed config and
    composition factories at the common construction points above, preserving
-   specialized components, DSpark's config-less draft and model results. Draft
+   specialized components, DSpark's config-less draft and model results. Pass
+   finalized cache layouts and bindings to model constructors in this phase. Draft
    mappings/target sets are explicit but unused until phase 2. These breaking
    changes bump `PLUGIN_API_VERSION` to 2 together with plugin migrations;
    API-1 packages are not silently interpreted as API-2 declarations. Begin
