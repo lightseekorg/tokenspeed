@@ -1285,7 +1285,9 @@ def _compressor_pool(
     NORM,
     EPS: tl.constexpr,
     HAS_NORM: tl.constexpr,
-    N: tl.constexpr,
+    # The row count is the forward's token count; a constexpr here would
+    # recompile the kernel for every new prefill length.
+    N,
     C0: tl.constexpr,
     C1: tl.constexpr,
     G0: tl.constexpr,
