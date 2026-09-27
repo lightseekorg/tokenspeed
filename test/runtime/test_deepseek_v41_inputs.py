@@ -256,7 +256,9 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         "ngram_accepted_tokens",
         "ngram_needs_seed",
         "ngram_request_ids",
+        "request_token_history_ids",
     }
+    assert not runtime.has_request_token_history
     assert runtime.ngram_accepted_tokens.shape == (6, 3)
     assert runtime.ngram_accepted_tokens[2].tolist() == [18, 17, 16]
 
@@ -737,7 +739,8 @@ def test_executor_input_capacity_covers_decode_capture(
         mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
         model=SimpleNamespace(get_ngram_hash_parameters=lambda: _hash_params("cpu")),
         model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(engram_layer_ids=[1], ngram_context_len=3)
+            hf_text_config=SimpleNamespace(engram_layer_ids=[1], ngram_context_len=3),
+            requires_request_token_history=False,
         ),
     )
     unsupported = pp_size != 1 or depth > 1
@@ -766,7 +769,7 @@ def test_executor_input_capacity_covers_decode_capture(
     [ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.MIXED, ForwardMode.IDLE],
 )
 def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
-    ib, _ = buffers
+    ib, runtime = buffers
     num_tokens = 0 if mode == ForwardMode.IDLE else 2
 
     class Model:
@@ -781,6 +784,7 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.model_runner = runner
     executor.input_buffers = ib
+    executor.runtime_states = runtime
     executor.config = SimpleNamespace(
         model_is_mrope=False, pp_size=1, data_parallel_size=1
     )
@@ -805,7 +809,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     buffers, monkeypatch, context_len, lengths
 ):
     """Run the startup forward, not just its serving-path counterpart."""
-    ib, _ = buffers
+    ib, runtime = buffers
     num_tokens = min(7, context_len * 2)
     bs = len(lengths)
     events = []
@@ -881,6 +885,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         device=ib.device,
     )
     executor.input_buffers = ib
+    executor.runtime_states = runtime
     executor.model_runner = runner
     executor.drafter = None
     pg = PrefillGraph.__new__(PrefillGraph)
@@ -906,7 +911,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         model_executor.dist, "barrier", lambda: events.append("barrier")
     )
 
-    executor._autotune()
+    executor.autotune()
 
     assert (ib.ngram_previous_tokens_buf == -1).all()
     assert not ib.ngram_token_mask_buf.any()
@@ -1082,6 +1087,7 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         grammar_inputs=None,
         multimodal_context=None,
         ngram_inputs=snapshot,
+        request_history_seeds=None,
     )
     pending = handle._submit_forward(planned, capture_next_input_ids=False)
     states["a"].prompt_input_ids.clear()
@@ -1149,6 +1155,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
     config = SimpleNamespace(
         dtype=torch.bfloat16,
         hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"]),
+        tokenizer_kwargs={},
     )
     result = WeightLoader.load_model(
         model_config=config,

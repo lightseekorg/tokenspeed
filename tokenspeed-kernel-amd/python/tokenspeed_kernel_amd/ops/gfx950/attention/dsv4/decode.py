@@ -28,7 +28,7 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
 __all__ = [
-    "gluon_dsv4_decode_split_gfx950",
+    "launch_gluon_dsv4_decode_split_gfx950",
 ]
 
 
@@ -93,7 +93,7 @@ def _load_page_planar_tile(
 
 
 @gluon.jit
-def _dsv4_paged_split_stage_kernel(
+def gluon_dsv4_decode_split_gfx950(
     q,
     swa_cache_u8,
     swa_cache_fp8,
@@ -376,7 +376,7 @@ def _dsv4_paged_split_stage_kernel(
 
 
 @gluon.jit
-def _dsv4_paged_split_reduce_kernel(
+def gluon_dsv4_decode_split_reduce_gfx950(
     partial_out,
     partial_lse,
     attn_sink,
@@ -626,7 +626,7 @@ def _validate_paged_attention_inputs(
     return output, has_extra, scale
 
 
-def gluon_dsv4_decode_split_gfx950(
+def launch_gluon_dsv4_decode_split_gfx950(
     q: torch.Tensor,
     swa_kv_cache: torch.Tensor,
     swa_slots: torch.Tensor,
@@ -711,7 +711,7 @@ def gluon_dsv4_decode_split_gfx950(
         dtype=torch.float32,
         device=q.device,
     )
-    _dsv4_paged_split_stage_kernel[(tokens, num_heads // 16, 18)](
+    gluon_dsv4_decode_split_gfx950[(tokens, num_heads // 16, 18)](
         q,
         swa_kv_cache,
         swa_kv_cache.view(torch.float8_e4m3fn),
@@ -750,7 +750,7 @@ def gluon_dsv4_decode_split_gfx950(
         num_stages=1,
         waves_per_eu=1,
     )
-    _dsv4_paged_split_reduce_kernel[(tokens, num_heads)](
+    gluon_dsv4_decode_split_reduce_gfx950[(tokens, num_heads)](
         partial_out,
         partial_lse,
         attn_sink,

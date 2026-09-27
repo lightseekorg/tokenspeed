@@ -88,8 +88,8 @@ __all__ = ["cutedsl_kda_chunk_prefill", "cutedsl_kda_supported"]
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={
-        "recurrent_layout": frozenset({"v_major"}),
         "prefill_capacity": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
     },
 )
 def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:

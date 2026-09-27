@@ -91,6 +91,24 @@ std::vector<std::int32_t> RealPages(const std::vector<std::vector<std::int32_t>>
     return out;
 }
 
+void ExpectDecodeWorkingState(const Scheduler& scheduler, const ForwardBatch& batch, std::int32_t computed_tokens,
+                              std::int32_t prefix_granularity, std::int32_t usable_blocks) {
+    ASSERT_EQ(batch.request_ids, std::vector<std::string>{"parent"});
+    const auto& state = batch.block_tables.at("state").at(0);
+    const std::int32_t input_slot = (computed_tokens - 1) / prefix_granularity;
+    ASSERT_GT(state.size(), static_cast<std::size_t>(input_slot));
+    for (std::int32_t slot = 0; slot < input_slot; ++slot) {
+        EXPECT_EQ(state[slot], 0) << "expired state at the exact accepted frontier: " << slot;
+    }
+    EXPECT_GT(state[input_slot], 0) << "the next forward still needs its input state";
+    for (const std::int32_t page : batch.block_tables.at("full").at(0)) {
+        EXPECT_GT(page, 0) << "full-history pages never expire";
+    }
+    // These prompts are shorter than P, so there is no retained prefill
+    // state. Once its table reference expires, a working state frees outright.
+    EXPECT_EQ(usable_blocks - scheduler.EmptyLcmBlocks(), scheduler.ActiveLcmBlocks());
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -244,7 +262,7 @@ TEST_F(MambaStateCheckpointSuite, BatchesFinalExtentInOneForward) {
     }
 }
 
-TEST(MambaStateCheckpointTest, PublishesAlignedDecodeEndpointUnderWideVerify) {
+TEST(MambaStateCheckpointTest, KeepsAlignedDecodeEndpointWorkingOnlyUnderWideVerify) {
     for (const std::int32_t depth : {0, 1}) {
         for (const bool lands_on_boundary : {false, true}) {
             SCOPED_TRACE(::testing::Message() << "depth=" << depth << " aligned=" << lands_on_boundary);
@@ -261,6 +279,7 @@ TEST(MambaStateCheckpointTest, PublishesAlignedDecodeEndpointUnderWideVerify) {
                 MakeGroup("full", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0),
                 MakeGroup("state", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0)};
             Scheduler scheduler{cfg};
+            const std::int32_t initially_empty = scheduler.EmptyLcmBlocks();
             std::vector<std::int32_t> tokens(124, 1);
             scheduler.SubmitRequests({RequestSpec{.request_id = "parent", .tokens = tokens, .max_new_tokens = 64}});
             auto feedback = [&](std::vector<std::int32_t> output, bool decode) {
@@ -286,35 +305,36 @@ TEST(MambaStateCheckpointTest, PublishesAlignedDecodeEndpointUnderWideVerify) {
             finish.With(forward::Finish{.request_id = "parent"});
             scheduler.Advance(std::move(finish));
             scheduler.NextExecutionPlan();
+            EXPECT_EQ(scheduler.EmptyLcmBlocks(),
+                      initially_empty - (static_cast<std::int32_t>(tokens.size()) - 1) / cfg.prefix_granularity)
+                << "Finish retains complete history pages, but no generated state";
             tokens.insert(tokens.end(), 11, 4);
             scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
             const ExecutionPlan resumed = scheduler.NextExecutionPlan();
             const ForwardBatch* batch = FindForwardBatch(resumed);
             ASSERT_NE(batch, nullptr);
-            EXPECT_EQ(batch->extend_prefix_lens.at(0), lands_on_boundary ? 128 : 0);
+            EXPECT_EQ(batch->extend_prefix_lens.at(0), 0);
         }
     }
 }
 
-TEST(MambaStateCheckpointTest, PublishesEveryAlignedDecodeEndpoint) {
+TEST(MambaStateCheckpointTest, ReclaimsWorkingStateAtExactAcceptedFrontier) {
     struct Case {
         std::int32_t width;
         std::vector<std::int32_t> accepted_counts;
         std::int32_t shared_tokens;
-        std::int32_t expected_hit;
     };
-    // P=4. Each accepted endpoint that lands on a boundary wrote that state;
-    // a boundary merely crossed by a wide verify window did not.
+    // P=4. Aligned and crossed decode boundaries both remain working-only.
+    // Reclamation still uses the exact accepted frontier, not verify width.
     const std::vector<Case> cases{
-        {4, {1, 4, 1}, 4, 4},        {3, {1, 1, 3, 1}, 4, 4}, {12, {1, 4, 4, 12}, 4, 4}, {12, {1, 4, 4, 12}, 8, 8},
-        {12, {1, 4, 4, 12}, 12, 12}, {12, {2, 3, 12}, 4, 0},  // crossed S_4, but never wrote it
+        {4, {1, 4, 1}, 4},      {3, {1, 1, 3, 1}, 4},    {12, {1, 4, 4, 12}, 4},
+        {12, {1, 4, 4, 12}, 8}, {12, {1, 4, 4, 12}, 12}, {12, {2, 3, 12}, 4},
     };
     for (const std::int32_t depth : {0, 1}) {
         for (const bool finish_parent : {false, true}) {
             for (const Case& test : cases) {
-                SCOPED_TRACE(::testing::Message()
-                             << "depth=" << depth << " finish=" << finish_parent << " width=" << test.width
-                             << " shared=" << test.shared_tokens << " expected=" << test.expected_hit);
+                SCOPED_TRACE(::testing::Message() << "depth=" << depth << " finish=" << finish_parent
+                                                  << " width=" << test.width << " shared=" << test.shared_tokens);
                 SchedulerConfig cfg{};
                 cfg.prefix_granularity = 4;
                 cfg.max_scheduled_tokens = 256;
@@ -353,7 +373,17 @@ TEST(MambaStateCheckpointTest, PublishesEveryAlignedDecodeEndpoint) {
                     finish.With(forward::Finish{.request_id = "parent"});
                     scheduler.Advance(std::move(finish));
                 }
-                scheduler.NextExecutionPlan();
+                const ExecutionPlan after_feedback = scheduler.NextExecutionPlan();
+                if (!finish_parent) {
+                    const ForwardBatch* current = FindForwardBatch(after_feedback);
+                    ASSERT_NE(current, nullptr);
+                    ExpectDecodeWorkingState(scheduler, *current, static_cast<std::int32_t>(tokens.size()) - 1,
+                                             cfg.prefix_granularity, cfg.device_allocator.NumUsableBlocks());
+                } else {
+                    EXPECT_EQ(scheduler.EmptyLcmBlocks(),
+                              cfg.device_allocator.NumUsableBlocks() -
+                                  (static_cast<std::int32_t>(tokens.size()) - 1) / cfg.prefix_granularity);
+                }
                 // Diverge immediately after the boundary under test: reusing
                 // the whole prefix could hide its loss behind a newer hit.
                 tokens.resize(test.shared_tokens);
@@ -364,67 +394,82 @@ TEST(MambaStateCheckpointTest, PublishesEveryAlignedDecodeEndpoint) {
                 ASSERT_NE(batch, nullptr);
                 const auto it = std::ranges::find(batch->request_ids, "resume");
                 ASSERT_NE(it, batch->request_ids.end());
-                EXPECT_EQ(batch->extend_prefix_lens.at(it - batch->request_ids.begin()), test.expected_hit);
+                EXPECT_EQ(batch->extend_prefix_lens.at(it - batch->request_ids.begin()), 0);
             }
         }
     }
 }
 
-TEST(MambaStateCheckpointTest, PublishesEveryEndpointLandedSinceLastAdmission) {
+TEST(MambaStateCheckpointTest, BackToBackResultsPublishExactHistoryButNoDecodeState) {
     // Overlap plans step k+1 before step k's result lands, so two results can
     // land back to back before the request's next admission. Both endpoints
-    // (4 and 8) wrote their state; both must publish once their pages hash.
-    for (const bool finish_parent : {false, true}) {
-        for (const std::int32_t shared : {4, 8}) {
-            SCOPED_TRACE(::testing::Message() << "finish=" << finish_parent << " shared=" << shared);
-            SchedulerConfig cfg{};
-            cfg.prefix_granularity = 4;
-            cfg.max_scheduled_tokens = 256;
-            cfg.max_batch_size = 2;
-            cfg.decode_input_tokens = 4;
-            cfg.overlap_schedule_depth = 1;
-            cfg.disable_l2_cache = true;
-            cfg.disable_prefix_cache = false;
-            cfg.device_allocator.total_pages = 128;
-            cfg.cache_groups = {
-                MakeGroup("full", 4, 128, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0),
-                MakeGroup("state", 4, 128, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0)};
-            Scheduler scheduler{cfg};
-            std::vector<std::int32_t> tokens(3, 1);
-            scheduler.SubmitRequests({RequestSpec{.request_id = "parent", .tokens = tokens, .max_new_tokens = 128}});
-            auto feedback = [&](std::int32_t count, bool decode) {
-                const std::vector<std::int32_t> output(count, 2);
-                tokens.insert(tokens.end(), output.begin(), output.end());
-                ExecutionEvent done;
-                done.With(forward::ExtendResult{.request_id = "parent", .tokens = output});
-                if (decode) {
-                    done.With(forward::UpdateReserveNumTokens{.request_id = "parent",
-                                                              .reserve_num_tokens_in_next_schedule_event = count});
+    // (4 and 8) must advance history hashing before the next admission,
+    // but neither state becomes reusable. A full-history-only control makes
+    // a lagging frontier observable even though the stateful hit is zero.
+    for (const bool with_state : {false, true}) {
+        for (const bool finish_parent : {false, true}) {
+            for (const std::int32_t shared : {4, 8}) {
+                SCOPED_TRACE(::testing::Message()
+                             << "state=" << with_state << " finish=" << finish_parent << " shared=" << shared);
+                SchedulerConfig cfg{};
+                cfg.prefix_granularity = 4;
+                cfg.max_scheduled_tokens = 256;
+                cfg.max_batch_size = 2;
+                cfg.decode_input_tokens = 4;
+                cfg.overlap_schedule_depth = 1;
+                cfg.disable_l2_cache = true;
+                cfg.disable_prefix_cache = false;
+                cfg.device_allocator.total_pages = 128;
+                cfg.cache_groups = {
+                    MakeGroup("full", 4, 128, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0)};
+                if (with_state) {
+                    cfg.cache_groups.push_back(MakeGroup("state", 4, 128, CacheGroupConfig::Retention::FullHistory,
+                                                         CacheGroupFamily::State, 0));
                 }
-                scheduler.Advance(std::move(done));
-            };
-            ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
-            feedback(1, false);
-            // Two decode steps planned back to back, then both results land.
-            ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
-            ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
-            feedback(1, true);  // endpoint 4
-            feedback(4, true);  // endpoint 8
-            if (finish_parent) {
-                ExecutionEvent finish;
-                finish.With(forward::Finish{.request_id = "parent"});
-                scheduler.Advance(std::move(finish));
+                Scheduler scheduler{cfg};
+                std::vector<std::int32_t> tokens(3, 1);
+                scheduler.SubmitRequests(
+                    {RequestSpec{.request_id = "parent", .tokens = tokens, .max_new_tokens = 128}});
+                auto feedback = [&](std::int32_t count, bool decode) {
+                    const std::vector<std::int32_t> output(count, 2);
+                    tokens.insert(tokens.end(), output.begin(), output.end());
+                    ExecutionEvent done;
+                    done.With(forward::ExtendResult{.request_id = "parent", .tokens = output});
+                    if (decode) {
+                        done.With(forward::UpdateReserveNumTokens{.request_id = "parent",
+                                                                  .reserve_num_tokens_in_next_schedule_event = count});
+                    }
+                    scheduler.Advance(std::move(done));
+                };
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                feedback(1, false);
+                // Two decode steps planned back to back, then both results land.
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                feedback(1, true);  // endpoint 4
+                feedback(4, true);  // endpoint 8
+                if (finish_parent) {
+                    ExecutionEvent finish;
+                    finish.With(forward::Finish{.request_id = "parent"});
+                    scheduler.Advance(std::move(finish));
+                }
+                const ExecutionPlan after_feedback = scheduler.NextExecutionPlan();
+                if (with_state && !finish_parent) {
+                    const ForwardBatch* current = FindForwardBatch(after_feedback);
+                    ASSERT_NE(current, nullptr);
+                    ExpectDecodeWorkingState(scheduler, *current, 8, cfg.prefix_granularity,
+                                             cfg.device_allocator.NumUsableBlocks());
+                }
+                tokens.resize(shared);
+                tokens.insert(tokens.end(), 4, 99);
+                scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
+                const ExecutionPlan resumed = scheduler.NextExecutionPlan();
+                const ForwardBatch* batch = FindForwardBatch(resumed);
+                ASSERT_NE(batch, nullptr);
+                const auto it = std::ranges::find(batch->request_ids, "resume");
+                ASSERT_NE(it, batch->request_ids.end());
+                EXPECT_EQ(batch->extend_prefix_lens.at(it - batch->request_ids.begin()), with_state ? 0 : shared);
             }
-            scheduler.NextExecutionPlan();
-            tokens.resize(shared);
-            tokens.insert(tokens.end(), 4, 99);
-            scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
-            const ExecutionPlan resumed = scheduler.NextExecutionPlan();
-            const ForwardBatch* batch = FindForwardBatch(resumed);
-            ASSERT_NE(batch, nullptr);
-            const auto it = std::ranges::find(batch->request_ids, "resume");
-            ASSERT_NE(it, batch->request_ids.end());
-            EXPECT_EQ(batch->extend_prefix_lens.at(it - batch->request_ids.begin()), shared);
         }
     }
 }
@@ -2954,15 +2999,21 @@ TEST_F(RetractStateGroupSuite, StateGroupRequestRetractsCleanly) {
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
-TEST(CacheProgressTest, StateBoundariesRecordAtLandingAndSurviveFailedAdmission) {
+TEST(CacheProgressTest, PrefillBoundariesSurviveFeedbackAndFailedAdmission) {
     TokenContainer tokens{{1, 1, 1}};
     fsm::ForwardResources resources{.token_container = &tokens, .prefix_granularity = 4};
-    // Results landing before the next admission each record their exact
-    // endpoint: 4, 8 (crossing 12 proves nothing), 16; an empty intermediate
-    // chunk records nothing.
+    // Only scheduled prefill provenance supplies reusable boundaries.
+    // Exercise duplicate and unaligned rejection independently of feedback.
+    for (const std::int32_t boundary : {4, 4, 8, 13, 16}) {
+        resources.cache_progress.RecordMaterializedStateBoundary(boundary, 4);
+    }
+    // Back-to-back results land at 4, 8, 13 and 16, but must neither add
+    // decode checkpoints nor consume the scheduled prefill evidence.
     for (const std::int32_t count : {1, 1, 4, 5, 3, 0}) {
         resources.ExtendTokens(std::vector<std::int32_t>(count, 2));
     }
+    EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{4, 8, 16}));
+    resources.ExtendTokens(std::vector<std::int32_t>(4, 2));  // aligned decode endpoint 20
     EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{4, 8, 16}));
 
     // Two state pages per prefix interval: only the interval's endpoint page
@@ -2985,7 +3036,7 @@ TEST(CacheProgressTest, StateBoundariesRecordAtLandingAndSurviveFailedAdmission)
             CompletedPages{
                 .prefix_hashes = staged.prefix_hashes,
                 .first_new_prefix_page = 0,
-                .boundary_kind = CacheBoundaryKind::kChunk,
+                .boundary_kind = CacheBoundaryKind::kEndpoint,
                 .materialized_state_boundaries = staged.materialized_state_boundaries,
             },
         .num_computed_tokens = 13,

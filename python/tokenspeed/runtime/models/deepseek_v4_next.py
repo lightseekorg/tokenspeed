@@ -50,7 +50,6 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v4 import (
     DeepseekV4Compressor,
     DeepseekV4DecoderLayer,
-    DeepseekV4MegaMoEExperts,
     hc_head,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -582,8 +581,6 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
         for module in self.modules():
             if isinstance(module, DeepseekV4Compressor):
                 module.process_weights_after_loading()
-            elif isinstance(module, DeepseekV4MegaMoEExperts):
-                module.finalize_weights()
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
 

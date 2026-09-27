@@ -213,22 +213,31 @@ skipped intermediate checkpoints as null holes (`0`). State consumers may gather
 input/output slots; compacting the row or publishing an unwritten intermediate
 checkpoint would break position identity.
 
-Publication requires provenance, not just an allocated block or completed hash.
-The request's cache progress keeps every aligned boundary whose state is
-written but not yet hashed: the checkpoint a scheduled prefill materializes
-(carried through the same ordered-forward contract as its token progress) and
-each accepted endpoint a landed result stops on. Verification commits only its
-accepted endpoint; a boundary it crosses proves nothing and is never recorded.
-Admission, finish and retraction pass the list to the coordinator, which
-publishes each recorded boundary inside the newly hashed range and no other —
-several in one admission when the overlap schedule lands two results back to
-back — before retention can reclaim the slot. Entries leave the list only after
-the admission that hashed them succeeds, so a failed attempt retries. The
-hashed range comes from `Request::NumComputedTokens()`, which is exact under
-any verify width ([Scheduler §5](scheduler.md#5-invariants-a-change-must-preserve)),
-so an aligned accepted endpoint is hashed by the very next admission rather
-than after a lag of up to the verify width. Remote endpoint-only landings do
-not claim an internal prefill checkpoint, only their endpoint when aligned.
+Computed state publication requires an Endpoint or Promoted boundary and
+checkpoint provenance at that exact prefix boundary. Scheduled local prefill
+records its last aligned checkpoint; endpoint-only PD records only an aligned
+final state, not an earlier internal checkpoint. The coordinator publishes
+only recorded boundaries covered by the newly hashed range. A successful
+admission discards those records; a failed one leaves them for retry.
+Allocated slots and completed hashes alone are not proof.
+
+Ordinary computed Chunks have no prefix-index reference and do not stream to
+Host. Their working references follow normal block-table reclamation.
+Newly completed prefill boundaries at the prompt's last aligned checkpoint
+are classified as Endpoint, unless already Promoted, including before a short
+final tail. A step with no newly completed hash does not reclassify a boundary.
+`PrefillDone` can publish pending prefill state before decode or PD handoff;
+decode itself records and publishes no state checkpoints. History publication
+and working-state retention use the exact `Request::NumComputedTokens()`
+frontier under every verify width
+([Scheduler §5](scheduler.md#5-invariants-a-change-must-preserve)).
+
+Host restores still use `CacheFullBlocks` and may register `kChunk` entries.
+All cached checkpoints remain subject to ordinary capacity eviction; Endpoint
+does not pin storage. Allocation, reservations and transfer fences are unchanged.
+Finish queues existing prefill checkpoints for L2 without upgrading their kind.
+With L2, prefill retraction may publish a computed recovery Endpoint; decode
+retraction uses available prefill cache and recomputes the suffix.
 
 Snapshot selection and slot addressing are distinct even within this mapping:
 the last internal reusable checkpoint is at
@@ -622,13 +631,13 @@ Its responsibilities:
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
   acquire/contains/pin queries. During prefill, each completed scheduling
-  boundary queues all newly published full-attention pages and one checkpoint
-  per snapshot-state group; the pending candidates are merged into a batched
+  boundary queues all newly published full-attention pages and any published
+  Endpoint/Promoted state checkpoints; the candidates are merged into a batched
   writeback. The first decode admission from `PrefillDone` applies the same
-  policy to the final prompt boundary. Ordinary decode still publishes Device
-  entries but does not stream full-attention or snapshot-state entries to
-  Host. At finish or retraction, all eligible Device-resident non-state pages
-  and only the newest Device-resident checkpoint per state group are queued
+  policy to the final prompt boundary. Ordinary decode publishes history-cache
+  Device entries but no state entries; full-attention pages do not stream to
+  Host during decode. At finish or retraction, eligible non-state Device pages
+  and the newest existing prefill checkpoint per state group are queued
   before request ownership is released. Ordinary sliding-window entries
   always stream when published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`: every store but a
@@ -663,7 +672,10 @@ Its responsibilities:
   fields that change cached keys), the pipeline stage, the
   context-parallel width (`cp_size`), the resolved attention-TP width
   (`attn.tp_size`), the speculative
-  draft checkpoint when a separate draft pool is present,
+  draft checkpoint when a separate draft pool is present, the resolved target
+  and draft full-attention backends (including hybrid sub-backend choices
+  and MSA's dense sub-backend, represented as `msa:<dense-backend>`;
+  no draft backend is recorded as an empty name),
   `--skip-softmax-threshold` (a nonzero gfx950 MHA prefill skip changes
   attention output and therefore downstream cached K/V; 0.0 is exact
   dense attention), the resolved EAGLE3 capture-layer list
@@ -847,7 +859,12 @@ Its responsibilities:
   resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
   the group indexes), so the scheduler keeps no residency counters of its own
   — only the token descriptor the event carries and whether that event is
-  currently out.
+  currently out. A mutation only marks its boundary for reconcile;
+  `DrainKvEvents` reconciles each marked boundary against its residency and
+  reports the net change (published exactly while fully resident), then drops
+  descriptors of boundaries with no cached child. Nothing is decided
+  mid-`Admit`, so one admission may evict a boundary's last cached copy and
+  then store the request's own copy without any ordering hazard.
 For L3 write-through, each lane carries only its own hashed Host destinations.
 Its CUDA completion starts those backups, and its scheduler ACK waits until
 those puts finish; a different lane completing cannot release its pages.
@@ -947,8 +964,11 @@ place the four stages appear in order, and a family fills in uniformly named
 seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
 `alignment`, `max_padding_fraction`, `packing`, `check_layout`,
 `num_lcm_blocks`, `token_capacity`, `parents_needed`, `workspace_bytes`,
-`pool_options`. `groups()` itself is a seam for the two families whose groups
-are not per-layer (Inkling appends conv columns; V4 declares each group
+`pool_options`, `verify_scratch_in_pool`.
+The last answers whether speculative verify stages its scratch in the bound
+pool; a CUDA-graph memory probe arena then keeps the serving concurrency.
+`groups()` itself is a seam for the two families whose groups are not
+per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`
 (`recipes/setup.py`) is the single family → recipe map.
 
@@ -1050,9 +1070,13 @@ window the first decode consumes. Under PD the retained tail of the SWA group
 ships to the decode node like any sliding window, draft rows included, and
 the decode node re-feeds nothing.
 
-Capacity has exactly two shapes, both on the base class. The default is the
-flat product (`parents × tightest packing × P`). Families whose per-group
-demand decides the pool — K3's state groups riding inside MLA planes, V4's
+Capacity has three shapes, all on the base class. The default is the flat
+product (`parents × tightest packing × P`). A probe arena is the third and
+narrowest: `probe_batch_rows` says how many requests the CUDA-graph probe
+fabricates, and the pool takes one parent block per fabricated row, floored at
+what a single request needs — it binds before the memory profile has run, so
+it cannot size from a budget at all. Families whose per-group demand decides
+the pool — K3's state groups riding inside MLA planes, V4's
 SWA and compressed chains, GLM-5.3-Flash — size from `parents_needed` and get
 the inverse for free from `_capacity_from_parents`, one monotonic binary
 search shared by all. `parents_needed` itself is not a Python formula: it
@@ -1067,7 +1091,11 @@ C++, and the `Scheduler` bounds single requests against the pool with the
 same model (`docs/design/scheduler.md` §1.4). No recipe restates any of it.
 `scheduler_limits` is the single place a recipe reads the scheduler's
 concurrency, role and reserve widths, so demand and capacity cannot size
-against different numbers.
+against different numbers. Under a probe it reports the probe's fabricated
+batch instead: that arena holds a capture, not requests. `probe_batch_rows`
+sets both sides: the arena holds at least that many parent blocks (more when
+admitting one token per group needs more), and the concurrency is that many
+rows, capped at the scheduler's `max_bs`.
 
 The runtime's global `max_num_seqs` is divided across attention DP ranks to
 produce each scheduler's rank-local `max_batch_size`. These values limit
@@ -1099,9 +1127,21 @@ A recipe's group set never depends on the DCP size. Only groups whose every
 reader can attend to a shard may be sharded; a group some consumer must read
 whole stays replicated and is declared as its own group at every DCP size, so
 prefix matching, transfer and zeroing -- all keyed by group -- see one
-topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache,
-the compressor states and the indexer's K replicated; the indexer K is its own
-full-history group rather than a tenant of the compressed chain it indexes.
+topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache
+and compressor states replicated. Index-K is sharded in its own full-history
+group; its virtual IDs are independent of the compressed attention chain.
+Backend binding validates the DCP shard count for both compressed KV and
+Index-K; SWA and compressor-state groups must remain replicated.
+
+Ordinary GPU MLA and DSA use the same ownership geometry for history storage.
+MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
+Decode gathers query heads, computes attention over owned history, and merges
+partials using FP32 natural-log LSE before restoring TP-local heads. MLA
+prefill reconstructs bounded history chunks with an owner-masked sum reduction;
+GPU DSA sparse prefill instead combines local sparse-attention partials.
+The dense MLA implementation requires FlashMLA and its device/dtype support;
+DCP does not make unsupported kernels portable. These GPU paths currently
+exclude speculative decoding, PD transfer and KVStore.
 
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte

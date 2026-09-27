@@ -24,16 +24,36 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.softmax_topk import moe_softmax_topk
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.moe.triton.softmax_topk import triton_softmax_topk
 from tokenspeed_kernel.platform import Platform
+
+
+def _softmax_topk(
+    router_logits: torch.Tensor,
+    topk: int,
+    topk_indices_dtype: torch.dtype,
+    renormalize: bool,
+    routed_scaling_factor: float,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return moe_topk(
+        router_logits,
+        topk,
+        score_function="softmax",
+        selection_method="topk",
+        renormalize=renormalize,
+        routed_scaling_factor=routed_scaling_factor,
+        topk_indices_dtype=topk_indices_dtype,
+        solution=solution,
+    )
 
 
 def test_torch_reference_runs_on_cpu() -> None:
     # FP64 is intentionally outside the fused signature and exercises the
     # portable fallback while preserving the previous runtime behavior.
     logits = torch.tensor([[0.0, 2.0, 1.0, -1.0]], dtype=torch.float64)
-    weights, ids = moe_softmax_topk(
+    weights, ids = _softmax_topk(
         logits,
         2,
         topk_indices_dtype=torch.int64,
@@ -128,7 +148,7 @@ def test_lowest_id_tie_break_and_strided_rows() -> None:
     storage = torch.zeros((6, 272), dtype=torch.bfloat16, device="cuda")
     logits = storage[::2, :256]
     assert not logits.is_contiguous() and logits.stride(1) == 1
-    weights, ids = moe_softmax_topk(
+    weights, ids = _softmax_topk(
         router_logits=logits,
         topk=8,
         topk_indices_dtype=torch.int64,
@@ -146,7 +166,7 @@ def test_public_entry_point_is_cuda_graph_capturable() -> None:
     logits = torch.randn(1, 256, dtype=torch.bfloat16, device="cuda")
     # Compile before capture; production warms the kernels before capturing a
     # decode graph as well.
-    moe_softmax_topk(
+    _softmax_topk(
         router_logits=logits,
         topk=8,
         topk_indices_dtype=torch.int64,
@@ -156,7 +176,7 @@ def test_public_entry_point_is_cuda_graph_capturable() -> None:
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        weights, ids = moe_softmax_topk(
+        weights, ids = _softmax_topk(
             router_logits=logits,
             topk=8,
             topk_indices_dtype=torch.int64,
@@ -179,7 +199,7 @@ def test_public_entry_point_is_cuda_graph_capturable() -> None:
 @needs_fused_softmax_topk
 def test_empty_batch() -> None:
     logits = torch.empty((0, 256), dtype=torch.bfloat16, device="cuda")
-    weights, ids = moe_softmax_topk(
+    weights, ids = _softmax_topk(
         router_logits=logits,
         topk=8,
         topk_indices_dtype=torch.int64,

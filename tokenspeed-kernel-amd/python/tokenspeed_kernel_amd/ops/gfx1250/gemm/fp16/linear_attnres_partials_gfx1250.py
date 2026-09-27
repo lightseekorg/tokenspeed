@@ -37,7 +37,7 @@ _KIMI3_KDA_OUTPUT_SIZE = 6288
 
 
 @gluon.jit
-def _linear_attnres_partials_kernel(
+def gluon_linear_attnres_partials_gfx1250(
     hidden_ptr,
     weight_ptr,
     output_ptr,
@@ -162,7 +162,7 @@ def _linear_attnres_partials_kernel(
     gl.store(sum_b_ptr, sum_b)
 
 
-def gluon_linear_attnres_partials_gfx1250(
+def launch_gluon_linear_attnres_partials_gfx1250(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
     blocks: torch.Tensor,
@@ -234,7 +234,7 @@ def gluon_linear_attnres_partials_gfx1250(
         raise ValueError("AttnRes epsilon must be positive")
 
     projection_programs = output_size // _BLOCK_N_SIZE
-    _linear_attnres_partials_kernel[(projection_programs + num_tokens,)](
+    gluon_linear_attnres_partials_gfx1250[(projection_programs + num_tokens,)](
         hidden_states,
         weight,
         out,
@@ -254,4 +254,4 @@ def gluon_linear_attnres_partials_gfx1250(
     return out
 
 
-__all__ = ["gluon_linear_attnres_partials_gfx1250"]
+__all__ = ["launch_gluon_linear_attnres_partials_gfx1250"]

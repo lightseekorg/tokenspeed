@@ -745,6 +745,7 @@ def _matmul(
     stride_y_z,
     stride_y_m,
     stride_y_n,
+    YGlobalScale,
     XGlobalScale,
     X,
     stride_x_z,
@@ -1065,6 +1066,8 @@ def _matmul(
     BLOCKED_LAYOUT_Y: gl.constexpr = get_blocked_layout(
         [BLOCK_M, OUT_BLOCK_N], Y.dtype, cfg.NUM_WARPS
     )
+    if YGlobalScale is not None:
+        out = out * (1.0 / gl.load(YGlobalScale).to(gl.float32))
     out = out.to(Y.dtype.element_ty)
     out = gl.convert_layout(out, BLOCKED_LAYOUT_Y)
 
@@ -1161,6 +1164,21 @@ def _mark_scale_preshuffled(scale: Tensor | None, enabled: bool) -> Tensor | Non
     if scale is not None and enabled:
         scale.storage.layout = _NamedScaleLayout("GFX1250_SCALE")
     return scale
+
+
+def _as_scalar_scale(
+    scale: torch.Tensor | float | None,
+    name: str,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Normalize a scalar scale argument to a one-element fp32 device tensor."""
+    if scale is None:
+        return None
+    if isinstance(scale, torch.Tensor):
+        if scale.numel() != 1:
+            raise ValueError(f"{name} must be scalar")
+        return scale.to(device=device, dtype=torch.float32).contiguous()
+    return torch.tensor([float(scale)], device=device, dtype=torch.float32)
 
 
 def _activation_config(fused_activation: FusedActivation | None):
@@ -1303,6 +1321,7 @@ def matmul(
     fused_activation: FusedActivation | None = None,
     *,
     x_global_scale: torch.Tensor | float | None = None,
+    y_global_scale: torch.Tensor | float | None = None,
     num_buffers: int = 2,
     scale_block: int = 32,
     block_m: int,
@@ -1332,6 +1351,10 @@ def matmul(
         scatter_indx: Optional destination row indices for combine writeback.
         precision_config: MX scale/output dtype configuration.
         x_global_scale: Optional scalar activation dequantization scale.
+        y_global_scale: Optional scalar scale the result is divided by before
+            it is cast to the output dtype. Combined with an FP8 ``out_dtype``
+            this quantizes the result in the epilogue, so a chained matmul can
+            consume it without a separate quantize pass.
         fused_activation: Optional SwiGLU or SiTU activation descriptor.
         block_m: Concrete row tile resolved by the caller.
         decode: Select the small-M, M-ragged decode kernel.
@@ -1475,22 +1498,14 @@ def matmul(
     bias_stride = None if bias is None else bias.stride(0)
 
     swizzle_mx_scale = None if b_scale is None else b_scale.storage.layout.name
-    if x_global_scale is not None:
-        if isinstance(x_global_scale, torch.Tensor):
-            if x_global_scale.numel() != 1:
-                raise ValueError("x_global_scale must be scalar")
-            x_global_scale = x_global_scale.to(
-                device=a.device, dtype=torch.float32
-            ).contiguous()
-        else:
-            x_global_scale = torch.tensor(
-                [float(x_global_scale)], device=a.device, dtype=torch.float32
-            )
+    x_global_scale = _as_scalar_scale(x_global_scale, "x_global_scale", a.device)
+    y_global_scale = _as_scalar_scale(y_global_scale, "y_global_scale", a.device)
 
     target_kernel = _matmul_decode if decode else _matmul
     kernel = target_kernel[(grid,)](
         c_storage.data,
         *out_matmul.stride(),
+        y_global_scale,
         x_global_scale,
         a_storage.data,
         *a_strides,
@@ -1653,7 +1668,7 @@ def _fp8_quantize_kernel(
     HAS_SCALE: tl.constexpr,
     HAS_SCALE_TENSOR: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
     if HAS_SCALE:
@@ -1677,12 +1692,13 @@ def _quantize_fp8_activation(
             raise ValueError("FP8 activation scale must be scalar")
         scale = scale.contiguous()
     out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    _fp8_quantize_kernel[(triton.cdiv(x.numel(), 256),)](
+    block_size = 4096
+    _fp8_quantize_kernel[(triton.cdiv(x.numel(), block_size),)](
         x,
         out,
         1.0 if scale is None else scale,
         x.numel(),
-        BLOCK_SIZE=256,
+        BLOCK_SIZE=block_size,
         HAS_SCALE=scale is not None,
         HAS_SCALE_TENSOR=isinstance(scale, torch.Tensor),
     )
@@ -2809,16 +2825,20 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             "gfx1250 Gluon MXFP4 MoE supports activation 'silu', "
             f"'swiglu', or 'situ', got {activation!r}"
         )
-    intermediate = gluon_mxfp_ragged_matmul(
+    # The second matmul wants its activation in FP8, so the first one divides
+    # by that scale and casts in its epilogue. Quantizing separately would
+    # re-read and rewrite the whole intermediate for no other reason.
+    intermediate_fp8 = gluon_mxfp_ragged_matmul(
         x_fp8,
         w13_weight,
         w13_bias,
         w_mx_scale=w13_mx_scale,
         x_format="e4m3",
         x_global_scale=w13_weight.act_scale,
+        y_global_scale=w2_weight.act_scale,
         a_ragged_metadata=ragged_metadata,
         gather_indx=gather_indx,
-        out_dtype=out_dtype,
+        out_dtype=torch.float8_e4m3fn,
         fused_activation=fused_activation,
         scale_preshuffle=True,
         block_m=block_m,
@@ -2828,10 +2848,6 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         num_buffers=3,
         decode=decode,
         partial_tdm=partial_tdm,
-    )
-    intermediate_fp8 = _quantize_fp8_activation(
-        intermediate,
-        w2_weight.act_scale,
     )
     flat = gluon_mxfp_combine(
         intermediate_fp8,
@@ -2870,6 +2886,7 @@ def gluon_mxfp_ragged_matmul(
     *,
     w_mx_scale: torch.Tensor,
     x_global_scale: torch.Tensor | float | None = None,
+    y_global_scale: torch.Tensor | float | None = None,
     x_mx_scale: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
     x_format: str = "e4m3",
@@ -2928,6 +2945,8 @@ def gluon_mxfp_ragged_matmul(
         raise TypeError(f"unsupported gfx1250 MoE keyword(s): {unsupported}")
 
     if scatter_indx is not None and gather_indx is None:
+        if y_global_scale is not None:
+            raise ValueError("y_global_scale is not supported on the combine path")
         return gluon_mxfp_combine(
             x,
             w,
@@ -2979,6 +2998,7 @@ def gluon_mxfp_ragged_matmul(
         fused_activation=fused_activation,
         block_m=block_m,
         x_global_scale=x_global_scale,
+        y_global_scale=y_global_scale,
         scale_preshuffle=scale_preshuffle,
         w_transpose=w_transpose,
         decode=decode,

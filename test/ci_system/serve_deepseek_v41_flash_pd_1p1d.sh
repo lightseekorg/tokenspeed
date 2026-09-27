@@ -218,7 +218,6 @@ COMMON_ARGS=(
   --max-num-seqs "$MAX_NUM_SEQS"
   --chunked-prefill-size 8192
   --max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE"
-  --disable-prefill-graph
   --disable-kvstore
   # The two FP8 Engram tables do not fit beside the weights on a TP2/TP4
   # split; the text-only path is what this smoke test exercises.
@@ -243,7 +242,10 @@ elif [[ "$ENABLE_DSPARK" != "0" ]]; then
   exit 2
 fi
 
-DECODE_ARGS=()
+# The prefill role replays the split prefill graph (encoder and decoder
+# graphs around the eager narrowing layer) for its chunks; the decode role
+# never runs an extend forward of its own, so it skips that capture.
+DECODE_ARGS=(--disable-prefill-graph)
 if [[ "$DECODE_PREFIX_CACHE" == "0" ]]; then
   DECODE_ARGS+=(--disable-prefix-caching)
 elif [[ "$DECODE_PREFIX_CACHE" != "1" ]]; then

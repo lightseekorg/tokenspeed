@@ -232,7 +232,7 @@ TEST(SwaManagerTest, MatchPinsUntilResultDies) {
     BlockPool pool(8, {1});
     SwaManager mgr(4, 4);
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
-    const std::int32_t b0 = CacheOnePage(mgr, pool, h0);
+    CacheOnePage(mgr, pool, h0);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 7);
 
     std::vector<CacheKey> keys{h0};
@@ -251,9 +251,9 @@ TEST(SwaManagerTest, ClaimHitBlocksSkipsNullHoles) {
     CacheKey h1 = RealKey({1, 1, 1, 1}, 0);
     CacheKey h2 = RealKey({2, 2, 2, 2}, 0);
     CacheKey h3 = RealKey({3, 3, 3, 3}, 0);
-    const std::int32_t b1 = CacheOnePage(mgr, pool, h1);
-    const std::int32_t b2 = CacheOnePage(mgr, pool, h2);
-    const std::int32_t b3 = CacheOnePage(mgr, pool, h3);
+    CacheOnePage(mgr, pool, h1);
+    CacheOnePage(mgr, pool, h2);
+    CacheOnePage(mgr, pool, h3);
     std::int32_t free_before = pool.NumEmptyLcmBlocks();
 
     std::vector<CacheKey> keys{h0, h1, h2, h3};

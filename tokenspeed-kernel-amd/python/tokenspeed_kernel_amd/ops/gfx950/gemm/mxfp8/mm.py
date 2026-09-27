@@ -136,7 +136,7 @@ def _load_scale_pair(
 
 
 @gluon.jit(launch_metadata=_mxfp8_launch_metadata)
-def _mxfp8_mm_kernel(
+def gluon_mm_mxfp8_gfx950(
     a_ptr,
     b_ptr,
     a_scales_ptr,
@@ -669,7 +669,7 @@ def _validate_scale(name: str, scale: torch.Tensor, rows: int, k: int) -> None:
         )
 
 
-def gluon_mm_mxfp8_gfx950(
+def launch_gluon_mm_mxfp8_gfx950(
     A: torch.Tensor,
     B: torch.Tensor,
     A_scales: torch.Tensor,
@@ -744,7 +744,7 @@ def gluon_mm_mxfp8_gfx950(
         scale.stride(1) == 1 and scale.stride(0) % 4 == 0 and scale.data_ptr() % 4 == 0
         for scale in (A_scales, B_scales)
     )
-    _mxfp8_mm_kernel[(grid_mn,)](
+    gluon_mm_mxfp8_gfx950[(grid_mn,)](
         A,
         B,
         A_scales,
@@ -782,6 +782,6 @@ def gluon_mm_mxfp8_gfx950(
 
 
 __all__ = [
-    "gluon_mm_mxfp8_gfx950",
+    "launch_gluon_mm_mxfp8_gfx950",
     "supports_mxfp8_gemm_shape",
 ]

@@ -133,12 +133,12 @@ if platform.is_nvidia and platform.is_hopper_plus:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "is_causal": frozenset({False, True}),
             "head_dim": frozenset({64, 128, 256}),
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "is_causal": frozenset({False, True}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
+            "sinks": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def flashinfer_trtllm_mha_extend_with_kvcache(
@@ -214,10 +214,10 @@ if platform.is_nvidia and platform.is_hopper_plus:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "sliding_window": frozenset({False, True}),
-            "support_sinks": frozenset({False, True}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
+            "sinks": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def flashinfer_trtllm_mha_decode_with_kvcache(

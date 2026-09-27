@@ -147,21 +147,21 @@ def _register_tokenspeed_mla_decode_kernel() -> None:
         signatures=format_signatures(("q", "kv_cache"), "dense", _MLA_DECODE_DTYPES),
         priority=Priority.SPECIALIZED,
         traits={
-            "sliding_window": frozenset({False, True}),
+            "q_len": _Q_LENS,
+            "num_q_heads": _NUM_Q_HEADS,
+            "kv_lora_rank": frozenset({_KV_LORA_RANK}),
+            "qk_rope_head_dim": frozenset({_QK_ROPE_HEAD_DIM}),
+            "page_size": _PAGE_SIZES,
             # A block drafter's proposal, never ordinary decode or target verify.
             "noncausal_block_size": _BLOCK_SIZES,
             # The block rides the query axis here. The flattened form, one row per
             # block position on the batch axis, stays with the portable kernel.
             "block_on_query_axis": frozenset({True}),
-            "page_size": _PAGE_SIZES,
-            "q_len": _Q_LENS,
-            "num_q_heads": _NUM_Q_HEADS,
-            "kv_lora_rank": frozenset({_KV_LORA_RANK}),
-            "qk_rope_head_dim": frozenset({_QK_ROPE_HEAD_DIM}),
-            "support_logit_cap": frozenset({False}),
+            "logit_cap": frozenset({False}),
             # The kernel reports log-sum-exp in log2 units, which is not this
             # dispatcher's contract; a caller that wants LSE keeps the Triton path.
             "return_lse": frozenset({False}),
+            "sliding_window": frozenset({False, True}),
         },
     )
     def tokenspeed_mla_decode_with_kvcache(

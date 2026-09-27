@@ -15,7 +15,9 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
 )
-from tokenspeed_kernel.ops.moe import moe_sigmoid_bias_topk
+from tokenspeed_kernel.ops.moe.sigmoid_topk import (
+    _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
+)
 
 
 def test_sigmoid_bias_topk_torch_is_byte_exact() -> None:

@@ -332,3 +332,80 @@ def test_exact_remainder_at_uint64_boundaries():
         inputs, primes, reciprocals, output, len(values)
     )
     assert output.cpu().tolist() == [v % p for v, p in zip(values, moduli)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/ROCm")
+@pytest.mark.parametrize("capacity", [512, 1024, 4096])
+@pytest.mark.parametrize("uniform", [False, True])
+def test_ngram_batch_shapes_reuse_compilation(capacity, uniform):
+    from tokenspeed_kernel.ops.metadata import ngram
+    from utils import assert_no_triton_compile
+
+    params = hash_params("cuda")
+    pool = 33
+    snapshots = torch.zeros((32, 4), dtype=torch.int64, device="cuda")
+    positions = torch.zeros(32, dtype=torch.int64, device="cuda")
+    reset = torch.ones_like(positions)
+    slots = torch.arange(32, device="cuda")
+    cache = torch.zeros(pool, dtype=torch.int32, device="cuda")
+    tail = torch.full((pool, 3), -1, dtype=torch.int64, device="cuda")
+    needs_seed = torch.ones(pool, dtype=torch.bool, device="cuda")
+    ids = torch.ones(capacity, dtype=torch.int32, device="cuda")
+    previous = torch.empty((capacity, 3), dtype=torch.int64, device="cuda")
+    mask = torch.empty(capacity, dtype=torch.bool, device="cuda")
+    prefix = torch.empty((32, 3), dtype=torch.int64, device="cuda")
+    hashes = torch.empty((capacity, 2, 6), dtype=torch.int64, device="cuda")
+
+    def run(bs, width, num_extends, extent):
+        cache.zero_()
+        lengths = torch.full((bs,), width, dtype=torch.int32, device="cuda")
+        if not uniform:
+            lengths[0] = 0
+        total = (bs if uniform else bs - 1) * width
+        prepare_ngram_inputs(
+            snapshots[:bs],
+            positions[:bs],
+            reset[:bs],
+            slots[:bs],
+            cache,
+            lengths.cumsum(0),
+            tail,
+            needs_seed,
+            ids,
+            previous[:extent],
+            mask[:extent],
+            prefix[:bs],
+            hashes[:extent],
+            total,
+            128,
+            width if uniform else 0,
+            params,
+        )
+        ngram.commit_ngram_inputs(
+            slots[:bs],
+            lengths,
+            lengths,
+            ids,
+            previous[:extent],
+            mask[:extent],
+            prefix[:bs],
+            tail,
+            needs_seed,
+            cache,
+            num_extends,
+            pool - 1,
+        )
+        torch.testing.assert_close(cache[:bs], lengths, rtol=0, atol=0)
+
+    # Each capacity stays in one preparation tile bucket; all request counts
+    # stay in the commit's 32-row bucket. Exact counts must not specialize.
+    run(17, 1, 0, capacity)
+    with assert_no_triton_compile(ngram._prepare_ngram_hash):
+        with assert_no_triton_compile(ngram._commit_ngram):
+            for bs, width, num_extends, trim in (
+                (18, 3, 1, 1),
+                (24, 4, 16, 3),
+                (31, 5, 31, 5),
+                (32, 16, 0, 0),
+            ):
+                run(bs, width, num_extends, capacity - trim)

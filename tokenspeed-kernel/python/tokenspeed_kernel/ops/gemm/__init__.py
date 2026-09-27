@@ -248,7 +248,11 @@ def prepare_fp8_linear(
             )
         if not enable_pdl:
             return _PreparedFp8Linear(
-                override=(None if platform.is_cdna4 else "triton_mm_fp8_blockscale"),
+                override=(
+                    None
+                    if platform.is_cdna4 or platform.is_cdna5
+                    else "triton_mm_fp8_blockscale"
+                ),
                 block_size=(block_n, block_k),
             )
 
@@ -985,8 +989,23 @@ def _gemm_format_signature(
             raise ValueError("mxfp8 format selection requires block_size")
         if B_scales is None:
             raise ValueError("mxfp8 format selection requires B_scales")
+        # Kernel selection precedes online activation quantization, so the
+        # signature must predict the scale storage produced afterward. Most
+        # paths emit FP32 scales; on CDNA5, canonical (1, 32) uint8 weight
+        # scales identify the UE8M0 contract, whose matching activation
+        # quantizer also emits uint8 UE8M0 scales.
+        online_scale_dtype = torch.float32
+        if (
+            A_scales is None
+            and tuple(block_size) == (1, 32)
+            and B_scales.dtype == torch.uint8
+            and _platform.is_cdna5
+        ):
+            online_scale_dtype = torch.uint8
         a_scale = ScaleFormat(
-            storage_dtype=(A_scales.dtype if A_scales is not None else torch.float32),
+            storage_dtype=(
+                A_scales.dtype if A_scales is not None else online_scale_dtype
+            ),
             granularity="block",
             block_shape=tuple(block_size),
         )
@@ -1097,6 +1116,19 @@ def _online_quantize_mxfp8(
             solution="triton",
         )
 
+    if kernel_name == "gluon_mm_mxfp8_ue8m0_gfx1250":
+        from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+
+        return quantize_fp8_with_scale(
+            A,
+            granularity="token_group",
+            group_size=block_k,
+            scale_encoding="ue8m0",
+            enable_pdl=False,
+            override="triton_quantize_fp8_group32_ue8m0",
+            solution=None,
+        )
+
     if (
         kernel_name in {"flashinfer_mm_fp8_blockscale", "triton_mm_fp8_blockscale"}
         and _platform.is_nvidia
@@ -1165,7 +1197,10 @@ def _online_quantize_mxfp8(
             *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
             group_major_scales=_platform.is_nvidia,
         )
-    elif kernel_name == "triton_mm_fp8_blockscale":
+    elif kernel_name in {
+        "gluon_mm_fp8_blockscale_gfx1250",
+        "triton_mm_fp8_blockscale",
+    }:
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
         return ensure_row_major_scales(
@@ -1285,9 +1320,12 @@ def mm(
         "n": N,
         "k": K,
         "a_inner_stride_one": A.stride(-1) == 1,
+        "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
         "b_inner_stride_one": B.stride(-1) == 1,
+        "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
         "block_scale_layout": block_scale_layout,
         "out_dtype": out_dtype,
+        "out_inner_stride_one": out is None or out.stride(-1) == 1,
         "pdl_enabled": enable_pdl,
     }
 

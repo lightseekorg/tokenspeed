@@ -30,7 +30,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4.sparse_prefill import (
     gluon_dsv4_sparse_prefill_gfx950,
 )
 
-__all__ = ["gluon_dsv4_prefill_gfx950"]
+__all__ = ["launch_gluon_dsv4_prefill_gfx950"]
 
 
 def _use_sparse_prefill(q: torch.Tensor, indices: torch.Tensor) -> bool:
@@ -39,7 +39,7 @@ def _use_sparse_prefill(q: torch.Tensor, indices: torch.Tensor) -> bool:
 
 
 @gluon.jit
-def _dsv4_prefill_kernel(
+def gluon_dsv4_prefill_gfx950(
     q,
     kv,
     indices,
@@ -458,7 +458,7 @@ def _validate_inputs(
             raise ValueError(f"out must not alias {name}")
 
 
-def gluon_dsv4_prefill_gfx950(
+def launch_gluon_dsv4_prefill_gfx950(
     q: torch.Tensor,
     kv: torch.Tensor,
     indices: torch.Tensor,
@@ -519,7 +519,7 @@ def gluon_dsv4_prefill_gfx950(
     kv_rows = kv.reshape(-1, 512)
     sink_values = attn_sink.reshape(-1)
     grid = (q.shape[0], triton.cdiv(q.shape[1], 16))
-    _dsv4_prefill_kernel[grid](
+    gluon_dsv4_prefill_gfx950[grid](
         q,
         kv_rows,
         indices,

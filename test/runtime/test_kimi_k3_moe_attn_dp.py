@@ -20,6 +20,8 @@
 
 """Attention-DP MoE ownership and collective ordering."""
 
+import os
+import sys
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest import mock
@@ -27,6 +29,11 @@ from unittest import mock
 import pytest
 import torch
 from torch import nn
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopKOutputFormat
@@ -211,6 +218,7 @@ def test_k3_rejects_unsupported_transport_layout(monkeypatch, backend, dp, match
 @pytest.mark.parametrize("with_norm", [False, True])
 @pytest.mark.parametrize("use_alltoall", [False, True])
 @pytest.mark.parametrize("nvfp4", [False, True])
+@pytest.mark.parametrize("shared_tp", [False, True])
 @pytest.mark.parametrize(
     "graph_phase,capture_mode", [(False, False), (True, False), (True, True)]
 )
@@ -222,6 +230,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     with_norm: bool,
     use_alltoall: bool,
     nvfp4: bool,
+    shared_tp: bool,
     graph_phase: bool,
     capture_mode: bool,
 ) -> None:
@@ -242,11 +251,34 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         yield
         events.append("branch_done")
 
+    @contextmanager
+    def branch_after_main():
+        events.append("branch_after_main")
+        with branch():
+            yield
+
     def shared(value, *, down_out):
         events.append("shared")
         return value * 3
 
-    fork = SimpleNamespace(scope=scope, branch=branch)
+    def shared_gather(value, physical_counts):
+        events.append("shared_gather")
+        assert physical_counts == list(counts)
+        return value
+
+    def shared_reduce(value, local_rows):
+        events.append("shared_reduce")
+        assert local_rows == rows
+        return value
+
+    fork = SimpleNamespace(
+        scope=scope,
+        branch=branch,
+        branch_after_main=branch_after_main,
+        join=lambda: events.append("join_branch"),
+        record_checkpoint=lambda: events.append("record_gather"),
+        join_checkpoint=lambda: events.append("join_gather"),
+    )
     monkeypatch.setattr(kimi_k3, "get_is_cuda_graph_phase", lambda: graph_phase)
     monkeypatch.setattr(kimi_k3, "get_is_capture_mode", lambda: capture_mode)
     group = (0, 1)
@@ -388,6 +420,10 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         routed_expert_up_proj=SimpleNamespace(forward_add3=up),
     )
     monkeypatch.setattr(kimi_k3, "all_gather", gather)
+    layer.shared_experts.shared_parallel = object() if shared_tp else None
+    layer.shared_experts.shared_communication = SimpleNamespace(
+        gather_inputs=shared_gather, reduce_outputs=shared_reduce
+    )
     monkeypatch.setattr(kimi_k3, "reduce_scatter", scatter)
     monkeypatch.setattr(
         kimi_k3, "all_reduce", mock.Mock(side_effect=AssertionError("all-reduce"))
@@ -419,10 +455,32 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         quantizer.assert_not_called()
     if rows and with_norm:
         expected_events.append("norm")
-    expected_events = ["fork", *expected_events, "branch"]
-    if rows:
-        expected_events.append("shared")
-    expected_events.extend(["branch_done", "join"])
+    if shared_tp:
+        expected_events.insert(1 if nvfp4 and rows else 0, "join_gather")
+        before_bmm = expected_events.index("experts")
+        expected_events[before_bmm:before_bmm] = [
+            "join_branch",
+            "branch_after_main",
+            "branch",
+            "shared_reduce",
+            "branch_done",
+        ]
+        expected_events.insert(expected_events.index("experts") + 1, "join_branch")
+        expected_events = [
+            "fork",
+            "branch",
+            "shared_gather",
+            "record_gather",
+            "shared",
+            "branch_done",
+            *expected_events,
+            "join",
+        ]
+    else:
+        expected_events = ["fork", *expected_events, "branch"]
+        if rows:
+            expected_events.append("shared")
+        expected_events.extend(["branch_done", "join"])
     if rows:
         expected_events.append("up")
     assert events == expected_events
@@ -434,7 +492,10 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         layer.gate.assert_not_called()
         topk.assert_not_called()
         layer.routed_expert_down_proj.assert_not_called()
-        layer.shared_experts.assert_not_called()
+        if shared_tp:
+            layer.shared_experts.assert_called_once_with(hidden, down_out=None)
+        else:
+            layer.shared_experts.assert_not_called()
 
 
 def test_attn_dp_all_idle_skips_collectives(monkeypatch) -> None:
@@ -503,7 +564,10 @@ def test_attn_dp_forward_requires_context() -> None:
 
 
 @pytest.mark.parametrize("rows", [0, 2])
-def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(monkeypatch, rows):
+@pytest.mark.parametrize("shared_tp", [False, True])
+def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
+    monkeypatch, rows, shared_tp
+):
     hidden = torch.randn(rows, 8, dtype=torch.bfloat16)
     prefix = torch.randn_like(hidden)
     latent = hidden[:, :4].contiguous()
@@ -518,11 +582,21 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(monkeypatch, rows):
     for name in ("all_gather", "reduce_scatter", "all_reduce"):
         monkeypatch.setattr(kimi_k3, name, mock.Mock(side_effect=AssertionError(name)))
 
+    events = []
+
     @contextmanager
     def scope(**kwargs):
-        yield SimpleNamespace(branch=nullcontext)
+        yield SimpleNamespace(
+            branch=nullcontext,
+            branch_after_main=nullcontext,
+            record_checkpoint=lambda: events.append("record_gather"),
+            join_checkpoint=lambda: events.append("join_gather"),
+            join=lambda: events.append("join"),
+        )
 
-    routed = mock.Mock(return_value=latent)
+    routed = mock.Mock(
+        side_effect=lambda *args, **kwargs: (events.append("experts"), latent)[1]
+    )
     up = mock.Mock(return_value=hidden + prefix)
     layer = SimpleNamespace(
         execution_plan=SimpleNamespace(use_mega_moe=True),
@@ -542,6 +616,15 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(monkeypatch, rows):
         routed_hidden=4,
         top_k=2,
     )
+    layer.shared_experts.shared_parallel = object() if shared_tp else None
+    layer.shared_experts.shared_communication = SimpleNamespace(
+        gather_inputs=mock.Mock(
+            side_effect=lambda *args: (events.append("gather"), hidden)[1]
+        ),
+        reduce_outputs=mock.Mock(
+            side_effect=lambda *args: (events.append("reduce"), hidden)[1]
+        ),
+    )
     layer.topk.topk_config = SimpleNamespace(
         topk_weights_dtype=torch.bfloat16, topk_indices_dtype=torch.int32
     )
@@ -549,6 +632,19 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(monkeypatch, rows):
         collective_global_num_tokens=[rows, 3], global_num_tokens=None
     )
     result = KimiLinearMoE._forward_attn_dp(layer, hidden, prefix, ctx)
+    if shared_tp:
+        assert events == [
+            "gather",
+            "record_gather",
+            "join_gather",
+            "join",
+            "reduce",
+            "join",
+            "experts",
+            "join",
+        ]
+    else:
+        assert events == ["experts"]
     routed.assert_called_once()
     call = routed.call_args
     assert call.args[0][0].shape[0] == rows
@@ -561,3 +657,7 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(monkeypatch, rows):
     else:
         assert result is prefix
         up.assert_not_called()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

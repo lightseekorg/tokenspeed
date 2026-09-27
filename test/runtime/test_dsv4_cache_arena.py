@@ -74,6 +74,7 @@ def _recipe(degree, fp4):
         draft_model_config=SimpleNamespace(hf_config=hf, num_attention_layers=1),
         draft_attn_config=SimpleNamespace(dcp_size=degree),
         cache_budget_bytes=32 << 30,
+        probe_batch_rows=None,
         decode_input_tokens=4,
         overlap_schedule_depth=0,
     )

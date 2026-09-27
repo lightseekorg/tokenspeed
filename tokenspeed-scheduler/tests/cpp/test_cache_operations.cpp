@@ -10,9 +10,9 @@
 
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
-#include "cache_test_access.h"
 #include "cache/tier/transfer.h"
 #include "cache/tier/transfer_manager.h"
+#include "cache_test_access.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
 
@@ -466,6 +466,69 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     };
 
     EXPECT_NO_THROW(scheduler.SubmitRequests({spec}));
+}
+
+TEST(CacheOperationTest, ComputedStateChunkDoesNotQueueAStoreButEndpointUsesNormalGuards) {
+    for (const auto guard : {StoreSourceGuard::kPinnedUntilAck, StoreSourceGuard::kStreamOrdered}) {
+        SCOPED_TRACE(static_cast<int>(guard));
+        BlockPool pool(2, {1});
+        BlockPool host_pool(2, {1});
+        const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
+        auto coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, true);
+        TierTransferManager transfers(coordinator);
+        const std::vector<std::string> hashes{"state2"};
+        const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
+        std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
+        CacheCompletedBlocksForTest(coordinator, tables, hashes, 1, 0, 2, CacheBoundaryKind::kChunk, true,
+                                    std::array{2});
+        EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
+        coordinator.QueueLatestSnapshotBlocksForStore(hashes);
+        EXPECT_FALSE(transfers.StartPendingStores(guard));
+        CacheCompletedBlocksForTest(coordinator, tables, hashes, 2, 0, 2, CacheBoundaryKind::kEndpoint, true,
+                                    std::array{2});
+        const auto store = transfers.StartPendingStores(guard);
+        ASSERT_TRUE(store);
+        ASSERT_EQ(store->transfers.size(), 1u);
+        EXPECT_EQ(store->source_pinned, guard == StoreSourceGuard::kPinnedUntilAck);
+        coordinator.Free(tables);
+        EXPECT_EQ(coordinator.ClearDeviceCache(), guard == StoreSourceGuard::kStreamOrdered);
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key));
+        transfers.CompleteWriteBack(store->op_id);
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
+        EXPECT_FALSE(transfers.HasAnyInFlight());
+        EXPECT_TRUE(coordinator.ClearDeviceCache());
+    }
+}
+
+TEST(CacheOperationTest, HostRestoredStateChunkRemainsCachedAfterLoadAckAndWorkingRelease) {
+    BlockPool pool(1, {1});
+    BlockPool host_pool(1, {1});
+    const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, false);
+    TierTransferManager transfers(coordinator);
+    const std::vector<std::string> hashes{"restored-state"};
+    const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
+    CacheBlockRef source = coordinator.AcquireHostBlock(0);
+    ASSERT_TRUE(source);
+    coordinator.CacheHostBlock(source, key);
+    std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
+    const auto location = tables[0].Blocks()[0]->Location();
+    coordinator.CacheFullBlocks(tables, hashes, 1, 0, CacheBoundaryKind::kChunk);
+    std::vector<BlockTransfer> pairs;
+    pairs.push_back(BlockTransfer{.source = std::move(source), .destination = tables[0].Blocks()[0]});
+    const auto load = transfers.StartPrefixLoad(std::move(pairs));
+    coordinator.Free(tables);
+    EXPECT_FALSE(coordinator.ClearDeviceCache()) << "load completion still owns the destination";
+    transfers.CompleteLoadBack(load.op_id, /*success=*/true);
+    EXPECT_FALSE(transfers.HasAnyInFlight());
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
+    const auto metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
+    ASSERT_TRUE(metadata);
+    EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kChunk);
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 2);
+    EXPECT_TRUE(coordinator.ClearDeviceCache());
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
 }
 
 TEST(CacheOperationTest, L3StorageRequiresHostCache) {

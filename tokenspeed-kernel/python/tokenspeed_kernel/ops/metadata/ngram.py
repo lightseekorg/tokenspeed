@@ -190,7 +190,7 @@ def _ngram_predecessor(
     return tl.where(live & (value >= 0) & (value < vocab), value, -1)
 
 
-@triton.jit(do_not_specialize=["capacity", "bs"])
+@triton.jit(do_not_specialize=["total", "capacity", "bs", "uniform_length"])
 def _prepare_ngram_hash(
     snapshots,
     positions,
@@ -417,11 +417,12 @@ def prepare_ngram_inputs(
         rows,
         triton.next_power_of_2(3 * heads),
         num_warps=4,
+        # Reject uncovered snapshots instead of silently hashing stale history.
         debug=True,
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["bs", "num_extends", "capacity"])
 def _commit_ngram(
     slots,
     lengths,
@@ -433,10 +434,10 @@ def _commit_ngram(
     tail,
     needs_seed,
     cache_lengths,
-    bs: tl.constexpr,
-    num_extends: tl.constexpr,
+    bs,
+    num_extends,
     padding_slot: tl.constexpr,
-    capacity: tl.constexpr,
+    capacity,
     ROWS: tl.constexpr,
 ):
     first = tl.program_id(0) * ROWS

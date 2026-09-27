@@ -255,8 +255,8 @@ def dsv4_swa_cache_insert(
     )
     traits = {
         "head_dim": int(q.shape[-1]),
-        "rope_dim": int(cos_sin_cache.shape[-1]),
         "quant_block_size": 64,
+        "rope_dim": int(cos_sin_cache.shape[-1]),
         "cache_layout": "fp8_swa_page_planar",
         "has_q_out": q_out is not None,
     }
@@ -353,8 +353,8 @@ def dsv4_csa_indexer_fp8_cache_insert(
     )
     traits = {
         "index_head_dim": int(rms_norm_weight.numel()),
-        "compress_ratio": int(compress_ratio),
         "page_size": int(kv_cache_block_size),
+        "compress_ratio": int(compress_ratio),
         "cache_format": "fp8_scaled_page_planar",
     }
     kernel = select_kernel(
@@ -460,12 +460,12 @@ def dsv4_prefill(
 
     signature = _attention_format_signature(q=q, kv=kv)
     traits = {
+        "num_q_heads": int(q.shape[1]),
         "head_dim": int(q.shape[-1]),
-        "num_heads": int(q.shape[1]),
-        "cache_layout": "dense_workspace",
-        "support_sink": True,
         "selected_width": int(indices.shape[-1]),
+        "cache_layout": "dense_workspace",
         "metadata_dtypes": frozenset({indices.dtype, lens.dtype}),
+        "sinks": True,
     }
     kernel = select_kernel(
         "attention",
@@ -507,7 +507,7 @@ def dsv4_prefill(
         )
 
 
-_DSV4_PARTIAL_DECODE_TRAITS = {"support_sink": False, "return_lse": True}
+_DSV4_PARTIAL_DECODE_TRAITS = {"return_lse": True, "sinks": False}
 
 
 def dsv4_decode_supports_partials(platform: PlatformInfo) -> bool:
@@ -515,8 +515,8 @@ def dsv4_decode_supports_partials(platform: PlatformInfo) -> bool:
 
     Decode context parallelism attends to each rank's cache shard separately
     and merges the partials through their LSE, so it needs a ``dsv4_decode``
-    kernel registered with ``support_sink`` including False and ``return_lse``
-    including True.
+    kernel explicitly registered with ``sinks`` including False and
+    ``return_lse`` including True.
 
     Args:
         platform: Hardware the kernel must be registered for.
@@ -528,7 +528,10 @@ def dsv4_decode_supports_partials(platform: PlatformInfo) -> bool:
     specs = KernelRegistry.get().get_for_operator(
         "attention", "dsv4_decode", platform=platform
     )
-    return any(spec_matches_traits(spec, _DSV4_PARTIAL_DECODE_TRAITS) for spec in specs)
+    return any(
+        spec_matches_traits(spec, _DSV4_PARTIAL_DECODE_TRAITS, require_all_traits=True)
+        for spec in specs
+    )
 
 
 def dsv4_decode(
@@ -652,19 +655,15 @@ def dsv4_decode(
     extra_width = int(extra_slots.numel() // tokens) if extra_slots is not None else 0
     signature = _attention_format_signature(q=q, swa_kv_cache=swa_kv_cache)
     traits = {
-        "tokens": tokens,
+        "num_tokens": tokens,
+        "num_q_heads": int(q.shape[1]),
         "head_dim": int(q.shape[-1]),
-        "num_heads": int(q.shape[1]),
-        "cache_layout": "fp8_swa_page_planar",
-        "topk_layout": "global_slots",
-        "support_sink": attn_sink is not None,
-        "return_lse": return_lse,
-        "has_extra": has_extra_segment,
-        "has_extra_segment": has_extra_segment,
-        "swa_selected_width": swa_width,
-        "extra_selected_width": extra_width,
         "swa_page_size": int(swa_page_size),
         "extra_page_size": int(extra_page_size or 0),
+        "swa_selected_width": swa_width,
+        "extra_selected_width": extra_width,
+        "cache_layout": "fp8_swa_page_planar",
+        "has_extra_segment": has_extra_segment,
         "metadata_dtypes": frozenset(
             {
                 swa_slots.dtype,
@@ -676,6 +675,9 @@ def dsv4_decode(
                 ),
             }
         ),
+        "return_lse": return_lse,
+        "sinks": attn_sink is not None,
+        "topk_layout": "global_slots",
     }
     kernel = select_kernel(
         "attention",
@@ -806,8 +808,8 @@ def dsv4_prefill_topk(
     traits = {
         "index_heads": int(q_values.shape[-2]),
         "head_dim": int(logical_head_dim),
-        "topk": int(topk),
         "page_size": int(page_size),
+        "topk": int(topk),
         "index_k_format": index_k_format,
     }
     if weights.dtype != torch.float32:
@@ -932,8 +934,8 @@ def dsv4_decode_topk(
     traits = {
         "index_heads": int(q_values.shape[-2]),
         "head_dim": int(logical_head_dim),
-        "topk": int(topk),
         "page_size": int(page_size),
+        "topk": int(topk),
         "index_k_format": index_k_format,
     }
     if weights.dtype != torch.float32:

@@ -41,12 +41,7 @@ if platform.is_hopper_plus:
         set_pdl,
         tf32_hc_prenorm_gemm,
     )
-    from tokenspeed_kernel.ops._deep_gemm.mega_moe_bf16 import (
-        prepare_mega_moe_bf16_jit,
-    )
     from tokenspeed_kernel.thirdparty.cuda.mhc import mhc_big_fuse
-
-    prepare_mega_moe_bf16_jit()
 
     @register_kernel(
         "residual",

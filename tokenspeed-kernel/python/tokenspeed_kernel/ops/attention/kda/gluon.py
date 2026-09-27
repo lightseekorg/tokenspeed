@@ -37,22 +37,19 @@ if current_platform().is_amd:
         gluon_kda_fused_decode_gfx950 as _kda_fused_decode_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
-        gluon_kda_fused_replay_gfx950 as _kda_fused_replay_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         gluon_kda_fused_verify_gfx950 as _kda_fused_verify_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         gluon_kda_recurrent_decode_gfx950 as _kda_decode_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+        launch_gluon_kda_fused_replay_gfx950 as _kda_fused_replay_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (
-        gluon_kda_paged_prefill_gfx950 as _kda_prefill_impl,
+        launch_gluon_kda_paged_prefill_gfx950 as _kda_prefill_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
         gluon_kda_fused_decode_gfx1250 as _kda_fused_decode_gfx1250_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
-        gluon_kda_fused_replay_gfx1250 as _kda_fused_replay_gfx1250_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
         gluon_kda_fused_verify_gfx1250 as _kda_fused_verify_gfx1250_impl,
@@ -60,8 +57,11 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
         gluon_kda_recurrent_decode_gfx1250 as _kda_decode_gfx1250_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
+        launch_gluon_kda_fused_replay_gfx1250 as _kda_fused_replay_gfx1250_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.prefill import (
-        gluon_kda_paged_prefill_gfx1250 as _kda_prefill_gfx1250_impl,
+        launch_gluon_kda_paged_prefill_gfx1250 as _kda_prefill_gfx1250_impl,
     )
 
     @register_kernel(
@@ -130,8 +130,8 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "indexed_state": frozenset({True}),
-            "single_token": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
+            "single_token": frozenset({True}),
         },
     )
     def gluon_kda_paged_decode_gfx950(**kwargs):
@@ -155,11 +155,11 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "paged_state": frozenset({True}),
-            "fused_output_norm": frozenset({True}),
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
+            "fused_output_norm": frozenset({True}),
+            "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
         },
     )
@@ -268,11 +268,11 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "paged_state": frozenset({True}),
-            "store_states": frozenset({False}),
-            "recurrent_layout": frozenset({"v_major"}),
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
+            "paged_state": frozenset({True}),
+            "recurrent_layout": frozenset({"v_major"}),
+            "store_states": frozenset({False}),
         },
     )
     def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(*args, **kwargs):
@@ -291,12 +291,12 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "flat_state": frozenset({True}),
-            "batched_layers": frozenset({True}),
-            "recurrent_layout": frozenset({"v_major"}),
-            "replay_raw_gate": frozenset({True}),
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
+            "batched_layers": frozenset({True}),
+            "flat_state": frozenset({True}),
+            "recurrent_layout": frozenset({"v_major"}),
+            "replay_raw_gate": frozenset({True}),
         },
     )
     def gluon_kda_fused_replay_gfx950(
@@ -358,8 +358,8 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "indexed_state": frozenset({True}),
-            "single_token": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
+            "single_token": frozenset({True}),
         },
     )
     def gluon_kda_paged_decode_gfx1250(**kwargs):
@@ -383,11 +383,11 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "paged_state": frozenset({True}),
-            "fused_output_norm": frozenset({True}),
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
             "conv_kernel_size": frozenset({4}),
+            "fused_output_norm": frozenset({True}),
+            "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
         },
     )
@@ -496,11 +496,11 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "paged_state": frozenset({True}),
-            "store_states": frozenset({False}),
-            "recurrent_layout": frozenset({"v_major"}),
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
+            "paged_state": frozenset({True}),
+            "recurrent_layout": frozenset({"v_major"}),
+            "store_states": frozenset({False}),
         },
     )
     def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(*args, **kwargs):
@@ -519,12 +519,12 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
-            "flat_state": frozenset({True}),
-            "batched_layers": frozenset({True}),
-            "recurrent_layout": frozenset({"v_major"}),
-            "replay_raw_gate": frozenset({True}),
             "num_heads": frozenset({12}),
             "head_dim": frozenset({128}),
+            "batched_layers": frozenset({True}),
+            "flat_state": frozenset({True}),
+            "recurrent_layout": frozenset({"v_major"}),
+            "replay_raw_gate": frozenset({True}),
         },
     )
     def gluon_kda_fused_replay_gfx1250(

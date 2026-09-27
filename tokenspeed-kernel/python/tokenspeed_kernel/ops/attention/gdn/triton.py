@@ -81,8 +81,8 @@ from tokenspeed_kernel.signature import format_signatures
     ),
     priority=Priority.PORTABLE,
     traits={
-        "qk_l2norm": frozenset({False, True}),
         "output_h": frozenset({False, True}),
+        "qk_l2norm": frozenset({False, True}),
     },
 )
 def triton_gdn_chunk_prefill(

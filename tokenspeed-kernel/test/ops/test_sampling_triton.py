@@ -866,6 +866,32 @@ def test_dspark_block_greedy_matches_the_full_vocabulary_argmax(
     assert torch.equal(out.long(), expected)
 
 
+def test_dspark_block_greedy_reads_strided_anchors(device: str) -> None:
+    """The drafters hand over a column of their ``[rows, spec]`` token table.
+
+    Every column of that table holds the row's bonus token, so a kernel that
+    read the column as a contiguous vector would give rows after the first
+    another row's anchor -- and a wrong bigram bias at step 0 -- while the
+    first row, and any single-request batch, stayed correct.
+    """
+    torch.manual_seed(11)
+    rows, block, vocab, rank, spec = 8, 3, 2048, 64, 6
+    embedding = torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+    projection = torch.randn(vocab, rank, device=device).to(torch.bfloat16)
+    base = torch.randn(rows, block, vocab, device=device) * 4
+    table = torch.randint(0, vocab, (rows, 1), device=device, dtype=torch.int32)
+    table = table.expand(rows, spec).contiguous()
+    anchors = table[:, 0]
+    assert anchors.stride(0) == spec
+
+    out = _dspark_block_on_shards(base, anchors, embedding, projection, 2)
+
+    expected = _dspark_block_reference(
+        base, anchors.contiguous(), embedding, projection
+    )
+    assert torch.equal(out.long(), expected)
+
+
 def test_dspark_block_greedy_breaks_ties_toward_the_lowest_token(device: str) -> None:
     """Rounded logits tie constantly; the winner must be the first maximum."""
     torch.manual_seed(1)

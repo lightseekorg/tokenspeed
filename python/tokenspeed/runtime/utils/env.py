@@ -41,6 +41,8 @@ global_server_args_dict: dict = {
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "mapping": ServerArgs.mapping,
     "force_deterministic_rsag": ServerArgs.force_deterministic_rsag,
+    "batch_invariant_collectives": ServerArgs.batch_invariant_collectives,
+    "numerics": ServerArgs.numerics,
     "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,
     "device": ServerArgs.device,
     "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
@@ -89,6 +91,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "enable_nan_detection": server_args.enable_nan_detection,
             "mapping": server_args.mapping,
             "force_deterministic_rsag": server_args.force_deterministic_rsag,
+            "batch_invariant_collectives": server_args.batch_invariant_collectives,
+            "numerics": server_args.numerics,
             "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
             "device": server_args.device,
             "draft_model_path_use_base": server_args.draft_model_path_use_base,
@@ -258,6 +262,10 @@ class Envs:
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
+
+    # Shared-expert parallelism. Keep raw strings so every rank can agree
+    # before strict validation; EnvInt would silently default malformed input.
+    TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvStr("1")
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)

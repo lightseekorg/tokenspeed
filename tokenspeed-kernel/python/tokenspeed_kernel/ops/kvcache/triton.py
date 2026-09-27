@@ -896,6 +896,7 @@ def _set_mla_kv_buffer_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    write_mask_ptr,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
@@ -916,6 +917,8 @@ def _set_mla_kv_buffer_kernel(
     offs = base + tl.arange(0, BLOCK)
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
+    if write_mask_ptr is not None:
+        mask &= tl.load(write_mask_ptr + pid_loc)
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
@@ -961,6 +964,7 @@ def _set_mla_kv_buffer_per_loc_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    write_mask_ptr,
     n_loc,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
@@ -980,6 +984,8 @@ def _set_mla_kv_buffer_per_loc_kernel(
     loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
     loc_mask = loc_indices < n_loc
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
+    if write_mask_ptr is not None:
+        loc_mask &= tl.load(write_mask_ptr + loc_indices, mask=loc_mask, other=False)
 
     nope_offs = tl.arange(0, nope_dim)
     src_nope = tl.load(
@@ -1028,6 +1034,8 @@ def set_mla_kv_buffer_triton(
     cache_k_rope: torch.Tensor,
     enable_pdl: bool | None = None,
     sanitize: bool = False,
+    *,
+    write_mask: torch.Tensor | None,
 ) -> None:
     """Scatter split MLA keys into a latent KV cache.
 
@@ -1040,6 +1048,9 @@ def set_mla_kv_buffer_triton(
         enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
             the platform policy; pass ``False`` to disable it explicitly.
         sanitize: Replace NaN and infinity values before storing.
+        write_mask: Required keyword. Boolean mask [rows] that suppresses both
+            reads of source rows and writes for false entries; explicitly None
+            writes every row. Locations for masked rows must still be safe.
 
     Returns:
         None. The cache writes are enqueued on the current device stream.
@@ -1047,6 +1058,17 @@ def set_mla_kv_buffer_triton(
     # Dispatch buckets from experiments on B200 GPUs.
     # Small batches use more CTAs per location; large batches use wider tiles.
     n_loc = loc.numel()
+    if write_mask is not None and (
+        write_mask.shape != (n_loc,)
+        or write_mask.dtype != torch.bool
+        or write_mask.device != loc.device
+        or not write_mask.is_contiguous()
+    ):
+        raise ValueError(
+            "MLA write mask must be contiguous bool [rows] on the slot device"
+        )
+    if n_loc == 0:
+        return
     nope_dim = cache_k_nope.size(-1)
     rope_dim = cache_k_rope.size(-1)
     # Clamp to a value representable by both source and destination. Bitwise
@@ -1073,6 +1095,7 @@ def set_mla_kv_buffer_triton(
             cache_k_nope,
             cache_k_rope,
             loc,
+            write_mask,
             n_loc,
             kv_buffer.stride(0),
             cache_k_nope.stride(0),
@@ -1099,6 +1122,7 @@ def set_mla_kv_buffer_triton(
             cache_k_nope,
             cache_k_rope,
             loc,
+            write_mask,
             kv_buffer.stride(0),
             cache_k_nope.stride(0),
             cache_k_rope.stride(0),
@@ -2729,7 +2753,9 @@ def _index_k_scatter_kernel(
     scale_buf_ptr,  # float32 flat view of buf (aliases fp8_buf_ptr)
     k_fp8_ptr,  # uint8 [tokens, HD]
     k_scale_ptr,  # float32 [tokens, NG]
-    loc_ptr,  # int [tokens] global slot index (non-negative)
+    loc_ptr,  # int [tokens] local slot index
+    write_mask_ptr,
+    HAS_WRITE_MASK: tl.constexpr,
     page_bytes,  # fp8 elements per page
     scale_page_off,  # float32 elements per page (page_bytes // 4)
     scale_base_off,  # float32 offset of the scale region ((ps*hd)//4)
@@ -2746,7 +2772,10 @@ def _index_k_scatter_kernel(
     slot = loc % PAGE_SIZE
 
     d = tl.arange(0, BLOCK_HD)
-    hd_mask = d < HD
+    owned = tl.full((), True, tl.int1)
+    if HAS_WRITE_MASK:
+        owned = tl.load(write_mask_ptr + t)
+    hd_mask = (d < HD) & owned
     fp8_dst = page * page_bytes + slot * HD + d
     tl.store(
         fp8_buf_ptr + fp8_dst,
@@ -2755,7 +2784,7 @@ def _index_k_scatter_kernel(
     )
 
     g = tl.arange(0, BLOCK_NG)
-    ng_mask = g < NG
+    ng_mask = (g < NG) & owned
     sc_dst = scale_base_off + page * scale_page_off + slot * NG + g
     tl.store(
         scale_buf_ptr + sc_dst,
@@ -2773,6 +2802,7 @@ def index_k_block_split_scatter(
     page_size: int,
     head_dim: int,
     group_size: int,
+    write_mask: torch.Tensor | None,
 ) -> None:
     """Scatter FP8 index-K rows + scales into the block-split paged buffer.
 
@@ -2788,6 +2818,8 @@ def index_k_block_split_scatter(
         index_k_scale: ``[tokens, num_groups]`` float32 scales.
         loc: ``[tokens]`` non-negative int global slot indices (any integer
             dtype).
+        write_mask: Required explicit ownership mask, or None to write all rows.
+            False entries suppress both source loads and destination writes.
         page_size, head_dim, group_size: layout; ``num_groups = head_dim //
             group_size``.
 
@@ -2795,6 +2827,12 @@ def index_k_block_split_scatter(
         None; ``buf`` is written in place.
     """
     tokens = index_k_fp8.shape[0]
+    if write_mask is not None and (
+        write_mask.shape != (tokens,)
+        or write_mask.dtype != torch.bool
+        or write_mask.device != loc.device
+    ):
+        raise ValueError("Index-K write mask must be bool [tokens] on the slot device")
     if tokens == 0:
         return
     ng = head_dim // group_size
@@ -2812,6 +2850,8 @@ def index_k_block_split_scatter(
         k_fp8,
         k_scale,
         loc.reshape(-1),
+        write_mask,
+        write_mask is not None,
         page_bytes,
         page_bytes // 4,
         (page_size * head_dim) // 4,

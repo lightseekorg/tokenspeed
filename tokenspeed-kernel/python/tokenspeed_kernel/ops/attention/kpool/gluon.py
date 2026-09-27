@@ -715,13 +715,13 @@ if _IS_AMD:
         traits={
             "index_heads": frozenset({32}),
             "head_dim": frozenset({128}),
-            "pool_size": frozenset({4}),
             "page_size": frozenset({16}),
+            "pool_size": frozenset({4}),
             "topk_pools": frozenset({512}),
+            "has_prefill_plan": frozenset({False, True}),
             "index_k_format": frozenset({"fp8_scaled"}),
             "score_activation": frozenset({"relu"}),
             "topk_layout": frozenset({"global_slots"}),
-            "prefill_plan": frozenset({False, True}),
         },
     )(gluon_kpool_prefill_topk_fp8_gfx950)
     register_kernel(
@@ -739,13 +739,13 @@ if _IS_AMD:
         traits={
             "index_heads": frozenset({32}),
             "head_dim": frozenset({128}),
-            "pool_size": frozenset({4}),
             "page_size": frozenset({16}),
+            "pool_size": frozenset({4}),
             "topk_pools": frozenset({512}),
+            "has_prefill_plan": frozenset({False, True}),
             "index_k_format": frozenset({"fp8_scaled"}),
             "score_activation": frozenset({"relu"}),
             "topk_layout": frozenset({"global_slots"}),
-            "prefill_plan": frozenset({False, True}),
         },
     )(gluon_kpool_prefill_topk_fp8_gfx1250)
     __all__ = [

@@ -170,6 +170,7 @@ def _planned(*, num_extends, label=None):
         grammar_inputs=None,
         multimodal_context=None,
         ngram_inputs=None,
+        request_history_seeds=None,
     )
 
 
