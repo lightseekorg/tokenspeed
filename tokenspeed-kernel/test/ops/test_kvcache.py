@@ -865,6 +865,7 @@ def test_index_k_block_split_scatter_matches_index_put(
         page_size=page_size,
         head_dim=head_dim,
         group_size=group_size,
+        write_mask=None,
     )
     torch.cuda.synchronize()
     assert torch.equal(buf_ref, buf_k)
@@ -883,5 +884,34 @@ def test_index_k_block_split_scatter_empty_is_noop(device: str) -> None:
         page_size=64,
         head_dim=128,
         group_size=128,
+        write_mask=None,
     )
     assert torch.count_nonzero(buf) == 0
+
+
+def test_index_k_scatter_mask_preserves_dummy_page(device):
+    from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
+
+    page_size, dim = 64, 128
+    cache = torch.full((128, 132), 97, device=device, dtype=torch.uint8)
+    before = cache.clone()
+    values = torch.randn(4, dim, device=device).to(torch.float8_e4m3fn)
+    scales = torch.randn(4, 1, device=device)
+    slots = torch.tensor([0, 65, 0, 67], device=device)
+    owned = torch.tensor([False, True, False, True], device=device)
+    index_k_block_split_scatter(
+        cache,
+        values,
+        scales,
+        slots,
+        page_size=page_size,
+        head_dim=dim,
+        group_size=128,
+        write_mask=owned,
+    )
+    expected = before.clone()
+    data, scale = _index_k_block_views(expected, 2, page_size, dim, 1)
+    data[1, [1, 3]] = values.view(torch.uint8)[[1, 3]].view(torch.float8_e4m3fn)
+    scale[1, [1, 3]] = scales[[1, 3]]
+    assert torch.equal(cache, expected)
+    assert torch.equal(cache[:64], before[:64])

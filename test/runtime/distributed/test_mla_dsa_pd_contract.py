@@ -105,6 +105,7 @@ def _recipe(family: str, pd_enabled: bool = False):
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1 << 30,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )

@@ -1,8 +1,9 @@
 api_version: ci.tokenspeed.io/v1
-# Kimi-K3 + EAGLE3 speculative decoding. Deliberately a separate job from
-# perf-kimi-k3-mxfp4-tp8ep8-random-4k-1k-mi35x, which tracks pure-target K3
-# performance and must stay speculator-free (Issue #879).
-name: perf-kimi-k3-eagle3-mxfp4-tp8ep8-random-4k-1k-mi35x
+# Kimi-K3 + EAGLE3 long-context throughput at the production-shaped batch.
+# TP8/EP1 reduces prefill latency enough to improve end-to-end latency at
+# 50K-input/500-output concurrency 16, despite its higher per-token decode
+# latency. Keep the speculator-free TP8/EP8 job as the independent control.
+name: perf-kimi-k3-eagle3-mxfp4-tp8ep1-random-50k-500-mi35x
 type: perf
 workflow_stage: model-test
 triggers:
@@ -16,8 +17,8 @@ env:
 install:
   - bash test/ci_system/install_deps_rocm.sh
 # --disable-prefill-graph: prefill graphs want 40 buckets on top of the decode
-# one and OOM at this memory fraction. Decode graphs are what speculative
-# decoding rides on, and the batch-1 bucket captures cleanly.
+# ones and OOM at this memory fraction. Decode graphs are what speculative
+# decoding rides on, and all benchmark batch-size buckets capture cleanly.
 server:
   command: >-
     ts serve
@@ -31,16 +32,20 @@ server:
     --speculative-draft-model-quantization unquant
     --eagle3-layers-to-capture 2,46,90
     --tp 8
-    --ep-size 8
-    --attention-backend mla
-    --drafter-attention-backend mla
+    --ep-size 1
+    --init-expert-location trivial
+    --ep-dispatch-algorithm static
+    --attention-backend gluon
+    --drafter-attention-backend gluon
     --moe-backend auto
     --kv-cache-dtype fp8
     --mm-encoder-tp-mode data
-    --max-model-len 8192
-    --max-num-seqs 1
-    --max-cudagraph-capture-size 1
-    --cudagraph-capture-sizes 1
+    --max-model-len 65536
+    --max-num-seqs 16
+    --chunked-prefill-size 8192
+    --max-prefill-tokens 8192
+    --max-cudagraph-capture-size 16
+    --cudagraph-capture-sizes 1 2 4 8 16
     --disable-prefill-graph
     --gpu-memory-utilization 0.92
     --trust-remote-code
@@ -66,13 +71,13 @@ perf:
     REPO_ROOT=$PWD &&
     MODEL=kimi-k3 &&
     URL=http://127.0.0.1:21000/v1/completions &&
-    OUTPUTS_DIR="$PWD/.ci-artifacts/published/kimi-k3-eagle3-perf" &&
+    OUTPUTS_DIR="$PWD/.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf" &&
     TOKENIZER_PATH="$OUTPUTS_DIR/tokenizer" &&
     rm -rf "$OUTPUTS_DIR" &&
     /tmp/evalscope-perf/bin/python -c 'import sys; from transformers import AutoTokenizer; AutoTokenizer.from_pretrained("moonshotai/Kimi-K3", trust_remote_code=True).save_pretrained(sys.argv[1])' "$TOKENIZER_PATH" &&
     set +e &&
     echo "==================================================" &&
-    echo ">>> EAGLE3 input=4k output=1k conc=1" &&
+    echo ">>> EAGLE3 TP8/EP1 input=50k output=500 conc=16" &&
     echo "==================================================" &&
     /tmp/evalscope-perf/bin/evalscope perf
     --model "$MODEL"
@@ -81,19 +86,23 @@ perf:
     --dataset random
     --data-source huggingface
     --tokenizer-path "$TOKENIZER_PATH"
-    --min-prompt-length 4096
-    --max-prompt-length 4096
+    --min-prompt-length 50000
+    --max-prompt-length 50000
     --prefix-length 0
-    --min-tokens 1024
-    --max-tokens 1024
-    --parallel 1
-    --number 1
+    --min-tokens 500
+    --max-tokens 500
+    --parallel 16
+    --number 16
     --warmup-num 0
     --rate -1
-    --seed 1
+    --dataset-offset 300160
+    --seed 20260906
     --temperature 0
+    --no-apply-chat-template
     --stream
-    --outputs-dir "$OUTPUTS_DIR/input_4k"
+    --no-test-connection
+    --total-timeout 21600
+    --outputs-dir "$OUTPUTS_DIR/input_50k"
     --no-timestamp
     --extra-args '{"ignore_eos": true}';
     PERF_STATUS=$?;
@@ -106,9 +115,8 @@ perf:
 report:
   github_step_summary: true
 perf_threshold: 0.9
-# Values are [Latency (tps/user), Throughput (tps/gpu)]. Rounded down from three
-# consecutive 8x MI350X runs, which measured 161.29 / 18.80-18.82. This tracks
-# EAGLE3 independently from the pure-target control and is about 6x the prior
-# DSpark reference (25.4 / 3.1).
+# Values are [Latency (tps/user), Throughput (tps/gpu)]. Rounded down from the
+# median of three consecutive 8x MI350X TP8/EP1 runs. They measured
+# 22.38-24.39 tps/user and 12.33-13.13 tps/GPU at 50K/500, concurrency 16.
 perf_reference:
-  1: [161, 18.8]
+  16: [23, 12.5]

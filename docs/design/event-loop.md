@@ -16,6 +16,13 @@ the cross-rank collectives that keep the redundant schedulers aligned always
 find every rank promptly, however deep the GPUs are in queued work — a stage's
 launch-queue backpressure stalls only its own forward thread, never the round.
 
+FIFO describes submission ownership, not a promise that every model kernel
+uses one CUDA stream. Main-stream scratch and persistent kernel protocol state
+may be shared across calls only while those calls are ordered on that stream.
+Work deliberately forked to a side stream must use private storage or establish
+an ordering edge before touching a shared layout; joining the side stream later
+does not make concurrent reuse safe.
+
 This is enforced by **visibility**, not by discipline. `build_device_side`
 (`execution/device.py`) constructs the model runners, attention backends, KV
 pools and executor as its own locals, and returns one `DeviceBuild`, split by
@@ -242,11 +249,13 @@ behind the forward that captured it, not inline.
 
 ## Principle 5: publishing drains, once per round
 
-`_publish_scheduler_kv_events` has drain semantics: KV events accumulate
-inside the C++ scheduler across any number of mutations (advance,
+`_publish_scheduler_kv_events` has drain semantics: cache mutations
+accumulate inside the C++ scheduler across any number of calls (advance,
 `next_execution_plan`), so a single unconditional call at the loop tail
-publishes everything the round produced, in order, as one batch. Do not add
-per-mutation publish calls; they only fragment batches.
+publishes everything the round produced, in order, as one batch. The batch
+is the round's net change: a block evicted and cached again within the round
+produces no event. Do not add per-mutation publish calls; they only fragment
+batches.
 
 The same reasoning fixes the metrics call: scheduler iteration metrics are
 recorded once per round, from the same pre-dispatch snapshot as the

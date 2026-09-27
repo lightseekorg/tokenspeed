@@ -146,12 +146,21 @@ runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
 
+CI runner images are expected to provide `ninja`. Runner setup checks for the
+executable and only refreshes apt metadata and installs `ninja-build` when it is
+missing. This keeps source checkouts independently installable without making
+every ephemeral GPU runner wait on package mirrors before installation.
+
 For model evaluation and performance jobs, the reusable PR task workflow puts
 uv's cache in `.uv-cache` under the job's work directory, overriding an inherited
-shared uv cache. EvalScope dependency installs therefore do not depend on free
-space in a persistent `/cache/uv` volume. The existing always-run work-directory
-cleanup removes the job's uv cache on success or failure. Unit-test, kernel
-benchmark, pip, and release-wheel caches retain their existing policy.
+shared uv cache. The existing always-run work-directory cleanup removes this
+general task cache on success or failure. EvalScope downloads use the dedicated
+`HF_HOME/.uv-cache/evalscope` namespace when a runner provides `HF_HOME`, or an
+explicit `EVALSCOPE_UV_CACHE_DIR` override. Only the `eval.install` and
+`perf.install` stages use this cache, so every job still creates a clean virtual
+environment. Runners without either location continue using the disposable job
+cache. Unit-test, kernel benchmark, pip, and release-wheel caches retain their
+existing policy.
 
 Accuracy jobs also keep Triton's compiled kernels in `.triton-cache` under their
 work directory. Lazy compilation during a request can then write its cache even
@@ -162,11 +171,12 @@ Triton cache policy so cold compilation is not newly introduced into measured
 requests.
 
 The AMD Kimi-K3 EAGLE3 performance task publishes its EvalScope outputs and
-tokenizer under `.ci-artifacts/published/kimi-k3-eagle3-perf`, including the
+tokenizer under
+`.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf`, including the
 request/response database. These artifacts allow input, output, and speculative
 acceptance differences to be investigated alongside timing changes. The task
-still measures one 4K-input/1K-output request with zero benchmark warmup requests
-and its original performance reference and threshold.
+measures 16 concurrent 50K-input/500-output requests with TP8/EP1 and zero
+benchmark warmup requests.
 
 The corresponding AMD Kimi-K3 EAGLE3 AIME26 gate publishes its per-question
 predictions and scoring records under
@@ -174,12 +184,18 @@ predictions and scoring records under
 misses without changing the full 30-question workload, generation settings, or
 score threshold.
 
-The AMD DeepSeek-V4.1-Flash GSM8K task downloads its weights into
-`.hf-model-cache` in the job's work directory. Its uncached checkpoint can exceed
-the remaining capacity of the shared model volume; the job filesystem provides
-separate writable storage, cleaned up with the work directory. The model ID,
-precision, evaluation workload, and score threshold stay the same. This task
-downloads a fresh checkpoint for each job, so startup includes the download time.
+Model jobs load weights from the runner's shared Hugging Face cache
+(`HF_HOME`) and must not pass `--download-dir` into the job's work directory.
+The work directory is deleted after every job, so a per-job download fetches
+the full checkpoint again on every run. On the AMD runners the work directory
+and the shared cache sit on the same node filesystem, so a per-job copy does
+not add capacity either.
+
+EvalScope perf jobs pass a local tokenizer directory to `--tokenizer-path`.
+EvalScope loads a remote tokenizer ID through ModelScope into the job's
+ephemeral home directory, which downloads it again for every job. The jobs
+instead save the tokenizer from the shared Hugging Face cache into their
+output directory before running the benchmark.
 
 The same model jobs isolate MIOpen's writable user database and kernel cache
 under `.miopen-db` and `.miopen-kernels` in their work directory. This avoids
@@ -243,6 +259,11 @@ matching rule decides (`ci_path_filter.py` holds the full lists):
   `tokenspeed-scheduler/` require every runner group.
 * Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
+
+PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
+with existing validation and runner/trigger rules. Mixed, empty, or potentially
+truncated diffs (300+ paths) keep the existing scope. Manual and nightly runs
+retain their existing task selection.
 
 `tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
 module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
@@ -474,7 +495,7 @@ hardware. A selected YAML follows the same rule; YAMLs that already declare a
 `slurm-dispatch-gb300` coordinators form one shared pool for manual, nightly,
 and per-commit submissions.
 
-The `GB200 Slurm Per Commit` workflow runs single-node `slurm-gb200-*`
+The `GB200` workflow runs single-node `slurm-gb200-*`
 tasks through the `slurm-dispatch` coordinator. Qwen four-GPU tasks migrated
 from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation, 35B FP8
 DeepEP GSM8K evaluation, and 122B EPD OCRBench evaluation and unit test.
@@ -491,7 +512,7 @@ the approved-PR and latest-main retry workflows also cover this workflow.
 Its default `eval,perf` selection covers the three migrated evaluations;
 select `ut` explicitly to include the EPD unit test.
 
-The `GB300 Slurm Per Commit` workflow selects only multi-node model tasks with
+The `GB300` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
 `slurm-dispatch-gb300` coordinator pool used by manual dispatch. It runs for
 pushes to `main` and for non-draft pull requests whose head branch belongs to
@@ -509,7 +530,7 @@ cannot filter the multi-node matrix here. During this workflow's
 bootstrap only, leave the switch unset; after dispatcher support reaches
 `main`, set it to `true` and re-run the merge commit's workflow.
 
-`Retry Failed Latest Main CI` also covers `GB300 Slurm Per Commit`. Its hourly
+`Retry Failed Latest Main CI` also covers `GB300`. Its hourly
 or manual scan retries failed jobs from completed, failed push runs on the
 latest `main` commit, using the original run and commit. The retry workflow
 stops after three total attempts (the original plus two retries); older

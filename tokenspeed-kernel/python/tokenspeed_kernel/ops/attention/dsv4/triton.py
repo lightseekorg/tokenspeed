@@ -4216,3 +4216,47 @@ def dsv4_fused_inv_rope_fp8_quant(
         num_warps=1,
     )
     return fp8_buf.transpose(0, 1), scale_buf.transpose(0, 1)
+
+
+def triton_dsv4_index_candidates(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return MXFP4 local logical candidates and scores for global DCP Top-K.
+
+    Index-K pages use -1 holes in global request order. Queries may belong to
+    arbitrary requests, covering both prefill and decode. The caller bounds
+    query tiles; only candidates and scores are communicated across ranks.
+    """
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import triton_topk_from_logits
+    from tokenspeed_kernel.ops.attention.dsv4._triton.indexer import _indexer_logits
+
+    if local_page_table.shape[0] == 0 or local_page_table.shape[1] == 0:
+        raise ValueError("Index candidates require a nonempty page table")
+    valid_requests = (query_requests >= 0) & (
+        query_requests < local_page_table.shape[0]
+    )
+    query_requests = query_requests.clamp(0, local_page_table.shape[0] - 1)
+    causal_lens = torch.where(valid_requests, causal_lens, 0)
+    logits, _ = _indexer_logits(
+        index_q,
+        weights.contiguous(),
+        index_k_cache,
+        causal_lens.to(torch.int32).contiguous(),
+        local_page_table.index_select(0, query_requests.long()),
+        page_size=page_size,
+        max_candidates=local_page_table.shape[1] * page_size,
+        cu_seq_lens=None,
+        starts=None,
+    )
+    offsets = triton_topk_from_logits(logits, topk)
+    scores = logits.gather(1, offsets.clamp_min(0).long())
+    valid = (offsets >= 0) & (scores > -float("inf"))
+    return torch.where(valid, offsets, -1), torch.where(valid, scores, -float("inf"))

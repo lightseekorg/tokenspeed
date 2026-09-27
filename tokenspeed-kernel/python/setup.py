@@ -57,6 +57,7 @@ import ctypes
 import importlib
 import json
 import os
+import shlex
 import shutil
 import site
 import subprocess
@@ -554,8 +555,10 @@ class CudaKernelBuilder:
             archs.add(self._normalize_cuda_arch(direct))
             return archs
 
-        if not archs:
-            archs.update(DEFAULT_CUDA_ARCHS)
+        archs.update(DEFAULT_CUDA_ARCHS)
+        nvcc_version = self._nvcc_toolkit_version()
+        if nvcc_version is not None and nvcc_version >= (13, 4):
+            archs.add("107a")
         return archs
 
     def _site_paths(self):
@@ -801,8 +804,10 @@ class CudaKernelBuilder:
 
     def _compile_one(self, src, obj, nvcc_flags, include_dirs, extra_cflags=()):
         include_flags = [f"-I{d}" for d in include_dirs]
+        launcher = shlex.split(os.environ.get("TOKENSPEED_KERNEL_NVCC_LAUNCHER", ""))
         cmd = (
-            [NVCC]
+            launcher
+            + [NVCC]
             + nvcc_flags
             + list(extra_cflags)
             + include_flags
