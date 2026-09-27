@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import logging
 from collections.abc import Callable
@@ -66,7 +65,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
-    cache_recipe,
     prepare_cache_setup,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -1192,39 +1190,6 @@ def _narrow_spec_for_pp(
         spec,
         memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
     )
-
-
-def cudagraph_probe_supported(
-    server_args: ServerArgs, model_config: ModelConfig
-) -> bool:
-    """Whether a probe-sized arena can stand in for this family's real one.
-
-    Resolved the way ``create_attn_components`` resolves it, without building
-    a pool and without writing back into ``server_args`` -- the build that
-    follows reads the operator's own backend choice, and family dispatch keys
-    on architecture facts rather than on the backend name. A family that stages
-    speculative verify scratch in the bound pool cannot: it needs a row per
-    request at the serving concurrency.
-    """
-    # The build's own resolver, on a copy: deriving it here would drift.
-    probe_args = copy.copy(server_args)
-    target = _resolve_attn_side(model_config, probe_args.attention_backend)
-    _apply_backend_overrides(probe_args, target, None)
-    config = _create_attn_config(probe_args, model_config)
-    # The seam reads only server_args and attn_config; the rest is fabricated.
-    recipe = cache_recipe(
-        _resolve_cache_family(target, config),
-        server_args=probe_args,
-        model_config=model_config,
-        attn_config=config,
-        draft_model_config=None,
-        draft_attn_config=None,
-        cache_budget_bytes=0,
-        probe_batch_rows=None,
-        decode_input_tokens=1,
-        overlap_schedule_depth=0,
-    )
-    return not recipe.verify_scratch_in_pool()
 
 
 def create_attn_components(

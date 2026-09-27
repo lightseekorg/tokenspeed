@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import ast
-import inspect
 import pathlib
 import sys
 from types import SimpleNamespace
@@ -336,47 +335,7 @@ def test_a_probe_arena_cannot_also_carry_a_reserve() -> None:
     assert "cannot also reserve" not in _failure(5 << 30, None)
 
 
-def test_the_probe_support_query_calls_the_factorys_resolvers(monkeypatch) -> None:
-    query = _function("layers/attention/registry.py", "cudagraph_probe_supported")
-    # cache_recipe takes **kwargs, so binding it would assert nothing.
-    callees = ("_resolve_cache_family", "_resolve_attn_side", "_create_attn_config")
-    bound = set()
-    for node in ast.walk(query):
-        name = getattr(getattr(node, "func", None), "id", None)
-        if isinstance(node, ast.Call) and name in callees:
-            inspect.signature(getattr(registry, name)).bind(
-                *node.args, **{kw.arg: None for kw in node.keywords}
-            )
-            bound.add(name)
-    assert bound == set(callees)
-
-    # The real override runs on a copy: the caller's --attention-backend survives.
-    args = SimpleNamespace(
-        attention_backend="trtllm",
-        drafter_attention_backend=None,
-        speculative_algorithm=None,
-        disaggregation_mode="null",
-    )
-    before = dict(vars(args))
-    monkeypatch.setattr(registry, "_create_attn_config", lambda *a, **k: object())
-    monkeypatch.setattr(registry, "_resolve_cache_family", lambda *a, **k: "mha")
-    for scratch, expected in ((False, True), (True, False)):
-        monkeypatch.setattr(
-            registry,
-            "cache_recipe",
-            lambda *a, _s=scratch, **k: SimpleNamespace(
-                verify_scratch_in_pool=lambda: _s
-            ),
-        )
-        config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"]),
-            model_profile=None,
-        )
-        assert registry.cudagraph_probe_supported(args, config) is expected
-    assert dict(vars(args)) == before
-
-
-def test_only_pool_staged_verify_scratch_refuses(monkeypatch) -> None:
+def test_pool_staged_verify_scratch_keeps_the_serving_concurrency(monkeypatch) -> None:
     from tokenspeed_kernel.ops.attention import kda as kda_ops
 
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
@@ -407,9 +366,23 @@ def test_only_pool_staged_verify_scratch_refuses(monkeypatch) -> None:
     assert speculative.workspace_bytes() == 0
     assert speculative.verify_scratch_in_pool() is False
 
+    def arena_bytes(max_bs: int) -> int:
+        recipe = _kimi_k3_recipe(
+            max_bs=max_bs, speculative_algorithm="eagle", speculative_num_draft_tokens=2
+        )
+        recipe.cache_budget_bytes = 0
+        recipe.probe_batch_rows = 2
+        assert recipe.verify_scratch_in_pool() is True
+        return recipe.setup().spec.memory_plan.arena_bytes
 
-def test_each_refusal_turns_the_probe_off_and_names_itself(monkeypatch) -> None:
-    monkeypatch.setattr(registry, "cudagraph_probe_supported", lambda *a, **k: True)
+    monkeypatch.setattr(
+        kda_ops, "kda_batched_replay_uses_raw_gate", lambda *a, **k: True
+    )
+    # Its verify scratch is a row per request of the bound pool, probe or not.
+    assert arena_bytes(8) < arena_bytes(64)
+
+
+def test_each_refusal_turns_the_probe_off_and_names_itself() -> None:
     plain = SimpleNamespace(model=object())
 
     class _Narrowing:
@@ -426,15 +399,13 @@ def test_each_refusal_turns_the_probe_off_and_names_itself(monkeypatch) -> None:
         args = SimpleNamespace(
             disable_cudagraph_memory_reserve=disable, enforce_eager=eager
         )
-        return device._cudagraph_probe_refusal(args, object(), model)
+        return device._cudagraph_probe_refusal(args, model)
 
     assert refusal() is None
     assert "--disable-cudagraph-memory-reserve" in refusal(disable=True)
     assert "--enforce-eager" in refusal(eager=True)
     # The protocol lives on the inner text model, not the causal-LM wrapper.
     assert "narrowing" in refusal(model=SimpleNamespace(model=_Narrowing()))
-    monkeypatch.setattr(registry, "cudagraph_probe_supported", lambda *a, **k: False)
-    assert "cache family" in refusal()
 
 
 if __name__ == "__main__":

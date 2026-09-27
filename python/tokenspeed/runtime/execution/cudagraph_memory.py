@@ -69,6 +69,8 @@ def probe_arena_parent_blocks(
     Each fabricated extend row -- the autotune dummy prefill and every captured
     prefill bucket, including configured capture batch sizes -- takes a
     distinct page; decode capture uses only the null page.
+    A family whose verify scratch is the pool itself keeps the serving
+    concurrency instead (``verify_scratch_in_pool``).
     """
     from tokenspeed.runtime.execution.prefill_graph import dummy_batch_size
 

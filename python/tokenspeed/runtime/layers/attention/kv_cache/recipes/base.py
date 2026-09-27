@@ -346,14 +346,16 @@ class CacheRecipe(ABC):
         The one place a recipe reads them, so per-group page demand and the
         capacity search cannot size against different numbers. Under a probe
         the concurrency is the probe's own fabricated batch, not the
-        scheduler's -- the arena it sizes serves a capture, not requests.
+        scheduler's -- the arena it sizes serves a capture, not requests --
+        unless verify scratch lives in the pool, which then needs a row per
+        request whatever pool is bound.
         """
         return SchedulerLimits(
             role=scheduler_role(self.server_args.disaggregation_mode),
             # One live request per fabricated row; serving concurrency is elsewhere.
             max_live_requests=(
                 self.attn_config.max_bs
-                if self.probe_batch_rows is None
+                if self.probe_batch_rows is None or self.verify_scratch_in_pool()
                 else min(self.attn_config.max_bs, self.probe_batch_rows)
             ),
             max_scheduled_tokens=int(self.server_args.chunked_prefill_size),
@@ -441,7 +443,7 @@ class CacheRecipe(ABC):
         """Whether speculative verify stages its scratch in the bound pool.
 
         A family that does needs a row per request at the serving concurrency
-        from whichever pool is bound, so no probe-sized arena can serve it.
+        from whichever pool is bound, so its probe arena keeps that concurrency.
         """
         return False
 

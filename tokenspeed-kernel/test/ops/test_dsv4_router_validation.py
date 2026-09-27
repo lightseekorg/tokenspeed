@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe import moe_topk
@@ -175,3 +177,40 @@ def test_unified_router_preserves_override_and_output_dtypes(
     torch.testing.assert_close(
         weights, (expected_weights * 2.5).double(), rtol=1e-6, atol=1e-7
     )
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("hash_routing", [False, True])
+def test_cuda_router_preserves_explicit_pdl(monkeypatch, enable_pdl, hash_routing):
+    from tokenspeed_kernel.thirdparty.cuda import routing
+
+    module = Mock()
+    monkeypatch.setattr(routing, "_load_routing_module", lambda: module)
+    monkeypatch.setattr(routing, "pdl_enabled", lambda: not enable_pdl)
+    logits = torch.zeros(1, 256)
+    ids = torch.empty(1, 6, dtype=torch.int32)
+    weights = torch.empty(1, 6)
+    if hash_routing:
+        routing.hash_softplus_sqrt_topk_flash(
+            logits,
+            torch.zeros(1, dtype=torch.int32),
+            ids,
+            ids,
+            weights,
+            1.0,
+            True,
+            enable_pdl=enable_pdl,
+        )
+        call = module.hash_softplus_sqrt_topk_flash.call_args
+    else:
+        routing.softplus_sqrt_topk_flash(
+            logits,
+            torch.zeros(256),
+            ids,
+            weights,
+            1.0,
+            True,
+            enable_pdl=enable_pdl,
+        )
+        call = module.softplus_sqrt_topk_flash.call_args
+    assert call.args[-1] is enable_pdl

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.cuda.routing import (
@@ -61,6 +61,7 @@ def cuda_sqrt_softplus_topk(
             topk_weights,
             routed_scaling_factor,
             renormalize,
+            enable_pdl=pdl_enabled(),
         )
     elif correction_bias is not None:
         softplus_sqrt_topk_flash(
@@ -73,6 +74,7 @@ def cuda_sqrt_softplus_topk(
             topk_weights,
             routed_scaling_factor,
             renormalize,
+            enable_pdl=pdl_enabled(),
         )
     else:
         raise ValueError("fused DeepSeek V4 selection requires bias or hash routing")

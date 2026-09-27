@@ -128,7 +128,7 @@ def test_router_preserves_score_order_and_ties(experts, pdl, case):
     original_pdl = pdl_enabled()
     pdl_enabled(pdl)
     try:
-        softplus_sqrt_topk_flash(logits, bias, ids, weights, 1.5, True)
+        softplus_sqrt_topk_flash(logits, bias, ids, weights, 1.5, True, enable_pdl=pdl)
         expected_ids = torch.tensor(selected, device="cuda", dtype=torch.int32)
         torch.testing.assert_close(ids, expected_ids.expand_as(ids), atol=0, rtol=0)
         if case == "infinite_logits":
@@ -156,7 +156,9 @@ def test_router_pdl_chain_reads_updated_graph_input(pdl):
 
         def run():
             logits = dsv4_linear_fp32(x, gate)
-            softplus_sqrt_topk_flash(logits, bias, ids, weights, 1.0, True)
+            softplus_sqrt_topk_flash(
+                logits, bias, ids, weights, 1.0, True, enable_pdl=pdl
+            )
             # A dependent consumer also must observe the current route outputs.
             return ids.clone(), weights.clone()
 
