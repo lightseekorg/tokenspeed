@@ -263,8 +263,9 @@ def test_mla_prefill_gluon_reuses_kernel_across_batch_and_query_sizes(
         expected_lse = visible.float().log().repeat(batch)[:, None].expand_as(lse)
         torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=1e-5)
 
-    # Warm the runtime integer specialization classes before checking that
-    # changing the batch/sequence lengths never introduces another binary.
+    # Compile once and check small shapes, including a one-row query.
+    # batch_size and max_seqlen_q are not specialized, so crossing scheduler
+    # slot boundaries below must reuse the same binary.
     for batch, q_len in ((1, 1), (2, 16), (16, 17), (16, 16), (2, 17)):
         invoke(batch, q_len)
     with assert_no_triton_compile(getattr(module, kernel)):

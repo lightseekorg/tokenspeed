@@ -325,14 +325,12 @@ class TileCopies:
             program.k_ptr,
             self.k_offsets + shift * cfg.k_strides.stride_t,
             mask=self.k_rows[:, None] < rows_left,
-            other=0.0,
         )
         async_copy.buffer_load_to_shared(
             k_pe_smem.index(slot),
             program.k_ptr,
             self.k_pe_offsets + shift * cfg.k_strides.stride_t,
             mask=self.k_pe_rows[:, None] < rows_left,
-            other=0.0,
         )
         async_copy.commit_group()
 
@@ -345,7 +343,6 @@ class TileCopies:
             program.v_ptr,
             self.v_offsets + shift * cfg.v_strides.stride_t,
             mask=self.v_rows[:, None] < program.kv_len - shift,
-            other=0.0,
         )
         async_copy.commit_group()
 

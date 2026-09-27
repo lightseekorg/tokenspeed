@@ -630,6 +630,11 @@ if current_platform().is_amd:
         ),
         # Preferred over gluon_mla_prefill_gfx950 wherever both apply.
         priority=Priority.SPECIALIZED + 1,
+        # For FP8 both kernels cover 256 query rows per block, so the 8-wave
+        # pipeline wins once each sequence has enough keys to pay off
+        # refilling it for every block. The threshold comes from cold-cache
+        # measurements of Kimi-K3 prefill shapes. mla_prefill_traits rounds
+        # avg_kv_len down to a power of two, so keep this minimum one too.
         traits={
             "avg_kv_len_min": frozenset({1024}),
             "head_dim": frozenset({192}),

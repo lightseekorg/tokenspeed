@@ -269,9 +269,7 @@ only for now.
   agree with the authoritative `cu_seqlens_kv` lengths.
 - Both share launch metadata that reports attention FLOPs and each tensor's
   bytes once without reading device-resident sequence lengths: FLOPs assume
-  every sequence has the batch's fractional average query and key length,
-  with rounding only on the final FLOP count. This is an estimate for ragged
-  batches and does not read device lengths or synchronize the host.
+  every sequence has the batch's average query and key length.
 
 #### Algorithm
 
@@ -292,13 +290,12 @@ MFMAs with the next tile's row maximum. The two waves on a SIMD run one
 cluster apart, so one wave's MFMAs overlap the other's memory work.
 
 K and V stream into 4-slot LDS rings by asynchronous copies, K four tiles
-ahead and V three. Tiles past the visible range explicitly load zeros for
-masked rows in every input dtype,
-so the loop needs no drain, and only tiles crossing the causal diagonal or the
-key tail apply a score mask. For 16-bit inputs the running maximum moves only
-when a tile maximum exceeds it by more than 8 (base 2); FP8 keeps the exact
-maximum so P stays at most 1 before its FP8 conversion. A wave skips the
-rescale when none of its rows moved. Empty asm statements keep LLVM from
+ahead and V three. Tiles past the visible range load fully masked; buffer
+loads zero-fill masked rows in LDS, so the loop needs no drain, and only tiles
+crossing the causal diagonal or the key tail apply a score mask. For 16-bit
+inputs the running maximum moves only when a tile maximum exceeds it by more
+than 8 (base 2); FP8 keeps the exact maximum so P stays at most 1 before its
+FP8 conversion. A wave skips the rescale when none of its rows moved. Empty asm statements keep LLVM from
 moving each cluster's results across cluster barriers.
 
 ## Sampling
