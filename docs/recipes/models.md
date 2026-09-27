@@ -799,6 +799,19 @@ tokenspeed serve openai/gpt-oss-120b \
 
 ## DeepSeek V4-Flash / V4-Pro
 
+With `tokenspeed-smg==1.11.0.post20260924`, DeepSeek V4 and V4.1 chat
+requests enable thinking by default. Reasoning consumes the output token
+budget, so set an explicit `max_tokens` large enough for reasoning and the
+final answer, within the configured context length. To request non-thinking
+answers, send `"thinking": {"type": "disabled"}` in the JSON request body
+(or `extra_body={"thinking": {"type": "disabled"}}` with the OpenAI Python
+client).
+
+The GSM8K CI evaluations keep this thinking default and use explicit output
+budgets: 3,072 tokens for the V4 jobs with a 4,096-token context and 30,000
+for V4.1. The runtime clamps the budget to the remaining context after the
+prompt; each evaluation request also has a 1,800-second timeout.
+
 DeepSeek V4 uses FP8 KV cache.
 `tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
 and `--tool-call-parser deepseek_v4`, and auto-sets `block_size=256` (pass

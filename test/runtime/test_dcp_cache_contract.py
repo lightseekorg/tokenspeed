@@ -136,6 +136,7 @@ def _recipe(*, dcp_size: int, fp4: bool, draft: bool) -> DeepseekV4Recipe:
         ),
         draft_attn_config=SimpleNamespace(dcp_size=dcp_size) if draft else None,
         cache_budget_bytes=8 << 30,
+        probe_batch_rows=None,
         decode_input_tokens=4,
         overlap_schedule_depth=0,
     )

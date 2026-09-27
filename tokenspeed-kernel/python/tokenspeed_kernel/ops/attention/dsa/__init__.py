@@ -426,6 +426,8 @@ def dsa_prefill_topk(
     q_scales: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     candidate_lens_cpu: torch.Tensor | None = None,
+    initial_tokens: int = 0,
+    local_tokens: int = 0,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
     override: str | None = None,
@@ -518,12 +520,26 @@ def dsa_prefill_topk(
             if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
             else "page_planar"
         )
+    initial_tokens = int(initial_tokens)
+    local_tokens = int(local_tokens)
+    if initial_tokens < 0 or local_tokens < 0:
+        raise ValueError("initial_tokens and local_tokens must be non-negative")
+    if initial_tokens + local_tokens > int(topk):
+        raise ValueError(
+            "initial_tokens + local_tokens must not exceed topk; got "
+            f"{initial_tokens} + {local_tokens} > {int(topk)}"
+        )
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
         "attention",
         "dsa_prefill_topk",
         signature,
         traits=traits,
+        features=(
+            frozenset({"forced_initial_local"})
+            if initial_tokens or local_tokens
+            else None
+        ),
         solution=solution,
         override=override,
     )
@@ -564,6 +580,9 @@ def dsa_prefill_topk(
             kernel_kwargs["q_scales"] = q_scales
         if candidate_lens_cpu is not None and kernel.name.startswith("deep_gemm_"):
             kernel_kwargs["candidate_lens_cpu"] = candidate_lens_cpu
+        if initial_tokens or local_tokens:
+            kernel_kwargs["initial_tokens"] = initial_tokens
+            kernel_kwargs["local_tokens"] = local_tokens
         return kernel(**kernel_kwargs)
 
 
@@ -583,6 +602,8 @@ def dsa_decode_topk(
     q_scales: torch.Tensor | None = None,
     seq_lens_2d: torch.Tensor | None = None,
     plan: object | None = None,
+    initial_tokens: int = 0,
+    local_tokens: int = 0,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
     override: str | None = None,
@@ -691,15 +712,27 @@ def dsa_decode_topk(
             if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
             else "page_planar"
         )
+    initial_tokens = int(initial_tokens)
+    local_tokens = int(local_tokens)
+    if initial_tokens < 0 or local_tokens < 0:
+        raise ValueError("initial_tokens and local_tokens must be non-negative")
+    if initial_tokens + local_tokens > int(topk):
+        raise ValueError(
+            "initial_tokens + local_tokens must not exceed topk; got "
+            f"{initial_tokens} + {local_tokens} > {int(topk)}"
+        )
+    required_features = set()
+    if topk_layout == "logical_offsets":
+        required_features.add("logical_offsets")
+    if initial_tokens or local_tokens:
+        required_features.add("forced_initial_local")
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
         "attention",
         "dsa_decode_topk",
         signature,
         traits=traits,
-        features=(
-            frozenset({"logical_offsets"}) if topk_layout == "logical_offsets" else None
-        ),
+        features=frozenset(required_features) if required_features else None,
         solution=solution,
         override=override,
     )
@@ -742,6 +775,9 @@ def dsa_decode_topk(
             kernel_kwargs["block_table_base_offsets"] = block_table_base_offsets
         if q_scales is not None:
             kernel_kwargs["q_scales"] = q_scales
+        if initial_tokens or local_tokens:
+            kernel_kwargs["initial_tokens"] = initial_tokens
+            kernel_kwargs["local_tokens"] = local_tokens
         return kernel(**kernel_kwargs)
 
 

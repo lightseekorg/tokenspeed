@@ -854,6 +854,11 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
             draft_model_config=draft,
             decode_input_tokens=6,
             overlap_schedule_depth=0,
+            graph_reserve_bytes=0,
+            probe_batch_rows=None,
+            profiled_cache_bytes=None,
+            reuse_target_backend=None,
+            reuse_draft_backend=None,
         )
     config_builder.assert_called_once_with(args, target)
 

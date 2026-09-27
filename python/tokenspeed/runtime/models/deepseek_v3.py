@@ -892,10 +892,15 @@ class DeepseekV3AttentionMLA(nn.Module):
             query_pe_written = True
         # latent_cache contains normalized kv_a and k_pe before rotate.
         K = latent_cache.unsqueeze(1)
+        # The absorption projection must be per-row batch-invariant under
+        # rl-bitwise: the cuBLAS batched GEMM retiles by the token count.
         bmm(
             q_nope.transpose(0, 1),
             self.w_kc.transpose(1, 2),
             out=Q[..., : self.kv_lora_rank].transpose(0, 1),
+            override=(
+                "aok" if global_server_args_dict["numerics"] == "rl-bitwise" else None
+            ),
         )
         # Model-owned fused FP8 decode: RoPE + quantize + KV cache write
         # all done here, so backend only needs to do attention.

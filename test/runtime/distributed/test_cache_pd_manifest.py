@@ -661,6 +661,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1 << 24,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )

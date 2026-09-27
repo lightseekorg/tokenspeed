@@ -249,11 +249,13 @@ behind the forward that captured it, not inline.
 
 ## Principle 5: publishing drains, once per round
 
-`_publish_scheduler_kv_events` has drain semantics: KV events accumulate
-inside the C++ scheduler across any number of mutations (advance,
+`_publish_scheduler_kv_events` has drain semantics: cache mutations
+accumulate inside the C++ scheduler across any number of calls (advance,
 `next_execution_plan`), so a single unconditional call at the loop tail
-publishes everything the round produced, in order, as one batch. Do not add
-per-mutation publish calls; they only fragment batches.
+publishes everything the round produced, in order, as one batch. The batch
+is the round's net change: a block evicted and cached again within the round
+produces no event. Do not add per-mutation publish calls; they only fragment
+batches.
 
 The same reasoning fixes the metrics call: scheduler iteration metrics are
 recorded once per round, from the same pre-dispatch snapshot as the

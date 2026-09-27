@@ -85,6 +85,14 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        if global_server_args_dict["numerics"] == "rl-bitwise":
+            # Bitwise envelope: the logits GEMM must be batch-invariant like
+            # every other row-parallel projection (see layers/dense/unquant).
+            import tokenspeed_kernel
+
+            return tokenspeed_kernel.mm(x, layer.weight, bias=bias, override="aok")
         return F.linear(x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

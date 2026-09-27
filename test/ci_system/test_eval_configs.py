@@ -343,3 +343,21 @@ def test_kimi_k25_amd_accuracy_gate_preserves_question_outputs():
     assert generation == {"do_sample": False, "temperature": 0.0, "max_tokens": 65536}
     assert task["score_threshold"] == 0.75
     assert "retries" not in task
+
+
+def test_deepseek_gsm8k_has_bounded_thinking_output():
+    paths = sorted(EVAL_CONFIG_DIR.glob("deepseek-v4*gsm8k*.yaml"))
+    assert paths
+    for path in paths:
+        task = yaml.safe_load(path.read_text(encoding="utf-8"))
+        eval_tokens = shlex.split(task["eval"]["command"])
+        generation = json.loads(flag_value(eval_tokens, "--generation-config"))
+        server_tokens = shlex.split(task["server"]["command"])
+        if "--max-model-len" in server_tokens:
+            context_len = int(flag_value(server_tokens, "--max-model-len"))
+        else:
+            context_len = int(task["env"]["MAX_MODEL_LEN"])
+        assert 0 < generation["max_tokens"] < context_len, path
+        assert 0 < generation["timeout"] <= 1800, path
+        # Exercise the gateway's thinking default without an override.
+        assert "extra_body" not in generation, path

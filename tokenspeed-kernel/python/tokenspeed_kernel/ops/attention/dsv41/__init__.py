@@ -432,8 +432,9 @@ def index_topk(
     to powers of two and at least the score tile width (at most256 lanes).
     With replicated32 heads and compatible Blackwell pages, optional DeepGEMM
     scores packed FP4 inputs with FP32 accumulation and DeepSelect selects rows
-    and block maxima. This native accumulation differs from the portable
-    reference's intermediate BF16 rounding. Native query tiles cap logits at
+    and block maxima; on Hopper, DeepGEMM scores FP8 ``index_v4`` rows and the
+    in-tree CuTe DSL DeepSelect kernel selects. This native accumulation
+    differs from the portable reference's intermediate BF16 rounding. Native query tiles cap logits at
     32MiB for paged queries and 128MiB for a zero-row-stride request table.
     That broadcast layout gathers packed history once per call and packs Q
     once before the score tiles; no payload survives the call. For unsharded
@@ -448,7 +449,7 @@ def index_topk(
     from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
 
     # Each target scores the index rows its own cache format stores: FP4 with
-    # DeepSelect on Blackwell, FP8 with FlashInfer's selection on Hopper.
+    # DeepSelect on Blackwell, FP8 with the CuTe DSL DeepSelect kernel on Hopper.
     row_bytes = index_cache.shape[2] if index_cache.ndim == 3 else 0
     shaped = (
         index_q.is_cuda
