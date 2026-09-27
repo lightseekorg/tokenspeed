@@ -1195,19 +1195,31 @@ def _attention_mla_decode(
 def _attention_mla_prefill(
     dtype: torch.dtype, batch_size: int, q_len: int, kv_len: int, num_heads: int
 ) -> object:
+    return _attention_mla_prefill_ragged(
+        dtype, q_len, (kv_len,) * batch_size, num_heads
+    )
+
+
+def _attention_mla_prefill_ragged(
+    dtype: torch.dtype, q_len: int, kv_lens: tuple[int, ...], num_heads: int
+) -> object:
     # Selection reads the problem size from tensor shapes only, so stride-0
     # views stand in for full-size inputs.
     def tokens(count: int, dim: int) -> torch.Tensor:
         return torch.empty((1, num_heads, dim), dtype=dtype).expand(count, -1, -1)
 
+    batch_size = len(kv_lens)
+    lens_kv = torch.tensor(kv_lens, dtype=torch.int32)
+    cu_seqlens_kv = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens_kv[1:] = lens_kv.cumsum(0)
     return _attention_mla_pkg.mla_prefill(
         q=tokens(batch_size * q_len, 192),
-        k=tokens(batch_size * kv_len, 192),
-        v=tokens(batch_size * kv_len, 128),
+        k=tokens(sum(kv_lens), 192),
+        v=tokens(sum(kv_lens), 128),
         cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32) * q_len,
-        cu_seqlens_kv=torch.arange(batch_size + 1, dtype=torch.int32) * kv_len,
+        cu_seqlens_kv=cu_seqlens_kv,
         max_seqlen_q=q_len,
-        max_seqlen_kv=kv_len,
+        max_seqlen_kv=max(kv_lens),
         softmax_scale=1.0,
         is_causal=True,
     )
@@ -4757,6 +4769,26 @@ _CASES = [
         )
         for batch in (1, 3)
         for kv_len in (513, 1023, 1024, 1025)
+    ],
+    # Ragged batches select on the average key length, including totals the
+    # batch size does not divide.
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            "mla_prefill",
+            expected,
+            partial(
+                _attention_mla_prefill_ragged, torch.float8_e4m3fn, 256, kv_lens, 12
+            ),
+            id_suffix=f"fp8-ragged-kv{'-'.join(map(str, kv_lens))}",
+        )
+        for kv_lens, expected in (
+            ((1023, 1024, 1024), "gluon_mla_prefill_gfx950"),
+            ((1024, 1024, 1025), "gluon_mla_prefill_8wave_gfx950"),
+            ((512, 1536, 1024), "gluon_mla_prefill_8wave_gfx950"),
+        )
     ],
     _case(
         _is_cdna5,
