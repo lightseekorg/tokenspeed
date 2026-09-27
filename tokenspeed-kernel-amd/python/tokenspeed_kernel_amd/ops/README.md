@@ -252,7 +252,6 @@ only for now.
   (128 no-PE plus 64 RoPE dimensions); values are `(tokens, kv_heads, 128)`,
   all FP16, BF16, FP8 E4M3, or FP8 E5M2 with one shared dtype and a contiguous
   last dimension. Query heads must be a multiple of KV heads.
-- Each batch must contain at least one sequence.
 - `cu_seqlens_q` and `cu_seqlens_kv` delimit the sequences. Causal masking
   aligns each query block to the end of its keys. `logit_cap` is unsupported.
 - The output may be any caller-owned floating dtype with a contiguous last
@@ -295,8 +294,9 @@ loads zero-fill masked rows in LDS, so the loop needs no drain, and only tiles
 crossing the causal diagonal or the key tail apply a score mask. For 16-bit
 inputs the running maximum moves only when a tile maximum exceeds it by more
 than 8 (base 2); FP8 keeps the exact maximum so P stays at most 1 before its
-FP8 conversion. A wave skips the rescale when none of its rows moved. Empty asm statements keep LLVM from
-moving each cluster's results across cluster barriers.
+FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
+asm statements keep LLVM from moving each cluster's results across cluster
+barriers.
 
 ## Sampling
 

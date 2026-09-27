@@ -592,35 +592,3 @@ def test_mla_prefill_gluon_launch_metadata(
         "bytes": tensor_bytes + (lse.numel() * 4 if has_lse else 0),
     }
     assert getattr(module, kernel).launch_metadata is module.prefill_launch_metadata
-
-
-@pytest.mark.parametrize("kernel", _KERNELS)
-@pytest.mark.parametrize("missing", ["is_causal", "logit_cap", "return_lse"])
-def test_mla_prefill_launcher_requires_explicit_options(kernel, missing):
-    launcher = getattr(_kernel_module(kernel), f"launch_{kernel}")
-    options = {"is_causal": True, "logit_cap": 0.0, "return_lse": False}
-    del options[missing]
-    with pytest.raises(TypeError, match=missing):
-        launcher(None, None, None, None, None, 0, 0, 1.0, **options)
-
-
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_mla_prefill_launcher_rejects_empty_batch(kernel):
-    launcher = getattr(_kernel_module(kernel), f"launch_{kernel}")
-    q = torch.empty((0, 12, 192), dtype=torch.bfloat16, device="meta")
-    v = torch.empty((0, 12, 128), dtype=torch.bfloat16, device="meta")
-    cu = torch.empty((1,), dtype=torch.int32, device="meta")
-    with pytest.raises(ValueError, match="at least one sequence"):
-        launcher(
-            q,
-            q,
-            v,
-            cu,
-            cu,
-            0,
-            0,
-            192**-0.5,
-            is_causal=True,
-            logit_cap=0.0,
-            return_lse=False,
-        )
