@@ -304,15 +304,24 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
     monkeypatch,
 ) -> None:
     order = []
+    entry_stream = object()
+
+    class _Stream:
+        def wait_stream(self, stream):
+            assert stream is entry_stream
+            order.append("stream wait")
+
+    capture_stream = _Stream()
 
     class _Recorder:
         def __init__(self, name, pool=None, _stream=None):
             self.name, self.pool = name, pool or "pool"
-            if name == "capture":
-                order.append("allocate pool")
+            self.stream = capture_stream
 
         def __enter__(self):
             order.append(f"{self.name} enter")
+            if self.name == "capture":
+                order.append("allocate pool")
             return self
 
         def __exit__(self, *_exc):
@@ -326,7 +335,14 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
         "BreakableCapture",
         lambda pool, stream: _Recorder("capture", pool),
     )
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_a, **_k: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: entry_stream)
+
+    def stream_context(stream):
+        assert stream is capture_stream
+        return _Recorder("stream")
+
+    monkeypatch.setattr(torch.cuda, "stream", stream_context)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: order.append("synchronize"))
     graph = PrefillGraph.__new__(PrefillGraph)
     graph.num_warmup = 2
     graph._pool = None
@@ -335,11 +351,15 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
     PrefillGraph._capture_bucket(graph, 8, None, _Recorder("observe"))
 
     assert order == [
+        "stream wait",
+        "stream enter",
         "forward",
         "forward",
-        "allocate pool",
+        "stream exit",
+        "synchronize",
         "observe enter",
         "capture enter",
+        "allocate pool",
         "forward",
         "capture exit",
         "observe exit",
