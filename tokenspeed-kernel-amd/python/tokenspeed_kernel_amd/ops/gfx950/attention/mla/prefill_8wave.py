@@ -806,17 +806,41 @@ def launch_gluon_mla_prefill_8wave_gfx950(
     out: torch.Tensor | None = None,
     seq_lens_kv: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Dense non-absorbed MLA prefill on AMD gfx950.
+    """Dense non-absorbed MLA prefill on AMD gfx950 with 8-wave pipelining.
 
-    ``q`` is ``[total_tokens, num_heads, 192]`` and ``k`` is
-    ``[total_tokens, num_kv_heads, 192]`` (128 NoPE + 64 RoPE); ``v`` is
-    ``[total_tokens, num_kv_heads, 128]``, all FP16, BF16, FP8 E4M3
-    or FP8 E5M2.
-    Output is ``[total_tokens, num_heads, 128]``. ``seq_lens_kv`` and
-    ``max_seqlen_kv`` are redundant hints that must agree with ``cu_seqlens_kv``,
-    which defines the KV lengths. ``is_causal``, ``logit_cap`` and ``return_lse``
-    are explicit; when ``return_lse`` is true, return the output and FP32
-    log-sum-exp tensors.
+    Args:
+        q: Queries shaped ``[total_q, num_heads, 192]`` (128 NoPE + 64 RoPE),
+            FP16, BF16, FP8 E4M3 or FP8 E5M2 with a contiguous last dimension.
+        k: Keys shaped ``[total_kv, num_kv_heads, 192]`` with ``q``'s dtype and
+            a contiguous last dimension. ``num_heads`` must be a multiple of
+            ``num_kv_heads``.
+        v: Values shaped ``[total_kv, num_kv_heads, 128]`` with ``q``'s dtype
+            and a contiguous last dimension.
+        cu_seqlens_q: Int32 query offsets shaped ``[batch_size + 1]``; must
+            hold at least one sequence.
+        cu_seqlens_kv: Int32 key/value offsets shaped ``[batch_size + 1]``.
+            These define the KV lengths.
+        max_seqlen_q: Longest query sequence in the batch. It is a runtime
+            argument, so varying lengths reuse one compiled kernel.
+        max_seqlen_kv: Longest KV sequence in the batch. A redundant hint that
+            must agree with ``cu_seqlens_kv``; the kernel does not read it.
+        softmax_scale: Scale applied to QK logits before the softmax.
+        is_causal: Whether to apply a causal mask aligning each sequence's
+            last query with its last key.
+        logit_cap: Soft cap on attention logits. Must be ``0.0``; capping is
+            unsupported.
+        return_lse: Whether to also return the log-sum-exp values.
+        out: Optional destination shaped ``[total_q, num_heads, 128]`` of any
+            floating dtype with a contiguous last dimension. Allocated as BF16
+            when omitted.
+        seq_lens_kv: Optional KV lengths shaped ``[batch_size]``. A redundant
+            hint that must agree with ``cu_seqlens_kv``; the kernel does not
+            read it.
+
+    Returns:
+        The output tensor, or ``(output, lse)`` when ``return_lse`` is true,
+        where ``lse`` is FP32 shaped ``[total_q, num_heads]`` in natural-log
+        units.
     """
     if cu_seqlens_q.numel() < 2:
         raise ValueError("MLA prefill requires at least one sequence")
