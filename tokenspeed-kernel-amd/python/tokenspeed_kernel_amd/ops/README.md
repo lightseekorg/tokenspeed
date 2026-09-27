@@ -159,6 +159,12 @@ decode, including the KDA QKVFAB shape.
   and divide the K tiles. A split greater than 1 must also leave each split
   at least one full TDM pipeline.
 
+The K3 shared-down facade preserves a caller-owned row-strided output. Its
+`auto` selector uses this kernel only for eligible GPU BF16 contiguous inputs;
+otherwise Torch writes the same destination. Forced `torch` never dispatches
+WMMA. Selectors requiring contiguous output reject a row-strided destination,
+and unknown selectors always raise.
+
 #### Algorithm
 
 M is consumed in 16-row chunks, and each chunk re-reads B. `N` divisible by

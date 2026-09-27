@@ -987,8 +987,9 @@ def kimi3_shared_down_projection(
         out: Optional BF16 output shaped ``[M, 7168]``. A contiguous tensor
             keeps the existing kernel. With ``solution="auto"``, a row-strided
             tensor is written by the CDNA5 dense WMMA when that kernel accepts
-            the shape; otherwise the destination is ignored and a contiguous
-            result is returned.
+            the tensor contract; otherwise Torch writes into the same destination.
+            Row-strided outputs require unit inner stride and non-overlapping
+            rows, and are supported only by ``"auto"`` and ``"torch"``.
         solution: ``"auto"`` selects the gfx950 decode GEMV and otherwise
             uses the portable Torch linear operation.
 
@@ -996,39 +997,48 @@ def kimi3_shared_down_projection(
         The local shared-expert output contribution shaped ``[M, 7168]``.
     """
 
-    # The packed join lane is the only strided destination K3 passes here.
-    # An explicit solution stays on the selector below so a forced baseline
-    # cannot silently run this kernel.
+    if solution not in {"auto", "triton_gemv", "gluon_largem_gfx1250", "torch"}:
+        raise ValueError(f"unknown Kimi K3 shared down solution {solution!r}")
     strided_out = out is not None and not out.is_contiguous()
-    if (
-        solution == "auto"
-        and strided_out
-        and Platform.get().is_cdna5
-        and hidden_states.ndim == 2
-        and weight.ndim == 2
-        and hidden_states.shape[1] == weight.shape[1]
-        and use_gluon_wmma_dense_gfx1250(
-            hidden_states.shape[0], hidden_states.shape[1], weight.shape[0]
-        )
-    ):
-        from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
-            gluon_wmma_tdm_dense_gfx1250,
-        )
-
-        return gluon_wmma_tdm_dense_gfx1250(hidden_states, weight, out=out)
-    if strided_out:
-        out = None
     m, output_width, input_width = _validate_fallback_projection(
         hidden_states,
         weight,
-        out,
+        None if strided_out else out,
         name="Kimi K3 shared down projection",
     )
+    if strided_out:
+        if (
+            tuple(out.shape) != (m, output_width)
+            or out.dtype != hidden_states.dtype
+            or out.device != hidden_states.device
+            or out.stride(-1) != 1
+            or out.stride(0) < output_width
+        ):
+            raise ValueError(
+                "Kimi K3 shared down out must have matching shape, dtype and "
+                "device, unit inner stride and non-overlapping rows"
+            )
+        if solution not in {"auto", "torch"}:
+            raise ValueError(f"{solution!r} requires a contiguous shared down out")
+        if (
+            solution == "auto"
+            and Platform.get().is_cdna5
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and weight.is_contiguous()
+            and use_gluon_wmma_dense_gfx1250(m, input_width, output_width)
+        ):
+            from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+                gluon_wmma_tdm_dense_gfx1250,
+            )
+
+            return gluon_wmma_tdm_dense_gfx1250(hidden_states, weight, out=out)
+        return torch.mm(hidden_states, weight.T, out=out)
     expected_output = (m, output_width)
     if out is None:
         out = hidden_states.new_empty(expected_output)
-    if solution not in {"auto", "triton_gemv", "gluon_largem_gfx1250", "torch"}:
-        raise ValueError(f"unknown Kimi K3 shared down solution {solution!r}")
     specialized = (
         hidden_states.is_cuda
         and hidden_states.dtype == torch.bfloat16

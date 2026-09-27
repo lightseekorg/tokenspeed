@@ -57,6 +57,7 @@ import ctypes
 import importlib
 import json
 import os
+import shlex
 import shutil
 import site
 import subprocess
@@ -803,8 +804,10 @@ class CudaKernelBuilder:
 
     def _compile_one(self, src, obj, nvcc_flags, include_dirs, extra_cflags=()):
         include_flags = [f"-I{d}" for d in include_dirs]
+        launcher = shlex.split(os.environ.get("TOKENSPEED_KERNEL_NVCC_LAUNCHER", ""))
         cmd = (
-            [NVCC]
+            launcher
+            + [NVCC]
             + nvcc_flags
             + list(extra_cflags)
             + include_flags
