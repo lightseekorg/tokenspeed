@@ -30,6 +30,8 @@ from tokenspeed_kernel.benchmark.harness import (
     BenchmarkRequest,
     BenchmarkStatus,
 )
+from tokenspeed_kernel.platform import PlatformInfo
+from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _KIMI_K3_CONFIG = {
@@ -330,18 +332,22 @@ def test_mla_normalize_project_query_selection_matches_operation_api(
     assert actual[1]["inputs_contiguous"] is True
 
 
-def test_mla_prefill_selection_matches_operation_api(monkeypatch) -> None:
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("kv_len", [513, 1023, 1024, 1025])
+def test_mla_prefill_selection_matches_operation_api(
+    monkeypatch, batch, kv_len
+) -> None:
     fp8 = torch.float8_e4m3fn
     expected = _capture_operation_selection(
         monkeypatch,
         lambda ops: ops.mla_prefill(
-            q=torch.zeros((256, 12, 192), dtype=fp8),
-            k=torch.zeros((1024, 12, 192), dtype=fp8),
-            v=torch.zeros((1024, 12, 128), dtype=fp8),
-            cu_seqlens_q=torch.tensor([0, 256], dtype=torch.int32),
-            cu_seqlens_kv=torch.tensor([0, 1024], dtype=torch.int32),
+            q=torch.zeros((batch * 256, 12, 192), dtype=fp8),
+            k=torch.zeros((batch * kv_len, 12, 192), dtype=fp8),
+            v=torch.zeros((batch * kv_len, 12, 128), dtype=fp8),
+            cu_seqlens_q=torch.arange(batch + 1, dtype=torch.int32) * 256,
+            cu_seqlens_kv=torch.arange(batch + 1, dtype=torch.int32) * kv_len,
             max_seqlen_q=256,
-            max_seqlen_kv=1024,
+            max_seqlen_kv=kv_len,
             softmax_scale=192**-0.5,
             is_causal=False,
             return_lse=True,
@@ -350,7 +356,42 @@ def test_mla_prefill_selection_matches_operation_api(monkeypatch) -> None:
     actual = _capture_generator_selection(
         monkeypatch,
         mla_generator.prepare_mla_prefill,
-        _request("mla_prefill", _PREFILL_SHAPE),
+        _request(
+            "mla_prefill",
+            {**_PREFILL_SHAPE, "batch": batch, "kv_tokens_per_sequence": kv_len},
+        ),
     )
 
     assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        (_FP8, "gluon_mla_prefill_8wave_gfx950"),
+        ("bfloat16", "gluon_mla_prefill_gfx950"),
+    ],
+)
+def test_mla_prefill_generator_reports_executed_kernel_on_cdna4(
+    monkeypatch, mi350_platform: PlatformInfo, dtype: str, expected: str
+) -> None:
+    """The reported kernel must be the one mla_prefill runs for the case."""
+    load_builtin_kernels()
+    if KernelRegistry.get().get_by_name(expected) is None:
+        pytest.skip("gfx950 Gluon MLA prefill kernels are unavailable")
+
+    select_registration = mla_generator._select_registration
+    selected: dict[str, object] = {}
+
+    def capture(request, platform, *, signature_roles, traits):
+        selected["spec"] = select_registration(
+            request, platform, signature_roles=signature_roles, traits=traits
+        )
+        raise RuntimeError("selection captured")
+
+    monkeypatch.setattr(mla_generator, "_select_registration", capture)
+    request = _request("mla_prefill", {**_PREFILL_SHAPE, "dtype": dtype})
+    with pytest.raises(RuntimeError, match="selection captured"):
+        mla_generator.prepare_mla_prefill(request, mi350_platform)
+
+    assert selected["spec"].name == expected

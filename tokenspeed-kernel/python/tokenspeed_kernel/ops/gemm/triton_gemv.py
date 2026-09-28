@@ -201,7 +201,7 @@ def gluon_wmma_dense_gemv_gfx1250(
         gluon_wmma_tdm_dense_gfx1250,
     )
 
-    return gluon_wmma_tdm_dense_gfx1250(x, weight, out=out)
+    return gluon_wmma_tdm_dense_gfx1250(x, weight, out=out, split_k=None)
 
 
 @register_kernel(

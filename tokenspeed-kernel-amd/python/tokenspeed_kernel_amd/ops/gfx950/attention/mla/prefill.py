@@ -80,7 +80,6 @@ class AttentionConfig:
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_WARPS: gl.constexpr
-    BATCH_SIZE: gl.constexpr
     NUM_XCDS: gl.constexpr
     NUM_BLOCKS: gl.constexpr
     IS_FP8: gl.constexpr
@@ -117,7 +116,6 @@ class AttentionConfig:
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        BATCH_SIZE,
         IS_FP8,
         KV_DTYPE,
         q_strides,
@@ -179,7 +177,6 @@ class AttentionConfig:
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
-        self.BATCH_SIZE = gl.constexpr(BATCH_SIZE)
         self.NUM_XCDS = gl.constexpr(8)
         self.NUM_BLOCKS = gl.constexpr(512)
         self.IS_FP8 = gl.constexpr(IS_FP8)
@@ -975,8 +972,9 @@ class ProgramScheduler:
     q_head: gl.tensor
     q_slot: gl.tensor
     q_cycles_per_batch_group: gl.tensor
-    batch_slots: gl.constexpr
-    q_slots: gl.constexpr
+    batch_size: gl.tensor
+    batch_slots: gl.tensor
+    q_slots: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -991,6 +989,7 @@ class ProgramScheduler:
         q_head,
         q_slot,
         q_cycles_per_batch_group,
+        batch_size,
         batch_slots,
         q_slots,
     ):
@@ -1004,8 +1003,9 @@ class ProgramScheduler:
         self.q_head = q_head
         self.q_slot = q_slot
         self.q_cycles_per_batch_group = q_cycles_per_batch_group
-        self.batch_slots = gl.constexpr(batch_slots)
-        self.q_slots = gl.constexpr(q_slots)
+        self.batch_size = batch_size
+        self.batch_slots = batch_slots
+        self.q_slots = q_slots
 
     @gluon.jit
     def create(cfg, batch_size, max_seqlen_q, swizzled_order: gl.constexpr):
@@ -1018,19 +1018,14 @@ class ProgramScheduler:
 
         if swizzled_order:
             max_batch_slots: gl.constexpr = cfg.NUM_BLOCKS // cfg.N_HEADS
-            if cfg.BATCH_SIZE < max_batch_slots:
-                batch_slots: gl.constexpr = cfg.BATCH_SIZE
-            else:
-                batch_slots: gl.constexpr = max_batch_slots
-            q_slots: gl.constexpr = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
+            batch_slots = gl.minimum(batch_size, max_batch_slots)
+            q_slots = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
 
             q_cycles_per_batch_group = (num_q_blocks + q_slots - 1) // q_slots
-            num_batch_groups: gl.constexpr = (
-                cfg.BATCH_SIZE + batch_slots - 1
-            ) // batch_slots
+            num_batch_groups = (batch_size + batch_slots - 1) // batch_slots
             total_work = num_batch_groups * q_cycles_per_batch_group
 
-            active_slots: gl.constexpr = batch_slots * cfg.N_HEADS * q_slots
+            active_slots = batch_slots * cfg.N_HEADS * q_slots
             slot_valid = logical_pid < active_slots
             safe_pid = gl.where(slot_valid, logical_pid, 0)
             q_slot = safe_pid % q_slots
@@ -1059,8 +1054,8 @@ class ProgramScheduler:
         else:
             total_work = batch_size * cfg.N_HEADS * num_q_blocks
             zero = logical_pid - logical_pid
-            batch_slots: gl.constexpr = 1
-            q_slots: gl.constexpr = 1
+            batch_slots = zero + 1
+            q_slots = zero + 1
             slot_valid = logical_pid >= 0
             batch_slot = zero
             q_head = zero
@@ -1081,6 +1076,7 @@ class ProgramScheduler:
             q_head,
             q_slot,
             q_cycles_per_batch_group,
+            batch_size,
             batch_slots,
             q_slots,
         )
@@ -1110,6 +1106,7 @@ class ProgramScheduler:
             self.q_head,
             self.q_slot,
             self.q_cycles_per_batch_group,
+            self.batch_size,
             self.batch_slots,
             self.q_slots,
         )
@@ -1140,7 +1137,7 @@ class ProgramScheduler:
             # The final batch group may not fill every persistent batch slot.
             valid = (
                 self.slot_valid
-                & (batch < cfg.BATCH_SIZE)
+                & (batch < self.batch_size)
                 & (query_block < self.num_q_blocks)
             )
             safe_batch = gl.where(valid, batch, 0)
@@ -1185,7 +1182,40 @@ class ProgramScheduler:
 # ===-----------------------------------------------------------------------===#
 
 
-@gluon.jit
+def prefill_launch_metadata(grid, kernel, args):
+    """Report attention work without reading device-resident lengths.
+
+    Sequence lengths live in cu_seqlens on the device, so FLOPs assume every
+    sequence has the average query and key length of the batch. Causal masks
+    align the last query with the last key. Bytes count each tensor once.
+    """
+    total_q, heads, qk_dim = args["q_ptr"].shape
+    total_kv = args["k_ptr"].shape[0]
+    v_dim = args["v_ptr"].shape[-1]
+    batch = args["batch_size"]
+    q_len, kv_len = total_q / batch, total_kv / batch
+    if args["IS_CAUSAL"]:
+        # Query row i sees min(max(kv_len - q_len, 0) + i + 1, kv_len) keys,
+        # so the mask hides a triangle of size min(q_len, kv_len) - 1.
+        rows = min(q_len, kv_len)
+        pairs = q_len * kv_len - rows * (rows - 1 if rows > 1 else 0) / 2
+    else:
+        pairs = q_len * kv_len
+    flops = round(2 * batch * pairs * heads * (qk_dim + v_dim))
+    tensors = [args[name] for name in ("q_ptr", "k_ptr", "v_ptr", "output_ptr")]
+    if args["HAS_LSE"]:
+        tensors.append(args["lse_ptr"])
+    return {
+        "name": kernel.name,
+        "flops8" if args["IS_FP8"] else "flops16": flops,
+        "bytes": sum(t.numel() * t.element_size() for t in tensors),
+    }
+
+
+@gluon.jit(
+    launch_metadata=prefill_launch_metadata,
+    do_not_specialize=("batch_size", "max_seqlen_q"),
+)
 def gluon_mla_prefill_gfx950(
     q_ptr,
     k_ptr,
@@ -1214,7 +1244,7 @@ def gluon_mla_prefill_gfx950(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    BATCH_SIZE: gl.constexpr,
+    batch_size,
     max_seqlen_q,
     IS_FP8: gl.constexpr,
 ):
@@ -1229,7 +1259,6 @@ def gluon_mla_prefill_gfx950(
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        BATCH_SIZE,
         IS_FP8,
         k_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, 1),
@@ -1252,7 +1281,7 @@ def gluon_mla_prefill_gfx950(
 
     # Swizzle only helps the triangular causal workload; non-causal tiles are
     # uniform cost, so use the simpler round-robin order there.
-    scheduler = ProgramScheduler.create(cfg, BATCH_SIZE, max_seqlen_q, IS_CAUSAL)
+    scheduler = ProgramScheduler.create(cfg, batch_size, max_seqlen_q, IS_CAUSAL)
     while scheduler.has_work():
         program, active = scheduler.get_program(
             q_ptr,
@@ -1318,18 +1347,50 @@ def launch_gluon_mla_prefill_gfx950(
     max_seqlen_kv: int,
     softmax_scale: float,
     *,
-    is_causal: bool = True,
-    logit_cap: float = 0.0,
-    return_lse: bool = False,
+    is_causal: bool,
+    logit_cap: float,
+    return_lse: bool,
     out: torch.Tensor | None = None,
     seq_lens_kv: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Dense non-absorbed MLA prefill on AMD gfx950.
 
-    ``q``/``k`` are ``[total_tokens, num_heads, 192]`` (128 NoPE + 64 RoPE),
-    ``v`` is ``[total_tokens, num_kv_heads, 128]``. Output is
-    ``[total_tokens, num_heads, 128]``.
+    Args:
+        q: Queries shaped ``[total_q, num_heads, 192]`` (128 NoPE + 64 RoPE),
+            FP16, BF16, FP8 E4M3 or FP8 E5M2 with a contiguous last dimension.
+        k: Keys shaped ``[total_kv, num_kv_heads, 192]`` with ``q``'s dtype and
+            a contiguous last dimension. ``num_heads`` must be a multiple of
+            ``num_kv_heads``.
+        v: Values shaped ``[total_kv, num_kv_heads, 128]`` with ``q``'s dtype
+            and a contiguous last dimension.
+        cu_seqlens_q: Int32 query offsets shaped ``[batch_size + 1]``; must
+            hold at least one sequence.
+        cu_seqlens_kv: Int32 key/value offsets shaped ``[batch_size + 1]``.
+            These define the KV lengths.
+        max_seqlen_q: Longest query sequence in the batch. It is a runtime
+            argument, so varying lengths reuse one compiled kernel.
+        max_seqlen_kv: Longest KV sequence in the batch. A redundant hint that
+            must agree with ``cu_seqlens_kv``; the kernel does not read it.
+        softmax_scale: Scale applied to QK logits before the softmax.
+        is_causal: Whether to apply a causal mask aligning each sequence's
+            last query with its last key.
+        logit_cap: Soft cap on attention logits. Must be ``0.0``; capping is
+            unsupported.
+        return_lse: Whether to also return the log-sum-exp values.
+        out: Optional destination shaped ``[total_q, num_heads, 128]`` of any
+            floating dtype with a contiguous last dimension. Allocated as BF16
+            when omitted.
+        seq_lens_kv: Optional KV lengths shaped ``[batch_size]``. A redundant
+            hint that must agree with ``cu_seqlens_kv``; the kernel does not
+            read it.
+
+    Returns:
+        The output tensor, or ``(output, lse)`` when ``return_lse`` is true,
+        where ``lse`` is FP32 shaped ``[total_q, num_heads]`` in natural-log
+        units.
     """
+    if cu_seqlens_q.numel() < 2:
+        raise ValueError("MLA prefill requires at least one sequence")
     if logit_cap != 0.0:
         raise NotImplementedError("gluon MLA prefill gfx950 does not support logit_cap")
     if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
@@ -1415,7 +1476,7 @@ def launch_gluon_mla_prefill_gfx950(
         BLOCK_M=config.block_m,
         BLOCK_N=config.block_n,
         NUM_WARPS=config.num_warps,
-        BATCH_SIZE=batch_size,
+        batch_size=batch_size,
         max_seqlen_q=max_seqlen_q,
         IS_FP8=is_fp8,
         num_warps=config.num_warps,
