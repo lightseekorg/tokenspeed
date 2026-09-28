@@ -495,6 +495,21 @@ Queued requests that can take a batch slot and Device pages this round
 re-probe L3 immediately before admission so a hit that waited for capacity
 cannot keep a deleted or evicted object as a Host hit. A full decode batch
 or exhausted Device pool does not rehash the rest of the wait queue.
+
+L3 diagnostics are log-based and byte-denominated. `L3HostStore` logs every
+backup (PUT) and prefetch (GET) with key counts, successful keys, successful
+payload bytes, and call latency, and logs each admission `batch_exists`
+probe at debug level (the revalidation probe runs per scheduling round, so
+it stays off the info path); cumulative exists/GET/PUT counters (calls,
+keys, ok keys, ok bytes, total seconds) are kept per store. Above that, the
+L2 executor logs each completed backup with queue wait separated from actual
+PUT time plus the remaining backlog: pending backup pages, pending backup
+bytes, and the oldest pending age. A slow PUT retains Host pages (and, for
+ordinary stores, Device pages) until its acknowledgment, delaying admission
+despite bounded pools — the backlog line is what separates that queue
+pressure from transfer time. Transferred volume is reported as bytes, never
+as an effective token hit rate.
+
 `--kvstore-storage-backend memory` is an in-process dict for tests only.
 CI exercises that Mooncake-compatible contract end-to-end (scheduler
 prefetch after `register_storage_keys` / Host eviction, and a CUDA

@@ -25,6 +25,7 @@ import inspect
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from contextlib import contextmanager
@@ -1778,6 +1779,90 @@ class L3HostStoreTest(unittest.TestCase):
         self.assertEqual(l3.backup(pages), [True])
         self.assertTrue(l3.object_key("h0", 0, 0).startswith("v2_"))
         self.assertEqual(backend.batch_exists([old_key]), [False])
+
+
+class L3StoreStatsTest(unittest.TestCase):
+    """Per-op exists/GET/PUT counters and latency on ``L3HostStore``."""
+
+    def test_backup_prefetch_and_exists_record_calls_keys_bytes(self):
+        backend = MemoryKvStore()
+        host = _FakeHost(b"abcdefgh", size=64)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
+        pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
+
+        self.assertEqual(l3.backup(pages), [True, True])
+        self.assertEqual(l3.prefetch(pages), [True, True])
+        self.assertEqual(l3.exists(pages + [(0, 3, "miss", 0)]), [True, True, False])
+
+        stats = l3.stats()
+        self.assertEqual(stats.put.calls, 1)
+        self.assertEqual(stats.put.keys, 2)
+        self.assertEqual(stats.put.ok_keys, 2)
+        # Transferred volume is reported as successful payload bytes.
+        self.assertEqual(stats.put.payload_bytes, 16)
+        self.assertGreaterEqual(stats.put.total_seconds, 0.0)
+        self.assertEqual(stats.get.calls, 1)
+        self.assertEqual(stats.get.keys, 2)
+        self.assertEqual(stats.get.ok_keys, 2)
+        self.assertEqual(stats.get.payload_bytes, 16)
+        self.assertEqual(stats.exists.calls, 1)
+        self.assertEqual(stats.exists.keys, 3)
+        self.assertEqual(stats.exists.ok_keys, 2)
+        # An exists probe carries no payload bytes.
+        self.assertEqual(stats.exists.payload_bytes, 0)
+        l3.close()
+
+    def test_slow_get_and_put_latencies_are_measured(self):
+        class SlowStore(MemoryKvStore):
+            def batch_put_from(self, keys, host_buffer, offsets, sizes):
+                time.sleep(0.05)
+                return super().batch_put_from(keys, host_buffer, offsets, sizes)
+
+            def batch_get_into(self, keys, host_buffer, offsets, sizes):
+                time.sleep(0.05)
+                return super().batch_get_into(keys, host_buffer, offsets, sizes)
+
+        host = _FakeHost(b"abcdefgh", size=64)
+        l3 = L3HostStore(SlowStore(), host, key_prefix="m", rank=0, cp_rank=0)
+        pages = [(0, 1, "h0", 0)]
+        self.assertEqual(l3.backup(pages), [True])
+        self.assertEqual(l3.prefetch(pages), [True])
+
+        stats = l3.stats()
+        self.assertGreaterEqual(stats.put.total_seconds, 0.04)
+        self.assertGreaterEqual(stats.get.total_seconds, 0.04)
+        l3.close()
+
+    def test_failed_put_records_zero_ok_keys_and_bytes(self):
+        class FailingStore(MemoryKvStore):
+            def batch_put_from(self, keys, host_buffer, offsets, sizes):
+                return [False] * len(keys)
+
+        host = _FakeHost(b"abcdefgh", size=64)
+        l3 = L3HostStore(FailingStore(), host, key_prefix="m", rank=0, cp_rank=0)
+        pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
+
+        self.assertEqual(l3.backup(pages), [False, False])
+
+        stats = l3.stats()
+        self.assertEqual(stats.put.calls, 1)
+        self.assertEqual(stats.put.keys, 2)
+        self.assertEqual(stats.put.ok_keys, 0)
+        self.assertEqual(stats.put.payload_bytes, 0)
+        l3.close()
+
+    def test_stats_snapshot_is_detached_from_later_calls(self):
+        backend = MemoryKvStore()
+        host = _FakeHost(b"abcdefgh", size=64)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=0, cp_rank=0)
+        pages = [(0, 1, "h0", 0)]
+
+        self.assertEqual(l3.backup(pages), [True])
+        snapshot = l3.stats()
+        self.assertEqual(l3.backup(pages), [True])
+        self.assertEqual(snapshot.put.calls, 1)
+        self.assertEqual(l3.stats().put.calls, 2)
+        l3.close()
 
 
 class FactoryTest(unittest.TestCase):
