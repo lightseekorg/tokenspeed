@@ -244,6 +244,7 @@ def test_sm103_bf16_decode_causal_variants_compile() -> None:
                 use_pdl=False,
                 return_lse=False,
                 compute_capability=(10, 3),
+                partial_fp16=False,
             )
             assert compiled_kernel is not None
         """)

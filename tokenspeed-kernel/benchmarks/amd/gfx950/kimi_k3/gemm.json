@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "kimi_k3.gemm.mm/gluon_mm_a16w16_prefill_gfx950/tp8-kv_b-n3072-k512-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [2816, 3072, 3328, 3584, 3840, 4096],
+          "N": 3072,
+          "K": 512,
+          "quant": "none",
+          "dtype": "bfloat16",
+          "validation": {
+            "runs": 3,
+            "atol": 0.0001,
+            "rtol": 0.0078125
+          }
+        },
+        "registration": "gluon_mm_a16w16_prefill_gfx950",
+        "cold_cache": true,
+        "seed": 4601
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    }
+  ]
+}
