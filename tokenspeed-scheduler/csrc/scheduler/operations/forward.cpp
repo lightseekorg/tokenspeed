@@ -375,18 +375,13 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         // rather than a capacity one. The P role is exempt: it never decodes
         // locally and never retracts, so there is no decode room to prepay.
         const std::int32_t headroom = config_.role == Role::kP ? 0 : request->AdmissionHeadroom(kRetractionSafeSteps);
-        // A later local chunk reads this one's lookback before any of it can
-        // slide out. A remote landing has no later chunk: the peer fills the
-        // whole prompt.
+        // Sliding-window prepay (docs/design/scheduler.md §1). A remote landing
+        // has no later local chunk: the peer fills the whole prompt.
         const std::int32_t later_chunk_tokens =
             source == fsm::PrefillSource::kLocal ? unscheduled - tokens_this_round : 0;
-        // Prepay only while another request holds pages: those are what can
-        // leave this growth unfunded. With none, hit pages are held by the
-        // prefix index alone and recycle like the request's own, and a prepay
-        // could ask for more than max_single_request_tokens counts, leaving a
-        // request the bound accepts inadmissible on its own. A request that
-        // meets other requests' pages only after its admission is left to the
-        // last resort of maybeRetractForCapacity.
+        // Only beside another page holder, so a request alone asks for what
+        // max_single_request_tokens counts. Any holder, not only one sharing the
+        // hit: hit pages may become shared after this admission.
         const bool others_hold_pages = (hit_tokens > 0 || later_chunk_tokens > 0) &&
                                        std::ranges::any_of(requests_, [request](const std::unique_ptr<Request>& other) {
                                            return other.get() != request && other->HoldsPages();
@@ -398,7 +393,9 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             // A remote landing always finishes shaping; the P role needs no local decode growth.
             .reserve_snapshot_state_growth =
                 config_.role != Role::kP && (source == fsm::PrefillSource::kRemote || completes_prefill),
-            .swa_unrecycled_growth_tokens = others_hold_pages ? std::max(hit_tokens, later_chunk_tokens) : 0,
+            .swa_hit_tokens = others_hold_pages ? hit_tokens : 0,
+            .swa_later_chunk_tokens = others_hold_pages ? later_chunk_tokens : 0,
+            .swa_prompt_after_hit_tokens = unscheduled,
         };
         tables = std::vector<BlockTable>(static_cast<std::size_t>(coordinator_.NumGroups()));
         std::vector<GroupDemand> demands =

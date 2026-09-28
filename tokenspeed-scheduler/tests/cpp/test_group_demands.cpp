@@ -107,32 +107,42 @@ TEST(ReservePrefillDemandsTest, EachRetentionHoldsItsOwnShareOfTheRound) {
 }
 
 TEST(ReservePrefillDemandsTest, SlidingWindowPrepaysUnrecycledGrowthUpToItsLookback) {
-    // Window 8: a token reads a 7-token lookback, the most growth recycling
-    // can fall behind by.
-    const std::vector<CacheGroupConfig> groups = {
-        Group("swa", CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History),
-    };
+    // Window 8 and 4-token blocks: a token reads a 7-token lookback, the most
+    // growth recycling can fall behind by, and 7 + 4 prompt tokens after the
+    // hit slide every hit page out before the first decode.
+    CacheGroupConfig swa = Group("swa", CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History);
+    CacheGroupConfig replayable = swa;
+    replayable.replayable = true;
     const struct {
         const char* name;
+        bool replayable;
         bool completes_prefill;
         std::int32_t prompt_headroom_tokens;
-        std::int32_t swa_unrecycled_growth_tokens;
+        std::int32_t hit_tokens;
+        std::int32_t prompt_after_hit_tokens;
+        std::int32_t later_chunk_tokens;
         std::int32_t expected;
     } cases[] = {
-        {"nothing unrecycled", false, 30, 0, 0},         {"below the lookback", false, 30, 5, 5},
-        {"capped by the lookback", false, 30, 20, 7},    {"capped by the prompt headroom", false, 4, 20, 4},
-        {"never below the decode slot", true, 30, 1, 2},
+        {"nothing unrecycled", false, false, 30, 0, 10, 0, 0},
+        {"later chunk below the lookback", false, false, 30, 0, 10, 5, 5},
+        {"hit capped by the lookback", false, false, 30, 20, 10, 0, 7},
+        {"capped by the prompt headroom", false, false, 4, 20, 10, 0, 4},
+        {"never below the decode slot", false, true, 30, 1, 10, 0, 2},
+        {"hit slides out within the prompt", false, false, 30, 20, 11, 5, 5},
+        {"replayable hit pages are private", true, false, 30, 20, 10, 5, 5},
     };
     std::vector<BlockTable> tables(1);
     for (const auto& c : cases) {
         SCOPED_TRACE(c.name);
         std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{6}});
-        ReservePrefillDemands(demands, groups,
+        ReservePrefillDemands(demands, std::vector<CacheGroupConfig>{c.replayable ? replayable : swa},
                               PrefillReserve{.decode_input_tokens = 2,
                                              .completes_prefill = c.completes_prefill,
                                              .prompt_headroom_tokens = c.prompt_headroom_tokens,
                                              .reserve_snapshot_state_growth = false,
-                                             .swa_unrecycled_growth_tokens = c.swa_unrecycled_growth_tokens});
+                                             .swa_hit_tokens = c.hit_tokens,
+                                             .swa_later_chunk_tokens = c.later_chunk_tokens,
+                                             .swa_prompt_after_hit_tokens = c.prompt_after_hit_tokens});
         EXPECT_EQ(demands[0].reserve_tokens, c.expected);
     }
 }

@@ -51,11 +51,15 @@ std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillRese
             SnapshotStateReserveTokens(group.block_granularity, reserve.decode_input_tokens));
     }
     if (group.Kind() == AttnKind::kSlidingWindow) {
-        // Growth recycles the request's own pages as they slide out; growth
-        // recycling cannot fund (swa_unrecycled_growth_tokens) is prepaid, at
-        // most the lookback a token still reads (window - 1).
+        // Prepay the growth recycling cannot fund, at most the lookback a token
+        // reads (window - 1). A replayable group holds no shared hit page, and
+        // once the prompt's own tokens after the hit reach the lookback plus
+        // one block, every hit page slides out before the first decode.
         const std::int32_t lookback = std::max(group.sliding_window_tokens.value_or(0) - 1, 0);
-        const std::int32_t unrecycled = std::min(reserve.swa_unrecycled_growth_tokens, lookback);
+        const bool hit_counts =
+            !group.replayable && reserve.swa_prompt_after_hit_tokens < lookback + group.block_granularity;
+        const std::int32_t unrecycled =
+            std::min(std::max(hit_counts ? reserve.swa_hit_tokens : 0, reserve.swa_later_chunk_tokens), lookback);
         return std::max(reserve.DecodeTokens(), std::min(reserve.prompt_headroom_tokens, unrecycled));
     }
     return std::max(reserve.DecodeTokens(), reserve.prompt_headroom_tokens);
