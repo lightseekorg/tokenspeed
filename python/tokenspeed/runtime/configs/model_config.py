@@ -286,12 +286,39 @@ def configure_mla_attention(model_config, server_args: ServerArgs) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
+def configure_dots3_note_attention(model_config, server_args: ServerArgs) -> None:
+    """Configure target DSA or MTP SWA within the same model family.
+
+    Only the draft runtime view uses SWA geometry; the loader retains the
+    checkpoint's source configuration.
+    """
+    if model_config.hf_config.architectures[0] == "Dots3NoteForCausalLM":
+        configure_dsa_attention(model_config, server_args)
+        return
+
+    hf = copy.copy(model_config.hf_text_config)
+    hf.num_attention_heads = hf.swa_num_attention_heads
+    hf.num_key_value_heads = hf.swa_num_key_value_heads
+    hf.kv_lora_rank = hf.swa_kv_lora_rank
+    hf.qk_nope_head_dim = hf.swa_qk_nope_head_dim
+    hf.qk_rope_head_dim = hf.swa_qk_rope_head_dim
+    hf.v_head_dim = hf.swa_v_head_dim
+    model_config.hf_text_config = hf
+    configure_mla_attention(model_config, server_args)
+
+
 def configure_minimax_m3_attention(model_config, server_args: ServerArgs) -> None:
     del server_args  # the geometry follows the checkpoint alone
     model_config.attention_arch = AttentionArch.MSA
 
 
 _ATTENTION_FAMILY_SPECS = (
+    _AttentionFamilySpec(
+        name="Dots3-note",
+        architectures=frozenset({"Dots3NoteForCausalLM", "Dots3NoteForCausalLMNextN"}),
+        configure=configure_dots3_note_attention,
+        default_backend="dots3_note",
+    ),
     _AttentionFamilySpec(
         name="DeepSeek V4.1",
         architectures=frozenset(
@@ -1026,6 +1053,7 @@ def is_generation_model(model_architectures: list[str]):
 def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
         "DeepseekV41ForCausalLM",
+        "Dots3NoteForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen4ExpForConditionalGeneration",

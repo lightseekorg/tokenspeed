@@ -137,6 +137,8 @@ def _make_dense_leaf(
     # The dense delegate interprets spec.backend_name itself (the MLA leaf's
     # kernel-solution map only knows its own names) — the 'dsa' name that
     # selected THIS wrapper must not leak through.
+    if spec.backend_name == "triton":
+        return MLAAttnBackend(config, spec, kernel_page_size=kernel_page_size)
     dense_spec = dataclasses.replace(spec, backend_name=None)
     if platform.is_nvidia:
         return TRTLLMMLABackend(config, dense_spec, kernel_page_size=kernel_page_size)
@@ -204,7 +206,13 @@ class DSABackend(PagedAttentionBackend):
         self.batch_invariant: bool = (
             global_server_args_dict["numerics"] in BITWISE_ENVELOPES
         )
-        self.kernel_solution: str | None = "aok" if self.batch_invariant else None
+        if self.batch_invariant and spec.backend_name == "triton":
+            raise ValueError("the Triton DSA leaf does not support rl-bitwise numerics")
+        self.kernel_solution: str | None = (
+            "aok"
+            if self.batch_invariant
+            else "triton" if spec.backend_name == "triton" else None
+        )
         # --dsa-slot-order: how the cores reduce the selected slots
         # (docs/design/numerics.md, invariance.batch).
         self.slot_order: str = global_server_args_dict["dsa_slot_order"]
@@ -479,6 +487,7 @@ class DSABackend(PagedAttentionBackend):
             metadata._dsa_plan = dsa_plan(
                 seq_lens_2d=metadata._dsa_seq_lens_2d,
                 page_size=self.kernel_page_size,
+                solution=self.kernel_solution,
             )
             return
         self._publish_k_row_indexer_rows(metadata, seq_lens, bs)
@@ -501,6 +510,7 @@ class DSABackend(PagedAttentionBackend):
             seq_lens_2d=rows,
             page_size=self.kernel_page_size,
             out=metadata._dsa_plan,
+            solution=self.kernel_solution,
         )
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
@@ -516,6 +526,7 @@ class DSABackend(PagedAttentionBackend):
             seq_lens_2d=metadata.seq_lens_k.unsqueeze(1),
             page_size=self.kernel_page_size,
             out=metadata._dsa_plan,
+            solution=self.kernel_solution,
         )
 
     def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
@@ -620,7 +631,9 @@ class DSABackend(PagedAttentionBackend):
                 # generate dsa_plan as a placeholder
                 seq_lens_2d = metadata._dsa_seq_lens_2d
             metadata._dsa_plan = dsa_plan(
-                seq_lens_2d=seq_lens_2d, page_size=self.kernel_page_size
+                seq_lens_2d=seq_lens_2d,
+                page_size=self.kernel_page_size,
+                solution=self.kernel_solution,
             )
 
         self._prefill_page_table = None

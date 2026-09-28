@@ -36,6 +36,7 @@ from tokenspeed_scheduler import (
 
 def make_scheduler() -> Scheduler:
     cfg = SchedulerConfig()
+    cfg.prefix_hash_lookahead_tokens = 0
     cfg.prefix_granularity = 16
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 4
@@ -86,6 +87,7 @@ def test_execution_plan_exposes_forward():
 
 def test_pd_counters_follow_request_state():
     cfg = SchedulerConfig()
+    cfg.prefix_hash_lookahead_tokens = 0
     cfg.role = SchedulerConfig.Role.D
     cfg.prefix_granularity = 16
     cfg.max_scheduled_tokens = 32
@@ -125,6 +127,7 @@ def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
     the first candidate window, so it reserves ``decode_input_tokens`` exactly
     like a decoding role; intermediate chunks hold only their own tokens."""
     cfg = SchedulerConfig()
+    cfg.prefix_hash_lookahead_tokens = 0
     cfg.role = SchedulerConfig.Role.P
     cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 4

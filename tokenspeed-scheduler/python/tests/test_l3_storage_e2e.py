@@ -44,6 +44,7 @@ def _l3_config(
     with_swa: bool,
 ) -> ts.SchedulerConfig:
     cfg = ts.SchedulerConfig()
+    cfg.prefix_hash_lookahead_tokens = 0
     cfg.prefix_granularity = 2
     cfg.num_device_pages = num_device_pages
     cfg.num_host_pages = num_host_pages
@@ -195,6 +196,7 @@ def test_l3_host_shortage_rounds_down_to_prefix_grain() -> None:
     """A fine-group Host shortage must not skip a coarser group's prefix KV."""
 
     cfg = ts.SchedulerConfig()
+    cfg.prefix_hash_lookahead_tokens = 0
     cfg.prefix_granularity = 4
     cfg.num_device_pages = 32
     cfg.num_host_pages = 2

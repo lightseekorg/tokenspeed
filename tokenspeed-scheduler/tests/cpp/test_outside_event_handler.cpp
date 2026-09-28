@@ -228,7 +228,7 @@ TEST_F(LoadBackDoneTestSuite, LoadBackDone_Success_PrefixLenChangesInForward) {
 class DisaggDecodeAdmissionTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         // Cache block 0 is the null page, leaving three usable pages.
         cfg.device_allocator.total_pages = 4;

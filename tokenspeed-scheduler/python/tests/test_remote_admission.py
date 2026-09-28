@@ -34,10 +34,10 @@ GROUPS = (
 PROBE_TOKENS = list(range(577)) + [9001] * 62
 
 
-def _scheduler(*, width, overlap):
+def _scheduler(*, lookahead, width, overlap):
     cfg = ts.SchedulerConfig()
     cfg.role = ts.SchedulerConfig.Role.D
-
+    cfg.prefix_hash_lookahead_tokens = lookahead
     cfg.prefix_granularity = 64
     cfg.num_device_pages = 257
     cfg.num_host_pages = 0
@@ -93,13 +93,14 @@ def _seed_prefix(scheduler, prompt):
     assert scheduler.active_lcm_blocks() == 0
 
 
+@pytest.mark.parametrize("lookahead", [0, 1])
 @pytest.mark.parametrize("width", [1, 2, 4])
 @pytest.mark.parametrize("overlap", [0, 1])
 @pytest.mark.parametrize("seed_prompt, expected_hit", [(634, 0), (600, 576)])
 def test_remote_admission_preserves_prompt_extent_and_decode_reserve(
-    width, overlap, seed_prompt, expected_hit
+    lookahead, width, overlap, seed_prompt, expected_hit
 ):
-    scheduler = _scheduler(width=width, overlap=overlap)
+    scheduler = _scheduler(lookahead=lookahead, width=width, overlap=overlap)
     # Both seeds publish Full through 576. SWA starts at slot 3 for 634, missing
     # slot 2 needed to resume 576; at 600 it starts at slot 2 and the hit is usable.
     _seed_prefix(scheduler, seed_prompt)
@@ -136,8 +137,9 @@ def test_remote_admission_preserves_prompt_extent_and_decode_reserve(
     assert scheduler.active_lcm_blocks() == 0
 
 
-def test_decode_role_local_recovery_still_chunks_at_promotion():
-    scheduler = _scheduler(width=4, overlap=1)
+@pytest.mark.parametrize("lookahead", [0, 1])
+def test_decode_role_local_recovery_still_chunks_at_promotion(lookahead):
+    scheduler = _scheduler(lookahead=lookahead, width=4, overlap=1)
     spec = _spec("probe", list(range(634)))
     spec.max_new_tokens = 8192  # Exceeds admission headroom: eligible for retraction.
     scheduler.submit_requests([spec])

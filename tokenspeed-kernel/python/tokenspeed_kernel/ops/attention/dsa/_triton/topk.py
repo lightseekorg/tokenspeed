@@ -721,13 +721,11 @@ def _ordered_key_to_fp32(x):
 def _dsa_logits_topk_kernel(
     logits,
     out,
-    # Runtime values: these track the batch's KV length, so keying the JIT
-    # cache on them recompiles per request.  ``n_cols_padded`` stays a
-    # constexpr -- it is a power of two that drives the unroll below.
+    # Keep lengths runtime-valued so long contexts reuse a bounded sorting loop.
     logits_stride,
     out_stride,
     n_cols,
-    n_cols_padded: tl.constexpr,
+    n_cols_padded,
     topk: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -747,8 +745,7 @@ def _dsa_logits_topk_kernel(
     packed = (value_keys << 32) | index_keys
     acc = tl.topk(packed[None, :], topk, dim=1)
 
-    loop_iterations: tl.constexpr = n_cols_padded // BLOCK_N - 1
-    for _ in tl.static_range(0, loop_iterations):
+    for _ in range(n_cols_padded // BLOCK_N - 1):
         acc = tl.bitonic_merge(acc)
         offsets -= BLOCK_N
         valid = offsets < n_cols

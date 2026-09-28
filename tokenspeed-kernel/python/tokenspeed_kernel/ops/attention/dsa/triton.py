@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.kvcache.triton import _mla_cache_strides
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -200,7 +201,9 @@ def _dsa_dense_kv_kernel(
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
     qk_rope_head_dim: tl.constexpr,
-    kv_dim: tl.constexpr,
+    page_size: tl.constexpr,
+    page_stride: tl.constexpr,
+    row_stride: tl.constexpr,
     topk: tl.constexpr,
     softmax_scale: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
@@ -240,18 +243,21 @@ def _dsa_dense_kv_kernel(
         valid = valid & (slots >= 0)
         score = tl.zeros((BLOCK_TOPK,), tl.float32)
 
+        row_offsets = (slots // page_size) * page_stride + (
+            slots % page_size
+        ) * row_stride
         for k_start in range(0, kv_lora_rank, BLOCK_K):
             ks = k_start + k_offsets
             q_vals = tl.load(q + q_nope_base + ks).to(tl.float32)
             k_vals = tl.load(
-                kv + slots[:, None] * kv_dim + ks[None, :],
+                kv + row_offsets[:, None] + ks[None, :],
                 mask=valid[:, None],
                 other=0.0,
             ).to(tl.float32)
             score += tl.sum(k_vals * q_vals[None, :], axis=1)
 
         k_rope = tl.load(
-            kv + slots[:, None] * kv_dim + kv_lora_rank + rope_offsets[None, :],
+            kv + row_offsets[:, None] + kv_lora_rank + rope_offsets[None, :],
             mask=valid[:, None] & (rope_offsets[None, :] < qk_rope_head_dim),
             other=0.0,
         ).to(tl.float32)
@@ -274,18 +280,21 @@ def _dsa_dense_kv_kernel(
         valid = valid & (slots >= 0)
         score = tl.zeros((BLOCK_TOPK,), tl.float32)
 
+        row_offsets = (slots // page_size) * page_stride + (
+            slots % page_size
+        ) * row_stride
         for k_start in range(0, kv_lora_rank, BLOCK_K):
             ks = k_start + k_offsets
             q_vals = tl.load(q + q_nope_base + ks).to(tl.float32)
             k_vals = tl.load(
-                kv + slots[:, None] * kv_dim + ks[None, :],
+                kv + row_offsets[:, None] + ks[None, :],
                 mask=valid[:, None],
                 other=0.0,
             ).to(tl.float32)
             score += tl.sum(k_vals * q_vals[None, :], axis=1)
 
         k_rope = tl.load(
-            kv + slots[:, None] * kv_dim + kv_lora_rank + rope_offsets[None, :],
+            kv + row_offsets[:, None] + kv_lora_rank + rope_offsets[None, :],
             mask=valid[:, None] & (rope_offsets[None, :] < qk_rope_head_dim),
             other=0.0,
         ).to(tl.float32)
@@ -297,7 +306,7 @@ def _dsa_dense_kv_kernel(
         denom += tl.sum(probs, axis=0)
 
         v_vals = tl.load(
-            kv + slots[:, None] * kv_dim + v_offsets[None, :],
+            kv + row_offsets[:, None] + v_offsets[None, :],
             mask=valid[:, None] & v_mask[None, :],
             other=0.0,
         ).to(tl.float32)
@@ -375,7 +384,7 @@ def _run_dense_kv(
     qk_rope_head_dim: int,
     return_lse: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    kv_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
+    page_size, page_stride, row_stride = _mla_cache_strides(kv_cache)
     out = torch.empty(
         (q.shape[0], q.shape[1], kv_lora_rank),
         dtype=torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype,
@@ -399,7 +408,9 @@ def _run_dense_kv(
         q.shape[2],
         kv_lora_rank,
         qk_rope_head_dim,
-        kv_dim,
+        page_size,
+        page_stride,
+        row_stride,
         topk_indices.shape[1],
         float(softmax_scale),
         BLOCK_TOPK=32,
@@ -418,13 +429,13 @@ def _flatten_packed_kv_cache(packed_kv_cache: torch.Tensor) -> torch.Tensor:
 
 
 def _flatten_dense_kv_cache(kv_cache: torch.Tensor) -> torch.Tensor:
-    if kv_cache.dim() == 2:
-        return kv_cache
-    if kv_cache.dim() == 3:
-        return kv_cache.squeeze(1)
-    if kv_cache.shape[1] == 1:
-        kv_cache = kv_cache.permute(0, 2, 1, 3)
-    return kv_cache.reshape(-1, kv_cache.shape[-1])
+    """Remove the singleton head axis, but never flatten across strided pages."""
+    if kv_cache.ndim == 4:
+        if kv_cache.shape[2] == 1:
+            return kv_cache.squeeze(2)
+        if kv_cache.shape[1] == 1:
+            return kv_cache.squeeze(1)
+    return kv_cache
 
 
 def _flatten_query(q: torch.Tensor) -> torch.Tensor:
@@ -472,7 +483,7 @@ def _run_dsa(
     else:
         result, lse = _run_dense_kv(
             q,
-            _flatten_dense_kv_cache(kv_cache).contiguous(),
+            _flatten_dense_kv_cache(kv_cache),
             topk_slots,
             topk_lens,
             softmax_scale=softmax_scale,
@@ -615,7 +626,9 @@ def triton_dsa_prefill(
 
 from tokenspeed_kernel.ops.attention.dsa._triton.topk import *  # noqa: E402,F403
 from tokenspeed_kernel.ops.attention.dsa._triton.topk import (  # noqa: E402
-    _topk_with_padding,
+    _topk_with_padding as _topk_with_padding,
+)
+from tokenspeed_kernel.ops.attention.dsa._triton.topk import (
     _triton_dsa_decode_topk_fp8_impl,
     _triton_dsa_plan_impl,
     _triton_dsa_prefill_topk_fp8_impl,

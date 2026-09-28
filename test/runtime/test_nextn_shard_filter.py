@@ -216,6 +216,30 @@ class TestNextNModelFilters(unittest.TestCase):
             model.checkpoint_weight_name_filter("model.layers.0.mlp.gate.weight")
         )
 
+    def test_dots3_note_nextn(self):
+        from tokenspeed.runtime.models.dots3_note_nextn import (
+            Dots3NoteForCausalLMNextN,
+            EntryClass,
+        )
+
+        self.assertEqual(EntryClass, [Dots3NoteForCausalLMNextN])
+        model = object.__new__(Dots3NoteForCausalLMNextN)
+        for name in (
+            "model.layers.46.eh_proj.weight",
+            "model.layers.46.eh_proj.weight_scale_inv",
+            "model.layers.46.shared_head.norm.weight",
+            "model.mtp.embed_tokens.weight",
+        ):
+            self.assertTrue(model.checkpoint_weight_name_filter(name), name)
+        for name in (
+            "model.layers.45.self_attn.q_a_proj.weight",
+            "model.layers.47.eh_proj.weight",
+            "model.layers.460.eh_proj.weight",
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+        ):
+            self.assertFalse(model.checkpoint_weight_name_filter(name), name)
+
     def test_deepseek_nextn(self):
         from tokenspeed.runtime.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 

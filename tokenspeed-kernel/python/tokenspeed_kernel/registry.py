@@ -475,6 +475,7 @@ def load_builtin_kernels() -> None:
             ):
                 del sys.modules[key]
     import tokenspeed_kernel.ops.attention  # noqa: F401
+    import tokenspeed_kernel.ops.attention.dots3_note  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsa  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsv4  # noqa: F401
     import tokenspeed_kernel.ops.attention.dsv41  # noqa: F401

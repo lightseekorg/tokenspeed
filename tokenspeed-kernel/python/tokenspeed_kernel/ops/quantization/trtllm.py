@@ -46,7 +46,14 @@ if platform.is_nvidia:
                 "trtllm fp8_quantize_1x128 only supports group_size=128, "
                 f"got {group_size}"
             )
-        return torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
+        q, scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
+        rows, columns = x.shape
+        groups = columns // group_size
+        padded_rows = (rows + 3) // 4 * 4
+        # Native scales are flat MN-major storage with row pitch rounded up
+        # to a multiple of four and possible trailing allocation padding.
+        scale = scale[: groups * padded_rows].view(groups, padded_rows)[:, :rows]
+        return q, scale
 
     def _per_token_quant_fp8(
         input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor
@@ -105,7 +112,12 @@ if platform.is_nvidia:
                 group_size=group_size,
                 use_ue8m0=scale_encoding == "ue8m0",
             )
-            return q, scale.t().contiguous()
+            scale = scale.t().contiguous()
+            if scale_encoding == "ue8m0":
+                # The native flag rounds scales to powers of two but still
+                # returns FP32; the public encoding is one exponent byte.
+                scale = scale.to(torch.float8_e8m0fnu).view(torch.uint8)
+            return q, scale
 
         raise ValueError(f"unsupported TRT-LLM FP8 granularity: {granularity!r}")
 

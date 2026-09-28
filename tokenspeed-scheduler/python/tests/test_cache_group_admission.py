@@ -42,6 +42,7 @@ def _send_reserve(scheduler: Scheduler, request_id: str, n: int = 0) -> None:
 
 def _base_config(num_device_pages: int = 64) -> SchedulerConfig:
     cfg = SchedulerConfig()
+    cfg.prefix_hash_lookahead_tokens = 0
     cfg.prefix_granularity = 64
     cfg.max_scheduled_tokens = 4096
     cfg.max_batch_size = 8
@@ -95,10 +96,12 @@ def test_overlap_decode_admission_uses_runtime_verify_width(verify_width: int):
 @pytest.mark.parametrize("overlap_depth", [0, 1])
 @pytest.mark.parametrize("accepted_tokens", [1, 3, 4])
 @pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("lookahead", [0, 1])
 def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions(
-    overlap_depth: int, accepted_tokens: int, mixed: bool
+    overlap_depth: int, accepted_tokens: int, mixed: bool, lookahead: int
 ):
     cfg = _base_config(num_device_pages=4096)
+    cfg.prefix_hash_lookahead_tokens = lookahead
     cfg.prefix_granularity = 64
     cfg.decode_input_tokens = 4
     cfg.overlap_schedule_depth = overlap_depth

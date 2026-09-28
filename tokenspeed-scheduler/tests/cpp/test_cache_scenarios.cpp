@@ -117,7 +117,7 @@ void ExpectDecodeWorkingState(const Scheduler& scheduler, const ForwardBatch& ba
 class ChunkedPrefillSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
@@ -196,7 +196,7 @@ TEST_F(ChunkedPrefillSuite, FirstChunkPrepaysPromptHeadroomOnlyInFullHistoryGrou
 class MambaChunkAlignmentSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
@@ -266,7 +266,7 @@ TEST(MambaStateCheckpointTest, KeepsAlignedDecodeEndpointWorkingOnlyUnderWideVer
     for (const std::int32_t depth : {0, 1}) {
         for (const bool lands_on_boundary : {false, true}) {
             SCOPED_TRACE(::testing::Message() << "depth=" << depth << " aligned=" << lands_on_boundary);
-            SchedulerConfig cfg{};
+            SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
             cfg.prefix_granularity = 128;
             cfg.max_scheduled_tokens = 256;
             cfg.max_batch_size = 1;
@@ -335,7 +335,7 @@ TEST(MambaStateCheckpointTest, ReclaimsWorkingStateAtExactAcceptedFrontier) {
             for (const Case& test : cases) {
                 SCOPED_TRACE(::testing::Message() << "depth=" << depth << " finish=" << finish_parent
                                                   << " width=" << test.width << " shared=" << test.shared_tokens);
-                SchedulerConfig cfg{};
+                SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
                 cfg.prefix_granularity = 4;
                 cfg.max_scheduled_tokens = 256;
                 cfg.max_batch_size = 2;
@@ -411,7 +411,7 @@ TEST(MambaStateCheckpointTest, BackToBackResultsPublishExactHistoryButNoDecodeSt
             for (const std::int32_t shared : {4, 8}) {
                 SCOPED_TRACE(::testing::Message()
                              << "state=" << with_state << " finish=" << finish_parent << " shared=" << shared);
-                SchedulerConfig cfg{};
+                SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
                 cfg.prefix_granularity = 4;
                 cfg.max_scheduled_tokens = 256;
                 cfg.max_batch_size = 2;
@@ -475,7 +475,7 @@ TEST(MambaStateCheckpointTest, BackToBackResultsPublishExactHistoryButNoDecodeSt
 }
 
 TEST(MambaStateCheckpointCapacityTest, CountsInternalCheckpointEvenWithoutPrefixCaching) {
-    SchedulerConfig cfg{};
+    SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
     cfg.prefix_granularity = 4;
     cfg.device_allocator.total_pages = 3;  // null + two usable state blocks
     cfg.host_allocator.total_pages = 0;
@@ -503,7 +503,7 @@ TEST(MambaStateCheckpointCapacityTest, CountsInternalCheckpointEvenWithoutPrefix
 
 TEST(MambaStateCheckpointCapacityTest, CountsRetainedInputForChunkedSingleForward) {
     for (const std::int32_t usable_blocks : {3, 4}) {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = usable_blocks + 1;
         cfg.max_scheduled_tokens = 8;
@@ -535,7 +535,7 @@ TEST(MambaStateCheckpointCapacityTest, CountsRetainedInputForChunkedSingleForwar
 }
 
 TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkSuffixAndSubPageGrowth) {
-    SchedulerConfig cfg{};
+    SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
     cfg.prefix_granularity = 4;
     cfg.device_allocator.total_pages = 4;  // null + three usable state blocks
     cfg.host_allocator.total_pages = 0;
@@ -887,7 +887,7 @@ TEST_F(MambaMixedSpareBudgetSuite, DecodeUsesOnlyBudgetAboveReservedStatePage) {
 }
 
 TEST(MambaChunkAlignmentConfigTest, RejectsBudgetSmallerThanStatePage) {
-    SchedulerConfig cfg{};
+    SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
     cfg.prefix_granularity = 4;
     cfg.device_allocator.total_pages = 64;
     cfg.host_allocator.total_pages = 64;
@@ -912,7 +912,7 @@ TEST(MambaChunkAlignmentConfigTest, RejectsBudgetSmallerThanStatePage) {
 class ThreeGroupSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 96;
         cfg.host_allocator.total_pages = 96;
@@ -973,7 +973,7 @@ TEST_F(ThreeGroupSuite, ThreeGroupsEachEmitARowAndReclaim) {
 class SubPageWindowSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = 96;
         cfg.host_allocator.total_pages = 96;
@@ -1054,7 +1054,7 @@ TEST_F(SubPageWindowSuite, StraddlingWindowHoldsPreviousPage) {
 class AllFullTwoGroupSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
@@ -1108,7 +1108,7 @@ TEST_F(AllFullTwoGroupSuite, BothFullGroupsKeepHistoryNoHoles) {
 class PoolAccountingSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
@@ -1288,7 +1288,7 @@ TEST_F(ThreeGroupSuite, TwoRequestsBatchedAcrossThreeGroupsNoCollision) {
 class MixedBatchSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
@@ -1403,7 +1403,7 @@ TEST_F(MixedBatchSuite, PerRequestSwaHoleAtDifferentDecodeDepths) {
 class PrefixGranularityOneSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 1;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
@@ -1473,7 +1473,7 @@ void SendAbort(Scheduler& scheduler, const std::string& id) {
 class TinyPoolSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         // 11 physical pages -> 10 usable (page 0 is the null placeholder):
         // one 4-page prompt over 2 groups (8 prefill + 2 reserve) = the pool.
@@ -1541,7 +1541,7 @@ TEST_F(TinyPoolSuite, ExhaustedPoolDefersSecondRequestUntilFirstFinishes) {
 class PrefillSlideAdmissionSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 13;
         cfg.host_allocator.total_pages = 14;  // 13 usable + the null placeholder (page 0)
@@ -1722,7 +1722,7 @@ TEST_F(PrefillPlateauSuite, SwaWorkingSetPlateausWhileFullGrowsToPromptLength) {
 class CapacityBlockSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         // 13 physical pages -> 12 usable: two 2-page prompts charge
         // 2*ceil(5/2) = 6 blocks each at admission = exactly the pool.
@@ -1876,7 +1876,7 @@ TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
 class ConsumedHeadroomRetractionSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 4096;
         // Four usable blocks: each request initially holds one prompt block
         // and one 4096-token headroom block, exactly filling the pool.
@@ -2123,7 +2123,7 @@ TEST_F(FusedRetractionL2TestSuite, ADecodingVictimReadmitsPastItsProbeBound) {
 class RetractSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         // 15 physical pages -> 14 usable: "a" (3-page prompt) charges
         // 2*ceil(7/2) = 8 and "b" (2-page prompt) 2*ceil(5/2) = 6 = the pool.
@@ -2839,7 +2839,7 @@ TEST_F(RetractExactFitSuite, IncludesOverlapDecodeReserveInTokenCapacity) {
 }
 
 TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
-    SchedulerConfig cfg{};
+    SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
     cfg.prefix_granularity = 4;
     cfg.device_allocator.total_pages = 3;  // null + two usable LCM parents
     cfg.host_allocator.total_pages = 0;
@@ -3159,7 +3159,7 @@ TEST(CacheProgressTest, PromotionBoundarySurvivesPrefillRounds) {
 class PromotionBoundaryHeadOfLineSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
@@ -3532,7 +3532,7 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
 class PhysicalReserveSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 11;
         cfg.host_allocator.total_pages = 11;
@@ -3632,7 +3632,7 @@ protected:
     virtual std::int32_t TotalPages() const { return 64; }
 
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = TotalPages();
         cfg.host_allocator.total_pages = TotalPages();
@@ -3838,6 +3838,103 @@ TEST_F(PrefixHitSuite, FullHitCapsAtLastToken) {
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
+class PrefixHashLookaheadSuite : public PrefixHitSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = PrefixHitSuite::MakeConfig();
+        cfg.prefix_granularity = 64;
+        cfg.prefix_hash_lookahead_tokens = 1;
+        cfg.max_scheduled_tokens = 256;
+        cfg.cache_groups[0].block_granularity = 64;
+        cfg.cache_groups[1].block_granularity = 32;
+        cfg.cache_groups[1].sliding_window_tokens = 1024;
+        return cfg;
+    }
+};
+
+TEST_F(PrefixHashLookaheadSuite, ChangedNextTokenInvalidatesOnlyAffectedPageAndLaterPages) {
+    const auto tokens = MakeTokens(130);
+    const auto original = RunLifecycle(MakeSpecWithTokens("parent", tokens));
+    for (const std::int32_t divergence : {64, 128, 129}) {
+        auto branch = tokens;
+        branch[divergence] = 8001;
+        Submit(MakeSpecWithTokens("branch", branch));
+        const auto plan = PlanOnce();
+        const auto* op = FindForwardBatch(plan);
+        ASSERT_NE(op, nullptr);
+        const std::int32_t hit = divergence == 129 ? 128 : divergence - 64;
+        EXPECT_EQ(op->extend_prefix_lens.at(0), hit);
+        EXPECT_EQ(op->input_lengths.at(0), 130 - hit);
+        for (const auto& group : Config().cache_groups) {
+            const auto& row = op->block_tables.at(group.group_id).at(0);
+            for (std::int32_t slot = 0; slot < hit / group.block_granularity; ++slot) {
+                EXPECT_EQ(row[slot], original.at(group.group_id)[slot]);
+            }
+            EXPECT_NE(row[hit / group.block_granularity], original.at(group.group_id)[hit / group.block_granularity]);
+        }
+        SendAbortEvent("branch");
+        PlanOnce();
+    }
+}
+
+TEST_F(PrefixHashLookaheadSuite, FinishPublishesExactBoundaryUsingSampledContinuation) {
+    const auto tokens = MakeTokens(128);
+    Submit(MakeSpecWithTokens("parent", tokens));
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("parent", {9001});
+    SendFinish("parent");
+    PlanOnce();
+    for (const std::int32_t continuation : {9001, 9002}) {
+        auto branch = tokens;
+        branch.push_back(continuation);
+        Submit(MakeSpecWithTokens("branch", branch));
+        const auto plan = PlanOnce();
+        const auto* op = FindForwardBatch(plan);
+        ASSERT_NE(op, nullptr);
+        EXPECT_EQ(op->extend_prefix_lens.at(0), continuation == 9001 ? 128 : 64);
+        SendAbortEvent("branch");
+        PlanOnce();
+    }
+}
+
+class PrefixHashLookaheadChunkSuite : public PrefixHashLookaheadSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefixHashLookaheadSuite::MakeConfig();
+        cfg.max_scheduled_tokens = 64;
+        cfg.enable_kv_cache_events = true;
+        return cfg;
+    }
+};
+
+TEST_F(PrefixHashLookaheadChunkSuite, IntermediatePagePublishesButFinalPageWaitsForLandedToken) {
+    Submit(MakeSpecWithTokens("parent", MakeTokens(128)));
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+    SendForwardDone("parent", {});
+    PlanOnce();
+    const auto intermediate = scheduler_->DrainKvEvents();
+    ASSERT_EQ(intermediate.size(), 1u);
+    const auto& stored = std::get<KvBlockStoredEvent>(intermediate[0]);
+    EXPECT_EQ(stored.block_size, 64);
+    EXPECT_EQ(stored.token_ids, MakeTokens(64));
+    // Overlap schedules decode before the final prefill result has landed.
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+    SendForwardDone("parent", {129});
+    PlanOnce();
+    const auto final = scheduler_->DrainKvEvents();
+    ASSERT_EQ(final.size(), 1u);
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(final[0]).token_ids, MakeTokens(64, 65));
+    SendForwardDone("parent", {130});
+    SendFinish("parent");
+    PlanOnce();
+    Submit(MakeSpecWithTokens("child", MakeTokens(129)));
+    const auto plan = PlanOnce();
+    ASSERT_NE(FindForwardBatch(plan), nullptr);
+    EXPECT_EQ(FindForwardBatch(plan)->extend_prefix_lens.at(0), 128);
+}
+
 class PrefixReplaySuite : public PrefixHitSuite {
 protected:
     virtual std::int32_t PrefixReplayTokens() const { return 4; }
@@ -3957,7 +4054,7 @@ TEST_F(PrefixReplayDisabledSuite, DisabledPrefixCacheStillPrefillsTheFullPrompt)
 class PrefixReplayHeterogeneousSuite : public PrefixHitSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 8;
         cfg.device_allocator.total_pages = 128;
         cfg.host_allocator.total_pages = 0;
@@ -4189,7 +4286,7 @@ TEST_F(ProbeBoundReadmissionSuite, ASkippedChunkDoesNotRelaxTheProbeBound) {
 }
 
 TEST(PrefixReplayConfigTest, RejectsNegativeReplayTokens) {
-    SchedulerConfig cfg{};
+    SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
     cfg.prefix_granularity = 2;
     cfg.device_allocator.total_pages = 8;
     cfg.max_scheduled_tokens = 8;
@@ -4697,7 +4794,7 @@ TEST_F(DecodeCachingSuite, PoolBalanceAcrossDecodeCaching) {
 class StreamingSinkSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 7;  // 6 usable + the null placeholder (page 0, device convention)
@@ -5390,7 +5487,7 @@ TEST_F(L3ShortHostPoolSuite, FirstChunkWindowUsesAdmittedHostPrefix) {
 class L3MixedGranularityHostPoolSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 2;
@@ -5539,7 +5636,7 @@ protected:
     virtual std::int32_t PrefixReplayTokens() const { return 0; }
 
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 8;
         cfg.device_allocator.total_pages = 256;
         cfg.host_allocator.total_pages = 256;

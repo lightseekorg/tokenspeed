@@ -27,6 +27,7 @@ def _sizing_config(
 ) -> "ts.SchedulerConfig":
     """A config as the recipes hand it to the model: no page counts yet."""
     cfg = ts.SchedulerConfig()
+    cfg.prefix_hash_lookahead_tokens = 0
     cfg.role = role
     cfg.prefix_granularity = prefix_granularity
     cfg.max_scheduled_tokens = max_scheduled_tokens

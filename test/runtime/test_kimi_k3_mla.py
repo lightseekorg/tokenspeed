@@ -562,6 +562,7 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
             seq_lens=cmeta.extend_seq_lens,
             batch_size=bs,
             causal=True,
+            window_left=-1,
             out=out,
         )
         for loop_idx in range(cmeta.chunked_loop_num):
@@ -581,6 +582,7 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
                 seq_lens=cmeta.chunked_seq_len[loop_idx],
                 batch_size=bs,
                 causal=False,
+                window_left=-1,
             )
             attn_merge_state(out, lse, chunk_out, chunk_lse, inplace=True)
         return out

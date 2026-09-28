@@ -367,7 +367,7 @@ TEST(ForwardCacheOpsDecode, AdmissionWithEmptyHashesOnlySlidesAndAllocates) {
 }
 
 TEST(MakeSpecsFromConfigTest, TranslatesCacheGroups) {
-    SchedulerConfig config;
+    SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
     config.prefix_granularity = 16;
     CacheGroupConfig full_grp;
     full_grp.group_id = "full";
@@ -391,7 +391,7 @@ TEST(MakeSpecsFromConfigTest, TranslatesCacheGroups) {
 }
 
 TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
-    SchedulerConfig config;
+    SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
     config.prefix_granularity = 4;
     CacheGroupConfig full_grp;
     full_grp.group_id = "full_attention";
@@ -429,7 +429,7 @@ TEST(CacheGroupConfigKindTest, EachValidFamilyRetentionPairHasOneKind) {
 }
 
 TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
-    SchedulerConfig config;
+    SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
     config.prefix_granularity = 128;
     CacheGroupConfig full;
     full.group_id = "full";
@@ -455,7 +455,7 @@ TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
 }
 
 TEST(MakeSpecsFromConfigTest, PreservesPerGroupCachePageTokens) {
-    SchedulerConfig config;
+    SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
     config.prefix_granularity = 256;
     CacheGroupConfig history;
     history.group_id = "history";
@@ -476,7 +476,7 @@ TEST(MakeSpecsFromConfigTest, PreservesPerGroupCachePageTokens) {
 // A configuration SchedulerConfig::Validate() accepts, so that each rejection
 // test below can perturb exactly one field.
 SchedulerConfig MakeValidConfig() {
-    SchedulerConfig config;
+    SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
     config.prefix_granularity = 128;
     config.device_allocator.total_pages = 32;
     config.max_scheduled_tokens = 1024;

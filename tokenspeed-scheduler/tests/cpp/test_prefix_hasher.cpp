@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "cache/prefix/prefix_hasher.h"
+#include "core/token_container.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -173,7 +174,7 @@ TEST(ComputePrefixHashesTest, MatchesManualRollingChain) {
     std::vector<std::int32_t> p2 = {5, 6};
     std::vector<token_span> pages = {Tokens(p0), Tokens(p1), Tokens(p2)};
 
-    std::vector<std::string> got = ComputePrefixHashes(pages, "root");
+    std::vector<std::string> got = ComputePrefixHashes(pages, "root", 0);
 
     std::string h0 = HashPrefixPage(Tokens(p0), "root");
     std::string h1 = HashPrefixPage(Tokens(p1), h0);
@@ -191,8 +192,8 @@ TEST(ComputePrefixHashesTest, SamePageDifferentPrefixDiffers) {
     std::vector<token_span> a = {Tokens(same), Tokens(same)};
     std::vector<token_span> b = {Tokens(other), Tokens(same)};
 
-    std::vector<std::string> ha = ComputePrefixHashes(a, "");
-    std::vector<std::string> hb = ComputePrefixHashes(b, "");
+    std::vector<std::string> ha = ComputePrefixHashes(a, "", 0);
+    std::vector<std::string> hb = ComputePrefixHashes(b, "", 0);
     EXPECT_NE(ha[0], hb[0]);
     EXPECT_NE(ha[1], hb[1]);
 }
@@ -205,7 +206,7 @@ TEST(ComputePrefixHashesTest, MissingExtraKeysPerPageTreatedAsEmpty) {
     std::vector<std::string> k0 = {"salt"};
     std::vector<key_span> extra = {Keys(k0)};
 
-    std::vector<std::string> got = ComputePrefixHashes(pages, "", extra);
+    std::vector<std::string> got = ComputePrefixHashes(pages, "", 0, extra);
 
     std::string h0 = HashPrefixPage(Tokens(p0), "", Keys(k0));
     std::string h1 = HashPrefixPage(Tokens(p1), h0);
@@ -224,12 +225,12 @@ TEST(ComputePrefixHashesTest, IncrementalChainEqualsOneShot) {
         pages.push_back(token_span(tokens.data() + start, 2));
     }
 
-    const std::vector<std::string> one_shot = ComputePrefixHashes(pages, "");
+    const std::vector<std::string> one_shot = ComputePrefixHashes(pages, "", 0);
 
     const std::vector<token_span> head(pages.begin(), pages.begin() + 3);
     const std::vector<token_span> tail(pages.begin() + 3, pages.end());
-    std::vector<std::string> incremental = ComputePrefixHashes(head, "");
-    const std::vector<std::string> rest = ComputePrefixHashes(tail, incremental.back());
+    std::vector<std::string> incremental = ComputePrefixHashes(head, "", 0);
+    const std::vector<std::string> rest = ComputePrefixHashes(tail, incremental.back(), 0);
     incremental.insert(incremental.end(), rest.begin(), rest.end());
 
     EXPECT_EQ(incremental, one_shot);
@@ -245,12 +246,53 @@ TEST(ComputePrefixHashesTest, AdvancePrefixHashesReturnsOnlyNewPages) {
         pages.push_back(token_span(tokens.data() + start, 2));
     }
 
-    const std::vector<std::string> one_shot = ComputePrefixHashes(pages, "");
-    const std::vector<std::string> first = AdvancePrefixHashes(pages, 0, "", 2);
-    const std::vector<std::string> second = AdvancePrefixHashes(pages, 2, first.back(), 5);
+    const std::vector<std::string> one_shot = ComputePrefixHashes(pages, "", 0);
+    const std::vector<std::string> first = AdvancePrefixHashes(pages, 0, "", 2, 0);
+    const std::vector<std::string> second = AdvancePrefixHashes(pages, 2, first.back(), 5, 0);
 
     EXPECT_EQ(first, std::vector<std::string>(one_shot.begin(), one_shot.begin() + 2));
     EXPECT_EQ(second, std::vector<std::string>(one_shot.begin() + 2, one_shot.begin() + 5));
+}
+
+TEST(PrefixHashLookaheadTest, OverlappingSpansPreserveLogicalGrainAndOrdinaryHashes) {
+    TokenContainer tokens({1, 2, 3, 4, 5});
+    const auto ordinary = tokens.FullPrefixPages(2, false, 0);
+    const auto shifted = tokens.FullPrefixPages(2, false, 1);
+    ASSERT_EQ(ordinary.size(), 2u);
+    ASSERT_EQ(shifted.size(), 2u);
+    EXPECT_EQ(shifted[0].size(), 3u);
+    EXPECT_EQ(shifted[1].data(), shifted[0].data() + 2);
+    EXPECT_EQ(shifted[0].back(), shifted[1].front());
+    const auto hashes = ComputePrefixHashes(ordinary, "", 0);
+    EXPECT_EQ(hashes[0], HashPrefixPage(ordinary[0], ""));
+    EXPECT_EQ(hashes[1], HashPrefixPage(ordinary[1], hashes[0]));
+    EXPECT_NE(hashes[0], ComputePrefixHashes(shifted, "", 1)[0]);
+}
+
+TEST(PrefixHashLookaheadTest, SameHashSpanWithDifferentLogicalGrainsCannotCrossModes) {
+    TokenContainer tokens({1, 2, 3, 4});
+    const auto ordinary = ComputePrefixHashes(tokens.FullPrefixPages(3, false, 0), "", 0);
+    const auto shifted = ComputePrefixHashes(tokens.FullPrefixPages(2, false, 1), "", 1);
+    ASSERT_EQ(ordinary.size(), 1u);
+    ASSERT_EQ(shifted.size(), 1u);
+    EXPECT_NE(ordinary[0], shifted[0]);
+}
+
+TEST(PrefixHashLookaheadTest, UnknownContinuationWaitsAndSampledLastTokenIdentifiesPreviousPage) {
+    TokenContainer tokens({1, 2, 3, 4});
+    EXPECT_EQ(tokens.FullPrefixPages(2, false, 0).size(), 2u);
+    EXPECT_EQ(tokens.FullPrefixPages(2, false, 1).size(), 1u);
+    const auto first = ComputePrefixHashes(tokens.FullPrefixPages(2, false, 1), "", 1);
+    tokens.Extend({5});
+    const auto pages = tokens.FullPrefixPages(2, true, 1);
+    ASSERT_EQ(pages.size(), 2u);
+    EXPECT_EQ(pages.back().back(), 5);
+    const auto rest = AdvancePrefixHashes(pages, 1, first.back(), 2, 1);
+    auto incremental = first;
+    incremental.insert(incremental.end(), rest.begin(), rest.end());
+    EXPECT_EQ(incremental, ComputePrefixHashes(pages, "", 1));
+    EXPECT_TRUE(TokenContainer({}).FullPrefixPages(2, true, 1).empty());
+    EXPECT_TRUE(TokenContainer({1}).FullPrefixPages(1, false, 1).empty());
 }
 
 }  // namespace

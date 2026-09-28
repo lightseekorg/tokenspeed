@@ -48,3 +48,6 @@ from tokenspeed.runtime.layers.attention.backends.paged import mha  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import mla  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import msa  # noqa: F401
 from tokenspeed.runtime.layers.attention.backends.paged import qsa  # noqa: F401
+
+# Model-owned routers register after their ordinary paged leaves.
+from tokenspeed.runtime.layers.attention.backends.specific import dots3_note

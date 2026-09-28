@@ -52,7 +52,10 @@ public:
     // requeued request prefills prompt + generated as one fresh extend.
     void RebasePrefill() { num_prefill_tokens_ = static_cast<std::int32_t>(tokens_.size()); }
 
-    std::vector<std::span<const std::int32_t>> FullPrefixPages(std::int32_t prefix_granularity, bool except_last) const;
+    // Hash spans overlap by lookahead tokens; logical page stride remains prefix_granularity.
+    // except_last excludes the last token from page coverage, not from hash lookahead.
+    std::vector<std::span<const std::int32_t>> FullPrefixPages(std::int32_t prefix_granularity, bool except_last,
+                                                               std::int32_t prefix_hash_lookahead_tokens) const;
     std::int32_t Size() const { return static_cast<std::int32_t>(tokens_.size()); }
     std::int32_t PrefillSize() const { return num_prefill_tokens_; }
     std::span<const std::int32_t> TokenSlice(Window window) const;

@@ -70,7 +70,7 @@ CacheGroupConfig State(const std::string& id, std::int32_t block_granularity, st
 SchedulerConfig SizingConfig(Role role, std::int32_t prefix_granularity, std::int32_t chunk_tokens,
                              std::int32_t decode_width, std::int32_t overlap_depth, bool disable_prefix_cache,
                              std::vector<CacheGroupConfig> groups) {
-    SchedulerConfig cfg{};
+    SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
     cfg.role = role;
     cfg.prefix_granularity = prefix_granularity;
     cfg.max_scheduled_tokens = chunk_tokens;

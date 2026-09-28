@@ -491,7 +491,7 @@ def triton_mla_prologue(
         is_neox=is_neox,
         fused_mla_set_kv_buffer_arg=FusedMLASetKVBufferArg(
             k_nope=latent[..., :rank],
-            kv_buffer=cache.kv_cache.view(cache.kv_cache.shape[0], -1),
+            kv_buffer=cache.kv_cache,
             cache_loc=cache.slots,
             q_nope=query[..., :rank] if fp8 else None,
             sanitize=cache.sanitize,

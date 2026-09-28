@@ -243,6 +243,29 @@ def register_backend(
     _BACKEND_REGISTRY[name] = (archs, cls)
 
 
+# HF architecture -> model-owned config generator and cache family.
+_MODEL_ATTENTION: dict[str, tuple[type[SoftmaxAttnConfig], CacheModelFamily]] = {}
+
+
+def register_model_attention(
+    architectures: tuple[str, ...],
+    config_cls: type[SoftmaxAttnConfig],
+    cache_family: CacheModelFamily,
+) -> None:
+    """Register HF architecture aliases with their config class and cache family."""
+    for architecture in architectures:
+        _MODEL_ATTENTION[architecture] = (config_cls, cache_family)
+
+
+def _model_attention(
+    architectures: tuple[str, ...],
+) -> tuple[type[SoftmaxAttnConfig], CacheModelFamily] | None:
+    for architecture in architectures:
+        if architecture in _MODEL_ATTENTION:
+            return _MODEL_ATTENTION[architecture]
+    return None
+
+
 # The composite name the hybrid linear-attention wrapper runs under; it
 # selects the wrapper, never a registered leaf.
 HYBRID_LINEAR_ATTN_BACKEND = "hybrid_linear_attn"
@@ -434,6 +457,12 @@ def _apply_backend_overrides(
     ``_create_attn_config`` call. The user's pre-override choice survives
     as ``profile.requested_backend``.
     """
+    # Model-owned generators select backends and validate the original choices.
+    if (
+        target.model_profile is None
+        and _model_attention(target.architectures) is not None
+    ):
+        return
     if (
         draft is not None
         and "K3DSparkModel" in draft.architectures
@@ -541,6 +570,9 @@ def _resolve_cache_family(
     """The one dispatch from family facts (plus built config) to the recipe."""
     if profile.model_profile is not None:
         return profile.model_profile.cache_family
+    registration = _model_attention(profile.architectures)
+    if registration is not None:
+        return registration[1]
     if config.component(DeepseekV41Config) is not None:
         return "deepseek_v41"
     if profile.is_deepseek_v4:
@@ -700,11 +732,19 @@ def _create_attn_config(
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    config_cls = (
-        DeepseekV41Config
-        if is_deepseek_v41_config(model_config.hf_config)
-        else _CONFIG_CLS[arch]
+    registration = (
+        _model_attention(
+            tuple(getattr(model_config.hf_config, "architectures", None) or ())
+        )
+        if model_config.model_profile is None
+        else None
     )
+    if registration is not None:
+        config_cls = registration[0]
+    elif is_deepseek_v41_config(model_config.hf_config):
+        config_cls = DeepseekV41Config
+    else:
+        config_cls = _CONFIG_CLS[arch]
     config = config_cls.generate(server_args, model_config, is_draft)
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
@@ -1038,8 +1078,7 @@ def _create_draft_components(
             "heterogeneous cache views currently support ordinary drafts only"
         )
     num_layers = model_config.num_attention_layers
-    # The draft view's transfer counter stays local/None; heterogeneous PD is
-    # rejected before construction.
+    # Draft fields have their own final producer barrier in the merged plan.
     draft_pool = create_cache_pool(
         cache_spec,
         config,
@@ -1282,14 +1321,22 @@ def create_attn_components(
     draft_profile = (
         draft_model_config.model_profile if draft_attn_config is not None else None
     )
+    draft_registration = (
+        _model_attention(draft.architectures)
+        if draft_attn_config is not None and draft_profile is None
+        else None
+    )
     if draft_profile is not None:
         draft_cache_family = draft_profile.cache_family
+    elif draft_registration is not None:
+        draft_cache_family = _resolve_cache_family(draft, draft_attn_config)
     else:
         draft_cache_family = _ordinary_cache_family(draft_attn_config)
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
         cache_family,
         draft_cache_family,
-        draft_family_declared=draft_profile is not None,
+        draft_family_declared=draft_profile is not None
+        or draft_registration is not None,
     )
     # One profile per boot, where a boot without a reserve takes it; a rebuild reuses it.
     if profiled_cache_bytes is None:

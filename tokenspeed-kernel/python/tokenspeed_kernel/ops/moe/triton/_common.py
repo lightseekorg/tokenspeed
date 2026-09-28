@@ -53,7 +53,8 @@ def _routing_kernel(
 def _routing(
     topk_ids: torch.Tensor, num_experts: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    topk_ids = topk_ids.to(torch.int32).contiguous()
+    # Preserve int64 sentinels: narrowing could wrap an invalid ID to an expert.
+    topk_ids = topk_ids.contiguous()
     num_routes = topk_ids.numel()
     expert_route_ids = torch.empty(
         (num_experts, num_routes), device=topk_ids.device, dtype=torch.int32

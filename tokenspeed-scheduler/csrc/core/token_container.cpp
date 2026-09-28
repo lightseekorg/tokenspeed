@@ -20,7 +20,10 @@
 
 #include "core/token_container.h"
 
+#include <algorithm>
 #include <cstddef>
+
+#include "utils.h"
 
 namespace tokenspeed {
 
@@ -28,20 +31,27 @@ void TokenContainer::Extend(const std::vector<std::int32_t>& new_tokens) {
     tokens_.insert(tokens_.end(), new_tokens.begin(), new_tokens.end());
 }
 
-std::vector<std::span<const std::int32_t>> TokenContainer::FullPrefixPages(std::int32_t prefix_granularity,
-                                                                           bool except_last) const {
+std::vector<std::span<const std::int32_t>> TokenContainer::FullPrefixPages(
+    std::int32_t prefix_granularity, bool except_last, std::int32_t prefix_hash_lookahead_tokens) const {
+    _assert(prefix_granularity > 0, "prefix_granularity must be positive");
+    _assert(prefix_hash_lookahead_tokens == 0 || prefix_hash_lookahead_tokens == 1,
+            "prefix_hash_lookahead_tokens must be 0 or 1");
     std::vector<std::span<const std::int32_t>> result;
 
     if (tokens_.empty()) {
         return result;
     }
 
-    std::int32_t token_size = except_last ? tokens_.size() - 1 : tokens_.size();
-    std::size_t num_full_pages = token_size / prefix_granularity;
+    // tokens_ contains only prompt and committed output, never unaccepted drafts.
+    // A sampled last token can identify the preceding page without having its own KV.
+    const std::int32_t token_size =
+        Size() - std::max(static_cast<std::int32_t>(except_last), prefix_hash_lookahead_tokens);
+    const std::size_t num_full_pages = token_size / prefix_granularity;
     result.reserve(num_full_pages);
     for (std::size_t i = 0; i < num_full_pages; ++i) {
         std::size_t start = i * prefix_granularity;
-        result.emplace_back(tokens_.data() + start, prefix_granularity);
+        result.emplace_back(tokens_.data() + start,
+                            static_cast<std::size_t>(prefix_granularity) + prefix_hash_lookahead_tokens);
     }
 
     return result;
