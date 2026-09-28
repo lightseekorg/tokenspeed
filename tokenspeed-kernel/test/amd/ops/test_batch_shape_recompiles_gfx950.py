@@ -25,6 +25,9 @@ specialization class, then sweep the batch-dependent value inside
 ``assert_no_triton_compile``.
 """
 
+import importlib
+import sys
+
 import pytest
 import torch
 from utils import (
@@ -222,10 +225,11 @@ def test_moe_topk_row_count():
     from tokenspeed_kernel_amd.ops.gfx950.moe import _common
 
     experts, topk = 128, 4
-    logits = torch.randn(2400, experts, device=DEVICE, dtype=torch.bfloat16)
+    # Each row is a permutation of 0..127, exact in BF16, so the top-k has no ties.
+    logits = torch.rand(2400, experts, device=DEVICE).argsort(-1).bfloat16()
 
     def run(rows):
-        _, indices, _ = _common.topk(logits[:rows], topk)
+        indices = _common.topk(logits[:rows], topk).indx
         expected = torch.topk(logits[:rows].float(), topk).indices
         assert torch.equal(indices.long().sort(-1).values, expected.sort(-1).values)
 
@@ -237,10 +241,20 @@ def test_moe_topk_row_count():
             run(rows)
 
 
-def test_iris_allreduce_sizes():
+def test_iris_allreduce_sizes(monkeypatch):
     pytest.importorskip("iris")
     from tokenspeed_kernel._triton import gl
-    from tokenspeed_kernel.ops.communication import iris as comm
+
+    # Other tests stub the Iris module through sys.modules, which only works
+    # while it has not been imported; record its absence so teardown drops the
+    # import this test makes.
+    name = "tokenspeed_kernel.ops.communication.iris"
+    if name not in sys.modules:
+        package = importlib.import_module("tokenspeed_kernel.ops.communication")
+        monkeypatch.setattr(package, "iris", None, raising=False)
+        monkeypatch.setitem(sys.modules, name, None)
+        del sys.modules[name]
+    comm = importlib.import_module(name)
 
     buf = torch.empty(1 << 22, device=DEVICE, dtype=torch.bfloat16)
     flags = torch.zeros(1024, device=DEVICE, dtype=torch.int32)
