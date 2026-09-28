@@ -152,12 +152,12 @@ decode, including the KDA QKVFAB shape.
   inner stride and a row stride of at least `N`.
 - KDA QKVFAB is the fixed shape `M` in `{1, 2, 4, 8, 16, 32}`, `K = 7168`,
   `N = 6288`.
-- Callers must supply `split_k`; `None` selects the largest of 8, 4, or 2 that divides the K
-  tiles, leaves each split at least eight K tiles and one full TDM pipeline,
-  and keeps `N`-tile count times the split within 256 CUs.
-  Otherwise the launch is direct. An explicit `split_k` must be one of
-  1, 2, 4, or 8 and divide the K tiles. A split greater than 1 must also leave each split
-  at least one full TDM pipeline.
+- Callers must supply `split_k`; `None` selects the largest of 8, 4, or 2
+  that divides the K tiles, leaves each split at least eight K tiles and one
+  full TDM pipeline, and keeps `N`-tile count times the split within 256 CUs.
+  Otherwise the launch is direct. An explicit `split_k` must be one of 1, 2,
+  4, or 8 and divide the K tiles. A split greater than 1 must also leave each
+  split at least one full TDM pipeline.
 
 #### Algorithm
 
