@@ -313,3 +313,47 @@ def test_iris_allreduce_sizes(monkeypatch):
             two_stage(words)
         for numel in (7168 * 5, 7168 * 11, 7168 * 29 + 3):
             one_stage(numel)
+
+
+def test_kda_fused_replay_batch_size():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda import decode
+
+    layers = 4
+    descriptors = torch.zeros(layers, 10, dtype=torch.uint64, device=DEVICE)
+    groups = torch.zeros(layers, dtype=torch.int32, device=DEVICE)
+
+    # Compile only: the descriptors would have to address real layer buffers.
+    def compile_for(batch):
+        pages = torch.zeros(2, batch, dtype=torch.int32, device=DEVICE)
+        accepted = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
+        decode.gluon_kda_fused_replay_gfx950.warmup(
+            descriptors,
+            groups,
+            pages,
+            pages,
+            accepted,
+            H=12,
+            D=128,
+            TOKENS_PER_SEQUENCE=4,
+            MIXED_ROW_STRIDE=4608,
+            CONV_WEIGHT_ROW_STRIDE=4,
+            CONV_WEIGHT_COL_STRIDE=1,
+            CONV_POOL_PAGE_STRIDE=13824,
+            CONV_POOL_CHANNEL_STRIDE=3,
+            CONV_POOL_HISTORY_STRIDE=1,
+            GATE_ROW_STRIDE=1536,
+            BETA_ROW_STRIDE=12,
+            STATE_POOL_PAGE_STRIDE=196608,
+            HAS_LOWER_BOUND=True,
+            LOWER_BOUND=-5.0,
+            BATCH_SIZE=batch,
+            num_warps=4,
+            num_stages=2,
+            grid=(1,),
+        )
+
+    compile_for(16)
+    compile_for(3)
+    with assert_no_triton_compile(decode.gluon_kda_fused_replay_gfx950):
+        for batch in (5, 7, 11, 13, 15):
+            compile_for(batch)
