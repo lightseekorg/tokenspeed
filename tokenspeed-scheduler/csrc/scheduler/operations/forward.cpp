@@ -743,18 +743,8 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         const bool last_resort = victim == nullptr && build.operations.empty() && build.remote_prefill.empty() &&
                                  build.remote_decode.empty();
         if (last_resort) {
-            // No resident can be retracted under the exemption and this round
-            // runs nothing, so no completion of it can free capacity. The
-            // exemption trusts the admission reserve to cover all growth; a
-            // sliding-window group's does not always: it recycles pages that
-            // slide out of the window and prepays only against pages other
-            // requests held at its admission. A page that becomes shared after
-            // admission frees nothing when it slides out, and a sequence still
-            // shorter than the window, or a prompt whose next chunk still reads
-            // its lookback, has nothing to recycle yet. Fall back to the exempt
-            // set rather than build empty plans forever. Like the ordinary
-            // choice, the loop may take several victims until a decode or the
-            // blocked admission fits.
+            // Nothing is retractable under the exemption and the round runs
+            // nothing: the last resort (docs/design/scheduler.md §2).
             victim = chooseVictim(candidates, /*ignore_exemption=*/true);
         }
         if (victim == nullptr) {
@@ -769,15 +759,8 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         retractVictim(*victim, write_back_operations);
 
         if (last_resort) {
-            // The round runs nothing, so none of its decodes got a page: the
-            // freed pages go to them first. A generated token survives any
-            // later retraction, so each last resort that lets a decode run is
-            // progress no retract/readmit cycle can undo. A prompt granted the
-            // pages instead can block on its next chunk and become the next
-            // victim before it produces anything, and a victim whose pages go
-            // to nobody can be admitted again ahead of the decodes and take
-            // the same pages back. Only when no decode fits does the blocker
-            // get the grant, as below.
+            // The round's decodes, none of which got a page, take the freed
+            // pages before the blocker (docs/design/scheduler.md §2).
             scheduleDecodeBatch(feedback, build, candidates);
             if (build.pushed_decode) {
                 return;
