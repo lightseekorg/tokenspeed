@@ -501,6 +501,25 @@ def triton_cdiv(a, b):
     return (a + b - 1) // b
 
 
+def _int_class(value):
+    """The class Triton specializes a runtime integer on."""
+    return "one" if value == 1 else "div16" if value % 16 == 0 else "other"
+
+
+def _warm_classes(run, key, sweep, pool):
+    """Run one pool value per specialization key the sweep will hit.
+
+    Split counts depend on the SM count, so which classes a sweep reaches
+    differs between GPUs; warming from a pool keeps the guard meaningful on
+    every device. A key no pool value reaches is warmed with its sweep value.
+    """
+    needed = {key(value) for value in sweep}
+    for value in [*(v for v in pool if v not in sweep), *sweep]:
+        if key(value) in needed:
+            needed.discard(key(value))
+            run(value)
+
+
 def test_merge_prefill_checkpoint_outputs_token_counts():
     from tokenspeed_kernel.ops.attention._triton import (
         prefill_state_checkpoints as ckpt,
@@ -873,19 +892,23 @@ def test_mhc_mixes_split_count():
         torch.testing.assert_close(comb, comb_ref, rtol=1e-3, atol=1e-3)
         return pre
 
-    # 64 tokens use 64 splits on current GPUs and 704 tokens fewer than 16:
-    # both integer classes are warm.
+    def key(tokens):
+        splits = residual.compute_mhc_num_splits(
+            x.device, 64, 4 * hidden, triton_cdiv(tokens, 64)
+        )
+        config = residual._mhc_prenorm_gemm_launch_config(
+            tokens, 4 * hidden, 24, splits
+        )
+        return _int_class(tokens), _int_class(splits), config
+
+    # Each batch size picks its own split count from the SM count.
+    sweep = (128, 192, 320, 448, 1024)
     first = run(64)
-    run(704)
+    _warm_classes(run, key, sweep, range(64, 1025, 64))
     with assert_no_triton_compile(
         residual._mhc_prenorm_gemm_triton_kernel, residual._mhc_pre_mix_hc4_kernel
     ):
-        # Each batch size picks its own split count from the SM count.
-        for tokens in (128, 192, 320, 448, 1024):
-            splits = residual.compute_mhc_num_splits(
-                x.device, 64, 4 * hidden, triton_cdiv(tokens, 64)
-            )
-            assert splits & (splits - 1) == 0
+        for tokens in sweep:
             pre = run(tokens)
             torch.testing.assert_close(pre[:64], first, rtol=1e-5, atol=1e-5)
 
@@ -936,13 +959,22 @@ def test_mhc_pre_split_count():
         for got, want in zip(actual, _reference(*args), strict=True):
             torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-2)
 
-    run(64)
-    run(33)
+    def key(tokens):
+        splits = residual.compute_mhc_num_splits(
+            x.device, 64, 4 * hidden, triton_cdiv(tokens, 64)
+        )
+        config = residual._mhc_prenorm_gemm_launch_config(
+            tokens, 4 * hidden, 24, splits
+        )
+        return _int_class(tokens), _int_class(splits), config
+
+    # Below 256 SMs, two to four token tiles pick fewer splits than one.
+    sweep = (65, 130, 200, 256)
+    _warm_classes(run, key, sweep, range(1, 257))
     with assert_no_triton_compile(
         residual._mhc_prenorm_gemm_triton_kernel, residual._mhc_pre_mix_triton_kernel
     ):
-        # Two to four token tiles pick fewer splits than one.
-        for tokens in (65, 130, 200, 256):
+        for tokens in sweep:
             run(tokens)
 
 
