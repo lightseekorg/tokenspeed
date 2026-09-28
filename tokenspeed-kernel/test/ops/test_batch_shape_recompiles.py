@@ -439,6 +439,28 @@ def test_dsv41_index_topk_table_width():
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
+def test_dsv41_cache_pack_row_count():
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as dsv41
+
+    # Packing index queries gives each row its own slot, so the slot bound is
+    # the row count. Rows are independent: a shorter batch is a prefix.
+    x = torch.randn(1500, 128, device=DEVICE, dtype=torch.bfloat16)
+    full_packed = dsv41.cache_pack(x, "index", None)
+    full_unpacked = dsv41.cache_unpack(full_packed, "index", None)
+
+    def run(rows):
+        packed = dsv41.cache_pack(x[:rows], "index", None)
+        unpacked = dsv41.cache_unpack(full_packed[:rows], "index", None)
+        torch.testing.assert_close(packed, full_packed[:rows], rtol=0, atol=0)
+        torch.testing.assert_close(unpacked, full_unpacked[:rows], rtol=0, atol=0)
+
+    run(32)
+    run(33)
+    with assert_no_triton_compile(dsv41._pack_kernel, dsv41._gather_kernel):
+        for rows in (48, 97, 130, 1483):
+            run(rows)
+
+
 def test_dp_sampling_kernels_bucket_size():
     from tokenspeed_kernel.ops.communication import triton as comm
 

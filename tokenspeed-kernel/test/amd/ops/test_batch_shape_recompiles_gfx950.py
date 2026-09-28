@@ -1,0 +1,101 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""GFX950 kernels launched with batch-shaped arguments must not recompile.
+
+Same pattern as ``test/ops/test_batch_shape_recompiles.py``: warm each integer
+specialization class, then sweep the batch-dependent value inside
+``assert_no_triton_compile``.
+"""
+
+import pytest
+import torch
+from utils import assert_no_triton_compile, is_cdna4
+
+if not is_cdna4():
+    pytest.skip("AMD CDNA4 is required", allow_module_level=True)
+
+DEVICE = "cuda"
+
+
+def test_mxfp4_activation_quantize_row_count():
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import quantize
+
+    x = torch.randn(2000, 512, device=DEVICE, dtype=torch.bfloat16)
+    full, _ = quantize._quantize_mxfp4_activation(x)
+
+    def run(rows):
+        # Rows quantize independently: a shorter batch is a prefix.
+        out, _ = quantize._quantize_mxfp4_activation(x[:rows])
+        torch.testing.assert_close(out, full[:rows], rtol=0, atol=0)
+
+    # 128 rows and up take the tiled kernel, fewer the scalar one.
+    for rows in (128, 129, 32, 33):
+        run(rows)
+    with assert_no_triton_compile(
+        quantize._mxfp4_quantize_cdna4_scale_tiled_kernel,
+        quantize._mxfp4_quantize_cdna4_scale_kernel,
+    ):
+        for rows in (130, 1483, 1800, 48, 97, 100):
+            run(rows)
+
+
+def test_mha_extend_split_count():
+    from tokenspeed_kernel.ops.attention.mha import mha_extend_with_kvcache
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
+
+    heads, kv_heads, dim, page, q_len = 8, 2, 128, 64, 4
+    k_cache = torch.randn(65, page, kv_heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    v_cache = torch.randn_like(k_cache)
+    # A fixed table width keeps the table stride out of the sweep.
+    table = torch.arange(1, 65, dtype=torch.int32, device=DEVICE)[None]
+    q = torch.randn(q_len, heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    cu_q = torch.tensor([0, q_len], dtype=torch.int32, device=DEVICE)
+
+    def run(kv_len):
+        # One request over two KV heads under-fills the GPU, so the split count
+        # follows the page count: half the pages, clamped to [8, 32].
+        out = mha_extend_with_kvcache(
+            q=q,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=torch.tensor([0, kv_len], dtype=torch.int32, device=DEVICE),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=table,
+            cache_seqlens=torch.tensor([kv_len], dtype=torch.int32, device=DEVICE),
+            max_seqlen_q=q_len,
+            max_seqlen_k=kv_len,
+            solution="gluon",
+        )
+        k = k_cache[1:].flatten(0, 1)[:kv_len].float().repeat_interleave(4, dim=1)
+        v = v_cache[1:].flatten(0, 1)[:kv_len].float().repeat_interleave(4, dim=1)
+        scores = torch.einsum("qhd,khd->hqk", q.float(), k) * dim**-0.5
+        expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v)
+        torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
+    # 32 pages give 16 splits and 18 pages give 9: both integer classes.
+    run(32 * page)
+    run(18 * page)
+    with assert_no_triton_compile(
+        extend.gluon_mha_extend_split_gfx950, extend.gluon_mha_extend_reduce_gfx950
+    ):
+        # 10, 11, 13, 20 and 32 splits.
+        for pages in (20, 22, 26, 40, 64):
+            run(pages * page - 5)
