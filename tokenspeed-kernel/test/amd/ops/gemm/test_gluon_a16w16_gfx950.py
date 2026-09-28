@@ -50,6 +50,12 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     launch_gluon_mm_a16w16_warp_gfx950,
 )
 
+# Kernels and references accumulate in FP32 and round once to BF16, so outputs
+# differ by at most one BF16 ULP (2**-7 relative). atol only covers FP32
+# accumulation-order noise on near-zero outputs.
+_ATOL = 1e-5
+_RTOL = 2**-7
+
 _CORRECTNESS_CASES = [
     pytest.param(
         launch_gluon_mm_a16w16_warp_gfx950,
@@ -87,7 +93,7 @@ def test_dense16_kernel_variant_correctness(
     out = kernel(a, b, dtype)
     assert out is not None
 
-    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=_ATOL, rtol=_RTOL)
 
 
 @pytest.mark.parametrize("kernel,shape", _CORRECTNESS_CASES)
@@ -105,7 +111,7 @@ def test_dense16_kernel_variant_writes_strided_out(
     actual = kernel(a, b, dtype, out=out)
 
     assert actual is out
-    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=_ATOL, rtol=_RTOL)
 
 
 @pytest.mark.parametrize("batch", [12, 16])
@@ -123,7 +129,7 @@ def test_dense16_bmm_writes_strided_out(batch: int) -> None:
     actual = launch_gluon_bmm_a16w16_gfx950(a, b, dtype, out=out)
 
     assert actual is out
-    torch.testing.assert_close(out, torch.bmm(a, weight), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(out, torch.bmm(a, weight), atol=_ATOL, rtol=_RTOL)
 
 
 def test_dense16_bmm_rejects_unsupported_shape() -> None:
@@ -145,7 +151,7 @@ def test_splitk_smallm_out_handles_padded_reducer_rows() -> None:
     actual = launch_gluon_mm_a16w16_splitk_gfx950(a, b, dtype, out=out)
 
     assert actual is out
-    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=_ATOL, rtol=_RTOL)
 
 
 def test_use_warp_reduce_covers_small_k_decode_shapes() -> None:

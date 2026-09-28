@@ -115,18 +115,19 @@ def test_non_bf16_inputs_fall_back_to_torch():
 
     x = torch.randn(1, 7168, device="cuda", dtype=torch.float16)
     w = torch.randn(768, 7168, device="cuda", dtype=torch.float16)
+    # The fallback is torch_decode_gemv, i.e. this very expression.
     got = cute_dsl_skinny_gemv(x, w)
-    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
+    assert torch.equal(got, x @ w.t())
 
     x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
     w = torch.randn(7168, 1536, device="cuda", dtype=torch.float16)
     got = flashinfer_tgv_gemv(x, w)
-    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
+    assert torch.equal(got, x @ w.t())
 
     x = torch.randn(1, 1536, device="cuda", dtype=torch.float16)
     w = torch.randn(2560, 1536, device="cuda", dtype=torch.float16)
     got = cute_dsl_ll_bf16_gemv(x, w)
-    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
+    assert torch.equal(got, x @ w.t())
 
 
 @pytest.mark.skipif(
@@ -206,7 +207,9 @@ def test_skinny_add3_matches_reference(m):
     c = c_wide[:, n:]
     got = skinny_gemv_add3(x, w, a, c).float()
     ref = a.float() + x.float() @ w.float().t() + c.float()
-    assert torch.allclose(got, ref, atol=0.5, rtol=2e-2)
+    # |out| ~ 8 (bf16 ulp 3e-2); atol spans the composed fallback's three
+    # roundings when the GEMM term cancels against the addends.
+    assert torch.allclose(got, ref, atol=5e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(
@@ -226,7 +229,7 @@ def test_kimi3_add3_auto_selects_the_skinny_epilogue():
     forced = kimi3_latent_projection_add3(x, w, a, c, solution="skinny_add3").float()
     composed = kimi3_latent_projection_add3(x, w, a, c, solution="composed").float()
     assert torch.allclose(auto, forced, atol=0.0, rtol=0.0)
-    assert torch.allclose(auto, composed, atol=0.5, rtol=2e-2)
+    assert torch.allclose(auto, composed, atol=5e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(
@@ -261,7 +264,7 @@ def test_skinny_add3_unwarmed_capture_falls_back(monkeypatch):
         g.replay()
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
-    assert torch.allclose(out.float(), ref, atol=0.5, rtol=2e-2)
+    assert torch.allclose(out.float(), ref, atol=5e-2, rtol=2e-2)
 
 
 def test_unlisted_shapes_keep_the_generic_selection():
@@ -486,8 +489,11 @@ def test_bf16_backend_support_is_what_the_route_was_tuned_against(backend):
             f"{backend} pdl={pdl} now runs but was excluded from the sweep; "
             f"re-run test/gemm_tuning/tune_route.py -- it may win a shape"
         )
-        rel = (got.float() - ref).abs().max().item() / ref.abs().max().item()
-        assert rel < 0.02, f"{backend} pdl={pdl} rel err {rel:.4f}"
+        # atol spans bf16 rounding of split-K partials at |partial| ~ sqrt(K).
+        err = (got.float() - ref).abs().max().item()
+        assert torch.allclose(
+            got.float(), ref, atol=1.0, rtol=2e-2
+        ), f"{backend} pdl={pdl} max abs err {err:.4f}"
 
 
 def test_the_shared_vendor_module_is_never_touched():
@@ -568,7 +574,8 @@ def test_splitk_serves_m_past_the_vendor_cutover(m):
     flashinfer_splitk.splitk_mm(x, w, tactic, out)
     ref = x.float() @ w.float().t()
     assert int((out.abs().sum(dim=1) == 0).sum()) == 0
-    assert (out.float() - ref).abs().max() / ref.abs().max() < 0.02
+    # atol spans bf16 rounding of split-K partials at |partial| ~ sqrt(K).
+    assert torch.allclose(out.float(), ref, atol=1.0, rtol=2e-2)
 
 
 def _splitk_cases():
@@ -661,7 +668,7 @@ def test_under_aligned_operands_fall_back_to_torch(monkeypatch, misalign, offset
         lambda *a, **kw: pytest.fail("under-aligned input must not launch vw-16"),
     )
     got = routed_gemv.cute_dsl_skinny_gemv(x, w)
-    assert torch.allclose(got.float(), (x @ w.t()).float(), atol=0.5, rtol=2e-2)
+    assert torch.equal(got, x @ w.t())
 
 
 @pytest.mark.skipif(

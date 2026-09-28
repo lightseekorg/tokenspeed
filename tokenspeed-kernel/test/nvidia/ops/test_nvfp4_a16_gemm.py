@@ -112,7 +112,9 @@ def test_flashinfer_nvfp4_a16_matches_dequantized_reference(m: int) -> None:
         torch.bfloat16
     )
 
-    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=6e-2)
+    # E2M1 x E4M3 products are exact in bf16, so the kernel and the reference
+    # differ by at most one bf16 ulp (2^-7 relative).
+    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 
 @requires_flashinfer_nvfp4_a16
