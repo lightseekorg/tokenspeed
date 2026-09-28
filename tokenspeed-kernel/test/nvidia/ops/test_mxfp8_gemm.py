@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import mm
+from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -32,5 +33,11 @@ def test_triton_mxfp8_1x32_raw_ue8m0_weight(device: str, override: str | None) -
     )
 
     scales = torch.exp2(b_scales.float() - 127.0).repeat_interleave(32, dim=1)
-    ref = a.float() @ (b.float() * scales).t()
-    torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.12)
+    # Compare against the operands mm() actually quantizes; UE8M0 scales are
+    # stored as biased exponent bytes.
+    q_a, a_scales = _online_quantize_mxfp8(a, [1, 32], "ue8m0", enable_pdl=False)
+    activation_scales = torch.exp2(a_scales.float() - 127.0).repeat_interleave(
+        32, dim=1
+    )
+    ref = (q_a.float() * activation_scales) @ (b.float() * scales).t()
+    torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=5e-3)
