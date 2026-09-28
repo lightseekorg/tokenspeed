@@ -19,7 +19,13 @@ best people and average people is more than tenfold.
 
 ## Code changes
 
-* Add tests and update docs for the changed code.
+* Add tests for the changed code. Don't be excessive--avoid checking trivial
+  details or exceptions.
+* Update docs for the changed code. Use concise comments to explain code
+  where it might be tricky for humans to understand, and leave project/component
+  level (design) docs focusing on high-level picture. In general, put suitable
+  docs at the suitable place and avoid duplicating the same across a lot of
+  places.
 * For code comments, use common/existing terms for easy human understanding;
   avoid obsecure terms or coining unnecessary new concepts.
 * Parameters that select execution paths, algorithms, or correctness-critical
@@ -172,21 +178,22 @@ Inside the root `tokenspeed-kernel/` directory:
   Tests for common infra and covering multi-vendors reside under `test/`
   directly.
 * Use tight atol/rtol in correctness comparison tests.
-* Compile-time kernel parameters (`tl.constexpr`, Gluon `gl.constexpr`,
-  `cutlass.Constexpr`) are part of the JIT cache key: every new value compiles
-  a new binary on the forward thread and stalls serving for 100+ ms. Make a
-  parameter compile-time only when its value set is small and fixed once the
-  server starts: model dimensions, block sizes, feature flags, pool geometry.
-  Values that vary per batch or request must be runtime arguments, or be
-  bucketed first (e.g. `next_power_of_2`) when the kernel needs a compile-time
-  bound. That includes values derived from them: token, request, or row
-  counts, `shape[0]`, `numel()`, sequence lengths, block-table and score
-  widths and the strides that follow them, and split or worker counts computed
-  from the batch size. The same holds for template arguments of other JITs
-  (DeepGEMM compiles a kernel per new value). Reviews must check every new or
-  changed kernel signature and launch site for this. Kernels launched with
-  batch-varying shapes need a test that warms the kernel, then sweeps those
-  shapes inside `assert_no_triton_compile` from `test/utils.py`.
+* Compile-time kernel parameters (`tl.constexpr`, `gl.constexpr`,
+  `cutlass.Constexpr`) are part of the JIT cache key: a new value triggers a
+  recompilation on the forward thread and stalls serving for 100+ ms. Use it
+  for fixed static values once the server starts (e.g., model dimensions,
+  feature flags) or scalar knob specialization that matters greatly for kernel
+  performance (e.g., block size, alignment). Values that vary per batch or
+  request (e.g, token, request, row counts, sequence lengths, block-table
+  widths), and values derived from them (e.g., the strides that follow those
+  widths, split counts computed from the batch size), must be runtime
+  arguments, or be bucketed first (e.g. `next_power_of_2`) when the kernel
+  needs a compile-time bound. The same holds for template arguments of other
+  JITs such as DeepGEMM. Reviews should check every new or changed kernel
+  signature and launch site for this. Kernels should have tests to guard
+  against excessive scalar parameter specialization with
+  `assert_no_triton_compile` from `test/utils.py`; for tensor parameters no
+  need to test.
 
 ## tokenspeed-kernel-amd
 
