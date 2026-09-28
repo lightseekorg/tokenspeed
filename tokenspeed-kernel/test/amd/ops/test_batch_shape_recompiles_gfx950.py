@@ -216,3 +216,22 @@ def test_mxfp4_moe_sorting_route_count():
     ):
         for tokens in sweep:
             run(tokens)
+
+
+def test_moe_topk_row_count():
+    from tokenspeed_kernel_amd.ops.gfx950.moe import _common
+
+    experts, topk = 128, 4
+    logits = torch.randn(2400, experts, device=DEVICE, dtype=torch.bfloat16)
+
+    def run(rows):
+        _, indices, _ = _common.topk(logits[:rows], topk)
+        expected = torch.topk(logits[:rows].float(), topk).indices
+        assert torch.equal(indices.long().sort(-1).values, expected.sort(-1).values)
+
+    # The routing bitmatrix pads its rows to 32, so its stride follows the batch.
+    run(64)
+    run(65)
+    with assert_no_triton_compile(_common._topk_forward):
+        for rows in (97, 130, 1483, 2336):
+            run(rows)
