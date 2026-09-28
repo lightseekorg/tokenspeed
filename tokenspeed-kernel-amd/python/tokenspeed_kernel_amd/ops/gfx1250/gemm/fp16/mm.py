@@ -246,10 +246,7 @@ def _gluon_wmma_dense_reduce_gfx1250_launch_metadata(grid, kernel, args):
     }
 
 
-@gluon.jit(
-    launch_metadata=_gluon_wmma_dense_reduce_gfx1250_launch_metadata,
-    do_not_specialize=["split_stride"],
-)
+@gluon.jit(launch_metadata=_gluon_wmma_dense_reduce_gfx1250_launch_metadata)
 def gluon_wmma_dense_reduce_gfx1250(
     partial_ptr,
     out_ptr,
