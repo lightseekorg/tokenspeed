@@ -112,6 +112,7 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
         page_size=page_size,
         topk=topk,
         softmax_scale=128**-0.5,
+        batch_invariant=False,
         index_k_cache=packed_index_k,
         solution="triton",
     )
@@ -169,6 +170,7 @@ def test_dsa_decode_topk_fp8_mtp(device: str, q_len_per_req: int, require) -> No
         page_size=page_size,
         topk=topk,
         softmax_scale=128**-0.5,
+        batch_invariant=False,
         q_len_per_req=q_len_per_req,
         index_k_cache=packed_index_k,
         solution="triton",
@@ -217,6 +219,7 @@ def test_dsa_prefill_topk_fp8(device: str, require) -> None:
         row_ends,
         topk=topk,
         softmax_scale=128**-0.5,
+        batch_invariant=False,
         index_k_cache=packed_index_k,
         page_size=page_size,
         solution="triton",
