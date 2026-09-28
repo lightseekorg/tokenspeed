@@ -152,9 +152,9 @@ def _check_output(actual, expected, dtype):
 @pytest.mark.parametrize(
     "batch,q_len,heads,splits,expected",
     [
-        (1, 1, 6, 32, 4),
+        (1, 1, 6, 32, 2),
         (1, 1, 48, 32, 2),
-        (1, 1, 96, 32, 4),
+        (1, 1, 96, 32, 1),
         (1, 8, 96, 8, 1),
         (4, 1, 48, 32, 1),
         (1, 1, 6, 2, 2),
@@ -375,6 +375,7 @@ class TestCompile:
                     is_var_seq=True,
                     is_var_split_kv=False,
                     compute_capability={capability!r},
+                    partial_fp16=False,
                     fold_sq_factor={4 if heads == 16 else 1},
                     causal_mask=causal_mask,
                     num_heads={heads},
@@ -406,8 +407,11 @@ class TestCompile:
         )
 
 
-def _check_decode_gpu(case, variable_kv, dtype):
+def _check_decode_gpu(case, variable_kv, dtype, partial_fp16):
+    import tokenspeed_mla.mla_decode as decode
     from tokenspeed_mla import tokenspeed_mla_decode
+
+    decode._FP16_PARTIALS = partial_fp16
 
     q, kv, tables, lengths = _make_inputs(case, dtype, variable_kv, "cuda")
     workspace = torch.zeros(256 * 1024**2, dtype=torch.int8, device="cuda")
@@ -727,8 +731,10 @@ def _check_packed_masks_gpu(interleave):
         )
 
 
-def _check_reducer_variants():
+def _check_reducer_variants(partial_fp16):
     import tokenspeed_mla.mla_decode as decode
+
+    decode._FP16_PARTIALS = partial_fp16
 
     torch.backends.cuda.matmul.allow_tf32 = False
     original_compile = decode._get_compiled_mla_kernel
@@ -736,7 +742,8 @@ def _check_reducer_variants():
     for case, capacity in [(_Case(1, 8192, 12, 4), 64), (_Case(1, 8192, 96, 1), 32)]:
         q, kv, tables, lengths = _make_inputs(case, "fp8", False, "cuda")
         q.zero_()  # Uniform attention has a closed-form base-2 LSE.
-        expected_out = _reference_mla(q, kv, tables, lengths, [0])
+        output_scale = 0.375
+        expected_out = _reference_mla(q, kv, tables, lengths, [0]) * output_scale
         visible = (
             case.kv_len - case.q_len + torch.arange(1, case.q_len + 1, device="cuda")
         )
@@ -748,6 +755,7 @@ def _check_reducer_variants():
             for bands, max_splits in [
                 (1, 256),
                 (1, capacity),
+                (1, capacity + 1),
                 (2, capacity),
                 (4, capacity),
             ]:
@@ -768,6 +776,7 @@ def _check_reducer_variants():
                     seq_lens=lengths,
                     max_seq_len=case.kv_len,
                     softmax_scale=192**-0.5,
+                    output_scale=output_scale,
                     return_lse=True,
                     is_var_seq=False,
                     enable_pdl=pdl,
@@ -839,8 +848,9 @@ class TestGPU:
         ],
         ids=lambda value: value.name if isinstance(value, _Case) else None,
     )
-    def test_fp8_decode_accuracy_and_cuda_graph(self, case, variable_kv):
-        _run_gpu_check(_check_decode_gpu, (case, variable_kv, "fp8"), 180)
+    @pytest.mark.parametrize("partial_fp16", [False, True])
+    def test_fp8_decode_accuracy_and_cuda_graph(self, case, variable_kv, partial_fp16):
+        _run_gpu_check(_check_decode_gpu, (case, variable_kv, "fp8", partial_fp16), 180)
 
     @pytest.mark.parametrize(
         "case,variable_kv",
@@ -854,7 +864,8 @@ class TestGPU:
         ids=lambda value: value.name if isinstance(value, _Case) else None,
     )
     def test_bf16_decode_accuracy_and_cuda_graph(self, case, variable_kv):
-        _run_gpu_check(_check_decode_gpu, (case, variable_kv, "bf16"), 180)
+        # BF16 partials are always acc_dtype; the fp16 flag is FP8-only.
+        _run_gpu_check(_check_decode_gpu, (case, variable_kv, "bf16", False), 180)
 
     def test_packed_q_outputs_lse_tails_and_legacy_paths(self):
         _run_gpu_check(_check_packed_gpu, (), 600)
@@ -863,5 +874,6 @@ class TestGPU:
     def test_packed_q_preserves_sliding_window_and_dcp_masks(self, interleave):
         _run_gpu_check(_check_packed_masks_gpu, (interleave,), 600)
 
-    def test_reducer_bands_preserve_output_lse_and_pdl(self):
-        _run_gpu_check(_check_reducer_variants, (), 240)
+    @pytest.mark.parametrize("partial_fp16", [False, True])
+    def test_reducer_bands_preserve_output_lse_and_pdl(self, partial_fp16):
+        _run_gpu_check(_check_reducer_variants, (partial_fp16,), 240)
