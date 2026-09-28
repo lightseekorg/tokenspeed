@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import mm
+from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8
 from tokenspeed_kernel.ops.gemm.fp8_utils import per_block_quant_fp8
 
 
@@ -49,10 +50,14 @@ def test_per_block_quant_fp8_roundtrip(
     )
 
     dequantized = _dequantize(q, scales, block_size)
-    cosine = torch.nn.functional.cosine_similarity(
-        dequantized.flatten(), x.float().flatten(), dim=0
+    # Round-to-nearest E4M3 (3 mantissa bits) is off by at most half an ulp:
+    # 2^-4 relative for normal values, 2^-10 * scale for subnormal ones.
+    torch.testing.assert_close(
+        dequantized,
+        x.float(),
+        atol=scales.max().item() * 2**-10,
+        rtol=2**-4,
     )
-    assert cosine > 0.99
 
 
 def test_per_block_quant_fp8_scale_is_per_block(device: str) -> None:
@@ -97,5 +102,11 @@ def test_per_block_quant_fp8_feeds_block_scaled_gemm(device: str) -> None:
         override="triton_mm_fp8_blockscale",
     )
 
-    reference = a.float() @ _dequantize(q_weight, weight_scales, block_size).t()
-    torch.testing.assert_close(out.float(), reference, atol=0.05, rtol=0.05)
+    # Dequantize the activation exactly as mm() quantized it online, so only
+    # the GEMM's single bf16 rounding (at most 2^-8 relative) separates them.
+    q_a, a_scales = _online_quantize_mxfp8(
+        a, list(block_size), "triton_mm_fp8_blockscale"
+    )
+    activation = q_a.float() * a_scales.repeat_interleave(block_size[1], dim=1)[:, :k]
+    reference = activation @ _dequantize(q_weight, weight_scales, block_size).t()
+    torch.testing.assert_close(out.float(), reference, atol=1e-3, rtol=5e-3)
