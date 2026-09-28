@@ -74,7 +74,7 @@ def _csa2_page_rows(
     num_pages,
     visible,
     PAGE_SIZE: gl.constexpr,
-    TABLE_WIDTH: gl.constexpr,
+    table_width,
     CANDIDATES: gl.constexpr,
 ):
     if CANDIDATES >= 0:
@@ -90,7 +90,7 @@ def _csa2_page_rows(
         logical = positions.to(gl.int64)
         valid = valid & (logical < visible)
     logical_page = logical // PAGE_SIZE
-    safe_page = gl.minimum(gl.maximum(logical_page, 0), TABLE_WIDTH - 1)
+    safe_page = gl.minimum(gl.maximum(logical_page, 0), table_width - 1)
     physical = gl.amd.cdna5.buffer_load(
         page_table,
         (query * table_stride + safe_page).to(gl.int32),
@@ -150,6 +150,7 @@ def _index_launch_metadata(grid, kernel, args):
         "stride_w_token",
         "stride_w_head",
         "table_stride",
+        "table_width",
         "cand_stride",
         "logits_stride",
         "page_stride_bytes",
@@ -175,7 +176,7 @@ def gluon_dsv41_index_topk_gfx1250(
     num_pages,
     max_candidates,
     PAGE_SIZE: gl.constexpr,
-    TABLE_WIDTH: gl.constexpr,
+    table_width,
     CANDIDATES: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     SCORE_CHUNK: gl.constexpr,
@@ -187,7 +188,7 @@ def gluon_dsv41_index_topk_gfx1250(
     split = gl.program_id(1)
     vis = gl.minimum(
         gl.maximum(gl.load(visible + token).to(gl.int32), 0),
-        TABLE_WIDTH * PAGE_SIZE,
+        table_width * PAGE_SIZE,
     )
     if CANDIDATES >= 0:
         width = gl.where(vis > 0, CANDIDATES * 8, 0)
@@ -242,7 +243,7 @@ def gluon_dsv41_index_topk_gfx1250(
             num_pages,
             vis,
             PAGE_SIZE,
-            TABLE_WIDTH,
+            table_width,
             CANDIDATES,
         )
         packed = gl.load(
@@ -286,7 +287,7 @@ def gluon_dsv41_index_topk_gfx1250(
             num_pages,
             vis,
             PAGE_SIZE,
-            TABLE_WIDTH,
+            table_width,
             CANDIDATES,
         )
         gl.store(
@@ -347,7 +348,7 @@ def dsv41_index_logits_gfx1250(
         int(cache_2d.shape[0]),
         width,
         PAGE_SIZE=64,
-        TABLE_WIDTH=int(table.shape[1]),
+        table_width=int(table.shape[1]),
         CANDIDATES=-1 if candidates is None else int(candidates.shape[1]),
         HEAD_DIM=_HEAD_DIM,
         SCORE_CHUNK=score_chunk_size,

@@ -461,6 +461,60 @@ def test_dsv41_cache_pack_row_count():
             run(rows)
 
 
+def test_kda_prepare_capacity_scan_token_and_sequence_counts():
+    from tokenspeed_kernel.ops.attention.kda._triton import prefill_scan_inputs as scan
+
+    heads, dim = 2, 128
+
+    def run(case):
+        lengths, capacity = case
+        live, sequences = sum(lengths), len(lengths)
+
+        def randn(*shape):
+            return torch.randn(1, capacity, *shape, device=DEVICE).bfloat16()
+
+        q, k, v, gate = (randn(heads, dim) for _ in range(4))
+        beta = randn(heads)
+        bounds = F.pad(torch.tensor(lengths).cumsum(0), (1, 0)).int().to(DEVICE)
+        oq, ok, ov, og, ob, chunks, chunk_rows = scan.prepare_capacity_scan(
+            q, k, v, gate, beta, bounds, inputs_packed=False
+        )
+        rows = torch.arange(capacity, device=DEVICE) < live
+        for got, x in ((oq, q), (ok, k), (ov, v), (og, gate.float())):
+            torch.testing.assert_close(got, x * rows[None, :, None, None])
+        torch.testing.assert_close(ob, beta * rows[None, :, None])
+        counts = [triton_cdiv(n, 16) for n in lengths]
+        expected = [s for s, c in enumerate(counts) for _ in range(c)]
+        expected += [sequences - 1] * (chunk_rows.numel() - len(expected))
+        assert chunks.tolist() == [0, *torch.tensor(counts).cumsum(0).tolist()]
+        assert chunk_rows.tolist() == expected
+
+    def key(case):
+        lengths, capacity = case
+        chunk_count = triton_cdiv(capacity, 16) + len(lengths) - 1
+        counts = (capacity, len(lengths), chunk_count)
+        return (*map(_int_class, counts), 1 << (len(lengths) - 1).bit_length())
+
+    # Token capacity and live sequences both follow the batch.
+    sweep = (
+        ((20, 7, 33), 64),
+        ((1, 2, 3, 4), 130),
+        ((50, 60, 70, 5, 9, 11), 300),
+        ((100, 3, 3, 3, 3), 381),
+        ((8, 8, 8, 8, 8, 8, 8), 264),
+        ((500, 17), 590),
+    )
+    pool = [
+        ((max(1, capacity // (2 * n)),) * n, capacity)
+        for n in range(1, 9)
+        for capacity in (48, 49, 96, 97, 160, 161, 400, 401)
+    ]
+    _warm_classes(run, key, sweep, pool)
+    with assert_no_triton_compile(scan._prepare_capacity_scan_kernel):
+        for case in sweep:
+            run(case)
+
+
 def test_dp_sampling_kernels_bucket_size():
     from tokenspeed_kernel.ops.communication import triton as comm
 
