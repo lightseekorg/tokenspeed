@@ -35,6 +35,7 @@ from typing import Any, Protocol
 
 import torch
 
+from tokenspeed.runtime.multimodal.encoder_batching import pack_encoder_batches
 from tokenspeed.runtime.utils import logger
 
 
@@ -563,51 +564,23 @@ class EncoderForwardStepRunner:
         per_item_encoder_output_tokens = batch.encoder_output_tokens
         per_item_metadata_sequences = batch.metadata_sequences
 
-        sorted_indices = sorted(
-            range(num_items), key=lambda i: per_item_encoder_output_tokens[i]
+        groups = pack_encoder_batches(
+            per_item_encoder_output_tokens,
+            per_item_metadata_sequences,
+            max_tokens=max_budget,
+            max_items=self.max_batch_size,
+            max_metadata_sequences=max_metadata_sequence_budget,
         )
-
-        batches: list[tuple[list[int], int | None]] = []
-        current_batch: list[int] = []
-        current_batch_encoder_output_tokens = 0
-        current_batch_metadata_sequences = 0
-        for orig_idx in sorted_indices:
-            item_encoder_output_tokens = per_item_encoder_output_tokens[orig_idx]
-            item_metadata_sequences = per_item_metadata_sequences[orig_idx]
-            if (
-                current_batch_encoder_output_tokens + item_encoder_output_tokens
-                <= max_budget
-                and len(current_batch) < self.max_batch_size
-                and current_batch_metadata_sequences + item_metadata_sequences
-                <= max_metadata_sequence_budget
-            ):
-                current_batch.append(orig_idx)
-                current_batch_encoder_output_tokens += item_encoder_output_tokens
-                current_batch_metadata_sequences += item_metadata_sequences
-            else:
-                if current_batch:
-                    batches.append(
-                        (
-                            current_batch,
-                            self._smallest_fitting_budget(
-                                current_batch_encoder_output_tokens,
-                                current_batch_metadata_sequences,
-                            ),
-                        )
-                    )
-                current_batch = [orig_idx]
-                current_batch_encoder_output_tokens = item_encoder_output_tokens
-                current_batch_metadata_sequences = item_metadata_sequences
-        if current_batch:
-            batches.append(
-                (
-                    current_batch,
-                    self._smallest_fitting_budget(
-                        current_batch_encoder_output_tokens,
-                        current_batch_metadata_sequences,
-                    ),
-                )
+        batches = [
+            (
+                indices,
+                self._smallest_fitting_budget(
+                    sum(per_item_encoder_output_tokens[i] for i in indices),
+                    sum(per_item_metadata_sequences[i] for i in indices),
+                ),
             )
+            for indices in groups
+        ]
 
         # Packing reorders; restore original order before return.
         outputs_by_orig_idx: dict[int, torch.Tensor] = {}
