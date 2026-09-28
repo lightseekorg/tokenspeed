@@ -667,9 +667,33 @@ def test_sharded_index_candidates(degree, solution, index_k_format, monkeypatch)
     reference = (
         torch.einsum("thd,sd->ths", query, keys).relu() * weights.unsqueeze(-1)
     ).sum(1)
-    reference.masked_fill_(
-        torch.arange(keys.shape[0], device=device) >= lengths[:, None], -float("inf")
-    )
+    positions = torch.arange(keys.shape[0], device=device)
+
+    def check_candidates(indices, scores, expected_logits):
+        # Top-K does not promise ordering, including across graph replay.
+        # Validate score/index correspondence and the optimal score multiset;
+        # ties at the cutoff may legitimately choose different token IDs.
+        valid = indices >= 0
+        assert ((indices == -1) | (valid & (indices < keys.shape[0]))).all()
+        assert (scores[~valid] == -float("inf")).all()
+        ordered = indices.sort(dim=-1).values
+        assert not ((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)).any()
+        torch.testing.assert_close(
+            scores[valid],
+            expected_logits.gather(1, indices.clamp_min(0).long())[valid],
+            rtol=2e-5,
+            atol=2e-3,
+        )
+        torch.testing.assert_close(
+            valid.sum(-1), torch.isfinite(expected_logits).sum(-1).clamp_max(topk)
+        )
+        torch.testing.assert_close(
+            scores.sort(dim=-1, descending=True).values,
+            expected_logits.topk(topk, dim=-1).values,
+            rtol=2e-5,
+            atol=2e-3,
+        )
+
     candidates, values = [], []
     for rank in range(degree):
         local = cache[[0] + list(range(rank + 1, pages, degree))].contiguous()
@@ -686,14 +710,14 @@ def test_sharded_index_candidates(degree, solution, index_k_format, monkeypatch)
             page_size=page_size,
             topk=topk,
         )
-        valid = indices >= 0
-        torch.testing.assert_close(
-            scores[valid],
-            reference.gather(1, indices.clamp_min(0).long())[valid],
-            rtol=2e-5,
-            atol=2e-3,
-        )
-        assert (scores[~valid] == -float("inf")).all()
+        owned = ((table[0].repeat_interleave(page_size) - 1) % degree) == rank
+
+        def local_reference():
+            return reference.masked_fill(
+                ~owned[None, :] | (positions >= lengths[:, None]), -float("inf")
+            )
+
+        check_candidates(indices, scores, local_reference())
         candidates.append(indices)
         values.append(scores)
         # Refresh lengths in place: captured kernels must not retain old validity.
@@ -710,8 +734,7 @@ def test_sharded_index_candidates(degree, solution, index_k_format, monkeypatch)
                 topk=topk,
             )
         graph.replay()
-        torch.testing.assert_close(captured_indices, indices)
-        torch.testing.assert_close(captured_scores, scores)
+        check_candidates(captured_indices, captured_scores, local_reference())
         lengths[0] = 19
         graph.replay()
         updated_indices, updated_scores = index_candidates(
@@ -724,15 +747,13 @@ def test_sharded_index_candidates(degree, solution, index_k_format, monkeypatch)
             page_size=page_size,
             topk=topk,
         )
-        torch.testing.assert_close(captured_indices, updated_indices)
-        torch.testing.assert_close(captured_scores, updated_scores)
+        check_candidates(updated_indices, updated_scores, local_reference())
+        check_candidates(captured_indices, captured_scores, local_reference())
         lengths[0] = 0
     indices, scores = torch.cat(candidates, 1), torch.cat(values, 1)
-    selected = indices.gather(
-        1, torch.argsort(scores, descending=True, stable=True)[:, :topk]
+    order = scores.topk(topk, dim=-1).indices
+    check_candidates(
+        indices.gather(1, order),
+        scores.gather(1, order),
+        reference.masked_fill(positions >= lengths[:, None], -float("inf")),
     )
-    for row in (1, 2):
-        count = min(topk, int(lengths[row]))
-        assert set(selected[row, :count].tolist()) == set(
-            torch.argsort(reference[row], descending=True, stable=True)[:count].tolist()
-        )
