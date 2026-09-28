@@ -515,6 +515,52 @@ def test_kda_prepare_capacity_scan_token_and_sequence_counts():
             run(case)
 
 
+def test_causal_conv1d_capacity_metadata_counts():
+    from tokenspeed_kernel.ops.attention.gdn._triton import causal_conv1d_metadata
+
+    block_m = 8
+
+    def run(case):
+        lengths, capacity = case
+        bounds = F.pad(torch.tensor(lengths).cumsum(0), (1, 0)).int().to(DEVICE)
+        metadata = causal_conv1d_metadata.build_causal_conv1d_capacity_metadata(
+            bounds, capacity, block_m
+        )
+        requests, offsets = [], []
+        for request, length in enumerate(lengths):
+            count = triton_cdiv(length, block_m)
+            requests += [request] * count
+            offsets += list(range(count))
+        pad = metadata.batch_indices.numel() - len(requests)
+        assert metadata.batch_indices.tolist() == requests + [-1] * pad
+        assert metadata.chunk_offsets.tolist() == offsets + [0] * pad
+
+    def key(case):
+        lengths, capacity = case
+        chunks = triton_cdiv(capacity, block_m) + len(lengths) - 1
+        # The offsets map starts ``chunks`` int32s into one allocation, so its
+        # 16-byte pointer alignment is a specialization class too.
+        return _int_class(chunks), _int_class(len(lengths)), chunks % 4 == 0
+
+    # Token capacity and live sequences both follow the batch.
+    sweep = (
+        ((20, 7, 33), 64),
+        ((1, 2, 3, 4), 130),
+        ((50, 60, 70, 5, 9, 11), 300),
+        ((100, 3, 3, 3, 3), 381),
+        ((500, 17), 590),
+    )
+    pool = [
+        ((max(1, capacity // (2 * n)),) * n, capacity)
+        for n in range(1, 9)
+        for capacity in (48, 49, 96, 97, 160, 161, 400, 401)
+    ]
+    _warm_classes(run, key, sweep, pool)
+    with assert_no_triton_compile(causal_conv1d_metadata._refresh_conv_capacity_kernel):
+        for case in sweep:
+            run(case)
+
+
 def test_dp_sampling_kernels_bucket_size():
     from tokenspeed_kernel.ops.communication import triton as comm
 

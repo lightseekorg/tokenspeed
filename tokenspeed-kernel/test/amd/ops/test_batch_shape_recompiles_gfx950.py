@@ -99,3 +99,35 @@ def test_mha_extend_split_count():
         # 10, 11, 13, 20 and 32 splits.
         for pages in (20, 22, 26, 40, 64):
             run(pages * page - 5)
+
+
+def test_mxfp8_gemm_row_count():
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8 import mm
+
+    n, k = 512, 1024
+    a = (torch.randn(2560, k, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
+    b = (torch.randn(n, k, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
+    a_scales = torch.randint(124, 130, (2560, k // 32), dtype=torch.uint8)
+    b_scales = torch.randint(124, 130, (n, k // 32), dtype=torch.uint8)
+    a_scales, b_scales = a_scales.to(DEVICE), b_scales.to(DEVICE)
+
+    def run(rows):
+        return mm.launch_gluon_mm_mxfp8_gfx950(
+            a[:rows],
+            b,
+            a_scales[:rows],
+            b_scales,
+            torch.bfloat16,
+            alpha=None,
+            block_size=[1, 32],
+            out=None,
+        )
+
+    full = run(2560)
+    # The tile count follows the row count: 16 tiles and 6 warm both classes.
+    run(2048)
+    run(768)
+    with assert_no_triton_compile(mm.gluon_mm_mxfp8_gfx950):
+        for rows in (256, 1280, 1792):
+            # Rows are independent: a shorter batch is a prefix.
+            torch.testing.assert_close(run(rows), full[:rows], rtol=0, atol=0)
