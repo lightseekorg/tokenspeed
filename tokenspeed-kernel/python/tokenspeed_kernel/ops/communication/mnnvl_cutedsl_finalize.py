@@ -194,11 +194,8 @@ def mnnvl_cutedsl_finalize_allreduce_rmsnorm_supported(
 
     This function does not allocate or enter a collective.  Its result must be
     combined across ``group`` before construction; :meth:`initialize` performs
-    that vote.  Any import, version, capability, or API-inspection failure
-    returns ``False`` rather than partially enabling the path.  The version and
-    signature checks protect normal wheel installs; a deployment that overlays
-    FlashInfer source on an installed wheel must additionally pin and record
-    that source revision because package metadata cannot identify an overlay.
+    that vote. Any import, capability, or API-inspection failure returns
+    ``False`` rather than partially enabling the path.
 
     Args:
         group: Intended TP process group.
@@ -210,7 +207,7 @@ def mnnvl_cutedsl_finalize_allreduce_rmsnorm_supported(
         candidate_max_tokens: Last qualified M and BT workspace capacity.
 
     Returns:
-        Whether this rank has the exact validated FlashInfer API and hardware.
+        Whether this rank has the required FlashInfer API and hardware.
     """
 
     return (
@@ -364,7 +361,6 @@ def _require_collective_agreement(
         "capturing": frozenset({True}),
     },
     priority=Priority.SPECIALIZED,
-    tags={"blackwell", "cuda_graph", "determinism", "throughput"},
 )
 def mnnvl_cutedsl_deferred_finalize_allreduce_rmsnorm(
     backend: MNNVLCuteDSLDeferredFinalizeBackend,

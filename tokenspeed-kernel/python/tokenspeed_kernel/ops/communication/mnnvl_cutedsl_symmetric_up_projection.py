@@ -492,7 +492,6 @@ class BoundSymmetricUpProjection:
         max_arch_version=ArchVersion(10, 3),
     ),
     priority=Priority.SPECIALIZED,
-    tags={"blackwell", "throughput", "experimental"},
 )
 def symmetric_up_projection(plan: BoundSymmetricUpProjection) -> torch.Tensor:
     """Run a prepared plan and return its explicitly owned symmetric output."""

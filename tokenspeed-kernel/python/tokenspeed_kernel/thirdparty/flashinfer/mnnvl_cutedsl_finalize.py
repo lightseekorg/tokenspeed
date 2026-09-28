@@ -36,7 +36,6 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-_FLASHINFER_VERSION = "0.6.18"
 _K3_LATENT_SIZE = 3584
 _K3_TOP_K = 16
 _K3_TP_SIZE = 8
@@ -151,7 +150,6 @@ def bt_support_error(
         if not _is_supported_blackwell_capability(capability):
             return "the deferred BT path requires data-center Blackwell"
 
-        import flashinfer
         import torch.distributed._symmetric_memory as symm_mem
         from flashinfer.comm.mnnvl import is_multicast_supported
         from flashinfer.comm.mnnvl_cutedsl.kernel_bt import (
@@ -160,12 +158,6 @@ def bt_support_error(
         )
         from flashinfer.comm.mnnvl_cutedsl.kernel_bt.protocol import BTProtocol
 
-        version = str(flashinfer.__version__).split("+", 1)[0]
-        if version != _FLASHINFER_VERSION:
-            return (
-                f"FlashInfer {_FLASHINFER_VERSION} is required; found "
-                f"{flashinfer.__version__}"
-            )
         finalize_parameters = inspect.signature(BTFinalizeTuning).parameters
         if not {
             "elements_per_thread",
