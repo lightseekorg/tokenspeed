@@ -119,7 +119,8 @@ def _sqrt_softplus_topk_kernel(
         "routing_kind": frozenset({"plain", "bias", "hash"}),
         "score_function": frozenset({"sqrt_softplus"}),
     },
-    priority=Priority.PORTABLE,
+    # Prefer the fused kernel over the portable PyTorch fallback.
+    priority=Priority.PORTABLE + 1,
 )
 def triton_sqrt_softplus_topk(
     router_logits: torch.Tensor,

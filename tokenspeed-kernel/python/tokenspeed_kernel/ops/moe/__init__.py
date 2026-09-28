@@ -21,6 +21,7 @@ from collections.abc import Callable
 from typing import Any, Literal
 
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.numerics.reference.moe  # noqa: F401
 import tokenspeed_kernel.ops.moe.cuda  # noqa: F401
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
@@ -232,7 +233,7 @@ def moe_topk(
     }
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
     per_token_bias = correction_bias is not None and correction_bias.ndim == 2
-    if per_token_bias and solution not in {None, "torch"}:
+    if per_token_bias and solution not in {None, "torch", "reference"}:
         raise ValueError(
             f"per-token correction bias does not support solution {solution!r}"
         )
@@ -240,6 +241,7 @@ def moe_topk(
         None,
         "torch",
         "torch_sqrt_softplus_topk",
+        "reference",
     }:
         raise ValueError(
             f"per-token correction bias does not support override {override!r}"

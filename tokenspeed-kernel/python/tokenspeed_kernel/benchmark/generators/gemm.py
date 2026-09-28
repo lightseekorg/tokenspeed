@@ -38,7 +38,12 @@ from tokenspeed_kernel.benchmark.validation import OutputValidationSpec
 from tokenspeed_kernel.numerics.inputs import get_input_generator
 from tokenspeed_kernel.numerics.tolerance import get_family_tolerance
 from tokenspeed_kernel.platform import PlatformInfo
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+    load_builtin_kernels,
+    resolve_solutions,
+)
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
     SelectedKernel,
@@ -236,13 +241,17 @@ def _select_reference_registration(
     platform: PlatformInfo,
 ) -> tuple[KernelSpec, SelectedKernel]:
     registry = KernelRegistry.get()
-    references = registry.get_for_operator(
-        spec.family,
-        spec.mode,
-        platform=platform,
-        format_signature=signature,
-        solution="reference",
-    )
+    references = [
+        reference
+        for concrete in resolve_solutions("reference")
+        for reference in registry.get_for_operator(
+            spec.family,
+            spec.mode,
+            platform=platform,
+            format_signature=signature,
+            solution=concrete,
+        )
+    ]
     for reference in references:
         if (
             reference.name == spec.name

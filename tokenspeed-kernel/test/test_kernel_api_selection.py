@@ -41,7 +41,10 @@ from types import SimpleNamespace
 
 import pytest
 import tokenspeed_kernel
+import tokenspeed_kernel.numerics.reference.attention as _attention_reference
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
+import tokenspeed_kernel.numerics.reference.moe as _moe_reference
+import tokenspeed_kernel.numerics.reference.residual as _residual_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
 import tokenspeed_kernel.ops.attention.dsa as _attention_dsa_pkg
@@ -93,6 +96,7 @@ import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
 import tokenspeed_kernel.ops.moe.gluon.sqrt_softplus_topk as _moe_gluon_sqrt_softplus
 import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
 import tokenspeed_kernel.ops.moe.marlin as _moe_marlin
+import tokenspeed_kernel.ops.moe.mega_moe as _moe_mega_moe
 import tokenspeed_kernel.ops.moe.native as _moe_native
 import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
 import tokenspeed_kernel.ops.moe.softmax_topk as _moe_softmax_topk
@@ -108,7 +112,6 @@ import tokenspeed_kernel.ops.residual.cuda as _residual_cuda
 import tokenspeed_kernel.ops.residual.cute_fused as _residual_cute_fused
 import tokenspeed_kernel.ops.residual.deep_gemm as _residual_deep_gemm
 import tokenspeed_kernel.ops.residual.gluon as _residual_gluon
-import tokenspeed_kernel.ops.residual.torch as _residual_torch
 import tokenspeed_kernel.ops.residual.triton as _residual_triton
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
@@ -166,6 +169,7 @@ if _attention_gluon_kpool is not None:
 
 _RELOAD_MODULES = [
     # Attention registration modules.
+    _attention_reference,
     _attention_cuda_dsa,
     _attention_cuda_dsv4,
     _attention_flashinfer_dsa,
@@ -200,14 +204,15 @@ _RELOAD_MODULES = [
     _gemm_trtllm,
     _gemm_pkg,
     # Residual registration modules.
+    _residual_reference,
     _residual_cuda,
     _residual_cute_fused,
     _residual_deep_gemm,
     _residual_gluon,
-    _residual_torch,
     _residual_triton,
     _residual_pkg,
     # MoE registration modules.
+    _moe_reference,
     _moe_cuda,
     _moe_deep_gemm_deepep_fp8,
     _moe_deep_gemm,
@@ -233,6 +238,7 @@ _RELOAD_MODULES = [
     _moe_marlin_mxfp4,
     _moe_marlin,
     _moe_native,
+    _moe_mega_moe,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
     _moe_triton_sqrt_softplus,
@@ -313,6 +319,14 @@ def test_builtin_moe_preprocessor_links_are_callables():
     assert process_weight_kernels == []
 
     assert errors == []
+
+
+def test_production_moe_fallbacks_remain_auto_selectable() -> None:
+    registry = KernelRegistry.get()
+    for name in ("trtllm_nvfp4_mega_moe_apply", "torch_sqrt_softplus_topk"):
+        spec = registry.get_by_name(name)
+        assert spec is not None
+        assert spec.priority >= Priority.PORTABLE
 
 
 def test_builtin_moe_specialized_offsets_are_intentional() -> None:

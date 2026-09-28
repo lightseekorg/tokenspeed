@@ -66,75 +66,7 @@ def _make_inputs(
     return q, k, v, g, beta, initial_state, cu_seqlens
 
 
-def _torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    x_float = x.float()
-    return (
-        x_float * torch.rsqrt(x_float.square().sum(dim=-1, keepdim=True).clamp_min(eps))
-    ).to(x.dtype)
-
-
-def _torch_gdn_chunk_prefill_reference(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    *,
-    scale: float,
-    initial_state: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Independent token-by-token recurrence, used as an oracle.
-
-    ``initial_state``/the returned final state follow ``gdn_chunk_prefill``'s
-    public K-last ``[N, Hv, V, K]`` contract (matches the runtime's SSM state
-    pool); this reference's own math is plain ``[N, Hv, K, V]`` (K row, V
-    col), so it transposes in/out at its boundary, mirroring the production
-    Triton wrapper (``triton_gdn_chunk_prefill``).
-    """
-    q_f = q.float()
-    k_f = k.float()
-    v_f = v.float()
-    g_f = g.float()
-    beta_f = beta.float()
-    initial_state_kv = initial_state.transpose(-2, -1)
-
-    batch, total_tokens, num_q_heads, _ = q.shape
-    assert batch == 1
-    num_v_heads = v.shape[2]
-    head_v_dim = v.shape[-1]
-    group_size = num_v_heads // num_q_heads
-
-    out = torch.empty(
-        (1, total_tokens, num_v_heads, head_v_dim),
-        device=q.device,
-        dtype=torch.float32,
-    )
-    final_states = []
-    starts = cu_seqlens[:-1].to(torch.int64).tolist()
-    ends = cu_seqlens[1:].to(torch.int64).tolist()
-
-    for seq_idx, (start, end) in enumerate(zip(starts, ends, strict=True)):
-        state = initial_state_kv[seq_idx].float().clone()
-        for token_idx in range(start, end):
-            for value_head in range(num_v_heads):
-                qk_head = value_head // group_size
-                q_t = q_f[0, token_idx, qk_head]
-                k_t = k_f[0, token_idx, qk_head]
-                v_t = v_f[0, token_idx, value_head]
-                state_h = torch.exp(g_f[0, token_idx, value_head]) * state[value_head]
-                delta = beta_f[0, token_idx, value_head] * (v_t - k_t @ state_h)
-                state_h = state_h + k_t[:, None] * delta[None, :]
-
-                out[0, token_idx, value_head] = scale * (q_t @ state_h)
-                state[value_head] = state_h
-        final_states.append(state)
-
-    final_state_kv = torch.stack(final_states, dim=0).to(initial_state.dtype)
-    return out.to(q.dtype), final_state_kv.transpose(-2, -1)
-
-
-def test_gdn_chunk_prefill_triton_matches_torch_reference(device: str, require):
+def test_gdn_chunk_prefill_triton_matches_reference(device: str, require):
     # The Triton wrapper should match an independent token-by-token recurrence.
     require("attention", "gdn_chunk_prefill", "triton", torch.bfloat16, "q")
 
@@ -158,44 +90,38 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference(device: str, require):
     cu_seqlens = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
     scale = head_dim**-0.5
 
-    result = gdn_chunk_prefill(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        scale=scale,
-        initial_state=initial_state.clone(),
-        cu_seqlens=cu_seqlens,
-        qk_l2norm=True,
-        output_final_state=True,
-        solution="triton",
-    )
+    def run(solution: str) -> GdnChunkPrefillResult:
+        return gdn_chunk_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            initial_state=initial_state.clone(),
+            cu_seqlens=cu_seqlens,
+            qk_l2norm=True,
+            output_final_state=True,
+            solution=solution,
+        )
+
+    result = run("triton")
     assert isinstance(result, GdnChunkPrefillResult)
     assert result.h_layout is GdnCheckpointLayout.NONE
-    ref_out, ref_state = _torch_gdn_chunk_prefill_reference(
-        _torch_l2norm(q),
-        _torch_l2norm(k),
-        v,
-        g,
-        beta,
-        scale=scale,
-        initial_state=initial_state.clone(),
-        cu_seqlens=cu_seqlens,
-    )
+    reference = run("reference")
 
     torch.testing.assert_close(
-        result.out.float(), ref_out.float(), rtol=2e-2, atol=2e-2
+        result.out.float(), reference.out.float(), rtol=2e-2, atol=2e-2
     )
     torch.testing.assert_close(
         result.final_state.float(),
-        ref_state.float(),
+        reference.final_state.float(),
         rtol=2e-2,
         atol=3e-2,
     )
 
 
-def test_gdn_chunk_prefill_triton_matches_torch_reference_varlen(device: str, require):
+def test_gdn_chunk_prefill_triton_matches_reference_varlen(device: str, require):
     # Varlen cu_seqlens should reset recurrent state independently per sequence.
     require("attention", "gdn_chunk_prefill", "triton", torch.bfloat16, "q")
 
@@ -228,38 +154,32 @@ def test_gdn_chunk_prefill_triton_matches_torch_reference_varlen(device: str, re
     cu_seqlens = cu_seqlens.to(torch.int32)
     scale = head_dim**-0.5
 
-    result = gdn_chunk_prefill(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        scale=scale,
-        initial_state=initial_state.clone(),
-        cu_seqlens=cu_seqlens,
-        qk_l2norm=True,
-        output_final_state=True,
-        solution="triton",
-    )
+    def run(solution: str) -> GdnChunkPrefillResult:
+        return gdn_chunk_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            initial_state=initial_state.clone(),
+            cu_seqlens=cu_seqlens,
+            qk_l2norm=True,
+            output_final_state=True,
+            solution=solution,
+        )
+
+    result = run("triton")
     assert isinstance(result, GdnChunkPrefillResult)
     assert result.h_layout is GdnCheckpointLayout.NONE
-    ref_out, ref_state = _torch_gdn_chunk_prefill_reference(
-        _torch_l2norm(q),
-        _torch_l2norm(k),
-        v,
-        g,
-        beta,
-        scale=scale,
-        initial_state=initial_state.clone(),
-        cu_seqlens=cu_seqlens,
-    )
+    reference = run("reference")
 
     torch.testing.assert_close(
-        result.out.float(), ref_out.float(), rtol=2e-2, atol=2e-2
+        result.out.float(), reference.out.float(), rtol=2e-2, atol=2e-2
     )
     torch.testing.assert_close(
         result.final_state.float(),
-        ref_state.float(),
+        reference.final_state.float(),
         rtol=2e-2,
         atol=3e-2,
     )

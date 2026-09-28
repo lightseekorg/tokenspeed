@@ -23,41 +23,16 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel
 import torch
-import torch.nn.functional as F
 from utils import is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required for the mHC test", allow_module_level=True)
 
 
-def _reference(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_tokens, hc_mult, hidden_size = residual.shape
-    flat = residual.float().view(num_tokens, hc_mult * hidden_size)
-    inv_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + rms_eps)
-    mixes = F.linear(flat, fn) * inv_rms
-    pre_raw, post_raw, comb_raw = torch.split(mixes, [4, 4, 16], dim=-1)
-    pre = torch.sigmoid(pre_raw * hc_scale[0] + hc_base[:4]) + hc_eps
-    post = torch.sigmoid(post_raw * hc_scale[1] + hc_base[4:8]) * 2.0
-    comb = torch.softmax(
-        comb_raw.view(num_tokens, hc_mult, hc_mult) * hc_scale[2]
-        + hc_base[8:].view(1, hc_mult, hc_mult),
-        dim=-1,
+def _reference(*args) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return tokenspeed_kernel.mhc_pre(
+        *args, norm_weight=None, norm_eps=None, solution="reference"
     )
-    comb = comb + hc_eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
-    for _ in range(1, sinkhorn_iters):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
-    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(dim=1)
-    return layer_input.to(torch.bfloat16), post.unsqueeze(-1), comb
 
 
 @pytest.mark.parametrize("num_tokens", [8, 16, 32, 64])

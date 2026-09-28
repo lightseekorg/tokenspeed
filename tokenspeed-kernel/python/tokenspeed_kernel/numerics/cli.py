@@ -71,9 +71,7 @@ def _iter_candidate_specs(
             raise ValueError(f"Kernel {kernel_name!r} is not registered")
         specs = [spec]
     else:
-        specs = [
-            spec for spec in registry.list_kernels() if spec.solution != "reference"
-        ]
+        specs = [spec for spec in registry.list_kernels() if spec.solution != "torch"]
 
     if op_filter is not None:
         family, mode = op_filter

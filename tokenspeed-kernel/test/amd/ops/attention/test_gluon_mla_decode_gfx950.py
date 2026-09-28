@@ -10,6 +10,7 @@ if not is_cdna4():
     pytest.skip("AMD CDNA4 is required for Gluon MLA tests", allow_module_level=True)
 
 
+from tokenspeed_kernel.ops.attention.mla import mla_decode_with_kvcache  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (  # noqa: E402
     gluon_mla_decode_fp8xfp8_gfx950,
 )
@@ -55,13 +56,25 @@ def _make_inputs(seqlen: int, batch_size: int = 1):
 
 
 def _reference(q: torch.Tensor, kv_cache: torch.Tensor, seqlen: int):
+    """Ground truth over the compact cache: ``batch_size`` contiguous page runs."""
     batch_size = q.shape[0]
-    kv = kv_cache[:, :, 0].reshape(batch_size, -1, _QK_DIM)[:, :seqlen].float()
-    scores = torch.einsum("bhd,bkd->bhk", q[:, 0].float(), kv) * _SOFTMAX_SCALE
-    probs = torch.softmax(scores, dim=-1)
-    out = torch.einsum("bhk,bkd->bhd", probs, kv[:, :, :_KV_LORA_RANK]).unsqueeze(1)
-    lse = torch.logsumexp(scores, dim=-1).unsqueeze(1)
-    return out, lse
+    page_table = torch.arange(kv_cache.shape[0], device="cuda", dtype=torch.int32)
+    out, lse = mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table.view(batch_size, -1),
+        cache_seqlens=torch.full(
+            (batch_size,), seqlen, device="cuda", dtype=torch.int32
+        ),
+        max_seqlen_k=seqlen,
+        qk_nope_head_dim=128,
+        kv_lora_rank=_KV_LORA_RANK,
+        qk_rope_head_dim=_ROPE_DIM,
+        softmax_scale=_SOFTMAX_SCALE,
+        return_lse=True,
+        solution="reference",
+    )
+    return out.float(), lse
 
 
 def _run(

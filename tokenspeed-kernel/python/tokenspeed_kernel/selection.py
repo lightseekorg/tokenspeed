@@ -28,7 +28,12 @@ from enum import Enum
 from typing import Any, Callable, Generator
 
 from tokenspeed_kernel.platform import PlatformInfo, current_platform
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+    Priority,
+    resolve_solutions,
+)
 from tokenspeed_kernel.signature import FormatSignature
 
 logger = logging.getLogger(__name__)
@@ -46,6 +51,7 @@ __all__ = [
     "register_oracle",
     "kernel_override",
     "explain_selection",
+    "is_ground_truth",
     "spec_matches_traits",
     "ref_compatible_with_spec",
     "spec_matches_shape_traits",
@@ -403,6 +409,64 @@ def _filter_by_traits(
     ]
 
 
+def is_ground_truth(spec: KernelSpec) -> bool:
+    """Return whether ``spec`` sits in the REFERENCE band.
+
+    Ground-truth kernels are never auto-selected: they are reachable only
+    when the caller names them through ``solution=`` or ``override=``.
+    """
+    return spec.priority < int(Priority.PORTABLE)
+
+
+def _drop_ground_truth(specs: list[KernelSpec]) -> list[KernelSpec]:
+    return [spec for spec in specs if not is_ground_truth(spec)]
+
+
+def _collect_candidates(
+    registry: KernelRegistry,
+    family: str,
+    mode: str,
+    format_signature: FormatSignature,
+    *,
+    features: frozenset[str] | None,
+    platform: PlatformInfo,
+    solution: str | None,
+    traits: dict[str, Any] | None,
+) -> tuple[list[KernelSpec], list[KernelSpec], str | None]:
+    """Gather the specs that survive every filter for one request.
+
+    Returns every pre-trait candidate seen, the post-trait candidates, and
+    the concrete solution the latter came from. The ``"reference"`` meta
+    solution resolves here: each concrete solution in its order is tried
+    with the full filter chain, and the first with a trait-compatible kernel
+    wins. Automatic selection (``solution=None``) never sees the REFERENCE
+    band.
+    """
+    matched: list[KernelSpec] = []
+    compatible: list[KernelSpec] = []
+    resolved = solution
+    for concrete in resolve_solutions(solution):
+        specs = registry.get_for_operator(
+            family,
+            mode,
+            features=features,
+            platform=platform,
+            format_signature=format_signature,
+            solution=concrete,
+        )
+        if concrete is None:
+            # REFERENCE-band ground truth never wins automatic selection; a
+            # missing real kernel surfaces as NoKernelFoundError instead of
+            # a silent slow path.
+            specs = _drop_ground_truth(specs)
+        matched.extend(specs)
+        compatible = _filter_by_traits(specs, traits) if traits else specs
+        resolved = concrete
+        if compatible:
+            break
+    return matched, compatible, resolved
+
+
 def _resolve_override(
     registry: KernelRegistry,
     family: str,
@@ -415,6 +479,7 @@ def _resolve_override(
     if impl is not None:
         return SelectedKernel(name=override, impl=impl)
 
+    # A solution name, including the "reference" meta solution.
     specs = registry.get_for_operator(family, mode, solution=override)
     if specs:
         kernel_name = specs[0].name
@@ -478,8 +543,13 @@ def select_kernel(
         traits: Op-specific trait values that affect kernel applicability
                (e.g., {"head_dim": 128, "num_kv_heads": 8})
         solution: Restrict selection to a registered solution while preserving
-            normal platform, format signature, and trait filtering.
-        override: Force a specific kernel name or solution string
+            normal platform, format signature, and trait filtering. The
+            ``"reference"`` meta solution resolves to the first of ``"torch"``
+            then ``"triton"`` that has a kernel for this call.
+        override: Force a specific kernel name or solution string, bypassing
+            platform, format, and trait filtering. Use ``solution="reference"``
+            for trait-aware reference fallback; ``override="reference"`` uses
+            the first registered kernel in the alias order.
 
     Returns:
         A :class:`SelectedKernel` that is directly callable and also
@@ -520,24 +590,23 @@ def select_kernel(
         )
 
     # Get candidates (same filtering for both strategies)
-    candidates = registry.get_for_operator(
+    matched, candidates, _ = _collect_candidates(
+        registry,
         family,
         mode,
+        format_signature,
         features=features,
         platform=platform,
-        format_signature=format_signature,
         solution=solution,
+        traits=traits,
     )
 
     solution_clause = f" with solution {solution!r}" if solution else ""
-    if not candidates:
+    if not matched:
         raise NoKernelFoundError(
             f"No kernel found for {family}.{mode} ({format_signature})"
             f"{solution_clause} on {platform.device_name}"
         )
-
-    if traits:
-        candidates = _filter_by_traits(candidates, traits)
 
     if not candidates:
         raise NoKernelFoundError(
@@ -641,27 +710,29 @@ def explain_selection(
     registry = KernelRegistry.get()
 
     all_specs = registry.list_kernels(family=family, mode=mode)
-    candidates = registry.get_for_operator(
+    _, candidates, resolved = _collect_candidates(
+        registry,
         family,
         mode,
+        format_signature,
         features=features,
         platform=platform,
-        format_signature=format_signature,
         solution=solution,
+        traits=traits,
     )
-
-    if traits:
-        candidates = _filter_by_traits(candidates, traits)
 
     scored = _rank(candidates, platform, traits)
 
     filtered_names = {s.name for s in candidates}
     filtered_out = [s for s in all_specs if s.name not in filtered_names]
 
+    solution_line = f"Solution: {solution or 'any'}"
+    if resolved != solution:
+        solution_line += f" (resolved to {resolved!r})"
     lines = [
         f"Op: {family}.{mode} ({format_signature})",
         f"Platform: {platform.device_name} ({platform.arch})",
-        f"Solution: {solution or 'any'}",
+        solution_line,
         "Ranking: lex (oracle, priority); higher wins",
         "",
         f"Candidates ({len(scored)} matched, {len(all_specs)} registered):",
@@ -701,8 +772,12 @@ def explain_selection(
                     f"format signature mismatch (supports "
                     f"{', '.join(str(d) for d in spec.format_signatures)})"
                 )
-            if solution and spec.solution != solution:
+            if resolved and spec.solution != resolved:
                 reasons.append(f"solution mismatch (is {spec.solution!r})")
+            if solution is None and is_ground_truth(spec):
+                reasons.append(
+                    f"ground truth (REFERENCE band; request solution={spec.solution!r})"
+                )
             reason_str = "; ".join(reasons) if reasons else "unknown"
             lines.append(f"  - {spec.name}: {reason_str}")
 

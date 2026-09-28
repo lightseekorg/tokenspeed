@@ -22,42 +22,14 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
+from tokenspeed_kernel.ops.residual import mhc_pre
 from tokenspeed_kernel.ops.residual.triton import triton_mhc_pre
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def _reference(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_tokens, hc_mult, hidden_size = residual.shape
-    flat = residual.float().view(num_tokens, hc_mult * hidden_size)
-    inv_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + rms_eps)
-    mixes = F.linear(flat, fn) * inv_rms
-    pre_raw, post_raw, comb_raw = torch.split(
-        mixes, [hc_mult, hc_mult, hc_mult * hc_mult], dim=-1
-    )
-    pre = torch.sigmoid(pre_raw * hc_scale[0] + hc_base[:hc_mult]) + hc_eps
-    post = torch.sigmoid(post_raw * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]) * 2.0
-    comb = torch.softmax(
-        comb_raw.view(num_tokens, hc_mult, hc_mult) * hc_scale[2]
-        + hc_base[2 * hc_mult :].view(1, hc_mult, hc_mult),
-        dim=-1,
-    )
-    comb = comb + hc_eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
-    for _ in range(1, sinkhorn_iters):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
-    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(dim=1)
-    return layer_input.to(torch.bfloat16), post.unsqueeze(-1), comb
+def _reference(*args) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return mhc_pre(*args, norm_weight=None, norm_eps=None, solution="reference")
 
 
 def test_tiled_hc4_prefill_matches_reference() -> None:

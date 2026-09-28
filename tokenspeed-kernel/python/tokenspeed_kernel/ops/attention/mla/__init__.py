@@ -29,7 +29,6 @@ from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
     select_kernel,
-    spec_matches_traits,
 )
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
@@ -737,14 +736,18 @@ def mla_use_absorbed_extend(
     }
     if max_seqlen_q is not None:
         traits["max_seqlen_q"] = max_seqlen_q
-    candidates = KernelRegistry.get().get_for_operator(
-        "attention",
-        "mla_extend_with_kvcache",
-        platform=current_platform(),
-        format_signature=signature,
-        solution=solution,
-    )
-    return any(spec_matches_traits(spec, traits) for spec in candidates)
+    try:
+        select_kernel(
+            "attention",
+            "mla_extend_with_kvcache",
+            signature,
+            platform=current_platform(),
+            traits=traits,
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    return True
 
 
 def mla_extend_with_kvcache(
@@ -1260,6 +1263,7 @@ def mla_decode_with_kvcache(
 
 # Backend registration (side-effect imports)
 # isort: off
+import tokenspeed_kernel.numerics.reference.attention  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.tokenspeed_mla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.triton  # noqa: E402,F401

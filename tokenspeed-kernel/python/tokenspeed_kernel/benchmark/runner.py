@@ -39,7 +39,7 @@ from tokenspeed_kernel.numerics.inputs import (
 from tokenspeed_kernel.numerics.tolerance import get_family_tolerance
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ProfilingConfig, profiling
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, resolve_solutions
 from tokenspeed_kernel.selection import (
     ref_compatible_with_spec,
     spec_matches_shape_traits,
@@ -229,7 +229,8 @@ class BenchmarkRunner:
         dtype_role: str | Iterable[str],
         generator: Any,
     ) -> tuple[bool | None, float | None, float | None]:
-        if spec.solution == "reference":
+        if spec.solution == "torch":
+            # PyTorch references are the ground truth, not verified subjects.
             return None, None, None
 
         registry = KernelRegistry.get()
@@ -237,12 +238,16 @@ class BenchmarkRunner:
         if signature is None:
             return None, None, None
 
-        ref_specs = registry.get_for_operator(
-            spec.family,
-            spec.mode,
-            format_signature=signature,
-            solution="reference",
-        )
+        ref_specs = [
+            reference
+            for concrete in resolve_solutions("reference")
+            for reference in registry.get_for_operator(
+                spec.family,
+                spec.mode,
+                format_signature=signature,
+                solution=concrete,
+            )
+        ]
         if not ref_specs:
             return None, None, None
 
@@ -250,12 +255,12 @@ class BenchmarkRunner:
         for ref in ref_specs:
             if ref.name == spec.name:
                 continue
-            if ref_compatible_with_spec(ref, spec):
+            if ref_compatible_with_spec(ref, spec) and spec_matches_shape_traits(
+                ref, shape_traits(shape)
+            ):
                 ref_spec = ref
                 break
         if ref_spec is None:
-            return None, None, None
-        if not spec_matches_shape_traits(ref_spec, shape_traits(shape)):
             return None, None, None
 
         ref_kernel = registry.get_impl(ref_spec.name)
