@@ -82,7 +82,8 @@ to align for.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, prompt headroom,
-whether the round finishes shaping the state groups) and turned into each
+whether the round finishes shaping the state groups, the sliding-window growth
+recycling cannot fund) and turned into each
 group's page demand by `ReservePrefillDemands` — the only writer of
 `GroupDemand::reserve_tokens`. It picks the rule by the group's retention,
 never by call site:
@@ -93,8 +94,21 @@ never by call site:
   to decode — raised on a decoding role's first chunk to the rest of the prompt
   plus the admission headroom (§4), so a partially prefetched request is never
   stranded.
-- *Sliding-window* groups recycle slid-out pages, so the rest
-  of the prompt costs them nothing: they hold only the decode slot.
+- *Sliding-window* groups recycle slid-out pages, so they hold the decode
+  slot, raised on a decoding role's first chunk, while another request holds
+  pages, only to the growth recycling cannot fund
+  (`PrefillReserve::swa_unrecycled_growth_tokens`), capped by the window's
+  lookback (`window - 1` tokens) and the prompt headroom. That growth is the
+  larger of two terms: a prefix hit (a shared page frees nothing when it
+  slides out), and the rest of the prompt when a local chunk leaves some
+  behind (the next chunk reads this one's lookback before any of it can slide
+  out). A remote landing has no later local chunk, so it prepays only the hit.
+  With no other request holding pages the raise is 0 and the group holds only
+  the decode slot: hit pages are then held by the prefix index alone and
+  recycle like the request's own, and the single-request bound (§1.4) counts
+  no prepay, so a prepay could leave a request the bound accepts inadmissible
+  on its own. Growth left unfunded by pages taken after the admission is left
+  to the victim policy's last resort (§2).
   Broadcasting the headroom to them once kept a 54K-token DeepSeek-V4 prompt
   waiting on a pool that had room for it.
 - *Snapshot-state* groups reserve at least one growth block on a decoding
@@ -204,15 +218,18 @@ The capacity guarantees are retention-specific:
 
 - **History and sliding-window groups reserve decode tokens.** A decoding
   role's first chunk additionally raises full-history reserve to the remaining
-  prompt plus admission headroom; sliding-window groups do not hold headroom.
+  prompt plus admission headroom; sliding-window groups hold at most one
+  window lookback of it, and only while another request holds pages (§1,
+  sliding-window rule).
 - **Snapshot-state groups on decoding roles reserve growth at the admission
   that finishes shaping them** (completing chunk or remote landing):
   `ReservePrefillDemands` reserves `max(block_granularity, decode_input_tokens)`,
   at least one block beyond the endpoint for every prompt length.
   Without it an endpoint with no spare block needs a fresh **empty** parent
-  per state group at its first boundary crossing. A full pool can deadlock
-  when residents are retraction-exempt because their generation is covered by
-  admission headroom (§4). Invariant: *no request needs an empty parent
+  per state group at its first boundary crossing. On a full pool whose
+  residents are retraction-exempt because their generation is covered by
+  admission headroom (§4), such a crossing waits for a completion or for the
+  victim policy's last resort (§2). Invariant: *no request needs an empty parent
   for its first crossing* — it already owns the block. Later crossings
   re-acquire from the shared pool and depend on the capacity bound (§1.4) and
   admission back-pressure.
@@ -315,7 +332,13 @@ continuation state, decode reserve, overlap-depth protection, the state growth
 block, and for chunked sparse local recovery the retained input checkpoint
 (and, with the prefix cache on, a first chunk's cached one) — fits the pool.
 It is not a live check against currently free capacity; a prompt within the
-bound can still fail admission right now and simply waits.
+bound can still fail admission right now and simply waits. The bound counts
+no sliding-window prepay (§1), and a request with no other request holding
+pages prepays nothing, so the prepay never makes a request the bound accepts
+inadmissible on its own. Beside other requests the prepay can ask for up to
+one window lookback more than the bound counts; such a request waits until
+their pages are released, at the latest until it is alone, unless later
+arrivals keep taking the pages.
 
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
@@ -371,7 +394,9 @@ admission is **retried in the same plan build**, looping (retract → retry →
 retract) until it fits or the victims run out. The freed capacity therefore
 reaches the request it was freed for within the round; there is never a free
 page waiting for whoever asks first next round, which is what previously
-required a cross-round capacity barrier. Two edges of the loop:
+required a cross-round capacity barrier. The last resort (below) is the one
+exception: it offers the freed pages to the round's decodes first. Two edges
+of the loop:
 
 - **The victim may BE the blocker** (a resident request blocked on its own
   next page is the preferred victim). It comes back through the readmission
@@ -453,6 +478,35 @@ tokens — the most capacity for the least lost work. Exempt in both tiers: a
 request whose reserve already covers its whole generation
 (`Request::ReserveCoversGeneration`) — retracting it frees exactly what its
 readmission must take back, pure thrash.
+
+**Last resort.** The exemption trusts the admission reserve to cover all
+growth, and a sliding-window group's does not always: it prepays only against
+pages other requests hold at the admission (§1). A page that becomes shared
+after the admission (a later prefix hit on it, or publish-time dedup of
+identical prompt pages) frees nothing when it slides out, and a sequence still
+shorter than the window, or a prompt whose next chunk still reads its
+lookback, has nothing to recycle yet. When no resident can be
+retracted under the exemption and the round built nothing — no forward, no
+remote prefill or decode — no completion of it can free capacity, so the
+choice is repeated with the exemption dropped. A round that runs anything
+keeps the exemption: that work moves toward completions that free capacity
+without a retraction. The last resort changes who may be chosen and where the
+freed pages go first; the quiescence checks and global gates above still
+apply. The round ran nothing, so none of its decodes got a page, and they are
+offered the freed pages before the blocker: a generated token survives any
+later retraction, so each last resort that lets a decode run is progress no
+retract/readmit cycle can undo. Granted to a prompt instead, the pages can go
+to one that blocks the same way on its next chunk and becomes the next
+victim; granted to nobody (the victim was the blocker and no prompt waits),
+the victim can be admitted again ahead of the decodes and take the same pages
+back, round after round. Only when no decode fits does the blocker get the
+grant, by the same rules as for any victim, and the loop may take several
+victims in one round until a decode or the blocked admission fits.
+
+**Stall diagnostic.** `NextExecutionPlan` counts consecutive rounds whose plan
+carries no work while requests are live and nothing is out (no forward
+result, PD transfer or tier transfer) that could change the next plan, and
+warns at 1024 such rounds and every doubling after. It never changes a plan.
 
 The P role never retracts: `buildPrefillWorkerPlan` simply does not call
 `maybeRetractForCapacity` (the only two call sites are the D and fused
@@ -551,7 +605,10 @@ engine whose attention layout cannot run one (head TP,
 `max_new_tokens` fits one safe-step window, so every resident request has its
 generation prepaid and `chooseVictim` finds nobody — the readmission path
 stays unreachable by construction, and the runtime refuses larger budgets at
-admission (`RequestHandler`, mirroring `kRetractionSafeSteps`).
+admission (`RequestHandler`, mirroring `kRetractionSafeSteps`). The last
+resort (§2) drops that exemption only in a round that builds nothing; while
+every cache group is full-history, a prepaid resident's next decode always
+fits, so such a round has no quiescent decode for it to retract.
 
 ### 3.3 Fused — one engine, everything local
 
@@ -630,10 +687,12 @@ Request::AdmissionHeadroom(safe_steps)
 with `safe_steps = 4096` — note the `1 +`: a *fresh* admission already
 prepays one window (see `schedulePrefillFirstChunk`), so for prompts with
 `max_new_tokens <= 4096` the reserve covers the whole generation up front and
-retraction never touches them. Capped by the generation budget the request
+retraction never touches them, except the last resort of a round that builds
+nothing (§2). Capped by the generation budget the request
 could ever use, so after a couple of retractions it holds enough room to run
 to completion — at which point `ReserveCoversGeneration` exempts it from the
-victim policy and it **cannot be retracted again**. This is a per-request
+victim policy and it **cannot be retracted again** outside that last resort.
+This is a per-request
 adaptive backoff: it penalises only the request whose admission proved
 over-optimistic, and never makes anyone else wait.
 
@@ -646,14 +705,18 @@ judging the window against today's remainder would count spent headroom as
 still held: a request that outgrew a partial reserve would look covered the
 moment its remainder dipped under the window — exactly when it needs a new
 page — and once every resident request looked covered, retraction would have
-no victim and nothing could free that page.
+no victim short of the last resort (§2), and nothing else could free that page.
 
 ## 5. Invariants a change must preserve
 
 - Admission never grants pages for tokens beyond the chunk being scheduled,
   except the decode reserve on the completing chunk (1), the snapshot-state
   growth block banked by the admission that finishes shaping a state group
-  (1.2), and the admission headroom (4) — which only full-history groups hold.
+  (1.2), and the admission headroom (4) — which full-history groups hold
+  whole and sliding-window groups at most one window lookback of, and only
+  while another request holds pages: the growth recycling cannot fund on a
+  first chunk (1). A request alone prepays nothing, so the prepay never makes
+  a request the single-request bound (1.4) accepts inadmissible on its own.
   A replayable group's private suffix starts at the replay window, which is
   inside the forward's input, not beyond it (1.3).
 - A replayable group is never matched, published or streamed (1.3); its
@@ -671,7 +734,8 @@ no victim and nothing could free that page.
   no PD transfer against its pages (§3.1) — and an in-flight load-back or an in-flight pinned
   store defers all retraction; stream-ordered stores defer nothing.
 - Freed capacity is granted to the request it was freed for in the same plan
-  build whenever the round's grammar admits the grant (2); the write-back →
+  build whenever the round's grammar admits the grant, except that the last
+  resort offers it to the round's decodes first (2); the write-back →
   zero → load → forward order on the forward thread's stream is what makes
   the immediate release safe, and changing `DeviceHandle.execute`'s ordering
   breaks it.
@@ -692,8 +756,11 @@ no victim and nothing could free that page.
 - At most one readmission is in progress per role, by phase construction; a
   readmission that fails admission waits and never triggers retraction (4).
 - A request whose admission prepaid the generation budget open at that
-  admission is never a victim (2); with the fresh-admission prepay this bounds
-  retraction to requests whose `max_new_tokens` exceeds one safe-step window
-  (or is undeclared). Spending a partial reserve never makes it qualify: the
+  admission is never a victim (2) in a round that builds a forward, remote
+  prefill or remote decode; with the
+  fresh-admission prepay this bounds such retraction to requests whose
+  `max_new_tokens` exceeds one safe-step window (or is undeclared). Spending
+  a partial reserve never makes it qualify: the
   exemption is judged against the budget open at admission, not the current
-  remainder (4).
+  remainder (4). Only the last resort (2), in a round that builds nothing,
+  retracts an exempt request.

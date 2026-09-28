@@ -283,11 +283,23 @@ private:
     // fires only when no prefill progressed and admission failed. Retracts
     // victims and RETRIES the blocked admission in the same plan build, so
     // the freed capacity reaches the request it was freed for -- never a
-    // free page waiting for whoever asks first next round.
+    // free page waiting for whoever asks first next round. The last resort
+    // offers it to the round's failed decodes first.
     void maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                  std::vector<WriteBackOperation>& write_back_operations);
-    Request* chooseVictim(std::span<Request* const> candidates) const;
+    // `ignore_exemption` also considers requests whose reserve covers their
+    // whole generation: the last resort when nothing else can be retracted
+    // and the round runs nothing.
+    Request* chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const;
     void retractVictim(Request& victim, std::vector<WriteBackOperation>& write_back_operations);
+
+    // Liveness diagnostic, called once per NextExecutionPlan. A round is
+    // stalled when its plan carries no work while requests are live and
+    // nothing is out whose landing could change the next plan (no forward
+    // result, PD transfer or tier transfer). Warns once the streak reaches
+    // kStalledRoundsBeforeWarning and again at every doubling; it never
+    // changes a plan.
+    void trackStalledRounds(std::size_t num_live_requests, bool plan_is_empty);
 
     // One plan-building grammar per engine role: the roles share the
     // scheduling mechanism (schedulePrefill / scheduleDecode / admission)
@@ -320,6 +332,10 @@ private:
     // Stamped onto each retraction; the readmission order lives on the
     // Retracted states themselves (nextReadmission).
     std::int64_t next_retraction_epoch_{1};
+
+    // Consecutive stalled rounds (trackStalledRounds); 0 after any round
+    // that schedules work or leaves work in flight.
+    std::int64_t stalled_rounds_{0};
 
     // Submission order -- the FIFO every scheduling phase walks, identical
     // on every rank because the mirrored schedulers receive identical

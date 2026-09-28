@@ -21,6 +21,7 @@
 #include "scheduler/scheduler.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -46,6 +47,11 @@
 namespace tokenspeed {
 
 namespace {
+
+// Stalled rounds (Scheduler::trackStalledRounds) before the first warning.
+// Later warnings come at every doubling of the streak, so a stall that never
+// ends still logs only a few dozen lines.
+constexpr std::int64_t kStalledRoundsBeforeWarning = 1024;
 
 std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
@@ -462,9 +468,12 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             candidates.push_back(request.get());
         }
     }
+    const std::size_t num_live_requests = candidates.size();
     ExecutionPlan plan;
     auto [forward_operations, load_back_operations] =
         buildForwardOperations(plan, std::move(candidates), write_back_operations);
+    const bool builds_work =
+        !forward_operations.empty() || plan.remote_decode.has_value() || plan.remote_prefill.has_value();
 
     plan.With(ForwardBatch{std::move(forward_operations)});
 
@@ -483,7 +492,38 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     if (!load_back_operations.empty()) {
         plan.With(CacheOperation{LoadBackBatch{load_back_operations}});
     }
+    trackStalledRounds(num_live_requests,
+                       /*plan_is_empty=*/!builds_work && write_back_operations.empty() && load_back_operations.empty());
     return plan;
+}
+
+void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_empty) {
+    // With nothing out, no event can land that changes the next plan: only a
+    // new submission or an abort can, so every live request is stuck until
+    // then. The victim policy exists to make this impossible; if it happens
+    // anyway, the event loop spins on empty plans, and without this warning
+    // nothing in the logs says so.
+    const bool stalled = num_live_requests > 0 && plan_is_empty && !tier_transfers_.HasAnyInFlight() &&
+                         std::ranges::none_of(requests_, [this](const std::unique_ptr<Request>& request) {
+                             return request->ResultsInFlight() > 0 || pdTransferInFlight(*request);
+                         });
+    if (!stalled) {
+        if (stalled_rounds_ >= kStalledRoundsBeforeWarning) {
+            spdlog::info("[Scheduler] scheduling resumed after {} stalled rounds", stalled_rounds_);
+        }
+        stalled_rounds_ = 0;
+        return;
+    }
+    ++stalled_rounds_;
+    if (stalled_rounds_ >= kStalledRoundsBeforeWarning &&
+        std::has_single_bit(static_cast<std::uint64_t>(stalled_rounds_))) {
+        spdlog::warn(
+            "[Scheduler] no work scheduled for {} consecutive rounds with {} live requests and nothing in flight "
+            "(waiting={}, prefilling={}, decoding={}; device LCM blocks active={}, empty={}, total={}); "
+            "they cannot progress until a request is aborted",
+            stalled_rounds_, num_live_requests, WaitingSize(), PrefillSize(), DecodingSize(), ActiveLcmBlocks(),
+            EmptyLcmBlocks(), coordinator_.TotalLcmBlocks());
+    }
 }
 
 void Scheduler::Advance(const ExecutionEvent& event) {
