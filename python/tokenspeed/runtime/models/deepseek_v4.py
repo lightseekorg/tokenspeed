@@ -47,9 +47,9 @@ from tokenspeed_kernel import (
     moe_topk,
 )
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
-from tokenspeed_kernel.ops.attention.dsa.triton import triton_dsa_index_candidates
 from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode_topk,
+    dsv4_index_candidates,
     dsv4_indexer_cache_format,
     dsv4_padded_heads,
     dsv4_plan,
@@ -59,7 +59,6 @@ from tokenspeed_kernel.ops.attention.dsv4 import (
 from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_group_slot_mapping,
     dsv4_indexer_decode_metadata_compute,
-    triton_dsv4_index_candidates,
 )
 from torch import nn
 from transformers import PretrainedConfig
@@ -2412,34 +2411,19 @@ class DeepseekV4Indexer(nn.Module):
         )
         for start in range(0, positions.numel(), tile):
             end = min(positions.numel(), start + tile)
-            if self.use_fp4_cache:
-                offsets, scores = triton_dsv4_index_candidates(
-                    (
-                        packed_q[0][start:end].contiguous(),
-                        packed_q[1][start:end].contiguous(),
-                    ),
-                    weights[start:end],
-                    indexer_cache,
-                    table,
-                    requests[start:end],
-                    lengths[start:end],
-                    page_size=page_size,
-                    topk=self.topk_tokens,
-                )
-            else:
-                offsets, scores = triton_dsa_index_candidates(
-                    packed_q[0][start:end],
-                    weights[start:end],
-                    indexer_cache,
-                    table,
-                    requests[start:end],
-                    lengths[start:end],
-                    page_size=page_size,
-                    topk=self.topk_tokens,
-                    softmax_scale=self.softmax_scale,
-                    initial_tokens=0,
-                    local_tokens=0,
-                )
+            offsets, scores = dsv4_index_candidates(
+                (packed_q[0][start:end], packed_q[1][start:end]),
+                weights[start:end],
+                indexer_cache,
+                table,
+                requests[start:end],
+                lengths[start:end],
+                page_size=page_size,
+                topk=self.topk_tokens,
+                softmax_scale=self.softmax_scale,
+                index_k_format="mxfp4" if self.use_fp4_cache else "fp8_scaled",
+                solution=None,
+            )
             indices, _ = merge_index_candidates(
                 offsets, scores, topk=self.topk_tokens, group=group
             )
