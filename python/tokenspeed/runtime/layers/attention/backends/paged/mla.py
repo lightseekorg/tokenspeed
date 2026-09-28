@@ -110,7 +110,7 @@ class MLAAttnBackend(PagedAttentionBackend):
 
     supports_mla_projected_value_decode = True
     default_kernel_page_size = MLA_PAGE_SIZE
-    # Decode forwards layer.sliding_window_size as window_left.
+    # Prefill and decode forward layer.sliding_window_size as window_left.
     supports_layer_sliding_window: bool = True
 
     def __init__(self, config: AttnConfig, spec: MLAConfig, *, kernel_page_size: int):
@@ -135,7 +135,11 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.draft_block_decode = bool(config.draft_block_decode)
 
         backend_name = spec.backend_name or "mla"
-        self.kernel_solution = {"mla": None, "gluon": "gluon"}[backend_name]
+        self.kernel_solution = {
+            "mla": None,
+            "gluon": "gluon",
+            "triton": "triton",
+        }[backend_name]
 
         self.forward_decode_metadata: MLADecodeMetadata | None = None
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
@@ -308,7 +312,7 @@ class MLAAttnBackend(PagedAttentionBackend):
             extend_seq_lens=extend_seq_lens,
             cum_extend_seq_lens=cum_extend_seq_lens,
             cum_seq_lens_kv=cum_seq_lens_kv,
-            page_table=page_table if use_absorbed_cached_extend else None,
+            page_table=page_table,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             max_extend_seq_len=max_extend_seq_len,
@@ -447,7 +451,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         num_extends = metadata.num_extends
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
-        window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
+        window_left = layer.sliding_window_size
         noncausal_block_size = self.spec_num_tokens if self.block_decode_active else 1
 
         if self.block_decode_active:
@@ -517,7 +521,8 @@ class MLAAttnBackend(PagedAttentionBackend):
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         if self.data_type != kv_cache.dtype:
             kv_cache = kv_cache.to(self.data_type)
-        kv_cache = kv_cache.view(-1, self.kernel_page_size, 1, self.kv_cache_dim)
+        if kv_cache.ndim != 4:
+            kv_cache = kv_cache.view(-1, self.kernel_page_size, 1, self.kv_cache_dim)
 
         value_weight = kwargs.get("value_weight")
         gate = kwargs.get("output_gate")
@@ -538,6 +543,7 @@ class MLAAttnBackend(PagedAttentionBackend):
                 gate=gate,
                 out=projected_out,
                 logit_cap=layer.logit_cap,
+                solution=self.kernel_solution,
                 window_left=window_left,
                 noncausal_block_size=noncausal_block_size,
             )
@@ -576,13 +582,21 @@ class MLAAttnBackend(PagedAttentionBackend):
         metadata = self.forward_prefill_metadata
         assert metadata is not None
         if metadata.use_absorbed_cached_extend:
+            if layer.sliding_window_size >= 0:
+                raise NotImplementedError(
+                    "Absorbed MLA extend does not support a sliding window; gather "
+                    "visible prefix plus current rows and use mla_prefill"
+                )
             assert metadata.page_table is not None
             assert metadata.cum_seq_lens_kv is not None
             q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
             if self.data_type != kv_cache.dtype:
                 kv_cache = kv_cache.to(self.data_type)
-            kv_cache = kv_cache.view(-1, self.kernel_page_size, 1, self.kv_cache_dim)
+            if kv_cache.ndim != 4:
+                kv_cache = kv_cache.view(
+                    -1, self.kernel_page_size, 1, self.kv_cache_dim
+                )
             result = mla_extend_with_kvcache(
                 q=q,
                 kv_cache=kv_cache,
@@ -623,6 +637,7 @@ class MLAAttnBackend(PagedAttentionBackend):
             softmax_scale=layer.scaling,
             seq_lens_kv=metadata.extend_seq_lens,
             is_causal=True,
+            window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
             solution=self.kernel_solution,
         )
@@ -646,6 +661,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         causal,
         out: torch.Tensor | None = None,
     ):
+        """Full-history prefill and independent prefix-only LSE contributions."""
         if causal:
             step_counter = self.step_counter
             if step_counter is not None:
@@ -671,6 +687,7 @@ class MLAAttnBackend(PagedAttentionBackend):
             softmax_scale=scaling,
             seq_lens_kv=seq_lens,
             is_causal=causal,
+            window_left=-1,
             logit_cap=logits_soft_cap or 0.0,
             return_lse=True,
             out=out,

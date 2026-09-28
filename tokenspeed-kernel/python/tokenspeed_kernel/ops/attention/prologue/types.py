@@ -167,10 +167,18 @@ class LatentKVCache:
     """One MLA layer's latent cache destination.
 
     Attributes:
-        kv_cache: ``[slots, 1, kv_lora_rank + rope_dim]`` FP8 e4m3 or native
-            rows, or the planes of an FP8_PER_TOKEN_HEAD cache.
+        kv_cache: FP8 e4m3 or native rows, shaped ``[slots, 1, width]`` or
+            ``[pages, page_size, 1, width]`` with positive ``page_size`` and
+            ``width = kv_lora_rank + rope_dim``. Channels are contiguous and
+            elements must not overlap; page and row strides may contain gaps.
+            Pass the original field view, including its storage offset: no
+            flattening or cache copy is needed. Alternatively, the three
+            3-D planes of an FP8_PER_TOKEN_HEAD cache.
         sanitize: Replace NaN/Inf with finite values before storing.
-        slots: Dense 1-D destination slot of each written row.
+        slots: Dense 1-D physical destination slot of each written row. For
+            a paged tensor, slot ``loc`` addresses ``loc // page_size`` and
+            row ``loc % page_size``, using the tensor's strides in elements.
+            Slot 0 is writable unless excluded by ``write_mask``.
         write_mask: True for each row to store, or None to store every row;
             a skipped row's slot is still a valid address.
     """

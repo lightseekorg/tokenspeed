@@ -528,6 +528,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             disable_l2_cache=True,
             enable_l3_storage=False,
             role="fused",
+            speculative_algorithm=None,
             cache_groups=groups,
         )
         Scheduler(config)

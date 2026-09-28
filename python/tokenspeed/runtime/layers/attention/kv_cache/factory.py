@@ -301,6 +301,31 @@ def _hybrid_kda_pool(
     )
 
 
+def _dots3_note_pool(
+    spec: CachePoolSpec,
+    config: AttnConfig,
+    arena: CacheArena,
+    *,
+    num_layers: int,
+    rank: int,
+    field_layer_offset: int,
+) -> CachePool:
+    from tokenspeed.runtime.layers.attention.configs.dots3_note import (
+        Dots3NoteAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.dots3_note import (
+        Dots3NoteCachePool,
+    )
+
+    _softmax_config(config, spec.family, Dots3NoteAttnConfig)
+    return Dots3NoteCachePool(
+        arena,
+        layer_num=num_layers,
+        rank=rank,
+        field_layer_offset=field_layer_offset,
+    )
+
+
 # family -> the pool its recipe's plan binds to. A factory takes
 # ``(spec, config, arena, *, num_layers, rank, field_layer_offset)``. Plugins
 # add families via ``tokenspeed.runtime.plugins.registry.register_cache_pool``.
@@ -317,6 +342,7 @@ _POOL_FACTORIES: dict[str, Callable[..., CachePool]] = {
     "glm53_flash": _glm53_flash_pool,
     "deepseek_v4": _deepseek_v4_pool,
     "deepseek_v41": _deepseek_v41_pool,
+    "dots3_note": _dots3_note_pool,
 }
 
 

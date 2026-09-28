@@ -2022,7 +2022,37 @@ def _scale(dtype: torch.dtype, rows: int, width: int = 1):
             dict(cache__kv_cache=lambda c: c.kv_cache[:1].expand(8, -1, -1)),
             "latent cache rows",
         ),
-        (dict(cache__kv_cache=lambda c: c.kv_cache.unsqueeze(1)), "latent cache rows"),
+        (
+            dict(cache__kv_cache=lambda c: c.kv_cache.unsqueeze(1).unsqueeze(1)),
+            "latent cache rows",
+        ),
+        (
+            dict(cache__kv_cache=lambda c: c.kv_cache.unsqueeze(1)[:, :0]),
+            "latent cache rows",
+        ),
+        (
+            dict(
+                cache__kv_cache=lambda c: c.kv_cache.unsqueeze(1).expand(-1, 2, -1, -1)
+            ),
+            "latent cache rows",
+        ),
+        (
+            dict(
+                cache__kv_cache=lambda c: c.kv_cache.unsqueeze(1)
+                .expand(-1, -1, 2, -1)
+                .contiguous()
+            ),
+            "latent cache rows",
+        ),
+        (
+            dict(
+                cache=_plane_cache(512, 64),
+                cache__kv_cache=lambda c: dataclasses.replace(
+                    c.kv_cache, latent=c.kv_cache.latent.unsqueeze(1)
+                ),
+            ),
+            "per-token-head planes",
+        ),
         (dict(cache__kv_cache=lambda c: c.kv_cache[..., :512]), "latent cache rows"),
         (
             dict(cache__kv_cache=lambda c: torch.cat([c.kv_cache] * 2, -1)[..., :640]),
@@ -2195,6 +2225,226 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
                 run(count, offset)
 
 
+def _paged_latent(pages, page_size, width, dtype, row_gap, page_gap):
+    row_stride = width + row_gap
+    page_stride = page_size * row_stride + page_gap
+    backing = torch.empty(16 + pages * page_stride, dtype=dtype, device="cuda")
+    backing.view(torch.uint8).fill_(POISON)
+    cache = backing.as_strided(
+        (pages, page_size, 1, width), (page_stride, row_stride, width, 1), 16
+    )
+    return backing, cache
+
+
+def _assert_paged_latent(backing, cache, flat):
+    # Compare the entire allocation: neighboring fields, row gaps and page tails.
+    expected = torch.empty_like(backing)
+    expected.view(torch.uint8).fill_(POISON)
+    expected.as_strided(cache.shape, cache.stride(), cache.storage_offset()).copy_(
+        flat.view(cache.shape)
+    )
+    assert bytes_equal(backing, expected)
+
+
+@pytest.mark.parametrize("solution", ["triton", "composite"])
+@pytest.mark.parametrize(
+    "dtype,cache_dtype", [(BF16, BF16), (torch.float16, BF16), (BF16, FP8)]
+)
+@pytest.mark.parametrize("style", [None, RopeStyle.NEOX, RopeStyle.GPTJ])
+@pytest.mark.parametrize("page_size,rank", [(1, 512), (32, 1024), (64, 512)])
+@pytest.mark.parametrize("masked", [False, True])
+def test_mla_paged_cache_writes_the_flat_bytes(
+    solution, dtype, cache_dtype, style, page_size, rank, masked
+):
+    tokens, heads, rope, pages = 7, 2, 64, 8
+    q_nope, q_pe, latent = (
+        x.to(dtype) for x in mla_inputs(tokens, heads, rank, rope, seed=211)
+    )
+    if masked:
+        latent[1, :3] = torch.tensor([float("nan"), float("inf"), -float("inf")])
+        latent[3, rank : rank + 3] = latent[1, :3]
+    loc = torch.tensor(
+        (
+            [0, 2, 3, 1, 5, 6, 7]
+            if page_size == 1
+            else [
+                0,
+                page_size - 1,
+                page_size,
+                2 * page_size - 1,
+                2 * page_size,
+                3 * page_size,
+                4 * page_size - 1,
+            ]
+        ),
+        device="cuda",
+        dtype=torch.int64,
+    )
+    mask = (
+        torch.tensor([False, True, False, True, True, False, True], device="cuda")
+        if masked
+        else None
+    )
+    rotary = (
+        None
+        if style is None
+        else Rotary(
+            cos_sin_cache(rope), torch.arange(tokens, device="cuda") + 17, style, None
+        )
+    )
+    backing, paged = _paged_latent(pages, page_size, rank + rope, cache_dtype, 8, 96)
+    flat = poisoned_latent(pages * page_size, rank + rope, cache_dtype)
+
+    def run(cache):
+        return mla_prologue(
+            mla_query(q_nope, rope),
+            q_pe.clone(),
+            latent.clone(),
+            expanded=None,
+            rotary=rotary,
+            cache=latent_target(cache, loc, sanitize=masked, write_mask=mask),
+            solution=solution,
+            override=None,
+        ).query
+
+    assert bytes_equal(run(paged), run(flat))
+    _assert_paged_latent(backing, paged, flat)
+    written = loc if mask is None else loc[mask]
+    assert not bytes_equal(
+        flat[written], poisoned_latent(len(written), rank + rope, cache_dtype)
+    )
+
+
+@pytest.mark.parametrize("expanded", [False, True])
+@pytest.mark.parametrize("cache_dtype", [BF16, FP8])
+def test_mla_paged_composite_writes_only_committed_rows(expanded, cache_dtype):
+    tokens, heads, rank, rope = 9, 2, 512, 64
+    q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=212)
+    kv = MLAExpandedKV(q_nope[..., :128], q_nope[..., 128:256]) if expanded else None
+    if expanded:
+        q_nope = q_nope[..., :128]
+    loc = torch.tensor([7, 8, 0, 23], device="cuda")
+    mask = torch.tensor([True, True, False, True], device="cuda")
+    rotary = Rotary(
+        cos_sin_cache(rope), torch.arange(tokens, device="cuda"), RopeStyle.GPTJ, None
+    )
+    backing, paged = _paged_latent(4, 8, rank + rope, cache_dtype, 0, 96)
+    flat = poisoned_latent(32, rank + rope, cache_dtype)
+
+    def run(cache):
+        return mla_prologue(
+            mla_query(q_nope, rope),
+            q_pe.clone(),
+            latent.clone(),
+            expanded=kv,
+            rotary=rotary,
+            cache=latent_target(cache, loc, write_mask=mask),
+            solution="composite",
+            override=None,
+        )
+
+    got, ref = run(paged), run(flat)
+    assert bytes_equal(got.query, ref.query)
+    if expanded:
+        assert bytes_equal(got.key, ref.key)
+        assert bytes_equal(got.value, ref.value)
+    _assert_paged_latent(backing, paged, flat)
+
+
+@pytest.mark.parametrize("solution", ["triton", "composite"])
+@pytest.mark.parametrize("tokens", [7, 512])
+def test_mla_paged_cache_strides_do_not_specialize(solution, tokens):
+    from tokenspeed_kernel.ops.embedding.triton import _mla_rope_set_kv_buffer_kernel
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        _set_mla_kv_buffer_kernel,
+        _set_mla_kv_buffer_per_loc_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    rank, rope, page_size = 512, 0, 32
+    q_nope, q_pe, latent = mla_inputs(tokens, 2, rank, rope, seed=213)
+    loc = torch.arange(tokens, device="cuda").flip(0)
+
+    def run(pages, row_gap, page_gap):
+        backing, cache = _paged_latent(pages, page_size, rank, BF16, row_gap, page_gap)
+        mla_prologue(
+            mla_query(q_nope, rope),
+            q_pe,
+            latent,
+            expanded=None,
+            rotary=None,
+            cache=latent_target(cache, loc),
+            solution=solution,
+            override=None,
+        )
+        flat = poisoned_latent(pages * page_size, rank, BF16)
+        flat[loc, 0] = latent
+        _assert_paged_latent(backing, cache, flat)
+
+    run(17, 0, 16)
+    with assert_no_triton_compile(
+        _mla_rope_set_kv_buffer_kernel,
+        _set_mla_kv_buffer_kernel,
+        _set_mla_kv_buffer_per_loc_kernel,
+    ):
+        for pages, row_gap, page_gap in ((18, 1, 7), (19, 8, 32), (20, 16, 96)):
+            run(pages, row_gap, page_gap)
+
+
+@pytest.mark.parametrize("solution", ["triton", "composite"])
+@pytest.mark.parametrize("cache_dtype", [BF16, FP8])
+def test_mla_paged_cache_graph_refreshes_slots_and_mask(solution, cache_dtype):
+    tokens, heads, rank, rope = 7, 2, 512, 64
+    q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=214)
+    query = mla_query(q_nope, rope)
+    positions = torch.arange(tokens, device="cuda")
+    loc = torch.arange(tokens, device="cuda")
+    mask = torch.ones(tokens, dtype=torch.bool, device="cuda")
+    rotary = Rotary(cos_sin_cache(rope), positions, RopeStyle.NEOX, None)
+    backing, paged = _paged_latent(4, 8, rank + rope, cache_dtype, 8, 96)
+
+    def run(q, pe, kv, cache):
+        return mla_prologue(
+            q,
+            pe,
+            kv,
+            expanded=None,
+            rotary=rotary,
+            cache=latent_target(cache, loc, write_mask=mask),
+            solution=solution,
+            override=None,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(query, q_pe, latent, paged)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = run(query, q_pe, latent, paged)
+    for seed in (215, 216):
+        fresh_q, fresh_pe, fresh_latent = mla_inputs(
+            tokens, heads, rank, rope, seed=seed
+        )
+        query[..., :rank].copy_(fresh_q)
+        q_pe.copy_(fresh_pe)
+        latent.copy_(fresh_latent)
+        positions.add_(11)
+        loc.copy_(torch.tensor([7, 8, 0, 15, 16, 0, 31], device="cuda"))
+        mask.copy_(
+            torch.tensor(
+                [True, True, False, True, seed == 215, False, True], device="cuda"
+            )
+        )
+        backing.view(torch.uint8).fill_(POISON)
+        flat = poisoned_latent(32, rank + rope, cache_dtype)
+        expected = run(mla_query(fresh_q, rope), fresh_pe, fresh_latent, flat)
+        graph.replay()
+        assert bytes_equal(captured.query, expected.query)
+        _assert_paged_latent(backing, paged, flat)
+
+
 def test_mla_token_count_reuses_compiled_tiles():
     """The six token tile sizes cover new batch counts without new binaries."""
     from tokenspeed_kernel.ops.embedding.triton import _mla_rope_set_kv_buffer_kernel
@@ -2230,7 +2480,10 @@ def test_mla_token_count_reuses_compiled_tiles():
 
 @pytest.mark.parametrize("fused", ["composite", "triton"])
 @pytest.mark.parametrize("masked", [False, True])
-def test_the_storeless_prologue_and_latent_store_write_the_fused_bytes(masked, fused):
+@pytest.mark.parametrize("paged", [False, True])
+def test_the_storeless_prologue_and_latent_store_write_the_fused_bytes(
+    masked, fused, paged
+):
     """``mla_prologue(cache=None)`` rotates and returns the latent for
     ``latent_store``; rotation then store (the query-context-parallel write,
     where other ranks' rows are gathered in between) must leave the query and
@@ -2251,7 +2504,10 @@ def test_the_storeless_prologue_and_latent_store_write_the_fused_bytes(masked, f
     for store in (True, False):
         q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=13)
         query = mla_query(q_nope, rope)
-        cache = poisoned_latent(total, rank + rope, BF16)
+        if paged:
+            backing, cache = _paged_latent(4, 32, rank + rope, BF16, 8, 96)
+        else:
+            cache = poisoned_latent(total, rank + rope, BF16)
         target = latent_target(cache, row_slots, write_mask=write_mask)
         if store:
             out = mla_prologue(
@@ -2278,7 +2534,10 @@ def test_the_storeless_prologue_and_latent_store_write_the_fused_bytes(masked, f
             )
             assert out.latent is not None and out.latent.shape == (tokens, rank + rope)
             latent_store(out.latent, kv_lora_rank=rank, cache=target)
-        outputs.append((out.query.clone(), cache.clone()))
+        flat = cache.contiguous().view(total, 1, rank + rope)
+        if paged:
+            _assert_paged_latent(backing, cache, flat)
+        outputs.append((out.query.clone(), flat.clone()))
     (fused_q, fused_cache), (split_q, split_cache) = outputs
     assert bytes_equal(fused_q, split_q)
     assert bytes_equal(fused_cache, split_cache)

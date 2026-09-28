@@ -356,6 +356,7 @@ class EventLoop:
             role=server_args.disaggregation_mode,
             enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=decode_input_tokens,
+            speculative_algorithm=server_args.speculative_algorithm,
             overlap_schedule_depth=self.overlap_schedule_depth,
             disable_prefix_cache=not server_args.enable_prefix_caching,
             prefix_replay_tokens=prefix_replay_tokens,
@@ -374,6 +375,7 @@ class EventLoop:
             f"{server_args.max_num_seqs!s}, dp_size={self.dp_size!s}) "
             f"disable_prefix_cache={scheduler_cfg.disable_prefix_cache!s} "
             f"prefix_replay_tokens={scheduler_cfg.prefix_replay_tokens!s} "
+            f"prefix_hash_lookahead_tokens={scheduler_cfg.prefix_hash_lookahead_tokens!s} "
             f"cache_groups={[group.group_id for group in cache_groups]!s}",
         )
         self.scheduler = Scheduler(scheduler_cfg)

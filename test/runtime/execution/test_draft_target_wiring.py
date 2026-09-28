@@ -229,6 +229,34 @@ def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
     assert draft_model.legacy is None
 
 
+def test_wire_mtp_preserves_dedicated_embedding_when_sharing_only_head():
+    class HeadSharingDraft(_ModuleSharingDraft):
+        def __init__(self):
+            super().__init__()
+            self.embedding = object()
+            self.norm = object()
+            self.head = None
+
+        def set_head(self, head):
+            self.head = head
+
+    target = _target_runner(
+        SimpleNamespace(
+            get_embed_and_head=lambda: ("TARGET_EMBED", "HEAD"),
+            logits_processor=_head_layout(),
+        )
+    )
+    draft_model = HeadSharingDraft()
+    embedding, norm = draft_model.embedding, draft_model.norm
+    with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
+        factory.configure_draft_target(
+            _server_args("MTP"), target, _draft_runner(draft_model)
+        )
+    assert draft_model.head == "HEAD"
+    assert draft_model.embedding is embedding and draft_model.norm is norm
+    assert draft_model.shared is None and draft_model.legacy is None
+
+
 def test_wire_mtp_module_sharing_requires_target_lm_head():
     target = _target_runner(
         SimpleNamespace(

@@ -34,6 +34,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v41 import (
     DeepseekV41Recipe,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.dots3_note import (
+    Dots3NoteRecipe,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
     Glm53FlashRecipe,
 )
@@ -60,9 +63,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
 
-# A cache family names one registered recipe and pool factory. The in-tree
-# families are mha, mla, dsa, msa, qwen_gdn, qwen4_exp, mamba2, inkling,
-# kimi_k3, glm53_flash, deepseek_v4 and deepseek_v41; plugins register their own.
+# A cache family names one registered recipe and pool factory, including plugins.
 CacheModelFamily = str
 
 
@@ -171,6 +172,7 @@ _RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
     "glm53_flash": Glm53FlashRecipe,
     "deepseek_v4": DeepseekV4Recipe,
     "deepseek_v41": DeepseekV41Recipe,
+    "dots3_note": Dots3NoteRecipe,
 }
 
 

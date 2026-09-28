@@ -22,6 +22,7 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     MambaStateManager (SwaManager window=2), i.e. one page per
     state-snapshot slot, exactly the production ratio."""
     cfg = ts.SchedulerConfig()
+    cfg.prefix_hash_lookahead_tokens = 0
     cfg.prefix_granularity = PAGE
     cfg.num_device_pages = 33  # page 0 = null sentinel, 32 usable
     cfg.num_host_pages = 0

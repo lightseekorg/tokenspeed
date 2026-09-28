@@ -361,6 +361,7 @@ def make_config(
     disable_l2_cache: bool,
     enable_l3_storage: bool,
     role: str,
+    speculative_algorithm: str | None,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
@@ -369,6 +370,11 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
 ) -> SchedulerConfig:
+    """Build scheduler config; MTP/EAGLE3 prefix rows depend on the next token.
+
+    ``speculative_algorithm`` is required (None for non-speculative execution).
+    Lookahead changes hash coverage, not prefix or cache-group granularity.
+    """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
             "prefix_replay_tokens must fit a non-negative int32; "
@@ -389,6 +395,7 @@ def make_config(
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.prefix_replay_tokens = prefix_replay_tokens
+    cfg.prefix_hash_lookahead_tokens = int(speculative_algorithm in ("MTP", "EAGLE3"))
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode

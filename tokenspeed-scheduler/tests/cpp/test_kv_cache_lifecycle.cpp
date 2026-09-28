@@ -33,7 +33,7 @@ namespace tokenspeed::test {
 class KvCacheLifecycleTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;

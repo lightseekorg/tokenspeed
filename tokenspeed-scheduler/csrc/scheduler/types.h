@@ -69,6 +69,9 @@ struct SchedulerConfig {
     // Zero preserves the default logits contract, which already recomputes at
     // least the final prompt token. The effective hit is page-aligned down.
     std::int32_t prefix_replay_tokens{0};
+    // Required: 0 for ordinary rows, 1 when row t also consumes token t+1.
+    // Changes hash coverage only, never logical page or allocation geometry.
+    std::int32_t prefix_hash_lookahead_tokens{-1};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

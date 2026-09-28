@@ -109,7 +109,7 @@ TEST(CacheOperationTest, LoadBackPreservesTransferOrder) {
 }
 
 TEST(CacheOperationTest, HostCacheAndContinuousStreamingAreSeparatePolicies) {
-    SchedulerConfig config;
+    SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
     config.host_allocator.total_pages = 2;
 
     config.role = Role::kFused;
@@ -127,7 +127,7 @@ TEST(CacheOperationTest, HostCacheAndContinuousStreamingAreSeparatePolicies) {
 
 TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
     const auto make_config = [] {
-        SchedulerConfig config;
+        SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
         config.prefix_granularity = 2;
         config.device_allocator.total_pages = 4;
         config.host_allocator.total_pages = 4;
@@ -156,7 +156,7 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
 
 TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
     const auto make_config = [](std::int32_t host_pages) {
-        SchedulerConfig config;
+        SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
         config.prefix_granularity = 2;
         config.device_allocator.total_pages = 9;
         config.host_allocator.total_pages = host_pages;
@@ -415,7 +415,7 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
 }
 
 TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) {
-    SchedulerConfig config;
+    SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
     config.prefix_granularity = 2;
     config.device_allocator.total_pages = 4;
     config.host_allocator.total_pages = 10;
@@ -442,7 +442,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
 }
 
 TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeTokens) {
-    SchedulerConfig config;
+    SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
     config.prefix_granularity = 2;
     config.device_allocator.total_pages = 4;
     config.host_allocator.total_pages = 10;
@@ -532,7 +532,7 @@ TEST(CacheOperationTest, HostRestoredStateChunkRemainsCachedAfterLoadAckAndWorki
 }
 
 TEST(CacheOperationTest, L3StorageRequiresHostCache) {
-    SchedulerConfig config;
+    SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
     config.prefix_granularity = 2;
     config.device_allocator.total_pages = 4;
     config.host_allocator.total_pages = 1;
@@ -550,7 +550,7 @@ TEST(CacheOperationTest, L3StorageRequiresHostCache) {
 }
 
 TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
-    SchedulerConfig config;
+    SchedulerConfig config{.prefix_hash_lookahead_tokens = 0};
     config.prefix_granularity = 2;
     config.device_allocator.total_pages = 4;
     config.host_allocator.total_pages = 8;

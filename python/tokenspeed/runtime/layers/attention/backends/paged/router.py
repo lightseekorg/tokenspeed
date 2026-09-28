@@ -312,14 +312,22 @@ class CacheGroupRouter(AttentionBackend):
         for leaf in self.leaves.values():
             leaf.step_counter = step_counter
 
-    def _leaf_for(self, layer: PagedAttention) -> PagedAttentionBackend:
+    def leaf_for(self, layer: PagedAttention) -> PagedAttentionBackend:
+        """Return the bound layer's leaf, including its group-local metadata.
+
+        Multi-group models read prefill/decode metadata and invoke explicit
+        Q/K/V prefill here; KV write slots still come from ``write_locations``.
+        """
         try:
             return self.leaves[layer.group_id]
         except KeyError:
             raise KeyError(
-                f"layer {getattr(layer, 'layer_id', '?')} names cache group "
+                f"layer {layer.layer_id} names cache group "
                 f"{layer.group_id!r}; this router serves {self.group_ids}"
             ) from None
+
+    def _leaf_for(self, layer: PagedAttention) -> PagedAttentionBackend:
+        return self.leaf_for(layer)
 
     def _sole_leaf(self, what: str) -> PagedAttentionBackend:
         if len(self.leaves) != 1:
@@ -1046,10 +1054,8 @@ class CacheGroupRouter(AttentionBackend):
             *args, **kwargs
         )
 
-    def forward_sparse_prefill(self, *args, **kwargs):
-        return self._sole_leaf("forward_sparse_prefill").forward_sparse_prefill(
-            *args, **kwargs
-        )
+    def forward_sparse_prefill(self, *, layer: PagedAttention, **kwargs):
+        return self.leaf_for(layer).forward_sparse_prefill(layer=layer, **kwargs)
 
     # ------------------------------------------------------------------
     # DSA query-shard surface: a sparse-attention model's own top-k over KVP

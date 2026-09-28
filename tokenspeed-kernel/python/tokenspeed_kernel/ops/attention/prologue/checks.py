@@ -470,11 +470,20 @@ def _check_latent_cache(
     else:
         rows = ((cache.kv_cache, kv_lora_rank + rope_dim),)
         malformed = (
-            f"latent cache rows are not dense [slots, 1, {kv_lora_rank} + {rope_dim}]"
+            f"latent cache rows must have non-overlapping dense channels in "
+            f"[slots, 1, {kv_lora_rank} + {rope_dim}] or "
+            f"[pages, page_size, 1, {kv_lora_rank} + {rope_dim}], page_size > 0"
         )
     if any(
-        p.dim() != 3
-        or p.shape[1] != 1
+        not (
+            (p.dim() == 3 and p.shape[1] == 1)
+            or (
+                cache.format is not KVCacheFormat.FP8_PER_TOKEN_HEAD
+                and p.dim() == 4
+                and p.shape[1] > 0
+                and p.shape[2] == 1
+            )
+        )
         or p.shape[-1] != channels
         or p.stride(-1) != 1
         or _overlapping(p)

@@ -705,9 +705,12 @@ if current_platform().is_amd:
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False}),
         },
     )
-    def gluon_mla_prefill_gfx950(*args, **kwargs):
+    def gluon_mla_prefill_gfx950(*args, window_left: int, **kwargs):
+        if window_left != -1:
+            raise NotImplementedError("Gluon MLA prefill does not support window_left")
         return _mla_prefill_gfx950_impl(*args, **kwargs)
 
     @register_kernel(
@@ -741,9 +744,12 @@ if current_platform().is_amd:
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False}),
         },
     )
-    def gluon_mla_prefill_8wave_gfx950(*args, **kwargs):
+    def gluon_mla_prefill_8wave_gfx950(*args, window_left: int, **kwargs):
+        if window_left != -1:
+            raise NotImplementedError("Gluon MLA prefill does not support window_left")
         return _mla_prefill_8wave_gfx950_impl(*args, **kwargs)
 
     @register_kernel(
@@ -773,7 +779,10 @@ if current_platform().is_amd:
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False}),
         },
     )
-    def gluon_mla_prefill_gfx1250(*args, **kwargs):
+    def gluon_mla_prefill_gfx1250(*args, window_left: int, **kwargs):
+        if window_left != -1:
+            raise NotImplementedError("Gluon MLA prefill does not support window_left")
         return _mla_prefill_gfx1250_impl(*args, **kwargs)

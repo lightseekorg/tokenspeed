@@ -91,6 +91,7 @@ def test_mla_prefill_gluon_strided_output(
         cu_seqlens_kv=cu_kv,
         max_seqlen_q=257,
         max_seqlen_kv=385,
+        window_left=-1,
         softmax_scale=192**-0.5,
         is_causal=is_causal,
         return_lse=True,
@@ -154,6 +155,7 @@ def test_mla_prefill_gluon_static_grid_graph(
             cu_seqlens_kv=cu_kv,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=512,
+            window_left=-1,
             softmax_scale=192**-0.5,
             is_causal=is_causal,
             return_lse=True,
@@ -311,6 +313,7 @@ def test_mla_prefill_gluon_scheduler_coverage(
         cu_seqlens_kv=cu_kv,
         max_seqlen_q=max(q_lens),
         max_seqlen_kv=kv_len,
+        window_left=-1,
         softmax_scale=192**-0.5,
         is_causal=is_causal,
         return_lse=True,
@@ -434,6 +437,7 @@ def test_mla_prefill_gluon_online_max(
         cu_seqlens_kv=cu_kv,
         max_seqlen_q=q.shape[0],
         max_seqlen_kv=kv_len,
+        window_left=-1,
         softmax_scale=192**-0.5,
         is_causal=False,
         return_lse=True,
@@ -487,6 +491,7 @@ def test_mla_prefill_gluon_repeated_launches(
     first = None
     for _ in range(4):
         out, lse = mla_prefill(
+            window_left=-1,
             q=q,
             k=k,
             v=v,
@@ -524,6 +529,7 @@ def test_mla_prefill_gluon_kernels_agree(device, require, dtype, is_causal):
     cu_kv = torch.tensor([0, 300, 1200, 1900], dtype=torch.int32, device=device)
     (out, lse), (other_out, other_lse) = [
         mla_prefill(
+            window_left=-1,
             q=q,
             k=k,
             v=v,

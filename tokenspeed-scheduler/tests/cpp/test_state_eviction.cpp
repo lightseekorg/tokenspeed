@@ -32,7 +32,7 @@ namespace tokenspeed::test {
 class StatePublicationSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = 257;
         cfg.host_allocator.total_pages = 257;

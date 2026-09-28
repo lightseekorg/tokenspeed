@@ -25,6 +25,7 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import (
@@ -40,6 +41,10 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
     DeepseekV41Config,
     is_deepseek_v41_config,
+)
+from tokenspeed.runtime.layers.attention.configs.dots3_note import (
+    Dots3NoteAttnConfig,
+    is_dots3_note_config,
 )
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (
@@ -149,10 +154,11 @@ def _resolve_heterogeneous_draft_family(
     """
     if draft_family is None or draft_family == target_family:
         return None
-    if target_family == "kimi_k3":
+    if target_family in ("kimi_k3", "dots3_note"):
         if draft_family != "mla":
             raise RuntimeError(
-                "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
+                f"{'Kimi-K3' if target_family == 'kimi_k3' else 'dots3_note'} "
+                "unified cache currently requires an ordinary MLA draft view"
             )
         return draft_family
     if target_family not in _ORDINARY_CACHE_FAMILIES:
@@ -252,14 +258,14 @@ def validate_attention_backend_name(name: str | None, *, flag: str) -> None:
     """Reject a launch backend name no in-tree or plugin backend registered.
 
     Runs after plugin discovery, so plugin backends are accepted exactly like
-    in-tree ones.
+    in-tree ones. Composite names select routers rather than registered leaves.
     """
-    if name is None or name == HYBRID_LINEAR_ATTN_BACKEND:
+    if name is None or name in (HYBRID_LINEAR_ATTN_BACKEND, "dots3_note"):
         return
     if name not in _BACKEND_REGISTRY:
         raise ValueError(
             f"Unknown {flag} {name!r}; available: "
-            f"{sorted([*_BACKEND_REGISTRY, HYBRID_LINEAR_ATTN_BACKEND])}"
+            f"{sorted([*_BACKEND_REGISTRY, HYBRID_LINEAR_ATTN_BACKEND, 'dots3_note'])}"
         )
 
 
@@ -443,6 +449,10 @@ def _apply_backend_overrides(
             "K3 DSpark does not support DCP: context KV injection does not "
             "translate virtual slots or mask nonowner writes"
         )
+    if "Dot3NoteForCausalLM" in target.architectures and (
+        target.requested_backend not in (None, "dots3_note")
+    ):
+        raise ValueError("dots3 Plan A requires the dots3_note attention backend")
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
     elif target.is_deepseek_v4:
@@ -541,6 +551,8 @@ def _resolve_cache_family(
     """The one dispatch from family facts (plus built config) to the recipe."""
     if profile.model_profile is not None:
         return profile.model_profile.cache_family
+    if config.component(Dots3NoteAttnConfig) is not None:
+        return "dots3_note"
     if config.component(DeepseekV41Config) is not None:
         return "deepseek_v41"
     if profile.is_deepseek_v4:
@@ -586,7 +598,10 @@ def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
         raise ValueError(
             f"No backend supports arch {arch}. Available: {list(_BACKEND_REGISTRY)}"
         )
-    entry = _BACKEND_REGISTRY.get(name)
+    # Triton names a kernel solution for both MHA and MLA. Select the MLA
+    # class by architecture without changing the solution passed to its leaf.
+    lookup = "mla" if name == "triton" and arch == AttentionArch.MLA else name
+    entry = _BACKEND_REGISTRY.get(lookup)
     if entry is None:
         raise ValueError(
             f"Unknown attention backend: {name!r}. Available: {list(_BACKEND_REGISTRY)}"
@@ -613,6 +628,9 @@ def create_paged_router(
     ``set_cache_pool``; each leaf's kernel page size resolves from the
     config override, the leaf class default, or the group's own block
     granularity (``PagedAttentionBackend.resolve_kernel_page_size``).
+    Dots3's one composite spec supplies a page64 DSA leaf for ``full`` and
+    page32 MLA leaves for ``swa.0`` / ``swa.1`` / ``swa.2``. Their separate
+    metadata and write locations use the same router lifecycle.
     """
     from tokenspeed.runtime.layers.attention.backends.paged.router import (
         CacheGroupRouter,
@@ -625,10 +643,42 @@ def create_paged_router(
         # server_args (and MHAConfig.generate copies into the spec). It
         # names the WRAPPER; the leaf under it auto-resolves from the arch.
         name = None
-    leaf_cls = _get_backend_cls(name, arch)
+    if isinstance(spec, Dots3NoteAttnConfig):
+        if name != "dots3_note":
+            raise ValueError("dots3 Plan A requires the dots3_note attention backend")
+        if config.kernel_page_size is not None:
+            raise ValueError("dots3 Plan A selects page64/page32 per cache group")
+        if config.is_draft:
+            raise NotImplementedError("dots3 Plan A does not support drafts")
+        if (
+            config.kv_cache_dtype != torch.bfloat16
+            or config.kv_cache_quant_method != "none"
+        ):
+            raise ValueError("dots3 Plan A requires unquantized BF16 latent KV cache")
+    else:
+        leaf_cls = _get_backend_cls(name, arch)
 
     def leaf_factory(group_id: str, block_granularity: int):
-        del group_id
+        if isinstance(spec, Dots3NoteAttnConfig):
+            from tokenspeed.runtime.layers.attention.backends.paged.dsa import (
+                DSABackend,
+            )
+            from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+                MLAAttnBackend,
+            )
+
+            if group_id == "full":
+                group_cls, group_spec, page_size = DSABackend, spec.full, 64
+            elif group_id in ("swa.0", "swa.1", "swa.2"):
+                group_cls, group_spec, page_size = MLAAttnBackend, spec.swa, 32
+            else:
+                raise ValueError(f"Unsupported dots3 cache group: {group_id!r}")
+            if block_granularity != page_size:
+                raise ValueError(
+                    f"dots3 group {group_id!r} requires {page_size}-token pages, "
+                    f"got {block_granularity}"
+                )
+            return group_cls(config, group_spec, kernel_page_size=page_size)
         kernel_page_size = leaf_cls.resolve_kernel_page_size(config, block_granularity)
         # A fresh spec, never a mutate-restore of the shared component: leaf
         # construction happens lazily at set_cache_pool, and several leaves
@@ -700,11 +750,12 @@ def _create_attn_config(
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    config_cls = (
-        DeepseekV41Config
-        if is_deepseek_v41_config(model_config.hf_config)
-        else _CONFIG_CLS[arch]
-    )
+    if is_dots3_note_config(model_config.hf_config):
+        config_cls = Dots3NoteAttnConfig
+    elif is_deepseek_v41_config(model_config.hf_config):
+        config_cls = DeepseekV41Config
+    else:
+        config_cls = _CONFIG_CLS[arch]
     config = config_cls.generate(server_args, model_config, is_draft)
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
@@ -769,6 +820,8 @@ def _create_attn_backend_with_name(
         PagedAttentionBackend,
     )
 
+    if config.component(Dots3NoteAttnConfig) is not None:
+        return create_paged_router(config, arch, backend_name=name)
     cls = _get_backend_cls(name, arch)
     if issubclass(cls, PagedAttentionBackend):
         # Paged leaves are served through the cache-group router: one leaf
@@ -1038,8 +1091,7 @@ def _create_draft_components(
             "heterogeneous cache views currently support ordinary drafts only"
         )
     num_layers = model_config.num_attention_layers
-    # The draft view's transfer counter stays local/None; heterogeneous PD is
-    # rejected before construction.
+    # Draft fields have their own final producer barrier in the merged plan.
     draft_pool = create_cache_pool(
         cache_spec,
         config,

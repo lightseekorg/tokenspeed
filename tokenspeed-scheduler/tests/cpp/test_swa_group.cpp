@@ -46,7 +46,7 @@ using token_span = std::span<const std::int32_t>;
 
 CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
-    std::vector<std::string> hashes = ComputePrefixHashes(pages, "");
+    std::vector<std::string> hashes = ComputePrefixHashes(pages, "", 0);
     return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};
 }
 

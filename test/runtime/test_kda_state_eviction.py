@@ -163,6 +163,7 @@ class _ScheduledKDA:
             self.pool, self.contract, layer_ids=_LAYERS, device="cuda", seed=seed
         )
         config = ts.SchedulerConfig()
+        config.prefix_hash_lookahead_tokens = 0
         config.prefix_granularity = _P
         config.num_device_pages = _USABLE_BLOCKS + 1
         config.num_host_pages = 0

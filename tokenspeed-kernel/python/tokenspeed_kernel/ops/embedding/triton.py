@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.kvcache.triton import _mla_cache_strides
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
@@ -163,7 +164,10 @@ def _sanitize_for_store(x, MAX_FINITE: tl.constexpr):
     return tl.minimum(tl.maximum(x, -MAX_FINITE), MAX_FINITE)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["kv_buffer_stride_t", "kv_buffer_stride_p"],
+    do_not_specialize_on_alignment=["kv_buffer_stride_t", "kv_buffer_stride_p"],
+)
 def _mla_rope_set_kv_buffer_kernel(
     q_rope_ptr,
     k_nope_ptr,
@@ -183,7 +187,9 @@ def _mla_rope_set_kv_buffer_kernel(
     k_rope_stride_t: tl.constexpr,
     q_out_rope_stride_t: tl.constexpr,
     q_out_rope_stride_h: tl.constexpr,
-    kv_buffer_stride_t: tl.constexpr,
+    kv_buffer_stride_t,
+    kv_buffer_stride_p,
+    PAGE_SIZE: tl.constexpr,
     cos_sin_stride_p: tl.constexpr,
     q_nope_stride_t: tl.constexpr,
     q_nope_stride_h: tl.constexpr,
@@ -300,7 +306,11 @@ def _mla_rope_set_kv_buffer_kernel(
                     tl.store(q_out_base + pair_hi, q2, mask=half_mask)
             else:
                 loc = tl.load(loc_ptr + token_idx * loc_stride).to(tl.int64)
-                kv_base = kv_buffer_ptr + loc * kv_buffer_stride_t
+                kv_base = (
+                    kv_buffer_ptr
+                    + (loc // PAGE_SIZE) * kv_buffer_stride_p
+                    + (loc % PAGE_SIZE) * kv_buffer_stride_t
+                )
                 nope_store = nope_mask
                 half_store = half_mask
                 if write_mask_ptr is not None:
@@ -367,7 +377,10 @@ def apply_rope_mla_set_kv_buffer_triton(
     needs.
     ``fused_mla_set_kv_buffer_arg.write_mask``, when given, holds one bool per
     token, and a False token's latent row is not stored; its slot is still
-    formed into an address, so it must be in range.
+    formed into an address, so it must be in range. The destination may be
+    flat ``[slots, width]`` / ``[slots, 1, width]`` or a paged
+    ``[pages, page_size, 1, width]`` field view. Page and row strides are read
+    in elements without flattening or copying the cache.
 
     Contract the caller owns, unchecked here because the decode scheduler
     already guarantees it: ``fused_mla_set_kv_buffer_arg.cache_loc`` holds one
@@ -394,7 +407,8 @@ def apply_rope_mla_set_kv_buffer_triton(
     assert q_rope.ndim == 3
     assert k_nope.ndim == 3 and k_nope.shape[1] == 1
     assert k_rope.ndim == 3 and k_rope.shape[1] == 1
-    assert kv_buffer.ndim == 2
+    page_size, page_stride, row_stride = _mla_cache_strides(kv_buffer)
+    assert page_size > 0
     assert loc.numel() == num_tokens
     assert positions.numel() == num_tokens
     assert q_rope.dtype == k_nope.dtype == k_rope.dtype
@@ -410,7 +424,7 @@ def apply_rope_mla_set_kv_buffer_triton(
     num_q_heads = q_rope.shape[1]
     rope_dim = q_rope.shape[2]
     assert k_rope.shape == (num_tokens, 1, rope_dim)
-    assert kv_buffer.shape[1] == nope_dim + rope_dim
+    assert kv_buffer.shape[-1] == nope_dim + rope_dim
     assert rope_dim % 2 == 0
     assert loc.dtype in (torch.int32, torch.int64)
     assert loc.ndim == 1
@@ -467,7 +481,9 @@ def apply_rope_mla_set_kv_buffer_triton(
         k_rope.stride(0),
         q_rope_out.stride(0),
         q_rope_out.stride(1),
-        kv_buffer.stride(0),
+        row_stride,
+        page_stride,
+        page_size,
         0 if cos_sin_cache is None else cos_sin_cache.stride(0),
         0 if q_nope is None else q_nope.stride(0),
         0 if q_nope is None else q_nope.stride(1),

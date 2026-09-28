@@ -1339,6 +1339,7 @@ def _attention_mla_prefill_ragged(
     cu_seqlens_kv = torch.zeros(batch_size + 1, dtype=torch.int32)
     cu_seqlens_kv[1:] = lens_kv.cumsum(0)
     return _attention_mla_pkg.mla_prefill(
+        window_left=-1,
         q=tokens(batch_size * q_len, 192),
         k=tokens(sum(kv_lens), 192),
         v=tokens(sum(kv_lens), 128),

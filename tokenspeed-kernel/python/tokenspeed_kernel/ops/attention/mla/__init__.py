@@ -532,6 +532,7 @@ def mla_normalize_project_query(
 
 def mla_prefill_traits(
     *,
+    window_left: int,
     batch_size: int,
     total_kv: int,
     head_dim: int,
@@ -547,6 +548,7 @@ def mla_prefill_traits(
     traits so both pick the same kernel.
 
     Args:
+        window_left: Left visibility bound, or -1 for unbounded attention.
         batch_size: Number of sequences.
         total_kv: KV tokens summed over all sequences.
         head_dim: Query/key head dimension.
@@ -562,6 +564,7 @@ def mla_prefill_traits(
     # exactly, including ragged/non-power-of-two batches, and bounds the cache.
     avg_kv_len = total_kv // batch_size if batch_size > 0 else 0
     return {
+        "sliding_window": window_left >= 0,
         "avg_kv_len": 1 << (avg_kv_len.bit_length() - 1) if avg_kv_len else 0,
         "head_dim": head_dim,
         "value_head_dim": value_head_dim,
@@ -590,6 +593,8 @@ def mla_prefill(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    *,
+    window_left: int,
 ) -> AttentionResult:
     """MLA prefill/cross-attention from explicit, non-cached Q/K/V tensors.
 
@@ -615,6 +620,11 @@ def mla_prefill(
         softmax_scale: Scale applied to QK logits before softmax.
         seq_lens_kv: Optional per-request KV lengths with shape [batch]. Some
             backends need this in addition to cu_seqlens_kv.
+        window_left: Left visibility bound relative to bottom-right aligned
+            query positions (``kv_len - q_len + q_index``). Pass -1 for no
+            left bound, or 512 for the previous 512 keys plus the current key
+            with ``is_causal=True``. Independent prefix-only chunks need their
+            true query/key offsets; lengths alone do not describe that layout.
         is_causal: Whether to apply a causal mask between Q and KV. Prefix-cache
             replay chunks should pass False because all prefix tokens precede all
             extend tokens.
@@ -630,10 +640,13 @@ def mla_prefill(
         Attention output with shape [total_q, num_q_heads, v_head_dim], or
         (output, lse) when return_lse is True.
     """
+    if window_left < -1:
+        raise ValueError("window_left must be -1 (unbounded) or non-negative")
     # Problem sizes are read from shapes so selection never syncs and also
     # works under graph capture.
     batch_size = cu_seqlens_q.shape[0] - 1
     traits = mla_prefill_traits(
+        window_left=window_left,
         batch_size=batch_size,
         total_kv=k.shape[0],
         head_dim=q.shape[-1],
@@ -642,6 +655,7 @@ def mla_prefill(
         logit_cap=logit_cap,
         return_lse=return_lse,
     )
+
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
         "attention",
@@ -662,6 +676,7 @@ def mla_prefill(
         "v_head_dim": v.shape[-1],
         "max_seqlen_q": max_seqlen_q,
         "max_seqlen_kv": max_seqlen_kv,
+        "window_left": window_left,
     }
     ShapeCapture.get().record(
         "attention",
@@ -689,6 +704,7 @@ def mla_prefill(
             softmax_scale=softmax_scale,
             seq_lens_kv=seq_lens_kv,
             is_causal=is_causal,
+            window_left=window_left,
             logit_cap=logit_cap,
             return_lse=return_lse,
             out=out,

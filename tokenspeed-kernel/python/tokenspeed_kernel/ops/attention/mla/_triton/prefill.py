@@ -57,6 +57,7 @@ def _mla_prefill_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    WINDOW_LEFT: tl.constexpr,
     HAS_LSE: tl.constexpr,
 ):
     cur_seq = tl.program_id(0)
@@ -68,7 +69,7 @@ def _mla_prefill_kernel(
     q_len = tl.load(cu_seqlens_q + cur_seq + 1) - q_start
     kv_start = tl.load(cu_seqlens_kv + cur_seq)
     kv_len = tl.load(cu_seqlens_kv + cur_seq + 1) - kv_start
-    q_causal_start = tl.maximum(kv_len - q_len, 0)
+    q_causal_start = kv_len - q_len
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -101,16 +102,24 @@ def _mla_prefill_kernel(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, kv_len, BLOCK_N):
+    query_positions = q_causal_start + q_offsets_m[:, None]
+    key_begin = 0
+    key_end = kv_len
+    if WINDOW_LEFT >= 0:
+        key_begin = tl.maximum(q_causal_start + cur_block_m * BLOCK_M - WINDOW_LEFT, 0)
+    if IS_CAUSAL:
+        key_end = tl.minimum(q_causal_start + (cur_block_m + 1) * BLOCK_M, kv_len)
+
+    for start_n in range(key_begin // BLOCK_N * BLOCK_N, key_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         kv_offsets_n = start_n + offs_n
-        mask_n = kv_offsets_n < kv_len
+        mask_n = (kv_offsets_n >= key_begin) & (kv_offsets_n < key_end)
         final_mask = mask_m[:, None] & mask_n[None, :]
-
+        key_positions = kv_offsets_n[None, :]
         if IS_CAUSAL:
-            query_positions = q_causal_start + q_offsets_m[:, None]
-            key_positions = kv_offsets_n[None, :]
             final_mask &= query_positions >= key_positions
+        if WINDOW_LEFT >= 0:
+            final_mask &= key_positions >= query_positions - WINDOW_LEFT
 
         offs_k = (
             (kv_start + kv_offsets_n[None, :]) * stride_kbs
@@ -152,8 +161,13 @@ def _mla_prefill_kernel(
             + offs_dv[None, :]
         )
         v = tl.load(V + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0)
-        p = p.to(v.dtype)
-        acc = acc * re_scale[:, None] + tl.dot(p, v)
+        p_hi = p.to(v.dtype)
+        acc = acc * re_scale[:, None] + tl.dot(p_hi, v)
+        if v.dtype == tl.bfloat16:
+            # BF16 probability rounding loses small differences when values
+            # cancel. Keep its residual without narrowing BF16 values to FP16.
+            p_lo = (p - p_hi.to(tl.float32)).to(v.dtype)
+            acc += tl.dot(p_lo, v)
         e_max = n_e_max
 
     safe_deno = tl.where(deno > 0.0, deno, 1.0)
@@ -186,9 +200,12 @@ def mla_prefill_fwd(
     softmax_scale: float,
     *,
     is_causal: bool,
+    window_left: int,
     logit_cap: float = 0.0,
     lse: torch.Tensor | None = None,
 ) -> None:
+    if window_left < -1:
+        raise ValueError("window_left must be -1 (unbounded) or non-negative")
     if q.shape[-1] != k.shape[-1]:
         raise ValueError(
             f"q/k head dims must match, got {q.shape[-1]} and {k.shape[-1]}"
@@ -262,6 +279,7 @@ def mla_prefill_fwd(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         IS_CAUSAL=is_causal,
+        WINDOW_LEFT=window_left,
         HAS_LSE=lse is not None,
         num_warps=num_warps,
         num_stages=1,
@@ -278,6 +296,7 @@ def _triton_mla_prefill_impl(
     max_seqlen_kv: int,
     softmax_scale: float,
     *,
+    window_left: int,
     is_causal: bool = True,
     logit_cap: float = 0.0,
     return_lse: bool = False,
@@ -308,6 +327,7 @@ def _triton_mla_prefill_impl(
         max_seqlen_kv,
         softmax_scale,
         is_causal=is_causal,
+        window_left=window_left,
         logit_cap=logit_cap,
         lse=lse,
     )

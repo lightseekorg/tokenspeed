@@ -104,12 +104,12 @@ void classifyCompletedStateBoundaries(CompletedPages& completed, std::int32_t en
 
 void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
                                  const std::vector<std::span<const std::int32_t>>& prefix_pages,
-                                 std::int32_t filled_prefix_pages) {
+                                 std::int32_t filled_prefix_pages, std::int32_t prefix_hash_lookahead_tokens) {
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(prefix_hashes.size());
     _assert(filled_prefix_pages > first_new_prefix_page, "caller must pre-check page-hash progress");
     const std::string previous_hash = prefix_hashes.empty() ? std::string{} : prefix_hashes.back();
-    std::vector<std::string> new_hashes =
-        AdvancePrefixHashes(prefix_pages, first_new_prefix_page, previous_hash, filled_prefix_pages);
+    std::vector<std::string> new_hashes = AdvancePrefixHashes(prefix_pages, first_new_prefix_page, previous_hash,
+                                                              filled_prefix_pages, prefix_hash_lookahead_tokens);
     prefix_hashes.insert(prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                          std::make_move_iterator(new_hashes.end()));
 }
@@ -155,11 +155,16 @@ void recordPrefillStateCheckpoint(fsm::CacheProgress& cache_progress, fsm::Prefi
 // The returned spans view cache_progress, which must outlive their use.
 RequestProgress advanceRequestProgress(Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
-                                       bool stream_completed_to_host) {
+                                       std::int32_t prefix_hash_lookahead_tokens, bool stream_completed_to_host) {
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
-    const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
+    // Scheduled prefill can reach the prompt end before its sampled token lands.
+    // Delay that page's identity until the lookahead exists; do not hash a placeholder.
+    const std::int32_t filled_prefix_pages =
+        std::min(num_computed_tokens, request.TokenSize() - prefix_hash_lookahead_tokens) / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
-        appendCompletedPrefixHashes(cache_progress.prefix_hashes, request.FullPrefixPages(false), filled_prefix_pages);
+        appendCompletedPrefixHashes(cache_progress.prefix_hashes,
+                                    request.FullPrefixPages(false, prefix_hash_lookahead_tokens), filled_prefix_pages,
+                                    prefix_hash_lookahead_tokens);
     }
     RequestProgress progress{.num_computed_tokens = num_computed_tokens};
     if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
@@ -241,9 +246,10 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         std::max(std::min(request->PrefillSize() - replay_tokens, request_bound), 0);
     const std::int32_t probe_prefix_pages = max_cacheable_tokens / prefix_granularity;
     const std::int32_t candidate_prefix_pages = std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
-    std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
+    std::vector<std::span<const std::int32_t>> prefix_pages =
+        request->FullPrefixPages(false, config_.prefix_hash_lookahead_tokens);
     prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-    std::vector<std::string> hashes = ComputePrefixHashes(prefix_pages, "");
+    std::vector<std::string> hashes = ComputePrefixHashes(prefix_pages, "", config_.prefix_hash_lookahead_tokens);
     const auto probe_hashes = std::span<const std::string>(hashes).first(
         std::min(hashes.size(), static_cast<std::size_t>(probe_prefix_pages)));
 
@@ -359,8 +365,11 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         match.extension_hashes.assign(extension_begin, extension_begin + extension_pages);
 
         const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
-        tokens_this_round = PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
-                                               promotion_boundary_tokens);
+        // Remote admission covers the whole suffix; promotion only shapes local forwards.
+        tokens_this_round = source == fsm::PrefillSource::kRemote
+                                ? unscheduled
+                                : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled,
+                                                     remaining, promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return std::nullopt;
         }
@@ -512,7 +521,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     };
     const RequestProgress progress =
         advanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
-                               config_.StreamsDeviceCacheToHost());
+                               config_.prefix_hash_lookahead_tokens, config_.StreamsDeviceCacheToHost());
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{prefill_tokens}});
@@ -548,9 +557,9 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
             tables.front().NumBlocks() * coordinator_.GroupBlockGranularity(0) - tables.front().AvailableTokens();
         reserve_tokens = std::max(num_computed_tokens + pending_decode_tokens + decode_width - reserved_end, 0);
     }
-    const RequestProgress progress =
-        advanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>());
+    const RequestProgress progress = advanceRequestProgress(
+        *request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
+        config_.prefix_hash_lookahead_tokens, config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>());
 
     if (!progress.completed_pages &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
@@ -680,7 +689,7 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
         const std::int32_t num_computed_tokens = victim.NumComputedTokens();
         RequestProgress progress =
             advanceRequestProgress(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                                   /*stream_completed_to_host=*/false);
+                                   config_.prefix_hash_lookahead_tokens, /*stream_completed_to_host=*/false);
         if (progress.completed_pages) {
             classifyCompletedStateBoundaries(*progress.completed_pages, num_computed_tokens,
                                              coordinator_.PrefixGranularity());

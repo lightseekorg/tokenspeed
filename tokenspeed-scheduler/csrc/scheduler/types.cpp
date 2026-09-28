@@ -59,6 +59,9 @@ void SchedulerConfig::Validate() const {
     for (const CacheGroupConfig& group : cache_groups) {
         group.Validate();
     }
+    if (prefix_hash_lookahead_tokens != 0 && prefix_hash_lookahead_tokens != 1) {
+        throw std::invalid_argument("Scheduler: prefix_hash_lookahead_tokens must be explicitly set to 0 or 1");
+    }
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }

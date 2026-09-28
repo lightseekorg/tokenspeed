@@ -715,7 +715,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
     backend.kv_lora_rank = 1
     backend.qk_rope_head_dim = 0
     backend.kernel_page_size = 64
-    backend.kernel_solution = None
+    backend.kernel_solution = "triton"
     backend.slot_order = "selection"
     backend.num_local_heads = 1
     backend.num_attention_heads = 1

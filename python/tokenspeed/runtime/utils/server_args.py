@@ -2542,7 +2542,7 @@ class ServerArgs:
         # after plugin discovery, so plugins can add their own.
         attention_backend_names = (
             "mha, mla, fa3, fa4, triton, gluon, flashinfer, trtllm, trtllm_mla, "
-            "flashmla, tokenspeed_mla, hybrid_linear_attn"
+            "flashmla, tokenspeed_mla, hybrid_linear_attn, dots3_note"
         )
         parser.add_argument(
             "--attention-backend",

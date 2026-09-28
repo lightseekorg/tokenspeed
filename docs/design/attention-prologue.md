@@ -58,8 +58,12 @@ The entries validate each request once, from metadata only, and raise
   `[T, H, rope]` and the latent `[T, kv_lora_rank + rope]`; an absorbed
   query's non-RoPE part is `kv_lora_rank` wide, expanded keys are as wide as
   the query's non-RoPE part and values `[T, H, ·]`, both in the query dtype,
-  a dense cache row is `[slots, 1, kv_lora_rank + rope]`, and per-token-head
-  planes are `[slots, 1, kv_lora_rank]`, `[slots, 1, 1]` fp32 and
+  a dense cache is `[slots, 1, kv_lora_rank + rope]` or a page-strided view
+  `[pages, page_size, 1, kv_lora_rank + rope]`. Page views remain aliases of
+  their arena: stores address `slot // page_size` and `slot % page_size`
+  with the page and row strides, never flatten or copy the cache. Page size
+  is fixed geometry; strides and page count do not specialize the writer.
+  Per-token-head planes are `[slots, 1, kv_lora_rank]`, `[slots, 1, 1]` fp32 and
   `[slots, 1, rope]` with one row count; `q_pe` is the query's RoPE channels
   themselves or shares no element with the query (the entry checks the first
   case's layout, not the second);

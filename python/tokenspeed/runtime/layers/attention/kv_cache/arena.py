@@ -110,10 +110,11 @@ class CacheArena:
                 device=device,
             )
 
-        # The plan names every field and its dtype
-        self._fields: dict[str, torch.Tensor] = {
+        # Keep the page axis: interleaved fields cannot collapse it without a copy.
+        self._field_pages: dict[str, torch.Tensor] = {
             field.field_id: self._bind(field) for field in plan.fields
         }
+        self._fields: dict[str, torch.Tensor] = {}
         plan_groups = {group.group_id: group for group in plan.groups}
         # The contract joins the recipe's logical specs with the plan's
         # physical facts for the same groups. The plan owns page counts and
@@ -186,9 +187,8 @@ class CacheArena:
     def _bind(self, field) -> torch.Tensor:
         """Stride one planned field's view over the arena bytes.
 
-        Pages are the physical unit, so the stride math is page-major; a
-        per-token field then folds that axis into its entries (see
-        :meth:`field` for why the planned shape decides).
+        Pages are the physical unit. Token-shaped compatibility views are
+        built only when a consumer requests :meth:`field`.
         """
         dtype = getattr(torch, field.dtype)
         group = self.plan.group(field.group_id)
@@ -205,10 +205,24 @@ class CacheArena:
             ),
             self.field_block_byte_offset(field.field_id, 0) // field.element_size,
         )
-        spec = self._cache_group_specs_by_id[field.group_id]
-        if field.shape[0] != self.plan.prefix_granularity or spec.family == "state":
-            return pages
-        return pages.view(-1, *field.shape[1:])
+        return pages
+
+    def field_pages(self, field_id: str) -> torch.Tensor:
+        """Return ``[pages, *planned_shape]`` without collapsing page strides.
+
+        Args:
+            field_id: A field id named by the memory plan.
+
+        Returns:
+            A zero-copy view, including the null page, over the arena bytes.
+
+        Raises:
+            ValueError: The plan does not name this field.
+        """
+        try:
+            return self._field_pages[field_id]
+        except KeyError:
+            raise ValueError(f"cache field {field_id!r} is not planned") from None
 
     def field(self, field_id: str) -> torch.Tensor:
         """Return one planned field's view into the arena.
@@ -230,14 +244,21 @@ class CacheArena:
         Raises:
             ValueError: The plan does not name this field.
         """
-        try:
-            return self._fields[field_id]
-        except KeyError:
-            raise ValueError(f"cache field {field_id!r} is not planned") from None
+        if field_id not in self._fields:
+            pages = self.field_pages(field_id)
+            field = self.plan.field(field_id)
+            spec = self._cache_group_specs_by_id[field.group_id]
+            if (
+                field.shape[0] == self.plan.prefix_granularity
+                and spec.family != "state"
+            ):
+                pages = pages.view(-1, *field.shape[1:])
+            self._fields[field_id] = pages
+        return self._fields[field_id]
 
     def field_ids(self) -> frozenset[str]:
-        """Every field the plan names, all of them materialized."""
-        return frozenset(self._fields)
+        """Every field the plan names, independent of the requested view shape."""
+        return frozenset(self._field_pages)
 
     def field_block_byte_offset(self, field_id: str, block_id: int) -> int:
         return self.plan.field_page_byte_offset(field_id, block_id)
