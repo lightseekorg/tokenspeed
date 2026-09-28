@@ -843,7 +843,9 @@ def _index_scan_kernel(
     CS0,
     CS1,
     PAGES: tl.constexpr,
-    TABLE_WIDTH: tl.constexpr,
+    # The page-table width follows the batch; a compile-time value would
+    # recompile the scan for every new longest request.
+    TABLE_WIDTH,
     CANDIDATES: tl.constexpr,
     HEADS: tl.constexpr,
     SHARD_HEADS: tl.constexpr,

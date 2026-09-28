@@ -70,6 +70,7 @@ class TestQwen3OmniConfig(unittest.TestCase):
             mapping=None,
             language_model_only=False,
             disaggregation_mode="encode",
+            speculative_algorithm=None,
         )
         with (
             patch(

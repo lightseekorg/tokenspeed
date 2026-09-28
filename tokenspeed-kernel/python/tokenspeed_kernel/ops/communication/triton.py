@@ -424,7 +424,9 @@ def symm_mem_barrier(
 def _dp_sampling_swap_kernel(
     local_logits,
     recv_logits_ptrs_dev,
-    REQS_PER_RANK: tl.constexpr,
+    # The padded batch changes step to step; runtime so every bucket shares
+    # one binary.
+    REQS_PER_RANK,
     N: tl.constexpr,
     V_LOCAL: tl.constexpr,
     V: tl.constexpr,
@@ -478,7 +480,9 @@ def _dp_sampling_gather_kernel(
     recv_predict_ptrs_dev,
     recv_accept_idx_ptrs_dev,
     recv_accept_len_ptrs_dev,
-    REQS_PER_RANK: tl.constexpr,
+    # The padded batch changes step to step; runtime so every bucket shares
+    # one binary.
+    REQS_PER_RANK,
     N: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,

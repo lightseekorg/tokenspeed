@@ -21,6 +21,7 @@ def run_bash(command: str, env: dict[str, str]) -> subprocess.CompletedProcess[s
 
 def test_other_clusters_do_not_enable_package_cache(tmp_path: Path):
     env = os.environ.copy()
+    env.pop("RUNNER_NAME", None)
     env.update(
         {
             "CI_RUNNER_LABEL": "gb200-4gpu",
@@ -63,7 +64,8 @@ def test_slurm_uses_mounted_persistent_cache(tmp_path: Path):
     env = os.environ.copy()
     env.update(
         {
-            "CI_RUNNER_LABEL": "slurm-gb300-4gpu",
+            "CI_RUNNER_LABEL": "b200-4gpu",
+            "RUNNER_NAME": "slurm-123",
             "XDG_CACHE_HOME": str(tmp_path),
         }
     )
@@ -139,7 +141,7 @@ def test_nvcc_cache_normalizes_checkout_and_isolates_fork_writes(
             "100G",
             "002",
             read_only,
-            str(workspace / ".ci-artifacts" / "ccache-stats.log"),
+            str(workspace / ".ccache-tmp" / "ccache-stats.log"),
             "",
         ]
     )

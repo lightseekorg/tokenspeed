@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.numerics.comparison import compare_outputs, format_comparison
+from tokenspeed_kernel.numerics.gemm import tolerance as gemm_tolerance
 from tokenspeed_kernel.numerics.inputs import get_input_generator, shape_traits
 from tokenspeed_kernel.numerics.reference.gemm import (
     torch_bmm_fp8_blockscale,
@@ -75,6 +76,15 @@ class TestCompareOutputs:
 
         assert not result.passed
         assert result.num_mismatches == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, _fp8_dtype])
+def test_gemm_tolerance_stays_at_output_cast_floor(dtype: torch.dtype) -> None:
+    # Both emit bf16 against an exactly dequantized reference, so the output
+    # cast bounds the error at every K; a K-scaled FP8 tolerance would accept
+    # accumulation bugs on the K=7168 standard shapes.
+    for k in (64, 512, 7168):
+        assert gemm_tolerance(dtype, K=k) == Tolerance(atol=1.5e-2, rtol=1.5e-2)
 
 
 def test_gemm_input_generator_uses_signature_scale_metadata() -> None:

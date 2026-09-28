@@ -55,6 +55,7 @@ from tokenspeed.runtime.epd.encode_scheduler import EncodeScheduler
 from tokenspeed.runtime.epd.encode_worker import EncodeWorker
 from tokenspeed.runtime.utils import get_colorful_logger, get_zmq_socket
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.jit_compile_check import mark_jit_compile_serving
 
 logger = get_colorful_logger(__name__)
 
@@ -261,6 +262,7 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
             "multimodal_encoder_dtype": multimodal_encoder_dtype,
         }
     )
+    mark_jit_compile_serving()
 
     while True:
         # Rank 0 drains the gateway ZMQ without blocking; other ranks get the

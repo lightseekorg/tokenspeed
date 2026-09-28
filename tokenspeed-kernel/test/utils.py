@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import Any
 from unittest.mock import patch
 
@@ -72,21 +72,28 @@ def is_cdna5() -> bool:
 
 
 @contextmanager
-def assert_no_triton_compile(kernel: Any) -> Iterator[None]:
-    """Fail if the Triton ``kernel`` compiles a new specialization in the block.
+def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
+    """Fail if any Triton kernel compiles a new specialization in the block.
 
     Every ``tl.constexpr`` value is part of the compile-cache key, so a
     per-batch quantity passed as a constexpr recompiles the kernel on every new
-    shape. Warm the kernel before entering, covering each integer
+    shape. Warm the kernels before entering, covering each integer
     specialization class Triton still keys on for runtime scalars (divisible by
-    16 or not), then launch it with shapes that vary the way serving does.
+    16 or not), then launch them with shapes that vary the way serving does.
     """
-    with patch.object(kernel, "_do_compile", wraps=kernel._do_compile) as compiles:
+    with ExitStack() as stack:
+        compiles = [
+            stack.enter_context(
+                patch.object(kernel, "_do_compile", wraps=kernel._do_compile)
+            )
+            for kernel in kernels
+        ]
         yield
-    assert compiles.call_count == 0, (
-        f"{kernel.fn.__name__} compiled {compiles.call_count} new "
-        f"specialization(s); a per-batch value is likely passed as tl.constexpr"
-    )
+    for kernel, compile_calls in zip(kernels, compiles, strict=True):
+        assert compile_calls.call_count == 0, (
+            f"{kernel.fn.__name__} compiled {compile_calls.call_count} new "
+            "specialization(s); a per-batch value is likely passed as tl.constexpr"
+        )
 
 
 def make_mxfp4_moe_weights(
@@ -343,3 +350,35 @@ def register_all_samples(
         raise ValueError("sample registrations must target the active KernelRegistry")
     for options, impl in samples.values():
         register_kernel(**options)(impl)
+
+
+class FakeTimer:
+    """Benchmark timer that invokes the operation once and reports fixed samples."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.cold_cache: list[bool] = []
+        self.measurement_blocks: list[int] = []
+
+    def measure(self, prepared, *, cold_cache: bool, measurement_blocks: int):
+        # Imported lazily: conftest imports this module for every test.
+        from tokenspeed_kernel.benchmark.graph import GraphMeasurement
+
+        self.calls += 1
+        self.cold_cache.append(cold_cache)
+        self.measurement_blocks.append(measurement_blocks)
+        prepared.invoke()
+        return GraphMeasurement(
+            samples_us=(2.0, 3.0, 4.0),
+            median_us=3.0,
+            p90_us=3.8,
+            min_us=2.0,
+            max_us=4.0,
+            relative_mad=1.0 / 3.0,
+            eager_warmup_iterations=5,
+            replay_warmup_iterations=3,
+            warmup_time_ms=1.0,
+            capture_time_ms=2.0,
+            first_replay_time_ms=3.0,
+            measurement_time_ms=4.0,
+        )

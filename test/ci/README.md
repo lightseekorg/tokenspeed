@@ -18,6 +18,12 @@ Supported task types:
 - `eval`
 - `perf`
 
+Task types that start a server (`server_smoke`, `eval`, `perf`) run with
+`TOKENSPEED_JIT_COMPILE_CHECK=error` unless the task's `env` sets it: a
+compile-time kernel parameter that keeps taking new values after startup
+(a per-batch `tl.constexpr`) fails the run. The server log names the kernel,
+the parameter, and the launching call site.
+
 Currently configured task directories:
 
 - `eval`
