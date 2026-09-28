@@ -927,7 +927,10 @@ def gluon_kda_paged_prefill_gfx1250(
 
     v_rows = gl.arange(0, BT, layout=gl.SliceLayout(1, load_v_layout))
     v_cols = gl.arange(0, V, layout=gl.SliceLayout(0, load_v_layout))
-    v_offsets = ((token0 + v_rows[:, None]) * H * V + v_cols[None, :]).to(gl.int32)
+    # Buffer loads still form an address on masked-off lanes. A partial last
+    # chunk of the last sequence would otherwise walk off vnew.
+    v_token = gl.minimum(token0 + v_rows[:, None], length - 1)
+    v_offsets = (v_token * H * V + v_cols[None, :]).to(gl.int32)
     v_mask = (token0 + v_rows[:, None] < length) & (v_cols[None, :] < V)
     v_value = cdna5.buffer_load(
         vnew + value_base,
@@ -941,9 +944,8 @@ def gluon_kda_paged_prefill_gfx1250(
 
     out_rows = gl.arange(0, BT, layout=gl.SliceLayout(1, tail_layout))
     out_cols = gl.arange(0, V, layout=gl.SliceLayout(0, tail_layout))
-    out_offsets = ((token0 + out_rows[:, None]) * H * V + out_cols[None, :]).to(
-        gl.int32
-    )
+    out_token = gl.minimum(token0 + out_rows[:, None], length - 1)
+    out_offsets = (out_token * H * V + out_cols[None, :]).to(gl.int32)
     out_mask = (token0 + out_rows[:, None] < length) & (out_cols[None, :] < V)
     inter = cdna5.buffer_load(
         output + value_base,
