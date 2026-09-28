@@ -70,19 +70,23 @@ never by call site:
   stranded.
 - *Sliding-window* groups recycle slid-out pages, so they hold the decode
   slot, raised on a decoding role's first chunk, while another request holds
-  pages, only to the growth recycling cannot fund
-  (`PrefillReserve::swa_unrecycled_growth_tokens`), capped by the window's
+  pages, only to the growth recycling cannot fund, capped by the window's
   lookback (`window - 1` tokens) and the prompt headroom. That growth is the
   larger of two terms: a prefix hit (a shared page frees nothing when it
   slides out), and the rest of the prompt when a local chunk leaves some
   behind (the next chunk reads this one's lookback before any of it can slide
-  out). A remote landing has no later local chunk, so it prepays only the hit.
-  With no other request holding pages the raise is 0 and the group holds only
-  the decode slot: hit pages are then held by the prefix index alone and
-  recycle like the request's own, and the single-request bound (§1.4) counts
-  no prepay, so a prepay could leave a request the bound accepts inadmissible
-  on its own. Growth left unfunded by pages taken after the admission is left
-  to the victim policy's last resort (§2).
+  out). The hit term is 0 in a replayable group, whose pages over the hit are
+  private (§1.3), and once the prompt's own tokens after the hit reach
+  `window - 1 + block_granularity`: every hit page then slides out before the
+  first decode. A remote landing has no later local chunk, so it prepays only
+  the hit. Any other page holder raises the reserve, not only one sharing the
+  hit: the prepay deliberately covers hit pages that may become shared after
+  the admission. With no other request holding pages the raise is 0 and the
+  group holds only the decode slot: hit pages are then held by the prefix
+  index alone and recycle like the request's own, and the single-request bound
+  (§1.4) counts no prepay, so a prepay could leave a request the bound accepts
+  inadmissible on its own. Growth left unfunded by pages taken after the
+  admission is left to the victim policy's last resort (§2).
   Broadcasting the headroom to them once kept a 54K-token DeepSeek-V4 prompt
   waiting on a pool that had room for it.
 - *Snapshot-state* groups reserve at least one growth block on a decoding
