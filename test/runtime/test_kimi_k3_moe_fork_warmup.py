@@ -96,7 +96,6 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
     hidden = torch.zeros(2, 4)
 
     plan = SimpleNamespace(
-        symm_outputs=None,
         split_shared_rs=False,
         routed_in_fork=False,
         defer_finalize=False,

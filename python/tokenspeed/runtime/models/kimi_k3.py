@@ -2227,21 +2227,13 @@ class KimiLinearMoE(nn.Module):
         routing_output_format = self._routing_output_format(ctx)
         precompute_topk = routing_output_format.is_standard()
         plan = self.comm.plan(num_tokens)
-        # Integrated fusion consumes shared output directly from symmetric
-        # storage; all other routes use ordinary producer outputs.
-        if plan.symm_outputs is not None:
-            routed_out_buf, shared_out_buf = plan.symm_outputs
-        else:
-            routed_out_buf = shared_out_buf = None
-        self.experts._situ_output_buffer = routed_out_buf
+        self.experts._situ_output_buffer = None
 
         # The router, routed latent and shared gate/up read the same activation
         # and reduce over the same width, so one GEMM replaces three. Returns
         # None when the packed weight is unavailable or the shapes are outside
         # the fused kernel, which leaves the separate projections below.
-        fused_inputs = self._latent_input_projections(
-            hidden_states, shared_out=shared_out_buf
-        )
+        fused_inputs = self._latent_input_projections(hidden_states, shared_out=None)
         if fused_inputs is not None:
             router_logits, routed_in, shared_partial = fused_inputs
         else:
@@ -2279,7 +2271,7 @@ class KimiLinearMoE(nn.Module):
                 if shared_partial is None:
                     shared_partial = self.shared_experts(
                         hidden_states,
-                        down_out=shared_out_buf,
+                        down_out=None,
                     )
                 if plan.split_shared_rs and fork._active:
                     prepared_shared_shard = self.comm.reduce_scatter_shared(

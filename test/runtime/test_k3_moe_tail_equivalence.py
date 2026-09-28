@@ -21,8 +21,8 @@
 """Compare the retained small fused tail and separate-reduce path.
 
 The selector routes small graph forwards to the fused tail and other
-non-integrated forwards to separate reduction. These tests compare both paths
-on identical inputs; integrated medium/large kernels have their own tests under
+non-deferred forwards to separate reduction. These tests compare both paths
+on identical inputs; deferred medium/large kernels have their own tests under
 tokenspeed-kernel/test/nvidia/thirdparty/.
 
 The tiers are driven through ``K3MoeTailComm``'s own ``_tail_*`` methods, on an
@@ -150,7 +150,7 @@ def _build_comm(device: torch.device, *, latent_tail=None):
     # Negotiated state stand-in.
     comm.state = SimpleNamespace(
         rms_eps=EPS,
-        integrated_tail=False,
+        deferred_tail=False,
         latent_tail_ok=latent_tail is not None,
     )
     comm.latent_tail = latent_tail
@@ -363,7 +363,7 @@ def test_profit_cap_stops_the_fused_tail_below_its_capacity(monkeypatch):
         split_collective_min_tokens=9,
     )
     comm.execution_plan = SimpleNamespace(fused_moe_ar=True)
-    comm.state = SimpleNamespace(integrated_tail=False)
+    comm.state = SimpleNamespace(deferred_tail=False)
     comm._shard_up_projection = False
     # __init__ is bypassed here; the probe declines on CPU, so no symmetric
     # heap is reached.
@@ -398,7 +398,7 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
             split_collective_min_tokens=9,
         )
         comm.execution_plan = SimpleNamespace(fused_moe_ar=fused_ar)
-        comm.state = SimpleNamespace(integrated_tail=False)
+        comm.state = SimpleNamespace(deferred_tail=False)
         comm._shard_up_projection = False
         # __init__ is bypassed here; the probe declines on CPU, so no
         # symmetric heap is reached.
@@ -410,7 +410,7 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
     assert plan.tier is mod.K3MoETailTier.TAIL_FUSION
     assert plan.defer_finalize
     assert not plan.split_shared_rs
-    assert plan.symm_outputs is None and not plan.routed_in_fork
+    assert not plan.routed_in_fork
 
     # A tail op without the deferred variant must keep the materialized mode.
     plan = build(supports_deferred=False, fused_ar=True).plan(32)

@@ -1,206 +1,59 @@
-# Integrated K3 MoE tail design
+# K3 MoE tail
 
-The integrated path is selected automatically for NVIDIA SM100/SM103 with
-K3's TP8/EP1, attention DP1/CP1, H7168/latent3584/top16 layout, routed RMSNorm,
-sharded up-projection and a deferred-finalize-capable fused-AR expert backend.
-No environment switch enables or disables it. Intermediate first-stage-only
-and medium-only routes, discrete bucket policies and their serving adapters
-are removed. Only four routes remain: the small fused tail, integrated medium
-and large tails, and separate reduction. The former staged multimem-AR and
-fused-lane/join tail routes are removed. Old experimental environment variables
-are no longer read.
+The NVIDIA K3 TP8/EP1 path uses deferred expert finalize, all-reduce and
+RMSNorm for routed latents, followed by the standard sharded up-projection
+and shared all-reduce. Attention DP/CP configurations remain separate.
 
-The kernel configuration has a completed single-pair serving measurement,
-not replicated performance or full-model numerical qualification. Removing
-the opt-in does not constitute a new serving acceptance result. Comparisons
-use an unchanged main checkout, not a baseline mode inside this implementation.
+## Routing
 
-| Kernel M | First stage | Second stage |
+| Kernel M | Routed stage | Shared output and up-projection |
 | --- | --- | --- |
-| 0 | Existing empty forward | Existing empty forward |
-| 1..32 | Small fused tail in graph phase; separate otherwise | Same small/separate route |
-| 33..1024 | Deferred BT finalize/AR/RMSNorm | Fused RS/up/residual/AG |
-| 1025..8192 | Deferred HT finalize/AR/RMSNorm, ten stages | Fused RS/up/residual/AG |
-| Above 8192 | Existing separate path | Existing separate path |
+| 0 | No MoE work | Return the residual |
+| 1..32 in graph phase | Existing multicast latent tail, when available | Existing small-tail implementation |
+| 33..1024 | FlashInfer BT finalize/all-reduce/RMSNorm | Sharded projection and shared all-reduce |
+| 1025..8192 | Vendored HT finalize/all-reduce/RMSNorm | Sharded projection and shared all-reduce |
+| Other forwards | Existing separate reduction | Existing sharded or replicated projection path |
 
-The selector uses continuous intervals on actual kernel M; a graph dispatches
-on its padded M using the existing graph ladder. Eager and graph forwards use
-the same selector and live-pointer launcher, including speculative forwards.
-No optimized-range fallback is permitted after integrated initialization.
-Capability disagreement fails before collective allocation; missing in-range
-plans fail rather than switching to an AllReduce control. Required communication
-support, dependencies and PDL must be available once the layout is selected;
-failure is not an opt-out. Unsupported hardware/model/backend layouts use the
-small graph tail where available, otherwise separate reduction. Small eager
-forwards also use separate reduction. Its plan reduces, normalizes and projects
-the routed branch inside the existing stream-fork scope before completing the
-shared branch and residual. It does not consume unreduced routed partials as
-though they were already projected. Removing the old fast paths changes these
-fallbacks' performance and BF16 rounding; this cleanup has no new performance
-or numerical qualification for those configurations.
+BT/HT require the K3 H7168/latent3584/top-k16 layout, attention DP1/CP1,
+routed RMSNorm, sharded up-projection and deferred-finalize expert output.
+These are static model/backend requirements. Ranks agree on communication
+capabilities before allocating either routed workspace. A missing capability
+or in-range workspace fails explicitly. PDL remains required by BT/HT.
 
-Both comparison arms explicitly set `--prefill-graph-max-tokens 8192`. The
-original agentic benchmark does not mandate 2048: it omits the option and
-inherits a runtime default. This profile neither changes that default nor the
-benchmark client, workload, request counts, KVStore or speculative settings.
-The BT/HT and fused workspaces cover M through 8192 independently of the graph
-capture limit, including eager-only execution. A smaller or disabled capture
-ladder therefore does not disable the optimization; it only changes which
-forwards replay a graph. This does not enlarge the configured capture ladder.
+The token ranges use the actual kernel M, including CUDA-graph padding when
+enabled. The graph capture limit does not set the BT/HT workspace capacity.
+The small path retains its existing split-shared-RS behavior. Other layouts
+and token counts retain the separate-reduce path.
 
-## Tuning and memory
+## Second stage
 
-The inherited medium specialization changes host geometry only. M33..512 uses
-one-CTA 64x64; M513..1024 one-CTA 64x128. These retain
-automatic A/B/C stages. M1025..8192 uses two-CTA 256x128, AB6/C3/ACC2; the
-persistent cluster cap is 38 through 4096 and queried capacity above 4096.
-All use one addend stage, four independent reductions and static-persistent
-scheduling. Interpolation is a candidate policy, not a measured optimality claim.
+BT/HT produce replicated normalized BF16 routed latents `[M,3584]`. Each rank
+owns one `[896,3584]` up-projection weight shard and a full-width rank-local
+shared-expert partial `[M,7168]`.
 
-The M256 two-CTA short-screen result was less than one percent faster than
-one-CTA 64x64, without a repeated cluster-only comparison. That is insufficient
-evidence for a separate low-M two-CTA interval. The integrated profile therefore
-uses one CTA throughout M33..1024. This is a simplicity choice among close
-screened configurations, not proof of noise or a universal small-batch rule.
-Historical endpoint-only measurements refer to earlier revisions, not a retained
-serving entry point in this branch.
+The second stage uses the sharded sequence from main:
 
-One raw symmetric workspace and two 8192x7168 BF16 symmetric outputs are
-shared by sequential layers. Global layer-index parity selects the output;
-each layer still owns its weight-dependent launch cache. Both outputs together
-require 224 MiB, versus 10304 MiB for the original 92 per-layer outputs.
-This is a 10080 MiB allocation reduction. The pooled serving measurement
-reports 51.00 GiB KV per GPU versus 51.58 GiB for same-run main, compared with
-40.97 GiB in the historical per-layer candidate.
-The original two-batch campaign uses the old per-layer allocation and does not
-qualify this revised ownership policy.
+1. Add the residual to this rank's owning columns of the shared partial.
+2. Apply `addmm_` to those columns using the routed latent and local weight.
+3. All-reduce the full shared partial over the MoE TP/EP group.
 
-The removed staged AllReduce route no longer reserves its [8192,3584] and
-[8192,7168] BF16 buffers (168 MiB of tensor payload per rank). BT/HT and fused
-shared-RS retain their own allocations and multicast/fabric capability checks;
-they do not depend on those staging buffers. This is an allocation change, not
-a remeasured KV-capacity or serving-performance result. Generic communication
-primitives and the small-tail capability setup remain available.
+The projection shards occupy disjoint columns, so this all-reduce also
+assembles the full up-projected output and includes the residual once per
+column. Preserve the BF16 addition and `addmm_` boundaries of that sequence.
 
-The previous layer's output can remain the current residual, so one output
-would be unsafe. Two outputs keep it distinct from the current destination;
-the existing live-input alias checks remain enabled. AttnRes block writes copy
-into independent block storage, and EAGLE3/DFLASH taps clone or materialize their
-results before later layers overwrite a slot. The existing entry rank barrier
-orders all prior consumers before multicast reuse, and the exit barrier makes
-the result visible before its next consumers. Auxiliary consumer streams must
-join before reuse. No new copy or device barrier is introduced.
+Shared producers use ordinary output tensors. This stage has no fused
+shared-RS/GEMM kernels, dedicated symmetric output pool or per-layer compiled
+GEMM plans. The small multicast tail keeps its own existing resources.
 
-Allocate before KV sizing and retain both handles through every graph replay.
-All graph buckets use fixed parity addresses and execute sequentially; outputs
-are transient until the same slot is next written, not per-layer archives.
-Different concurrent model/graph instances require separate storage. Direct
-kernel tests may give the integrated adapter an independent output to test its
-live-pointer contract; there is no separate medium-only serving profile.
+## Implementation boundaries
 
-## Dataflow and arithmetic
+`python/tokenspeed/runtime/models/kimi_k3_comm.py` owns routing and workspace
+lifetimes. Runtime accesses third-party kernels through `tokenspeed-kernel`.
+The BT adapter imports FlashInfer; HT uses the vendored native-H3584 kernel
+until upstream support is released. Compatibility uses available APIs and
+hardware capabilities, without an exact FlashInfer version gate.
 
-```mermaid
-flowchart TD
-    E[Deferred expert output] --> B[BT or HT finalize / reduce / RMSNorm]
-    S[Shared down-projection: out= symmetric input] --> F
-    B --> F[Fused shared RS + up-projection + residual + AG]
-    R[Residual owner slice] --> F
-    F --> O[Direct multicast to final symmetric output]
-```
-
-The first half produces replicated normalized latent [M,3584]. The second
-half consumes rank-local up weight [896,3584], raw shared partial [M,7168]
-and replicated residual [M,7168]. Each rank produces its896-column owner
-slice and multicasts it into the replicated [M,7168] output.
-
-Grouped128-bit multimem reductions feed shared addend stages while persistent
-GEMM executes. The epilogue releases accumulators after their final read,
-before waiting for output-stage reuse, then uses TMA multicast directly into
-the final symmetric buffer. There is no shared staging copy, separate global
-RS result or mailbox/AG materializer. A legacy shard allocation remains layout
-metadata, not a produced intermediate. Overlap is inside the second stage;
-stall-free MMA and overlap between both tail stages are not claimed.
-
-Preserve these BF16 boundaries for each owned slice:
-
-```text
-shared = BF16(sum_ranks(raw_shared))
-acc    = FP32(latent @ weight.T)
-q      = BF16(acc + FP32(shared_owner))
-out    = BF16(FP32(q) + FP32(residual_owner))
-```
-
-Residual is included once after reduction. Main pre-adds residual to the shared
-owner before addmm and AllReduce #2, so bitwise equality to main is not promised.
-System-level publication/acquire/release, proxy-alias fences and cross-rank
-output completion remain. There is no rank barrier inside GEMM. Allocation,
-rank agreement, occupancy checks and compilation precede capture; replay uses
-live inputs without host collectives. The real shared producer writes the
-exact symmetric `out=` view. Target verification follows the same M dispatch:
-sixteen requests with four speculative tokens can use M64.
-
-## Validation boundary
-
-This performance campaign runs uninstrumented same-main comparisons directly;
-independent adapter/full-model smoke and dedicated non-tile-multiple GPU
-validation are deliberately omitted. Do not report those checks as passed.
-The original gold warmup and runtime/device-error checks remain enabled.
-Actual serving graph startup and replay are exercised by the benchmark, but
-uninstrumented timing does not prove a complete per-bucket route inventory.
-CPU interval tests verify routing only, not kernel memory safety or accuracy.
-Preserve execution failures, source/container/config identities and numeric
-results. Report local tail, all-turn gold TTFT and first-turn TTFT separately,
-including speculative acceptance and KV-capacity differences. Performance
-results alone do not establish numerical equivalence or model task quality.
-
-Only kernel unit/correctness tests and their helpers are retained in this
-branch; experiment drivers and result datasets are excluded. Tests cover BT/HT
-references and graph replay, fused launch configuration, live input pointers,
-guarded outputs and changed-input replay. The integrated correctness harness
-supports `--pooled-outputs` for four layers sharing two physical outputs.
-Its intermediate snapshots are correctness instrumentation, not serving copies.
-Distributed tests require TP8 and are not substitutes for model-quality checks.
-
-## Source map and attribution
-
-Runtime integration is in `python/tokenspeed/runtime/models/kimi_k3_comm.py`.
-Bindings live under `tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/`;
-fused device code is in `thirdparty/cute_dsl/symmetric_up_projection/` within
-that package. Runtime uses only the `tokenspeed-kernel` boundary.
-
-`ops/communication/fused_rs_workspace.py` owns the symmetric shared input,
-retained shard-layout metadata and allocation-time rank checks. Serving bindings
-and fused correctness tests share that workspace. The standalone CuTeDSL shared
-RS and Triton hidden-dimension RS kernels, their launch/staging APIs and the
-standalone RS tuning sweep are removed. Shared reduction remains inside the
-fused GEMM; its entry/exit barriers, proxy-alias fences, allocation sizes and
-M dispatch are unchanged. Existing generic Triton collectives remain available.
-
-The endpoint-only facade, fixed-M configuration, medium-only serving profile and
-separate cluster-cap binding are removed. The common serving base retains
-live-pointer validation and launch but cannot be instantiated; the integrated
-adapter supplies input views and compilation directly, without a legacy adapter.
-Integrated medium/large configurations and cluster caps still use the existing
-continuous-range binder, with unchanged fused device code and output pooling.
-BT/HT first-stage kernels remain dependencies of this integrated route, but the
-first-stage-only routes and their old AllReduce back half are removed. Their
-prefill-only graph-phase marker is removed too; the execution framework matches
-main again. Main's small and separate paths are retained; its multimem-AR and
-fused-lane/join tail methods, producer-lane field and staging allocations are
-removed. The fused kernels' multimem instructions, barriers and launch tuning
-are unchanged.
-The large-M correctness harness now checks that integrated adapter against the
-same-profile fixed-input binding and the unchanged independent addmm/AllReduce
-reference; M4096/M8192 remain test cases, not a dispatch whitelist.
-
-The native H3584 HT specialization vendors FlashInfer's
-`flashinfer/comm/mnnvl_cutedsl/kernel_ht/device_kernel.py` from v0.6.18,
-commit `69ff11fc4954396d98326656dc85debd2223f637`, under its original Apache-2.0
-license. Upstream file SHA256:
-`076c6621d5456affa6c7255c868260a90904a3e4c624d18779d15f35a54c44a6`.
-Original notices remain in source. The specialization uses ceiling-divided
-reduction vectors and predicated multimem loads/stores: H3584/TP8 has448 BF16x8
-packs and56 packs per shard. With two reduction warps, lanes56–63 issue no
-load/store. This avoids H4096 padding copies and RMSNorm rescaling while
-preserving the producer/consumer/RMSNorm geometry contract.
+The HT device source derives from FlashInfer v0.6.18, commit
+`69ff11fc4954396d98326656dc85debd2223f637`, under its original Apache-2.0
+license. Original notices remain in source. Its predicated loads/stores
+support the partial 56-pack TP8 reduction shard.
