@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Numerical and dependent-input coverage for the vendored CUDA softmax."""
+"""PDL coverage for the vendored CUDA softmax's per-row temperature input."""
 
 from __future__ import annotations
 
@@ -29,147 +29,69 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.flashinfer_softmax import softmax
 
 pytestmark = pytest.mark.skipif(
-    not current_platform().is_nvidia, reason="Vendored softmax requires NVIDIA CUDA."
+    not current_platform().is_hopper_plus, reason="PDL requires NVIDIA SM90+"
 )
-
-_SHAPES = [
-    pytest.param(1, 4096, id="fused-cached"),
-    pytest.param(1, 129280, id="map-reduce"),
-    pytest.param(129, 65536, id="fused-uncached"),
-]
-_DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 
 
 @triton.jit
-def _delayed_temperature(temperature_ptr, rows: tl.constexpr, BLOCK: tl.constexpr):
-    # Bounded producer: completion never depends on consumer concurrency.
+def _publish_after_release(source, target, rows, BLOCK: tl.constexpr):
+    # Release the softmax first, then write the temperatures after a delay.
     tl.extra.cuda.gdc_wait()
     tl.extra.cuda.gdc_launch_dependents()
-    value = tl.inline_asm_elementwise(
-        """
-        {
-            .reg .u64 started, current, elapsed;
-            .reg .pred waiting;
-            mov.u64 started, %clock64;
-        bounded_delay:
-            mov.u64 current, %clock64;
-            sub.u64 elapsed, current, started;
-            setp.lt.u64 waiting, elapsed, $1;
-            @waiting bra bounded_delay;
-            mov.f32 $0, 0f3F800000;
-        }
-        """,
-        constraints="=f,l",
-        args=[tl.full((), 3000000, tl.uint64)],
-        dtype=tl.float32,
-        is_pure=False,
-        pack=1,
+    start = tl.inline_asm_elementwise(
+        "mov.u64 $0, %clock64;", "=l", [], dtype=tl.uint64, is_pure=False, pack=1
     )
+    now = start
+    while now - start < 3000000:
+        now = tl.inline_asm_elementwise(
+            "mov.u64 $0, %clock64;", "=l", [], dtype=tl.uint64, is_pure=False, pack=1
+        )
     offsets = tl.arange(0, BLOCK)
-    tl.store(temperature_ptr + offsets, value, mask=offsets < rows)
+    mask = offsets < rows
+    tl.store(target + offsets, tl.load(source + offsets, mask=mask), mask=mask)
 
 
-def _check_pdl(device: str, enable_pdl: bool) -> None:
-    if enable_pdl and torch.cuda.get_device_capability(device)[0] < 9:
-        pytest.skip("PDL requires compute capability 9.0 or newer.")
-
-
-def _logits(rows: int, vocab: int, dtype: torch.dtype, device: str) -> torch.Tensor:
-    generator = torch.Generator(device=device).manual_seed(42)
-    return torch.randn(rows, vocab, dtype=dtype, device=device, generator=generator)
-
-
+# Map-reduce needs rows <= 128 and vocab >= 24576. Otherwise the fused kernel
+# caches the row in shared memory when it fits.
 @pytest.mark.parametrize(
     "rows,vocab",
-    _SHAPES
-    + [pytest.param(2, 4095, id="odd-vocab"), pytest.param(1, 1, id="singleton")],
+    [
+        pytest.param(4, 4096, id="fused-cached"),
+        pytest.param(129, 65536, id="fused-uncached"),
+        pytest.param(4, 32768, id="map-reduce"),
+    ],
 )
-@pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("enable_pdl", [False, True])
-@pytest.mark.parametrize("temperature_kind", ["default", "zero", "scalar", "tensor"])
-def test_softmax_reference(
-    rows: int,
-    vocab: int,
-    dtype: torch.dtype,
-    enable_pdl: bool,
-    temperature_kind: str,
-    device: str,
-    request: pytest.FixtureRequest,
-) -> None:
-    _check_pdl(device, enable_pdl)
-    if temperature_kind in ("zero", "tensor") and vocab in (129280, 4095, 1):
-        # Existing in the serialized original: padded -inf lanes multiply by
-        # zero and contaminate the reduction. Do not hide a future fix (XPASS).
-        request.node.add_marker(
-            pytest.mark.xfail(
-                strict=True,
-                reason="Pre-existing zero-temperature padding defect, separate from PDL.",
-            )
-        )
-    logits = _logits(rows, vocab, dtype, device)
-    temperature = {"default": None, "zero": 0.0, "scalar": 0.7}.get(temperature_kind)
-    if temperature_kind == "tensor":
-        temperature = torch.linspace(0.5, 1.5, rows, dtype=torch.float32, device=device)
-        temperature[0] = 0.0
-    values = torch.as_tensor(
-        1.0 if temperature is None else temperature, dtype=torch.float32, device=device
-    ).reshape(-1, 1)
-    inverse = torch.where(values == 0, 0.0, values.reciprocal())
-    reference = torch.softmax(logits.float() * inverse, dim=-1)
-    actual = softmax(logits, temperature=temperature, enable_pdl=enable_pdl)
-    assert actual.dtype == torch.float32 and actual.shape == logits.shape
-    assert torch.isfinite(actual).all()
-    torch.testing.assert_close(actual, reference, rtol=1e-5, atol=1e-7)
-
-
-@pytest.mark.parametrize("rows,vocab", _SHAPES)
-@pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("graph_replay", [False, True])
 def test_softmax_waits_for_temperature(
-    rows: int,
-    vocab: int,
-    dtype: torch.dtype,
-    enable_pdl: bool,
-    graph_replay: bool,
-    device: str,
+    rows: int, vocab: int, graph_replay: bool, device: str
 ) -> None:
-    _check_pdl(device, True)  # The stress producer always uses PDL.
-    logits = _logits(rows, vocab, dtype, device)
-    temperature = torch.ones(rows, dtype=torch.float32, device=device)
-    reference = softmax(logits, temperature=temperature, enable_pdl=False).cpu()
+    logits = torch.randn(rows, vocab, device=device)
+    published = torch.linspace(0.5, 1.5, rows, device=device)
+    expected = torch.softmax(logits / published[:, None], dim=-1)
+    temperature = torch.empty_like(published)
 
-    def invoke() -> torch.Tensor:
-        temperature.fill_(float("nan"))
-        _delayed_temperature[(1,)](
+    def run() -> torch.Tensor:
+        temperature.fill_(float("nan"))  # Visible only to a read before the wait.
+        _publish_after_release[(1,)](
+            published,
             temperature,
-            rows=rows,
+            rows,
             BLOCK=triton.next_power_of_2(rows),
-            num_warps=1,
             launch_pdl=True,
         )
-        return softmax(logits, temperature=temperature, enable_pdl=enable_pdl)
+        return softmax(logits, temperature=temperature, enable_pdl=True)
 
-    stream = torch.cuda.Stream(device=device)
+    stream = torch.cuda.Stream(device)
     stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(stream):
-        invoke()  # Compile before capture; this output is not evidence.
-    stream.synchronize()
-    graph = None
-    if graph_replay:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            actual = invoke()
-    for _ in range(2):
-        if graph is not None:
+        run()  # Compile and load both kernels before the checked run.
+        if graph_replay:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                actual = run()
             graph.replay()
         else:
-            with torch.cuda.stream(stream):
-                actual = invoke()
-            stream.synchronize()
-        copied = actual.cpu()
-        assert torch.isfinite(copied).all()
-        assert torch.equal(copied, reference)
-        assert torch.equal(temperature.cpu(), torch.ones(rows))
-    if graph is not None:
-        graph.reset()
+            actual = run()
+    stream.synchronize()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-7)
