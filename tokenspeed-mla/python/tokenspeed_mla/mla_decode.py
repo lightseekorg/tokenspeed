@@ -27,6 +27,7 @@ and exposes them via a PyTorch API compatible with FlashInfer's MLA backend.
 """
 
 import functools
+import os
 from typing import Callable, Optional, Tuple
 
 import cutlass
@@ -48,6 +49,9 @@ from tokenspeed_mla.utils import (
     torch_to_cutlass_dtype,
 )
 
+# FP8 split-KV partials as fp16 instead of fp32: faster reductions, opt in with =1
+_FP16_PARTIALS = os.environ.get("TOKENSPEED_MLA_FP16_PARTIALS", "0") == "1"
+
 
 def _get_reducer_d_tiles(
     batch_size: int,
@@ -56,7 +60,7 @@ def _get_reducer_d_tiles(
     num_sms: int,
     split_kv: int,
 ) -> int:
-    """Return 1/2/4 D512 bands for the real output rows and split count.
+    """Return 1 or 2 D512 bands for the real output rows and split count.
 
     Adapted from FlashInfer PR #4178: minimize waves per output band, keeping
     the smaller grid on ties. Full row grids avoid duplicating LSE reduction.
@@ -64,14 +68,14 @@ def _get_reducer_d_tiles(
     rows = batch_size * seq_len_q * num_heads
     if rows <= 0 or num_sms <= 0 or rows >= num_sms or split_kv <= 1:
         return 1
-    best = 1
-    best_waves = ceil_div(rows, num_sms)
-    for bands in (2, 4):
-        if bands <= split_kv:
-            waves = ceil_div(rows * bands, num_sms)
-            if waves * best < best_waves * bands:
-                best, best_waves = bands, waves
-    return best
+    # no 4 bands: that leaves one partial element per reducer thread, and those
+    # single-element loads cost more than the band saves
+    return 2 if ceil_div(rows * 2, num_sms) < 2 * ceil_div(rows, num_sms) else 1
+
+
+def _get_reducer_max_splits(split_kv: int) -> int:
+    """Smallest power of two (at least 4) covering the split count."""
+    return max(4, 1 << (split_kv - 1).bit_length())
 
 
 @functools.cache
@@ -204,6 +208,8 @@ def _get_compiled_mla_kernel(
     reducer_d_tiles: int = 1,
     reducer_max_splits: int = 256,
     pack_q: bool = False,
+    *,
+    partial_fp16: bool,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
@@ -259,6 +265,7 @@ def _get_compiled_mla_kernel(
         kernel_kwargs["cp_interleave_size"] = cp_interleave_size
         kernel_kwargs["reducer_d_tiles"] = reducer_d_tiles
         kernel_kwargs["reducer_max_splits"] = reducer_max_splits
+        kernel_kwargs["partial_fp16"] = partial_fp16
     kernel_obj = KernelClass(**kernel_kwargs)
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -625,16 +632,6 @@ def tokenspeed_mla_decode(
         min_split_kv,
     )
 
-    # Public FP8 auto-splitting is bounded by 64 (M64) or 32 (M128).
-    # Both values are in the compile cache key, including across batches.
-    reducer_max_splits = 256
-    if is_fp8:
-        reducer_max_splits = 64 if mma_m_tile == 64 else 32
-        if min_split_kv > reducer_max_splits:
-            reducer_max_splits = 64
-        if min_split_kv > 64:
-            reducer_max_splits = 256
-
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
     assert (
         workspace_buffer.dtype == torch.int8
@@ -706,7 +703,8 @@ def tokenspeed_mla_decode(
 
     is_var_split_kv = False
     block_split_kvs = None
-    skip_correction_threshold = 0.0
+    # FP8: keep the row max while it grows by <= 8 log2 units (P <= 256 < 448).
+    skip_correction_threshold = 8.0 if is_fp8 else 0.0
 
     # For fixed-length input, set is_persistent to True; otherwise, set to False.
     is_persistent = not is_var_seq
@@ -754,8 +752,11 @@ def tokenspeed_mla_decode(
             if is_fp8
             else 1
         ),
-        reducer_max_splits=reducer_max_splits,
+        # reducer capacity: the power of two covering split_kv, which already
+        # includes min_split_kv (part of the compile cache key)
+        reducer_max_splits=_get_reducer_max_splits(split_kv) if is_fp8 else 256,
         pack_q=pack_q,
+        partial_fp16=_FP16_PARTIALS,
     )
 
     # DCP: allocate real LSE tensor when return_lse=True (DCP path). torch.zeros
