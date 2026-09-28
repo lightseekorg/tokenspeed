@@ -18,7 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import importlib.machinery
+import importlib.util
 import logging
+import os
 
 import pytest
 import torch
@@ -156,6 +159,18 @@ def test_error_mode_raises():
 def test_rejects_unknown_mode():
     with pytest.raises(ValueError, match="on_unbounded"):
         CompileMonitor("loud", 8)
+
+
+def test_call_sites_skip_the_amd_kernel_package(monkeypatch, tmp_path):
+    amd_dir = str(tmp_path / "tokenspeed_kernel_amd")
+    spec = importlib.machinery.ModuleSpec("tokenspeed_kernel_amd", None)
+    spec.submodule_search_locations = [amd_dir]
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name: spec if name == "tokenspeed_kernel_amd" else None,
+    )
+    assert amd_dir + os.sep in compile_monitor._internal_dirs()
 
 
 @triton.jit

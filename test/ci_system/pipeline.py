@@ -1816,7 +1816,11 @@ def execute_task(
     env.update(get_default_runner_env(runner))
     env.update(get_runner_specific_env(task, declared_runner))
     if task["type"] in SERVING_TASK_TYPES:
-        env.setdefault(JIT_COMPILE_CHECK_ENV, "error")
+        # Only the task itself may relax the check; a value inherited from
+        # the runner's environment must not.
+        env[JIT_COMPILE_CHECK_ENV] = str(
+            task.get("env", {}).get(JIT_COMPILE_CHECK_ENV, "error")
+        )
 
     jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
     env.update(jit_cache_env)

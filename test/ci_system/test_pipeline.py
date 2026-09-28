@@ -715,19 +715,25 @@ def test_slurm_runner_override_keeps_task_env_and_uses_gb300_hardware(
 
 
 @pytest.mark.parametrize(
-    ("task_type", "task_env", "expected"),
+    ("task_type", "inherited", "task_env", "expected"),
     [
-        ("eval", {}, "error"),
-        ("perf", {}, "error"),
-        ("server_smoke", {}, "error"),
-        ("eval", {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
-        ("ut", {}, None),
+        ("eval", None, {}, "error"),
+        ("perf", None, {}, "error"),
+        ("server_smoke", None, {}, "error"),
+        ("eval", None, {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("eval", "off", {}, "error"),
+        ("perf", "off", {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("ut", None, {}, None),
+        ("ut", "warn", {}, "warn"),
     ],
 )
 def test_serving_tasks_arm_the_jit_compile_check(
-    monkeypatch, tmp_path, task_type, task_env, expected
+    monkeypatch, tmp_path, task_type, inherited, task_env, expected
 ):
-    monkeypatch.delenv("TOKENSPEED_JIT_COMPILE_CHECK", raising=False)
+    if inherited is None:
+        monkeypatch.delenv("TOKENSPEED_JIT_COMPILE_CHECK", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_JIT_COMPILE_CHECK", inherited)
     task = {
         "name": "jit-check",
         "type": task_type,

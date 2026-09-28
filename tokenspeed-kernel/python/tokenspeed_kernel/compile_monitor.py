@@ -41,6 +41,7 @@ and it is log-bounded.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import sys
@@ -278,12 +279,22 @@ def _specialization(fn: Any, compile_info: dict[str, Any]) -> tuple[
     return rendered, constexprs
 
 
+def _internal_dirs() -> tuple[str, ...]:
+    dirs = [
+        os.path.dirname(module.__file__) + os.sep
+        for module in (triton, torch, sys.modules[__package__])
+    ]
+    # AMD Gluon kernels launch from tokenspeed_kernel_amd; locate it without
+    # importing it on other platforms.
+    amd = importlib.util.find_spec("tokenspeed_kernel_amd")
+    if amd is not None and amd.submodule_search_locations:
+        dirs.extend(path + os.sep for path in amd.submodule_search_locations)
+    return tuple(dirs)
+
+
 # Frames under these directories are the JIT and the kernel wrappers; the
 # call site worth naming is the first frame outside them.
-_INTERNAL_DIRS = tuple(
-    os.path.dirname(module.__file__) + os.sep
-    for module in (triton, torch, sys.modules[__package__])
-)
+_INTERNAL_DIRS = _internal_dirs()
 
 
 def _call_site() -> str:
