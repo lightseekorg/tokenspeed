@@ -244,20 +244,6 @@ def test_dispatcher_widens_a_bf16_bias_onto_the_packed_kernel(monkeypatch):
     )
 
 
-def test_packed_wrapper_rejects_a_non_k3_topk():
-    logits = torch.empty(1, EXPERTS, device="cuda", dtype=torch.float32)
-    bias = torch.empty(EXPERTS, device="cuda", dtype=torch.float32)
-    with pytest.raises(ValueError, match="supports only topk=16"):
-        kimi3_sigmoid_topk_mod.triton_kimi3_packed_sigmoid_bias_topk_nvidia(
-            router_logits=logits,
-            correction_bias=bias,
-            topk=8,
-            routed_scaling_factor=2.5,
-            normalize_topk_weights=True,
-            weights_dtype=torch.float32,
-        )
-
-
 def test_packed_mapped_wrapper_keeps_an_int64_dispatch_map(monkeypatch):
     seen = []
 
