@@ -178,9 +178,10 @@ TEST_F(ChunkedPrefillSuite, FirstChunkPrepaysPromptHeadroomOnlyInFullHistoryGrou
     // 16 tokens in 4-token chunks with a declared budget of 6: the first
     // chunk prepays the 12 unscheduled prompt tokens plus 6 tokens of decode
     // headroom. The full-history group holds all of it (4 + 18 tokens -> 11
-    // pages); the sliding-window group recycles slid-out pages and holds only
-    // the chunk itself. An intermediate chunk banks no tail and no decode
-    // slot, so it reserves nothing there.
+    // pages); the sliding-window group recycles slid-out pages and, with no
+    // other request holding pages, holds only the chunk itself. An
+    // intermediate chunk banks no tail and no decode slot, so it reserves
+    // nothing there.
     RequestSpec request = MakeRequestSpec("r1", /*num_pages=*/8);
     request.max_new_tokens = 6;
     Submit(request);

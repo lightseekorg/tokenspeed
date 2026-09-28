@@ -106,6 +106,37 @@ TEST(ReservePrefillDemandsTest, EachRetentionHoldsItsOwnShareOfTheRound) {
     EXPECT_EQ(demands[2].reserve_tokens, 4) << "max(block_granularity, decode)";
 }
 
+TEST(ReservePrefillDemandsTest, SlidingWindowPrepaysUnrecycledGrowthUpToItsLookback) {
+    // Window 8: a token reads a 7-token lookback, the most growth recycling
+    // can fall behind by.
+    const std::vector<CacheGroupConfig> groups = {
+        Group("swa", CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History),
+    };
+    const struct {
+        const char* name;
+        bool completes_prefill;
+        std::int32_t prompt_headroom_tokens;
+        std::int32_t swa_unrecycled_growth_tokens;
+        std::int32_t expected;
+    } cases[] = {
+        {"nothing unrecycled", false, 30, 0, 0},         {"below the lookback", false, 30, 5, 5},
+        {"capped by the lookback", false, 30, 20, 7},    {"capped by the prompt headroom", false, 4, 20, 4},
+        {"never below the decode slot", true, 30, 1, 2},
+    };
+    std::vector<BlockTable> tables(1);
+    for (const auto& c : cases) {
+        SCOPED_TRACE(c.name);
+        std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{6}});
+        ReservePrefillDemands(demands, groups,
+                              PrefillReserve{.decode_input_tokens = 2,
+                                             .completes_prefill = c.completes_prefill,
+                                             .prompt_headroom_tokens = c.prompt_headroom_tokens,
+                                             .reserve_snapshot_state_growth = false,
+                                             .swa_unrecycled_growth_tokens = c.swa_unrecycled_growth_tokens});
+        EXPECT_EQ(demands[0].reserve_tokens, c.expected);
+    }
+}
+
 TEST(MakeSnapshotStatePrefillSparseTest, MaterializesOnlyTheStateGroupsFromTheLastCheckpoint) {
     const std::vector<CacheGroupConfig> groups = {
         Group("full", CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),

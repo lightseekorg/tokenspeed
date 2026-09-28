@@ -57,6 +57,14 @@ struct PrefillReserve {
     // Whether this admission finishes shaping the snapshot-state groups: the
     // chunk that completes the prompt, or a remote landing.
     bool reserve_snapshot_state_growth{false};
+    // Sliding-window growth a first-chunk admission prepays while another
+    // request holds pages, because recycling cannot fund it: the larger of the
+    // prefix hit (a shared page frees nothing when it slides out) and the
+    // prompt left for later local chunks (the next chunk still reads this
+    // one's lookback, so none of it can slide out first). Capped by the
+    // window's lookback and the prompt headroom; 0 on later chunks and while
+    // no other request holds pages.
+    std::int32_t swa_unrecycled_growth_tokens{0};
 
     // The decode slot when the chunk completes the prompt, else 0.
     std::int32_t DecodeTokens() const { return completes_prefill ? decode_input_tokens : 0; }
@@ -71,9 +79,11 @@ std::int64_t SnapshotStateReserveTokens(std::int64_t block_granularity, std::int
 // Sets every group's reserve_tokens from the round's PrefillReserve, by
 // retention: full-history groups hold every token the round is accountable
 // for, including the prepaid prompt headroom; sliding-window groups recycle
-// slid-out pages and hold only the decode slot; snapshot-state groups bank
-// one growth block (SnapshotStateReserveTokens) on the admission that
-// finishes shaping them and 0 otherwise.
+// slid-out pages and hold the decode slot, raised on a first chunk to the
+// growth recycling cannot fund (swa_unrecycled_growth_tokens, capped by the
+// window's lookback and the prompt headroom); snapshot-state groups bank one
+// growth block (SnapshotStateReserveTokens) on the admission that finishes
+// shaping them and 0 otherwise.
 void ReservePrefillDemands(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
                            const PrefillReserve& reserve);
 

@@ -51,7 +51,12 @@ std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillRese
             SnapshotStateReserveTokens(group.block_granularity, reserve.decode_input_tokens));
     }
     if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
-        return reserve.DecodeTokens();
+        // Growth recycles the request's own pages as they slide out; growth
+        // recycling cannot fund (swa_unrecycled_growth_tokens) is prepaid, at
+        // most the lookback a token still reads (window - 1).
+        const std::int32_t lookback = std::max(group.sliding_window_tokens.value_or(0) - 1, 0);
+        const std::int32_t unrecycled = std::min(reserve.swa_unrecycled_growth_tokens, lookback);
+        return std::max(reserve.DecodeTokens(), std::min(reserve.prompt_headroom_tokens, unrecycled));
     }
     return std::max(reserve.DecodeTokens(), reserve.prompt_headroom_tokens);
 }
