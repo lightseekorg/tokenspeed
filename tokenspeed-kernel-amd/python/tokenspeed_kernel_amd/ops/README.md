@@ -380,6 +380,58 @@ FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
 asm statements keep LLVM from moving each cluster's results across cluster
 barriers.
 
+### gfx950 MLA extend
+
+`gluon_mla_extend_gfx950` computes absorbed MLA attention for cached extend
+(chunked prefill over a prefix cache) directly on the paged latent cache.
+`gluon_mla_extend_bf16_gfx950` registers the same launcher for a BF16 cache.
+
+#### Contract
+
+- Queries are `(total_q, heads, 576)`, already projected into the 512-dim
+  latent space plus 64 RoPE dimensions; the cache is
+  `(pages, 64, 1, 576)` and already holds the new tokens. Values are the first
+  512 dimensions of the cache rows, and the output is BF16
+  `(total_q, heads, 512)`.
+- Supported `(q, cache)` dtypes are `(FP8 E4M3, FP8 E4M3)`,
+  `(BF16, FP8 E4M3)` (the query is cast to FP8 on load) and `(BF16, BF16)`.
+- Attention is causal: query `i` of a request sees keys up to
+  `cache_len - q_len + i`. `logit_cap` and LSE output are unsupported.
+- Registration limits `max_seqlen_q` to 256 for an FP8 cache and 16 for BF16.
+  Absorbed attention spends 512 + 576 MACs per (query, key) pair and head
+  against 192 + 128 for prefix replay, which also expands every prefix token
+  once; these bounds are where the kernel's throughput stops paying for the
+  extra MACs.
+- The grid is ragged over `cu_seqlens_q` and the KV split count depends only
+  on `max_seqlen_k` and the grid size, so batch composition and lengths are
+  runtime values and reuse the warmed binaries.
+
+#### Algorithm
+
+Each program packs `128 / head_group` query positions of `head_group` heads
+into 128 MFMA rows (12 heads x 10 positions for Kimi K3 at TP8), so a KV tile
+read from LDS serves every packed head. Four wave64s each own 32 rows and the
+full 32x512 FP32 accumulator; each LDS operand read then feeds twice the MFMAs
+of a 16-row wave, which keeps the MFMA pipe, not LDS, the limiter. FP8 uses
+the K=64 unscaled FP8 MFMA with 64-key tiles (one page); BF16 uses 32-key
+tiles.
+
+KV tiles stream into a four-stage LDS ring with direct-to-LDS buffer loads.
+FP8 swizzles the load's source columns (16-byte groups XOR the row) so the
+linear LDS writes land conflict-free for both the row-major K reads and the
+transposed V reads (`ds_read_b64_tr_b8`). The loop is software-pipelined one
+tile deep: the next tile's Q @ K^T chain runs with the current tile's softmax
+interleaved into its MFMA shadows (two `v_exp` per MFMA via group barriers),
+then P @ V over four 128-wide chunks, with the copy of the tile three ahead
+interleaved into the first chunk's MFMAs. The running maximum only moves when
+a tile raises it by more than 8 (base 2), keeping P at most 256 for its FP8
+conversion. When the grid leaves CUs idle, the KV stream is split and a small
+kernel, `gluon_mla_extend_reduce_gfx950`, merges the partials by LSE. Splits
+fill at most one wave of CTAs (a second wave costs more than the extra
+parallelism buys) and stream at least four pages each, since every split pays
+a fixed prologue and a 2 KiB-per-row FP32 partial store. The reduce loads 16
+splits per step, so it runs at close to HBM bandwidth on the partials.
+
 ### gfx1250 MLA prefill
 
 `gluon_mla_prefill_gfx1250` computes the same dense, non-absorbed attention

@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""AMD instruction-scheduling barrier and its external-library dependency."""
+"""AMD scheduling and wave-level intrinsics from an external LLVM library."""
 
 import hashlib
 from functools import lru_cache
@@ -30,6 +30,7 @@ from tokenspeed_kernel_amd._triton import tl
 
 _SCHED_LIBRARY_NAME = "tokenspeed_sched"
 _SCHED_SYMBOL = "__tokenspeed_sched_barrier0"
+_READFIRSTLANE_SYMBOL = "__tokenspeed_readfirstlane_i32"
 _SCHED_LIBRARY_PATH = str(Path(__file__).with_name("sched_barrier.ll"))
 
 
@@ -66,6 +67,48 @@ def sched_barrier(_semantic):
         _SCHED_LIBRARY_PATH,
         [],
         {(): (_SCHED_SYMBOL, tl.int32)},
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def wave_uniform_i32(value, _semantic):
+    """Return lane 0's int32 ``value``, marking it wave-uniform (in an SGPR).
+
+    Emits ``llvm.amdgcn.readfirstlane``. Unlike an inline-asm
+    ``v_readfirstlane_b32``, the backend sees the instruction and inserts the
+    wait states needed after a VALU write of its source; the inline-asm form
+    can read a stale VGPR on gfx950. Launch with
+    :func:`sched_barrier_compile_options`.
+    """
+    return tl.core.extern_elementwise(
+        _SCHED_LIBRARY_NAME,
+        _SCHED_LIBRARY_PATH,
+        [value],
+        {(tl.int32,): (_READFIRSTLANE_SYMBOL, tl.int32)},
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def sched_group_barrier(mask, size, _semantic):
+    """Emit ``llvm.amdgcn.sched.group.barrier(mask, size, 0)``.
+
+    ``mask`` selects the instruction class (e.g. 0x8 MFMA, 0x10 VMEM, 0x400
+    TRANS) and ``size`` how many instructions of it the group takes. A sequence
+    of these after a region's instructions pins their interleave. Direct-to-LDS
+    ``buffer_load ... lds`` matches 0x10 but not 0x20 (VMEM read). Only the
+    (mask, size) pairs defined in ``sched_barrier.ll`` exist.
+    """
+    mask = tl.core._unwrap_if_constexpr(mask)
+    size = tl.core._unwrap_if_constexpr(size)
+    return tl.core.extern_elementwise(
+        _SCHED_LIBRARY_NAME,
+        _SCHED_LIBRARY_PATH,
+        [],
+        {(): (f"__tokenspeed_sgb_{mask}_{size}", tl.int32)},
         is_pure=False,
         _semantic=_semantic,
     )
