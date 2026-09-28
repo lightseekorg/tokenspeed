@@ -131,3 +131,35 @@ def test_mxfp8_gemm_row_count():
         for rows in (256, 1280, 1792):
             # Rows are independent: a shorter batch is a prefix.
             torch.testing.assert_close(run(rows), full[:rows], rtol=0, atol=0)
+
+
+def test_mxfp4_precomputed_route_row_count():
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import routing
+
+    experts, topk = 256, 8
+
+    def run(tokens):
+        ids = torch.stack(
+            [
+                (torch.arange(topk, dtype=torch.int32, device=DEVICE) * 3 + row * 7)
+                % experts
+                for row in range(tokens)
+            ]
+        )
+        weights = torch.randn(tokens, topk, device=DEVICE)
+        metadata, gather, scatter, gate = routing.gluon_precomputed_topk_fused_route(
+            weights, ids, experts
+        )
+        sizes = torch.bincount(ids.flatten(), minlength=experts).to(torch.int32)
+        assert torch.equal(metadata.slice_sizes, sizes)
+        assert torch.equal(metadata.slice_offs[1:], sizes.cumsum(0).to(torch.int32))
+        assert torch.equal(gate, weights.flatten()[scatter.long()])
+        assert torch.equal(gather, scatter // topk)
+
+    # 5 to 8 tokens share the power-of-two route tiles; the block counts
+    # alternate between the two integer classes.
+    run(5)
+    run(6)
+    with assert_no_triton_compile(routing._fused_precomputed_topk_route_small_m):
+        for tokens in (7, 8):
+            run(tokens)
