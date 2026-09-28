@@ -150,6 +150,7 @@ class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     gather_ids: torch.Tensor | None = None
+    logits_rows_selected: bool = False
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -183,6 +184,7 @@ class LogitsMetadata:
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
+            logits_rows_selected=ctx.logits_rows_selected,
         )
 
 
@@ -498,13 +500,34 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         aux_hidden_states: torch.Tensor | None = None,
     ) -> LogitsProcessorOutput:
+        # A model may finish a cache-only chunk without any logits rows.
+        # Return before LM-head/collective kernels, retaining the empty taps.
+        if logits_metadata.logits_rows_selected and hidden_states.shape[0] == 0:
+            if logits_metadata.extend_return_logprob:
+                raise ValueError("selected logits rows cannot provide input logprobs")
+            capture = None
+            if logits_metadata.capture_hidden_mode.need_capture():
+                capture = (
+                    torch.cat(aux_hidden_states, dim=-1)
+                    if aux_hidden_states
+                    else hidden_states
+                )
+            return LogitsProcessorOutput(
+                next_token_logits=hidden_states.new_empty(
+                    (0, self.config.vocab_size), dtype=torch.float32
+                ),
+                hidden_states=capture,
+            )
         # Get the last hidden states and last logits for the next token prediction
         if not logits_metadata.extend_return_logprob:
             gather_ids = logits_metadata.gather_ids
             if gather_ids is not None:
                 # Shapes align iff midlayer already pruned to one row per request
                 # (draft first-step reduce). Other paths emit [N, H] with N > bs.
-                if gather_ids.shape[0] == hidden_states.shape[0]:
+                if (
+                    logits_metadata.logits_rows_selected
+                    or gather_ids.shape[0] == hidden_states.shape[0]
+                ):
                     pruned_states = hidden_states
                     if aux_hidden_states is not None:
                         aux_pruned_states = list(aux_hidden_states)

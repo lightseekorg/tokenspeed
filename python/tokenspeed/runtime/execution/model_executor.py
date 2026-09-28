@@ -57,6 +57,7 @@ from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph, dummy_batch_size
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
@@ -1043,10 +1044,11 @@ class ModelExecutor:
         pinned by test_decode_verify_n1_equivalence.py)."""
         num_extends = ctx.num_extends
         num_decodes = ctx.bs - num_extends
+        layout = ctx.output_layout
+        num_prefills = num_extends if layout is None else layout.num_prefill_outputs
 
-        if num_decodes == 0:
+        if num_decodes == 0 and num_prefills == num_extends:
             return self.sampling_backend.sample(logits_output, sampling_info)
-
         if num_extends == 0:
             output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output, sampling_info, candidates
@@ -1057,37 +1059,70 @@ class ModelExecutor:
             return output_tokens, accept_lengths
 
         logits = logits_output.next_token_logits
-        prefill_out = LogitsProcessorOutput(next_token_logits=logits[:num_extends])
-        prefill_tokens, prefill_accept = self.sampling_backend.sample(
-            prefill_out, sampling_info[:num_extends]
-        )
-        # sample() lands its outputs (tokens, accept lengths and, with output
-        # logprobs on, the selected logprobs) in the backend's packed output
-        # region — the same buffer prefix verify() writes next, so snapshot
-        # the prefill rows before verifying. Mixed rounds are eager-only, so
-        # the allocation never lands inside a captured graph.
-        prefill_tokens = prefill_tokens.clone()
-        prefill_accept = prefill_accept.clone()
-        if prefill_out.next_token_logprobs is not None:
-            prefill_out.next_token_logprobs = prefill_out.next_token_logprobs.clone()
-        decode_out = LogitsProcessorOutput(next_token_logits=logits[num_extends:])
-        decode_tokens, decode_accept = self.sampling_backend.verify(
-            decode_out, sampling_info[num_extends:], candidates
-        )
-        decode_accept = self._apply_force_single_token_verify(
-            decode_accept, num_extends, num_decodes, ctx.decode_input_ids
-        )
-        if (
-            prefill_out.next_token_logprobs is not None
-            and decode_out.next_token_logprobs is not None
-        ):
-            logits_output.next_token_logprobs = torch.cat(
-                [prefill_out.next_token_logprobs, decode_out.next_token_logprobs]
+        token_parts, length_parts, logprob_parts = [], [], []
+
+        def request_info(begin, end, *, prefill):
+            info = sampling_info[begin:end]
+            if layout is not None and sampling_info.vocab_mask is not None:
+                # Parameters/coins are request-indexed; grammar masks can
+                # carry one row for every position in the verify window.
+                mask = sampling_info.vocab_mask
+                width = mask.shape[0] // ctx.bs
+                selected = mask[begin * width : end * width]
+                info.vocab_mask = (
+                    selected[::width].contiguous() if prefill else selected
+                )
+            return info
+
+        if num_prefills:
+            prefill_out = LogitsProcessorOutput(next_token_logits=logits[:num_prefills])
+            tokens, lengths = self.sampling_backend.sample(
+                prefill_out, request_info(0, num_prefills, prefill=True)
             )
-        return (
-            torch.cat([prefill_tokens, decode_tokens]),
-            torch.cat([prefill_accept, decode_accept]),
+            # verify writes the same backend buffers; snapshot the prefix.
+            token_parts.append(tokens.clone() if num_decodes else tokens)
+            length_parts.append(lengths.clone() if num_decodes else lengths)
+            if prefill_out.next_token_logprobs is not None:
+                logprob_parts.append(
+                    prefill_out.next_token_logprobs.clone()
+                    if num_decodes
+                    else prefill_out.next_token_logprobs
+                )
+        if num_prefills < num_extends:
+            length_parts.append(
+                torch.zeros(
+                    num_extends - num_prefills, dtype=torch.int32, device=logits.device
+                )
+            )
+        if num_decodes:
+            decode_out = LogitsProcessorOutput(next_token_logits=logits[num_prefills:])
+            tokens, lengths = self.sampling_backend.verify(
+                decode_out, request_info(num_extends, ctx.bs, prefill=False), candidates
+            )
+            lengths = self._apply_force_single_token_verify(
+                lengths, num_extends, num_decodes, ctx.decode_input_ids
+            )
+            token_parts.append(tokens)
+            length_parts.append(lengths)
+            if decode_out.next_token_logprobs is not None:
+                logprob_parts.append(decode_out.next_token_logprobs)
+        if logprob_parts:
+            logits_output.next_token_logprobs = (
+                logprob_parts[0]
+                if len(logprob_parts) == 1
+                else torch.cat(logprob_parts)
+            )
+        tokens = (
+            token_parts[0]
+            if len(token_parts) == 1
+            else (
+                torch.cat(token_parts)
+                if token_parts
+                else torch.empty(0, dtype=torch.int32, device=logits.device)
+            )
         )
+        lengths = length_parts[0] if len(length_parts) == 1 else torch.cat(length_parts)
+        return tokens, lengths
 
     def _log_dp_sampling_route(self, bs: int, ctx: ForwardContext) -> None:
         runtime = self.dp_sampling_runtime_config
@@ -1140,7 +1175,16 @@ class ModelExecutor:
             slice_ = (
                 self.input_buffers.input_ids_buf[: bs * n] if is_spec_verify else None
             )
-            self.capturable_grammar.schedule_fill(input_ids_buf_slice=slice_)
+            candidate_start = 0
+            if ctx.output_layout is not None and n > 1 and ctx.bs > ctx.num_extends:
+                candidate_start = ctx.num_extends
+                count = (ctx.bs - ctx.num_extends) * n
+                slice_ = self.input_buffers.input_ids_buf[
+                    ctx.input_num_tokens - count : ctx.input_num_tokens
+                ]
+            self.capturable_grammar.schedule_fill(
+                input_ids_buf_slice=slice_, candidate_start=candidate_start
+            )
 
         ctx.dspark_context_producer = self.dspark_context_producer
         if self.drafter is not None:
@@ -1188,9 +1232,20 @@ class ModelExecutor:
             )
             # _update_runtime_state skips future_input_map when drafter is
             # active — drafter writes the next-round inputs directly.
-            self.runtime_states.future_input_map[
-                self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
-            ] = next_round_input_ids.to(torch.int32)
+            indices = self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
+            if ctx.output_layout is None:
+                self.runtime_states.future_input_map[indices] = next_round_input_ids.to(
+                    torch.int32
+                )
+            else:
+                p = ctx.output_layout.num_prefill_outputs
+                e = ctx.num_extends
+                self.runtime_states.future_input_map[indices[:p]] = (
+                    next_round_input_ids[:p].to(torch.int32)
+                )
+                self.runtime_states.future_input_map[indices[e:]] = (
+                    next_round_input_ids[e:].to(torch.int32)
+                )
             self._record_draft_final_cache_step(ctx.num_extends)
 
         output_logprobs = logits_output.next_token_logprobs
@@ -1204,6 +1259,8 @@ class ModelExecutor:
         accept_lengths: torch.Tensor,
         input_lengths: torch.Tensor,
         num_extends: int,
+        *,
+        output_layout: ForwardOutputLayout | None,
     ):
         """Advance accepted inputs and cache lengths together on execution_stream.
 
@@ -1211,7 +1268,19 @@ class ModelExecutor:
         are tensor-only, including padding masks, so recording this update has
         the same semantics. Callers must pass the state-write pool indices.
         """
-        if self.drafter is None:
+        if self.drafter is None and output_layout is not None:
+            p, e = output_layout.num_prefill_outputs, num_extends
+            if p:
+                self.runtime_states.future_input_map[req_pool_indices[:p], :1] = (
+                    output_tokens[:p, None].to(torch.int32)
+                )
+            if output_layout.num_decodes:
+                self.runtime_states.future_input_map[req_pool_indices[e:]] = (
+                    output_tokens[p:]
+                    .view(output_layout.num_decodes, output_layout.decode_width)
+                    .to(torch.int32)
+                )
+        elif self.drafter is None:
             # Without drafter, store output tokens for next round.
             # With drafter, _forward_step already wrote the drafter's
             # next-round input (verified + draft tokens) to future_input_map.
@@ -1281,7 +1350,7 @@ class ModelExecutor:
             # for this idle replay, same as run_once.
             if self.capturable_grammar is not None:
                 self.capturable_grammar.add_batch(
-                    grammars=[None] * padded_bs, bs=padded_bs, has_candidates=False
+                    grammars=[None] * padded_bs, bs=padded_bs, has_candidates=False, output_layout=None
                 )
             # IDLE doesn't produce tokens, so no sampler/drafter call here —
             # only the model forward, which still participates in collectives.
@@ -1631,6 +1700,17 @@ class ModelExecutor:
                             - 1
                         )
 
+                output_layout = None
+                if num_extends and self.attn_backend.skips_incomplete_prefill_outputs:
+                    planned = ForwardOutputLayout.from_prefill(
+                        prefix_lengths=forward_op.extend_prefix_lens,
+                        input_lengths=forward_op.input_lengths[:num_extends],
+                        prompt_lengths=forward_op.prefill_lengths[:num_extends],
+                        num_decodes=bs - num_extends,
+                        decode_width=self.config.output_length,
+                    )
+                    if planned.num_prefill_outputs < num_extends:
+                        output_layout = planned
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -1646,6 +1726,7 @@ class ModelExecutor:
                     ),
                     gather_ids=gather_ids,
                     decode_input_ids=decode_input_ids,
+                    output_layout=output_layout,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_metadata is None:
@@ -1667,8 +1748,13 @@ class ModelExecutor:
                         spec_num_tokens=self.config.spec_num_tokens or 1,
                         grammar_inputs=grammar_inputs,
                         grammar_runtime=self.grammar_runtime,
-                        input_ids_buf=self.input_buffers.input_ids_buf,
+                        input_ids_buf=(
+                            self.input_buffers.input_ids_buf[:total_tokens]
+                            if output_layout is not None
+                            else self.input_buffers.input_ids_buf
+                        ),
                         grammar_backend=self.config.grammar_backend,
+                        output_layout=output_layout,
                     )
                     extend_with_prefix = num_extends > 0 and any(
                         forward_op.extend_prefix_lens
@@ -1743,6 +1829,7 @@ class ModelExecutor:
                     accept_lengths=output_lengths,
                     input_lengths=self.input_buffers.input_lengths_buf[:bs],
                     num_extends=num_extends,
+                    output_layout=ctx.output_layout,
                 )
             with nvtx_range("output_d2h", color="green"):
                 output_d2h_start = time.perf_counter() if timing_enabled else 0.0

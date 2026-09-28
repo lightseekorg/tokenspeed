@@ -32,7 +32,7 @@ NAN = float("nan")
 
 
 def _ctx(bs: int, num_extends: int = 0):
-    return SimpleNamespace(bs=bs, num_extends=num_extends)
+    return SimpleNamespace(bs=bs, num_extends=num_extends, output_layout=None)
 
 
 def _logits_output(logits: torch.Tensor, layout_plan=None):

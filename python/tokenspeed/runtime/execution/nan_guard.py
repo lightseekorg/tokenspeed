@@ -96,6 +96,8 @@ class NanGuard:
         so their legitimate ``-inf`` entries survive sanitize.
         """
         logits = logits_output.next_token_logits
+        if logits.shape[0] == 0:
+            return
         if logits_output.logits_layout_plan is None:
             self._or_per_request(torch.isnan(logits.amax(dim=-1)), ctx)
         torch.nan_to_num_(
@@ -125,11 +127,12 @@ class NanGuard:
         """
         ne = ctx.num_extends
         nd = ctx.bs - ne
-        if ne > 0:
-            self.flags[:ne] |= rows[:ne].to(torch.int32)
+        np = ne if ctx.output_layout is None else ctx.output_layout.num_prefill_outputs
+        if np > 0:
+            self.flags[:np] |= rows[:np].to(torch.int32)
         if nd > 0:
-            n = (rows.shape[0] - ne) // nd
-            self.flags[ne : ctx.bs] |= rows[ne:].view(nd, n).any(dim=-1).to(torch.int32)
+            n = (rows.shape[0] - np) // nd
+            self.flags[ne : ctx.bs] |= rows[np:].view(nd, n).any(dim=-1).to(torch.int32)
 
 
 class _DisabledNanGuard(NanGuard):

@@ -1222,6 +1222,8 @@ class PrefillGraph:
 
     def _decoder_bucket(self, rows: int) -> int | None:
         """Smallest decoder bucket >= ``rows``, or ``None`` to run the decoder eager."""
+        if rows == 0:
+            return None
         idx = bisect.bisect_left(self.decoder_buckets, rows)
         if idx == len(self.decoder_buckets):
             return None

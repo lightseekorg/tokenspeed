@@ -546,7 +546,12 @@ class OutputProcesser:
                 continue
             n_accepted = int(accept_lengths[i].item())
             for j in range(n_accepted):
-                tok = int(output_tokens[i * stride + j].item())
+                offset = (
+                    i * stride
+                    if completion.output_layout is None
+                    else completion.output_layout.token_offset(i)
+                )
+                tok = int(output_tokens[offset + j].item())
                 try:
                     grammar.accept_token(tok)
                 except Exception:

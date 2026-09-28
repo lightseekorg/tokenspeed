@@ -324,7 +324,7 @@ A prefill forward whose row count drops once, at a fixed layer, by an amount
 that is not a function of the token bucket cannot be one token-shaped
 breakable graph. DeepSeek-V4.1 is the case: its CED decoder (layer 20 on)
 runs on a per-request tail of the prefill rows (`decoder_view()` — a
-completing prompt's last window, one row for an open chunk, every decode
+completing prompt's last window, no rows for an open chunk, every decode
 row), so the row count at layer 20 depends on which requests complete.
 
 The model declares the split instead of opting out: it implements
@@ -356,6 +356,41 @@ collective shapes its graph bakes would differ across ranks, and the stages
 size their collectives from their own rows, which the DP metadata gather
 does not carry (the same gap that keeps narrowing itself unimplemented under
 DP).
+
+### Prefill requests without generated outputs
+
+The original execution batch and cache metadata always contain every request.
+A backend may declare `skips_incomplete_prefill_outputs` only when its model
+still produces all cache state required by later chunks. DeepSeek V4.1 uses
+this after the candidate-source layer writes global KV. Other backends keep
+the original output contract.
+
+The scheduler packs completing prefills first, at most one incomplete prefill
+last among prefills, then decode requests. An immutable `ForwardOutputLayout`
+records E original prefills, P output-bearing prefills, D decode requests and
+verify width K. Completing prefills must form a prefix (validated on the CPU).
+Only P<E forwards carry the layout; identity forwards retain their buffers.
+
+Logits and tokens use P+D*K rows. Accept lengths still use E+D request rows,
+with zero in [P,E). Sample uses the parameter prefix [:P]; verify uses the
+original [E:] suffix, retaining its batch-row coin offset. Grammar masks have
+a separate token axis. Each consumer uses the same token offset:
+`i` for i<P, P for P<=i<E (no storage), and P+(i-E)*K for decode.
+V4.1 explicitly marks selected logits rows so the logits processor never
+re-gathers them using original input indices.
+
+Cache advancement still consumes all input lengths for prefill, independently
+of output lengths. Future input writes, NaN/OOV attribution, grammar advances
+and V4.1 DSpark anchors operate only on output-bearing requests. Grammar keeps
+one queue completion per forward, including zero-output rounds; both deferred
+hostfunc and host fallback consume the frozen layout. A zero-row decoder
+bypasses its graph, normalization, LM head, sampler and draft-context writes;
+the encoder and global KV producer have already executed.
+
+Final prefill windows, bootstrap tokens and PD candidate/cache handoff remain
+unchanged. V4.1 PD still requires layerwise transfer interval zero. This does
+not enable a cache-only prefill role or reduce resident model weights. PP and
+attention-DP narrowing retain their existing restrictions.
 
 ### One draft metadata contract
 

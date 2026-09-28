@@ -809,6 +809,18 @@ class DeepseekV41Attention(nn.Module):
             )
         return self._padded_attn_sink
 
+    def _write_global_kv(self, hidden_states, positions, requests, backend, mode):
+        if self.compressor is None:
+            return
+        latent, row_positions, row_requests = self.compressor(
+            hidden_states, self.layer_id, positions, requests, backend, mode
+        )
+        index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
+        main_k = self.rotary_emb.apply_owned(latent, row_positions, False)
+        backend.write_global(
+            self.layer_id, main_k, index_k, row_positions, row_requests, mode
+        )
+
     @break_point
     def forward(
         self,
@@ -834,6 +846,13 @@ class DeepseekV41Attention(nn.Module):
             raise ValueError("V4.1 hidden rows and backend query metadata disagree")
         # Backend positions carry -1 for padding; request indices are batch rows.
         positions, requests = meta.positions, meta.request_indices
+        if rows.keep_rows is not None:
+            # The producer is token-shaped; query/SWA projections are not.
+            self._write_global_kv(hidden_states, positions, requests, backend, mode)
+            hidden_states = hidden_states.index_select(0, rows.keep_rows)
+            positions, requests = rows.query.positions, rows.query.request_indices
+            if hidden_states.shape[0] == 0:
+                return hidden_states
         qkv, _ = self.wq_a_wkv(hidden_states, block_scale=None, output_dtype=None)
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
         qr = _attention_norm(qr, self.q_norm)
@@ -858,31 +877,9 @@ class DeepseekV41Attention(nn.Module):
             # Submit the longer compressor/index branch first. Serial eager and
             # captured decode execute these identical operations and dependency joins.
             with fork.branch():
-                if self.compressor is not None:
-                    latent, row_positions, row_requests = self.compressor(
-                        hidden_states, self.layer_id, positions, requests, backend, mode
-                    )
-                    index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
-                    main_k = self.rotary_emb.apply_owned(latent, row_positions, False)
-                    backend.write_global(
-                        self.layer_id,
-                        main_k,
-                        index_k,
-                        row_positions,
-                        row_requests,
-                        mode,
-                    )
-                if rows.keep_rows is not None:
-                    # CED: the decoder's global KV above came from every
-                    # encoder row; from here on only the per-request tail
-                    # is attended and carried forward.
-                    hidden_states, qr, swa = (
-                        t.index_select(0, rows.keep_rows)
-                        for t in (hidden_states, qr, swa)
-                    )
-                    positions, requests = (
-                        rows.query.positions,
-                        rows.query.request_indices,
+                if rows.keep_rows is None:
+                    self._write_global_kv(
+                        hidden_states, positions, requests, backend, mode
                     )
                 if self.indexer is not None:
                     index_q, index_weights = self.indexer(
@@ -1095,6 +1092,17 @@ class DeepseekV41DecoderLayer(nn.Module):
     def forward(self, hidden_states, pre_mix, positions, image_mask, ctx):
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         residual = hidden_states
+        if rows.keep_rows is not None and rows.keep_rows.numel() == 0:
+            # HC input is needed by the global producer; output mixes and
+            # every decoder consumer are unnecessary for an open chunk.
+            x = _v41_hc_input(residual, pre_mix, self.attn_norm)
+            self.attn(positions, x, ctx)
+            return residual[:0], pre_mix[:0]
+        mix_residual = (
+            residual
+            if rows.keep_rows is None
+            else residual.index_select(0, rows.keep_rows)
+        )
         overlap = (
             residual.is_cuda
             and ctx.forward_mode is not None
@@ -1108,7 +1116,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         with self.hc_stream_fork.scope(enable=overlap, overlap=True) as fork:
             with fork.branch():
                 attn_pre, post, comb = v41_hc_mixes(
-                    residual,
+                    mix_residual,
                     self.hc_attn_fn,
                     self.hc_attn_scale,
                     self.hc_attn_base,
@@ -1122,10 +1130,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             x = _v41_hc_input(residual, pre_mix, self.attn_norm)
             x = self.attn(positions, x, ctx)
         if rows.keep_rows is not None:
-            residual, post, comb, attn_pre = (
-                t.index_select(0, rows.keep_rows)
-                for t in (residual, post, comb, attn_pre)
-            )
+            residual = mix_residual
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
         hidden_states = v41_hc_post(x, residual, post, comb)
@@ -1537,6 +1542,12 @@ class DeepseekV41Model(nn.Module):
         start = self.ced_decoder_start
         captured = list(state.captured)
         h, pre_mix = state.hidden, state.pre_mix
+        if state.rows == 0:
+            hidden = h[:, 0, :]
+            captured.extend(
+                hidden for layer_id in self.dspark_capture_layers if layer_id > start
+            )
+            return hidden, captured
         layers = self.layers[start + 1 :]
         if layers:
             with report_collective_sizing(ctx, state.rows, None):
@@ -1554,17 +1565,27 @@ class DeepseekV41Model(nn.Module):
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         """Gather the sampled rows and report the narrowed tap layout."""
         view = ctx.attn_backend.decoder_view()
+        ctx.logits_rows_selected = view.logits_rows is not None
+        ctx.captured_rows = None
         if view.logits_rows is not None:
             hidden = hidden.index_select(0, view.logits_rows)
+        if ctx.output_layout is not None:
+            if hidden.shape[0] != ctx.output_layout.num_output_tokens:
+                raise RuntimeError("V4.1 decoder and output layout disagree")
         capture = (
             ctx.capture_hidden_mode is not None
             and ctx.capture_hidden_mode.need_capture()
         )
         if capture and view.keep_rows is not None:
-            ctx.captured_rows = CapturedRows(
-                view.metadata.positions,
-                tuple((span.offset, span.count) for span in view.spans),
-            )
+            by_request = {span.request: span for span in view.spans}
+            offset = 0
+            spans = []
+            for request in range(ctx.num_extends):
+                span = by_request.get(request)
+                count = 0 if span is None else span.count
+                spans.append((offset, count))
+                offset += count
+            ctx.captured_rows = CapturedRows(view.metadata.positions, tuple(spans))
         return hidden, (captured or [hidden]) if capture else None
 
     def decoder_rows(self, ctx: ForwardContext) -> int:

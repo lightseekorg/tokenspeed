@@ -607,9 +607,9 @@ def test_decoder_view_is_the_identity_for_decode_and_complete_short_chunks():
     assert backend.decoder_view()[1:] == (None, (), None, None)
 
 
-def test_decoder_view_keeps_one_row_per_open_chunk_and_the_final_window():
+def test_decoder_view_omits_open_chunks_and_keeps_the_final_window():
     """The CED decoder runs on each prompt-completing chunk's last window
-    (the whole chunk when shorter), on one row of every other chunk, and on
+    (the whole chunk when shorter), on no rows of an open chunk, and on
     every decode row; sampled rows are the last kept row per request."""
     backend = _verify_backend("cpu", 3, 2)
     tables = _tables("cpu")
@@ -626,22 +626,18 @@ def test_decoder_view_keeps_one_row_per_open_chunk_and_the_final_window():
         extend_prefix_lens=torch.tensor([4, 2]),
         extend_prefix_lens_cpu=torch.tensor([4, 2]),
         extend_replay_lens_cpu=torch.tensor([4, 0]),
-        extend_prompt_lens_cpu=torch.tensor([12, 5]),
+        extend_prompt_lens_cpu=torch.tensor([9, 12]),
         extend_with_prefix=True,
     )
     full = backend.query_metadata(ForwardMode.MIXED)
     view = backend.decoder_view()
-    # Request 0 continues past this chunk: one row. Request 1 completes: all
-    # three rows. The verify-width-2 decode request keeps both rows.
-    assert view.keep_rows.tolist() == [4, 5, 6, 7, 8, 9]
-    assert view.metadata.positions.tolist() == [8, 2, 3, 4, 7, 8]
-    assert view.metadata.request_indices.tolist() == [0, 1, 1, 1, 2, 2]
-    assert view.logits_rows.tolist() == [0, 3, 4, 5]
-    assert view.spans == (
-        V41PrefillSpan(0, 0, 8, 1, 8),
-        V41PrefillSpan(1, 1, 2, 3, 2),
-    )
-    assert view.prefill.positions.tolist() == [8, 2, 3, 4]
+    # Request 0 completes: all five rows. Request 1 continues: no rows. The verify-width-2 decode request keeps both rows.
+    assert view.keep_rows.tolist() == [0, 1, 2, 3, 4, 8, 9]
+    assert view.metadata.positions.tolist() == [4, 5, 6, 7, 8, 7, 8]
+    assert view.metadata.request_indices.tolist() == [0, 0, 0, 0, 0, 2, 2]
+    assert view.logits_rows.tolist() == [4, 5, 6]
+    assert view.spans == (V41PrefillSpan(0, 0, 4, 5, 4),)
+    assert view.prefill.positions.tolist() == [4, 5, 6, 7, 8]
     assert torch.equal(
         view.metadata.swa_write_slots, full.swa_write_slots[view.keep_rows]
     )
@@ -654,7 +650,7 @@ def test_decoder_view_keeps_one_row_per_open_chunk_and_the_final_window():
     plan = backend._swa_query_plan(
         view.prefill.positions, view.prefill.request_indices, ForwardMode.EXTEND
     )
-    assert [r.prefix_slots.numel() for r in plan.requests] == [0, 0]
+    assert [r.prefix_slots.numel() for r in plan.requests] == [0]
     # A completing chunk longer than the window keeps exactly the window.
     # Without decode rows the view is its own prefill window, so the rows
     # the decoder layers hand back are recognized as canonical.
@@ -2219,3 +2215,14 @@ def test_compressor_plan_ragged_windows_rebase_only_predecessors(device):
                 assert got.data_ptr() == parent[start:stop].data_ptr()
     for original, value in zip(before, full, strict=True):
         torch.testing.assert_close(value, original, rtol=0, atol=0)
+
+
+def test_open_prefill_chunk_has_no_decoder_or_logits_rows():
+    backend = _verify_backend("cpu", 1, 1)
+    _extend(backend, _tables("cpu"), [8], [0], [0], [64])
+    view = backend.decoder_view()
+    assert view.keep_rows.numel() == 0
+    assert view.logits_rows.numel() == 0
+    assert view.metadata.positions.numel() == 0
+    assert view.prefill.positions.numel() == 0
+    assert view.spans == ()

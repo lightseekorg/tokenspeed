@@ -186,6 +186,7 @@ def _sample(ib, runtime, ids, num_extends, accept_lengths, has_drafter):
         torch.tensor(accept_lengths, dtype=torch.int32, device=ib.device),
         ib.input_lengths_buf[:bs],
         num_extends,
+        output_layout=None,
     )
 
 
@@ -561,6 +562,7 @@ def test_runtime_update_replay_shrink_idle_and_slot_reuse(buffers, record_update
             accepts,
             ib.input_lengths_buf[:4],
             0,
+            output_layout=None,
         )
 
     graph = None

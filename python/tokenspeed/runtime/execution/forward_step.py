@@ -578,7 +578,10 @@ class ForwardStepRunner:
             # would otherwise raise queue.Empty.
             if self.capturable_grammar is not None:
                 self.capturable_grammar.add_batch(
-                    grammars=[None] * bs, bs=bs, has_candidates=False
+                    grammars=[None] * bs,
+                    bs=bs,
+                    has_candidates=False,
+                    output_layout=None,
                 )
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 

@@ -210,6 +210,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     cuda_graph_support = CudaGraphSupport(decode_graph=True, prefill_graph=True)
     supports_layer_sliding_window = True
 
+    skips_incomplete_prefill_outputs = True
+
     def __init__(self, config: AttnConfig, spec: DeepseekV41Config) -> None:
         super().__init__(config, spec)
         if config.is_draft:
@@ -671,16 +673,16 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         """Select the rows the CED decoder layers run on.
 
         The decoder attends the prompt's last window only, so a chunk that ends
-        its prompt keeps its last ``window`` rows and any other chunk keeps one
-        row (its logits are discarded, and one row per request keeps the
-        sampler's row contract). Decode rows are all kept. The scheduler never
+        its prompt keeps its last ``window`` rows; incomplete chunks keep no
+        decoder rows. Their global KV is still produced from every input
+        row before narrowing. Decode rows are all kept. The scheduler never
         leaves a final chunk shorter than the window, so a kept tail is the
         prompt's last window unless the whole prompt is shorter.
         """
         n = self.forward_prefill_metadata.positions.numel()
         total = meta.positions.numel()
         keeps = [
-            min(window, span.count) if done else min(1, span.count)
+            min(window, span.count) if done else 0
             for span, done in zip(self._prefill_spans, completes, strict=True)
         ]
         if all(keep == span.count for keep, span in zip(keeps, self._prefill_spans)):

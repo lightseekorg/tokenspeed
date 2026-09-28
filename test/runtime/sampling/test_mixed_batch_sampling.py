@@ -212,6 +212,7 @@ def test_mixed_round_preserves_prefill_outputs():
         pass
 
     ctx = _Ctx()
+    ctx.output_layout = None
     ctx.num_extends = num_extends
     ctx.bs = bs
     ctx.decode_input_ids = None
@@ -291,6 +292,7 @@ def test_mixed_round_preserves_prefill_logprobs():
         pass
 
     ctx = _Ctx()
+    ctx.output_layout = None
     ctx.num_extends = num_extends
     ctx.bs = bs
     ctx.decode_input_ids = None

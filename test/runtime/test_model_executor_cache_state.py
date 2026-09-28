@@ -232,7 +232,11 @@ def test_non_spec_decode_routes_through_verify():
 
     # Pure decode, bs=3, N=1: candidates are the tail 3 ids as [3, 1].
     ctx = SimpleNamespace(
-        bs=3, num_extends=0, input_num_tokens=3, decode_input_ids=None
+        bs=3,
+        num_extends=0,
+        input_num_tokens=3,
+        decode_input_ids=None,
+        output_layout=None,
     )
     candidates = executor._decode_candidates(ctx)
     assert candidates.shape == (3, 1)
@@ -244,7 +248,11 @@ def test_non_spec_decode_routes_through_verify():
     # Pure prefill still samples.
     calls.clear()
     ctx2 = SimpleNamespace(
-        bs=2, num_extends=2, input_num_tokens=6, decode_input_ids=None
+        bs=2,
+        num_extends=2,
+        input_num_tokens=6,
+        decode_input_ids=None,
+        output_layout=None,
     )
     assert executor._decode_candidates(ctx2) is None
     executor._run_sampling(object(), object(), ctx2, None)
