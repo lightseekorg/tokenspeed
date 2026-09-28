@@ -138,6 +138,7 @@ def main() -> None:
         page_size=64,
         topk=topk,
         softmax_scale=0.1,
+        batch_invariant=False,
         index_k_cache=full,
         seq_lens_2d=seq2d,
         plan=dsa_plan(page_size=64, seq_lens_2d=seq2d),

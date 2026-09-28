@@ -674,6 +674,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
 
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = 64
+    backend.kernel_solution = None
     backend.data_type = torch.bfloat16
     backend.kv_lora_rank = 128
     backend.qk_nope_head_dim = 128

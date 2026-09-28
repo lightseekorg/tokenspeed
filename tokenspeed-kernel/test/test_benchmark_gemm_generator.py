@@ -77,6 +77,122 @@ def test_mxfp8_mm_rejects_invalid_generator_parameters(
     assert raised.value.status is BenchmarkStatus.INVALID_CASE
 
 
+def _gemm_mm_request(parameters, *, registration=None) -> BenchmarkRequest:
+    return BenchmarkRequest(
+        family="gemm",
+        mode="mm",
+        parameters=parameters,
+        solution=None,
+        registration=registration,
+        cold_cache=True,
+        seed=42,
+    )
+
+
+def _dense_mm_parameters(**updates):
+    parameters = {
+        "M": 2816,
+        "N": 3072,
+        "K": 512,
+        "quant": "none",
+        "dtype": "bfloat16",
+    }
+    parameters.update(updates)
+    return parameters
+
+
+def test_mm_requires_explicit_quant(mi350_platform):
+    parameters = _dense_mm_parameters()
+    del parameters["quant"]
+
+    with pytest.raises(BenchmarkCaseError, match="quant") as raised:
+        gemm_generator.prepare_mm(_gemm_mm_request(parameters), mi350_platform)
+
+    assert raised.value.status is BenchmarkStatus.INVALID_CASE
+
+
+def test_dense_mm_runs_through_harness_with_registered_reference(
+    mi350_platform,
+    fresh_registry,
+    monkeypatch,
+):
+    _ = fresh_registry
+    signature = format_signature(
+        a=dense_tensor_format(torch.bfloat16),
+        b=dense_tensor_format(torch.bfloat16),
+    )
+    candidate_spec = KernelSpec(
+        name="unit_candidate_mm",
+        family="gemm",
+        mode="mm",
+        solution="unit",
+        format_signatures=frozenset({signature}),
+        traits={
+            "mnk_problem_filter": frozenset({lambda m, n, k: m % 4 == 0}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "out_dtype": frozenset({torch.bfloat16}),
+        },
+    )
+    reference_spec = KernelSpec(
+        name="unit_reference_mm",
+        family="gemm",
+        mode="mm",
+        solution="reference",
+        format_signatures=frozenset({signature}),
+    )
+    out_shapes: list[tuple[int, ...]] = []
+
+    def kernel(**kwargs):
+        out_shapes.append(tuple(kwargs["out"].shape))
+        kwargs["out"].copy_(kwargs["A"] @ kwargs["B"].T)
+        return kwargs["out"]
+
+    KernelRegistry.get().register(candidate_spec, kernel)
+    KernelRegistry.get().register(reference_spec, kernel)
+
+    class InputGenerator:
+        def generate(self, *, M, N, K):
+            return {
+                "A": torch.ones((M, K), dtype=torch.bfloat16),
+                "B": torch.ones((N, K), dtype=torch.bfloat16),
+                "A_scales": None,
+                "B_scales": None,
+                "out_dtype": torch.bfloat16,
+                "alpha": None,
+                "block_size": None,
+            }
+
+    monkeypatch.setattr(
+        gemm_generator,
+        "get_input_generator",
+        lambda *_args, **_kwargs: InputGenerator(),
+    )
+    monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
+    # The harness routes quant="none" through prepare_mm to the dense generator,
+    # whose traits must satisfy the candidate's problem filter.
+    result = KernelBenchmarkHarness(
+        FakeTimer(), platform_provider=lambda: mi350_platform
+    ).run(
+        _gemm_mm_request(
+            _dense_mm_parameters(
+                M=4,
+                N=3,
+                K=8,
+                validation={"runs": 1, "atol": 0.0, "rtol": 0.0},
+            ),
+            registration="unit_candidate_mm",
+        ),
+        measurement_blocks=3,
+    )
+
+    assert result.status is BenchmarkStatus.SUCCESS, result.to_dict()
+    assert result.registration_name == "unit_candidate_mm"
+    assert result.correctness is not None
+    assert result.correctness["passed"] is True
+    assert set(out_shapes) == {(4, 3)}
+
+
 @pytest.mark.parametrize(
     "parameters, match",
     [
