@@ -27,7 +27,12 @@ specialization class, then sweep the batch-dependent value inside
 
 import pytest
 import torch
-from utils import assert_no_triton_compile, is_cdna4
+from utils import (
+    assert_no_triton_compile,
+    int_specialization_class,
+    is_cdna4,
+    warm_specialization_classes,
+)
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -162,4 +167,52 @@ def test_mxfp4_precomputed_route_row_count():
     run(6)
     with assert_no_triton_compile(routing._fused_precomputed_topk_route_small_m):
         for tokens in (7, 8):
+            run(tokens)
+
+
+def test_mxfp4_moe_sorting_route_count():
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import moe_sorting
+
+    experts, topk, block = 64, 8, 32
+    generator = torch.Generator(device=DEVICE).manual_seed(3)
+
+    def run(tokens):
+        ids = torch.randint(
+            0, experts, (tokens, topk), device=DEVICE, generator=generator
+        ).int()
+        weights = torch.rand(tokens, topk, device=DEVICE, generator=generator)
+        sorted_ids, sorted_weights, block_experts, valid, _ = (
+            moe_sorting.gluon_moe_sorting(
+                ids, weights, experts, 128, torch.bfloat16, block
+            )
+        )
+        assert int(valid[1]) == tokens
+        slots = sorted_ids[: int(valid[0])]
+        routed = slots != ((topk << 24) | tokens)
+        position = torch.nonzero(routed).flatten()
+        token, slot = slots[routed] & 0xFFFFFF, slots[routed] >> 24
+        flat = token * topk + slot
+        assert torch.equal(
+            flat.sort().values, torch.arange(tokens * topk, device=DEVICE)
+        )
+        torch.testing.assert_close(sorted_weights[position], weights.flatten()[flat])
+        assert torch.equal(block_experts[position // block], ids.flatten()[flat])
+
+    def key(tokens):
+        routes = tokens * topk
+        programs = max(experts, -(-routes // 1024))
+        per_program = -(-routes // programs)
+        counts = (routes, programs, per_program)
+        return (
+            *map(int_specialization_class, counts),
+            1 << (per_program - 1).bit_length(),
+        )
+
+    # Route counts from 8K to 16K share one power-of-two route block.
+    sweep = (1033, 1100, 1500, 2000)
+    warm_specialization_classes(run, key, sweep, range(1030, 2049))
+    with assert_no_triton_compile(
+        moe_sorting._moe_sorting_stage1_kernel, moe_sorting._moe_sorting_stage4_kernel
+    ):
+        for tokens in sweep:
             run(tokens)

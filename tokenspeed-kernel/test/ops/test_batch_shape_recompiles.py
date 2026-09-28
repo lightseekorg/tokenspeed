@@ -30,7 +30,11 @@ the results against a reference or against an equivalent narrower launch.
 import pytest
 import torch
 import torch.nn.functional as F
-from utils import assert_no_triton_compile
+from utils import (
+    assert_no_triton_compile,
+    int_specialization_class,
+    warm_specialization_classes,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -493,7 +497,10 @@ def test_kda_prepare_capacity_scan_token_and_sequence_counts():
         lengths, capacity = case
         chunk_count = triton_cdiv(capacity, 16) + len(lengths) - 1
         counts = (capacity, len(lengths), chunk_count)
-        return (*map(_int_class, counts), 1 << (len(lengths) - 1).bit_length())
+        return (
+            *map(int_specialization_class, counts),
+            1 << (len(lengths) - 1).bit_length(),
+        )
 
     # Token capacity and live sequences both follow the batch.
     sweep = (
@@ -509,7 +516,7 @@ def test_kda_prepare_capacity_scan_token_and_sequence_counts():
         for n in range(1, 9)
         for capacity in (48, 49, 96, 97, 160, 161, 400, 401)
     ]
-    _warm_classes(run, key, sweep, pool)
+    warm_specialization_classes(run, key, sweep, pool)
     with assert_no_triton_compile(scan._prepare_capacity_scan_kernel):
         for case in sweep:
             run(case)
@@ -540,7 +547,11 @@ def test_causal_conv1d_capacity_metadata_counts():
         chunks = triton_cdiv(capacity, block_m) + len(lengths) - 1
         # The offsets map starts ``chunks`` int32s into one allocation, so its
         # 16-byte pointer alignment is a specialization class too.
-        return _int_class(chunks), _int_class(len(lengths)), chunks % 4 == 0
+        return (
+            int_specialization_class(chunks),
+            int_specialization_class(len(lengths)),
+            chunks % 4 == 0,
+        )
 
     # Token capacity and live sequences both follow the batch.
     sweep = (
@@ -555,7 +566,7 @@ def test_causal_conv1d_capacity_metadata_counts():
         for n in range(1, 9)
         for capacity in (48, 49, 96, 97, 160, 161, 400, 401)
     ]
-    _warm_classes(run, key, sweep, pool)
+    warm_specialization_classes(run, key, sweep, pool)
     with assert_no_triton_compile(causal_conv1d_metadata._refresh_conv_capacity_kernel):
         for case in sweep:
             run(case)
@@ -599,25 +610,6 @@ def test_dp_sampling_kernels_bucket_size():
 
 def triton_cdiv(a, b):
     return (a + b - 1) // b
-
-
-def _int_class(value):
-    """The class Triton specializes a runtime integer on."""
-    return "one" if value == 1 else "div16" if value % 16 == 0 else "other"
-
-
-def _warm_classes(run, key, sweep, pool):
-    """Run one pool value per specialization key the sweep will hit.
-
-    Split counts depend on the SM count, so which classes a sweep reaches
-    differs between GPUs; warming from a pool keeps the guard meaningful on
-    every device. A key no pool value reaches is warmed with its sweep value.
-    """
-    needed = {key(value) for value in sweep}
-    for value in [*(v for v in pool if v not in sweep), *sweep]:
-        if key(value) in needed:
-            needed.discard(key(value))
-            run(value)
 
 
 def test_merge_prefill_checkpoint_outputs_token_counts():
@@ -999,12 +991,16 @@ def test_mhc_mixes_split_count():
         config = residual._mhc_prenorm_gemm_launch_config(
             tokens, 4 * hidden, 24, splits
         )
-        return _int_class(tokens), _int_class(splits), config
+        return (
+            int_specialization_class(tokens),
+            int_specialization_class(splits),
+            config,
+        )
 
     # Each batch size picks its own split count from the SM count.
     sweep = (128, 192, 320, 448, 1024)
     first = run(64)
-    _warm_classes(run, key, sweep, range(64, 1025, 64))
+    warm_specialization_classes(run, key, sweep, range(64, 1025, 64))
     with assert_no_triton_compile(
         residual._mhc_prenorm_gemm_triton_kernel, residual._mhc_pre_mix_hc4_kernel
     ):
@@ -1066,11 +1062,15 @@ def test_mhc_pre_split_count():
         config = residual._mhc_prenorm_gemm_launch_config(
             tokens, 4 * hidden, 24, splits
         )
-        return _int_class(tokens), _int_class(splits), config
+        return (
+            int_specialization_class(tokens),
+            int_specialization_class(splits),
+            config,
+        )
 
     # Below 256 SMs, two to four token tiles pick fewer splits than one.
     sweep = (65, 130, 200, 256)
-    _warm_classes(run, key, sweep, range(1, 257))
+    warm_specialization_classes(run, key, sweep, range(1, 257))
     with assert_no_triton_compile(
         residual._mhc_prenorm_gemm_triton_kernel, residual._mhc_pre_mix_triton_kernel
     ):
