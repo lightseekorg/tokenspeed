@@ -498,11 +498,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
 }
 
 void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_empty) {
-    // With nothing out, no event can land that changes the next plan: only a
-    // new submission or an abort can, so every live request is stuck until
-    // then. The victim policy exists to make this impossible; if it happens
-    // anyway, the event loop spins on empty plans, and without this warning
-    // nothing in the logs says so.
+    // With nothing out, only a new submission or an abort can change the next
+    // plan.
     const bool stalled = num_live_requests > 0 && plan_is_empty && !tier_transfers_.HasAnyInFlight() &&
                          std::ranges::none_of(requests_, [this](const std::unique_ptr<Request>& request) {
                              return request->ResultsInFlight() > 0 || pdTransferInFlight(*request);
