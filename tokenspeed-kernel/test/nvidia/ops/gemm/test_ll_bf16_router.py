@@ -68,9 +68,11 @@ def test_matches_the_cuda_router_kernel(m: int) -> None:
     a, b = _inputs(m)
     got = kimi3_router_projection(a, b, solution="ll_bf16")
     expected = kimi3_router_projection(a, b, solution="cuda")
-    torch.testing.assert_close(got, expected, atol=2e-3, rtol=2e-3)
+    # rtol stays far below bf16's 2^-8 so any bf16 rounding inside the
+    # reduction fails; atol covers fp32 reordering noise near zero.
+    torch.testing.assert_close(got, expected, atol=2e-3, rtol=1e-4)
     reference = torch.nn.functional.linear(a.float(), b.float())
-    torch.testing.assert_close(got, reference, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(got, reference, atol=2e-3, rtol=1e-4)
 
 
 @pytest.mark.parametrize("m", [1, 8, 32])
@@ -155,8 +157,8 @@ def test_mm_matches_linear(m: int, with_bias: bool) -> None:
         torch.nn.functional.linear(
             a.float(), b.float(), None if bias is None else bias.float()
         ),
-        atol=2e-2,
-        rtol=2e-2,
+        atol=1e-2,
+        rtol=1e-2,
     )
 
 
@@ -194,8 +196,8 @@ def test_flashinfer_branch_meets_its_documented_requirement(monkeypatch) -> None
     torch.testing.assert_close(
         ll_bf16_mm(a, b, bias).float(),
         torch.nn.functional.linear(a.float(), b.float(), bias.float()),
-        atol=2e-2,
-        rtol=2e-2,
+        atol=1e-2,
+        rtol=1e-2,
     )
 
 

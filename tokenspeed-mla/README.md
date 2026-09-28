@@ -299,3 +299,12 @@ python -m build tokenspeed-mla --wheel --outdir dist
 python -m twine check --strict dist/*
 python tokenspeed-mla/scripts/check_release.py --package-dir tokenspeed-mla --dist-dir dist
 ```
+
+### FP8 split-KV partial storage
+
+FP8 decode keeps split-KV partial outputs in FP32 by default. Set
+`TOKENSPEED_MLA_FP16_PARTIALS=1` before importing the package to opt into FP16
+partial storage. Accumulation and log-sum-exp remain FP32; the reducer applies
+`output_scale` after combining normalized partials. Direct FP8 kernel callers
+must explicitly specify `partial_fp16` and a `reducer_max_splits` capacity that
+covers every split in their launches.
