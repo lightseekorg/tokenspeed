@@ -399,6 +399,34 @@ class TestSlidingWindowPrepay:
         assert len(second[SLIDING_GROUP]) == 160 // PAGE + 5
         assert len(second[FULL_GROUP]) == len(first[FULL_GROUP])
 
+    def test_prefix_hit_alone_prepays_nothing(self):
+        """With no other request holding pages, a prompt that hits the
+        160-token prefix a finished request left cached prepays nothing: its
+        sliding-window group holds 8 + 1 tokens in 1 private page, so a
+        request alone asks for what max_single_request_tokens counts."""
+        scheduler = ts.Scheduler(
+            _config(
+                64,
+                window=self.WINDOW,
+                prefix_cache=True,
+                overlap_schedule_depth=0,
+                max_scheduled_tokens=1024,
+            )
+        )
+        shared = [100 + i for i in range(160)]
+        _submit_and_step(scheduler, "a", shared + [7000 + j for j in range(8)], 1)
+        _land(scheduler, "a", 1, decode_reserve=None)
+        finish = ts.ForwardEvent.Finish()
+        finish.request_id = "a"
+        scheduler.advance(ts.ExecutionEvent().add_event(finish))
+
+        plan = _submit_and_step(
+            scheduler, "b", shared + [8000 + j for j in range(8)], 200
+        )
+        batch, row, tables = _row_of(plan, "b")
+        assert batch.extend_prefix_lens[row] == 160
+        assert len(tables[SLIDING_GROUP]) == 160 // PAGE + 1, tables[SLIDING_GROUP]
+
     def test_first_chunk_prepays_the_lookback_its_next_chunk_reads(self):
         """A 200-token prompt in 64-token chunks beside a resident request
         that holds pages: the second chunk reads the first one's 63-token
