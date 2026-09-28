@@ -1063,9 +1063,15 @@ def _select_package_prefill_block_m(
     top_k: int,
     num_experts: int,
 ) -> int:
-    """Use 64 rows when average route density makes 128 over-pad."""
+    """Limit per-expert padding for sparse routes without shrinking dense tiles."""
 
     routed_rows = num_tokens * top_k
+    if routed_rows <= 8 * num_experts:
+        return 16
+    if routed_rows <= 32 * num_experts:
+        return 32
+    if routed_rows <= 64 * num_experts:
+        return 64
     if 128 * num_experts < routed_rows <= 192 * num_experts:
         return 64
     return 128
@@ -1215,11 +1221,12 @@ def _maybe_gluon_package_mxfp4_prefill(
     ):
         raise ValueError("local expert range exceeds global expert count")
     if force_reduce is None:
-        # EP ranks own only a fraction of each token's routes. For TP, keep the
-        # faster atomic path within the graph-captured EAGLE3 decode window and
-        # preserve deterministic FP32 reduction for larger batches.
+        # EP ranks own only a fraction of each token's routes. For TP E2M1,
+        # paired-column atomics avoid the partials/reduce cost through 2048
+        # rows. Larger outputs still favor scratch plus FP32 reduction.
         is_ep_shard = global_num_experts != n_experts or expert_start != 0
-        force_reduce = False if is_ep_shard else n_tokens > 64
+        atomic_max_m = 2048 if activation_format == "e2m1" else 64
+        force_reduce = False if is_ep_shard else n_tokens > atomic_max_m
     hidden_dim = int(hidden_states.shape[1])
     inter_dim = int(package_w13.shape[1]) // 2
     if (
