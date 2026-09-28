@@ -70,7 +70,8 @@ def _verify_chain_greedy_torch(
 
     # Fill all of `predicts` with target_predict; slots outside the accepted
     # prefix are harmless because accept_index keeps them at -1 and callers
-    # mask on that. Matches the CUDA kernel's observable state.
+    # mask on that. The CUDA kernel writes only the accepted prefix and the
+    # bonus slot, leaving the rest as the caller passed them in.
     predicts.copy_(target_predict.reshape(-1).to(torch.int32))
 
     device = candidates.device

@@ -44,7 +44,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _make_dummy,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._layouts import (
-    _moe_partial_reduce,
     _moe_partial_reduce_shared,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.gemm_api import (
@@ -85,6 +84,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.warp_decode import (
     _gluon_mxfp4_fp8_warp_decode_moe,
     _warp_decode_precomputed_situ_stage1_kernel,
     _warp_decode_stage2_fp8_mxfp4_kernel,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
+    gluon_mxfp4_moe_stage2_reduce_kernel,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     MXFP4_BLOCK,
@@ -430,15 +432,22 @@ def gluon_mxfp4_fp8_precomputed_situ(
     reduce_block_n = 256
     reduce_programs = M * triton.cdiv(N, reduce_block_n)
     reduce_grid = reduce_programs + (M * num_shared_pid_n if fuse_shared_down else 0)
-    reduce = _moe_partial_reduce_shared if fuse_shared_down else _moe_partial_reduce
+    reduce = (
+        _moe_partial_reduce_shared
+        if fuse_shared_down
+        else gluon_mxfp4_moe_stage2_reduce_kernel
+    )
     reduce[(reduce_grid,)](
         partial,
         out,
         *((shared_input, shared_weight, shared_out) if fuse_shared_down else ()),
         M,
         N,
-        partial.stride(0),
-        TOPK * partial.stride(0),
+        *(
+            (partial.stride(0), TOPK * partial.stride(0))
+            if fuse_shared_down
+            else (TOPK * partial.stride(0), partial.stride(0))
+        ),
         partial.stride(1),
         out.stride(0),
         out.stride(1),
@@ -452,16 +461,16 @@ def gluon_mxfp4_fp8_precomputed_situ(
             if fuse_shared_down
             else ()
         ),
-        SPLIT_K=TOPK,
         BLOCK_N=reduce_block_n,
         **(
             {
+                "SPLIT_K": TOPK,
                 "NUM_REDUCE_PROGRAMS": reduce_programs,
                 "NUM_SHARED_PID_N": num_shared_pid_n,
                 "SHARED_BLOCK_N": shared_block_n,
             }
             if fuse_shared_down
-            else {}
+            else {"BLOCK_M": 1, "TOP_K": TOPK}
         ),
         num_warps=1,
     )

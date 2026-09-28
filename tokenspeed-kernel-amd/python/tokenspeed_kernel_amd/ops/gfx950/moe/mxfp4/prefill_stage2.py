@@ -1555,13 +1555,13 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
 
 @gluon.jit
 def gluon_mxfp4_moe_stage2_reduce_kernel(
-    partials_ptr,  # bf16, shape [token_num, topk, N], contiguous
-    out_ptr,  # bf16, shape [token_num, N]
+    partials_ptr,  # shape [token_num, topk, N]
+    out_ptr,  # shape [token_num, N]
     token_num,
     N,
-    stride_pt,  # partials: stride for token dim = topk * N
-    stride_ps,  # partials: stride for slot  dim = N
-    stride_pn,  # partials: stride for col   dim = 1
+    stride_pt,  # partials: stride for token dim
+    stride_ps,  # partials: stride for slot dim
+    stride_pn,  # partials: stride for col dim
     stride_ot,
     stride_on,
     BLOCK_M: gl.constexpr,
@@ -1573,19 +1573,18 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
     Grid: ``(cdiv(token_num, BLOCK_M) * cdiv(N, BLOCK_N),)``. Each CTA
     owns a ``[BLOCK_M, BLOCK_N]`` tile of the output and reads
     ``TOP_K`` slices from the partial buffer, accumulating in fp32 and
-    casting back to bf16 at the end. ``TOP_K`` is a constexpr so the
-    accumulation loop unrolls (TOP_K is small: 4-10 across the models
-    we serve).
+    casting to the output dtype at the end. ``TOP_K`` is a constexpr so the
+    accumulation loop unrolls.
     """
     pid = gl.program_id(axis=0)
     num_pid_n = gl.cdiv(N, BLOCK_N)
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    # Plain blocked layout for the bf16 tile. 1 wave / CTA, NUM_WARPS=1.
+    # Plain blocked layout for the tile. 1 wave / CTA, NUM_WARPS=1.
     blk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[16, 4],
+        size_per_thread=[1, 4],
+        threads_per_warp=[1, 64],
         warps_per_cta=[1, 1],
         order=[1, 0],
     )
@@ -1945,9 +1944,9 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
 
     if _use_reduce:
         # Step 6: reduce. Sum partials[token, :, n] over the topk dim
-        # (fp32 accumulate, bf16 output) into `out`. Tile (32, 256),
+        # (fp32 accumulate, bf16 output) into `out`. Tile (1, 256),
         # 1 wave/CTA.
-        BLOCK_M_R = 16 if token_num >= 4096 else 32
+        BLOCK_M_R = 1
         BLOCK_N_R = 256
         NUM_WARPS_R = 1
         rgrid = (triton.cdiv(token_num, BLOCK_M_R) * triton.cdiv(N, BLOCK_N_R),)

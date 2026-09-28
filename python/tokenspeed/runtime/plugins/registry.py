@@ -234,16 +234,20 @@ def registered_architectures() -> frozenset[str]:
 
 def resolve_model_profile(
     architectures: Iterable[str], hf_config: PretrainedConfig
-) -> ModelProfile | None:
-    """Return the profile of the first registered architecture, if any.
+) -> tuple[str, ModelProfile] | None:
+    """Return the first registered architecture and its profile, if any.
 
     Args:
-        architectures: Candidate architecture names in resolution order.
+        architectures: Candidate architecture names in the order the model
+            loader walks them, so the profile and the loaded class come from
+            the same list.
         hf_config: The checkpoint config handed to ``model_profile``.
 
     Returns:
-        The class's profile, or None when no candidate is registered by a
-        plugin (in-tree models still resolve through the architecture tables).
+        ``(architecture, profile)``, or None when no candidate is registered
+        by a plugin (in-tree models still resolve through the architecture
+        tables). The loader checks that it builds the class of exactly this
+        architecture.
     """
     for architecture in architectures:
         registered = _MODELS.get(architecture)
@@ -255,8 +259,45 @@ def resolve_model_profile(
                 f"{registered.cls.__name__}.model_profile returned "
                 f"{type(profile).__name__}, not ModelProfile"
             )
-        return profile
+        return architecture, profile
     return None
+
+
+def _mirror_autoconfig(model_type: str, cls: type[PretrainedConfig], *, override: bool):
+    """Register ``model_type`` with Transformers' AutoConfig, reversibly.
+
+    Mirrors the in-tree table so Transformers' own lookups (e.g. from
+    AutoTokenizer) resolve the type too. Best effort, as in tree: a type
+    Transformers already ships keeps serving its lookups unless the plugin
+    overrides it. A failed plugin must not stay resolvable through AutoConfig,
+    so the mutation joins the recording's rollback — which needs the mapping's
+    private extra-content table. If a Transformers release moves it, the
+    mirror is skipped rather than made load-blocking or irreversible.
+    """
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    extra = vars(CONFIG_MAPPING).get("_extra_content")
+    if not isinstance(extra, dict):
+        logger.warning(
+            f"Transformers' AutoConfig mapping has no extra-content table; "
+            f"not mirroring config model_type {model_type!r} into AutoConfig"
+        )
+        return
+    prior = extra.get(model_type, _MISSING)
+    try:
+        AutoConfig.register(model_type, cls, exist_ok=override)
+    except ValueError:
+        # Transformers ships this type and the plugin did not override it.
+        return
+
+    def undo() -> None:
+        if prior is _MISSING:
+            extra.pop(model_type, None)
+        else:
+            extra[model_type] = prior
+
+    record_external("AutoConfig model_type", model_type, undo)
 
 
 def register_config(
@@ -283,8 +324,6 @@ def register_config(
         ValueError: Nothing to key the class by, or a key is already
             registered and ``override`` is False.
     """
-    from transformers import AutoConfig
-
     from tokenspeed.runtime.utils import hf_transformers_utils
 
     if model_type is None and not architectures:
@@ -297,26 +336,7 @@ def register_config(
             kind="config model_type",
             override=override,
         )
-        # Mirrors the in-tree table: Transformers' own lookups (e.g. from
-        # AutoTokenizer) resolve the type too. Best effort, as in tree — but
-        # a failed plugin must not leave its config class resolvable through
-        # AutoConfig, so the global mutation joins the recording's rollback.
-        with contextlib.suppress(ValueError):
-            from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
-            extra = CONFIG_MAPPING._extra_content
-            prior = extra.get(model_type, _MISSING)
-            AutoConfig.register(model_type, cls)
-
-            def undo_autoconfig(
-                model_type: str = model_type, prior: Any = prior
-            ) -> None:
-                if prior is _MISSING:
-                    extra.pop(model_type, None)
-                else:
-                    extra[model_type] = prior
-
-            record_external("AutoConfig model_type", model_type, undo_autoconfig)
+        _mirror_autoconfig(model_type, cls, override=override)
     for architecture in architectures:
         _put(
             hf_transformers_utils._ARCHITECTURE_CONFIG_REGISTRY,

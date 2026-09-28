@@ -1325,6 +1325,22 @@ class ModelExecutor:
             idle_forward_steps = getattr(
                 self.drafter, "idle_forward_steps", self.drafter.spec_num_steps
             )
+            # A draft model that reads request-token history takes the view
+            # on every forward; the idle rank hands it an empty one, as the
+            # target's idle forward above does.
+            draft_kwargs: dict[str, object] = {}
+            if (
+                self.drafter.draft_model_runner.model_config.requires_request_token_history
+            ):
+                ib = self.input_buffers
+                draft_kwargs["request_token_history"] = (
+                    self.runtime_states.draft_request_token_history_view(
+                        req_pool_indices=ib.req_pool_indices_buf[:0],
+                        input_start_offsets=ib.input_start_offsets_buf[:1],
+                        active_request_mask=ib.active_request_mask_buf[:0],
+                        committed_lengths=self.runtime_states.valid_cache_lengths,
+                    )
+                )
             for step_idx in range(idle_forward_steps or 0):
                 # Mirror active rank's catch-up step: when all non-idle ranks
                 # are decoding, step 0 sizes collectives from bs/global_bs.
@@ -1349,6 +1365,7 @@ class ModelExecutor:
                     input_ids=empty,
                     positions=empty,
                     spec_step_idx=step_idx,
+                    **draft_kwargs,
                 )
 
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):

@@ -1925,3 +1925,67 @@ def test_situ_warp_decode_matches_reference_above_old_bound_gfx950(
         situ_linear_beta=25.0,
     )
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
+
+
+@pytest.mark.parametrize("partial_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("split_major", [False, True])
+@pytest.mark.parametrize(
+    ("num_tokens", "topk", "width", "column_stride"),
+    [
+        (1, 1, 1, 1),
+        (5, 2, 127, 2),
+        (31, 4, 257, 1),
+        (84, 16, 3584, 1),
+        (96, 16, 3584, 1),
+        (112, 16, 3584, 1),
+        (513, 8, 7168, 1),
+        (8192, 16, 3584, 1),
+    ],
+)
+def test_partial_reduce_matches_reference_gfx950(
+    num_tokens: int,
+    topk: int,
+    width: int,
+    column_stride: int,
+    partial_dtype: torch.dtype,
+    split_major: bool,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
+        gluon_mxfp4_moe_stage2_reduce_kernel,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    partials = torch.randn(
+        (num_tokens, topk, width * column_stride),
+        dtype=partial_dtype,
+        device="cuda",
+        generator=generator,
+    )
+    if split_major:
+        partials = partials.transpose(0, 1).contiguous().transpose(0, 1)
+    partials = partials[:, :, ::column_stride]
+    expected = torch.zeros((num_tokens, width), dtype=torch.float32, device="cuda")
+    for slot in range(topk):
+        expected += partials[:, slot].float()
+    expected = expected.to(torch.bfloat16)
+    actual = torch.empty(
+        (num_tokens, width * column_stride), dtype=torch.bfloat16, device="cuda"
+    )[:, ::column_stride]
+
+    gluon_mxfp4_moe_stage2_reduce_kernel[(num_tokens * ((width + 255) // 256),)](
+        partials,
+        actual,
+        num_tokens,
+        width,
+        partials.stride(0),
+        partials.stride(1),
+        partials.stride(2),
+        actual.stride(0),
+        actual.stride(1),
+        BLOCK_N=256,
+        BLOCK_M=1,
+        TOP_K=topk,
+        num_warps=1,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
