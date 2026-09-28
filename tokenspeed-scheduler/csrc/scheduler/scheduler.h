@@ -378,9 +378,7 @@ private:
         Request* victim{nullptr};
         bool image_fits{false};
     };
-    // `ignore_exemption` also considers requests whose reserve covers their
-    // whole generation: the empty-round retraction when nothing else can be
-    // retracted and the round runs nothing.
+    // `ignore_exemption`: the empty-round retraction (docs/design/scheduler.md §2).
     VictimChoice chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const;
     // The first half of a retraction: publishes the pages the victim completed
     // since its last admission (see forward.cpp).
@@ -414,12 +412,8 @@ private:
     void maybeForceRetraction(PlanBuild& build, std::span<Request* const> candidates,
                               std::vector<WriteBackOperation>& write_back_operations);
 
-    // Liveness diagnostic, called once per NextExecutionPlan. A round is
-    // stalled when its plan carries no work while requests are live and
-    // nothing is out whose landing could change the next plan (no forward
-    // result, PD transfer or tier transfer). Warns once the streak reaches
-    // kStalledRoundsBeforeWarning and again at every doubling; it never
-    // changes a plan.
+    // The stall diagnostic (docs/design/scheduler.md §2), called once per
+    // NextExecutionPlan. It never changes a plan.
     void trackStalledRounds(std::size_t num_live_requests, bool plan_is_empty);
 
     // One plan-building grammar per engine role: the roles share the
