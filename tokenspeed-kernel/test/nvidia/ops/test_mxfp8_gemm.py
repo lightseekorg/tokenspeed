@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel import mm
+from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -81,8 +82,12 @@ def test_triton_mxfp8_1x32_raw_ue8m0_weight(device: str) -> None:
     )
 
     scales = torch.exp2(b_scales.float() - 127.0).repeat_interleave(32, dim=1)
-    ref = a.float() @ (b.float() * scales).t()
-    torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.12)
+    # Dequantize the activation exactly as mm() quantized it online, so only
+    # the GEMM's single bf16 rounding (at most 2^-8 relative) separates them.
+    q_a, a_scales = _online_quantize_mxfp8(a, [1, 32], "triton_mm_fp8_blockscale")
+    activation = q_a.float() * a_scales.repeat_interleave(32, dim=1)
+    ref = activation @ (b.float() * scales).t()
+    torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=5e-3)
 
 
 def _has_flashinfer_mxfp8() -> bool:
@@ -104,6 +109,10 @@ def _quantize_mxfp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     q, s = mxfp8_quantize(x, is_sf_swizzled_layout=False)
     return q, s.view(x.shape[0], x.shape[1] // 32)
+
+
+def _dequantize_mxfp8(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    return q.float() * torch.exp2(s.float() - 127.0).repeat_interleave(32, dim=1)
 
 
 @requires_flashinfer_mxfp8
@@ -190,10 +199,11 @@ def test_flashinfer_mxfp8_selected_with_online_quant(device: str) -> None:
         quant="mxfp8",
         block_size=[1, 32],
     )
-    scales = torch.exp2(b_s.float() - 127.0).repeat_interleave(32, dim=1)
-    ref = a.float() @ (b_q.float() * scales).t()
-    rel = (torch.norm(out.float() - ref) / torch.norm(ref)).item()
-    assert rel < 5e-2, f"rel_l2={rel}"
+    # mm() quantizes the activation online with the same FlashInfer quantizer;
+    # dequantizing that result keeps quantization noise out of the comparison.
+    a_q, a_s = _quantize_mxfp8(a)
+    ref = _dequantize_mxfp8(a_q, a_s) @ _dequantize_mxfp8(b_q, b_s).t()
+    torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
 
 
 @requires_flashinfer_mxfp8
