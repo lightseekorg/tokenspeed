@@ -265,3 +265,38 @@ def test_install_chains_and_uninstall_restores_hooks(device):
         compile_monitor.uninstall_compile_monitor()
         runtime.jit_cache_hook = None
         runtime.jit_post_compile_hook = None
+
+
+def test_launch_options_are_plain_values():
+    # With a compile hook installed, Triton serializes the launch options to
+    # JSON, so a constexpr object passed as e.g. num_warps fails every compile.
+    import ast
+    from pathlib import Path
+
+    options = {"num_warps", "num_stages", "num_ctas", "waves_per_eu", "maxnreg"}
+    roots = [Path(compile_monitor.__file__).parent]
+    amd = importlib.util.find_spec("tokenspeed_kernel_amd")
+    if amd is not None and amd.submodule_search_locations:
+        roots += [Path(path) for path in amd.submodule_search_locations]
+    offenders = []
+    for path in (p for root in roots for p in root.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        constexprs = {
+            target.id
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and ast.unparse(node.value.func).endswith("constexpr")
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript):
+                offenders += [
+                    f"{path}:{node.lineno} {kw.arg}={kw.value.id}"
+                    for kw in node.keywords
+                    if kw.arg in options
+                    and isinstance(kw.value, ast.Name)
+                    and kw.value.id in constexprs
+                ]
+    assert not offenders, offenders
