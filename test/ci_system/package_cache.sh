@@ -2,14 +2,16 @@
 
 configure_package_cache() {
     local cache_root="${CI_CACHE_ROOT:-}"
-    case "${CI_RUNNER_LABEL:-}" in
-        b200v2-*)
+    case "${RUNNER_NAME:-}:${CI_RUNNER_LABEL:-}" in
+        slurm-*:*|*:slurm-*)
+            cache_root="${cache_root:-${XDG_CACHE_HOME:-/home/runner/.cache}}"
+            ;;
+        *:b200v2-*)
             if [ -z "${cache_root}" ] && [ -n "${FLASHINFER_CACHE_DIR:-}" ]; then
                 cache_root="$(dirname "${FLASHINFER_CACHE_DIR}")"
             fi
             cache_root="${cache_root:-/raid/cache}"
             ;;
-        slurm-*) cache_root="${cache_root:-${XDG_CACHE_HOME:-/home/runner/.cache}}" ;;
         *) return 0 ;;
     esac
 
@@ -39,7 +41,8 @@ configure_nvcc_cache() {
     export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-100G}"
     export CCACHE_UMASK="${CCACHE_UMASK:-002}"
     export CCACHE_TEMPDIR="${CCACHE_TEMPDIR:-${WORKSPACE}/.ccache-tmp}"
-    export CCACHE_STATSLOG="${CCACHE_STATSLOG:-${WORKSPACE}/.ci-artifacts/ccache-stats.log}"
+    # Each compiler locks this log; keep concurrent writes off shared artifacts.
+    export CCACHE_STATSLOG="${CCACHE_STATSLOG:-${CCACHE_TEMPDIR}/ccache-stats.log}"
     if [ "${TOKENSPEED_CI_FORK_PR:-false}" = "true" ]; then
         export CCACHE_READONLY=1
     fi
@@ -68,6 +71,11 @@ show_nvcc_cache_stats() {
     if [ "${phase}" = "after" ] && [ -s "${CCACHE_STATSLOG:-}" ]; then
         echo "=== NVCC cache stats for this build ==="
         ccache --show-log-stats || true
+        local artifact_dir="${WORKSPACE}/.ci-artifacts"
+        if [ "${CCACHE_STATSLOG}" != "${artifact_dir}/ccache-stats.log" ]; then
+            mkdir -p "${artifact_dir}" \
+                && cp "${CCACHE_STATSLOG}" "${artifact_dir}/ccache-stats.log" || true
+        fi
     fi
 }
 
@@ -114,4 +122,27 @@ cache_remote_wheel() {
     ) 9>"${cache_path}.lock"
 
     printf '%s\n' "${cache_path}"
+}
+
+# A version alone cannot identify a wheel downloaded outside the package index.
+# pip records the installed archive hash in direct_url.json (PEP 610).
+installed_wheel_matches() {
+    python3 - "$@" <<'PYTHON'
+import json
+import sys
+from importlib import metadata
+
+try:
+    dist = metadata.distribution(sys.argv[1])
+    origin = json.loads(dist.read_text("direct_url.json") or "{}")
+    archive = origin["archive_info"]
+    digest = archive.get("hashes", {}).get("sha256")
+    if digest is None:
+        legacy_hash = archive.get("hash", "")
+        digest = legacy_hash[7:] if legacy_hash.startswith("sha256=") else None
+    matches = dist.version == sys.argv[2] and digest == sys.argv[3]
+except (metadata.PackageNotFoundError, ValueError, KeyError, TypeError, AttributeError):
+    matches = False
+sys.exit(0 if matches else 1)
+PYTHON
 }
