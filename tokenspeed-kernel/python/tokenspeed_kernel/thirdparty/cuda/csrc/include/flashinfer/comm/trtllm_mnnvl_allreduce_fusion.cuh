@@ -647,6 +647,25 @@ cudaError_t mnnvl_allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> cons
   return mnnvl_launch_oneshot<Pattern, T, NRanks, false>(params, comm, cfg);
 }
 
+// Share the supported collective sizes with specialized fusion entry points.
+template <typename Launch>
+cudaError_t mnnvl_dispatch_ranks(int nranks, Launch&& launch) {
+  switch (nranks) {
+    case 2:
+      return launch(std::integral_constant<int, 2>{});
+    case 4:
+      return launch(std::integral_constant<int, 4>{});
+    case 8:
+      return launch(std::integral_constant<int, 8>{});
+    case 16:
+      return launch(std::integral_constant<int, 16>{});
+    default:
+      FLASHINFER_ERROR(
+          "mnnvl allreduce fusion: unsupported world size (supported: 2, 4, 8, 16)");
+  }
+  return cudaErrorInvalidValue;
+}
+
 template <typename T>
 cudaError_t mnnvl_allreduce_fusion_op(AllReduceFusionParams<T> const& params,
                                       MnnvlCommArgs const& comm, bool launch_with_pdl,
@@ -678,25 +697,11 @@ cudaError_t mnnvl_allreduce_fusion_op(AllReduceFusionParams<T> const& params,
                        "kAllReduceLatentNorm)");                                             \
   }
 
-  switch (params.nranks) {
-    case 2:
-      MNNVL_DISPATCH_PATTERN(2);
-      break;
-    case 4:
-      MNNVL_DISPATCH_PATTERN(4);
-      break;
-    case 8:
-      MNNVL_DISPATCH_PATTERN(8);
-      break;
-    case 16:
-      MNNVL_DISPATCH_PATTERN(16);
-      break;
-    default:
-      FLASHINFER_ERROR(
-          "mnnvl allreduce fusion: unsupported world size (supported: 2, 4, 8, 16)");
-  }
+  return mnnvl_dispatch_ranks(params.nranks, [&](auto ranks) {
+    MNNVL_DISPATCH_PATTERN(decltype(ranks)::value);
+    return cudaErrorInvalidValue;
+  });
 #undef MNNVL_DISPATCH_PATTERN
-  return cudaErrorInvalidValue;
 }
 
 }  // namespace trtllm_mnnvl_allreduce_fusion

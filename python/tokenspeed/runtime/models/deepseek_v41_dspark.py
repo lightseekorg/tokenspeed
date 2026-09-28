@@ -389,6 +389,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         selection = _WindowSelection(page, row, indices)
         h = self.embed_tokens(ids)
         h = h[:, None, :].repeat(1, self.config.hc_mult, 1)
+        pending_post = None
         for stage, layer in enumerate(self.layers):
             backend = _WindowAttention(
                 positions,
@@ -398,13 +399,18 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 selection,
                 request_indices,
             )
-            h, pre_mix = layer(
+            h, pre_mix, pending_post, _ = layer(
                 h,
                 pre_mix,
                 positions,
                 image_mask=None,
                 ctx=replace(ctx, attn_backend=backend),
+                pending_post=pending_post,
+                allow_ffn_reduce_fusion=stage + 1 < len(self.layers),
+                capture_input=False,
             )
+        if pending_post is not None:
+            h = pending_post.finish(h)
         return _norm(v41_hc_pre(h, pre_mix), self.norm).reshape(
             batch, self.block_size, -1
         )

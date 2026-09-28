@@ -727,6 +727,7 @@ enum class AllReduceFusionPattern : int {
   // Lane AR for the latent MoE: all-reduce [routed latent | shared hidden]
   // and RMS-normalize the latent slice in the epilogue (Kimi-K3).
   kAllReduceLatentNorm = 10,
+  kAllReduceMhcNorm = 11,
 };
 
 enum class QuantType : int { kNone = 0, kFP8 = 1, kFP4 = 2, kFP8BlockWise = 3 };
@@ -769,6 +770,8 @@ DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualAttnResCombine, 
                              true, true, false, false, false, QuantType::kNone);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kAllReduceLatentNorm, true, false, false,
                              false, false, false, QuantType::kNone);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kAllReduceMhcNorm, false, false, false,
+                             true, true, false, QuantType::kNone);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
@@ -813,6 +816,9 @@ struct AllReduceFusionParams {
   void* attnres_out_norm_w = nullptr;
   // Latent-slice width for kAllReduceLatentNorm (rms_gamma/rms_eps reused).
   int latent_width = 0;
+  float* mhc_pre = nullptr;
+  float* mhc_post = nullptr;
+  float* mhc_comb = nullptr;
   void* norm_out;
   void* partial_normed_out;
   void* quant_out;
@@ -965,6 +971,14 @@ class FusedOp {
       : m_params(params), m_access_id(access_id), m_access_id_in_token(access_id_in_token) {}
 
   __device__ __forceinline__ void load_upstream_inputs() {
+    if constexpr (Pattern == AllReduceFusionPattern::kAllReduceMhcNorm) {
+      int token = m_access_id * VEC_SIZE / m_params.hidden_dim;
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        m_hc_residual[c].load(reinterpret_cast<T*>(m_params.residual_in) +
+            (token * 4 + c) * m_params.hidden_dim + m_access_id_in_token * VEC_SIZE);
+      }
+    }
     if constexpr (HasRMSNorm<Pattern>) {
       m_gamma_val.load(reinterpret_cast<T*>(m_params.rms_gamma) +
                        m_access_id_in_token * VEC_SIZE);
@@ -1047,6 +1061,9 @@ class FusedOp {
           val.store(reinterpret_cast<T*>(m_params.residual_out) + residual_access_id * VEC_SIZE);
         }
       }
+    }
+    if constexpr (Pattern == AllReduceFusionPattern::kAllReduceMhcNorm) {
+      val = mhc_post_pre(val, token_id);
     }
     if constexpr (HasRMSNorm<Pattern>) {
       val = rms_norm(val, m_gamma_val);
@@ -1131,6 +1148,34 @@ class FusedOp {
       reinterpret_cast<__nv_fp8_e4m3*>(&quanted_out)[i] = static_cast<__nv_fp8_e4m3>(r);
     }
     return quanted_out;
+  }
+
+  __device__ __forceinline__ vec_t<T, VEC_SIZE> mhc_post_pre(
+      vec_t<T, VEC_SIZE> const& x, int token) {
+    vec_t<T, VEC_SIZE> combined;
+    float pre_sum[VEC_SIZE] = {};
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      vec_t<T, VEC_SIZE> mixed;
+      float post = m_params.mhc_post[token * 4 + c];
+      float pre = m_params.mhc_pre[token * 4 + c];
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        float acc = __fmul_rn(post, static_cast<float>(x[i]));
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+          acc = fmaf(m_params.mhc_comb[token * 16 + r * 4 + c],
+                     static_cast<float>(m_hc_residual[r][i]), acc);
+        }
+        mixed[i] = static_cast<T>(acc);
+        pre_sum[i] = fmaf(pre, static_cast<float>(mixed[i]), pre_sum[i]);
+      }
+      mixed.store(reinterpret_cast<T*>(m_params.residual_out) +
+          (token * 4 + c) * m_params.hidden_dim + m_access_id_in_token * VEC_SIZE);
+    }
+#pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) combined[i] = static_cast<T>(pre_sum[i]);
+    return combined;
   }
 
   __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const& residual,
@@ -1328,6 +1373,7 @@ class FusedOp {
   int m_access_id_in_token;
   float m_scale_factor;
   vec_t<T, VEC_SIZE> m_residual_val;
+  vec_t<T, VEC_SIZE> m_hc_residual[4];
   vec_t<T, VEC_SIZE> m_gamma_val;
   vec_t<T, VEC_SIZE> m_resw_val;
   vec_t<T, VEC_SIZE> m_outw_val;

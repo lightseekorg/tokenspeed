@@ -51,6 +51,20 @@ class CommBackend(ABC):
             raise ValueError("all-reduce requires at least one tensor")
         return tuple(self.all_reduce(value, group, op=op) for value in tensors)
 
+    def supports_all_reduce_mhc_norm(
+        self, x: torch.Tensor, norm_weight: torch.Tensor, group: Group
+    ) -> bool:
+        """Whether the prepared group can fuse the anticipated output spec of x."""
+        return False
+
+    def all_reduce_mhc_norm(
+        self, x, residual, post, comb, pre, weight, eps, group: Group
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Execute admitted fusion; return residual/norm outputs or raise."""
+        raise NotImplementedError(
+            "This backend does not support mHC communication fusion"
+        )
+
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         """Prepare an implementation-specific one-shot lane when supported."""
 

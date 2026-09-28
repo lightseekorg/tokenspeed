@@ -357,6 +357,13 @@ size their collectives from their own rows, which the DP metadata gather
 does not carry (the same gap that keeps narrowing itself unimplemented under
 DP).
 
+V4.1 completes deferred HC posts and reductions before stage handoffs or
+Engram updates. The fixed graph input state contains only completed residuals.
+Prefill warmup runs on the eventual capture stream because MegaMHC initializes
+per-stream barriers. Allocation observers wrap capture alone, leaving eager
+warmup allocations in utilization headroom. Fused HC all-reduce admission
+respects both deterministic and batch-invariant collective settings.
+
 ### One draft metadata contract
 
 The draft backend's decode metadata comes from `refresh_decode_metadata` and

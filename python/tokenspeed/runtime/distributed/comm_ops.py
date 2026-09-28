@@ -136,6 +136,39 @@ def all_reduce(
     return backend.all_reduce(tensor, group, op=op)
 
 
+def supports_all_reduce_mhc_norm(
+    x: torch.Tensor, norm_weight: torch.Tensor, group: Group
+) -> bool:
+    """Select fusion before scheduling the producer's ordinary all-reduce.
+
+    x describes the producer's anticipated output shape, dtype, device and
+    layout, including CED narrowing and graph padding. The producer must honor
+    that spec; HC residual/coefficient formats follow all_reduce_mhc_norm's
+    contract. Backend configuration and the prepared workspace remain fixed
+    between this query and execution. Only the shape, dtype, device and
+    contiguity of norm_weight are inspected. It may be a producer norm with
+    equivalent storage; execution uses the consumer's own weight and epsilon.
+    This query does not read tensor values, retain tensors or launch GPU work.
+    """
+    return get_global_backend().supports_all_reduce_mhc_norm(x, norm_weight, group)
+
+
+def all_reduce_mhc_norm(
+    x, residual, post, comb, pre, weight, eps, group: Group
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute fusion selected by supports_all_reduce_mhc_norm.
+
+    x is BF16 [T,H], residual BF16 [T,4,H], post/pre FP32 [T,4], comb
+    FP32 [T,4,4], and weight BF16 [H]. All tensors are contiguous and on the
+    same CUDA device; eps is positive and group is the admitted prepared group.
+    Returns updated residual and normalized input. Contract violations and
+    execution errors propagate; this operation never requests a fallback.
+    """
+    return get_global_backend().all_reduce_mhc_norm(
+        x, residual, post, comb, pre, weight, eps, group
+    )
+
+
 def prepare_all_reduce_lane(
     group: Group,
     hidden_dim: int,

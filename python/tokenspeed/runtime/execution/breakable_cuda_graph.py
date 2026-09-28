@@ -168,6 +168,7 @@ class BreakableCapture:
             2478MB -> 564MB for buckets [8192,4096,2048,1024] on the repro). This
             mirrors ``torch.cuda.graph``'s shared ``default_capture_stream`` and
             its documented "pass the same stream for effective memory sharing".
+            The selected stream is exposed as ``stream`` for caller-owned warmup.
     """
 
     _active: BreakableCapture | None = None
@@ -184,13 +185,14 @@ class BreakableCapture:
             if BreakableCapture._default_capture_stream is None:
                 BreakableCapture._default_capture_stream = torch.cuda.Stream()
             stream = BreakableCapture._default_capture_stream
-        self._stream = stream
+        self.stream = stream
         self._stream_ctx: Any | None = None
         # Break-output handoff buffers keyed by (shape, dtype, device); see break_point.
         self._handoff: dict[Any, torch.Tensor] = {}
 
     @classmethod
     def current(cls) -> BreakableCapture | None:
+        """Graph being captured, including its eager breaks, if any."""
         return cls._active
 
     # -- capture lifecycle -------------------------------------------------
@@ -206,8 +208,8 @@ class BreakableCapture:
         self._gc_was_enabled = gc.isenabled()
         gc.disable()
         # The capture stream must observe prior entry-stream work (warmup, buffers).
-        self._stream.wait_stream(torch.cuda.current_stream())
-        self._stream_ctx = torch.cuda.stream(self._stream)
+        self.stream.wait_stream(torch.cuda.current_stream())
+        self._stream_ctx = torch.cuda.stream(self.stream)
         self._stream_ctx.__enter__()
         BreakableCapture._active = self
         self._begin_segment()
@@ -222,7 +224,7 @@ class BreakableCapture:
                 self._stream_ctx.__exit__(*exc)
                 self._stream_ctx = None
             # Eager breaks ran on the side stream; entry stream must observe them.
-            torch.cuda.current_stream().wait_stream(self._stream)
+            torch.cuda.current_stream().wait_stream(self.stream)
             if self._gc_was_enabled:
                 gc.enable()
         return False
