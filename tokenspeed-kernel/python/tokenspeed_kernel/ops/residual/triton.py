@@ -323,20 +323,33 @@ def triton_hyperconnection_combine(
 def compute_mhc_num_splits(
     device: torch.device, block_k: int, k: int | None, grid_size: int
 ) -> int:
-    """Split-K count for the mHC prenorm GEMM over ``grid_size`` token tiles.
+    """Split-K count for the mHC prenorm GEMM.
 
-    Fills the SMs once, rounded down to a power of two: the split count is a
-    DeepGEMM template argument (every new value is a JIT compilation on the
-    forward thread) and the fused pre-reduce-apply kernel only supports
-    powers of two. Callers that warm DeepGEMM must use this same count.
+    The count that fills the SMs once is rounded down to a power of two, then
+    capped at a quarter of the K tiles. The split count is a DeepGEMM
+    template argument, so every new value is a JIT compilation on the
+    forward thread: the rounding keeps the batch-dependent part to a few
+    values, and the cap only depends on the model. The cap is applied
+    exactly because the GFX950 pre-reduce-apply kernel requires
+    ``hidden_size // 64`` splits. Callers that warm DeepGEMM must use this
+    same count.
+
+    Args:
+        device: CUDA device whose SM count bounds the split.
+        block_k: K tile size of the GEMM.
+        k: GEMM reduction size (``hc_mult * hidden_size``), or ``None`` to
+            skip the K-tile cap.
+        grid_size: Token tiles the GEMM launches without splitting.
+
+    Returns:
+        The split count, at least 1.
     """
     device_props = torch.cuda.get_device_properties(device)
-    split_k = device_props.multi_processor_count // grid_size
+    fill = max(device_props.multi_processor_count // grid_size, 1)
+    split_k = 1 << (fill.bit_length() - 1)
     if k is not None:
-        num_block_k = triton.cdiv(k, block_k)
-        split_k = min(split_k, num_block_k // 4)
-    split_k = max(split_k, 1)
-    return 1 << (split_k.bit_length() - 1)
+        split_k = min(split_k, triton.cdiv(k, block_k) // 4)
+    return max(split_k, 1)
 
 
 def _pre_reduce_apply_is_supported(
