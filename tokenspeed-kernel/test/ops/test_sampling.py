@@ -173,7 +173,8 @@ def _ref_topk_topp(
 ) -> torch.Tensor:
     """Pure-torch baseline mirroring flashinfer's ``top_k_renorm_prob`` followed
     by ``top_p_renorm_prob(is_deterministic=True)``. K >= V is treated as no
-    top-k cutoff (matches both the flashinfer clamp and the K = 1<<30 sentinel).
+    top-k cutoff (matches both the flashinfer clamp and the K = 1<<30 sentinel),
+    and P >= 1 as no top-p cutoff (renormalize only).
     """
     bs, V = probs.shape
     out = probs.clone()
@@ -185,15 +186,15 @@ def _ref_topk_topp(
             s = out[i].sum()
             if s > 0:
                 out[i] = out[i] / s
-        sorted_vals, _ = torch.sort(out[i], descending=True)
-        cs = torch.cumsum(sorted_vals, 0)
         p = float(top_ps[i].item())
-        # Smallest prefix with cumulative mass >= p. Clamp to V to absorb
-        # fp32 rounding when p = 1.0 (cumsum's last value can fall a ulp
-        # short of 1.0 and would otherwise push keep past the end).
-        keep = min((cs < p).sum().item() + 1, V)
-        thresh = sorted_vals[keep - 1]
-        out[i] = torch.where(out[i] >= thresh, out[i], torch.zeros_like(out[i]))
+        if p < 1.0:
+            sorted_vals, _ = torch.sort(out[i], descending=True)
+            cs = torch.cumsum(sorted_vals, 0)
+            # Smallest prefix with cumulative mass >= p. Clamp to V in case
+            # fp32 rounding leaves the row total below p.
+            keep = min((cs < p).sum().item() + 1, V)
+            thresh = sorted_vals[keep - 1]
+            out[i] = torch.where(out[i] >= thresh, out[i], torch.zeros_like(out[i]))
         s = out[i].sum()
         if s > 0:
             out[i] = out[i] / s
@@ -420,21 +421,11 @@ def test_fused_topk_topp_keeps_sub_ulp_tail_at_top_p_one(
     top_ks = torch.full((bs,), top_k, dtype=torch.int32, device=device)
     top_ps = torch.ones(bs, dtype=torch.float32, device=device)
 
+    ref = _ref_topk_topp(probs, top_ks, top_ps)
     ours = fused_topk_topp_renorm(probs, top_ks, top_ps)
-    torch.cuda.synchronize()
-
-    # Expected: the ``kept`` largest entries of each row, renormalized.
-    keep = torch.zeros_like(probs, dtype=torch.bool)
-    keep.scatter_(1, torch.topk(probs, kept, dim=-1).indices, True)
-    ref = torch.where(keep, probs, torch.zeros_like(probs))
-    ref = ref / ref.sum(dim=-1, keepdim=True)
 
     assert int((ours != 0).sum().item()) == bs * kept
-    torch.testing.assert_close(ours != 0, keep, atol=0, rtol=0)
-    torch.testing.assert_close(
-        ours.sum(dim=-1), torch.ones(bs, device=device), atol=1e-5, rtol=1e-5
-    )
-    torch.testing.assert_close(ours, ref, atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(ours, ref, atol=0.0, rtol=1e-5)
 
 
 def test_gather_empty_batch(device: str) -> None:

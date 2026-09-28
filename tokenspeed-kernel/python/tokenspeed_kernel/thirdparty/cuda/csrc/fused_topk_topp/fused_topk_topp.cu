@@ -619,7 +619,6 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
                 if (v >= threshold) out_row[i] = v * inv;
             }
         }
-        (void)p;  // unused in this branch
     }
 }
 
