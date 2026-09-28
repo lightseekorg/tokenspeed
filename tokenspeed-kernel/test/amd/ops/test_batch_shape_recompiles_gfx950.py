@@ -235,3 +235,67 @@ def test_moe_topk_row_count():
     with assert_no_triton_compile(_common._topk_forward):
         for rows in (97, 130, 1483, 2336):
             run(rows)
+
+
+def test_iris_allreduce_sizes():
+    pytest.importorskip("iris")
+    from tokenspeed_kernel._triton import gl
+    from tokenspeed_kernel.ops.communication import iris as comm
+
+    buf = torch.empty(1 << 22, device=DEVICE, dtype=torch.bfloat16)
+    flags = torch.zeros(1024, device=DEVICE, dtype=torch.int32)
+    heaps = [1 << 40] * 8
+    common = dict(RANK=0, WORLD_SIZE=8, SUBGROUP_SIZE=64, WORDS_PER_LANE=2)
+    common.update(ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
+
+    # Compile only: the allreduce itself needs the symmetric heap of every rank.
+    def two_stage(words):
+        tiles = -(-words // 128)
+        comm.iris_reduce_symmetric_two_stage_gluon_kernel.warmup(
+            buf,
+            buf,
+            buf,
+            flags,
+            *heaps,
+            PARTITION_WORDS=words,
+            BLOCK_WORDS=128,
+            NUM_PROGRAMS=min(tiles, 84),
+            NUM_TILES=tiles,
+            NUM_WARPS=8,
+            EXIT_BARRIER=True,
+            num_warps=8,
+            grid=(1,),
+            **common,
+        )
+
+    def one_stage(numel):
+        tiles = -(-numel // 512)
+        comm.iris_reduce_symmetric_gluon_kernel.warmup(
+            buf,
+            buf,
+            flags,
+            *heaps,
+            TOTAL_NUMEL=numel,
+            BLOCK_SIZE=512,
+            NUM_PROGRAMS=min(tiles, 84),
+            NUM_TILES=tiles,
+            NUM_WARPS=1,
+            PUBLISH_READY=False,
+            num_warps=1,
+            grid=(1,),
+            **common,
+        )
+
+    # The reduced size follows the batch, and so do the tile and program counts.
+    two_stage(60480)
+    two_stage(60481)
+    one_stage(7168 * 3)
+    one_stage(7168 * 3 + 1)
+    with assert_no_triton_compile(
+        comm.iris_reduce_symmetric_two_stage_gluon_kernel,
+        comm.iris_reduce_symmetric_gluon_kernel,
+    ):
+        for words in (157248, 996240, 236880, 79296):
+            two_stage(words)
+        for numel in (7168 * 5, 7168 * 11, 7168 * 29 + 3):
+            one_stage(numel)
