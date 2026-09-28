@@ -212,7 +212,7 @@ def test_gluon_bmm_writes_head_major_strided_output(device: str, require) -> Non
     )
 
     assert returned.data_ptr() == out.data_ptr()
-    torch.testing.assert_close(out, torch.bmm(a, weight), atol=0.25, rtol=0.01)
+    torch.testing.assert_close(out, torch.bmm(a, weight), atol=6e-2, rtol=1e-2)
 
 
 def test_gluon_bmm_allocates_output(device: str, require) -> None:
@@ -226,7 +226,7 @@ def test_gluon_bmm_allocates_output(device: str, require) -> None:
         override="gluon_bmm_a16w16_gfx950",
     )
 
-    torch.testing.assert_close(output, torch.bmm(a, weight), atol=0.25, rtol=0.01)
+    torch.testing.assert_close(output, torch.bmm(a, weight), atol=6e-2, rtol=1e-2)
 
 
 def test_gluon_bmm_falls_back_for_fp32_output(device: str, require) -> None:
@@ -424,8 +424,8 @@ def test_linear_attnres_partials_gfx950_matches_composition(
     torch.testing.assert_close(
         actual,
         torch.nn.functional.linear(hidden, weight),
-        atol=2e-2,
-        rtol=2e-2,
+        atol=1e-3,
+        rtol=1e-2,
     )
     values = blocks.float()
     inverse_rms = torch.rsqrt(values.square().mean(dim=-1) + 1e-6)
@@ -502,8 +502,8 @@ def _assert_linear_attnres_matches_composition(
     torch.testing.assert_close(
         actual,
         torch.nn.functional.linear(hidden, weight),
-        atol=2e-2,
-        rtol=2e-2,
+        atol=1e-3,
+        rtol=1e-2,
     )
     values = blocks.float()
     inverse_rms = torch.rsqrt(values.square().mean(dim=-1) + eps)
@@ -593,7 +593,7 @@ def test_linear_attnres_partials_gfx1250_cuda_graph_replay(output_size: int) -> 
     torch.cuda.synchronize()
     replayed = out.clone()
     expected = run()
-    torch.testing.assert_close(replayed, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(replayed, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(
