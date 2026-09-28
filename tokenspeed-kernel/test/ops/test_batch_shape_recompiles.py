@@ -587,7 +587,10 @@ def test_mha_decode_and_extend_table_width():
     kv_lens = [64, 130, 17, 191]
     k_cache, v_cache, table = _paged_kv(kv_lens, 2, 64, 64)
     seqlens = torch.tensor(kv_lens, dtype=torch.int32, device=DEVICE)
-    q = torch.randn(4, 8, 64, device=DEVICE, dtype=torch.bfloat16)
+    # 8 query heads over 2 KV heads take the grouped decode kernel, 2 over 2
+    # the per-head one.
+    q_grouped = torch.randn(4, 8, 64, device=DEVICE, dtype=torch.bfloat16)
+    q_per_head = torch.randn(4, 2, 64, device=DEVICE, dtype=torch.bfloat16)
     q_lens = torch.tensor([1, 3, 2, 4], dtype=torch.int32, device=DEVICE)
     q_extend = torch.randn(10, 8, 64, device=DEVICE, dtype=torch.bfloat16)
     cu_q = F.pad(q_lens.cumsum(0, dtype=torch.int32), (1, 0))
@@ -595,16 +598,19 @@ def test_mha_decode_and_extend_table_width():
 
     def run(cols):
         wide = _widen(table, cols)
-        decoded = mha_decode_with_kvcache(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=wide,
-            cache_seqlens=seqlens,
-            max_seqlen_q=1,
-            max_seqlen_k=256,
-            solution="triton",
-        )
+        decoded = [
+            mha_decode_with_kvcache(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                page_table=wide,
+                cache_seqlens=seqlens,
+                max_seqlen_q=1,
+                max_seqlen_k=256,
+                solution="triton",
+            )
+            for q in (q_grouped, q_per_head)
+        ]
         extended = mha_extend_with_kvcache(
             q=q_extend,
             cu_seqlens_q=cu_q,
@@ -617,7 +623,7 @@ def test_mha_decode_and_extend_table_width():
             max_seqlen_k=191,
             solution="triton",
         )
-        return decoded, extended
+        return *decoded, extended
 
     expected = run(table.shape[1])
     run(16)
@@ -632,7 +638,7 @@ def test_mha_decode_and_extend_table_width():
 
 
 def test_rel_mha_decode_table_width_and_split_count():
-    from rel_mha_reference import HEAD_DIM, NUM_Q_HEADS, build_paged
+    from rel_mha_reference import HEAD_DIM, NUM_KV_HEADS, NUM_Q_HEADS, build_paged
     from tokenspeed_kernel.ops.attention.rmha import (
         rel_mha_decode_with_kvcache,
     )
@@ -646,19 +652,24 @@ def test_rel_mha_decode_table_width_and_split_count():
     cu_q = torch.arange(4, dtype=torch.int32, device=DEVICE)
 
     def run(cols, max_seqlen_k):
-        return rel_mha_decode_with_kvcache(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=_widen(table, cols),
-            cache_seqlens=seqlens,
-            max_seqlen_k=max_seqlen_k,
-            rel_logits=rel_logits,
-            cu_seqlens_q=cu_q,
-            max_seqlen_q=1,
-            softmax_scale=1.0 / HEAD_DIM,
-            solution="triton",
-        )
+        # All query heads share the 2 KV heads (grouped kernel); the first 2
+        # alone map one to one (per-head kernel).
+        return [
+            rel_mha_decode_with_kvcache(
+                q=q[:, :heads],
+                k_cache=k_cache,
+                v_cache=v_cache,
+                page_table=_widen(table, cols),
+                cache_seqlens=seqlens,
+                max_seqlen_k=max_seqlen_k,
+                rel_logits=rel_logits[:, :heads],
+                cu_seqlens_q=cu_q,
+                max_seqlen_q=1,
+                softmax_scale=1.0 / HEAD_DIM,
+                solution="triton",
+            )
+            for heads in (NUM_Q_HEADS, NUM_KV_HEADS)
+        ]
 
     expected = run(table.shape[1], 300)
     run(16, 2 * 2048)
@@ -669,9 +680,88 @@ def test_rel_mha_decode_table_width_and_split_count():
     ):
         # The longest context picks 3, 5 and 11 KV splits here.
         for cols, max_seqlen_k in ((7, 5000), (19, 9000), (40, 21000)):
-            torch.testing.assert_close(
-                run(cols, max_seqlen_k), expected, rtol=1e-2, atol=1e-2
-            )
+            for got, want in zip(run(cols, max_seqlen_k), expected, strict=True):
+                torch.testing.assert_close(got, want, rtol=1e-2, atol=1e-2)
+
+
+def test_rel_mha_extend_table_width():
+    from rel_mha_reference import HEAD_DIM, NUM_Q_HEADS, build_paged
+    from tokenspeed_kernel.ops.attention.rmha import rel_mha_extend_with_kvcache
+    from tokenspeed_kernel.ops.attention.rmha import triton as rmha
+
+    q_lens, kv_lens = [3, 5, 2], [70, 300, 17]
+    k_cache, v_cache, table, _, _ = build_paged(kv_lens, DEVICE, 64)
+    q = torch.randn(10, NUM_Q_HEADS, HEAD_DIM, device=DEVICE, dtype=torch.bfloat16)
+    rel_logits = torch.randn(10, NUM_Q_HEADS, 64, device=DEVICE, dtype=torch.bfloat16)
+    seqlens = torch.tensor(kv_lens, dtype=torch.int32, device=DEVICE)
+    cu_q = F.pad(
+        torch.tensor(q_lens, device=DEVICE).cumsum(0, dtype=torch.int32), (1, 0)
+    )
+    cu_kv = F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0))
+
+    def run(cols):
+        return rel_mha_extend_with_kvcache(
+            q=q,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=_widen(table, cols),
+            cache_seqlens=seqlens,
+            max_seqlen_q=5,
+            max_seqlen_k=300,
+            rel_logits=rel_logits,
+            softmax_scale=1.0 / HEAD_DIM,
+            solution="triton",
+        )
+
+    expected = run(table.shape[1])
+    run(16)
+    with assert_no_triton_compile(rmha._rel_mha_prefill_kernel):
+        for cols in (7, 19, 40):
+            torch.testing.assert_close(run(cols), expected, rtol=0, atol=0)
+
+
+def test_kpool_prefill_chunk_scores_table_width():
+    from test_kpool_select import _DIM, _KV_PAGE, _PAGE, _POOL, _setup
+    from tokenspeed_kernel.ops.attention.kpool import kpool_prefill_topk
+    from tokenspeed_kernel.ops.attention.kpool._triton import score
+
+    # Four query rows at the end of each request; both see more pools than
+    # topk, so they are scored in chunked windows.
+    seq_lens = [900, 1300]
+    q, cache, _, weights, _, index_table, kv_table = _setup(
+        seq_lens, q_len_per_req=4, seed=53
+    )
+    positions = torch.cat(
+        [torch.arange(n - 4, n, dtype=torch.int32, device=DEVICE) for n in seq_lens]
+    )
+    query_start_loc = torch.tensor([0, 4, 8], dtype=torch.int32, device=DEVICE)
+
+    def run(extra_cols):
+        return kpool_prefill_topk(
+            q,
+            cache,
+            weights,
+            positions,
+            query_start_loc,
+            _widen(index_table, index_table.shape[1] + extra_cols),
+            kv_table,
+            pool_size=_POOL,
+            page_size=_PAGE,
+            kv_page_size=_KV_PAGE,
+            topk_pools=64,
+            softmax_scale=_DIM**-0.5,
+            apply_relu=True,
+            chunk_pools=128,
+        )
+
+    expected = run(0)
+    run(10)
+    with assert_no_triton_compile(score._kpool_score_prefill_chunk_kernel):
+        for extra_cols in (1, 5, 13, 42):
+            for got, want in zip(run(extra_cols), expected, strict=True):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 def test_kpool_dense_scores_width():
@@ -776,3 +866,98 @@ def test_mhc_mixes_split_count():
             assert splits & (splits - 1) == 0
             pre = run(tokens)
             torch.testing.assert_close(pre[:64], first, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("sm_count", "hidden", "tokens", "expected"),
+    [
+        # MI355: the GFX950 pre-reduce-apply kernel needs hidden_size // 64.
+        (256, 7168, 64, 112),
+        (256, 4096, 64, 64),
+        # H20 and B200: the SM fill is rounded down before the K-tile cap.
+        (78, 7168, 64, 64),
+        (148, 7168, 64, 112),
+        (148, 7168, 128, 64),
+        (148, 7168, 1024, 8),
+    ],
+)
+def test_mhc_split_count_rounds_the_sm_fill_before_the_k_cap(
+    monkeypatch, sm_count, hidden, tokens, expected
+):
+    from types import SimpleNamespace
+
+    from tokenspeed_kernel.ops.residual import triton as residual
+
+    props = SimpleNamespace(multi_processor_count=sm_count)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: props)
+    splits = residual.compute_mhc_num_splits.__wrapped__(
+        torch.device(DEVICE), 64, 4 * hidden, triton_cdiv(tokens, 64)
+    )
+    assert splits == expected
+
+
+def test_mhc_pre_split_count():
+    from test_mhc_prefill import _reference
+    from tokenspeed_kernel.ops.residual import triton as residual
+
+    hidden = 4096
+    generator = torch.Generator(device=DEVICE).manual_seed(7)
+    x = torch.randn(256, 4, hidden, device=DEVICE, generator=generator).bfloat16()
+    fn = torch.randn(24, 4 * hidden, device=DEVICE, generator=generator) * 0.01
+    scale = torch.tensor([0.7, 1.1, 0.5], device=DEVICE)
+    base = torch.randn(24, device=DEVICE, generator=generator)
+
+    def run(tokens):
+        # Up to 256 tokens take the split-K GEMM and the generic mix kernel.
+        args = (x[:tokens], fn, scale, base, 1e-6, 1e-5, 3)
+        actual = residual.triton_mhc_pre(*args, norm_weight=None, norm_eps=None)
+        for got, want in zip(actual, _reference(*args), strict=True):
+            torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-2)
+
+    run(64)
+    run(33)
+    with assert_no_triton_compile(
+        residual._mhc_prenorm_gemm_triton_kernel, residual._mhc_pre_mix_triton_kernel
+    ):
+        # Two to four token tiles pick fewer splits than one.
+        for tokens in (65, 130, 200, 256):
+            run(tokens)
+
+
+def test_mhc_hc4_coefficients_split_count():
+    from tokenspeed_kernel.ops.residual import triton as residual
+
+    hidden, tokens = 4096, 37
+    generator = torch.Generator(device=DEVICE).manual_seed(11)
+    mul = torch.randn(tokens, 24, device=DEVICE, generator=generator)
+    sqrsum = torch.rand(tokens, device=DEVICE, generator=generator) * 4 * hidden
+    scale = torch.tensor([0.7, 1.1, 0.5], device=DEVICE)
+    base = torch.randn(24, device=DEVICE, generator=generator)
+
+    def run(n_splits):
+        # The whole projection sits in split 0 and the rest add exact zeros,
+        # so every split count must reproduce the single-split result.
+        gemm_mul = torch.zeros(n_splits, tokens, 24, device=DEVICE)
+        gemm_sqrsum = torch.zeros(n_splits, tokens, device=DEVICE)
+        gemm_mul[0], gemm_sqrsum[0] = mul, sqrsum
+        pre = torch.empty(tokens, 4, device=DEVICE)
+        post = torch.empty(tokens, 4, device=DEVICE)
+        comb = torch.empty(tokens, 16, device=DEVICE)
+        common = dict(hidden_size=hidden, rms_eps=1e-6, hc_eps=1e-5)
+        common.update(n_splits=n_splits, num_tokens=tokens)
+        residual.mhc_pre_only_hc4(gemm_mul, gemm_sqrsum, scale, base, pre, **common)
+        residual.mhc_post_comb_hc4(
+            gemm_mul, gemm_sqrsum, scale, base, post, comb, sinkhorn_iters=3, **common
+        )
+        return pre, post, comb
+
+    expected = run(1)
+    run(16)
+    run(3)
+    with assert_no_triton_compile(
+        residual._mhc_pre_only_hc4_kernel, residual._mhc_post_comb_hc4_kernel
+    ):
+        # 112 is the split count of hidden_size 7168 on GFX950.
+        for n_splits in (5, 7, 12, 64, 112):
+            for got, want in zip(run(n_splits), expected, strict=True):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
