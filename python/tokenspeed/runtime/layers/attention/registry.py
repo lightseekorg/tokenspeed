@@ -670,35 +670,46 @@ def _create_attn_config(
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
     # ``component()``).
-    profile_linear: str | None = None
+    linear_attn = _linear_attn_component(server_args, model_config, is_draft)
+    if linear_attn is not None:
+        config = dataclasses.replace(
+            config, components=config.components + (linear_attn,)
+        )
+    return config
+
+
+def _linear_attn_component(
+    server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
+) -> LinearAttnConfig | None:
+    """The linear-attention component, or None for a model without one.
+
+    A plugin profile that declares ``linear_attention`` must get it: serving
+    the model through full attention alone would be silently wrong. The
+    in-tree schema is the one linear-config reader today, so the checkpoint
+    config must expose ``linear_layer_ids`` and the geometry fields
+    ``LinearAttnConfig.generate`` reads.
+    """
     if model_config.model_profile is not None:
         profile_linear = model_config.model_profile.linear_attention
-        linear_cls = LinearAttnConfig if profile_linear is not None else None
-    else:
-        architectures = getattr(model_config.hf_config, "architectures", None) or ()
-        linear_cls = next(
-            (_LINEAR_ATTN_CLS[a] for a in architectures if a in _LINEAR_ATTN_CLS),
-            None,
-        )
-    if linear_cls is not None:
-        linear_attn = linear_cls.generate(server_args, model_config, is_draft)
-        if linear_attn is None and profile_linear is not None:
-            # The profile positively declared linear layers; serving the
-            # model through full attention alone would be silently wrong.
-            # The in-tree schema is the one linear-config reader today: a
-            # plugin's checkpoint config must expose ``linear_layer_ids``
-            # and the geometry fields ``LinearAttnConfig.generate`` reads.
+        if profile_linear is None:
+            return None
+        linear_attn = LinearAttnConfig.generate(server_args, model_config, is_draft)
+        if linear_attn is None:
             raise ValueError(
                 f"model profile declares linear_attention={profile_linear!r} "
                 "but the checkpoint config exposes no linear_layer_ids; "
                 "declare the linear geometry LinearAttnConfig reads, or drop "
                 "linear_attention from the profile"
             )
-        if linear_attn is not None:
-            config = dataclasses.replace(
-                config, components=config.components + (linear_attn,)
-            )
-    return config
+        return linear_attn
+    architectures = getattr(model_config.hf_config, "architectures", None) or ()
+    linear_cls = next(
+        (_LINEAR_ATTN_CLS[a] for a in architectures if a in _LINEAR_ATTN_CLS),
+        None,
+    )
+    if linear_cls is None:
+        return None
+    return linear_cls.generate(server_args, model_config, is_draft)
 
 
 def _create_attn_backend(

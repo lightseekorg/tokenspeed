@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from tokenspeed.runtime.configs.numerics import require_verified_numerics
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
@@ -35,6 +36,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
+from tokenspeed.runtime.utils.hf_transformers_utils import resolve_architecture
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -99,6 +101,13 @@ class ModelRunner:
         self._weight_update_device: torch.device | None = None
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
         self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
+        # Target and draft alike: the envelope covers every model that serves.
+        require_verified_numerics(
+            server_args.numerics,
+            model_profile=model_config.model_profile,
+            architecture=resolve_architecture(model_config.hf_config),
+            quantization=model_config.quantization,
+        )
 
         draft_moe_override = (
             self.is_draft_worker
