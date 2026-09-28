@@ -19,9 +19,9 @@
 // SOFTWARE.
 
 // Fused TopK + TopP renorm. Picks one of three branches per row, but launches
-// the same kernels every call so the host-side path is deterministic and
-// CUDA-graph capturable. Per-row dispatch happens inside the apply kernel via
-// topKs[row].
+// the same kernels on every call for a given vocabulary size, so the host-side
+// path is deterministic and CUDA-graph capturable; V <= K_TOPK_MAX skips the
+// radix stages. Per-row dispatch happens inside the apply kernel via topKs[row].
 
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
@@ -327,8 +327,9 @@ size_t getWorkspaceSize(SizeType32 batchSize, SizeType32 vocabSize) {
 //   K_eff >  MAX_K → mode 3.2: use the top-p threshold left in the
 //     air_top_p counter, scan the row, renormalize, write outProbs[row].
 //
-// outProbs is pre-zeroed by an asynchronous memset on a side stream — both
-// branches write only the kept positions.
+// outProbs is pre-zeroed by an asynchronous memset (on the side stream when
+// V > MAX_K and one is given, otherwise on the main stream) — both branches
+// write only the kept positions.
 // ROWS_ALIGNED: the caller guarantees every row base of `probs`/`out_probs` is
 // 16B-aligned (both bases 16B-aligned and vocab_size % 4 == 0), so the top-p
 // V-scan can use float4 loads/stores with no peel. Decided host-side in
@@ -458,9 +459,10 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
                 }
             }
             if constexpr (DIRECT_INPUT) {
-                // Top-P only rows match the radix path, which keeps every value
-                // tied at the cutoff; finite top-K keeps the stable prefix.
-                if (k_raw > max_k) {
+                // K >= V (including the K > max_k sentinel) applies no top-K
+                // cut, so keep every value tied at the top-P cutoff, as the
+                // radix top-p path does; a finite K < V keeps the stable prefix.
+                if (k_raw >= vocab_size) {
                     while (j + 1 < k && s_vals[j + 1] == s_vals[j]) ++j;
                 }
             }

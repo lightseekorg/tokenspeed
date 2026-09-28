@@ -381,9 +381,13 @@ def test_fused_topk_topp_small_vocab(device: str, V: int, enable_pdl: bool) -> N
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    # New inputs on replay; the uniform top-P-only row keeps every tied token.
+    # New inputs on replay. Uniform rows keep every token tied at the top-P
+    # cutoff when no top-K cut applies: the top-P-only row, and K = 128 >= V
+    # (at V = 129, K = 128 is a real top-K cut).
     probs.copy_(torch.softmax(torch.randn(bs, V, device=device) * 3.0, dim=-1))
     probs[-1] = 1.0 / V
+    if V <= 128:
+        probs[2] = 1.0 / V
     graph.replay()
     check()
 
