@@ -39,6 +39,8 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _LAYOUTS,
     _finish_topk,
     _index_topk_outputs,
+    block_maxima,
+    block_maxima_with_lengths,
     candidate_scores,
     clean_logits,
     dense_ranges,
@@ -427,21 +429,7 @@ def _hopper_paged_scores(queries, cache, weights, block_table, valid_lengths, ca
 
 
 def _block_maxima(logits, visible):
-    """Reduce rows to their 8-row block maximum, pinning the newest block."""
-    tokens, width = logits.shape
-    padded = (width + 7) // 8 * 8
-    if padded != width:
-        logits = torch.nn.functional.pad(
-            logits, (0, padded - width), value=-float("inf")
-        )
-    blocks = logits.reshape(tokens, -1, 8).amax(-1)
-    newest = ((visible.to(torch.int64) - 1) // 8).clamp(0, blocks.shape[1] - 1)
-    rows = torch.arange(tokens, device=blocks.device)
-    current = blocks[rows, newest]
-    blocks[rows, newest] = torch.where(
-        current > -float("inf"), torch.full_like(current, float("inf")), current
-    )
-    return blocks
+    return block_maxima(logits, visible)
 
 
 # V4.1 selects at most 512 rows and at most 2048 candidate blocks per query;
@@ -496,12 +484,14 @@ def _native_select(logits, visible, candidates, topk, candidate_topk, out, score
             scores = candidate_scores(logits, candidates)
         _select(scores, topk, _ROW_CAPACITY, rows, lengths, candidates)
     if candidate_topk:
+        maxima, block_ends = block_maxima_with_lengths(logits, visible)
         _select(
-            _block_maxima(logits, visible),
+            maxima,
             candidate_topk,
             _BLOCK_CAPACITY,
             blocks,
             block_lengths,
+            ends=block_ends,
         )
     else:
         # Outputs may be uninitialized; a pass that sources no candidates still
