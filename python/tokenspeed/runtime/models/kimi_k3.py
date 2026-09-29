@@ -2213,9 +2213,10 @@ class KimiLinearMoE(nn.Module):
         """Routed + shared experts, accumulated onto ``prefix_sum``.
 
         Returns the new prefix (``prefix_sum + routed + shared``); the tail
-        tiers fuse the accumulate in-kernel. With ``prefix_is_sharded``, the
-        TP8 caller supplies only its rank's token rows; the tail consumes them
-        directly or gathers the residual before selecting a replicated path.
+        tiers fuse the accumulate in-kernel. When ``prefix_is_sharded`` is
+        true, ``prefix_sum`` contains this rank's consecutive one-eighth of
+        the token rows. The tail consumes them directly or gathers the full
+        residual before using a path that expects every row.
         """
         if prefix_is_sharded and (
             self.mapping.attn.dp_size > 1
@@ -2228,7 +2229,7 @@ class KimiLinearMoE(nn.Module):
             or prefix_sum.shape != (hidden_states.shape[0] // 8, hidden_states.shape[1])
         ):
             raise ValueError(
-                "Token-sharded residuals require matching TP8 groups and one eighth of the rows"
+                "A residual with only this rank's rows requires matching TP8 groups and one eighth of the token rows"
             )
         if self.mapping.attn.dp_size > 1:
             if ctx is None:

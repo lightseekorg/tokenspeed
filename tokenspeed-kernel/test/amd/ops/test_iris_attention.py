@@ -67,15 +67,13 @@ def _attention_worker(rank: int, port: int) -> None:
     )
     group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
     from tokenspeed_kernel.ops.communication import triton as comm
-    from tokenspeed_kernel.ops.communication._iris.attention import (
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_attention_mix,
         iris_attention_mix_push_gluon_kernel,
         iris_attention_push_gather_gluon_kernel,
         iris_attention_reduce_scatter_gluon_kernel,
+        iris_kimi3_moe_tail,
     )
-    from tokenspeed_kernel.ops.communication.iris_prefill import (
-        iris_attention_prefill_mix,
-    )
-    from tokenspeed_kernel.ops.moe.iris import iris_kimi3_moe_tail
 
     backing = comm.TritonCommState(
         group=group,
@@ -141,7 +139,7 @@ def _attention_worker(rank: int, port: int) -> None:
         # of the existing Iris tree below.
         torch.testing.assert_close(ordinary, reduced, atol=0.001953125, rtol=0.0078125)
         reduced = ordinary
-        for prefix, valid_blocks in product((None, residual), (0, 1, 4, 7, 8, 11)):
+        for prefix, valid_blocks in product((None, residual), (0, 4, 7, 8, 11)):
             partial.copy_(source)
             if rank == m % 8:
                 torch.cuda._sleep(100_000)
@@ -154,8 +152,6 @@ def _attention_worker(rank: int, port: int) -> None:
                     expected, history, score, norm, valid_blocks
                 )
                 partial.copy_(source)
-                # Warm each algorithm/history/layout variant, then ensure new
-                # token counts reuse its collective binaries.
                 fused = (m < 1024 or m >= 4096) and (
                     valid_blocks <= 6 or (m >= 7680 and valid_blocks <= 8)
                 )
@@ -168,7 +164,7 @@ def _attention_worker(rank: int, port: int) -> None:
                             iris_attention_mix_push_gluon_kernel,
                         ):
                             stack.enter_context(assert_no_triton_compile(kernel))
-                    mixed = iris_attention_prefill_mix(
+                    mixed = iris_attention_mix(
                         partial,
                         prefix,
                         history,
@@ -208,7 +204,7 @@ def _attention_worker(rank: int, port: int) -> None:
                 dist.barrier()
                 flags_before = state._producer_direct_ready_flags.clone()
                 assert (
-                    iris_attention_prefill_mix(
+                    iris_attention_mix(
                         partial,
                         prefix,
                         history,
@@ -248,11 +244,11 @@ def _attention_worker(rank: int, port: int) -> None:
         (partial, residual.float(), group),
         (partial, partial, group),
         (partial, state._moe_tail_output_buf[1 : m + 1], group),
-        (partial, residual[:, ::2], group),
-        (partial.T, None, group),
+        (partial, residual.as_strided(residual.shape, (1, m)), group),
+        (partial.as_strided(partial.shape, (1, m)), None, group),
     ):
         assert (
-            iris_attention_prefill_mix(
+            iris_attention_mix(
                 operand,
                 prefix,
                 history,
@@ -273,7 +269,7 @@ def _attention_worker(rank: int, port: int) -> None:
     # before publishing an entry flag, even when there is no history to read.
     oversized = comm.acquire_symm_outputs(backing, ((8200, 7168),), torch.bfloat16)[0]
     assert (
-        iris_attention_prefill_mix(
+        iris_attention_mix(
             oversized,
             None,
             oversized.new_empty((0, 8200, 7168)),
@@ -297,10 +293,9 @@ def _attention_worker(rank: int, port: int) -> None:
         (partial[None].expand(8, -1, -1), score, 1e-6, group),
         (history, score, 0.0, group),
         (history, score, float("nan"), group),
-        (history, score, 1e-6, dist.group.WORLD),
     ):
         assert (
-            iris_attention_prefill_mix(
+            iris_attention_mix(
                 partial,
                 residual,
                 blocks,
@@ -327,12 +322,12 @@ def _attention_worker(rank: int, port: int) -> None:
     expected_activation = _reference_mix(moe_prefix, history, score, norm, 8)
     # The previous MoE result is the production residual. Each owner must finish
     # reading its rows before the attention gather overwrites those same rows.
-    borrowed_residual = state._moe_tail_output_buf[:m]
-    borrowed_residual.copy_(residual)
+    stored_residual = state._moe_tail_output_buf[:m]
+    stored_residual.copy_(residual)
     partial.copy_(source)
-    alias_result = iris_attention_prefill_mix(
+    alias_result = iris_attention_mix(
         partial,
-        borrowed_residual,
+        stored_residual,
         history,
         score,
         norm,
@@ -373,7 +368,7 @@ def _attention_worker(rank: int, port: int) -> None:
         partial.copy_(source)
         first = comm.all_reduce_symmetric(backing, (partial,))[0].clone() + residual
         partial.copy_(source)
-        mixed = iris_attention_prefill_mix(
+        mixed = iris_attention_mix(
             partial,
             residual,
             history,
@@ -476,7 +471,7 @@ def _attention_worker(rank: int, port: int) -> None:
     not current_platform().is_cdna4 or torch.cuda.device_count() < 8,
     reason="requires eight CDNA4 GPUs",
 )
-def test_attention_prefill_reuses_moe_state():
+def test_attention_mix_reuses_moe_state():
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]

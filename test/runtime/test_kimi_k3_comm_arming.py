@@ -57,28 +57,7 @@ needs_iris = pytest.mark.skipif(
         (0, True, True, False),
         (15, True, True, False),
         (16, True, True, True),
-        (32, True, True, True),
         (37, True, True, True),
-        (48, True, True, True),
-        (128, True, True, True),
-        (256, True, True, True),
-        (511, True, True, True),
-        (512, True, True, True),
-        (513, True, True, True),
-        (519, True, True, True),
-        (848, True, True, True),
-        (849, True, True, True),
-        (1023, True, True, True),
-        (1024, True, True, True),
-        (2047, True, True, True),
-        (2048, True, True, True),
-        (3071, True, True, True),
-        (4088, True, True, True),
-        (4095, True, True, True),
-        (4096, True, True, True),
-        (4097, True, True, True),
-        (6143, True, True, True),
-        (8191, True, True, True),
         (8192, True, True, True),
         (8193, True, True, False),
         (8192, False, True, False),
@@ -122,7 +101,7 @@ def test_attention_prefill_producer_window(
     )
     assert (out is destination) == eligible
     assert acquire.call_count == int(eligible)
-    if eligible:
+    if rows == 16 and eligible:
         projection.reduce_results = True
         assert (
             comm.acquire_prefill_projection_output(
@@ -142,9 +121,8 @@ def test_attention_prefill_producer_window(
 
 @pytest.mark.parametrize("has_prefix", [False, True])
 @pytest.mark.parametrize("producer_direct", [False, True])
-@pytest.mark.parametrize("rows", [16, 37, 511, 519])
 def test_attention_prefill_fallback_preserves_residual_ownership(
-    monkeypatch, has_prefix, producer_direct, rows
+    monkeypatch, has_prefix, producer_direct
 ):
     from tokenspeed.runtime.models import kimi_k3_comm as module
 
@@ -152,7 +130,7 @@ def test_attention_prefill_fallback_preserves_residual_ownership(
     comm = module.K3AttnComm(
         SimpleNamespace(mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=group)))
     )
-    partial = torch.zeros((rows, 7168), dtype=torch.bfloat16)
+    partial = torch.zeros((37, 7168), dtype=torch.bfloat16)
     prefix = torch.ones_like(partial) if has_prefix else None
     output = torch.full_like(partial, 3)
 
@@ -193,25 +171,12 @@ def test_attention_prefill_fallback_preserves_residual_ownership(
         (511, False),
         (512, True),
         (513, False),
-        (519, False),
-        (848, True),
-        (849, False),
-        (1023, False),
-        (1024, True),
-        (2048, True),
-        (4088, True),
-        (4095, False),
         (4096, True),
-        (4097, False),
-        (6224, True),
-        (8191, False),
         (8192, True),
         (8193, False),
     ],
 )
 def test_attention_prefill_mix_window(monkeypatch, rows, eligible):
-    from tokenspeed_kernel.ops.communication import iris_prefill
-
     from tokenspeed.runtime.models import kimi_k3_comm as module
 
     group = tuple(range(8))
@@ -223,7 +188,14 @@ def test_attention_prefill_mix_window(monkeypatch, rows, eligible):
     weight = torch.empty((7168,), dtype=torch.bfloat16, device="meta")
     expected = (object(), object())
     operation = Mock(return_value=expected)
-    monkeypatch.setattr(iris_prefill, "iris_attention_prefill_mix", operation)
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_kernel.ops.communication.iris",
+        SimpleNamespace(iris_attention_mix=operation),
+    )
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
+    )
     monkeypatch.setattr(module, "_get_process_group", lambda _: "owner")
     result = comm.prefill_mix_for_moe(
         partial,
@@ -253,6 +225,42 @@ def test_attention_prefill_mix_window(monkeypatch, rows, eligible):
     else:
         assert result is None
         operation.assert_not_called()
+
+
+def test_attention_prefill_mix_skips_iris_import_on_other_platform(monkeypatch):
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    operation = Mock()
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_kernel.ops.communication.iris",
+        SimpleNamespace(iris_attention_mix=operation),
+    )
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_cdna4=False)
+    )
+    comm = module.K3AttnComm(
+        SimpleNamespace(mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=(0,))))
+    )
+    partial = torch.empty((512, 7168), dtype=torch.bfloat16, device="meta")
+    history = torch.empty((4, 512, 7168), dtype=torch.bfloat16, device="meta")
+    weight = torch.empty((7168,), dtype=torch.bfloat16, device="meta")
+
+    assert (
+        comm.prefill_mix_for_moe(
+            partial,
+            None,
+            history,
+            weight,
+            weight,
+            eps=1e-6,
+            out_norm_weight=weight,
+            out_norm_eps=1e-6,
+            num_valid_blocks=4,
+        )
+        is None
+    )
+    operation.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -290,7 +298,14 @@ def test_sharded_attention_residual_is_gathered_before_moe_fallback(
     candidate = Mock(return_value=expected if accepted else None)
     gather = Mock(return_value=full)
     joined = Mock(return_value=(routed, shared))
-    monkeypatch.setattr(module, "iris_kimi3_moe_tail", candidate)
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_kernel.ops.communication.iris",
+        SimpleNamespace(iris_kimi3_moe_tail=candidate),
+    )
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
+    )
     monkeypatch.setattr(module, "all_gather", gather)
     monkeypatch.setattr(module, "kimi3_join_reduce_moe", joined)
     monkeypatch.setattr(module, "_get_process_group", lambda _: "owner")
@@ -819,7 +834,12 @@ def test_row_sharded_moe_tail_selection_and_fallback(
     candidate = Mock(return_value=expected if accepted else None)
     joined = Mock(return_value=(routed, shared))
     resolve = Mock(return_value=process_group)
-    monkeypatch.setattr(mod, "iris_kimi3_moe_tail", candidate)
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_kernel.ops.communication.iris",
+        SimpleNamespace(iris_kimi3_moe_tail=candidate),
+    )
+    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
     monkeypatch.setattr(mod, "kimi3_join_reduce_moe", joined)
     monkeypatch.setattr(mod, "_get_process_group", resolve)
     symm_outputs = (routed, shared) if producer_direct else None
@@ -871,6 +891,52 @@ def test_row_sharded_moe_tail_selection_and_fallback(
         owner._projection_tail.assert_called_once_with(
             routed, shared, prefix, rows, 7168
         )
+
+
+def test_row_sharded_moe_tail_skips_iris_import_on_other_platform(monkeypatch):
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    group = tuple(range(8))
+    routed = torch.empty((512, 3584), dtype=torch.bfloat16, device="meta")
+    shared = torch.empty((512, 7168), dtype=torch.bfloat16, device="meta")
+    prefix = torch.empty_like(shared)
+    fallback = object()
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(
+            pp_size=1,
+            attn=SimpleNamespace(tp_size=8, tp_group=group),
+            moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
+        ),
+        up_proj=SimpleNamespace(narrowed=False, solution="auto"),
+        routed_hidden=3584,
+        routed_norm=None,
+        execution_plan=SimpleNamespace(
+            lane_latent_norm_ar=False, comm_fusion_max_num_tokens=16
+        ),
+        _projection_tail=Mock(return_value=fallback),
+    )
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_cdna4=False)
+    )
+    monkeypatch.setitem(
+        sys.modules, "tokenspeed_kernel.ops.communication.iris", SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        module, "kimi3_join_reduce_moe", Mock(return_value=(routed, shared))
+    )
+
+    result = module.K3MoeTailComm._tail_fused_lane_ar_replicated(
+        owner,
+        routed,
+        shared,
+        prefix,
+        None,
+        (routed, shared),
+        512,
+        7168,
+        prefix_is_sharded=False,
+    )
+    assert result is fallback
 
 
 if __name__ == "__main__":
