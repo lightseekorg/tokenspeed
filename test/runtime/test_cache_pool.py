@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -201,7 +202,7 @@ class CacheArenaCudaTest(unittest.TestCase):
         history.fill_(7)
         state.fill_(9)
 
-        arena.zero_blocks({"history": [1]})
+        arena.zero_blocks({"history": np.asarray([1])})
         torch.cuda.synchronize()
 
         # history.k is a per-token field (planned shape leads with P=4), so
@@ -215,11 +216,13 @@ class CacheArenaCudaTest(unittest.TestCase):
         arena = _arena("cuda")
 
         with self.assertRaises(IndexError):
-            arena.zero_blocks({"state": [arena.plan.group("state").page_count]})
+            arena.zero_blocks(
+                {"state": np.asarray([arena.plan.group("state").page_count])}
+            )
         # Every group is validated before any block is touched.
         arena.buffer.fill_(7)
         with self.assertRaises(IndexError):
-            arena.zero_blocks({"history": [1], "state": [-1]})
+            arena.zero_blocks({"history": np.asarray([1]), "state": np.asarray([-1])})
         torch.cuda.synchronize()
         self.assertTrue(bool((arena.buffer == 7).all()))
 
@@ -229,14 +232,19 @@ class CacheArenaCudaTest(unittest.TestCase):
         state_pages = arena.plan.group("state").page_count
         # Unsorted with duplicates and uneven span lengths, so the staging
         # layout has to align each group's span on its own.
+        # int32 read-only views are what the scheduler export hands over.
         requests = {
-            "history": [3, 0, 3, history_pages - 1, 1],
-            "state": list(range(state_pages - 1, -1, -1))[:3],
+            "history": np.asarray([3, 0, 3, history_pages - 1, 1], dtype=np.int32),
+            "state": np.arange(
+                state_pages - 1, max(state_pages - 4, -1), -1, dtype=np.int64
+            ),
         }
+        for ids in requests.values():
+            ids.setflags(write=False)
         arena.buffer.fill_(7)
         expected = torch.full_like(arena.buffer, 7, device="cpu")
         for group_id, block_ids in requests.items():
-            for offset, size in arena.block_byte_segments(group_id, block_ids):
+            for offset, size in arena.block_byte_segments(group_id, block_ids.tolist()):
                 expected[offset : offset + size] = 0
 
         arena.zero_blocks(requests)
@@ -244,9 +252,16 @@ class CacheArenaCudaTest(unittest.TestCase):
 
         torch.testing.assert_close(arena.buffer.cpu(), expected, rtol=0, atol=0)
 
-        # Empty requests are a no-op, not a launch.
-        arena.zero_blocks({"history": [], "state": []})
+        # Empty requests are a no-op, not a launch; lists are not accepted.
+        arena.zero_blocks(
+            {
+                "history": np.asarray([], dtype=np.int32),
+                "state": np.asarray([], dtype=np.int64),
+            }
+        )
         arena.zero_blocks({})
+        with self.assertRaises(TypeError):
+            arena.zero_blocks({"history": [1]})
         torch.cuda.synchronize()
         torch.testing.assert_close(arena.buffer.cpu(), expected, rtol=0, atol=0)
 

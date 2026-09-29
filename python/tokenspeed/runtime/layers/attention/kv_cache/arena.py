@@ -22,7 +22,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -231,9 +231,7 @@ class CacheArena:
     def field_block_byte_offset(self, field_id: str, block_id: int) -> int:
         return self.plan.field_page_byte_offset(field_id, block_id)
 
-    def zero_blocks(
-        self, block_ids_by_group: Mapping[str, Sequence[int] | np.ndarray]
-    ) -> None:
+    def zero_blocks(self, block_ids_by_group: Mapping[str, np.ndarray]) -> None:
         """Clear local physical blocks after validating every group's IDs.
 
         Host work stays O(pages) with no per-page Python object: the ids are
@@ -243,18 +241,26 @@ class CacheArena:
         would stall the forward thread.
 
         Args:
-            block_ids_by_group: Local block IDs, each in [0, group.page_count),
-                as sequences or integer arrays.
+            block_ids_by_group: Local block IDs per group as 1-D integer
+                arrays, each in [0, group.page_count).
 
         Raises:
             IndexError: A block ID is outside its group's physical range.
+            TypeError: A group's IDs are not a 1-D integer array.
         """
         spans: list[tuple[str, int, int]] = []
         arrays: list[np.ndarray] = []
         total = 0
-        for group_id, block_ids in block_ids_by_group.items():
+        for group_id, ids in block_ids_by_group.items():
             page_count, _, _ = self._zero_field_tables[group_id]
-            ids = np.asarray(block_ids, dtype=np.int64).reshape(-1)
+            if (
+                not isinstance(ids, np.ndarray)
+                or ids.ndim != 1
+                or ids.dtype.kind not in "iu"
+            ):
+                raise TypeError(
+                    f"block IDs for group {group_id!r} must be a 1-D integer array"
+                )
             if ids.size == 0:
                 continue
             low, high = int(ids.min()), int(ids.max())
