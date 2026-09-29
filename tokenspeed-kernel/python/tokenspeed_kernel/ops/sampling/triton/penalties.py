@@ -152,7 +152,8 @@ def _accumulate_counts_inplace_kernel(
     pool_idx_ptr,
     tokens_ptr,
     weights_ptr,
-    total: tl.constexpr,
+    # Per-step token count; runtime so every batch shape shares one binary.
+    total,
     counts_row_stride: tl.constexpr,
     vocab_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,

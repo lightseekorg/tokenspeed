@@ -32,7 +32,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._layouts import (
     _load_layout,
-    _moe_partial_reduce,
     _situ_reduce,
     _swiglu_reduce,
 )
@@ -48,6 +47,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.pipelined_program import (
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
     _route_next_pow2,
     gluon_route_supported,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
+    gluon_mxfp4_moe_stage2_reduce_kernel,
 )
 
 
@@ -251,11 +253,11 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
         R_BLOCK_N = 256
         r_grid = (n_tokens * ((N + R_BLOCK_N - 1) // R_BLOCK_N),)
         # fmt: off
-        _moe_partial_reduce[r_grid](
+        gluon_mxfp4_moe_stage2_reduce_kernel[r_grid](
             out_partial, out, n_tokens, N,
-            out_partial.stride(0), out_partial.stride(1), out_partial.stride(2),
+            out_partial.stride(1), out_partial.stride(0), out_partial.stride(2),
             out.stride(0), out.stride(1),
-            SPLIT_K=s2_split_k, BLOCK_N=R_BLOCK_N, num_warps=1,
+            BLOCK_M=1, BLOCK_N=R_BLOCK_N, TOP_K=s2_split_k, num_warps=1,
         )
         # fmt: on
     return out
@@ -960,7 +962,7 @@ def _warp_decode_stage2_fp8_mxfp4_kernel(
 
     With SPLIT_K > 1 the K (intermediate) reduction is partitioned across
     SPLIT_K CTAs per output tile; each writes an fp32 partial into slice
-    ``pid_k`` of the destination, reduced by ``_moe_partial_reduce``.
+    ``pid_k`` of the destination, reduced by ``gluon_mxfp4_moe_stage2_reduce_kernel``.
     Bias is added only by the first slice so it is not counted SPLIT_K times.
     """
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2

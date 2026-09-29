@@ -50,8 +50,11 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 from tokenspeed.runtime.sampling.backends.flashinfer import (
     FlashInferSamplingBackend,
+    canonical_greedy_tokens,
+    canonical_greedy_verify,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -324,6 +327,11 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             offset=offsets,
             deterministic=True,
         )
+        if global_server_args_dict["numerics"] == "rl-bitwise":
+            # Greedy maximizes the penalized logits.
+            batch_next_token_ids = canonical_greedy_tokens(
+                logits, top_ks, batch_next_token_ids
+            )
 
         sampled = batch_next_token_ids.to(torch.int32)
 
@@ -445,6 +453,15 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
             deterministic=True,
         )
+        if global_server_args_dict["numerics"] == "rl-bitwise":
+            canonical_greedy_verify(
+                logits=logits,
+                top_ks=top_ks,
+                candidates=candidates,
+                predict=predict,
+                accept_index=accept_index,
+                accept_length=accept_length,
+            )
 
         accept_length += 1
 

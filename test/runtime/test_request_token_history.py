@@ -34,9 +34,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tokenspeed.runtime.engine.scheduler_utils import (
-    request_history_seeds_for_forward,
-)
+from tokenspeed.runtime.engine.scheduler_utils import RequestHistoryRows
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import RequestHistorySeeds
@@ -47,9 +45,17 @@ class _ForwardOp(SimpleNamespace):
         return len(self.extend_prefix_lens)
 
 
+class _State:
+    """A request state: weak-referenceable, like the output processor's."""
+
+    def __init__(self, prompt_input_ids: list[int], output_ids: list[int]) -> None:
+        self.prompt_input_ids = prompt_input_ids
+        self.output_ids = output_ids
+
+
 _STATES = {
-    "a": SimpleNamespace(prompt_input_ids=[10, 11, 12, 13], output_ids=[20, 21]),
-    "b": SimpleNamespace(prompt_input_ids=[30, 31], output_ids=[]),
+    "a": _State(prompt_input_ids=[10, 11, 12, 13], output_ids=[20, 21]),
+    "b": _State(prompt_input_ids=[30, 31], output_ids=[]),
 }
 
 
@@ -59,29 +65,86 @@ def test_seeds_cover_prompt_and_output_prefixes() -> None:
         request_pool_indices=[1, 2],
         extend_prefix_lens=[5, 2],
     )
-    assert request_history_seeds_for_forward(op, _STATES) == RequestHistorySeeds(
+    assert RequestHistoryRows().seeds_for_forward(op, _STATES) == RequestHistorySeeds(
         slots=(1, 2),
         prefix_lengths=(5, 2),
         tokens=((10, 11, 12, 13, 20), (30, 31)),
     )
 
 
-def test_seeds_skip_fresh_extends_and_decodes() -> None:
+def test_fresh_extends_seed_nothing_and_claim_their_rows() -> None:
+    rows = RequestHistoryRows()
     fresh = _ForwardOp(
         request_ids=["a"], request_pool_indices=[1], extend_prefix_lens=[0]
     )
-    assert request_history_seeds_for_forward(fresh, _STATES) is None
-    # The decode row "b" follows the extend rows and never resumes a prefix.
-    mixed = _ForwardOp(
-        request_ids=["a", "b"], request_pool_indices=[1, 2], extend_prefix_lens=[0]
+    assert rows.seeds_for_forward(fresh, _STATES) is None
+    # The next chunk resumes a prefix the row already holds: no reseed, so a
+    # k-chunk prefill moves O(N), not O(N*k), tokens host to device.
+    next_chunk = _ForwardOp(
+        request_ids=["a"], request_pool_indices=[1], extend_prefix_lens=[3]
     )
-    assert request_history_seeds_for_forward(mixed, _STATES) is None
+    assert rows.seeds_for_forward(next_chunk, _STATES) is None
+    # Decode steps in the owned row never reseed either.
+    decode = _ForwardOp(
+        request_ids=["a"], request_pool_indices=[1], extend_prefix_lens=[]
+    )
+    assert rows.seeds_for_forward(decode, _STATES) is None
+
+
+def test_remote_prefill_landing_seeds_its_first_decode() -> None:
+    # A PD decode node's first local forward for a request is a decode over
+    # a prompt prefilled elsewhere: the row holds nothing of it yet.
+    rows = RequestHistoryRows()
+    landing = _ForwardOp(
+        request_ids=["b"], request_pool_indices=[2], extend_prefix_lens=[]
+    )
+    states = {"b": _State(prompt_input_ids=[30, 31, 32], output_ids=[40])}
+    assert rows.seeds_for_forward(landing, states) == RequestHistorySeeds(
+        slots=(2,), prefix_lengths=(3,), tokens=((30, 31, 32),)
+    )
+    assert rows.seeds_for_forward(landing, states) is None
+
+
+def test_slot_handoff_and_recovery_reseed() -> None:
+    rows = RequestHistoryRows()
+    rows.seeds_for_forward(
+        _ForwardOp(request_ids=["a"], request_pool_indices=[1], extend_prefix_lens=[0]),
+        _STATES,
+    )
+    # "b" takes slot 1 over with a prefix-cache hit: the row holds "a".
+    handoff = _ForwardOp(
+        request_ids=["b"], request_pool_indices=[1], extend_prefix_lens=[2]
+    )
+    assert rows.seeds_for_forward(handoff, _STATES).slots == (1,)
+    # "a" recovers into slot 1 after "b" used it: reseed its prefix.
+    recovery = _ForwardOp(
+        request_ids=["a"], request_pool_indices=[1], extend_prefix_lens=[4]
+    )
+    assert rows.seeds_for_forward(recovery, _STATES).prefix_lengths == (4,)
+
+
+def test_a_reused_request_id_does_not_inherit_the_row() -> None:
+    # Clients may reuse a finished request's id; at bs=1 the new request
+    # lands in the same slot. Ownership follows the admission, not the id.
+    rows = RequestHistoryRows()
+    first = {"a": _State(prompt_input_ids=[10, 11, 12, 13], output_ids=[])}
+    rows.seeds_for_forward(
+        _ForwardOp(request_ids=["a"], request_pool_indices=[1], extend_prefix_lens=[0]),
+        first,
+    )
+    again = {"a": _State(prompt_input_ids=[50, 51, 52, 53], output_ids=[])}
+    hit = _ForwardOp(
+        request_ids=["a"], request_pool_indices=[1], extend_prefix_lens=[3]
+    )
+    assert rows.seeds_for_forward(hit, again) == RequestHistorySeeds(
+        slots=(1,), prefix_lengths=(3,), tokens=((50, 51, 52),)
+    )
 
 
 def test_seed_prefix_must_exist() -> None:
     op = _ForwardOp(request_ids=["b"], request_pool_indices=[2], extend_prefix_lens=[3])
     with pytest.raises(ValueError, match="exceeds the physical tokens"):
-        request_history_seeds_for_forward(op, _STATES)
+        RequestHistoryRows().seeds_for_forward(op, _STATES)
     with pytest.raises(ValueError, match="equal lengths"):
         RequestHistorySeeds(slots=(1, 2), prefix_lengths=(0,), tokens=((),))
     with pytest.raises(ValueError, match="3 tokens for a 4-token prefix"):
@@ -223,3 +286,50 @@ def test_draft_table_requires_capacity_and_enablement() -> None:
             active_request_mask=torch.tensor([True]),
             committed_lengths=torch.zeros(5, dtype=torch.int32),
         )
+
+
+def test_idle_rank_hands_history_drafts_an_empty_view() -> None:
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.execution.types import DpForwardMetadata
+
+    runtime = _runtime_states(8)
+    runtime.init_draft_request_token_history(8)
+    draft_calls: list[dict] = []
+
+    def draft_forward(ctx, input_ids, positions, spec_step_idx, **kwargs):
+        assert ctx.forward_mode == ForwardMode.IDLE
+        view = kwargs["request_token_history"]
+        assert view.history_token_ids is runtime.draft_request_token_history_ids
+        assert view.req_pool_indices.numel() == 0
+        assert view.input_start_offsets.numel() == 1
+        draft_calls.append(kwargs)
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device = "cpu"
+    executor.input_buffers = _input_buffers()
+    executor.runtime_states = runtime
+    executor.attn_backend = SimpleNamespace()
+    executor.token_to_kv_pool = SimpleNamespace()
+    executor.model_runner = SimpleNamespace(forward=lambda ctx, **kwargs: None)
+    executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
+    executor.drafter = SimpleNamespace(
+        spec_num_steps=2,
+        attn_backend=SimpleNamespace(),
+        token_to_kv_pool=SimpleNamespace(),
+        draft_model_runner=SimpleNamespace(
+            model_config=SimpleNamespace(requires_request_token_history=True),
+            forward=draft_forward,
+        ),
+    )
+    executor.execute_idle_forward(
+        DpForwardMetadata(
+            global_num_tokens=[0, 4],
+            global_batch_size=[0, 4],
+            global_forward_mode=[ForwardMode.IDLE, ForwardMode.DECODE],
+            all_decode_or_idle=True,
+            all_extend=False,
+            need_idle_forward=True,
+        )
+    )
+    assert len(draft_calls) == 2

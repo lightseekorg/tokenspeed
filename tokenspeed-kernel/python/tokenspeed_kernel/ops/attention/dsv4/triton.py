@@ -2183,7 +2183,9 @@ def _dsv4_gather_indexer_mxfp4_cache_kernel(
     slot_mapping_ptr,
     values_out_ptr,
     scales_out_ptr,
-    rows: tl.constexpr,
+    # Gathered token count follows the batch; runtime so every batch shape
+    # shares one binary.
+    rows,
     slot_stride: tl.constexpr,
     value_stride: tl.constexpr,
     scale_stride: tl.constexpr,
@@ -3947,11 +3949,13 @@ def _dsv4_indexer_decode_metadata_kernel(
     block_table_ptr,
     block_table_stride,
     block_table_base_offsets_ptr,
-    rows: tl.constexpr,
-    cols: tl.constexpr,
+    # Block-table geometry follows the batch; runtime so every batch shape
+    # shares one binary.
+    rows,
+    cols,
     compress_ratio: tl.constexpr,
     cache_block_size: tl.constexpr,
-    max_blocks: tl.constexpr,
+    max_blocks,
     candidate_block: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
