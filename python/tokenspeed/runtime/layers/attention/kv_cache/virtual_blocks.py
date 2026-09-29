@@ -30,8 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-import torch
-from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
+import numpy as np
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
@@ -65,16 +64,18 @@ def local_pages(
     require_positive_int("shard_count", shard_count)
     if rank < 0 or (shard_count > 1 and rank >= shard_count):
         raise ValueError("DCP rank is out of range")
-    blocks = torch.tensor(virtual_blocks, dtype=torch.int64, device="cpu")
-    if ((blocks < 0) | (blocks >= virtual_block_count)).any():
+    blocks = np.asarray(virtual_blocks, dtype=np.int64).reshape(-1)
+    if blocks.size == 0:
+        return []
+    if blocks.min() < 0 or blocks.max() >= virtual_block_count:
         raise IndexError("virtual cache block ID is out of range")
-    local, owned = virtual_slots_to_local(
-        blocks,
-        rows_per_page=1,
-        virtual_block_count=virtual_block_count,
-        degree=shard_count,
-        rank=rank if shard_count > 1 else 0,
-    )
+    # Same placement as the device kernels' virtual_block_to_local: block 0 is
+    # the null page, the rest are dealt cyclically to the shard_count owners.
+    positive = blocks - 1
+    owned = blocks > 0
+    if shard_count > 1:
+        owned &= positive % shard_count == rank
+    local = positive // shard_count + 1
     return local[owned].tolist()
 
 

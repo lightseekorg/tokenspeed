@@ -216,6 +216,39 @@ class CacheArenaCudaTest(unittest.TestCase):
 
         with self.assertRaises(IndexError):
             arena.zero_blocks({"state": [arena.plan.group("state").page_count]})
+        # Every group is validated before any block is touched.
+        arena.buffer.fill_(7)
+        with self.assertRaises(IndexError):
+            arena.zero_blocks({"history": [1], "state": [-1]})
+        torch.cuda.synchronize()
+        self.assertTrue(bool((arena.buffer == 7).all()))
+
+    def test_zero_blocks_many_pages_across_groups_match_the_segment_geometry(self):
+        arena = _arena("cuda")
+        history_pages = arena.plan.group("history").page_count
+        state_pages = arena.plan.group("state").page_count
+        # Unsorted with duplicates and uneven span lengths, so the staging
+        # layout has to align each group's span on its own.
+        requests = {
+            "history": [3, 0, 3, history_pages - 1, 1],
+            "state": list(range(state_pages - 1, -1, -1))[:3],
+        }
+        arena.buffer.fill_(7)
+        expected = torch.full_like(arena.buffer, 7, device="cpu")
+        for group_id, block_ids in requests.items():
+            for offset, size in arena.block_byte_segments(group_id, block_ids):
+                expected[offset : offset + size] = 0
+
+        arena.zero_blocks(requests)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(arena.buffer.cpu(), expected, rtol=0, atol=0)
+
+        # Empty requests are a no-op, not a launch.
+        arena.zero_blocks({"history": [], "state": []})
+        arena.zero_blocks({})
+        torch.cuda.synchronize()
+        torch.testing.assert_close(arena.buffer.cpu(), expected, rtol=0, atol=0)
 
     def test_clear_zeros_the_whole_arena_once(self):
         arena = _arena("cuda")

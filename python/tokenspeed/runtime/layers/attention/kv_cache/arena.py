@@ -22,10 +22,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
+import numpy as np
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import zero_byte_ranges
+from tokenspeed_kernel.ops.kvcache.triton import zero_page_fields
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
@@ -68,10 +69,18 @@ class CacheArena:
                 "cache arena requires at least one cache group spec to publish"
             )
         self.plan = plan
-        # Materialize immutable byte geometry at setup, not on first hand-out.
-        for group in plan.groups:
-            plan.block_byte_segments(group.group_id, [])
         self.device = device
+        # Materialize immutable byte geometry at setup, not on first hand-out.
+        # zero_blocks ships only page ids per call; each group's field table
+        # (page-0 offset, page stride, payload bytes) lives on the device.
+        self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
+        for group in plan.groups:
+            page_count, fields = plan.page_field_layout(group.group_id)
+            self._zero_field_tables[group.group_id] = (
+                page_count,
+                torch.tensor(fields, dtype=torch.int64, device=device).reshape(-1, 3),
+                max((size for _, _, size in fields), default=0),
+            )
         self._cache_group_specs_by_id = {
             spec.group_id: spec for spec in cache_group_specs
         }
@@ -222,8 +231,13 @@ class CacheArena:
     def field_block_byte_offset(self, field_id: str, block_id: int) -> int:
         return self.plan.field_page_byte_offset(field_id, block_id)
 
-    def zero_blocks(self, block_ids_by_group: dict[str, list[int]]) -> None:
+    def zero_blocks(self, block_ids_by_group: Mapping[str, Sequence[int]]) -> None:
         """Clear local physical blocks after validating every group's IDs.
+
+        Host work stays O(pages): the ids are validated as one array, staged
+        through one pinned copy, and each group's page x field expansion runs
+        in the kernel. A long prompt's admission hands out thousands of
+        pages, so per-range Python here would stall the forward thread.
 
         Args:
             block_ids_by_group: Local block IDs, each in [0, group.page_count).
@@ -231,21 +245,42 @@ class CacheArena:
         Raises:
             IndexError: A block ID is outside its group's physical range.
         """
+        spans: list[tuple[str, int, int]] = []
+        arrays: list[np.ndarray] = []
+        total = 0
         for group_id, block_ids in block_ids_by_group.items():
-            page_count = self.plan.group(group_id).page_count
-            for block in block_ids:
-                if not 0 <= block < page_count:
-                    raise IndexError(
-                        f"local block ID {block} outside [0, {page_count}) "
-                        f"for group {group_id!r}"
-                    )
-        segments = [
-            segment
-            for group_id, block_ids in block_ids_by_group.items()
-            for segment in self.block_byte_segments(group_id, block_ids)
-        ]
-        if segments:
-            zero_byte_ranges(self.buffer, segments)
+            page_count, _, _ = self._zero_field_tables[group_id]
+            ids = np.asarray(block_ids, dtype=np.int64).reshape(-1)
+            if ids.size == 0:
+                continue
+            low, high = int(ids.min()), int(ids.max())
+            if low < 0 or high >= page_count:
+                raise IndexError(
+                    f"local block ID {low if low < 0 else high} outside "
+                    f"[0, {page_count}) for group {group_id!r}"
+                )
+            spans.append((group_id, total, ids.size))
+            arrays.append(ids)
+            # Each group's span starts 16-byte aligned, as the kernel requires
+            # of the pointer it receives.
+            total += -(-ids.size // 4) * 4
+        if total == 0:
+            return
+        # The caching host allocator tracks the pinned block's pending copy,
+        # so the next call cannot overwrite it early.
+        staging = torch.empty(total, dtype=torch.int32, pin_memory=True)
+        host = staging.numpy()
+        for (_, start, count), ids in zip(spans, arrays, strict=True):
+            host[start : start + count] = ids
+        pages = staging.to(self.buffer.device, non_blocking=True)
+        for group_id, start, count in spans:
+            _, fields, max_field_bytes = self._zero_field_tables[group_id]
+            zero_page_fields(
+                self.buffer,
+                pages[start : start + count],
+                fields,
+                max_field_bytes=max_field_bytes,
+            )
 
     def block_byte_segments(
         self, group_id: str, block_ids: list[int]
