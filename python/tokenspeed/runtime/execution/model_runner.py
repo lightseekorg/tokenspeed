@@ -343,6 +343,87 @@ class ModelRunner:
             logger.exception("update_weights_from_distributed failed")
             return False, str(e)
 
+    def update_weights_from_disk(self, obj) -> tuple[bool, str]:
+        """Reload this worker's parameters in place from a checkpoint directory.
+
+        The checkpoint is read with the startup loader and handed to the
+        model's own ``load_weights``, so fused and stacked parameters map
+        exactly as on the initial load. The reported count comes from the
+        tensors the loader actually yielded, not from the request: a
+        checkpoint that yields nothing is a failure, not a success that
+        updated nothing.
+        """
+        from tokenspeed.runtime.configs.load_config import LoadConfig
+        from tokenspeed.runtime.model_loader.loader import (
+            DefaultModelLoader,
+            get_model_loader,
+        )
+
+        model_path = str(obj.model_path)
+        load_format = obj.load_format or self.server_args.load_format
+        consumed = 0
+        try:
+            loader = get_model_loader(
+                LoadConfig(
+                    load_format=load_format,
+                    download_dir=self.server_args.download_dir,
+                    ext_yaml=self.server_args.ext_yaml,
+                    weight_loader_prefetch_checkpoints=(
+                        self.server_args.weight_loader_prefetch_checkpoints
+                    ),
+                    weight_loader_prefetch_num_threads=(
+                        self.server_args.weight_loader_prefetch_num_threads
+                    ),
+                )
+            )
+            if not isinstance(loader, DefaultModelLoader):
+                return False, (
+                    f"load_format {load_format!r} selects "
+                    f"{type(loader).__name__}, which does not read checkpoint "
+                    "files; an in-place reload needs a file-backed format"
+                )
+
+            # Same primary source ``DefaultModelLoader._get_all_weights``
+            # builds at startup, pointed at the new checkpoint.
+            source = DefaultModelLoader.Source(
+                model_path,
+                revision=None,
+                prefix="",
+                fall_back_to_pt=getattr(
+                    self.model, "fall_back_to_pt_during_load", False
+                ),
+            )
+            weights = loader._get_weights_iterator(
+                source,
+                getattr(self.model, "checkpoint_weight_name_filter", None),
+                getattr(self.model, "checkpoint_load_group", None),
+            )
+
+            def _counted():
+                nonlocal consumed
+                for name, tensor in weights:
+                    consumed += 1
+                    yield name, tensor
+
+            self.model.load_weights(_counted())
+            if consumed == 0:
+                return False, (
+                    f"no checkpoint tensors found at {model_path!r}; "
+                    "nothing was updated"
+                )
+            if self.device != "cpu":
+                torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("update_weights_from_disk failed")
+            return False, str(e)
+
+        self.model_config.model_path = model_path
+        logger.info(f"weights reloaded from {model_path!s} ({consumed:d} tensors)")
+        return True, (
+            f"Succeeded to update model weights from {model_path} "
+            f"({consumed} checkpoint tensors read)"
+        )
+
     def destroy_weights_update_group(self, obj) -> tuple[bool, str]:
         """Tear down the trainer weight-update NCCL group joined in ``init``.
 
