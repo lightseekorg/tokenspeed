@@ -264,6 +264,7 @@ class Envs:
     # values (a per-batch constexpr, one JIT compile on the forward thread per
     # batch shape), "error" raises on such a parameter, "off" disables the
     # monitor. CI serves with "error".
+    TOKENSPEED_STARTUP_TIMING = EnvBool(False)
     TOKENSPEED_JIT_COMPILE_CHECK = EnvStr("warn")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)

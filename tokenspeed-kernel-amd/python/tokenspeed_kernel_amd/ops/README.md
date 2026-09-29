@@ -469,6 +469,26 @@ up halves sit 768 columns apart, so no tile holds both.
 
 Partial row tiles are masked in both kernels, so any token count is accepted.
 
+### MXFP4 Sorted Experts
+
+The gfx950 block-sorted path uses native scaled matrix instructions for MXFP4
+activations and weights. Stage 1 fuses the gated activation and intermediate
+quantization; stage 2 applies route weights and combines expert outputs.
+Expert tiles support 16, 32, 64 and 128 rows. Sparse route counts select smaller
+tiles to limit per-expert padding, while dense routes retain larger tiles to
+amortize weight loads. This does not change activation precision or routing.
+
+Scale storage keeps its 32-row CDNA4 layout even for 16-row expert tiles.
+Each such tile reads and writes its own half of the scale panel; expert
+boundaries need not coincide with panel boundaries.
+
+For TP E2M1 inputs through 2048 tokens, stage 2 combines routed outputs directly
+with BF16 atomics. Two adjacent columns per lane match packed atomic stores;
+column-first workgroup order distributes concurrent updates across the output.
+This avoids the per-route partials buffer and FP32 reduction kernel, at the cost
+of order-dependent BF16 rounding. The destination is cleared on each call and
+graph replay. Larger token counts retain the FP32 reduction path.
+
 ### MXFP8 SiTU Experts
 
 On gfx950, the MoE API selects Gluon kernels with MXFP8 activations and MXFP4

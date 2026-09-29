@@ -101,6 +101,7 @@ from tokenspeed.runtime.utils.jit_compile_check import (
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.process import register_usr_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.startup_timing import startup_phase
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
@@ -574,6 +575,7 @@ class EventLoop:
     # Helpers
     # ------------------------------------------------------------------
 
+    @startup_phase("model.config")
     def _load_model_config(
         self, model_path: str, is_draft_worker: bool = False
     ) -> ModelConfig:
@@ -598,6 +600,7 @@ class EventLoop:
             is_draft_worker=is_draft_worker,
         )
 
+    @startup_phase("distributed.init")
     def _init_distributed(self) -> float:
         max_num_input_tokens = (
             self.server_args.chunked_prefill_size
@@ -1302,17 +1305,20 @@ def run_event_loop(
             previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
             signal.signal(signal.SIGTERM, request_shutdown)
 
-        maybe_warm_cupti_for_graph_capture()
+        with startup_phase(
+            "scheduler.init", rank=global_rank, role=server_args.disaggregation_mode
+        ):
+            maybe_warm_cupti_for_graph_capture()
 
-        event_loop = EventLoop(
-            server_args,
-            port_args,
-            gpu_id,
-            attn_tp_rank,
-            dp_rank,
-            global_rank,
-            shutdown_event,
-        )
+            event_loop = EventLoop(
+                server_args,
+                port_args,
+                gpu_id,
+                attn_tp_rank,
+                dp_rank,
+                global_rank,
+                shutdown_event,
+            )
         pipe_writer.send(
             {
                 "status": "ready",
