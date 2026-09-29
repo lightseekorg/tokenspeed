@@ -104,20 +104,22 @@ class SharedBufferSampler:
 
 
 @pytest.mark.parametrize(
-    "p,e,d,width,compact",
+    "p,e,d,width,compact,with_mask",
     [
-        (1, 2, 1, 1, True),
-        (1, 2, 2, 3, True),
-        (0, 1, 1, 3, True),
-        (0, 1, 0, 3, True),
-        (1, 2, 0, 1, True),
-        (2, 3, 2, 3, True),
-        (2, 2, 2, 1, False),
-        (2, 2, 2, 3, False),
+        (1, 2, 1, 1, True, True),
+        (1, 2, 2, 3, True, True),
+        (0, 1, 1, 3, True, True),
+        (0, 1, 0, 3, True, True),
+        (1, 2, 0, 1, True, True),
+        (2, 3, 2, 3, True, True),
+        (2, 2, 2, 1, False, False),
+        (2, 2, 2, 3, False, False),
+        (1, 1, 1, 2, False, True),
+        (2, 2, 2, 3, False, True),
     ],
 )
 def test_sampling_preserves_request_parameters_and_shared_outputs(
-    p, e, d, width, compact
+    p, e, d, width, compact, with_mask
 ):
     info_cls = load_symbol(
         RUNTIME + "sampling/sampling_batch_info.py", "SamplingBatchInfo"
@@ -150,7 +152,7 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
         top_ks=torch.arange(e + d) + 10,
         valid_cache_lengths=cache_lengths,
         batch_row_offset=7,
-        vocab_mask=torch.arange((e + d) * width)[:, None] if compact else None,
+        vocab_mask=torch.arange((e + d) * width)[:, None] if with_mask else None,
     )
     logits = torch.full((p + d * width, 32), -10.0)
     if logits.shape[0]:
@@ -170,21 +172,25 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
             assert subset.temperatures.tolist() == [i + 0.5 for i in range(p)]
             assert subset.top_ks.tolist() == list(range(10, 10 + p))
             assert subset.batch_row_offset == 7
-            if compact:
-                assert subset.vocab_mask[:, 0].tolist() == list(
-                    range(0, p * width, width)
+            if with_mask:
+                expected_mask = (
+                    list(range(0, p * width, width)) if compact else list(range(p))
                 )
+                assert subset.vocab_mask[:, 0].tolist() == expected_mask
         else:
             assert subset.req_pool_indices.tolist() == pool_indices[e:].tolist()
             assert subset.temperatures.tolist() == [i + 0.5 for i in range(e, e + d)]
             assert subset.top_ks.tolist() == list(range(10 + e, 10 + e + d))
             assert subset.batch_row_offset == 7 + e
-            if compact:
+            if with_mask:
+                # Legacy sampling forwards the original mask suffix unchanged;
+                # only compact outputs select masks on the token axis.
+                mask_start = e * width if compact else e
                 assert subset.vocab_mask[:, 0].tolist() == list(
-                    range(e * width, (e + d) * width)
+                    range(mask_start, (e + d) * width)
                 )
         assert subset.valid_cache_lengths is cache_lengths
-        if not compact:
+        if not with_mask:
             assert subset.vocab_mask is None
     if p or d:
         assert output.next_token_logprobs.tolist() == (

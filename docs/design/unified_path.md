@@ -387,7 +387,8 @@ token-indexed grammar masks at the sampler boundary; sampler interfaces and
 result buffers stay unchanged. Grammar owns matcher advancement and rollback,
 and zero accepted lengths already suppress advancement. Existing consumers
 that only need token_offset keep that interface. Models without cropped
-outputs continue to use None, not a mandatory identity layout.
+outputs continue to use None, not a mandatory identity layout. Their sampler
+parameter and grammar-mask views retain the original slicing contract.
 
 Completion remains a local comparison in the executor and V4.1 attention
 metadata. Both use the same scheduled prefix, input count (including replay),

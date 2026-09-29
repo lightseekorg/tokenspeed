@@ -1077,10 +1077,9 @@ class ModelExecutor:
 
         # Parameters remain request-indexed; logits may omit open prefills.
         prefill = slice(0, num_extends) if layout is None else layout.prefill_slice
+        # Keep the legacy suffix open-ended: masks can have more rows than requests.
         decode_requests = (
-            slice(num_extends, ctx.bs)
-            if layout is None
-            else layout.decode_request_slice
+            slice(num_extends, None) if layout is None else layout.decode_request_slice
         )
         decode_outputs = (
             slice(num_extends, None) if layout is None else layout.decode_output_slice

@@ -24,6 +24,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
 
@@ -149,7 +151,14 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     executor._draft_final_step_counter = SimpleNamespace(
         record_cache=lambda: events.append("draft-final")
     )
-    ctx = SimpleNamespace(bs=1, num_extends=1, input_num_tokens=1)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=1,
+        input_num_tokens=1,
+        forward_mode=ForwardMode.EXTEND,
+    )
 
     executor._forward_step(bs=1, ctx=ctx, sampling_info=object())
 
