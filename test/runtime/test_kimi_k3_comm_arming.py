@@ -285,13 +285,11 @@ def test_the_collective_is_what_serves_an_eligible_reduce():
     collective = Mock(return_value=(reduced, "shared"))
     vendor = Mock(return_value=(None, "vendor-residual", None))
     comm = K3AttnComm.__new__(K3AttnComm)
-    comm.state = SimpleNamespace(
-        cute_ar=collective,
-        dummy_norm=SimpleNamespace(
-            weight="gamma", forward_with_allreduce_fusion=vendor
-        ),
-        attn_ar_fusion_ok=True,
+    comm.cute_ar = collective
+    comm.dummy_norm = SimpleNamespace(
+        weight="gamma", forward_with_allreduce_fusion=vendor
     )
+    comm.attn_ar_fusion_ok = True
     comm.mapping = SimpleNamespace(attn=SimpleNamespace(tp_rank=0, tp_group=(0, 1)))
 
     partial, prefix = torch.zeros(1, 8), torch.zeros(1, 8)
@@ -329,28 +327,15 @@ def test_the_operator_can_forbid_the_fused_attention_reduce():
     )
 
 
-def _arming_world(monkeypatch, *, multicast: bool, shape_ok: bool, peers_agree: bool):
-    """Stand up K3AttnCommState's collaborators so arming can be exercised."""
+def _arming_world(monkeypatch, *, multicast: bool, shape_ok: bool):
+    """Stand up K3AttnComm's collaborators so arming can be exercised."""
     from tokenspeed.runtime.models import kimi_k3_comm as mod
 
-    recorded = {"ops": [], "groups": []}
-
-    class FakeDist:
-        ReduceOp = torch.distributed.ReduceOp
-
-        @staticmethod
-        def is_initialized():
-            return True
-
-        @staticmethod
-        def all_reduce(tensor, *, op, group):
-            # Required, not defaulted: dropping either in production must fail here.
-            recorded["ops"].append(op)
-            recorded["groups"].append(group)
-            if not peers_agree:
-                tensor.zero_()
-
-    monkeypatch.setattr(mod, "dist", FakeDist)
+    monkeypatch.setattr(mod.K3AttnComm, "_prepared_hidden_size", None)
+    monkeypatch.setattr(mod.K3AttnComm, "attn_ar_fusion_ok", False)
+    monkeypatch.setattr(mod.K3AttnComm, "dummy_norm", None)
+    monkeypatch.setattr(mod.K3AttnComm, "cute_ar", None)
+    monkeypatch.setattr(mod, "dist", SimpleNamespace(is_initialized=lambda: True))
     monkeypatch.setattr(mod, "prepare_all_reduce_lane", lambda *a, **k: True)
     monkeypatch.setattr(mod, "prepare_all_reduce_fusion", lambda *a, **k: True)
     monkeypatch.setattr(mod, "_get_process_group", lambda g: "the-group")
@@ -364,8 +349,7 @@ def _arming_world(monkeypatch, *, multicast: bool, shape_ok: bool, peers_agree: 
     )
     builder = Mock(return_value="collective")
     monkeypatch.setattr(mod, "build_attn_reduce_collective", builder)
-    recorded["builder"] = builder
-    return mod, recorded
+    return mod, builder
 
 
 _ARMING_MAPPING = SimpleNamespace(
@@ -373,38 +357,35 @@ _ARMING_MAPPING = SimpleNamespace(
 )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the vote is a cuda tensor")
-def test_arming_builds_only_when_every_rank_agrees(monkeypatch):
-    """A rank that armed alone would sit in a rendezvous its peers never join."""
-    mod, rec = _arming_world(
-        monkeypatch, multicast=True, shape_ok=True, peers_agree=True
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the dummy norm is on CUDA")
+def test_arming_shares_workspaces_across_instances(monkeypatch):
+    mod, builder = _arming_world(monkeypatch, multicast=True, shape_ok=True)
+    comm = mod.K3AttnComm(mapping=_ARMING_MAPPING, hidden_size=7168)
+    dummy_norm = comm.dummy_norm
+    other = mod.K3AttnComm(mapping=_ARMING_MAPPING, hidden_size=7168)
+    assert other is not comm
+    assert other.cute_ar is comm.cute_ar is builder.return_value
+    assert other.dummy_norm is dummy_norm
+    builder.assert_called_once_with(
+        group="the-group",
+        rank=3,
+        tp_size=8,
+        hidden_size=7168,
+        max_tokens=mod.ATTN_AR_MAX_TOKENS,
     )
-    state = mod.K3AttnCommState(mapping=_ARMING_MAPPING, hidden_size=7168)
-    assert state.cute_ar == "collective"
-    # MIN is what makes one dissenting rank stop all of them.
-    assert rec["ops"] == [torch.distributed.ReduceOp.MIN]
-    assert rec["groups"] == ["the-group"]
-    kwargs = rec["builder"].call_args.kwargs
-    assert kwargs["rank"] == 3 and kwargs["tp_size"] == 8  # rank is not size
-    assert kwargs["hidden_size"] == 7168
-    assert kwargs["max_tokens"] == mod.ATTN_AR_MAX_TOKENS
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the vote is a cuda tensor")
-@pytest.mark.parametrize(
-    "multicast,shape_ok,peers_agree",
-    [(False, True, True), (True, False, True), (True, True, False)],
-)
-def test_arming_declines_when_any_probe_or_peer_says_no(
-    monkeypatch, multicast, shape_ok, peers_agree
-):
-    """Each term is load-bearing: the constructor raises, it does not decline."""
-    mod, rec = _arming_world(
-        monkeypatch, multicast=multicast, shape_ok=shape_ok, peers_agree=peers_agree
-    )
-    state = mod.K3AttnCommState(mapping=_ARMING_MAPPING, hidden_size=7168)
-    assert state.cute_ar is None
-    assert rec["builder"].call_count == 0
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the dummy norm is on CUDA")
+@pytest.mark.parametrize("multicast,shape_ok", [(False, True), (True, False)])
+def test_arming_declines_unsupported_collectives(monkeypatch, multicast, shape_ok):
+    mod, builder = _arming_world(monkeypatch, multicast=multicast, shape_ok=shape_ok)
+    comm = mod.K3AttnComm(mapping=_ARMING_MAPPING, hidden_size=7168)
+    dummy_norm = comm.dummy_norm
+    other = mod.K3AttnComm(mapping=_ARMING_MAPPING, hidden_size=7168)
+    assert comm.cute_ar is None
+    assert other.cute_ar is None
+    assert other.dummy_norm is dummy_norm
+    builder.assert_not_called()
 
 
 if __name__ == "__main__":

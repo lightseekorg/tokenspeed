@@ -167,7 +167,6 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 from tokenspeed.runtime.models.kimi_k3_comm import (
     K3_SHARED_RS_MAX_TOKENS,
     K3AttnComm,
-    K3AttnCommState,
     K3MoeTailComm,
     prepare_k3_all_reduce_buffers,
 )
@@ -2474,11 +2473,7 @@ class KimiLinearDecoderLayer(nn.Module):
 
         # K3 AttnRes bypasses CommManager's fused residual, but the MLA attention
         # still uses it for the (no-op in AllReduce mode) pre_attn_comm.
-        # AR+residual fusion arming and the dummy-norm ride live in
-        # K3AttnCommState (armed once per process).
-        self.k3_comm = K3AttnComm(
-            K3AttnCommState.get(mapping=mapping, hidden_size=config.hidden_size)
-        )
+        self.k3_comm = K3AttnComm(mapping=mapping, hidden_size=config.hidden_size)
 
         self.attn_fork = StreamFork(alt_stream)
         # (proj_w_getter, norm, valid_blocks) for the NEXT layer's attn-side
@@ -2805,7 +2800,7 @@ class KimiLinearDecoderLayer(nn.Module):
             and (
                 num_tokens == 1
                 or (
-                    self.k3_comm.state.attn_ar_fusion_ok
+                    self.k3_comm.attn_ar_fusion_ok
                     and num_tokens
                     <= global_server_args_dict["comm_fusion_max_num_tokens"]
                 )

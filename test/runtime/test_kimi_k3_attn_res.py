@@ -83,15 +83,13 @@ class AttnResTests(unittest.TestCase):
         import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
 
         group = object()
-        state = SimpleNamespace(
-            attn_ar_fusion_ok=False,
-            cute_ar=None,
-            mapping=SimpleNamespace(
-                nprocs_per_node=8,
-                attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),
-            ),
+        comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+        comm.attn_ar_fusion_ok = False
+        comm.cute_ar = None
+        comm.mapping = SimpleNamespace(
+            nprocs_per_node=8,
+            attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),
         )
-        comm = kimi_k3_comm.K3AttnComm(state)
         partial = torch.randn(4, _HIDDEN, dtype=torch.bfloat16)
         prefix = torch.randn_like(partial)
         scratch = (object(), object(), object())
@@ -135,15 +133,13 @@ class AttnResTests(unittest.TestCase):
         import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
 
         group = object()
-        state = SimpleNamespace(
-            attn_ar_fusion_ok=False,
-            cute_ar=None,
-            mapping=SimpleNamespace(
-                nprocs_per_node=8,
-                attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),
-            ),
+        comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+        comm.attn_ar_fusion_ok = False
+        comm.cute_ar = None
+        comm.mapping = SimpleNamespace(
+            nprocs_per_node=8,
+            attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),
         )
-        comm = kimi_k3_comm.K3AttnComm(state)
         partial = torch.randn(17, _HIDDEN, dtype=torch.bfloat16)
         prefix = torch.randn_like(partial)
         reduced = torch.randn_like(partial)
@@ -178,7 +174,7 @@ class AttnResTests(unittest.TestCase):
         torch.testing.assert_close(residual, prefix + reduced)
         self.assertIsNone(hidden)
         supported.assert_called_once()
-        fallback_reduce.assert_called_once_with(partial, state.mapping.attn.tp_group)
+        fallback_reduce.assert_called_once_with(partial, comm.mapping.attn.tp_group)
 
     def test_fused_attention_reduce_window(self):
         import tokenspeed_kernel.ops.communication.triton as triton_comm
@@ -213,16 +209,14 @@ class AttnResTests(unittest.TestCase):
                         _HIDDEN,
                         dtype=torch.bfloat16,
                     )
-                    state = SimpleNamespace(
-                        mapping=SimpleNamespace(
-                            nprocs_per_node=8,
-                            attn=SimpleNamespace(
-                                tp_rank=0,
-                                tp_group=tuple(range(8)),
-                            ),
-                        )
+                    comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+                    comm.mapping = SimpleNamespace(
+                        nprocs_per_node=8,
+                        attn=SimpleNamespace(
+                            tp_rank=0,
+                            tp_group=tuple(range(8)),
+                        ),
                     )
-                    comm = kimi_k3_comm.K3AttnComm(state)
                     self.assertEqual(
                         comm.fused_attnres_reduce_available(
                             partial,
@@ -597,7 +591,7 @@ class AttnResTests(unittest.TestCase):
             self_attn=attention,
             comm_manager=object(),
             k3_comm=SimpleNamespace(
-                state=SimpleNamespace(attn_ar_fusion_ok=False),
+                attn_ar_fusion_ok=False,
                 fused_attnres_reduce_available=mock.Mock(return_value=True),
             ),
             attn_fork=fork,

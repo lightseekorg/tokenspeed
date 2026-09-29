@@ -28,6 +28,7 @@ AMD and attention-DP execution are owned by the model.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import ClassVar
 
 import torch
@@ -178,56 +179,32 @@ def prepare_k3_all_reduce_buffers(
     return prepared
 
 
-class K3AttnCommState:
-    """Process-wide attention-AR fusion arming for Kimi-K3 (attn TP group).
+class K3AttnComm:
+    """Attention all-reduce, residual fusion, and shared workspaces for Kimi-K3.
 
-    Construction is collective: every rank must call :meth:`get` with
-    identical arguments, in lockstep, before any forward (model ``__init__``
-    satisfies this). The first call runs the collective allocators exactly
-    once per process — per-layer callers reuse the singleton. Splitting the
-    arming per layer is what previously left several independent ways to
-    strand a peer inside a rendezvous.
-
-    Collective constructors are deliberately unguarded: a rank that fails
-    mid-build has already stranded its peers, so propagating the exception
-    and killing the whole job is the good outcome.
+    Each decoder layer owns an instance. The first instance initializes the
+    class-level workspaces, which subsequent instances reuse. Layer-specific
+    weights are supplied to each reduction call.
     """
 
-    _instance: "K3AttnCommState | None" = None
+    _prepared_hidden_size: ClassVar[int | None] = None
+    attn_ar_fusion_ok: ClassVar[bool] = False
+    dummy_norm: ClassVar[RMSNorm | None] = None
+    cute_ar: ClassVar[Callable | None] = None
 
-    @classmethod
-    def get(cls, *, mapping, hidden_size: int) -> "K3AttnCommState":
-        """Return the singleton, constructing it on first use (any decoder
-        layer; construction is per-process, the collective prepares inside
-        run lockstep on the attention TP group).
-
-        Args:
-            mapping: Parallel mapping (attn/moe groups) — rank-uniform.
-            hidden_size: Model hidden width.
-        """
-        if cls._instance is None:
-            cls._instance = cls(mapping=mapping, hidden_size=hidden_size)
-        elif cls._instance.hidden_size != hidden_size:
-            # The singleton would otherwise silently hand a second model
-            # (e.g. an MTP draft sharing the process with its base) arming
-            # done for the wrong width.
-            raise ValueError(
-                "K3AttnCommState is armed once per process for "
-                f"hidden_size={cls._instance.hidden_size}, but a later caller "
-                f"asked for hidden_size={hidden_size}; the current "
-                "implementation assumes every model in the process (base + "
-                "draft) shares this width."
-            )
-        return cls._instance
-
-    def __init__(self, *, mapping, hidden_size: int):
+    def __init__(self, *, mapping, hidden_size: int) -> None:
         self.mapping = mapping
         self.hidden_size = hidden_size
+        if self._prepared_hidden_size is not None:
+            if hidden_size != self._prepared_hidden_size:
+                raise ValueError(
+                    "K3 attention workspace hidden size differs from its initial configuration"
+                )
+            return
         hidden = hidden_size
-        # --- attention AR+residual fusion arming (was per decoder layer) ---
         # Fused AR+residual for the attention reduce: a ones-weight RMSNorm
         # rides the one-shot pattern and its norm output is discarded.
-        self.attn_ar_fusion_ok = dist.is_initialized() and (
+        K3AttnComm.attn_ar_fusion_ok = dist.is_initialized() and (
             mapping.attn.tp_size > 1
             and prepare_all_reduce_lane(mapping.attn.tp_group, hidden)
             and prepare_all_reduce_fusion(
@@ -239,7 +216,7 @@ class K3AttnCommState:
         # Plain attribute (not a registered submodule): the model loader
         # never migrates it, so the device must be pinned explicitly here.
         # The eps only shapes the discarded ones-weight norm output.
-        self.dummy_norm = RMSNorm(hidden, eps=1e-6)
+        K3AttnComm.dummy_norm = RMSNorm(hidden, eps=1e-6)
         self.dummy_norm.weight.data = torch.ones(
             hidden,
             dtype=torch.bfloat16,
@@ -247,36 +224,22 @@ class K3AttnCommState:
         )
         self.dummy_norm.weight.requires_grad_(False)
 
-        # A rank that skipped the build would strand its peers in the rendezvous.
-        self.cute_ar = None
-        if dist.is_initialized() and mapping.attn.tp_size > 1:
+        if (
+            self.attn_ar_fusion_ok
+            and global_server_args_dict["comm_fusion_max_num_tokens"] > 0
+        ):
             group = _get_process_group(mapping.attn.tp_group)
-            # Gate first: a forbidden window should not pay the rendezvous.
-            local_ok = (
-                attn_ar_eligible(
-                    armed=True,
-                    has_prefix=True,
-                    num_tokens=1,
-                    fusion_max_tokens=global_server_args_dict[
-                        "comm_fusion_max_num_tokens"
-                    ],
-                )
-                and self.attn_ar_fusion_ok
-                and multicast_backend_available(group)
-                and attn_reduce_shape_supported(
-                    tp_size=mapping.attn.tp_size, hidden_size=hidden
-                )
-            )
-            vote = torch.tensor([int(local_ok)], dtype=torch.int32, device="cuda")
-            dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
-            if bool(vote.item()):
-                self.cute_ar = build_attn_reduce_collective(
+            if multicast_backend_available(group) and attn_reduce_shape_supported(
+                tp_size=mapping.attn.tp_size, hidden_size=hidden
+            ):
+                K3AttnComm.cute_ar = build_attn_reduce_collective(
                     group=group,
                     rank=mapping.attn.tp_rank,
                     tp_size=mapping.attn.tp_size,
                     hidden_size=hidden,
                     max_tokens=ATTN_AR_MAX_TOKENS,
                 )
+        K3AttnComm._prepared_hidden_size = hidden_size
         attention_reduce_backend = (
             f"tokenspeed CuteDSL collective at M<={ATTN_AR_MAX_TOKENS}"
             if self.cute_ar is not None
@@ -284,21 +247,6 @@ class K3AttnCommState:
         )
         logger.info(f"Kimi K3 attention reduce: {attention_reduce_backend}")
 
-
-class K3AttnComm:
-    """Per-decoder-layer handle over the negotiated K3 communication state.
-
-    Model code states semantics (``attn_reduce``); backend choice,
-    thresholds and workspace access all live behind this class.
-    """
-
-    def __init__(self, state: K3AttnCommState) -> None:
-        self.state = state
-        self.mapping = state.mapping
-
-    # ------------------------------------------------------------------
-    # Attention-side reduction, hoisted from KimiLinearDecoderLayer.
-    # ------------------------------------------------------------------
     def fused_attnres_reduce_available(
         self,
         partial: torch.Tensor,
@@ -365,23 +313,23 @@ class K3AttnComm:
         """
         num_tokens = attn_partial.shape[0]
         if attn_ar_eligible(
-            armed=self.state.cute_ar is not None,
+            armed=self.cute_ar is not None,
             has_prefix=prefix_sum is not None,
             num_tokens=num_tokens,
             fusion_max_tokens=global_server_args_dict["comm_fusion_max_num_tokens"],
         ):
             # Any later reduce in this process overwrites it; this layer is done by then.
-            residual_out, _ = self.state.cute_ar(
+            residual_out, _ = self.cute_ar(
                 attn_partial,
                 prefix_sum,
-                self.state.dummy_norm.weight,
+                self.dummy_norm.weight,
                 include_reduce_scatter=False,
                 include_routed=True,
             )
             return residual_out, None
         if (
             prefix_sum is not None
-            and self.state.attn_ar_fusion_ok
+            and self.attn_ar_fusion_ok
             and 0 < num_tokens
             and num_tokens <= global_server_args_dict["comm_fusion_max_num_tokens"]
         ):
@@ -404,7 +352,7 @@ class K3AttnComm:
                     max_token_num=global_server_args_dict["comm_fusion_max_num_tokens"],
                 )
                 return residual_out, h
-            _, residual_out, *_ = self.state.dummy_norm.forward_with_allreduce_fusion(
+            _, residual_out, *_ = self.dummy_norm.forward_with_allreduce_fusion(
                 self.mapping.attn.tp_rank,
                 self.mapping.attn.tp_group,
                 attn_partial,
@@ -671,6 +619,5 @@ class K3MoeTailComm:
 __all__ = [
     "K3_SHARED_RS_MAX_TOKENS",
     "K3AttnComm",
-    "K3AttnCommState",
     "K3MoeTailComm",
 ]

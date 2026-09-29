@@ -450,7 +450,7 @@ class CheckpointPrefetcher:
     """
 
     _BLOCK_SIZE = 16 * 1024 * 1024
-    _WINDOW_MAX_BYTES = 80 * 1024**3
+    _WINDOW_MAX_BYTES = 40 * 1024**3
     _WINDOW_MEM_FRACTION = 0.25
 
     @classmethod
