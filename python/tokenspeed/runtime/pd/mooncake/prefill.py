@@ -359,15 +359,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             sges = packer.materialize(pending)
         else:
             sges = flatten_transfer_blocks(pending)
-        started = time.monotonic()
-        n_sge = 0
-        n_bytes = 0
         ret = 0
         block_iter = iter(sges)
         while batch := tuple(islice(block_iter, _TRANSFER_DESCRIPTOR_BATCH_SIZE)):
             src_addrs, dst_addrs, lengths = zip(*batch, strict=True)
-            n_sge += len(batch)
-            n_bytes += sum(lengths)
             ret = self.engine.batch_transfer_sync(
                 mooncake_session_id,
                 list(src_addrs),
@@ -376,10 +371,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
             if ret != 0:
                 break
-        logger.info(
-            f"CachePD WRITE n_sge={n_sge:d} bytes={n_bytes:d} wait_ms="
-            f"{(time.monotonic() - started) * 1000.0:.1f} ret={ret!s}",
-        )
         return ret
 
     def _cache_transfer_blocks(
@@ -925,10 +916,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             self.rejected_decode_sessions.pop(session_id, None)
             with self.session_lock:
                 self._clear_failed_session(session_id)
-            logger.info(
-                "[Prefill bootstrap_thread] registered kv_args from decode session="
-                f"{session_id!s}",
-            )
             return
 
         parsed_room = None
@@ -1022,11 +1009,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
             return
         complete = len(candidate_infos) == expected_fanout
-        logger.info(
-            f"[Prefill bootstrap_thread] pre-alloc received: room={parsed_room:d} "
-            f"session={session_id!s} got={len(candidate_infos):d}/{expected_fanout:d}, "
-            f"status -> {('Bootstrapped' if complete else 'waiting more')!s}",
-        )
         if complete:
             self.update_status(parsed_room, TransferPoll.Bootstrapped)
 

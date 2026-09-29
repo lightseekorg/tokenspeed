@@ -157,8 +157,10 @@ Choose buckets around the work your forwards actually perform. Sparse buckets
 reduce capture work but pad more tokens, including in projections and MoE
 operations captured by the outer graph. Denser buckets reduce padding at the
 cost of more capture time and retained memory. Additional request counts also
-increase capture work and storage. Shared graph pools reuse scratch, but graph
-objects, outputs and stable metadata remain resident per configuration.
+increase capture work and storage. Shared graph pools reuse scratch, and the
+captures that produce outputs share one set of output and break-handoff buffers
+(narrowing encoders keep a separate handoff map); graph objects and stable
+metadata remain resident per configuration.
 
 ## Coverage and fallback
 

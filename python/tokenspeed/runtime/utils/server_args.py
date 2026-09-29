@@ -161,7 +161,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
-    enable_log_requests: bool = False
+    enable_log_requests: bool = True
     log_requests_level: int = 0
     enable_log_request_stats: bool = False
     enable_metrics: bool = False
@@ -988,6 +988,78 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+    def validate_petit_moe_options(self):
+        """Validate shared backend, model, and scheduling options for Petit.
+
+        MoELayer owns hardware, MoE topology, and expert compatibility checks.
+        """
+        active_moe_backends = [("target", self.moe_backend)]
+        if self.speculative_algorithm is not None:
+            active_moe_backends.append(
+                ("draft", self.draft_moe_backend or self.moe_backend)
+            )
+        gluon_petit_roles = [
+            role for role, backend in active_moe_backends if backend == "gluon_petit"
+        ]
+        if self.all2all_backend == "gluon_petit":
+            mismatched_roles = [
+                f"{role}={backend}"
+                for role, backend in active_moe_backends
+                if backend != "gluon_petit"
+            ]
+            if mismatched_roles:
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires every active MoE backend to "
+                    "match --all2all-backend gluon_petit; incompatible "
+                    + ", ".join(mismatched_roles)
+                )
+        elif gluon_petit_roles:
+            raise ValueError(
+                "Gluon Petit MegaMoE requires --all2all-backend gluon_petit "
+                f"for the active {', '.join(gluon_petit_roles)} MoE backend"
+            )
+
+        if gluon_petit_roles:
+            if self.dtype != "bfloat16":
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires --dtype bfloat16; "
+                    f"configured dtype={self.dtype}"
+                )
+            if (
+                self.mapping.attn.tp_size != 1
+                or self.mapping.attn.cp_size != 1
+                or self.mapping.dense.tp_size != 1
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires attention TP1, CP1, and dense TP1"
+                )
+            decode_tokens_per_request = (
+                self.speculative_num_draft_tokens
+                if self.speculative_algorithm is not None
+                else 1
+            )
+            decode_tokens_per_rank = (
+                self.max_num_seqs // self.mapping.attn.dp_size
+            ) * decode_tokens_per_request
+            if decode_tokens_per_rank > 1024:
+                raise ValueError(
+                    "Gluon Petit MegaMoE supports at most 1024 decode tokens "
+                    "per rank; reduce --max-num-seqs or the speculative draft "
+                    f"token count (configured {decode_tokens_per_rank} tokens "
+                    "per rank)"
+                )
+            if (
+                self.chunked_prefill_size <= 0
+                or self.chunked_prefill_size > 1024
+                or self.max_prefill_tokens > 1024
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE supports at most 1024 prefill tokens "
+                    "per rank; set --chunked-prefill-size to a positive value "
+                    "no greater than 1024 and --max-prefill-tokens no greater "
+                    "than 1024"
+                )
+
     def validate(self):
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
@@ -996,6 +1068,8 @@ class ServerArgs:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
             if not self.disable_pdl:
                 raise ValueError("NPU execution requires --disable-pdl")
+
+        self.validate_petit_moe_options()
 
         if (
             self.max_num_seqs is not None
@@ -1411,7 +1485,7 @@ class ServerArgs:
             "--enable-log-requests",
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.enable_log_requests,
-            help="Log metadata, inputs, outputs of all requests. The verbosity is decided by --log-requests-level",
+            help="Log metadata, inputs, outputs of all requests (default on; --no-enable-log-requests to disable). The verbosity is decided by --log-requests-level",
         )
         parser.add_argument(
             "--log-requests-level",
@@ -1583,9 +1657,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
-            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, aok "
-            "(the batch-invariant leaves; --numerics rl-bitwise folds auto to "
-            "it)",
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, "
+            "gluon_petit, aok (the batch-invariant leaves; --numerics rl-bitwise "
+            "folds auto to it)",
         )
         parser.add_argument(
             "--moe-mxfp4-fp8-activation",
@@ -1610,9 +1684,10 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            choices=["none", "agrs", "deepep", "flashinfer"],
+            choices=["none", "agrs", "deepep", "flashinfer", "gluon_petit"],
             help="MoE communication backend. agrs and flashinfer explicitly select "
-            "the Kimi-K3 attention-DP transport; none preserves existing behavior.",
+            "the Kimi-K3 attention-DP transport; gluon_petit selects the fused "
+            "Petit MegaMoE transport; none preserves existing behavior.",
         )
         parser.add_argument(
             "--deepep-mode",

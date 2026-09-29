@@ -96,6 +96,27 @@ def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
         )
 
 
+def int_specialization_class(value: int) -> str:
+    """The class Triton specializes a runtime integer on."""
+    return "one" if value == 1 else "div16" if value % 16 == 0 else "other"
+
+
+def warm_specialization_classes(run, key, sweep, pool) -> None:
+    """Run one pool value per specialization key the sweep will hit.
+
+    ``key`` maps a value to everything that selects a binary (integer classes,
+    power-of-two buckets, launch configs). Which keys a sweep reaches can
+    depend on the device, e.g. split counts follow the SM count; warming from
+    a pool keeps the guard meaningful everywhere. A key no pool value reaches
+    is warmed with its sweep value.
+    """
+    needed = {key(value) for value in sweep}
+    for value in [*(v for v in pool if v not in sweep), *sweep]:
+        if key(value) in needed:
+            needed.discard(key(value))
+            run(value)
+
+
 def make_mxfp4_moe_weights(
     num_experts: int,
     hidden_size: int,

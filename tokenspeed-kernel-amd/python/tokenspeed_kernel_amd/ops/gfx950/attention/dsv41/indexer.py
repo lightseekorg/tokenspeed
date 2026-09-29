@@ -57,7 +57,7 @@ def _csa2_page_rows(
     num_pages,
     visible,
     PAGE_SIZE: gl.constexpr,
-    TABLE_WIDTH: gl.constexpr,
+    table_width,
     CANDIDATES: gl.constexpr,
 ):
     if CANDIDATES >= 0:
@@ -73,7 +73,7 @@ def _csa2_page_rows(
         logical = positions.to(gl.int64)
         valid = valid & (logical < visible)
     logical_page = logical // PAGE_SIZE
-    safe_page = gl.minimum(gl.maximum(logical_page, 0), TABLE_WIDTH - 1)
+    safe_page = gl.minimum(gl.maximum(logical_page, 0), table_width - 1)
     physical = gl.amd.cdna4.buffer_load(
         ptr=page_table,
         offsets=(query * table_stride + safe_page).to(gl.int32),
@@ -104,7 +104,7 @@ def _score_csa2_group(
     dot_b_layout: gl.constexpr,
     b_scale_layout: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
-    TABLE_WIDTH: gl.constexpr,
+    table_width,
     CANDIDATES: gl.constexpr,
 ):
     packed_dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(1, dot_b_layout))[
@@ -124,7 +124,7 @@ def _score_csa2_group(
         num_pages,
         visible,
         PAGE_SIZE,
-        TABLE_WIDTH,
+        table_width,
         CANDIDATES,
     )
     key_offsets = (
@@ -151,7 +151,7 @@ def _score_csa2_group(
         num_pages,
         visible,
         PAGE_SIZE,
-        TABLE_WIDTH,
+        table_width,
         CANDIDATES,
     )
     key_scale_offsets = (
@@ -208,6 +208,7 @@ def _index_launch_metadata(grid, kernel, args):
         "stride_w_token",
         "stride_w_head",
         "table_stride",
+        "table_width",
         "cand_stride",
         "logits_stride",
         "page_stride_bytes",
@@ -237,7 +238,7 @@ def gluon_dsv41_index_topk_gfx950(
     max_candidates,
     NUM_HEADS: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
-    TABLE_WIDTH: gl.constexpr,
+    table_width,
     CANDIDATES: gl.constexpr,
     SCORE_CHUNK: gl.constexpr,
     BLOCK_N: gl.constexpr,
@@ -248,7 +249,7 @@ def gluon_dsv41_index_topk_gfx950(
     split = gl.program_id(1)
     vis = gl.minimum(
         gl.maximum(gl.load(visible + token).to(gl.int32), 0),
-        TABLE_WIDTH * PAGE_SIZE,
+        table_width * PAGE_SIZE,
     )
     if CANDIDATES >= 0:
         width = gl.where(vis > 0, CANDIDATES * 8, 0)
@@ -321,7 +322,7 @@ def gluon_dsv41_index_topk_gfx950(
             dot_b_layout,
             b_scale_layout,
             PAGE_SIZE,
-            TABLE_WIDTH,
+            table_width,
             CANDIDATES,
         )
         scores += _score_csa2_group(
@@ -343,7 +344,7 @@ def gluon_dsv41_index_topk_gfx950(
             dot_b_layout,
             b_scale_layout,
             PAGE_SIZE,
-            TABLE_WIDTH,
+            table_width,
             CANDIDATES,
         )
         positions = tile_start + output_columns
@@ -359,7 +360,7 @@ def gluon_dsv41_index_topk_gfx950(
             num_pages,
             vis,
             PAGE_SIZE,
-            TABLE_WIDTH,
+            table_width,
             CANDIDATES,
         )
         gl.store(
@@ -427,7 +428,7 @@ def dsv41_index_logits_gfx950(
         width,
         NUM_HEADS=_MFMA_HEADS,
         PAGE_SIZE=_PAGE_SIZE,
-        TABLE_WIDTH=int(table.shape[1]),
+        table_width=int(table.shape[1]),
         CANDIDATES=-1 if candidates is None else int(candidates.shape[1]),
         SCORE_CHUNK=score_chunk_size,
         BLOCK_N=32,

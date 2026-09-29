@@ -125,7 +125,9 @@ def _pack_kernel(
     CB: tl.constexpr,
     SS,
     PAGE_ROWS: tl.constexpr,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
@@ -243,7 +245,9 @@ def _gather_kernel(
     OS0,
     OS1,
     PAGE_ROWS: tl.constexpr,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
@@ -538,7 +542,9 @@ def _compressor_tail_scatter_kernel(
     TK,
     TD,
     LS,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
 ):
     row = tl.program_id(0)
     slot = tl.load(Slots + row * LS).to(tl.int64)
@@ -2845,7 +2851,7 @@ def decode_rows(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["SW", "SS", "SC", "TABLE_ROWS"])
 def _decode_window_kernel(
     Positions,
     Requests,
@@ -2921,7 +2927,7 @@ def decode_window(
         )
 
 
-@triton.jit(do_not_specialize=["N"])
+@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
 def _global_slots_kernel(
     Rows,
     P,
@@ -2989,7 +2995,7 @@ def global_slots(rows, positions, requests, table, ratio, pages):
     return out
 
 
-@triton.jit(do_not_specialize=["N", "TC"])
+@triton.jit(do_not_specialize=["N", "TC", "TR", "TS0", "TS1"])
 def _selection_table_kernel(
     P,
     Req,
@@ -3050,7 +3056,7 @@ def selection_table(positions, requests, table, ratio):
     return out, lengths
 
 
-@triton.jit(do_not_specialize=["N"])
+@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
 def _compressor_metadata(
     Positions,
     Requests,
