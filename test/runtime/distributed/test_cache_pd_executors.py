@@ -910,8 +910,37 @@ def test_page_field_copies_validates_its_grid() -> None:
         list(flatten_transfer_blocks([item]))
 
 
-def test_engine_wrapper_requires_and_forwards_the_page_gathered_write() -> None:
+def test_engine_wrapper_requires_and_forwards_the_page_gathered_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    import types
+
     from tokenspeed.runtime.pd.base.mooncake_engine import MooncakeTransferEngine
+
+    class FakeTransferEngine:
+        def __init__(self) -> None:
+            self.initialized = None
+
+        def initialize(self, *args):
+            self.initialized = args
+            return 0
+
+        def get_rpc_port(self):
+            return 4321
+
+    fake_module = types.ModuleType("mooncake.engine")
+    fake_module.TransferEngine = FakeTransferEngine
+    monkeypatch.setitem(sys.modules, "mooncake", types.ModuleType("mooncake"))
+    monkeypatch.setitem(sys.modules, "mooncake.engine", fake_module)
+    # An engine without the page-gathered WRITE is a wrong install.
+    with pytest.raises(RuntimeError, match="batch_transfer_sync_write_pages"):
+        MooncakeTransferEngine("10.0.0.1", gpu_id=0, ib_device=None)
+    # With it, bring-up completes and the session id names this rank.
+    FakeTransferEngine.batch_transfer_sync_write_pages = lambda self, *a: 0
+    engine = MooncakeTransferEngine("10.0.0.1", gpu_id=0, ib_device="mlx5_0")
+    assert engine.session_id == "10.0.0.1:4321"
+    assert engine.engine.initialized == ("10.0.0.1", "P2PHANDSHAKE", "rdma", "mlx5_0")
 
     src = np.asarray([1, 2], dtype=np.int64)
     dst = np.asarray([3, 4], dtype=np.int64)

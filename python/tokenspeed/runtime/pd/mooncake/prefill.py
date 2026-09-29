@@ -515,11 +515,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 continue
 
             group_fields = layout.fields_for_group(group_spec.group_id)
+            if len(group_src_indices) != len(group_dst_indices):
+                raise ValueError(
+                    "cache transfer source and destination pages differ in count"
+                )
             if group_fields and len(group_src_indices):
-                if len(group_src_indices) != len(group_dst_indices):
-                    raise ValueError(
-                        "cache transfer source and destination pages differ in count"
-                    )
                 # One pages x fields item per group: the descriptors are
                 # expanded inside Mooncake, never here.
                 field_rows = []

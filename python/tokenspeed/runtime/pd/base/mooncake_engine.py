@@ -49,6 +49,18 @@ class MooncakeTransferEngine:
                 "install tokenspeed-mooncake >= 0.3.13.post20260929."
             )
 
+        self.initialize(
+            hostname=self.hostname,
+            device_name=self.ib_device,
+        )
+        self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
+        # The peer identifies this rank by session_id in its transfer logs
+        # (Prefill's "session=..."), so name it once per process here.
+        logger.info(
+            f"Mooncake transfer engine ready: session_id={self.session_id} "
+            f"gpu_id={self.gpu_id} ib_device={self.ib_device}"
+        )
+
     def register(self, ptr, length):
         """Register ``ptr`` with Mooncake.
 
