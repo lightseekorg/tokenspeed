@@ -54,10 +54,11 @@ jobs:
             changed=false
           fi
 
+          # CI validates merged code; branch protection is a local commit guard.
           if [[ "$changed" == "true" ]]; then
-            pre_commit_skip=
+            pre_commit_skip=no-commit-to-branch
           else
-            pre_commit_skip=clang-format
+            pre_commit_skip=no-commit-to-branch,clang-format
           fi
           {
             echo "changed=$changed"
