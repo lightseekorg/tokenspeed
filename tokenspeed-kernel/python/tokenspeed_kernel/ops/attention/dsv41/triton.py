@@ -3226,3 +3226,127 @@ def block_maxima_with_lengths(
             128,
         )
     return output, ends
+
+
+@triton.jit(
+    do_not_specialize=[
+        "width",
+        "score_stride",
+        "length_stride",
+        "table_stride",
+        "page_stride",
+        "table_width",
+        "num_pages",
+        "blocks",
+        "workers",
+    ],
+    do_not_specialize_on_alignment=[
+        "width",
+        "score_stride",
+        "length_stride",
+        "table_stride",
+        "page_stride",
+        "table_width",
+        "num_pages",
+        "blocks",
+        "workers",
+    ],
+)
+def _clean_block_maxima_kernel(
+    Scores,
+    Lengths,
+    Table,
+    Cleaned,
+    Maxima,
+    Ends,
+    width,
+    score_stride,
+    length_stride,
+    table_stride,
+    page_stride,
+    table_width,
+    num_pages,
+    blocks,
+    workers,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    worker = tl.program_id(1)
+    length = tl.minimum(tl.maximum(tl.load(Lengths + row * length_stride), 0), width)
+    end = (length + 7) // 8
+    if worker == 0:
+        tl.store(Ends + row, end)
+    # Keep the launch shape fixed for graph replay, but visit only live tiles.
+    for tile in range(worker, tl.cdiv(length, TILE), workers):
+        block = tile * (TILE // 8) + tl.arange(0, TILE // 8)
+        column = block[:, None] * 8 + tl.arange(0, 8)[None, :]
+        live = column < length
+        page = tl.load(
+            Table + row * table_stride + (column // 64) * page_stride,
+            live & (column // 64 < table_width),
+            other=-1,
+        )
+        valid = live & (column // 64 < table_width) & (page >= 0) & (page < num_pages)
+        value = tl.load(
+            Scores + row * score_stride + column, valid, other=-float("inf")
+        )
+        tl.store(Cleaned + row * width + column, value, live)
+        # Preserve amax NaN propagation, even for the pinned newest block.
+        has_nan = tl.sum((value != value).to(tl.int32), axis=1) != 0
+        maximum = tl.max(value, axis=1)
+        maximum = tl.where(has_nan, float("nan"), maximum)
+        maximum = tl.where(
+            (block == end - 1) & (maximum > -float("inf")), float("inf"), maximum
+        )
+        tl.store(Maxima + row * blocks + block, maximum, block < end)
+
+
+def clean_block_maxima(
+    scores: torch.Tensor, visible: torch.Tensor, table: torch.Tensor, num_pages: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Clean paged FP32 scores and reduce their visible eight-token blocks.
+
+    ``table`` maps each row's logical 64-token pages to physical page IDs.
+    Invalid pages inside the visible prefix are masked to -inf. Return fixed-
+    shape cleaned scores, block maxima, and GPU-resident valid block counts.
+    Only the clamped visible score prefix and returned block prefix are written:
+    consumers must bound every read, including after CUDA Graph length changes.
+    """
+    if (
+        scores.ndim != 2
+        or scores.shape[1] == 0
+        or scores.stride(1) != 1
+        or scores.dtype != torch.float32
+        or visible.ndim != 1
+        or visible.numel() != scores.shape[0]
+        or table.ndim != 2
+        or table.shape[0] != scores.shape[0]
+    ):
+        raise ValueError("incompatible paged score geometry")
+    rows, width = scores.shape
+    blocks = triton.cdiv(width, 8)
+    # Enough independent tiles for long contexts; short rows exit on the GPU.
+    workers = min(triton.cdiv(width, 1024), 256)
+    cleaned = torch.empty((rows, width), device=scores.device, dtype=scores.dtype)
+    maxima = torch.empty((rows, blocks), device=scores.device, dtype=scores.dtype)
+    ends = torch.empty((rows,), device=scores.device, dtype=torch.int32)
+    if rows:
+        _clean_block_maxima_kernel[(rows, workers)](
+            scores,
+            visible,
+            table,
+            cleaned,
+            maxima,
+            ends,
+            width,
+            scores.stride(0),
+            visible.stride(0),
+            table.stride(0),
+            table.stride(1),
+            table.shape[1],
+            num_pages,
+            blocks,
+            workers,
+            1024,
+        )
+    return cleaned, maxima, ends
