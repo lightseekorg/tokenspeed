@@ -46,6 +46,14 @@ class MooncakeTransferEngine:
         self.batch_transfer_sync_write_arrays = getattr(
             self.engine, "batch_transfer_sync_write_arrays", None
         )
+        # Page-gathered batch WRITE from the same patch: pages x fields are
+        # expanded inside Mooncake. None when the engine lacks it; callers
+        # then expand on the host.
+        self.batch_transfer_sync_pages = (
+            self._batch_transfer_sync_pages
+            if hasattr(self.engine, "batch_transfer_sync_write_pages")
+            else None
+        )
 
         self.initialize(
             hostname=self.hostname,
@@ -168,6 +176,31 @@ class MooncakeTransferEngine:
             logger.debug(
                 f"Failed to batch transfer data. Buffers: {buffers!s}, Session: "
                 f"{session_id!s}, Peer addresses: {peer_buffer_addresses!s}",
+            )
+        return ret
+
+    def _batch_transfer_sync_pages(
+        self,
+        session_id: str,
+        src_pages: np.ndarray,
+        dst_pages: np.ndarray,
+        fields: np.ndarray,
+        *,
+        max_batch_size: int,
+    ) -> int:
+        """WRITE the pages x fields grid described by ``fields`` (see
+        ``PageFieldCopies``) in batches of at most ``max_batch_size``."""
+        try:
+            ret = self.engine.batch_transfer_sync_write_pages(
+                session_id, src_pages, dst_pages, fields, max_batch_size
+            )
+        except Exception:
+            logger.exception("Mooncake page-gathered batch transfer raised")
+            ret = -1
+        if ret < 0:
+            logger.debug(
+                f"Failed to batch transfer {fields.shape[0]} fields x "
+                f"{src_pages.shape[0]} pages to session {session_id!s}"
             )
         return ret
 

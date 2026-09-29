@@ -33,6 +33,7 @@ from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
     TransferKVChunk,
 )
 from tokenspeed.runtime.pd.mooncake.pack import (  # noqa: E402
+    PageFieldCopies,
     SgeColumns,
     flatten_transfer_blocks,
 )
@@ -245,7 +246,9 @@ def _recording_transfer_manager(layout: CacheTransferContract, src_ptr: int):
                 )
             )
             or 0
-        )
+        ),
+        # No page-gathered WRITE: descriptors expand on the host.
+        batch_transfer_sync_pages=None,
     )
     return manager, calls
 
@@ -800,9 +803,12 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
             dst_cache_layout=destination_layout,
         )
     )
-    # One array column block per field, no per-page Python objects.
-    assert [type(block) for block in blocks] == [SgeColumns, SgeColumns]
-    assert all(len(block) == pages for block in blocks)
+    # One pages x fields item for the group, no per-page Python objects; its
+    # host expansion is one column block per field.
+    (item,) = blocks
+    assert isinstance(item, PageFieldCopies)
+    assert item.fields.shape == (2, 5) and len(item) == 2 * pages
+    assert [type(block) for block in item.expand()] == [SgeColumns, SgeColumns]
     assert list(flatten_transfer_blocks(blocks)) == expected
 
     fragment = CacheTransferFragment(
@@ -860,9 +866,60 @@ def test_transfer_data_coalesces_column_blocks_into_descriptor_batches() -> None
     assert calls[1] == ("session", [7], [8], [9])
     assert calls[2][1][0] == 300 and calls[3][1][-1] == 300 + batch + 29
 
-    failing = SimpleNamespace(batch_transfer_sync=lambda *args: -1)
+    failing = SimpleNamespace(
+        batch_transfer_sync=lambda *args: -1, batch_transfer_sync_pages=None
+    )
     manager.engine = failing
     assert manager._transfer_data("session", iter([columns(0, 3)])) == -1
+
+
+def test_transfer_data_uses_the_page_gathered_write_when_the_engine_has_it() -> None:
+    from tokenspeed.runtime.pd.mooncake import prefill as prefill_module
+
+    manager, calls = _recording_transfer_manager(
+        _typed_layout(local_heads=4, global_heads=4), 0
+    )
+    page_calls = []
+    manager.engine.batch_transfer_sync_pages = (
+        lambda session, src, dst, fields, *, max_batch_size: (
+            page_calls.append((session, src, dst, fields, max_batch_size)) or 0
+        )
+    )
+    item = PageFieldCopies(
+        np.asarray([1, 2, 3], dtype=np.int64),
+        np.asarray([9, 8, 7], dtype=np.int64),
+        np.asarray([[100, 10, 200, 20, 5], [300, 30, 400, 40, 6]], dtype=np.int64),
+    )
+    # Buffered columns and pending rows are flushed ahead of the page item.
+    columns = SgeColumns(*(np.asarray([v], dtype=np.int64) for v in (1, 2, 3)))
+    assert manager._transfer_data("session", iter([columns, (4, 5, 6), item])) == 0
+    assert [call[1] for call in calls] == [[1], [4]]
+    ((session, src, dst, fields, max_batch_size),) = page_calls
+    assert session == "session" and src is item.src_pages and fields is item.fields
+    assert max_batch_size == prefill_module._TRANSFER_DESCRIPTOR_BATCH_SIZE
+
+    manager.engine.batch_transfer_sync_pages = lambda *args, **kwargs: -3
+    assert manager._transfer_data("session", iter([item])) == -3
+
+
+def test_page_field_copies_expand_matches_the_descriptor_formula() -> None:
+    item = PageFieldCopies(
+        np.asarray([1, 5], dtype=np.int64),
+        np.asarray([9, 8], dtype=np.int64),
+        np.asarray(
+            [[1000, 64, 5000, 128, 16], [2000, 4096, 3000, 4096, 3000]], dtype=np.int64
+        ),
+    )
+    assert list(flatten_transfer_blocks([item])) == [
+        (1064, 6152, 16),
+        (1320, 6024, 16),
+        (6096, 39864, 3000),
+        (22480, 35768, 3000),
+    ]
+    with pytest.raises(TypeError):
+        PageFieldCopies(item.src_pages, item.dst_pages, item.fields[:, :4].copy())
+    with pytest.raises(ValueError):
+        PageFieldCopies(item.src_pages, item.dst_pages[:1], item.fields)
 
 
 def test_engine_wrapper_sends_columns_as_arrays_when_mooncake_offers_it() -> None:
@@ -897,6 +954,31 @@ def test_engine_wrapper_sends_columns_as_arrays_when_mooncake_offers_it() -> Non
     seen.clear()
     assert wrapper.batch_transfer_sync("s", [1], [2], [3]) == 0
     assert seen == [("list", [1], [2], [3])]
+
+    # The page-gathered WRITE passes the grid and batch bound through, and a
+    # raising engine reports failure instead of propagating.
+    fields = np.zeros((2, 5), dtype=np.int64)
+    wrapper.engine = SimpleNamespace(
+        batch_transfer_sync_write_pages=lambda session, s, d, f, batch: seen.append(
+            ("pages", s, d, f, batch)
+        )
+        or 0
+    )
+    wrapper.batch_transfer_sync_pages = wrapper._batch_transfer_sync_pages
+    seen.clear()
+    assert (
+        wrapper.batch_transfer_sync_pages("s", src, dst, fields, max_batch_size=4096)
+        == 0
+    )
+    assert seen == [("pages", src, dst, fields, 4096)]
+    wrapper.engine = SimpleNamespace(
+        batch_transfer_sync_write_pages=lambda *args: (_ for _ in ()).throw(
+            RuntimeError("x")
+        )
+    )
+    assert (
+        wrapper.batch_transfer_sync_pages("s", src, dst, fields, max_batch_size=1) == -1
+    )
 
 
 class _FakePackScratch:
@@ -1155,7 +1237,8 @@ def test_fallback_write_batches_expanded_row_sges(
     batch_sizes: list[int] = []
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.engine = SimpleNamespace(
-        batch_transfer_sync=lambda _s, src, _d, _l: batch_sizes.append(len(src)) or 0
+        batch_transfer_sync=lambda _s, src, _d, _l: batch_sizes.append(len(src)) or 0,
+        batch_transfer_sync_pages=None,
     )
     packer = PrefillPackScratch(
         SimpleNamespace(register=lambda *_a, **_k: None, deregister=lambda *_a: None)
@@ -1236,7 +1319,9 @@ def test_shared_manager_lazily_bounds_application_descriptor_batches() -> None:
         batch_sizes.append((len(src), len(dst), len(lengths)))
         return 0
 
-    manager.engine = SimpleNamespace(batch_transfer_sync=record_write)
+    manager.engine = SimpleNamespace(
+        batch_transfer_sync=record_write, batch_transfer_sync_pages=None
+    )
     block_count = 2 * _TRANSFER_DESCRIPTOR_BATCH_SIZE + 17
 
     def blocks():

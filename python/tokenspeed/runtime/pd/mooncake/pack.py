@@ -110,6 +110,64 @@ class SgeColumns:
         )
 
 
+@dataclass(frozen=True)
+class PageFieldCopies:
+    """One cache group's whole-field copies as pages x fields, unexpanded.
+
+    ``fields`` is a C-contiguous int64 ``[F, 5]`` table of
+    ``(src_base, src_stride, dst_base, dst_stride, length)`` rows; descriptor
+    ``(f, i)`` copies ``length`` bytes from ``src_base + src_pages[i] *
+    src_stride`` to ``dst_base + dst_pages[i] * dst_stride``. Mooncake's
+    ``batch_transfer_sync_write_pages`` consumes this shape directly, so a
+    group is one call with no descriptor built on the host; :meth:`expand`
+    is the fallback for engines without it.
+    """
+
+    src_pages: np.ndarray
+    dst_pages: np.ndarray
+    fields: np.ndarray
+
+    def __post_init__(self) -> None:
+        for name, column in (
+            ("src_pages", self.src_pages),
+            ("dst_pages", self.dst_pages),
+        ):
+            if (
+                not isinstance(column, np.ndarray)
+                or column.ndim != 1
+                or column.dtype != np.int64
+            ):
+                raise TypeError(f"PageFieldCopies.{name} must be a 1-D int64 array")
+        if self.src_pages.shape != self.dst_pages.shape:
+            raise ValueError("PageFieldCopies page arrays must have the same length")
+        if (
+            not isinstance(self.fields, np.ndarray)
+            or self.fields.ndim != 2
+            or self.fields.shape[1] != 5
+            or self.fields.dtype != np.int64
+            or not self.fields.flags.c_contiguous
+        ):
+            raise TypeError(
+                "PageFieldCopies.fields must be a C-contiguous int64 [F, 5] array"
+            )
+
+    def __len__(self) -> int:
+        return int(self.src_pages.shape[0] * self.fields.shape[0])
+
+    def expand(self) -> list[SgeColumns]:
+        """One column block per field, in field order."""
+        return [
+            SgeColumns(
+                src_base + self.src_pages * src_stride,
+                dst_base + self.dst_pages * dst_stride,
+                np.full(self.src_pages.shape, length, np.int64),
+            )
+            for src_base, src_stride, dst_base, dst_stride, length in (
+                self.fields.tolist()
+            )
+        ]
+
+
 def expand_packed_copy(copy: PackedCopy) -> list[Sge]:
     """Row-wise SGEs used when 2D pack is unavailable. Dest is contiguous."""
     return [
@@ -131,6 +189,10 @@ def flatten_transfer_blocks(blocks: Iterable[object]) -> Iterator[Sge]:
     for block in blocks:
         if isinstance(block, PackedCopy):
             yield from expand_packed_copy(block)
+            continue
+        if isinstance(block, PageFieldCopies):
+            for columns in block.expand():
+                yield from columns.tolist()
             continue
         if isinstance(block, SgeColumns):
             yield from block.tolist()
@@ -193,6 +255,10 @@ class PrefillPackScratch:
         sges: list[Sge] = []
         offset = 0
         for item in items:
+            if isinstance(item, PageFieldCopies):
+                for columns in item.expand():
+                    sges.extend(columns.tolist())
+                continue
             if isinstance(item, SgeColumns):
                 sges.extend(item.tolist())
                 continue

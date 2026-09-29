@@ -49,6 +49,7 @@ from tokenspeed.runtime.pd.mooncake.entities import (
 )
 from tokenspeed.runtime.pd.mooncake.pack import (
     PackedCopy,
+    PageFieldCopies,
     PrefillPackScratch,
     SgeColumns,
     flatten_transfer_blocks,
@@ -344,10 +345,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     def _transfer_data(self, mooncake_session_id, transfer_blocks, packer=None):
         """WRITE descriptors in bounded batches, packing PackedCopy items per batch.
 
-        ``SgeColumns`` items are coalesced across fields and written as
+        A ``PageFieldCopies`` item goes to Mooncake's page-gathered WRITE as
+        is when the engine has it; otherwise it expands to one column block
+        per field, and those are coalesced across fields and written as
         arrays in batches of the same size as the per-descriptor path, so a
         transfer still costs one WRITE round per 4096 descriptors rather
-        than one per field. They are never packed. Per-descriptor items
+        than one per field. Neither form is packed. Per-descriptor items
         (tuples, PackedCopy) are collected and written through the packer
         path in between, preserving order.
         """
@@ -390,17 +393,38 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             return 0
 
         for item in transfer_blocks:
-            if isinstance(item, SgeColumns):
+            if isinstance(item, (PageFieldCopies, SgeColumns)):
                 if pending:
                     ret = self._write_sge_batch(mooncake_session_id, pending, packer)
                     pending = []
                     if ret != 0:
                         return ret
-                columns.append(item)
-                column_rows += len(item)
-                ret = write_columns(flush=False)
-                if ret != 0:
-                    return ret
+                if (
+                    isinstance(item, PageFieldCopies)
+                    and self.engine.batch_transfer_sync_pages is not None
+                ):
+                    ret = write_columns(flush=True)
+                    if ret != 0:
+                        return ret
+                    ret = self.engine.batch_transfer_sync_pages(
+                        mooncake_session_id,
+                        item.src_pages,
+                        item.dst_pages,
+                        item.fields,
+                        max_batch_size=_TRANSFER_DESCRIPTOR_BATCH_SIZE,
+                    )
+                    if ret != 0:
+                        return ret
+                    continue
+                expanded = (
+                    item.expand() if isinstance(item, PageFieldCopies) else [item]
+                )
+                for block in expanded:
+                    columns.append(block)
+                    column_rows += len(block)
+                    ret = write_columns(flush=False)
+                    if ret != 0:
+                        return ret
                 continue
             ret = write_columns(flush=True)
             if ret != 0:
@@ -447,7 +471,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_cache_layout: CacheTransferContract,
         block_selection: CachePDLayerwiseBlockSelection | None = None,
         field_ids: frozenset[str] | None = None,
-    ) -> Iterator[SgeColumns | PackedCopy | tuple[int, int, int]]:
+    ) -> Iterator[PageFieldCopies | PackedCopy | tuple[int, int, int]]:
         layout = self.kv_args.cache_layout
 
         cache_fragments = tuple(transfer_fragments)
@@ -561,29 +585,35 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     raise ValueError(
                         "cache transfer source and destination pages differ in count"
                     )
-                src_pages = np.asarray(group_src_indices, dtype=np.int64)
-                dst_pages = np.asarray(group_dst_indices, dtype=np.int64)
+                # One pages x fields item per group: the descriptors are
+                # expanded by Mooncake (or by the fallback in _transfer_data),
+                # never here.
+                field_rows = []
                 for src_segment in group_fields:
                     if field_ids is not None and src_segment.field_id not in field_ids:
                         continue
                     key = (group_spec.group_id, src_segment.field_id)
                     dst_segment = peer_segments[key]
-                    src_addrs = (
-                        src_ptr
-                        + layout.plan.field_page_byte_offset(src_segment.field_id, 0)
-                        + src_pages * src_segment.page_stride_bytes
-                    )
-                    dst_addrs = (
-                        dst_ptr
-                        + dst_cache_layout.plan.field_page_byte_offset(
-                            dst_segment.field_id, 0
+                    field_rows.append(
+                        (
+                            src_ptr
+                            + layout.plan.field_page_byte_offset(
+                                src_segment.field_id, 0
+                            ),
+                            src_segment.page_stride_bytes,
+                            dst_ptr
+                            + dst_cache_layout.plan.field_page_byte_offset(
+                                dst_segment.field_id, 0
+                            ),
+                            dst_segment.page_stride_bytes,
+                            src_segment.payload_bytes,
                         )
-                        + dst_pages * dst_segment.page_stride_bytes
                     )
-                    yield SgeColumns(
-                        src_addrs,
-                        dst_addrs,
-                        np.full(src_pages.shape, src_segment.payload_bytes, np.int64),
+                if field_rows:
+                    yield PageFieldCopies(
+                        np.asarray(group_src_indices, dtype=np.int64),
+                        np.asarray(group_dst_indices, dtype=np.int64),
+                        np.asarray(field_rows, dtype=np.int64).reshape(-1, 5),
                     )
                 continue
 
