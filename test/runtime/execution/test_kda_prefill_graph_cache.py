@@ -473,7 +473,8 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
     )
     owner.disable = False
     owner.dp_size, owner.num_warmup, owner._pool = 1, 1, None
-    owner.capture_buckets = [bucket]
+    owner.capture_buckets, owner.decoder_buckets = [bucket], []
+    owner._handoff_storage, owner._outputs = {}, None
     owner._captures = {}
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
     owner._embed_tokens = lambda ids: ids

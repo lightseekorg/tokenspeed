@@ -50,7 +50,12 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 
-_SPLIT_TILE = gl.constexpr(MAX_KV_SPLITS)
+# The reduce kernel reads all split LSEs at once, one per lane of its single
+# wave, so the split count must fit in a wave.
+_LSE_TILE = gl.constexpr(64)
+assert MAX_KV_SPLITS <= _LSE_TILE.value
+# Split partials the reduce kernel loads per loop iteration.
+_SPLIT_CHUNK = gl.constexpr(8)
 
 
 @gluon.jit
@@ -896,31 +901,48 @@ def gluon_mha_extend_reduce_gfx950(
     # Combine the NUM_KV_SPLITS partials for one (query token, head) with a
     # global softmax rescale. Empty splits carry -inf lse (written by the
     # compute pass) so they drop out. Grid is (total_q, N_HEADS).
+    #
+    # NUM_KV_SPLITS is a runtime value so one binary serves every batch shape.
+    # Pass 1 reads all split LSEs (one per lane) to get the global max and
+    # denominator; pass 2 streams the partial outputs in _SPLIT_CHUNK-row tiles,
+    # so registers stay bounded by the chunk rather than the largest split
+    # count.
     reduce_layout: gl.constexpr = gl.BlockedLayout(
         [1, HEAD_DIM // 64], [1, 64], [1, 1], [1, 0]
     )
+    lse_layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
     row = gl.program_id(0)
     q_head = gl.program_id(1)
+    base = (row * N_HEADS + q_head) * NUM_KV_SPLITS
 
-    # The tile covers the largest split count; lanes past NUM_KV_SPLITS are
-    # masked out.
-    offs_s = gl.arange(0, _SPLIT_TILE, layout=gl.SliceLayout(1, reduce_layout))
-    offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, reduce_layout))
-    split_valid = offs_s < NUM_KV_SPLITS
-    base = (row * N_HEADS + q_head) * NUM_KV_SPLITS + offs_s
-    part_lse = gl.load(mid_lse_ptr + base, mask=split_valid, other=-float("inf"))
-    o_off = base[:, None] * HEAD_DIM + offs_d[None, :]
-    part_o = cdna4.buffer_load(mid_o_ptr, o_off, mask=split_valid[:, None], other=0.0)
-
-    m_i = max(part_lse, axis=0)
+    offs_l = gl.arange(0, _LSE_TILE, layout=lse_layout)
+    all_lse = gl.load(
+        mid_lse_ptr + base + offs_l,
+        mask=offs_l < NUM_KV_SPLITS,
+        other=-float("inf"),
+    )
+    m_i = max(all_lse, axis=0)
     if HAS_SINK:
         sink = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
         m_i = maximum(m_i, sink)
-    beta = gl.exp2(part_lse - m_i)
-    l_i = gl.sum(beta, axis=0)
+    l_i = gl.sum(gl.exp2(all_lse - m_i), axis=0)
     if HAS_SINK:
         l_i = l_i + gl.exp2(sink - m_i)
-    acc = gl.sum(part_o * beta[:, None], axis=0)
+
+    offs_c = gl.arange(0, _SPLIT_CHUNK, layout=gl.SliceLayout(1, reduce_layout))
+    offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, reduce_layout))
+    acc = gl.zeros([HEAD_DIM], gl.float32, layout=gl.SliceLayout(0, reduce_layout))
+    for chunk_start in range(0, NUM_KV_SPLITS, _SPLIT_CHUNK):
+        offs_s = chunk_start + offs_c
+        split_valid = offs_s < NUM_KV_SPLITS
+        part_lse = gl.load(
+            mid_lse_ptr + base + offs_s, mask=split_valid, other=-float("inf")
+        )
+        o_off = (base + offs_s)[:, None] * HEAD_DIM + offs_d[None, :]
+        part_o = cdna4.buffer_load(
+            mid_o_ptr, o_off, mask=split_valid[:, None], other=0.0
+        )
+        acc += gl.sum(part_o * gl.exp2(part_lse - m_i)[:, None], axis=0)
 
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)
