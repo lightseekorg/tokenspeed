@@ -26,7 +26,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import replace
-from itertools import chain, islice
+from itertools import chain, islice, repeat
 
 import numpy as np
 import requests
@@ -342,16 +342,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks, packer=None):
         """WRITE descriptors in bounded batches, packing PackedCopy items per batch."""
-        pending: list[object] = []
-        for item in transfer_blocks:
-            pending.append(item)
-            if len(pending) >= _TRANSFER_DESCRIPTOR_BATCH_SIZE:
-                ret = self._write_sge_batch(mooncake_session_id, pending, packer)
-                pending = []
-                if ret != 0:
-                    return ret
-        if pending:
-            return self._write_sge_batch(mooncake_session_id, pending, packer)
+        iterator = iter(transfer_blocks)
+        while pending := list(islice(iterator, _TRANSFER_DESCRIPTOR_BATCH_SIZE)):
+            ret = self._write_sge_batch(mooncake_session_id, pending, packer)
+            if ret != 0:
+                return ret
         return 0
 
     def _write_sge_batch(self, mooncake_session_id, pending, packer) -> int:
@@ -431,6 +426,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 )
             )
 
+        # Per-field constants are hoisted out of the page loops: a long
+        # prompt moves thousands of pages per field, and this generator runs
+        # on the transfer thread while holding the GIL the forward thread
+        # needs.
+        src_ptr = self.kv_args.kv_data_ptr
         for group_spec, group_src_indices, group_dst_indices in group_transfers:
             if cache_fragments:
                 for fragment in fragments_by_group.get(group_spec.group_id, ()):
@@ -439,24 +439,28 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     dst_segment = peer_segments[key]
                     if field_ids is not None and src_segment.field_id not in field_ids:
                         continue
+                    src_field_base = (
+                        src_ptr
+                        + layout.plan.field_page_byte_offset(src_segment.field_id, 0)
+                        + fragment.src_byte_offset
+                    )
+                    dst_field_base = (
+                        dst_ptr
+                        + dst_cache_layout.plan.field_page_byte_offset(
+                            dst_segment.field_id, 0
+                        )
+                        + fragment.dst_byte_offset
+                    )
                     for src_page, dst_page in zip(
                         group_src_indices, group_dst_indices, strict=True
                     ):
                         src_page_addr = (
-                            self.kv_args.kv_data_ptr
-                            + layout.plan.field_page_byte_offset(
-                                src_segment.field_id, 0
-                            )
+                            src_field_base
                             + int(src_page) * src_segment.page_stride_bytes
-                            + fragment.src_byte_offset
                         )
                         dst_page_addr = (
-                            dst_ptr
-                            + dst_cache_layout.plan.field_page_byte_offset(
-                                dst_segment.field_id, 0
-                            )
+                            dst_field_base
                             + int(dst_page) * dst_segment.page_stride_bytes
-                            + fragment.dst_byte_offset
                         )
                         width = fragment.bytes_per_row
                         rows = fragment.rows_per_page
@@ -483,28 +487,36 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 continue
 
             group_fields = layout.fields_for_group(group_spec.group_id)
-            if group_fields:
+            if group_fields and len(group_src_indices):
+                if len(group_src_indices) != len(group_dst_indices):
+                    raise ValueError(
+                        "cache transfer source and destination pages differ in count"
+                    )
+                src_pages = np.asarray(group_src_indices, dtype=np.int64)
+                dst_pages = np.asarray(group_dst_indices, dtype=np.int64)
                 for src_segment in group_fields:
                     if field_ids is not None and src_segment.field_id not in field_ids:
                         continue
                     key = (group_spec.group_id, src_segment.field_id)
                     dst_segment = peer_segments[key]
-                    for src_page, dst_page in zip(
-                        group_src_indices, group_dst_indices, strict=True
-                    ):
-                        yield (
-                            self.kv_args.kv_data_ptr
-                            + layout.plan.field_page_byte_offset(
-                                src_segment.field_id, 0
-                            )
-                            + int(src_page) * src_segment.page_stride_bytes,
-                            dst_ptr
-                            + dst_cache_layout.plan.field_page_byte_offset(
-                                dst_segment.field_id, 0
-                            )
-                            + int(dst_page) * dst_segment.page_stride_bytes,
-                            src_segment.payload_bytes,
+                    src_addrs = (
+                        src_ptr
+                        + layout.plan.field_page_byte_offset(src_segment.field_id, 0)
+                        + src_pages * src_segment.page_stride_bytes
+                    )
+                    dst_addrs = (
+                        dst_ptr
+                        + dst_cache_layout.plan.field_page_byte_offset(
+                            dst_segment.field_id, 0
                         )
+                        + dst_pages * dst_segment.page_stride_bytes
+                    )
+                    yield from zip(
+                        src_addrs.tolist(),
+                        dst_addrs.tolist(),
+                        repeat(src_segment.payload_bytes),
+                        strict=False,
+                    )
                 continue
 
     def _wait_until_cache_step(

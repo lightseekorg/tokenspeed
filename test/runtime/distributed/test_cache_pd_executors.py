@@ -741,6 +741,81 @@ def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
     ]
 
 
+def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
+    # Two fields and hundreds of pages: the generator resolves each field's
+    # geometry once and expands pages in bulk, so check it against the plain
+    # per-page formula in both the whole-field and the fragment path.
+    def two_field_layout(capacity: int):
+        return make_layout(
+            make_group(
+                "history",
+                make_segment("layer.0.k", dtype="bfloat16", shape=(2, 4, 2)),
+                make_segment("layer.1.k", dtype="bfloat16", shape=(2, 4, 2)),
+            ),
+            capacity=capacity,
+            page_bytes=64,
+        )
+
+    source_layout = two_field_layout(700)
+    destination_layout = two_field_layout(900)
+    pages = 300
+    src_pages = tuple(range(1, 2 * pages, 2))
+    dst_pages = tuple(range(899, 899 - 2 * pages, -2))
+    source_manifest = _single_group_block_manifest("history", src_pages)
+    destination_manifest = _single_group_block_manifest("history", dst_pages)
+
+    def field_pages(layout, ptr, field_id, page_ids):
+        segment = next(f for f in layout.plan.fields if f.field_id == field_id)
+        return [
+            ptr + layout.plan.field_page_byte_offset(field_id, page)
+            for page in page_ids
+        ], segment.payload_bytes
+
+    manager, _ = _recording_transfer_manager(source_layout, 0x1000)
+    fields = tuple(f.field_id for f in source_layout.fields_for_group("history"))
+    expected = []
+    for field_id in fields:
+        src, size = field_pages(source_layout, 0x1000, field_id, src_pages)
+        dst, _ = field_pages(destination_layout, 0x2000, field_id, dst_pages)
+        expected.extend(zip(src, dst, [size] * pages, strict=True))
+    blocks = list(
+        manager._cache_transfer_blocks(
+            dst_ptr=0x2000,
+            src_block_manifest=source_manifest,
+            dst_block_manifest=destination_manifest,
+            dst_cache_layout=destination_layout,
+        )
+    )
+    assert blocks == expected
+
+    fragment = CacheTransferFragment(
+        group_id="history",
+        field_id=fields[1],
+        src_byte_offset=4,
+        dst_byte_offset=8,
+        src_row_stride_bytes=16,
+        dst_row_stride_bytes=16,
+        bytes_per_row=8,
+        rows_per_page=2,
+    )
+    src, _ = field_pages(source_layout, 0x1000, fields[1], src_pages)
+    dst, _ = field_pages(destination_layout, 0x2000, fields[1], dst_pages)
+    fragment_blocks = list(
+        manager._cache_transfer_blocks(
+            dst_ptr=0x2000,
+            src_block_manifest=source_manifest,
+            dst_block_manifest=destination_manifest,
+            transfer_fragments=(fragment,),
+            dst_cache_layout=destination_layout,
+        )
+    )
+    assert fragment_blocks == [
+        (s + 4 + row * 16, d + 8 + row * 16, 8)
+        for s, d in zip(src, dst, strict=True)
+        for row in range(2)
+    ]
+
+
 class _FakePackScratch:
     def __init__(self, base: int = 0xB000) -> None:
         self.base = base
