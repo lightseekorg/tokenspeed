@@ -224,14 +224,15 @@ class DeepseekV41DSpark(BaseDrafter):
         # it; decode rows overwrite the proposal columns below), and each
         # decode request's anchor is its last accepted verify position.
         next_tokens = self.next_tokens_buf[: base_ctx.bs]
+        if rows == 0:
+            return next_tokens
+
         start_pos = self.start_pos_buf[:num_decodes]
         num_prefill_outputs = (
             num_extends
             if base_ctx.output_layout is None
             else base_ctx.output_layout.num_prefill_outputs
         )
-        if rows == 0:
-            return next_tokens
         dsv41.dspark_anchors(
             output_tokens,
             accept_lengths,
