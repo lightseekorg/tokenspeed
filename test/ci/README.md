@@ -320,9 +320,11 @@ infrastructure failures fail the task.
 The shared task executor uploads the task result and the benchmark's published
 comparison in one Actions artifact. A separate `AMD Kernel Benchmark PR
 Comment` workflow runs trusted code from the default branch after `PR Test AMD`
-finishes. It validates the untrusted artifact and source revision before
-creating or replacing one bot-owned comment. Runs where the benchmark task was
-not selected have no report and are ignored.
+finishes. It validates the untrusted artifact and exact source revision before
+creating or replacing one bot-owned comment, including for fork runs whose
+completion event omits the pull request association and for runs that finish
+after the pull request merges. Closed, unmerged pull requests remain ignored.
+Runs where the benchmark task was not selected have no report and are ignored.
 
 A merge base that does not contain the suite yields a candidate-only
 bootstrap instead of a comparison. Changes to the comment workflow take effect
