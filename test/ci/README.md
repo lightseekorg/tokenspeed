@@ -309,10 +309,13 @@ task executor provides runner cleanup and setup before invoking the benchmark.
 
 The coordinator creates independent worktrees and Python environments inside
 that allocation. Each revision installs its own ROCm kernel requirements and
-uses isolated compilation caches. A benchmark fails only when it exceeds both
-its merge-base relative and absolute regression limits. Noisy measurements and
-successful added, changed, or missing cases remain informational. Correctness,
-execution, environment, and infrastructure failures fail the task.
+uses isolated compilation caches. The automated task explicitly disables
+profiling so regression measurements match production execution as closely as
+possible; direct manual worker runs on AMD retain Proton as their default.
+A benchmark fails only when it exceeds both its merge-base relative and absolute
+regression limits. Noisy measurements and successful added, changed, or missing
+cases remain informational. Correctness, execution, environment, and
+infrastructure failures fail the task.
 
 The shared task executor uploads the task result and the benchmark's published
 comparison in one Actions artifact. A separate `AMD Kernel Benchmark PR
@@ -327,7 +330,7 @@ only after they merge, since `workflow_run` workflows execute from the default
 branch. Manual runs produce summaries and artifacts but not pull request
 comments.
 
-`CUDA_VISIBLE_DEVICES=0` does not limit the shared cleanup process scan, so the
+`ROCR_VISIBLE_DEVICES=0` does not limit the shared cleanup process scan, so the
 runner must provide scheduler-enforced GPU or process-namespace isolation. The
 runner fleet must prevent two jobs from sharing one physical GPU.
 
