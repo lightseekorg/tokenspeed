@@ -366,22 +366,17 @@ as the gfx950 kernels, with WMMA and TDM.
 
 Four warps own 32 rows each of a 128-row query block and walk 64-key tiles
 with base-2 online softmax. TDM streams the NoPE and RoPE halves of K and all
-of V into double-buffered LDS, one tile ahead of the tile being computed.
-Tiles below the first query row's causal limit are visible to every row and
-skip masking.
+of V into double-buffered LDS, one tile ahead. Tiles below the first query
+row's causal limit skip masking.
 
-16-bit inputs keep Q in registers and run one wave per SIMD. Tiles at or
-past the causal limit mask the scores and zero the value rows past the key
-tail.
+16-bit inputs keep Q in registers and run one wave per SIMD. Tiles at or past
+the causal limit mask the scores and zero the value rows past the key tail.
 
-FP8 inputs stage Q in LDS and re-read it every tile, and split the NoPE QK
-into two 64-wide WMMAs. Together these keep a wave within the 336 VGPRs that
-three waves per SIMD allow, so other workgroups run while one waits on its
-loads. Fully visible tiles run a loop with no mask code, because a masked
-branch inside one loop compiles to selects on every tile; the boundary tiles
-run a second loop that masks keys only, since rows past `q_len` are never
-stored. V needs no mask: TDM zero-fills tile rows past `kv_len`, and those
-keys already score `-inf`.
+FP8 inputs stage Q in LDS, split the NoPE QK into two 64-wide WMMAs, and run
+three waves per SIMD. Fully visible tiles run in their own loop without mask
+code, and the boundary tiles mask keys only, since rows past `q_len` are
+never stored. V is not masked: TDM zero-fills tile rows past `kv_len`, and
+those keys score `-inf`.
 
 ## Sampling
 
