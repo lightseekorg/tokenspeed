@@ -1062,9 +1062,11 @@ class ModelExecutor:
         num_extends = ctx.num_extends
         num_decodes = ctx.bs - num_extends
         layout = ctx.output_layout
-        num_prefills = num_extends if layout is None else layout.num_prefill_outputs
+        num_prefill_outputs = (
+            num_extends if layout is None else layout.num_prefill_outputs
+        )
 
-        if num_decodes == 0 and num_prefills == num_extends:
+        if num_decodes == 0 and num_prefill_outputs == num_extends:
             return self.sampling_backend.sample(logits_output, sampling_info)
         if num_extends == 0:
             output_tokens, accept_lengths = self.sampling_backend.verify(
@@ -1092,7 +1094,7 @@ class ModelExecutor:
         logits = logits_output.next_token_logits
         token_parts, length_parts, logprob_parts = [], [], []
 
-        if num_prefills:
+        if num_prefill_outputs:
             prefill_out = LogitsProcessorOutput(next_token_logits=logits[prefill])
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
@@ -1110,10 +1112,12 @@ class ModelExecutor:
                     else prefill_out.next_token_logprobs
                 )
         # Empty prefills contribute request lengths, not token storage.
-        if num_prefills < num_extends:
+        if num_prefill_outputs < num_extends:
             length_parts.append(
                 torch.zeros(
-                    num_extends - num_prefills, dtype=torch.int32, device=logits.device
+                    num_extends - num_prefill_outputs,
+                    dtype=torch.int32,
+                    device=logits.device,
                 )
             )
         if num_decodes:
