@@ -272,6 +272,7 @@ def _mla_decode_fwd_kernel(
     WARP_SIZE: gl.constexpr,  # int
     num_warps: gl.constexpr,  # int
     num_stages: gl.constexpr,  # int
+    NUM_BUFFERS: gl.constexpr,  # int
     NUM_HEAD_BLOCKS: gl.constexpr = 1,  # int
     SHUFFLED_KV_CACHE: gl.constexpr = False,  # bool
     ALL_DECODE: gl.constexpr = False,  # bool
@@ -280,7 +281,6 @@ def _mla_decode_fwd_kernel(
     SCALE_K_WIDTH_ROPE: gl.constexpr = 16,  # int
     IS_FP8: gl.constexpr = False,
     BLOCK_SCALES_SIZE: gl.constexpr = 4,  # int
-    NUM_BUFFERS: gl.constexpr = 1,  # int
 ):
     assert not SHUFFLED_KV_CACHE
     assert NUM_BUFFERS == 1 or NUM_BUFFERS == 2

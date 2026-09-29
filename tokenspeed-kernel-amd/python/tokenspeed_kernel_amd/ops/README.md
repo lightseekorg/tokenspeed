@@ -288,6 +288,36 @@ storage before scoring. Missing or out-of-range cache pages never contribute
 rows or blocks, including the newest visible block. A valid newest block
 remains eligible regardless of its score.
 
+### gfx1250 MLA decode
+
+`gluon_mla_decode_gfx1250` computes absorbed MLA decode over a paged cache,
+one query token per sequence. The projected-value variant fuses the value
+projection and optional sigmoid gate into its split merge.
+
+#### Contract
+
+- Queries are `(batch, 1, heads, 576)` (512 latent plus 64 RoPE dimensions)
+  and the cache is a contiguous `(pages, 64, 1, 576)` of the same dtype: FP16,
+  BF16, FP8 E4M3, or FP8 E5M2. The page table and cache lengths are Int32.
+  `logit_cap` is unsupported, and the projected-value variant is FP8 only.
+- The output is BF16 `(batch, 1, heads, 512)`, with an optional log-sum-exp
+  in natural-log units. The projected-value variant writes BF16
+  `(batch, heads * 128)` instead.
+
+#### Algorithm
+
+Each workgroup of two warps owns one sequence, a block of up to 16 query
+heads, and one split of the keys, and walks one 64-key page per tile. TDM
+loads the latent and RoPE parts of each page into LDS as two loads. The
+splits write FP32 partials that a second kernel merges.
+
+16-bit inputs load each tile into one LDS slot and wait for it before the
+math. FP8 inputs use two slots and two waves per SIMD: the next tile's page
+index and its two TDM loads go out before the current tile's math, and each
+split issues its first tile before loading the queries. The loop is unrolled
+by two so each slot index is a compile-time constant; waiting until two loads
+remain then leaves the other slot's loads in flight.
+
 ### gfx950 MLA prefill
 
 Two kernels compute dense, non-absorbed MLA prefill attention over ragged
