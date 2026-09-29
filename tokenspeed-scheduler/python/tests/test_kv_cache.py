@@ -133,6 +133,29 @@ def test_forward_batch_uses_per_group_block_tables_as_the_only_page_table():
     assert not hasattr(op, "sizes")
 
 
+def test_pages_to_zero_arrays_view_the_plan_without_python_ints():
+    import numpy as np
+
+    scheduler = ts.Scheduler(_make_config())
+    scheduler.submit_requests([_make_spec("r1", num_pages=2)])
+
+    plan = scheduler.next_execution_plan()
+    arrays = plan.pages_to_zero_arrays()
+    assert set(arrays) == set(plan.pages_to_zero) == {"full", "swa"}
+    for group_id, pages in plan.pages_to_zero.items():
+        array = arrays[group_id]
+        assert array.dtype == np.int32 and array.ndim == 1
+        assert array.tolist() == list(pages)
+    assert any(array.size for array in arrays.values())
+
+    # The views borrow the plan's storage; the plan must outlive them even
+    # when the caller drops its own reference.
+    full = arrays["full"]
+    expected = full.tolist()
+    del plan, arrays
+    assert full.tolist() == expected
+
+
 def test_k3_four_groups_share_one_global_id_namespace() -> None:
     scheduler = ts.Scheduler(_make_k3_config())
     before = scheduler.available_lcm_blocks()

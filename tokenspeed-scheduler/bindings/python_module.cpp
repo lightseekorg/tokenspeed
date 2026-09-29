@@ -345,7 +345,21 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                          }
                          return nb::cast(*plan.remote_prefill, nb::rv_policy::copy);
                      })
-        .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero);
+        .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero)
+        .def("pages_to_zero_arrays", [](nb::handle self) {
+            // Zero-copy 1-D int32 views of pages_to_zero, one per cache group
+            // (empty groups included); `self` keeps the ExecutionPlan alive
+            // for the lifetime of each ndarray. The list export builds one
+            // Python int per page, which for a long prompt's admission is
+            // thousands of objects on the forward thread's critical path.
+            auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
+            nb::dict out;
+            for (auto& [gid, pages] : plan.pages_to_zero) {
+                out[nb::str(gid.c_str())] =
+                    nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>>(pages.data(), {pages.size()}, self);
+            }
+            return out;
+        });
 
     nb::class_<tokenspeed::Scheduler>(m, "Scheduler")
         .def(nb::init<tokenspeed::SchedulerConfig>(), nb::arg("config"))

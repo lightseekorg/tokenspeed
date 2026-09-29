@@ -452,14 +452,13 @@ def test_kimi3_moe_execution_policy_takes_marlin_when_its_probe_says_yes() -> No
     assert not plan.use_trtllm
 
 
-def test_kimi3_moe_execution_policy_selects_mega_moe() -> None:
+@pytest.mark.parametrize("backend", [MoeBackend.MEGA_MOE, MoeBackend.GLUON_PETIT])
+def test_kimi3_moe_execution_policy_selects_mega_moe(backend) -> None:
     with (
         mock.patch.object(latent_module, "native_latent_moe_available") as native_probe,
         mock.patch.object(latent_module, "_marlin_moe_available") as marlin_probe,
     ):
-        plan = Kimi3MoEExecutionPlan.build(
-            _plan_mapping(), MoeBackend.MEGA_MOE, alt_stream=None
-        )
+        plan = Kimi3MoEExecutionPlan.build(_plan_mapping(), backend, alt_stream=None)
     assert plan.use_mega_moe
     assert not plan.use_native
     assert not plan.use_trtllm

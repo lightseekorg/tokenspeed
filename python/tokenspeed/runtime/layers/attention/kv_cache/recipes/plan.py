@@ -327,6 +327,20 @@ class CacheMemoryPlan:
             for group in self.groups
         }
 
+    def page_field_layout(
+        self, group_id: str
+    ) -> tuple[int, tuple[tuple[int, int, int], ...]]:
+        """Return one group's page count and its fields' byte geometry.
+
+        Args:
+            group_id: The planned cache group.
+
+        Returns:
+            The group's page count and, per field in plan order,
+            ``(byte offset of page 0, page stride bytes, payload bytes)``.
+        """
+        return self._block_byte_layouts[group_id]
+
     def block_byte_segments(
         self, group_id: str, block_ids: list[int]
     ) -> list[tuple[int, int]]:

@@ -98,14 +98,17 @@ def _wmma_tdm_dense_m16_kernel(
     pid_split = gl.program_id(1)
 
     gl.static_assert(
-        BLOCK_N == 16 or BLOCK_N == 64,
-        "candidate supports one or four WMMA output tiles",
+        BLOCK_N == 16 or BLOCK_N == 32,
+        "candidate supports one or two WMMA output tiles",
     )
-    gl.static_assert(BLOCK_K == 128, "candidate is tuned for 128-wide K tiles")
+    gl.static_assert(
+        BLOCK_K == 128 or BLOCK_K == 256, "candidate uses 128- or 256-wide K tiles"
+    )
     gl.static_assert(K % BLOCK_K == 0, "K must tile exactly into BLOCK_K")
     gl.static_assert((K // BLOCK_K) % SPLIT_K == 0, "split-K must divide the K tiles")
 
-    warp_bases: gl.constexpr = [] if BLOCK_N == 16 else [[0, 1], [0, 2]]
+    # One warp per 16-column WMMA tile, laid out along N.
+    warp_bases: gl.constexpr = [] if BLOCK_N == 16 else [[0, 1]]
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
@@ -312,11 +315,11 @@ def _launch_wmma_tdm_dense_tiles(
     out: torch.Tensor,
     *,
     block_n: int,
+    block_k: int,
     num_warps: int,
     split_k: int | None,
     num_buffers: int,
 ) -> None:
-    block_k = 128
     k_tiles = A.shape[1] // block_k
     if split_k is None:
         split_k = _dense_m16_split_k(B.shape[0], block_n, k_tiles, num_buffers)
@@ -324,8 +327,11 @@ def _launch_wmma_tdm_dense_tiles(
         raise ValueError("split_k must be one of 1, 2, 4, or 8")
     if k_tiles % split_k != 0:
         raise ValueError(f"split_k={split_k} must divide K/{block_k}={k_tiles}")
-    if split_k > 1 and k_tiles // split_k < num_buffers:
-        raise ValueError("each split needs at least one full TDM pipeline")
+    if split_k > 1 and k_tiles // split_k < 2:
+        raise ValueError(
+            "each split needs at least two K tiles for a full TDM pipeline"
+        )
+    num_buffers = max(2, min(num_buffers, k_tiles // split_k))
     n = B.shape[0]
     for start in range(0, A.shape[0], 16):
         a_tile = A[start : start + 16]
@@ -444,9 +450,17 @@ def gluon_wmma_tdm_dense_gfx1250(
         )
 
     # BLOCK_N selects the WMMA warp bases, so the warp count follows from it.
-    block_n, num_warps = (64, 4) if n % 64 == 0 else (16, 1)
+    block_k = 256 if k % 256 == 0 else 128
+    block_n = 32 if n % 32 == 0 and n // 32 >= 192 else 16
     _launch_wmma_tdm_dense_tiles(
-        A, B, out, block_n=block_n, num_warps=num_warps, split_k=split_k, num_buffers=3
+        A,
+        B,
+        out,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=block_n // 16,
+        split_k=split_k,
+        num_buffers=6,
     )
     return out
 
@@ -478,10 +492,11 @@ def gluon_wmma_tdm_mla_qkv_gate_gfx1250(
         A,
         B,
         out,
-        block_n=64,
-        num_warps=4,
+        block_n=16,
+        block_k=256,
+        num_warps=1,
         split_k=None,
-        num_buffers=3,
+        num_buffers=6,
     )
     return out
 
@@ -527,6 +542,7 @@ def gluon_wmma_tdm_kda_qkvfab_gfx1250(
         B,
         out,
         block_n=16,
+        block_k=128,
         num_warps=1,
         split_k=None,
         num_buffers=7,
@@ -560,14 +576,24 @@ def _wmma_tdm_add3_m16_kernel(
     K: gl.constexpr = 3584
     pid_n = gl.program_id(0)
 
-    gl.static_assert(BLOCK_N == 64, "candidate uses one 16x64 WMMA output tile")
-    gl.static_assert(BLOCK_K == 128, "candidate is tuned for 128-wide K tiles")
-    gl.static_assert(NUM_BUFFERS == 3, "candidate uses a triple-buffer TDM pipeline")
+    gl.static_assert(
+        BLOCK_N == 16 or BLOCK_N == 32,
+        "candidate supports one or two WMMA output tiles",
+    )
+    gl.static_assert(
+        BLOCK_K == 128 or BLOCK_K == 256, "candidate uses 128- or 256-wide K tiles"
+    )
+    gl.static_assert(
+        K % BLOCK_K == 0 and K // BLOCK_K >= NUM_BUFFERS - 1 and NUM_BUFFERS >= 2,
+        "the TDM prologue must fit inside K",
+    )
 
+    # One warp per 16-column WMMA tile, laid out along N.
+    warp_bases: gl.constexpr = [] if BLOCK_N == 16 else [[0, 1]]
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=[[0, 1], [0, 2]],
+        warp_bases=warp_bases,
         reg_bases=[],
         instr_shape=[16, 16, 32],
     )
@@ -609,7 +635,7 @@ def _wmma_tdm_add3_m16_kernel(
         layout=shared_layout_b,
     )
 
-    # Two tiles are prefetched before the steady-state issue/wait/WMMA loop.
+    # NUM_BUFFERS - 1 tiles are prefetched before the issue/wait/WMMA loop.
     for tile in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.cdna5.tdm.async_load(a_desc, [0, tile * BLOCK_K], a_smem.index(tile))
         gl.amd.cdna5.tdm.async_load(b_desc, [0, tile * BLOCK_K], b_smem.index(tile))
@@ -637,7 +663,7 @@ def _wmma_tdm_add3_m16_kernel(
                 b_smem.index((tile + NUM_BUFFERS - 1) % NUM_BUFFERS),
                 pred=tile + NUM_BUFFERS - 1 < num_k_tiles,
             )
-        # Keep one complete A/B batch in flight while consuming the oldest.
+        # Keep up to NUM_BUFFERS - 2 A/B batches in flight while consuming the oldest.
         gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
         with gl.amd.warp_pipeline_stage("wmma", priority=0):
             acc = gl.amd.cdna5.wmma(a, b, acc)
@@ -702,7 +728,7 @@ def gluon_wmma_tdm_add3_m16_gfx1250(
             )
 
     out = A.new_empty((16, 7168))
-    block_n, block_k, num_buffers = 64, 128, 3
+    block_n, block_k, num_buffers = 32, 256, 6
     _wmma_tdm_add3_m16_kernel[(7168 // block_n,)](
         A,
         B,
@@ -722,7 +748,7 @@ def gluon_wmma_tdm_add3_m16_gfx1250(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         NUM_BUFFERS=num_buffers,
-        num_warps=4,
+        num_warps=block_n // 16,
         num_stages=1,
         waves_per_eu=1,
     )
@@ -930,10 +956,10 @@ def _wmma_tdm_dense_largem_kernel(
         operand_index=1, parent=wmma_layout, k_width=8
     )
     shared_layout_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+        [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
     )
     shared_layout_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+        [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
     )
 
     a_smem = gl.allocate_shared_memory(
@@ -1068,11 +1094,7 @@ def gluon_mm_a16w16_largem_gfx1250(
         # those edges off into vendor calls would cost a second full pass over
         # A plus, for a ragged N, a scratch buffer and a copy of the whole
         # result.
-        block_n = next(
-            candidate
-            for candidate in (block_m, 128, 64, 32)
-            if (n - n % 32) % candidate == 0
-        )
+        block_n = block_m if n % block_m == 0 else 128
         warp_bases, num_warps = _WARP_BASES_4, 4
         group_m = 8
     grid = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
