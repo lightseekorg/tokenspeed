@@ -27,8 +27,8 @@ _INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
 _LN2_VALUE = 0.6931471805599453
 _LN2 = tl.constexpr(_LN2_VALUE)
 
-# Upper bound of select_kv_splits; reduce kernels size their split tile by it so
-# every split count shares one binary.
+# Upper bound of select_kv_splits. Reduce kernels take the split count at
+# runtime and must handle any value up to this bound.
 MAX_KV_SPLITS = 32
 
 
