@@ -186,11 +186,9 @@ class Kimi3LatentProjection(ReplicatedLinear):
 
     With ``shard_group`` the output dimension is partitioned across the group
     (column parallel): each rank stores ``output_size / tp`` rows of the weight
-    and the ordinary projection ends with one all-gather. K3's tail paths avoid
-    that gather: the fused multicast tail consumes the shard directly, while
-    the other tiers inject each rank's column block into a reduction they
-    already run. Thus every tail retains ``(tp-1)/tp`` of the weight's memory
-    savings without adding collective wire bytes.
+    and the ordinary projection ends with one all-gather. K3 stage 2 uses the
+    weight shard directly for up-projection and multicast gather, or injects
+    this rank's output columns into the shared-expert all-reduce.
 
     With ``multicast_down`` the projection instead takes a column shard that
     publishes each rank's block into every peer's mailbox, which keeps each

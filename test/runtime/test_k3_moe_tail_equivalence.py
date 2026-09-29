@@ -65,14 +65,13 @@ def _setup() -> tuple[int, torch.device]:
     return dist.get_rank(), torch.device("cuda", local)
 
 
-def _mapping_stub(world: int = 1):
-    """The slice of ``mapping`` the tail and the producer-direct probe read."""
+def _mapping_stub(world: int):
+    """The MoE group used by the tail collectives."""
     return SimpleNamespace(
         moe=SimpleNamespace(
             # tokenspeed groups are tuples of global ranks, not ProcessGroups.
             tp_ep_group=tuple(range(world)),
             tp_ep_size=world,
-            has_tp_ep=world > 1,
         )
     )
 
@@ -126,8 +125,7 @@ def _inputs(rank: int, device: torch.device, m: int, seed: int):
 def _reference(comm, up_weight, routed, shared, prefix):
     """All-reduce both partials, RMS-norm the latent, up-project, accumulate.
 
-    Computed in fp32 from the same weights the tiers use, so it is a fixed
-    target rather than one tier's arithmetic standing in for the truth.
+    Compute in FP32 from the full projection weight and per-rank partials.
     """
     routed_sum = routed.float().clone()
     shared_sum = shared.float().clone()

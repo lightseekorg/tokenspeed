@@ -72,8 +72,6 @@ class TritonCommState:
     hidden_dim: int
     comm_buff: torch.Tensor | None
     symm_mem_hdl: object | None
-    local_buff: torch.Tensor | None
-    local_symm_mem_hdl: object | None
 
 
 @dataclass
@@ -1060,8 +1058,6 @@ def nvidia_create_rsag_state(
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
         symm_mem_hdl=None,
-        local_buff=None,
-        local_symm_mem_hdl=None,
     )
 
 
@@ -1531,8 +1527,6 @@ def amd_create_rsag_state(
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
         symm_mem_hdl=symm_mem_hdl,
-        local_buff=None,
-        local_symm_mem_hdl=None,
     )
 
 
@@ -1746,8 +1740,6 @@ def create_allreduce_residual_rmsnorm_state(
         hidden_dim=hidden_dim,
         comm_buff=comm_buff,
         symm_mem_hdl=symm_mem_hdl,
-        local_buff=None,
-        local_symm_mem_hdl=None,
     )
 
 
@@ -1969,8 +1961,6 @@ def create_state(
             hidden_dim=0,
             comm_buff=comm_buff,
             symm_mem_hdl=symm_mem_hdl,
-            local_buff=None,
-            local_symm_mem_hdl=None,
         )
 
     assert max_tokens > 0, "max_tokens must be specified for RS/AG state"
@@ -2331,8 +2321,6 @@ def _attnres_comm_state(
         hidden_dim=0,
         comm_buff=None,
         symm_mem_hdl=None,
-        local_buff=None,
-        local_symm_mem_hdl=None,
     )
 
 

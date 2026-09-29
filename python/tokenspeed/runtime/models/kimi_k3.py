@@ -1906,8 +1906,7 @@ class KimiLinearMoE(nn.Module):
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             do_finalize=do_finalize,
         )
-        # The kernel returns this rank's pre-reduce partial; the selected
-        # tail tier owns the combining reduction.
+        # The kernel returns this rank's partial; the caller owns its reduction.
         return out
 
     def _routing_output_format(self, ctx: ForwardContext | None) -> TopKOutputFormat:
