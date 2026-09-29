@@ -685,8 +685,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             min(window, span.count) if done else 0
             for span, done in zip(self._prefill_spans, completes, strict=True)
         ]
-        if all(keep == span.count for keep, span in zip(keeps, self._prefill_spans)):
-            # Identity: the decoder sees exactly the forward's query window.
+        if all(
+            keep == span.count and span.swa_prefix_begin == span.prefix
+            for keep, span in zip(keeps, self._prefill_spans)
+        ):
+            # Reuse metadata only when both rows and visible SWA history match.
             return V41DecoderView(
                 self.query_metadata(forward_mode),
                 self.forward_prefill_metadata,

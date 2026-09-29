@@ -740,3 +740,82 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
     assert [
         i for i in range(bs) for _ in range(layout.output_width(i))
     ] == expected_requests
+
+
+@pytest.mark.parametrize("prefix,count", [(0, 19), (256, 128), (256, 129), (256, 8192)])
+@pytest.mark.parametrize("decode_rows", [0, 2])
+def test_decoder_swa_excludes_history_before_its_retained_window(
+    prefix, count, decode_rows
+):
+    from typing import NamedTuple
+
+    path = RUNTIME + "layers/attention/backends/specific/deepseek_v41.py"
+    bindings = {"V41_SWA_GROUP_ID": "swa"}
+    for name in (
+        "V41Metadata",
+        "V41PrefillSpan",
+        "V41DecoderView",
+        "V41PrefillRequestPlan",
+        "V41SWAQueryPlan",
+    ):
+        bindings[name] = load_symbol(
+            path, name, NamedTuple=NamedTuple, dataclass=dataclasses.dataclass
+        )
+    methods = {
+        name: load_symbol(path, name, owner="DeepseekV41AttentionBackend", **bindings)
+        for name in ("_build_decoder_view", "_window", "_swa_query_plan")
+    }
+    positions = torch.cat(
+        (torch.arange(prefix, prefix + count), torch.arange(decode_rows))
+    )
+    requests = torch.cat(
+        (
+            torch.zeros(count, dtype=torch.int64),
+            torch.ones(decode_rows, dtype=torch.int64),
+        )
+    )
+    metadata = bindings["V41Metadata"](
+        {},
+        positions,
+        requests,
+        torch.arange(1 + bool(decode_rows)),
+        torch.tensor([prefix + count] + ([decode_rows] if decode_rows else [])),
+        1,
+        torch.arange(count + decode_rows),
+        None,
+        None,
+        SimpleNamespace(window=lambda *args: None),
+        None,
+    )
+    prefill = dataclasses.replace(
+        metadata, positions=positions[:count], request_indices=requests[:count]
+    )
+    backend = SimpleNamespace(
+        device="cpu",
+        forward_prefill_metadata=prefill,
+        _prefill_spans=(
+            bindings["V41PrefillSpan"](0, 0, prefix, count, max(0, prefix - 127)),
+        ),
+        _decoder_view=None,
+        _swa_plans={},
+        query_metadata=lambda mode: metadata,
+        _upload_int64=lambda values: torch.tensor(values, dtype=torch.int64),
+        cache_slots=lambda group, positions, requests, mode: positions,
+    )
+    backend._window = lambda *args: methods["_window"](backend, *args)
+    mode = object()
+    view = methods["_build_decoder_view"](backend, metadata, [True], 128, mode)
+    backend._decoder_view = view
+    plan = methods["_swa_query_plan"](
+        backend, view.prefill.positions, view.prefill.request_indices, mode
+    )
+    request = plan.requests[0]
+    # Even an unchanged row set must not inherit the encoder's older SWA keys.
+    assert request.prefix_slots.numel() == 0
+    indices = request.swa_indices
+    assert indices[0][indices[0] >= 0].tolist() == [0]
+    assert indices[-1][indices[-1] >= 0].tolist() == list(range(min(count, 128)))
+    if decode_rows:
+        assert (
+            view.metadata.request_indices[-decode_rows:].tolist() == [1] * decode_rows
+        )
