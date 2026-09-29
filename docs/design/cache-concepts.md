@@ -1135,6 +1135,11 @@ Index-K; SWA and compressor-state groups must remain replicated.
 
 Ordinary GPU MLA and DSA use the same ownership geometry for history storage.
 MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
+Before allocating the arena, hybrid DCP validates these declared group shard
+counts rather than the recipe name or its inheritance. Plugin recipes follow
+the same storage contract as built-in recipes. Both pure MLA and MLA/KDA hybrids
+require the full-attention backend to declare `supports_mla_dcp`; only FlashMLA
+currently declares this capability.
 Decode gathers query heads, computes attention over owned history, and merges
 partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reconstructs bounded history chunks with an owner-masked sum reduction;
