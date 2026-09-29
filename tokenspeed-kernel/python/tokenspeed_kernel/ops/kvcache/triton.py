@@ -53,11 +53,13 @@ __all__ = [
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
     "gather_page_table_with_padding",
+    "get_flashmla_kv_buffer",
     "get_mla_kv_buffer_triton",
     "index_k_block_split_scatter",
     "mla_latent_norm_rope_scatter",
     "quantize_mxfp8_rows",
     "quantize_store_kv_mxfp8",
+    "set_flashmla_kv_buffer",
     "set_mla_kv_buffer_triton",
     "state_verify_commit_rows",
     "store_kv_cache",
@@ -2861,3 +2863,132 @@ def index_k_block_split_scatter(
         BLOCK_HD=_next_power_of_two(head_dim),
         BLOCK_NG=_next_power_of_two(ng),
     )
+
+
+@triton.jit
+def _set_flashmla_kv_buffer(
+    cache,
+    scales,
+    rope_cache,
+    loc,
+    nope,
+    rope,
+    write_mask,
+    nope_stride,
+    rope_stride,
+    ROPE_DIM: tl.constexpr,
+    SANITIZE: tl.constexpr,
+    MASKED: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slot = tl.load(loc + row).to(tl.int64)
+    valid = slot >= 0
+    if MASKED:
+        valid = valid & tl.load(write_mask + row)
+    if valid:
+        offsets = tl.arange(0, 512).reshape(4, 128)
+        values = tl.load(nope + row * nope_stride + offsets).to(tl.float32)
+        if SANITIZE:
+            values = tl.where(values == values, values, 0.0)
+            values = tl.minimum(tl.maximum(values, -3.38953139e38), 3.38953139e38)
+        scale = tl.maximum(tl.max(tl.abs(values), axis=1), 1e-12) / 448.0
+        quantized = tl.minimum(tl.maximum(values / scale[:, None], -448.0), 448.0)
+        tl.store(cache + slot * 656 + offsets, quantized.to(tl.float8e4nv))
+        tl.store(scales + slot * 164 + 128 + tl.arange(0, 4), scale)
+        r = tl.arange(0, 64)
+        rope_values = tl.load(
+            rope + row * rope_stride + r, mask=r < ROPE_DIM, other=0.0
+        )
+        if SANITIZE:
+            rope_values = rope_values.to(tl.float32)
+            rope_values = tl.where(rope_values == rope_values, rope_values, 0.0)
+            rope_values = tl.minimum(
+                tl.maximum(rope_values, -3.38953139e38), 3.38953139e38
+            )
+        tl.store(rope_cache + slot * 328 + 264 + r, rope_values)
+
+
+def set_flashmla_kv_buffer(
+    cache: torch.Tensor,
+    loc: torch.Tensor,
+    nope: torch.Tensor,
+    rope: torch.Tensor,
+    *,
+    sanitize: bool,
+    write_mask: torch.Tensor | None,
+) -> None:
+    """Write E4M3 latent groups, FP32 scales and BF16 RoPE into 656-byte rows."""
+    if (
+        cache.dtype != torch.uint8
+        or cache.shape[-1] != 656
+        or not cache.is_contiguous()
+    ):
+        raise ValueError("FlashMLA KV requires contiguous uint8 rows of 656 bytes")
+    if nope.shape[-1] != 512 or rope.shape[-1] not in (0, 64):
+        raise ValueError("FlashMLA KV requires latent width 512 and RoPE width 0 or 64")
+    if loc.numel() == 0:
+        return
+    nope = nope.reshape(loc.numel(), 512)
+    rope = rope.reshape(loc.numel(), rope.shape[-1])
+    _set_flashmla_kv_buffer[(loc.numel(),)](
+        cache.view(torch.float8_e4m3fn),
+        cache.view(torch.float32),
+        cache.view(torch.bfloat16),
+        loc,
+        nope,
+        rope,
+        write_mask,
+        nope.stride(0),
+        rope.stride(0),
+        ROPE_DIM=rope.shape[-1],
+        SANITIZE=sanitize,
+        MASKED=write_mask is not None,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _get_flashmla_kv_buffer(
+    cache,
+    scales,
+    rope_cache,
+    loc,
+    nope,
+    rope,
+    ROPE_DIM: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slot = tl.load(loc + row).to(tl.int64)
+    offsets = tl.arange(0, 512)
+    values = tl.load(cache + slot * 656 + offsets, mask=slot >= 0, other=0.0).to(
+        tl.float32
+    )
+    scale = tl.load(scales + slot * 164 + 128 + offsets // 128, mask=slot >= 0, other=0)
+    tl.store(nope + row * 512 + offsets, values * scale)
+    if ROPE_DIM:
+        r = tl.arange(0, 64)
+        values = tl.load(rope_cache + slot * 328 + 264 + r, mask=slot >= 0, other=0)
+        tl.store(rope + row * ROPE_DIM + r, values)
+
+
+def get_flashmla_kv_buffer(
+    cache: torch.Tensor,
+    loc: torch.Tensor,
+    rope_dim: int,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather packed FlashMLA rows into latent and RoPE tensors."""
+    nope = torch.empty((loc.numel(), 1, 512), dtype=dtype, device=cache.device)
+    rope = torch.empty((loc.numel(), 1, rope_dim), dtype=dtype, device=cache.device)
+    if loc.numel():
+        _get_flashmla_kv_buffer[(loc.numel(),)](
+            cache.view(torch.float8_e4m3fn),
+            cache.view(torch.float32),
+            cache.view(torch.bfloat16),
+            loc,
+            nope,
+            rope,
+            ROPE_DIM=rope_dim,
+            num_warps=4,
+        )
+    return nope, rope

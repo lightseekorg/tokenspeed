@@ -298,7 +298,7 @@ def _mla_layer_fields(config, layer_id: int, occurrence: int):
     if config.prefix_granularity <= 0:
         raise ValueError("MLA full-attention geometry must be positive")
     if config.kv_cache_quant_method != "per_token_head":
-        latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
+        latent_width = spec.cache_storage_dim(config)
         return (
             CacheFieldSpec(
                 f"layer.{layer_id}.latent_kv",

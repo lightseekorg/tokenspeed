@@ -847,6 +847,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             self.attention_backend in self._MLA_KERNEL_BACKENDS
             and getattr(kv_backend, "data_type", None) == torch.float8_e4m3fn
             and k_scale == 1.0
+            and ctx.token_to_kv_pool.quant_method != "flashmla"
         )
 
     def forward_absorb_qkv_proj(
