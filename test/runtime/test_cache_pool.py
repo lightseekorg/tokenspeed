@@ -265,6 +265,46 @@ class CacheArenaCudaTest(unittest.TestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(arena.buffer.cpu(), expected, rtol=0, atol=0)
 
+    def test_zero_blocks_skips_groups_this_stage_holds_no_fields_of(self):
+        # Pipeline parallelism narrows the plan to a stage's layers but keeps
+        # every group, so a stage may own a group with no fields at all. The
+        # scheduler still hands that group's fresh pages to every rank.
+        plan = pack(
+            (
+                one_group(
+                    "history",
+                    CacheFieldSpec("layer.0.k", "plane.a", (4,), "uint8"),
+                    rows_per_page=2,
+                ),
+                one_group(
+                    "state",
+                    CacheFieldSpec("layer.1.ssm", "plane.b", (8,), "uint8"),
+                    rows_per_page=4,
+                ),
+            ),
+            prefix_granularity=4,
+            cache_blocks_per_lcm_block={"history": 2, "state": 1},
+            max_padding_fraction=1.0,
+        ).bind(2)
+        stage0 = make_arena(plan.narrow_to_layers(0, 1), "cuda")
+        self.assertEqual(stage0.field_ids(), {"layer.0.k"})
+        history = stage0.field("layer.0.k")
+        history.fill_(7)
+        state_pages = stage0.plan.group("state").page_count
+
+        stage0.zero_blocks(
+            {"state": np.asarray([1, state_pages - 1]), "history": np.asarray([1])}
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(bool((history[4:8] == 0).all()))
+        self.assertTrue(bool((history[:4] == 7).all()))
+        # A fieldless group's ids are still validated.
+        with self.assertRaises(IndexError):
+            stage0.zero_blocks({"state": np.asarray([state_pages])})
+        # Nothing at all to zero on this stage is a plain no-op.
+        stage0.zero_blocks({"state": np.asarray([1])})
+        torch.cuda.synchronize()
+
     def test_clear_zeros_the_whole_arena_once(self):
         arena = _arena("cuda")
         history = arena.field("history.k")

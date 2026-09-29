@@ -73,12 +73,23 @@ class CacheArena:
         # Materialize immutable byte geometry at setup, not on first hand-out.
         # zero_blocks ships only page ids per call; each group's field table
         # (page-0 offset, page stride, payload bytes) lives on the device.
+        # The kernel trusts these ranges, so their bound is checked once here.
+        # A group may have no fields on this rank: pipeline parallelism keeps
+        # every group but drops the fields of layers another stage owns.
         self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
         for group in plan.groups:
             page_count, fields = plan.page_field_layout(group.group_id)
+            for base, stride, size in fields:
+                if base + (page_count - 1) * stride + size > plan.arena_bytes:
+                    raise ValueError(
+                        f"cache group {group.group_id!r} field geometry reaches "
+                        f"past the {plan.arena_bytes}-byte arena"
+                    )
             self._zero_field_tables[group.group_id] = (
                 page_count,
-                torch.tensor(fields, dtype=torch.int64, device=device).reshape(-1, 3),
+                torch.tensor(fields, dtype=torch.int64, device=device).reshape(
+                    len(fields), 3
+                ),
                 max((size for _, _, size in fields), default=0),
             )
         self._cache_group_specs_by_id = {
@@ -252,7 +263,7 @@ class CacheArena:
         arrays: list[np.ndarray] = []
         total = 0
         for group_id, ids in block_ids_by_group.items():
-            page_count, _, _ = self._zero_field_tables[group_id]
+            page_count, fields, _ = self._zero_field_tables[group_id]
             if (
                 not isinstance(ids, np.ndarray)
                 or ids.ndim != 1
@@ -269,6 +280,9 @@ class CacheArena:
                     f"local block ID {low if low < 0 else high} outside "
                     f"[0, {page_count}) for group {group_id!r}"
                 )
+            if fields.shape[0] == 0:
+                # Validated, but this rank holds none of the group's bytes.
+                continue
             spans.append((group_id, total, ids.size))
             arrays.append(ids)
             # Each group's span starts 16-byte aligned, as the kernel requires

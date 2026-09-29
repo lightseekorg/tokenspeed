@@ -482,6 +482,10 @@ def zero_page_fields(
 
     The page x field expansion happens on the device: the host ships only the
     page ids, and the group's field table is fixed once the memory plan is.
+    The expanded ranges are trusted: checking them against ``backing`` would
+    need the largest page id on the host, so the caller must guarantee that
+    every ``offset + page * stride + size`` lies within ``backing`` (the cache
+    arena asserts this once per field when it builds the table).
 
     Args:
         backing: Contiguous uint8 cache allocation.
