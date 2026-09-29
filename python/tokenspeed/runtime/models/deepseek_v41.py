@@ -846,13 +846,9 @@ class DeepseekV41Attention(nn.Module):
             raise ValueError("V4.1 hidden rows and backend query metadata disagree")
         # Backend positions carry -1 for padding; request indices are batch rows.
         positions, requests = meta.positions, meta.request_indices
-        if rows.keep_rows is not None:
-            # The producer is token-shaped; query/SWA projections are not.
+        if rows.keep_rows is not None and rows.keep_rows.numel() == 0:
             self._write_global_kv(hidden_states, positions, requests, backend, mode)
-            hidden_states = hidden_states.index_select(0, rows.keep_rows)
-            positions, requests = rows.query.positions, rows.query.request_indices
-            if hidden_states.shape[0] == 0:
-                return hidden_states
+            return hidden_states[:0]
         qkv, _ = self.wq_a_wkv(hidden_states, block_scale=None, output_dtype=None)
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
         qr = _attention_norm(qr, self.q_norm)
@@ -877,9 +873,17 @@ class DeepseekV41Attention(nn.Module):
             # Submit the longer compressor/index branch first. Serial eager and
             # captured decode execute these identical operations and dependency joins.
             with fork.branch():
-                if rows.keep_rows is None:
-                    self._write_global_kv(
-                        hidden_states, positions, requests, backend, mode
+                self._write_global_kv(hidden_states, positions, requests, backend, mode)
+                if rows.keep_rows is not None:
+                    # Preserve the projection batch: narrowing before QKV can
+                    # change quantized GEMM arithmetic for the retained rows.
+                    hidden_states, qr, swa = (
+                        t.index_select(0, rows.keep_rows)
+                        for t in (hidden_states, qr, swa)
+                    )
+                    positions, requests = (
+                        rows.query.positions,
+                        rows.query.request_indices,
                     )
                 if self.indexer is not None:
                     index_q, index_weights = self.indexer(
@@ -1098,11 +1102,6 @@ class DeepseekV41DecoderLayer(nn.Module):
             x = _v41_hc_input(residual, pre_mix, self.attn_norm)
             self.attn(positions, x, ctx)
             return residual[:0], pre_mix[:0]
-        mix_residual = (
-            residual
-            if rows.keep_rows is None
-            else residual.index_select(0, rows.keep_rows)
-        )
         overlap = (
             residual.is_cuda
             and ctx.forward_mode is not None
@@ -1116,7 +1115,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         with self.hc_stream_fork.scope(enable=overlap, overlap=True) as fork:
             with fork.branch():
                 attn_pre, post, comb = v41_hc_mixes(
-                    mix_residual,
+                    residual,
                     self.hc_attn_fn,
                     self.hc_attn_scale,
                     self.hc_attn_base,
@@ -1130,7 +1129,11 @@ class DeepseekV41DecoderLayer(nn.Module):
             x = _v41_hc_input(residual, pre_mix, self.attn_norm)
             x = self.attn(positions, x, ctx)
         if rows.keep_rows is not None:
-            residual = mix_residual
+            # Keep mHC's original split-K shape before selecting the tail.
+            residual, post, comb, attn_pre = (
+                t.index_select(0, rows.keep_rows)
+                for t in (residual, post, comb, attn_pre)
+            )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
         hidden_states = v41_hc_post(x, residual, post, comb)

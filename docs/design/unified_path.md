@@ -387,6 +387,13 @@ hostfunc and host fallback consume the frozen layout. A zero-row decoder
 bypasses its graph, normalization, LM head, sampler and draft-context writes;
 the encoder and global KV producer have already executed.
 
+When the decoder view is nonempty, the candidate-source layer retains the
+original full-row mHC and QKV projection shapes, then gathers the selected
+rows. Moving that gather before the projections changes split-K or quantized
+GEMM arithmetic and can change the retained logits. Only an empty decoder
+view bypasses those projections; its global KV producer still runs on all
+encoder rows.
+
 Final prefill windows, bootstrap tokens and PD candidate/cache handoff remain
 unchanged. V4.1 PD still requires layerwise transfer interval zero. This does
 not enable a cache-only prefill role or reduce resident model weights. PP and

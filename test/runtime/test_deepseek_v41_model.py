@@ -757,6 +757,18 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     ctx.bs = ctx.num_extends = 2
     ctx.capture_hidden_mode = CaptureHiddenMode.FULL
     seen = {}
+    projection_rows = {}
+    original_mixes = v41.v41_hc_mixes
+
+    def observe_mixes(hidden, weight, *args):
+        if weight is model.layers[20].hc_attn_fn:
+            projection_rows["hc"] = hidden.shape[0]
+        return original_mixes(hidden, weight, *args)
+
+    def observe_qkv(module, args):
+        projection_rows["qkv"] = args[0].shape[0]
+
+    monkeypatch.setattr(v41, "v41_hc_mixes", observe_mixes)
 
     def observe(layer_id):
         def hook(module, args):
@@ -776,6 +788,9 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     handles = [
         model.layers[i].register_forward_pre_hook(observe(i)) for i in (19, 20, 21, 39)
     ]
+    handles.append(
+        model.layers[20].attn.wq_a_wkv.register_forward_pre_hook(observe_qkv)
+    )
     previous = torch.tensor([[-1, -1, -1], [0, -1, -1], [3, 0, -1], [4, 3, 0]])
     previous = torch.cat((previous, previous[:2]))
     actual, aux = model(
@@ -794,6 +809,9 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     assert seen[20] == (6, [0, 1, 2, 3, 0, 1], 3, True)
     assert seen[21] == (3, [3, 0, 1], 3, False)
     assert seen[39] == (3, [3, 0, 1], 3, False)
+    # Changing these batch shapes can change split-K/quantized arithmetic
+    # for the retained rows. Only zero-output chunks may bypass projections.
+    assert projection_rows == {"hc": 6, "qkv": 6}
     rows_attended = {layer: q.shape[0] for layer, q, *_ in backend.calls}
     assert all(rows_attended[layer] == 6 for layer in range(20))
     assert all(rows_attended[layer] == 3 for layer in range(20, 40))
