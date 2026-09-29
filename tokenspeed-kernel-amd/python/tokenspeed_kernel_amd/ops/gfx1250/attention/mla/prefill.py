@@ -600,7 +600,9 @@ def _attend_tile_fp8(
 
     if tile_idx + 2 < num_tiles:
         next_tile_idx = tile_idx + 2
-        program.issue_tile_loads(next_tile_idx * cfg.BLOCK_N, buffer_index)
+        program.issue_tile_loads(
+            next_tile_idx * cfg.BLOCK_N, next_tile_idx % cfg.NUM_BUFFERS
+        )
     return m_i, l_i, acc
 
 

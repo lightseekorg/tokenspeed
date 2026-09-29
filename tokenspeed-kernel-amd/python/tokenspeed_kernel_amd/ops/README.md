@@ -347,6 +347,42 @@ FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
 asm statements keep LLVM from moving each cluster's results across cluster
 barriers.
 
+### gfx1250 MLA prefill
+
+`gluon_mla_prefill_gfx1250` computes the same dense, non-absorbed attention
+as the gfx950 kernels, with WMMA and TDM.
+
+#### Contract
+
+- Queries, keys, values, dtypes, `cu_seqlens_q`, `cu_seqlens_kv`, causal
+  alignment, and the unsupported `logit_cap` are the gfx950 entry's.
+- The output is BF16 unless the caller passes a buffer, which may be any
+  floating dtype with a contiguous last dimension. The optional log-sum-exp
+  is FP32 in natural-log units.
+- The grid is one workgroup per sequence, head, and 128-row query block.
+  `max_seqlen_kv` and `seq_lens_kv` are ignored.
+
+#### Algorithm
+
+Four warps own 32 rows each of a 128-row query block and walk 64-key tiles
+with base-2 online softmax. TDM streams the NoPE and RoPE halves of K and all
+of V into double-buffered LDS, one tile ahead of the tile being computed.
+Tiles below the first query row's causal limit are visible to every row and
+skip masking.
+
+16-bit inputs keep Q in registers and run one wave per SIMD. Tiles at or
+past the causal limit mask the scores and zero the value rows past the key
+tail.
+
+FP8 inputs stage Q in LDS and re-read it every tile, and split the NoPE QK
+into two 64-wide WMMAs. Together these keep a wave within the 336 VGPRs that
+three waves per SIMD allow, so other workgroups run while one waits on its
+loads. Fully visible tiles run a loop with no mask code, because a masked
+branch inside one loop compiles to selects on every tile; the boundary tiles
+run a second loop that masks keys only, since rows past `q_len` are never
+stored. V needs no mask: TDM zero-fills tile rows past `kv_len`, and those
+keys already score `-inf`.
+
 ## Sampling
 
 ### Argmax
