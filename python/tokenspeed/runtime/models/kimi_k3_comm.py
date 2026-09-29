@@ -20,37 +20,34 @@
 
 """Kimi-K3 communication routing and collective workspace ownership.
 
-BT/HT finalize and normalize routed latents before a sharded up-projection.
-The shared all-reduce also gathers the projection shards and adds the residual.
-Small graph batches retain the multicast tail; other layouts use separate reduce.
+The routed all-reduce and RMSNorm run before joining the shared-expert stream.
+The up-projection and shared all-reduce assemble the output after the join.
+AMD and attention-DP execution are owned by the model.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from enum import IntEnum
+from typing import ClassVar
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.activation.triton import add3
-from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
-from tokenspeed_kernel.ops.communication.mnnvl_cutedsl_finalize import (
-    MNNVLCuteDSLBTFinalizeTuning,
-    MNNVLCuteDSLFinalizeAllReduceRMSNorm,
-    MNNVLCuteDSLHTFinalizeAllReduceRMSNorm,
-    MNNVLCuteDSLHTFinalizeTuning,
-    mnnvl_cutedsl_finalize_allreduce_rmsnorm_supported,
-    mnnvl_cutedsl_ht_finalize_allreduce_rmsnorm_supported,
+from tokenspeed_kernel.ops.communication import (
+    AllReduceFusionPattern,
+    AllReduceFusionWorkspace,
+    allreduce_fusion,
+    create_allreduce_fusion_workspace,
 )
 from tokenspeed_kernel.ops.communication.multimem import (
-    multimem_available,
+    multimem_all_reduce_staged,
+    multimem_prealloc,
+    multimem_stage,
 )
 from tokenspeed_kernel.ops.moe.latent_tail import (
+    K3_SHARED_RS_MAX_TOKENS,
     KimiK3LatentTailOp,
     attn_reduce_shape_supported,
     build_attn_reduce_collective,
-    latent_tail_supported,
     multicast_backend_available,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -61,11 +58,6 @@ from tokenspeed.runtime.distributed.comm_ops import (
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
-from tokenspeed.runtime.execution.forward_step import (
-    get_is_capture_mode,
-    get_is_cuda_graph_phase,
-)
-from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.layers.layernorm import RMSNorm, _get_process_group
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -90,62 +82,15 @@ def attn_ar_eligible(
     return armed and has_prefix and 0 < num_tokens <= window
 
 
-class K3MoETailTier(IntEnum):
-    """How the K3 MoE tail combines routed/shared partials, best first.
-
-    Declaration order *is* the priority order (mirrors the selector's
-    branch order). Values never escape the process (identity comparisons
-    only, no serialization), so inserting mid-list is safe — keep new
-    tiers at their semantic rank rather than appending.
-    """
-
-    TAIL_FUSION = 0  # fused decode kernel (aka the multicast latent tail)
-    MNNVL_HT = 1  # large M: HT finalize, all-reduce, and RMSNorm
-    MNNVL_BT = 2  # medium M: BT finalize, all-reduce, and RMSNorm
-    SEPARATE_REDUCE = 3  # portable: reduce each partial on its own
-
-
-# Measured profit edge of the fused tail; the kernel's own capacity is larger.
-TAIL_FUSION_MAX_TOKENS = 32
-
-# Continuous deferred intervals, shared by eager and graph execution.
-MNNVL_BT_MIN_TOKENS = 33
-MNNVL_BT_MAX_TOKENS = 1024
-MNNVL_HT_MIN_TOKENS = 1025
-MNNVL_HT_MAX_TOKENS = 8192
-
-
-def _deferred_tail_applicable(
+def _unified_tail_applicable(
     *,
     mapping,
     hidden_size: int,
     latent_size: int,
     top_k: int,
     is_blackwell: bool,
-    fused_moe_ar: bool,
     has_routed_norm: bool,
-    shard_up_projection: bool,
-    experts_supports_deferred_finalize: bool,
 ) -> bool:
-    """Select the automatic deferred path from static model/backend traits.
-
-    Args:
-        mapping: MoE TP/EP and attention DP/CP topology.
-        hidden_size: Full shared/residual width.
-        latent_size: Routed latent width before up-projection.
-        top_k: Number of routed experts per token.
-        is_blackwell: Whether this rank uses NVIDIA SM100/SM103.
-        fused_moe_ar: Whether the execution plan supports the routed AR lane.
-        has_routed_norm: Whether routed RMSNorm is present.
-        shard_up_projection: Whether up-projection owns a rank-local weight shard.
-        experts_supports_deferred_finalize: Actual expert-backend output trait.
-
-    Returns:
-        True for the supported K3 TP8/EP1 layout. Rank agreement, communication
-        support and PDL are validated collectively before allocation; failure
-        must not silently select an old in-range tail. Graph capture settings
-        and experimental environment variables never select the implementation.
-    """
     return (
         is_blackwell
         and mapping.moe.tp_size == 8
@@ -156,56 +101,8 @@ def _deferred_tail_applicable(
         and hidden_size == 7168
         and latent_size == 3584
         and top_k == 16
-        and fused_moe_ar
         and has_routed_norm
-        and shard_up_projection
-        and experts_supports_deferred_finalize
     )
-
-
-def select_deferred_k3_moe_tail_tier(num_tokens: int) -> K3MoETailTier | None:
-    """Return the deferred interval tier; None preserves the old small path.
-
-    Args:
-        num_tokens: Actual forward M, or graph-padded M, not request count.
-
-    Returns:
-        BT for (32,1024], HT for (1024,8192], separate above
-        8192, and None for empty/small forwards. No sampled-point whitelist.
-    """
-    if type(num_tokens) is not int or num_tokens < 0:
-        raise ValueError("token count must be a nonnegative integer")
-    if num_tokens <= 32:
-        return None
-    if num_tokens <= 1024:
-        return K3MoETailTier.MNNVL_BT
-    if num_tokens <= 8192:
-        return K3MoETailTier.MNNVL_HT
-    return K3MoETailTier.SEPARATE_REDUCE
-
-
-def select_k3_moe_tail_tier(
-    *,
-    num_tokens: int,
-    graph_phase: bool,
-    tail_fusion_max_tokens: int,
-) -> K3MoETailTier:
-    """Select the small graph tail or the portable separate-reduce path.
-
-    Args:
-        num_tokens: Rank-uniform token count for this forward.
-        graph_phase: Whether the forward runs under the CUDA-graph phase.
-        tail_fusion_max_tokens: Available small-tail capacity, already capped
-            at the profitable token range; zero when unavailable.
-
-    Returns:
-        TAIL_FUSION for a supported small graph forward, otherwise
-        SEPARATE_REDUCE. The deferred medium/large route is selected first
-        by K3MoeTailComm.plan.
-    """
-    if graph_phase and 1 <= num_tokens <= tail_fusion_max_tokens:
-        return K3MoETailTier.TAIL_FUSION
-    return K3MoETailTier.SEPARATE_REDUCE
 
 
 def prepare_k3_all_reduce_buffers(
@@ -391,247 +288,6 @@ class K3AttnCommState:
         logger.info(f"Kimi K3 attention reduce: {attention_reduce_backend}")
 
 
-class K3MoeTailCommState:
-    """Process-wide negotiated MoE-tail backends for Kimi-K3 (moe tp_ep group).
-
-    Constructed by the first ``K3MoeTailComm`` — every rank builds MoE layers
-    in the same order, so the single MIN all-reduce and the collective
-    allocators below stay lockstep. Collective constructors are deliberately
-    unguarded: a failed rank has already stranded its peers, so killing the
-    whole job is the good outcome.
-    """
-
-    _instance: "K3MoeTailCommState | None" = None
-
-    @classmethod
-    def get(
-        cls,
-        *,
-        mapping,
-        hidden_size: int,
-        latent_size: int,
-        top_k: int,
-        rms_eps: float,
-        allow_latent_tail: bool,
-        deferred_tail: bool,
-    ) -> "K3MoeTailCommState":
-        if cls._instance is None:
-            cls._instance = cls(
-                mapping=mapping,
-                hidden_size=hidden_size,
-                latent_size=latent_size,
-                top_k=top_k,
-                rms_eps=rms_eps,
-                allow_latent_tail=allow_latent_tail,
-                deferred_tail=deferred_tail,
-            )
-        else:
-            inst = cls._instance
-            if (
-                inst.hidden_size != hidden_size
-                or inst.latent_size != latent_size
-                or inst.top_k != top_k
-                or inst.rms_eps != float(rms_eps)
-                or inst.allow_latent_tail != allow_latent_tail
-                or inst.deferred_tail != deferred_tail
-            ):
-                # The singleton would otherwise silently hand a second model
-                # (e.g. an MTP draft sharing the process with its base) a
-                # negotiation done for the wrong shapes.
-                raise ValueError(
-                    "K3MoeTailCommState is negotiated once per process for "
-                    f"hidden={inst.hidden_size} latent={inst.latent_size} "
-                    f"top_k={inst.top_k} rms_eps={inst.rms_eps} "
-                    f"allow_latent_tail={inst.allow_latent_tail} "
-                    f"deferred_tail={inst.deferred_tail}, but a later "
-                    f"caller asked for hidden={hidden_size} "
-                    f"latent={latent_size} top_k={top_k} "
-                    f"rms_eps={float(rms_eps)} "
-                    f"allow_latent_tail={allow_latent_tail} "
-                    f"deferred_tail={deferred_tail}; the current "
-                    "implementation assumes every model in the process "
-                    "(base + draft) shares these parameters."
-                )
-        return cls._instance
-
-    def __init__(
-        self,
-        *,
-        mapping,
-        hidden_size,
-        latent_size,
-        top_k,
-        rms_eps,
-        allow_latent_tail,
-        deferred_tail,
-    ):
-        self.hidden_size = hidden_size
-        self.latent_size = latent_size
-        self.top_k = top_k
-        self.rms_eps = float(rms_eps)
-        self.allow_latent_tail = allow_latent_tail
-        # Derived from model/backend traits by K3MoeTailComm, never an opt-in.
-        self.deferred_tail = deferred_tail
-        self.mnnvl_bt_deferred = None
-        self.mnnvl_ht_deferred = None
-        self.latent_tail_ok = False  # per-layer ops built by K3MoeTailComm
-        if not dist.is_initialized():
-            return
-
-        world = dist.get_world_size()
-        hidden, latent = hidden_size, latent_size
-        # Graph capture is a subset of supported M, not an allocation limit.
-        bt_capacity = MNNVL_BT_MAX_TOKENS
-        ht_capacity = MNNVL_HT_MAX_TOKENS
-
-        # --- local probes (pure local; failures just vote False) ---
-        # All ranks must agree on eligibility before any collective
-        # allocator runs.
-        deferred_comm_local = (
-            self.deferred_tail
-            and mapping.moe.tp_ep_size > 1
-            and mapping.moe.tp_ep_size == world
-            and mapping.attn.dp_size == 1
-            and mapping.attn.cp_size == 1
-            and multimem_available()
-            # Cross-node symmetric-memory rendezvous requires fabric/IMEX.
-            and (
-                world <= torch.cuda.device_count()
-                or fabric_allocation_supported(torch.cuda.current_device())
-            )
-        )
-        mnnvl_bt_local = (
-            self.deferred_tail
-            and deferred_comm_local
-            and mnnvl_cutedsl_finalize_allreduce_rmsnorm_supported(
-                group=dist.group.WORLD,
-                tp_size=mapping.moe.tp_ep_size,
-                hidden_size=latent,
-                top_k=top_k,
-                dtype=torch.bfloat16,
-                candidate_min_tokens=MNNVL_BT_MIN_TOKENS,
-                candidate_max_tokens=bt_capacity,
-            )
-        )
-        mnnvl_ht_local = (
-            self.deferred_tail
-            and deferred_comm_local
-            and mnnvl_cutedsl_ht_finalize_allreduce_rmsnorm_supported(
-                group=dist.group.WORLD,
-                tp_size=mapping.moe.tp_ep_size,
-                hidden_size=latent,
-                top_k=top_k,
-                dtype=torch.bfloat16,
-                candidate_min_tokens=MNNVL_HT_MIN_TOKENS,
-                candidate_max_tokens=ht_capacity,
-            )
-        )
-        tail_local = False
-        # PDL is a requirement of the unchanged BT/HT kernels, not an opt-out.
-        configuration_valid = not self.deferred_tail or not global_server_args_dict.get(
-            "disable_pdl", False
-        )
-        if (
-            allow_latent_tail
-            # The fused tail requires tp_ep to span WORLD.
-            and mapping.moe.tp_ep_size == world
-            and mapping.attn.dp_size == 1
-            and mapping.attn.cp_size == 1
-        ):
-            tail_local = latent_tail_supported(
-                tp_size=mapping.moe.tp_ep_size,
-                hidden_size=hidden,
-                latent_size=latent,
-                dtype=torch.bfloat16,
-                group=dist.group.WORLD,
-            )
-        # --- the single agreement point: every rank executes unconditionally ---
-        votes = torch.tensor(
-            [
-                int(deferred_comm_local),
-                int(tail_local),
-                int(mnnvl_bt_local),
-                int(mnnvl_ht_local),
-                int(configuration_valid),
-                int(self.deferred_tail),
-                -int(self.deferred_tail),
-            ],
-            dtype=torch.int32,
-            device="cuda",
-        )
-        dist.all_reduce(votes, op=dist.ReduceOp.MIN)
-        values = votes.tolist()
-        configuration_ok, deferred_min, deferred_negative_min = values[4:]
-        if not configuration_ok or deferred_min != -deferred_negative_min:
-            raise ValueError(
-                "K3 tail capabilities must agree across ranks; the automatic "
-                "deferred BT/HT path requires PDL"
-            )
-        deferred_comm_ok, tail_ok, mnnvl_bt_ok, mnnvl_ht_ok = (
-            bool(v) for v in values[:4]
-        )
-        if self.deferred_tail and not all(
-            (deferred_comm_ok, tail_ok, mnnvl_bt_ok, mnnvl_ht_ok)
-        ):
-            raise RuntimeError(
-                "deferred K3 tail requires every TP8 capability; no fallback"
-            )
-
-        # --- collective builds, fixed order, unguarded ---
-        # BT/HT own the routed buffers; shared partials use the ordinary all-reduce.
-        if mnnvl_bt_ok and deferred_comm_ok:
-            self.mnnvl_bt_deferred = MNNVLCuteDSLFinalizeAllReduceRMSNorm.initialize(
-                group=dist.group.WORLD,
-                hidden_size=latent,
-                top_k=top_k,
-                rms_eps=self.rms_eps,
-                candidate_min_tokens=MNNVL_BT_MIN_TOKENS,
-                candidate_max_tokens=bt_capacity,
-                tuning_routes=(
-                    MNNVLCuteDSLBTFinalizeTuning(
-                        max_tokens=bt_capacity,
-                        elements_per_thread=2,
-                        threads=256,
-                        prefetch_group=1,
-                        reduction_threads=224,
-                        rms_threads=448,
-                        enable_pdl=True,
-                    ),
-                ),
-            )
-        if mnnvl_ht_ok and deferred_comm_ok:
-            self.mnnvl_ht_deferred = MNNVLCuteDSLHTFinalizeAllReduceRMSNorm.initialize(
-                group=dist.group.WORLD,
-                hidden_size=latent,
-                top_k=top_k,
-                rms_eps=self.rms_eps,
-                candidate_min_tokens=MNNVL_HT_MIN_TOKENS,
-                candidate_max_tokens=ht_capacity,
-                tuning_routes=(
-                    MNNVLCuteDSLHTFinalizeTuning(
-                        max_tokens=ht_capacity,
-                        persistent_ctas=None,
-                        consumer_threads=448,
-                        vectors_per_thread=1,
-                        stages=10,
-                        reduction_warps=2,
-                        reduction_cta_groups=None,
-                        rms_token_groups=2,
-                        rms_pipeline_stages=3,
-                        rms_shard_major=False,
-                        enable_pdl=True,
-                    ),
-                ),
-            )
-        self.latent_tail_ok = tail_ok
-        logger.info(
-            f"K3 comm negotiated: deferred_comm={deferred_comm_ok!s} "
-            f"mnnvl_bt_deferred={self.mnnvl_bt_deferred is not None!s} "
-            f"mnnvl_ht_deferred={self.mnnvl_ht_deferred is not None!s} "
-            f"latent_tail={self.latent_tail_ok!s}",
-        )
-
-
 class K3AttnComm:
     """Per-decoder-layer handle over the negotiated K3 communication state.
 
@@ -788,447 +444,236 @@ class K3AttnComm:
         return (reduced if prefix_sum is None else prefix_sum + reduced), None
 
 
-@dataclass
-class TailPlan:
-    """Per-forward contract between the model and the MoE tail.
-
-    Attributes:
-        tier: The negotiated tail tier for this token count.
-        defer_finalize: The experts kernel must run with
-            ``do_finalize=False``. BT/HT own finalize; the small multicast
-            tail does so when it supports deferred expert output.
-        routed_in_fork: Whether the routed partial must be reduced and
-            projected inside the fork (SEPARATE_REDUCE overlap).
-        split_shared_rs: Start the shared ReduceScatter on the auxiliary
-            stream before the routed collective is ready.
-    """
-
-    tier: "K3MoETailTier"
-    defer_finalize: bool = False
-    routed_in_fork: bool = False
-    split_shared_rs: bool = False
-
-
-def _tail_finalize_top_k(
-    top_k: int,
-    execution_plan,
-    experts_supports_deferred_finalize: bool,
-) -> int | None:
-    """Deferred-finalize arming decision for the latent tail (rank-uniform).
-
-    Both inputs are identical on every rank: ``fused_moe_ar`` comes from the
-    negotiated execution plan, and ``experts_supports_deferred_finalize`` is
-    the experts kernel plan's capability bit (``MoELayer.plan``), so all
-    ranks arm — or don't — together. Returns ``top_k`` to request the
-    deferred triple from the experts kernel, or ``None`` for the
-    materialized-input tail.
-    """
-    if execution_plan.fused_moe_ar and experts_supports_deferred_finalize:
-        return top_k
-    return None
-
-
 class K3MoeTailComm:
-    """MoE-tail routing and execution for one KimiLinearMoE module.
+    """Combine routed and shared expert outputs using sharded up-projection.
 
-    Holds the negotiated ``K3MoeTailCommState`` plus this module's own
-    resources (per-module multicast mailbox, norm/up-proj weights).
+    Stage 1 -- routed_ar_fusion:
+        Finalize deferred routed output, all-reduce, and apply RMSNorm.
+        Runs on the routed branch before the stream join.
+
+    Stage 2 -- shared_rs + up_proj_ag, for 1..32 tokens:
+        Reduce-scatter the shared output in the shared-expert branch. After
+        the join, up-project the routed latent, add the reduced shared shard,
+        and all-gather the output.
+
+    Stage 2 -- up_proj_inject_ar, for 33 or more tokens:
+        After the join, accumulate this rank's up-projection block into the
+        full shared-expert partial, then all-reduce the combined output.
+
+    Both stage-2 patterns add the attention residual exactly once. Token count
+    selects the pattern; the model controls stream scheduling independently.
+    Workspaces are prepared once and reused by sequential layers, while each
+    layer supplies its own normalization and projection weights.
     """
+
+    _routed_workspace: ClassVar[AllReduceFusionWorkspace | None] = None
+    _latent_tail: ClassVar[KimiK3LatentTailOp | None] = None
+    _stage2_capacity: ClassVar[int | None] = None
+    _multimem_group_name: ClassVar[str | None] = None
+    _workspace_config: ClassVar[tuple[tuple[int, ...], int, int, float] | None] = None
 
     def __init__(
         self,
         *,
         mapping,
         hidden_size: int,
-        prefix: str,
-        layer_index: int,
-        model_scope: str,
         routed_hidden: int,
         top_k: int,
         routed_norm,
         up_proj,
-        execution_plan,
         experts_supports_deferred_finalize: bool,
     ) -> None:
-        # Derived from the projection itself (built with a shard group iff
-        # _shard_k3_up_projection held), so comm and module cannot disagree.
-        self._shard_up_projection = up_proj.shard_group is not None
-        self._experts_supports_deferred_finalize = experts_supports_deferred_finalize
-        self.state = K3MoeTailCommState.get(
-            mapping=mapping,
-            hidden_size=hidden_size,
-            latent_size=routed_hidden,
-            top_k=top_k,
-            rms_eps=(routed_norm.variance_epsilon if routed_norm is not None else 1e-5),
-            allow_latent_tail=(
-                not execution_plan.use_native and routed_norm is not None
-            ),
-            deferred_tail=_deferred_tail_applicable(
-                mapping=mapping,
-                hidden_size=hidden_size,
-                latent_size=routed_hidden,
-                top_k=top_k,
-                is_blackwell=current_platform().is_blackwell,
-                fused_moe_ar=execution_plan.fused_moe_ar,
-                has_routed_norm=routed_norm is not None,
-                shard_up_projection=self._shard_up_projection,
-                experts_supports_deferred_finalize=experts_supports_deferred_finalize,
-            ),
-        )
         self.mapping = mapping
         self.hidden_size = hidden_size
         self.routed_hidden = routed_hidden
         self.top_k = top_k
         self.routed_norm = routed_norm
         self.up_proj = up_proj
-        self.execution_plan = execution_plan
-        # Derived from the projection itself (built with a shard group iff
-        # _shard_k3_latent_projection held), so comm and module cannot disagree.
-        self._shard_up_projection = up_proj.shard_group is not None
-        self.latent_tail = None
-        if self.state.latent_tail_ok:
-            # Deferred-finalize arming (rank-uniform). The gate is the
-            # experts kernel plan's own supports_deferred_finalize bit,
-            # passed in by the model (this comm layer never sees the experts
-            # module itself) — NOT a use_trtllm proxy: the trtllm solution
-            # spans kernels with either capability (the SiTU variants emit
-            # the deferred triple, mxfp4 SwiGLU does not). The backstops stay
-            # explicit: the experts layer raises on do_finalize=False without
-            # the trait, and KimiK3LatentTailOp.call_deferred raises on
-            # non-BF16 scales (no silent down-cast), so a mis-armed or
-            # fp32-scale producer fails loudly instead of silently degrading.
-            tail_finalize_top_k = _tail_finalize_top_k(
+        self.use_allreduce_fusion = _unified_tail_applicable(
+            mapping=mapping,
+            hidden_size=hidden_size,
+            latent_size=routed_hidden,
+            top_k=top_k,
+            is_blackwell=current_platform().is_blackwell,
+            has_routed_norm=routed_norm is not None,
+        )
+        self.defer_finalize = (
+            self.use_allreduce_fusion and experts_supports_deferred_finalize
+        )
+        self.rms_eps = (
+            float(routed_norm.variance_epsilon) if routed_norm is not None else 1e-5
+        )
+        if self.use_allreduce_fusion:
+            configuration = (
+                tuple(mapping.moe.tp_ep_group),
+                routed_hidden,
                 top_k,
-                execution_plan,
-                experts_supports_deferred_finalize,
+                self.rms_eps,
             )
-            # Per-module mailbox. Constructor failures must propagate because
-            # peers are already rendezvousing: a rank that failed mid-way has
-            # stranded them, and killing the whole job is the good outcome.
-            _device = torch.device("cuda", torch.cuda.current_device())
-            self.latent_tail = KimiK3LatentTailOp.initialize(
-                group=dist.group.WORLD,
-                hidden_size=hidden_size,
-                latent_size=routed_hidden,
-                rms_eps=self.state.rms_eps,
-                device=_device,
-                layer_index=layer_index,
-                model_scope=model_scope,
-                # Staging may alias the workspace pool; each barrier-free
-                # mailbox must remain private.
-                scratch_allocator=workspace_pool(_device).allocate,
-                finalize_top_k=tail_finalize_top_k,
-                split_collective=current_platform().is_blackwell,
-            )
-            logger.info(
-                "multicast latent tail engaged "
-                f"({prefix!s}, deferred_finalize={tail_finalize_top_k is not None!s}, "
-                f"split_shared_rs={self.latent_tail.supports_split_collective!s})",
-            )
+            if K3MoeTailComm._workspace_config is None:
+                K3MoeTailComm._workspace_config = configuration
+            elif K3MoeTailComm._workspace_config != configuration:
+                raise ValueError(
+                    "K3 routed workspace geometry differs from its initial configuration"
+                )
 
-    # ------------------------------------------------------------------
-    # Routing
-    # ------------------------------------------------------------------
-    def plan(
+    def prepare(self, max_num_tokens: int) -> bool:
+        """Prepare both tail stages once, before KV sizing and graph capture."""
+        if self._stage2_capacity is not None:
+            if max_num_tokens > self._stage2_capacity:
+                raise RuntimeError("Cannot grow a prepared K3 MoE workspace")
+            return True
+        group = _get_process_group(self.mapping.moe.tp_ep_group)
+        if self.use_allreduce_fusion:
+            K3MoeTailComm._routed_workspace = create_allreduce_fusion_workspace(
+                group=group,
+                hidden_size=self.routed_hidden,
+                top_k=self.top_k,
+                max_num_tokens=max_num_tokens,
+                rms_eps=self.rms_eps,
+            )
+        K3MoeTailComm._latent_tail = KimiK3LatentTailOp(
+            group=group, hidden_size=self.hidden_size, latent_size=self.routed_hidden
+        )
+        if max_num_tokens >= 256:
+            if not multimem_prealloc(
+                max_num_tokens, (self.hidden_size,), group.group_name
+            ):
+                raise RuntimeError("K3 MoE tail requires Multimem all-reduce")
+            K3MoeTailComm._multimem_group_name = group.group_name
+        K3MoeTailComm._stage2_capacity = max_num_tokens
+        logger.info(f"K3 MoE tail workspaces prepared through M={max_num_tokens}")
+        return True
+
+    def shared_rs(self, shared_partial: torch.Tensor) -> torch.Tensor:
+        """Reduce-scatter the shared-expert partial in the shared branch.
+
+        Args:
+            shared_partial: Rank-local BF16 [M,H], with M in [1,32].
+
+        Returns:
+            Padded [64,H/TP] reduced shard, with the first M rows live.
+        """
+        tail = self._latent_tail
+        if tail is None:
+            raise RuntimeError("K3 shared RS must be prepared before forward")
+        return tail.reduce_scatter_shared(shared_partial)
+
+    def routed_ar_fusion(
         self,
+        routed_out: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         num_tokens: int,
-    ) -> TailPlan:
-        """Pick the tail tier and its forward-side obligations.
+    ) -> torch.Tensor:
+        """Finalize, all-reduce and normalize routed output before the stream join.
 
-        Every input must be rank-uniform (token count, graph phase and the
-        negotiated capabilities) so all ranks take identical branches.
+        ``routed_out`` is deferred expert rows with weights and indices when
+        ``defer_finalize`` is true, otherwise a finalized rank-local tensor.
+        Returns replicated [M, latent] output, normalized when configured.
         """
-        if self.state.deferred_tail:
-            deferred_tier = select_deferred_k3_moe_tail_tier(num_tokens)
-            if deferred_tier is K3MoETailTier.SEPARATE_REDUCE:
-                return TailPlan(tier=deferred_tier, routed_in_fork=True)
-            if deferred_tier is not None:
-                finalize = (
-                    self.state.mnnvl_bt_deferred
-                    if deferred_tier is K3MoETailTier.MNNVL_BT
-                    else self.state.mnnvl_ht_deferred
+        if type(num_tokens) is not int or num_tokens <= 0:
+            raise ValueError("K3 tail expects a positive token count")
+        if self.use_allreduce_fusion:
+            workspace = self._routed_workspace
+            if workspace is None:
+                raise RuntimeError(
+                    "K3 routed workspace must be prepared before forward"
                 )
-                if (
-                    finalize is None
-                    or not finalize.supports_num_tokens(num_tokens)
-                    or not self._experts_supports_deferred_finalize
-                ):
-                    raise RuntimeError(f"deferred K3 tail missing M={num_tokens} route")
-                return TailPlan(
-                    tier=deferred_tier,
-                    defer_finalize=True,
-                )
-        # Only small M or unsupported model/backend layouts reach compatibility dispatch.
-        # Supported M33..8192 returned above; a missing deferred route raises.
-        # Graph warmup, capture, and replay must select the same tier.
-        tier = select_k3_moe_tail_tier(
-            num_tokens=num_tokens,
-            graph_phase=get_is_cuda_graph_phase(),
-            tail_fusion_max_tokens=(
-                min(self.latent_tail.max_num_tokens, TAIL_FUSION_MAX_TOKENS)
-                if self.latent_tail is not None
-                else 0
-            ),
-        )
-        if tier is K3MoETailTier.TAIL_FUSION:
-            # Full fusion: with the trtllm fused-AR plan armed and a
-            # deferred-capable tail op, the multicast tail consumes the
-            # experts kernel's deferred-finalize triple directly — no
-            # standalone finalize kernel, no [M, latent] intermediate.
-            # Otherwise the materialized-input mode remains.
-            return TailPlan(
-                tier=tier,
-                defer_finalize=(
-                    self.execution_plan.fused_moe_ar
-                    and self.latent_tail is not None
-                    and self.latent_tail.supports_deferred_finalize
-                ),
-                split_shared_rs=(
-                    self.latent_tail is not None
-                    and self.latent_tail.supports_split_collective
-                    and num_tokens >= self.latent_tail.split_collective_min_tokens
-                    and get_is_capture_mode()
-                ),
+            if not workspace.supports_num_tokens(num_tokens):
+                raise ValueError("K3 token count exceeds the prepared routed workspace")
+            if self.defer_finalize:
+                routed_input, weights, indices = routed_out
+                pattern = AllReduceFusionPattern.MOE_FINALIZE_ALLREDUCE_RMSNORM
+            else:
+                routed_input, weights, indices = routed_out, None, None
+                pattern = AllReduceFusionPattern.ALLREDUCE_RMSNORM
+            return allreduce_fusion(
+                routed_input,
+                workspace,
+                pattern=pattern,
+                rms_gamma=self.routed_norm.weight,
+                num_tokens=num_tokens,
+                expert_weights=weights,
+                expanded_idx_to_permuted_idx=indices,
             )
-        return TailPlan(
-            tier=tier,
-            routed_in_fork=tier is K3MoETailTier.SEPARATE_REDUCE,
-        )
-
-    # ------------------------------------------------------------------
-    # Fork-side helpers (called by the model inside its stream fork)
-    # ------------------------------------------------------------------
-    def reduce_shared(self, shared_partial: torch.Tensor) -> torch.Tensor:
-        """Reduce the shared experts' TP partial on the current stream."""
-        if self.mapping.moe.tp_ep_size > 1:
-            return all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
-        return shared_partial
-
-    def reduce_scatter_shared(self, shared_partial: torch.Tensor) -> torch.Tensor:
-        """Launch the split shared ReduceScatter on the current stream."""
-        if self.latent_tail is None:
-            raise RuntimeError("split shared ReduceScatter requires the latent tail")
-        return self.latent_tail.reduce_scatter_shared(
-            shared_partial,
-            self.routed_norm.weight,
-        )
-
-    def reduce_project_routed(self, routed_out: torch.Tensor) -> torch.Tensor:
-        """Reduce, norm and up-project the routed partial (SEPARATE_REDUCE).
-
-        Runs in the model's ``forward`` inside the stream fork so it overlaps
-        the shared-expert branch; the tier method then receives an
-        already-projected routed output, unlike the other tiers.
-        """
-        routed_reduced = routed_out
         if self.mapping.moe.has_tp_ep:
-            routed_reduced = all_reduce(routed_reduced, self.mapping.moe.tp_ep_group)
+            routed_out = all_reduce(routed_out, self.mapping.moe.tp_ep_group)
         if self.routed_norm is not None:
-            routed_reduced = self.routed_norm(routed_reduced)
-        if self._shard_up_projection:
-            # This block must wait for the fork before folding into the shared reduction.
-            return self.up_proj.project_shard(routed_reduced)
-        return self.up_proj(routed_reduced)[0]
+            routed_out = self.routed_norm(routed_out)
+        return routed_out
 
-    # ------------------------------------------------------------------
-    # Tail dispatch (moved verbatim from KimiLinearMoE._moe_tail and the
-    # tier methods)
-    # ------------------------------------------------------------------
-    def run(
+    def up_proj_ag(
         self,
-        plan: TailPlan,
-        routed_out,
-        shared_partial: torch.Tensor,
+        routed_latent: torch.Tensor,
+        shared_shard: torch.Tensor,
         prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-        prepared_shared_shard: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Dispatch the selected tier over the partials.
+        """Up-project, add the reduced shared shard, and gather after the join.
 
-        Raw partials everywhere except SEPARATE_REDUCE, whose routed side
-        already ran inside the fork scope to overlap the shared branch, and
-        deferred-finalize tiers (``plan.defer_finalize``), whose ``routed_out``
-        is the experts kernel's deferred triple.
+        Args:
+            routed_latent: Replicated normalized BF16 [M,L], with M in [1,32].
+            shared_shard: Padded rank-local output returned by shared_rs.
+            prefix_sum: Replicated BF16 [M,H] attention residual.
+
+        Returns:
+            BF16 [M,H] combined output on every rank. Projection uses SIMT
+            for M1..5 and TensorCore for M6..32.
         """
-        tier = plan.tier
-        if tier in (
-            K3MoETailTier.MNNVL_BT,
-            K3MoETailTier.MNNVL_HT,
-        ):
-            gemm2_out, expert_weights, expanded_idx = routed_out
-            finalize = (
-                self.state.mnnvl_bt_deferred
-                if tier is K3MoETailTier.MNNVL_BT
-                else self.state.mnnvl_ht_deferred
-            )
-            routed_norm = finalize(
-                gemm2_out, expert_weights, expanded_idx, self.routed_norm.weight
-            )
-            shared_partial = self._project_and_inject_local_block(
-                routed_norm, shared_partial, prefix_sum, num_tokens, hidden_size
-            )
-            return self.reduce_shared(shared_partial).view(num_tokens, hidden_size)
-        if tier is K3MoETailTier.TAIL_FUSION:
-            if plan.defer_finalize:
-                gemm2_out, expert_weights, expanded_idx = routed_out
-                return self._tail_fusion_deferred(
-                    gemm2_out,
-                    expert_weights,
-                    expanded_idx,
-                    shared_partial,
-                    prefix_sum,
-                    num_tokens,
-                    prepared_shared_shard,
-                )
-            return self._tail_fusion(
-                routed_out,
-                shared_partial,
-                prefix_sum,
-                prepared_shared_shard,
-            )
-        return self._tail_separate_reduce(
-            routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
+        capacity = self._stage2_capacity
+        if capacity is None:
+            raise RuntimeError("K3 MoE tail must be prepared before forward")
+        if routed_latent.shape[0] > capacity:
+            raise ValueError("K3 token count exceeds the prepared MoE workspace")
+        return self._latent_tail.project_and_gather(
+            routed_latent, self.up_proj.weight, shared_shard, prefix_sum
         )
 
-    def _tail_fusion(
+    def up_proj_inject_ar(
         self,
-        routed_out: torch.Tensor,
+        routed_latent: torch.Tensor,
         shared_partial: torch.Tensor,
         prefix_sum: torch.Tensor,
-        prepared_shared_shard: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.latent_tail(
-            routed_out,
-            shared_partial,
-            self.routed_norm.weight,
-            self.up_proj.weight,
-            prefix=prefix_sum,
-            prepared_shared_shard=prepared_shared_shard,
-        )
+        """Inject the projection block and residual, then all-reduce after the join.
 
-    def _tail_fusion_deferred(
-        self,
-        gemm2_out: torch.Tensor,
-        expert_weights: torch.Tensor,
-        expanded_idx: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        prepared_shared_shard: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """TAIL_FUSION over the deferred-finalize triple (finalize in-kernel)."""
-        return self.latent_tail.call_deferred(
-            gemm2_out,
-            expert_weights,
-            expanded_idx,
-            shared_partial,
-            self.routed_norm.weight,
-            self.up_proj.weight,
-            num_tokens=num_tokens,
-            prefix=prefix_sum,
-            prepared_shared_shard=prepared_shared_shard,
-        )
+        Args:
+            routed_latent: Replicated normalized BF16 [M,L].
+            shared_partial: Unreduced rank-local BF16 [M,H] shared-expert output.
+            prefix_sum: Replicated BF16 [M,H] attention residual.
 
-    def _project_and_inject_local_block(
-        self,
-        routed_reduced: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
+        Returns:
+            BF16 [M,H] combined output on every rank. M33..255 uses ordinary
+            AR; M>=256 uses Multimem AR.
+        """
+        num_tokens = routed_latent.shape[0]
+        capacity = self._stage2_capacity
+        if capacity is None:
+            raise RuntimeError("K3 MoE tail must be prepared before forward")
+        if num_tokens > capacity:
+            raise ValueError("K3 token count exceeds the prepared MoE workspace")
+        shared_partial = shared_partial.view(num_tokens, self.hidden_size)
+        if num_tokens >= 256:
+            shared_partial = multimem_stage(
+                shared_partial, self._multimem_group_name, capacity
+            )
+            if shared_partial is None:
+                raise RuntimeError("K3 Multimem staging was not prepared")
         start, width = self.up_proj.shard_slice
-        shared_partial = shared_partial.view(num_tokens, hidden_size)
         target = shared_partial[:, start : start + width]
-        target += prefix_sum.view(num_tokens, hidden_size)[:, start : start + width]
-        target.addmm_(routed_reduced, self.up_proj.weight.t())
-        return shared_partial
-
-    def _inject_local_block(
-        self,
-        routed_projected_shard: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        """Add this rank's projection block into its columns of the shared
-        partial, in place, so the shared reduction also gathers the projection.
-
-        The column blocks are disjoint across ranks, so summing the partials
-        concatenates the blocks and adds ``prefix`` exactly once per column.
-        Works with any sum all-reduce; the caller runs it right after this.
-        """
-        # One extra bf16 rounding vs the joined tiers; measured nil on GPQA, not bitwise.
-        start, width = self.up_proj.shard_slice
-        shared_partial = shared_partial.view(num_tokens, hidden_size)
-        shared_partial[
+        target += prefix_sum.view(num_tokens, self.hidden_size)[
             :, start : start + width
-        ] += routed_projected_shard + prefix_sum.view(num_tokens, hidden_size).narrow(
-            -1, start, width
-        )
-        return shared_partial
-
-    def _tail_separate_reduce(
-        self,
-        routed_out: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        if self._shard_up_projection:
-            return self._tail_separate_reduce_sharded(
-                routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
-            )
-        return self._tail_separate_reduce_replicated(
-            routed_out, shared_partial, prefix_sum, num_tokens, hidden_size
-        )
-
-    def _tail_separate_reduce_sharded(
-        self,
-        routed_out: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        routed_projected_shard = routed_out
-        shared_partial = self._inject_local_block(
-            routed_projected_shard,
-            shared_partial,
-            prefix_sum,
-            num_tokens,
-            hidden_size,
-        )
-        shared_reduced = self.reduce_shared(shared_partial)
-        return shared_reduced.view(num_tokens, hidden_size)
-
-    def _tail_separate_reduce_replicated(
-        self,
-        routed_out: torch.Tensor,
-        shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
-        num_tokens: int,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        routed_projected = routed_out
-        shared_reduced = self.reduce_shared(shared_partial)
-        # routed_scaling_factor already applied in TopK (matches reference).
-        return add3(
-            prefix_sum,
-            routed_projected.view(num_tokens, hidden_size),
-            shared_reduced.view(num_tokens, hidden_size),
-        )
+        ]
+        target.addmm_(routed_latent, self.up_proj.weight.t())
+        if num_tokens >= 256:
+            # The next layer reuses the symmetric staging buffer.
+            return multimem_all_reduce_staged(
+                shared_partial, self._multimem_group_name
+            ).clone()
+        return all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
 
 
 __all__ = [
+    "K3_SHARED_RS_MAX_TOKENS",
     "K3AttnComm",
     "K3AttnCommState",
-    "K3MoETailTier",
     "K3MoeTailComm",
-    "K3MoeTailCommState",
-    "TailPlan",
-    "select_k3_moe_tail_tier",
 ]

@@ -18,35 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``KimiLinearMoE`` must exercise its auxiliary stream during graph warmup.
+"""K3 MoE preserves stream scheduling independently of stage-2 kernel selection.
 
-``_capture_one`` runs several warmup forwards on the capture stream before
-recording, and documents that "capture-only auxiliary branches use this graph
-phase to warm their own streams serially". Honouring that contract requires
-gating the stream fork on the graph *phase* and gating only the overlap on
-capture mode.
-
-Gating ``enable`` on capture mode instead left the auxiliary stream untouched
-until capture itself. The first hipBLASLt call on that stream then performed its
-lazy handle/workspace setup inside the capturing stream, which HIP rejects with
-"operation not permitted when stream is capturing" (900) on every rank, and
-startup deadlocked with the GPUs idle. It reproduced on gfx950 at TP8/EP1 --
-where the tensor-parallel MoE places a projection on the forked branch -- while
-TP8/EP8 captured cleanly, so the config coverage matters as much as the flag.
-
-The TP8/EP1 CI jobs that exercise the real failure are manual-trigger only, so
-this is the only per-commit signal guarding the contract. It is a deliberately
-narrow one: it pins the enable/overlap decision at the call site, not the effect
-on the auxiliary stream, so it would not catch a change to StreamFork's own
-semantics. Run the EP1 perf job for that.
-
-CPU-only: no real streams or capture, just the enable/overlap decision.
+CPU-only checks cover stream selection and tail-stage ordering around the join.
+GPU correctness and concurrent collective progress require distributed tests.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -67,47 +49,69 @@ class _SpyFork:
 
     def __init__(self) -> None:
         self.calls: list[dict[str, bool]] = []
+        self.events: list[str] = []
+        self.inside_scope = False
+        self.inside_branch = False
         self._active = False
 
+    @contextmanager
     def scope(self, *, enable: bool, overlap: bool = True):
         self.calls.append({"enable": enable, "overlap": overlap})
-        # Mirror StreamFork: scope() yields the fork itself, and without an aux
-        # stream it stays inactive, so branch() is a passthrough and the fake
-        # collaborators below run inline.
-        return _NullCtx(self)
+        self.events.append("fork")
+        self.inside_scope = True
+        try:
+            yield self
+        finally:
+            self.inside_scope = False
+            self.events.append("join")
 
+    @contextmanager
     def branch(self):
-        return _NullCtx(None)
+        self.inside_branch = True
+        try:
+            yield
+        finally:
+            self.inside_branch = False
 
 
-class _NullCtx:
-    def __init__(self, value):
-        self._value = value
-
-    def __enter__(self):
-        return self._value
-
-    def __exit__(self, *exc):
-        return False
-
-
-def _make_moe(fork: _SpyFork) -> SimpleNamespace:
+def _make_moe(fork: _SpyFork, *, num_tokens: int) -> SimpleNamespace:
     """Minimal stand-in exposing only what the fork path of forward() touches."""
-    hidden = torch.zeros(2, 4)
+    hidden = torch.zeros(num_tokens, 4)
+    shard = torch.zeros(num_tokens, 2)
 
-    plan = SimpleNamespace(
-        split_shared_rs=False,
-        routed_in_fork=False,
-        defer_finalize=False,
-    )
+    def shared_rs(shared_partial):
+        assert fork.inside_scope and fork.inside_branch
+        assert num_tokens <= 32
+        fork.events.append("shared_rs")
+        return shard
+
+    def routed_ar_fusion(routed_out, num_tokens):
+        assert fork.inside_scope and not fork.inside_branch
+        fork.events.append("routed_ar_fusion")
+        return routed_out
+
+    def up_proj_ag(routed_latent, shared_shard, prefix_sum):
+        assert not fork.inside_scope
+        assert num_tokens <= 32 and shared_shard is shard
+        fork.events.append("up_proj_ag")
+        return hidden
+
+    def up_proj_inject_ar(routed_latent, shared_partial, prefix_sum):
+        assert not fork.inside_scope
+        assert num_tokens > 32 and shared_partial.shape == hidden.shape
+        fork.events.append("up_proj_inject_ar")
+        return hidden
+
     comm = SimpleNamespace(
-        plan=lambda num_tokens: plan,
-        run=lambda *a, **k: hidden,
-        reduce_scatter_shared=lambda x: x,
-        reduce_project_routed=lambda x: x,
+        defer_finalize=False,
+        shared_rs=shared_rs,
+        routed_ar_fusion=routed_ar_fusion,
+        up_proj_ag=up_proj_ag,
+        up_proj_inject_ar=up_proj_inject_ar,
     )
     return SimpleNamespace(
         mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
+        execution_plan=SimpleNamespace(use_native=False),
         native_latent_moe=None,
         stream_fork=fork,
         _topk_ready=None,
@@ -116,10 +120,10 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
         # Stand in for TopKOutputFormat so the fake does not have to track the
         # enum; only is_standard() is consulted on this path.
         _routing_output_format=lambda ctx: SimpleNamespace(is_standard=lambda: True),
-        gate=lambda hs: torch.zeros(2, 2),
+        gate=lambda hs: torch.zeros(num_tokens, 2),
         topk=lambda hs, logits, output_format=None: (
-            torch.zeros(2, 1),
-            torch.zeros(2, 1),
+            torch.zeros(num_tokens, 1),
+            torch.zeros(num_tokens, 1),
         ),
         # None keeps this on the separate per-module projections, which is the
         # composition whose fork structure these tests pin.
@@ -131,9 +135,9 @@ def _make_moe(fork: _SpyFork) -> SimpleNamespace:
     )
 
 
-def _run(*, graph_phase: bool, capture_mode: bool) -> dict[str, bool]:
+def _run(*, graph_phase: bool, capture_mode: bool, num_tokens: int) -> dict[str, bool]:
     fork = _SpyFork()
-    moe = _make_moe(fork)
+    moe = _make_moe(fork, num_tokens=num_tokens)
     with (
         mock.patch(
             "tokenspeed.runtime.models.kimi_k3.get_is_cuda_graph_phase",
@@ -146,39 +150,32 @@ def _run(*, graph_phase: bool, capture_mode: bool) -> dict[str, bool]:
     ):
         KimiLinearMoE.forward(
             moe,
-            torch.zeros(2, 4),
-            torch.zeros(2, 4),
-            num_global_tokens=2,
-            max_num_tokens_per_gpu=2,
+            torch.zeros(num_tokens, 4),
+            torch.zeros(num_tokens, 4),
+            num_global_tokens=num_tokens,
+            max_num_tokens_per_gpu=num_tokens,
         )
     assert len(fork.calls) == 1
+    assert fork.events == (
+        ["fork"]
+        + (["shared_rs"] if num_tokens <= 32 else [])
+        + ["routed_ar_fusion", "join"]
+        + (["up_proj_ag"] if num_tokens <= 32 else ["up_proj_inject_ar"])
+    )
     return fork.calls[0]
 
 
-def test_warmup_forward_activates_the_auxiliary_stream():
-    """Warmup (graph phase, not yet capturing) must still use the aux stream.
-
-    This is the regression: with ``enable`` gated on capture mode the warmup
-    forwards never touched the aux stream, so hipBLASLt initialized inside the
-    capturing stream and capture died with HIP error 900.
-    """
-    call = _run(graph_phase=True, capture_mode=False)
-    assert call["enable"] is True
-    # Serial during warmup: the point is to initialize the stream, not to
-    # overlap, and overlapping outside capture would race the main stream.
-    assert call["overlap"] is False
-
-
-def test_capture_forward_overlaps():
-    call = _run(graph_phase=True, capture_mode=True)
-    assert call["enable"] is True
-    assert call["overlap"] is True
-
-
-def test_eager_serving_leaves_the_fork_disabled():
-    """Outside the graph phase behaviour is unchanged: no fork, no aux stream."""
-    call = _run(graph_phase=False, capture_mode=False)
-    assert call["enable"] is False
+@pytest.mark.parametrize("num_tokens", [32, 33])
+@pytest.mark.parametrize(
+    "graph_phase,capture_mode", [(False, False), (True, False), (True, True)]
+)
+def test_moe_preserves_stream_scheduling_in_eager_warmup_and_capture(
+    graph_phase, capture_mode, num_tokens
+):
+    call = _run(
+        graph_phase=graph_phase, capture_mode=capture_mode, num_tokens=num_tokens
+    )
+    assert call == {"enable": graph_phase, "overlap": capture_mode}
 
 
 @pytest.mark.parametrize("prequantized", [False, True])
@@ -190,7 +187,7 @@ def test_moe_passes_projection_payload_to_experts(prequantized):
         else hidden
     )
     projection = mock.Mock(spec=["__call__"], return_value=(payload, None))
-    moe = _make_moe(_SpyFork())
+    moe = _make_moe(_SpyFork(), num_tokens=8)
     moe.routed_expert_down_proj = projection
     moe._routed_experts = mock.Mock(return_value=hidden)
     with (

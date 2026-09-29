@@ -96,9 +96,6 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
     monkeypatch.setattr(
         kimi_k3.Kimi3MoEExecutionPlan, "build", mock.Mock(return_value=plan)
     )
-    monkeypatch.setattr(
-        kimi_k3.Kimi3MoEExecutionPlan, "prepare_latent_fusion", forbidden
-    )
     monkeypatch.setattr(kimi_k3.KimiK3LatentDownOp, "initialize", forbidden)
     monkeypatch.setattr(kimi_k3, "K3MoeTailComm", forbidden)
     monkeypatch.setattr(kimi_k3, "LatentMoELayer", forbidden)
@@ -182,7 +179,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
     assert layer.shared_experts.down_proj.tp_size == 1
     assert layer.shared_experts.down_proj.tp_group is None
     assert layer.experts.kwargs["routing_mode"] == "precomputed_topk"
-    assert not hasattr(layer, "comm")
+    assert layer.comm is None
     assert not hasattr(layer, "native_latent_moe")
 
 

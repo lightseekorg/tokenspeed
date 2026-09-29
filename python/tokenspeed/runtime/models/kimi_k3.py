@@ -63,6 +63,7 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import fp8_linear
 from tokenspeed_kernel.ops.activation.triton import (
+    add3,
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
@@ -164,6 +165,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     _prepare_mla_kv_b_proj_weights,
 )
 from tokenspeed.runtime.models.kimi_k3_comm import (
+    K3_SHARED_RS_MAX_TOKENS,
     K3AttnComm,
     K3AttnCommState,
     K3MoeTailComm,
@@ -1470,6 +1472,7 @@ class KimiLinearMoE(nn.Module):
         super().__init__()
         self.config = config
         self.mapping = mapping
+        self.comm: K3MoeTailComm | None = None
         if mapping.attn.dp_size > 1:
             if not (mapping.attn.dp_size == mapping.moe.ep_size == mapping.world_size):
                 raise ValueError(
@@ -1673,18 +1676,6 @@ class KimiLinearMoE(nn.Module):
             if config.latent_moe_use_norm
             else None
         )
-        if mapping.attn.dp_size == 1:
-            self.execution_plan = self.execution_plan.prepare_latent_fusion(
-                mapping,
-                lane_width=self.routed_hidden + config.hidden_size,
-                has_latent_norm=self.routed_expert_norm is not None,
-                max_token_num=max(
-                    int(global_server_args_dict["comm_fusion_max_num_tokens"]),
-                    1,
-                ),
-                shard_up_projection=self._shard_latent_projections,
-            )
-
         self._topk_ready = (
             torch.cuda.Event()
             if mapping.attn.dp_size == 1
@@ -1764,9 +1755,7 @@ class KimiLinearMoE(nn.Module):
                 logger.info("K3 MoE communication: all-gather/reduce-scatter")
             return
 
-        # LatentMoELayer reduces routed partials across EP only. A TP-sharded
-        # W2 also needs a TP reduction, which the graph-safe K3MoeTailComm path
-        # below performs across the full TP x EP group.
+        # Native EP owns its collectives; native TP reduces before replicated up-projection.
         self.native_latent_moe = (
             LatentMoELayer(
                 router=self.gate,
@@ -1776,11 +1765,7 @@ class KimiLinearMoE(nn.Module):
                 routed_norm=self.routed_expert_norm,
                 routed_up_proj=self.routed_expert_up_proj,
                 shared_experts=self.shared_experts,
-                shared_reduce=(
-                    None
-                    if self.execution_plan.joint_moe_reduce
-                    else self._reduce_shared
-                ),
+                shared_reduce=None,
                 joint_reduce=self.execution_plan.joint_moe_reduce,
                 shared_expert_stream=(
                     alt_stream if self.execution_plan.overlap_shared_experts else None
@@ -1809,27 +1794,17 @@ class KimiLinearMoE(nn.Module):
             )
         )
 
-        # Communication capability negotiation and tail routing live in
-        # K3MoeTailComm (one MIN-vote per process; see kimi_k3_comm.py).
+        if self.execution_plan.use_native:
+            return
+
         self.comm = K3MoeTailComm(
             mapping=mapping,
             hidden_size=config.hidden_size,
-            prefix=prefix,
-            layer_index=layer_index,
-            model_scope=model_scope,
             routed_hidden=self.routed_hidden,
             top_k=self.top_k,
             routed_norm=self.routed_expert_norm,
             up_proj=self.routed_expert_up_proj,
-            execution_plan=self.execution_plan,
-            # The experts kernel plan's capability bit (rank-uniform):
-            # both SiTU variants register the deferred capability, while a
-            # kernel without it (e.g. mxfp4 SwiGLU) arms the
-            # materialized-input tail instead.
-            # self.experts is constructed above, before this comm object.
-            experts_supports_deferred_finalize=(
-                self.experts.supports_deferred_finalize
-            ),
+            experts_supports_deferred_finalize=self.experts.supports_deferred_finalize,
         )
 
     def pack_input_projection_weights(self) -> None:
@@ -1998,6 +1973,75 @@ class KimiLinearMoE(nn.Module):
             routed_latent,
             prefix_sum,
             shared_output,
+        )
+
+    def _forward_amd(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        ctx: ForwardContext | None,
+    ) -> torch.Tensor:
+        """Execute AMD EP or TP with replicated latent projections."""
+        if self.native_latent_moe is not None:
+            if self._use_fused_decode_pipeline and 0 < hidden_states.shape[0] <= 4:
+                return self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
+            return self.native_latent_moe(
+                hidden_states,
+                num_global_tokens=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                prefix_sum=prefix_sum,
+            )
+
+        num_tokens, hidden_size = hidden_states.shape
+        if num_tokens == 0:
+            return prefix_sum
+
+        routing_output_format = self._routing_output_format(ctx)
+        precompute_topk = routing_output_format.is_standard()
+        self.experts._situ_output_buffer = None
+        fused_inputs = self._latent_input_projections(hidden_states, shared_out=None)
+        if fused_inputs is not None:
+            router_logits, routed_in, shared_partial = fused_inputs
+        else:
+            router_logits = self.gate(hidden_states)
+            routed_in = shared_partial = None
+
+        # Warm the auxiliary stream serially before capture enables overlap.
+        with self.stream_fork.scope(
+            enable=get_is_cuda_graph_phase(),
+            overlap=get_is_capture_mode(),
+        ) as fork:
+            with fork.branch():
+                topk_output = self.topk(
+                    hidden_states, router_logits, output_format=routing_output_format
+                )
+                if self._topk_ready is not None and precompute_topk and fork._active:
+                    self._topk_ready.record(torch.cuda.current_stream())
+                if shared_partial is None:
+                    shared_partial = self.shared_experts(hidden_states, down_out=None)
+            if routed_in is None:
+                routed_in, _ = self.routed_expert_down_proj(hidden_states)
+            if self._topk_ready is not None and precompute_topk and fork._active:
+                self._topk_ready.wait(torch.cuda.current_stream())
+            routed = self._routed_experts(
+                routed_in,
+                topk_output,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                do_finalize=True,
+            )
+            routed = all_reduce(routed, self.mapping.moe.tp_ep_group)
+            if self.routed_expert_norm is not None:
+                routed = self.routed_expert_norm(routed)
+            routed, _ = self.routed_expert_up_proj(routed)
+
+        shared = all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
+        return add3(
+            prefix_sum,
+            routed.view(num_tokens, hidden_size),
+            shared.view(num_tokens, hidden_size),
         )
 
     def _forward_attn_dp(
@@ -2200,33 +2244,31 @@ class KimiLinearMoE(nn.Module):
     ) -> torch.Tensor:
         """Routed + shared experts, accumulated onto ``prefix_sum``.
 
-        Returns the new prefix (``prefix_sum + routed + shared``); the tail
-        tiers fuse the accumulate in-kernel.
+        Reduce routed output and, for small batches, the shared shard inside
+        the stream fork. Join before projecting and assembling the output.
         """
         if self.mapping.attn.dp_size > 1:
             if ctx is None:
                 raise ValueError("Kimi-K3 attention DP requires a ForwardContext.")
             return self._forward_attn_dp(hidden_states, prefix_sum, ctx)
 
-        if self.native_latent_moe is not None:
-            if self._use_fused_decode_pipeline and 0 < hidden_states.shape[0] <= 4:
-                output = self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
-            else:
-                output = self.native_latent_moe(
-                    hidden_states,
-                    num_global_tokens=num_global_tokens,
-                    max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-                    prefix_sum=prefix_sum,
-                )
-            return output
+        if self.execution_plan.use_native:
+            return self._forward_amd(
+                hidden_states,
+                prefix_sum,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                ctx,
+            )
 
-        num_tokens, hidden_size = hidden_states.shape
+        num_tokens = hidden_states.shape[0]
         if num_tokens == 0:
             return prefix_sum
 
         routing_output_format = self._routing_output_format(ctx)
         precompute_topk = routing_output_format.is_standard()
-        plan = self.comm.plan(num_tokens)
+        if self.comm is None:
+            raise RuntimeError("K3 MoE communication is not initialized")
         self.experts._situ_output_buffer = None
 
         # The router, routed latent and shared gate/up read the same activation
@@ -2244,18 +2286,7 @@ class KimiLinearMoE(nn.Module):
             router_logits = self.gate(hidden_states)
             routed_in = shared_partial = None
 
-        prepared_shared_shard = None
-        # Enable the fork for the whole graph phase, but only overlap during
-        # capture. The pre-capture warmup runs with capture mode off, so gating
-        # ``enable`` on it left the auxiliary stream completely untouched until
-        # capture itself -- the first hipBLASLt call on that stream then did its
-        # lazy handle/workspace setup inside the capturing stream and raised
-        # "operation not permitted when stream is capturing" (900) on every
-        # rank, deadlocking startup. Enabling on the graph phase makes warmup
-        # execute the same branches on the auxiliary stream, serially
-        # (``overlap=False``), so every backend is initialized before capture.
-        # This matches the contract _capture_one documents and the pattern the
-        # other fork-using models already follow.
+        # Warm the auxiliary stream serially before capture enables overlap.
         with self.stream_fork.scope(
             enable=get_is_cuda_graph_phase(),
             overlap=get_is_capture_mode(),
@@ -2273,10 +2304,9 @@ class KimiLinearMoE(nn.Module):
                         hidden_states,
                         down_out=None,
                     )
-                if plan.split_shared_rs and fork._active:
-                    prepared_shared_shard = self.comm.reduce_scatter_shared(
-                        shared_partial
-                    )
+                if num_tokens <= K3_SHARED_RS_MAX_TOKENS:
+                    shared_shard = self.comm.shared_rs(shared_partial)
+
             if routed_in is None:
                 routed_in, _ = self.routed_expert_down_proj(hidden_states)
             if self._topk_ready is not None and precompute_topk and fork._active:
@@ -2286,28 +2316,16 @@ class KimiLinearMoE(nn.Module):
                 topk_output,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
-                do_finalize=not plan.defer_finalize,
+                do_finalize=not self.comm.defer_finalize,
             )
-            if plan.routed_in_fork:
-                # No fused collective to hide behind: reduce and project here
-                # so the work overlaps the shared branch inside the fork.
-                routed_tail_input = self.comm.reduce_project_routed(routed_partial)
-            else:
-                routed_tail_input = routed_partial
-        output = self.comm.run(
-            plan,
-            routed_tail_input,
-            shared_partial,
-            prefix_sum,
-            num_tokens,
-            hidden_size,
-            prepared_shared_shard,
-        )
-        return output
+            routed_latent = self.comm.routed_ar_fusion(routed_partial, num_tokens)
 
-    def _reduce_shared(self, shared_partial: torch.Tensor) -> torch.Tensor:
-        """Reduce the shared experts' TP partial (delegates to K3MoeTailComm)."""
-        return self.comm.reduce_shared(shared_partial)
+        if num_tokens <= K3_SHARED_RS_MAX_TOKENS:
+            return self.comm.up_proj_ag(routed_latent, shared_shard, prefix_sum)
+        else:
+            return self.comm.up_proj_inject_ar(
+                routed_latent, shared_partial, prefix_sum
+            )
 
 
 def create_kimi_linear_moe(
@@ -3254,6 +3272,13 @@ class KimiLinearForCausalLM(BaseCausalLM):
             routed_hidden_size=routed_hidden_size,
             max_num_tokens=max_num_tokens,
         )
+        for layer in self.model.layers:
+            if not isinstance(layer, KimiLinearDecoderLayer) or not layer.is_moe_layer:
+                continue
+            moe = layer.block_sparse_moe
+            if isinstance(moe, KimiLinearMoE) and moe.comm is not None:
+                prepared = moe.comm.prepare(max_num_tokens) or prepared
+                break
         return bool(shared_mlps) or prepared
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:

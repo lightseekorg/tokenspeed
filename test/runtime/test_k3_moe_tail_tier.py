@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""K3 MoE-tail routing and sharded output assembly."""
+"""K3 routed-workspace capacity, input contracts, and second-stage assembly."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -26,119 +26,217 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tokenspeed.runtime.models.kimi_k3_comm import (
-    K3MoeTailComm,
-    K3MoETailTier,
-    select_k3_moe_tail_tier,
-)
+from tokenspeed.runtime.models import kimi_k3_comm as mod
 
 
-def _select(**overrides):
-    args = dict(
-        num_tokens=1024,
-        graph_phase=False,
-        tail_fusion_max_tokens=32,
+@pytest.fixture(autouse=True)
+def reset_workspace(monkeypatch):
+    monkeypatch.setattr(mod.K3MoeTailComm, "_routed_workspace", None)
+    monkeypatch.setattr(mod.K3MoeTailComm, "_workspace_config", None)
+    monkeypatch.setattr(mod.K3MoeTailComm, "_latent_tail", None)
+    monkeypatch.setattr(mod.K3MoeTailComm, "_stage2_capacity", None)
+    monkeypatch.setattr(mod.K3MoeTailComm, "_multimem_group_name", None)
+
+
+def _comm(*, enabled, capacity, deferred):
+    comm = object.__new__(mod.K3MoeTailComm)
+    workspace = SimpleNamespace(
+        max_num_tokens=capacity,
+        supports_num_tokens=lambda m: 0 < m <= capacity,
     )
-    args.update(overrides)
-    return select_k3_moe_tail_tier(**args)
+    mod.K3MoeTailComm._routed_workspace = workspace
+    mod.K3MoeTailComm._stage2_capacity = capacity
+    comm.use_allreduce_fusion = enabled
+    comm.defer_finalize = enabled and deferred
+    comm.routed_norm = SimpleNamespace(weight=object())
+    return comm
 
 
-@pytest.mark.parametrize("m", [1, 8, 16, 32])
-def test_small_graph_range_uses_fused_tail(m):
-    assert _select(num_tokens=m, graph_phase=True) is K3MoETailTier.TAIL_FUSION
+def test_prepared_capacity_covers_tokens_above_8192(monkeypatch):
+    comm = _comm(enabled=True, capacity=16384, deferred=True)
+    output = object()
+    reduce = Mock(return_value=output)
+    monkeypatch.setattr(mod, "allreduce_fusion", reduce)
+    routed = (object(), object(), object())
+    assert comm.routed_ar_fusion(routed, 8193) is output
+    assert reduce.call_args.kwargs["num_tokens"] == 8193
+    with pytest.raises(ValueError, match="exceeds"):
+        comm.routed_ar_fusion(routed, 16385)
+    reduce.assert_called_once()
 
 
-@pytest.mark.parametrize("m", [1, 8, 16, 32, 64, 256, 1024, 8192, 16384])
-def test_eager_compatibility_path_uses_separate_reduce(m):
-    assert _select(num_tokens=m) is K3MoETailTier.SEPARATE_REDUCE
-
-
-@pytest.mark.parametrize("m", [0, 64, 256, 1024, 8192, 16384])
-def test_outside_small_graph_capacity_uses_separate_reduce(m):
-    assert _select(num_tokens=m, graph_phase=True) is K3MoETailTier.SEPARATE_REDUCE
-
-
-def test_missing_small_tail_uses_separate_reduce():
-    assert (
-        _select(num_tokens=8, graph_phase=True, tail_fusion_max_tokens=0)
-        is K3MoETailTier.SEPARATE_REDUCE
+def test_workspace_uses_serving_capacity_once(monkeypatch):
+    group = SimpleNamespace(group_name="moe_tp8")
+    workspace = SimpleNamespace(max_num_tokens=32768)
+    create = Mock(return_value=workspace)
+    small = Mock()
+    prealloc = Mock(return_value=True)
+    monkeypatch.setattr(mod, "KimiK3LatentTailOp", small)
+    monkeypatch.setattr(mod, "multimem_prealloc", prealloc)
+    monkeypatch.setattr(mod, "_get_process_group", lambda ranks: group)
+    monkeypatch.setattr(mod, "create_allreduce_fusion_workspace", create)
+    monkeypatch.setattr(
+        mod, "current_platform", lambda: SimpleNamespace(is_blackwell=True)
     )
+    monkeypatch.setattr(mod, "global_server_args_dict", {"disable_pdl": True})
+    mapping = SimpleNamespace(
+        moe=SimpleNamespace(
+            tp_size=8, ep_size=1, tp_ep_size=8, tp_ep_group=tuple(range(8))
+        ),
+        attn=SimpleNamespace(dp_size=1, cp_size=1),
+    )
+    comms = [
+        mod.K3MoeTailComm(
+            mapping=mapping,
+            hidden_size=7168,
+            routed_hidden=3584,
+            top_k=16,
+            routed_norm=SimpleNamespace(variance_epsilon=1e-5),
+            up_proj=SimpleNamespace(shard_group=mapping.moe.tp_ep_group),
+            experts_supports_deferred_finalize=True,
+        )
+        for _ in range(2)
+    ]
+    assert comms[0].prepare(32768)
+    assert comms[1]._routed_workspace is workspace
+    assert comms[1].prepare(32768)
+    assert comms[1].prepare(8192)
+    create.assert_called_once_with(
+        group=group, hidden_size=3584, top_k=16, max_num_tokens=32768, rms_eps=1e-5
+    )
+    small.assert_called_once_with(group=group, hidden_size=7168, latent_size=3584)
+    prealloc.assert_called_once_with(32768, (7168,), "moe_tp8")
+    with pytest.raises(RuntimeError, match="grow"):
+        comms[1].prepare(32769)
+
+
+def test_model_prepares_routed_workspace_at_serving_limit(monkeypatch):
+    from tokenspeed.runtime.models import kimi_k3
+
+    layers = []
+    for _ in range(2):
+        moe = object.__new__(kimi_k3.KimiLinearMoE)
+        torch.nn.Module.__init__(moe)
+        moe.shared_experts = SimpleNamespace(shared_parallel=None)
+        moe.comm = SimpleNamespace(prepare=Mock(return_value=True))
+        layer = object.__new__(kimi_k3.KimiLinearDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.is_moe_layer = True
+        layer.block_sparse_moe = moe
+        layers.append(layer)
+    owner = SimpleNamespace(
+        model=SimpleNamespace(layers=layers),
+        mapping=object(),
+        config=SimpleNamespace(hidden_size=7168, routed_expert_hidden_size=3584),
+    )
+    monkeypatch.setattr(kimi_k3, "prepare_k3_all_reduce_buffers", lambda **kw: False)
+    assert kimi_k3.KimiLinearForCausalLM.prepare_communication_runtime(owner, 32768)
+    layers[0].block_sparse_moe.comm.prepare.assert_called_once_with(32768)
+    layers[1].block_sparse_moe.comm.prepare.assert_not_called()
 
 
 @pytest.mark.parametrize(
-    "deferred,m",
-    [(False, 8), (False, 256), (False, 8192), (True, 8), (True, 16384)],
+    "enabled,deferred", [(True, False), (True, True), (False, False)]
 )
-def test_fallback_plan_reduces_and_projects_routed_in_fork(monkeypatch, deferred, m):
-    from tokenspeed.runtime.models import kimi_k3_comm
-
-    monkeypatch.setattr(kimi_k3_comm, "get_is_cuda_graph_phase", lambda: False)
-    comm = object.__new__(K3MoeTailComm)
-    comm.state = SimpleNamespace(deferred_tail=deferred)
-    comm.latent_tail = None
-
-    plan = comm.plan(m)
-    assert plan.tier is K3MoETailTier.SEPARATE_REDUCE
-    assert plan.routed_in_fork
-    assert not plan.defer_finalize
-    assert not plan.split_shared_rs
-
-
-def test_only_four_tail_routes_remain():
-    assert set(K3MoETailTier.__members__) == {
-        "TAIL_FUSION",
-        "MNNVL_BT",
-        "MNNVL_HT",
-        "SEPARATE_REDUCE",
-    }
-
-
-@pytest.mark.parametrize(
-    "m,tier", [(33, K3MoETailTier.MNNVL_BT), (1025, K3MoETailTier.MNNVL_HT)]
-)
-def test_deferred_tail_uses_main_sharded_projection_and_shared_reduce(
-    monkeypatch, m, tier
-):
-    from tokenspeed.runtime.models import kimi_k3_comm
-
-    normalized = torch.ones(m, 3, dtype=torch.bfloat16)
+def test_routed_implementations_use_same_second_stage(monkeypatch, enabled, deferred):
+    m = 33
+    local_routed = torch.full((m, 3), 2, dtype=torch.bfloat16)
+    summed_routed = torch.full_like(local_routed, 4)
+    normalized = torch.ones_like(local_routed)
     shared = torch.ones(m, 16, dtype=torch.bfloat16)
     residual = torch.full_like(shared, 3)
     reduced = torch.full_like(shared, 21)
-    bt = Mock(return_value=normalized)
-    ht = Mock(return_value=normalized)
-    bt.supports_num_tokens.return_value = True
-    ht.supports_num_tokens.return_value = True
+    fused_reduce = Mock(return_value=normalized)
+    monkeypatch.setattr(mod, "allreduce_fusion", fused_reduce)
     group = tuple(range(8))
 
     def reduce(value, actual_group):
         assert actual_group == group
+        if value.shape[-1] == 3:
+            assert value is local_routed
+            return summed_routed
         assert torch.all(value[:, :4] == 1)
         assert torch.all(value[:, 4:6] == 10)
         assert torch.all(value[:, 6:] == 1)
         return reduced
 
-    shared_reduce = Mock(side_effect=reduce)
-    monkeypatch.setattr(kimi_k3_comm, "all_reduce", shared_reduce)
-    comm = object.__new__(K3MoeTailComm)
-    comm.state = SimpleNamespace(
-        deferred_tail=True, mnnvl_bt_deferred=bt, mnnvl_ht_deferred=ht
+    plain_reduce = Mock(side_effect=reduce)
+    monkeypatch.setattr(mod, "all_reduce", plain_reduce)
+    comm = _comm(enabled=enabled, capacity=16384, deferred=deferred)
+    comm.hidden_size = 16
+    comm.routed_norm = Mock(
+        return_value=normalized, weight=torch.ones(3, dtype=torch.bfloat16)
     )
-    comm._experts_supports_deferred_finalize = True
-    comm.routed_norm = SimpleNamespace(weight=torch.ones(3, dtype=torch.bfloat16))
     comm.up_proj = SimpleNamespace(
         shard_slice=(4, 2), weight=torch.full((2, 3), 2, dtype=torch.bfloat16)
     )
-    comm.mapping = SimpleNamespace(moe=SimpleNamespace(tp_ep_size=8, tp_ep_group=group))
-    plan = comm.plan(m)
-    assert plan.tier is tier and plan.defer_finalize
-    assert not plan.routed_in_fork
-    deferred = (object(), object(), object())
-    result = comm.run(plan, deferred, shared, residual, m, 16)
-
-    selected, other = (bt, ht) if tier is K3MoETailTier.MNNVL_BT else (ht, bt)
-    selected.assert_called_once_with(*deferred, comm.routed_norm.weight)
-    other.assert_not_called()
-    shared_reduce.assert_called_once()
+    comm.mapping = SimpleNamespace(
+        moe=SimpleNamespace(has_tp_ep=True, tp_ep_size=8, tp_ep_group=group)
+    )
+    values = (local_routed, object(), object())
+    routed_latent = comm.routed_ar_fusion(values if deferred else local_routed, m)
+    result = comm.up_proj_inject_ar(routed_latent, shared, residual)
+    if enabled:
+        fused_reduce.assert_called_once_with(
+            local_routed,
+            comm._routed_workspace,
+            pattern=(
+                mod.AllReduceFusionPattern.MOE_FINALIZE_ALLREDUCE_RMSNORM
+                if deferred
+                else mod.AllReduceFusionPattern.ALLREDUCE_RMSNORM
+            ),
+            rms_gamma=comm.routed_norm.weight,
+            num_tokens=m,
+            expert_weights=values[1] if deferred else None,
+            expanded_idx_to_permuted_idx=values[2] if deferred else None,
+        )
+        comm.routed_norm.assert_not_called()
+        plain_reduce.assert_called_once()
+    else:
+        fused_reduce.assert_not_called()
+        comm.routed_norm.assert_called_once_with(summed_routed)
+        assert plain_reduce.call_count == 2
     assert result.data_ptr() == reduced.data_ptr()
     torch.testing.assert_close(result, reduced, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("m,use_multimem", [(255, False), (256, True), (8193, True)])
+def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem):
+    comm = _comm(enabled=False, capacity=16384, deferred=False)
+    comm.hidden_size = 16
+    comm.mapping = SimpleNamespace(moe=SimpleNamespace(tp_ep_group=tuple(range(8))))
+    comm.up_proj = SimpleNamespace(
+        shard_slice=(4, 2), weight=torch.full((2, 3), 2, dtype=torch.bfloat16)
+    )
+    latent = torch.ones(m, 3, dtype=torch.bfloat16)
+    shared = torch.ones(m, 16, dtype=torch.bfloat16)
+    residual = torch.full_like(shared, 3)
+    result = torch.full_like(shared, 21)
+    monkeypatch.setattr(mod.K3MoeTailComm, "_multimem_group_name", "moe_tp8")
+    stage = Mock(side_effect=lambda value, group, capacity: value.clone())
+
+    def reduce(value, group):
+        assert group == ("moe_tp8" if use_multimem else tuple(range(8)))
+        assert torch.all(value[:, :4] == 1)
+        assert torch.all(value[:, 4:6] == 10)
+        assert torch.all(value[:, 6:] == 1)
+        return result
+
+    ordinary = Mock(side_effect=reduce)
+    multimem = Mock(side_effect=reduce)
+    monkeypatch.setattr(mod, "all_reduce", ordinary)
+    monkeypatch.setattr(mod, "multimem_stage", stage)
+    monkeypatch.setattr(mod, "multimem_all_reduce_staged", multimem)
+    output = comm.up_proj_inject_ar(latent, shared, residual)
+    if use_multimem:
+        ordinary.assert_not_called()
+        stage.assert_called_once()
+        torch.testing.assert_close(stage.call_args.args[0], shared, rtol=0, atol=0)
+        assert stage.call_args.args[1:] == ("moe_tp8", 16384)
+        multimem.assert_called_once()
+        result.zero_()
+    else:
+        ordinary.assert_called_once()
+        multimem.assert_not_called()
+        stage.assert_not_called()
+    torch.testing.assert_close(output, torch.full_like(output, 21), rtol=0, atol=0)

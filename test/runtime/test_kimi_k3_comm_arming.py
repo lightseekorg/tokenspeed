@@ -18,15 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Deferred-finalize arming of the K3 latent tail.
-
-The arming gate must be the experts kernel plan's own
-``supports_deferred_finalize`` capability bit, not a use_trtllm proxy: the
-trtllm solution spans kernels with either capability (the nvfp4/mxfp4 SiTU
-variants emit the deferred triple, mxfp4 SwiGLU does not), and a mis-armed
-TAIL_FUSION request crashes the experts layer with
-``MoELayer does not support do_finalize=False``.
-"""
+"""Attention and AMD communication preparation for Kimi K3."""
 
 from __future__ import annotations
 
@@ -51,25 +43,8 @@ needs_iris = pytest.mark.skipif(
 
 from tokenspeed.runtime.models.kimi_k3_comm import (  # noqa: E402
     ATTN_AR_MAX_TOKENS,
-    _tail_finalize_top_k,
     attn_ar_eligible,
 )
-
-
-def test_arming_requires_experts_capability_bit():
-    plan = SimpleNamespace(fused_moe_ar=True, use_trtllm=True)
-    # A kernel without the deferred capability (e.g. mxfp4 SwiGLU) ->
-    # materialized-input tail (finalize_top_k=None), even though
-    # use_trtllm is True.
-    assert _tail_finalize_top_k(10, plan, False) is None
-    # Deferred-capable kernel (either SiTU variant) -> deferred triple.
-    assert _tail_finalize_top_k(10, plan, True) == 10
-
-
-def test_arming_requires_fused_moe_ar():
-    plan = SimpleNamespace(fused_moe_ar=False, use_trtllm=True)
-    assert _tail_finalize_top_k(10, plan, True) is None
-    assert _tail_finalize_top_k(10, plan, False) is None
 
 
 @needs_iris

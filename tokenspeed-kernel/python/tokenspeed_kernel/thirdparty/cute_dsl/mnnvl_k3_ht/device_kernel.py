@@ -31,7 +31,6 @@ from flashinfer.comm.mnnvl_cutedsl.cute_dsl_primitives import (
     fragment_has_negative_zero,
     load_global_bf16_as_f32,
     load_global_u32x4_address,
-    load_global_u32x4_predicated,
     load_shared_u32x4,
     packed_negative_zero_bf16x8,
     packed_u32x4_to_bf16x8,
@@ -41,8 +40,9 @@ from flashinfer.comm.mnnvl_cutedsl.cute_dsl_primitives import (
     store_shared_u32x4,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.mnnvl_k3_ht.primitives import (
-    ldmc_bf16x8_predicated,
-    stmc_bf16x8_predicated,
+    ldmc_bf16x8,
+    load_global_u32x4,
+    stmc_bf16x8,
 )
 
 SMEM_ALIGNMENT = 1024
@@ -190,6 +190,9 @@ class K3H3584MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                 )
         else:
             self.reduction_shards_per_rms_warp = 0
+        self.reduction_has_tail = (
+            self.packs_per_reduction_shard % self.reduction_threads != 0
+        )
         self.reduction_vectors_per_thread = (
             self.packs_per_reduction_shard + self.reduction_threads - 1
         ) // self.reduction_threads
@@ -947,10 +950,8 @@ class K3H3584MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                 reduction_barrier.arrive_and_wait()
                 values = []
                 addresses = []
-                predicates = []
                 token_pack = token * self.packs_per_token
                 shard_pack = reduction_shard * self.packs_per_reduction_shard
-                shard_pack_end = shard_pack + self.packs_per_reduction_shard
                 for item in cutlass.range_constexpr(self.reduction_vectors_per_thread):
                     pack = shard_pack + reduction_tid + item * self.reduction_threads
                     input_address = (
@@ -959,26 +960,34 @@ class K3H3584MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                     output_address = (
                         prenorm_mailbox_multicast_address + (token_pack + pack) * 16
                     )
-                    valid = Int32(pack < shard_pack_end)
-                    reduced_packed = ldmc_bf16x8_predicated(input_address, valid)
+                    valid = None
+                    if cutlass.const_expr(self.reduction_has_tail):
+                        valid = Int32(
+                            reduction_tid + item * self.reduction_threads
+                            < self.packs_per_reduction_shard
+                        )
+                    reduced_packed = ldmc_bf16x8(input_address, valid)
                     reduced_values = packed_u32x4_to_bf16x8(reduced_packed).to(Float32)
                     if cutlass.const_expr(self.add_residual):
-                        residual_values = packed_u32x4_to_bf16x8(
-                            load_global_u32x4_predicated(
-                                residual_source.iterator
-                                + (token_pack + pack) * VEC_BF16,
-                                valid,
-                            )
-                        ).to(Float32)
+                        residual_packed = load_global_u32x4(
+                            residual_source.iterator + (token_pack + pack) * VEC_BF16,
+                            valid,
+                        )
+                        residual_values = packed_u32x4_to_bf16x8(residual_packed).to(
+                            Float32
+                        )
                         reduced_values = reduced_values + residual_values
                     reduced_packed = bf16x8_to_packed_u32x4(reduced_values.to(BFloat16))
                     values.append(sanitize_negative_zero_u32x4(reduced_packed))
                     addresses.append(output_address)
-                    predicates.append(valid)
                 for item in cutlass.range_constexpr(self.reduction_vectors_per_thread):
-                    stmc_bf16x8_predicated(
-                        addresses[item], values[item], predicates[item]
-                    )
+                    valid = None
+                    if cutlass.const_expr(self.reduction_has_tail):
+                        valid = Int32(
+                            reduction_tid + item * self.reduction_threads
+                            < self.packs_per_reduction_shard
+                        )
+                    stmc_bf16x8(addresses[item], values[item], valid)
                 if reduction_tid == 0:
                     cute.arch.store(
                         (processed_counters.iterator + processed_index).llvm_ptr,

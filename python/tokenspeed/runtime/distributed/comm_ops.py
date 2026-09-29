@@ -31,11 +31,6 @@ import torch
 import torch.distributed
 from tokenspeed_kernel.ops.communication import (
     allgather_dual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication import (
-    allreduce_lane_latent_norm as kernel_allreduce_lane_latent_norm,
-)
-from tokenspeed_kernel.ops.communication import (
     allreduce_residual_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication import (
@@ -49,12 +44,6 @@ from tokenspeed.runtime.distributed.comm_backend import (
     CommBackend,
     Group,
     get_global_backend,
-)
-
-# Re-exported for reduce-strategy callers (e.g. kimi3_join_reduce_moe):
-# tensor collections past the one-shot window take an NCCL path.
-from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # noqa: F401
-    MAX_ONESHOT_BYTES as COMM_ONESHOT_MAX_BYTES,
 )
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -209,30 +198,6 @@ def prepare_all_reduce_fusion(
         )
     except Exception:
         return False
-
-
-def all_reduce_latent_norm(
-    lane: torch.Tensor,
-    norm_weight: torch.Tensor,
-    latent_width: int,
-    group: Group,
-    *,
-    eps: float,
-    max_token_num: int,
-) -> torch.Tensor:
-    """All-reduce a routed/shared lane and RMS-normalize its routed prefix."""
-
-    process_group = _get_process_group(group)
-    return kernel_allreduce_lane_latent_norm(
-        lane,
-        norm_weight,
-        latent_width,
-        rank=process_group.rank(),
-        group=process_group,
-        eps=eps,
-        max_token_num=max_token_num,
-        trigger_completion_at_end=True,
-    )
 
 
 def can_acquire_all_reduce_outputs(
