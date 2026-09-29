@@ -29,7 +29,7 @@ import functools
 import os
 from collections.abc import Callable
 from enum import Enum
-from typing import Any
+from typing import Any, NoReturn
 
 import torch
 from packaging import version
@@ -122,18 +122,21 @@ def check_pytorch_version(version_s: str = "2.4") -> bool:
     return version.parse(torch.__version__) >= version.parse(version_s)
 
 
-def _cpu_device_warning():
+def _triton_backend_unavailable(cause: Exception) -> NoReturn:
+    # Chain the probe's own error: it is often not the platform at all (e.g. an
+    # unwritable TRITON_CACHE_DIR while the driver compiles its helper module).
     raise RuntimeError(
-        "Triton is not supported on the current platform. Only NVIDIA CUDA and AMD HIP backends are supported."
-    )
+        f"Triton backend probe failed ({type(cause).__name__}: {cause}). "
+        "Only NVIDIA CUDA and AMD HIP backends are supported."
+    ) from cause
 
 
 @functools.cache
 def get_available_device() -> str:
     try:
         return triton.runtime.driver.active.get_current_target().backend
-    except BaseException:
-        _cpu_device_warning()
+    except Exception as e:
+        _triton_backend_unavailable(e)
 
 
 device = get_available_device() if get_available_device() != "hip" else "cuda"
@@ -148,8 +151,8 @@ def get_all_max_shared_mem():
             ]
             for i in range(device_torch_lib.device_count())
         ]
-    except BaseException:
-        _cpu_device_warning()
+    except Exception as e:
+        _triton_backend_unavailable(e)
 
 
 class Backend(Enum):
