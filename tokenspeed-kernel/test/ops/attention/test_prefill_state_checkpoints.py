@@ -23,11 +23,13 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
+    _gather_checkpoint_output_kernel,
     merge_prefill_checkpoint_outputs,
     pack_prefill_recurrent_checkpoint_inputs,
     write_prefill_conv_checkpoints,
     write_prefill_recurrent_checkpoints,
 )
+from utils import assert_no_triton_compile
 
 
 def _device() -> torch.device:
@@ -174,6 +176,47 @@ def test_shared_inverse_gather_replay(token_dim, strided):
         )
         graph.replay()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("token_dim", [0, 1])
+@pytest.mark.parametrize("strided", [False, True])
+def test_inverse_gather_variable_token_extents(token_dim, strided):
+    device = _device()
+
+    def check(body_rows, tail_rows, padding):
+        body = torch.randn(body_rows, 3, 8, device=device, dtype=torch.bfloat16)
+        tail = torch.randn(tail_rows, 3, 8, device=device, dtype=torch.bfloat16)
+        if strided:
+            body, tail = body.transpose(-1, -2), tail.transpose(-1, -2)
+        if token_dim == 1:
+            body, tail = body.unsqueeze(0), tail.unsqueeze(0)
+        total = body_rows + tail_rows
+        extent = total + padding
+        sources = torch.full((extent,), -1, device=device, dtype=torch.int64)
+        sources[:total] = torch.randperm(total, device=device)
+        actual = merge_prefill_checkpoint_outputs(
+            body,
+            tail,
+            torch.empty(body_rows, device=device, dtype=torch.int64),
+            torch.empty(tail_rows, device=device, dtype=torch.int64),
+            token_dim,
+            extent,
+            sources,
+        )
+        expected = torch.zeros_like(actual)
+        expected.narrow(token_dim, 0, total).copy_(
+            torch.cat((body, tail), dim=token_dim).index_select(
+                token_dim, sources[:total]
+            )
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    # Warm both alignment classes retained by Triton for these runtime scalars.
+    check(1024, 128, 0)
+    check(1031, 127, 3)
+    with assert_no_triton_compile(_gather_checkpoint_output_kernel):
+        for shape in ((1061, 137, 1), (1093, 149, 5), (1040, 144, 16)):
+            check(*shape)
 
 
 @pytest.fixture

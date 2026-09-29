@@ -240,7 +240,7 @@ def ple_ngram_ids(
         N=ngram_size,
         HPN=heads_per_ngram,
         H=ngram_heads,
-        UNIFORM_LENGTH=uniform_length,
+        uniform_length=uniform_length,
         WRITE_TAIL=need_tail or scatter_tail,
         SCATTER_TAIL=scatter_tail,
         USE_RECIPROCAL=mod_reciprocals is not None,

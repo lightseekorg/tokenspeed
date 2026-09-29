@@ -72,8 +72,9 @@ class QSAIndexerMetadata:
 class QSAIndexerBackend(AttentionBackend):
     """Prepare the two indexer cache groups once for all local QSA layers."""
 
-    # Token-shaped side writes do not support padded prefill-graph replay.
-    cuda_graph_support = CudaGraphSupport(prefill_graph=False)
+    # The indexer's break runs request-shaped writes eagerly and slices padded
+    # token rows before building its live QSA layout.
+    cuda_graph_support = CudaGraphSupport(prefill_graph=True)
     cache_consumer_families = frozenset({"history"})
 
     def __init__(self, config: AttnConfig, full_attn_backend: CacheGroupRouter) -> None:

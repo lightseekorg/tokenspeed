@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_mtp,
     gdn_decode_step,
 )
+from utils import assert_no_triton_compile
 
 
 def _fla_chunk_gated_delta_rule():
@@ -71,6 +72,28 @@ def _torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return (
         x_float * torch.rsqrt(x_float.square().sum(dim=-1, keepdim=True).clamp_min(eps))
     ).to(x.dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GDN L2 norm requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_gdn_l2norm_fwd_varying_prefill_rows(dtype: torch.dtype) -> None:
+    from tokenspeed_kernel.ops.attention.gdn._triton.l2norm import (
+        l2norm_fwd,
+        l2norm_fwd_kernel,
+    )
+
+    l2norm_fwd(torch.randn((1476, 4, 128), device="cuda", dtype=dtype))
+    with assert_no_triton_compile(l2norm_fwd_kernel):
+        for rows in (1499, 1620, 2051, 2064):
+            x = torch.randn((rows, 4, 128), device="cuda", dtype=dtype)
+            actual = l2norm_fwd(x)
+            reference = x.float() * torch.rsqrt(
+                x.float().square().sum(dim=-1, keepdim=True) + 1e-6
+            )
+            tolerance = 5e-3 if dtype is torch.bfloat16 else 1e-5
+            torch.testing.assert_close(
+                actual.float(), reference, atol=tolerance, rtol=tolerance
+            )
 
 
 def _torch_gdn_chunk_prefill_reference(

@@ -86,7 +86,6 @@ class _FlashInferQSASparseRunner:
         self._row_capacity = 0
         self._buffer_width = 0
         self._indices: torch.Tensor | None = None
-        self._initial_mask: torch.Tensor | None = None
         self._packed_mask: torch.Tensor | None = None
         self._indptr: torch.Tensor | None = None
         self._qo_indptr: torch.Tensor | None = None
@@ -190,10 +189,7 @@ class _FlashInferQSASparseRunner:
         self._indices = torch.zeros(
             (capacity, width), dtype=torch.int32, device=self.device
         )
-        self._initial_mask = torch.zeros(
-            (capacity, width), dtype=torch.bool, device=self.device
-        )
-        self._packed_mask = torch.empty(
+        self._packed_mask = torch.zeros(
             (capacity, packed_width), dtype=torch.uint8, device=self.device
         )
         self._indptr = torch.arange(capacity + 1, dtype=torch.int32, device=self.device)
@@ -216,16 +212,15 @@ class _FlashInferQSASparseRunner:
 
     def _active_metadata(
         self, rows: int, width: int, capacity_rows: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self._ensure_metadata_capacity(max(rows, capacity_rows), width)
         assert self._indices is not None
-        assert self._initial_mask is not None
         indices, packed_mask, indptr, _, _, _ = self._metadata_views(rows)
         # FlashInfer validates indices before the dynamic slot-preparation
         # kernel runs, so erase values left by the preceding geometry.
         indices.zero_()
-        initial_mask = self._initial_mask[:rows].view(rows * width, 1, 1)
-        return indices, initial_mask, packed_mask, indptr
+        packed_mask.zero_()
+        return indices, packed_mask, indptr
 
     def _cache_plan(self, key: _PlanKey, plan: _FlashInferQSAPlan) -> None:
         self._plans[key] = plan
@@ -297,7 +292,7 @@ class _FlashInferQSASparseRunner:
                 "FlashInfer QSA plan geometry must be warmed before CUDA Graph capture"
             )
 
-        indices, initial_mask, packed_mask, indptr = self._active_metadata(
+        indices, packed_mask, indptr = self._active_metadata(
             int(rows), int(selected_width), capacity_rows
         )
         if self._planner is None:
@@ -313,7 +308,7 @@ class _FlashInferQSASparseRunner:
             int(num_q_heads),
             int(num_kv_heads),
             int(head_dim),
-            mask=initial_mask,
+            packed_mask=packed_mask,
             causal=False,
             pos_encoding_mode="NONE",
             sm_scale=float(softmax_scale),
@@ -321,9 +316,9 @@ class _FlashInferQSASparseRunner:
             kv_data_type=k_cache.dtype,
             o_data_type=q.dtype,
         )
-        # FlashInfer 0.6.x converts custom-mask offsets from bits to bytes only
-        # while planning from a bool mask. Plan from bool to obtain those byte
-        # offsets, then replace the generated mask with the shared arena below.
+        # FlashInfer leaves custom-mask offsets in bits when planning from a
+        # packed mask. _bind_plan_metadata replaces them with the shared byte
+        # offsets prepared in _ensure_metadata_capacity.
         if planner._backend != "fa2":
             raise RuntimeError(
                 f"FlashInfer QSA requested FA2 but planned {planner._backend!r}"
