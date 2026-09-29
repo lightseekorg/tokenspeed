@@ -140,6 +140,9 @@ class AttentionBackend(CachePoolBinding, ABC):
     # validation: every published family must have a consumer); composites
     # union their children's.
     cache_consumer_families: frozenset[str] = frozenset({"history"})
+    # MLA sharded history reads/writes and global attention-partial merging,
+    # independent of whether the model also has linear-attention layers.
+    supports_mla_dcp: bool = False
     supports_mla_projected_value_decode: bool = False
     # Bound by register_step_counter (PD layerwise transfer); None otherwise.
     step_counter: StepCounter | None = None

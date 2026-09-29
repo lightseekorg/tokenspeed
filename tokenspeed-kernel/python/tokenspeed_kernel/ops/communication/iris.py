@@ -1964,10 +1964,12 @@ def iris_reduce_symmetric_gluon_kernel(
     heap_base_7,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
-    TOTAL_NUMEL: gl.constexpr,
+    # The reduced size and the tile/program counts derived from it follow the
+    # batch; runtime so every batch shape shares one binary.
+    TOTAL_NUMEL,
     BLOCK_SIZE: gl.constexpr,
-    NUM_PROGRAMS: gl.constexpr,
-    NUM_TILES: gl.constexpr,
+    NUM_PROGRAMS,
+    NUM_TILES,
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
@@ -2015,7 +2017,7 @@ def iris_reduce_symmetric_gluon_kernel(
         [WORDS_PER_LANE], [SUBGROUP_SIZE], [NUM_WARPS], [0]
     )
     lane = gl.arange(0, BLOCK_SIZE // ELEMENTS_PER_WORD, layout=layout)
-    total_packed: gl.constexpr = TOTAL_NUMEL // ELEMENTS_PER_WORD
+    total_packed = TOTAL_NUMEL // ELEMENTS_PER_WORD
     tile_id = block_id
     while tile_id < NUM_TILES:
         packed_offset = tile_id * (BLOCK_SIZE // ELEMENTS_PER_WORD) + lane
@@ -2116,10 +2118,12 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
     heap_base_7,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
-    PARTITION_WORDS: gl.constexpr,
+    # The partition size and the tile/program counts derived from it follow
+    # the batch; runtime so every batch shape shares one binary.
+    PARTITION_WORDS,
     BLOCK_WORDS: gl.constexpr,
-    NUM_PROGRAMS: gl.constexpr,
-    NUM_TILES: gl.constexpr,
+    NUM_PROGRAMS,
+    NUM_TILES,
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
@@ -2204,7 +2208,7 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
         [WORLD_SIZE, BLOCK_WORDS],
         shared_layout,
     )
-    rank_start: gl.constexpr = RANK * PARTITION_WORDS
+    rank_start = RANK * PARTITION_WORDS
 
     # Reduce only this rank's partition of the full input into symmetric scratch.
     tile_id = block_id

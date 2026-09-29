@@ -1048,6 +1048,13 @@ setup(
             "csrc/*.jinja",
             "csrc/include/*",
         ],
+        # Petit Gluon compiles its small HIP VMM binding lazily on first use.
+        "tokenspeed_kernel.thirdparty.gluon_petit": [
+            "LICENSE.txt",
+            "README.md",
+            "lib/pybind/*.cc",
+            "lib/pybind/*.h",
+        ],
     },
     cmdclass={
         "build_native": BuildNative,

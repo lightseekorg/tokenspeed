@@ -36,6 +36,7 @@ from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.sampling.registry import create_sampling_backend
 from tokenspeed.runtime.utils.nvtx import set_nvtx_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -137,22 +138,24 @@ def create_model_runner(
     global_rank: int,
 ):
     """Create the main model runner and optional draft model runner."""
-    model_runner = ModelRunner(
-        model_config=model_config,
-        gpu_id=gpu_id,
-        server_args=server_args,
-        global_rank=global_rank,
-    )
-
-    draft_model_runner = None
-    if draft_model_config is not None:
-        draft_model_runner = ModelRunner(
-            model_config=draft_model_config,
+    with startup_phase("weights.target", rank=global_rank):
+        model_runner = ModelRunner(
+            model_config=model_config,
             gpu_id=gpu_id,
             server_args=server_args,
             global_rank=global_rank,
-            is_draft_worker=True,
         )
+
+    draft_model_runner = None
+    if draft_model_config is not None:
+        with startup_phase("weights.draft", rank=global_rank):
+            draft_model_runner = ModelRunner(
+                model_config=draft_model_config,
+                gpu_id=gpu_id,
+                server_args=server_args,
+                global_rank=global_rank,
+                is_draft_worker=True,
+            )
         if server_args.speculative_algorithm is not None:
             configure_draft_target(server_args, model_runner, draft_model_runner)
 

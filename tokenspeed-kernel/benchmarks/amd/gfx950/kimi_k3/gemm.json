@@ -29,6 +29,79 @@
         "max_regression_absolute_us": 1.0,
         "max_relative_mad": 0.05
       }
+    },
+    {
+      "id": "kimi_k3.gemm.linear_attnres_partials/gluon_linear_attnres_partials_gfx950/tp8-kda_qkvfab-n6288-k7168-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "linear_attnres_partials",
+        "parameters": {
+          "tokens": [1, 2, 4],
+          "input_size": 7168,
+          "output_size": 6288,
+          "num_blocks": [1, 8],
+          "dtype": "bfloat16",
+          "eps": 1e-05
+        },
+        "registration": "gluon_linear_attnres_partials_gfx950",
+        "cold_cache": true,
+        "seed": 4602
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.linear_attnres_partials/gluon_linear_attnres_partials_gfx950/tp8-mla_qkv_gate-n3648-k7168-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "linear_attnres_partials",
+        "parameters": {
+          "tokens": [1, 2, 4],
+          "input_size": 7168,
+          "output_size": 3648,
+          "num_blocks": [1, 8],
+          "dtype": "bfloat16",
+          "eps": 1e-05
+        },
+        "registration": "gluon_linear_attnres_partials_gfx950",
+        "cold_cache": true,
+        "seed": 4603
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.decode_gemv/triton_rowcta_gemv/tp8-mla_qkv_gate-m1-n3648-k7168-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "decode_gemv",
+        "parameters": {
+          "M": 1,
+          "N": 3648,
+          "K": 7168,
+          "dtype": "bfloat16"
+        },
+        "registration": "triton_rowcta_gemv",
+        "cold_cache": true,
+        "seed": 4604
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
     }
   ]
 }
