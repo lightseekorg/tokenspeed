@@ -189,8 +189,11 @@ def _load_builtin_generators() -> None:
         prepare_mm,
     )
     from tokenspeed_kernel.benchmark.generators.kda import (
+        prepare_kda_fused_paged_decode,
+        prepare_kda_fused_paged_verify,
         prepare_kda_paged_decode,
         prepare_kda_paged_prefill,
+        prepare_kda_replay_commit,
     )
     from tokenspeed_kernel.benchmark.generators.mla import (
         prepare_mla_decode,
@@ -210,6 +213,15 @@ def _load_builtin_generators() -> None:
     )
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kda_paged_prefill"), prepare_kda_paged_prefill
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kda_fused_paged_decode"), prepare_kda_fused_paged_decode
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kda_fused_paged_verify"), prepare_kda_fused_paged_verify
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kda_replay_commit"), prepare_kda_replay_commit
     )
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kpool_prefill_write"), prepare_kpool_prefill_write
