@@ -757,6 +757,21 @@ def test_hybrid_dcp_accepts_builtin_groups_and_requires_history() -> None:
             dcp_size=8,
         )
 
+    history = next(g for g in groups if g.family == "history")
+    for shard_count in (1, 8):
+        window = replace(
+            history,
+            group_id="window",
+            retention="sliding_window",
+            sliding_window_tokens=256,
+            shard_count=shard_count,
+        )
+        with pytest.raises(ValueError, match="must use full-history retention"):
+            attention_registry._validate_hybrid_dcp_cache(
+                SimpleNamespace(cache_group_specs=(*groups, window)),
+                dcp_size=8,
+            )
+
 
 def test_mla_dcp_checks_backend_capability(monkeypatch) -> None:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend

@@ -1222,6 +1222,11 @@ def _validate_hybrid_dcp_cache(spec: CachePoolSpec, *, dcp_size: int) -> None:
     ):
         raise ValueError("Hybrid MLA DCP requires a full-history cache group")
     for group in groups:
+        if group.family == "history" and group.retention != "full_history":
+            raise ValueError(
+                f"Hybrid MLA DCP cache group {group.group_id!r} "
+                "must use full-history retention"
+            )
         expected = dcp_size if group.family == "history" else 1
         if group.shard_count != expected:
             raise ValueError(
