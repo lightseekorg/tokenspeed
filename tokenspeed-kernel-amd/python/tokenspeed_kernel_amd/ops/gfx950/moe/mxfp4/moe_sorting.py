@@ -93,8 +93,9 @@ def _moe_sorting_stage1_kernel(
     topk_ids_ptr,  # (numel,) int32, row-major (M, TOPK)
     tokens_cnts_ptr,  # (num_programs + 1, E) int32
     num_experts: gl.constexpr,
-    numel: gl.constexpr,
-    tokens_per_program: gl.constexpr,
+    # Route and program counts follow the batch; runtime so shapes share one binary.
+    numel,
+    tokens_per_program,
     EXPERT_START: gl.constexpr,
     ROUTE_BLOCK: gl.constexpr,
     EXPERT_PAD: gl.constexpr,
@@ -146,7 +147,8 @@ def _moe_sorting_stage1_kernel(
 def _moe_sorting_stage2_kernel(
     tokens_cnts_ptr,  # (num_programs + 1, E) int32
     num_experts: gl.constexpr,
-    num_programs: gl.constexpr,
+    # Route and program counts follow the batch; runtime so shapes share one binary.
+    num_programs,
     PROGRAM_PAD: gl.constexpr,
 ):
     """Column-wise inclusive prefix sum over programs (vectorized).
@@ -173,7 +175,8 @@ def _moe_sorting_stage3_kernel(
     cumsum_ptr,  # (E + 1,) int32
     m_total,  # python int -> int32 scalar
     num_experts: gl.constexpr,
-    num_programs: gl.constexpr,
+    # Route and program counts follow the batch; runtime so shapes share one binary.
+    num_programs,
     block_size: gl.constexpr,
     E_PAD: gl.constexpr,
 ):
@@ -208,10 +211,11 @@ def _moe_sorting_stage4_kernel(
     tokens_cnts_ptr,  # (num_programs + 1, E) int32
     cumsum_ptr,  # (E + 1,) int32
     num_experts: gl.constexpr,
-    num_programs: gl.constexpr,
+    # Route and program counts follow the batch; runtime so shapes share one binary.
+    num_programs,
     block_size: gl.constexpr,
-    numel: gl.constexpr,
-    tokens_per_program: gl.constexpr,
+    numel,
+    tokens_per_program,
     TOPK: gl.constexpr,
     EXPERT_START: gl.constexpr,
     ROUTE_BLOCK: gl.constexpr,

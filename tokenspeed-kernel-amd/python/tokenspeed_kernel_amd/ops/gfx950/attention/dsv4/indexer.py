@@ -129,7 +129,7 @@ def _candidate_page_rows(
     token,
     block_table_stride,
     PAGE_SIZE: gl.constexpr,
-    BLOCK_TABLE_COLS: gl.constexpr,
+    block_table_cols,
     IS_PREFILL: gl.constexpr,
     HAS_BASE_OFFSETS: gl.constexpr,
 ):
@@ -143,7 +143,7 @@ def _candidate_page_rows(
     logical_page = logical_position // PAGE_SIZE
     if IS_PREFILL and HAS_BASE_OFFSETS:
         logical_page -= gl.load(block_table_base_offsets + request).to(gl.int32)
-    safe_logical_page = gl.minimum(gl.maximum(logical_page, 0), BLOCK_TABLE_COLS - 1)
+    safe_logical_page = gl.minimum(gl.maximum(logical_page, 0), block_table_cols - 1)
     physical_page = gl.amd.cdna4.buffer_load(
         ptr=block_table,
         offsets=(request * block_table_stride + safe_logical_page).to(gl.int32),
@@ -173,7 +173,7 @@ def _score_query_group(
     dot_b_layout: gl.constexpr,
     b_scale_layout: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
-    BLOCK_TABLE_COLS: gl.constexpr,
+    block_table_cols,
     IS_PREFILL: gl.constexpr,
     HAS_BASE_OFFSETS: gl.constexpr,
 ):
@@ -194,7 +194,7 @@ def _score_query_group(
         token,
         block_table_stride,
         PAGE_SIZE,
-        BLOCK_TABLE_COLS,
+        block_table_cols,
         IS_PREFILL,
         HAS_BASE_OFFSETS,
     )
@@ -222,7 +222,7 @@ def _score_query_group(
         token,
         block_table_stride,
         PAGE_SIZE,
-        BLOCK_TABLE_COLS,
+        block_table_cols,
         IS_PREFILL,
         HAS_BASE_OFFSETS,
     )
@@ -267,6 +267,7 @@ def _score_query_group(
         "stride_w_token",
         "stride_w_head",
         "block_table_stride",
+        "block_table_cols",
         "logits_stride",
         "page_stride_bytes",
     )
@@ -295,7 +296,7 @@ def _dsv4_mxfp4_logits_kernel(
     max_candidates,
     NUM_HEADS: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
-    BLOCK_TABLE_COLS: gl.constexpr,
+    block_table_cols,
     BLOCK_N: gl.constexpr,
     CHUNK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
@@ -412,7 +413,7 @@ def _dsv4_mxfp4_logits_kernel(
             dot_b_layout,
             b_scale_layout,
             PAGE_SIZE,
-            BLOCK_TABLE_COLS,
+            block_table_cols,
             IS_PREFILL,
             HAS_BASE_OFFSETS,
         )
@@ -435,7 +436,7 @@ def _dsv4_mxfp4_logits_kernel(
             dot_b_layout,
             b_scale_layout,
             PAGE_SIZE,
-            BLOCK_TABLE_COLS,
+            block_table_cols,
             IS_PREFILL,
             HAS_BASE_OFFSETS,
         )
@@ -459,7 +460,7 @@ def _dsv4_mxfp4_logits_kernel(
                 dot_b_layout,
                 b_scale_layout,
                 PAGE_SIZE,
-                BLOCK_TABLE_COLS,
+                block_table_cols,
                 IS_PREFILL,
                 HAS_BASE_OFFSETS,
             )
@@ -482,7 +483,7 @@ def _dsv4_mxfp4_logits_kernel(
                 dot_b_layout,
                 b_scale_layout,
                 PAGE_SIZE,
-                BLOCK_TABLE_COLS,
+                block_table_cols,
                 IS_PREFILL,
                 HAS_BASE_OFFSETS,
             )
@@ -679,7 +680,7 @@ def _dsv4_mxfp4_logits(
         max_candidates,
         NUM_HEADS=q.shape[1],
         PAGE_SIZE=page_size,
-        BLOCK_TABLE_COLS=block_table.shape[1],
+        block_table_cols=block_table.shape[1],
         BLOCK_N=_BLOCK_N,
         CHUNK_N=_CHUNK_N,
         NUM_WARPS=2,
