@@ -200,12 +200,18 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     """
 
     gl.static_assert(
-        BLOCK_M == 32 or BLOCK_M == 64 or BLOCK_M == 128,
-        "1x2 kernel requires BLOCK_M in {32, 64, 128}",
+        BLOCK_M == 32
+        or BLOCK_M == 64
+        or BLOCK_M == 128
+        or (BLOCK_M == 16 and A_FORMAT == "e2m1"),
+        "1x2 kernel requires BLOCK_M in {32, 64, 128}, or 16 for E2M1",
     )
     gl.static_assert(
-        SORT_BLOCK_M == 32 or SORT_BLOCK_M == 64 or SORT_BLOCK_M == 128,
-        "1x2 kernel requires SORT_BLOCK_M in {32, 64, 128}",
+        SORT_BLOCK_M == 16
+        or SORT_BLOCK_M == 32
+        or SORT_BLOCK_M == 64
+        or SORT_BLOCK_M == 128,
+        "1x2 kernel requires SORT_BLOCK_M in {16, 32, 64, 128}",
     )
     gl.static_assert(SORT_BLOCK_M % BLOCK_M == 0)
     gl.static_assert(BLOCK_N == 256, "1x2 kernel requires BLOCK_N=256")
@@ -286,6 +292,14 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
             [1, 0],
         )
         shared_a_m_bases: gl.constexpr = []
+    elif BLOCK_M == 16:
+        gload_a_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 16],
+            [16, 4],
+            [1, 4],
+            [1, 0],
+        )
+        shared_a_m_bases: gl.constexpr = [[1, 0], [2, 0], [4, 0], [8, 0]]
     elif BLOCK_M == 32:
         gload_a_layout: gl.constexpr = gl.BlockedLayout(
             [1, 16],
@@ -390,8 +404,14 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
             flat_tile = pid_n * num_pid_m + pid_m
         else:
             flat_tile = cta_id
-            pid_m = flat_tile % num_pid_m
-            pid_n = flat_tile // num_pid_m
+            if not USE_REDUCE and A_FORMAT == "e2m1":
+                # Spread simultaneous atomic updates across output columns,
+                # instead of having every expert update the same N tile.
+                pid_m = flat_tile // num_pid_n
+                pid_n = flat_tile % num_pid_n
+            else:
+                pid_m = flat_tile % num_pid_m
+                pid_n = flat_tile // num_pid_m
         tile_ok = (
             (pid_n < num_pid_n)
             & (pid_m < num_pid_m)
@@ -460,11 +480,10 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 )
 
                 if COALESCE_SCALES:
-                    if DIRECT_SCALE_LAYOUT:
-                        # Diagnostic path: load A scales directly in the MFMA
-                        # scale layout.  This removes the full-layout
-                        # convert_layout that emits v_cndmask near line 395,
-                        # at the cost of a less coalescer-friendly load shape.
+                    if DIRECT_SCALE_LAYOUT or BLOCK_M == 16:
+                        # A 16-row tile covers half of the 32-row scale panel.
+                        # Address its half directly in the MFMA layout instead
+                        # of reshaping it into a whole-panel coalesced load.
                         m_full_layout: gl.constexpr = gl.SliceLayout(
                             1, a_scale_layout_full
                         )
@@ -982,12 +1001,25 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 # BM64, and [8, 64] at BM32. A fixed four-row ownership
                 # would alias rows for the smaller tiles.
                 if MFMA_STORE_LAYOUT:
-                    # Small-M atomic A/B path: keep the accumulator's MFMA
-                    # layout through the store to avoid the convert_layout
-                    # LDS shuffle/barrier tax.  Stores are less coalesced, so
-                    # reduce mode keeps the coalesced C-shuffle layout because
-                    # the launcher pairs MFMA-store layout with atomic mode.
+                    # Keep the existing E4M3 atomic epilogue in MFMA layout.
                     store_layout: gl.constexpr = mfma_layout
+                elif not USE_REDUCE:
+                    # Packed BF16 atomics update two adjacent columns per lane.
+                    # Unlike the eight-value plain-store layout below, a half
+                    # wave issues one contiguous 128-byte span per instruction.
+                    store_layout: gl.constexpr = gl.BlockedLayout(
+                        size_per_thread=[1, 2],
+                        threads_per_warp=[2, 32],
+                        warps_per_cta=[4, 1],
+                        order=[1, 0],
+                    )
+                elif BLOCK_M == 16:
+                    store_layout: gl.constexpr = gl.BlockedLayout(
+                        size_per_thread=[1, 8],
+                        threads_per_warp=[4, 16],
+                        warps_per_cta=[4, 1],
+                        order=[1, 0],
+                    )
                 else:
                     store_layout: gl.constexpr = gl.BlockedLayout(
                         size_per_thread=[BLOCK_M // 32, 8],
@@ -1555,13 +1587,13 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
 
 @gluon.jit
 def gluon_mxfp4_moe_stage2_reduce_kernel(
-    partials_ptr,  # bf16, shape [token_num, topk, N], contiguous
-    out_ptr,  # bf16, shape [token_num, N]
+    partials_ptr,  # shape [token_num, topk, N]
+    out_ptr,  # shape [token_num, N]
     token_num,
     N,
-    stride_pt,  # partials: stride for token dim = topk * N
-    stride_ps,  # partials: stride for slot  dim = N
-    stride_pn,  # partials: stride for col   dim = 1
+    stride_pt,  # partials: stride for token dim
+    stride_ps,  # partials: stride for slot dim
+    stride_pn,  # partials: stride for col dim
     stride_ot,
     stride_on,
     BLOCK_M: gl.constexpr,
@@ -1573,19 +1605,18 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
     Grid: ``(cdiv(token_num, BLOCK_M) * cdiv(N, BLOCK_N),)``. Each CTA
     owns a ``[BLOCK_M, BLOCK_N]`` tile of the output and reads
     ``TOP_K`` slices from the partial buffer, accumulating in fp32 and
-    casting back to bf16 at the end. ``TOP_K`` is a constexpr so the
-    accumulation loop unrolls (TOP_K is small: 4-10 across the models
-    we serve).
+    casting to the output dtype at the end. ``TOP_K`` is a constexpr so the
+    accumulation loop unrolls.
     """
     pid = gl.program_id(axis=0)
     num_pid_n = gl.cdiv(N, BLOCK_N)
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    # Plain blocked layout for the bf16 tile. 1 wave / CTA, NUM_WARPS=1.
+    # Plain blocked layout for the tile. 1 wave / CTA, NUM_WARPS=1.
     blk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[16, 4],
+        size_per_thread=[1, 4],
+        threads_per_warp=[1, 64],
         warps_per_cta=[1, 1],
         order=[1, 0],
     )
@@ -1676,9 +1707,9 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
 
     by launching the GEMM kernel followed, in reduce mode, by a small
     reduce that sums each token's ``topk`` partial contributions into
-    ``out``. The wrapper can instead use the direct-atomic path for
-    small M, but the standalone Kimi comparison currently forces reduce
-    mode at M512 because this Gluon atomic epilogue is still slower.
+    ``out``. The direct-atomic path instead combines in BF16 inside GEMM2,
+    avoiding the partials buffer and reduction launch. Atomic accumulation
+    order is not deterministic and differs from the FP32 reduction.
 
     Steps below correspond to the ``# Step N:`` comments in the body:
       1. Validate inputs; reject unsupported modes.
@@ -1707,7 +1738,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
                        tensors retain physical CDNA4 panel pitches
         out          : (token_num, D) bf16 -- final per-token output
         sorted_*     : generated with ``sort_block_m`` when it differs
-                       from compute ``block_m``; use 32/64/128 to mirror
+                       from compute ``block_m``; use 16/32/64/128 to mirror
                        FlyDSL sort_block_m
 
     Unsupported: ``quant_type`` and ``activation`` are signature
@@ -1802,14 +1833,14 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         )
 
     BLOCK_M = 128 if block_m is None else int(block_m)
-    if BLOCK_M not in (32, 64, 128):
+    if BLOCK_M not in (16, 32, 64, 128) or (BLOCK_M == 16 and a_format != "e2m1"):
         raise NotImplementedError(
-            f"stage2 1x2 block_m must be one of 32, 64, 128; got {BLOCK_M}"
+            f"stage2 1x2 block_m must be 32, 64, 128, or 16 for E2M1; got {BLOCK_M}"
         )
     SORT_BLOCK_M = BLOCK_M if sort_block_m is None else int(sort_block_m)
-    if SORT_BLOCK_M not in (32, 64, 128) or SORT_BLOCK_M % BLOCK_M != 0:
+    if SORT_BLOCK_M not in (16, 32, 64, 128) or SORT_BLOCK_M % BLOCK_M != 0:
         raise NotImplementedError(
-            "stage2 1x2 sort_block_m must be one of 32, 64, 128 "
+            "stage2 1x2 sort_block_m must be one of 16, 32, 64, 128 "
             f"and divisible by block_m; got {SORT_BLOCK_M} for block_m={BLOCK_M}"
         )
     BLOCK_N = 256
@@ -1841,29 +1872,13 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
     # epilogue phase) is ~3.6% faster and bit-exact, so it is always on.
     DEFER_EPILOGUE = True
 
-    # Atomic vs reduce dispatch.
-    #
-    # At small M, the cross-slot reduce overhead (extra scratch write +
-    # separate reduce kernel launch) dominates: at M=16 the reduce alone
-    # is ~12 % of the stage 2 budget while reducing essentially nothing
-    # (each output row has at most a handful of contributors and the
-    # atomic_add path costs ~3-4 atomic_pk_add_bf16 per row instead).
-    #
-    # At large M the atomic_add path loses to scratch+reduce because
-    # M * topk concurrent atomic_pk_add_bf16 ops contend on the same
-    # output rows (the cost is in serialization at the HBM line, not
-    # the instruction).
-    #
-    # With FlyDSL-like smaller sort blocks, the reduce path is faster
-    # starting at M512: direct atomic avoids the reduce launch, but this
-    # Gluon epilogue still loses to topk-way output-row contention.
-    # Keep tiny/decode shapes on atomic and switch to scratch+reduce for
-    # M>=512. The ``force_reduce`` caller argument overrides the tuned default.
+    # Preserve the standalone launcher's default; the package dispatcher
+    # explicitly selects combine mode using the local/global expert range.
     if force_reduce is not None:
         _use_reduce = bool(force_reduce)
     else:
         _use_reduce = token_num >= 512
-    _mfma_store_layout = not _use_reduce
+    _mfma_store_layout = not _use_reduce and a_format == "e4m3"
 
     # See stage 1: the async-copy path uses raw bytes in LDS and the scaled
     # MFMA interprets them as E4M3 according to ``A_FORMAT``.
@@ -1945,9 +1960,9 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
 
     if _use_reduce:
         # Step 6: reduce. Sum partials[token, :, n] over the topk dim
-        # (fp32 accumulate, bf16 output) into `out`. Tile (32, 256),
+        # (fp32 accumulate, bf16 output) into `out`. Tile (1, 256),
         # 1 wave/CTA.
-        BLOCK_M_R = 16 if token_num >= 4096 else 32
+        BLOCK_M_R = 1
         BLOCK_N_R = 256
         NUM_WARPS_R = 1
         rgrid = (triton.cdiv(token_num, BLOCK_M_R) * triton.cdiv(N, BLOCK_N_R),)

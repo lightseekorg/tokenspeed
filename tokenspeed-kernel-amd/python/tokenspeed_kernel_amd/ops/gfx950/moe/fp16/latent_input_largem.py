@@ -192,7 +192,8 @@ def gluon_latent_input_largem_gfx950(
     BLOCK_K: gl.constexpr,
     WARPS_M: gl.constexpr,
     WARPS_N: gl.constexpr,
-    GRID_MN: gl.constexpr,
+    # Follows M (the token count); runtime so every batch shape shares one binary.
+    GRID_MN,
     NUM_XCDS: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
 ):

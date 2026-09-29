@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from unittest import mock
+
 import pytest
 import torch
 from kimi3_reference import (
@@ -1214,23 +1217,38 @@ def test_package_prefill_low_density_route_capacity_gfx950() -> None:
     assert int(num_valid[0].cpu()) == expected_capacity
 
 
-def test_stage1_quantized_output_rejects_partial_scale_panel_gfx950() -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
-        invoke_gluon_mxfp4_moe_stage1,
+@pytest.mark.parametrize(
+    "rows,output_k,scale_rows,block_m,error",
+    [
+        (64, 128, 64, 64, "complete CDNA4 scale panels"),
+        (16, 256, 16, 16, "out_scale must have shape"),
+        (48, 256, 48, 16, "out_scale must have shape"),
+        (16, 256, 32, 16, None),
+        (48, 256, 64, 16, None),
+    ],
+)
+def test_stage1_quantized_output_scale_panels_gfx950(
+    monkeypatch, rows, output_k, scale_rows, block_m, error
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import prefill_stage1
+
+    # Test host validation without allowing an undersized buffer onto the GPU.
+    kernel = mock.MagicMock()
+    monkeypatch.setattr(prefill_stage1, "gluon_mxfp4_moe_stage1_kernel", kernel)
+    hidden_states = torch.empty((64, 128), dtype=torch.uint8, device="cuda")
+    w1 = torch.empty((1, 2 * output_k, 128), dtype=torch.uint8, device="cuda")
+    sorted_ids = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    sorted_experts = torch.zeros(rows // block_m, dtype=torch.int32, device="cuda")
+    num_valid = torch.tensor([rows, rows], dtype=torch.int32, device="cuda")
+    out = torch.empty((rows, output_k // 2), dtype=torch.uint8, device="cuda")
+    out_scale = torch.empty(
+        (scale_rows, output_k // 32), dtype=torch.uint8, device="cuda"
     )
+    a_scale = torch.empty((64, 8), dtype=torch.uint8, device="cuda")
+    w_scale = torch.empty((1, 2 * output_k, 8), dtype=torch.uint8, device="cuda")
 
-    hidden_states = torch.empty((64, 64), dtype=torch.uint8, device="cuda")
-    w1 = torch.empty((1, 256, 64), dtype=torch.uint8, device="cuda")
-    sorted_ids = torch.zeros(64, dtype=torch.int32, device="cuda")
-    sorted_experts = torch.zeros(1, dtype=torch.int32, device="cuda")
-    num_valid = torch.tensor([64, 64], dtype=torch.int32, device="cuda")
-    out = torch.empty((64, 64), dtype=torch.uint8, device="cuda")
-    out_scale = torch.empty((64, 4), dtype=torch.uint8, device="cuda")
-    a_scale = torch.empty((64, 4), dtype=torch.uint8, device="cuda")
-    w_scale = torch.empty((1, 256, 4), dtype=torch.uint8, device="cuda")
-
-    with pytest.raises(ValueError, match="complete CDNA4 scale panels"):
-        invoke_gluon_mxfp4_moe_stage1(
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        prefill_stage1.invoke_gluon_mxfp4_moe_stage1(
             hidden_states,
             w1,
             None,
@@ -1241,14 +1259,18 @@ def test_stage1_quantized_output_rejects_partial_scale_panel_gfx950() -> None:
             1,
             w1_scale=w_scale,
             a1_scale=a_scale,
-            block_m=64,
+            block_m=block_m,
             sorted_weights=None,
             b_preshuffled=True,
             output_sorted=True,
             output_quantized=True,
             out_scale=out_scale,
-            output_k=128,
+            output_k=output_k,
         )
+    if error:
+        kernel.__getitem__.assert_not_called()
+    else:
+        kernel.__getitem__.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -1364,9 +1386,12 @@ def test_package_prefill_intermediate_padding_gfx950(
 
 
 @pytest.mark.parametrize("logical_k", [256, 384, 512, 640])
+@pytest.mark.parametrize("topk", [2, 16])
 @pytest.mark.parametrize(
     "a_format,input_sorted,b_gdot128,force_reduce,block_m,sort_block_m",
     [
+        ("e2m1", True, True, True, 16, 16),
+        ("e2m1", False, False, False, 16, 32),
         ("e2m1", True, True, True, 64, 64),
         ("e2m1", False, False, False, 32, 64),
         ("e4m3", True, True, True, 64, 64),
@@ -1378,7 +1403,14 @@ def test_package_prefill_intermediate_padding_gfx950(
     ],
 )
 def test_stage2_logical_k_ignores_padding_gfx950(
-    logical_k, a_format, input_sorted, b_gdot128, force_reduce, block_m, sort_block_m
+    logical_k,
+    topk,
+    a_format,
+    input_sorted,
+    b_gdot128,
+    force_reduce,
+    block_m,
+    sort_block_m,
 ) -> None:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import gluon_moe_sorting
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
@@ -1396,18 +1428,24 @@ def test_stage2_logical_k_ignores_padding_gfx950(
         shuffle_weight_for_gluon_dot_layout,
     )
 
-    tokens, topk, experts, n = 73, 2, 4, 256
+    tokens, experts, n = 73, 4, 256
     physical_k = (logical_k + 255) // 256 * 256
     a_div = 1 if a_format == "e4m3" else 2
     generator = torch.Generator(device="cuda").manual_seed(104 + logical_k)
     ids = torch.arange(tokens * topk, device="cuda", dtype=torch.int32)
     ids = (ids % (experts - 1)).view(tokens, topk)
-    weights = (
-        torch.tensor([0.25, 0.75], device="cuda").expand(tokens, topk).contiguous()
-    )
+    weights = torch.full((tokens, topk), 1 / topk, device="cuda")
+    if topk == 2:
+        weights = (
+            torch.tensor([0.25, 0.75], device="cuda").expand(tokens, topk).contiguous()
+        )
     sorted_ids, sorted_weights, sorted_experts, valid, out = gluon_moe_sorting(
         ids, weights, experts, n, torch.bfloat16, sort_block_m
     )
+    output_storage = torch.full(
+        (tokens, n + 16), 42, dtype=torch.bfloat16, device="cuda"
+    )
+    out = output_storage[:, :n]
     raw_a = torch.randint(
         0,
         256,
@@ -1489,35 +1527,69 @@ def test_stage2_logical_k_ignores_padding_gfx950(
     else:
         w = _b_preshuffle_3d(raw_w)
     a_view = a[:, : logical_k // a_div]
-    result = invoke_gluon_mxfp4_moe_stage2_1x2(
-        a_view,
-        None,
-        w,
-        sorted_ids,
-        sorted_experts,
-        valid,
-        out,
-        topk,
-        w2_scale=w_scale,
-        a2_scale=a_scale,
-        sorted_weights=sorted_weights,
-        block_m=block_m,
-        sort_block_m=sort_block_m,
-        b_preshuffled=True,
-        b_gdot128=b_gdot128,
-        force_reduce=force_reduce,
-        input_sorted=input_sorted,
-        a_format=a_format,
-    )
+
+    def run():
+        return invoke_gluon_mxfp4_moe_stage2_1x2(
+            a_view,
+            None,
+            w,
+            sorted_ids,
+            sorted_experts,
+            valid,
+            out,
+            topk,
+            w2_scale=w_scale,
+            a2_scale=a_scale,
+            sorted_weights=sorted_weights,
+            block_m=block_m,
+            sort_block_m=sort_block_m,
+            b_preshuffled=True,
+            b_gdot128=b_gdot128,
+            force_reduce=force_reduce,
+            input_sorted=input_sorted,
+            a_format=a_format,
+        )
+
+    result = run()
     assert result is out
     assert a_view.stride() == (physical_k // a_div, 1)
     assert a_scale.shape == (sorted_ids.numel(), physical_k // 32)
-    torch.testing.assert_close(result, reference, rtol=0.0, atol=0.0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        # Every replay must clear the atomic destination, not accumulate into
+        # the previous invocation or overwrite the adjacent output columns.
+        out.fill_(float("nan"))
+        graph.replay()
+        assert torch.all(output_storage[:, n:] == 42)
+        if force_reduce or topk == 2:
+            torch.testing.assert_close(out, reference, rtol=0.0, atol=0.0)
+        else:
+            # BF16 atomics round after each route; bound cancellation error by
+            # the sum of absolute partials, not by the near-zero final sum.
+            unit_roundoff = torch.finfo(torch.bfloat16).eps / 2
+            gamma = (topk - 1) * unit_roundoff / (1 - (topk - 1) * unit_roundoff)
+            magnitude = partials.view(tokens, topk, n).float().abs().sum(1)
+            error = (out.float() - reference.float()).abs()
+            assert torch.all(error <= (gamma + unit_roundoff) * magnitude)
+            assert error.norm() / reference.float().norm() < 0.01
 
 
 @pytest.mark.parametrize(
     ("num_tokens", "expected"),
-    [(128, 128), (129, 64), (192, 64), (193, 128)],
+    [
+        (8, 16),
+        (9, 32),
+        (32, 32),
+        (33, 64),
+        (64, 64),
+        (65, 128),
+        (128, 128),
+        (129, 64),
+        (192, 64),
+        (193, 128),
+    ],
 )
 def test_package_prefill_block_m_selection_gfx950(
     num_tokens: int,
@@ -1530,13 +1602,34 @@ def test_package_prefill_block_m_selection_gfx950(
     assert _select_package_prefill_block_m(num_tokens, 16, 16) == expected
 
 
-def test_tp_situ_package_prefill_block64_matches_block128_gfx950(
+@pytest.mark.parametrize("block_m", [16, 32, 64])
+@pytest.mark.parametrize(
+    "num_tokens,num_experts", [(65, 16), (72, 64), (160, 16), (2048, 16), (2049, 16)]
+)
+def test_tp_situ_package_prefill_tiles_match_block128_gfx950(
     monkeypatch: pytest.MonkeyPatch,
+    block_m: int,
+    num_tokens: int,
+    num_experts: int,
 ) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4 import prefill_stage2
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe as fused_moe
 
+    stage2 = prefill_stage2.invoke_gluon_mxfp4_moe_stage2_1x2
+    selected_combine_modes = []
+
+    def reduce_stage2(*args, **kwargs):
+        # Compare tile arithmetic independently of atomic summation order.
+        selected_combine_modes.append(kwargs["force_reduce"])
+        kwargs["force_reduce"] = True
+        return stage2(*args, **kwargs)
+
+    monkeypatch.setattr(
+        prefill_stage2, "invoke_gluon_mxfp4_moe_stage2_1x2", reduce_stage2
+    )
+
     generator = torch.Generator(device="cuda").manual_seed(20260828)
-    num_tokens, num_experts, top_k = 160, 16, 16
+    top_k = 16
     latent_size, intermediate_size = 3584, 384
     module, _ = _make_mxfp4_module(
         num_experts=num_experts,
@@ -1575,7 +1668,12 @@ def test_tp_situ_package_prefill_block64_matches_block128_gfx950(
     )
     tokenspeed_kernel.moe_process_weights(plan, module)
 
-    block64 = tokenspeed_kernel.moe_apply(
+    monkeypatch.setattr(
+        fused_moe,
+        "_select_package_prefill_block_m",
+        lambda *_args: block_m,
+    )
+    actual = tokenspeed_kernel.moe_apply(
         plan,
         hidden_states,
         module,
@@ -1597,7 +1695,8 @@ def test_tp_situ_package_prefill_block64_matches_block128_gfx950(
         topk_ids=topk_ids,
     )
 
-    torch.testing.assert_close(block64, block128, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(actual, block128, atol=0.0, rtol=0.0)
+    assert selected_combine_modes == [num_tokens > 2048] * 2
 
 
 def test_ep_situ_package_prefill_matches_reference_gfx950(
@@ -1925,3 +2024,67 @@ def test_situ_warp_decode_matches_reference_above_old_bound_gfx950(
         situ_linear_beta=25.0,
     )
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
+
+
+@pytest.mark.parametrize("partial_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("split_major", [False, True])
+@pytest.mark.parametrize(
+    ("num_tokens", "topk", "width", "column_stride"),
+    [
+        (1, 1, 1, 1),
+        (5, 2, 127, 2),
+        (31, 4, 257, 1),
+        (84, 16, 3584, 1),
+        (96, 16, 3584, 1),
+        (112, 16, 3584, 1),
+        (513, 8, 7168, 1),
+        (8192, 16, 3584, 1),
+    ],
+)
+def test_partial_reduce_matches_reference_gfx950(
+    num_tokens: int,
+    topk: int,
+    width: int,
+    column_stride: int,
+    partial_dtype: torch.dtype,
+    split_major: bool,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
+        gluon_mxfp4_moe_stage2_reduce_kernel,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    partials = torch.randn(
+        (num_tokens, topk, width * column_stride),
+        dtype=partial_dtype,
+        device="cuda",
+        generator=generator,
+    )
+    if split_major:
+        partials = partials.transpose(0, 1).contiguous().transpose(0, 1)
+    partials = partials[:, :, ::column_stride]
+    expected = torch.zeros((num_tokens, width), dtype=torch.float32, device="cuda")
+    for slot in range(topk):
+        expected += partials[:, slot].float()
+    expected = expected.to(torch.bfloat16)
+    actual = torch.empty(
+        (num_tokens, width * column_stride), dtype=torch.bfloat16, device="cuda"
+    )[:, ::column_stride]
+
+    gluon_mxfp4_moe_stage2_reduce_kernel[(num_tokens * ((width + 255) // 256),)](
+        partials,
+        actual,
+        num_tokens,
+        width,
+        partials.stride(0),
+        partials.stride(1),
+        partials.stride(2),
+        actual.stride(0),
+        actual.stride(1),
+        BLOCK_N=256,
+        BLOCK_M=1,
+        TOP_K=topk,
+        num_warps=1,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
