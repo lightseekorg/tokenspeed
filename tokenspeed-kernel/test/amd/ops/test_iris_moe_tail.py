@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Producer ownership, lifetime and ordering of the token-sharded K3 tail."""
+"""Verify the MoE tail when each rank handles consecutive token rows."""
 
 import socket
 from contextlib import ExitStack
@@ -53,14 +53,14 @@ def _moe_tail_worker(rank: int, port: int) -> None:
 
 def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -> None:
     from tokenspeed_kernel.ops.communication import triton as comm
-    from tokenspeed_kernel.ops.communication._iris.prefill import (
+    from tokenspeed_kernel.ops.communication.iris import (
+        create_iris_ar_rmsnorm_state,
+        iris_kimi3_moe_tail,
         iris_moe_add_push_gather_gluon_kernel,
         iris_moe_reduce_scatter_gluon_kernel,
     )
-    from tokenspeed_kernel.ops.communication.iris import create_iris_ar_rmsnorm_state
     from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_latent_projection_add3
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
-    from tokenspeed_kernel.ops.moe.iris import iris_kimi3_moe_tail
 
     backing = comm.TritonCommState(
         group=group,
@@ -178,22 +178,22 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
             restore(inputs, sources)
             if rank == rows % 8:
                 torch.cuda._sleep(100_000)
-            borrowed = projected(inputs, prefix, norm_weight)
-            assert borrowed.data_ptr() == state._moe_tail_output_buf.data_ptr()
-            torch.testing.assert_close(borrowed, expected, atol=0.03125, rtol=0.015625)
-            output = borrowed.clone()
+            result = projected(inputs, prefix, norm_weight)
+            assert result.data_ptr() == state._moe_tail_output_buf.data_ptr()
+            torch.testing.assert_close(result, expected, atol=0.03125, rtol=0.015625)
+            output = result.clone()
             for tensor, source in zip(inputs, sources, strict=True):
                 torch.testing.assert_close(tensor, source, atol=0, rtol=0)
-            # Ordinary collectives preserve the borrowed result.
+            # Ordinary collectives preserve the reusable result.
             ordinary(inputs, prefix, norm_weight)
-            torch.testing.assert_close(borrowed, output, atol=0, rtol=0)
+            torch.testing.assert_close(result, output, atol=0, rtol=0)
             # Delay one rank before reusing the output as its prefix.
             restore(inputs, sources)
             if rank == rows % 8:
                 torch.cuda._sleep(100_000)
-            borrowed.copy_(prefix)
-            inplace = projected(inputs, borrowed, norm_weight)
-            assert inplace is not None and inplace.data_ptr() == borrowed.data_ptr()
+            result.copy_(prefix)
+            inplace = projected(inputs, result, norm_weight)
+            assert inplace is not None and inplace.data_ptr() == result.data_ptr()
             torch.testing.assert_close(
                 inplace.view(torch.int16), output.view(torch.int16), atol=0, rtol=0
             )
@@ -314,11 +314,11 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     restore(inputs, tuple(-t for t in base_sources))
     negative = projected(inputs, prefix, None).clone()
     restore(sources, base_sources)
-    borrowed_snapshots = [torch.empty_like(prefix) for _ in range(4)]
+    result_snapshots = [torch.empty_like(prefix) for _ in range(4)]
     torch.cuda.synchronize()
     dist.barrier()
-    borrowed_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(borrowed_graph):
+    result_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(result_graph):
         for iteration in range(4):
             for source in sources:
                 source.neg_()
@@ -327,10 +327,10 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
                 torch.cuda._sleep(100_000)
             result = projected(inputs, prefix, None)
             assert result is not None
-            borrowed_snapshots[iteration].copy_(result)
+            result_snapshots[iteration].copy_(result)
     for _ in range(3):
-        borrowed_graph.replay()
-        for iteration, result in enumerate(borrowed_snapshots):
+        result_graph.replay()
+        for iteration, result in enumerate(result_snapshots):
             oracle = negative if iteration % 2 == 0 else exact
             torch.testing.assert_close(
                 result.view(torch.int16), oracle.view(torch.int16), atol=0, rtol=0
@@ -341,8 +341,8 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     state._moe_tail_ready_flags.fill_(-2)
     torch.cuda.synchronize()
     dist.barrier()
-    borrowed_graph.replay()
-    torch.testing.assert_close(borrowed_snapshots[-1], exact, atol=0, rtol=0)
+    result_graph.replay()
+    torch.testing.assert_close(result_snapshots[-1], exact, atol=0, rtol=0)
 
     # Replay in-place residual updates against a disjoint-prefix reference.
     initial_prefix = exact.clone()
@@ -381,7 +381,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
 
 @pytest.mark.skipif(
     not current_platform().is_cdna4 or torch.cuda.device_count() < 8,
-    reason="Token-sharded Iris MoE requires eight CDNA4 GPUs",
+    reason="Iris MoE tail assigns token rows across eight CDNA4 GPUs",
 )
 def test_iris_moe_tail() -> None:
     pytest.importorskip("tokenspeed_kernel.ops.communication.iris")

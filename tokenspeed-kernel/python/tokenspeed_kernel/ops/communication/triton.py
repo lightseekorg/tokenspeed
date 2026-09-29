@@ -1926,7 +1926,8 @@ def create_state(
             zero when the state does not use AttnRes.
         enable_lamport: Allow Lamport for eligible producer-direct payloads;
             pass false for RS/AG states.
-        moe_tail_max_rows: Prepared borrowed K3 MoE result rows, or zero.
+        moe_tail_max_rows: Maximum rows in the reusable symmetric result buffer;
+            zero skips its allocation.
 
     Returns:
         The initialized communication state.

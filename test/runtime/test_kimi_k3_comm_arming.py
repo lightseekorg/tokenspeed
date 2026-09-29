@@ -520,7 +520,12 @@ def test_row_sharded_moe_tail_selection_and_fallback(
     candidate = Mock(return_value=expected if accepted else None)
     joined = Mock(return_value=(routed, shared))
     resolve = Mock(return_value=process_group)
-    monkeypatch.setattr(mod, "iris_kimi3_moe_tail", candidate)
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_kernel.ops.communication.iris",
+        SimpleNamespace(iris_kimi3_moe_tail=candidate),
+    )
+    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
     monkeypatch.setattr(mod, "kimi3_join_reduce_moe", joined)
     monkeypatch.setattr(mod, "_get_process_group", resolve)
     symm_outputs = (routed, shared) if producer_direct else None
@@ -563,6 +568,51 @@ def test_row_sharded_moe_tail_selection_and_fallback(
         owner._projection_tail.assert_called_once_with(
             routed, shared, prefix, rows, 7168
         )
+
+
+def test_row_sharded_moe_tail_skips_iris_import_on_other_platform(monkeypatch):
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    group = tuple(range(8))
+    routed = torch.empty((512, 3584), dtype=torch.bfloat16, device="meta")
+    shared = torch.empty((512, 7168), dtype=torch.bfloat16, device="meta")
+    prefix = torch.empty_like(shared)
+    fallback = object()
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(
+            pp_size=1,
+            attn=SimpleNamespace(tp_size=8, tp_group=group),
+            moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
+        ),
+        up_proj=SimpleNamespace(narrowed=False, solution="auto"),
+        routed_hidden=3584,
+        routed_norm=None,
+        execution_plan=SimpleNamespace(
+            lane_latent_norm_ar=False, comm_fusion_max_num_tokens=16
+        ),
+        _projection_tail=Mock(return_value=fallback),
+    )
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_cdna4=False)
+    )
+    monkeypatch.setitem(
+        sys.modules, "tokenspeed_kernel.ops.communication.iris", SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        module, "kimi3_join_reduce_moe", Mock(return_value=(routed, shared))
+    )
+
+    result = module.K3MoeTailComm._tail_fused_lane_ar_replicated(
+        owner,
+        routed,
+        shared,
+        prefix,
+        None,
+        (routed, shared),
+        512,
+        7168,
+    )
+    assert result is fallback
 
 
 if __name__ == "__main__":

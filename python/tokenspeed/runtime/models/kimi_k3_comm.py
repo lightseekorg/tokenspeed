@@ -57,7 +57,6 @@ from tokenspeed_kernel.ops.communication.multimem import (
     multimem_prealloc,
     multimem_stage,
 )
-from tokenspeed_kernel.ops.moe.iris import iris_kimi3_moe_tail
 from tokenspeed_kernel.ops.moe.latent_tail import (
     KimiK3LatentTailOp,
     attn_reduce_shape_supported,
@@ -1252,10 +1251,11 @@ class K3MoeTailComm:
         num_tokens: int,
         hidden_size: int,
     ) -> torch.Tensor:
-        # Replicated projection weights let each rank process its token shard.
+        # Replicated projection weights let each rank process its assigned token rows.
         # The kernel wrapper checks producer ownership before launching.
         if (
             symm_outputs is not None
+            and current_platform().is_cdna4
             and self.mapping.pp_size == 1
             and _IRIS_MOE_ROW_SHARD_MIN_TOKENS <= num_tokens <= _IRIS_MAX_TOKENS
             and self.mapping.attn.tp_size == 8
@@ -1265,6 +1265,8 @@ class K3MoeTailComm:
             and not self.up_proj.narrowed
             and self.up_proj.solution == "auto"
         ):
+            from tokenspeed_kernel.ops.communication.iris import iris_kimi3_moe_tail
+
             output = iris_kimi3_moe_tail(
                 routed_out,
                 shared_partial,
