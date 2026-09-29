@@ -356,14 +356,9 @@ class CapturableGrammarExecutor:
 
                 continue
 
-            if (
-                layout is not None
-                and layout.num_prefill_outputs <= i < layout.num_extends
-            ):
-                continue
             row_base = i * per_req_rows
             advanced = 0
-            positions = 1 if layout is not None and i < layout.num_extends else n
+            positions = n if layout is None else layout.output_width(i)
 
             for pos in range(positions):
 
@@ -572,17 +567,12 @@ def _fill_eager_bitmask(
         for i, grammar in enumerate(grammars):
             if grammar is None or grammar.finished or grammar.is_terminated():
                 continue
-            if (
-                output_layout is not None
-                and output_layout.num_prefill_outputs <= i < output_layout.num_extends
-            ):
-                continue
             row_base = i * spec_num_tokens
             advanced = 0
             positions = (
-                1
-                if output_layout is not None and i < output_layout.num_extends
-                else spec_num_tokens
+                spec_num_tokens
+                if output_layout is None
+                else output_layout.output_width(i)
             )
             for pos in range(positions):
                 if grammar.is_terminated():

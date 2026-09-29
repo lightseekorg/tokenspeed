@@ -104,10 +104,21 @@ class SharedBufferSampler:
 
 
 @pytest.mark.parametrize(
-    "p,e,d,width",
-    [(1, 2, 1, 1), (1, 2, 2, 3), (0, 1, 1, 3), (0, 1, 0, 3), (1, 2, 0, 1)],
+    "p,e,d,width,compact",
+    [
+        (1, 2, 1, 1, True),
+        (1, 2, 2, 3, True),
+        (0, 1, 1, 3, True),
+        (0, 1, 0, 3, True),
+        (1, 2, 0, 1, True),
+        (2, 3, 2, 3, True),
+        (2, 2, 2, 1, False),
+        (2, 2, 2, 3, False),
+    ],
 )
-def test_sampling_preserves_request_parameters_and_shared_outputs(p, e, d, width):
+def test_sampling_preserves_request_parameters_and_shared_outputs(
+    p, e, d, width, compact
+):
     info_cls = load_symbol(
         RUNTIME + "sampling/sampling_batch_info.py", "SamplingBatchInfo"
     )
@@ -116,6 +127,9 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(p, e, d, width
         "_run_sampling",
         owner="ModelExecutor",
         LogitsProcessorOutput=Output,
+        _sampling_info_for_requests=load_symbol(
+            RUNTIME + "execution/model_executor.py", "_sampling_info_for_requests"
+        ),
     )
     backend = SharedBufferSampler()
     executor = SimpleNamespace(
@@ -126,11 +140,17 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(p, e, d, width
         bs=e + d,
         num_extends=e,
         decode_input_ids=None,
-        output_layout=ForwardOutputLayout(e, p, d, width),
+        output_layout=ForwardOutputLayout(e, p, d, width) if compact else None,
     )
+    pool_indices = torch.tensor([17, 3, 11, 5, 13])[: e + d]
+    cache_lengths = torch.arange(32)
     info = info_cls(
-        req_pool_indices=torch.arange(e + d) + 10,
-        vocab_mask=torch.arange((e + d) * width)[:, None],
+        req_pool_indices=pool_indices,
+        temperatures=torch.arange(e + d).float() + 0.5,
+        top_ks=torch.arange(e + d) + 10,
+        valid_cache_lengths=cache_lengths,
+        batch_row_offset=7,
+        vocab_mask=torch.arange((e + d) * width)[:, None] if compact else None,
     )
     logits = torch.full((p + d * width, 32), -10.0)
     if logits.shape[0]:
@@ -146,16 +166,31 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(p, e, d, width
     )
     for kind, subset in backend.calls:
         if kind == "sample":
-            assert subset.req_pool_indices.tolist() == list(range(10, 10 + p))
-            assert subset.vocab_mask[:, 0].tolist() == list(range(0, p * width, width))
+            assert subset.req_pool_indices.tolist() == pool_indices[:p].tolist()
+            assert subset.temperatures.tolist() == [i + 0.5 for i in range(p)]
+            assert subset.top_ks.tolist() == list(range(10, 10 + p))
+            assert subset.batch_row_offset == 7
+            if compact:
+                assert subset.vocab_mask[:, 0].tolist() == list(
+                    range(0, p * width, width)
+                )
         else:
-            assert subset.req_pool_indices.tolist() == list(range(10 + e, 10 + e + d))
-            assert subset.batch_row_offset == e
-            assert subset.vocab_mask[:, 0].tolist() == list(
-                range(e * width, (e + d) * width)
-            )
-    if p:
-        assert output.next_token_logprobs[:p].tolist() == [-1.0] * p
+            assert subset.req_pool_indices.tolist() == pool_indices[e:].tolist()
+            assert subset.temperatures.tolist() == [i + 0.5 for i in range(e, e + d)]
+            assert subset.top_ks.tolist() == list(range(10 + e, 10 + e + d))
+            assert subset.batch_row_offset == 7 + e
+            if compact:
+                assert subset.vocab_mask[:, 0].tolist() == list(
+                    range(e * width, (e + d) * width)
+                )
+        assert subset.valid_cache_lengths is cache_lengths
+        if not compact:
+            assert subset.vocab_mask is None
+    if p or d:
+        assert output.next_token_logprobs.tolist() == (
+            [-float(i) for i in range(1, p + 1)]
+            + [-float(10 + i) for i in range(d * width)]
+        )
 
 
 def test_nan_and_oov_map_to_original_decode_rows():
@@ -263,7 +298,8 @@ def test_zero_decoder_rows_do_not_select_a_padded_graph():
     assert bucket(SimpleNamespace(decoder_buckets=[16, 32, 64]), 0) is None
 
 
-def test_cache_progress_is_independent_of_generated_tokens():
+@pytest.mark.parametrize("width", [1, 3])
+def test_cache_progress_is_independent_of_generated_tokens(width):
     advance = load_symbol(
         "tokenspeed-kernel/python/tokenspeed_kernel/ops/metadata/accepted_frontier.py",
         "_advance_accepted_frontier_torch",
@@ -275,7 +311,7 @@ def test_cache_progress_is_independent_of_generated_tokens():
         advance_accepted_frontier=advance,
     )
     states = SimpleNamespace(
-        future_input_map=torch.full((6, 1), 77, dtype=torch.int32),
+        future_input_map=torch.full((6, width), 77, dtype=torch.int32),
         valid_cache_lengths=torch.zeros(6, dtype=torch.int32),
         ngram_accepted_tokens=None,
     )
@@ -289,15 +325,22 @@ def test_cache_progress_is_independent_of_generated_tokens():
     )
     update(
         executor,
-        torch.tensor([4, 2, 5]),
-        torch.tensor([11, 21]),
-        torch.tensor([1, 0, 1]),
-        torch.tensor([128, 128, 1]),
+        torch.tensor([4, 2, 5, 1]),
+        torch.tensor([11] + [21, 22, 23][:width] + [31, 32, 33][:width]),
+        torch.tensor([1, 0, min(2, width), 1]),
+        torch.tensor([128, 128, width, width]),
         2,
-        output_layout=ForwardOutputLayout(2, 1, 1, 1),
+        output_layout=ForwardOutputLayout(2, 1, 2, width),
     )
-    assert states.valid_cache_lengths.tolist() == [0, 0, 128, 0, 128, 1]
-    assert states.future_input_map[:, 0].tolist() == [77, 77, 77, 77, 11, 21]
+    assert states.valid_cache_lengths.tolist() == [0, 1, 128, 0, 128, min(2, width)]
+    assert states.future_input_map.tolist() == [
+        [77] * width,
+        [31, 32, 33][:width],
+        [77] * width,
+        [77] * width,
+        [11] + [77] * (width - 1),
+        [21, 22, 23][:width],
+    ]
 
 
 def test_zero_rows_return_before_lm_head_and_retain_empty_taps():
@@ -449,7 +492,9 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
     )
 
     class Step:
-        def __init__(self): self.called = False
+        def __init__(self):
+            self.called = False
+
         def can_run(self, **kwargs):
             return True
 
@@ -497,33 +542,195 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
     assert grammar.queue.empty()
 
 
-@pytest.mark.parametrize("capturable", [True,False])
-def test_grammar_mask_producers_walk_only_original_decode_candidates(capturable,monkeypatch):
+@pytest.mark.parametrize("capturable", [True, False])
+def test_grammar_mask_producers_walk_only_original_decode_candidates(
+    capturable, monkeypatch
+):
     class MaskMatcher(Matcher):
-        def __init__(self,tag):
+        def __init__(self, tag):
             super().__init__()
-            self.tag=tag
-        def fill_vocab_mask(self,mask,row): mask[row,0]=self.tag+sum(self.tokens)
-        def try_accept_token(self,token):
+            self.tag = tag
+
+        def fill_vocab_mask(self, mask, row):
+            mask[row, 0] = self.tag + sum(self.tokens)
+
+        def try_accept_token(self, token):
             self.tokens.append(token)
             return True
-        def rollback(self,count): del self.tokens[-count:]
-    grammars=[MaskMatcher(100),MaskMatcher(200),MaskMatcher(300)]
-    layout=ForwardOutputLayout(2,1,1,3)
-    masks=torch.empty(9,1,dtype=torch.int32)
-    candidates=torch.full((3,3),-99,dtype=torch.int32)
+
+        def rollback(self, count):
+            del self.tokens[-count:]
+
+    grammars = [MaskMatcher(100), MaskMatcher(200), MaskMatcher(300)]
+    layout = ForwardOutputLayout(2, 1, 1, 3)
+    masks = torch.empty(9, 1, dtype=torch.int32)
+    candidates = torch.full((3, 3), -99, dtype=torch.int32)
     if capturable:
-        candidates[2]=torch.tensor([20,21,22])
-        fill=load_symbol(RUNTIME+"grammar/capturable_grammar.py","_fill_current",owner="CapturableGrammarExecutor")
-        executor=SimpleNamespace(max_tokens_per_req=3,bitmask_host=masks,candidates_host=candidates)
-        fill(executor,dict(grammars=grammars,bs=3,has_candidates=True,completion=SimpleNamespace(output_layout=layout)))
+        candidates[2] = torch.tensor([20, 21, 22])
+        fill = load_symbol(
+            RUNTIME + "grammar/capturable_grammar.py",
+            "_fill_current",
+            owner="CapturableGrammarExecutor",
+        )
+        executor = SimpleNamespace(
+            max_tokens_per_req=3, bitmask_host=masks, candidates_host=candidates
+        )
+        fill(
+            executor,
+            dict(
+                grammars=grammars,
+                bs=3,
+                has_candidates=True,
+                completion=SimpleNamespace(output_layout=layout),
+            ),
+        )
     else:
-        fill=load_symbol(RUNTIME+"grammar/capturable_grammar.py","_fill_eager_bitmask")
-        monkeypatch.setattr(torch.cuda,"Event",lambda:SimpleNamespace(record=lambda:None,synchronize=lambda:None))
-        buffers=SimpleNamespace(candidates_cpu_buf=candidates,vocab_mask_spec_cpu_buf=masks,
-            vocab_mask_spec_buf=torch.empty_like(masks))
-        fill(grammars,3,buffers,3,True,torch.tensor([1,2,3,4,5,20,21,22]),layout)
-        torch.testing.assert_close(buffers.vocab_mask_spec_buf,masks)
-        assert candidates[2].tolist()==[20,21,22]
-    assert masks[:,0].tolist()==[100,-1,-1,-1,-1,-1,300,321,343]
-    assert [g.tokens for g in grammars]==[[],[],[]]
+        fill = load_symbol(
+            RUNTIME + "grammar/capturable_grammar.py", "_fill_eager_bitmask"
+        )
+        monkeypatch.setattr(
+            torch.cuda,
+            "Event",
+            lambda: SimpleNamespace(record=lambda: None, synchronize=lambda: None),
+        )
+        buffers = SimpleNamespace(
+            candidates_cpu_buf=candidates,
+            vocab_mask_spec_cpu_buf=masks,
+            vocab_mask_spec_buf=torch.empty_like(masks),
+        )
+        fill(
+            grammars,
+            3,
+            buffers,
+            3,
+            True,
+            torch.tensor([1, 2, 3, 4, 5, 20, 21, 22]),
+            layout,
+        )
+        torch.testing.assert_close(buffers.vocab_mask_spec_buf, masks)
+        assert candidates[2].tolist() == [20, 21, 22]
+    assert masks[:, 0].tolist() == [100, -1, -1, -1, -1, -1, 300, 321, 343]
+    assert [g.tokens for g in grammars] == [[], [], []]
+
+
+def test_drafter_future_inputs_keep_original_request_rows():
+    forward = load_symbol(
+        RUNTIME + "execution/model_executor.py", "_forward_step", owner="ModelExecutor"
+    )
+    future_inputs = torch.full((6, 3), 77, dtype=torch.int32)
+    draft_tokens = torch.tensor(
+        [[11, 12, 13], [-99, -99, -99], [21, 22, 23], [31, 32, 33]]
+    )
+    tokens = torch.tensor([11, 21, 22, 23, 31, 32, 33])
+    lengths = torch.tensor([1, 0, 2, 1])
+    executor = SimpleNamespace(
+        capturable_grammar=None,
+        dspark_context_producer=None,
+        drafter=SimpleNamespace(
+            prepare_target_forward=lambda ctx: None, run=lambda **kwargs: draft_tokens
+        ),
+        config=SimpleNamespace(pp_size=1),
+        nan_guard=NanGuard(4, "cpu"),
+        runtime_states=SimpleNamespace(future_input_map=future_inputs, vocab_size=64),
+        input_buffers=SimpleNamespace(
+            state_write_req_pool_indices_buf=torch.tensor([4, 2, 5, 1])
+        ),
+        _run_target_forward=lambda ctx: Output(torch.zeros(7, 64)),
+        _decode_candidates=lambda ctx: None,
+        _run_sampling=lambda *args: (tokens, lengths),
+        _record_draft_final_cache_step=lambda num_extends: None,
+    )
+    ctx = SimpleNamespace(
+        bs=4, num_extends=2, output_layout=ForwardOutputLayout(2, 1, 2, 3)
+    )
+    forward(executor, 4, ctx, None)
+    assert future_inputs.tolist() == [
+        [77, 77, 77],
+        [31, 32, 33],
+        [77, 77, 77],
+        [77, 77, 77],
+        [11, 12, 13],
+        [21, 22, 23],
+    ]
+
+
+@pytest.mark.parametrize(
+    "prefixes,counts,replays,targets,decodes,expected_requests",
+    [
+        ([0, 0], [4, 4], [0, 0], [4, 12], 1, [0, 2, 2]),
+        ([4, 4], [4, 4], [4, 0], [8, 16], 1, [0, 2, 2]),
+        ([4, 8], [4, 4], [4, 4], [8, 12], 1, [0, 1, 2, 2]),
+        ([0], [4], [0], [12], 0, []),
+    ],
+)
+def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
+    prefixes, counts, replays, targets, decodes, expected_requests
+):
+    from typing import NamedTuple
+
+    path = RUNTIME + "layers/attention/backends/specific/deepseek_v41.py"
+    bindings = {
+        "ForwardMode": SimpleNamespace(MIXED=object()),
+        "V41_GROUP_GEOMETRY": {},
+        "V41_SWA_GROUP_ID": "swa",
+    }
+    for name in (
+        "V41PrefillSpan",
+        "V41CompressorPlan",
+        "V41Metadata",
+        "V41DecoderView",
+    ):
+        bindings[name] = load_symbol(
+            path, name, NamedTuple=NamedTuple, dataclass=dataclasses.dataclass
+        )
+    initialize = load_symbol(
+        path, "init_forward_metadata", owner="DeepseekV41AttentionBackend", **bindings
+    )
+    build = load_symbol(
+        path, "_build_decoder_view", owner="DeepseekV41AttentionBackend", **bindings
+    )
+    backend = SimpleNamespace(
+        device="cpu",
+        spec_num_tokens=2,
+        spec=SimpleNamespace(sliding_window_tokens=2, max_query_tokens=32),
+        _swa_plans={},
+        _prepared_selections={},
+        _decode_schedules={},
+        sparse_topk={},
+        _check_tables=lambda *args: None,
+        _upload_int64=lambda values: torch.tensor(values, dtype=torch.int64),
+        _prepare_compressor=lambda meta: None,
+        _refresh_decode_window=lambda meta: None,
+        cache_slots=lambda group, positions, *args: torch.zeros_like(positions),
+    )
+    backend._build_decoder_view = lambda *args: build(backend, *args)
+    e = len(counts)
+    bs = e + decodes
+    initialize(
+        backend,
+        bs,
+        e,
+        torch.arange(bs),
+        torch.tensor(targets + [8] * decodes),
+        SimpleNamespace(is_decode=lambda: False),
+        block_tables={},
+        extend_seq_lens=torch.tensor(counts),
+        extend_seq_lens_cpu=torch.tensor(counts),
+        extend_prefix_lens=torch.tensor(prefixes),
+        extend_prefix_lens_cpu=torch.tensor(prefixes),
+        extend_replay_lens_cpu=torch.tensor(replays),
+        extend_prompt_lens_cpu=torch.tensor(targets),
+        extend_with_prefix=any(prefixes),
+    )
+    layout = ForwardOutputLayout.from_prefill(
+        prefix_lengths=prefixes,
+        input_lengths=counts,
+        prompt_lengths=targets,
+        num_decodes=decodes,
+        decode_width=2,
+    )
+    view = backend._decoder_view
+    assert view.metadata.request_indices[view.logits_rows].tolist() == expected_requests
+    assert [
+        i for i in range(bs) for _ in range(layout.output_width(i))
+    ] == expected_requests

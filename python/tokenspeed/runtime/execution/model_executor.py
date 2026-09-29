@@ -113,6 +113,23 @@ LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
 
 
+def _sampling_info_for_requests(
+    sampling_info: SamplingBatchInfo,
+    requests: slice,
+    *,
+    mask_width: int | None,
+    prefill: bool,
+) -> SamplingBatchInfo:
+    """Select original request parameters and their token-indexed masks."""
+    info = sampling_info[requests]
+    if mask_width is not None and sampling_info.vocab_mask is not None:
+        mask = sampling_info.vocab_mask[
+            requests.start * mask_width : requests.stop * mask_width
+        ]
+        info.vocab_mask = mask[::mask_width].contiguous() if prefill else mask
+    return info
+
+
 def _draft_idle_global_num_tokens_for_step(
     step_idx: int,
     global_num_tokens: list[int],
@@ -1058,26 +1075,31 @@ class ModelExecutor:
             )
             return output_tokens, accept_lengths
 
+        # Parameters remain request-indexed; logits may omit open prefills.
+        prefill = slice(0, num_extends) if layout is None else layout.prefill_slice
+        decode_requests = (
+            slice(num_extends, ctx.bs)
+            if layout is None
+            else layout.decode_request_slice
+        )
+        decode_outputs = (
+            slice(num_extends, None) if layout is None else layout.decode_output_slice
+        )
+        mask_width = (
+            sampling_info.vocab_mask.shape[0] // ctx.bs
+            if layout is not None and sampling_info.vocab_mask is not None
+            else None
+        )
         logits = logits_output.next_token_logits
         token_parts, length_parts, logprob_parts = [], [], []
 
-        def request_info(begin, end, *, prefill):
-            info = sampling_info[begin:end]
-            if layout is not None and sampling_info.vocab_mask is not None:
-                # Parameters/coins are request-indexed; grammar masks can
-                # carry one row for every position in the verify window.
-                mask = sampling_info.vocab_mask
-                width = mask.shape[0] // ctx.bs
-                selected = mask[begin * width : end * width]
-                info.vocab_mask = (
-                    selected[::width].contiguous() if prefill else selected
-                )
-            return info
-
         if num_prefills:
-            prefill_out = LogitsProcessorOutput(next_token_logits=logits[:num_prefills])
+            prefill_out = LogitsProcessorOutput(next_token_logits=logits[prefill])
             tokens, lengths = self.sampling_backend.sample(
-                prefill_out, request_info(0, num_prefills, prefill=True)
+                prefill_out,
+                _sampling_info_for_requests(
+                    sampling_info, prefill, mask_width=mask_width, prefill=True
+                ),
             )
             # verify writes the same backend buffers; snapshot the prefix.
             token_parts.append(tokens.clone() if num_decodes else tokens)
@@ -1088,6 +1110,7 @@ class ModelExecutor:
                     if num_decodes
                     else prefill_out.next_token_logprobs
                 )
+        # Empty prefills contribute request lengths, not token storage.
         if num_prefills < num_extends:
             length_parts.append(
                 torch.zeros(
@@ -1095,9 +1118,13 @@ class ModelExecutor:
                 )
             )
         if num_decodes:
-            decode_out = LogitsProcessorOutput(next_token_logits=logits[num_prefills:])
+            decode_out = LogitsProcessorOutput(next_token_logits=logits[decode_outputs])
             tokens, lengths = self.sampling_backend.verify(
-                decode_out, request_info(num_extends, ctx.bs, prefill=False), candidates
+                decode_out,
+                _sampling_info_for_requests(
+                    sampling_info, decode_requests, mask_width=mask_width, prefill=False
+                ),
+                candidates,
             )
             lengths = self._apply_force_single_token_verify(
                 lengths, num_extends, num_decodes, ctx.decode_input_ids
@@ -1112,15 +1139,9 @@ class ModelExecutor:
                 if len(logprob_parts) == 1
                 else torch.cat(logprob_parts)
             )
-        tokens = (
-            token_parts[0]
-            if len(token_parts) == 1
-            else (
-                torch.cat(token_parts)
-                if token_parts
-                else torch.empty(0, dtype=torch.int32, device=logits.device)
-            )
-        )
+        if not token_parts:
+            token_parts.append(torch.empty(0, dtype=torch.int32, device=logits.device))
+        tokens = token_parts[0] if len(token_parts) == 1 else torch.cat(token_parts)
         lengths = length_parts[0] if len(length_parts) == 1 else torch.cat(length_parts)
         return tokens, lengths
 
@@ -1238,14 +1259,13 @@ class ModelExecutor:
                     torch.int32
                 )
             else:
-                p = ctx.output_layout.num_prefill_outputs
-                e = ctx.num_extends
-                self.runtime_states.future_input_map[indices[:p]] = (
-                    next_round_input_ids[:p].to(torch.int32)
-                )
-                self.runtime_states.future_input_map[indices[e:]] = (
-                    next_round_input_ids[e:].to(torch.int32)
-                )
+                for requests in (
+                    ctx.output_layout.prefill_slice,
+                    ctx.output_layout.decode_request_slice,
+                ):
+                    self.runtime_states.future_input_map[indices[requests]] = (
+                        next_round_input_ids[requests].to(torch.int32)
+                    )
             self._record_draft_final_cache_step(ctx.num_extends)
 
         output_logprobs = logits_output.next_token_logprobs
@@ -1269,14 +1289,15 @@ class ModelExecutor:
         the same semantics. Callers must pass the state-write pool indices.
         """
         if self.drafter is None and output_layout is not None:
-            p, e = output_layout.num_prefill_outputs, num_extends
-            if p:
-                self.runtime_states.future_input_map[req_pool_indices[:p], :1] = (
-                    output_tokens[:p, None].to(torch.int32)
+            prefill = output_layout.prefill_slice
+            if output_layout.num_prefill_outputs:
+                self.runtime_states.future_input_map[req_pool_indices[prefill], :1] = (
+                    output_tokens[prefill, None].to(torch.int32)
                 )
             if output_layout.num_decodes:
-                self.runtime_states.future_input_map[req_pool_indices[e:]] = (
-                    output_tokens[p:]
+                requests = output_layout.decode_request_slice
+                self.runtime_states.future_input_map[req_pool_indices[requests]] = (
+                    output_tokens[output_layout.decode_output_slice]
                     .view(output_layout.num_decodes, output_layout.decode_width)
                     .to(torch.int32)
                 )
@@ -1350,7 +1371,10 @@ class ModelExecutor:
             # for this idle replay, same as run_once.
             if self.capturable_grammar is not None:
                 self.capturable_grammar.add_batch(
-                    grammars=[None] * padded_bs, bs=padded_bs, has_candidates=False, output_layout=None
+                    grammars=[None] * padded_bs,
+                    bs=padded_bs,
+                    has_candidates=False,
+                    output_layout=None,
                 )
             # IDLE doesn't produce tokens, so no sampler/drafter call here —
             # only the model forward, which still participates in collectives.

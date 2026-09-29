@@ -122,17 +122,24 @@ class NanGuard:
     def _or_per_request(self, rows: torch.Tensor, ctx: ForwardContext) -> None:
         """OR a per-row bool vector into per-request flags.
 
-        Row layout mirrors ``_run_sampling``: ``[num_extends]`` extend rows,
-        then ``num_decodes * n`` decode/verify rows.
+        Prefill rows may be omitted; flags always use original request rows.
         """
         ne = ctx.num_extends
         nd = ctx.bs - ne
-        np = ne if ctx.output_layout is None else ctx.output_layout.num_prefill_outputs
-        if np > 0:
-            self.flags[:np] |= rows[:np].to(torch.int32)
+        layout = ctx.output_layout
+        prefill = slice(0, ne) if layout is None else layout.prefill_slice
+        decode_requests = (
+            slice(ne, ctx.bs) if layout is None else layout.decode_request_slice
+        )
+        decode_outputs = (
+            slice(ne, None) if layout is None else layout.decode_output_slice
+        )
+        if prefill.stop:
+            self.flags[prefill] |= rows[prefill].to(torch.int32)
         if nd > 0:
-            n = (rows.shape[0] - np) // nd
-            self.flags[ne : ctx.bs] |= rows[np:].view(nd, n).any(dim=-1).to(torch.int32)
+            self.flags[decode_requests] |= (
+                rows[decode_outputs].view(nd, -1).any(dim=-1).to(torch.int32)
+            )
 
 
 class _DisabledNanGuard(NanGuard):

@@ -72,3 +72,47 @@ def test_finishing_replayed_window_uses_current_prefill_target():
     )
     assert layout.num_prefill_outputs == layout.num_extends == 1
     assert [layout.token_offset(i) for i in range(2)] == [0, 1]
+
+
+@pytest.mark.parametrize(
+    "layout,request_names,token_slots,prefills,decodes,widths,per_request",
+    [
+        (
+            ForwardOutputLayout(2, 1, 2, 3),
+            ["A", "B", "C", "D"],
+            [11, 21, 22, 23, 31, 32, 33],
+            (["A"], [11]),
+            (["C", "D"], [21, 22, 23, 31, 32, 33]),
+            [1, 0, 3, 3],
+            [[11], [], [21, 22, 23], [31, 32, 33]],
+        ),
+        (ForwardOutputLayout(1, 0, 0, 3), ["B"], [], ([], []), ([], []), [0], [[]]),
+        (
+            ForwardOutputLayout(1, 1, 1, 1),
+            ["A", "C"],
+            [11, 21],
+            (["A"], [11]),
+            (["C"], [21]),
+            [1, 1],
+            [[11], [21]],
+        ),
+    ],
+)
+def test_output_ranges_preserve_request_identity_and_fixed_capacity(
+    layout, request_names, token_slots, prefills, decodes, widths, per_request
+):
+    assert (
+        request_names[layout.prefill_slice],
+        token_slots[layout.prefill_slice],
+    ) == prefills
+    assert (
+        request_names[layout.decode_request_slice],
+        token_slots[layout.decode_output_slice],
+    ) == decodes
+    assert [layout.output_width(i) for i in range(len(request_names))] == widths
+    assert [
+        token_slots[
+            layout.token_offset(i) : layout.token_offset(i) + layout.output_width(i)
+        ]
+        for i in range(len(request_names))
+    ] == per_request

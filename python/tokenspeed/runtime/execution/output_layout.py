@@ -68,6 +68,29 @@ class ForwardOutputLayout:
     def num_output_tokens(self) -> int:
         return self.num_prefill_outputs + self.num_decodes * self.decode_width
 
+    @property
+    def prefill_slice(self) -> slice:
+        """Completing prefills share the same request and output prefix."""
+        return slice(0, self.num_prefill_outputs)
+
+    @property
+    def decode_request_slice(self) -> slice:
+        """Decode rows in request-indexed parameters and state."""
+        return slice(self.num_extends, self.num_extends + self.num_decodes)
+
+    @property
+    def decode_output_slice(self) -> slice:
+        """Decode rows in compact logits and fixed-width token storage."""
+        return slice(self.num_prefill_outputs, self.num_output_tokens)
+
+    def output_width(self, request: int) -> int:
+        """Stored output rows for a request, independent of accepted length."""
+        if not 0 <= request < self.num_extends + self.num_decodes:
+            raise IndexError("output request is outside the batch")
+        if request < self.num_extends:
+            return int(request < self.num_prefill_outputs)
+        return self.decode_width
+
     def token_offset(self, request: int) -> int:
         if not 0 <= request < self.num_extends + self.num_decodes:
             raise IndexError("output request is outside the batch")

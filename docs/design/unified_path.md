@@ -379,6 +379,22 @@ a separate token axis. Each consumer uses the same token offset:
 V4.1 explicitly marks selected logits rows so the logits processor never
 re-gathers them using original input indices.
 
+The layout owns host queries for the shared prefill prefix, the original
+decode request suffix, the compact decode output suffix, and each request's
+stored output width. Consumers use these queries instead of deriving the
+same offsets independently. The executor aligns sampling parameters and
+token-indexed grammar masks at the sampler boundary; sampler interfaces and
+result buffers stay unchanged. Grammar owns matcher advancement and rollback,
+and zero accepted lengths already suppress advancement. Existing consumers
+that only need token_offset keep that interface. Models without cropped
+outputs continue to use None, not a mandatory identity layout.
+
+Completion remains a local comparison in the executor and V4.1 attention
+metadata. Both use the same scheduled prefix, input count (including replay),
+and current prefill target, which may include previously generated tokens
+after re-admission. Contract tests keep those decisions consistent without
+adding state or parameters to the shared metadata initialization interface.
+
 Cache advancement still consumes all input lengths for prefill, independently
 of output lengths. Future input writes, NaN/OOV attribution, grammar advances
 and V4.1 DSpark anchors operate only on output-bearing requests. Grammar keeps
