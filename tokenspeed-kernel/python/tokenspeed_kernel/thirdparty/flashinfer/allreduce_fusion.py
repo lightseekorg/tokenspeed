@@ -30,8 +30,8 @@ def allreduce_fusion_support_error(group, hidden_size, top_k, max_num_tokens, dt
     """Return a local incompatibility without allocating collective state."""
     if type(max_num_tokens) is not int or max_num_tokens <= 0:
         return "allreduce fusion capacity must be positive"
-    if not dist.is_initialized() or dist.get_world_size(group) != 8:
-        return "allreduce fusion requires an initialized TP8 group"
+    if not dist.is_initialized() or dist.get_world_size(group) not in (4, 8, 16):
+        return "allreduce fusion requires an initialized TP4, TP8, or TP16 group"
     if hidden_size != 3584 or top_k != 16 or dtype != torch.bfloat16:
         return "allreduce fusion currently supports BF16 H3584/top-k16"
     if not torch.cuda.is_available():
@@ -95,8 +95,8 @@ class MNNVLAllReduceFusionBackend:
             MNNVLCuteDSLAllReduceFusionWorkspace,
         )
         from tokenspeed_kernel.thirdparty.cute_dsl.mnnvl_k3_ht import (
-            K3_HT_ALL_REDUCE_GB300_TP8_H3584,
-            K3_HT_FINALIZE_GB300_TP8_H3584_K16,
+            K3_HT_ALL_REDUCE_GB300_H3584,
+            K3_HT_FINALIZE_GB300_H3584_K16,
             K3H3584HTProtocol,
         )
 
@@ -178,8 +178,8 @@ class MNNVLAllReduceFusionBackend:
             config=MNNVLCuteDSLConfig(profiles=(profile,)),
         )
         self._ht = None
-        self._ht_finalize_tuning = K3_HT_FINALIZE_GB300_TP8_H3584_K16
-        self._ht_allreduce_tuning = K3_HT_ALL_REDUCE_GB300_TP8_H3584
+        self._ht_finalize_tuning = K3_HT_FINALIZE_GB300_H3584_K16
+        self._ht_allreduce_tuning = K3_HT_ALL_REDUCE_GB300_H3584
         if max_num_tokens > 1024:
             self._ht = K3H3584HTProtocol(
                 hidden_size=hidden_size,

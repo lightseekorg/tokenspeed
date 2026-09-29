@@ -65,8 +65,10 @@ def test_prepared_capacity_covers_tokens_above_8192(monkeypatch):
     reduce.assert_called_once()
 
 
-def test_workspace_uses_serving_capacity_once(monkeypatch):
-    group = SimpleNamespace(group_name="moe_tp8")
+@pytest.mark.parametrize("tp,ep", [(4, 1), (8, 1), (16, 1), (1, 4), (1, 8), (1, 16)])
+def test_workspace_uses_serving_capacity_once(monkeypatch, tp, ep):
+    group_size = tp * ep
+    group = SimpleNamespace(group_name=f"moe_tp{tp}_ep{ep}")
     workspace = SimpleNamespace(max_num_tokens=32768)
     create = Mock(return_value=workspace)
     small = Mock()
@@ -81,9 +83,12 @@ def test_workspace_uses_serving_capacity_once(monkeypatch):
     monkeypatch.setattr(mod, "global_server_args_dict", {"disable_pdl": True})
     mapping = SimpleNamespace(
         moe=SimpleNamespace(
-            tp_size=8, ep_size=1, tp_ep_size=8, tp_ep_group=tuple(range(8))
+            tp_size=tp,
+            ep_size=ep,
+            tp_ep_size=group_size,
+            tp_ep_group=tuple(range(group_size)),
         ),
-        attn=SimpleNamespace(dp_size=1, cp_size=1),
+        attn=SimpleNamespace(tp_size=group_size),
     )
     comms = [
         mod.K3MoeTailComm(
@@ -105,7 +110,7 @@ def test_workspace_uses_serving_capacity_once(monkeypatch):
         group=group, hidden_size=3584, top_k=16, max_num_tokens=32768, rms_eps=1e-5
     )
     small.assert_called_once_with(group=group, hidden_size=7168, latent_size=3584)
-    prealloc.assert_called_once_with(32768, (7168,), "moe_tp8")
+    prealloc.assert_called_once_with(32768, (7168,), group.group_name)
     with pytest.raises(RuntimeError, match="grow"):
         comms[1].prepare(32769)
 

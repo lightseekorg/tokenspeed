@@ -18,9 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TP8 correctness and graph lifetime for the unified routed stage.
+"""TP4/TP8/TP16 correctness and graph lifetime for the unified routed stage.
 
-Run under torchrun with eight ranks. Snapshot copies are test instrumentation;
+Run under torchrun with 4, 8, or 16 ranks. Snapshot copies are test instrumentation;
 serving consumes the first-stage view before reusing its workspace.
 """
 
@@ -38,7 +38,8 @@ from tokenspeed_kernel.ops.communication import (
 
 H, K, EPS = 3584, 16, 1e-5
 pytestmark = pytest.mark.skipif(
-    int(os.environ.get("WORLD_SIZE", "1")) != 8, reason="requires torchrun TP8"
+    int(os.environ.get("WORLD_SIZE", "1")) not in (4, 8, 16),
+    reason="requires torchrun TP4, TP8, or TP16",
 )
 
 
@@ -94,7 +95,7 @@ def local_finalize(rows, weights, indices):
 
 
 def rank_sum(value, group):
-    peers = [torch.empty_like(value) for _ in range(8)]
+    peers = [torch.empty_like(value) for _ in range(dist.get_world_size(group))]
     dist.all_gather(peers, value.contiguous(), group=group)
     result = torch.zeros_like(value, dtype=torch.float32)
     for peer in peers:

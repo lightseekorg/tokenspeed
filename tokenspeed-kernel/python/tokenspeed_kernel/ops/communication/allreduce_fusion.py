@@ -79,7 +79,7 @@ def allreduce_fusion_supported(
     max_num_tokens: int,
     dtype: torch.dtype,
 ) -> bool:
-    """Probe K3 TP8 BF16 support without allocation or collectives.
+    """Probe K3 TP4/TP8/TP16 BF16 support without allocation or collectives.
 
     Args:
         group: Initialized process group shared by the operation's ranks.
@@ -108,7 +108,7 @@ def create_allreduce_fusion_workspace(
     """Collectively prepare LL/BT and patched HT before graph capture.
 
     Args:
-        group: TP8 process group; all ranks must supply identical configuration
+        group: TP4, TP8, or TP16 group; all ranks must supply identical configuration
             and enter in the same order.
         hidden_size: Routed latent width, currently 3584.
         top_k: Number of expert contributions per token, currently 16.
@@ -241,7 +241,7 @@ def allreduce_fusion(
     traits={
         "hidden_size": frozenset({3584}),
         "top_k": frozenset({16}),
-        "tp_size": frozenset({8}),
+        "tp_size": frozenset({4, 8, 16}),
     },
     priority=Priority.SPECIALIZED,
 )

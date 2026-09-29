@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Distributed reference checks for K3 TP8 stage-2 dispatch and stream ordering.
+"""Distributed K3 TP4/TP8/TP16 stage-2 dispatch and stream-ordering checks.
 
-The TP8 LL/BT/HT contracts are covered by the allreduce_fusion kernel tests.
-Run this file under torchrun with eight ranks.
+The LL/BT/HT contracts are covered by the allreduce_fusion kernel tests.
+Run this file under torchrun with 4, 8, or 16 ranks.
 """
 
 from __future__ import annotations
@@ -159,8 +159,8 @@ def _run_tail(comm, routed, shared, prefix, m, aux):
 
 
 collective = pytest.mark.skipif(
-    _world_size() != 8,
-    reason="launch with torchrun world size 8",
+    _world_size() not in (4, 8, 16),
+    reason="launch with torchrun world size 4, 8, or 16",
 )
 
 

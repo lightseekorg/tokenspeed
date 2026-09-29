@@ -25,8 +25,8 @@ from tokenspeed_kernel.thirdparty.cute_dsl.mnnvl_k3_ht.device_kernel import (
 
 K3_LATENT_SIZE = 3584
 K3_TOP_K = 16
-K3_TP_SIZE = 8
-K3_HT_FINALIZE_GB300_TP8_H3584_K16 = HTFinalizeTuning(
+K3_TP_SIZES = (4, 8, 16)
+K3_HT_FINALIZE_GB300_H3584_K16 = HTFinalizeTuning(
     persistent_ctas=None,
     consumer_threads=448,
     vectors_per_thread=1,
@@ -38,7 +38,7 @@ K3_HT_FINALIZE_GB300_TP8_H3584_K16 = HTFinalizeTuning(
     rms_shard_major=False,
     enable_pdl=True,
 )
-K3_HT_ALL_REDUCE_GB300_TP8_H3584 = HTAllReduceTuning(
+K3_HT_ALL_REDUCE_GB300_H3584 = HTAllReduceTuning(
     persistent_ctas=None,
     consumer_threads=448,
     vectors_per_thread=1,
@@ -53,13 +53,13 @@ K3_HT_ALL_REDUCE_GB300_TP8_H3584 = HTAllReduceTuning(
 
 
 class K3H3584HTProtocol(HTProtocol):
-    """HT protocol using a tail-predicated 56-pack TP8 reduction shard."""
+    """HT protocol using tail-predicated reduction shards at TP4/TP8/TP16."""
 
     def _validate_k3_geometry(self) -> None:
         if self.hidden_size != K3_LATENT_SIZE:
             raise ValueError(f"hidden_size must be {K3_LATENT_SIZE}")
-        if self.tp_size != K3_TP_SIZE:
-            raise ValueError(f"tp_size must be {K3_TP_SIZE}")
+        if self.tp_size not in K3_TP_SIZES:
+            raise ValueError(f"tp_size must be one of {K3_TP_SIZES}")
         if self.top_k not in (1, K3_TOP_K):
             raise ValueError(f"top_k must be 1 or {K3_TOP_K}")
 
@@ -122,9 +122,9 @@ class K3H3584HTProtocol(HTProtocol):
 
 __all__ = [
     "K3H3584HTProtocol",
-    "K3_HT_ALL_REDUCE_GB300_TP8_H3584",
-    "K3_HT_FINALIZE_GB300_TP8_H3584_K16",
+    "K3_HT_ALL_REDUCE_GB300_H3584",
+    "K3_HT_FINALIZE_GB300_H3584_K16",
     "K3_LATENT_SIZE",
     "K3_TOP_K",
-    "K3_TP_SIZE",
+    "K3_TP_SIZES",
 ]

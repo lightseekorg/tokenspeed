@@ -93,11 +93,8 @@ def _unified_tail_applicable(
 ) -> bool:
     return (
         is_blackwell
-        and mapping.moe.tp_size == 8
-        and mapping.moe.ep_size == 1
-        and mapping.moe.tp_ep_size == 8
-        and mapping.attn.dp_size == 1
-        and mapping.attn.cp_size == 1
+        and mapping.moe.tp_ep_size in (4, 8, 16)
+        and mapping.attn.tp_size == mapping.moe.tp_ep_size
         and hidden_size == 7168
         and latent_size == 3584
         and top_k == 16
@@ -445,7 +442,7 @@ class K3AttnComm:
 
 
 class K3MoeTailComm:
-    """Combine routed and shared expert outputs using sharded up-projection.
+    """Combine routed and shared expert outputs over 4, 8, or 16 MoE ranks.
 
     Stage 1 -- routed_ar_fusion:
         Finalize deferred routed output, all-reduce, and apply RMSNorm.

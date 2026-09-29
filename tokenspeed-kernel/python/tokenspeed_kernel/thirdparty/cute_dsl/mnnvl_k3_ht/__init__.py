@@ -18,14 +18,14 @@ from tokenspeed_kernel.thirdparty.cute_dsl.mnnvl_k3_ht.device_kernel import (
     K3H3584MoeFinalizeAllReduceRMSNormHTDeviceKernel,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.mnnvl_k3_ht.protocol import (
-    K3_HT_ALL_REDUCE_GB300_TP8_H3584,
-    K3_HT_FINALIZE_GB300_TP8_H3584_K16,
+    K3_HT_ALL_REDUCE_GB300_H3584,
+    K3_HT_FINALIZE_GB300_H3584_K16,
     K3H3584HTProtocol,
 )
 
 __all__ = [
     "K3H3584HTProtocol",
     "K3H3584MoeFinalizeAllReduceRMSNormHTDeviceKernel",
-    "K3_HT_ALL_REDUCE_GB300_TP8_H3584",
-    "K3_HT_FINALIZE_GB300_TP8_H3584_K16",
+    "K3_HT_ALL_REDUCE_GB300_H3584",
+    "K3_HT_FINALIZE_GB300_H3584_K16",
 ]

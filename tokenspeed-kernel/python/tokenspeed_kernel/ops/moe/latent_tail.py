@@ -216,7 +216,7 @@ class KimiK3LatentTailOp:
         """Allocate and prepare the existing kernels before graph capture.
 
         Args:
-            group: TP8 multicast-capable group, constructed collectively.
+            group: TP4, TP8, or TP16 multicast group, constructed collectively.
             hidden_size: Full output width, currently 7168.
             latent_size: Replicated routed width, currently 3584.
         """
@@ -230,8 +230,10 @@ class KimiK3LatentTailOp:
         )
 
         tp_size = dist.get_world_size(group)
-        if (tp_size, hidden_size, latent_size) != (8, 7168, 3584):
-            raise ValueError("K3 stage-2 multicast requires TP8, H7168, and L3584")
+        if tp_size not in (4, 8, 16) or (hidden_size, latent_size) != (7168, 3584):
+            raise ValueError(
+                "K3 stage-2 multicast requires TP4/TP8/TP16, H7168, and L3584"
+            )
         rank = dist.get_rank(group)
         device = torch.device("cuda", torch.cuda.current_device())
         self._collective = CollectiveKernel(
@@ -286,7 +288,7 @@ class KimiK3LatentTailOp:
             shared_partial: Rank-local BF16 [M,7168], with M in [1,32].
 
         Returns:
-            Padded BF16 [64,896] shard with row stride 7168. Only the first M
+            Padded BF16 [64,7168/TP] shard with row stride 7168. Only the first M
             rows are live; consume them before the next shared RS call.
         """
         m = shared_partial.shape[0]
@@ -314,7 +316,7 @@ class KimiK3LatentTailOp:
 
         Args:
             latent: Replicated normalized BF16 [M,3584], with M in [1,32].
-            weight: This layer's BF16 [896,3584] up-projection weight shard.
+            weight: This layer's BF16 [7168/TP,3584] up-projection weight shard.
             shared_shard: Padded rank-local output from reduce_scatter_shared.
             residual: Replicated BF16 [M,7168] attention residual.
 
