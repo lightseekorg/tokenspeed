@@ -94,6 +94,10 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     setup_dp_sampling,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+from tokenspeed.runtime.sampling.score_utils import (
+    build_score_label_ids,
+    gather_score_logprobs,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
@@ -1155,10 +1159,20 @@ class ModelExecutor:
             self._pp_send_stage_state(logits_output)
             output_tokens = torch.zeros(bs, dtype=torch.int32, device=self.device)
             accept_lengths = torch.ones(bs, dtype=torch.int32, device=self.device)
-            return output_tokens, accept_lengths, None
+            return output_tokens, accept_lengths, None, None
 
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)
+
+        # Score API readout: gather label logprobs at the answer boundary from
+        # the sanitized logits, before the sampler touches them. Score
+        # requests only ever appear on extend rows, which lead the batch.
+        score_logprobs = None
+        if sampling_info.score_label_ids is not None:
+            score_logprobs = gather_score_logprobs(
+                logits_output.next_token_logits[: ctx.num_extends],
+                sampling_info.score_label_ids,
+            )
 
         candidates = self._decode_candidates(ctx)
 
@@ -1194,7 +1208,7 @@ class ModelExecutor:
             self._record_draft_final_cache_step(ctx.num_extends)
 
         output_logprobs = logits_output.next_token_logprobs
-        return output_tokens, accept_lengths, output_logprobs
+        return output_tokens, accept_lengths, output_logprobs, score_logprobs
 
     @nvtx_range("update_runtime_state", color="orange")
     def _update_runtime_state(
@@ -1238,13 +1252,25 @@ class ModelExecutor:
             input_ids=ib.input_ids_buf if tail is not None else None,
         )
 
-    def _build_sampling_info(self, bs: int) -> SamplingBatchInfo:
-        return SamplingBatchInfo(
+    def _build_sampling_info(
+        self,
+        bs: int,
+        sampling_params_list: list[SamplingParams] | None = None,
+        num_extends: int = 0,
+    ) -> SamplingBatchInfo:
+        sampling_info = SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
         )
+        if sampling_params_list is not None and num_extends > 0:
+            # Score API: label ids ride the batch info into the eager forward;
+            # only extend rows are covered (score requests never decode).
+            sampling_info.score_label_ids = build_score_label_ids(
+                sampling_params_list, num_extends, self.device
+            )
+        return sampling_info
 
     def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
@@ -1594,6 +1620,7 @@ class ModelExecutor:
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
+                score_logprobs = None
             else:
                 gather_ids = None
                 if num_extends > 0:
@@ -1659,7 +1686,9 @@ class ModelExecutor:
                     ctx.all_extend = dp_metadata.all_extend
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
-                    sampling_info = self._build_sampling_info(bs)
+                    sampling_info = self._build_sampling_info(
+                        bs, sampling_params_list, num_extends
+                    )
                     grammar_completion = setup_grammar_step(
                         sampling_info=sampling_info,
                         bs=bs,
@@ -1703,7 +1732,12 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
-                    output_tokens, output_lengths, output_logprobs = self.forward_step(
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        score_logprobs,
+                    ) = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -1796,6 +1830,9 @@ class ModelExecutor:
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
 
+                if score_logprobs is not None:
+                    score_logprobs = score_logprobs.to("cpu", non_blocking=True)
+
                 output_nan_flags = self.nan_guard.flags_cpu
 
                 copy_event = self.device_module.Event()
@@ -1827,6 +1864,7 @@ class ModelExecutor:
             output_tokens=output_tokens,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,
+            score_logprobs=score_logprobs,
             copy_event=copy_event,
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,

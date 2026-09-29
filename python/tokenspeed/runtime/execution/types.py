@@ -150,6 +150,11 @@ class ModelExecutionResult:
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
+    # Score API readout: per-extend-row label logprobs, [num_extends,
+    # max_labels] padded (see sampling/score_utils.py). None when no request
+    # in the batch carries score labels; always eager (extends never replay
+    # a captured graph).
+    score_logprobs: torch.Tensor | None = None
     # P role, final chunk only: the sampled rows the commit path folds into
     # the ExtendResult as the bootstrap payload the peer's decode needs.
     next_input_ids: torch.Tensor | None = None

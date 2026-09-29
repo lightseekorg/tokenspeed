@@ -706,6 +706,11 @@ class BatchTokenIDOut(BaseBatchReq, kw_only=True):
 
     generated_time: float
 
+    # Score API: per-request label scores (see sampling/score_utils.py),
+    # parallel to rids; [] for requests that did not ask for scoring.
+    # Appended wire tail: older peers decode with None.
+    output_score_vals: list[list[float]] | None = None
+
 
 def _finish_type(finished_reason) -> str:
     """Reduce an OutputProcesser finish reason to its wire type string."""
@@ -751,6 +756,10 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     num_waiting: int = 0
     kv_active_pages: int = 0
     kv_total_pages: int = 0
+    # Score API label scores, parallel to rids ([] for non-score requests,
+    # same non-ragged-column rule as output_token_logprobs_*). Appended wire
+    # tail: older peers decode with None.
+    output_score_vals: list[list[float]] | None = None
 
     @classmethod
     def from_full(
@@ -795,6 +804,11 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
             output_token_logprobs_idx=(
                 list(out.output_token_logprobs_idx)
                 if out.output_token_logprobs_idx is not None
+                else [[] for _ in out.rids]
+            ),
+            output_score_vals=(
+                [list(row) for row in out.output_score_vals]
+                if out.output_score_vals is not None
                 else [[] for _ in out.rids]
             ),
         )

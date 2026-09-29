@@ -298,6 +298,13 @@ class OutputProcessor:
                     "meta_info": meta_info,
                 }
 
+            # Score API readout, present only on score requests (parallel to
+            # rids; [] means the request did not ask for scoring).
+            if isinstance(recv_obj, BatchTokenIDOut):
+                score_vals = recv_obj.output_score_vals
+                if score_vals is not None and score_vals[i]:
+                    out_dict["scores"] = score_vals[i]
+
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
                 if self.engine.server_args.speculative_algorithm:

@@ -352,6 +352,15 @@ async def completions(request: Request):
     return await _proxy_request(request)
 
 
+@app.api_route("/v1/score", methods=["POST"])
+async def score(request: Request):
+    # Score API (label scoring at the prefill boundary). Path kept identical
+    # to SGLang's /v1/score so clients work against either serving stack.
+    # The smg gateway owns request validation; the engine enforces the
+    # score-only contract (max_new_tokens=0) in SamplingParams.verify().
+    return await _proxy_request(request)
+
+
 @app.api_route("/v1/chat/completions", methods=["POST"])
 async def chat_completions(request: Request):
     return await _proxy_request(request)
