@@ -942,3 +942,32 @@ class TestInlineLogprobPassThrough(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRepeatedTokenFrames(unittest.TestCase):
+    def test_coalesced_frames_preserve_repeated_tokens(self):
+        class Tokenizer:
+            def batch_decode(self, sequences, **kwargs):
+                return ["x" * len(ids) for ids in sequences]
+
+        for inline, stream_output in [(False, True), (False, False), (True, True)]:
+            with self.subTest(inline=inline, stream_output=stream_output):
+                manager = _StubTokenizerManager(
+                    Tokenizer(),
+                    enable_inline_detokenizer=inline,
+                    stream_output=stream_output,
+                )
+                state = _mk_state(stream=True, rid="repeated")
+                _register(manager, state)
+                for total in (2, 4):
+                    manager.output_processor.handle_batch_output(
+                        _batch_token_id_out(
+                            ["repeated"],
+                            decode_ids=[[7, 7]],
+                            output_ids=[[7, 7]],
+                            completion_tokens=[total],
+                        )
+                    )
+                result = state.collector.take()
+                self.assertEqual(result["output_ids"], [7, 7, 7, 7])
+                self.assertEqual(result["meta_info"]["completion_tokens"], 4)

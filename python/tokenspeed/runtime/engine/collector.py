@@ -65,6 +65,8 @@ class RequestOutputCollector:
     ``put`` calls cost O(total_delta) instead of O(N * total_delta). The first
     merge after a take/reset clones the held output once to detach it from the
     producer's reference; subsequent merges extend the cloned lists directly.
+    Producers explicitly declare delta versus cumulative token frames: matching
+    token prefixes cannot distinguish repeated deltas from cumulative snapshots.
     """
 
     def __init__(self) -> None:
@@ -80,7 +82,9 @@ class RequestOutputCollector:
         self._pending_owned = False
         return output
 
-    def put(self, output: dict[str, Any], *, stream: bool) -> None:
+    def put(
+        self, output: dict[str, Any], *, stream: bool, token_ids_are_delta: bool
+    ) -> None:
         if self._pending is None or not stream:
             self._pending = output
             self._pending_owned = False
@@ -88,9 +92,11 @@ class RequestOutputCollector:
         if not self._pending_owned:
             self._pending = self._clone_for_merge(self._pending)
             self._pending_owned = True
-        self._merge_into_pending(output)
+        self._merge_into_pending(output, token_ids_are_delta=token_ids_are_delta)
 
-    def _merge_into_pending(self, output: dict[str, Any]) -> None:
+    def _merge_into_pending(
+        self, output: dict[str, Any], *, token_ids_are_delta: bool
+    ) -> None:
         pending = self._pending
         if pending is None:
             raise RuntimeError("Cannot merge output without a pending value.")
@@ -113,12 +119,19 @@ class RequestOutputCollector:
         if output_kind == "text" and "text" in output:
             pending["text"] = output["text"]
 
-        self._extend_sequence(pending, "output_ids", output.get("output_ids"))
-
-        if "output_multi_ids" in pending or "output_multi_ids" in output:
-            self._extend_sequence(
-                pending, "output_multi_ids", output.get("output_multi_ids")
-            )
+        for key in ("output_ids", "output_multi_ids"):
+            value = output.get(key)
+            if value is None:
+                continue
+            if token_ids_are_delta:
+                # Equal consecutive deltas are still distinct generated tokens.
+                # Only the producer knows whether a frame is cumulative.
+                if pending.get(key) is None:
+                    pending[key] = list(value)
+                else:
+                    pending[key].extend(value)
+            else:
+                self._extend_sequence(pending, key, value)
 
         if "output_extra_info" in output:
             pending["output_extra_info"] = output["output_extra_info"]

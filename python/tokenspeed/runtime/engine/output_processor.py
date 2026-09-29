@@ -130,6 +130,7 @@ class OutputProcessor:
             logprobs_info = state.logprobs_info if not state.obj.stream else {}
 
             obj = state.obj
+            token_ids_are_delta = False
             sp = getattr(obj, "sampling_params", None) or {}
             vllm_req = sp.get("logprobs") is not None
             sglang_req = bool(getattr(obj, "return_logprob", False))
@@ -168,6 +169,7 @@ class OutputProcessor:
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
             if isinstance(recv_obj, BatchStrOut):
+                token_ids_are_delta = state.obj.stream
                 if len(recv_obj.batch_accept_draft_tokens) > 0:
                     meta_info.update(
                         {"accept_draft_tokens": recv_obj.batch_accept_draft_tokens[i]}
@@ -195,6 +197,7 @@ class OutputProcessor:
                     self.engine.server_args.enable_inline_detokenizer
                     and self.engine.tokenizer is not None
                 ):
+                    token_ids_are_delta = state.obj.stream
                     # Inline detokenizer path: run
                     # IncrementalDetokenizer per request and produce
                     # a BatchStrOut-shaped out_dict that
@@ -261,6 +264,7 @@ class OutputProcessor:
 
                     output_multi_ids = None
                     if self.engine.server_args.stream_output and state.obj.stream:
+                        token_ids_are_delta = True
                         state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids[state.last_output_offset :]
                         if recv_obj.output_multi_ids is not None:
@@ -315,7 +319,9 @@ class OutputProcessor:
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
             state.collector.put(
-                out_dict, stream=bool(getattr(state.obj, "stream", False))
+                out_dict,
+                stream=bool(getattr(state.obj, "stream", False)),
+                token_ids_are_delta=token_ids_are_delta,
             )
             state.event.set()
 
