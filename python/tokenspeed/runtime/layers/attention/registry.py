@@ -1280,8 +1280,13 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
-    if config.dcp_size > 1 and (
-        model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+    # DeepSeek V4 validates its specialized DCP cache contract in its backend.
+    if (
+        config.dcp_size > 1
+        and not target.is_deepseek_v4
+        and (
+            model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+        )
     ):
         _validate_mla_dcp_backend(
             target_full_attn_backend_name, model_config.attention_arch
