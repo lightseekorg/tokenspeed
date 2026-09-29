@@ -663,7 +663,7 @@ def _wmma_tdm_add3_m16_kernel(
                 b_smem.index((tile + NUM_BUFFERS - 1) % NUM_BUFFERS),
                 pred=tile + NUM_BUFFERS - 1 < num_k_tiles,
             )
-        # Keep one complete A/B batch in flight while consuming the oldest.
+        # Keep up to NUM_BUFFERS - 2 A/B batches in flight while consuming the oldest.
         gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
         with gl.amd.warp_pipeline_stage("wmma", priority=0):
             acc = gl.amd.cdna5.wmma(a, b, acc)
