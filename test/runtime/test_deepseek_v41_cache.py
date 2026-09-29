@@ -569,14 +569,20 @@ def test_write_global_masks_rows_below_the_replay_floor(monkeypatch):
 def test_decoder_view_is_the_identity_for_decode_and_complete_short_chunks():
     backend = _backend("cpu", 2)
     tables = _tables("cpu")
-    meta = _extend(backend, tables, [5, 3], [0, 2], [0, 0], [5, 5])
+    meta = _extend(backend, tables, [5, 3], [0, 0], [0, 0], [5, 3])
     view = backend.decoder_view()
     assert view.keep_rows is None and view.logits_rows is None
     assert view.metadata is meta and view.prefill is meta
     assert [(s.request, s.offset, s.prefix, s.count) for s in view.spans] == [
         (0, 0, 0, 5),
-        (1, 5, 2, 3),
+        (1, 5, 0, 3),
     ]
+    # Keeping every query row does not make an older SWA prefix visible.
+    meta = _extend(backend, tables, [5, 3], [0, 2], [0, 0], [5, 5])
+    view = backend.decoder_view()
+    assert view.keep_rows.tolist() == list(range(8))
+    assert view.logits_rows.tolist() == [4, 7]
+    assert view.metadata is not meta
     backend.refresh_decode_metadata(
         2,
         2,
@@ -607,10 +613,29 @@ def test_decoder_view_is_the_identity_for_decode_and_complete_short_chunks():
     assert backend.decoder_view()[1:] == (None, (), None, None)
 
 
-def test_decoder_view_omits_open_chunks_and_keeps_the_final_window():
+@pytest.mark.parametrize("open_count", [1, 17])
+def test_decoder_view_preserves_compute_rows_without_open_chunk_logits(open_count):
+    backend = _verify_backend("cpu", 2, 1)
+    _extend(
+        backend,
+        _tables("cpu"),
+        [128, open_count],
+        [0, 0],
+        [0, 0],
+        [128, 256],
+    )
+    view = backend.decoder_view()
+    # Dropping the last row changes the GEMM shape seen by the completing
+    # request. Keep that computation, but never sample the open request.
+    assert view.keep_rows.tolist() == list(range(128)) + [127 + open_count]
+    assert view.metadata.request_indices.tolist() == [0] * 128 + [1]
+    assert view.logits_rows.tolist() == [127]
+
+
+def test_decoder_view_keeps_compute_rows_and_selects_only_valid_logits():
     """The CED decoder runs on each prompt-completing chunk's last window
-    (the whole chunk when shorter), on no rows of an open chunk, and on
-    every decode row; sampled rows are the last kept row per request."""
+    (the whole chunk when shorter), on one numerical-shape row of an open
+    chunk, and on every decode row; open chunks have no sampled row."""
     backend = _verify_backend("cpu", 3, 2)
     tables = _tables("cpu")
     tables = {gid: torch.cat((t, t[:1])) for gid, t in tables.items()}
@@ -631,13 +656,16 @@ def test_decoder_view_omits_open_chunks_and_keeps_the_final_window():
     )
     full = backend.query_metadata(ForwardMode.MIXED)
     view = backend.decoder_view()
-    # Request 0 completes: all five rows. Request 1 continues: no rows. The verify-width-2 decode request keeps both rows.
-    assert view.keep_rows.tolist() == [0, 1, 2, 3, 4, 8, 9]
-    assert view.metadata.positions.tolist() == [4, 5, 6, 7, 8, 7, 8]
-    assert view.metadata.request_indices.tolist() == [0, 0, 0, 0, 0, 2, 2]
-    assert view.logits_rows.tolist() == [4, 5, 6]
-    assert view.spans == (V41PrefillSpan(0, 0, 4, 5, 4),)
-    assert view.prefill.positions.tolist() == [4, 5, 6, 7, 8]
+    # Keep the open request's last compute row, but omit it from logits.
+    assert view.keep_rows.tolist() == [0, 1, 2, 3, 4, 7, 8, 9]
+    assert view.metadata.positions.tolist() == [4, 5, 6, 7, 8, 4, 7, 8]
+    assert view.metadata.request_indices.tolist() == [0, 0, 0, 0, 0, 1, 2, 2]
+    assert view.logits_rows.tolist() == [4, 6, 7]
+    assert view.spans == (
+        V41PrefillSpan(0, 0, 4, 5, 4),
+        V41PrefillSpan(1, 5, 4, 1, 4),
+    )
+    assert view.prefill.positions.tolist() == [4, 5, 6, 7, 8, 4]
     assert torch.equal(
         view.metadata.swa_write_slots, full.swa_write_slots[view.keep_rows]
     )
@@ -650,7 +678,7 @@ def test_decoder_view_omits_open_chunks_and_keeps_the_final_window():
     plan = backend._swa_query_plan(
         view.prefill.positions, view.prefill.request_indices, ForwardMode.EXTEND
     )
-    assert [r.prefix_slots.numel() for r in plan.requests] == [0]
+    assert [r.prefix_slots.numel() for r in plan.requests] == [0, 0]
     # A completing chunk longer than the window keeps exactly the window.
     # Without decode rows the view is its own prefill window, so the rows
     # the decoder layers hand back are recognized as canonical.
