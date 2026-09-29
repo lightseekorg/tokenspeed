@@ -36,6 +36,8 @@ import logging
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 _PACK_ALIGN = 256
@@ -65,6 +67,49 @@ class PackedCopy:
         return self.width * self.rows
 
 
+@dataclass(frozen=True)
+class SgeColumns:
+    """Ready SGEs as three int64 columns, one row per descriptor.
+
+    A whole field of a cache group is one of these: the generator computes
+    every page's addresses in a single vectorized step and the WRITE hands
+    the columns to Mooncake as arrays, so no per-descriptor Python object is
+    built. Never packed: the rows are already contiguous copies.
+    """
+
+    src: np.ndarray
+    dst: np.ndarray
+    length: np.ndarray
+
+    def __post_init__(self) -> None:
+        for name, column in (
+            ("src", self.src),
+            ("dst", self.dst),
+            ("length", self.length),
+        ):
+            if (
+                not isinstance(column, np.ndarray)
+                or column.ndim != 1
+                or column.dtype != np.int64
+            ):
+                raise TypeError(f"SgeColumns.{name} must be a 1-D int64 array")
+        if not (self.src.shape == self.dst.shape == self.length.shape):
+            raise ValueError("SgeColumns columns must have the same length")
+
+    def __len__(self) -> int:
+        return int(self.src.shape[0])
+
+    def rows(self, start: int, stop: int) -> SgeColumns:
+        return SgeColumns(
+            self.src[start:stop], self.dst[start:stop], self.length[start:stop]
+        )
+
+    def tolist(self) -> list[Sge]:
+        return list(
+            zip(self.src.tolist(), self.dst.tolist(), self.length.tolist(), strict=True)
+        )
+
+
 def expand_packed_copy(copy: PackedCopy) -> list[Sge]:
     """Row-wise SGEs used when 2D pack is unavailable. Dest is contiguous."""
     return [
@@ -86,6 +131,9 @@ def flatten_transfer_blocks(blocks: Iterable[object]) -> Iterator[Sge]:
     for block in blocks:
         if isinstance(block, PackedCopy):
             yield from expand_packed_copy(block)
+            continue
+        if isinstance(block, SgeColumns):
+            yield from block.tolist()
             continue
         src, dst, length = block
         yield (int(src), int(dst), int(length))
@@ -145,6 +193,9 @@ class PrefillPackScratch:
         sges: list[Sge] = []
         offset = 0
         for item in items:
+            if isinstance(item, SgeColumns):
+                sges.extend(item.tolist())
+                continue
             if not isinstance(item, PackedCopy):
                 src, dst, length = item
                 sges.append((int(src), int(dst), int(length)))

@@ -26,7 +26,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import replace
-from itertools import chain, islice, repeat
+from itertools import chain, islice
 
 import numpy as np
 import requests
@@ -50,6 +50,7 @@ from tokenspeed.runtime.pd.mooncake.entities import (
 from tokenspeed.runtime.pd.mooncake.pack import (
     PackedCopy,
     PrefillPackScratch,
+    SgeColumns,
     flatten_transfer_blocks,
 )
 from tokenspeed.runtime.pd.transfer_plan import (
@@ -341,12 +342,80 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks, packer=None):
-        """WRITE descriptors in bounded batches, packing PackedCopy items per batch."""
-        iterator = iter(transfer_blocks)
-        while pending := list(islice(iterator, _TRANSFER_DESCRIPTOR_BATCH_SIZE)):
-            ret = self._write_sge_batch(mooncake_session_id, pending, packer)
+        """WRITE descriptors in bounded batches, packing PackedCopy items per batch.
+
+        ``SgeColumns`` items are coalesced across fields and written as
+        arrays in batches of the same size as the per-descriptor path, so a
+        transfer still costs one WRITE round per 4096 descriptors rather
+        than one per field. They are never packed. Per-descriptor items
+        (tuples, PackedCopy) are collected and written through the packer
+        path in between, preserving order.
+        """
+        pending: list[object] = []
+        columns: list[SgeColumns] = []
+        column_rows = 0
+
+        def write_columns(*, flush: bool) -> int:
+            """WRITE the buffered columns in full batches; keep a partial tail
+            buffered unless flushing."""
+            nonlocal columns, column_rows
+            if column_rows == 0 or (
+                not flush and column_rows < _TRANSFER_DESCRIPTOR_BATCH_SIZE
+            ):
+                return 0
+            merged = (
+                columns[0]
+                if len(columns) == 1
+                else SgeColumns(
+                    np.concatenate([c.src for c in columns]),
+                    np.concatenate([c.dst for c in columns]),
+                    np.concatenate([c.length for c in columns]),
+                )
+            )
+            full_rows = (
+                len(merged)
+                if flush
+                else len(merged) - len(merged) % _TRANSFER_DESCRIPTOR_BATCH_SIZE
+            )
+            tail = merged.rows(full_rows, len(merged))
+            columns = [tail] if len(tail) else []
+            column_rows = len(tail)
+            for start in range(0, full_rows, _TRANSFER_DESCRIPTOR_BATCH_SIZE):
+                rows = merged.rows(start, start + _TRANSFER_DESCRIPTOR_BATCH_SIZE)
+                ret = self.engine.batch_transfer_sync(
+                    mooncake_session_id, rows.src, rows.dst, rows.length
+                )
+                if ret != 0:
+                    return ret
+            return 0
+
+        for item in transfer_blocks:
+            if isinstance(item, SgeColumns):
+                if pending:
+                    ret = self._write_sge_batch(mooncake_session_id, pending, packer)
+                    pending = []
+                    if ret != 0:
+                        return ret
+                columns.append(item)
+                column_rows += len(item)
+                ret = write_columns(flush=False)
+                if ret != 0:
+                    return ret
+                continue
+            ret = write_columns(flush=True)
             if ret != 0:
                 return ret
+            pending.append(item)
+            if len(pending) >= _TRANSFER_DESCRIPTOR_BATCH_SIZE:
+                ret = self._write_sge_batch(mooncake_session_id, pending, packer)
+                pending = []
+                if ret != 0:
+                    return ret
+        ret = write_columns(flush=True)
+        if ret != 0:
+            return ret
+        if pending:
+            return self._write_sge_batch(mooncake_session_id, pending, packer)
         return 0
 
     def _write_sge_batch(self, mooncake_session_id, pending, packer) -> int:
@@ -378,7 +447,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_cache_layout: CacheTransferContract,
         block_selection: CachePDLayerwiseBlockSelection | None = None,
         field_ids: frozenset[str] | None = None,
-    ) -> Iterator[PackedCopy | tuple[int, int, int]]:
+    ) -> Iterator[SgeColumns | PackedCopy | tuple[int, int, int]]:
         layout = self.kv_args.cache_layout
 
         cache_fragments = tuple(transfer_fragments)
@@ -511,11 +580,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         )
                         + dst_pages * dst_segment.page_stride_bytes
                     )
-                    yield from zip(
-                        src_addrs.tolist(),
-                        dst_addrs.tolist(),
-                        repeat(src_segment.payload_bytes),
-                        strict=False,
+                    yield SgeColumns(
+                        src_addrs,
+                        dst_addrs,
+                        np.full(src_pages.shape, src_segment.payload_bytes, np.int64),
                     )
                 continue
 

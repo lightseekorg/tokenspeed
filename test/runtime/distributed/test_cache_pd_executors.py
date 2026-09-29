@@ -32,6 +32,10 @@ from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
     TransferInfo,
     TransferKVChunk,
 )
+from tokenspeed.runtime.pd.mooncake.pack import (  # noqa: E402
+    SgeColumns,
+    flatten_transfer_blocks,
+)
 from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
 from tokenspeed.runtime.pd.transfer_plan import CacheTransferFragment  # noqa: E402
 
@@ -228,9 +232,19 @@ def _recording_transfer_manager(layout: CacheTransferContract, src_ptr: int):
     calls = []
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.kv_args = SimpleNamespace(cache_layout=layout, kv_data_ptr=src_ptr)
+    # Whole-field descriptors arrive as int64 array columns, fragment rows as
+    # lists; record both as plain lists so the geometry asserts read the same.
     manager.engine = SimpleNamespace(
         batch_transfer_sync=lambda session, src, dst, lengths: (
-            calls.append((session, src, dst, lengths)) or 0
+            calls.append(
+                (
+                    session,
+                    [int(value) for value in src],
+                    [int(value) for value in dst],
+                    [int(value) for value in lengths],
+                )
+            )
+            or 0
         )
     )
     return manager, calls
@@ -786,7 +800,10 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
             dst_cache_layout=destination_layout,
         )
     )
-    assert blocks == expected
+    # One array column block per field, no per-page Python objects.
+    assert [type(block) for block in blocks] == [SgeColumns, SgeColumns]
+    assert all(len(block) == pages for block in blocks)
+    assert list(flatten_transfer_blocks(blocks)) == expected
 
     fragment = CacheTransferFragment(
         group_id="history",
@@ -814,6 +831,72 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
         for s, d in zip(src, dst, strict=True)
         for row in range(2)
     ]
+
+
+def test_transfer_data_coalesces_column_blocks_into_descriptor_batches() -> None:
+    from tokenspeed.runtime.pd.mooncake import prefill as prefill_module
+
+    manager, calls = _recording_transfer_manager(
+        _typed_layout(local_heads=4, global_heads=4), 0
+    )
+
+    def columns(start: int, count: int) -> SgeColumns:
+        rows = np.arange(start, start + count, dtype=np.int64)
+        return SgeColumns(rows, rows + 1_000_000, np.full(count, 64, np.int64))
+
+    batch = prefill_module._TRANSFER_DESCRIPTOR_BATCH_SIZE
+    blocks = [
+        columns(0, 100),  # two small fields coalesce into one WRITE ...
+        columns(100, 200),
+        (7, 8, 9),  # ... flushed before a per-descriptor item, order kept
+        columns(300, batch + 10),  # a field spanning a batch: full batch
+        columns(300 + batch + 10, 20),  # goes out, the tail keeps buffering
+    ]
+    assert manager._transfer_data("session", iter(blocks)) == 0
+
+    sizes = [len(call[1]) for call in calls]
+    assert sizes == [300, 1, batch, 30]
+    assert calls[0][1] == list(range(300)) and calls[0][2][0] == 1_000_000
+    assert calls[1] == ("session", [7], [8], [9])
+    assert calls[2][1][0] == 300 and calls[3][1][-1] == 300 + batch + 29
+
+    failing = SimpleNamespace(batch_transfer_sync=lambda *args: -1)
+    manager.engine = failing
+    assert manager._transfer_data("session", iter([columns(0, 3)])) == -1
+
+
+def test_engine_wrapper_sends_columns_as_arrays_when_mooncake_offers_it() -> None:
+    from tokenspeed.runtime.pd.base.mooncake_engine import MooncakeTransferEngine
+
+    src = np.asarray([1, 2], dtype=np.int64)
+    dst = np.asarray([3, 4], dtype=np.int64)
+    lengths = np.asarray([5, 6], dtype=np.int64)
+    seen = []
+
+    wrapper = object.__new__(MooncakeTransferEngine)
+    wrapper.engine = SimpleNamespace(
+        batch_transfer_sync_write=lambda session, a, b, c: seen.append(
+            ("list", a, b, c)
+        )
+        or 0
+    )
+    # Older wheel: arrays are listified for the list API.
+    wrapper.batch_transfer_sync_write_arrays = None
+    assert wrapper.batch_transfer_sync("s", src, dst, lengths) == 0
+    assert seen == [("list", [1, 2], [3, 4], [5, 6])]
+    assert all(isinstance(value, int) for value in seen[0][1])
+
+    # tokenspeed-mooncake with the arrays API: columns pass through untouched.
+    seen.clear()
+    wrapper.batch_transfer_sync_write_arrays = (
+        lambda session, a, b, c: seen.append(("arrays", a, b, c)) or 0
+    )
+    assert wrapper.batch_transfer_sync("s", src, dst, lengths) == 0
+    assert seen[0][0] == "arrays" and seen[0][1] is src and seen[0][3] is lengths
+    # Lists still take the list API.
+    seen.clear()
+    assert wrapper.batch_transfer_sync("s", [1], [2], [3]) == 0
+    assert seen == [("list", [1], [2], [3])]
 
 
 class _FakePackScratch:

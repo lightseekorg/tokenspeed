@@ -20,6 +20,8 @@
 
 import logging
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +40,12 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id
         self.ib_device = ib_device
+        # Array-taking batch WRITE (tokenspeed-mooncake >= 0.3.13.post20260929;
+        # absent upstream): descriptors go over as int64 arrays instead of
+        # three lists of Python ints. Without it, arrays are listified.
+        self.batch_transfer_sync_write_arrays = getattr(
+            self.engine, "batch_transfer_sync_write_arrays", None
+        )
 
         self.initialize(
             hostname=self.hostname,
@@ -120,15 +128,33 @@ class MooncakeTransferEngine:
     def batch_transfer_sync(
         self,
         session_id: str,
-        buffers: list[int],
-        peer_buffer_addresses: list[int],
-        lengths: list[int],
+        buffers: list[int] | np.ndarray,
+        peer_buffer_addresses: list[int] | np.ndarray,
+        lengths: list[int] | np.ndarray,
     ) -> int:
-        """Synchronously transfer data to the specified addresses in batches."""
+        """Synchronously transfer data to the specified addresses in batches.
+
+        The three descriptor columns are either lists of ints or 1-D int64
+        arrays; arrays reach Mooncake without per-descriptor conversion when
+        the engine offers ``batch_transfer_sync_write_arrays``.
+        """
         try:
-            ret = self.engine.batch_transfer_sync_write(
-                session_id, buffers, peer_buffer_addresses, lengths
-            )
+            if isinstance(buffers, np.ndarray):
+                if self.batch_transfer_sync_write_arrays is not None:
+                    ret = self.batch_transfer_sync_write_arrays(
+                        session_id, buffers, peer_buffer_addresses, lengths
+                    )
+                else:
+                    ret = self.engine.batch_transfer_sync_write(
+                        session_id,
+                        buffers.tolist(),
+                        peer_buffer_addresses.tolist(),
+                        lengths.tolist(),
+                    )
+            else:
+                ret = self.engine.batch_transfer_sync_write(
+                    session_id, buffers, peer_buffer_addresses, lengths
+                )
         except Exception:
             ret = -1
             # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
