@@ -167,3 +167,115 @@ def test_bounded_selection_graph_refresh():
         torch.testing.assert_close(
             canonical(actual[0]), canonical(expected[0]), atol=0, rtol=0
         )
+
+
+def assert_cleaned_prefixes(scores, visible, table, num_pages, actual):
+    expected = impl.clean_logits(scores, visible, table, num_pages, scores.shape[1], 64)
+    maxima, ends = impl.block_maxima_with_lengths(expected, visible)
+    torch.testing.assert_close(actual[2], ends, atol=0, rtol=0)
+    for row, length in enumerate(visible.cpu().tolist()):
+        length = max(0, min(length, scores.shape[1]))
+        for old, new, count in (
+            (expected, actual[0], length),
+            (maxima, actual[1], (length + 7) // 8),
+        ):
+            torch.testing.assert_close(
+                old[row, :count], new[row, :count], atol=0, rtol=0, equal_nan=True
+            )
+    return expected
+
+
+@pytest.mark.parametrize("table_layout", ["contiguous", "strided", "broadcast"])
+def test_clean_block_prefixes(table_layout):
+    width = 4103
+    torch.manual_seed(37)
+    scores = torch.randn((8, width + 13), device="cuda")[:, :width]
+    visible = torch.tensor(
+        [-1, 0, 1, 7, 8, 9, 1330, width + 64], device="cuda", dtype=torch.int32
+    ).repeat_interleave(2)[::2]
+    pages = (width + 63) // 64
+    table = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(8, 1)
+    table[:, 2] = -1
+    table[:, 4] = pages
+    if table_layout == "strided":
+        table = table.repeat_interleave(2, dim=1)[:, ::2]
+    elif table_layout == "broadcast":
+        table = table[:1].expand(8, -1)
+    scores[3, 0] = float("nan")
+    scores[7, -1] = float("nan")
+    scores[6, 8] = float("inf")
+    actual = impl.clean_block_maxima(scores, visible, table, pages)
+    assert_cleaned_prefixes(scores, visible, table, pages, actual)
+
+
+def native_selection(scores, visible, block_stats):
+    rows = scores.shape[0]
+    out = (
+        torch.empty((rows, 512), device="cuda", dtype=torch.int32),
+        torch.empty((rows,), device="cuda", dtype=torch.int32),
+        torch.empty((rows, 2048), device="cuda", dtype=torch.int32),
+        torch.empty((rows,), device="cuda", dtype=torch.int32),
+    )
+    impl._native_select(scores, visible, None, 512, 2048, out, None, block_stats)
+    return out
+
+
+def test_clean_block_selection_graph_refresh():
+    width = 65536
+    torch.manual_seed(73)
+    scores = torch.randn((4, width), device="cuda")
+    visible = torch.tensor([0, 1, 9, 1330], device="cuda", dtype=torch.int32)
+    pages = (width + 63) // 64
+    table = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(4, 1)
+    table[:, 2] = -1
+
+    def run():
+        cleaned, maxima, ends = impl.clean_block_maxima(scores, visible, table, pages)
+        return cleaned, maxima, ends, native_selection(cleaned, visible, (maxima, ends))
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for lengths in ([width] * 4, [0] * 4, [1, 1330, 9, 32768]):
+        visible.copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
+        scores.normal_()
+        table[:, 3] = -1 if lengths[0] == 0 else 3
+        # Poison unwritten tails to prove that selection obeys device lengths.
+        actual[0].fill_(float("inf"))
+        actual[1].fill_(float("inf"))
+        graph.replay()
+        expected = assert_cleaned_prefixes(scores, visible, table, pages, actual[:3])
+        selected = native_selection(expected, visible, None)
+        for i, (old, new) in enumerate(zip(selected, actual[3])):
+            if i % 2 == 0:
+                old, new = canonical(old), canonical(new)
+            torch.testing.assert_close(old, new, atol=0, rtol=0)
+
+
+def test_clean_block_empty_rows():
+    actual = impl.clean_block_maxima(
+        torch.empty((0, 17), device="cuda"),
+        torch.empty((0,), device="cuda", dtype=torch.int32),
+        torch.empty((0, 1), device="cuda", dtype=torch.int32),
+        1,
+    )
+    assert [x.shape for x in actual] == [(0, 17), (0, 3), (0,)]
+
+
+def test_clean_block_capacity_does_not_recompile():
+    from tokenspeed_kernel.ops.attention.dsv41.triton import _clean_block_maxima_kernel
+
+    def run(rows, width):
+        pages = (width + 63) // 64
+        scores = torch.randn((rows, width), device="cuda")
+        visible = torch.full((rows,), width, device="cuda", dtype=torch.int32)
+        table = torch.arange(pages, device="cuda", dtype=torch.int32).repeat(rows, 1)
+        actual = impl.clean_block_maxima(scores, visible, table, pages)
+        assert_cleaned_prefixes(scores, visible, table, pages, actual)
+
+    for width in (1024, 1025, 1032):
+        run(8, width)
+    with assert_no_triton_compile(_clean_block_maxima_kernel):
+        for rows, width in ((1, 2048), (17, 2049), (3, 16385), (6, 1048640)):
+            run(rows, width)
