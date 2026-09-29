@@ -51,7 +51,6 @@ from tokenspeed.runtime.pd.mooncake.pack import (
     PackedCopy,
     PageFieldCopies,
     PrefillPackScratch,
-    SgeColumns,
     flatten_transfer_blocks,
 )
 from tokenspeed.runtime.pd.transfer_plan import (
@@ -345,99 +344,35 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     def _transfer_data(self, mooncake_session_id, transfer_blocks, packer=None):
         """WRITE descriptors in bounded batches, packing PackedCopy items per batch.
 
-        A ``PageFieldCopies`` item goes to Mooncake's page-gathered WRITE as
-        is when the engine has it; otherwise it expands to one column block
-        per field, and those are coalesced across fields and written as
-        arrays in batches of the same size as the per-descriptor path, so a
-        transfer still costs one WRITE round per 4096 descriptors rather
-        than one per field. Neither form is packed. Per-descriptor items
-        (tuples, PackedCopy) are collected and written through the packer
-        path in between, preserving order.
+        A ``PageFieldCopies`` item is one page-gathered WRITE, expanded and
+        batched inside Mooncake; per-descriptor items (tuples, PackedCopy)
+        are collected and written through the packer path in between,
+        preserving order.
         """
         pending: list[object] = []
-        columns: list[SgeColumns] = []
-        column_rows = 0
-
-        def write_columns(*, flush: bool) -> int:
-            """WRITE the buffered columns in full batches; keep a partial tail
-            buffered unless flushing."""
-            nonlocal columns, column_rows
-            if column_rows == 0 or (
-                not flush and column_rows < _TRANSFER_DESCRIPTOR_BATCH_SIZE
-            ):
-                return 0
-            merged = (
-                columns[0]
-                if len(columns) == 1
-                else SgeColumns(
-                    np.concatenate([c.src for c in columns]),
-                    np.concatenate([c.dst for c in columns]),
-                    np.concatenate([c.length for c in columns]),
-                )
-            )
-            full_rows = (
-                len(merged)
-                if flush
-                else len(merged) - len(merged) % _TRANSFER_DESCRIPTOR_BATCH_SIZE
-            )
-            tail = merged.rows(full_rows, len(merged))
-            columns = [tail] if len(tail) else []
-            column_rows = len(tail)
-            for start in range(0, full_rows, _TRANSFER_DESCRIPTOR_BATCH_SIZE):
-                rows = merged.rows(start, start + _TRANSFER_DESCRIPTOR_BATCH_SIZE)
-                ret = self.engine.batch_transfer_sync(
-                    mooncake_session_id, rows.src, rows.dst, rows.length
-                )
-                if ret != 0:
-                    return ret
-            return 0
-
         for item in transfer_blocks:
-            if isinstance(item, (PageFieldCopies, SgeColumns)):
+            if isinstance(item, PageFieldCopies):
                 if pending:
                     ret = self._write_sge_batch(mooncake_session_id, pending, packer)
                     pending = []
                     if ret != 0:
                         return ret
-                if (
-                    isinstance(item, PageFieldCopies)
-                    and self.engine.batch_transfer_sync_pages is not None
-                ):
-                    ret = write_columns(flush=True)
-                    if ret != 0:
-                        return ret
-                    ret = self.engine.batch_transfer_sync_pages(
-                        mooncake_session_id,
-                        item.src_pages,
-                        item.dst_pages,
-                        item.fields,
-                        max_batch_size=_TRANSFER_DESCRIPTOR_BATCH_SIZE,
-                    )
-                    if ret != 0:
-                        return ret
-                    continue
-                expanded = (
-                    item.expand() if isinstance(item, PageFieldCopies) else [item]
+                ret = self.engine.batch_transfer_sync_pages(
+                    mooncake_session_id,
+                    item.src_pages,
+                    item.dst_pages,
+                    item.fields,
+                    max_batch_size=_TRANSFER_DESCRIPTOR_BATCH_SIZE,
                 )
-                for block in expanded:
-                    columns.append(block)
-                    column_rows += len(block)
-                    ret = write_columns(flush=False)
-                    if ret != 0:
-                        return ret
+                if ret != 0:
+                    return ret
                 continue
-            ret = write_columns(flush=True)
-            if ret != 0:
-                return ret
             pending.append(item)
             if len(pending) >= _TRANSFER_DESCRIPTOR_BATCH_SIZE:
                 ret = self._write_sge_batch(mooncake_session_id, pending, packer)
                 pending = []
                 if ret != 0:
                     return ret
-        ret = write_columns(flush=True)
-        if ret != 0:
-            return ret
         if pending:
             return self._write_sge_batch(mooncake_session_id, pending, packer)
         return 0
@@ -586,8 +521,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         "cache transfer source and destination pages differ in count"
                     )
                 # One pages x fields item per group: the descriptors are
-                # expanded by Mooncake (or by the fallback in _transfer_data),
-                # never here.
+                # expanded inside Mooncake, never here.
                 field_rows = []
                 for src_segment in group_fields:
                     if field_ids is not None and src_segment.field_id not in field_ids:

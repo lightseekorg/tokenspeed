@@ -68,49 +68,6 @@ class PackedCopy:
 
 
 @dataclass(frozen=True)
-class SgeColumns:
-    """Ready SGEs as three int64 columns, one row per descriptor.
-
-    A whole field of a cache group is one of these: the generator computes
-    every page's addresses in a single vectorized step and the WRITE hands
-    the columns to Mooncake as arrays, so no per-descriptor Python object is
-    built. Never packed: the rows are already contiguous copies.
-    """
-
-    src: np.ndarray
-    dst: np.ndarray
-    length: np.ndarray
-
-    def __post_init__(self) -> None:
-        for name, column in (
-            ("src", self.src),
-            ("dst", self.dst),
-            ("length", self.length),
-        ):
-            if (
-                not isinstance(column, np.ndarray)
-                or column.ndim != 1
-                or column.dtype != np.int64
-            ):
-                raise TypeError(f"SgeColumns.{name} must be a 1-D int64 array")
-        if not (self.src.shape == self.dst.shape == self.length.shape):
-            raise ValueError("SgeColumns columns must have the same length")
-
-    def __len__(self) -> int:
-        return int(self.src.shape[0])
-
-    def rows(self, start: int, stop: int) -> SgeColumns:
-        return SgeColumns(
-            self.src[start:stop], self.dst[start:stop], self.length[start:stop]
-        )
-
-    def tolist(self) -> list[Sge]:
-        return list(
-            zip(self.src.tolist(), self.dst.tolist(), self.length.tolist(), strict=True)
-        )
-
-
-@dataclass(frozen=True)
 class PageFieldCopies:
     """One cache group's whole-field copies as pages x fields, unexpanded.
 
@@ -119,8 +76,7 @@ class PageFieldCopies:
     ``(f, i)`` copies ``length`` bytes from ``src_base + src_pages[i] *
     src_stride`` to ``dst_base + dst_pages[i] * dst_stride``. Mooncake's
     ``batch_transfer_sync_write_pages`` consumes this shape directly, so a
-    group is one call with no descriptor built on the host; :meth:`expand`
-    is the fallback for engines without it.
+    group is one call with no descriptor built on the host. Never packed.
     """
 
     src_pages: np.ndarray
@@ -154,19 +110,6 @@ class PageFieldCopies:
     def __len__(self) -> int:
         return int(self.src_pages.shape[0] * self.fields.shape[0])
 
-    def expand(self) -> list[SgeColumns]:
-        """One column block per field, in field order."""
-        return [
-            SgeColumns(
-                src_base + self.src_pages * src_stride,
-                dst_base + self.dst_pages * dst_stride,
-                np.full(self.src_pages.shape, length, np.int64),
-            )
-            for src_base, src_stride, dst_base, dst_stride, length in (
-                self.fields.tolist()
-            )
-        ]
-
 
 def expand_packed_copy(copy: PackedCopy) -> list[Sge]:
     """Row-wise SGEs used when 2D pack is unavailable. Dest is contiguous."""
@@ -191,12 +134,7 @@ def flatten_transfer_blocks(blocks: Iterable[object]) -> Iterator[Sge]:
             yield from expand_packed_copy(block)
             continue
         if isinstance(block, PageFieldCopies):
-            for columns in block.expand():
-                yield from columns.tolist()
-            continue
-        if isinstance(block, SgeColumns):
-            yield from block.tolist()
-            continue
+            raise TypeError("PageFieldCopies takes the page-gathered WRITE, not SGEs")
         src, dst, length = block
         yield (int(src), int(dst), int(length))
 
@@ -256,12 +194,9 @@ class PrefillPackScratch:
         offset = 0
         for item in items:
             if isinstance(item, PageFieldCopies):
-                for columns in item.expand():
-                    sges.extend(columns.tolist())
-                continue
-            if isinstance(item, SgeColumns):
-                sges.extend(item.tolist())
-                continue
+                raise TypeError(
+                    "PageFieldCopies takes the page-gathered WRITE, not the packer"
+                )
             if not isinstance(item, PackedCopy):
                 src, dst, length = item
                 sges.append((int(src), int(dst), int(length)))

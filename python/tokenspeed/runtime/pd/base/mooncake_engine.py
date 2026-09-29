@@ -40,32 +40,14 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id
         self.ib_device = ib_device
-        # Array-taking batch WRITE (tokenspeed-mooncake >= 0.3.13.post20260929;
-        # absent upstream): descriptors go over as int64 arrays instead of
-        # three lists of Python ints. Without it, arrays are listified.
-        self.batch_transfer_sync_write_arrays = getattr(
-            self.engine, "batch_transfer_sync_write_arrays", None
-        )
-        # Page-gathered batch WRITE from the same patch: pages x fields are
-        # expanded inside Mooncake. None when the engine lacks it; callers
-        # then expand on the host.
-        self.batch_transfer_sync_pages = (
-            self._batch_transfer_sync_pages
-            if hasattr(self.engine, "batch_transfer_sync_write_pages")
-            else None
-        )
-
-        self.initialize(
-            hostname=self.hostname,
-            device_name=self.ib_device,
-        )
-        self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
-        # The peer identifies this rank by session_id in its transfer logs
-        # (Prefill's "session=..."), so name it once per process here.
-        logger.info(
-            f"Mooncake transfer engine ready: session_id={self.session_id} "
-            f"gpu_id={self.gpu_id} ib_device={self.ib_device}"
-        )
+        # Page-gathered batch WRITE (pages x fields expanded inside Mooncake)
+        # is the only way the CachePD sender moves whole fields, so an engine
+        # without it is a wrong install, not a slower one.
+        if not hasattr(self.engine, "batch_transfer_sync_write_pages"):
+            raise RuntimeError(
+                "Mooncake's TransferEngine lacks batch_transfer_sync_write_pages; "
+                "install tokenspeed-mooncake >= 0.3.13.post20260929."
+            )
 
     def register(self, ptr, length):
         """Register ``ptr`` with Mooncake.
@@ -136,33 +118,15 @@ class MooncakeTransferEngine:
     def batch_transfer_sync(
         self,
         session_id: str,
-        buffers: list[int] | np.ndarray,
-        peer_buffer_addresses: list[int] | np.ndarray,
-        lengths: list[int] | np.ndarray,
+        buffers: list[int],
+        peer_buffer_addresses: list[int],
+        lengths: list[int],
     ) -> int:
-        """Synchronously transfer data to the specified addresses in batches.
-
-        The three descriptor columns are either lists of ints or 1-D int64
-        arrays; arrays reach Mooncake without per-descriptor conversion when
-        the engine offers ``batch_transfer_sync_write_arrays``.
-        """
+        """Synchronously transfer data to the specified addresses in batches."""
         try:
-            if isinstance(buffers, np.ndarray):
-                if self.batch_transfer_sync_write_arrays is not None:
-                    ret = self.batch_transfer_sync_write_arrays(
-                        session_id, buffers, peer_buffer_addresses, lengths
-                    )
-                else:
-                    ret = self.engine.batch_transfer_sync_write(
-                        session_id,
-                        buffers.tolist(),
-                        peer_buffer_addresses.tolist(),
-                        lengths.tolist(),
-                    )
-            else:
-                ret = self.engine.batch_transfer_sync_write(
-                    session_id, buffers, peer_buffer_addresses, lengths
-                )
+            ret = self.engine.batch_transfer_sync_write(
+                session_id, buffers, peer_buffer_addresses, lengths
+            )
         except Exception:
             ret = -1
             # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
@@ -179,7 +143,7 @@ class MooncakeTransferEngine:
             )
         return ret
 
-    def _batch_transfer_sync_pages(
+    def batch_transfer_sync_pages(
         self,
         session_id: str,
         src_pages: np.ndarray,
