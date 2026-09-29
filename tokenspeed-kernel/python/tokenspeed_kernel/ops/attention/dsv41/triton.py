@@ -3151,3 +3151,78 @@ def compressor_metadata(
             BLOCK=256,
             num_warps=4,
         )
+
+
+@triton.jit
+def _block_maxima_kernel(
+    Logits,
+    Visible,
+    Output,
+    Ends,
+    width,
+    stride_row,
+    stride_col,
+    visible_stride,
+    blocks,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    col = block[:, None] * 8 + tl.arange(0, 8)[None, :]
+    values = tl.load(
+        Logits + row * stride_row + col * stride_col,
+        mask=col < width,
+        other=-float("inf"),
+    ).to(tl.float32)
+    # torch.amax propagates NaNs, including in the pinned newest block.
+    has_nan = tl.sum((values != values).to(tl.int32), axis=1) != 0
+    maxima = tl.max(values, axis=1)
+    maxima = tl.where(has_nan, float("nan"), maxima)
+    visible = tl.load(Visible + row * visible_stride).to(tl.int64)
+    if tl.program_id(1) == 0:
+        end = (tl.minimum(tl.maximum(visible, 0), width) + 7) // 8
+        tl.store(Ends + row, end.to(tl.int32))
+    newest = tl.minimum(tl.maximum(visible - 1, 0) // 8, blocks - 1)
+    maxima = tl.where(
+        (block == newest) & (maxima > -float("inf")), float("inf"), maxima
+    )
+    tl.store(Output + row * blocks + block, maxima, mask=block < blocks)
+
+
+def block_maxima(logits: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
+    """Reduce each eight-score block and pin the valid newest block to +inf.
+
+    Preserve input row order, NaNs and -inf padding. Widths and tensor strides
+    remain runtime arguments so varying history capacity does not recompile.
+    """
+    return block_maxima_with_lengths(logits, visible)[0]
+
+
+def block_maxima_with_lengths(
+    logits: torch.Tensor, visible: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return eight-score maxima and GPU-resident valid block counts.
+
+    Consumers may ignore scores at or after each returned block count only
+    when scores outside the visible prefix have already been masked to -inf.
+    """
+    rows, width = logits.shape
+    if width == 0:
+        raise ValueError("block maxima requires a positive score width")
+    blocks = triton.cdiv(width, 8)
+    output = torch.empty((rows, blocks), dtype=logits.dtype, device=logits.device)
+    ends = torch.empty((rows,), dtype=torch.int32, device=logits.device)
+    if rows:
+        _block_maxima_kernel[(rows, triton.cdiv(blocks, 128))](
+            logits,
+            visible,
+            output,
+            ends,
+            width,
+            logits.stride(0),
+            logits.stride(1),
+            visible.stride(0),
+            blocks,
+            128,
+        )
+    return output, ends
