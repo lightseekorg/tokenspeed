@@ -35,7 +35,9 @@ def _mark_forced_initial_local_logits_kernel(
     logits_ptr,
     logits_row_stride,
     causal_lens_ptr,
-    num_cols: tl.constexpr,
+    # Candidate width follows the batch; runtime so every batch shape shares
+    # one binary.
+    num_cols,
     initial_tokens: tl.constexpr,
     local_tokens: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -112,7 +114,9 @@ def _local_topk_to_global_slots_kernel(
     block_table_ptr,
     block_table_base_offsets_ptr,
     block_table_stride,
-    block_table_cols: tl.constexpr,
+    # Block-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    block_table_cols,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     has_seq_lens: tl.constexpr,

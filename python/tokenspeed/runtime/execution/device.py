@@ -89,6 +89,7 @@ from tokenspeed.runtime.execution.types import (
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
 
@@ -1004,8 +1005,9 @@ def build_device_side(
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank
     )
-    if server_args.disaggregation_mode in ("null", "prefill"):
-        target.prepare_multimodal_runtime()
+    with startup_phase("multimodal.init"):
+        if server_args.disaggregation_mode in ("null", "prefill"):
+            target.prepare_multimodal_runtime()
     max_forward_tokens = (
         server_args.chunked_prefill_size
         if server_args.chunked_prefill_size > 0
@@ -1015,10 +1017,12 @@ def build_device_side(
         max_forward_tokens,
         max_batch_size * decode_input_tokens,
     )
-    target.prepare_communication_runtime(max_forward_tokens)
-    if draft is not None:
-        draft.prepare_communication_runtime(max_forward_tokens)
+    with startup_phase("communication.prepare"):
+        target.prepare_communication_runtime(max_forward_tokens)
+        if draft is not None:
+            draft.prepare_communication_runtime(max_forward_tokens)
 
+    @startup_phase("kv.build")
     def build_components(
         *,
         graph_reserve_bytes: int,
@@ -1081,38 +1085,42 @@ def build_device_side(
             )
             server_args.chunked_prefill_size = aligned
 
-    executor = create_model_executor(
-        server_args=server_args,
-        config=ModelExecutorConfig.from_server_args(
+    with startup_phase("executor.init"):
+        executor = create_model_executor(
             server_args=server_args,
-            model_config=model_config,
-            max_req_pool_size=max_batch_size + 1,
-            gpu_id=gpu_id,
-            global_rank=global_rank,
-            prefix_granularity=views.cache_geometry.prefix_granularity,
-            overlap_schedule_depth=overlap_schedule_depth,
-        ),
-        model_runner=target,
-        draft_model_runner=draft,
-        attn_backend=attention.attn_backend,
-        token_to_kv_pool=views.token_to_kv_pool,
-        draft_attn_backend=attention.draft_attn_backend,
-        draft_token_to_kv_pool=views.draft_token_to_kv_pool,
-    )
+            config=ModelExecutorConfig.from_server_args(
+                server_args=server_args,
+                model_config=model_config,
+                max_req_pool_size=max_batch_size + 1,
+                gpu_id=gpu_id,
+                global_rank=global_rank,
+                prefix_granularity=views.cache_geometry.prefix_granularity,
+                overlap_schedule_depth=overlap_schedule_depth,
+            ),
+            model_runner=target,
+            draft_model_runner=draft,
+            attn_backend=attention.attn_backend,
+            token_to_kv_pool=views.token_to_kv_pool,
+            draft_attn_backend=attention.draft_attn_backend,
+            draft_token_to_kv_pool=views.draft_token_to_kv_pool,
+        )
     # Once per process, before the probe: a graph keeps its capture-time tactic.
-    executor.autotune()
+    with startup_phase("kernels.autotune"):
+        executor.autotune()
     if probing:
         # Consumers above keep the probe's: they read only block-count-invariant fields.
-        attention, views = _rebind_under_reserve(
-            executor,
-            build_components,
-            server_args,
-            gpu_id,
-            attention,
-            requested_backends,
-        )
+        with startup_phase("graph.probe_rebind"):
+            attention, views = _rebind_under_reserve(
+                executor,
+                build_components,
+                server_args,
+                gpu_id,
+                attention,
+                requested_backends,
+            )
 
-    executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
+    with startup_phase("graph.capture"):
+        executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
     # Tuning and capture draw from the generator; this is the state startup leaves.
     set_random_seed(48)
 

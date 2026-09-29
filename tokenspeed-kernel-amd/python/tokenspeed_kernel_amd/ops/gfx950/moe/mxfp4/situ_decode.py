@@ -1234,7 +1234,7 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
             BLOCK_N=_GDOT_STAGE1_BLOCK_N,
             BLOCK_KB=_GDOT_DECODE_BLOCK_KB,
             NUM_WARPS=_GDOT_STAGE1_NUM_WARPS,
-            num_warps=_GDOT_STAGE1_NUM_WARPS,
+            num_warps=_GDOT_STAGE1_NUM_WARPS.value,
         )
     else:
         tp_local = num_experts == 896 and intermediate_dim == 384 and top_k == 16
@@ -1349,7 +1349,7 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
             BLOCK_N=_GDOT_STAGE2_BLOCK_N,
             BLOCK_KB=_GDOT_DECODE_BLOCK_KB,
             NUM_WARPS=_GDOT_STAGE2_NUM_WARPS,
-            num_warps=_GDOT_STAGE2_NUM_WARPS,
+            num_warps=_GDOT_STAGE2_NUM_WARPS.value,
         )
         _reduce_topk_groups[(num_tokens * triton.cdiv(hidden_dim, 256),)](
             stage2_out,

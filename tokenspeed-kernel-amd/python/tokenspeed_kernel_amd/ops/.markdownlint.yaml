@@ -1,0 +1,9 @@
+# Line length for ops/README.md. The pre-commit hook loads this config and
+# only runs against that file. Sibling READMEs are catalogs, not this style.
+default: false
+MD013:
+  line_length: 80
+  headings: false
+  code_blocks: false
+  tables: false
+  strict: false

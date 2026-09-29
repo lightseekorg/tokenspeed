@@ -28,6 +28,7 @@ import torch
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -256,6 +257,50 @@ class MoELayer(torch.nn.Module):
         if self._internal_activation_dtype_override is not None:
             internal_activation_dtype = self._internal_activation_dtype_override
 
+        if self._spec.use_gluon_petit:
+            if internal_activation_dtype not in {"input", "mxfp4"}:
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires MXFP4 activations; "
+                    f"the requested {internal_activation_dtype} activations are unsupported"
+                )
+            # Keep Petit hardware and expert constraints here; ServerArgs checks
+            # shared backends, model dtype, and scheduling capacity.
+            if not current_platform().is_cdna4:
+                raise ValueError(
+                    "Gluon Petit MegaMoE currently requires AMD CDNA4 (gfx950)"
+                )
+            mapping = global_server_args_dict["mapping"]
+            if mapping.nnodes != 1:
+                raise ValueError("Gluon Petit MegaMoE currently supports one node only")
+            if mapping.moe.tp_size != 1 or self.tp_size != 1:
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires MoE tensor parallel size 1"
+                )
+            if mapping.world_size != 8 or mapping.moe.ep_size != 8 or self.ep_size != 8:
+                raise ValueError("Gluon Petit MegaMoE requires world_size=ep_size=8")
+            if (
+                global_server_args_dict["enable_eplb"]
+                or self.ep_num_redundant_experts
+                or global_server_args_dict["init_expert_location"]
+                not in (None, "trivial")
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires trivial expert placement "
+                    "without EPLB or redundant experts"
+                )
+            if (
+                self._quant_kind != "mxfp4"
+                or not self.quant_config.is_checkpoint_mxfp4_serialized
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires serialized MXFP4 expert weights"
+                )
+            if swiglu_beta is None and activation_alpha is not None:
+                raise ValueError(
+                    "Gluon Petit MegaMoE does not support nonstandard SiLU alpha"
+                )
+            internal_activation_dtype = "mxfp4"
+
         input_dtype = torch.get_default_dtype()
         if input_dtype not in {torch.float16, torch.bfloat16}:
             input_dtype = torch.float16
@@ -268,6 +313,8 @@ class MoELayer(torch.nn.Module):
         # Preserve the legacy CLI name; weight dtype selects the MegaMoE implementation.
         if moe_backend == "deep_gemm_mega_moe":
             moe_backend = "mega_moe"
+        if moe_backend == "gluon_petit":
+            moe_backend = "gluon"
         moe_backend = None if moe_backend == "auto" else moe_backend
         process_group = None
         deepep_mode = None
