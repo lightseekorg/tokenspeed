@@ -231,16 +231,20 @@ class CacheArena:
     def field_block_byte_offset(self, field_id: str, block_id: int) -> int:
         return self.plan.field_page_byte_offset(field_id, block_id)
 
-    def zero_blocks(self, block_ids_by_group: Mapping[str, Sequence[int]]) -> None:
+    def zero_blocks(
+        self, block_ids_by_group: Mapping[str, Sequence[int] | np.ndarray]
+    ) -> None:
         """Clear local physical blocks after validating every group's IDs.
 
-        Host work stays O(pages): the ids are validated as one array, staged
-        through one pinned copy, and each group's page x field expansion runs
-        in the kernel. A long prompt's admission hands out thousands of
-        pages, so per-range Python here would stall the forward thread.
+        Host work stays O(pages) with no per-page Python object: the ids are
+        validated as one array, staged through one pinned copy, and each
+        group's page x field expansion runs in the kernel. A long prompt's
+        admission hands out thousands of pages, so per-range Python here
+        would stall the forward thread.
 
         Args:
-            block_ids_by_group: Local block IDs, each in [0, group.page_count).
+            block_ids_by_group: Local block IDs, each in [0, group.page_count),
+                as sequences or integer arrays.
 
         Raises:
             IndexError: A block ID is outside its group's physical range.
