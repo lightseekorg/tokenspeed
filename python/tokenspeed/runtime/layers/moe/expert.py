@@ -28,6 +28,9 @@ import torch
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
 )
+from tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant import (
+    TRTLLM_UNQUANT_ISPP_ALIGNMENT,
+)
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -212,15 +215,21 @@ class MoELayer(torch.nn.Module):
                 fp8_scale_block_shape[0], "FP8 block scales tile it"
             )
         if self._quant_kind == "unquant":
-            # The flashinfer_trtllm unquant kernel declares
-            # ispp_alignment={128} (ops/moe/flashinfer/trtllm_unquant.py);
-            # without padding a misaligned intermediate size silently
-            # deselects it during moe_plan and the layer falls back to the
-            # triton bf16 path. The padded tail rows/columns stay zero
-            # (create_dense_weight_pair zero-initializes) and contribute
-            # nothing to the MoE output.
+            # The flashinfer_trtllm unquant kernels (SiLU/SwiGLU) declare
+            # ispp_alignment={TRTLLM_UNQUANT_ISPP_ALIGNMENT}: 64, or 128 when
+            # the installed FlashInfer launcher cannot be relaxed
+            # (ops/moe/flashinfer/trtllm_unquant.py); without padding
+            # moe_plan does not select them for a misaligned intermediate
+            # size. Other activations keep 128. The padded tail rows/columns
+            # stay zero (create_dense_weight_pair zero-initializes) and
+            # contribute nothing to the MoE output.
             self._apply_trtllm_ispp_padding(
-                128, "the flashinfer_trtllm unquant kernel accepts it"
+                (
+                    TRTLLM_UNQUANT_ISPP_ALIGNMENT
+                    if activation in ("silu", "swiglu")
+                    else 128
+                ),
+                "the flashinfer_trtllm unquant kernel accepts it",
             )
         if self._quant_kind == "nvfp4":
             self._apply_trtllm_ispp_padding(
