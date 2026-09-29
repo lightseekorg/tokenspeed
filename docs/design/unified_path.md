@@ -945,13 +945,16 @@ consume the target's capture configuration; they do not change the tap
 selection or output layout.
 
 The reverse direction rides on the context as well: a target that captures
-its taps on a row subset reports it as `ctx.captured_rows`
-(`CapturedRows(positions, prefill_spans)`). V4.1's CED narrowing is the one
-producer — its taps sit in layers 37–39 and hold one row per open chunk and
-the last window of every completing one, so DSpark's prefill seeding
-(`_seed_prefill_windows`) reads the spans and positions from there instead
-of the input-length mirror. A target with one captured row per input row
-leaves it `None`, and the drafter keeps its buffer-based layout.
+its taps on a row subset reports it as ctx.captured_rows
+(CapturedRows(positions, prefill_spans)). V4.1's CED narrowing is the one
+producer: its taps in layers 37–39 contain no rows for incomplete prefill
+chunks, the last window of each completing prefill, and all decode rows.
+The reported prefill spans retain a zero-length entry for each incomplete
+request, preserving the original request order. DSpark's prefill seeding
+(_seed_prefill_windows) reads these spans and positions instead of the
+input-length mirror and skips zero-length spans. A target with one captured
+row per input row leaves ctx.captured_rows as None, and the drafter keeps
+its buffer-based layout.
 
 ## Shared prefill convolution preparation
 
