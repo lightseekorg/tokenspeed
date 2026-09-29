@@ -419,6 +419,7 @@ def dsa_prefill_topk(
     *,
     topk: int,
     softmax_scale: float,
+    batch_invariant: bool,
     index_k_cache: torch.Tensor | None = None,
     page_size: int | None = None,
     index_k_fp8: torch.Tensor | None = None,
@@ -448,6 +449,10 @@ def dsa_prefill_topk(
         softmax_scale: Score scale. Each candidate score is exactly
             ``softmax_scale * sum_h(weights[h] * relu(dot(dequant(q[h]), dequant(k))))``.
             BF16 queries are already in their compute representation.
+        batch_invariant: Require the selection to be a function of each
+            token's own row only: equal scores resolve toward the lowest
+            candidate, whatever else the batch holds. Only implementations
+            declaring the ``batch_invariant`` feature are eligible.
         index_k_cache: Packed or page-planar FP8 index-K cache with scales
             (uint8). Page-planar caches may have a padded outer page stride.
             Used with kv_workspace_slots to resolve workspace rows inside the
@@ -529,17 +534,18 @@ def dsa_prefill_topk(
             "initial_tokens + local_tokens must not exceed topk; got "
             f"{initial_tokens} + {local_tokens} > {int(topk)}"
         )
+    required_features = set()
+    if initial_tokens or local_tokens:
+        required_features.add("forced_initial_local")
+    if batch_invariant:
+        required_features.add("batch_invariant")
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
         "attention",
         "dsa_prefill_topk",
         signature,
         traits=traits,
-        features=(
-            frozenset({"forced_initial_local"})
-            if initial_tokens or local_tokens
-            else None
-        ),
+        features=frozenset(required_features) if required_features else None,
         solution=solution,
         override=override,
     )
@@ -583,6 +589,8 @@ def dsa_prefill_topk(
         if initial_tokens or local_tokens:
             kernel_kwargs["initial_tokens"] = initial_tokens
             kernel_kwargs["local_tokens"] = local_tokens
+        if batch_invariant:
+            kernel_kwargs["batch_invariant"] = True
         return kernel(**kernel_kwargs)
 
 
@@ -595,6 +603,7 @@ def dsa_decode_topk(
     page_size: int,
     topk: int,
     softmax_scale: float,
+    batch_invariant: bool,
     q_len_per_req: int = 1,
     topk_layout: str = "global_slots",
     block_table_base_offsets: torch.Tensor | None = None,
@@ -626,6 +635,10 @@ def dsa_decode_topk(
         softmax_scale: Score scale. Each candidate score is exactly
             ``softmax_scale * sum_h(weights[h] * relu(dot(dequant(q[h]), dequant(k))))``.
             BF16 queries are already in their compute representation.
+        batch_invariant: Require the selection to be a function of each
+            token's own row only: equal scores resolve toward the lowest
+            candidate, whatever else the batch holds. Only implementations
+            declaring the ``batch_invariant`` feature are eligible.
         q_len_per_req: Query rows per request (spec-verify next_n). Plain
             decode uses 1, where per-request is equivalent to per-token.
         topk_layout: Return physical cache slots when ``global_slots`` or
@@ -726,6 +739,8 @@ def dsa_decode_topk(
         required_features.add("logical_offsets")
     if initial_tokens or local_tokens:
         required_features.add("forced_initial_local")
+    if batch_invariant:
+        required_features.add("batch_invariant")
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
         "attention",
@@ -778,6 +793,8 @@ def dsa_decode_topk(
         if initial_tokens or local_tokens:
             kernel_kwargs["initial_tokens"] = initial_tokens
             kernel_kwargs["local_tokens"] = local_tokens
+        if batch_invariant:
+            kernel_kwargs["batch_invariant"] = True
         return kernel(**kernel_kwargs)
 
 

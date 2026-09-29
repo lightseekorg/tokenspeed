@@ -47,7 +47,7 @@ logger = get_colorful_logger(__name__)
 ENTRY_POINT_GROUP = "tokenspeed.plugins"
 DISABLE_ENV_VAR = "TOKENSPEED_DISABLE_PLUGINS"
 # Bumped whenever a class or protocol on the plugin contract changes.
-PLUGIN_API_VERSION = 1
+PLUGIN_API_VERSION = 2
 
 __all__ = [
     "DISABLE_ENV_VAR",
@@ -117,8 +117,9 @@ def ensure_loaded() -> list[PluginInfo]:
         The runtime plugins loaded in this process.
     """
     global _loaded
-    if _loaded:
-        return list_plugins()
+    # No unlocked fast path: _loaded is set when loading STARTS, so another
+    # thread reading it outside the lock would return with registries still
+    # being populated. Other threads block here until the load completes.
     with _lock:
         if _loaded:
             return list_plugins()

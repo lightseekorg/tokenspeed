@@ -120,6 +120,7 @@ def test_wire_eagle3_shares_embed_head_and_installs_capture_ids():
     draft.model_config.hf_config = {
         "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}
     }
+    draft.model_config.requires_request_token_history = False
 
     with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
         factory.configure_draft_target(_server_args("EAGLE3"), target, draft)

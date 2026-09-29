@@ -163,6 +163,63 @@ def test_kimi3_join_reduce_moe_selects_lane_norm(
     torch.testing.assert_close(shared, lane[:, 2:] + 10)
 
 
+def test_kimi3_join_reduce_moe_uses_multirow_lane_without_cat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lane = torch.arange(12, dtype=torch.float32).view(2, 6)
+    seen: dict[str, object] = {}
+
+    def _reduce(value, _group):
+        seen["ptr"] = value.data_ptr()
+        seen["shape"] = tuple(value.shape)
+        return value + 1
+
+    monkeypatch.setattr(latent_module, "all_reduce", _reduce)
+
+    routed, shared = latent_module.kimi3_join_reduce_moe(
+        lane[:, :2],
+        lane[:, 2:],
+        lane=lane,
+        routed_hidden=2,
+        routed_norm=None,
+        group=(0, 1),
+        enable_lane_norm=False,
+        max_token_num=8,
+    )
+
+    assert seen["ptr"] == lane.data_ptr()
+    assert seen["shape"] == (2, 6)
+    torch.testing.assert_close(routed, lane[:, :2] + 1)
+    torch.testing.assert_close(shared, lane[:, 2:] + 1)
+
+
+def test_kimi3_join_reduce_moe_cats_when_shared_misses_the_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lane = torch.arange(12, dtype=torch.float32).view(2, 6)
+    shared_partial = torch.arange(8, dtype=torch.float32).view(2, 4)
+    seen: dict[str, object] = {}
+
+    def _reduce(value, _group):
+        seen["ptr"] = value.data_ptr()
+        return value
+
+    monkeypatch.setattr(latent_module, "all_reduce", _reduce)
+
+    latent_module.kimi3_join_reduce_moe(
+        lane[:, :2],
+        shared_partial,
+        lane=lane,
+        routed_hidden=2,
+        routed_norm=None,
+        group=(0, 1),
+        enable_lane_norm=False,
+        max_token_num=8,
+    )
+
+    assert seen["ptr"] != lane.data_ptr()
+
+
 def test_kimi3_join_reduce_moe_cats_small_partials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

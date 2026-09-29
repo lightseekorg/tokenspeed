@@ -31,7 +31,8 @@ from tokenspeed_kernel.signature import format_signatures
 def _hadamard_128_kernel(
     x,
     out,
-    n_rows: tl.constexpr,
+    # Per-call row count; runtime so every batch shape shares one binary.
+    n_rows,
     scale: tl.constexpr,
     BLOCK_OUT: tl.constexpr,
 ):

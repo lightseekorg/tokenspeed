@@ -326,51 +326,6 @@ def _load_w_scale_tile_direct_cdna4(
 
 
 @gluon.jit
-def _moe_partial_reduce(
-    Partial,
-    Out,
-    M,
-    N,
-    stride_pk,
-    stride_pm,
-    stride_pn,
-    stride_om,
-    stride_on,
-    SPLIT_K: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-):
-    """Sum SPLIT_K partials per (m, n) into Out in one launch.
-
-    Shared by the warp-decode split-K stage2 ([SPLIT_K, M, N] partials) and the
-    medium-decode top-k combine (consecutive-row partials, mapped by passing
-    stride_pk = row stride and stride_pm = TOPK * row stride). The float32 cast
-    is a no-op for f32 partials and upcasts bf16 combine partials.
-    """
-    pid = gl.program_id(axis=0)
-    num_n = gl.cdiv(N, BLOCK_N)
-    pid_m = pid // num_n
-    pid_n = pid % num_n
-    LAYOUT: gl.constexpr = gl.BlockedLayout([4], [64], [1], [0])
-    n = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=LAYOUT)
-    bound = (pid_m < M) & (n < N)
-    acc = gl.zeros([BLOCK_N], gl.float32, layout=LAYOUT)
-    for k in gl.static_range(SPLIT_K):
-        acc += gl.load(
-            Partial
-            + k * stride_pk
-            + pid_m.to(gl.int64) * stride_pm
-            + n.to(gl.int64) * stride_pn,
-            mask=bound,
-            other=0.0,
-        ).to(gl.float32)
-    gl.store(
-        Out + pid_m.to(gl.int64) * stride_om + n.to(gl.int64) * stride_on,
-        acc.to(Out.dtype.element_ty),
-        mask=bound,
-    )
-
-
-@gluon.jit
 def _moe_partial_reduce_shared(
     Partial,
     Out,

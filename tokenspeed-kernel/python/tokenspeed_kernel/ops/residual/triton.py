@@ -320,14 +320,35 @@ def triton_hyperconnection_combine(
 
 
 @cache
-def _compute_num_split(
+def compute_mhc_num_splits(
     device: torch.device, block_k: int, k: int | None, grid_size: int
 ) -> int:
+    """Split-K count for the mHC prenorm GEMM.
+
+    The count that fills the SMs once is rounded down to a power of two, then
+    capped at a quarter of the K tiles. The split count is a DeepGEMM
+    template argument, so every new value is a JIT compilation on the
+    forward thread: the rounding keeps the batch-dependent part to a few
+    values, and the cap only depends on the model. The cap is applied
+    exactly because the GFX950 pre-reduce-apply kernel requires
+    ``hidden_size // 64`` splits. Callers that warm DeepGEMM must use this
+    same count.
+
+    Args:
+        device: CUDA device whose SM count bounds the split.
+        block_k: K tile size of the GEMM.
+        k: GEMM reduction size (``hc_mult * hidden_size``), or ``None`` to
+            skip the K-tile cap.
+        grid_size: Token tiles the GEMM launches without splitting.
+
+    Returns:
+        The split count, at least 1.
+    """
     device_props = torch.cuda.get_device_properties(device)
-    split_k = device_props.multi_processor_count // grid_size
+    fill = max(device_props.multi_processor_count // grid_size, 1)
+    split_k = 1 << (fill.bit_length() - 1)
     if k is not None:
-        num_block_k = triton.cdiv(k, block_k)
-        split_k = min(split_k, num_block_k // 4)
+        split_k = min(split_k, triton.cdiv(k, block_k) // 4)
     return max(split_k, 1)
 
 
@@ -369,7 +390,9 @@ def _mhc_prenorm_gemm_triton_kernel(
     num_tokens,
     K: tl.constexpr,
     N: tl.constexpr,
-    SPLIT_K: tl.constexpr,
+    # Derived from the per-batch split count; runtime so every batch shape
+    # shares one binary.
+    SPLIT_K,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -467,10 +490,12 @@ def _load_reduced_mix(
     mix_id: tl.constexpr,
     num_tokens,
     hc_mult3: tl.constexpr,
-    n_splits: tl.constexpr,
+    # The split count follows the batch's token count; a runtime loop bound
+    # keeps one binary per kernel (the partials are summed in the same order).
+    n_splits,
 ):
     value = tl.full((), 0.0, tl.float32)
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         offset = split_id * num_tokens * hc_mult3 + token_id * hc_mult3 + mix_id
         value += tl.load(gemm_out_mul + offset)
     return value
@@ -489,7 +514,9 @@ def _mhc_pre_mix_triton_kernel(
     rms_eps: tl.constexpr,
     hc_eps: tl.constexpr,
     sinkhorn_iters: tl.constexpr,
-    n_splits: tl.constexpr,
+    # The split count follows the batch's token count; a runtime loop bound
+    # keeps one binary per kernel (the partials are summed in the same order).
+    n_splits,
     hc_mult: tl.constexpr,
     hc_mult2: tl.constexpr,
     hc_mult3: tl.constexpr,
@@ -499,7 +526,7 @@ def _mhc_pre_mix_triton_kernel(
     token_id = tl.program_id(0)
 
     rms_sum = tl.full((), 0.0, tl.float32)
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         rms_sum += tl.load(gemm_out_sqrsum + split_id * num_tokens + token_id)
     rms = tl.rsqrt(rms_sum / (hc_mult * hidden_size) + rms_eps)
 
@@ -536,7 +563,7 @@ def _mhc_pre_mix_triton_kernel(
     comb_mask = comb_offsets < hc_mult2
     comb_scale = tl.load(hc_scale + 2)
     comb_mix_values = tl.zeros((block_comb,), tl.float32)
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         split_base = split_id * num_tokens * hc_mult3 + token_id * hc_mult3
         comb_mix_values += tl.load(
             gemm_out_mul + split_base + hc_mult * 2 + comb_offsets,
@@ -781,7 +808,7 @@ def _mhc_pre_impl(
             ),
         )
 
-    n_splits = _compute_num_split(
+    n_splits = compute_mhc_num_splits(
         residual.device,
         64,
         hc_hidden_size,
@@ -1285,7 +1312,9 @@ def _mhc_pre_mix_hc4_kernel(
     rms_eps: tl.constexpr,
     hc_eps: tl.constexpr,
     sinkhorn_iters: tl.constexpr,
-    n_splits: tl.constexpr,
+    # The split count follows the batch's token count; a runtime loop bound
+    # keeps one binary per kernel (the partials are summed in the same order).
+    n_splits,
     num_tokens,
 ):
     token_id = tl.program_id(0)
@@ -1295,7 +1324,7 @@ def _mhc_pre_mix_hc4_kernel(
     comb_values = tl.zeros((16,), tl.float32)
     rms_sum = tl.full((), 0.0, tl.float32)
 
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         split_base = split_id * num_tokens * 24 + token_id * 24
         pre_post_values += tl.load(gemm_out_mul + split_base + pre_post_offsets)
         comb_values += tl.load(gemm_out_mul + split_base + 8 + comb_offsets)
@@ -1408,7 +1437,9 @@ def _mhc_pre_only_hc4_kernel(
     hidden_size: tl.constexpr,
     rms_eps: tl.constexpr,
     hc_eps: tl.constexpr,
-    n_splits: tl.constexpr,
+    # The split count follows the batch's token count; a runtime loop bound
+    # keeps one binary per kernel (the partials are summed in the same order).
+    n_splits,
     num_tokens,
 ):
     token_id = tl.program_id(0)
@@ -1416,7 +1447,7 @@ def _mhc_pre_only_hc4_kernel(
     pre_values = tl.zeros((4,), tl.float32)
     rms_sum = tl.full((), 0.0, tl.float32)
 
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         split_base = split_id * num_tokens * 24 + token_id * 24
         pre_values += tl.load(gemm_out_mul + split_base + pre_offsets)
         rms_sum += tl.load(gemm_out_sqrsum + split_id * num_tokens + token_id)
@@ -1488,7 +1519,9 @@ def _mhc_post_comb_hc4_kernel(
     rms_eps: tl.constexpr,
     hc_eps: tl.constexpr,
     sinkhorn_iters: tl.constexpr,
-    n_splits: tl.constexpr,
+    # The split count follows the batch's token count; a runtime loop bound
+    # keeps one binary per kernel (the partials are summed in the same order).
+    n_splits,
     num_tokens,
 ):
     token_id = tl.program_id(0)
@@ -1498,7 +1531,7 @@ def _mhc_post_comb_hc4_kernel(
     comb_values = tl.zeros((16,), tl.float32)
     rms_sum = tl.full((), 0.0, tl.float32)
 
-    for split_id in tl.static_range(0, n_splits):
+    for split_id in range(0, n_splits):
         split_base = split_id * num_tokens * 24 + token_id * 24
         post_values += tl.load(gemm_out_mul + split_base + 4 + post_offsets)
         comb_values += tl.load(gemm_out_mul + split_base + 8 + comb_offsets)
@@ -1818,7 +1851,7 @@ def _mhc_mixes_impl(
     residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters, prenorm_gemm
 ):
     tokens, _, hidden = residual.shape
-    splits = _compute_num_split(
+    splits = compute_mhc_num_splits(
         residual.device, 64, 4 * hidden, max(1, triton.cdiv(tokens, 64))
     )
     projection = torch.empty(

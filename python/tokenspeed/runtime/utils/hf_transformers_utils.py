@@ -159,6 +159,15 @@ def resolve_architecture(config: PretrainedConfig) -> str:
     return type(config).__name__
 
 
+def model_loader_architectures(config: PretrainedConfig) -> list[str]:
+    """The architecture names the model loader resolves, in its order.
+
+    Plugin profile resolution walks the same list, so a profile always
+    describes the class that is actually built.
+    """
+    return list(getattr(config, "architectures", None) or [])
+
+
 def get_hf_text_config(config: PretrainedConfig):
     """Get the "sub" config relevant to llm for multi modal models.
     No op for pure text models.

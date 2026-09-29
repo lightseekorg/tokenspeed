@@ -871,6 +871,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend = SimpleNamespace(
             is_mega_moe=lambda: False,
+            is_gluon_petit=lambda: False,
             is_flashinfer_trtllm=lambda: True,
         )
         config = SimpleNamespace(
