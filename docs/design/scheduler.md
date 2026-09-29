@@ -52,7 +52,9 @@ entry both prefill paths call), what each group demands for it in
 boundary (or on a promotion boundary), because a page is the unit of prefix
 caching — a chunk ending mid-page would leave a partial page that can never be
 matched. A chunk that *completes* the prompt is exempt: there is no next chunk
-to align for.
+to align for. With a chunk budget below one prefix page no aligned chunk fits,
+so admission passes a promotion boundary, as the final window does (§1.3),
+rather than the request waiting forever.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, prompt headroom,
