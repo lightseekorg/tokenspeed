@@ -32,11 +32,11 @@ from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.layers.moe import expert as expert_mod
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-# The alignment declared by the flashinfer_trtllm unquant MoE kernels
-# (tokenspeed_kernel/ops/moe/flashinfer/trtllm_unquant.py, ispp_alignment).
+# The alignment the stock FlashInfer TRT-LLM BF16 MoE launcher requires.
 _UNQUANT_ALIGNMENT = 128
 
 
@@ -114,6 +114,57 @@ def test_auto_backend_pads_non_gated_experts_for_trtllm(monkeypatch):
     assert relu2.intermediate_size == 1408 * 2
     assert relu2._spec.intermediate_size == 1408 * 2
     assert swiglu.intermediate_size == 2688
+
+
+@pytest.mark.parametrize(
+    "activation, kernel_alignment, ispp, planned",
+    [
+        # Gated sizes the 64-aligned launcher accepts are not padded.
+        ("silu", 64, 64, 64),
+        ("swiglu", 64, 192, 192),
+        # Other gated sizes pad to the next multiple of 64, not 128.
+        ("silu", 64, 96, 128),
+        ("silu", 64, 160, 192),
+        # Without the 64-aligned launcher, padding stays at 128.
+        ("silu", 128, 192, 256),
+        # Activations the flashinfer_trtllm unquant kernels do not serve keep 128.
+        ("situ", 64, 192, 256),
+    ],
+)
+def test_unquant_padding_follows_the_trtllm_kernel_alignment(
+    monkeypatch, activation, kernel_alignment, ispp, planned
+):
+    plans = []
+    monkeypatch.setattr(
+        expert_mod,
+        "get_moe_backend",
+        lambda: SimpleNamespace(value="flashinfer_trtllm"),
+    )
+    monkeypatch.setattr(expert_mod, "TRTLLM_UNQUANT_ISPP_ALIGNMENT", kernel_alignment)
+    monkeypatch.setattr(
+        expert_mod.tokenspeed_kernel,
+        "moe_plan",
+        lambda weight_dtype, **kwargs: plans.append(kwargs) or {"solution": "fake"},
+    )
+    monkeypatch.setattr(expert_mod, "create_layer_weights", lambda *a, **k: None)
+    monkeypatch.setitem(global_server_args_dict, "moe_mxfp4_fp8_activation", False)
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    tp_size = 4
+    MoELayer(
+        top_k=2,
+        num_experts=8,
+        hidden_size=2048,
+        intermediate_size=ispp * tp_size,
+        quant_config=None,
+        layer_index=0,
+        prefix="model.layers.0.mlp.experts",
+        tp_rank=0,
+        tp_size=tp_size,
+        activation=activation,
+        activation_situ_beta=1.0 if activation == "situ" else None,
+    )
+
+    assert [plan["ispp"] for plan in plans] == [planned]
 
 
 if __name__ == "__main__":

@@ -218,7 +218,11 @@ With `--moe-backend flashinfer_trtllm`, NVFP4 expert shards are automatically
 padded to a multiple of 64 along their per-rank intermediate dimension. The
 packed weights and block scales in the padded tail are zero-filled, so the
 extra dimensions do not change the MoE result. For example, a 640-wide expert
-under MoE TP4 is padded from 160 to 192 values per rank.
+under MoE TP4 is padded from 160 to 192 values per rank. BF16 SiLU/SwiGLU
+expert shards are zero-padded the same way to a multiple of 64 (128 when the
+installed FlashInfer launcher cannot be adapted). For example, Qwen3-30B-A3B's
+768-wide experts need no padding under MoE TP4 (192 per rank), while a 96-wide
+shard is padded to 128.
 
 On Hopper, MXFP4 routed experts with a SiLU/SwiGLU activation and dense EP
 (`--all2all-backend none`) default to the FlashInfer CUTLASS mixed-input
