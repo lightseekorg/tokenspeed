@@ -177,7 +177,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
         """Construct one MoE block on a chosen plan; report what it wired."""
         from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
         from tokenspeed.runtime.models import kimi_k3
-        from tokenspeed.runtime.models.kimi_k3_comm import K3MoeTailCommState
 
         linear_calls: list[dict] = []
         multicast_calls: list[dict] = []
@@ -215,8 +214,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.components = kwargs
 
         config = KimiLinearConfig(
-            # Distinct widths: the MoE tail comm state is negotiated once per
-            # process, and another test already claimed 64/32.
             hidden_size=128,
             routed_expert_hidden_size=routed_hidden,
             moe_intermediate_size=64,
@@ -248,8 +245,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
         with (
             _model_dtype(torch.bfloat16),
-            # Negotiated once per process; another test already claimed it.
-            mock.patch.object(K3MoeTailCommState, "_instance", None),
             mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
             mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
             mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
@@ -361,7 +356,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
         # Not get_process_group("nccl", ...): that spelling passes either way,
         # since the manager's device backend defaults to "nccl" in a test.
         get_pg.assert_called_with(mapping.moe.tp_ep_group)
-        self.assertFalse(layer.execution_plan.join_moe_reduce)
 
     def test_the_column_group_needs_a_divisible_latent(self):
         """The group would otherwise raise at construction and kill the boot.
@@ -1025,6 +1019,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             layer.topk.topk_config.output_format, TopKOutputFormat.STANDARD
         )
         self.assertTrue(layer.native_latent_moe.components["joint_reduce"])
+        self.assertIsNone(layer.native_latent_moe.components["shared_reduce"])
         self._assert_latent_projection_sharding(linear_calls, mapping)
         self.assertEqual(len(multicast_calls), 1)
         wired = multicast_calls[0]
@@ -1146,7 +1141,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         self.assertIsNone(unsharded["routed_expert_up_proj"].get("shard_group"))
 
         self.assertIsNone(tp_layer.native_latent_moe)
-        self.assertEqual(tp_layer.comm.mapping.moe.tp_ep_group, ep_group)
+        self.assertIsNone(tp_layer.comm)
         routed_input = torch.zeros(1, config.routed_expert_hidden_size)
         torch.testing.assert_close(
             tp_layer._routed_experts(
@@ -1170,10 +1165,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
         layer = SimpleNamespace(
             mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
+            execution_plan=SimpleNamespace(use_native=True),
             native_latent_moe=native_latent_moe,
             _use_fused_decode_pipeline=True,
             _forward_fused_decode_pipeline=fused_pipeline,
         )
+
+        layer._forward_amd = KimiLinearMoE._forward_amd.__get__(layer)
 
         output = KimiLinearMoE.forward(
             layer,
