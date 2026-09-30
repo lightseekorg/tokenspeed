@@ -437,7 +437,7 @@ class CheckpointPrefetcher:
     The read-ahead window is bounded so shards are consumed before cache
     pressure evicts them again; an unbounded prefetch of a checkpoint larger
     than the page cache evicts its own early work. The window defaults to
-    min(80 GiB, 25% of available host memory): it only needs to be much
+    min(40 GiB, 25% of available host memory): it only needs to be much
     larger than a few shards and much smaller than the page cache, and no
     cross-rank agreement is needed since it only sizes each rank's
     independent read-ahead. Every rank reads every shard in consumption
@@ -450,7 +450,7 @@ class CheckpointPrefetcher:
     """
 
     _BLOCK_SIZE = 16 * 1024 * 1024
-    _WINDOW_MAX_BYTES = 80 * 1024**3
+    _WINDOW_MAX_BYTES = 40 * 1024**3
     _WINDOW_MEM_FRACTION = 0.25
 
     @classmethod

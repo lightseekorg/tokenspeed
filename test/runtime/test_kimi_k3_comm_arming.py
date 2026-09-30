@@ -18,15 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Deferred-finalize arming of the K3 latent tail.
-
-The arming gate must be the experts kernel plan's own
-``supports_deferred_finalize`` capability bit, not a use_trtllm proxy: the
-trtllm solution spans kernels with either capability (the nvfp4/mxfp4 SiTU
-variants emit the deferred triple, mxfp4 SwiGLU does not), and a mis-armed
-TAIL_FUSION request crashes the experts layer with
-``MoELayer does not support do_finalize=False``.
-"""
+"""Attention and AMD communication preparation for Kimi K3."""
 
 from __future__ import annotations
 
@@ -51,25 +43,8 @@ needs_iris = pytest.mark.skipif(
 
 from tokenspeed.runtime.models.kimi_k3_comm import (  # noqa: E402
     ATTN_AR_MAX_TOKENS,
-    _tail_finalize_top_k,
     attn_ar_eligible,
 )
-
-
-def test_arming_requires_experts_capability_bit():
-    plan = SimpleNamespace(fused_moe_ar=True, use_trtllm=True)
-    # A kernel without the deferred capability (e.g. mxfp4 SwiGLU) ->
-    # materialized-input tail (finalize_top_k=None), even though
-    # use_trtllm is True.
-    assert _tail_finalize_top_k(10, plan, False) is None
-    # Deferred-capable kernel (either SiTU variant) -> deferred triple.
-    assert _tail_finalize_top_k(10, plan, True) == 10
-
-
-def test_arming_requires_fused_moe_ar():
-    plan = SimpleNamespace(fused_moe_ar=False, use_trtllm=True)
-    assert _tail_finalize_top_k(10, plan, True) is None
-    assert _tail_finalize_top_k(10, plan, False) is None
 
 
 @needs_iris
@@ -81,7 +56,7 @@ def test_arming_requires_fused_moe_ar():
 def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
     monkeypatch, pp_size, max_rows, tail_rows
 ):
-    from tokenspeed.runtime.models import kimi_k3_comm
+    from tokenspeed.runtime.models import kimi_k3
 
     group = tuple(range(8))
     mapping = SimpleNamespace(
@@ -91,13 +66,13 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
     )
     prepare = Mock(return_value=True)
     monkeypatch.setattr(
-        kimi_k3_comm,
+        kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
-    assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+    assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
@@ -118,7 +93,7 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
 
 @needs_iris
 def test_iris_preparation_handles_distinct_groups(monkeypatch):
-    from tokenspeed.runtime.models import kimi_k3_comm
+    from tokenspeed.runtime.models import kimi_k3
 
     attn_group = (0, 1, 2, 3)
     moe_group = tuple(range(8))
@@ -129,13 +104,13 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
     )
     prepare = Mock(return_value=True)
     monkeypatch.setattr(
-        kimi_k3_comm,
+        kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
-    assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+    assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
@@ -169,7 +144,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
 
 @needs_iris
 def test_iris_preparation_handles_moe_only_group(monkeypatch):
-    from tokenspeed.runtime.models import kimi_k3_comm
+    from tokenspeed.runtime.models import kimi_k3
 
     attn_group = (0,)
     moe_group = tuple(range(8))
@@ -180,13 +155,13 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
     )
     prepare = Mock(return_value=True)
     monkeypatch.setattr(
-        kimi_k3_comm,
+        kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
-    assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+    assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
@@ -207,7 +182,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
 
 @needs_iris
 def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
-    from tokenspeed.runtime.models import kimi_k3_comm
+    from tokenspeed.runtime.models import kimi_k3
 
     group = tuple(range(4))
     mapping = SimpleNamespace(
@@ -217,13 +192,13 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
     )
     prepare = Mock(return_value=True)
     monkeypatch.setattr(
-        kimi_k3_comm,
+        kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
-    assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+    assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
@@ -260,10 +235,10 @@ def test_iris_lamport_requires_attention_and_moe_tp8(
     monkeypatch, world, attn_tp, moe_tp, moe_ep, expected
 ):
     from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.models import kimi_k3_comm
+    from tokenspeed.runtime.models import kimi_k3
 
     monkeypatch.setattr(
-        kimi_k3_comm, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
+        kimi_k3, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
     )
     for rank in range(world):
         mapping = Mapping(
@@ -274,9 +249,9 @@ def test_iris_lamport_requires_attention_and_moe_tp8(
             moe_ep_size=moe_ep,
         )
         prepare = Mock(return_value=True)
-        monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+        monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
-        assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+        assert kimi_k3.prepare_k3_all_reduce_buffers(
             mapping=mapping,
             hidden_size=7168,
             routed_hidden_size=3584,
@@ -326,13 +301,11 @@ def test_the_collective_is_what_serves_an_eligible_reduce():
     collective = Mock(return_value=(reduced, "shared"))
     vendor = Mock(return_value=(None, "vendor-residual", None))
     comm = K3AttnComm.__new__(K3AttnComm)
-    comm.state = SimpleNamespace(
-        cute_ar=collective,
-        dummy_norm=SimpleNamespace(
-            weight="gamma", forward_with_allreduce_fusion=vendor
-        ),
-        attn_ar_fusion_ok=True,
+    comm.cute_ar = collective
+    comm.dummy_norm = SimpleNamespace(
+        weight="gamma", forward_with_allreduce_fusion=vendor
     )
+    comm.attn_ar_fusion_ok = True
     comm.mapping = SimpleNamespace(attn=SimpleNamespace(tp_rank=0, tp_group=(0, 1)))
 
     partial, prefix = torch.zeros(1, 8), torch.zeros(1, 8)
@@ -370,28 +343,15 @@ def test_the_operator_can_forbid_the_fused_attention_reduce():
     )
 
 
-def _arming_world(monkeypatch, *, multicast: bool, shape_ok: bool, peers_agree: bool):
-    """Stand up K3AttnCommState's collaborators so arming can be exercised."""
+def _arming_world(monkeypatch, *, multicast: bool, shape_ok: bool):
+    """Stand up K3AttnComm's collaborators so arming can be exercised."""
     from tokenspeed.runtime.models import kimi_k3_comm as mod
 
-    recorded = {"ops": [], "groups": []}
-
-    class FakeDist:
-        ReduceOp = torch.distributed.ReduceOp
-
-        @staticmethod
-        def is_initialized():
-            return True
-
-        @staticmethod
-        def all_reduce(tensor, *, op, group):
-            # Required, not defaulted: dropping either in production must fail here.
-            recorded["ops"].append(op)
-            recorded["groups"].append(group)
-            if not peers_agree:
-                tensor.zero_()
-
-    monkeypatch.setattr(mod, "dist", FakeDist)
+    monkeypatch.setattr(mod.K3AttnComm, "_prepared_hidden_size", None)
+    monkeypatch.setattr(mod.K3AttnComm, "attn_ar_fusion_ok", False)
+    monkeypatch.setattr(mod.K3AttnComm, "dummy_norm", None)
+    monkeypatch.setattr(mod.K3AttnComm, "cute_ar", None)
+    monkeypatch.setattr(mod, "dist", SimpleNamespace(is_initialized=lambda: True))
     monkeypatch.setattr(mod, "prepare_all_reduce_lane", lambda *a, **k: True)
     monkeypatch.setattr(mod, "prepare_all_reduce_fusion", lambda *a, **k: True)
     monkeypatch.setattr(mod, "_get_process_group", lambda g: "the-group")
@@ -405,8 +365,7 @@ def _arming_world(monkeypatch, *, multicast: bool, shape_ok: bool, peers_agree: 
     )
     builder = Mock(return_value="collective")
     monkeypatch.setattr(mod, "build_attn_reduce_collective", builder)
-    recorded["builder"] = builder
-    return mod, recorded
+    return mod, builder
 
 
 _ARMING_MAPPING = SimpleNamespace(
@@ -414,210 +373,35 @@ _ARMING_MAPPING = SimpleNamespace(
 )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the vote is a cuda tensor")
-def test_arming_builds_only_when_every_rank_agrees(monkeypatch):
-    """A rank that armed alone would sit in a rendezvous its peers never join."""
-    mod, rec = _arming_world(
-        monkeypatch, multicast=True, shape_ok=True, peers_agree=True
-    )
-    state = mod.K3AttnCommState(mapping=_ARMING_MAPPING, hidden_size=7168)
-    assert state.cute_ar == "collective"
-    # MIN is what makes one dissenting rank stop all of them.
-    assert rec["ops"] == [torch.distributed.ReduceOp.MIN]
-    assert rec["groups"] == ["the-group"]
-    kwargs = rec["builder"].call_args.kwargs
-    assert kwargs["rank"] == 3 and kwargs["tp_size"] == 8  # rank is not size
-    assert kwargs["hidden_size"] == 7168
-    assert kwargs["max_tokens"] == mod.ATTN_AR_MAX_TOKENS
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the vote is a cuda tensor")
-@pytest.mark.parametrize(
-    "multicast,shape_ok,peers_agree",
-    [(False, True, True), (True, False, True), (True, True, False)],
-)
-def test_arming_declines_when_any_probe_or_peer_says_no(
-    monkeypatch, multicast, shape_ok, peers_agree
-):
-    """Each term is load-bearing: the constructor raises, it does not decline."""
-    mod, rec = _arming_world(
-        monkeypatch, multicast=multicast, shape_ok=shape_ok, peers_agree=peers_agree
-    )
-    state = mod.K3AttnCommState(mapping=_ARMING_MAPPING, hidden_size=7168)
-    assert state.cute_ar is None
-    assert rec["builder"].call_count == 0
-
-
-@pytest.mark.parametrize(
-    "rows,producer_direct,tp,ep,narrowed,solution,accepted,attempted,pp_size",
-    [
-        (1, True, 8, 1, False, "auto", True, False, 1),
-        (32, True, 8, 1, False, "auto", True, False, 1),
-        (39, True, 8, 1, False, "auto", True, False, 1),
-        (40, True, 8, 1, False, "auto", True, True, 1),
-        (41, True, 8, 1, False, "auto", False, True, 1),
-        (48, True, 8, 1, False, "auto", True, True, 1),
-        (64, True, 8, 1, False, "auto", True, True, 1),
-        (504, True, 8, 1, False, "auto", True, True, 1),
-        (512, True, 8, 1, False, "auto", True, True, 1),
-        (848, True, 8, 1, False, "auto", True, True, 1),
-        (8192, True, 8, 1, False, "auto", True, True, 1),
-        (8200, True, 8, 1, False, "auto", True, False, 1),
-        (8192, False, 8, 1, False, "auto", True, False, 1),
-        (8192, True, 1, 8, False, "auto", True, False, 1),
-        (8192, True, 8, 1, True, "auto", True, False, 1),
-        (8192, True, 8, 1, False, "torch", True, False, 1),
-        (8192, True, 8, 1, False, "auto", False, True, 1),
-        (8192, True, 8, 1, False, "auto", True, False, 2),
-    ],
-)
-@pytest.mark.parametrize("has_norm", [False, True])
-def test_row_sharded_moe_tail_selection_and_fallback(
-    monkeypatch,
-    rows,
-    producer_direct,
-    tp,
-    ep,
-    narrowed,
-    solution,
-    accepted,
-    attempted,
-    has_norm,
-    pp_size,
-):
-    from tokenspeed.runtime.models import kimi_k3_comm as mod
-
-    # Check dispatch here; GPU tests cover ownership and numerical correctness.
-    routed = torch.empty((rows, 3584), dtype=torch.bfloat16, device="meta")
-    shared = torch.empty((rows, 7168), dtype=torch.bfloat16, device="meta")
-    prefix = torch.empty_like(shared)
-    expected = torch.empty_like(shared)
-    fallback = torch.empty_like(shared)
-    group = tuple(range(8))
-    process_group = object()
-    norm = (
-        SimpleNamespace(
-            weight=torch.empty(3584, dtype=torch.bfloat16, device="meta"),
-            variance_epsilon=1e-5,
-        )
-        if has_norm
-        else None
-    )
-    projection = SimpleNamespace(
-        narrowed=narrowed,
-        solution=solution,
-        weight=torch.empty((7168, 3584), dtype=torch.bfloat16, device="meta"),
-    )
-    owner = SimpleNamespace(
-        mapping=SimpleNamespace(
-            pp_size=pp_size,
-            attn=SimpleNamespace(tp_size=8, tp_group=group),
-            moe=SimpleNamespace(tp_size=tp, ep_size=ep, tp_ep_group=group),
-        ),
-        routed_hidden=3584,
-        routed_norm=norm,
-        up_proj=projection,
-        execution_plan=SimpleNamespace(
-            lane_latent_norm_ar=False, comm_fusion_max_num_tokens=16
-        ),
-        _projection_tail=Mock(return_value=fallback),
-    )
-    candidate = Mock(return_value=expected if accepted else None)
-    joined = Mock(return_value=(routed, shared))
-    resolve = Mock(return_value=process_group)
-    monkeypatch.setitem(
-        sys.modules,
-        "tokenspeed_kernel.ops.communication.iris",
-        SimpleNamespace(iris_kimi3_moe_tail=candidate),
-    )
-    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
-    monkeypatch.setattr(mod, "kimi3_join_reduce_moe", joined)
-    monkeypatch.setattr(mod, "_get_process_group", resolve)
-    symm_outputs = (routed, shared) if producer_direct else None
-
-    output = mod.K3MoeTailComm._tail_fused_lane_ar_replicated(
-        owner, routed, shared, prefix, None, symm_outputs, rows, 7168
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the dummy norm is on CUDA")
+def test_arming_shares_workspaces_across_instances(monkeypatch):
+    mod, builder = _arming_world(monkeypatch, multicast=True, shape_ok=True)
+    comm = mod.K3AttnComm(mapping=_ARMING_MAPPING, hidden_size=7168)
+    dummy_norm = comm.dummy_norm
+    other = mod.K3AttnComm(mapping=_ARMING_MAPPING, hidden_size=7168)
+    assert other is not comm
+    assert other.cute_ar is comm.cute_ar is builder.return_value
+    assert other.dummy_norm is dummy_norm
+    builder.assert_called_once_with(
+        group="the-group",
+        rank=3,
+        tp_size=8,
+        hidden_size=7168,
+        max_tokens=mod.ATTN_AR_MAX_TOKENS,
     )
 
-    if attempted:
-        candidate.assert_called_once_with(
-            routed,
-            shared,
-            prefix,
-            projection.weight,
-            norm_weight=norm.weight if has_norm else None,
-            eps=norm.variance_epsilon if has_norm else None,
-            group=process_group,
-        )
-        resolve.assert_called_once_with(group)
-    else:
-        candidate.assert_not_called()
-        resolve.assert_not_called()
-    if attempted and accepted:
-        assert output is expected
-        joined.assert_not_called()
-        owner._projection_tail.assert_not_called()
-    else:
-        assert output is fallback
-        joined.assert_called_once_with(
-            routed,
-            shared,
-            lane=None,
-            symm_outputs=symm_outputs,
-            routed_hidden=3584,
-            routed_norm=norm,
-            group=group,
-            enable_lane_norm=False,
-            max_token_num=16,
-        )
-        owner._projection_tail.assert_called_once_with(
-            routed, shared, prefix, rows, 7168
-        )
 
-
-def test_row_sharded_moe_tail_skips_iris_import_on_other_platform(monkeypatch):
-    from tokenspeed.runtime.models import kimi_k3_comm as module
-
-    group = tuple(range(8))
-    routed = torch.empty((512, 3584), dtype=torch.bfloat16, device="meta")
-    shared = torch.empty((512, 7168), dtype=torch.bfloat16, device="meta")
-    prefix = torch.empty_like(shared)
-    fallback = object()
-    owner = SimpleNamespace(
-        mapping=SimpleNamespace(
-            pp_size=1,
-            attn=SimpleNamespace(tp_size=8, tp_group=group),
-            moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
-        ),
-        up_proj=SimpleNamespace(narrowed=False, solution="auto"),
-        routed_hidden=3584,
-        routed_norm=None,
-        execution_plan=SimpleNamespace(
-            lane_latent_norm_ar=False, comm_fusion_max_num_tokens=16
-        ),
-        _projection_tail=Mock(return_value=fallback),
-    )
-    monkeypatch.setattr(
-        module, "current_platform", lambda: SimpleNamespace(is_cdna4=False)
-    )
-    monkeypatch.setitem(
-        sys.modules, "tokenspeed_kernel.ops.communication.iris", SimpleNamespace()
-    )
-    monkeypatch.setattr(
-        module, "kimi3_join_reduce_moe", Mock(return_value=(routed, shared))
-    )
-
-    result = module.K3MoeTailComm._tail_fused_lane_ar_replicated(
-        owner,
-        routed,
-        shared,
-        prefix,
-        None,
-        (routed, shared),
-        512,
-        7168,
-    )
-    assert result is fallback
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the dummy norm is on CUDA")
+@pytest.mark.parametrize("multicast,shape_ok", [(False, True), (True, False)])
+def test_arming_declines_unsupported_collectives(monkeypatch, multicast, shape_ok):
+    mod, builder = _arming_world(monkeypatch, multicast=multicast, shape_ok=shape_ok)
+    comm = mod.K3AttnComm(mapping=_ARMING_MAPPING, hidden_size=7168)
+    dummy_norm = comm.dummy_norm
+    other = mod.K3AttnComm(mapping=_ARMING_MAPPING, hidden_size=7168)
+    assert comm.cute_ar is None
+    assert other.cute_ar is None
+    assert other.dummy_norm is dummy_norm
+    builder.assert_not_called()
 
 
 if __name__ == "__main__":
