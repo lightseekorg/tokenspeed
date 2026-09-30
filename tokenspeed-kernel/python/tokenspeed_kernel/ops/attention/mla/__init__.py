@@ -1260,8 +1260,8 @@ def mla_decode_with_kvcache(
         )
         # Forward the mask arguments only where they carry information, so a
         # kernel registered for plain decode is never handed a keyword it does
-        # not take. A block of one with no window is plain decode.
-        if window_left >= 0 or noncausal_block_size != 1:
+        # not take. Flattened full-attention rows already carry block-end lengths.
+        if window_left >= 0 or (noncausal_block_size != 1 and q.shape[1] > 1):
             kernel_kwargs.update(
                 window_left=window_left,
                 noncausal_block_size=noncausal_block_size,

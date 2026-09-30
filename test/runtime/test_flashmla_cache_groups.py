@@ -115,6 +115,7 @@ def _stacks_for(backend, pool, max_bs: int = 4) -> GroupTableStacks:
         ],
         max_bs=max_bs,
         max_tokens_per_req=backend.spec_num_tokens,
+        max_extend_tokens=0,
         device="cuda",
     )
 

@@ -261,6 +261,7 @@ class ForwardStepRunner:
             cache_group_page_counts=(token_to_kv_pool.arena.cache_group_page_counts),
             max_tokens_per_req=self.max_tokens_per_req,
             overlap_schedule_depth=self.overlap_schedule_depth,
+            max_extend_tokens=config.prefill_graph_max_tokens,
         )
         if draft_attn_backend is not None:
             draft_attn_backend.init_cuda_graph_state(
@@ -271,6 +272,7 @@ class ForwardStepRunner:
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
+                max_extend_tokens=config.prefill_graph_max_tokens,
             )
 
         # One placeholder table set serves capture, the idle replay and any

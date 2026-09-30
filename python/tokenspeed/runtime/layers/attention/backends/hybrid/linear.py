@@ -125,6 +125,16 @@ class HybridLinearAttnBackend(AttentionBackend):
             layer, forward_mode
         )
 
+    def forward_write_locations(self, layer, forward_mode):
+        return self._backend_for_layer(layer.layer_id).forward_write_locations(
+            layer, forward_mode
+        )
+
+    def padded_write_locations(self, layer, forward_mode, rows):
+        return self._backend_for_layer(layer.layer_id).padded_write_locations(
+            layer, forward_mode, rows
+        )
+
     def cache_placement(self, layer):
         return self._backend_for_layer(layer.layer_id).cache_placement(layer)
 
@@ -182,10 +192,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend.refresh_decode_metadata(*args, **kwargs)
         self.linear_attn_backend.refresh_decode_metadata(*args, **kwargs)
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
-        return self.full_attn_backend.support_kv_cache_prewrite(forward_mode)
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        return self.full_attn_backend.supports_narrowed_draft_decode(forward_mode)
 
     # ---- Forward dispatch ----
 
