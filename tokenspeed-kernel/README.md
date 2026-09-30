@@ -11,6 +11,27 @@ performant kernels for multi-silicon AI inference. It features:
 TokenSpeed-kernel is pip-installable on its own and can be directly used by
 others.
 
+## Nightly installation
+
+CUDA 13 nightly wheels are published daily from `main` for Linux x86_64 and
+ARM64, with Python 3.10–3.13. Versions append the UTC build date to the base
+version, for example `0.1.3.post20260929`.
+
+```bash
+pip install --upgrade tokenspeed-kernel \
+  --extra-index-url https://lightseek.org/whl/nightly
+```
+
+PyPI supplies dependencies that are absent from the nightly index. To select a
+specific nightly, use `tokenspeed-kernel==0.1.3.post20260929`. Post releases sort
+above the corresponding base release and do not require `--pre`.
+
+The `Build and Release tokenspeed-kernel` workflow also supports manual nightly
+builds from pull request branches. To publish manually, run it from `main` with
+both `nightly` and `publish_github` enabled. Same-day reruns preserve already
+published wheels.
+Historical nightlies are retained; automatic cleanup is deferred.
+
 ## Design Goals
 
 TokenSpeed-kernel is designed with the following functionality goals in mind:

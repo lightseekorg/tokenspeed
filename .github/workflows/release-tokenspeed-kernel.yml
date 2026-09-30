@@ -1,8 +1,15 @@
 name: Build and Release tokenspeed-kernel
 
 on:
+  schedule:
+    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
+      nightly:
+        description: "Build CUDA 13 wheels with a .postYYYYMMDD version; enable publish_github on main to publish."
+        required: false
+        default: false
+        type: boolean
       tag_name:
         description: "Git tag prefix to create or update. Defaults to tokenspeed-kernel-v<version>; non-release refs include the date and source SHA."
         required: false
@@ -60,6 +67,8 @@ jobs:
       version_date: ${{ steps.metadata.outputs.version_date }}
       tag_name: ${{ steps.metadata.outputs.tag_name }}
       cuda_matrix: ${{ steps.metadata.outputs.cuda_matrix }}
+      cuda_variant: ${{ steps.metadata.outputs.cuda_variant }}
+      nightly: ${{ steps.metadata.outputs.nightly }}
     steps:
       - name: Validate publish inputs
         if: inputs.publish_pypi && inputs.cuda_variant != 'all' && inputs.cuda_variant != inputs.pypi_cuda_variant
@@ -82,9 +91,24 @@ jobs:
         id: metadata
         env:
           CUDA_VARIANT: ${{ inputs.cuda_variant }}
+          NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
+          VERSION_DATE: ${{ inputs.version_date }}
+          REQUESTED_TAG: ${{ inputs.tag_name }}
           PUBLISH_PYPI: ${{ inputs.publish_pypi }}
+          PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
         run: |
-          version_date="${{ inputs.version_date }}"
+          if [ "$NIGHTLY" = "true" ]; then
+            if [ "$PUBLISH_PYPI" = "true" ]; then
+              echo "Nightly builds cannot publish to PyPI." >&2
+              exit 1
+            fi
+            if [ "$PUBLISH_GITHUB" = "true" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "Nightly publication requires main." >&2
+              exit 1
+            fi
+            CUDA_VARIANT=cu130
+          fi
+          version_date="$VERSION_DATE"
           if [ -z "$version_date" ]; then
             version_date="$(date -u +%Y%m%d)"
           fi
@@ -93,6 +117,7 @@ jobs:
             cd tokenspeed-kernel/python
             TOKENSPEED_KERNEL_BACKEND=cuda \
             TOKENSPEED_KERNEL_VERSION_DATE="$version_date" \
+            TOKENSPEED_KERNEL_NIGHTLY="$NIGHTLY" \
             TOKENSPEED_KERNEL_GIT_SHA="$GITHUB_SHA" \
             TOKENSPEED_KERNEL_GIT_BRANCH="$GITHUB_REF_NAME" \
               python setup.py --version
@@ -103,7 +128,10 @@ jobs:
             exit 1
           fi
 
-          tag_name="${{ inputs.tag_name }}"
+          tag_name="$REQUESTED_TAG"
+          if [ "$NIGHTLY" = "true" ]; then
+            tag_name="tokenspeed-kernel-nightly-v${version}"
+          fi
           if [ -z "$tag_name" ]; then
             tag_name="tokenspeed-kernel-v${version}"
           fi
@@ -127,6 +155,8 @@ jobs:
               ;;
           esac
 
+          echo "nightly=${NIGHTLY}" >> "$GITHUB_OUTPUT"
+          echo "cuda_variant=${CUDA_VARIANT}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "version_date=${version_date}" >> "$GITHUB_OUTPUT"
           echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
@@ -215,6 +245,7 @@ jobs:
             -e PYTHON_TAG=${{ matrix.python.tag }} \
             -e TORCH_INDEX_URL=${{ matrix.cuda.torch_index_url }} \
             -e TOKENSPEED_KERNEL_BACKEND=cuda \
+            -e TOKENSPEED_KERNEL_NIGHTLY=${{ needs.metadata.outputs.nightly }} \
             -e TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
             -e TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
             -e TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \
@@ -273,6 +304,7 @@ jobs:
             build twine "setuptools<82" wheel packaging "apache-tvm-ffi==0.1.13.post3"
           cd tokenspeed-kernel/python
           TOKENSPEED_KERNEL_BACKEND=cuda \
+          TOKENSPEED_KERNEL_NIGHTLY=${{ needs.metadata.outputs.nightly }} \
           TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
           TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
           TOKENSPEED_KERNEL_GIT_BRANCH=$GITHUB_REF_NAME \
@@ -287,7 +319,10 @@ jobs:
 
   release:
     name: Create wheelhouse release
-    if: inputs.publish_github
+    if: github.event_name == 'schedule' || inputs.publish_github
+    concurrency:
+      group: wheelhouse-publication
+      cancel-in-progress: false
     needs: [metadata, build-wheel, build-sdist]
     runs-on: ubuntu-24.04-32core-x64
     steps:
@@ -307,12 +342,17 @@ jobs:
           RELEASE_REPOSITORY: lightseekorg/whl
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
           VERSION: ${{ needs.metadata.outputs.version }}
-          CUDA_VARIANT: ${{ inputs.cuda_variant }}
+          CUDA_VARIANT: ${{ needs.metadata.outputs.cuda_variant }}
+          NIGHTLY: ${{ needs.metadata.outputs.nightly }}
           PRERELEASE: ${{ inputs.prerelease }}
           SOURCE_SHA: ${{ github.sha }}
         run: |
+          test "$(gh api user --jq .login)" = lightseek-bot
+          for repository in "$RELEASE_REPOSITORY" lightseekorg/tokenspeed; do
+            test "$(gh repo view "$repository" --json visibility --jq .visibility)" = PUBLIC
+          done
           prerelease_args=()
-          if [ "$PRERELEASE" = "true" ] || [[ "$VERSION" == *.dev* ]] || [[ "$VERSION" == *+* ]]; then
+          if [ "$NIGHTLY" = "true" ] || [ "$PRERELEASE" = "true" ] || [[ "$VERSION" == *.dev* ]] || [[ "$VERSION" == *+* ]]; then
             prerelease_args+=(--prerelease)
           fi
 
@@ -339,9 +379,24 @@ jobs:
                   --repo "$RELEASE_REPOSITORY" \
                   --prerelease
               fi
-              gh release upload "$release_tag" "${assets[@]}" \
-                --repo "$RELEASE_REPOSITORY" \
-                --clobber
+              if [ "$NIGHTLY" = "true" ]; then
+                # Same-day reruns preserve existing assets, including their hashes.
+                existing_assets=$(gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" --json assets --jq '.assets[].name')
+                for asset in "${assets[@]}"; do
+                  if ! grep -Fxq "$(basename "$asset")" <<< "$existing_assets"; then
+                    release_notes=$(gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" --json body --jq .body)
+                    if [ "$release_notes" != "$release_title built from lightseekorg/tokenspeed@$SOURCE_SHA" ]; then
+                      echo "Cannot complete a nightly release from a different source commit." >&2
+                      exit 1
+                    fi
+                    gh release upload "$release_tag" "$asset" --repo "$RELEASE_REPOSITORY"
+                  fi
+                done
+              else
+                gh release upload "$release_tag" "${assets[@]}" \
+                  --repo "$RELEASE_REPOSITORY" \
+                  --clobber
+              fi
             else
               gh release create "$release_tag" "${assets[@]}" \
                 --repo "$RELEASE_REPOSITORY" \
@@ -364,6 +419,51 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Checkout wheel index
+        if: needs.metadata.outputs.nightly == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: lightseekorg/whl
+          ref: gh-pages
+          path: wheelhouse
+          token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+
+      - name: Publish nightly pip index
+        if: needs.metadata.outputs.nightly == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
+        run: |
+          test "$(gh api user --jq .login)" = lightseek-bot
+          test "$(gh repo view lightseekorg/whl --json visibility --jq .visibility)" = PUBLIC
+          gh api "repos/lightseekorg/whl/releases/tags/${TAG_NAME}-cu130" > nightly-release.json
+          python .github/scripts/update-kernel-nightly-index.py \
+            wheelhouse nightly-release.json dist
+          cd wheelhouse
+          git config user.name lightseek-bot
+          git config user.email 243258330+lightseek-bot@users.noreply.github.com
+          git add nightly/index.html nightly/tokenspeed-kernel/index.html
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git diff --cached
+          if [ -f .pre-commit-config.yaml ]; then
+            pre-commit run --all-files
+          fi
+          git commit -s -m "Publish tokenspeed-kernel nightly index"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:gh-pages; then
+              gh api repos/lightseekorg/whl/contents/nightly/tokenspeed-kernel/index.html --jq .content | base64 --decode
+              gh api repos/lightseekorg/whl/contents/nightly/index.html --jq .content | base64 --decode
+              exit 0
+            fi
+            git fetch origin gh-pages
+            git rebase origin/gh-pages
+          done
+          echo "Could not publish the nightly index after three attempts." >&2
+          exit 1
 
   publish-pypi:
     name: Publish ${{ inputs.pypi_cuda_variant }} to PyPI
