@@ -142,6 +142,7 @@ if platform.is_nvidia:
         enable_pdl: bool,
         routed: bool,
         activation_type: ActivationType,
+        fp32_correction_bias: bool,
     ):
         """Shared body for the in-kernel-routing and precomputed-topk variants.
 
@@ -152,6 +153,8 @@ if platform.is_nvidia:
         weight rounding; everything else is identical.
         ``activation_type`` is SwiGLU for gated experts and Relu2 for
         non-gated ones.
+        ``fp32_correction_bias`` routes on a module that adds the DeepSeekV3
+        correction bias in FP32.
         """
         if x.shape[0] == 0:
             # Idle DP ranks run a dummy forward with 0 tokens; the fused kernel
@@ -172,6 +175,8 @@ if platform.is_nvidia:
             if intermediate_size % ispp64_launcher.STOCK_ISPP_ALIGNMENT
             else (trtllm_bf16_moe, trtllm_bf16_routed_moe)
         )
+        if fp32_correction_bias and not ispp64_launcher.stock_routing_keeps_fp32_bias():
+            bf16_moe = ispp64_launcher.trtllm_bf16_fp32_routing_bias_moe
         # GEMM and sizing arguments shared by both kernel entry points.
         common_kwargs = dict(
             hidden_states=x,
@@ -296,7 +301,14 @@ if platform.is_nvidia:
             enable_pdl,
             routed=False,
             activation_type=ActivationType.Swiglu,
+            fp32_correction_bias=plan["fp32_correction_bias"],
         )
+
+    # moe_plan keeps in-kernel routing for an FP32 correction bias only if
+    # this returns True.
+    flashinfer_trtllm_unquant_moe_apply._tokenspeed_fp32_correction_bias = (  # type: ignore[attr-defined]
+        ispp64_launcher.fp32_routing_bias_ready
+    )
 
     @register_kernel(
         "moe",
@@ -353,6 +365,7 @@ if platform.is_nvidia:
             enable_pdl,
             routed=True,
             activation_type=ActivationType.Swiglu,
+            fp32_correction_bias=False,
         )
 
     @register_kernel(
@@ -392,6 +405,9 @@ if platform.is_nvidia:
             enable_pdl,
             routed=False,
             activation_type=ActivationType.Relu2,
+            # Without the FP32 correction-bias hook, moe_plan plans
+            # precomputed top-k for layers that need that bias.
+            fp32_correction_bias=False,
         )
 
     @register_kernel(
@@ -434,4 +450,5 @@ if platform.is_nvidia:
             enable_pdl,
             routed=True,
             activation_type=ActivationType.Relu2,
+            fp32_correction_bias=False,
         )

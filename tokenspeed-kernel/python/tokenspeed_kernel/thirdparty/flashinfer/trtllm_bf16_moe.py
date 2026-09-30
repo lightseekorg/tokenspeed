@@ -29,6 +29,15 @@ the installed launcher whose BF16 check states exactly that, and exposes the
 BF16 entry points through a cloned namespace with private operator names.
 Routing, tuning and GEMM code stay FlashInfer's. The installed package,
 upstream Python globals and stock JIT artifacts are unchanged.
+
+FlashInfer's grouped DeepSeekV3 router (``routingMainKernel``) casts the
+correction bias to the BF16 output type before adding it to the FP32 sigmoid
+score, and its tanh-form sigmoid loses the small probabilities of negative
+logits. Layers whose reference router adds the bias in FP32 can route on a
+second copy of the TRT-LLM MoE module whose routing source carries
+flashinfer-ai/flashinfer#5557's edit, plus the 64-aligned launcher when it
+applies. It is built the same way under its own operator names; a FlashInfer
+whose routing already has that edit is used as is.
 """
 
 from __future__ import annotations
@@ -39,10 +48,12 @@ import logging
 import os
 import re
 import shutil
+import time
 
 from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
     _clone,
     _patched_launcher_spec,
+    _patched_sources_spec,
     _register_private,
 )
 
@@ -74,6 +85,34 @@ _RELAXED_CHECK = (
     '    << "BF16 MoE: intermediate_size must be a multiple of "',
     '    << intermediate_size_alignment << ", got " << args->intermediate_size << ".";',
 )
+_ROUTING = "trtllm_fused_moe_routing_deepseek.cu"
+_FP32_BIAS_OPERATORS = "tokenspeed_flashinfer_fp32_routing_bias"
+_ROUTING_KERNEL = re.compile(
+    r"(?m)^__global__ void routingMainKernel\(KernelParams params\) \{$"
+)
+_FUNCTION_END = re.compile(r"(?m)^\}$")
+_BIAS_LOAD = re.compile(r"loadScalar\(params\.mPtrRoutingBias\b")
+# Each routing edit in its stock form and in flashinfer-ai/flashinfer#5557's.
+_BF16_BIAS = re.compile(
+    r"(?P<head>auto biasVal = \(expertSelected && params\.mPtrRoutingBias != nullptr\)\n"
+    r"(?P<indent>[ \t]*)\? )static_cast<OutputT>\(\n[ \t]*"
+    r"(?P<load>loadScalar\(params\.mPtrRoutingBias, threadExpert, params\.mDtypeBias\))\)\n"
+    r"(?P=indent): \(expertSelected \? OutputT\{0\} : invalidScore\);"
+)
+_FP32_BIAS = re.compile(
+    r"auto biasVal = \(expertSelected && params\.mPtrRoutingBias != nullptr\)\s*"
+    r"\?\s*loadScalar\(params\.mPtrRoutingBias, threadExpert, params\.mDtypeBias\)\s*"
+    r":\s*\(expertSelected \? 0\.0[fF] : invalidScoreFloat\);"
+)
+_BF16_INVALID_SCORE = re.compile(
+    r"(?m)^[ \t]*const OutputT invalidScore = OutputT\{invalidScoreFloat\};\n"
+)
+_TANH_SIGMOID = re.compile(
+    r"(?m)^(?P<indent>[ \t]*)auto scoreSigmoid = sigmoid_accurate\(score\);$"
+)
+_EXP_SIGMOID = re.compile(
+    r"auto scoreSigmoid = 1\.0[fF] / \(1\.0[fF] \+ expf\(-score\)\);"
+)
 # Each cloned function must reach the next through the cloned globals.
 _DISPATCH = {
     "trtllm_bf16_moe": {"get_trtllm_moe_sm100_module"},
@@ -86,10 +125,10 @@ _DISPATCH = {
 }
 
 
-def _one(matches: list, what: str) -> re.Match:
+def _one(matches: list, what: str, where: str = "BF16 MoE launcher") -> re.Match:
     if len(matches) != 1:
         raise RuntimeError(
-            f"Unsupported FlashInfer BF16 MoE launcher: expected exactly one {what}, "
+            f"Unsupported FlashInfer {where}: expected exactly one {what}, "
             f"found {len(matches)}; review the BF16 MoE adapter."
         )
     return matches[0]
@@ -122,6 +161,62 @@ def _relaxed_spec(*args, **kwargs):
     )
 
 
+def _stock_form(kernel: str, stock: re.Pattern, edited: re.Pattern, what: str):
+    """Whether one routing edit is still in its stock form (else already made)."""
+    stock_matches = list(stock.finditer(kernel))
+    _one(stock_matches + list(edited.finditer(kernel)), what, "DeepSeekV3 routing")
+    return bool(stock_matches)
+
+
+def _keep_routing_bias_fp32(source: str) -> str:
+    """Apply flashinfer-ai/flashinfer#5557's edit to ``routingMainKernel``.
+
+    The correction bias is added to the FP32 sigmoid score in FP32 rather than
+    after a cast to the BF16 output type, and the sigmoid is
+    ``1 / (1 + exp(-x))``. Each edit is made where its stock form occurs
+    exactly once in the kernel and kept where its edited form does; anything
+    else is refused. A source with both edits is returned unchanged.
+    """
+    routing = "DeepSeekV3 routing"
+    kernel = _one(list(_ROUTING_KERNEL.finditer(source)), "routingMainKernel", routing)
+    end = _FUNCTION_END.search(source, kernel.end())
+    if end is None:
+        raise RuntimeError(
+            f"Unsupported FlashInfer {routing}: no routingMainKernel end"
+        )
+    body = source[kernel.end() : end.start()]
+    _one(list(_BIAS_LOAD.finditer(body)), "correction-bias load", routing)
+    if _stock_form(body, _BF16_BIAS, _FP32_BIAS, "correction-bias sum"):
+        _one(list(_BF16_INVALID_SCORE.finditer(body)), "BF16 invalidScore", routing)
+        body = _BF16_INVALID_SCORE.sub("", body)
+        body = _BF16_BIAS.sub(
+            lambda bias: f"{bias['head']}{bias['load']}\n{bias['indent']}"
+            ": (expertSelected ? 0.0F : invalidScoreFloat);",
+            body,
+        )
+        if re.search(r"\binvalidScore\b", body):
+            raise RuntimeError(
+                f"Unsupported FlashInfer {routing}: the BF16 invalidScore has "
+                "another use; review the BF16 MoE adapter."
+            )
+    if _stock_form(body, _TANH_SIGMOID, _EXP_SIGMOID, "score sigmoid"):
+        body = _TANH_SIGMOID.sub(
+            lambda sigmoid: f"{sigmoid['indent']}// The tanh form loses small "
+            f"positive probabilities for negative logits.\n{sigmoid['indent']}"
+            "auto scoreSigmoid = 1.0f / (1.0f + expf(-score));",
+            body,
+        )
+    return source[: kernel.end()] + body + source[end.start() :]
+
+
+def _fp32_routing_bias_spec(*args, **kwargs):
+    transforms = {_ROUTING: _keep_routing_bias_fp32}
+    # One module serves every size the in-kernel routing kernels accept.
+    if gated_ispp_alignment() == GATED_ISPP_ALIGNMENT:
+        transforms[_LAUNCHER] = _relax_bf16_intermediate_check
+    return _patched_sources_spec(transforms, "fp32_routing_bias", *args, **kwargs)
+
+
 def _require_jit_compiler() -> None:
     """Raise unless FlashInfer's JIT can compile the private module.
 
@@ -143,7 +238,7 @@ def _require_jit_compiler() -> None:
 
 
 @functools.cache
-def _entrypoints() -> dict:
+def _entrypoints(spec=_relaxed_spec, prefix: str = _OPERATORS) -> dict:
     from flashinfer.fused_moe import core
 
     missing = sorted(name for name in _DISPATCH if not hasattr(core, name))
@@ -152,10 +247,10 @@ def _entrypoints() -> dict:
             f"FlashInfer no longer defines {missing}; review the BF16 MoE adapter."
         )
     namespace = dict(vars(core))
-    namespace["gen_trtllm_gen_fused_moe_sm100_module"] = _relaxed_spec
+    namespace["gen_trtllm_gen_fused_moe_sm100_module"] = spec
     for name in ("register_custom_op", "register_fake_op"):
         namespace[name] = functools.partial(
-            _register_private, getattr(core, name), prefix=_OPERATORS
+            _register_private, getattr(core, name), prefix=prefix
         )
     for name in _DISPATCH:
         namespace[name] = _clone(getattr(core, name), namespace)
@@ -215,3 +310,58 @@ def trtllm_bf16_routed_moe(*args, **kwargs):
     Arguments and returned tensors follow FlashInfer's same-named API.
     """
     return _entrypoints()["trtllm_bf16_routed_moe"](*args, **kwargs)
+
+
+@functools.cache
+def stock_routing_keeps_fp32_bias() -> bool:
+    """Whether the installed FlashInfer's DeepSeekV3 routing already adds the
+    correction bias in FP32 (flashinfer-ai/flashinfer#5557). Raises for a
+    routing source the adapter does not recognize."""
+    from flashinfer.jit import env as jit_env
+
+    path = jit_env.FLASHINFER_CSRC_DIR / "fused_moe" / "trtllm_backend" / _ROUTING
+    source = path.read_text()
+    return _keep_routing_bias_fp32(source) == source
+
+
+@functools.cache
+def fp32_routing_bias_ready() -> bool:
+    """Prepare in-kernel DeepSeekV3 routing that adds the correction bias in FP32.
+
+    Builds and loads the FP32 correction-bias module once per process unless
+    the installed routing already adds the bias in FP32. Returns False after
+    one warning when the routing source is refused or the build fails.
+    """
+    try:
+        if stock_routing_keeps_fp32_bias():
+            logger.info("FlashInfer's DeepSeekV3 routing adds the bias in FP32")
+            return True
+        start = time.monotonic()
+        logger.info(
+            "Building FlashInfer's TRT-LLM MoE with FP32 correction-bias routing; "
+            "the first build takes several minutes"
+        )
+        namespace = _entrypoints(_fp32_routing_bias_spec, _FP32_BIAS_OPERATORS)
+        namespace["get_trtllm_moe_sm100_module"]()
+    except Exception as error:
+        logger.warning(
+            "FP32 correction-bias routing is unavailable in the TRT-LLM MoE "
+            f"kernel ({type(error).__name__}: {error})"
+        )
+        return False
+    seconds = time.monotonic() - start
+    logger.info(
+        f"FlashInfer TRT-LLM MoE with FP32 correction-bias routing is ready "
+        f"({seconds:.0f} s)"
+    )
+    return True
+
+
+def trtllm_bf16_fp32_routing_bias_moe(*args, **kwargs):
+    """Run FlashInfer BF16 MoE from logits, adding the DeepSeekV3 correction
+    bias in FP32.
+
+    Arguments and returned tensors follow FlashInfer's ``trtllm_bf16_moe``.
+    """
+    namespace = _entrypoints(_fp32_routing_bias_spec, _FP32_BIAS_OPERATORS)
+    return namespace["trtllm_bf16_moe"](*args, **kwargs)

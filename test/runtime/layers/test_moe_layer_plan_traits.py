@@ -33,6 +33,7 @@ import pytest
 
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -163,3 +164,27 @@ def test_slot_order_hands_the_leaf_the_ep_device_group_over_the_planned_one(
         monkeypatch, activation="swiglu", ep_rank=0, ep_size=2, tp_rank=0, tp_size=1
     )
     assert plan["process_group"] is process_group
+
+
+def test_fp32_correction_bias_is_requested_from_the_routing_config(monkeypatch):
+    assert (
+        _plan_kwargs(monkeypatch, activation="swiglu")["fp32_correction_bias"] is False
+    )
+    requested = _plan_kwargs(
+        monkeypatch,
+        activation="swiglu",
+        routing_config={"fp32_correction_bias": True},
+    )
+    assert requested["fp32_correction_bias"] is True
+
+
+def test_fp32_correction_bias_requires_deepseek_v3_routing(monkeypatch):
+    with pytest.raises(ValueError, match="requires DeepSeekV3 routing"):
+        _plan_kwargs(
+            monkeypatch,
+            activation="swiglu",
+            routing_config={
+                "fp32_correction_bias": True,
+                "routing_method_type": RoutingMethodType.MiniMax2,
+            },
+        )
