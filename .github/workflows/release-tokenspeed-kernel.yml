@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       nightly:
-        description: "Build and publish CUDA 13 nightly wheels from main with a .postYYYYMMDD version."
+        description: "Build CUDA 13 wheels with a .postYYYYMMDD version; enable publish_github on main to publish."
         required: false
         default: false
         type: boolean
@@ -95,10 +95,15 @@ jobs:
           VERSION_DATE: ${{ inputs.version_date }}
           REQUESTED_TAG: ${{ inputs.tag_name }}
           PUBLISH_PYPI: ${{ inputs.publish_pypi }}
+          PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
         run: |
           if [ "$NIGHTLY" = "true" ]; then
-            if [ "$GITHUB_REF" != "refs/heads/main" ] || [ "$PUBLISH_PYPI" = "true" ]; then
-              echo "Nightly publication requires main and cannot publish to PyPI." >&2
+            if [ "$PUBLISH_PYPI" = "true" ]; then
+              echo "Nightly builds cannot publish to PyPI." >&2
+              exit 1
+            fi
+            if [ "$PUBLISH_GITHUB" = "true" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+              echo "Nightly publication requires main." >&2
               exit 1
             fi
             CUDA_VARIANT=cu130
@@ -314,7 +319,7 @@ jobs:
 
   release:
     name: Create wheelhouse release
-    if: github.event_name == 'schedule' || inputs.nightly || inputs.publish_github
+    if: github.event_name == 'schedule' || inputs.publish_github
     concurrency:
       group: wheelhouse-publication
       cancel-in-progress: false

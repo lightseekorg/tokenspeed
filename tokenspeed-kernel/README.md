@@ -19,8 +19,7 @@ version, for example `0.1.3.post20260929`.
 
 ```bash
 pip install --upgrade tokenspeed-kernel \
-  --index-url https://lightseek.org/whl/nightly \
-  --extra-index-url https://pypi.org/simple
+  --extra-index-url https://lightseek.org/whl/nightly
 ```
 
 PyPI supplies dependencies that are absent from the nightly index. To select a
@@ -28,7 +27,9 @@ specific nightly, use `tokenspeed-kernel==0.1.3.post20260929`. Post releases sor
 above the corresponding base release and do not require `--pre`.
 
 The `Build and Release tokenspeed-kernel` workflow also supports manual nightly
-publication from `main`. Same-day reruns preserve already published wheels.
+builds from pull request branches. To publish manually, run it from `main` with
+both `nightly` and `publish_github` enabled. Same-day reruns preserve already
+published wheels.
 Historical nightlies are retained; automatic cleanup is deferred.
 
 ## Design Goals
