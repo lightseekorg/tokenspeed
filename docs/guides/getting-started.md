@@ -59,7 +59,7 @@ For ROCm 7.2 on Linux x86_64, first install ROCm PyTorch in a fresh Python
 python -m pip install "torch==2.14.0" "torchvision==0.29.0" \
   --index-url https://download.pytorch.org/whl/rocm7.2
 python -m pip install --upgrade tokenspeed \
-  --extra-index-url https://lightseek.org/whl/rocm7.2/nightly
+  --extra-index-url https://lightseek.org/whl/nightly/rocm7.2
 python -c 'import torch; assert torch.version.hip, torch.__version__'
 python -m pip check
 ```

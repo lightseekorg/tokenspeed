@@ -59,7 +59,9 @@ def update_index(
             f"{escape(name)}</a><br>\n"
         )
 
-    nightly = wheelhouse / ("nightly" if variant == "cu130" else "rocm7.2/nightly")
+    nightly = wheelhouse / "nightly"
+    if variant == "rocm72":
+        nightly /= "rocm7.2"
     index = nightly / package / "index.html"
     index.parent.mkdir(parents=True, exist_ok=True)
     previous = index.read_text() if index.exists() else "<!DOCTYPE html>\n"
@@ -74,13 +76,13 @@ def update_index(
         root.write_text(previous_root + package_link)
 
     if variant == "rocm72":
-        rocm_root = wheelhouse / "rocm7.2" / "index.html"
-        previous_rocm_root = (
-            rocm_root.read_text() if rocm_root.exists() else "<!DOCTYPE html>\n"
+        nightly_root = wheelhouse / "nightly" / "index.html"
+        previous_nightly_root = (
+            nightly_root.read_text() if nightly_root.exists() else "<!DOCTYPE html>\n"
         )
-        nightly_link = '<a href="nightly/">nightly</a><br>\n'
-        if nightly_link not in previous_rocm_root:
-            rocm_root.write_text(previous_rocm_root + nightly_link)
+        rocm_link = '<a href="rocm7.2/">rocm7.2</a><br>\n'
+        if rocm_link not in previous_nightly_root:
+            nightly_root.write_text(previous_nightly_root + rocm_link)
 
 
 if __name__ == "__main__":

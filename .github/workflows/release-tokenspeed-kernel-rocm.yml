@@ -349,7 +349,7 @@ jobs:
           cd wheelhouse
           git config user.name lightseek-bot
           git config user.email 243258330+lightseek-bot@users.noreply.github.com
-          git add rocm7.2/index.html rocm7.2/nightly/index.html rocm7.2/nightly/tokenspeed-kernel/index.html
+          git add nightly/index.html nightly/rocm7.2/index.html nightly/rocm7.2/tokenspeed-kernel/index.html
           git diff --cached --check
           if git diff --cached --quiet; then
             exit 0
@@ -361,8 +361,8 @@ jobs:
           git commit -s -m "Publish tokenspeed-kernel ROCm nightly index"
           for attempt in 1 2 3; do
             if git push origin HEAD:gh-pages; then
-              gh api repos/lightseekorg/whl/contents/rocm7.2/nightly/tokenspeed-kernel/index.html --jq .content | base64 --decode
-              gh api repos/lightseekorg/whl/contents/rocm7.2/nightly/index.html --jq .content | base64 --decode
+              gh api repos/lightseekorg/whl/contents/nightly/rocm7.2/tokenspeed-kernel/index.html --jq .content | base64 --decode
+              gh api repos/lightseekorg/whl/contents/nightly/rocm7.2/index.html --jq .content | base64 --decode
               exit 0
             fi
             git fetch origin gh-pages

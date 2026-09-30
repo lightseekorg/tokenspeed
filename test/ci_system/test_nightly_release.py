@@ -69,7 +69,9 @@ def test_invalid_or_mismatched_date_does_not_change_metadata(project, date, kern
 @pytest.mark.parametrize("variant", ["cu130", "rocm72"])
 def test_tokenspeed_index_preserves_kernel_and_history(tmp_path, variant):
     wheelhouse = tmp_path / "wheelhouse"
-    nightly = wheelhouse / ("nightly" if variant == "cu130" else "rocm7.2/nightly")
+    nightly = wheelhouse / "nightly"
+    if variant == "rocm72":
+        nightly /= "rocm7.2"
     (nightly / "tokenspeed-kernel").mkdir(parents=True)
     kernel = nightly / "tokenspeed-kernel/index.html"
     kernel.write_text("existing kernel links\n")
@@ -99,4 +101,5 @@ def test_tokenspeed_index_preserves_kernel_and_history(tmp_path, variant):
     UPDATE(wheelhouse, release, dist.parent, "tokenspeed", variant)
     assert index.read_text() == contents
     if variant == "rocm72":
-        assert 'href="nightly/"' in (wheelhouse / "rocm7.2/index.html").read_text()
+        assert 'href="rocm7.2/"' in (wheelhouse / "nightly/index.html").read_text()
+        assert not (wheelhouse / "rocm7.2/nightly").exists()

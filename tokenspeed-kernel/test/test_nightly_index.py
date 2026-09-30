@@ -32,7 +32,9 @@ def test_nightly_index_preserves_history_and_uses_published_digest(
 ) -> None:
     update_index = runpy.run_path(str(SCRIPT))["update_index"]
     wheelhouse = tmp_path / "wheelhouse"
-    nightly = wheelhouse / ("nightly" if variant == "cu130" else "rocm7.2/nightly")
+    nightly = wheelhouse / "nightly"
+    if variant == "rocm72":
+        nightly /= "rocm7.2"
     nightly.mkdir(parents=True)
     root = nightly / "index.html"
     root.write_text('<!DOCTYPE html>\n<a href="cu130/">cu130</a><br>\n')
@@ -64,7 +66,8 @@ def test_nightly_index_preserves_history_and_uses_published_digest(
     update_index(wheelhouse, release, wheels.parent, "tokenspeed-kernel", variant)
     assert project.read_text() == contents
     if variant == "rocm72":
-        assert 'href="nightly/"' in (wheelhouse / "rocm7.2/index.html").read_text()
+        assert 'href="rocm7.2/"' in (wheelhouse / "nightly/index.html").read_text()
+        assert not (wheelhouse / "rocm7.2/nightly").exists()
 
     with pytest.raises(ValueError, match="missing expected nightly wheels"):
         update_index(
