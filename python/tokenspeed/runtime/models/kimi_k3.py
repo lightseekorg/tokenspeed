@@ -63,7 +63,6 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel import fp8_linear
 from tokenspeed_kernel.ops.activation.triton import (
-    add3,
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
