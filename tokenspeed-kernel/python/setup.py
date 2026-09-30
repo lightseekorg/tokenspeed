@@ -153,6 +153,17 @@ def _git_branch() -> str:
 
 
 def _package_version() -> str:
+    if os.environ.get("TOKENSPEED_KERNEL_NIGHTLY") == "true":
+        version_date = _version_date()
+        if (
+            len(version_date) != 8
+            or not version_date.isascii()
+            or not version_date.isdigit()
+        ):
+            raise ValueError("Nightly version date must be YYYYMMDD")
+        datetime.strptime(version_date, "%Y%m%d")
+        return f"{BASE_VERSION}.post{version_date}"
+
     if _git_branch().startswith("release/"):
         return BASE_VERSION
 
