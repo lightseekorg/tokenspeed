@@ -20,6 +20,7 @@
 
 """Attention producer ownership and reuse of the existing MoE communication state."""
 
+import re
 import socket
 from contextlib import ExitStack
 from datetime import timedelta
@@ -31,6 +32,74 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
+
+
+@pytest.mark.parametrize("rank", (0, 7))
+@pytest.mark.parametrize(
+    "operation,has_residual", (("reduce", False), ("reduce", True), ("gather", False))
+)
+def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
+    """Runtime rows must preserve vector payload traffic, including tail tiles."""
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_attention_push_gather_gluon_kernel,
+        iris_attention_reduce_scatter_gluon_kernel,
+    )
+
+    fn = (
+        iris_attention_reduce_scatter_gluon_kernel
+        if operation == "reduce"
+        else iris_attention_push_gather_gluon_kernel
+    )
+    constants = {
+        "RANK": rank,
+        "BLOCK_ELEMENTS": 2048,
+        "NUM_PROGRAMS": 24 if operation == "reduce" else 32,
+        "NUM_WARPS": 4,
+    }
+    if operation == "reduce":
+        constants["HAS_RESIDUAL"] = has_residual
+    signature = {}
+    for name in fn.arg_names:
+        if name in constants:
+            continue
+        if name.startswith("heap_base_"):
+            signature[name] = "i64"
+        elif name in ("LOCAL_ROWS", "PARTITION_ELEMENTS"):
+            signature[name] = "i32"
+        elif name == "ready_flags":
+            signature[name] = "*i32"
+        else:
+            signature[name] = "*bf16"
+    source = gluon._runtime.GluonASTSource(
+        fn,
+        signature,
+        constexprs=constants,
+        # Only pointers/bases are aligned; odd runtime row counts have no hint.
+        attrs={
+            (index,): [["tt.divisibility", 16]]
+            for index, name in enumerate(fn.arg_names)
+            if name in signature and signature[name] != "i32"
+        },
+    )
+    kernel = triton.compile(
+        source,
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 4},
+    )
+    assembly = kernel.asm["amdgcn"]
+    (tmp_path / f"attention-{operation}-rank{rank}.amdgcn").write_text(assembly)
+    lines = assembly.splitlines()
+    loads = 8 + int(has_residual) if operation == "reduce" else 1
+    stores = 1 if operation == "reduce" else 8
+    assert sum("buffer_load_dwordx4" in line for line in lines) == loads
+    assert sum("buffer_store_dwordx4" in line for line in lines) == stores
+    if operation == "gather":
+        assert (
+            sum("buffer_store_dwordx4" in line and "sc0 sc1" in line for line in lines)
+            == 8
+        )
+    assert not re.search(r"\bbuffer_(?:load_ushort|store_short)\b", assembly)
 
 
 def _reference_mix(prefix, history, score, norm, valid_blocks):
@@ -103,7 +172,23 @@ def _attention_worker(rank: int, port: int) -> None:
     gen = torch.Generator(device=device)
     held_mix = None
     warmed_variants = set()
-    for m in (512, 513, 520, 848, 1024, 2048, 4096, 6224, 8144, 8192):
+    for m in (
+        56,
+        57,
+        64,
+        128,
+        256,
+        512,
+        513,
+        520,
+        848,
+        1024,
+        2048,
+        4096,
+        6224,
+        8144,
+        8192,
+    ):
         partial = comm.acquire_symm_outputs(backing, ((m, 7168),), torch.bfloat16)[0]
         gen.manual_seed(31729 + rank)
         source = (
@@ -196,6 +281,46 @@ def _attention_worker(rank: int, port: int) -> None:
                         f"M={m}, history={valid_blocks}, residual={prefix is not None}: {message}"
                     ),
                 )
+                if m in (56, 64) and valid_blocks in (4, 11):
+                    # Exercise both fusion choices at the new lower boundary.
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    small_graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(small_graph):
+                        partial.copy_(source)
+                        captured = iris_attention_mix(
+                            partial,
+                            prefix,
+                            history,
+                            score,
+                            norm,
+                            eps=1e-6,
+                            out_norm_weight=norm,
+                            out_norm_eps=1e-6,
+                            num_valid_blocks=valid_blocks,
+                            group=group,
+                        )
+                    assert captured is not None
+                    for sign in (-1, 1):
+                        source.neg_()
+                        small_graph.replay()
+                        reference_prefix = reduced * sign
+                        if prefix is not None:
+                            reference_prefix += prefix
+                        torch.testing.assert_close(
+                            captured[0],
+                            reference_prefix[rank * m // 8 : (rank + 1) * m // 8],
+                            atol=0,
+                            rtol=0,
+                        )
+                        torch.testing.assert_close(
+                            captured[1],
+                            _reference_mix(
+                                reference_prefix, history, score, norm, valid_blocks
+                            ),
+                            atol=1 / 512,
+                            rtol=1 / 64,
+                        )
                 held_mix = ((shard, shard.clone()), (activation, activation.clone()))
             else:
                 # Peers must not enter the next valid collective while a

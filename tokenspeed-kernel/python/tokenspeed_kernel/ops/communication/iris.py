@@ -1713,7 +1713,7 @@ def iris_moe_reduce_scatter_gluon_kernel(
 #                         + FP32(shared_reduced_q[u,j]))
 #
 # Rank q pushes its rows to every peer; other ranks write disjoint rows.
-@gluon.jit(do_not_specialize=["PARTITION_ELEMENTS"])
+@gluon.jit(do_not_specialize=["LOCAL_ROWS"])
 def iris_moe_add_push_gather_gluon_kernel(
     projection_ptr,
     shared_ptr,
@@ -1729,12 +1729,14 @@ def iris_moe_add_push_gather_gluon_kernel(
     heap_base_6,
     heap_base_7,
     RANK: gl.constexpr,
-    PARTITION_ELEMENTS,
+    LOCAL_ROWS,
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     PREFIX_IS_SHARDED: gl.constexpr,
 ):
+    # Preserve row alignment for vector loads/stores without specializing M.
+    PARTITION_ELEMENTS = LOCAL_ROWS * 7168
     # In-place prefixes are safe: ranks read then write disjoint rows.
     # Reduce-scatter entry waits for prior prefix consumers.
     heaps = (
@@ -1787,7 +1789,7 @@ def iris_moe_add_push_gather_gluon_kernel(
 
 
 def _reduce_metadata(grid, kernel, args):
-    elements = args["PARTITION_ELEMENTS"]
+    elements = args["LOCAL_ROWS"] * 7168
     return {
         "name": kernel.name,
         "bytes": elements * (9 + int(args["HAS_RESIDUAL"])) * 2,
@@ -1796,7 +1798,7 @@ def _reduce_metadata(grid, kernel, args):
 
 
 def _gather_metadata(grid, kernel, args):
-    return {"name": kernel.name, "bytes": args["PARTITION_ELEMENTS"] * 9 * 2}
+    return {"name": kernel.name, "bytes": args["LOCAL_ROWS"] * 7168 * 9 * 2}
 
 
 def _mix_gather_metadata(grid, kernel, args):
@@ -1819,7 +1821,7 @@ def _mix_gather_metadata(grid, kernel, args):
 #
 # The sum uses the even/odd FP32 tree. BF16 rounding precedes the residual
 # add; only rank q's rows are stored in its local prefix.
-@gluon.jit(launch_metadata=_reduce_metadata, do_not_specialize=["PARTITION_ELEMENTS"])
+@gluon.jit(launch_metadata=_reduce_metadata, do_not_specialize=["LOCAL_ROWS"])
 def iris_attention_reduce_scatter_gluon_kernel(
     input_ptr,
     residual_ptr,
@@ -1834,12 +1836,14 @@ def iris_attention_reduce_scatter_gluon_kernel(
     heap_base_6,
     heap_base_7,
     RANK: gl.constexpr,
-    PARTITION_ELEMENTS,
+    LOCAL_ROWS,
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     HAS_RESIDUAL: gl.constexpr,
 ):
+    # Whole rows preserve vector alignment without specializing the row count.
+    PARTITION_ELEMENTS = LOCAL_ROWS * 7168
     heaps = (
         heap_base_0,
         heap_base_1,
@@ -1901,7 +1905,7 @@ def iris_attention_reduce_scatter_gluon_kernel(
 #   output_p[r,j] = mixed_q[u,j]
 #
 # Each rank pushes its rows to every peer; other ranks write disjoint rows.
-@gluon.jit(launch_metadata=_gather_metadata, do_not_specialize=["PARTITION_ELEMENTS"])
+@gluon.jit(launch_metadata=_gather_metadata, do_not_specialize=["LOCAL_ROWS"])
 def iris_attention_push_gather_gluon_kernel(
     mixed_ptr,
     output_ptr,
@@ -1915,11 +1919,12 @@ def iris_attention_push_gather_gluon_kernel(
     heap_base_6,
     heap_base_7,
     RANK: gl.constexpr,
-    PARTITION_ELEMENTS,
+    LOCAL_ROWS,
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
+    PARTITION_ELEMENTS = LOCAL_ROWS * 7168
     heaps = (
         heap_base_0,
         heap_base_1,
@@ -3826,10 +3831,17 @@ def iris_kimi3_moe_tail(
     shared = scratch[routed_elements : routed_elements + shared_elements].view(
         local_rows, 7168
     )
-    projected = torch.empty(
-        (local_rows, 7168), device=prefix.device, dtype=prefix.dtype
-    )
     output = result_buffer[:rows]
+    # A sharded prefix is disjoint from the result. Its owner can project into
+    # its output rows, then consume them before the gather overwrites them.
+    # A replicated prefix can already occupy the result and must be preserved.
+    projected = (
+        output[
+            state.rank_in_group * local_rows : (state.rank_in_group + 1) * local_rows
+        ]
+        if prefix_is_sharded
+        else torch.empty((local_rows, 7168), device=prefix.device, dtype=prefix.dtype)
+    )
     iris_moe_reduce_scatter_gluon_kernel[(programs,)](
         state._input_buf,
         scratch,
@@ -3845,7 +3857,7 @@ def iris_kimi3_moe_tail(
         num_warps=4,
     )
     normalized = (
-        rmsnorm(routed, norm_weight, eps, residual=None, out=None)
+        rmsnorm(routed, norm_weight, eps, residual=None, out=routed)
         if norm_weight is not None
         else routed
     )
@@ -3860,7 +3872,7 @@ def iris_kimi3_moe_tail(
         gather_flags,
         *state._heap_base_addresses,
         RANK=state.rank_in_group,
-        PARTITION_ELEMENTS=shared_elements,
+        LOCAL_ROWS=local_rows,
         BLOCK_ELEMENTS=2048,
         NUM_PROGRAMS=gather_programs,
         NUM_WARPS=4,
@@ -4018,7 +4030,6 @@ def iris_attention_mix(
     from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 
     rows = partial.shape[0] // 8
-    partition = rows * 7168
     first_row = state.rank_in_group * rows
     history = block_residual[:, first_row : first_row + rows]
     if not attn_res_fwd_available(
@@ -4051,7 +4062,7 @@ def iris_attention_mix(
         flags,
         *state._heap_base_addresses,
         RANK=state.rank_in_group,
-        PARTITION_ELEMENTS=partition,
+        LOCAL_ROWS=rows,
         BLOCK_ELEMENTS=2048,
         NUM_PROGRAMS=programs,
         NUM_WARPS=4,
@@ -4108,7 +4119,7 @@ def iris_attention_mix(
             gather_flags,
             *state._heap_base_addresses,
             RANK=state.rank_in_group,
-            PARTITION_ELEMENTS=partition,
+            LOCAL_ROWS=rows,
             BLOCK_ELEMENTS=2048,
             NUM_PROGRAMS=gather_programs,
             NUM_WARPS=4,

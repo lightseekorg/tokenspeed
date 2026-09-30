@@ -443,6 +443,78 @@ def test_dsv41_index_topk_table_width():
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
+def test_dsv41_page_table_geometry():
+    """The dsv41 address kernels take the page table's rows, columns and
+    strides as runtime scalars. Rows follow the batch and columns the longest
+    request, so a lone request (one row, which Triton otherwise folds into a
+    constant) or a width crossing a multiple of 16 must not recompile."""
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as dsv41
+    from tokenspeed_kernel.ops.attention.mla._triton import page_table
+
+    base = torch.tensor([3, 1, 7, 2], dtype=torch.int32, device=DEVICE)
+    positions = torch.tensor([0, 5, 63, 64, 130, 255, 256, -1], device=DEVICE)
+    requests = torch.zeros(8, dtype=torch.int32, device=DEVICE)
+    requests[-1] = -1
+    selected = (torch.arange(48, device=DEVICE, dtype=torch.int32) * 7 % 70).view(8, 6)
+    n = positions.numel()
+
+    def run(rows, cols, col_stride):
+        table = torch.full(
+            (rows, cols * col_stride), -1, dtype=torch.int32, device=DEVICE
+        )
+        table = table[:, ::col_stride]
+        table[0, :4] = base
+        window = (
+            torch.empty(n, dtype=torch.int64, device=DEVICE),
+            torch.empty((n, 128), dtype=torch.int32, device=DEVICE),
+            torch.empty(n, dtype=torch.int32, device=DEVICE),
+        )
+        dsv41.decode_window(positions, requests, *window, table, 8)
+        compressor = tuple(
+            torch.empty(n, dtype=dtype, device=DEVICE)
+            for dtype in (
+                torch.bool,
+                torch.int64,
+                torch.int32,
+                torch.int64,
+                torch.int64,
+                torch.int64,
+            )
+        )
+        dsv41.compressor_metadata(positions, requests, table, 8, *compressor)
+        selection, lengths = dsv41.selection_table(positions, requests, table, 4)
+        assert (selection[:, 4:] == -1).all()
+        return (
+            page_table.bounded_group_slots(positions, requests, table, 64, 1, 1, 8),
+            dsv41.global_slots(selected, positions, requests, table, 4, 8),
+            selection[:, :4],
+            lengths,
+            *window,
+            *compressor,
+        )
+
+    expected = run(3, 8, 1)
+    # Pages 3, 1, 7 hold columns 0-2; column 4 is padding and resolves to -1.
+    assert expected[0][[1, 3, 4, 6]].tolist() == [197, 64, 450, -1]
+    with assert_no_triton_compile(
+        page_table._group_slots_kernel,
+        dsv41._global_slots_kernel,
+        dsv41._selection_table_kernel,
+        dsv41._decode_window_kernel,
+        dsv41._compressor_metadata,
+    ):
+        for rows, cols, col_stride in (
+            (1, 4, 1),
+            (1, 16, 1),
+            (2, 33, 1),
+            (16, 1024, 1),
+            (17, 129, 2),
+            (1, 6, 2),
+        ):
+            for got, want in zip(run(rows, cols, col_stride), expected, strict=True):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
 def test_dsv41_cache_pack_row_count():
     from tokenspeed_kernel.ops.attention.dsv41 import triton as dsv41
 

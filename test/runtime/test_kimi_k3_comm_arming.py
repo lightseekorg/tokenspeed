@@ -168,6 +168,11 @@ def test_attention_prefill_fallback_preserves_residual_ownership(
 @pytest.mark.parametrize(
     "rows,eligible",
     [
+        (48, False),
+        (55, False),
+        (56, True),
+        (57, False),
+        (64, True),
         (511, False),
         (512, True),
         (513, False),
@@ -390,7 +395,7 @@ def test_arming_requires_fused_moe_ar():
 @pytest.mark.parametrize("pp_size", [1, 2])
 @pytest.mark.parametrize(
     "max_rows,tail_rows",
-    [(511, 0), (512, 512), (519, 512), (8192, 8192), (16384, 8192)],
+    [(39, 0), (40, 40), (47, 40), (511, 504), (8192, 8192), (16384, 8192)],
 )
 def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
     monkeypatch, pp_size, max_rows, tail_rows
@@ -766,8 +771,13 @@ def test_arming_declines_when_any_probe_or_peer_says_no(
     "rows,producer_direct,tp,ep,narrowed,solution,accepted,attempted,pp_size",
     [
         (1, True, 8, 1, False, "auto", True, False, 1),
-        (48, True, 8, 1, False, "auto", True, False, 1),
-        (504, True, 8, 1, False, "auto", True, False, 1),
+        (32, True, 8, 1, False, "auto", True, False, 1),
+        (39, True, 8, 1, False, "auto", True, False, 1),
+        (40, True, 8, 1, False, "auto", True, True, 1),
+        (41, True, 8, 1, False, "auto", False, True, 1),
+        (48, True, 8, 1, False, "auto", True, True, 1),
+        (64, True, 8, 1, False, "auto", True, True, 1),
+        (504, True, 8, 1, False, "auto", True, True, 1),
         (512, True, 8, 1, False, "auto", True, True, 1),
         (848, True, 8, 1, False, "auto", True, True, 1),
         (8192, True, 8, 1, False, "auto", True, True, 1),

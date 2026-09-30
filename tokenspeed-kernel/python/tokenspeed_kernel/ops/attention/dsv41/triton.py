@@ -2837,7 +2837,7 @@ def decode_rows(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["SW", "SS", "SC", "TABLE_ROWS"])
 def _decode_window_kernel(
     Positions,
     Requests,
@@ -2913,7 +2913,7 @@ def decode_window(
         )
 
 
-@triton.jit(do_not_specialize=["N"])
+@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
 def _global_slots_kernel(
     Rows,
     P,
@@ -2981,7 +2981,7 @@ def global_slots(rows, positions, requests, table, ratio, pages):
     return out
 
 
-@triton.jit(do_not_specialize=["N", "TC"])
+@triton.jit(do_not_specialize=["N", "TC", "TR", "TS0", "TS1"])
 def _selection_table_kernel(
     P,
     Req,
@@ -3042,7 +3042,7 @@ def selection_table(positions, requests, table, ratio):
     return out, lengths
 
 
-@triton.jit(do_not_specialize=["N"])
+@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
 def _compressor_metadata(
     Positions,
     Requests,

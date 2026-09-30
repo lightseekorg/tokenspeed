@@ -1203,6 +1203,38 @@ def _narrow_spec_for_pp(
     )
 
 
+def _validate_mla_dcp_backend(name: str | None, arch: AttentionArch) -> None:
+    backend_cls = _get_backend_cls(name, arch)
+    if not backend_cls.supports_mla_dcp:
+        raise ValueError(
+            f"Attention backend {name or _get_default_backend_name(arch)!r} "
+            "does not support MLA DCP "
+            "(supports_mla_dcp=False)"
+        )
+
+
+def _validate_hybrid_dcp_cache(spec: CachePoolSpec, *, dcp_size: int) -> None:
+    """Validate declared storage, independent of recipe name or inheritance."""
+    groups = spec.cache_group_specs
+    if not any(
+        group.family == "history" and group.retention == "full_history"
+        for group in groups
+    ):
+        raise ValueError("Hybrid MLA DCP requires a full-history cache group")
+    for group in groups:
+        if group.family == "history" and group.retention != "full_history":
+            raise ValueError(
+                f"Hybrid MLA DCP cache group {group.group_id!r} "
+                "must use full-history retention"
+            )
+        expected = dcp_size if group.family == "history" else 1
+        if group.shard_count != expected:
+            raise ValueError(
+                f"Hybrid MLA DCP cache group {group.group_id!r} ({group.family}) "
+                f"requires shard_count={expected}, got {group.shard_count}"
+            )
+
+
 def create_attn_components(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -1253,11 +1285,18 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
+    # DeepSeek V4 validates its specialized DCP cache contract in its backend.
+    if (
+        config.dcp_size > 1
+        and not target.is_deepseek_v4
+        and (
+            model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+        )
+    ):
+        _validate_mla_dcp_backend(
+            target_full_attn_backend_name, model_config.attention_arch
+        )
     if config.dcp_size > 1 and target.is_hybrid_linear:
-        if cache_family != "kimi_k3" or target_full_attn_backend_name != "flashmla":
-            raise ValueError(
-                "Hybrid MLA DCP requires the MLA/KDA cache and FlashMLA backend"
-            )
         resolved_softmax = dataclasses.replace(
             softmax_attn, backend_name=target_full_attn_backend_name
         )
@@ -1330,6 +1369,8 @@ def create_attn_components(
         probe_batch_rows=probe_batch_rows,
     )
     spec = cache_setup.spec
+    if config.dcp_size > 1 and target.is_hybrid_linear:
+        _validate_hybrid_dcp_cache(spec, dcp_size=config.dcp_size)
     num_target_cache_layers = cache_setup.num_target_layers
     num_draft_cache_layers = cache_setup.num_draft_layers
     if server_args.mapping.has_pp:
