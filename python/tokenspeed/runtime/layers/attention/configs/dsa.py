@@ -76,7 +76,22 @@ class DSAConfig(MLAConfig):
         config = super().generate(server_args, model_config, is_draft)
         if config.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             platform = current_platform()
-            if not (platform.is_blackwell_plus or platform.is_cdna4_plus):
+            if platform.is_hopper:
+                spec = config.component(cls)
+                if (
+                    config.kv_cache_dtype != torch.float8_e4m3fn
+                    or config.dtype != torch.bfloat16
+                    or config.kv_cache_quant_method != "none"
+                    or spec.kv_lora_rank != 512
+                    or spec.qk_rope_head_dim not in (0, 64)
+                ):
+                    raise ValueError(
+                        "Hopper DSA FP8 requires BF16 queries, E4M3 KV, "
+                        "kv_cache_quant_method='none', latent rank 512, "
+                        "and RoPE width 0 or 64"
+                    )
+                config.kv_cache_quant_method = "flashmla"
+            elif not (platform.is_blackwell_plus or platform.is_cdna4_plus):
                 raise ValueError(
                     "GLM DSA FP8 KV cache currently requires NVIDIA Blackwell "
                     "or AMD CDNA4 sparse attention support; use --kv-cache-dtype "

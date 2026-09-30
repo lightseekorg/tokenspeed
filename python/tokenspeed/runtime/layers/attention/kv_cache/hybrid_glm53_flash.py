@@ -149,11 +149,11 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-        sanitize: bool = False,
+        sanitize: bool | None = None,
         *,
         write_mask: torch.Tensor | None,
     ) -> None:
-        if self.qk_rope_head_dim != 0:
+        if self.qk_rope_head_dim != 0 or self.quant_method == "flashmla":
             super().set_mla_kv_buffer(
                 layer,
                 loc,
@@ -200,7 +200,7 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
         loc: torch.Tensor,
         dst_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.qk_rope_head_dim != 0:
+        if self.qk_rope_head_dim != 0 or self.quant_method == "flashmla":
             return super().get_mla_kv_buffer(layer, loc, dst_dtype=dst_dtype)
 
         dst_dtype = dst_dtype or self.dtype

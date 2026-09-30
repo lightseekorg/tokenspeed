@@ -121,7 +121,14 @@ class MLAConfig(SoftmaxAttnConfig):
             ),
         )
 
+    def cache_storage_dim(self, config: AttnConfig) -> int:
+        if config.kv_cache_quant_method == "flashmla":
+            return self.kv_lora_rank + self.kv_lora_rank // 128 * 4 + 64 * 2
+        return self.kv_lora_rank + self.qk_rope_head_dim
+
     def cache_cell_size(self, config: AttnConfig) -> int:
+        if config.kv_cache_quant_method == "flashmla":
+            return self.cache_storage_dim(config)
         if config.kv_cache_quant_method == "per_token_head":
             cell_size = (
                 self.kv_lora_rank * torch._utils._element_size(config.kv_cache_dtype)

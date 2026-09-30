@@ -110,6 +110,7 @@ class DSABackend(PagedAttentionBackend):
         self.kv_cache_dim = spec.kv_cache_dim
         self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
+        self.packed_kv = config.kv_cache_quant_method == "flashmla"
         self.q_data_type = config.dtype
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
         # rl-bitwise pins the sparse decode onto the batch-invariant no-split
@@ -504,8 +505,8 @@ class DSABackend(PagedAttentionBackend):
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
             )
-        if len(self.dcp_group) > 1:
-            raise ValueError("Sharded DSA decode requires global top-k selection")
+        if self.packed_kv or len(self.dcp_group) > 1:
+            raise ValueError("Packed or sharded DSA decode requires top-k selection")
         metadata = self.forward_decode_metadata
         if metadata is not None and metadata.seq_lens_k is not None:
             num_extends = int(metadata.num_extends or 0)
@@ -574,7 +575,11 @@ class DSABackend(PagedAttentionBackend):
                 f"indices={tuple(topk_slots.shape)}"
             )
         q_view = q.view(q.shape[0], layer.tp_q_head_num, layer.head_dim)
-        if self.data_type == torch.float8_e4m3fn and q_view.dtype != self.data_type:
+        if (
+            not self.packed_kv
+            and self.data_type == torch.float8_e4m3fn
+            and q_view.dtype != self.data_type
+        ):
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
 
@@ -583,6 +588,8 @@ class DSABackend(PagedAttentionBackend):
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
         )
+        if self.packed_kv and k_scale != 1.0:
+            raise ValueError("Packed FlashMLA KV uses per-group scales")
         use_dcp = len(self.dcp_group) > 1
         if use_dcp:
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
@@ -590,8 +597,8 @@ class DSABackend(PagedAttentionBackend):
             q_view = gather_query_heads(q_view, self.dcp_group)
         out = dsa_prefill(
             q=q_view,
-            kv_cache=kv_cache,
-            sparse_kv_cache=None,
+            kv_cache=None if self.packed_kv else kv_cache,
+            sparse_kv_cache=kv_cache if self.packed_kv else None,
             topk_slots=topk_slots,
             topk_lens=topk_lens.to(device=q.device, dtype=torch.int32).contiguous(),
             kv_seq_lens=(
@@ -743,7 +750,7 @@ class DSABackend(PagedAttentionBackend):
             )
 
         q_view = q.view(num_tokens, layer.tp_q_head_num, layer.head_dim)
-        if self.data_type == torch.float8_e4m3fn:
+        if not self.packed_kv and self.data_type == torch.float8_e4m3fn:
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
 
@@ -752,6 +759,8 @@ class DSABackend(PagedAttentionBackend):
             if getattr(layer, "k_scale_float", None) is not None
             else 1.0
         )
+        if self.packed_kv and k_scale != 1.0:
+            raise ValueError("Packed FlashMLA KV uses per-group scales")
         max_seqlen_k = int(
             getattr(metadata, "max_seq_len_k", 0) or self.max_context_len
         )
@@ -763,8 +772,8 @@ class DSABackend(PagedAttentionBackend):
             q_view = gather_query_heads(q_view, self.dcp_group)
         out = dsa_decode(
             q=q_view,
-            kv_cache=kv_cache,
-            sparse_kv_cache=None,
+            kv_cache=None if self.packed_kv else kv_cache,
+            sparse_kv_cache=kv_cache if self.packed_kv else None,
             topk_slots=topk_slots,
             topk_lens=topk_lens,
             max_seqlen_k=max_seqlen_k,

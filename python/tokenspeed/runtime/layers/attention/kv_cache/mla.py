@@ -25,7 +25,9 @@ from typing import ClassVar
 import numpy as np
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
+    get_flashmla_kv_buffer,
     get_mla_kv_buffer_triton,
+    set_flashmla_kv_buffer,
     set_mla_kv_buffer_triton,
 )
 
@@ -104,7 +106,7 @@ class MLATokenToKVPool(CachePool):
         buffer = self.kv_buffer[layer_id]
         if buffer is None:
             raise ValueError(f"layer {layer_id} is a KDA state layer")
-        if self.quant_method == "per_token_head":
+        if self.quant_method in ("per_token_head", "flashmla"):
             return buffer
         elif self.store_dtype != self.dtype:
             return buffer.view(self.dtype)
@@ -117,6 +119,8 @@ class MLATokenToKVPool(CachePool):
         buffer = self.kv_buffer[layer_id]
         if buffer is None:
             raise ValueError(f"layer {layer_id} is a KDA state layer")
+        if self.quant_method == "flashmla":
+            raise ValueError("Packed FlashMLA KV requires sparse attention")
         if self.quant_method == "per_token_head":
             return buffer[:2]
         elif self.store_dtype != self.dtype:
@@ -135,6 +139,15 @@ class MLATokenToKVPool(CachePool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
+        if self.quant_method == "flashmla":
+            self.set_mla_kv_buffer(
+                layer,
+                loc,
+                cache_k[..., : self.kv_lora_rank],
+                cache_k[..., self.kv_lora_rank :],
+                write_mask=None,
+            )
+            return
         if self.quant_method == "per_token_head":
             k_lora = cache_k[..., : self.kv_lora_rank].float()
             k_rope = cache_k[..., self.kv_lora_rank :].float()
@@ -165,6 +178,16 @@ class MLATokenToKVPool(CachePool):
         if sanitize is None:
             sanitize = self.latent_write_sanitizes
         layer_id = layer.layer_id
+        if self.quant_method == "flashmla":
+            set_flashmla_kv_buffer(
+                self.kv_buffer[layer_id],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                sanitize=sanitize,
+                write_mask=write_mask,
+            )
+            return
         if self.quant_method == "per_token_head":
             if write_mask is not None:
                 raise ValueError("Per-token quantized MLA writes do not support a mask")
@@ -204,8 +227,14 @@ class MLATokenToKVPool(CachePool):
         dst_dtype: torch.dtype | None = None,
     ):
         layer_id = layer.layer_id
-        dst_dtype = dst_dtype or self.dtype
+        dst_dtype = dst_dtype or (
+            self.model_dtype if self.quant_method == "flashmla" else self.dtype
+        )
 
+        if self.quant_method == "flashmla":
+            return get_flashmla_kv_buffer(
+                self.get_key_buffer(layer_id), loc, self.qk_rope_head_dim, dst_dtype
+            )
         if self.quant_method == "per_token_head":
             k_lora_cache, k_scale_cache, k_rope_cache = self.kv_buffer[layer_id]
             k_lora = k_lora_cache[loc].view(self.dtype).float()
