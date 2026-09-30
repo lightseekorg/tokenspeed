@@ -8,6 +8,7 @@ import torch
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -129,6 +130,7 @@ def test_forward_step_runner_uses_existing_route_for_padding():
         token_to_kv_pool=None,
         bs=30,
         num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, 30, 1),
         input_num_tokens=30,
         forward_mode=ForwardMode.DECODE,
     )
@@ -171,6 +173,7 @@ def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
         token_to_kv_pool=None,
         bs=0,
         num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, 0, 1),
         input_num_tokens=0,
         forward_mode=ForwardMode.DECODE,
         global_num_tokens=[0, 17],
@@ -193,6 +196,7 @@ def test_cuda_graph_route_respects_disable_padding_with_global_batch():
         token_to_kv_pool=None,
         bs=0,
         num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, 0, 1),
         input_num_tokens=0,
         forward_mode=ForwardMode.DECODE,
         global_num_tokens=[0, 17],

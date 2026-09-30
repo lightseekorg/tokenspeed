@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -1159,6 +1160,7 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
             token_to_kv_pool=None,
             bs=1,
             num_extends=1,
+            output_layout=ForwardOutputLayout(1, 1, 0, 1),
             input_num_tokens=num_tokens,
             forward_mode=ForwardMode.EXTEND,
         )

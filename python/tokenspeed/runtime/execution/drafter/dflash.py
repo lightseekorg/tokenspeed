@@ -44,6 +44,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsMetadata,
     _force_deterministic_rsag,
@@ -1203,6 +1204,12 @@ class DFlash(BaseDrafter):
             token_to_kv_pool=self.token_to_kv_pool,
             bs=bs,
             num_extends=metadata_num_extends,
+            output_layout=ForwardOutputLayout(
+                metadata_num_extends,
+                metadata_num_extends,
+                bs - metadata_num_extends,
+                self.draft_query_width,
+            ),
             input_num_tokens=bs * self.draft_query_width,
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.FULL,

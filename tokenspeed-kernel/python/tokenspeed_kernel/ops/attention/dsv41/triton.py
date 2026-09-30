@@ -1887,7 +1887,7 @@ def triton_dsv41_dspark_rows(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["EXTENDS", "PREFILL_OUTPUTS"])
 def _dspark_anchors_kernel(
     TOKENS,
     ACCEPT,
@@ -1896,6 +1896,7 @@ def _dspark_anchors_kernel(
     START,
     N0,
     EXTENDS,
+    PREFILL_OUTPUTS,
     WIDTH: tl.constexpr,
     SPEC: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -1905,10 +1906,15 @@ def _dspark_anchors_kernel(
     decode = row >= EXTENDS
     index = row - EXTENDS
     accepted = tl.minimum(tl.maximum(tl.load(ACCEPT + row).to(tl.int64), 1), WIDTH)
-    verify = EXTENDS + index * WIDTH + accepted - 1
-    bonus = tl.load(TOKENS + tl.where(decode, verify, row)).to(tl.int32)
+    active = (row < PREFILL_OUTPUTS) | decode
+    verify = PREFILL_OUTPUTS + index * WIDTH + accepted - 1
+    bonus = tl.load(TOKENS + tl.where(decode, verify, row), active, 0).to(tl.int32)
     columns = tl.arange(0, BLOCK)
-    tl.store(NEXT + row * N0 + columns, tl.zeros_like(columns) + bonus, columns < SPEC)
+    tl.store(
+        NEXT + row * N0 + columns,
+        tl.zeros_like(columns) + bonus,
+        active & (columns < SPEC),
+    )
     anchor_mask = decode & (one == 0)
     anchor = tl.load(POSITIONS + index * WIDTH + accepted - 1 + one, anchor_mask, -1)
     tl.store(START + index + one, anchor.to(tl.int64), anchor_mask)
@@ -1925,7 +1931,14 @@ def _dspark_anchors_kernel(
     priority=Priority.PORTABLE,
 )
 def triton_dsv41_dspark_anchors(
-    output_tokens, accept_lengths, positions, num_extends, width, next_tokens, start_pos
+    output_tokens,
+    accept_lengths,
+    positions,
+    num_extends,
+    num_prefill_outputs,
+    width,
+    next_tokens,
+    start_pos,
 ):
     rows = accept_lengths.shape[0]
     if rows == 0:
@@ -1938,6 +1951,7 @@ def triton_dsv41_dspark_anchors(
         start_pos,
         next_tokens.stride(0),
         num_extends,
+        num_prefill_outputs,
         WIDTH=width,
         SPEC=next_tokens.shape[1],
         BLOCK=triton.next_power_of_2(next_tokens.shape[1]),

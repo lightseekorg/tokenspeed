@@ -318,13 +318,37 @@ class-attribute-driven, so every DP rank derives the same answer
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
+### One output layout per forward
+
+Every ForwardContext and grammar completion carries a required, immutable
+ForwardOutputLayout. Ordinary prefill, mixed and decode batches use the same
+contract as compact outputs: each emitting prefill has one output row, and
+each decode has its fixed verify width. Ordinary models emit one row for
+every extend request; a backend that skips incomplete-prefill outputs
+shortens only the emitting prefill prefix. Missing layout is not an execution
+mode.
+
+Sampling parameters, cache progress and acceptance lengths remain indexed by
+the original requests. Logits and token storage use the output layout's
+prefill/decode slices and per-request offsets. Grammar masks retain a fixed
+width per original request: sampling selects the first mask of each emitting
+prefill and the full mask span of each decode. This rule applies equally to
+ordinary mixed batches and batches with zero-output prefills. Grammar
+candidate preparation reads only the decode suffix of the live input buffer.
+
+Graph capture uses the captured batch size in its layout. Replay temporarily
+pairs the padded context with a padded layout, then restores the original
+live layout before output/state processing. Queued grammar completions retain
+their immutable per-step layout, independently of later context updates.
+Idle graph warmup also supplies an explicit layout.
+
 ### Prefill graphs around a row narrowing
 
 A prefill forward whose row count drops once, at a fixed layer, by an amount
 that is not a function of the token bucket cannot be one token-shaped
 breakable graph. DeepSeek-V4.1 is the case: its CED decoder (layer 20 on)
 runs on a per-request tail of the prefill rows (`decoder_view()` — a
-completing prompt's last window, one row for an open chunk, every decode
+completing prompt's last window, no rows for an open chunk, every decode
 row), so the row count at layer 20 depends on which requests complete.
 
 The model declares the split instead of opting out: it implements
@@ -356,6 +380,77 @@ collective shapes its graph bakes would differ across ranks, and the stages
 size their collectives from their own rows, which the DP metadata gather
 does not carry (the same gap that keeps narrowing itself unimplemented under
 DP).
+
+### Prefill requests without generated outputs
+
+The original execution batch and cache metadata always contain every request.
+A backend may declare `skips_incomplete_prefill_outputs` only when its model
+still produces all cache state required by later chunks. DeepSeek V4.1 uses
+this after the candidate-source layer writes global KV. Other backends keep
+the original output contract.
+
+The scheduler packs completing prefills first, at most one incomplete prefill
+last among prefills, then decode requests. An immutable `ForwardOutputLayout`
+records E original prefills, P output-bearing prefills, D decode requests and
+verify width K. Completing prefills must form a prefix (validated on the CPU).
+Every forward carries a layout; one with P=E is the identity layout, and the
+executor's fast paths (whole-batch `sample`, whole-batch `verify`) still apply
+to it.
+
+Logits and tokens use P+D*K rows. Accept lengths still use E+D request rows,
+with zero in [P,E). Sample uses the parameter prefix [:P]; verify uses the
+original [E:] suffix, retaining its batch-row coin offset. Grammar masks have
+a separate token axis. Each consumer uses the same token offset:
+`i` for i<P, P for P<=i<E (no storage), and P+(i-E)*K for decode.
+V4.1 explicitly marks selected logits rows so the logits processor never
+re-gathers them using original input indices.
+
+The layout owns host queries for the shared prefill prefix, the original
+decode request suffix, the compact decode output suffix, and each request's
+stored output width. Consumers use these queries instead of deriving the
+same offsets independently. The executor aligns sampling parameters and
+token-indexed grammar masks at the sampler boundary; sampler interfaces and
+result buffers stay unchanged. Grammar owns matcher advancement and rollback,
+and zero accepted lengths already suppress advancement. Existing consumers
+that only need token_offset keep that interface. Models without cropped
+outputs carry the identity layout, under which every slice and offset above
+reduces to the original request-indexed contract.
+
+Completion remains a local comparison in the executor and V4.1 attention
+metadata. Both use the same scheduled prefix, input count (including replay),
+and current prefill target, which may include previously generated tokens
+after re-admission. Contract tests keep those decisions consistent without
+adding state or parameters to the shared metadata initialization interface.
+
+Cache advancement still consumes all input lengths for prefill, independently
+of output lengths. Future input writes, NaN/OOV attribution, grammar advances
+and V4.1 DSpark anchors operate only on output-bearing requests. Grammar keeps
+one queue completion per forward, including zero-output rounds; both deferred
+hostfunc and host fallback consume the frozen layout. A zero-row decoder
+bypasses its graph, normalization, LM head, sampler and draft-context writes;
+the encoder and global KV producer have already executed.
+
+When the decoder view is nonempty, the candidate-source layer retains the
+original full-row mHC and QKV projection shapes, then gathers the selected
+rows. Moving that gather before the projections changes split-K or quantized
+GEMM arithmetic and can change the retained logits. Only an empty decoder
+view bypasses those projections; its global KV producer still runs on all
+encoder rows.
+
+Compute rows and output rows are distinct. When a batch contains a completing
+prefill or a decode, each incomplete prefill retains its original single
+decoder compute row. Removing that row changes quantized attention and MoE
+batch shapes and can alter other requests' logits even with identical input
+tokens and chunk boundaries. The retained row is omitted from `logits_rows`,
+so it still has no sampled token. Batches containing only incomplete prefills
+keep zero decoder rows and skip the entire decoder consumer stack. This
+preserves the optimization on cache-only rounds without changing the numerical
+shape of rounds that produce outputs.
+
+Final prefill windows, bootstrap tokens and PD candidate/cache handoff remain
+unchanged. V4.1 PD still requires layerwise transfer interval zero. This does
+not enable a cache-only prefill role or reduce resident model weights. PP and
+attention-DP narrowing retain their existing restrictions.
 
 ### One draft metadata contract
 
@@ -886,13 +981,16 @@ consume the target's capture configuration; they do not change the tap
 selection or output layout.
 
 The reverse direction rides on the context as well: a target that captures
-its taps on a row subset reports it as `ctx.captured_rows`
-(`CapturedRows(positions, prefill_spans)`). V4.1's CED narrowing is the one
-producer — its taps sit in layers 37–39 and hold one row per open chunk and
-the last window of every completing one, so DSpark's prefill seeding
-(`_seed_prefill_windows`) reads the spans and positions from there instead
-of the input-length mirror. A target with one captured row per input row
-leaves it `None`, and the drafter keeps its buffer-based layout.
+its taps on a row subset reports it as ctx.captured_rows
+(CapturedRows(positions, prefill_spans)). V4.1's CED narrowing is the one
+producer: its taps in layers 37–39 contain no rows for incomplete prefill
+chunks, the last window of each completing prefill, and all decode rows.
+The reported prefill spans retain a zero-length entry for each incomplete
+request, preserving the original request order. DSpark's prefill seeding
+(_seed_prefill_windows) reads these spans and positions instead of the
+input-length mirror and skips zero-length spans. A target with one captured
+row per input row leaves ctx.captured_rows as None, and the drafter keeps
+its buffer-based layout.
 
 ## Shared prefill convolution preparation
 

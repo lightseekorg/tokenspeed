@@ -140,6 +140,8 @@ class AttentionBackend(CachePoolBinding, ABC):
     # validation: every published family must have a consumer); composites
     # union their children's.
     cache_consumer_families: frozenset[str] = frozenset({"history"})
+    # Only backends whose model skips incomplete-prefill outputs opt in.
+    skips_incomplete_prefill_outputs: bool = False
     # MLA sharded history reads/writes and global attention-partial merging,
     # independent of whether the model also has linear-attention layers.
     supports_mla_dcp: bool = False

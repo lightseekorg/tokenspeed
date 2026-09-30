@@ -33,6 +33,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DsaTopKState = tuple[Any | None, Any | None]
@@ -310,6 +311,12 @@ class Eagle(BaseDrafter):
             token_to_kv_pool=self.token_to_kv_pool,
             bs=bs,
             num_extends=draft_input.num_extends,
+            output_layout=ForwardOutputLayout(
+                draft_input.num_extends,
+                draft_input.num_extends,
+                bs - draft_input.num_extends,
+                1,
+            ),
             input_num_tokens=input_num_tokens,
             forward_mode=forward_mode,
             capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -414,6 +421,7 @@ class Eagle(BaseDrafter):
             ctx = ForwardContext(
                 bs=bs,
                 num_extends=0,
+                output_layout=ForwardOutputLayout(0, 0, bs, 1),
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
                 input_num_tokens=bs,

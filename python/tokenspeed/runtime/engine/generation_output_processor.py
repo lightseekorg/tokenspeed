@@ -530,7 +530,6 @@ class OutputProcesser:
         the hostfunc (e.g., last live request finished).
         """
         grammars = completion.grammars or []
-        stride = completion.tokens_per_req
         bs = completion.bs
         advance_mask = completion.advance_mask or [True] * bs
         output_tokens = model_execution_results.output_tokens
@@ -545,8 +544,9 @@ class OutputProcesser:
             ):
                 continue
             n_accepted = int(accept_lengths[i].item())
+            offset = completion.output_layout.token_offset(i)
             for j in range(n_accepted):
-                tok = int(output_tokens[i * stride + j].item())
+                tok = int(output_tokens[offset + j].item())
                 try:
                     grammar.accept_token(tok)
                 except Exception:
