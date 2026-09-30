@@ -955,6 +955,13 @@ _KERNELS_WITH_PDL: frozenset[str] = frozenset(
 )
 
 
+def _as_2d_tensor_scale(scale: torch.Tensor | None) -> torch.Tensor | None:
+    """A single-element scale of rank < 2 as its ``[1, 1]`` view."""
+    if scale is not None and scale.dim() < 2 and scale.numel() == 1:
+        return scale.view(1, 1)
+    return scale
+
+
 def _infer_scale_type(
     A_scales: torch.Tensor | None,
     B_scales: torch.Tensor | None,
@@ -1288,6 +1295,9 @@ def mm(
     """
     enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
+    # Per-tensor scales may arrive as 0-dim or [1]; kernels take them as [1, 1].
+    A_scales = _as_2d_tensor_scale(A_scales)
+    B_scales = _as_2d_tensor_scale(B_scales)
 
     M = A.shape[0]
     if quant == "mxfp4":
