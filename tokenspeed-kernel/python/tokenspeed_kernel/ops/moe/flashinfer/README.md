@@ -56,6 +56,29 @@ on the intermediate size, so these layers keep FlashInfer's BF16 routing
 behavior. Remove the adapter once the minimum supported FlashInfer accepts
 these sizes.
 
+## FP32 correction bias for in-kernel DeepSeekV3 routing
+
+FlashInfer's grouped DeepSeekV3 router (`routingMainKernel` in
+`trtllm_fused_moe_routing_deepseek.cu`, used when `n_group > 1`) casts the
+correction bias to the BF16 output type before adding it to the FP32 sigmoid
+score, and its tanh-form sigmoid returns 0 for strongly negative logits.
+Reference routers such as DeepSeek-V3's add the bias in FP32, and so do
+TokenSpeed's top-k routers. A model opts in per layer with
+`routing_config["fp32_correction_bias"] = True`; nothing enables it by default.
+
+`moe_plan(fp32_correction_bias=True)` keeps a kernel that routes from logits
+only if its `_tokenspeed_fp32_correction_bias` hook returns True, and otherwise
+plans precomputed top-k. Only the BF16 TRT-LLM kernel has the hook. It builds,
+when the plan is made, a copy of FlashInfer's TRT-LLM MoE module whose routing
+source carries the edit of flashinfer-ai/flashinfer#5557 (FP32 bias,
+`1 / (1 + exp(-x))` sigmoid), together with the 64-aligned launcher above when
+that applies, under private operator names. Each edit must be found exactly
+once in its stock form or in #5557's form; any other source, or a failed
+build, logs a warning and the layer plans precomputed top-k. A FlashInfer
+whose routing already has both edits is used as is, so this module is no
+longer built once the minimum supported FlashInfer includes #5557; remove the
+adapter then.
+
 ## Qwen3.8 low-batch tactic
 
 For Qwen3.8's 2,560-hidden, 640-intermediate, 512-expert NVFP4 MoE with

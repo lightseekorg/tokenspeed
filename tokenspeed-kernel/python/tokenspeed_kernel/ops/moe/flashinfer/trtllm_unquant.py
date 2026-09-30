@@ -118,12 +118,15 @@ if platform.is_nvidia:
         do_finalize: bool,
         enable_pdl: bool,
         routed: bool,
+        fp32_correction_bias: bool,
     ):
         """Shared body for the in-kernel-routing and precomputed-topk variants.
 
         ``routed`` selects between ``trtllm_bf16_moe`` (in-kernel routing from
         ``router_logits``) and ``trtllm_bf16_routed_moe`` (precomputed
         ``topk_ids``/``topk_weights``); everything else is identical.
+        ``fp32_correction_bias`` routes on a module that adds the DeepSeekV3
+        correction bias in FP32.
         """
         if x.shape[0] == 0:
             # Idle DP ranks run a dummy forward with 0 tokens; the fused kernel
@@ -144,6 +147,8 @@ if platform.is_nvidia:
             if intermediate_size % ispp64_launcher.STOCK_ISPP_ALIGNMENT
             else (trtllm_bf16_moe, trtllm_bf16_routed_moe)
         )
+        if fp32_correction_bias and not ispp64_launcher.stock_routing_keeps_fp32_bias():
+            bf16_moe = ispp64_launcher.trtllm_bf16_fp32_routing_bias_moe
         # GEMM and sizing arguments shared by both kernel entry points.
         common_kwargs = dict(
             hidden_states=x,
@@ -269,7 +274,14 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=False,
+            fp32_correction_bias=plan["fp32_correction_bias"],
         )
+
+    # moe_plan keeps in-kernel routing for an FP32 correction bias only if
+    # this returns True.
+    flashinfer_trtllm_unquant_moe_apply._tokenspeed_fp32_correction_bias = (  # type: ignore[attr-defined]
+        ispp64_launcher.fp32_routing_bias_ready
+    )
 
     @register_kernel(
         "moe",
@@ -325,4 +337,5 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=True,
+            fp32_correction_bias=False,
         )

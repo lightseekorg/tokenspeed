@@ -31,6 +31,7 @@ import pytest
 
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -106,3 +107,27 @@ def test_activation_clamped_follows_the_swiglu_limit(monkeypatch, layer, clamped
     # The W4A8 kernel's fixed FC2 activation scale assumes a bounded SwiGLU
     # output; the plan states whether the checkpoint provides that bound.
     assert _plan_kwargs(monkeypatch, **layer)["activation_clamped"] is clamped
+
+
+def test_fp32_correction_bias_is_requested_from_the_routing_config(monkeypatch):
+    assert (
+        _plan_kwargs(monkeypatch, activation="swiglu")["fp32_correction_bias"] is False
+    )
+    requested = _plan_kwargs(
+        monkeypatch,
+        activation="swiglu",
+        routing_config={"fp32_correction_bias": True},
+    )
+    assert requested["fp32_correction_bias"] is True
+
+
+def test_fp32_correction_bias_requires_deepseek_v3_routing(monkeypatch):
+    with pytest.raises(ValueError, match="requires DeepSeekV3 routing"):
+        _plan_kwargs(
+            monkeypatch,
+            activation="swiglu",
+            routing_config={
+                "fp32_correction_bias": True,
+                "routing_method_type": RoutingMethodType.MiniMax2,
+            },
+        )
