@@ -1385,7 +1385,7 @@ def _windowed_decode(q, kv_cache, page_table, cache_seqlens, cache_len, window, 
 
 
 @pytest.mark.skipif(
-    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+    not platform.is_blackwell_plus,
     reason="the query-axis block MLA decode is a Blackwell CuteDSL kernel",
 )
 @pytest.mark.parametrize("window", [129, -1], ids=["windowed", "full-attention"])

@@ -972,6 +972,14 @@ per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`
 (`recipes/setup.py`) is the single family → recipe map.
 
+Ordinary recipes pin one CacheBlock per group in each parent, so a group's
+stride does not shrink with its layer count or cache dtype. For example,
+equal-sized layers split into groups of one and four need a padding fraction
+of `3.0` for the smaller group. The recipe therefore opts out of the padding
+ratio limit through `max_padding_fraction`; the common packer still validates
+field geometry, strides and block-size limits, and the profiled byte budget
+still bounds capacity. Grouping, packing and allocation are unchanged.
+
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
 
@@ -1135,6 +1143,11 @@ Index-K; SWA and compressor-state groups must remain replicated.
 
 Ordinary GPU MLA and DSA use the same ownership geometry for history storage.
 MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
+Before allocating the arena, hybrid DCP validates these declared group shard
+counts rather than the recipe name or its inheritance. Plugin recipes follow
+the same storage contract as built-in recipes. Both pure MLA and MLA/KDA hybrids
+require the full-attention backend to declare `supports_mla_dcp`; only FlashMLA
+currently declares this capability.
 Decode gathers query heads, computes attention over owned history, and merges
 partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reconstructs bounded history chunks with an owner-masked sum reduction;
@@ -1173,12 +1186,17 @@ used to shape an arena field. Virtual null ID 0 has no owner and is filtered
 during translation.
 
 Before zeroing scheduler blocks, the runtime checks IDs against the virtual
-bound and translates each group's batch to owned local IDs through the shared
-translation API. Translation precedes dispatch to pool views; pools and the
-arena receive physical IDs and hold no context rank. The arena's
-`zero_blocks()` validates every ID against its group's local page count before
-clearing any bytes. Physical page 0 is within that range and is handled like
-any other page when explicitly requested.
+bound and translates each group's batch to owned local IDs on the host
+(`local_pages`, plain integer arithmetic over the same cyclic placement the
+device translation kernels implement). Translation precedes dispatch to pool
+views; pools and the arena receive physical IDs and hold no context rank. The
+arena's `zero_blocks()` validates every ID against its group's local page
+count before clearing any bytes. Physical page 0 is within that range and is
+handled like any other page when explicitly requested. Host work on this path
+is O(pages): the arena ships the page ids through one pinned copy and the
+kernel expands page x field byte ranges from the group's fixed field table,
+because a long prompt's admission hands out thousands of pages and per-range
+Python here stalls the forward thread while the device sits idle.
 
 The allocator receives only an integer `shard_count`, fixed when the
 coordinator registers the group in its pools. It counts

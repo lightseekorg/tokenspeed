@@ -489,6 +489,8 @@ def gluon_sigmoid_bias_topk_gfx950(
         selected_weights = selected_weights.to(gl.float32) * (
             ROUTED_SCALING_FACTOR / denominator
         )
+    else:
+        selected_weights *= ROUTED_SCALING_FACTOR
 
     topk_mask = topk_lane < TOPK
     cdna4.buffer_store(

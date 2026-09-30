@@ -32,6 +32,10 @@ from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
     TransferInfo,
     TransferKVChunk,
 )
+from tokenspeed.runtime.pd.mooncake.pack import (  # noqa: E402
+    PageFieldCopies,
+    flatten_transfer_blocks,
+)
 from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
 from tokenspeed.runtime.pd.transfer_plan import CacheTransferFragment  # noqa: E402
 
@@ -228,12 +232,48 @@ def _recording_transfer_manager(layout: CacheTransferContract, src_ptr: int):
     calls = []
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.kv_args = SimpleNamespace(cache_layout=layout, kv_data_ptr=src_ptr)
+
+    # Whole-field descriptors arrive as int64 array columns, fragment rows as
+    # lists; record both as plain lists so the geometry asserts read the same.
+    # The fake engine records per-descriptor WRITEs as lists and expands the
+    # page-gathered WRITE the way Mooncake does (field-major, batched), so the
+    # geometry asserts read the same for both.
+    def record_pages(session, src_pages, dst_pages, fields, *, max_batch_size):
+        src, dst, lengths = zip(
+            *_expand_page_fields(src_pages, dst_pages, fields), strict=True
+        )
+        for start in range(0, len(src), max_batch_size):
+            stop = start + max_batch_size
+            calls.append(
+                (
+                    session,
+                    list(src[start:stop]),
+                    list(dst[start:stop]),
+                    list(lengths[start:stop]),
+                )
+            )
+        return 0
+
     manager.engine = SimpleNamespace(
         batch_transfer_sync=lambda session, src, dst, lengths: (
-            calls.append((session, src, dst, lengths)) or 0
-        )
+            calls.append((session, list(src), list(dst), list(lengths))) or 0
+        ),
+        batch_transfer_sync_pages=record_pages,
     )
     return manager, calls
+
+
+def _expand_page_fields(src_pages, dst_pages, fields) -> list[tuple[int, int, int]]:
+    """Reference expansion of a PageFieldCopies grid, field-major."""
+    return [
+        (
+            int(src_base + page * src_stride),
+            int(dst_base + peer * dst_stride),
+            int(length),
+        )
+        for src_base, src_stride, dst_base, dst_stride, length in fields.tolist()
+        for page, peer in zip(src_pages.tolist(), dst_pages.tolist(), strict=True)
+    ]
 
 
 def _route_manager():
@@ -741,6 +781,194 @@ def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
     ]
 
 
+def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
+    # Two fields and hundreds of pages: the generator resolves each field's
+    # geometry once and expands pages in bulk, so check it against the plain
+    # per-page formula in both the whole-field and the fragment path.
+    def two_field_layout(capacity: int):
+        return make_layout(
+            make_group(
+                "history",
+                make_segment("layer.0.k", dtype="bfloat16", shape=(2, 4, 2)),
+                make_segment("layer.1.k", dtype="bfloat16", shape=(2, 4, 2)),
+            ),
+            capacity=capacity,
+            page_bytes=64,
+        )
+
+    source_layout = two_field_layout(700)
+    destination_layout = two_field_layout(900)
+    pages = 300
+    src_pages = tuple(range(1, 2 * pages, 2))
+    dst_pages = tuple(range(899, 899 - 2 * pages, -2))
+    source_manifest = _single_group_block_manifest("history", src_pages)
+    destination_manifest = _single_group_block_manifest("history", dst_pages)
+
+    def field_pages(layout, ptr, field_id, page_ids):
+        segment = next(f for f in layout.plan.fields if f.field_id == field_id)
+        return [
+            ptr + layout.plan.field_page_byte_offset(field_id, page)
+            for page in page_ids
+        ], segment.payload_bytes
+
+    manager, _ = _recording_transfer_manager(source_layout, 0x1000)
+    fields = tuple(f.field_id for f in source_layout.fields_for_group("history"))
+    expected = []
+    for field_id in fields:
+        src, size = field_pages(source_layout, 0x1000, field_id, src_pages)
+        dst, _ = field_pages(destination_layout, 0x2000, field_id, dst_pages)
+        expected.extend(zip(src, dst, [size] * pages, strict=True))
+    blocks = list(
+        manager._cache_transfer_blocks(
+            dst_ptr=0x2000,
+            src_block_manifest=source_manifest,
+            dst_block_manifest=destination_manifest,
+            dst_cache_layout=destination_layout,
+        )
+    )
+    # One pages x fields item for the group, no per-page Python objects.
+    (item,) = blocks
+    assert isinstance(item, PageFieldCopies)
+    assert item.fields.shape == (2, 5) and len(item) == 2 * pages
+    assert _expand_page_fields(item.src_pages, item.dst_pages, item.fields) == expected
+    with pytest.raises(TypeError):
+        list(flatten_transfer_blocks(blocks))
+
+    fragment = CacheTransferFragment(
+        group_id="history",
+        field_id=fields[1],
+        src_byte_offset=4,
+        dst_byte_offset=8,
+        src_row_stride_bytes=16,
+        dst_row_stride_bytes=16,
+        bytes_per_row=8,
+        rows_per_page=2,
+    )
+    src, _ = field_pages(source_layout, 0x1000, fields[1], src_pages)
+    dst, _ = field_pages(destination_layout, 0x2000, fields[1], dst_pages)
+    fragment_blocks = list(
+        manager._cache_transfer_blocks(
+            dst_ptr=0x2000,
+            src_block_manifest=source_manifest,
+            dst_block_manifest=destination_manifest,
+            transfer_fragments=(fragment,),
+            dst_cache_layout=destination_layout,
+        )
+    )
+    assert fragment_blocks == [
+        (s + 4 + row * 16, d + 8 + row * 16, 8)
+        for s, d in zip(src, dst, strict=True)
+        for row in range(2)
+    ]
+
+
+def test_transfer_data_writes_page_grids_between_descriptor_batches() -> None:
+    from tokenspeed.runtime.pd.mooncake import prefill as prefill_module
+
+    manager, calls = _recording_transfer_manager(
+        _typed_layout(local_heads=4, global_heads=4), 0
+    )
+    page_calls = []
+    manager.engine.batch_transfer_sync_pages = (
+        lambda session, src, dst, fields, *, max_batch_size: (
+            page_calls.append((session, src, dst, fields, max_batch_size)) or 0
+        )
+    )
+    item = PageFieldCopies(
+        np.asarray([1, 2, 3], dtype=np.int64),
+        np.asarray([9, 8, 7], dtype=np.int64),
+        np.asarray([[100, 10, 200, 20, 5], [300, 30, 400, 40, 6]], dtype=np.int64),
+    )
+    # Pending per-descriptor rows are flushed ahead of the page item, and
+    # rows after it start a new batch; order on the wire is preserved.
+    blocks = [(1, 2, 3), (4, 5, 6), item, (7, 8, 9)]
+    assert manager._transfer_data("session", iter(blocks)) == 0
+    assert [call[1] for call in calls] == [[1, 4], [7]]
+    ((session, src, dst, fields, max_batch_size),) = page_calls
+    assert session == "session" and src is item.src_pages and fields is item.fields
+    assert max_batch_size == prefill_module._TRANSFER_DESCRIPTOR_BATCH_SIZE
+
+    manager.engine.batch_transfer_sync_pages = lambda *args, **kwargs: -3
+    assert manager._transfer_data("session", iter([item])) == -3
+
+
+def test_page_field_copies_validates_its_grid() -> None:
+    item = PageFieldCopies(
+        np.asarray([1, 5], dtype=np.int64),
+        np.asarray([9, 8], dtype=np.int64),
+        np.asarray(
+            [[1000, 64, 5000, 128, 16], [2000, 4096, 3000, 4096, 3000]], dtype=np.int64
+        ),
+    )
+    assert len(item) == 4
+    with pytest.raises(TypeError):
+        PageFieldCopies(item.src_pages, item.dst_pages, item.fields[:, :4].copy())
+    with pytest.raises(ValueError):
+        PageFieldCopies(item.src_pages, item.dst_pages[:1], item.fields)
+    # Neither the packer nor the SGE flattener may see one.
+    with pytest.raises(TypeError):
+        list(flatten_transfer_blocks([item]))
+
+
+def test_engine_wrapper_requires_and_forwards_the_page_gathered_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    import types
+
+    from tokenspeed.runtime.pd.base.mooncake_engine import MooncakeTransferEngine
+
+    class FakeTransferEngine:
+        def __init__(self) -> None:
+            self.initialized = None
+
+        def initialize(self, *args):
+            self.initialized = args
+            return 0
+
+        def get_rpc_port(self):
+            return 4321
+
+    fake_module = types.ModuleType("mooncake.engine")
+    fake_module.TransferEngine = FakeTransferEngine
+    monkeypatch.setitem(sys.modules, "mooncake", types.ModuleType("mooncake"))
+    monkeypatch.setitem(sys.modules, "mooncake.engine", fake_module)
+    # An engine without the page-gathered WRITE is a wrong install.
+    with pytest.raises(RuntimeError, match="batch_transfer_sync_write_pages"):
+        MooncakeTransferEngine("10.0.0.1", gpu_id=0, ib_device=None)
+    # With it, bring-up completes and the session id names this rank.
+    FakeTransferEngine.batch_transfer_sync_write_pages = lambda self, *a: 0
+    engine = MooncakeTransferEngine("10.0.0.1", gpu_id=0, ib_device="mlx5_0")
+    assert engine.session_id == "10.0.0.1:4321"
+    assert engine.engine.initialized == ("10.0.0.1", "P2PHANDSHAKE", "rdma", "mlx5_0")
+
+    src = np.asarray([1, 2], dtype=np.int64)
+    dst = np.asarray([3, 4], dtype=np.int64)
+    fields = np.zeros((2, 5), dtype=np.int64)
+    seen = []
+    wrapper = object.__new__(MooncakeTransferEngine)
+    wrapper.engine = SimpleNamespace(
+        batch_transfer_sync_write_pages=lambda session, s, d, f, batch: seen.append(
+            ("pages", s, d, f, batch)
+        )
+        or 0
+    )
+    assert (
+        wrapper.batch_transfer_sync_pages("s", src, dst, fields, max_batch_size=4096)
+        == 0
+    )
+    assert seen == [("pages", src, dst, fields, 4096)]
+    # A raising engine reports failure instead of propagating.
+    wrapper.engine = SimpleNamespace(
+        batch_transfer_sync_write_pages=lambda *args: (_ for _ in ()).throw(
+            RuntimeError("x")
+        )
+    )
+    assert (
+        wrapper.batch_transfer_sync_pages("s", src, dst, fields, max_batch_size=1) == -1
+    )
+
+
 class _FakePackScratch:
     def __init__(self, base: int = 0xB000) -> None:
         self.base = base
@@ -1124,13 +1352,15 @@ def test_shared_manager_uses_destination_page_zero_offsets() -> None:
         )
         == 0
     )
+    # One page-gathered WRITE per cache group.
     assert calls == [
         (
             "session",
-            [0x10000 + 1 * 32, 0x10000 + 2 * 32, 0x10000 + 16 + 4 * 32],
-            [0x20000 + 8 + 5 * 64, 0x20000 + 8 + 6 * 64, 0x20000 + 40 + 3 * 64],
-            [16, 16, 16],
-        )
+            [0x10000 + 1 * 32, 0x10000 + 2 * 32],
+            [0x20000 + 8 + 5 * 64, 0x20000 + 8 + 6 * 64],
+            [16, 16],
+        ),
+        ("session", [0x10000 + 16 + 4 * 32], [0x20000 + 40 + 3 * 64], [16]),
     ]
 
 

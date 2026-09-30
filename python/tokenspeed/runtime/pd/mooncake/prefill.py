@@ -49,6 +49,7 @@ from tokenspeed.runtime.pd.mooncake.entities import (
 )
 from tokenspeed.runtime.pd.mooncake.pack import (
     PackedCopy,
+    PageFieldCopies,
     PrefillPackScratch,
     flatten_transfer_blocks,
 )
@@ -341,9 +342,31 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks, packer=None):
-        """WRITE descriptors in bounded batches, packing PackedCopy items per batch."""
+        """WRITE descriptors in bounded batches, packing PackedCopy items per batch.
+
+        A ``PageFieldCopies`` item is one page-gathered WRITE, expanded and
+        batched inside Mooncake; per-descriptor items (tuples, PackedCopy)
+        are collected and written through the packer path in between,
+        preserving order.
+        """
         pending: list[object] = []
         for item in transfer_blocks:
+            if isinstance(item, PageFieldCopies):
+                if pending:
+                    ret = self._write_sge_batch(mooncake_session_id, pending, packer)
+                    pending = []
+                    if ret != 0:
+                        return ret
+                ret = self.engine.batch_transfer_sync_pages(
+                    mooncake_session_id,
+                    item.src_pages,
+                    item.dst_pages,
+                    item.fields,
+                    max_batch_size=_TRANSFER_DESCRIPTOR_BATCH_SIZE,
+                )
+                if ret != 0:
+                    return ret
+                continue
             pending.append(item)
             if len(pending) >= _TRANSFER_DESCRIPTOR_BATCH_SIZE:
                 ret = self._write_sge_batch(mooncake_session_id, pending, packer)
@@ -359,15 +382,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             sges = packer.materialize(pending)
         else:
             sges = flatten_transfer_blocks(pending)
-        started = time.monotonic()
-        n_sge = 0
-        n_bytes = 0
         ret = 0
         block_iter = iter(sges)
         while batch := tuple(islice(block_iter, _TRANSFER_DESCRIPTOR_BATCH_SIZE)):
             src_addrs, dst_addrs, lengths = zip(*batch, strict=True)
-            n_sge += len(batch)
-            n_bytes += sum(lengths)
             ret = self.engine.batch_transfer_sync(
                 mooncake_session_id,
                 list(src_addrs),
@@ -376,10 +394,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
             if ret != 0:
                 break
-        logger.info(
-            f"CachePD WRITE n_sge={n_sge:d} bytes={n_bytes:d} wait_ms="
-            f"{(time.monotonic() - started) * 1000.0:.1f} ret={ret!s}",
-        )
         return ret
 
     def _cache_transfer_blocks(
@@ -392,7 +406,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         dst_cache_layout: CacheTransferContract,
         block_selection: CachePDLayerwiseBlockSelection | None = None,
         field_ids: frozenset[str] | None = None,
-    ) -> Iterator[PackedCopy | tuple[int, int, int]]:
+    ) -> Iterator[PageFieldCopies | PackedCopy | tuple[int, int, int]]:
         layout = self.kv_args.cache_layout
 
         cache_fragments = tuple(transfer_fragments)
@@ -440,6 +454,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 )
             )
 
+        # Per-field constants are hoisted out of the page loops: a long
+        # prompt moves thousands of pages per field, and this generator runs
+        # on the transfer thread while holding the GIL the forward thread
+        # needs.
+        src_ptr = self.kv_args.kv_data_ptr
         for group_spec, group_src_indices, group_dst_indices in group_transfers:
             if cache_fragments:
                 for fragment in fragments_by_group.get(group_spec.group_id, ()):
@@ -448,24 +467,28 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     dst_segment = peer_segments[key]
                     if field_ids is not None and src_segment.field_id not in field_ids:
                         continue
+                    src_field_base = (
+                        src_ptr
+                        + layout.plan.field_page_byte_offset(src_segment.field_id, 0)
+                        + fragment.src_byte_offset
+                    )
+                    dst_field_base = (
+                        dst_ptr
+                        + dst_cache_layout.plan.field_page_byte_offset(
+                            dst_segment.field_id, 0
+                        )
+                        + fragment.dst_byte_offset
+                    )
                     for src_page, dst_page in zip(
                         group_src_indices, group_dst_indices, strict=True
                     ):
                         src_page_addr = (
-                            self.kv_args.kv_data_ptr
-                            + layout.plan.field_page_byte_offset(
-                                src_segment.field_id, 0
-                            )
+                            src_field_base
                             + int(src_page) * src_segment.page_stride_bytes
-                            + fragment.src_byte_offset
                         )
                         dst_page_addr = (
-                            dst_ptr
-                            + dst_cache_layout.plan.field_page_byte_offset(
-                                dst_segment.field_id, 0
-                            )
+                            dst_field_base
                             + int(dst_page) * dst_segment.page_stride_bytes
-                            + fragment.dst_byte_offset
                         )
                         width = fragment.bytes_per_row
                         rows = fragment.rows_per_page
@@ -492,28 +515,40 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 continue
 
             group_fields = layout.fields_for_group(group_spec.group_id)
-            if group_fields:
+            if len(group_src_indices) != len(group_dst_indices):
+                raise ValueError(
+                    "cache transfer source and destination pages differ in count"
+                )
+            if group_fields and len(group_src_indices):
+                # One pages x fields item per group: the descriptors are
+                # expanded inside Mooncake, never here.
+                field_rows = []
                 for src_segment in group_fields:
                     if field_ids is not None and src_segment.field_id not in field_ids:
                         continue
                     key = (group_spec.group_id, src_segment.field_id)
                     dst_segment = peer_segments[key]
-                    for src_page, dst_page in zip(
-                        group_src_indices, group_dst_indices, strict=True
-                    ):
-                        yield (
-                            self.kv_args.kv_data_ptr
+                    field_rows.append(
+                        (
+                            src_ptr
                             + layout.plan.field_page_byte_offset(
                                 src_segment.field_id, 0
-                            )
-                            + int(src_page) * src_segment.page_stride_bytes,
+                            ),
+                            src_segment.page_stride_bytes,
                             dst_ptr
                             + dst_cache_layout.plan.field_page_byte_offset(
                                 dst_segment.field_id, 0
-                            )
-                            + int(dst_page) * dst_segment.page_stride_bytes,
+                            ),
+                            dst_segment.page_stride_bytes,
                             src_segment.payload_bytes,
                         )
+                    )
+                if field_rows:
+                    yield PageFieldCopies(
+                        np.asarray(group_src_indices, dtype=np.int64),
+                        np.asarray(group_dst_indices, dtype=np.int64),
+                        np.asarray(field_rows, dtype=np.int64).reshape(-1, 5),
+                    )
                 continue
 
     def _wait_until_cache_step(
@@ -925,10 +960,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             self.rejected_decode_sessions.pop(session_id, None)
             with self.session_lock:
                 self._clear_failed_session(session_id)
-            logger.info(
-                "[Prefill bootstrap_thread] registered kv_args from decode session="
-                f"{session_id!s}",
-            )
             return
 
         parsed_room = None
@@ -1022,11 +1053,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             )
             return
         complete = len(candidate_infos) == expected_fanout
-        logger.info(
-            f"[Prefill bootstrap_thread] pre-alloc received: room={parsed_room:d} "
-            f"session={session_id!s} got={len(candidate_infos):d}/{expected_fanout:d}, "
-            f"status -> {('Bootstrapped' if complete else 'waiting more')!s}",
-        )
         if complete:
             self.update_status(parsed_room, TransferPoll.Bootstrapped)
 

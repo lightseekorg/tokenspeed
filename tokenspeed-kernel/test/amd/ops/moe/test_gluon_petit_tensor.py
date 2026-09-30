@@ -234,6 +234,13 @@ def test_tensor_quantization_padding_and_zero_groups(groups):
             petit_kernel.MegaMoeActivationFunction.silu,
             False,
         ),
+        (
+            896,
+            16,
+            3584,
+            petit_kernel.MegaMoeActivationFunction.kimi_situ,
+            False,
+        ),
     ),
 )
 @pytest.mark.parametrize("num_tokens", (1, 256, 1024))

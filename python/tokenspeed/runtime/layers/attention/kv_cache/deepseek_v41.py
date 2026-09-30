@@ -20,6 +20,9 @@
 
 """Strided V4.1 FlatKV views over the scheduler-owned shared arena."""
 
+from collections.abc import Mapping
+
+import numpy as np
 import torch
 from typing_extensions import override
 
@@ -102,7 +105,7 @@ class DeepseekV41CachePool(CachePool):
         """Return the bytes of the arena every V4.1 cache group lives in."""
         return int(self.arena.buffer.nbytes)
 
-    def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
+    def zero_new_blocks(self, new_page_ids: Mapping[str, np.ndarray]) -> None:
         """Clear freshly admitted local pages of every group before reuse."""
         self.arena.zero_blocks(new_page_ids)
 

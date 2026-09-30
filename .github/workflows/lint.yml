@@ -1,6 +1,9 @@
 name: Lint
 
-on: [pull_request]
+on:
+  pull_request:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -20,17 +23,26 @@ jobs:
         id: scheduler_cpp_changes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
           changed_files="$RUNNER_TEMP/tokenspeed-lint-changed-files.txt"
           scheduler_cpp_files='^tokenspeed-scheduler/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$'
           scheduler_cpp_config='^tokenspeed-scheduler/(\.clang-(format|tidy)|(.*/)?CMakeLists\.txt|.*\.cmake)$'
 
-          if ! gh api \
-            "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-            --paginate \
-            -q '.[] | .filename, (.previous_filename // empty)' \
-            > "$changed_files" || [[ ! -s "$changed_files" ]]; then
+          list_changed_files() {
+            if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+              git fetch --no-tags --depth=1 origin "$PUSH_BEFORE" &&
+                git diff --name-only --no-renames "$PUSH_BEFORE" "$GITHUB_SHA"
+            else
+              gh api \
+                "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+                --paginate \
+                -q '.[] | .filename, (.previous_filename // empty)'
+            fi
+          }
+
+          if ! list_changed_files > "$changed_files" || [[ ! -s "$changed_files" ]]; then
             echo "::warning::Unable to classify changed files; running scheduler C++ lint"
             changed=true
           elif grep -Eq \
@@ -42,10 +54,11 @@ jobs:
             changed=false
           fi
 
+          # CI validates merged code; branch protection is a local commit guard.
           if [[ "$changed" == "true" ]]; then
-            pre_commit_skip=
+            pre_commit_skip=no-commit-to-branch
           else
-            pre_commit_skip=clang-format
+            pre_commit_skip=no-commit-to-branch,clang-format
           fi
           {
             echo "changed=$changed"

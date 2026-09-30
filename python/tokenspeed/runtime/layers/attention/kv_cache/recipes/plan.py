@@ -260,23 +260,28 @@ class CacheMemoryPlan:
             resident_block_bytes=resident,
         )
 
+    # Lookups are hot on transfer paths that resolve a field per page; index
+    # the immutable layout once instead of scanning it per call.
+    @cached_property
+    def _groups_by_id(self) -> dict[str, CacheGroupLayout]:
+        return {group.group_id: group for group in self.groups}
+
+    @cached_property
+    def _fields_by_id(self) -> dict[str, CacheFieldLayout]:
+        return {field.field_id: field for field in self.fields}
+
+    @cached_property
+    def _planes_by_id(self) -> dict[str, CachePlaneLayout]:
+        return {plane.plane_id: plane for plane in self.planes}
+
     def group(self, group_id: str) -> CacheGroupLayout:
-        for group in self.groups:
-            if group.group_id == group_id:
-                return group
-        raise KeyError(group_id)
+        return self._groups_by_id[group_id]
 
     def field(self, field_id: str) -> CacheFieldLayout:
-        for field in self.fields:
-            if field.field_id == field_id:
-                return field
-        raise KeyError(field_id)
+        return self._fields_by_id[field_id]
 
     def plane(self, plane_id: str) -> CachePlaneLayout:
-        for plane in self.planes:
-            if plane.plane_id == plane_id:
-                return plane
-        raise KeyError(plane_id)
+        return self._planes_by_id[plane_id]
 
     def field_page_byte_offset(self, field_id: str, page_id: int) -> int:
         """Return one field page's byte offset in the shared cache arena."""
@@ -321,6 +326,20 @@ class CacheMemoryPlan:
             )
             for group in self.groups
         }
+
+    def page_field_layout(
+        self, group_id: str
+    ) -> tuple[int, tuple[tuple[int, int, int], ...]]:
+        """Return one group's page count and its fields' byte geometry.
+
+        Args:
+            group_id: The planned cache group.
+
+        Returns:
+            The group's page count and, per field in plan order,
+            ``(byte offset of page 0, page stride bytes, payload bytes)``.
+        """
+        return self._block_byte_layouts[group_id]
 
     def block_byte_segments(
         self, group_id: str, block_ids: list[int]
