@@ -160,6 +160,7 @@ class MLAAttnBackend(PagedAttentionBackend):
                 kv_lora_rank=self.kv_lora_rank,
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 sliding_window=sliding_window,
+                noncausal_block_size=q_len if self.block_decode_active else 1,
                 solution=self.kernel_solution,
             )
             self._query_block_decode[key] = answer
@@ -474,6 +475,22 @@ class MLAAttnBackend(PagedAttentionBackend):
                 query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
                 page_table = metadata.page_table
                 cache_seqlens = metadata.seq_lens
+            max_seqlen_k = self.max_context_len
+        elif (
+            q_len_per_req > 1
+            and q.dtype == self.data_type
+            and layer.logit_cap == 0.0
+            and self._takes_query_blocks(
+                layer.tp_q_head_num, q_len_per_req, window_left >= 0
+            )
+        ):
+            query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
+            page_table = metadata.page_table[num_extends:]
+            cache_seqlens = metadata.seq_lens[num_extends:]
+            if self.is_draft:
+                # Draft catch-up stores the first query's visible KV length;
+                # this kernel expects the last query's visible KV length.
+                cache_seqlens = cache_seqlens + (q_len_per_req - 1)
             max_seqlen_k = self.max_context_len
         elif q_len_per_req > 1:
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)

@@ -439,7 +439,7 @@ jobs:
           test "$(gh repo view lightseekorg/whl --json visibility --jq .visibility)" = PUBLIC
           gh api "repos/lightseekorg/whl/releases/tags/${TAG_NAME}-cu130" > nightly-release.json
           python .github/scripts/update-nightly-index.py \
-            --package tokenspeed-kernel wheelhouse nightly-release.json dist
+            --package tokenspeed-kernel --variant cu130 wheelhouse nightly-release.json dist
           cd wheelhouse
           git config user.name lightseek-bot
           git config user.email 243258330+lightseek-bot@users.noreply.github.com

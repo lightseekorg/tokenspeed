@@ -55,6 +55,9 @@ if current_platform().is_amd:
         launch_gluon_mla_decode_bf16xbf16_gfx950_bh64_small as _mla_decode_bf16xbf16_bh64_small_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        launch_gluon_mla_decode_fp8_query_blocks_gfx950 as _mla_decode_fp8_query_blocks_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
         launch_gluon_mla_decode_projected_value_gfx950 as _mla_decode_projected_value_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.normalize_project_query import (
@@ -242,6 +245,33 @@ if current_platform().is_amd:
     )
     def gluon_mla_decode_fp8xfp8_gfx950_bh16bn128(*args, **kwargs):
         return _mla_decode_fp8xfp8_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        name="gluon_mla_decode_fp8_query_blocks_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(("q", "kv_cache"), "dense", {torch.float8_e4m3fn}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "q_len": frozenset(range(2, 17)),
+            "page_size": frozenset({64, 128, 256}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False}),
+            "block_on_query_axis": frozenset({True}),
+            "noncausal_block_size": frozenset({1}),
+        },
+    )
+    def gluon_mla_decode_fp8_query_blocks_gfx950(*args, **kwargs):
+        return _mla_decode_fp8_query_blocks_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

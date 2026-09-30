@@ -1415,6 +1415,7 @@ def test_mla_block_decode_agrees_across_both_block_layouts(
         kv_lora_rank=_QUERY_BLOCK_DIMS["kv_lora_rank"],
         qk_rope_head_dim=_QUERY_BLOCK_DIMS["qk_rope_head_dim"],
         sliding_window=window >= 0,
+        noncausal_block_size=block,
     )
 
     q = torch.randn(block, heads, qk_head_dim, device=device, dtype=torch.bfloat16) / 8
@@ -1462,6 +1463,7 @@ def test_query_block_support_declines_what_the_fast_kernel_never_declared() -> N
         num_q_heads=8,
         q_len=8,
         sliding_window=True,
+        noncausal_block_size=8,
         **{k: v for k, v in _QUERY_BLOCK_DIMS.items() if k != "qk_nope_head_dim"},
     )
     assert not supports_mla_decode_query_blocks(**{**probe, "page_size": 128})
@@ -1469,3 +1471,27 @@ def test_query_block_support_declines_what_the_fast_kernel_never_declared() -> N
     assert not supports_mla_decode_query_blocks(**{**probe, "solution": "triton"})
     # A block of one is ordinary decode or target verify, never a proposal.
     assert not supports_mla_decode_query_blocks(**{**probe, "q_len": 1})
+
+
+def test_query_block_support_distinguishes_causal_fp8_from_other_masks() -> None:
+    if not current_platform().is_cdna4:
+        pytest.skip("causal FP8 query blocks target CDNA4")
+    probe = dict(
+        q_dtype=torch.float8_e4m3fn,
+        kv_dtype=torch.float8_e4m3fn,
+        page_size=64,
+        num_q_heads=12,
+        q_len=4,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        sliding_window=False,
+        noncausal_block_size=1,
+        solution="gluon",
+    )
+    assert supports_mla_decode_query_blocks(**probe)
+    # Ordinary decode, non-causal draft blocks, windows and BF16 queries keep
+    # their existing kernels and flattened rows.
+    assert not supports_mla_decode_query_blocks(**{**probe, "q_len": 1})
+    assert not supports_mla_decode_query_blocks(**{**probe, "noncausal_block_size": 4})
+    assert not supports_mla_decode_query_blocks(**{**probe, "sliding_window": True})
+    assert not supports_mla_decode_query_blocks(**{**probe, "q_dtype": torch.bfloat16})
