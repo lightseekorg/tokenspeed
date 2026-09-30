@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Add published CUDA 13 kernel wheels to the nightly Simple API index."""
+"""Add published wheels to the nightly Simple API index."""
 
 import argparse
 import json
@@ -27,11 +27,14 @@ from html import escape
 from pathlib import Path
 
 
-def update_index(wheelhouse: Path, release: dict, distributions: Path) -> None:
-    expected = {
-        path.name
-        for path in distributions.glob("tokenspeed-kernel-wheel-cu130-*/*.whl")
-    }
+def update_index(
+    wheelhouse: Path, release: dict, distributions: Path, package: str
+) -> None:
+    pattern = {
+        "tokenspeed": "tokenspeed-dist/*.whl",
+        "tokenspeed-kernel": "tokenspeed-kernel-wheel-cu130-*/*.whl",
+    }[package]
+    expected = {path.name for path in distributions.glob(pattern)}
     assets = {asset["name"]: asset for asset in release["assets"]}
     if not expected or not expected <= assets.keys():
         raise ValueError("Release is missing expected nightly wheels")
@@ -50,7 +53,7 @@ def update_index(wheelhouse: Path, release: dict, distributions: Path) -> None:
             f"{escape(name)}</a><br>\n"
         )
 
-    index = wheelhouse / "nightly" / "tokenspeed-kernel" / "index.html"
+    index = wheelhouse / "nightly" / package / "index.html"
     index.parent.mkdir(parents=True, exist_ok=True)
     previous = index.read_text() if index.exists() else "<!DOCTYPE html>\n"
     # Published assets are immutable; reruns add only missing links.
@@ -59,17 +62,23 @@ def update_index(wheelhouse: Path, release: dict, distributions: Path) -> None:
 
     root = wheelhouse / "nightly" / "index.html"
     previous_root = root.read_text() if root.exists() else "<!DOCTYPE html>\n"
-    package_link = '<a href="tokenspeed-kernel/">tokenspeed-kernel</a><br>\n'
+    package_link = f'<a href="{package}/">{package}</a><br>\n'
     if package_link not in previous_root:
         root.write_text(previous_root + package_link)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--package", choices=("tokenspeed", "tokenspeed-kernel"), required=True
+    )
     parser.add_argument("wheelhouse", type=Path)
     parser.add_argument("release_json", type=Path)
     parser.add_argument("distributions", type=Path)
     args = parser.parse_args()
     update_index(
-        args.wheelhouse, json.loads(args.release_json.read_text()), args.distributions
+        args.wheelhouse,
+        json.loads(args.release_json.read_text()),
+        args.distributions,
+        args.package,
     )
