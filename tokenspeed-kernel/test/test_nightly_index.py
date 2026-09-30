@@ -1,0 +1,61 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+import runpy
+from pathlib import Path
+
+import pytest
+
+SCRIPT = Path(__file__).parents[2] / ".github/scripts/update-kernel-nightly-index.py"
+
+
+def test_nightly_index_preserves_history_and_uses_published_digest(tmp_path) -> None:
+    update_index = runpy.run_path(str(SCRIPT))["update_index"]
+    wheelhouse = tmp_path / "wheelhouse"
+    nightly = wheelhouse / "nightly"
+    nightly.mkdir(parents=True)
+    root = nightly / "index.html"
+    root.write_text('<!DOCTYPE html>\n<a href="cu130/">cu130</a><br>\n')
+    project = nightly / "tokenspeed-kernel" / "index.html"
+    project.parent.mkdir()
+    history = '<!DOCTYPE html>\n<a href="older.whl">older.whl</a><br>\n'
+    project.write_text(history)
+    wheels = tmp_path / "dist" / "tokenspeed-kernel-wheel-cu130-x64-py3.12"
+    wheels.mkdir(parents=True)
+    name = "tokenspeed_kernel-0.1.3.post20260929-cp312-cp312-manylinux_2_28_x86_64.whl"
+    (wheels / name).write_bytes(b"rebuilt contents differ from the published wheel")
+    url = f"https://github.com/lightseekorg/whl/releases/download/nightly/{name}"
+    release = {
+        "assets": [
+            {"name": name, "browser_download_url": url, "digest": f"sha256:{'a' * 64}"}
+        ]
+    }
+    update_index(wheelhouse, release, wheels.parent)
+    contents = project.read_text()
+    assert contents.startswith(history)
+    assert f'{url}#sha256={"a" * 64}' in contents
+    assert 'href="tokenspeed-kernel/"' in root.read_text()
+    assert 'href="cu130/"' in root.read_text()
+    update_index(wheelhouse, release, wheels.parent)
+    assert project.read_text() == contents
+
+    with pytest.raises(ValueError, match="missing expected nightly wheels"):
+        update_index(wheelhouse, {"assets": []}, wheels.parent)
+    assert project.read_text() == contents

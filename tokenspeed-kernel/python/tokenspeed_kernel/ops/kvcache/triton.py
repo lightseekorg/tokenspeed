@@ -69,6 +69,7 @@ __all__ = [
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
     "zero_byte_ranges",
+    "zero_page_fields",
 ]
 
 
@@ -439,6 +440,91 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     _zero_byte_ranges_kernel[grid](
         backing,
         range_table,
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+
+
+@triton.jit(do_not_specialize=["num_fields"])
+def _zero_page_fields_kernel(
+    backing_ptr,
+    pages_ptr,
+    fields_ptr,
+    # Runtime: the field count follows the cache group and the page count the
+    # batch; neither may specialize the binary.
+    num_fields,
+    BLOCK_SIZE: tl.constexpr,
+):
+    entry = tl.program_id(0)
+    page = tl.load(pages_ptr + entry // num_fields).to(tl.int64)
+    field = fields_ptr + (entry % num_fields) * 3
+    range_offset = tl.load(field) + page * tl.load(field + 1)
+    range_size = tl.load(field + 2)
+    for start in range(
+        tl.program_id(1) * BLOCK_SIZE, range_size, tl.num_programs(1) * BLOCK_SIZE
+    ):
+        byte_offsets = start + tl.arange(0, BLOCK_SIZE)
+        tl.store(
+            backing_ptr + range_offset + byte_offsets,
+            0,
+            mask=byte_offsets < range_size,
+        )
+
+
+def zero_page_fields(
+    backing: torch.Tensor,
+    pages: torch.Tensor,
+    fields: torch.Tensor,
+    *,
+    max_field_bytes: int,
+) -> None:
+    """Zero every field payload of the given pages of one cache group.
+
+    The page x field expansion happens on the device: the host ships only the
+    page ids, and the group's field table is fixed once the memory plan is.
+    The expanded ranges are trusted: checking them against ``backing`` would
+    need the largest page id on the host, so the caller must guarantee that
+    every ``offset + page * stride + size`` lies within ``backing`` (the cache
+    arena asserts this once per field when it builds the table).
+
+    Args:
+        backing: Contiguous uint8 cache allocation.
+        pages: Device int32/int64 page ids within the group, ``[num_pages]``.
+        fields: Device int64 ``[num_fields, 3]`` rows of
+            ``(byte offset of page 0, page stride bytes, payload bytes)``.
+        max_field_bytes: The largest payload in ``fields``; sizes the grid.
+    """
+    if backing.dtype != torch.uint8 or not backing.is_contiguous():
+        raise ValueError("backing must be a contiguous uint8 tensor")
+    if pages.dim() != 1 or pages.dtype not in (torch.int32, torch.int64):
+        raise ValueError("pages must be a 1-D int32/int64 tensor")
+    if fields.dim() != 2 or fields.shape[1] != 3 or fields.dtype != torch.int64:
+        raise ValueError("fields must be an int64 [num_fields, 3] tensor")
+    if not (pages.is_contiguous() and fields.is_contiguous()):
+        raise ValueError("pages and fields must be contiguous")
+    # Triton keys the binary on 16-byte pointer alignment; a caller slicing a
+    # shared staging buffer must hand over aligned spans.
+    if pages.data_ptr() % 16 or fields.data_ptr() % 16:
+        raise ValueError("pages and fields must be 16-byte aligned")
+    if max_field_bytes <= 0:
+        raise ValueError("max_field_bytes must be positive")
+    num_ranges = pages.numel() * fields.shape[0]
+    if num_ranges == 0:
+        return
+
+    block_size = 1024
+    # Same CTA budget as zero_byte_ranges: bound short ranges, keep a few
+    # large ones wide enough to occupy the device.
+    tiles_per_range = max(32, triton.cdiv(1024, num_ranges))
+    grid = (
+        num_ranges,
+        min(tiles_per_range, triton.cdiv(max_field_bytes, block_size)),
+    )
+    _zero_page_fields_kernel[grid](
+        backing,
+        pages,
+        fields,
+        fields.shape[0],
         BLOCK_SIZE=block_size,
         num_warps=4,
     )

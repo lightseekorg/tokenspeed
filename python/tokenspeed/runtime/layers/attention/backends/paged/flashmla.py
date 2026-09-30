@@ -142,6 +142,7 @@ class FlashMLABackend(PagedAttentionBackend):
     a fixed ``PAGE_SIZE`` stride, so that is the leaf's kernel page size.
     """
 
+    supports_mla_dcp = True
     default_kernel_page_size = PAGE_SIZE
 
     def __init__(self, config: AttnConfig, spec: MLAConfig, *, kernel_page_size: int):

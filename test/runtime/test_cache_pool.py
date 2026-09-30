@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -201,7 +202,7 @@ class CacheArenaCudaTest(unittest.TestCase):
         history.fill_(7)
         state.fill_(9)
 
-        arena.zero_blocks({"history": [1]})
+        arena.zero_blocks({"history": np.asarray([1])})
         torch.cuda.synchronize()
 
         # history.k is a per-token field (planned shape leads with P=4), so
@@ -215,7 +216,94 @@ class CacheArenaCudaTest(unittest.TestCase):
         arena = _arena("cuda")
 
         with self.assertRaises(IndexError):
-            arena.zero_blocks({"state": [arena.plan.group("state").page_count]})
+            arena.zero_blocks(
+                {"state": np.asarray([arena.plan.group("state").page_count])}
+            )
+        # Every group is validated before any block is touched.
+        arena.buffer.fill_(7)
+        with self.assertRaises(IndexError):
+            arena.zero_blocks({"history": np.asarray([1]), "state": np.asarray([-1])})
+        torch.cuda.synchronize()
+        self.assertTrue(bool((arena.buffer == 7).all()))
+
+    def test_zero_blocks_many_pages_across_groups_match_the_segment_geometry(self):
+        arena = _arena("cuda")
+        history_pages = arena.plan.group("history").page_count
+        state_pages = arena.plan.group("state").page_count
+        # Unsorted with duplicates and uneven span lengths, so the staging
+        # layout has to align each group's span on its own.
+        # int32 read-only views are what the scheduler export hands over.
+        requests = {
+            "history": np.asarray([3, 0, 3, history_pages - 1, 1], dtype=np.int32),
+            "state": np.arange(
+                state_pages - 1, max(state_pages - 4, -1), -1, dtype=np.int64
+            ),
+        }
+        for ids in requests.values():
+            ids.setflags(write=False)
+        arena.buffer.fill_(7)
+        expected = torch.full_like(arena.buffer, 7, device="cpu")
+        for group_id, block_ids in requests.items():
+            for offset, size in arena.block_byte_segments(group_id, block_ids.tolist()):
+                expected[offset : offset + size] = 0
+
+        arena.zero_blocks(requests)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(arena.buffer.cpu(), expected, rtol=0, atol=0)
+
+        # Empty requests are a no-op, not a launch; lists are not accepted.
+        arena.zero_blocks(
+            {
+                "history": np.asarray([], dtype=np.int32),
+                "state": np.asarray([], dtype=np.int64),
+            }
+        )
+        arena.zero_blocks({})
+        with self.assertRaises(TypeError):
+            arena.zero_blocks({"history": [1]})
+        torch.cuda.synchronize()
+        torch.testing.assert_close(arena.buffer.cpu(), expected, rtol=0, atol=0)
+
+    def test_zero_blocks_skips_groups_this_stage_holds_no_fields_of(self):
+        # Pipeline parallelism narrows the plan to a stage's layers but keeps
+        # every group, so a stage may own a group with no fields at all. The
+        # scheduler still hands that group's fresh pages to every rank.
+        plan = pack(
+            (
+                one_group(
+                    "history",
+                    CacheFieldSpec("layer.0.k", "plane.a", (4,), "uint8"),
+                    rows_per_page=2,
+                ),
+                one_group(
+                    "state",
+                    CacheFieldSpec("layer.1.ssm", "plane.b", (8,), "uint8"),
+                    rows_per_page=4,
+                ),
+            ),
+            prefix_granularity=4,
+            cache_blocks_per_lcm_block={"history": 2, "state": 1},
+            max_padding_fraction=1.0,
+        ).bind(2)
+        stage0 = make_arena(plan.narrow_to_layers(0, 1), "cuda")
+        self.assertEqual(stage0.field_ids(), {"layer.0.k"})
+        history = stage0.field("layer.0.k")
+        history.fill_(7)
+        state_pages = stage0.plan.group("state").page_count
+
+        stage0.zero_blocks(
+            {"state": np.asarray([1, state_pages - 1]), "history": np.asarray([1])}
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(bool((history[4:8] == 0).all()))
+        self.assertTrue(bool((history[:4] == 7).all()))
+        # A fieldless group's ids are still validated.
+        with self.assertRaises(IndexError):
+            stage0.zero_blocks({"state": np.asarray([state_pages])})
+        # Nothing at all to zero on this stage is a plain no-op.
+        stage0.zero_blocks({"state": np.asarray([1])})
+        torch.cuda.synchronize()
 
     def test_clear_zeros_the_whole_arena_once(self):
         arena = _arena("cuda")

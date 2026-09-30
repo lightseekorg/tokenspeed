@@ -37,7 +37,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopKOutputFormat
-from tokenspeed.runtime.layers.moe.utils import All2AllBackend
+from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
 from tokenspeed.runtime.models import kimi_k3
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
 
@@ -66,24 +66,34 @@ def test_attn_dp_rejects_partial_world_layout_before_backend_setup(
     backend.assert_not_called()
 
 
-@pytest.mark.parametrize("backend", ["none", "agrs", "flashinfer"])
+@pytest.mark.parametrize(
+    "moe_backend,backend",
+    [
+        (moe, a2a)
+        for moe in ("flashinfer_trtllm", "mega_moe")
+        for a2a in ("none", "agrs", "flashinfer")
+    ]
+    + [("gluon_petit", a2a) for a2a in ("none", "agrs", "flashinfer", "gluon_petit")],
+)
 @pytest.mark.parametrize("fabric_available", [False, True])
-@pytest.mark.parametrize("mega_moe", [False, True])
 def test_attn_dp_replicates_dense_weights_and_selects_transport(
-    monkeypatch, backend: str, fabric_available: bool, mega_moe: bool
+    monkeypatch, backend: str, fabric_available: bool, moe_backend: str
 ) -> None:
+    mega_moe = moe_backend in {"mega_moe", "gluon_petit"}
+    expected_a2a = "gluon_petit" if moe_backend == "gluon_petit" else "none"
+
     class Experts(nn.Module):
         def __init__(self, **kwargs):
             super().__init__()
             self.kwargs = kwargs
             self.supports_precomputed_topk = True
             self.topk_output_format = TopKOutputFormat.STANDARD
-            self.plan = {"a2a_backend": "none"}
+            self.plan = {"a2a_backend": expected_a2a}
 
     monkeypatch.setattr(
         kimi_k3,
         "get_moe_backend",
-        lambda: SimpleNamespace(value="mega_moe" if mega_moe else "flashinfer_trtllm"),
+        lambda: MoeBackend(moe_backend),
     )
     plan = kimi_k3.Kimi3MoEExecutionPlan(
         use_mega_moe=mega_moe,
@@ -135,7 +145,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
             dp_size=1,
         ),
     )
-    expected_error = (mega_moe and backend != "none") or (
+    expected_error = (mega_moe and backend != expected_a2a) or (
         not mega_moe and backend == "flashinfer" and not fabric_available
     )
     with (
@@ -565,8 +575,9 @@ def test_attn_dp_forward_requires_context() -> None:
 
 @pytest.mark.parametrize("rows", [0, 2])
 @pytest.mark.parametrize("shared_tp", [False, True])
+@pytest.mark.parametrize("weight_dtype", ["nvfp4", "mxfp4"])
 def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
-    monkeypatch, rows, shared_tp
+    monkeypatch, rows, shared_tp, weight_dtype
 ):
     hidden = torch.randn(rows, 8, dtype=torch.bfloat16)
     prefix = torch.randn_like(hidden)
@@ -606,7 +617,7 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
         gate=mock.Mock(return_value=torch.zeros(rows, 2)),
         routed_expert_down_proj=mock.Mock(return_value=(latent, None)),
         experts=SimpleNamespace(
-            plan={"weight_dtype": "nvfp4"}, w13_input_scale_quant=torch.ones(1)
+            plan={"weight_dtype": weight_dtype}, w13_input_scale_quant=torch.ones(1)
         ),
         moe_alltoall=None,
         _routed_experts=routed,
@@ -647,12 +658,15 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
         assert events == ["experts"]
     routed.assert_called_once()
     call = routed.call_args
-    assert call.args[0][0].shape[0] == rows
+    expert_input = call.args[0][0] if weight_dtype == "nvfp4" else call.args[0]
+    assert expert_input.shape[0] == rows
     assert call.args[1].topk_ids.shape == (rows, 2)
     assert call.kwargs["max_num_tokens_per_gpu"] == 3
     assert call.kwargs["num_global_tokens"] == 6
+    if weight_dtype == "mxfp4":
+        quantize.assert_not_called()
     if rows:
-        assert call.args[0] is payload
+        assert call.args[0] is (payload if weight_dtype == "nvfp4" else latent)
         torch.testing.assert_close(result, hidden + prefix)
     else:
         assert result is prefix

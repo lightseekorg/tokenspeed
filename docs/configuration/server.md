@@ -261,7 +261,7 @@ widening the draft's attention to the full history.
 | Parameter | Purpose |
 | --- | --- |
 | `--log-level` | Runtime log level. |
-| `--enable-log-requests` | Log request metadata and optionally payloads. |
+| `--enable-log-requests` | Log request metadata and optionally payloads. On by default; `--no-enable-log-requests` disables. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable metrics reporting. |
