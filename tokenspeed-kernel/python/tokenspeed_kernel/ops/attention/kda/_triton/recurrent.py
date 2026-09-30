@@ -2250,6 +2250,7 @@ def batched_recurrent_kda_replay_commit_kernel(
     STRIDE_BETA: tl.constexpr,
     STRIDE_STATE: tl.constexpr,
     STRIDE_GATE: tl.constexpr,
+    STATE_BF16: tl.constexpr,
     CONV_WIDTH: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -2257,15 +2258,19 @@ def batched_recurrent_kda_replay_commit_kernel(
     D_FA: tl.constexpr,
     BV: tl.constexpr,
 ):
-    """Replay one KDA layer/request/head per program via pointer descriptors."""
-    i_l, i_n, i_hv = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    """Replay one V tile of a layer/request/head via pointer descriptors."""
+    i_l, i_n, i_hv_v = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_hv = i_hv_v // tl.cdiv(K, BV)
+    i_v = (i_hv_v % tl.cdiv(K, BV)) * BV
     # address columns: qkv, conv_w, conv_pool, f_a, f_b, beta, A, dt, state, gate
     ab = i_l * 10
     qkv = tl.load(addresses + ab + 0).to(tl.pointer_type(tl.bfloat16))
     conv_w = tl.load(addresses + ab + 1).to(tl.pointer_type(tl.bfloat16))
     conv_pool = tl.load(addresses + ab + 2).to(tl.pointer_type(tl.bfloat16))
     beta = tl.load(addresses + ab + 5).to(tl.pointer_type(tl.bfloat16))
-    state = tl.load(addresses + ab + 8).to(tl.pointer_type(tl.float32))
+    state = tl.load(addresses + ab + 8).to(
+        tl.pointer_type(tl.bfloat16 if STATE_BF16 else tl.float32)
+    )
     gate_scratch = tl.load(addresses + ab + 9).to(tl.pointer_type(tl.float32))
     group = tl.load(group_indices + i_l).to(tl.int64)
 
@@ -2308,85 +2313,76 @@ def batched_recurrent_kda_replay_commit_kernel(
         tl.float32
     )
 
-    # Each program walks every V tile; conv publication is a later launch.
-    for i_v in tl.range(0, K, BV, loop_unroll_factor=1):
-        o_v = i_v + tl.arange(0, BV)
-        mask_v = o_v < K
-        mask_h = mask_v[:, None] & mask_k[None, :]
-        vf = 2 * P + i_hv * K + o_v
-        w_v0 = tl.load(conv_w + vf * CONV_WIDTH + 0, mask=mask_v, other=0.0).to(
-            tl.float32
-        )
-        w_v1 = tl.load(conv_w + vf * CONV_WIDTH + 1, mask=mask_v, other=0.0).to(
-            tl.float32
-        )
-        w_v2 = tl.load(conv_w + vf * CONV_WIDTH + 2, mask=mask_v, other=0.0).to(
-            tl.float32
-        )
-        w_v3 = tl.load(conv_w + vf * CONV_WIDTH + 3, mask=mask_v, other=0.0).to(
-            tl.float32
-        )
-        s_v0 = tl.load(
-            cp + vf * (CONV_WIDTH - 1) + 0, mask=mask_v & read_ok, other=0.0
-        ).to(tl.float32)
-        s_v1 = tl.load(
-            cp + vf * (CONV_WIDTH - 1) + 1, mask=mask_v & read_ok, other=0.0
-        ).to(tl.float32)
-        s_v2 = tl.load(
-            cp + vf * (CONV_WIDTH - 1) + 2, mask=mask_v & read_ok, other=0.0
-        ).to(tl.float32)
-        state_off = o_v[:, None] * K + o_k[None, :]
-        ph = state + read_page * STRIDE_STATE + i_hv * K * K + state_off
-        # Matches the window kernel's init; fp32 sums reorder, so close-not-exact.
-        b_h = tl.zeros([BV, BK], dtype=tl.float32)
-        b_h += tl.load(
-            ph, mask=mask_h & read_ok, other=0.0, eviction_policy="evict_first"
-        ).to(tl.float32)
+    # V tiles own disjoint state rows; conv is published in a later launch.
+    o_v = i_v + tl.arange(0, BV)
+    mask_v = o_v < K
+    mask_h = mask_v[:, None] & mask_k[None, :]
+    vf = 2 * P + i_hv * K + o_v
+    w_v0 = tl.load(conv_w + vf * CONV_WIDTH + 0, mask=mask_v, other=0.0).to(tl.float32)
+    w_v1 = tl.load(conv_w + vf * CONV_WIDTH + 1, mask=mask_v, other=0.0).to(tl.float32)
+    w_v2 = tl.load(conv_w + vf * CONV_WIDTH + 2, mask=mask_v, other=0.0).to(tl.float32)
+    w_v3 = tl.load(conv_w + vf * CONV_WIDTH + 3, mask=mask_v, other=0.0).to(tl.float32)
+    s_v0 = tl.load(cp + vf * (CONV_WIDTH - 1) + 0, mask=mask_v & read_ok, other=0.0).to(
+        tl.float32
+    )
+    s_v1 = tl.load(cp + vf * (CONV_WIDTH - 1) + 1, mask=mask_v & read_ok, other=0.0).to(
+        tl.float32
+    )
+    s_v2 = tl.load(cp + vf * (CONV_WIDTH - 1) + 2, mask=mask_v & read_ok, other=0.0).to(
+        tl.float32
+    )
+    state_off = o_v[:, None] * K + o_k[None, :]
+    ph = state + read_page * STRIDE_STATE + i_hv * K * K + state_off
+    # Matches the window kernel's init; fp32 sums reorder, so close-not-exact.
+    b_h = tl.zeros([BV, BK], dtype=tl.float32)
+    b_h += tl.load(
+        ph, mask=mask_h & read_ok, other=0.0, eviction_policy="evict_first"
+    ).to(tl.float32)
 
-        tq0, tq1, tq2 = s_q0, s_q1, s_q2
-        tk0, tk1, tk2 = s_k0, s_k1, s_k2
-        for i_t in range(steps):
-            tok = i_n * T + i_t
-            tq0, tq1, tq2, tk0, tk1, tk2, s_v0, s_v1, s_v2, b_h, _ = _kda_window_step(
-                qkv,
-                beta,
-                tok,
-                STRIDE_QKV,
-                STRIDE_BETA,
-                i_hv,
-                qf,
-                kf,
-                vf,
-                mask_k,
-                mask_v,
-                w_q0,
-                w_q1,
-                w_q2,
-                w_q3,
-                w_k0,
-                w_k1,
-                w_k2,
-                w_k3,
-                w_v0,
-                w_v1,
-                w_v2,
-                w_v3,
-                tq0,
-                tq1,
-                tq2,
-                tk0,
-                tk1,
-                tk2,
-                s_v0,
-                s_v1,
-                s_v2,
-                b_h,
-                gate_scratch + tok * STRIDE_GATE + qf,
-                K**-0.5,
-                COMPUTE_OUT=False,
-            )
-        po = state + write_page * STRIDE_STATE + i_hv * K * K + state_off
-        tl.store(po, b_h, mask=mask_h & write_ok, eviction_policy="evict_first")
+    tq0, tq1, tq2 = s_q0, s_q1, s_q2
+    tk0, tk1, tk2 = s_k0, s_k1, s_k2
+    for i_t in range(steps):
+        tok = i_n * T + i_t
+        tq0, tq1, tq2, tk0, tk1, tk2, s_v0, s_v1, s_v2, b_h, _ = _kda_window_step(
+            qkv,
+            beta,
+            tok,
+            STRIDE_QKV,
+            STRIDE_BETA,
+            i_hv,
+            qf,
+            kf,
+            vf,
+            mask_k,
+            mask_v,
+            w_q0,
+            w_q1,
+            w_q2,
+            w_q3,
+            w_k0,
+            w_k1,
+            w_k2,
+            w_k3,
+            w_v0,
+            w_v1,
+            w_v2,
+            w_v3,
+            tq0,
+            tq1,
+            tq2,
+            tk0,
+            tk1,
+            tk2,
+            s_v0,
+            s_v1,
+            s_v2,
+            b_h,
+            gate_scratch + tok * STRIDE_GATE + qf,
+            K**-0.5,
+            COMPUTE_OUT=False,
+        )
+    po = state + write_page * STRIDE_STATE + i_hv * K * K + state_off
+    tl.store(po, b_h, mask=mask_h & write_ok, eviction_policy="evict_first")
 
 
 @triton.jit
@@ -2419,7 +2415,7 @@ def batched_kda_commit_conv_window_kernel(
     s0 = tl.load(src, mask=mask & (read_page >= 0), other=0.0)
     s1 = tl.load(src + 1, mask=mask & (read_page >= 0), other=0.0)
     s2 = tl.load(src + 2, mask=mask & (read_page >= 0), other=0.0)
-    for i_t in range(steps):
+    for i_t in range(tl.maximum(steps - 3, 0), steps):
         x = tl.load(
             qkv + (i_n * T + i_t) * STRIDE_QKV + offsets,
             mask=mask,
@@ -2448,6 +2444,7 @@ def batched_recurrent_kda_replay_commit(
     f_a_stride: int,
     beta_stride: int,
     state_stride: int,
+    state_dtype: torch.dtype,
     gate_stride: int,
     conv_width: int,
     lower_bound: float,
@@ -2498,7 +2495,10 @@ def batched_recurrent_kda_replay_commit(
         BT=block_t,
         num_warps=gate_warps,
     )
-    batched_recurrent_kda_replay_commit_kernel[(layers, batch, num_heads)](
+    block_v = 32
+    batched_recurrent_kda_replay_commit_kernel[
+        (layers, batch, num_heads * triton.cdiv(head_dim, block_v))
+    ](
         addresses,
         group_indices,
         read_indices,
@@ -2511,12 +2511,13 @@ def batched_recurrent_kda_replay_commit(
         STRIDE_BETA=beta_stride,
         STRIDE_STATE=state_stride,
         STRIDE_GATE=gate_stride,
+        STATE_BF16=state_dtype == torch.bfloat16,
         CONV_WIDTH=conv_width,
         HV=num_heads,
         K=head_dim,
         BK=triton.next_power_of_2(head_dim),
         D_FA=f_a_dim,
-        BV=32,
+        BV=block_v,
         num_warps=1,
         num_stages=2,
     )
@@ -2592,7 +2593,7 @@ def kda_commit_conv_window_kernel(
     s1 = tl.load(src + 1, mask=mask & (b_read >= 0), other=0.0)
     s2 = tl.load(src + 2, mask=mask & (b_read >= 0), other=0.0)
 
-    for i_t in range(steps):
+    for i_t in range(tl.maximum(steps - 3, 0), steps):
         x = tl.load(
             qkv_raw + (base + i_t) * stride_raw_tok + offsets, mask=mask, other=0.0
         )

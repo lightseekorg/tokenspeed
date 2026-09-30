@@ -67,24 +67,27 @@ def _actual(inputs, state, bounds, cpu, layout):
 
 
 @pytest.mark.parametrize("layout", ["v_major", "k_major"])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_dispatch_native_state_and_shared_boundaries(
-    monkeypatch, layout, b300_platform
+    monkeypatch, layout, state_dtype, b300_platform
 ):
     """Exercise NVIDIA layout dispatch on CPU tensors on any host platform."""
     inputs, native_state, bounds, cpu = _inputs("cpu", [17, 15])
+    native_state = native_state.to(state_dtype)
     state = (
         native_state
         if layout == "v_major"
         else native_state.transpose(-1, -2).contiguous()
     )
     seen = []
-    final = native_state + 1
+    final = native_state.float() + 1
 
     def forward(q, k, v, g, a_log, dt_bias, beta, boundaries, initial, **kwargs):
         assert "out" not in kwargs
         assert boundaries is bounds
-        assert torch.equal(initial, native_state)
-        if layout == "v_major":
+        assert initial.dtype == torch.float32
+        assert torch.equal(initial, native_state.float())
+        if layout == "v_major" and state_dtype == torch.float32:
             assert initial is state
         assert g.dtype == torch.float32 and g.is_contiguous()
         assert beta.is_contiguous()
@@ -280,3 +283,23 @@ def test_native_prefill_cuda_graph_replay(native_cuda):
         graph.replay()
         assert torch.equal(actual.out, expected_out)
         assert torch.equal(actual.final_state, expected_state)
+
+
+@pytest.mark.parametrize("lengths", [[17], [33, 67]])
+def test_fla_prefill_accepts_bf16_initial_state(lengths):
+    pytest.importorskip("fla")
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from tokenspeed_kernel.ops.attention.kda._triton.fla import kda_chunk_prefill
+
+    inputs, state, bounds, cpu = _inputs("cuda", lengths)
+    state = state.to(torch.bfloat16)
+    before = state.clone()
+    kwargs = dict(
+        cu_seqlens=bounds, cu_seqlens_cpu=cpu, lower_bound=-5.0, beta_is_logit=True
+    )
+    expected = kda_chunk_prefill(*inputs, initial_state=state.float(), **kwargs)
+    actual = kda_chunk_prefill(*inputs, initial_state=state, **kwargs)
+    for value, reference in zip(actual, expected):
+        torch.testing.assert_close(value, reference, atol=0, rtol=0)
+    assert torch.equal(state, before)

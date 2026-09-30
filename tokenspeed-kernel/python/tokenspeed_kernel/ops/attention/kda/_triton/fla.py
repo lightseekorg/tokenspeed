@@ -93,7 +93,7 @@ def kda_chunk_prefill(
         beta,
         A_log=A_log,
         dt_bias=dt_bias,
-        initial_state=initial_state,
+        initial_state=initial_state.float() if initial_state is not None else None,
         output_final_state=True,
         use_qk_l2norm_in_kernel=True,
         use_gate_in_kernel=True,

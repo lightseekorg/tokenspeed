@@ -594,6 +594,45 @@ def test_descriptor_binding_rejects_nonuniform_conv_width():
         harness.backend._bind_replay_descriptor(last, weights)
 
 
+def test_bf16_replay_workspace_is_shared_and_budgeted(monkeypatch):
+    import test.runtime.conftest as fixtures
+
+    original_recipe = fixtures.kimi_recipe
+
+    def bf16_recipe(**kwargs):
+        recipe = original_recipe(**kwargs)
+        recipe.server_args.mamba_ssm_dtype = "bfloat16"
+        return recipe
+
+    monkeypatch.setattr(fixtures, "kimi_recipe", bf16_recipe)
+    harness = _Harness(eager_replay=True)
+    recipe = bf16_recipe(
+        draft_layers=5,
+        max_bs=8,
+        speculative_algorithm="EAGLE3",
+        speculative_num_draft_tokens=T,
+    )
+    allocated = harness.backend.preallocate_verify_workspace(8, T)
+    assert allocated == recipe.setup().fixed_workspace_bytes
+    scratch = harness.backend._replay_state_scratch
+    assert scratch.dtype == torch.bfloat16
+    assert scratch.shape == (8, 12, 128, 128)
+    assert all(pair[1] is scratch for pair in harness.backend._verify_scratch.values())
+
+    # Main can replace its probe pool before final graph capture. The shared
+    # BF16 input scratch must not retain the previous pool lifetime.
+    replacement = _make_kimi_pool(DEV, usable_pages=24)
+    harness.backend.set_kv_pool(replacement)
+    assert harness.backend._replay_state_scratch is None
+    assert harness.backend._verify_scratch is None
+    assert harness.backend.preallocate_verify_workspace(8, T) == allocated
+    rebound = harness.backend._replay_state_scratch
+    assert rebound is not scratch
+    assert rebound.data_ptr() != scratch.data_ptr()
+    assert rebound.dtype == torch.bfloat16
+    assert all(pair[1] is rebound for pair in harness.backend._verify_scratch.values())
+
+
 def test_equal_geometry_pool_replacement_rebinds_batched_replay():
     harness = _Harness(eager_replay=True)
     pages = {group: [2] for group in _STATE_GROUPS}
