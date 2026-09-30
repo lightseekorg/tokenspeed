@@ -1310,3 +1310,56 @@ def triton_mm_fp8_scaled(
         bias=bias,
         out=out,
     )
+
+
+@register_kernel(
+    "gemm",
+    "mm",
+    name="triton_mm_fp8_scaled_cdna4",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=_FP8_SCALED_FORMAT_SIGNATURES,
+    traits={},
+    priority=Priority.PERFORMANT + 2,
+)
+def triton_mm_fp8_scaled_cdna4(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """FP8 E4M3 GEMM with per-token/per-tensor A and per-channel/per-tensor B scales.
+
+    Args:
+        A: ``[M, K]`` FP8 activations.
+        B: ``[K, N]`` FP8 weights (a transposed ``[N, K]`` view is accepted).
+        A_scales: FP32 ``[M, 1]`` per-token or ``[1, 1]`` per-tensor scales.
+        B_scales: FP32 ``[N, 1]`` per-channel or ``[1, 1]`` per-tensor scales.
+        out_dtype: Output dtype.
+        alpha: Unused; accepted for the ``gemm.mm`` calling convention.
+        block_size: Unused; accepted for the ``gemm.mm`` calling convention.
+        bias: Optional ``[N]`` bias added in the epilogue.
+        out: Optional ``[M, N]`` output buffer.
+
+    Returns:
+        ``[M, N]`` tensor ``(A * A_scales) @ (B * B_scales^T)`` in ``out_dtype``.
+    """
+    del alpha, block_size
+    return triton_scaled_mm(
+        A,
+        B,
+        A_scales,
+        B_scales,
+        out_dtype=out_dtype,
+        bias=bias,
+        out=out,
+    )

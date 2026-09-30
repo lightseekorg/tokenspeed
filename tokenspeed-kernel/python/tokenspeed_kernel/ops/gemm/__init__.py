@@ -946,6 +946,7 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
         "torch_bmm",
         "torch_mm",
         "triton_mm_fp8_scaled",
+        "triton_mm_fp8_scaled_cdna4",
     }
 )
 
