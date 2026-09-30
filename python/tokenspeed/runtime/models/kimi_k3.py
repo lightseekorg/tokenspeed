@@ -81,9 +81,7 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     linear_attnres_partials,
     linear_attnres_partials_available,
-    mm,
 )
-from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
 )
@@ -117,6 +115,7 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.w8a8_fp8 import W8A8Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
     _get_process_group,
@@ -1257,6 +1256,11 @@ class KimiLinearKDA(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        if merged_fp8_channel:
+            # The merged buffer is not a LinearBase. Register the ordinary
+            # per-channel FP8 method so the loader post-processes it and the
+            # projection runs it like other FP8 linears.
+            self.qkvgb_proj.quant_method = W8A8Fp8LinearMethod(quant_config.fp8_config)
         if (
             merged_fp8
             and global_server_args_dict["dense_gemm_backend"] == "trtllm_cutedsl"
@@ -1289,18 +1293,7 @@ class KimiLinearKDA(nn.Module):
         if self.qkvgb_proj.fp8_channel_quant:
             if attnres_partial_args is not None:
                 attnres_partial_dual(*attnres_partial_args)
-            # Per-token FP8 activations x per-channel FP8 weights.
-            qinput, x_scale = per_token_group_quant_fp8(
-                hidden_states, hidden_states.shape[-1]
-            )
-            output = mm(
-                qinput,
-                self.qkvgb_proj.weight.t(),
-                A_scales=x_scale,
-                B_scales=self.qkvgb_proj.weight_scale,
-                out_dtype=hidden_states.dtype,
-                quant="fp8",
-            )
+            output = self.qkvgb_proj.quant_method.apply(self.qkvgb_proj, hidden_states)
         elif isinstance(
             getattr(self.qkvgb_proj, "quant_method", None),
             Fp8LinearMethod,

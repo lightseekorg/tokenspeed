@@ -310,6 +310,8 @@ def _quantize_per_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 def test_per_channel_merged_projection_matches_dequantized_reference(rank) -> None:
     from tokenspeed_kernel.platform import current_platform
 
+    from tokenspeed.runtime.layers.dense.w8a8_fp8 import W8A8Fp8LinearMethod
+    from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
     from tokenspeed.runtime.models.kimi_k3 import KimiKDAMergedProj, KimiLinearKDA
 
     platform = current_platform()
@@ -353,6 +355,11 @@ def test_per_channel_merged_projection_matches_dequantized_reference(rank) -> No
     torch.testing.assert_close(module.weight_scale[:used, 0], scales, rtol=0, atol=0)
     assert torch.count_nonzero(module.weight[used:].view(torch.uint8)) == 0
 
+    # The model registers the per-channel method; the loader post-processes it.
+    module.quant_method = W8A8Fp8LinearMethod(
+        W8A8Fp8Config(is_checkpoint_fp8_serialized=True)
+    )
+    module.quant_method.process_weights_after_loading(module)
     x = torch.randn(33, HIDDEN, device="cuda", dtype=torch.bfloat16)
     attention = SimpleNamespace(
         local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
