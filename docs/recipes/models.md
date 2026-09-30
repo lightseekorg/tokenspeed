@@ -383,6 +383,18 @@ their joint reduction before the fused latent up-projection epilogue. Other
 shapes and unsupported layouts retain the ordinary composed path. The fused
 sigmoid-bias top-k route supports the full scheduled token count.
 
+AMD Quark checkpoints such as `amd/Kimi-K3-Quark-MXFP4-AttnFP8` keep the routed
+experts in MXFP4 and override `*self_attn*` through Quark's `layer_quant_config`
+with static per-channel FP8 weights and dynamic per-token FP8 activations. The
+attention projections stay FP8-resident and run a per-token x per-channel FP8
+GEMM; `f_b_proj` and `kv_b_proj`, which the KDA backend and MLA absorption read
+as raw weights, dequantize to BF16 during load, as do the MXFP4 shared-expert and
+dense MLP weights, whose fused SiTU kernels take BF16 weights. Other
+`layer_quant_config` schemes are rejected at startup. This checkpoint is validated
+with the TP8/EP1 EAGLE3 recipe in
+`test/ci/perf/kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-random-50k-500-mi35x.yaml`,
+with `--model` replaced by the checkpoint path.
+
 For Gluon Petit MegaMoE on one node with 8x gfx950 and MXFP4 expert weights,
 use attention DP8 and EP8, with at most 1024 tokens per rank:
 

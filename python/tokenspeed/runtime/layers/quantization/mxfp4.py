@@ -22,13 +22,15 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any
 
 import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
+from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 
 
 def _is_fp4_e8m0_per_group(stage: object, *, is_dynamic: bool | None = None) -> bool:
@@ -93,6 +95,55 @@ def _is_amd_quark_mxfp4_checkpoint(config: dict) -> bool:
     return _is_amd_quark_w_mxfp4_a_fp8(config) or _is_amd_quark_dynamic_mxfp4(config)
 
 
+# Raw-consumed attention weights: model code reads these as BF16 tensors
+# (Kimi-K3's KDA backend GEMV reads f_b_proj; MLA absorbs kv_b_proj into
+# w_kc/w_vc after load), so FP8 checkpoints dequantize them during load.
+_QUARK_FP8_DEQUANT_LEAVES = frozenset({"f_b_proj", "kv_b_proj"})
+
+
+def _is_quark_fp8_per_channel_w8a8(spec: object) -> bool:
+    """Whether a Quark layer spec is static per-channel FP8 weights with
+    dynamic per-token FP8 activations (Quark labels per-token activation
+    scaling ``per_channel`` on the token axis)."""
+    if not isinstance(spec, Mapping):
+        return False
+    weight = spec.get("weight") or {}
+    inputs = spec.get("input_tensors") or {}
+    if not isinstance(weight, Mapping) or not isinstance(inputs, Mapping):
+        return False
+    return (
+        str(weight.get("dtype", "")).lower() == "fp8_e4m3"
+        and weight.get("is_dynamic") is False
+        and str(weight.get("qscheme", "")).lower() == "per_channel"
+        and weight.get("ch_axis") in {0, "0"}
+        and str(inputs.get("dtype", "")).lower() == "fp8_e4m3"
+        and inputs.get("is_dynamic") is True
+        and str(inputs.get("qscheme", "")).lower() == "per_channel"
+        and spec.get("output_tensors") is None
+    )
+
+
+def _quark_fp8_layer_patterns(config: Mapping[str, Any]) -> list[str]:
+    """Normalize Quark ``layer_quant_config`` globs to ignore-style patterns.
+
+    Only the FP8 per-channel W8A8 scheme is supported; any other per-layer
+    override would otherwise silently load under the global MXFP4 scheme.
+    """
+    layer_quant_config = config.get("layer_quant_config") or {}
+    if not isinstance(layer_quant_config, Mapping):
+        raise ValueError("Quark layer_quant_config must be a mapping")
+    patterns: list[str] = []
+    for glob, spec in layer_quant_config.items():
+        if not _is_quark_fp8_per_channel_w8a8(spec):
+            raise ValueError(
+                f"Unsupported Quark layer_quant_config scheme for {glob!r}; "
+                "only static per-channel FP8 E4M3 weights with dynamic FP8 "
+                "activations are supported"
+            )
+        patterns.append(glob)
+    return _normalize_ignored_layer_patterns(patterns)
+
+
 def _iter_ignored_layer_pattern_aliases(raw: str):
     yield raw
     if raw.startswith("language_model."):
@@ -152,6 +203,7 @@ class Mxfp4Config(QuantizationConfig):
         is_w4a8_fp8: bool = False,
         use_dynamic_mxfp4_activations: bool = False,
         quant_method: str | None = None,
+        fp8_layer_patterns: list[str] | None = None,
     ):
         super().__init__(ignored_layers=ignored_layers)
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
@@ -159,6 +211,14 @@ class Mxfp4Config(QuantizationConfig):
         self.use_dynamic_mxfp4_activations = use_dynamic_mxfp4_activations
         self.quant_method = quant_method
         self.group_size = 32
+        # Quark per-layer FP8 overrides (e.g. ``*self_attn*``), matched like
+        # ignored-layer patterns against runtime and checkpoint module names.
+        self.fp8_layer_patterns = fp8_layer_patterns or []
+        self.fp8_config: W8A8Fp8Config | None = (
+            W8A8Fp8Config(is_checkpoint_fp8_serialized=True)
+            if self.fp8_layer_patterns
+            else None
+        )
 
     @classmethod
     def from_config(cls, config):
@@ -171,6 +231,11 @@ class Mxfp4Config(QuantizationConfig):
 
         raw_ignored = cls.get_from_keys_or(config, ["ignored_layers", "exclude"], None)
         ignored_layers = _normalize_ignored_layer_patterns(raw_ignored)
+        fp8_layer_patterns = (
+            _quark_fp8_layer_patterns(config)
+            if _is_amd_quark_mxfp4_checkpoint(config)
+            else []
+        )
 
         return cls(
             ignored_layers=ignored_layers,
@@ -178,7 +243,26 @@ class Mxfp4Config(QuantizationConfig):
             is_w4a8_fp8=is_w4a8_fp8,
             use_dynamic_mxfp4_activations=use_dynamic_mxfp4_activations,
             quant_method=quant_method,
+            fp8_layer_patterns=fp8_layer_patterns,
         )
+
+    def quark_fp8_route(self, module_name: str) -> str | None:
+        """Route a module covered by a Quark FP8 per-layer override.
+
+        Returns ``"w8a8"`` for FP8-resident modules, ``"dequant"`` for weights
+        model code consumes raw (dequantized to BF16 at load), or ``None``
+        when no FP8 override applies (the module keeps the global scheme).
+        """
+        if not self.fp8_layer_patterns or should_ignore_quant_layer(
+            prefix=module_name, ignored_layers=self.ignored_layers
+        ):
+            return None
+        if not should_ignore_quant_layer(
+            prefix=module_name, ignored_layers=self.fp8_layer_patterns
+        ):
+            return None
+        leaf = module_name.rsplit(".", 1)[-1]
+        return "dequant" if leaf in _QUARK_FP8_DEQUANT_LEAVES else "w8a8"
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
@@ -210,3 +294,97 @@ class Mxfp4Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> list[str]:
         return []
+
+
+_FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+# E2M1 code -> value; the sign is the code's high bit.
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def dequantize_mxfp4_to_bf16(
+    packed: torch.Tensor, scales: torch.Tensor
+) -> torch.Tensor:
+    """Dequantize a serialized MXFP4 weight to BF16.
+
+    Args:
+        packed: ``[N, K // 2]`` uint8, two E2M1 codes per byte, the even
+            element in the low nibble (OCP MX packing).
+        scales: ``[N, K // 32]`` uint8 E8M0 exponents, one per 32 elements.
+
+    Returns:
+        ``[N, K]`` BF16 weight.
+    """
+    if packed.dtype != torch.uint8 or scales.dtype != torch.uint8:
+        raise TypeError("MXFP4 dequant expects uint8 codes and E8M0 scales")
+    rows, half_k = packed.shape
+    if scales.shape != (rows, half_k * 2 // 32):
+        raise ValueError(
+            f"MXFP4 scale shape {tuple(scales.shape)} does not match codes "
+            f"{tuple(packed.shape)}"
+        )
+    lut = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=packed.device)
+    lut = torch.cat((lut, -lut))
+    codes = torch.stack((packed & 0x0F, packed >> 4), dim=-1).reshape(rows, -1)
+    values = lut[codes.long()].view(rows, -1, 32)
+    scale = torch.exp2(scales.float() - 127.0).unsqueeze(-1)
+    return (values * scale).reshape(rows, -1).to(torch.bfloat16)
+
+
+def preprocess_quark_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    quant_config: QuantizationConfig | None,
+    dequantize_mxfp4_module: Callable[[str], bool],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Adapt an AMD Quark MXFP4 checkpoint stream with per-layer FP8 overrides.
+
+    * FP8 ``"w8a8"`` modules pass their codes through; the per-channel
+      ``weight_scale`` ``[N]`` is reshaped to the ``[N, 1]`` parameter layout.
+    * FP8 ``"dequant"`` modules (raw-consumed weights) and the MXFP4 modules
+      selected by ``dequantize_mxfp4_module`` pair each weight with its
+      ``weight_scale`` and are yielded as one BF16 ``.weight``.
+
+    Everything else passes through. At most one unpaired tensor is buffered
+    per dequantized module.
+    """
+    if not isinstance(quant_config, Mxfp4Config) or not (
+        quant_config.fp8_layer_patterns or quant_config.use_dynamic_mxfp4_activations
+    ):
+        yield from weights
+        return
+
+    pending: dict[str, dict[str, torch.Tensor]] = {}
+    for name, weight in weights:
+        is_scale = name.endswith(".weight_scale")
+        if not (is_scale or name.endswith(".weight")):
+            yield name, weight
+            continue
+        module = name.rsplit(".", 1)[0]
+        route = quant_config.quark_fp8_route(module)
+        if route == "w8a8":
+            yield name, weight.reshape(-1, 1) if is_scale else weight
+            continue
+        if route is None and (
+            not dequantize_mxfp4_module(module)
+            or (not is_scale and weight.dtype != torch.uint8)
+        ):
+            # Not selected, or a module the checkpoint keeps in BF16.
+            yield name, weight
+            continue
+        entry = pending.setdefault(module, {})
+        entry["scale" if is_scale else "weight"] = weight
+        if "weight" not in entry or "scale" not in entry:
+            continue
+        del pending[module]
+        codes, scale = entry["weight"], entry["scale"]
+        if codes.dtype in _FP8_WEIGHT_DTYPES:
+            dequantized = (codes.float() * scale.float().reshape(-1, 1)).to(
+                torch.bfloat16
+            )
+        else:
+            dequantized = dequantize_mxfp4_to_bf16(codes, scale)
+        yield module + ".weight", dequantized
+    if pending:
+        raise RuntimeError(
+            "Quark dequantized modules missing their weight/weight_scale pair "
+            f"at end of checkpoint stream: {sorted(pending)}"
+        )
