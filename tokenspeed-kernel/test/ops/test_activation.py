@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.ops.activation.triton as activation_triton
 import torch
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
@@ -122,6 +123,101 @@ def test_sigmoid_mul_rejects_4d_gate(device: str) -> None:
     gate = torch.randn(4, 2, 4, 4, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="gate must be 2D or 3D"):
         sigmoid_mul(x, gate)
+
+
+def _headed_gate(
+    layout: str, tokens: int, heads: int, head_dim: int, dtype: torch.dtype, device
+) -> torch.Tensor:
+    """A gate for ``[tokens, heads * head_dim]``: 2D, 3D, or the strided 3D gate
+    half of a packed ``[tokens, heads, 2 * head_dim]`` tensor."""
+    packed = (4 * torch.randn(tokens, heads, 2 * head_dim, device=device)).to(dtype)
+    gate = packed[..., head_dim:]
+    if layout == "strided":
+        return gate
+    gate = gate.contiguous()
+    return gate.reshape(tokens, -1) if layout == "2d" else gate
+
+
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("layout", ["2d", "3d", "strided"])
+def test_sigmoid_mul_head_bias_matches_eager(
+    layout: str, dtype: torch.dtype, bias_dtype: torch.dtype, device: str
+) -> None:
+    tokens, heads, head_dim = 19, 8, 128
+    x = torch.randn(tokens, heads * head_dim, device=device, dtype=dtype)
+    gate = _headed_gate(layout, tokens, heads, head_dim, dtype, device)
+    bias = torch.randn(heads, device=device)
+    # Saturate two heads to cover exp overflow and underflow.
+    bias[:2] = torch.tensor([100.0, -100.0])
+    bias = bias.to(bias_dtype)
+    z = gate.float().reshape(tokens, heads, head_dim) + bias.float()[:, None]
+    ref = (x.float() * (1.0 / (1.0 + torch.exp(-z))).reshape(x.shape)).to(dtype)
+
+    out = sigmoid_mul(x.clone(), gate, head_bias=bias)
+
+    # On NVIDIA the kernel rounds each FP32 operation as the eager expression does.
+    tol = 0 if platform.is_nvidia else (1e-2 if dtype == torch.bfloat16 else 5e-3)
+    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("head_bias", [False, True])
+@pytest.mark.parametrize("layout", ["2d", "3d", "strided"])
+def test_sigmoid_mul_launch_arguments(
+    layout: str, head_bias: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host side only, with the launch recorded: without ``head_bias`` the launch
+    is the one existing callers had; with it the bias and the per-head split of a
+    2D gate reach the kernel."""
+    launches = []
+
+    class _Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append((args, kwargs))
+
+    monkeypatch.setattr(activation_triton, "_sigmoid_mul_kernel", _Kernel())
+    tokens, heads, head_dim = 3, 4, 64
+    gate = _headed_gate(layout, tokens, heads, head_dim, torch.bfloat16, "cpu")
+    x = torch.randn(tokens, heads * head_dim, dtype=torch.bfloat16)
+    bias = torch.randn(heads) if head_bias else None
+
+    assert sigmoid_mul(x, gate, bias) is x
+
+    ((args, kwargs),) = launches
+    assert args[0] is x and args[1] is gate and args[2] == x.numel()
+    assert args[3] is bias
+    width = heads * head_dim
+    split_2d = head_dim if head_bias else width
+    assert kwargs == {
+        "hidden_dim": width,
+        "head_dim": split_2d if layout == "2d" else head_dim,
+        "gate_row_stride": gate.stride(0),
+        "gate_head_stride": split_2d if layout == "2d" else gate.stride(1),
+        "BLOCK_SIZE": 1024,
+        "ENABLE_PDL": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "gate_shape,bias,match",
+    [
+        ((4, 4, 8), torch.ones(2), "num_heads mismatch"),
+        ((4, 32), torch.ones(5), "hidden_dim mismatch"),
+        ((4, 32), torch.ones(0), "hidden_dim mismatch"),
+        ((4, 4, 8), torch.ones(4, 2)[:, 0], "contiguous 1D"),
+        ((4, 4, 8), torch.ones(1, 4), "contiguous 1D"),
+        ((4, 4, 8), torch.ones(4, dtype=torch.int32), "bf16, fp16 or fp32"),
+    ],
+    ids=["3d_heads", "2d_split", "empty", "strided", "2d_bias", "int32"],
+)
+def test_sigmoid_mul_rejects_bad_head_bias(
+    gate_shape: tuple[int, ...], bias: torch.Tensor, match: str
+) -> None:
+    # Host-side checks run before any launch, so CPU tensors suffice.
+    x = torch.randn(4, 32, dtype=torch.bfloat16)
+    gate = torch.randn(gate_shape, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=match):
+        sigmoid_mul(x, gate, head_bias=bias)
 
 
 # --- silu_and_mul tests ---

@@ -100,15 +100,17 @@ def _scratch(tokens: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     )
 
 
-def test_sigmoid_mul_waits_for_published_inputs():
+@pytest.mark.parametrize("head_bias", [False, True])
+def test_sigmoid_mul_waits_for_published_inputs(head_bias: bool):
     x = torch.randn(17, 4096, device="cuda", dtype=torch.bfloat16)
     gate = torch.randn_like(x)
-    serial = sigmoid_mul(x.clone(), gate)
+    bias = torch.randn(32, device="cuda") if head_bias else None
+    serial = sigmoid_mul(x.clone(), gate, bias)
     target_x, target_gate = _unpublished(x, gate)
 
     _publish((x, gate), (target_x, target_gate))
     pdl_enabled(overwrite=True)
-    pdl = sigmoid_mul(target_x, target_gate)
+    pdl = sigmoid_mul(target_x, target_gate, bias)
     assert torch.equal(pdl, serial)
 
 
