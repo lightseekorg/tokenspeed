@@ -1491,11 +1491,17 @@ class KimiLinearMoE(nn.Module):
             moe_backend,
             alt_stream,
         )
+        fused_all2all_backend = (
+            All2AllBackend.GLUON_PETIT
+            if moe_backend.is_gluon_petit()
+            else All2AllBackend.NONE
+        )
         if self.execution_plan.use_mega_moe and (
-            mapping.attn.dp_size <= 1 or all2all_backend is not All2AllBackend.NONE
+            mapping.attn.dp_size <= 1 or all2all_backend is not fused_all2all_backend
         ):
             raise ValueError(
-                "K3 MegaMoE requires attention DP > 1 and --all2all-backend none; "
+                "K3 MegaMoE requires attention DP > 1 and "
+                f"--all2all-backend {fused_all2all_backend.value}; "
                 "the fused kernel owns dispatch/combine."
             )
         # Router (gate+topk) and shared experts run on this stream during
@@ -1586,9 +1592,15 @@ class KimiLinearMoE(nn.Module):
                 raise ValueError(
                     "Kimi-K3 attention DP requires precomputed TopK support."
                 )
-            if self.experts.plan.get("a2a_backend") not in (None, "none"):
+            expected_a2a = (
+                fused_all2all_backend.value
+                if self.execution_plan.use_mega_moe
+                else "none"
+            )
+            if self.experts.plan.get("a2a_backend") not in (None, expected_a2a):
                 raise ValueError(
-                    "Kimi-K3 attention DP owns dispatch/combine; disable expert-backend all-to-all."
+                    "Kimi-K3 attention DP requires expert all-to-all backend "
+                    f"{expected_a2a!r}."
                 )
 
         # Derive the producer contract from the concrete registry selection;
@@ -1731,7 +1743,7 @@ class KimiLinearMoE(nn.Module):
             if self.execution_plan.use_mega_moe:
                 if layer_index == config.first_k_dense_replace:
                     logger.info(
-                        f"K3 routed MoE: TRTLLM NVFP4 SiTU MegaMoE (EP={mapping.moe.ep_size})",
+                        f"K3 routed MoE: {moe_backend.value} SiTU MegaMoE (EP={mapping.moe.ep_size})",
                     )
                 return
             if all2all_backend is not All2AllBackend.AGRS:

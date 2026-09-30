@@ -52,6 +52,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 TensorReducer = Callable[[torch.Tensor], torch.Tensor]
@@ -272,7 +273,7 @@ class Kimi3MoEExecutionPlan:
     ) -> "Kimi3MoEExecutionPlan":
         """Select orchestration from the backend, streams, and parallel layout."""
 
-        use_mega_moe = moe_backend.value == "mega_moe"
+        use_mega_moe = moe_backend in (MoeBackend.MEGA_MOE, MoeBackend.GLUON_PETIT)
         use_native = not use_mega_moe and native_latent_moe_available()
         # Hopper (SM90) has no native FP4 tensor cores and no flashinfer SiTU
         # cubin, so K3's MXFP4 SiTU MoE runs weight-only through the Marlin

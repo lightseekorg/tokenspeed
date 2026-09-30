@@ -391,6 +391,17 @@ def compare_runs(
                 _measurement_comparison(case_id, base_case, candidate_case)
             )
 
+    for comparison in comparisons:
+        case_id = comparison["id"]
+        base_case = base_cases.get(case_id)
+        candidate_case = candidate_cases.get(case_id)
+        comparison["base_profile"] = (
+            base_case.get("profile") if base_case is not None else None
+        )
+        comparison["candidate_profile"] = (
+            candidate_case.get("profile") if candidate_case is not None else None
+        )
+
     return {
         "schema_version": COMPARISON_SCHEMA_VERSION,
         "suite_id": candidate["suite_id"],

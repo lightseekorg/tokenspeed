@@ -34,6 +34,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -205,7 +206,7 @@ class LocalPagesTest(unittest.TestCase):
                         virtual_block_count=count,
                     )
                     # Each rank owns exactly the local pages 1..6, in order.
-                    self.assertEqual(owned, list(range(1, 7)))
+                    self.assertEqual(owned.tolist(), list(range(1, 7)))
                     seen.extend(
                         block
                         for block in virtual
@@ -215,11 +216,23 @@ class LocalPagesTest(unittest.TestCase):
 
     def test_null_block_and_duplicates(self):
         self.assertEqual(
-            local_pages([0, 3, 3, 0, 1], shard_count=2, rank=0, virtual_block_count=9),
+            local_pages(
+                [0, 3, 3, 0, 1], shard_count=2, rank=0, virtual_block_count=9
+            ).tolist(),
             [2, 2, 1],
         )
         self.assertEqual(
-            local_pages([0, 0], shard_count=1, rank=0, virtual_block_count=9), []
+            local_pages([0, 0], shard_count=1, rank=0, virtual_block_count=9).tolist(),
+            [],
+        )
+        # The scheduler's zero-copy export is a read-only int32 array.
+        exported = np.asarray([0, 3, 3, 0, 1], dtype=np.int32)
+        exported.setflags(write=False)
+        self.assertEqual(
+            local_pages(
+                exported, shard_count=2, rank=0, virtual_block_count=9
+            ).tolist(),
+            [2, 2, 1],
         )
 
     def test_out_of_range_ids_and_ranks_are_rejected(self):
@@ -240,7 +253,10 @@ class LocalPagesTest(unittest.TestCase):
             rank=1,
         )
         # Sharded: rank 1 owns virtual 2, 4, 6, 8 -> local 1, 2, 3, 4.
-        self.assertEqual(translated, {"sharded": [1, 2, 4], "replicated": [1, 4]})
+        self.assertEqual(
+            {group: pages.tolist() for group, pages in translated.items()},
+            {"sharded": [1, 2, 4], "replicated": [1, 4]},
+        )
         with self.assertRaises(IndexError):
             local_pages_by_group({"replicated": [5]}, contract=contract, rank=0)
 

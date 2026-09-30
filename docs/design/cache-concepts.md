@@ -1190,12 +1190,17 @@ used to shape an arena field. Virtual null ID 0 has no owner and is filtered
 during translation.
 
 Before zeroing scheduler blocks, the runtime checks IDs against the virtual
-bound and translates each group's batch to owned local IDs through the shared
-translation API. Translation precedes dispatch to pool views; pools and the
-arena receive physical IDs and hold no context rank. The arena's
-`zero_blocks()` validates every ID against its group's local page count before
-clearing any bytes. Physical page 0 is within that range and is handled like
-any other page when explicitly requested.
+bound and translates each group's batch to owned local IDs on the host
+(`local_pages`, plain integer arithmetic over the same cyclic placement the
+device translation kernels implement). Translation precedes dispatch to pool
+views; pools and the arena receive physical IDs and hold no context rank. The
+arena's `zero_blocks()` validates every ID against its group's local page
+count before clearing any bytes. Physical page 0 is within that range and is
+handled like any other page when explicitly requested. Host work on this path
+is O(pages): the arena ships the page ids through one pinned copy and the
+kernel expands page x field byte ranges from the group's fixed field table,
+because a long prompt's admission hands out thousands of pages and per-range
+Python here stalls the forward thread while the device sits idle.
 
 The allocator receives only an integer `shard_count`, fixed when the
 coordinator registers the group in its pools. It counts

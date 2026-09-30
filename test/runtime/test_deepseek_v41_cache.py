@@ -22,6 +22,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import pytest
 import torch
 from tokenspeed_kernel.platform import current_platform
@@ -1056,7 +1057,7 @@ def test_pool_zeroes_fresh_pages_per_group():
     pool.arena.buffer.fill_(1)
     # One parent belongs to one group: SWA page 1 is parent 1, R2 pages 41..60
     # are parent 3. Zeroing must touch only those parents.
-    pool.zero_new_blocks({SWA: [1], R2: [41]})
+    pool.zero_new_blocks({SWA: np.asarray([1]), R2: np.asarray([41])})
     assert pool.swa(3)[1].count_nonzero() == 0 and pool.swa(3)[2].count_nonzero() > 0
     assert pool.global_kv(8)[41].count_nonzero() == 0
     assert pool.global_kv(8)[21].count_nonzero() > 0

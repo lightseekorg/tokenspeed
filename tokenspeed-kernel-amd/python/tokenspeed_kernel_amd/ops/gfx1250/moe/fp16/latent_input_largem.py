@@ -132,10 +132,10 @@ def gluon_latent_input_largem_gfx1250(
         operand_index=1, parent=wmma_layout, k_width=8
     )
     shared_layout_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+        [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
     )
     shared_layout_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+        [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
     )
 
     a_smem = gl.allocate_shared_memory(

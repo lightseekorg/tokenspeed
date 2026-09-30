@@ -74,6 +74,16 @@ _PROFILES = {
         activation="swiglu",
         has_bias=False,
     ),
+    "kimi_k3": _BenchmarkProfile(
+        name="kimi_k3",
+        experts=896,
+        top_k=16,
+        hidden=3584,
+        logical_intermediate=3072,
+        compute_intermediate=3072,
+        activation="situ",
+        has_bias=False,
+    ),
 }
 
 
@@ -96,11 +106,13 @@ class _TestMoeLayer(torch.nn.Module):
         self.ep_size = 8
         self.tp_size = 1
         self.activation = profile.activation
+        self.activation_situ_beta = 4.0 if profile.activation == "situ" else None
+        self.activation_situ_linear_beta = (
+            25.0 if profile.activation == "situ" else None
+        )
         self.swiglu_beta = 1.0 if profile.has_bias else None
         self.swiglu_arg = (
-            argparse.Namespace(alpha=1.702, limit=7.0)
-            if profile.has_bias
-            else argparse.Namespace(alpha=None, limit=None)
+            argparse.Namespace(alpha=1.702, limit=7.0) if profile.has_bias else None
         )
         self.w13_input_layout = "interleaved" if profile.has_bias else "concatenated"
         self.register_parameter(
@@ -190,7 +202,11 @@ def _make_plan(profile: _BenchmarkProfile) -> dict:
         with_bias=profile.has_bias,
         process_group=None,
         hidden=profile.hidden,
-        swiglu_form="generalized" if profile.has_bias else "standard",
+        swiglu_form=(
+            "generalized"
+            if profile.has_bias
+            else "standard" if profile.activation == "swiglu" else None
+        ),
         activation_clamped=profile.has_bias,
         expert_id_repeats=False,
         fast_math=True,
@@ -293,6 +309,10 @@ def _reference(x, ids, weights, profile):
             up -= 0.03125
             gate = gate.clamp(max=7)
             hidden = gate * torch.sigmoid(1.702 * gate) * (up.clamp(-7, 7) + 1)
+        elif profile.activation == "situ":
+            hidden = (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (
+                25.0 * torch.tanh(up / 25.0)
+            )
         else:
             hidden = gate * torch.sigmoid(gate) * up
         hidden = _quantized_reference(hidden, input_quantization=False)
@@ -311,7 +331,7 @@ def _reference(x, ids, weights, profile):
     int(os.environ.get("WORLD_SIZE", "1")) != 8 or not is_cdna4(),
     reason="requires torchrun with eight gfx950 GPUs",
 )
-@pytest.mark.parametrize("profile_name", ("gpt_oss_120b", "dsv4"))
+@pytest.mark.parametrize("profile_name", ("gpt_oss_120b", "dsv4", "kimi_k3"))
 def test_distributed_petit_reference(profile_name):
     expected_root = os.environ.get("PETIT_EXPECTED_RUNTIME_ROOT")
     if expected_root is not None:
@@ -346,7 +366,11 @@ def test_distributed_petit_reference(profile_name):
 
         def refresh(step):
             values = torch.arange(x.numel(), device=device).reshape(x.shape)
-            x.copy_((((values * 13 + rank * 7 + step * 17) % 127) - 63).float() / 32)
+            input_scale = 4.0 if profile.activation == "situ" else 1.0 / 32
+            x.copy_(
+                (((values * 13 + rank * 7 + step * 17) % 127) - 63).float()
+                * input_scale
+            )
             new_ids, new_weights = _routing(count, rank + step, profile, device)
             if step:
                 # Concentrate routes on one destination without duplicate experts.
