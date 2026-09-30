@@ -1698,6 +1698,8 @@ def iris_moe_reduce_scatter_gluon_kernel(
             )
         reduced = ((sums[0] + sums[1]) + (sums[2] + sums[3])).to(gl.bfloat16)
         gl.amd.cdna4.buffer_store(reduced, scratch_ptr, offsets, mask, cache=".wt")
+    # The matching gather waits for every rank after these reads complete.
+    # Its completion must precede the next producer's symmetric-input writes.
 
 
 # Rank q owns L = M/8 consecutive rows. For local row u, r = q*L + u,
