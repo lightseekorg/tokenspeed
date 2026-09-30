@@ -3706,6 +3706,37 @@ def iris_allreduce_residual_rmsnorm(
     )
 
 
+def _find_iris_state(
+    group: dist.ProcessGroup, tensors: tuple[torch.Tensor, ...]
+) -> IrisAllReduce | None:
+    return next(
+        (
+            state
+            for state in IRIS_AR_STATES.values()
+            if state.group is group and state.owns_outputs(tensors)
+        ),
+        None,
+    )
+
+
+def _overlaps(tensor: torch.Tensor, buffer: torch.Tensor) -> bool:
+    span = tensor.numel()
+    if span == 0:
+        return False
+    # Collective buffers are contiguous; history can have padding between rows.
+    if not tensor.is_contiguous():
+        span = 1 + sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        )
+    begin = tensor.data_ptr()
+    end = begin + span * tensor.element_size()
+    return (
+        begin < buffer.data_ptr() + buffer.numel() * buffer.element_size()
+        and buffer.data_ptr() < end
+    )
+
+
 def iris_kimi3_moe_tail(
     routed_partial: torch.Tensor,
     shared_partial: torch.Tensor,
@@ -3778,15 +3809,7 @@ def iris_kimi3_moe_tail(
         return None
 
     # Reuse the state that owns both prepared outputs.
-    state = next(
-        (
-            candidate
-            for candidate in IRIS_AR_STATES.values()
-            if candidate.group is group
-            and candidate.owns_outputs((routed_partial, shared_partial))
-        ),
-        None,
-    )
+    state = _find_iris_state(group, (routed_partial, shared_partial))
     if state is None:
         return None
     local_rows = rows // 8
@@ -3811,17 +3834,13 @@ def iris_kimi3_moe_tail(
         return None
     # Reject unsafe overlaps before launching either collective.
     for tensor in tensors[2:]:
-        start = tensor.data_ptr()
-        end = start + tensor.numel() * tensor.element_size()
         for buffer in (state._input_buf, scratch, result_buffer):
-            buffer_start = buffer.data_ptr()
-            buffer_end = buffer_start + buffer.numel() * buffer.element_size()
-            if start < buffer_end and buffer_start < end:
+            if _overlaps(tensor, buffer):
                 # Only exact prefix aliasing preserves row ownership.
                 if not (
                     buffer is result_buffer
                     and tensor is prefix
-                    and start == buffer_start
+                    and tensor.data_ptr() == buffer.data_ptr()
                     and not prefix_is_sharded
                 ):
                     return None
@@ -3882,22 +3901,6 @@ def iris_kimi3_moe_tail(
         num_warps=4,
     )
     return output
-
-
-def _overlaps(tensor: torch.Tensor, buffer: torch.Tensor) -> bool:
-    if tensor.numel() == 0:
-        return False
-    # History can have padding between blocks or tokens. Include its full span.
-    span = 1 + sum(
-        (size - 1) * stride
-        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
-    )
-    begin = tensor.data_ptr()
-    end = begin + span * tensor.element_size()
-    return (
-        begin < buffer.data_ptr() + buffer.numel() * buffer.element_size()
-        and buffer.data_ptr() < end
-    )
 
 
 def iris_attention_mix(
@@ -3990,14 +3993,7 @@ def iris_attention_mix(
     ):
         return None
 
-    state = next(
-        (
-            s
-            for s in IRIS_AR_STATES.values()
-            if s.group is group and s.owns_outputs((partial,))
-        ),
-        None,
-    )
+    state = _find_iris_state(group, (partial,))
     if state is None:
         return None
     output_buffer = state._moe_tail_output_buf

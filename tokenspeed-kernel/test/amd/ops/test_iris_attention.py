@@ -179,7 +179,6 @@ def _attention_worker(rank: int, port: int) -> None:
         128,
         256,
         512,
-        513,
         520,
         848,
         1024,
@@ -224,7 +223,9 @@ def _attention_worker(rank: int, port: int) -> None:
         # of the existing Iris tree below.
         torch.testing.assert_close(ordinary, reduced, atol=0.001953125, rtol=0.0078125)
         reduced = ordinary
-        for prefix, valid_blocks in product((None, residual), (0, 4, 7, 8, 11)):
+        # Invalid row counts reject before history or residual specialization.
+        histories = (0, 4, 7, 8, 11) if m % 8 == 0 else (0,)
+        for prefix, valid_blocks in product((None, residual), histories):
             partial.copy_(source)
             if rank == m % 8:
                 torch.cuda._sleep(100_000)

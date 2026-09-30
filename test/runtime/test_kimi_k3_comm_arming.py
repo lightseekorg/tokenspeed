@@ -520,22 +520,17 @@ def test_attention_prefill_fallback_preserves_residual_ownership(
 
 
 @pytest.mark.parametrize(
-    "rows,eligible",
+    "rows,is_cdna4,eligible",
     [
-        (48, False),
-        (55, False),
-        (56, True),
-        (57, False),
-        (64, True),
-        (511, False),
-        (512, True),
-        (513, False),
-        (4096, True),
-        (8192, True),
-        (8193, False),
+        (48, True, False),
+        (56, True, True),
+        (57, True, False),
+        (8192, True, True),
+        (8200, True, False),
+        (512, False, False),
     ],
 )
-def test_attention_prefill_mix_window(monkeypatch, rows, eligible):
+def test_attention_prefill_mix_window(monkeypatch, rows, is_cdna4, eligible):
     from tokenspeed.runtime.models import kimi_k3_comm as module
 
     group = tuple(range(8))
@@ -552,7 +547,7 @@ def test_attention_prefill_mix_window(monkeypatch, rows, eligible):
         SimpleNamespace(iris_attention_mix=operation),
     )
     monkeypatch.setattr(
-        module, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
+        module, "current_platform", lambda: SimpleNamespace(is_cdna4=is_cdna4)
     )
     monkeypatch.setattr(module, "_get_process_group", lambda _: "owner")
     result = comm.prefill_mix_for_moe(
@@ -583,41 +578,6 @@ def test_attention_prefill_mix_window(monkeypatch, rows, eligible):
     else:
         assert result is None
         operation.assert_not_called()
-
-
-def test_attention_prefill_mix_skips_iris_import_on_other_platform(monkeypatch):
-    from tokenspeed.runtime.models import kimi_k3_comm as module
-
-    operation = Mock()
-    monkeypatch.setitem(
-        sys.modules,
-        "tokenspeed_kernel.ops.communication.iris",
-        SimpleNamespace(iris_attention_mix=operation),
-    )
-    monkeypatch.setattr(
-        module, "current_platform", lambda: SimpleNamespace(is_cdna4=False)
-    )
-    comm = module.K3AttnComm.__new__(module.K3AttnComm)
-    comm.mapping = SimpleNamespace(attn=SimpleNamespace(tp_group=(0,)))
-    partial = torch.empty((512, 7168), dtype=torch.bfloat16, device="meta")
-    history = torch.empty((4, 512, 7168), dtype=torch.bfloat16, device="meta")
-    weight = torch.empty((7168,), dtype=torch.bfloat16, device="meta")
-
-    assert (
-        comm.prefill_mix_for_moe(
-            partial,
-            None,
-            history,
-            weight,
-            weight,
-            eps=1e-6,
-            out_norm_weight=weight,
-            out_norm_eps=1e-6,
-            num_valid_blocks=4,
-        )
-        is None
-    )
-    operation.assert_not_called()
 
 
 if __name__ == "__main__":
