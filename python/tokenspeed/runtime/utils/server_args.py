@@ -334,7 +334,7 @@ class ServerArgs:
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
     weight_loader_prefetch_checkpoints: bool = True
-    weight_loader_prefetch_num_threads: int = 4
+    weight_loader_prefetch_num_threads: int = 8
     enable_memory_saver: bool = False
     disable_cudagraph_memory_reserve: bool = False
     mla_disable_ragged: bool = False
@@ -2192,8 +2192,8 @@ class ServerArgs:
             help=(
                 "Disable prefetching safetensors checkpoint shards into the OS "
                 "page cache. Prefetch is enabled by default: shards are read "
-                "sequentially a bounded window ahead of weight loading "
-                "(min(80 GiB, 25%% of available host memory)), so weight copies "
+                "in parallel ranges a bounded window ahead of weight loading "
+                "(min(40 GiB, 25%% of available host memory)), so weight copies "
                 "hit the cache at streaming bandwidth instead of demand-faulting "
                 "cold pages from shared filesystems."
             ),
@@ -2202,7 +2202,7 @@ class ServerArgs:
             "--weight-loader-prefetch-num-threads",
             type=int,
             default=ServerArgs.weight_loader_prefetch_num_threads,
-            help="Number of background threads per rank for checkpoint prefetching.",
+            help="Maximum concurrent checkpoint range readers per rank.",
         )
         parser.add_argument(
             "--enable-memory-saver",

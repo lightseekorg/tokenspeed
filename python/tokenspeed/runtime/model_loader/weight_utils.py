@@ -21,13 +21,16 @@
 
 """Utilities for downloading and initializing model weights."""
 
+import ctypes
 import fnmatch
 import glob
 import hashlib
 import importlib.util
 import json
+import mmap
 import os
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -426,59 +429,73 @@ def safetensors_encrypted_weights_iterator(
 
 
 class CheckpointPrefetcher:
-    """Sequentially read checkpoint shards a bounded distance ahead of the consumer.
+    """Read bounded checkpoint shards ahead using parallel contiguous ranges.
 
-    Copying weights out of an mmap'd safetensors shard demand-faults one page
-    at a time; on cold network filesystems the sparse per-rank access pattern
-    defeats readahead and every page fault becomes a synchronous round trip.
-    Reading each shard sequentially first moves the bytes at streaming
-    bandwidth, so the consumer's copies hit the page cache instead.
+    A fixed set of reader threads claims contiguous ranges in shard order.
+    Readers are reused across shards, and a shard becomes ready only after
+    all its ranges finish. Completed shards remain in the window until the
+    consumer advances.
 
-    The read-ahead window is bounded so shards are consumed before cache
-    pressure evicts them again; an unbounded prefetch of a checkpoint larger
-    than the page cache evicts its own early work. The window defaults to
-    min(40 GiB, 25% of available host memory): it only needs to be much
-    larger than a few shards and much smaller than the page cache, and no
-    cross-rank agreement is needed since it only sizes each rank's
-    independent read-ahead. Every rank reads every shard in consumption
-    order; concurrent readers of the same shard are deduplicated by the page
-    cache, so the shared filesystem sees roughly one read per node.
+    The window is min(40 GiB, 25% of available host memory). It bounds ahead
+    bytes, not total page-cache occupancy. Local ranks share cached file pages.
 
     Args:
         files: Shard paths in the exact order the consumer will load them.
-        num_threads: Number of background reader threads.
+        num_threads: Maximum concurrent range readers per rank.
     """
 
-    _BLOCK_SIZE = 16 * 1024 * 1024
+    _BLOCK_SIZE = 4 * 1024**2
+    _MIN_RANGE_SIZE = 64 * 1024**2
     _WINDOW_MAX_BYTES = 40 * 1024**3
     _WINDOW_MEM_FRACTION = 0.25
 
     @classmethod
-    def _read_file(cls, file_path: str) -> int:
-        """Sequentially read a file so its pages land in the OS page cache."""
-        bytes_read = 0
-        with open(file_path, "rb") as f:
-            while True:
-                data = f.read(cls._BLOCK_SIZE)
-                if not data:
-                    break
-                bytes_read += len(data)
-        return bytes_read
+    def _read_range(cls, file_path: str, start: int, end: int) -> int:
+        remaining = end - start
+        buffer = bytearray(min(cls._BLOCK_SIZE, remaining))
+        with open(file_path, "rb", buffering=0) as f, memoryview(buffer) as view:
+            f.seek(start)
+            while remaining:
+                count = f.readinto(view[: min(len(buffer), remaining)])
+                if not count:
+                    raise EOFError(
+                        f"Checkpoint shard ended before byte {end}: {file_path}"
+                    )
+                remaining -= count
+        return end - start
 
     def __init__(
         self,
         files: list[str],
-        num_threads: int = 4,
+        num_threads: int = 8,
     ) -> None:
         self._files = list(files)
         self._sizes = [os.path.getsize(path) for path in self._files]
-        self._num_threads = max(1, min(num_threads, max(len(self._files), 1)))
+        self._num_threads = max(1, num_threads)
+        self._range_sizes = []
+        self._ranges_remaining = []
+        for size in self._sizes:
+            readers = min(
+                self._num_threads,
+                max(1, (size + self._MIN_RANGE_SIZE - 1) // self._MIN_RANGE_SIZE),
+            )
+            range_size = max(
+                self._BLOCK_SIZE,
+                (size + readers * self._BLOCK_SIZE - 1)
+                // (readers * self._BLOCK_SIZE)
+                * self._BLOCK_SIZE,
+            )
+            self._range_sizes.append(range_size)
+            self._ranges_remaining.append(max(1, (size + range_size - 1) // range_size))
         self._window_bytes = min(
             self._WINDOW_MAX_BYTES,
             int(psutil.virtual_memory().available * self._WINDOW_MEM_FRACTION),
         )
         self._cond = threading.Condition()
         self._next_to_read = 0
+        self._next_offset = 0
+        self._stopped = False
+        self._threads: list[threading.Thread] = []
         self._files_read = 0
         self._inflight_bytes = 0  # claimed by a reader, not yet consumed
         self._ready = [threading.Event() for _ in self._files]
@@ -488,41 +505,52 @@ class CheckpointPrefetcher:
         logger.info(
             f"Prefetching {len(self._files)} checkpoint shards into the OS page "
             f"cache (window {self._window_bytes / 1024**3:.1f} GiB, "
-            f"{self._num_threads} reader threads)."
+            f"up to {self._num_threads} range-reader threads)."
         )
         self._start_time = time.perf_counter()
-        for _ in range(self._num_threads):
-            threading.Thread(target=self._reader, daemon=True).start()
+        for _ in range(min(self._num_threads, sum(self._ranges_remaining))):
+            thread = threading.Thread(target=self._reader, daemon=True)
+            self._threads.append(thread)
+            thread.start()
 
     def _reader(self) -> None:
         while True:
             with self._cond:
                 while True:
-                    if self._next_to_read >= len(self._files):
+                    if self._stopped or self._next_to_read >= len(self._files):
                         return
-                    size = self._sizes[self._next_to_read]
-                    # A shard larger than the window may still go alone.
-                    if (
-                        self._inflight_bytes == 0
-                        or self._inflight_bytes + size <= self._window_bytes
-                    ):
-                        break
-                    self._cond.wait()
-                idx = self._next_to_read
-                self._next_to_read += 1
-                self._inflight_bytes += size
+                    idx = self._next_to_read
+                    size = self._sizes[idx]
+                    if self._next_offset == 0:
+                        # An oversized shard is admitted alone; charge each shard once.
+                        if (
+                            self._inflight_bytes
+                            and self._inflight_bytes + size > self._window_bytes
+                        ):
+                            self._cond.wait()
+                            continue
+                        self._inflight_bytes += size
+                    start = self._next_offset
+                    end = min(size, start + self._range_sizes[idx])
+                    self._next_offset = end
+                    if end == size:
+                        self._next_to_read += 1
+                        self._next_offset = 0
+                    break
             try:
-                self._read_file(self._files[idx])
+                self._read_range(self._files[idx], start, end)
             except Exception:
                 logger.warning(
                     f"Failed to prefetch checkpoint shard {self._files[idx]}; "
                     f"the consumer will fall back to demand paging for it.",
                     exc_info=True,
                 )
-            finally:
-                # Unblock the consumer even on failure.
-                self._ready[idx].set()
             with self._cond:
+                self._ranges_remaining[idx] -= 1
+                if self._ranges_remaining[idx]:
+                    continue
+                # Failed ranges also release the consumer to use demand paging.
+                self._ready[idx].set()
                 self._files_read += 1
                 all_read = self._files_read == len(self._files)
             if all_read:
@@ -530,6 +558,14 @@ class CheckpointPrefetcher:
                     "Checkpoint prefetch finished after "
                     f"{time.perf_counter() - self._start_time:.2f}s."
                 )
+
+    def close(self) -> None:
+        """Stop admitting work and wait for active range reads to finish."""
+        with self._cond:
+            self._stopped = True
+            self._cond.notify_all()
+        for thread in self._threads:
+            thread.join()
 
     def wait_file(self, idx: int) -> None:
         """Block until shard ``idx`` has been prefetched."""
@@ -542,12 +578,43 @@ class CheckpointPrefetcher:
             self._cond.notify_all()
 
 
+def _madvise_sequential(tensors: Iterable[torch.Tensor]) -> None:
+    """Keep consumed file-backed storages from acquiring mmap reuse protection."""
+    if sys.platform != "linux":
+        return
+    ranges = []
+    for tensor in tensors:
+        storage = tensor.untyped_storage()
+        size = storage.nbytes()
+        if not size:
+            continue
+        address = storage.data_ptr()
+        start = address // mmap.PAGESIZE * mmap.PAGESIZE
+        end = (address + size + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE
+        ranges.append((start, end))
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    libc = ctypes.CDLL(None, use_errno=True)
+    madvise = libc.madvise
+    madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    madvise.restype = ctypes.c_int
+    for start, end in merged:
+        if madvise(start, end - start, mmap.MADV_SEQUENTIAL):
+            logger.debug(
+                f"Could not advise checkpoint mapping: {os.strerror(ctypes.get_errno())}"
+            )
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     is_all_weights_sharded: bool = False,
     decryption_key: str | None = None,
     prefetch: bool = False,
-    prefetch_num_threads: int = 4,
+    prefetch_num_threads: int = 8,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -577,27 +644,33 @@ def safetensors_weights_iterator(
         )
         prefetcher.start()
 
-    for file_idx, st_file in enumerate(
-        tqdm(
-            hf_weights_files,
-            desc="Loading safetensors checkpoint shards",
-            disable=not enable_tqdm,
-            bar_format=_BAR_FORMAT,
-        )
-    ):
+    try:
+        for file_idx, st_file in enumerate(
+            tqdm(
+                hf_weights_files,
+                desc="Loading safetensors checkpoint shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            )
+        ):
+            if prefetcher is not None:
+                prefetcher.wait_file(file_idx)
+            result = safetensors.torch.load_file(st_file, device="cpu")
+            if prefetcher is not None:
+                _madvise_sequential(result.values())
+            yield from result.items()
+            if prefetcher is not None:
+                prefetcher.advance(file_idx)
+    finally:
         if prefetcher is not None:
-            prefetcher.wait_file(file_idx)
-        result = safetensors.torch.load_file(st_file, device="cpu")
-        yield from result.items()
-        if prefetcher is not None:
-            prefetcher.advance(file_idx)
+            prefetcher.close()
 
 
 def safetensors_filtered_weights_iterator(
     hf_weights_files: list[str],
     accept: Callable[[str], bool],
     prefetch: bool = False,
-    prefetch_num_threads: int = 4,
+    prefetch_num_threads: int = 8,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield accepted tensors one at a time via ``get_tensor``, never load_file.
 
@@ -614,23 +687,27 @@ def safetensors_filtered_weights_iterator(
             num_threads=prefetch_num_threads,
         )
         prefetcher.start()
-    for file_idx, st_file in enumerate(
-        tqdm(
-            hf_weights_files,
-            desc="Loading safetensors checkpoint shards",
-            disable=not enable_tqdm,
-            bar_format=_BAR_FORMAT,
-        )
-    ):
+    try:
+        for file_idx, st_file in enumerate(
+            tqdm(
+                hf_weights_files,
+                desc="Loading safetensors checkpoint shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            )
+        ):
+            if prefetcher is not None:
+                prefetcher.wait_file(file_idx)
+            with safe_open(st_file, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if not accept(key):
+                        continue
+                    yield key, handle.get_tensor(key)
+            if prefetcher is not None:
+                prefetcher.advance(file_idx)
+    finally:
         if prefetcher is not None:
-            prefetcher.wait_file(file_idx)
-        with safe_open(st_file, framework="pt", device="cpu") as handle:
-            for key in handle.keys():
-                if not accept(key):
-                    continue
-                yield key, handle.get_tensor(key)
-        if prefetcher is not None:
-            prefetcher.advance(file_idx)
+            prefetcher.close()
 
 
 _SUB_BYTE_SAFETENSORS_DTYPES = frozenset({"F4", "F6_E2M3", "F6_E3M2"})
