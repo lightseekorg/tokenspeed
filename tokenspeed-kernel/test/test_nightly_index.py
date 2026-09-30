@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).parents[2] / ".github/scripts/update-kernel-nightly-index.py"
+SCRIPT = Path(__file__).parents[2] / ".github/scripts/update-nightly-index.py"
 
 
 def test_nightly_index_preserves_history_and_uses_published_digest(tmp_path) -> None:
@@ -47,15 +47,15 @@ def test_nightly_index_preserves_history_and_uses_published_digest(tmp_path) -> 
             {"name": name, "browser_download_url": url, "digest": f"sha256:{'a' * 64}"}
         ]
     }
-    update_index(wheelhouse, release, wheels.parent)
+    update_index(wheelhouse, release, wheels.parent, "tokenspeed-kernel")
     contents = project.read_text()
     assert contents.startswith(history)
     assert f'{url}#sha256={"a" * 64}' in contents
     assert 'href="tokenspeed-kernel/"' in root.read_text()
     assert 'href="cu130/"' in root.read_text()
-    update_index(wheelhouse, release, wheels.parent)
+    update_index(wheelhouse, release, wheels.parent, "tokenspeed-kernel")
     assert project.read_text() == contents
 
     with pytest.raises(ValueError, match="missing expected nightly wheels"):
-        update_index(wheelhouse, {"assets": []}, wheels.parent)
+        update_index(wheelhouse, {"assets": []}, wheels.parent, "tokenspeed-kernel")
     assert project.read_text() == contents
