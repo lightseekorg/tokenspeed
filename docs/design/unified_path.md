@@ -411,6 +411,16 @@ GEMM arithmetic and can change the retained logits. Only an empty decoder
 view bypasses those projections; its global KV producer still runs on all
 encoder rows.
 
+Compute rows and output rows are distinct. When a batch contains a completing
+prefill or a decode, each incomplete prefill retains its original single
+decoder compute row. Removing that row changes quantized attention and MoE
+batch shapes and can alter other requests' logits even with identical input
+tokens and chunk boundaries. The retained row is omitted from `logits_rows`,
+so it still has no sampled token. Batches containing only incomplete prefills
+keep zero decoder rows and skip the entire decoder consumer stack. This
+preserves the optimization on cache-only rounds without changing the numerical
+shape of rounds that produce outputs.
+
 Final prefill windows, bootstrap tokens and PD candidate/cache handoff remain
 unchanged. V4.1 PD still requires layerwise transfer interval zero. This does
 not enable a cache-only prefill role or reduce resident model weights. PP and
