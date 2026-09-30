@@ -173,6 +173,17 @@ python3 -m tokenspeed_kernel.benchmark.ci \
   --output /tmp/tokenspeed-kernel-result.json
 ```
 
+On AMD, a direct worker run profiles the measured graph replays with Proton and
+adds a per-case diagnostic summary to the result JSON. It reuses launch metadata
+from the final eager warm-up to calculate per-kernel TFLOP/s. Use
+`--profiler none` to disable it. Automated CI explicitly selects no profiler so
+its regression measurements stay as close to production execution as possible.
+Repeated launches with the same runtime kernel name are reported as one combined
+kernel entry because Proton groups them in graph-replay profiles.
+`--case-filter REGEX` selects expanded case IDs with `re.search`; repeat the
+option to match any expression. For example, `--case-filter '_0$'` selects the
+first expanded combination for each parameterized case.
+
 Run a complete base/candidate comparison from the repository root:
 
 ```bash

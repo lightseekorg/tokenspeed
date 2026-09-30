@@ -29,6 +29,30 @@ from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
 )
 
 
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_fp8_query_gather_preserves_bytes(monkeypatch, dtype):
+    from tokenspeed.runtime.layers.attention.dcp import comm
+
+    query = torch.arange(256, dtype=torch.uint8).view(dtype).reshape(2, 8, 16)
+    query = query.transpose(1, 2)
+
+    def gather(payload, group, dim):
+        assert payload.dtype == torch.uint8 and payload.is_contiguous()
+        assert group == (0, 1) and dim == -1
+        return torch.cat((payload, payload), dim=dim)
+
+    monkeypatch.setattr(comm, "all_gather", gather)
+    result = comm.gather_query_heads(query, (0, 1))
+    assert result.dtype == dtype
+    torch.testing.assert_close(
+        result.view(torch.uint8),
+        torch.cat((query.view(torch.uint8), query.view(torch.uint8)), dim=1),
+        rtol=0,
+        atol=0,
+    )
+    assert comm.gather_query_heads(query, (0,)) is query
+
+
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_noncontiguous_pages_and_partial_tail(degree, device):
@@ -674,6 +698,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
 
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = 64
+    backend.kernel_solution = None
     backend.data_type = torch.bfloat16
     backend.kv_lora_rank = 128
     backend.qk_nope_head_dim = 128

@@ -157,7 +157,9 @@ def _mxfp4_quantize_cdna4_scale_kernel(
     out_row_stride,
     scale_stride_kswizzled,
     scale_stride_mblock,
-    M: tl.constexpr,
+    # The token row count follows the batch; runtime so every batch shape
+    # shares one binary.
+    M,
     K_SCALE: tl.constexpr,
     HAS_GATHER: tl.constexpr,
     HAS_PADDED_SCALE_ROWS: tl.constexpr,
@@ -248,7 +250,9 @@ def _mxfp4_quantize_cdna4_scale_tiled_kernel(
     out_row_stride,
     scale_stride_kswizzled,
     scale_stride_mblock,
-    M: tl.constexpr,
+    # The token row count follows the batch; runtime so every batch shape
+    # shares one binary.
+    M,
     K_SCALE: tl.constexpr,
     HAS_GATHER: tl.constexpr,
     HAS_PADDED_SCALE_ROWS: tl.constexpr,

@@ -67,6 +67,7 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_ops import (
+    COMM_ONESHOT_MAX_BYTES,
     acquire_all_reduce_outputs,
     all_reduce,
     can_acquire_all_reduce_outputs,
@@ -722,6 +723,50 @@ def _tail_finalize_top_k(
     return None
 
 
+# One buffer per (rows, width, dtype, device). A captured graph holds the
+# pointer, so a later token count must not replace an earlier buffer.
+_PACKED_MOE_JOIN_LANES: dict[tuple, torch.Tensor] = {}
+# Matches the CDNA5 dense WMMA row ceiling. Past this the shared down
+# projection cannot store a row-strided destination.
+_PACKED_MOE_JOIN_MAX_ROWS = 32
+
+
+def _packed_moe_join_lane(
+    like: torch.Tensor,
+    width: int,
+    *,
+    enabled: bool,
+) -> torch.Tensor | None:
+    """Persistent packed join buffer for CDNA5 decode with more than one token.
+
+    Batch 1 stays on ``allreduce_fusion_lane``. Both partials then land in one
+    ``[rows, routed + hidden]`` tensor and the join does not launch a copy.
+    gfx950's shared down projection cannot store a row-strided destination,
+    so this lane stays off there and the cat remains.
+    """
+
+    rows = int(like.shape[0]) if like.ndim == 2 else 0
+    if (
+        not enabled
+        or rows <= 1
+        or rows > _PACKED_MOE_JOIN_MAX_ROWS
+        or width <= 0
+        or not current_platform().is_cdna5
+    ):
+        return None
+    if rows * width * like.element_size() > COMM_ONESHOT_MAX_BYTES:
+        return None
+    key = (rows, width, like.dtype, like.device)
+    lane = _PACKED_MOE_JOIN_LANES.get(key)
+    if lane is not None:
+        return lane
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    lane = like.new_zeros((rows, width))
+    _PACKED_MOE_JOIN_LANES[key] = lane
+    return lane
+
+
 def _acquire_symm_join_outputs(
     *, mapping, routed_hidden: int, hidden_size: int, like, enabled: bool
 ):
@@ -910,6 +955,15 @@ class K3MoeTailComm:
                 enabled=lane_enabled,
             )
         )
+        # Batch 1 already has the one-row fusion lane. CDNA5 decode past that
+        # still cats the two partials on every MoE layer; both producers can
+        # store into one row-strided buffer, so keep a lane per token count.
+        if lane is None and symm_outputs is None:
+            lane = _packed_moe_join_lane(
+                hidden_states,
+                self.routed_hidden + self.hidden_size,
+                enabled=lane_enabled,
+            )
         return TailPlan(
             tier=tier,
             lane=lane,

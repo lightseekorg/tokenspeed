@@ -27,6 +27,10 @@ _INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
 _LN2_VALUE = 0.6931471805599453
 _LN2 = tl.constexpr(_LN2_VALUE)
 
+# Upper bound of select_kv_splits. Reduce kernels take the split count at
+# runtime and must handle any value up to this bound.
+MAX_KV_SPLITS = 32
+
 
 def select_kv_splits(*, base_ctas: int, num_pages: int, sm_count: int) -> int:
     """Pick num_kv_splits to balance occupancy against reduce overhead.
@@ -44,7 +48,7 @@ def select_kv_splits(*, base_ctas: int, num_pages: int, sm_count: int) -> int:
     wave_target = 2
     min_pages_per_split = 2
     min_page_splits = 8
-    max_page_splits = 32
+    max_page_splits = MAX_KV_SPLITS
 
     target_ctas = sm_count * wave_target
     splits_for_occupancy = (target_ctas + base_ctas - 1) // base_ctas

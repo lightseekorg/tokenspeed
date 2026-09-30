@@ -10,7 +10,8 @@ runner:
     - amd-mi355-1gpu-bench
 env:
   CI: "true"
-  CUDA_VISIBLE_DEVICES: "0"
+  ROCR_VISIBLE_DEVICES: "0"
+  TOKENSPEED_KERNEL_BENCHMARK_PROFILER: "none"
 install:
   - bash test/ci_system/install_kernel_benchmark_rocm.sh
 perf:

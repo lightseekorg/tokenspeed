@@ -61,7 +61,9 @@ def _fwd_kernel(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
-    page_table_stride_b: tl.constexpr,
+    # Page-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    page_table_stride_b,
     PAGE_SIZE: tl.constexpr,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,

@@ -37,11 +37,13 @@ if TYPE_CHECKING:
     import torch
 
     from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 __all__ = [
     "get_drafter_impl",
     "register_drafter",
     "registered_drafter_algorithms",
+    "require_plugin_draft_checkpoint",
     "validate_drafter_algorithm",
 ]
 
@@ -79,11 +81,11 @@ def register_drafter(
         model_cls: When given, the entry applies only to draft models that
             are instances of this class; scoped entries win over the
             algorithm default, most recently registered first.
-        defaults_to_base_checkpoint: Whether launches of this algorithm
-            without ``--speculative-draft-model-path`` should read the draft
-            weights from the base checkpoint. Recorded for introspection;
-            server-args resolution runs before plugins load, so launches of a
-            plugin algorithm still pass ``--draft-model-path-use-base``.
+        defaults_to_base_checkpoint: Whether this algorithm's draft weights
+            live in the base checkpoint. Server-args resolution runs before
+            plugins load, so launches still pass ``--draft-model-path-use-base``;
+            one that omits every draft path is refused with that instruction
+            (``require_plugin_draft_checkpoint``).
         override: Allow replacing an existing default entry (in-tree or
             plugin). Overrides are logged by the plugin loader.
 
@@ -160,6 +162,39 @@ def validate_drafter_algorithm(name: str | None) -> None:
         raise ValueError(
             f"unknown --speculative-algorithm {name!r}; available: " f"{sorted(known)}"
         )
+
+
+def require_plugin_draft_checkpoint(server_args: ServerArgs) -> None:
+    """Refuse a plugin speculative launch that names no draft checkpoint.
+
+    Server-args resolution defaults the draft path for the in-tree algorithms
+    that read the base checkpoint, but it runs before plugins load, so a
+    plugin algorithm registered with ``defaults_to_base_checkpoint`` cannot
+    be defaulted there. Without a path the launch would build no draft model
+    and fail deep in the executor; say what to pass instead.
+
+    Args:
+        server_args: The launch's resolved server arguments.
+
+    Raises:
+        ValueError: A plugin algorithm launched without a draft checkpoint.
+    """
+    name = server_args.speculative_algorithm
+    entries = _PLUGIN_DRAFTERS.get(name) if name is not None else None
+    if entries is None or name in _IN_TREE_ALGORITHMS:
+        return
+    if server_args.speculative_draft_model_path is not None:
+        return
+    if entries.defaults_to_base_checkpoint:
+        raise ValueError(
+            f"--speculative-algorithm {name} reads its draft from the base "
+            "checkpoint; pass --draft-model-path-use-base (server arguments "
+            "resolve before plugins load, so the registration cannot default it)"
+        )
+    raise ValueError(
+        f"--speculative-algorithm {name} needs a draft checkpoint: pass "
+        "--speculative-draft-model-path or --draft-model-path-use-base"
+    )
 
 
 def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter]:

@@ -152,21 +152,30 @@ decode, including the KDA QKVFAB shape.
   inner stride and a row stride of at least `N`.
 - KDA QKVFAB is the fixed shape `M` in `{1, 2, 4, 8, 16, 32}`, `K = 7168`,
   `N = 6288`.
-- Callers must supply `split_k`; `None` selects the largest of 8, 4, or 2 that divides the K
-  tiles, leaves each split at least eight K tiles and one full TDM pipeline,
-  and keeps `N`-tile count times the split within 256 CUs.
-  Otherwise the launch is direct. An explicit `split_k` must be one of
-  1, 2, 4, or 8 and divide the K tiles. A split greater than 1 must also leave each split
-  at least one full TDM pipeline.
+- Callers must supply `split_k`; `None` selects the largest of 8, 4, or 2
+  that divides the K tiles, leaves each split at least eight K tiles and one
+  full TDM pipeline, and keeps `N`-tile count times the split within 256 CUs.
+  Otherwise the launch is direct. An explicit `split_k` must be one of 1, 2,
+  4, or 8 and divide the K tiles. A split greater than 1 must also leave each
+  split at least one full TDM pipeline.
+
+The K3 shared-down facade preserves a caller-owned row-strided output. Its
+`auto` selector uses this kernel only for eligible GPU BF16 contiguous inputs;
+otherwise Torch writes the same destination. Forced `torch` never dispatches
+WMMA. Selectors requiring contiguous output reject a row-strided destination,
+and unknown selectors always raise.
 
 #### Algorithm
 
-M is consumed in 16-row chunks, and each chunk re-reads B. `N` divisible by
-64 uses a four-warp `16 x 64` tile; other accepted `N` uses one warp and a
-`16 x 16` tile. The dense path triple-buffers TDM loads. KDA QKVFAB uses
-seven buffers. Once the K tiles fill that pipeline, the tail lowers the TDM
-wait before each remaining LDS read. Short K dimensions prefetch only
-valid tiles and drain each remaining pair before reading it.
+M is consumed in 16-row chunks, and each chunk re-reads B. General dense
+projections use a two-warp `16 x 32` tile when `N` is divisible by 32 and has
+at least 192 such tiles; other accepted `N` uses one warp and a `16 x 16`
+tile. They use 256-wide K tiles when K is divisible by 256, falling back to
+128-wide tiles otherwise, and request six TDM buffers. KDA QKVFAB keeps its
+one-warp `16 x 16 x 128` tile and seven buffers. The buffer count is clamped
+to the K tiles available per split. Once the K tiles fill that pipeline, the
+tail lowers the TDM wait before each remaining LDS read. Short K dimensions
+prefetch only valid tiles and drain each remaining pair before reading it.
 
 Both paths accumulate in FP32 and round to BF16 once. Direct launches store
 that conversion from the producer. Split-K launches write one FP32 partial
@@ -270,17 +279,47 @@ and estimated tensor traffic without reading device-resident sequence lengths.
 The `tokenspeed-kernel` adapter owns query preparation, validation, and sorted
 row/block selection. Gluon accepts one local or replicated shard with 1..32
 heads and the 68-byte MXFP4 index format; sharded heads, wider head counts, and
-132-byte FP8 index rows use portable Triton. Full selection scores the configured
-page-table capacity without reading device lengths on the host. Its query tile
-shrinks with history width to keep FP32 logits within 32 MiB (at most 256
-queries at 32K rows, 64 at 128K, and 8 at 1M). Reindex scores at most the
-candidate-list capacity. Score CTAs honor the caller's row-chunk bound up to the
-256-row tuned maximum; masked 32-row hardware tiles cover smaller bounds. Arena
-page strides are preserved without copying the full cache; a non-unit stride
-between page bytes is normalized to contiguous storage before scoring. Missing
-or out-of-range cache pages never contribute rows or blocks, including the
-newest visible block. A valid newest block remains eligible regardless of its
-score.
+132-byte FP8 index rows use portable Triton. Full selection scores the
+configured page-table capacity without reading device lengths on the host.
+Its query tile shrinks with history width to keep FP32 logits within 32 MiB
+(at most 256 queries at 32K rows, 64 at 128K, and 8 at 1M). Reindex scores
+at most the candidate-list capacity. Score CTAs honor the caller's row-chunk
+bound up to the 256-row tuned maximum; masked 32-row hardware tiles cover
+smaller bounds. Arena page strides are preserved without copying the full
+cache; a non-unit stride between page bytes is normalized to contiguous
+storage before scoring. Missing or out-of-range cache pages never contribute
+rows or blocks, including the newest visible block. A valid newest block
+remains eligible regardless of its score.
+
+### gfx1250 MLA decode
+
+`gluon_mla_decode_gfx1250` computes absorbed MLA decode over a paged cache,
+one query token per sequence. The projected-value variant fuses the value
+projection and optional sigmoid gate into its split merge.
+
+#### Contract
+
+- Queries are `(batch, 1, heads, 576)` (512 latent plus 64 RoPE dimensions)
+  and the cache is a contiguous `(pages, 64, 1, 576)` of the same dtype: FP16,
+  BF16, FP8 E4M3, or FP8 E5M2. The page table and cache lengths are Int32.
+  `logit_cap` is unsupported, and the projected-value variant is FP8 only.
+- The output is BF16 `(batch, 1, heads, 512)`, with an optional log-sum-exp
+  in natural-log units. The projected-value variant writes BF16
+  `(batch, heads * 128)` instead.
+
+#### Algorithm
+
+Each workgroup of two warps owns one sequence, a block of up to 16 query
+heads, and one split of the keys, and walks one 64-key page per tile. TDM
+loads the latent and RoPE parts of each page into LDS as two loads. The
+splits write FP32 partials that a second kernel merges.
+
+16-bit inputs load each tile into one LDS slot and wait for it before the
+math. FP8 inputs use two slots and two waves per SIMD: the next tile's page
+index and its two TDM loads go out before the current tile's math, and each
+split issues its first tile before loading the queries. The loop is unrolled
+by two so each slot index is a compile-time constant; waiting until two loads
+remain then leaves the other slot's loads in flight.
 
 ### gfx950 MLA prefill
 
@@ -341,6 +380,37 @@ FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
 asm statements keep LLVM from moving each cluster's results across cluster
 barriers.
 
+### gfx1250 MLA prefill
+
+`gluon_mla_prefill_gfx1250` computes the same dense, non-absorbed attention
+as the gfx950 kernels, with WMMA and TDM.
+
+#### Contract
+
+- Queries, keys, values, dtypes, `cu_seqlens_q`, `cu_seqlens_kv`, causal
+  alignment, and the unsupported `logit_cap` are the gfx950 entry's.
+- The output is BF16 unless the caller passes a buffer, which may be any
+  floating dtype with a contiguous last dimension. The optional log-sum-exp
+  is FP32 in natural-log units.
+- The grid is one workgroup per sequence, head, and 128-row query block.
+  `max_seqlen_kv` and `seq_lens_kv` are ignored.
+
+#### Algorithm
+
+Four warps own 32 rows each of a 128-row query block and walk 64-key tiles
+with base-2 online softmax. TDM streams the NoPE and RoPE halves of K and all
+of V into double-buffered LDS, one tile ahead. Tiles below the first query
+row's causal limit skip masking.
+
+16-bit inputs keep Q in registers and run one wave per SIMD. Tiles at or past
+the causal limit mask the scores and zero the value rows past the key tail.
+
+FP8 inputs stage Q in LDS, split the NoPE QK into two 64-wide WMMAs, and run
+three waves per SIMD. Fully visible tiles run in their own loop without mask
+code, and the boundary tiles mask keys only, since rows past `q_len` are
+never stored. V is not masked: TDM zero-fills tile rows past `kv_len`, and
+those keys score `-inf`.
+
 ## Sampling
 
 ### Argmax
@@ -389,10 +459,10 @@ and batch size to limit shared-memory usage.
 ### gfx950 latent input projection
 
 The Kimi K3 prefill path projects one packed BF16 input weight into router,
-routed-latent, and shared-expert inputs. Automatic selection uses the small-batch
-Gluon kernel through 320 tokens, a mid-range Gluon tile for 321--1280, and the
-large-M Gluon tile from 1281 tokens. The portable packed Triton kernel remains
-available for other shapes and devices.
+routed-latent, and shared-expert inputs. Automatic selection uses the
+small-batch Gluon kernel through 320 tokens, a mid-range Gluon tile for
+321--1280, and the large-M Gluon tile from 1281 tokens. The portable packed
+Triton kernel remains available for other shapes and devices.
 
 #### Contract
 
@@ -463,6 +533,26 @@ up halves sit 768 columns apart, so no tile holds both.
 
 Partial row tiles are masked in both kernels, so any token count is accepted.
 
+### MXFP4 Sorted Experts
+
+The gfx950 block-sorted path uses native scaled matrix instructions for MXFP4
+activations and weights. Stage 1 fuses the gated activation and intermediate
+quantization; stage 2 applies route weights and combines expert outputs.
+Expert tiles support 16, 32, 64 and 128 rows. Sparse route counts select smaller
+tiles to limit per-expert padding, while dense routes retain larger tiles to
+amortize weight loads. This does not change activation precision or routing.
+
+Scale storage keeps its 32-row CDNA4 layout even for 16-row expert tiles.
+Each such tile reads and writes its own half of the scale panel; expert
+boundaries need not coincide with panel boundaries.
+
+For TP E2M1 inputs through 2048 tokens, stage 2 combines routed outputs directly
+with BF16 atomics. Two adjacent columns per lane match packed atomic stores;
+column-first workgroup order distributes concurrent updates across the output.
+This avoids the per-route partials buffer and FP32 reduction kernel, at the cost
+of order-dependent BF16 rounding. The destination is cleared on each call and
+graph replay. Larger token counts retain the FP32 reduction path.
+
 ### MXFP8 SiTU Experts
 
 On gfx950, the MoE API selects Gluon kernels with MXFP8 activations and MXFP4
@@ -492,9 +582,10 @@ Starting from BF16 activations and precomputed top-k expert IDs and weights:
    weights, and atomically adds BF16 results into each token's output row.
 
 Batches of up to 1024 tokens use 32-row expert tiles to reduce padding;
-larger batches use 128-row tiles. With 32-row tiles, quantization and sorted-scale
-production share a launch. Small route sets use a two-launch sorter; larger
-route sets use four phases. Blocks beyond the valid routed prefix skip work.
+larger batches use 128-row tiles. With 32-row tiles, quantization and
+sorted-scale production share a launch. Small route sets use a two-launch
+sorter; larger route sets use four phases. Blocks beyond the valid routed
+prefix skip work.
 
 Both GEMMs overlap loads with matrix computation using double-buffered shared
 memory. Phased operand loading and scheduling barriers limit live registers;

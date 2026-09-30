@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from typing import Any
 from unittest.mock import patch
 
@@ -72,21 +72,49 @@ def is_cdna5() -> bool:
 
 
 @contextmanager
-def assert_no_triton_compile(kernel: Any) -> Iterator[None]:
-    """Fail if the Triton ``kernel`` compiles a new specialization in the block.
+def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
+    """Fail if any Triton kernel compiles a new specialization in the block.
 
     Every ``tl.constexpr`` value is part of the compile-cache key, so a
     per-batch quantity passed as a constexpr recompiles the kernel on every new
-    shape. Warm the kernel before entering, covering each integer
+    shape. Warm the kernels before entering, covering each integer
     specialization class Triton still keys on for runtime scalars (divisible by
-    16 or not), then launch it with shapes that vary the way serving does.
+    16 or not), then launch them with shapes that vary the way serving does.
     """
-    with patch.object(kernel, "_do_compile", wraps=kernel._do_compile) as compiles:
+    with ExitStack() as stack:
+        compiles = [
+            stack.enter_context(
+                patch.object(kernel, "_do_compile", wraps=kernel._do_compile)
+            )
+            for kernel in kernels
+        ]
         yield
-    assert compiles.call_count == 0, (
-        f"{kernel.fn.__name__} compiled {compiles.call_count} new "
-        f"specialization(s); a per-batch value is likely passed as tl.constexpr"
-    )
+    for kernel, compile_calls in zip(kernels, compiles, strict=True):
+        assert compile_calls.call_count == 0, (
+            f"{kernel.fn.__name__} compiled {compile_calls.call_count} new "
+            "specialization(s); a per-batch value is likely passed as tl.constexpr"
+        )
+
+
+def int_specialization_class(value: int) -> str:
+    """The class Triton specializes a runtime integer on."""
+    return "one" if value == 1 else "div16" if value % 16 == 0 else "other"
+
+
+def warm_specialization_classes(run, key, sweep, pool) -> None:
+    """Run one pool value per specialization key the sweep will hit.
+
+    ``key`` maps a value to everything that selects a binary (integer classes,
+    power-of-two buckets, launch configs). Which keys a sweep reaches can
+    depend on the device, e.g. split counts follow the SM count; warming from
+    a pool keeps the guard meaningful everywhere. A key no pool value reaches
+    is warmed with its sweep value.
+    """
+    needed = {key(value) for value in sweep}
+    for value in [*(v for v in pool if v not in sweep), *sweep]:
+        if key(value) in needed:
+            needed.discard(key(value))
+            run(value)
 
 
 def make_mxfp4_moe_weights(
