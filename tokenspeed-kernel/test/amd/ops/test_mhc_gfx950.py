@@ -24,7 +24,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
-from utils import is_cdna4
+from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required for the mHC test", allow_module_level=True)
@@ -176,9 +176,7 @@ def test_gluon_mhc_large_prefill_matches_reference(
     num_tokens: int, hidden_size: int
 ) -> None:
     args = _prefill_args(num_tokens, hidden_size)
-    actual = tokenspeed_kernel.mhc_pre(
-        *args, override="gluon_mhc_prefill_gfx950", norm_weight=None, norm_eps=None
-    )
+    actual = tokenspeed_kernel.mhc_pre(*args, norm_weight=None, norm_eps=None)
     expected = _reference(*args)
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         torch.testing.assert_close(
@@ -186,17 +184,71 @@ def test_gluon_mhc_large_prefill_matches_reference(
         )
 
 
+@pytest.mark.parametrize(("hidden_size", "n_splits"), [(4096, 4), (7168, 1)])
+def test_gluon_mhc_prefill_projection_split_counts(
+    hidden_size: int, n_splits: int
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950 import mhc
+
+    residual, fn, *_ = _prefill_args(65, hidden_size)
+    projection = torch.empty(n_splits, 65, 24, device="cuda", dtype=torch.float32)
+    square_sum = torch.empty(n_splits, 65, device="cuda", dtype=torch.float32)
+    mhc.launch_gluon_mhc_prefill_project_gfx950(
+        residual,
+        fn,
+        projection,
+        square_sum,
+        n_splits=n_splits,
+        block_m=64,
+        block_k=256,
+    )
+
+    flat = residual.float().view(65, 4 * hidden_size)
+    split_k = 4 * hidden_size // n_splits
+    for split in range(n_splits):
+        part = flat[:, split * split_k : (split + 1) * split_k]
+        weight = fn[:, split * split_k : (split + 1) * split_k]
+        torch.testing.assert_close(
+            projection[split], F.linear(part, weight), rtol=2e-3, atol=2e-3
+        )
+        torch.testing.assert_close(
+            square_sum[split], part.square().sum(dim=-1), rtol=1e-4, atol=1e-3
+        )
+
+
+def test_gluon_mhc_prefill_token_count_does_not_recompile() -> None:
+    from tokenspeed_kernel_amd.ops.gfx950 import mhc
+
+    residual, fn, *_ = _prefill_args(320, 4096)
+
+    def launch(num_tokens: int) -> None:
+        projection = torch.empty(8, num_tokens, 24, device="cuda", dtype=torch.float32)
+        square_sum = torch.empty(8, num_tokens, device="cuda", dtype=torch.float32)
+        mhc.launch_gluon_mhc_prefill_project_gfx950(
+            residual[:num_tokens],
+            fn,
+            projection,
+            square_sum,
+            n_splits=8,
+            block_m=32,
+            block_k=256,
+        )
+
+    launch(257)
+    launch(272)
+    with assert_no_triton_compile(mhc.gluon_mhc_prefill_project_gfx950):
+        for num_tokens in (258, 288, 320):
+            launch(num_tokens)
+
+
 def test_gluon_mhc_large_prefill_graph_replays_changed_input() -> None:
     args = _prefill_args(257, 4096)
     residual = args[0]
-    tokenspeed_kernel.mhc_pre(
-        *args, override="gluon_mhc_prefill_gfx950", norm_weight=None, norm_eps=None
-    )
+    tokenspeed_kernel.mhc_pre(*args, norm_weight=None, norm_eps=None)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         graph_output = tokenspeed_kernel.mhc_pre(
             *args,
-            override="gluon_mhc_prefill_gfx950",
             norm_weight=None,
             norm_eps=None,
         )
