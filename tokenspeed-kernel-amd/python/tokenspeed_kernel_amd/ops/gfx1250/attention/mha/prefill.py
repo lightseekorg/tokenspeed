@@ -920,6 +920,19 @@ def _select_reverse_q_blocks(
     return window_left < 0 and workgroups >= _GFX1250_NUM_CUS and max_seqlen > block_m
 
 
+def _has_full_query_tiles(
+    *,
+    seqlens: list[int],
+    max_seqlen: int,
+    block_m: int,
+) -> bool:
+    return (
+        max_seqlen % block_m == 0
+        and bool(seqlens)
+        and all(seqlen == max_seqlen for seqlen in seqlens)
+    )
+
+
 def _select_deep_pipeline(
     *,
     dtype: torch.dtype,
@@ -927,12 +940,32 @@ def _select_deep_pipeline(
     block_m: int,
     block_n: int,
     num_warps: int,
+    num_buffers: int,
     window_left: int,
     workgroups: int,
     min_positive_seqlen: int,
+    seqlens: list[int],
+    max_seqlen: int,
 ) -> bool:
-    """Compiler-gated specialization; disabled by default."""
-    return False
+    """Select the measured deep schedule for complete causal query tiles."""
+    return (
+        dtype in (torch.bfloat16, torch.float16)
+        and head_dim in (64, 128)
+        # D64 at S1024 is neutral; D128 or longer D64 amortizes the schedule.
+        and (head_dim == 128 or max_seqlen >= 2048)
+        and block_m == 256
+        and block_n == 64
+        and num_warps == 8
+        and num_buffers == 2
+        and window_left < 0
+        and workgroups >= _GFX1250_NUM_CUS
+        and min_positive_seqlen > 2 * block_n
+        and _has_full_query_tiles(
+            seqlens=seqlens,
+            max_seqlen=max_seqlen,
+            block_m=block_m,
+        )
+    )
 
 
 def _select_full_query_tiles(
@@ -943,11 +976,10 @@ def _select_full_query_tiles(
     block_m: int,
 ) -> bool:
     """Specialize deep attention when every query tile is fully populated."""
-    return (
-        deep_pipeline
-        and max_seqlen % block_m == 0
-        and bool(seqlens)
-        and all(seqlen == max_seqlen for seqlen in seqlens)
+    return deep_pipeline and _has_full_query_tiles(
+        seqlens=seqlens,
+        max_seqlen=max_seqlen,
+        block_m=block_m,
     )
 
 
@@ -1109,9 +1141,12 @@ def launch_gluon_mha_prefill_gfx1250(
         block_m=config.block_m,
         block_n=config.block_n,
         num_warps=config.num_warps,
+        num_buffers=config.num_buffers,
         window_left=config.window_left,
         workgroups=live_workgroups,
         min_positive_seqlen=min_positive_seqlen,
+        seqlens=seqlens,
+        max_seqlen=config.max_seqlen,
     )
     full_query_tiles = _select_full_query_tiles(
         deep_pipeline=deep_pipeline,
