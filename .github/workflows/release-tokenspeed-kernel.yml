@@ -210,13 +210,22 @@ jobs:
           ARG MANYLINUX_ARCH=x86_64
           FROM quay.io/pypa/manylinux_2_28_${MANYLINUX_ARCH}
 
+          ARG MANYLINUX_ARCH
           ARG CUDA_PKG_VERSION=13-0
           ARG CUDA_REPO_ARCH=x86_64
 
-          RUN curl -o /etc/yum.repos.d/cuda-rhel8.repo \
-                  https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${CUDA_REPO_ARCH}/cuda-rhel8.repo \
+          # CUDA 13 uses a self-contained repository to avoid network metadata drift.
+          RUN if [ "$CUDA_PKG_VERSION" = "13-0" ]; then \
+                  curl -fSL --retry 3 -o /tmp/cuda-local.rpm \
+                      https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda-repo-rhel8-13-0-local-13.0.2_580.95.05-1.${MANYLINUX_ARCH}.rpm \
+                  && rpm -i /tmp/cuda-local.rpm; \
+              else \
+                  curl -o /etc/yum.repos.d/cuda-rhel8.repo \
+                      https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${CUDA_REPO_ARCH}/cuda-rhel8.repo; \
+              fi \
               && yum install -y \
                   cuda-nvcc-${CUDA_PKG_VERSION} \
+                  cuda-cuobjdump-${CUDA_PKG_VERSION} \
                   cuda-cccl-${CUDA_PKG_VERSION} \
                   cuda-cudart-devel-${CUDA_PKG_VERSION} \
                   cuda-driver-devel-${CUDA_PKG_VERSION} \
@@ -227,6 +236,10 @@ jobs:
                   gcc-toolset-13-gcc \
                   gcc-toolset-13-gcc-c++ \
                   ninja-build \
+              && if [ "$CUDA_PKG_VERSION" = "13-0" ]; then \
+                  rpm -e "$(rpm -qp --qf '%{NAME}' /tmp/cuda-local.rpm)" \
+                  && rm -f /tmp/cuda-local.rpm; \
+              fi \
               && yum clean all \
               && rm -rf /var/cache/yum \
               && ln -s /usr/bin/ninja-build /usr/local/bin/ninja
