@@ -74,3 +74,34 @@ def test_nightly_index_preserves_history_and_uses_published_digest(
             wheelhouse, {"assets": []}, wheels.parent, "tokenspeed-kernel", variant
         )
     assert project.read_text() == contents
+
+
+def test_explicit_replacement_refreshes_hash_and_download_url(tmp_path) -> None:
+    update_index = runpy.run_path(str(SCRIPT))["update_index"]
+    wheelhouse = tmp_path / "wheelhouse"
+    wheels = tmp_path / "dist" / "tokenspeed-kernel-wheel-cu130-x64-py3.12"
+    wheels.mkdir(parents=True)
+    name = "tokenspeed_kernel-0.1.3.post20260930-cp312-cp312-manylinux_2_28_x86_64.whl"
+    (wheels / name).write_bytes(b"corrected wheel")
+    url = f"https://github.com/lightseekorg/whl/releases/download/nightly/{name}"
+    release = {
+        "assets": [
+            {"name": name, "browser_download_url": url, "digest": f"sha256:{'a' * 64}"}
+        ]
+    }
+    update_index(wheelhouse, release, wheels.parent, "tokenspeed-kernel", "cu130")
+    index = wheelhouse / "nightly/tokenspeed-kernel/index.html"
+    original = index.read_text()
+    release["assets"][0]["digest"] = f"sha256:{'b' * 64}"
+    with pytest.raises(ValueError, match="replacement required"):
+        update_index(wheelhouse, release, wheels.parent, "tokenspeed-kernel", "cu130")
+    assert index.read_text() == original
+    update_index(
+        wheelhouse, release, wheels.parent, "tokenspeed-kernel", "cu130", replace=True
+    )
+    updated = index.read_text()
+    assert f'?sha256={"b" * 64}#sha256={"b" * 64}' in updated
+    assert f'#sha256={"a" * 64}' not in updated
+    assert updated.count(f">{name}</a>") == 1
+    update_index(wheelhouse, release, wheels.parent, "tokenspeed-kernel", "cu130")
+    assert index.read_text() == updated
