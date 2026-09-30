@@ -72,12 +72,14 @@ def _mapping_stub(world: int):
             # tokenspeed groups are tuples of global ranks, not ProcessGroups.
             tp_ep_group=tuple(range(world)),
             tp_ep_size=world,
+            has_tp_ep=world > 1,
         )
     )
 
 
 def _build_comm(device: torch.device):
     """Build the separate-reduce tail with real norm and projection modules."""
+    from tokenspeed.runtime.distributed.comm_backend import get_global_backend
     from tokenspeed.runtime.layers.layernorm import RMSNorm
     from tokenspeed.runtime.layers.moe.latent import Kimi3LatentProjection
     from tokenspeed.runtime.models.kimi_k3_comm import K3MoeTailComm
@@ -109,6 +111,12 @@ def _build_comm(device: torch.device):
     comm.mapping = _mapping_stub(world)
     comm.use_allreduce_fusion = False
     comm.prepare(8193)
+    assert get_global_backend().trtllm_ar.configure_group(
+        dist.get_rank(),
+        comm.mapping.moe.tp_ep_group,
+        max_token_num=8193,
+        hidden_dim=H + L,
+    ), "Ordinary all-reduce must be armed before testing the stage-2 crossover"
     return comm, up_weight
 
 
@@ -163,7 +171,7 @@ collective = pytest.mark.skipif(
 
 
 @collective
-@pytest.mark.parametrize("m", [1, 5, 6, 32, 33, 255, 256, 8193])
+@pytest.mark.parametrize("m", [1, 5, 6, 32, 33, 256, 512, 1024, 1025, 8193])
 def test_stage2_matches_reference_in_eager_and_graph(m):
     rank, dev = _setup()
     comm, up_weight = _build_comm(dev)

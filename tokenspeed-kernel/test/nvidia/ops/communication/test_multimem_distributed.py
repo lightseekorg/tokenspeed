@@ -38,7 +38,7 @@ import torch
 import torch.distributed as dist
 
 LATENT, HIDDEN = 3584, 7168
-# Covers K3's Multimem threshold (256), staging granularity (2048),
+# Covers K3's Multimem threshold (1024), staging granularity (2048),
 # and larger payloads through 8192 tokens.
 M_VALUES = [17, 255, 256, 1024, 2047, 2048, 4096, 8192]
 

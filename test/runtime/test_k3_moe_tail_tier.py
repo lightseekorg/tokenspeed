@@ -65,11 +65,23 @@ def test_prepared_capacity_covers_tokens_above_8192(monkeypatch):
     reduce.assert_called_once()
 
 
-@pytest.mark.parametrize("tp,ep", [(4, 1), (8, 1), (16, 1), (1, 4), (1, 8), (1, 16)])
-def test_workspace_uses_serving_capacity_once(monkeypatch, tp, ep):
+@pytest.mark.parametrize(
+    "tp,ep,capacity",
+    [
+        (4, 1, 32768),
+        (8, 1, 32768),
+        (16, 1, 32768),
+        (1, 4, 32768),
+        (1, 8, 32768),
+        (1, 16, 32768),
+        (8, 1, 1024),
+        (8, 1, 1025),
+    ],
+)
+def test_workspace_uses_serving_capacity_once(monkeypatch, tp, ep, capacity):
     group_size = tp * ep
     group = SimpleNamespace(group_name=f"moe_tp{tp}_ep{ep}")
-    workspace = SimpleNamespace(max_num_tokens=32768)
+    workspace = SimpleNamespace(max_num_tokens=capacity)
     create = Mock(return_value=workspace)
     small = Mock()
     prealloc = Mock(return_value=True)
@@ -102,17 +114,21 @@ def test_workspace_uses_serving_capacity_once(monkeypatch, tp, ep):
         )
         for _ in range(2)
     ]
-    assert comms[0].prepare(32768)
+    assert comms[0].prepare(capacity)
     assert comms[1]._routed_workspace is workspace
-    assert comms[1].prepare(32768)
-    assert comms[1].prepare(8192)
+    assert comms[1].prepare(capacity)
+    assert comms[1].prepare(min(8192, capacity))
     create.assert_called_once_with(
-        group=group, hidden_size=3584, top_k=16, max_num_tokens=32768, rms_eps=1e-5
+        group=group, hidden_size=3584, top_k=16, max_num_tokens=capacity, rms_eps=1e-5
     )
     small.assert_called_once_with(group=group, hidden_size=7168, latent_size=3584)
-    prealloc.assert_called_once_with(32768, (7168,), group.group_name)
+    if capacity > 1024:
+        prealloc.assert_called_once_with(capacity, (7168,), group.group_name)
+    else:
+        prealloc.assert_not_called()
+        assert comms[0]._multimem_group_name is None
     with pytest.raises(RuntimeError, match="grow"):
-        comms[1].prepare(32769)
+        comms[1].prepare(capacity + 1)
 
 
 def test_model_prepares_routed_workspace_at_serving_limit(monkeypatch):
@@ -205,7 +221,10 @@ def test_routed_implementations_use_same_second_stage(monkeypatch, enabled, defe
     torch.testing.assert_close(result, reduced, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("m,use_multimem", [(255, False), (256, True), (8193, True)])
+@pytest.mark.parametrize(
+    "m,use_multimem",
+    [(256, False), (512, False), (1024, False), (1025, True), (8193, True)],
+)
 def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem):
     comm = _comm(enabled=False, capacity=16384, deferred=False)
     comm.hidden_size = 16

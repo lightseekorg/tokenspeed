@@ -66,6 +66,7 @@ logger = logging.getLogger(__name__)
 
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
+_MULTIMEM_AR_MIN_TOKENS = 1024
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
 ATTN_AR_MAX_TOKENS = 8
@@ -480,7 +481,7 @@ class K3MoeTailComm:
         K3MoeTailComm._latent_tail = KimiK3LatentTailOp(
             group=group, hidden_size=self.hidden_size, latent_size=self.routed_hidden
         )
-        if max_num_tokens >= 256:
+        if max_num_tokens > _MULTIMEM_AR_MIN_TOKENS:
             if not multimem_prealloc(
                 max_num_tokens, (self.hidden_size,), group.group_name
             ):
@@ -586,8 +587,8 @@ class K3MoeTailComm:
             prefix_sum: Replicated BF16 [M,H] attention residual.
 
         Returns:
-            BF16 [M,H] combined output on every rank. M33..255 uses ordinary
-            AR; M>=256 uses Multimem AR.
+            BF16 [M,H] combined output on every rank. M33..1024 uses ordinary
+            AR; M>1024 uses Multimem AR.
         """
         num_tokens = routed_latent.shape[0]
         capacity = self._stage2_capacity
@@ -596,7 +597,7 @@ class K3MoeTailComm:
         if num_tokens > capacity:
             raise ValueError("K3 token count exceeds the prepared MoE workspace")
         shared_partial = shared_partial.view(num_tokens, self.hidden_size)
-        if num_tokens >= 256:
+        if num_tokens > _MULTIMEM_AR_MIN_TOKENS:
             shared_partial = multimem_stage(
                 shared_partial, self._multimem_group_name, capacity
             )
@@ -608,7 +609,7 @@ class K3MoeTailComm:
             :, start : start + width
         ]
         target.addmm_(routed_latent, self.up_proj.weight.t())
-        if num_tokens >= 256:
+        if num_tokens > _MULTIMEM_AR_MIN_TOKENS:
             # The next layer reuses the symmetric staging buffer.
             return multimem_all_reduce_staged(
                 shared_partial, self._multimem_group_name
