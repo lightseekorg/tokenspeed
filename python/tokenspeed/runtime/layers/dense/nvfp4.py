@@ -25,12 +25,12 @@ import torch
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from torch.nn.parameter import Parameter
 
-from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
+from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 
 logger = logging.getLogger(__name__)
 
 
-class Nvfp4LinearMethod(QuantizeMethodBase):
+class Nvfp4LinearMethod(LinearMethodBase):
     """Linear method for NVFP4 quantization.
 
     Weight structure:
@@ -43,6 +43,9 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
     def __init__(self, quant_config):
         self.quant_config = quant_config
         self.group_size = quant_config.group_size
+
+    def input_shard_alignment(self) -> int:
+        return self.group_size
 
     def create_weights(
         self,
@@ -202,7 +205,7 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
         return out.view(x_fp4.size(0), w_n)
 
 
-class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
+class Nvfp4W4A16LinearMethod(LinearMethodBase):
     """Linear method for BF16 activations and packed NVFP4 weights."""
 
     ignored_checkpoint_params = frozenset({"input_scale"})
@@ -214,6 +217,9 @@ class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
             )
         self.quant_config = quant_config
         self.group_size = quant_config.group_size
+
+    def input_shard_alignment(self) -> int:
+        return self.group_size
 
     def create_weights(
         self,

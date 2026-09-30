@@ -145,8 +145,10 @@ def test_model_prepares_routed_workspace_at_serving_limit(monkeypatch):
         layer.is_moe_layer = True
         layer.block_sparse_moe = moe
         layers.append(layer)
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList(layers)
     owner = SimpleNamespace(
-        model=SimpleNamespace(layers=layers),
+        model=model,
         mapping=object(),
         config=SimpleNamespace(hidden_size=7168, routed_expert_hidden_size=3584),
     )

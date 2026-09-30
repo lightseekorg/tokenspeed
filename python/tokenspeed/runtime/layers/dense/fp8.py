@@ -285,6 +285,57 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.max(), requires_grad=False
                     )
 
+    def input_shard_alignment(self) -> int:
+        return self.quant_config.weight_block_size[-1] if self.block_quant else 1
+
+    def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
+        """Apply into caller-owned storage, using direct block-FP8 GEMM output."""
+        dtype = output_dtype or x.dtype
+        if out.dtype != dtype or out.device != x.device:
+            raise ValueError("Linear output destination has incompatible dtype/device")
+        if self.block_quant:
+            if tuple(out.shape) != (*x.shape[:-1], layer.weight.shape[0]):
+                raise ValueError("Linear output destination has incompatible shape")
+            return self._apply_block(layer, x, bias, block_scale, dtype, out)
+        out.copy_(self.apply(layer, x, bias, block_scale, dtype))
+        return out
+
+    def _apply_block(self, layer, x, bias, block_scale, output_dtype, out):
+        """Share quantization and prepared-plan dispatch for both output routes."""
+        input_2d = x.view(-1, x.shape[-1])
+        output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+        destination = out.view(-1, layer.weight.shape[0]) if out is not None else None
+        output_dtype = output_dtype or x.dtype
+        plan = getattr(layer, "_prepared_fp8_linear", None)
+        if plan is None:
+            output = tokenspeed_kernel.mm(
+                input_2d,
+                layer.weight,
+                A_scales=block_scale,
+                B_scales=layer.weight_scale_inv,
+                bias=bias,
+                out_dtype=output_dtype,
+                quant="mxfp8",
+                block_size=self.quant_config.weight_block_size,
+                out=destination,
+            )
+        else:
+            output = fp8_linear(
+                plan,
+                input_2d,
+                layer.weight,
+                layer.weight_scale_inv,
+                input_scales=block_scale,
+                bias=bias,
+                out_dtype=output_dtype,
+                out=destination,
+            )
+        # GEMM wrote destination, a view of out. Preserve the caller's object
+        # identity as well as its storage instead of returning another view.
+        if out is not None:
+            return out
+        return output.to(dtype=output_dtype).view(*output_shape)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -295,32 +346,7 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if self.block_quant:
-            input_2d = x.view(-1, x.shape[-1])
-            output_shape = [*x.shape[:-1], layer.weight.shape[0]]
-            output_dtype = output_dtype or x.dtype
-            plan = getattr(layer, "_prepared_fp8_linear", None)
-            if plan is None:
-                output = tokenspeed_kernel.mm(
-                    input_2d,
-                    layer.weight,
-                    A_scales=block_scale,
-                    B_scales=layer.weight_scale_inv,
-                    bias=bias,
-                    out_dtype=output_dtype,
-                    quant="mxfp8",
-                    block_size=self.quant_config.weight_block_size,
-                )
-            else:
-                output = fp8_linear(
-                    plan,
-                    input_2d,
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    input_scales=block_scale,
-                    bias=bias,
-                    out_dtype=output_dtype,
-                )
-            return output.to(dtype=output_dtype).view(*output_shape)
+            return self._apply_block(layer, x, bias, block_scale, output_dtype, None)
         else:
             input = x
             weight = layer.weight

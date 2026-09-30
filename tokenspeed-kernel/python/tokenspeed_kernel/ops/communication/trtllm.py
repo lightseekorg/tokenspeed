@@ -36,8 +36,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "TrtllmAllGatherState",
+    "TrtllmAllGatherQuantState",
     "TrtllmReduceScatterState",
     "trtllm_allgather",
+    "trtllm_allgather_fp8_quantize",
     "trtllm_reduce_scatter",
     "AllReduceFusionPattern",
     "allgather_dual_rmsnorm",
@@ -56,8 +58,10 @@ platform = current_platform()
 
 AllReduceFusionPattern = ErrorClass
 TrtllmAllGatherState = ErrorClass
+TrtllmAllGatherQuantState = ErrorClass
 TrtllmReduceScatterState = ErrorClass
 trtllm_allgather = error_fn
+trtllm_allgather_fp8_quantize = error_fn
 trtllm_reduce_scatter = error_fn
 # Two-shot token capacity of the mnnvl workspace; 0 where the path is absent.
 MNNVL_TWOSHOT_MAX_TOKEN = 0
@@ -1430,6 +1434,81 @@ if current_platform().is_nvidia:
                 self.handles, group=self.group
             )
             cudart.cudaFree(c_void_p(self.control_ptr))
+
+    class TrtllmAllGatherQuantState(TrtllmAllGatherState):
+        """Fused BF16 gather and 1x128 FP8 quantization scratch.
+
+        Construct collectively before capture. ``max_rows`` is the per-rank
+        capacity (1..128), ``hidden`` is a multiple of 128, and ``num_blocks``
+        bounds the launch grid to at most one CTA per SM. Outputs are borrowed
+        until the next quantized gather; calls sharing this state are serialized.
+        Ordinary ``gather`` remains available as the numerical reference.
+        """
+
+        def __init__(self, group, max_rows, hidden, device, num_blocks):
+            from tokenspeed_kernel.thirdparty.flashinfer.allgather_quant import (
+                load_allgather_quant_module,
+            )
+
+            if (
+                not 0
+                < num_blocks
+                <= torch.cuda.get_device_properties(device).multi_processor_count
+            ):
+                raise ValueError("Fused gather requires a positive, SM-bounded grid")
+            self.module = load_allgather_quant_module()
+            self.num_blocks = num_blocks
+            super().__init__(group, max_rows, hidden, device, True)
+            padded_rows = (self.tp_size * max_rows + 3) // 4 * 4
+            self.fp8_out = torch.empty(
+                (padded_rows, hidden), dtype=torch.float8_e4m3fn, device=device
+            )
+            self.scales_out = torch.empty(
+                padded_rows * (hidden // 128), dtype=torch.float32, device=device
+            )
+
+    @register_kernel(
+        "communication",
+        "stateful_allgather_fp8_quantize",
+        name="trtllm_allgather_fp8_quantize",
+        solution="trtllm",
+        signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
+    )
+    def trtllm_allgather_fp8_quantize(state, inputs):
+        """Gather BF16 rows and quantize ready 128-element groups in one kernel.
+
+        Args:
+            state: Prepared ``TrtllmAllGatherQuantState`` on the current GPU.
+            inputs: Contiguous BF16 ``[rows,H]``; every peer supplies equal rows.
+
+        Returns:
+            Borrowed FP8 values ``[round_up(TP*rows,4),H]`` and contiguous FP32
+            MN-major scales ``[H/128,round_up(TP*rows,4)]``. Padding is zero/one.
+            No RMSNorm or PDL is applied. A following GEMM uses normal stream
+            ordering; this API does not publish per-tile readiness to consumers.
+        """
+        if (
+            inputs.ndim != 2
+            or inputs.dtype != torch.bfloat16
+            or not inputs.is_contiguous()
+            or inputs.device != state.fp8_out.device
+            or inputs.shape[1] != state.hidden
+            or not 0 < inputs.shape[0] <= state.max_rows
+        ):
+            raise ValueError("Invalid fused AllGather quantization input")
+        rows = (state.tp_size * inputs.shape[0] + 3) // 4 * 4
+        values = state.fp8_out[:rows]
+        scales = state.scales_out[: rows * (state.hidden // 128)].view(-1, rows)
+        state.module.allgather_fp8_quantize(
+            inputs,
+            values,
+            scales,
+            state.workspace,
+            state.group.rank(),
+            state.tp_size,
+            state.num_blocks,
+        )
+        return values, scales
 
     @register_kernel(
         "communication",

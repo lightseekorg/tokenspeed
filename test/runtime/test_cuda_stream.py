@@ -18,88 +18,73 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Stream-fork staging orders event generations without host synchronization."""
+"""Check staged auxiliary-stream dependencies with real tensor consumers."""
 
 import os
 import sys
-from contextlib import contextmanager
+from unittest.mock import Mock
 
 import pytest
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.utils import cuda_stream
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA streams required")
 @pytest.mark.parametrize("enable", [False, True])
 @pytest.mark.parametrize("overlap", [False, True])
-def test_staged_branch_event_generations(monkeypatch, enable, overlap):
-    calls = []
-    events = []
+def test_staged_branch_tensor_dependencies(enable, overlap):
+    fork = StreamFork(torch.cuda.Stream())
+    # Keep real CUDA events, but observe the disabled/serialized contracts
+    # that numerical equality alone cannot distinguish from overlapping work.
+    fork.fork_event = Mock(wraps=fork.fork_event)
+    fork.join_event = Mock(wraps=fork.join_event)
+    fork.checkpoint_event = Mock(wraps=fork.checkpoint_event)
+    inputs = torch.randn(4096, device="cuda")
+    first, tail, main, combined, output = [torch.empty_like(inputs) for _ in range(5)]
 
-    class Event:
-        def __init__(self):
-            self.name = len(events)
-            self.generation = 0
-            events.append(self)
-
-        def record(self, stream):
-            self.generation += 1
-            calls.append(("record", self.name, self.generation, stream))
-
-        def wait(self, stream):
-            calls.append(("wait", self.name, self.generation, stream))
-
-    @contextmanager
-    def stream_context(stream):
-        assert stream == "aux"
-        yield
-
-    monkeypatch.setattr(cuda_stream.torch.cuda, "Event", Event)
-    monkeypatch.setattr(cuda_stream.torch.cuda, "current_stream", lambda: "main")
-    monkeypatch.setattr(cuda_stream.torch.cuda, "stream", stream_context)
-    fork = cuda_stream.StreamFork("aux")
-    for _ in range(2):
+    def run():
         with fork.scope(enable=enable, overlap=overlap):
             with fork.branch():
+                torch.add(inputs, 1, out=first)
                 fork.record_checkpoint()
+                torch.mul(first, 2, out=tail)
             fork.join_checkpoint()
+            torch.add(first, 3, out=main)
             fork.join()
+            torch.add(main, tail, out=combined)
             with fork.branch_after_main():
-                pass
+                torch.add(combined, 5, out=output)
             fork.join()
-    assert not fork._active
-    if not enable:
-        assert calls == []
-        return
-    expected = []
-    for checkpoint_generation, generation in enumerate((1, 3), start=1):
-        expected.extend(
-            [
-                ("record", 0, generation, "main"),
-                ("wait", 0, generation, "aux"),
-                ("record", 2, checkpoint_generation, "aux"),
-                ("record", 1, generation, "aux"),
-            ]
-        )
-        if not overlap:
-            expected.append(("wait", 1, generation, "main"))
-        expected.extend(
-            [
-                ("wait", 2, checkpoint_generation, "main"),
-                ("wait", 1, generation, "main"),
-                ("record", 0, generation + 1, "main"),
-                ("wait", 0, generation + 1, "aux"),
-                ("record", 1, generation + 1, "aux"),
-            ]
-        )
-        if not overlap:
-            expected.append(("wait", 1, generation + 1, "main"))
-        expected.extend([("wait", 1, generation + 1, "main")] * 2)
-    assert calls == expected
+            # A real main-stream consumer detects a missing branch join.
+            return output.mul(3)
+
+    for _ in range(3):
+        expected = ((inputs + 1) + 3 + (inputs + 1) * 2 + 5) * 3
+        torch.testing.assert_close(run(), expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        # Reusing events inside one graph must preserve both generations.
+        captured = [run(), run()]
+    for _ in range(5):
+        inputs.normal_()
+        graph.replay()
+        expected = ((inputs + 1) + 3 + (inputs + 1) * 2 + 5) * 3
+        for actual in captured:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if enable:
+        scopes = fork.checkpoint_event.record.call_count
+        assert scopes > 0
+        assert fork.join_event.wait.call_count == scopes * (3 if overlap else 5)
+    else:
+        for event in (fork.fork_event, fork.join_event, fork.checkpoint_event):
+            event.record.assert_not_called()
+            event.wait.assert_not_called()
 
 
 if __name__ == "__main__":

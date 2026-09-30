@@ -35,6 +35,9 @@ run_distributed() {
 python3 -m pytest tokenspeed-kernel/test/ops/test_communcation.py -v \
     --junitxml=/tmp/kernel-multi-gpu.xml
 check_reports /tmp/kernel-multi-gpu.xml
+python3 -m pytest test/runtime/distributed/test_dp_parallel_linear.py -k tp4 -v \
+    --junitxml=/tmp/kernel-dp-linear-tp4.xml
+check_reports /tmp/kernel-dp-linear-tp4.xml
 python3 -m pytest tokenspeed-kernel/test/ops/test_attention_dsv41_index_scan.py \
     -k 'not tp4' -v --junitxml=/tmp/kernel-index-scan.xml
 check_reports /tmp/kernel-index-scan.xml

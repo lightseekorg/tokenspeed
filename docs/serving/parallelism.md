@@ -127,7 +127,8 @@ behavior). The size must divide world size and be strictly smaller than it;
 DEP16 supports TP2, TP4 and TP8, with matching intermediate-channel divisibility.
 AllGather and ReduceScatter restore local token ownership around
 the sharded MLP. Attention and caches remain TP1/DP16; routed MoE remains EP16.
-See the [shared-expert TP runbook](../recipes/kimi-k3-shared-expert-tp.md).
+See the unified [Kimi-K3 TP-sharding recipe](../recipes/kimi-k3-tp-sharding.md),
+which also covers independent QKV and output-projection sharding.
 
 ### DeepEP all-to-all
 

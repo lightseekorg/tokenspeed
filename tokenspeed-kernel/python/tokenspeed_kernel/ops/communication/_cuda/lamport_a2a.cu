@@ -18,6 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include "a2a_fp8.cuh"
 #include "tvm_ffi_utils.h"
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -38,9 +39,9 @@ __device__ __forceinline__ uint64_t observe(const uint64_t *p) {
   return value;
 }
 
-template <bool Inverse, int Pipeline>
-__global__ __launch_bounds__(256, 1) void lamport_a2a(
-    const uint32_t *input, uint32_t *output, uint64_t **peers,
+template <bool Inverse, int Pipeline, bool Quantize, int Threads>
+__global__ __launch_bounds__(Threads, 1) void lamport_a2a(
+    const uint32_t *input, uint32_t *output, float *scales, uint64_t **peers,
     uint32_t *control, int capacity, int rows, int channels, int rank) {
   __shared__ uint32_t epoch;
   if (threadIdx.x == 0)
@@ -78,25 +79,45 @@ __global__ __launch_bounds__(256, 1) void lamport_a2a(
   // No grid barrier separates publish and polling. Every sender CTA completes
   // its bounded publish work before polling; limiting the grid permits all
   // producer CTAs to become resident even while other CTAs wait for packets.
-  for (int i = tid; i < 4 * count; i += Pipeline * stride) {
-    uint64_t packets[Pipeline];
-    bool ready;
-    do {
-      ready = true;
+  if constexpr (Quantize) {
+    // Each half-warp polls a complete 128-element group before its scale.
+    // The tagged payload and three-generation ring are shared with BF16 A2A.
+    for (int i = 4 * tid; i < 4 * count; i += 4 * stride) {
+      uint64_t packets[4];
+      bool ready;
+      do {
+        ready = true;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          packets[j] = observe(local + i + j);
+          ready &= uint32_t(packets[j] >> 32) == epoch;
+        }
+      } while (!ready);
+      const uint32_t words[4] = {uint32_t(packets[0]), uint32_t(packets[1]),
+                                 uint32_t(packets[2]), uint32_t(packets[3])};
+      quantize_a2a_group(words, output, scales, i, 4 * rows, channels / 4);
+    }
+  } else {
+    for (int i = tid; i < 4 * count; i += Pipeline * stride) {
+      uint64_t packets[Pipeline];
+      bool ready;
+      do {
+        ready = true;
+#pragma unroll
+        for (int j = 0; j < Pipeline; ++j) {
+          const int index = i + j * stride;
+          if (index < 4 * count) {
+            packets[j] = observe(local + i + j * stride);
+            ready &= uint32_t(packets[j] >> 32) == epoch;
+          }
+        }
+      } while (!ready);
 #pragma unroll
       for (int j = 0; j < Pipeline; ++j) {
         const int index = i + j * stride;
-        if (index < 4 * count) {
-          packets[j] = observe(local + i + j * stride);
-          ready &= uint32_t(packets[j] >> 32) == epoch;
-        }
+        if (index < 4 * count)
+          output[index] = uint32_t(packets[j]);
       }
-    } while (!ready);
-#pragma unroll
-    for (int j = 0; j < Pipeline; ++j) {
-      const int index = i + j * stride;
-      if (index < 4 * count)
-        output[index] = uint32_t(packets[j]);
     }
   }
   if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -208,8 +229,8 @@ void exchange(TensorView input, TensorView output, TensorView peers,
   auto ptrs = static_cast<uint64_t **>(peers.data_ptr());
   auto ctrl = static_cast<uint32_t *>(control.data_ptr());
 #define LAUNCH(INVERSE, PIPELINE)                                              \
-  lamport_a2a<INVERSE, PIPELINE><<<blocks, 256, 0, stream>>>(                  \
-      in, out, ptrs, ctrl, capacity, rows, channels, rank)
+  lamport_a2a<INVERSE, PIPELINE, false, 256><<<blocks, 256, 0, stream>>>(      \
+      in, out, nullptr, ptrs, ctrl, capacity, rows, channels, rank)
   if (rows * channels * 2 >= (4 << 20) && rows * channels * 2 <= (8 << 20)) {
 #define PAIRED(RANK)                                                           \
   if (inverse) {                                                               \
@@ -251,3 +272,47 @@ void exchange(TensorView input, TensorView output, TensorView peers,
   TVM_FFI_ICHECK(cudaGetLastError() == cudaSuccess);
 }
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exchange, exchange);
+
+void exchange_fp8(TensorView input, TensorView output, TensorView scales,
+                  TensorView peers, TensorView control, int64_t capacity,
+                  int64_t rows, int64_t channels, int64_t rank,
+                  int64_t blocks) {
+  ffi::CUDADeviceGuard guard(input.device().device_id);
+  CHECK_INPUT(input);
+  CHECK_INPUT(output);
+  CHECK_INPUT(scales);
+  CHECK_INPUT(peers);
+  CHECK_INPUT(control);
+  TVM_FFI_ICHECK_EQ(input.dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(output.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(scales.dtype(), dl_float32);
+  TVM_FFI_ICHECK(channels > 0 && channels % 512 == 0 && rows > 0);
+  TVM_FFI_ICHECK_EQ(input.numel(), rows * channels);
+  TVM_FFI_ICHECK_EQ(output.numel(), input.numel());
+  TVM_FFI_ICHECK_EQ(scales.numel(), rows * channels / 128);
+  TVM_FFI_ICHECK(rank >= 0 && rank < 4 && blocks > 0);
+  TVM_FFI_ICHECK(capacity >= rows * channels / 2 && capacity <= INT32_MAX / 3);
+  TVM_FFI_ICHECK_EQ(peers.dtype(), dl_int64);
+  TVM_FFI_ICHECK_EQ(peers.numel(), 4);
+  TVM_FFI_ICHECK_EQ(control.dtype(), dl_int32);
+  TVM_FFI_ICHECK_EQ(control.numel(), 2);
+  for (auto tensor : {output, scales, peers, control})
+    TVM_FFI_ICHECK_EQ(input.device().device_id, tensor.device().device_id);
+  auto stream = get_stream(input.device());
+#define QUANT(THREADS)                                                         \
+  lamport_a2a<false, 1, true, THREADS><<<blocks, THREADS, 0, stream>>>(        \
+      static_cast<const uint32_t *>(input.data_ptr()),                         \
+      static_cast<uint32_t *>(output.data_ptr()),                              \
+      static_cast<float *>(scales.data_ptr()),                                 \
+      static_cast<uint64_t **>(peers.data_ptr()),                              \
+      static_cast<uint32_t *>(control.data_ptr()), capacity, rows, channels,   \
+      rank)
+  if (rows * channels * 2 >= (4 << 20)) {
+    QUANT(1024);
+  } else {
+    QUANT(256);
+  }
+#undef QUANT
+  TVM_FFI_ICHECK(cudaGetLastError() == cudaSuccess);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exchange_fp8, exchange_fp8);

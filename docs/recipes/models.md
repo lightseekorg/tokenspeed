@@ -240,6 +240,10 @@ pip install flash-linear-attention
 Notes:
 
 - K3 uses the cache-group scheduler and KDA state groups.
+- For independent QKV, output-projection and shared-expert TP under DEP16, see
+  the [TP-sharding recipe](kimi-k3-tp-sharding.md). These opt-in paths restore
+  local token ownership before their consumers; attention/cache and routed-expert
+  sharding stay unchanged.
 - On Blackwell, `--dense-gemm-backend trtllm_cutedsl` opts the
   block-FP8 attention projections into TRT-LLM CuTe-DSL: KDA fused QKV/gates and output,
   and MLA fused QKV-a/gate, Q-b, and output. Omit it (or use `auto`) to keep

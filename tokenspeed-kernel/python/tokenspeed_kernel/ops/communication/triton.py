@@ -28,10 +28,167 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 logger = logging.getLogger(__file__)
 
+
+@triton.jit
+def _pack_channel_shards_for_a2a_kernel(
+    source,
+    destination,
+    N,
+    M,
+    D: tl.constexpr,
+    P: tl.constexpr,
+    S0,
+    S1,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    peer = offsets // (M * D)
+    row = offsets // D % M
+    column = peer * D + offsets % D
+    values = tl.load(
+        source + row * S0 + column * S1, (offsets < P * M * D) & (row < N), other=0
+    )
+    tl.store(destination + offsets, values, offsets < P * M * D)
+
+
+def triton_pack_channel_shards_for_a2a(
+    inputs: torch.Tensor, workspace: torch.Tensor
+) -> torch.Tensor:
+    """Split channels across peers and zero-pad destination-rank-major A2A messages.
+
+    Args:
+        inputs: Local ``[N, P*D]`` rows; arbitrary positive strides are allowed.
+        workspace: Contiguous ``[P, M, D]`` persistent scratch, with ``M >= N``.
+            When used, every element is overwritten, including zero padding.
+
+    Returns:
+        Contiguous ``[P*M, D]`` send rows. For one contiguous input row and
+        ``M == 1``, this aliases inputs without launching a kernel. Otherwise
+        it aliases workspace. Neither case changes dtype or quantization.
+    """
+    if inputs.ndim != 2 or workspace.ndim != 3:
+        raise ValueError("Channel-shard A2A packing expects [N,K] and [P,M,D]")
+    peers, rows, shard = workspace.shape
+    if (
+        peers < 1
+        or rows < 1
+        or shard < 1
+        or inputs.shape[0] > rows
+        or inputs.shape[1] != peers * shard
+        or not workspace.is_contiguous()
+        or inputs.dtype != workspace.dtype
+        or inputs.device != workspace.device
+    ):
+        raise ValueError("Incompatible channel-shard A2A packing workspace")
+    if rows == 1 and inputs.shape[0] == 1 and inputs.is_contiguous():
+        return inputs.view(peers, shard)
+    _pack_channel_shards_for_a2a_kernel[(triton.cdiv(workspace.numel(), 1024),)](
+        inputs,
+        workspace,
+        inputs.shape[0],
+        rows,
+        shard,
+        peers,
+        inputs.stride(0),
+        inputs.stride(1),
+        1024,
+    )
+    return workspace.view(peers * rows, shard)
+
+
+@triton.jit
+def _owner_reduce_kernel(
+    PTRS,
+    Y,
+    M,
+    H: tl.constexpr,
+    P: tl.constexpr,
+    R: tl.constexpr,
+    B: tl.constexpr,
+):
+    i = tl.program_id(0) * B + tl.arange(0, B)
+    total = tl.full((B,), 0, tl.float32)
+    for peer in tl.static_range(P):
+        # Symmetric allocation bases are 16-byte aligned. Recover this after
+        # the indirect load so BF16 reads can vectorize; owner offsets and
+        # tails may still require narrower accesses.
+        ptr = tl.load(PTRS + peer).to(tl.pointer_type(Y.dtype.element_ty))
+        ptr = tl.multiple_of(ptr, 16)
+        total += tl.load(ptr + R * M * H + i, mask=i < M * H, other=0).to(tl.float32)
+    tl.store(Y + i, total, mask=i < M * H)
+
+
+class ProjectionPeerState:
+    def __init__(self, group, max_rows, hidden, device):
+        """Allocate TP4 BF16 partials before capture for serialized stream calls."""
+        if group.size() != 4 or max_rows <= 0 or hidden <= 0:
+            raise ValueError(
+                "Projection peer reduction requires TP4 and positive capacity"
+            )
+        self.max_rows = max_rows
+        self.group = group
+        self.p, self.r, self.hidden = group.size(), group.rank(), hidden
+        self.buffer, self.handle = _alloc_symm(
+            (self.p * max_rows, hidden), torch.bfloat16, device, group
+        )
+        self.ptrs = _peer_ptrs_dev(
+            self.handle, self.buffer.shape, self.buffer.dtype, self.p, device
+        )
+
+    def input_buffer(self, rows):
+        """Return the borrowed GEMM destination for equal physical rows per peer."""
+        if not 0 < rows <= self.max_rows:
+            raise ValueError("Projection peer reduction exceeds prepared capacity")
+        return self.buffer[: self.p * rows]
+
+    def reduce(self, partial, rows):
+        """Return owned local rows; padded ranks must also participate."""
+        destination = self.input_buffer(rows)
+        if partial.shape != destination.shape or partial.dtype != destination.dtype:
+            raise ValueError("Projection partials have incompatible shape or dtype")
+        if (
+            partial.data_ptr() != destination.data_ptr()
+            or partial.stride() != destination.stride()
+        ):
+            destination.copy_(partial)
+        # Publish GEMM writes before peer reads; the second barrier protects
+        # this separate destination from being overwritten by the next GEMM.
+        self.handle.barrier(channel=0)
+        out = torch.empty(
+            (rows, self.hidden), device=partial.device, dtype=partial.dtype
+        )
+        _owner_reduce_kernel[(triton.cdiv(rows * self.hidden, 1024),)](
+            self.ptrs, out, rows, self.hidden, self.p, self.r, 1024
+        )
+        self.handle.barrier(channel=1)
+        return out
+
+
+@register_kernel(
+    "communication",
+    "projection_reduce_scatter",
+    name="triton_projection_reduce_scatter",
+    solution="triton",
+    signatures=format_signatures(("partial",), "dense", {torch.bfloat16}),
+)
+def triton_projection_reduce_scatter(state, partial, rows):
+    """Reduce TP4 [4*rows,H] partials to owned [rows,H] local-token outputs.
+
+    State is prepared collectively before capture. Calls and all consumers of
+    its borrowed input buffer must be serialized on one stream per subgroup.
+    """
+    return state.reduce(partial, rows)
+
+
 __all__ = [
+    "ProjectionPeerState",
+    "triton_projection_reduce_scatter",
+    "triton_pack_channel_shards_for_a2a",
     "create_state",
     "get_token_dist",
     "reduce_scatter",

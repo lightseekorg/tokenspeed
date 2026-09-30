@@ -23,12 +23,12 @@ import tokenspeed_kernel
 import torch
 from torch.nn.parameter import Parameter
 
-from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
+from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 
 MXFP4_BLOCK = 32
 
 
-class Mxfp4LinearMethod(QuantizeMethodBase):
+class Mxfp4LinearMethod(LinearMethodBase):
     """Packed MXFP4 dense weights.
 
     Kimi-K2.5 MXFP4 stores dense layer-0 MLP and MoE shared-expert MLP tensors
@@ -40,6 +40,9 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
     def __init__(self, quant_config):
         self.quant_config = quant_config
         self.group_size = getattr(quant_config, "group_size", MXFP4_BLOCK)
+
+    def input_shard_alignment(self) -> int:
+        return self.group_size
 
     def create_weights(
         self,

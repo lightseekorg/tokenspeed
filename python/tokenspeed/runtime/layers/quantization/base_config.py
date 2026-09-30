@@ -214,8 +214,28 @@ class LinearMethodBase(QuantizeMethodBase):
         """
         return self.apply(layer, activation(x), bias)
 
+    def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
+        """Apply into caller-owned storage, copying unless a method overrides it.
+
+        External activation scales require an explicit implementation; a
+        fallback must not silently discard them or broadcast into the output.
+        """
+        if block_scale is not None:
+            raise ValueError("This linear method does not accept external block scales")
+        if out.dtype != output_dtype or out.device != x.device:
+            raise ValueError("Linear output destination has incompatible dtype/device")
+        output = self.apply(layer, x, bias)
+        if output.shape != out.shape:
+            raise ValueError("Linear output destination has incompatible shape")
+        out.copy_(output)
+        return out
+
+    def input_shard_alignment(self) -> int:
+        """Return the number of input channels that must remain in one shard."""
+        return 1
+
     def prepared_linear_plan(self, layer: nn.Module) -> object | None:
-        """Return an opaque backend warmup plan, if this layer prepared one."""
+        """Return an opaque backend execution/warmup plan, if one was prepared."""
         return None
 
 

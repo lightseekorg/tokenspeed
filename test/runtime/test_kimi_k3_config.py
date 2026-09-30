@@ -753,6 +753,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
             out=down_out,
         )
 
+    @mock.patch.dict(
+        os.environ,
+        {
+            "TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE": "1",
+            "TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE": "1",
+        },
+    )
     def test_kda_stacks_qkvfab_projection_weights(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
 
@@ -775,6 +782,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
             linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
+        # Projection mapping also needs the global single-rank topology.
+        mapping.rank = 0
+        mapping.world_size = 1
         layer = KimiLinearKDA(config, mapping, layer_id=0)
 
         self.assertEqual(tuple(layer.qkvgb_proj.weight.shape), (288, 64))
@@ -806,7 +816,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
             for index in range(4)
         ]
-        mixed_qkv, gate, f_a, beta = layer._project_qkvfab(hidden_states)
+        mixed_qkv, gate, f_a, beta = layer._project_qkvfab(hidden_states, ctx=None)
         self.assertTrue(torch.equal(mixed_qkv, torch.cat(expected_qkvg[:3], dim=-1)))
         self.assertTrue(torch.equal(gate, expected_qkvg[3]))
         self.assertTrue(
@@ -822,6 +832,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
             gate.untyped_storage().data_ptr(),
         )
 
+    @mock.patch.dict(
+        os.environ,
+        {
+            "TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE": "1",
+            "TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE": "1",
+        },
+    )
     def test_kda_compacts_prefill_qkv_before_backend_break(self):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
@@ -845,6 +862,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
             linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
+        # Projection mapping also needs the global single-rank topology.
+        mapping.rank = 0
+        mapping.world_size = 1
         layer = KimiLinearKDA(config, mapping, layer_id=0)
         rows, projection_width = 4, 64
         packed = torch.randn(rows, 288, dtype=torch.bfloat16)
@@ -1234,6 +1254,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         attention.qk_nope_head_dim = 1
         attention.qk_rope_head_dim = 1
         attention._qkv_a_width = 6
+        attention.input_projection_parallel = SimpleNamespace(tp_size=1)
         attention._gate_width = 4
         attention.fused_qkv_a_proj_with_mqa = FakeProjection()
         attention.fused_qk_layernorm = FakeFusedNorm()
@@ -1278,6 +1299,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         attention = KimiLinearMLAAttention.__new__(KimiLinearMLAAttention)
         torch.nn.Module.__init__(attention)
+        attention.input_projection_parallel = SimpleNamespace(tp_size=1)
 
         self.assertFalse(attention.can_fuse_attnres_partials(torch.empty(1, 4), ()))
 

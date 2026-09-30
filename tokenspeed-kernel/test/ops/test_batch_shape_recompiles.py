@@ -41,6 +41,91 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 DEVICE = "cuda"
 
 
+def test_projection_pack_batch_sizes_and_strides():
+    from tokenspeed_kernel.ops.communication import triton as communication
+
+    peers, shard = 4, 64
+
+    def run(case):
+        tokens, rows, column_stride, extra_stride = case
+        width = peers * shard
+        storage = torch.randn(
+            tokens,
+            width * column_stride + extra_stride,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        inputs = storage[:, : width * column_stride : column_stride]
+        workspace = torch.full(
+            (peers, rows, shard),
+            float("nan"),
+            device=DEVICE,
+            dtype=inputs.dtype,
+        )
+        output = communication.triton_pack_channel_shards_for_a2a(inputs, workspace)
+        expected = torch.zeros(rows, width, device=DEVICE, dtype=inputs.dtype)
+        expected[:tokens] = inputs
+        expected = expected.view(rows, peers, shard).transpose(0, 1).contiguous()
+        torch.testing.assert_close(output.view_as(expected), expected, rtol=0, atol=0)
+
+    sweep = [
+        (n, m, s, e)
+        for n, m in ((0, 48), (48, 64), (49, 65), (3, 1 + 3))
+        for s, e in ((1, 0), (2, 0), (3, 16), (2, 3))
+    ]
+    pool = [
+        (n, m, s, e)
+        for n, m in ((0, 16), (16, 32), (17, 33), (5, 7))
+        for s, e in ((1, 0), (2, 0), (3, 16), (2, 3))
+    ]
+
+    def key(case):
+        n, m, s, e = case
+        return tuple(
+            int_specialization_class(v) for v in (n, m, peers * shard * s + e, s)
+        )
+
+    warm_specialization_classes(run, key, sweep, pool)
+    with assert_no_triton_compile(communication._pack_channel_shards_for_a2a_kernel):
+        for case in sweep:
+            run(case)
+
+
+def test_projection_owner_reduce_row_count():
+    from tokenspeed_kernel.ops.communication import triton as communication
+
+    peers, width, owner = 4, 128, 2
+
+    def run(rows):
+        # Local allocations isolate kernel indexing/recompilation. Distributed
+        # linear tests separately exercise IPC publication and buffer lifetime.
+        partials = [
+            torch.randn(peers * rows, width, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(peers)
+        ]
+        pointers = torch.tensor(
+            [p.data_ptr() for p in partials], dtype=torch.int64, device=DEVICE
+        )
+        output = torch.empty(rows, width, dtype=torch.bfloat16, device=DEVICE)
+        communication._owner_reduce_kernel[((rows * width + 1023) // 1024,)](
+            pointers,
+            output,
+            rows,
+            width,
+            peers,
+            owner,
+            1024,
+        )
+        expected = sum(p[owner * rows : (owner + 1) * rows].float() for p in partials)
+        torch.testing.assert_close(output, expected.to(output.dtype), rtol=0, atol=0)
+
+    run(16)
+    run(17)
+    with assert_no_triton_compile(communication._owner_reduce_kernel):
+        for rows in (32, 49, 128, 129):
+            run(rows)
+
+
 def test_packed_qkv_complex_rotary_token_count():
     from tokenspeed_kernel.ops.attention.mha._triton import qkv_rotary
 

@@ -132,9 +132,14 @@ def test_trtllm_cutedsl_merged_preparation_and_dispatch(monkeypatch) -> None:
     assert torch.count_nonzero(output[:, module.used_rows :]) == 0
     module.quant_method = method
     attention = SimpleNamespace(
-        local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
+        local_num_heads=NUM_HEADS // TP_SIZE,
+        head_dim=HEAD_DIM,
+        qkvgb_proj=module,
+        input_projection_parallel=SimpleNamespace(tp_size=1),
     )
-    parts = KimiLinearKDA._project_qkvfab(attention, x, attnres_partial_args=None)
+    parts = KimiLinearKDA._project_qkvfab(
+        attention, x, attnres_partial_args=None, ctx=None
+    )
     torch.testing.assert_close(
         torch.cat(parts, dim=-1), output[:, : module.used_rows], rtol=0, atol=0
     )

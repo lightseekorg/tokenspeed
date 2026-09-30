@@ -24,9 +24,26 @@
 
 
 import torch
+from tokenspeed_kernel import fp8_linear_accepts_prepacked_input, fp8_linear_prepacked
+from tokenspeed_kernel.ops.communication.cuda import (
+    tokenspeed_a2a_lamport,
+    tokenspeed_a2a_lamport_fp8_quantize,
+)
+from tokenspeed_kernel.ops.communication.triton import (
+    triton_pack_channel_shards_for_a2a,
+)
+from tokenspeed_kernel.ops.communication.trtllm import (
+    TrtllmAllGatherQuantState,
+    trtllm_allgather_fp8_quantize,
+)
 from torch.nn.parameter import Parameter
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_gather,
+    all_reduce,
+    all_to_all_single,
+)
+from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
 from tokenspeed.runtime.distributed.utils import divide, split_tensor_along_last_dim
 from tokenspeed.runtime.layers.dense import (
     Fp8LinearMethod,
@@ -34,6 +51,10 @@ from tokenspeed.runtime.layers.dense import (
     Nvfp4LinearMethod,
     UnquantizedLinearMethod,
     W8A8Fp8LinearMethod,
+)
+from tokenspeed.runtime.layers.dp_linear_communication import (
+    DPColumnParallelCommunication,
+    DPRowParallelCommunication,
 )
 from tokenspeed.runtime.layers.parameter import (
     BaseWeightParameter,
@@ -51,8 +72,8 @@ from tokenspeed.runtime.layers.quantization import (
     W8A8Fp8Config,
 )
 from tokenspeed.runtime.layers.quantization.base_config import (
+    LinearMethodBase,
     QuantizationConfig,
-    QuantizeMethodBase,
 )
 from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
@@ -193,7 +214,7 @@ class LinearBase(torch.nn.Module):
         if quant_config is None or should_ignore_quant_layer(
             prefix=prefix, ignored_layers=quant_config.ignored_layers
         ):
-            self.quant_method: QuantizeMethodBase | None = UnquantizedLinearMethod()
+            self.quant_method: LinearMethodBase | None = UnquantizedLinearMethod()
         elif isinstance(quant_config, Nvfp4Config):
             # For NVFP4, excluded layers use unquantized (bf16)
             if should_exclude_quant_module(prefix, quant_config.exclude_modules):
@@ -1266,6 +1287,17 @@ class RowParallelLinear(LinearBase):
         return None
 
     def forward(self, input_, scale=None):
+        return self._forward_into(input_, scale, None)
+
+    def forward_into(self, input_, scale, out):
+        """Project into caller-owned storage; unsupported methods copy the result.
+
+        Shares input sharding, bias handling and reduction with ordinary forward.
+        Communication consumers may supply persistent symmetric GEMM storage.
+        """
+        return self._forward_into(input_, scale, out)
+
+    def _forward_into(self, input_, scale, out):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1280,7 +1312,16 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
 
-        if scale is not None:
+        if out is not None:
+            output_parallel = self.quant_method.apply_into(
+                self,
+                input_parallel,
+                bias_,
+                scale,
+                torch.bfloat16 if scale is not None else input_parallel.dtype,
+                out,
+            )
+        elif scale is not None:
             output_parallel = self.quant_method.apply(
                 self, input_parallel, bias_, scale, torch.bfloat16
             )
@@ -1293,6 +1334,9 @@ class RowParallelLinear(LinearBase):
 
         output_bias = self.bias if self.skip_bias_add else None
 
+        if out is not None and output is not out:
+            out.copy_(output)
+            output = out
         return output, output_bias
 
     def forward_with_activation(
@@ -1327,3 +1371,262 @@ class RowParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", reduce_results={self.reduce_results}"
         return s
+
+
+class DPColumnParallelLinear(ColumnParallelLinear):
+    """Column-sharded projection over data-parallel token owners.
+
+    The parent owns weights, shard loading and quantization. Its output_size is
+    the padded checkpoint width; logical_output_size is the returned width.
+    Communication is bound before capture and shared by sequential layers of
+    the same shape. No communication buffers are allocated by this constructor.
+
+    Args:
+        input_size: Complete input channels on every token owner.
+        output_size: Logical output channels, excluding tail padding.
+        padded_output_size: Stored output channels, aligned for TP/quantization.
+        parallel: Projection-only TP subgroup, independent of attention TP.
+        params_dtype: Weight storage dtype before quantization setup.
+        quant_config: Quantization configuration, or None for unquantized weights.
+        prefix: Original checkpoint parameter prefix.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        padded_output_size: int,
+        parallel: DenseLayerMapping,
+        params_dtype: torch.dtype | None,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ):
+        if parallel.tp_size <= 1 or not 0 < output_size <= padded_output_size:
+            raise ValueError("DP column projection requires TP > 1 and valid widths")
+        super().__init__(
+            input_size=input_size,
+            output_size=padded_output_size,
+            bias=False,
+            gather_output=False,
+            skip_bias_add=False,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            output_sizes=None,
+            prefix=prefix,
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
+            tp_group=parallel.tp_group,
+            use_presharded_weights=False,
+            override_kernel_name=None,
+            interleave_linear_and_gate=False,
+        )
+        self.parallel = parallel
+        self.logical_output_size = output_size
+        self.communication: DPColumnParallelCommunication | None = None
+
+    def forward(
+        self, inputs: torch.Tensor, counts: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return (complete local-token outputs, None), including empty owners.
+
+        counts are explicit physical token counts for every world rank,
+        including graph padding. A2A restores channels instead of the parent's
+        gather_output reduction. Bias is unsupported by this projection path.
+        """
+        communication = self.communication
+        if communication is None:
+            raise RuntimeError("QKV communication must be prepared before forward")
+        if (
+            communication.closed
+            or len(counts) != self.parallel.world_size
+            or any(count < 0 for count in counts)
+            or inputs.ndim != 2
+            or inputs.shape != (counts[self.parallel.rank], self.input_size)
+            or inputs.dtype != communication.send.dtype
+            or inputs.device != communication.send.device
+            or communication.parallel.tp_group != self.tp_group
+            or communication.parallel.rank != self.parallel.rank
+            or communication.input_size != self.input_size
+            or communication.padded_output_size != self.output_size
+        ):
+            raise ValueError("Incompatible column projection inputs or communication")
+        rows = max(counts[r] for r in self.parallel.tp_group)
+        if rows == 0:
+            return inputs.new_empty((0, self.logical_output_size)), None
+        if rows > communication.max_tokens:
+            raise ValueError("Column projection exceeds prepared row capacity")
+        plan = self.quant_method.prepared_linear_plan(self)
+        num_tokens = self.tp_size * rows
+        if (
+            isinstance(communication.gather_state, TrtllmAllGatherQuantState)
+            and rows <= communication.gather_state.max_rows
+            and fp8_linear_accepts_prepacked_input(plan, num_tokens)
+        ):
+            values, scales = trtllm_allgather_fp8_quantize(
+                communication.gather_state, communication.padded_inputs(inputs, rows)
+            )
+            local = fp8_linear_prepacked(
+                plan, values, self.weight, scales, num_tokens, inputs.dtype, out=None
+            )
+        else:
+            gathered = communication.gather_inputs(inputs, rows)
+            local, _ = super().forward(gathered, block_scale=None, output_dtype=None)
+        output = communication.restore_outputs(local.contiguous(), rows)
+        return output[: inputs.shape[0], : self.logical_output_size], None
+
+
+class DPRowParallelLinear(RowParallelLinear):
+    """Row-sharded projection that restores outputs to their DP token owners.
+
+    Parameter names and shard loaders come from RowParallelLinear. A shared
+    communication object must be bound before memory profiling/graph capture.
+    The parent GEMM consumes redistributed channel shards without all-reduce;
+    exactly one ReduceScatter restores complete outputs to the original owners.
+
+    Args:
+        input_size: Complete input width before channel redistribution.
+        output_size: Complete output width returned to each token owner.
+        parallel: Projection-only TP subgroup, independent of attention TP.
+        params_dtype: Weight storage dtype before quantization setup.
+        quant_config: Quantization configuration, or None for unquantized weights.
+        prefix: Original checkpoint parameter prefix.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        parallel: DenseLayerMapping,
+        params_dtype: torch.dtype | None,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ):
+        if parallel.tp_size <= 1 or input_size % parallel.tp_size:
+            raise ValueError("DP row projection requires TP > 1 dividing input width")
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            params_dtype=params_dtype,
+            reduce_results=False,
+            quant_config=quant_config,
+            prefix=prefix,
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
+            tp_group=parallel.tp_group,
+            use_presharded_weights=False,
+            override_kernel_name=None,
+            interleave_linear_and_gate=False,
+        )
+        # Mixed checkpoints select quantization per Linear. Validate the resolved
+        # method's alignment, not the model-level precision label.
+        alignment = self.quant_method.input_shard_alignment()
+        if self.input_size_per_partition % alignment:
+            raise ValueError("Output projection TP shard splits a quantization block")
+        self.parallel = parallel
+        self.communication: DPRowParallelCommunication | None = None
+
+    def forward(
+        self, inputs: torch.Tensor, counts: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Project local [tokens, channels] rows using subgroup token counts.
+
+        Returns (complete [local_tokens, hidden] rows in the original order, None).
+        All subgroup ranks must call, including ranks with no local tokens.
+        """
+        parallel = self.parallel
+        if (
+            len(counts) != parallel.world_size
+            or counts[parallel.rank] != inputs.shape[0]
+            or any(count < 0 for count in counts)
+            or inputs.ndim != 2
+            or inputs.shape[1] != self.input_size
+        ):
+            raise ValueError(
+                "Output projection requires matching collective token counts"
+            )
+        max_tokens = max(counts[r] for r in parallel.tp_group)
+        if max_tokens == 0:
+            return inputs.new_empty((0, self.output_size)), None
+        workspace = self.communication
+        if workspace is None or max_tokens > workspace.max_tokens:
+            raise RuntimeError(
+                "Output projection workspace must be prepared before forward"
+            )
+        if (
+            inputs.dtype != workspace.send.dtype
+            or inputs.device != workspace.send.device
+        ):
+            raise ValueError(
+                "Output projection inputs must match the prepared workspace"
+            )
+        size = parallel.tp_size
+        shard = self.input_size // size
+        elements = max_tokens * self.input_size
+        send = workspace.send[:elements].view(size, max_tokens, shard)
+        recv = workspace.recv[:elements].view(size * max_tokens, shard)
+        # Equal-sized messages permit capture and avoid device-to-host counts.
+        # Rank-major output segments are exactly reduce-scatter's owner ordering.
+        # One row already has rank-major byte order. Other shapes fuse the
+        # transpose and padding, preserving the original BF16/FP16 values.
+        lamport_a2a = workspace.lamport_a2a_state(self.input_size, max_tokens)
+        peer = workspace.peer_state(self.output_size, max_tokens)
+        lamport = workspace.lamport_state(self.output_size, max_tokens)
+        # Preserve GEMM's prepared scale format and direct reduction destination.
+        # Other quantizers/backends retain their ordinary Linear execution.
+        plan = self.quant_method.prepared_linear_plan(self)
+        num_tokens = size * max_tokens
+        fused_quant = (
+            lamport_a2a is not None
+            and lamport_a2a.fp8_output is not None
+            and self.bias is None
+            and self.input_is_parallel
+            and not self.reduce_results
+            and fp8_linear_accepts_prepacked_input(plan, num_tokens)
+        )
+        destination = (
+            lamport.input_buffer(max_tokens)
+            if lamport is not None
+            else peer.input_buffer(max_tokens) if peer is not None else None
+        )
+        if lamport_a2a is not None:
+            if (
+                inputs.shape[0] == max_tokens
+                and inputs.is_contiguous()
+                and inputs.data_ptr() % 16 == 0
+            ):
+                padded = inputs
+            else:
+                padded = workspace.send[:elements].view(max_tokens, self.input_size)
+                padded.zero_()
+                padded[: inputs.shape[0]].copy_(inputs)
+            if fused_quant:
+                values, scales = tokenspeed_a2a_lamport_fp8_quantize(
+                    lamport_a2a, padded
+                )
+                partial = fp8_linear_prepacked(
+                    plan,
+                    values,
+                    self.weight,
+                    scales,
+                    num_tokens,
+                    inputs.dtype,
+                    out=destination,
+                )
+            else:
+                recv = tokenspeed_a2a_lamport(
+                    lamport_a2a, padded, inverse=False, out=None
+                )
+        else:
+            packed = triton_pack_channel_shards_for_a2a(inputs, send)
+            all_to_all_single(recv, packed, parallel.tp_group, backend=None)
+        if not fused_quant:
+            partial, _ = super().forward_into(recv, None, destination)
+        # Lamport owns its IPC ring; peer reduction retains a completion fence
+        # protecting its separate symmetric GEMM destination from the next call.
+        output = workspace.reduce_scatter(partial.contiguous(), parallel, max_tokens)
+        return output[: inputs.shape[0]], None
