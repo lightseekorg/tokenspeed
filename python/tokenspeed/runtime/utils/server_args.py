@@ -161,7 +161,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
-    enable_log_requests: bool = False
+    enable_log_requests: bool = True
     log_requests_level: int = 0
     enable_log_request_stats: bool = False
     enable_metrics: bool = False
@@ -1485,7 +1485,7 @@ class ServerArgs:
             "--enable-log-requests",
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.enable_log_requests,
-            help="Log metadata, inputs, outputs of all requests. The verbosity is decided by --log-requests-level",
+            help="Log metadata, inputs, outputs of all requests (default on; --no-enable-log-requests to disable). The verbosity is decided by --log-requests-level",
         )
         parser.add_argument(
             "--log-requests-level",

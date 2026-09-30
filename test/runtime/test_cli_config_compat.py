@@ -376,6 +376,11 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--enable-log-requests"])
         self.assertTrue(args.enable_log_requests)
 
+    def test_log_requests_default_on(self):
+        args = self._parse_args(["--model", "test/model"])
+        self.assertTrue(args.enable_log_requests)
+        self.assertEqual(args.log_requests_level, 0)
+
     def test_disable_log_requests_arg(self):
         args = self._parse_args(["--model", "test/model", "--no-enable-log-requests"])
         self.assertFalse(args.enable_log_requests)

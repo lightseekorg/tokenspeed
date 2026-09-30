@@ -871,6 +871,76 @@ def dsv4_prefill_topk(
         return kernel(**kernel_kwargs)
 
 
+def dsv4_index_candidates(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    index_k_format: str,
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score owned V4 Index-K pages for prefill or decode.
+
+    index_q holds prepared query values/scales; FP8-cache queries are BF16,
+    MXFP4 queries are packed uint8. weights holds per-head weights (including
+    query scaling for MXFP4). Cache pages are page-planar uint8. Page-table
+    columns retain global order with -1 for unowned pages. query_requests and
+    causal_lens identify each query's request and global compressed length.
+    page_size/topk select geometry; softmax_scale applies only to FP8 queries.
+    index_k_format selects fp8_scaled or mxfp4; solution=None uses dispatch.
+    Returns global logical offsets and FP32 scores, with (-1, -inf) padding.
+    """
+    if index_k_format not in ("fp8_scaled", "mxfp4"):
+        raise ValueError(f"Unsupported Index-K format: {index_k_format}")
+    q = index_q[0]
+    if q.ndim != 3 or weights.shape != q.shape[:2]:
+        raise ValueError("Index queries and per-head weights must match")
+    if topk <= 0 or topk & (topk - 1):
+        raise ValueError("Index candidate topk must be a positive power of two")
+    if query_requests.shape != (q.shape[0],) or causal_lens.shape != (q.shape[0],):
+        raise ValueError("Index candidate rows must match queries")
+    if local_page_table.ndim != 2 or 0 in local_page_table.shape:
+        raise ValueError("Index candidates require a nonempty page table")
+    if not q.shape[0]:
+        return (
+            torch.empty((0, topk), device=q.device, dtype=torch.int32),
+            torch.empty((0, topk), device=q.device, dtype=torch.float32),
+        )
+    kernel = select_kernel(
+        "attention",
+        "dsv4_index_candidates",
+        _attention_format_signature(q=q, weights=weights, index_k_cache=index_k_cache),
+        traits={
+            "index_heads": q.shape[1],
+            "head_dim": q.shape[2] * (2 if index_k_format == "mxfp4" else 1),
+            "page_size": page_size,
+            "index_k_format": index_k_format,
+        },
+        solution=solution,
+    )
+    with kernel_scope(
+        "attention", "dsv4_index_candidates", q.dtype, kernel_name=kernel.name
+    ):
+        return kernel(
+            index_q,
+            weights,
+            index_k_cache,
+            local_page_table,
+            query_requests,
+            causal_lens,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=softmax_scale,
+            index_k_format=index_k_format,
+        )
+
+
 def dsv4_decode_topk(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,

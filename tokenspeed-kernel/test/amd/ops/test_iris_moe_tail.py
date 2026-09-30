@@ -158,7 +158,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
 
     held = None
     held_expected = None
-    for rows in (512, 520, 848, 4096, 8144, 8192):
+    for rows in (40, 48, 56, 64, 128, 256, 512, 520, 848, 4096, 8144, 8192):
         inputs = acquire(rows)
         generator.manual_seed(89103 + rank)
         sources = tuple(
