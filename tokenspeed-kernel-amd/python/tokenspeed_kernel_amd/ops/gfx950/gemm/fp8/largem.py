@@ -329,7 +329,6 @@ def gluon_mm_fp8_blockscale_largem_gfx950(
             accumulator,
         )
         async_copy.wait_group(0)
-        gl.barrier()
         activation = (
             shared_a.index(0).load(dot_a_layout).to(gl.float8e4nv, bitcast=True)
         )
@@ -368,7 +367,6 @@ def gluon_mm_fp8_blockscale_largem_gfx950(
         accumulator,
     )
     async_copy.wait_group(0)
-    gl.barrier()
     activation = shared_a.index(1).load(dot_a_layout).to(gl.float8e4nv, bitcast=True)
     weight = async_copy.load_shared_relaxed(shared_b.index(1), dot_b_layout).to(
         gl.float8e4nv, bitcast=True
