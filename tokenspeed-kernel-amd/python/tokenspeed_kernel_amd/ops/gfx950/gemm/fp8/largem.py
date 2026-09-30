@@ -416,7 +416,7 @@ def pack_gluon_fp8_blockscale_weight(
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Create a persistent K128-major candidate weight copy.
+    """Create a private K128-major candidate weight copy.
 
     The returned tensor deliberately retains the checkpoint's logical ``[N,K]``
     shape.  The caller must pass the matching private layout marker when the
@@ -450,27 +450,6 @@ def pack_gluon_fp8_blockscale_weight(
     return out
 
 
-def _resolve_output(
-    activation: torch.Tensor,
-    m: int,
-    n: int,
-    out: torch.Tensor | None,
-) -> torch.Tensor:
-    if out is None:
-        return torch.empty((m, n), device=activation.device, dtype=torch.bfloat16)
-    if out.shape != (m, n):
-        raise ValueError(f"block-FP8 output must have shape {(m, n)}, got {out.shape}")
-    if out.dtype != torch.bfloat16:
-        raise TypeError(f"block-FP8 output must be bfloat16, got {out.dtype}")
-    if out.device != activation.device:
-        raise ValueError(
-            f"block-FP8 output must be on {activation.device}, got {out.device}"
-        )
-    if out.stride(-1) != 1:
-        raise ValueError("block-FP8 output must be contiguous in its last dimension")
-    return out
-
-
 def launch_gluon_mm_fp8_blockscale_largem_gfx950(
     activation: torch.Tensor,
     packed_weight: torch.Tensor,
@@ -483,60 +462,37 @@ def launch_gluon_mm_fp8_blockscale_largem_gfx950(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Execute the exact experimental GLM-5.3 large-row projection contract."""
-    if activation.ndim != 2 or packed_weight.ndim != 2:
-        raise ValueError("block-FP8 candidate expects two-dimensional operands")
-    if activation.dtype not in _FP8_DTYPES or packed_weight.dtype not in _FP8_DTYPES:
-        raise TypeError("block-FP8 candidate expects float8_e4m3fn operands")
-    if out_dtype != torch.bfloat16:
-        raise TypeError(
-            f"block-FP8 candidate requires bfloat16 output, got {out_dtype}"
-        )
-    if block_size != [128, 128]:
-        raise ValueError(
-            f"block-FP8 candidate requires [128,128] scales, got {block_size}"
-        )
     if weight_layout != GLUON_BLOCK_FP8_WEIGHT_LAYOUT:
-        raise ValueError(
-            "generic block-FP8 candidate requires the N64 packed layout; "
-            f"got {weight_layout!r}"
-        )
-    if not activation.is_cuda or not packed_weight.is_cuda:
-        raise ValueError("block-FP8 candidate requires CUDA/HIP tensors")
-    if activation.device != packed_weight.device:
-        raise ValueError("block-FP8 operands must be on the same device")
-    if activation.stride(-1) != 1 or not packed_weight.is_contiguous():
-        raise ValueError(
-            "block-FP8 operands must be contiguous in their inner dimension"
-        )
-    if activation_scales.dtype != torch.float32 or weight_scales.dtype != torch.float32:
-        raise TypeError("block-FP8 candidate requires FP32 scales")
-    if (
-        activation_scales.device != activation.device
-        or weight_scales.device != activation.device
-    ):
-        raise ValueError("block-FP8 scales and operands must be on the same device")
-    if activation_scales.stride(-1) != 1 or weight_scales.stride(-1) != 1:
-        raise ValueError("block-FP8 scales must be contiguous in their inner dimension")
+        raise ValueError("block-FP8 weight requires the N64 packed layout")
 
     m, k = activation.shape
     n, weight_k = packed_weight.shape
-    if weight_k != k or not supports_gluon_fp8_blockscale_largem(m, n, k):
-        raise ValueError(
-            f"unsupported experimental block-FP8 shape: M={m}, N={n}, K={k}"
+    if block_size != [128, 128] or weight_k != k:
+        raise ValueError("block-FP8 operands require matching K128 scale blocks")
+    if not supports_gluon_fp8_blockscale_largem(m, n, k):
+        raise ValueError(f"unsupported block-FP8 shape: M={m}, N={n}, K={k}")
+    if (
+        activation.dtype != torch.float8_e4m3fn
+        or packed_weight.dtype != torch.float8_e4m3fn
+        or activation_scales.dtype != torch.float32
+        or weight_scales.dtype != torch.float32
+        or out_dtype != torch.bfloat16
+    ):
+        raise TypeError(
+            "block-FP8 projection requires E4M3, FP32 scales, and BF16 output"
         )
+    if not packed_weight.is_contiguous():
+        raise ValueError("block-FP8 packed weight must be contiguous")
     k_tiles = k // BLOCK_K
-    if activation_scales.shape != (m, k_tiles):
-        raise ValueError(
-            "activation scales must have shape "
-            f"{(m, k_tiles)}, got {tuple(activation_scales.shape)}"
-        )
-    if weight_scales.shape != (n // 128, k_tiles):
-        raise ValueError(
-            f"weight scales must have shape {(n // 128, k_tiles)}, "
-            f"got {tuple(weight_scales.shape)}"
-        )
+    if activation_scales.shape != (m, k_tiles) or weight_scales.shape != (
+        n // 128,
+        k_tiles,
+    ):
+        raise ValueError("block-FP8 scales do not match operand shapes")
 
-    output = _resolve_output(activation, m, n, out)
+    output = out
+    if output is None:
+        output = torch.empty((m, n), device=activation.device, dtype=torch.bfloat16)
     grid = (triton.cdiv(m, BLOCK_M) * triton.cdiv(n, BLOCK_N),)
     gluon_mm_fp8_blockscale_largem_gfx950[grid](
         activation.view(torch.uint8),

@@ -124,10 +124,6 @@ _platform = Platform.get()
 _fp8_dtype = torch.float8_e4m3fn
 _GLUON_BLOCK_FP8_KERNEL = "gluon_mm_fp8_blockscale_largem_gfx950"
 _GLUON_BLOCK_FP8_WEIGHT_LAYOUT = "gluon_gfx950_k128_n64"
-_GLUON_BLOCK_FP8_LAYOUT_TO_KERNEL = {
-    _GLUON_BLOCK_FP8_WEIGHT_LAYOUT: _GLUON_BLOCK_FP8_KERNEL,
-}
-_GLUON_BLOCK_FP8_KERNELS = frozenset(_GLUON_BLOCK_FP8_LAYOUT_TO_KERNEL.values())
 _GLUON_BLOCK_FP8_ROWS = frozenset({8144, 8192})
 _GLUON_BLOCK_FP8_PROJECTIONS = frozenset(
     {
@@ -368,13 +364,10 @@ def prepare_fp8_linear(
 def refresh_fp8_linear_weight(plan: object, weight: torch.Tensor) -> bool:
     """Repack a graph-visible private weight buffer after a checkpoint update."""
     typed_plan = _require_fp8_linear_plan(plan)
-    if typed_plan.override not in _GLUON_BLOCK_FP8_KERNELS:
+    if typed_plan.override != _GLUON_BLOCK_FP8_KERNEL:
         return False
     prepared = typed_plan.prepared_weight
-    if (
-        prepared is None
-        or typed_plan.prepared_weight_layout not in _GLUON_BLOCK_FP8_LAYOUT_TO_KERNEL
-    ):
+    if prepared is None:
         return False
     if (
         prepared.shape != weight.shape
@@ -395,7 +388,7 @@ def refresh_fp8_linear_weight(plan: object, weight: torch.Tensor) -> bool:
 def invalidate_fp8_linear_weight(plan: object) -> bool:
     """Stop using a private weight layout before its canonical weight changes."""
     typed_plan = _require_fp8_linear_plan(plan)
-    if typed_plan.override not in _GLUON_BLOCK_FP8_KERNELS:
+    if typed_plan.override != _GLUON_BLOCK_FP8_KERNEL:
         return False
     typed_plan.invalidate_prepared_weight()
     return True
@@ -512,7 +505,7 @@ def fp8_linear(
     typed_plan = _require_fp8_linear_plan(plan)
     override = typed_plan.override
     prepared_weight = typed_plan.prepared_weight
-    if override in _GLUON_BLOCK_FP8_KERNELS:
+    if override == _GLUON_BLOCK_FP8_KERNEL:
         supported_input = (input_scales is None and x.dtype == torch.bfloat16) or (
             input_scales is not None
             and x.ndim == 2
@@ -556,12 +549,10 @@ def fp8_linear(
         if typed_plan.prepared_weight_scales is not None and override is not None
         else weight_scales
     )
-    selected_weight = (
-        prepared_weight if override in _GLUON_BLOCK_FP8_KERNELS else weight
-    )
+    selected_weight = prepared_weight if override == _GLUON_BLOCK_FP8_KERNEL else weight
     weight_layout = (
         typed_plan.prepared_weight_layout
-        if override in _GLUON_BLOCK_FP8_KERNELS
+        if override == _GLUON_BLOCK_FP8_KERNEL
         else None
     )
 
@@ -1375,6 +1366,8 @@ def _online_quantize_mxfp8(
     }:
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
+        if kernel_name == _GLUON_BLOCK_FP8_KERNEL:
+            A = A.contiguous()
         return ensure_row_major_scales(
             *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
             group_major_scales=_platform.is_nvidia,
@@ -1564,9 +1557,9 @@ def mm(
             "prepacked_scales is only supported by "
             f"flashinfer_mm_fp8_blockscale, selected {kernel.name!r}"
         )
-    if (
-        weight_layout is not None
-        and _GLUON_BLOCK_FP8_LAYOUT_TO_KERNEL.get(weight_layout) != kernel.name
+    if weight_layout is not None and (
+        weight_layout != _GLUON_BLOCK_FP8_WEIGHT_LAYOUT
+        or kernel.name != _GLUON_BLOCK_FP8_KERNEL
     ):
         raise ValueError(
             f"weight layout {weight_layout!r} does not match {kernel.name!r}"

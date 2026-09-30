@@ -32,6 +32,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
 )
 
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.linear import LinearBase
 from tokenspeed.runtime.layers.quantization.base_config import (
     finalize_quantized_weights_after_loading,
     invalidate_quantized_weights_before_loading,
@@ -66,3 +67,28 @@ def test_runtime_refresh_keeps_one_packed_buffer() -> None:
     assert plan.prepared_weight.data_ptr() == packed_pointer
     assert plan.state_dict() == {}
     assert torch.count_nonzero(plan.prepared_weight.float()) == layer.weight.numel()
+
+
+def test_linear_device_apply_refreshes_packed_weight() -> None:
+    layer = LinearBase(input_size=256, output_size=128)
+    layer.weight = torch.nn.Parameter(
+        torch.zeros((128, 256), dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    layer.quant_method = Fp8LinearMethod(SimpleNamespace(weight_block_size=(128, 128)))
+    packed = pack_gluon_fp8_blockscale_weight(layer.weight)
+    layer._prepared_fp8_linear = _PreparedFp8Linear(
+        override="gluon_mm_fp8_blockscale_largem_gfx950",
+        block_size=(128, 128),
+        prepared_weight=packed,
+        prepared_weight_source=layer.weight,
+        prepared_weight_layout=GLUON_BLOCK_FP8_WEIGHT_LAYOUT,
+    )
+
+    with torch.no_grad():
+        layer.weight.copy_(torch.ones_like(layer.weight))
+    assert not layer._prepared_fp8_linear.prepared_weight_is_current(layer.weight)
+    layer.to("cpu")
+    assert layer._prepared_fp8_linear.prepared_weight_is_current(layer.weight)
+    assert torch.count_nonzero(layer._prepared_fp8_linear.prepared_weight.float()) == (
+        layer.weight.numel()
+    )

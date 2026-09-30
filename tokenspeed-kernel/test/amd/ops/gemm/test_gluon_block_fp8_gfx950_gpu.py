@@ -32,6 +32,15 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
 )
 
 
+def _gfx950_device() -> torch.device:
+    if not torch.cuda.is_available():
+        pytest.skip("requires a gfx950 GPU")
+    device = torch.device("cuda:0")
+    if torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] != "gfx950":
+        pytest.skip("requires gfx950")
+    return device
+
+
 def _reference(
     activation: torch.Tensor,
     weight: torch.Tensor,
@@ -65,11 +74,7 @@ def _reference(
 def test_block_fp8_numerics_and_graph_replay(
     m: int, n: int, k: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("requires a gfx950 GPU")
-    device = torch.device("cuda:0")
-    if torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] != "gfx950":
-        pytest.skip("requires gfx950")
+    device = _gfx950_device()
 
     torch.manual_seed(42)
     activation = torch.randint(-2, 3, (m, k), device=device).to(torch.float8_e4m3fn)
@@ -131,3 +136,62 @@ def test_block_fp8_numerics_and_graph_replay(
     activation.zero_()
     graph.replay()
     assert not torch.count_nonzero(graph_output)
+
+
+def test_block_fp8_handles_broad_magnitudes_and_scales() -> None:
+    device = _gfx950_device()
+    m, n, k = 8144, 4096, 512
+    torch.manual_seed(71)
+    padded_activation = torch.empty(
+        (m, k + 16), device=device, dtype=torch.float8_e4m3fn
+    )
+    activation = padded_activation[:, :k]
+    activation.copy_((torch.randn((m, k), device=device) * 12).to(torch.float8_e4m3fn))
+    weight = (torch.randn((n, k), device=device) * 18).to(torch.float8_e4m3fn)
+    padded_scales = torch.empty((m, k // 128 + 1), device=device)
+    activation_scales = padded_scales[:, : k // 128]
+    activation_scales.copy_(
+        torch.exp(torch.randn((m, k // 128), device=device) * 0.6) * 0.02
+    )
+    weight_scales = (
+        torch.exp(torch.randn((n // 128, k // 128), device=device) * 0.6) * 0.02
+    )
+    output = torch.empty((m, n + 16), device=device, dtype=torch.bfloat16)[:, :n]
+
+    actual = launch_gluon_mm_fp8_blockscale_largem_gfx950(
+        activation,
+        pack_gluon_fp8_blockscale_weight(weight),
+        activation_scales,
+        weight_scales,
+        torch.bfloat16,
+        block_size=[128, 128],
+        weight_layout=GLUON_BLOCK_FP8_WEIGHT_LAYOUT,
+        out=output,
+    )
+    assert actual.data_ptr() == output.data_ptr()
+    expected = _reference(activation, weight, activation_scales, weight_scales)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.03)
+
+
+def test_online_bf16_quantization_accepts_padded_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _gfx950_device()
+    m, n, k = 8144, 4096, 512
+    torch.manual_seed(73)
+    padded = torch.randn((m, k + 16), device=device, dtype=torch.bfloat16)
+    activation = padded[:, :k]
+    assert not activation.is_contiguous()
+    weight = (torch.randn((n, k), device=device) * 4).to(torch.float8_e4m3fn)
+    weight_scales = torch.rand((n // 128, k // 128), device=device) * 0.05 + 0.05
+
+    monkeypatch.setenv("TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE", "1")
+    plan = prepare_fp8_linear(weight, weight_scales, (128, 128))
+    assert plan.prepared_weight_layout == GLUON_BLOCK_FP8_WEIGHT_LAYOUT
+    actual = fp8_linear(
+        plan, activation, weight, weight_scales, out_dtype=torch.bfloat16
+    )
+    expected = fp8_linear(
+        plan, activation.contiguous(), weight, weight_scales, out_dtype=torch.bfloat16
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
