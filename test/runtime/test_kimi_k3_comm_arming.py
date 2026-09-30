@@ -49,7 +49,7 @@ from tokenspeed.runtime.models.kimi_k3_comm import (  # noqa: E402
 
 @needs_iris
 def test_iris_preparation_caps_attnres_for_equal_tp8_groups(monkeypatch):
-    from tokenspeed.runtime.models import kimi_k3_comm
+    from tokenspeed.runtime.models import kimi_k3
 
     group = tuple(range(8))
     mapping = SimpleNamespace(
@@ -58,13 +58,13 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(monkeypatch):
     )
     prepare = Mock(return_value=True)
     monkeypatch.setattr(
-        kimi_k3_comm,
+        kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
-    assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+    assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
@@ -84,7 +84,7 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(monkeypatch):
 
 @needs_iris
 def test_iris_preparation_handles_distinct_groups(monkeypatch):
-    from tokenspeed.runtime.models import kimi_k3_comm
+    from tokenspeed.runtime.models import kimi_k3
 
     attn_group = (0, 1, 2, 3)
     moe_group = tuple(range(8))
@@ -94,13 +94,13 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
     )
     prepare = Mock(return_value=True)
     monkeypatch.setattr(
-        kimi_k3_comm,
+        kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
-    assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+    assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
@@ -132,7 +132,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
 
 @needs_iris
 def test_iris_preparation_handles_moe_only_group(monkeypatch):
-    from tokenspeed.runtime.models import kimi_k3_comm
+    from tokenspeed.runtime.models import kimi_k3
 
     attn_group = (0,)
     moe_group = tuple(range(8))
@@ -142,13 +142,13 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
     )
     prepare = Mock(return_value=True)
     monkeypatch.setattr(
-        kimi_k3_comm,
+        kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
-    assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+    assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
@@ -168,7 +168,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
 
 @needs_iris
 def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
-    from tokenspeed.runtime.models import kimi_k3_comm
+    from tokenspeed.runtime.models import kimi_k3
 
     group = tuple(range(4))
     mapping = SimpleNamespace(
@@ -177,13 +177,13 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
     )
     prepare = Mock(return_value=True)
     monkeypatch.setattr(
-        kimi_k3_comm,
+        kimi_k3,
         "current_platform",
         lambda: SimpleNamespace(is_cdna4=True),
     )
-    monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+    monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
-    assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+    assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
@@ -219,10 +219,10 @@ def test_iris_lamport_requires_attention_and_moe_tp8(
     monkeypatch, world, attn_tp, moe_tp, moe_ep, expected
 ):
     from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.models import kimi_k3_comm
+    from tokenspeed.runtime.models import kimi_k3
 
     monkeypatch.setattr(
-        kimi_k3_comm, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
+        kimi_k3, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
     )
     for rank in range(world):
         mapping = Mapping(
@@ -233,9 +233,9 @@ def test_iris_lamport_requires_attention_and_moe_tp8(
             moe_ep_size=moe_ep,
         )
         prepare = Mock(return_value=True)
-        monkeypatch.setattr(kimi_k3_comm, "prepare_all_reduce_buffers", prepare)
+        monkeypatch.setattr(kimi_k3, "prepare_all_reduce_buffers", prepare)
 
-        assert kimi_k3_comm.prepare_k3_all_reduce_buffers(
+        assert kimi_k3.prepare_k3_all_reduce_buffers(
             mapping=mapping,
             hidden_size=7168,
             routed_hidden_size=3584,

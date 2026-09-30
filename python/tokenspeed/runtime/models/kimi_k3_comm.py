@@ -55,7 +55,6 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
-    prepare_all_reduce_buffers,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
@@ -64,8 +63,6 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
-_IRIS_MAX_TOKENS = 8192
-_IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 _MULTIMEM_AR_MIN_TOKENS = 1024
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
@@ -102,82 +99,6 @@ def _unified_tail_applicable(
         and top_k == 16
         and has_routed_norm
     )
-
-
-def prepare_k3_all_reduce_buffers(
-    *,
-    mapping,
-    hidden_size: int,
-    routed_hidden_size: int,
-    max_num_tokens: int,
-) -> bool:
-    """Prepare the node-local AMD all-reduce buffers used by Kimi-K3."""
-    if not current_platform().is_cdna4:
-        return False
-
-    max_num_tokens = min(max_num_tokens, _IRIS_MAX_TOKENS)
-    if max_num_tokens <= 0:
-        return False
-
-    from tokenspeed_kernel.ops.communication.triton import (
-        allreduce_residual_attnres_max_tokens,
-    )
-
-    attnres_max_rows = min(
-        max_num_tokens,
-        allreduce_residual_attnres_max_tokens(mapping.attn.tp_size),
-    )
-    groups_are_equal = mapping.attn.tp_group == mapping.moe.tp_ep_group
-    # The Lamport crossover was measured with attention TP8 and MoE TP8.
-    enable_lamport = (
-        groups_are_equal
-        and mapping.attn.tp_size == 8
-        and mapping.moe.tp_size == 8
-        and mapping.moe.ep_size == 1
-    )
-    # Keep the full producer-direct window for equal TP8 groups. Its 50K/500
-    # C16 gain survives content-sensitive EAGLE3 trajectories; retain 48 tokens
-    # for other mappings.
-    expand_moe_window = (
-        groups_are_equal and mapping.attn.tp_size == 8 and mapping.moe.tp_ep_size == 8
-    )
-    producer_direct_max_tokens = (
-        max_num_tokens
-        if expand_moe_window
-        else min(max_num_tokens, _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS)
-    )
-    prepared = False
-    if mapping.attn.tp_size > 1:
-        prepared = prepare_all_reduce_buffers(
-            mapping.attn.tp_group,
-            staged_max_numel=max_num_tokens * hidden_size,
-            producer_direct_max_numel=(
-                producer_direct_max_tokens * (hidden_size + routed_hidden_size)
-                if groups_are_equal and mapping.moe.tp_ep_size > 1
-                else 0
-            ),
-            attnres_max_numel=attnres_max_rows * hidden_size,
-            attnres_max_rows=attnres_max_rows,
-            enable_lamport=enable_lamport,
-            dtype=torch.bfloat16,
-            backend=None,
-        )
-    if mapping.moe.tp_ep_size > 1 and not groups_are_equal:
-        prepared = (
-            prepare_all_reduce_buffers(
-                mapping.moe.tp_ep_group,
-                staged_max_numel=max_num_tokens * hidden_size,
-                producer_direct_max_numel=producer_direct_max_tokens
-                * (hidden_size + routed_hidden_size),
-                attnres_max_numel=0,
-                attnres_max_rows=0,
-                enable_lamport=False,
-                dtype=torch.bfloat16,
-                backend=None,
-            )
-            or prepared
-        )
-    return prepared
 
 
 class K3AttnComm:
