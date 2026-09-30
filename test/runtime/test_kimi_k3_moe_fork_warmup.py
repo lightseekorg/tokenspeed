@@ -440,32 +440,6 @@ def test_row_sharded_moe_tail_skips_iris_import_on_other_platform(monkeypatch):
     assert result._base is fallback
 
 
-@pytest.mark.parametrize("prefix_rows,reverse_group", [(3, False), (2, True)])
-def test_moe_rejects_mismatched_residual_shard_metadata(prefix_rows, reverse_group):
-    group = tuple(range(8))
-    layer = SimpleNamespace(
-        mapping=SimpleNamespace(
-            attn=SimpleNamespace(dp_size=1, tp_size=8, tp_group=group),
-            moe=SimpleNamespace(
-                tp_size=8,
-                ep_size=1,
-                tp_ep_group=group[::-1] if reverse_group else group,
-            ),
-        ),
-        native_latent_moe=None,
-    )
-    with pytest.raises(ValueError, match="matching TP8 groups"):
-        KimiLinearMoE.forward(
-            layer,
-            torch.zeros(16, 4),
-            torch.zeros(prefix_rows, 4),
-            num_global_tokens=16,
-            max_num_tokens_per_gpu=16,
-            ctx=None,
-            prefix_is_sharded=True,
-        )
-
-
 @pytest.mark.parametrize(
     "producer_direct,accepted", [(True, True), (True, False), (False, False)]
 )

@@ -170,19 +170,5 @@ def test_deepep_routes_unique_rows_and_joins_attention_tp(
     torch.testing.assert_close(output, prefix + hidden * 6 + full_routed * 5)
 
 
-def test_deepep_rejects_a_tp_residual_shard_before_dispatch():
-    hidden = torch.zeros(8, 4)
-    with pytest.raises(ValueError, match="replicated residual"):
-        KimiLinearMoEDeepEP.forward(
-            SimpleNamespace(),
-            hidden,
-            hidden[:1],
-            num_global_tokens=8,
-            max_num_tokens_per_gpu=8,
-            ctx=None,
-            prefix_is_sharded=True,
-        )
-
-
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

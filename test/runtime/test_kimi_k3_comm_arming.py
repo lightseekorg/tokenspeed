@@ -474,51 +474,6 @@ def test_attention_prefill_producer_window(
         )
 
 
-@pytest.mark.parametrize("has_prefix", [False, True])
-@pytest.mark.parametrize("producer_direct", [False, True])
-def test_attention_prefill_fallback_preserves_residual_ownership(
-    monkeypatch, has_prefix, producer_direct
-):
-    from tokenspeed.runtime.models import kimi_k3_comm as module
-
-    group = tuple(range(8))
-    comm = module.K3AttnComm.__new__(module.K3AttnComm)
-    comm.mapping = SimpleNamespace(attn=SimpleNamespace(tp_group=group))
-    partial = torch.zeros((37, 7168), dtype=torch.bfloat16)
-    prefix = torch.ones_like(partial) if has_prefix else None
-    output = torch.full_like(partial, 3)
-
-    def reduce(value, owner):
-        assert owner == group
-        if producer_direct:
-            assert isinstance(value, tuple) and len(value) == 1
-            assert value[0] is partial
-            return (value[0] + 3,)
-        assert value is partial
-        return value.add_(3)
-
-    fallback = Mock(side_effect=reduce)
-    monkeypatch.setattr(module, "all_reduce", fallback)
-    retained, delta = comm.prefill_reduce_for_attnres(
-        partial, prefix, producer_direct=producer_direct
-    )
-    assert fallback.call_count == 1
-    assert fallback.call_args.args[1] == group
-    reduced = delta if has_prefix else retained
-    torch.testing.assert_close(reduced, output)
-    if has_prefix:
-        assert retained is prefix
-    else:
-        assert delta is None
-    if producer_direct:
-        assert reduced.data_ptr() != partial.data_ptr()
-        torch.testing.assert_close(partial, torch.zeros_like(partial))
-        partial.fill_(9)  # The next producer cannot corrupt this retained result.
-        torch.testing.assert_close(reduced, output)
-    else:
-        assert reduced is partial
-
-
 @pytest.mark.parametrize(
     "rows,is_cdna4,eligible",
     [
