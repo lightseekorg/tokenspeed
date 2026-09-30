@@ -383,6 +383,20 @@ their joint reduction before the fused latent up-projection epilogue. Other
 shapes and unsupported layouts retain the ordinary composed path. The fused
 sigmoid-bias top-k route supports the full scheduled token count.
 
+For Gluon Petit MegaMoE on one node with 8x gfx950 and MXFP4 expert weights,
+use attention DP8 and EP8, with at most 1024 tokens per rank:
+
+```bash
+TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve moonshotai/Kimi-K3 \
+  --trust-remote-code --dtype bfloat16 \
+  --tensor-parallel-size 1 --data-parallel-size 8 --ep-size 8 \
+  --attention-backend mla --kv-cache-dtype fp8 \
+  --moe-backend gluon_petit --all2all-backend gluon_petit \
+  --max-model-len 8192 --max-num-seqs 32 \
+  --chunked-prefill-size 1024 --max-prefill-tokens 1024 \
+  --disable-kvstore --disable-autotune
+```
+
 ## GLM5 / GLM5.2
 
 GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV
