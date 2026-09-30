@@ -761,6 +761,8 @@ For four BF16 residual streams, FP32 projection weights, hidden width 4096 or
 existing reduction kernel, 65–256 rows use the portable Triton path, and
 eligible calls above 256 rows select the Gluon projection. Other
 configurations retain their existing registered backend.
+Inputs whose buffer offsets exceed signed 32-bit range retain the portable
+projection.
 
 The projection computes 64 token rows and 24 outputs per workgroup. Four waves
 reuse each asynchronously staged FP32 weight tile while accumulating their own

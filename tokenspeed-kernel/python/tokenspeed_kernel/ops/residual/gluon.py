@@ -271,6 +271,7 @@ if current_platform().is_amd:
         ),
         traits={
             "large_prefill": frozenset({True}),
+            "buffer_offsets_fit_int32": frozenset({True}),
             "hc_mult": frozenset({4}),
             "hidden_size": frozenset({4096, 7168}),
             "sinkhorn_iters": frozenset({20}),

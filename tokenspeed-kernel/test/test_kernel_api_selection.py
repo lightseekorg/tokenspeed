@@ -2723,6 +2723,7 @@ def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
         (64, "gluon_mhc_pre_gfx950"),
         (256, "triton_mhc_pre"),
         (257, "gluon_mhc_prefill_gfx950"),
+        (131072, "triton_mhc_pre"),
     ],
 )
 def test_mhc_prefill_selects_gfx950_projection(
@@ -2748,6 +2749,7 @@ def test_mhc_prefill_selects_gfx950_projection(
             traits={
                 "num_tokens": num_tokens,
                 "large_prefill": num_tokens > 256,
+                "buffer_offsets_fit_int32": num_tokens * 4 * 4096 < 2**31,
                 "hc_mult": 4,
                 "hidden_size": 4096,
                 "sinkhorn_iters": 20,

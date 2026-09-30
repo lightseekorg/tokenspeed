@@ -613,6 +613,7 @@ def mhc_pre(
     traits = {
         "num_tokens": num_tokens,
         "large_prefill": num_tokens > 256,
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
         "hc_mult": hc_mult,
         "hidden_size": hidden_size,
         "sinkhorn_iters": int(sinkhorn_iters),
