@@ -46,6 +46,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
@@ -186,7 +187,9 @@ def _sample(ib, runtime, ids, num_extends, accept_lengths, has_drafter):
         torch.tensor(accept_lengths, dtype=torch.int32, device=ib.device),
         ib.input_lengths_buf[:bs],
         num_extends,
-        output_layout=None,
+        output_layout=ForwardOutputLayout(
+            num_extends, num_extends, bs - num_extends, executor.config.output_length
+        ),
     )
 
 
@@ -562,7 +565,7 @@ def test_runtime_update_replay_shrink_idle_and_slot_reuse(buffers, record_update
             accepts,
             ib.input_lengths_buf[:4],
             0,
-            output_layout=None,
+            output_layout=ForwardOutputLayout(0, 0, 4, 4),
         )
 
     graph = None

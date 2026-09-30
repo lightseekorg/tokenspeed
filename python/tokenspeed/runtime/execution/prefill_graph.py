@@ -81,6 +81,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
@@ -1115,6 +1116,7 @@ class PrefillGraph:
             token_to_kv_pool=self.token_to_kv_pool,
             bs=bs,
             num_extends=bs,
+            output_layout=ForwardOutputLayout(bs, bs, 0, 1),
             input_num_tokens=num_tokens,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=(

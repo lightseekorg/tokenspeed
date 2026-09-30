@@ -27,6 +27,7 @@ from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiLinearConfig,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
     FULL_ATTENTION,
     LINEAR_ATTENTION,
@@ -661,6 +662,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             token_to_kv_pool=None,
             bs=3,
             num_extends=1,
+            output_layout=ForwardOutputLayout(1, 1, 2, 1),
             input_num_tokens=4,
             forward_mode=ForwardMode.DECODE,
         )

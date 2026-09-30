@@ -1572,7 +1572,6 @@ class DeepseekV41Model(nn.Module):
         ctx.captured_rows = None
         if view.logits_rows is not None:
             hidden = hidden.index_select(0, view.logits_rows)
-        if ctx.output_layout is not None:
             if hidden.shape[0] != ctx.output_layout.num_output_tokens:
                 raise RuntimeError("V4.1 decoder and output layout disagree")
         capture = (

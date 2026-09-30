@@ -24,11 +24,13 @@ from typing import Sequence
 
 @dataclass(frozen=True)
 class ForwardOutputLayout:
-    """Compact outputs for a completing-prefill prefix and the decode suffix.
+    """Output rows for every forward, including ordinary and compact batches.
 
-    Request/cache rows never move. Incomplete prefills between the two
-    intervals have no token storage; decode keeps its fixed verify width.
-    This host-only value is frozen before grammar work is queued.
+    Prefill outputs form a request prefix; decode keeps its fixed verify
+    width. Ordinary batches include every extend request in that prefix.
+    Backends that omit incomplete prefills shorten it without moving
+    request/cache rows. This host-only value is frozen before grammar work
+    is queued; consumers always use it, never infer a layout from absence.
     """
 
     num_extends: int

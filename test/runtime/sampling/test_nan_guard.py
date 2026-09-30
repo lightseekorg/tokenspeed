@@ -27,12 +27,19 @@ from types import SimpleNamespace
 import torch
 
 from tokenspeed.runtime.execution.nan_guard import NanGuard
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 
 NAN = float("nan")
 
 
-def _ctx(bs: int, num_extends: int = 0):
-    return SimpleNamespace(bs=bs, num_extends=num_extends, output_layout=None)
+def _ctx(bs: int, num_extends: int = 0, width: int = 1):
+    return SimpleNamespace(
+        bs=bs,
+        num_extends=num_extends,
+        output_layout=ForwardOutputLayout(
+            num_extends, num_extends, bs - num_extends, width
+        ),
+    )
 
 
 def _logits_output(logits: torch.Tensor, layout_plan=None):
@@ -58,7 +65,7 @@ def test_audit_logits_reduces_verify_rows_per_decode_slot():
     logits = torch.zeros((7, 8))
     logits[5, 0] = NAN  # decode slot 1 (rows 4-6), middle row
 
-    guard.audit_logits(_logits_output(logits), _ctx(bs=3, num_extends=1))
+    guard.audit_logits(_logits_output(logits), _ctx(bs=3, num_extends=1, width=3))
 
     assert guard.flags.tolist() == [0, 0, 1, 0]
 
@@ -114,7 +121,7 @@ def test_merge_oov_flags_decode_slots():
     # 1 extend token + 2 decode slots x 2 predictions.
     tokens = torch.tensor([5, 7, 9, -1, 11])
 
-    guard.merge_oov(tokens, _ctx(bs=3, num_extends=1), vocab_size=100)
+    guard.merge_oov(tokens, _ctx(bs=3, num_extends=1, width=3), vocab_size=100)
 
     assert guard.flags.tolist() == [0, 0, 1]
 

@@ -46,6 +46,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_SWA_GROUP_ID,
 )
@@ -164,6 +165,7 @@ class DeepseekV41DSpark(BaseDrafter):
             token_to_kv_pool=pool,
             bs=num_decodes,
             num_extends=0,
+            output_layout=ForwardOutputLayout(0, 0, num_decodes, self.block_size),
             input_num_tokens=num_decodes * self.block_size,
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -228,11 +230,7 @@ class DeepseekV41DSpark(BaseDrafter):
             return next_tokens
 
         start_pos = self.start_pos_buf[:num_decodes]
-        num_prefill_outputs = (
-            num_extends
-            if base_ctx.output_layout is None
-            else base_ctx.output_layout.num_prefill_outputs
-        )
+        num_prefill_outputs = base_ctx.output_layout.num_prefill_outputs
         dsv41.dspark_anchors(
             output_tokens,
             accept_lengths,

@@ -87,6 +87,7 @@ class GrammarStepCompletion:
     (intermediate chunked-prefill chunk) and MUST NOT advance the matcher.
     """
 
+    output_layout: ForwardOutputLayout
     event: threading.Event = field(default_factory=threading.Event)
     terminated_at: list[int] = field(default_factory=list)
 
@@ -94,8 +95,6 @@ class GrammarStepCompletion:
     grammars: list | None = None
 
     bs: int = 0
-    tokens_per_req: int = 1
-    output_layout: ForwardOutputLayout | None = None
 
     advance_mask: list[bool] | None = None
 
@@ -210,10 +209,9 @@ class CapturableGrammarExecutor:
         grammars: list,
         bs: int,
         has_candidates: bool = False,
-        tokens_per_req: int = 1,
         advance_mask: list[bool] | None = None,
         *,
-        output_layout: ForwardOutputLayout | None,
+        output_layout: ForwardOutputLayout,
     ) -> GrammarStepCompletion:
         """Push request state for the next captured iteration.
 
@@ -241,7 +239,6 @@ class CapturableGrammarExecutor:
         completion = GrammarStepCompletion(
             grammars=grammars_list,
             bs=bs,
-            tokens_per_req=tokens_per_req,
             advance_mask=advance_list,
             output_layout=output_layout,
         )
@@ -251,7 +248,6 @@ class CapturableGrammarExecutor:
                 "grammars": grammars_list,
                 "bs": bs,
                 "has_candidates": has_candidates,
-                "tokens_per_req": tokens_per_req,
                 "advance_mask": advance_list,
                 "completion": completion,
             }
@@ -289,7 +285,6 @@ class CapturableGrammarExecutor:
                 return
 
             grammars = prev["grammars"]
-            stride = prev["tokens_per_req"]
             bs = prev["bs"]
             advance_mask = prev["advance_mask"]
             terminated_at = [-1] * bs
@@ -308,11 +303,7 @@ class CapturableGrammarExecutor:
 
                 for j in range(n_accepted):
 
-                    offset = (
-                        i * stride
-                        if completion.output_layout is None
-                        else completion.output_layout.token_offset(i)
-                    )
+                    offset = completion.output_layout.token_offset(i)
                     tok = int(self.output_tokens_host[offset + j].item())
 
                     try:
@@ -358,7 +349,7 @@ class CapturableGrammarExecutor:
 
             row_base = i * per_req_rows
             advanced = 0
-            positions = n if layout is None else layout.output_width(i)
+            positions = layout.output_width(i)
 
             for pos in range(positions):
 
@@ -542,17 +533,13 @@ def _fill_eager_bitmask(
     spec_num_tokens: int,
     is_spec_decode: bool,
     input_ids_buf,
-    output_layout: ForwardOutputLayout | None,
+    output_layout: ForwardOutputLayout,
 ) -> None:
     """Sync, walk grammars on host, H2D the bitmask. Non-CUDA path only."""
     if is_spec_decode:
-        first = 0 if output_layout is None else output_layout.num_extends
+        first = output_layout.num_extends
         count = bs - first
-        candidates = (
-            input_ids_buf[: bs * spec_num_tokens]
-            if output_layout is None
-            else input_ids_buf[-count * spec_num_tokens :]
-        )
+        candidates = input_ids_buf[-count * spec_num_tokens :]
         eager_buffers.candidates_cpu_buf[first:bs].copy_(
             candidates.view(count, spec_num_tokens), non_blocking=True
         )
@@ -569,11 +556,7 @@ def _fill_eager_bitmask(
                 continue
             row_base = i * spec_num_tokens
             advanced = 0
-            positions = (
-                spec_num_tokens
-                if output_layout is None
-                else output_layout.output_width(i)
-            )
+            positions = output_layout.output_width(i)
             for pos in range(positions):
                 if grammar.is_terminated():
                     break
@@ -610,7 +593,7 @@ def setup_grammar_step(
     grammar_runtime: GrammarRuntime | None,
     input_ids_buf,
     grammar_backend: str,
-    output_layout: ForwardOutputLayout | None,
+    output_layout: ForwardOutputLayout,
 ) -> GrammarStepCompletion | None:
     """Bind the bitmask buffer and dispatch one step of grammar work.
 
@@ -649,12 +632,10 @@ def setup_grammar_step(
     if capturable is not None:
         # Always push (even all-None) to keep the captured hostfunc queue
         # 1:1 with replays.
-        tokens_per_req = spec_num_tokens if is_spec_decode else 1
         return capturable.add_batch(
             grammars=grammars,
             bs=bs,
             has_candidates=is_spec_decode,
-            tokens_per_req=tokens_per_req,
             advance_mask=advance_mask,
             output_layout=output_layout,
         )

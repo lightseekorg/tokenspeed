@@ -49,6 +49,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
@@ -212,7 +213,7 @@ def test_mixed_round_preserves_prefill_outputs():
         pass
 
     ctx = _Ctx()
-    ctx.output_layout = None
+    ctx.output_layout = ForwardOutputLayout(num_extends, num_extends, num_decodes, n)
     ctx.num_extends = num_extends
     ctx.bs = bs
     ctx.decode_input_ids = None
@@ -292,7 +293,7 @@ def test_mixed_round_preserves_prefill_logprobs():
         pass
 
     ctx = _Ctx()
-    ctx.output_layout = None
+    ctx.output_layout = ForwardOutputLayout(num_extends, num_extends, num_decodes, n)
     ctx.num_extends = num_extends
     ctx.bs = bs
     ctx.decode_input_ids = None

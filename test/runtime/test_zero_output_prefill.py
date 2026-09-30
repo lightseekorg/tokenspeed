@@ -63,7 +63,13 @@ def load_symbol(path, name, *, owner=None, **bindings):
         ],
         type_ignores=[],
     )
-    scope = dict(__name__=__name__, torch=torch, dataclasses=dataclasses, **bindings)
+    scope = dict(
+        __name__=__name__,
+        torch=torch,
+        dataclasses=dataclasses,
+        ForwardOutputLayout=ForwardOutputLayout,
+        **bindings,
+    )
     exec(compile(ast.fix_missing_locations(module), str(ROOT / path), "exec"), scope)
     return scope[name]
 
@@ -104,22 +110,22 @@ class SharedBufferSampler:
 
 
 @pytest.mark.parametrize(
-    "p,e,d,width,compact,with_mask",
+    "p,e,d,width,with_mask",
     [
-        (1, 2, 1, 1, True, True),
-        (1, 2, 2, 3, True, True),
-        (0, 1, 1, 3, True, True),
-        (0, 1, 0, 3, True, True),
-        (1, 2, 0, 1, True, True),
-        (2, 3, 2, 3, True, True),
-        (2, 2, 2, 1, False, False),
-        (2, 2, 2, 3, False, False),
-        (1, 1, 1, 2, False, True),
-        (2, 2, 2, 3, False, True),
+        (1, 2, 1, 1, True),
+        (1, 2, 2, 3, True),
+        (0, 1, 1, 3, True),
+        (0, 1, 0, 3, True),
+        (1, 2, 0, 1, True),
+        (2, 3, 2, 3, True),
+        (2, 2, 2, 1, False),
+        (2, 2, 2, 3, False),
+        (1, 1, 1, 2, True),
+        (2, 2, 2, 3, True),
     ],
 )
 def test_sampling_preserves_request_parameters_and_shared_outputs(
-    p, e, d, width, compact, with_mask
+    p, e, d, width, with_mask
 ):
     info_cls = load_symbol(
         RUNTIME + "sampling/sampling_batch_info.py", "SamplingBatchInfo"
@@ -142,7 +148,7 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
         bs=e + d,
         num_extends=e,
         decode_input_ids=None,
-        output_layout=ForwardOutputLayout(e, p, d, width) if compact else None,
+        output_layout=ForwardOutputLayout(e, p, d, width),
     )
     pool_indices = torch.tensor([17, 3, 11, 5, 13])[: e + d]
     cache_lengths = torch.arange(32)
@@ -173,9 +179,7 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
             assert subset.top_ks.tolist() == list(range(10, 10 + p))
             assert subset.batch_row_offset == 7
             if with_mask:
-                expected_mask = (
-                    list(range(0, p * width, width)) if compact else list(range(p))
-                )
+                expected_mask = list(range(0, p * width, width))
                 assert subset.vocab_mask[:, 0].tolist() == expected_mask
         else:
             assert subset.req_pool_indices.tolist() == pool_indices[e:].tolist()
@@ -183,9 +187,7 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
             assert subset.top_ks.tolist() == list(range(10 + e, 10 + e + d))
             assert subset.batch_row_offset == 7 + e
             if with_mask:
-                # Legacy sampling forwards the original mask suffix unchanged;
-                # only compact outputs select masks on the token axis.
-                mask_start = e * width if compact else e
+                mask_start = e * width
                 assert subset.vocab_mask[:, 0].tolist() == list(
                     range(mask_start, (e + d) * width)
                 )
@@ -232,7 +234,6 @@ def test_grammar_consumers_share_compact_token_offsets(hostfunc):
     completion = SimpleNamespace(
         grammars=grammars,
         bs=3,
-        tokens_per_req=2,
         advance_mask=[True, False, True],
         output_layout=ForwardOutputLayout(2, 1, 1, 2),
         lock=threading.Lock(),
@@ -252,7 +253,6 @@ def test_grammar_consumers_share_compact_token_offsets(hostfunc):
                 completion=completion,
                 grammars=grammars,
                 bs=3,
-                tokens_per_req=2,
                 advance_mask=completion.advance_mask,
             ),
         )
@@ -464,7 +464,14 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
     )
     info = info_cls(req_pool_indices=torch.tensor([3, 7]))
     ctx = SimpleNamespace(
-        bs=2, num_extends=0 if decode else 2, decode_input_ids=None, output_layout=None
+        bs=2,
+        num_extends=0 if decode else 2,
+        decode_input_ids=None,
+        output_layout=(
+            ForwardOutputLayout(0, 0, 2, 1)
+            if decode
+            else ForwardOutputLayout(2, 2, 0, 1)
+        ),
     )
     tokens, lengths = sample(
         executor, Output(torch.eye(2)), info, ctx, torch.zeros(2, 1, dtype=torch.int32)
@@ -544,13 +551,14 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
     )
     assert step.called
     completion = grammar.queue.get_nowait()["completion"]
-    assert completion.output_layout is None
+    assert completion.output_layout == ForwardOutputLayout(0, 0, 1, 1)
     assert grammar.queue.empty()
 
 
 @pytest.mark.parametrize("capturable", [True, False])
+@pytest.mark.parametrize("prefill_outputs", [1, 2])
 def test_grammar_mask_producers_walk_only_original_decode_candidates(
-    capturable, monkeypatch
+    capturable, prefill_outputs, monkeypatch
 ):
     class MaskMatcher(Matcher):
         def __init__(self, tag):
@@ -568,7 +576,7 @@ def test_grammar_mask_producers_walk_only_original_decode_candidates(
             del self.tokens[-count:]
 
     grammars = [MaskMatcher(100), MaskMatcher(200), MaskMatcher(300)]
-    layout = ForwardOutputLayout(2, 1, 1, 3)
+    layout = ForwardOutputLayout(2, prefill_outputs, 1, 3)
     masks = torch.empty(9, 1, dtype=torch.int32)
     candidates = torch.full((3, 3), -99, dtype=torch.int32)
     if capturable:
@@ -615,7 +623,17 @@ def test_grammar_mask_producers_walk_only_original_decode_candidates(
         )
         torch.testing.assert_close(buffers.vocab_mask_spec_buf, masks)
         assert candidates[2].tolist() == [20, 21, 22]
-    assert masks[:, 0].tolist() == [100, -1, -1, -1, -1, -1, 300, 321, 343]
+    assert masks[:, 0].tolist() == [
+        100,
+        -1,
+        -1,
+        200 if prefill_outputs == 2 else -1,
+        -1,
+        -1,
+        300,
+        321,
+        343,
+    ]
     assert [g.tokens for g in grammars] == [[], [], []]
 
 
@@ -819,3 +837,72 @@ def test_decoder_swa_excludes_history_before_its_retained_window(
         assert (
             view.metadata.request_indices[-decode_rows:].tolist() == [1] * decode_rows
         )
+
+
+@pytest.mark.parametrize("live_bs", [0, 2, 4])
+def test_graph_padding_restores_live_output_layout(live_bs):
+    from contextlib import nullcontext
+
+    run = load_symbol(
+        RUNTIME + "execution/forward_step.py",
+        "__call__",
+        owner="ForwardStepRunner",
+        nvtx_range=lambda *args, **kwargs: nullcontext(),
+    )
+    width, padded_bs = 3, 4
+    live_layout = ForwardOutputLayout(0, 0, live_bs, width)
+    ctx = SimpleNamespace(
+        bs=live_bs,
+        num_extends=0,
+        output_layout=live_layout,
+        forward_mode=SimpleNamespace(is_decode=lambda: True, is_idle=lambda: False),
+    )
+    observed = []
+    runner = SimpleNamespace(
+        _can_use_graph=lambda *args: True,
+        _padded_bs=lambda *args: padded_bs,
+        _pad_graph_req_pool_indices=lambda indices, bs: torch.nn.functional.pad(
+            indices, (0, bs - len(indices)), value=0
+        ),
+        _set_graph_state_write_indices=lambda *args: None,
+        _prepare_request_token_history_graph_inputs=lambda **kwargs: None,
+        _prepare_decode_metadata=lambda *args, **kwargs: None,
+        _cuda_graph_key=lambda bs: bs,
+        _graph_debug=False,
+        device="cuda",
+        max_tokens_per_req=width,
+        drafter=None,
+        deepep_adapter=SimpleNamespace(replay=lambda: None),
+        token_to_kv_pool=SimpleNamespace(arena=SimpleNamespace(cache_group_specs=[])),
+        input_buffers=SimpleNamespace(
+            req_pool_indices_buf=torch.arange(padded_bs),
+            seq_lens_buf=torch.ones(padded_bs),
+        ),
+        graphs={
+            padded_bs: SimpleNamespace(
+                replay=lambda: observed.append((ctx.bs, ctx.output_layout))
+            )
+        },
+        output_buffers={
+            padded_bs: (torch.arange(padded_bs * width), torch.ones(padded_bs), None)
+        },
+    )
+    empty = torch.empty(0, dtype=torch.int32)
+    tokens, lengths, _ = run(
+        runner,
+        live_bs,
+        ctx,
+        None,
+        extend_with_prefix=False,
+        extend_prefix_lens=empty,
+        extend_prefix_lens_cpu=empty,
+        extend_seq_lens=empty,
+        extend_seq_lens_cpu=empty,
+        extend_replay_lens_cpu=empty,
+        extend_prompt_lens_cpu=empty,
+    )
+    assert observed == [(padded_bs, ForwardOutputLayout(0, 0, padded_bs, width))]
+    assert ctx.bs == live_bs
+    assert ctx.output_layout is live_layout
+    assert tokens.tolist() == list(range(live_bs * width))
+    assert len(lengths) == live_bs

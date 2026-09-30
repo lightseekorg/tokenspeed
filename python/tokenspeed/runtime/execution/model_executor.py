@@ -1062,9 +1062,7 @@ class ModelExecutor:
         num_extends = ctx.num_extends
         num_decodes = ctx.bs - num_extends
         layout = ctx.output_layout
-        num_prefill_outputs = (
-            num_extends if layout is None else layout.num_prefill_outputs
-        )
+        num_prefill_outputs = layout.num_prefill_outputs
 
         if num_decodes == 0 and num_prefill_outputs == num_extends:
             return self.sampling_backend.sample(logits_output, sampling_info)
@@ -1078,17 +1076,12 @@ class ModelExecutor:
             return output_tokens, accept_lengths
 
         # Parameters remain request-indexed; logits may omit open prefills.
-        prefill = slice(0, num_extends) if layout is None else layout.prefill_slice
-        # Keep the legacy suffix open-ended: masks can have more rows than requests.
-        decode_requests = (
-            slice(num_extends, None) if layout is None else layout.decode_request_slice
-        )
-        decode_outputs = (
-            slice(num_extends, None) if layout is None else layout.decode_output_slice
-        )
+        prefill = layout.prefill_slice
+        decode_requests = layout.decode_request_slice
+        decode_outputs = layout.decode_output_slice
         mask_width = (
             sampling_info.vocab_mask.shape[0] // ctx.bs
-            if layout is not None and sampling_info.vocab_mask is not None
+            if sampling_info.vocab_mask is not None
             else None
         )
         logits = logits_output.next_token_logits
@@ -1200,7 +1193,7 @@ class ModelExecutor:
                 self.input_buffers.input_ids_buf[: bs * n] if is_spec_verify else None
             )
             candidate_start = 0
-            if ctx.output_layout is not None and n > 1 and ctx.bs > ctx.num_extends:
+            if n > 1 and ctx.output_layout.num_decodes:
                 candidate_start = ctx.num_extends
                 count = (ctx.bs - ctx.num_extends) * n
                 slice_ = self.input_buffers.input_ids_buf[
@@ -1257,18 +1250,15 @@ class ModelExecutor:
             # _update_runtime_state skips future_input_map when drafter is
             # active — drafter writes the next-round inputs directly.
             indices = self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
-            if ctx.output_layout is None:
-                self.runtime_states.future_input_map[indices] = next_round_input_ids.to(
-                    torch.int32
+            for requests in (
+                ctx.output_layout.prefill_slice,
+                ctx.output_layout.decode_request_slice,
+            ):
+                if requests.start == requests.stop:
+                    continue
+                self.runtime_states.future_input_map[indices[requests]] = (
+                    next_round_input_ids[requests].to(torch.int32)
                 )
-            else:
-                for requests in (
-                    ctx.output_layout.prefill_slice,
-                    ctx.output_layout.decode_request_slice,
-                ):
-                    self.runtime_states.future_input_map[indices[requests]] = (
-                        next_round_input_ids[requests].to(torch.int32)
-                    )
             self._record_draft_final_cache_step(ctx.num_extends)
 
         output_logprobs = logits_output.next_token_logprobs
@@ -1283,7 +1273,7 @@ class ModelExecutor:
         input_lengths: torch.Tensor,
         num_extends: int,
         *,
-        output_layout: ForwardOutputLayout | None,
+        output_layout: ForwardOutputLayout,
     ):
         """Advance accepted inputs and cache lengths together on execution_stream.
 
@@ -1291,7 +1281,7 @@ class ModelExecutor:
         are tensor-only, including padding masks, so recording this update has
         the same semantics. Callers must pass the state-write pool indices.
         """
-        if self.drafter is None and output_layout is not None:
+        if self.drafter is None:
             prefill = output_layout.prefill_slice
             if output_layout.num_prefill_outputs:
                 self.runtime_states.future_input_map[req_pool_indices[prefill], :1] = (
@@ -1299,22 +1289,13 @@ class ModelExecutor:
                 )
             if output_layout.num_decodes:
                 requests = output_layout.decode_request_slice
-                self.runtime_states.future_input_map[req_pool_indices[requests]] = (
+                self.runtime_states.future_input_map[
+                    req_pool_indices[requests], : output_layout.decode_width
+                ] = (
                     output_tokens[output_layout.decode_output_slice]
                     .view(output_layout.num_decodes, output_layout.decode_width)
                     .to(torch.int32)
                 )
-        elif self.drafter is None:
-            # Without drafter, store output tokens for next round.
-            # With drafter, _forward_step already wrote the drafter's
-            # next-round input (verified + draft tokens) to future_input_map.
-            tokens_per_req = self.config.output_length if num_extends == 0 else 1
-            next_round_input_ids = output_tokens.to(torch.int32).reshape(
-                -1, tokens_per_req
-            )
-            self.runtime_states.future_input_map[req_pool_indices, :tokens_per_req] = (
-                next_round_input_ids
-            )
 
         ib = self.input_buffers
         tail = self.runtime_states.ngram_accepted_tokens
@@ -1352,6 +1333,7 @@ class ModelExecutor:
             token_to_kv_pool=self.token_to_kv_pool,
             bs=0,
             num_extends=0,
+            output_layout=ForwardOutputLayout(0, 0, 0, 1),
             input_num_tokens=0,
             forward_mode=graph_forward_mode,
             global_num_tokens=dp_metadata.global_num_tokens,
@@ -1377,7 +1359,9 @@ class ModelExecutor:
                     grammars=[None] * padded_bs,
                     bs=padded_bs,
                     has_candidates=False,
-                    output_layout=None,
+                    output_layout=ForwardOutputLayout(
+                        0, 0, padded_bs, self.config.output_length
+                    ),
                 )
             # IDLE doesn't produce tokens, so no sampler/drafter call here —
             # only the model forward, which still participates in collectives.
@@ -1450,6 +1434,7 @@ class ModelExecutor:
                     token_to_kv_pool=self.drafter.token_to_kv_pool,
                     bs=0,
                     num_extends=0,
+                    output_layout=ForwardOutputLayout(0, 0, 0, 1),
                     input_num_tokens=0,
                     forward_mode=ForwardMode.IDLE,
                     global_num_tokens=draft_global_num_tokens,
@@ -1727,17 +1712,20 @@ class ModelExecutor:
                             - 1
                         )
 
-                output_layout = None
+                output_layout = ForwardOutputLayout(
+                    num_extends=num_extends,
+                    num_prefill_outputs=num_extends,
+                    num_decodes=bs - num_extends,
+                    decode_width=self.config.output_length,
+                )
                 if num_extends and self.attn_backend.skips_incomplete_prefill_outputs:
-                    planned = ForwardOutputLayout.from_prefill(
+                    output_layout = ForwardOutputLayout.from_prefill(
                         prefix_lengths=forward_op.extend_prefix_lens,
                         input_lengths=forward_op.input_lengths[:num_extends],
                         prompt_lengths=forward_op.prefill_lengths[:num_extends],
                         num_decodes=bs - num_extends,
                         decode_width=self.config.output_length,
                     )
-                    if planned.num_prefill_outputs < num_extends:
-                        output_layout = planned
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -1775,11 +1763,7 @@ class ModelExecutor:
                         spec_num_tokens=self.config.spec_num_tokens or 1,
                         grammar_inputs=grammar_inputs,
                         grammar_runtime=self.grammar_runtime,
-                        input_ids_buf=(
-                            self.input_buffers.input_ids_buf[:total_tokens]
-                            if output_layout is not None
-                            else self.input_buffers.input_ids_buf
-                        ),
+                        input_ids_buf=self.input_buffers.input_ids_buf[:total_tokens],
                         grammar_backend=self.config.grammar_backend,
                         output_layout=output_layout,
                     )

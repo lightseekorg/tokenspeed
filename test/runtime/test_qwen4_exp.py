@@ -43,6 +43,7 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention import registry as attention_registry
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
@@ -922,6 +923,9 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
             token_to_kv_pool=pool,
             bs=2,
             num_extends=num_extends,
+            output_layout=ForwardOutputLayout(
+                num_extends, num_extends, 2 - num_extends, 1
+            ),
             input_num_tokens=rows,
             forward_mode=mode,
         )
@@ -933,6 +937,7 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
         token_to_kv_pool=pool,
         bs=1,
         num_extends=1,
+        output_layout=ForwardOutputLayout(1, 1, 0, 1),
         input_num_tokens=8,
         forward_mode=ForwardMode.EXTEND,
     )
@@ -956,6 +961,7 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
         indexer(torch.ones((8, 4)), torch.arange(8), ctx)
     ctx.forward_mode = ForwardMode.EXTEND
     ctx.num_extends = ctx.bs
+    ctx.output_layout = ForwardOutputLayout(ctx.bs, ctx.bs, 0, 1)
     indexer(torch.ones((2, 4)), torch.arange(2), ctx)
     assert writes[-1]["stage_verify_buffers"] is None
 
@@ -1084,6 +1090,12 @@ def test_qwen4_exp_draft_attention_preserves_rows_and_cache_context(
         token_to_kv_pool=None,
         bs=2,
         num_extends=2 if mode.is_extend() else (1 if mode.is_mixed() else 0),
+        output_layout=ForwardOutputLayout(
+            2 if mode.is_extend() else 1 if mode.is_mixed() else 0,
+            2 if mode.is_extend() else 1 if mode.is_mixed() else 0,
+            0 if mode.is_extend() else 1 if mode.is_mixed() else 2,
+            1,
+        ),
         input_num_tokens=6,
         forward_mode=mode,
         capture_hidden_mode=None,

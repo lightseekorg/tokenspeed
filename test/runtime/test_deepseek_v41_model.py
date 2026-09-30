@@ -57,6 +57,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
     V41PrefillSpan,
@@ -189,6 +190,12 @@ def _ctx(backend, tokens, mode):
         token_to_kv_pool=None,
         bs=1,
         num_extends=1 if mode == ForwardMode.EXTEND else 0,
+        output_layout=ForwardOutputLayout(
+            1 if mode == ForwardMode.EXTEND else 0,
+            1 if mode == ForwardMode.EXTEND else 0,
+            0 if mode == ForwardMode.EXTEND else 1,
+            tokens if mode == ForwardMode.DECODE else 1,
+        ),
         input_num_tokens=tokens,
         forward_mode=mode,
     )
@@ -755,6 +762,7 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     backend = _Backend(positions, requests, view)
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     ctx.bs = ctx.num_extends = 2
+    ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
     ctx.capture_hidden_mode = CaptureHiddenMode.FULL
     seen = {}
     projection_rows = {}
@@ -867,6 +875,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     def whole():
         ctx = _ctx(backend, 6, ForwardMode.EXTEND)
         ctx.bs = ctx.num_extends = 2
+        ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
         ctx.capture_hidden_mode = CaptureHiddenMode.FULL
         out = model(
             ids,
@@ -884,6 +893,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
 
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     ctx.bs = ctx.num_extends = 2
+    ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
     ctx.capture_hidden_mode = CaptureHiddenMode.FULL
     assert model.decoder_rows(ctx) == 3
     state = model.encoder_forward(
@@ -1244,6 +1254,7 @@ def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
             token_to_kv_pool=backend.cache_pool,
             bs=1,
             num_extends=1,
+            output_layout=ForwardOutputLayout(1, 1, 0, 1),
             input_num_tokens=count,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -1345,6 +1356,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
             token_to_kv_pool=backend.cache_pool,
             bs=bs,
             num_extends=bs,
+            output_layout=ForwardOutputLayout(bs, bs, 0, 1),
             input_num_tokens=tokens,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.FULL,

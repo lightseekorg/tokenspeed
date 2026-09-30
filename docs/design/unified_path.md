@@ -318,6 +318,30 @@ class-attribute-driven, so every DP rank derives the same answer
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
+### One output layout per forward
+
+Every ForwardContext and grammar completion carries a required, immutable
+ForwardOutputLayout. Ordinary prefill, mixed and decode batches use the same
+contract as compact outputs: each emitting prefill has one output row, and
+each decode has its fixed verify width. Ordinary models emit one row for
+every extend request; a backend that skips incomplete-prefill outputs
+shortens only the emitting prefill prefix. Missing layout is not an execution
+mode.
+
+Sampling parameters, cache progress and acceptance lengths remain indexed by
+the original requests. Logits and token storage use the output layout's
+prefill/decode slices and per-request offsets. Grammar masks retain a fixed
+width per original request: sampling selects the first mask of each emitting
+prefill and the full mask span of each decode. This rule applies equally to
+ordinary mixed batches and batches with zero-output prefills. Grammar
+candidate preparation reads only the decode suffix of the live input buffer.
+
+Graph capture uses the captured batch size in its layout. Replay temporarily
+pairs the padded context with a padded layout, then restores the original
+live layout before output/state processing. Queued grammar completions retain
+their immutable per-step layout, independently of later context updates.
+Idle graph warmup also supplies an explicit layout.
+
 ### Prefill graphs around a row narrowing
 
 A prefill forward whose row count drops once, at a fixed layer, by an amount

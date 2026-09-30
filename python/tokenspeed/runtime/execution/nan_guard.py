@@ -127,13 +127,9 @@ class NanGuard:
         ne = ctx.num_extends
         nd = ctx.bs - ne
         layout = ctx.output_layout
-        prefill = slice(0, ne) if layout is None else layout.prefill_slice
-        decode_requests = (
-            slice(ne, ctx.bs) if layout is None else layout.decode_request_slice
-        )
-        decode_outputs = (
-            slice(ne, None) if layout is None else layout.decode_output_slice
-        )
+        prefill = layout.prefill_slice
+        decode_requests = layout.decode_request_slice
+        decode_outputs = layout.decode_output_slice
         if prefill.stop:
             self.flags[prefill] |= rows[prefill].to(torch.int32)
         if nd > 0:
