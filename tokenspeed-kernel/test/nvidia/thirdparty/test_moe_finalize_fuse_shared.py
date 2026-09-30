@@ -74,7 +74,9 @@ def test_finalize_verbatim_shared_add(num_tokens, ew_dtype):
     )
     shared = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
 
-    out = moe_finalize_fuse_shared(gemm2_out, expanded_idx, weights, shared, top_k)
+    out = moe_finalize_fuse_shared(
+        gemm2_out, expanded_idx, weights, shared, top_k, hidden_dim=hidden
+    )
     ref = _reference(gemm2_out, expanded_idx, weights, shared, top_k)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
@@ -93,16 +95,35 @@ def test_finalize_weighted_shared_sink(num_tokens, ew_dtype, num_shared, top_k):
         num_shared, num_tokens, hidden, dtype=torch.bfloat16, device="cuda"
     )
 
-    out = moe_finalize_fuse_shared(gemm2_out, expanded_idx, weights, shared, top_k)
+    out = moe_finalize_fuse_shared(
+        gemm2_out, expanded_idx, weights, shared, top_k, hidden_dim=hidden
+    )
     ref = _reference(gemm2_out, expanded_idx, weights, shared, top_k)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
-def test_finalize_no_shared():
-    """shared_output=None still works (plain weighted finalize)."""
-    gemm2_out, expanded_idx, weights = _make_inputs(64, 512, 8, 32, torch.float32, 0)
-    out = moe_finalize_fuse_shared(gemm2_out, expanded_idx, weights, None, 8)
-    ref = _reference(gemm2_out, expanded_idx, weights, None, 8)
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden", "hidden_padded"),
+    [
+        (4, 510, 544),  # Small batch: general kernel.
+        (4096, 512, 544),  # Large aligned batch: vectorized kernel.
+        (4096, 510, 544),  # Large unaligned batch: general-kernel fallback.
+    ],
+)
+@pytest.mark.parametrize("ew_dtype", [torch.float32, torch.bfloat16])
+def test_finalize_no_shared_with_padded_input(
+    num_tokens, hidden, hidden_padded, ew_dtype
+):
+    """shared_output=None trims padded expert output on every dispatch path."""
+    gemm2_out, expanded_idx, weights = _make_inputs(
+        num_tokens, hidden_padded, 8, 32, ew_dtype, 0
+    )
+    out = moe_finalize_fuse_shared(
+        gemm2_out, expanded_idx, weights, None, 8, hidden_dim=hidden
+    )
+    ref = _reference(gemm2_out, expanded_idx, weights, None, 8)[:, :hidden]
+    assert out.shape == (num_tokens, hidden)
+    assert out.is_contiguous()
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
@@ -185,7 +206,7 @@ def test_routed_deferred_finalize_matches_finalized():
         num_shared, num_tokens, hidden, dtype=torch.bfloat16, device="cuda"
     )
     fused = moe_finalize_fuse_shared(
-        gemm2_out, expanded_idx, full_weights, shared, top_k
+        gemm2_out, expanded_idx, full_weights, shared, top_k, hidden_dim=hidden
     )
     gammas = full_weights[:, top_k:]
     expected = finalized.float() + torch.einsum(

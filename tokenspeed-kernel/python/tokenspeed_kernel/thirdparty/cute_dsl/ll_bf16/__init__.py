@@ -27,7 +27,6 @@ import threading
 from typing import Any
 
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
 
 MAX_M_DOTPROD = 4
 MAX_M = 32
@@ -109,17 +108,24 @@ class LLBf16Router:
             True when a vendored kernel is compilable and applicable here.
         """
         return (
-            self.is_available()
-            and m <= MAX_M
+            a.ndim == 2
+            and b.ndim == 2
+            and 1 <= m <= MAX_M
+            and a.shape[0] == m
+            and a.shape[1] > 0
+            and b.shape[0] > 0
             and a.dtype is torch.bfloat16
             and b.dtype is torch.bfloat16
             and a.is_contiguous()
             and b.is_contiguous()
             # 128-bit vectorized bf16 loads need 16-byte aligned rows.
             and a.shape[1] % 8 == 0
+            and a.data_ptr() % 16 == 0
+            and b.data_ptr() % 16 == 0
             and a.shape[1] == b.shape[1]
             and a.device == b.device
             and a.device.type == "cuda"
+            and self.is_available()
             # Split-K reduces through DSMEM inside a thread block cluster.
             and (
                 m <= MAX_M_DOTPROD or torch.cuda.get_device_capability(a.device)[0] >= 9
@@ -232,6 +238,7 @@ class LLBf16Router:
         b: torch.Tensor,
         out: torch.Tensor | None = None,
         *,
+        enable_pdl: bool,
         bias: torch.Tensor | None = None,
         out_dtype: torch.dtype | None = None,
         block_size: int | None = None,
@@ -246,6 +253,7 @@ class LLBf16Router:
             b: ``[N, K]`` contiguous BF16 weight.
             out: Optional ``[M, N]`` destination in ``out_dtype``; allocated
                 when omitted.
+            enable_pdl: PDL policy used for compilation and launch.
             bias: Optional contiguous ``[N]`` bias in ``out_dtype``, added in
                 the epilogue.
             out_dtype: Output element type, one of :data:`OUT_DTYPES`. Defaults
@@ -283,7 +291,7 @@ class LLBf16Router:
 
         device = a.device
         stream = self._stream(device)
-        enable_pdl = pdl_enabled() and torch.cuda.get_device_capability(device)[0] >= 9
+        enable_pdl = enable_pdl and torch.cuda.get_device_capability(device)[0] >= 9
         # Every split-K cluster rank must own at least one K tile. Router
         # projections are normally wide enough, but low-rank consumers (for
         # example a padded rank-320 hyperconnection up projection) are not.

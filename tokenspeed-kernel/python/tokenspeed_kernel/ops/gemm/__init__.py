@@ -64,6 +64,7 @@ from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
     linear_attnres_partials,
     linear_attnres_partials_available,
 )
+from tokenspeed_kernel.ops.gemm.ll_bf16 import ll_bf16_router_supported
 from tokenspeed_kernel.platform import (
     ArchVersion,
     Platform,
@@ -887,6 +888,10 @@ def dsv4_linear_fp32(
     traits = {
         "has_tokens": hidden_states.numel() > 0,
         "hidden_rank": hidden_states.ndim,
+        "ll_bf16_supported": (
+            hidden_states.ndim == 2
+            and ll_bf16_router_supported(hidden_states, weight, hidden_states.shape[0])
+        ),
     }
     signature = format_signature(
         hidden_states=dense_tensor_format(hidden_states.dtype),

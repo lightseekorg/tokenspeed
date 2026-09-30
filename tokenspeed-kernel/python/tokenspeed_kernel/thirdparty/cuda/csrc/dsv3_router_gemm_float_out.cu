@@ -106,7 +106,7 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel_float_output(float*
 
   __syncthreads();
 
-  if (tid < kNumWarps) {
+  if (tid == 0) {
 #pragma unroll
     for (int m_idx = 0; m_idx < kNumTokens; m_idx++) {
       float sum = sm_reduction[m_idx][tid];
@@ -221,9 +221,11 @@ void invokeRouterGemmFloatOutput(float* output, ADtype const* mat_a, BDtype cons
       float*, ADtype const*, BDtype const*, int, bool, cudaStream_t);
 
 INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 3072)
+INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 5120)
 INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 6144)
 INSTANTIATE_RANGE(__nv_bfloat16, __nv_bfloat16, 7168)
 
 INSTANTIATE_RANGE(__nv_bfloat16, float, 3072)
+INSTANTIATE_RANGE(__nv_bfloat16, float, 5120)
 INSTANTIATE_RANGE(__nv_bfloat16, float, 6144)
 INSTANTIATE_RANGE(__nv_bfloat16, float, 7168)

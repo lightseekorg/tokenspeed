@@ -51,6 +51,7 @@ def _sqrt_softplus_topk_kernel(
     BIAS: tl.constexpr,
     RENORMALIZE: tl.constexpr,
     NEED_SCORES: tl.constexpr,
+    SCALE: tl.constexpr,
 ):
     """Write expert ids and sqrt-softplus weights using top-k or hash routing."""
     token = tl.program_id(0)
@@ -101,6 +102,7 @@ def _sqrt_softplus_topk_kernel(
         chosen_weights = tl.where(lanes == rank, weight, chosen_weights)
     if RENORMALIZE:
         chosen_weights /= tl.maximum(tl.sum(chosen_weights, 0), 1.1754943508222875e-38)
+    chosen_weights *= SCALE
     tl.store(weights_ptr + token * TOPK + lanes, chosen_weights, mask=lanes < TOPK)
     tl.store(experts_ptr + token * TOPK + lanes, chosen_ids, mask=lanes < TOPK)
 
@@ -129,6 +131,8 @@ def triton_sqrt_softplus_topk(
     hash_indices_table: torch.Tensor | None,
     input_ids: torch.Tensor | None,
     need_scores: bool,
+    routed_scaling_factor: float,
+    weights_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select experts using the sqrt-softplus routing contract.
 
@@ -140,9 +144,11 @@ def triton_sqrt_softplus_topk(
         hash_indices_table: Optional [vocabulary, top_k] expert lookup table.
         input_ids: Token ids indexing the hash table.
         need_scores: Materialize all sqrt-softplus scores when true.
+        routed_scaling_factor: FP32 multiplier applied after normalization.
+        weights_dtype: FP32 or BF16 storage, converted only after scaling.
 
     Returns:
-        FP32 route weights, INT32 expert ids, and FP32 scores (or the unused
+        Route weights in weights_dtype, INT32 expert ids, and FP32 scores (or the unused
         input logits when need_scores is false).
     """
     if router_logits.ndim != 2:
@@ -156,7 +162,7 @@ def triton_sqrt_softplus_topk(
     if bias_routing and correction_bias.device != router_logits.device:
         raise ValueError("correction_bias must share the router_logits device")
     weights = torch.empty(
-        (tokens, top_k), dtype=torch.float32, device=router_logits.device
+        (tokens, top_k), dtype=weights_dtype, device=router_logits.device
     )
     ids = torch.empty((tokens, top_k), dtype=torch.int32, device=router_logits.device)
     scores = (
@@ -186,6 +192,7 @@ def triton_sqrt_softplus_topk(
             BIAS=bias_routing,
             RENORMALIZE=renormalize,
             NEED_SCORES=need_scores,
+            SCALE=routed_scaling_factor,
             num_warps=4,
         )
     return weights, ids, scores

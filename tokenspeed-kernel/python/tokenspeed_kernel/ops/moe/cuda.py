@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.cuda.routing import (
@@ -27,13 +27,15 @@ def cuda_sqrt_softplus_topk(
     hash_indices_table: torch.Tensor | None,
     input_ids: torch.Tensor | None,
     need_scores: bool,
+    routed_scaling_factor: float,
+    weights_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the fused CUDA sqrt-softplus expert selector."""
     logits_f32 = router_logits.float().contiguous()
     topk_weights = torch.empty(
         router_logits.shape[0],
         top_k,
-        dtype=torch.float32,
+        dtype=weights_dtype,
         device=router_logits.device,
     )
     topk_ids = torch.empty(
@@ -42,6 +44,9 @@ def cuda_sqrt_softplus_topk(
         dtype=torch.int32,
         device=router_logits.device,
     )
+    if router_logits.shape[0] == 0:
+        scores = logits_f32 if need_scores else router_logits
+        return topk_weights, topk_ids, scores
     if hash_indices_table is not None:
         if input_ids is None:
             raise ValueError("hash-routed DeepSeek V4 MoE requires input_ids")
@@ -54,8 +59,9 @@ def cuda_sqrt_softplus_topk(
             ).contiguous(),
             topk_ids,
             topk_weights,
-            1.0,
+            routed_scaling_factor,
             renormalize,
+            enable_pdl=pdl_enabled(),
         )
     elif correction_bias is not None:
         softplus_sqrt_topk_flash(
@@ -66,8 +72,9 @@ def cuda_sqrt_softplus_topk(
             ).contiguous(),
             topk_ids,
             topk_weights,
-            1.0,
+            routed_scaling_factor,
             renormalize,
+            enable_pdl=pdl_enabled(),
         )
     else:
         raise ValueError("fused DeepSeek V4 selection requires bias or hash routing")

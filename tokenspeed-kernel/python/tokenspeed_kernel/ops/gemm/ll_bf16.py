@@ -27,7 +27,7 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (
     flashinfer_cute_dsl_mm_bf16,
     has_flashinfer_cute_dsl_bf16,
 )
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import MAX_M, ll_bf16_router
@@ -69,7 +69,7 @@ def cute_dsl_ll_bf16_router(
     Returns:
         ``[M, N]`` FP32 router logits, ``out`` when it was given.
     """
-    return ll_bf16_router(hidden_states, weight, out)
+    return ll_bf16_router(hidden_states, weight, out, enable_pdl=pdl_enabled())
 
 
 def ll_bf16_router_supported(
@@ -85,6 +85,39 @@ def ll_bf16_router_supported(
         True when a vendored kernel is compilable and applicable here.
     """
     return ll_bf16_router.supports(hidden_states, weight, m)
+
+
+@register_kernel(
+    "gemm",
+    "dsv4_linear_fp32",
+    name="cute_dsl_dsv4_linear_fp32",
+    solution="cute_dsl",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(9, 0),
+    ),
+    signatures=_BF16_IN_FP32_OUT,
+    priority=Priority.SPECIALIZED + 1,
+    traits={
+        "ll_bf16_supported": frozenset({True}),
+    },
+)
+def cute_dsl_dsv4_linear_fp32(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Project DSV4 inputs with the shared low-latency BF16 router driver.
+
+    Args:
+        hidden_states: Contiguous BF16 [M, K] activations, up to MAX_M rows.
+        weight: Contiguous BF16 [N, K] projection weights.
+        enable_pdl: PDL policy used for compilation and launch.
+
+    Returns:
+        FP32 router logits, accumulated and reduced in FP32.
+    """
+    return ll_bf16_router(hidden_states, weight, None, enable_pdl=enable_pdl)
 
 
 # The kernels issue 32-byte vector loads from the base of each operand.
@@ -170,6 +203,7 @@ def ll_bf16_mm(
             x.view(m, k),
             weight,
             flat_out,
+            enable_pdl=pdl_enabled(),
             bias=bias,
             out_dtype=torch.bfloat16,
         )

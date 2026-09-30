@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe import moe_topk
@@ -82,8 +84,15 @@ def test_hash_router_rejects_correction_bias() -> None:
 @pytest.mark.parametrize("renormalize", [False, True])
 @pytest.mark.parametrize("routing", ["plain", "bias", "per_token_bias", "hash"])
 @pytest.mark.parametrize("override", [None, "torch_sqrt_softplus_topk"])
+@pytest.mark.parametrize(
+    "weights_dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
 def test_sqrt_softplus_router_preserves_output_dtypes(
-    tokens: int, renormalize: bool, routing: str, override: str | None
+    tokens: int,
+    renormalize: bool,
+    routing: str,
+    override: str | None,
+    weights_dtype: torch.dtype,
 ) -> None:
     logits = torch.tensor([[-2.0, 0.5, 3.0, 1.0], [2.0, -1.0, 0.0, 4.0]])[:tokens]
     bias = None
@@ -108,7 +117,7 @@ def test_sqrt_softplus_router_preserves_output_dtypes(
         hash_indices_table=table,
         input_ids=input_ids,
         topk_indices_dtype=torch.int64,
-        topk_weights_dtype=torch.float64,
+        topk_weights_dtype=weights_dtype,
         override=override,
         solution="torch",
     )
@@ -122,7 +131,7 @@ def test_sqrt_softplus_router_preserves_output_dtypes(
     expected_weights = scores.gather(1, expected_ids)
     if renormalize:
         expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
-    expected_weights = (expected_weights * 2.5).double()
+    expected_weights = (expected_weights * 2.5).to(weights_dtype)
 
     torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
     torch.testing.assert_close(weights, expected_weights, rtol=1e-6, atol=1e-7)
@@ -168,3 +177,40 @@ def test_unified_router_preserves_override_and_output_dtypes(
     torch.testing.assert_close(
         weights, (expected_weights * 2.5).double(), rtol=1e-6, atol=1e-7
     )
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("hash_routing", [False, True])
+def test_cuda_router_preserves_explicit_pdl(monkeypatch, enable_pdl, hash_routing):
+    from tokenspeed_kernel.thirdparty.cuda import routing
+
+    module = Mock()
+    monkeypatch.setattr(routing, "_load_routing_module", lambda: module)
+    monkeypatch.setattr(routing, "pdl_enabled", lambda: not enable_pdl)
+    logits = torch.zeros(1, 256)
+    ids = torch.empty(1, 6, dtype=torch.int32)
+    weights = torch.empty(1, 6)
+    if hash_routing:
+        routing.hash_softplus_sqrt_topk_flash(
+            logits,
+            torch.zeros(1, dtype=torch.int32),
+            ids,
+            ids,
+            weights,
+            1.0,
+            True,
+            enable_pdl=enable_pdl,
+        )
+        call = module.hash_softplus_sqrt_topk_flash.call_args
+    else:
+        routing.softplus_sqrt_topk_flash(
+            logits,
+            torch.zeros(256),
+            ids,
+            weights,
+            1.0,
+            True,
+            enable_pdl=enable_pdl,
+        )
+        call = module.softplus_sqrt_topk_flash.call_args
+    assert call.args[-1] is enable_pdl
