@@ -31,7 +31,14 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
-from utils import assert_no_triton_compile
+from utils import assert_no_triton_compile, is_amd
+
+pytestmark = pytest.mark.skipif(not is_amd(), reason="Iris requires AMD ROCm")
+
+
+@pytest.fixture(autouse=True)
+def _require_iris():
+    pytest.importorskip("tokenspeed_kernel.ops.communication.iris")
 
 
 @pytest.mark.parametrize("rank", (0, 7))
