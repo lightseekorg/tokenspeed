@@ -300,10 +300,10 @@ class CapturableGrammarExecutor:
                     continue
 
                 n_accepted = int(self.accept_lengths_host[i].item())
+                offset = completion.output_layout.token_offset(i)
 
                 for j in range(n_accepted):
 
-                    offset = completion.output_layout.token_offset(i)
                     tok = int(self.output_tokens_host[offset + j].item())
 
                     try:

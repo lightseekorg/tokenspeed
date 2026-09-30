@@ -130,7 +130,7 @@ class NanGuard:
         prefill = layout.prefill_slice
         decode_requests = layout.decode_request_slice
         decode_outputs = layout.decode_output_slice
-        if prefill.stop:
+        if layout.num_prefill_outputs:
             self.flags[prefill] |= rows[prefill].to(torch.int32)
         if nd > 0:
             self.flags[decode_requests] |= (

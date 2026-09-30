@@ -222,9 +222,11 @@ class DeepseekV41DSpark(BaseDrafter):
                 f"{rows} > {hidden_states.shape[0]}."
             )
 
-        # Every row's bonus token fills its next-round row (extend rows keep
-        # it; decode rows overwrite the proposal columns below), and each
-        # decode request's anchor is its last accepted verify position.
+        # Output-bearing rows get their bonus token as next-round row
+        # (completing prefills keep it; decode rows overwrite the proposal
+        # columns below), and each decode request's anchor is its last
+        # accepted verify position. Incomplete prefills have no token, so
+        # their rows in [num_prefill_outputs, num_extends) are left as is.
         next_tokens = self.next_tokens_buf[: base_ctx.bs]
         if rows == 0:
             return next_tokens

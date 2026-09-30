@@ -393,7 +393,9 @@ The scheduler packs completing prefills first, at most one incomplete prefill
 last among prefills, then decode requests. An immutable `ForwardOutputLayout`
 records E original prefills, P output-bearing prefills, D decode requests and
 verify width K. Completing prefills must form a prefix (validated on the CPU).
-Only P<E forwards carry the layout; identity forwards retain their buffers.
+Every forward carries a layout; one with P=E is the identity layout, and the
+executor's fast paths (whole-batch `sample`, whole-batch `verify`) still apply
+to it.
 
 Logits and tokens use P+D*K rows. Accept lengths still use E+D request rows,
 with zero in [P,E). Sample uses the parameter prefix [:P]; verify uses the
@@ -411,8 +413,8 @@ token-indexed grammar masks at the sampler boundary; sampler interfaces and
 result buffers stay unchanged. Grammar owns matcher advancement and rollback,
 and zero accepted lengths already suppress advancement. Existing consumers
 that only need token_offset keep that interface. Models without cropped
-outputs continue to use None, not a mandatory identity layout. Their sampler
-parameter and grammar-mask views retain the original slicing contract.
+outputs carry the identity layout, under which every slice and offset above
+reduces to the original request-indexed contract.
 
 Completion remains a local comparison in the executor and V4.1 attention
 metadata. Both use the same scheduled prefix, input count (including replay),

@@ -1188,19 +1188,16 @@ class ModelExecutor:
         # attention/MoE. Rejoined at wait_bitmask() before apply_mask.
         if self.capturable_grammar is not None:
             n = self.capturable_grammar.max_tokens_per_req
-            is_spec_verify = n > 1 and ctx.forward_mode.is_decode()
-            slice_ = (
-                self.input_buffers.input_ids_buf[: bs * n] if is_spec_verify else None
-            )
-            candidate_start = 0
+            slice_ = None
             if n > 1 and ctx.output_layout.num_decodes:
-                candidate_start = ctx.num_extends
-                count = (ctx.bs - ctx.num_extends) * n
+                # Verify candidates: the decode rows' tokens at the tail of
+                # the live input buffer, after every prefill token.
+                count = ctx.output_layout.num_decodes * n
                 slice_ = self.input_buffers.input_ids_buf[
                     ctx.input_num_tokens - count : ctx.input_num_tokens
                 ]
             self.capturable_grammar.schedule_fill(
-                input_ids_buf_slice=slice_, candidate_start=candidate_start
+                input_ids_buf_slice=slice_, candidate_start=ctx.num_extends
             )
 
         ctx.dspark_context_producer = self.dspark_context_producer

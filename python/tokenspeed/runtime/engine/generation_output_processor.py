@@ -544,8 +544,8 @@ class OutputProcesser:
             ):
                 continue
             n_accepted = int(accept_lengths[i].item())
+            offset = completion.output_layout.token_offset(i)
             for j in range(n_accepted):
-                offset = completion.output_layout.token_offset(i)
                 tok = int(output_tokens[offset + j].item())
                 try:
                     grammar.accept_token(tok)
