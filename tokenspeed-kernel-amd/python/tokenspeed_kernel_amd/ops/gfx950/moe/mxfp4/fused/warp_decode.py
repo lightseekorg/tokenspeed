@@ -356,8 +356,8 @@ def _warp_decode_stage1_coop_compute(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
-    DO_SITU: gl.constexpr = False,
-    PACKED_ROUTES: gl.constexpr = False,
+    DO_SITU: gl.constexpr,
+    PACKED_ROUTES: gl.constexpr,
 ):
     """Cooperative gate_up GEMM + bias + SwiGLU + fp8-quant + store for one
     (token, slot, expert).  N runs over the INTERLEAVED gate_up rows (2*I);
@@ -702,6 +702,7 @@ def _warp_decode_topk_stage1_coop_kernel(
         x_global_scale_ptr, out_quant_scale_ptr, w13_bias,
         TOPK, BLOCK_M, BLOCK_N, BLOCK_K, NUM_BUFFERS, NUM_WARPS,
         W_PRESHUFFLED, EVEN_K, HAS_BIAS, SWIGLU_ALPHA, SWIGLU_LIMIT, SWIGLU_BETA,
+        DO_SITU=False, PACKED_ROUTES=False,
     )
 
     # fmt: on
@@ -803,6 +804,7 @@ def _warp_decode_precomputed_situ_stage1_kernel(
         SITU_LINEAR_BETA,
         0.0,
         DO_SITU=True,
+        PACKED_ROUTES=False,
     )
 
 

@@ -214,10 +214,14 @@ def gluon_mxfp4_fp8_precomputed_situ(
     global_num_experts: int | None = None,
     prefill_activation_format: str = "e2m1",
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
-    """Run route-direct SiTU decode or block-ragged SiTU prefill.
+    """Run SiTU decode (route-direct, combined top-k, or expert-sorted tiles)
+    or block-ragged SiTU prefill.
 
     ``expert_start`` and ``global_num_experts`` describe a contiguous local EP
     shard. Global top-k IDs outside that shard contribute zero to this rank.
+    The expert-sorted decode tiles (EP1 only) drop routes whose ID names no
+    expert, leaving their output undefined, so callers must pass valid expert
+    IDs there; Kimi K3's router always does.
     """
     if (
         hidden_states.ndim != 2
