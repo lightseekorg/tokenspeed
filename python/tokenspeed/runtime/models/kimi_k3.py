@@ -81,7 +81,9 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     linear_attnres_partials,
     linear_attnres_partials_available,
+    mm,
 )
+from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
 )
@@ -115,7 +117,6 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
-from tokenspeed.runtime.layers.dense.w8a8_fp8 import w8a8_fp8_per_channel_mm
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
     _get_process_group,
@@ -1288,11 +1289,17 @@ class KimiLinearKDA(nn.Module):
         if self.qkvgb_proj.fp8_channel_quant:
             if attnres_partial_args is not None:
                 attnres_partial_dual(*attnres_partial_args)
-            output = w8a8_fp8_per_channel_mm(
-                hidden_states,
+            # Per-token FP8 activations x per-channel FP8 weights.
+            qinput, x_scale = per_token_group_quant_fp8(
+                hidden_states, hidden_states.shape[-1]
+            )
+            output = mm(
+                qinput,
                 self.qkvgb_proj.weight.t(),
-                self.qkvgb_proj.weight_scale,
-                hidden_states.dtype,
+                A_scales=x_scale,
+                B_scales=self.qkvgb_proj.weight_scale,
+                out_dtype=hidden_states.dtype,
+                quant="fp8",
             )
         elif isinstance(
             getattr(self.qkvgb_proj, "quant_method", None),
