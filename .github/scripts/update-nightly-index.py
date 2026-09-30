@@ -37,8 +37,11 @@ def update_index(
 ) -> None:
     if variant not in ("cu130", "rocm72"):
         raise ValueError(f"Unsupported nightly variant: {variant}")
+    if package == "tokenspeed-kernel-amd" and variant != "rocm72":
+        raise ValueError("AMD kernel nightlies require the ROCm index")
     pattern = {
         "tokenspeed": "tokenspeed-dist/*.whl",
+        "tokenspeed-kernel-amd": "tokenspeed-kernel-amd-dist/*.whl",
         "tokenspeed-kernel": (
             "tokenspeed-kernel-wheel-cu130-*/*.whl"
             if variant == "cu130"
@@ -105,7 +108,9 @@ def update_index(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--package", choices=("tokenspeed", "tokenspeed-kernel"), required=True
+        "--package",
+        choices=("tokenspeed", "tokenspeed-kernel", "tokenspeed-kernel-amd"),
+        required=True,
     )
     parser.add_argument("--variant", choices=("cu130", "rocm72"), required=True)
     parser.add_argument("--replace", action="store_true")

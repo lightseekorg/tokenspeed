@@ -28,11 +28,8 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from tokenspeed_kernel.ops.embedding import (
-    FusedMLASetKVBufferArg,
-    FusedSetKVBufferArg,
-    apply_rope,
-)
+from tokenspeed_kernel.ops.attention.prologue import MRope, RopeStyle, Rotary
+from tokenspeed_kernel.ops.embedding import apply_rope
 
 logger = logging.getLogger(__name__)
 
@@ -48,35 +45,6 @@ def _rotate_gptj(x: torch.Tensor) -> torch.Tensor:
     x2 = x[..., 1::2]
     x = torch.stack((-x2, x1), dim=-1)
     return x.flatten(-2)
-
-
-def _apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    is_neox_style: bool,
-) -> torch.Tensor:
-    """
-    Args:
-        x: [num_tokens, num_heads, head_size]
-        cos: [num_tokens, head_size // 2]
-        sin: [num_tokens, head_size // 2]
-        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-            positional embeddings.
-    """
-    cos = cos.unsqueeze(-2).to(x.dtype)
-    sin = sin.unsqueeze(-2).to(x.dtype)
-    if is_neox_style:
-        x1, x2 = torch.chunk(x, 2, dim=-1)
-    else:
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    if is_neox_style:
-        return torch.cat((o1, o2), dim=-1)
-    else:
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
 # Copied from transformers
@@ -108,13 +76,6 @@ def apply_rotary_pos_emb_native(
     k_embed = k_embed.to(orig_k_dtype)
 
     return q_embed, k_embed
-
-
-def apply_interleaved_rope(x: torch.Tensor, mrope_section: list) -> torch.Tensor:
-    x_t = x[0].clone()
-    x_t[..., 1 : mrope_section[1] * 3 : 3] = x[1, ..., 1 : mrope_section[1] * 3 : 3]
-    x_t[..., 2 : mrope_section[2] * 3 : 3] = x[2, ..., 2 : mrope_section[2] * 3 : 3]
-    return x_t
 
 
 class RotaryEmbedding(torch.nn.Module):
@@ -172,10 +133,6 @@ class RotaryEmbedding(torch.nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: torch.Tensor | None = None,
-        fused_set_kv_buffer_arg: FusedSetKVBufferArg | None = None,
-        fused_mla_set_kv_buffer_arg: FusedMLASetKVBufferArg | None = None,
-        output_q_rope: torch.Tensor | None = None,
-        output_k_rope: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if offsets is not None:
             raise ValueError("embedding.rope does not support offsets")
@@ -186,11 +143,12 @@ class RotaryEmbedding(torch.nn.Module):
             head_size=self.head_size,
             cos_sin_cache=self.cos_sin_cache,
             is_neox=self.is_neox_style,
-            fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-            fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
-            q_rope_out=output_q_rope,
-            k_rope_out=output_k_rope,
         )
+
+    def as_rotary(self, positions: torch.Tensor) -> Rotary:
+        """This embedding as the attention prologue's rotary step."""
+        style = RopeStyle.NEOX if self.is_neox_style else RopeStyle.GPTJ
+        return Rotary(self.cos_sin_cache, positions, style, None)
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
@@ -454,7 +412,6 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         original_max_position_embeddings: int,
         base: int,
         is_neox_style: bool,
-        dtype: torch.dtype,
         short_factor: list[float],
         long_factor: list[float],
         short_mscale: float | None = None,
@@ -490,24 +447,18 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         self.short_mscale = short_mscale
         self.long_mscale = long_mscale
 
-        short_cache = self._compute_cos_sin_cache(
-            original_max_position_embeddings, short_factor, short_mscale
+        # Short-context rows, then long-context rows: as_rotary offsets into the second half.
+        rope_cache = torch.cat(
+            [
+                self._compute_cos_sin_cache(
+                    original_max_position_embeddings, short_factor, short_mscale
+                ),
+                self._compute_cos_sin_cache(
+                    max_position_embeddings, long_factor, long_mscale
+                ),
+            ]
         )
-        short_cache = short_cache.to(dtype)
-        self.register_buffer("short_cos_sin_cache", short_cache, persistent=False)
-
-        long_cache = self._compute_cos_sin_cache(
-            max_position_embeddings, long_factor, long_mscale
-        )
-        long_cache = long_cache.to(dtype)
-        self.register_buffer("long_cos_sin_cache", long_cache, persistent=False)
-
-        long_short_cache = torch.cat(
-            [self.short_cos_sin_cache, self.long_cos_sin_cache], dim=0
-        )
-        self.register_buffer(
-            "long_short_cos_sin_cache", long_short_cache, persistent=False
-        )
+        self.register_buffer("cos_sin_cache", rope_cache, persistent=False)
 
     def _compute_inv_freq(self, rescale_factors: list[float]) -> torch.Tensor:
         rescale_factors = torch.tensor(rescale_factors, dtype=torch.float32)
@@ -537,46 +488,12 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        offsets: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        query = query.view(*query.shape[:-1], -1, self.head_size)
-        key = key.view(*key.shape[:-1], -1, self.head_size)
-
-        k = self.original_max_position_embeddings
-        long_prompt_offset = (
-            torch.any(positions > k).float() * torch.full_like(positions, k)
-        ).long()
-        idx = (
-            torch.add(positions, long_prompt_offset)
-            if long_prompt_offset is not None
-            else positions
-        )
-        self.long_short_cos_sin_cache: torch.Tensor = self.long_short_cos_sin_cache.to(
-            idx.device
-        )
-        idx = torch.add(idx, offsets) if offsets is not None else idx
-        cos_sin = torch.index_select(self.long_short_cos_sin_cache, 0, idx)
-
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = cos.repeat(1, 2).unsqueeze(-2)
-        sin = sin.repeat(1, 2).unsqueeze(-2)
-
-        query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
-        query_rot = query_rot * cos + _rotate_neox(query_rot) * sin
-        query = torch.cat((query_rot, query_pass), dim=-1)
-
-        key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
-        key_rot = key_rot * cos + _rotate_neox(key_rot) * sin
-        key = torch.cat((key_rot, key_pass), dim=-1)
-
-        return query.flatten(-2), key.flatten(-2)
+    def as_rotary(self, positions: torch.Tensor) -> Rotary:
+        """Once any position passes the original context, every token reads
+        the long-context rows."""
+        original = self.original_max_position_embeddings
+        offset = torch.any(positions > original) * original
+        return Rotary(self.cos_sin_cache, positions + offset, RopeStyle.NEOX, None)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -671,30 +588,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
-        fused_set_kv_buffer_arg=None,
-        fused_mla_set_kv_buffer_arg=None,
-        output_q_rope=None,
         offsets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if offsets is None:
-            return super().forward(
-                positions=positions,
-                query=query,
-                key=key,
-                fused_set_kv_buffer_arg=fused_set_kv_buffer_arg,
-                fused_mla_set_kv_buffer_arg=fused_mla_set_kv_buffer_arg,
-                output_q_rope=output_q_rope,
-                offsets=offsets,
-            )
-        if (
-            fused_set_kv_buffer_arg is not None
-            or fused_mla_set_kv_buffer_arg is not None
-            or output_q_rope is not None
-        ):
-            raise ValueError(
-                "DeepseekScalingRotaryEmbedding offset path does not support "
-                "fused KV writes or output_q_rope"
-            )
+            return super().forward(positions=positions, query=query, key=key)
 
         dtype = query.dtype
         query_rot = query[..., : self.rotary_dim]
@@ -825,8 +722,8 @@ class MRotaryEmbedding(RotaryEmbedding):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
-        mrope_section: list[int] | None = None,
-        mrope_interleaved: bool = False,
+        mrope_section: list[int],
+        mrope_interleaved: bool,
     ) -> None:
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
@@ -867,61 +764,18 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        fused_set_kv_buffer_arg: FusedSetKVBufferArg | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """PyTorch-native implementation equivalent to forward().
+    def as_rotary(self, positions: torch.Tensor) -> Rotary:
+        """This embedding, with its multimodal sections, as the prologue's rotary step."""
+        style = RopeStyle.NEOX if self.is_neox_style else RopeStyle.GPTJ
+        return Rotary(
+            self.cos_sin_cache,
+            positions,
+            style,
+            MRope(tuple(self.mrope_section), self.mrope_interleaved),
+        )
 
-        Args:
-            positions:
-                [num_tokens,] (text only) or
-                [3, num_tokens] (T/H/W positions with multimodal inputs)
-            query: [num_tokens, num_heads * head_size]
-            key: [num_tokens, num_kv_heads * head_size]
-        """
-        if fused_set_kv_buffer_arg is not None:
-            raise ValueError("save kv cache is not supported for MRotaryEmbedding.")
-        if positions.ndim not in (1, 2):
-            raise ValueError(f"positions must be 1D or 2D, got ndim={positions.ndim}.")
-
-        num_tokens = positions.shape[-1]
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if positions.ndim == 2:
-            if not self.mrope_section:
-                raise RuntimeError("mrope_section must be set for 2D M-RoPE.")
-
-            if self.mrope_interleaved:
-                cos = apply_interleaved_rope(cos, self.mrope_section)
-                sin = apply_interleaved_rope(sin, self.mrope_section)
-            else:
-                cos = torch.cat(
-                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
-                    dim=-1,
-                )
-                sin = torch.cat(
-                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
-                    dim=-1,
-                )
-
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
-        query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
-
-        key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
-        key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
-        return query, key
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError("M-RoPE rotates inside the attention prologue")
 
     @staticmethod
     def get_rope_index(
@@ -1468,7 +1322,6 @@ def get_rope(
                 original_max_position,
                 base,
                 is_neox_style,
-                dtype,
                 short_factor,
                 long_factor,
                 **extra_kwargs,

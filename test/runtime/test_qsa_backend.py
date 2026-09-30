@@ -66,46 +66,30 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 @pytest.mark.parametrize("forward_name", ["forward_decode", "forward_extend"])
-@pytest.mark.parametrize("save_kv_cache", [False, True])
-def test_qsa_sparse_requires_cache_write(monkeypatch, forward_name, save_kv_cache):
+def test_qsa_sparse_attends_the_prewritten_cache(monkeypatch, forward_name):
     backend = object.__new__(QSAAttnBackend)
     sparse = Mock(return_value=object())
     monkeypatch.setattr(backend, "_sparse_attention", sparse)
-    args = tuple(object() for _ in range(6))
+    q, k, v, layer, locs, pool = (object() for _ in range(6))
     topk, ctx = object(), object()
-    forward = partial(
-        getattr(backend, forward_name),
-        *args,
-        bs=1,
-        save_kv_cache=save_kv_cache,
-        topk_indices=topk,
-        ctx=ctx,
+    output = getattr(backend, forward_name)(
+        q, k, v, layer, locs, pool, bs=1, topk_indices=topk, ctx=ctx
     )
-    if save_kv_cache:
-        assert forward() is sparse.return_value
-        sparse.assert_called_once_with(*args, topk, ctx)
-    else:
-        with pytest.raises(AssertionError, match="QSA.*requires save_kv_cache=True"):
-            forward()
-        sparse.assert_not_called()
+    assert output is sparse.return_value
+    sparse.assert_called_once_with(q, layer, pool, topk, ctx)
 
 
 @pytest.mark.parametrize("forward_name", ["forward_decode", "forward_extend"])
-@pytest.mark.parametrize("save_kv_cache", [False, True])
-def test_qsa_dense_forwards_cache_write_flag(monkeypatch, forward_name, save_kv_cache):
+def test_qsa_dense_falls_through_to_mha(monkeypatch, forward_name):
     backend = object.__new__(QSAAttnBackend)
     dense = Mock(return_value=object())
     monkeypatch.setattr(MHAAttnBackend, forward_name, dense)
     args = tuple(object() for _ in range(6))
     output = getattr(backend, forward_name)(
-        *args,
-        bs=1,
-        save_kv_cache=save_kv_cache,
-        topk_indices=None,
-        ctx=object(),
+        *args, bs=1, topk_indices=None, ctx=object()
     )
     assert output is dense.return_value
-    dense.assert_called_once_with(*args, 1, save_kv_cache=save_kv_cache)
+    dense.assert_called_once_with(*args, 1)
 
 
 def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:

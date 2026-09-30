@@ -439,19 +439,24 @@ def test_mla_decode_with_kvcache(
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
-def test_mla_decode_noncausal_block_sliding_window_matches_reference_and_captures(
+@pytest.mark.parametrize(
+    "window_left,kv_lora_rank,qk_rope_head_dim,qk_nope_head_dim",
+    [(129, 8, 4, 4), (-1, 512, 64, 128)],
+    ids=["windowed", "full-attention"],
+)
+def test_mla_decode_noncausal_block_matches_reference_and_captures(
     device: str,
+    window_left: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    qk_nope_head_dim: int,
 ) -> None:
     torch.manual_seed(91)
     block_size = 8
     context_len = 177
     cache_len = context_len + block_size
-    window_left = 129
     page_size = 64
     num_heads = 2
-    kv_lora_rank = 8
-    qk_rope_head_dim = 4
-    qk_nope_head_dim = 4
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
     max_pages = math.ceil(cache_len / page_size)
 
@@ -498,9 +503,10 @@ def test_mla_decode_noncausal_block_sliding_window_matches_reference_and_capture
     dense_kv = kv_cache.reshape(-1, qk_head_dim)[:cache_len].float()
     expected = []
     for block_position in range(block_size):
-        start = max(
-            0,
-            context_len - window_left + block_position,
+        start = (
+            max(0, context_len - window_left + block_position)
+            if window_left >= 0
+            else 0
         )
         visible = dense_kv[start:cache_len]
         scores = torch.einsum("hd,kd->hk", q[block_position, 0].float(), visible)
