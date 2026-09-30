@@ -92,23 +92,61 @@ def wave_uniform_i32(value, _semantic):
     )
 
 
+# Instruction classes of ``llvm.amdgcn.sched.group.barrier`` masks.
+_SCHED_GROUP_CLASSES = {
+    "alu": 0x1,
+    "valu": 0x2,
+    "salu": 0x4,
+    "mfma": 0x8,
+    "vmem": 0x10,
+    "vmem_read": 0x20,
+    "vmem_write": 0x40,
+    "ds": 0x80,
+    "ds_read": 0x100,
+    "ds_write": 0x200,
+    "trans": 0x400,
+}
+
+
+def _sched_group_mask(mask) -> int:
+    # A class name or a tuple of them; the classes are OR-ed together.
+    mask = tl.core._unwrap_if_constexpr(mask)
+    if isinstance(mask, tl.core.tuple):
+        mask = mask.values
+    if isinstance(mask, str):
+        mask = (mask,)
+    bits = 0
+    for name in mask:
+        name = tl.core._unwrap_if_constexpr(name)
+        if name not in _SCHED_GROUP_CLASSES:
+            raise ValueError(
+                f"unknown sched_group class {name!r}; "
+                f"expected one of {sorted(_SCHED_GROUP_CLASSES)}"
+            )
+        bits |= _SCHED_GROUP_CLASSES[name]
+    return bits
+
+
 @tl.core.extern
-def sched_group_barrier(mask, size, _semantic):
+def sched_group(mask, size, _semantic):
     """Emit ``llvm.amdgcn.sched.group.barrier(mask, size, 0)``.
 
-    ``mask`` selects the instruction class (e.g. 0x8 MFMA, 0x10 VMEM, 0x400
-    TRANS) and ``size`` how many instructions of it the group takes. A sequence
-    of these after a region's instructions pins their interleave. Direct-to-LDS
-    ``buffer_load ... lds`` matches 0x10 but not 0x20 (VMEM read). Only the
-    (mask, size) pairs defined in ``sched_barrier.ll`` exist.
+    ``mask`` names the instruction class, or a tuple of classes the group
+    accepts: ``"alu"``, ``"valu"``, ``"salu"``, ``"mfma"``, ``"vmem"``,
+    ``"vmem_read"``, ``"vmem_write"``, ``"ds"``, ``"ds_read"``, ``"ds_write"``
+    and ``"trans"``. ``size`` is how many instructions of it the group takes.
+    A sequence of these after a region's instructions pins their interleave.
+    Direct-to-LDS ``buffer_load ... lds`` matches ``"vmem"`` but not
+    ``"vmem_read"``. Only the (mask, size) pairs defined in
+    ``sched_barrier.ll`` exist.
     """
-    mask = tl.core._unwrap_if_constexpr(mask)
+    mask = _sched_group_mask(mask)
     size = tl.core._unwrap_if_constexpr(size)
     return tl.core.extern_elementwise(
         _SCHED_LIBRARY_NAME,
         _SCHED_LIBRARY_PATH,
         [],
-        {(): (f"__tokenspeed_sgb_{mask}_{size}", tl.int32)},
+        {(): (f"__tokenspeed_sched_group_barrier_{mask}_{size}", tl.int32)},
         is_pure=False,
         _semantic=_semantic,
     )

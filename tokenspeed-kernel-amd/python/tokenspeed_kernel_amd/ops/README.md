@@ -408,29 +408,23 @@ barriers.
 
 #### Algorithm
 
-Each program packs `128 / head_group` query positions of `head_group` heads
-into 128 MFMA rows (12 heads x 10 positions for Kimi K3 at TP8), so a KV tile
-read from LDS serves every packed head. Four wave64s each own 32 rows and the
-full 32x512 FP32 accumulator; each LDS operand read then feeds twice the MFMAs
-of a 16-row wave, which keeps the MFMA pipe, not LDS, the limiter. FP8 uses
-the K=64 unscaled FP8 MFMA with 64-key tiles (one page); BF16 uses 32-key
+Each program packs query positions of a head group into 128 MFMA rows, so a
+KV tile read from LDS serves every packed head. Four waves each own 32 rows
+and the full 512-wide FP32 accumulator, which keeps the kernel MFMA-bound
+rather than LDS-bound. FP8 uses 64-key tiles (one page); BF16 uses 32-key
 tiles.
 
-KV tiles stream into a four-stage LDS ring with direct-to-LDS buffer loads.
-FP8 swizzles the load's source columns (16-byte groups XOR the row) so the
-linear LDS writes land conflict-free for both the row-major K reads and the
-transposed V reads (`ds_read_b64_tr_b8`). The loop is software-pipelined one
-tile deep: the next tile's Q @ K^T chain runs with the current tile's softmax
-interleaved into its MFMA shadows (two `v_exp` per MFMA via group barriers),
-then P @ V over four 128-wide chunks, with the copy of the tile three ahead
-interleaved into the first chunk's MFMAs. The running maximum only moves when
-a tile raises it by more than 8 (base 2), keeping P at most 256 for its FP8
-conversion. When the grid leaves CUs idle, the KV stream is split and a small
-kernel, `gluon_mla_extend_reduce_gfx950`, merges the partials by LSE. Splits
-fill at most one wave of CTAs (a second wave costs more than the extra
-parallelism buys) and stream at least four pages each, since every split pays
-a fixed prologue and a 2 KiB-per-row FP32 partial store. The reduce loads 16
-splits per step, so it runs at close to HBM bandwidth on the partials.
+KV tiles stream into a four-stage LDS ring with direct-to-LDS buffer loads,
+swizzled so both the K reads and the transposed V reads are conflict-free.
+The loop is software-pipelined one tile deep: the current tile's softmax runs
+in the MFMA shadows of the next tile's Q @ K^T, and the next copy is issued
+under the first P @ V chunk. The running maximum only moves when a tile
+raises it by more than 8 (base 2), keeping P within FP8 range.
+
+When the grid leaves CUs idle, the KV stream is split and
+`gluon_mla_extend_reduce_gfx950` merges the partials by LSE. Splits fill at
+most one wave of CTAs and stream at least four pages each, since every split
+pays a fixed prologue and an FP32 partial store.
 
 ### gfx1250 MLA prefill
 

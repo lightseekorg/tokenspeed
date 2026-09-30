@@ -39,7 +39,7 @@ FP8 the loads swizzle their source columns so the linear LDS writes land in a
 bank-conflict-free layout for both the K and the transposed V reads. LDS
 operand reads skip the per-read wait (the stage wait covers them), and group
 barriers interleave the softmax exp2s into the Q @ K^T MFMAs and the next
-tile's copy into the P @ V MFMAs. See ``ops/README.md`` for the full contract.
+tile's copy into the P @ V MFMAs.
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ import torch
 from tokenspeed_kernel_amd._scheduling import (
     sched_barrier,
     sched_barrier_compile_options,
-    sched_group_barrier,
+    sched_group,
     wave_uniform_i32,
 )
 from tokenspeed_kernel_amd._triton import gl, gluon, gluon_builtin
@@ -90,10 +90,6 @@ _REDUCE_SPLITS = 16
 # raises it by more than this, so p = exp2(s - m) <= 2^8 = 256, which still
 # fits FP8 e4m3 (max 448).
 _RESCALE_THRESHOLD = gl.constexpr(8.0)
-# sched_group_barrier instruction classes.
-_SGB_MFMA = gl.constexpr(0x8)
-_SGB_VMEM = gl.constexpr(0x10)
-_SGB_TRANS = gl.constexpr(0x400)
 
 
 @gluon_builtin
@@ -637,8 +633,8 @@ class ExtendProgram:
             # issue port.
             self.issue_tile(kv_smem, pe_smem, issue_stage, page, issue_tile, tile_end)
             for _i in gl.static_range(4):
-                sched_group_barrier(_SGB_MFMA, 1)
-                sched_group_barrier(_SGB_VMEM, 3)
+                sched_group("mfma", 1)
+                sched_group("vmem", 3)
             sched_barrier()
         v = self.load_v(kv_smem, stage, 2)
         sched_barrier()
@@ -868,8 +864,8 @@ def gluon_mla_extend_gfx950(
             # Interleave the softmax exp2s into the Q @ K^T MFMA chain, two
             # per MFMA; the scheduler places the other ALU work itself.
             for _i in gl.static_range(16):
-                sched_group_barrier(_SGB_MFMA, 1)
-                sched_group_barrier(_SGB_TRANS, 2)
+                sched_group("mfma", 1)
+                sched_group("trans", 2)
             sched_barrier()
             acc0 = _rescale(acc0, alpha)
             acc1 = _rescale(acc1, alpha)

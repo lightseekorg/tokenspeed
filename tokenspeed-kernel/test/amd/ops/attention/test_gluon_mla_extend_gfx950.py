@@ -1,4 +1,6 @@
-# Copyright (c) 2026 LightSeek Foundation
+# MIT License
+#
+# Copyright (c) 2026 LightSeek Foundation <contact@lightseek.org>
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -7,8 +9,8 @@
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
 #
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
 #
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
@@ -31,11 +33,10 @@ import math
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.mla import mla_extend_with_kvcache
-from tokenspeed_kernel.platform import current_platform
-from utils import assert_no_triton_compile
+from utils import assert_no_triton_compile, is_cdna4
 
-platform = current_platform()
-pytestmark = pytest.mark.skipif(not platform.is_cdna4, reason="gfx950 MLA extend")
+if not is_cdna4():
+    pytest.skip("gfx950 MLA extend", allow_module_level=True)
 
 _KV_LORA_RANK = 512
 _ROPE_DIM = 64

@@ -51,21 +51,21 @@ entry:
 declare void @llvm.amdgcn.sched.group.barrier(i32 immarg, i32 immarg, i32 immarg)
 
 ; One MFMA.
-define i32 @__tokenspeed_sgb_8_1() alwaysinline {
+define i32 @__tokenspeed_sched_group_barrier_8_1() alwaysinline {
 entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 8, i32 1, i32 0)
   ret i32 0
 }
 
 ; Three VMEM instructions.
-define i32 @__tokenspeed_sgb_16_3() alwaysinline {
+define i32 @__tokenspeed_sched_group_barrier_16_3() alwaysinline {
 entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 16, i32 3, i32 0)
   ret i32 0
 }
 
 ; Two transcendental instructions.
-define i32 @__tokenspeed_sgb_1024_2() alwaysinline {
+define i32 @__tokenspeed_sched_group_barrier_1024_2() alwaysinline {
 entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 1024, i32 2, i32 0)
   ret i32 0
