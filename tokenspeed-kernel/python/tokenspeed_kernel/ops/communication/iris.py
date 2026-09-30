@@ -1710,7 +1710,7 @@ def iris_moe_reduce_scatter_gluon_kernel(
 #                         + FP32(shared_reduced_q[u,j]))
 #
 # Rank q pushes its rows to every peer; other ranks write disjoint rows.
-@gluon.jit(do_not_specialize=["PARTITION_ELEMENTS"])
+@gluon.jit(do_not_specialize=["LOCAL_ROWS"])
 def iris_moe_add_push_gather_gluon_kernel(
     projection_ptr,
     shared_ptr,
@@ -1726,11 +1726,13 @@ def iris_moe_add_push_gather_gluon_kernel(
     heap_base_6,
     heap_base_7,
     RANK: gl.constexpr,
-    PARTITION_ELEMENTS,
+    LOCAL_ROWS,
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
+    # Preserve row alignment for vector loads/stores without specializing M.
+    PARTITION_ELEMENTS = LOCAL_ROWS * 7168
     # In-place prefixes are safe: ranks read then write disjoint rows.
     # Reduce-scatter entry waits for prior prefix consumers.
     heaps = (
@@ -3576,7 +3578,7 @@ def iris_kimi3_moe_tail(
         num_warps=4,
     )
     normalized = (
-        rmsnorm(routed, norm_weight, eps, residual=None, out=None)
+        rmsnorm(routed, norm_weight, eps, residual=None, out=routed)
         if norm_weight is not None
         else routed
     )
@@ -3591,7 +3593,7 @@ def iris_kimi3_moe_tail(
         gather_flags,
         *state._heap_base_addresses,
         RANK=state.rank_in_group,
-        PARTITION_ELEMENTS=shared_elements,
+        LOCAL_ROWS=local_rows,
         BLOCK_ELEMENTS=2048,
         NUM_PROGRAMS=gather_programs,
         NUM_WARPS=4,
