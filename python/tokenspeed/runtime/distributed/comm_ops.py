@@ -45,6 +45,9 @@ from tokenspeed.runtime.distributed.comm_backend import (
     Group,
     get_global_backend,
 )
+from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # noqa: F401
+    MAX_ONESHOT_BYTES as COMM_ONESHOT_MAX_BYTES,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )

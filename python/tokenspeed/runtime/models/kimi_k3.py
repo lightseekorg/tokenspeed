@@ -71,6 +71,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     sigmoid_mul,
 )
 from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
+from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.flashinfer import get_flashinfer_moe_alltoall
 from tokenspeed_kernel.ops.gemm import (
     kimi3_mla_qkv_gate_projection,
@@ -98,8 +99,11 @@ from torch import nn
 from tokenspeed.runtime.configs.kimi_k3_config import KimiK3Config, KimiLinearConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
+    COMM_ONESHOT_MAX_BYTES,
+    acquire_all_reduce_outputs,
     all_gather,
     all_reduce,
+    can_acquire_all_reduce_outputs,
     reduce_scatter,
 )
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping, Mapping
@@ -1440,6 +1444,30 @@ def _attnres_scratch(
     return sc[slot]
 
 
+# Captured graphs retain each shape's address across later batches and layers.
+_AMD_MOE_JOIN_LANES: dict[tuple, torch.Tensor] = {}
+
+
+def _amd_moe_join_lane(like: torch.Tensor, width: int) -> torch.Tensor | None:
+    """Reuse a single-row lane or a CDNA5 strided-output buffer through M32."""
+    lane = allreduce_fusion_lane(like, width, enabled=True)
+    if lane is not None:
+        return lane
+    rows = like.shape[0]
+    if (
+        not current_platform().is_cdna5
+        or not 1 < rows <= 32
+        or rows * width * like.element_size() > COMM_ONESHOT_MAX_BYTES
+    ):
+        return None
+    key = (rows, width, like.dtype, like.device)
+    lane = _AMD_MOE_JOIN_LANES.get(key)
+    if lane is None and not torch.cuda.is_current_stream_capturing():
+        lane = like.new_zeros((rows, width))
+        _AMD_MOE_JOIN_LANES[key] = lane
+    return lane
+
+
 class KimiLinearMoE(nn.Module):
     """Kimi-K3 MoE block: sigmoid / noaux_tc router + Latent MoE + shared experts.
 
@@ -1981,7 +2009,13 @@ class KimiLinearMoE(nn.Module):
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext | None,
     ) -> torch.Tensor:
-        """Execute AMD EP or TP with replicated latent projections."""
+        """Run native EP, or join TP partials before norm and replicated up-projection.
+
+        TP producers use symmetric outputs or a packed lane when available.
+        After joining streams, reduce the pair in place, concatenate small
+        partials, or group large partials; forward_add3 combines the up-projection
+        with the shared output and attention residual.
+        """
         if self.native_latent_moe is not None:
             if self._use_fused_decode_pipeline and 0 < hidden_states.shape[0] <= 4:
                 return self._forward_fused_decode_pipeline(hidden_states, prefix_sum)
@@ -1998,8 +2032,21 @@ class KimiLinearMoE(nn.Module):
 
         routing_output_format = self._routing_output_format(ctx)
         precompute_topk = routing_output_format.is_standard()
-        self.experts._situ_output_buffer = None
-        fused_inputs = self._latent_input_projections(hidden_states, shared_out=None)
+        group = self.mapping.moe.tp_ep_group
+        shapes = ((num_tokens, self.routed_hidden), (num_tokens, hidden_size))
+        outputs = None
+        lane = None
+        if can_acquire_all_reduce_outputs(shapes, hidden_states, group):
+            outputs = acquire_all_reduce_outputs(shapes, hidden_states, group)
+        else:
+            lane = _amd_moe_join_lane(hidden_states, self.routed_hidden + hidden_size)
+            if lane is not None:
+                outputs = (lane[:, : self.routed_hidden], lane[:, self.routed_hidden :])
+        routed_out, shared_out = outputs if outputs is not None else (None, None)
+        self.experts._situ_output_buffer = routed_out
+        fused_inputs = self._latent_input_projections(
+            hidden_states, shared_out=shared_out
+        )
         if fused_inputs is not None:
             router_logits, routed_in, shared_partial = fused_inputs
         else:
@@ -2018,7 +2065,9 @@ class KimiLinearMoE(nn.Module):
                 if self._topk_ready is not None and precompute_topk and fork._active:
                     self._topk_ready.record(torch.cuda.current_stream())
                 if shared_partial is None:
-                    shared_partial = self.shared_experts(hidden_states, down_out=None)
+                    shared_partial = self.shared_experts(
+                        hidden_states, down_out=shared_out
+                    )
             if routed_in is None:
                 routed_in, _ = self.routed_expert_down_proj(hidden_states)
             if self._topk_ready is not None and precompute_topk and fork._active:
@@ -2030,16 +2079,25 @@ class KimiLinearMoE(nn.Module):
                 max_num_tokens_per_gpu,
                 do_finalize=True,
             )
-            routed = all_reduce(routed, self.mapping.moe.tp_ep_group)
-            if self.routed_expert_norm is not None:
-                routed = self.routed_expert_norm(routed)
-            routed, _ = self.routed_expert_up_proj(routed)
-
-        shared = all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
-        return add3(
-            prefix_sum,
-            routed.view(num_tokens, hidden_size),
-            shared.view(num_tokens, hidden_size),
+        # A producer may return its own tensor instead of filling its destination.
+        if outputs is not None and all(
+            partial.shape == output.shape and partial.data_ptr() == output.data_ptr()
+            for partial, output in zip((routed, shared_partial), outputs, strict=True)
+        ):
+            joined = outputs if lane is None else lane
+        elif routed.numel() * routed.element_size() > COMM_ONESHOT_MAX_BYTES:
+            joined = (routed, shared_partial)
+        else:
+            joined = torch.cat((routed, shared_partial), dim=-1)
+        reduced = all_reduce(joined, group)
+        if isinstance(reduced, torch.Tensor):
+            routed, shared = reduced.split((self.routed_hidden, hidden_size), dim=-1)
+        else:
+            routed, shared = reduced
+        if self.routed_expert_norm is not None:
+            routed = self.routed_expert_norm(routed)
+        return self.routed_expert_up_proj.forward_add3(routed, prefix_sum, shared).view(
+            num_tokens, hidden_size
         )
 
     def _forward_attn_dp(
