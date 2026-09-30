@@ -28,11 +28,17 @@ from pathlib import Path
 
 
 def update_index(
-    wheelhouse: Path, release: dict, distributions: Path, package: str
+    wheelhouse: Path, release: dict, distributions: Path, package: str, variant: str
 ) -> None:
+    if variant not in ("cu130", "rocm72"):
+        raise ValueError(f"Unsupported nightly variant: {variant}")
     pattern = {
         "tokenspeed": "tokenspeed-dist/*.whl",
-        "tokenspeed-kernel": "tokenspeed-kernel-wheel-cu130-*/*.whl",
+        "tokenspeed-kernel": (
+            "tokenspeed-kernel-wheel-cu130-*/*.whl"
+            if variant == "cu130"
+            else "tokenspeed-kernel-rocm72-wheel-*/*.whl"
+        ),
     }[package]
     expected = {path.name for path in distributions.glob(pattern)}
     assets = {asset["name"]: asset for asset in release["assets"]}
@@ -53,18 +59,28 @@ def update_index(
             f"{escape(name)}</a><br>\n"
         )
 
-    index = wheelhouse / "nightly" / package / "index.html"
+    nightly = wheelhouse / ("nightly" if variant == "cu130" else "rocm7.2/nightly")
+    index = nightly / package / "index.html"
     index.parent.mkdir(parents=True, exist_ok=True)
     previous = index.read_text() if index.exists() else "<!DOCTYPE html>\n"
     # Published assets are immutable; reruns add only missing links.
     additions = "".join(entry for entry in entries if entry not in previous)
     index.write_text(previous + additions)
 
-    root = wheelhouse / "nightly" / "index.html"
+    root = nightly / "index.html"
     previous_root = root.read_text() if root.exists() else "<!DOCTYPE html>\n"
     package_link = f'<a href="{package}/">{package}</a><br>\n'
     if package_link not in previous_root:
         root.write_text(previous_root + package_link)
+
+    if variant == "rocm72":
+        rocm_root = wheelhouse / "rocm7.2" / "index.html"
+        previous_rocm_root = (
+            rocm_root.read_text() if rocm_root.exists() else "<!DOCTYPE html>\n"
+        )
+        nightly_link = '<a href="nightly/">nightly</a><br>\n'
+        if nightly_link not in previous_rocm_root:
+            rocm_root.write_text(previous_rocm_root + nightly_link)
 
 
 if __name__ == "__main__":
@@ -72,6 +88,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--package", choices=("tokenspeed", "tokenspeed-kernel"), required=True
     )
+    parser.add_argument("--variant", choices=("cu130", "rocm72"), required=True)
     parser.add_argument("wheelhouse", type=Path)
     parser.add_argument("release_json", type=Path)
     parser.add_argument("distributions", type=Path)
@@ -81,4 +98,5 @@ if __name__ == "__main__":
         json.loads(args.release_json.read_text()),
         args.distributions,
         args.package,
+        args.variant,
     )

@@ -26,10 +26,13 @@ import pytest
 SCRIPT = Path(__file__).parents[2] / ".github/scripts/update-nightly-index.py"
 
 
-def test_nightly_index_preserves_history_and_uses_published_digest(tmp_path) -> None:
+@pytest.mark.parametrize("variant", ["cu130", "rocm72"])
+def test_nightly_index_preserves_history_and_uses_published_digest(
+    tmp_path, variant
+) -> None:
     update_index = runpy.run_path(str(SCRIPT))["update_index"]
     wheelhouse = tmp_path / "wheelhouse"
-    nightly = wheelhouse / "nightly"
+    nightly = wheelhouse / ("nightly" if variant == "cu130" else "rocm7.2/nightly")
     nightly.mkdir(parents=True)
     root = nightly / "index.html"
     root.write_text('<!DOCTYPE html>\n<a href="cu130/">cu130</a><br>\n')
@@ -37,7 +40,12 @@ def test_nightly_index_preserves_history_and_uses_published_digest(tmp_path) -> 
     project.parent.mkdir()
     history = '<!DOCTYPE html>\n<a href="older.whl">older.whl</a><br>\n'
     project.write_text(history)
-    wheels = tmp_path / "dist" / "tokenspeed-kernel-wheel-cu130-x64-py3.12"
+    artifact = (
+        "tokenspeed-kernel-wheel-cu130-x64-py3.12"
+        if variant == "cu130"
+        else "tokenspeed-kernel-rocm72-wheel-x64-py3.12"
+    )
+    wheels = tmp_path / "dist" / artifact
     wheels.mkdir(parents=True)
     name = "tokenspeed_kernel-0.1.3.post20260929-cp312-cp312-manylinux_2_28_x86_64.whl"
     (wheels / name).write_bytes(b"rebuilt contents differ from the published wheel")
@@ -47,15 +55,19 @@ def test_nightly_index_preserves_history_and_uses_published_digest(tmp_path) -> 
             {"name": name, "browser_download_url": url, "digest": f"sha256:{'a' * 64}"}
         ]
     }
-    update_index(wheelhouse, release, wheels.parent, "tokenspeed-kernel")
+    update_index(wheelhouse, release, wheels.parent, "tokenspeed-kernel", variant)
     contents = project.read_text()
     assert contents.startswith(history)
     assert f'{url}#sha256={"a" * 64}' in contents
     assert 'href="tokenspeed-kernel/"' in root.read_text()
     assert 'href="cu130/"' in root.read_text()
-    update_index(wheelhouse, release, wheels.parent, "tokenspeed-kernel")
+    update_index(wheelhouse, release, wheels.parent, "tokenspeed-kernel", variant)
     assert project.read_text() == contents
+    if variant == "rocm72":
+        assert 'href="nightly/"' in (wheelhouse / "rocm7.2/index.html").read_text()
 
     with pytest.raises(ValueError, match="missing expected nightly wheels"):
-        update_index(wheelhouse, {"assets": []}, wheels.parent, "tokenspeed-kernel")
+        update_index(
+            wheelhouse, {"assets": []}, wheels.parent, "tokenspeed-kernel", variant
+        )
     assert project.read_text() == contents

@@ -66,9 +66,10 @@ def test_invalid_or_mismatched_date_does_not_change_metadata(project, date, kern
     assert path.read_bytes() == original
 
 
-def test_tokenspeed_index_preserves_kernel_and_history(tmp_path):
+@pytest.mark.parametrize("variant", ["cu130", "rocm72"])
+def test_tokenspeed_index_preserves_kernel_and_history(tmp_path, variant):
     wheelhouse = tmp_path / "wheelhouse"
-    nightly = wheelhouse / "nightly"
+    nightly = wheelhouse / ("nightly" if variant == "cu130" else "rocm7.2/nightly")
     (nightly / "tokenspeed-kernel").mkdir(parents=True)
     kernel = nightly / "tokenspeed-kernel/index.html"
     kernel.write_text("existing kernel links\n")
@@ -88,12 +89,14 @@ def test_tokenspeed_index_preserves_kernel_and_history(tmp_path):
             {"name": name, "browser_download_url": url, "digest": f"sha256:{'a' * 64}"}
         ]
     }
-    UPDATE(wheelhouse, release, dist.parent, "tokenspeed")
+    UPDATE(wheelhouse, release, dist.parent, "tokenspeed", variant)
     contents = index.read_text()
     assert contents.startswith("older tokenspeed nightly\n")
     assert f'{url}#sha256={"a" * 64}' in contents
     assert kernel.read_text() == "existing kernel links\n"
     assert 'href="tokenspeed-kernel/"' in (nightly / "index.html").read_text()
     assert 'href="tokenspeed/"' in (nightly / "index.html").read_text()
-    UPDATE(wheelhouse, release, dist.parent, "tokenspeed")
+    UPDATE(wheelhouse, release, dist.parent, "tokenspeed", variant)
     assert index.read_text() == contents
+    if variant == "rocm72":
+        assert 'href="nightly/"' in (wheelhouse / "rocm7.2/index.html").read_text()
