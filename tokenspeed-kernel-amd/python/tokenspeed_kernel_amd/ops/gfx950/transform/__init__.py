@@ -93,25 +93,6 @@ def launch_gluon_hadamard_transform_128_gfx950(
     scale: float,
 ) -> torch.Tensor:
     """Apply the length-128 transform to a contiguous GFX950 BF16 tensor."""
-    if x.dim() == 0 or x.shape[-1] != 128:
-        last_dim = None if x.dim() == 0 else x.shape[-1]
-        raise ValueError(
-            "launch_gluon_hadamard_transform_128_gfx950 requires last dim 128, "
-            f"got {last_dim}"
-        )
-    if not x.is_cuda:
-        raise RuntimeError(
-            "launch_gluon_hadamard_transform_128_gfx950 requires a CUDA tensor"
-        )
-    if x.dtype != torch.bfloat16:
-        raise TypeError(
-            "launch_gluon_hadamard_transform_128_gfx950 requires torch.bfloat16"
-        )
-    if not x.is_contiguous():
-        raise ValueError(
-            "launch_gluon_hadamard_transform_128_gfx950 requires contiguous input"
-        )
-
     shape = x.shape
     x_2d = x.reshape(-1, 128)
     out = torch.empty_like(x_2d)

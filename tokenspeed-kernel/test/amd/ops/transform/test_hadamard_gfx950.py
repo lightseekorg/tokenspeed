@@ -23,6 +23,10 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.transform import hadamard_transform
+from tokenspeed_kernel_amd.ops.gfx950.transform import (
+    gluon_hadamard_transform_128_gfx950,
+)
+from utils import assert_no_triton_compile
 
 
 @pytest.mark.parametrize("tokens", [1, 17])
@@ -55,6 +59,31 @@ def test_gfx950_hadamard_empty_input(device: str, require) -> None:
 
     assert actual.shape == x.shape
     assert actual.dtype == x.dtype
+
+
+def test_gfx950_hadamard_strided_input_uses_portable_kernel(
+    device: str, require
+) -> None:
+    require("transform", "hadamard_transform", "gluon", torch.bfloat16, "x")
+    x = torch.randn((3, 32, 256), dtype=torch.bfloat16, device=device)[..., ::2]
+
+    actual = hadamard_transform(x, scale=128**-0.5)
+    expected = hadamard_transform(x.contiguous(), scale=128**-0.5, solution="triton")
+
+    assert torch.equal(actual, expected)
+
+
+def test_gfx950_hadamard_row_count_reuses_binary(device: str, require) -> None:
+    require("transform", "hadamard_transform", "gluon", torch.bfloat16, "x")
+
+    def run(tokens: int) -> None:
+        x = torch.empty((tokens, 32, 128), dtype=torch.bfloat16, device=device)
+        hadamard_transform(x, scale=128**-0.5, solution="gluon")
+
+    run(1)
+    with assert_no_triton_compile(gluon_hadamard_transform_128_gfx950):
+        run(2)
+        run(17)
 
 
 def test_gfx950_hadamard_changed_input_graph_replay(device: str, require) -> None:
