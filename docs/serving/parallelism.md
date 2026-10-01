@@ -3,6 +3,14 @@
 TokenSpeed exposes familiar `--tensor-parallel-size` and `--tp` entry points
 plus additional split parallelism controls for attention, dense, and MoE layers.
 
+Scheduler process names in `ps` include their parallel ranks, for example
+`tokenspeed::scheduler_tp1_ep3_dp0`. `tp` always identifies the attention TP
+rank, including `tp0` for a single process. Other suffixes appear only when
+their parallel size exceeds one: `ep` for MoE expert parallelism, `dp`, `cp`
+and `dcp` for attention data, context and decode context parallelism, and `pp`
+for pipeline parallelism. These are zero-based ranks within their respective
+groups, not parallel sizes.
+
 ## Quick Start
 
 Use this form when the same tensor-parallel group is acceptable for the model:
