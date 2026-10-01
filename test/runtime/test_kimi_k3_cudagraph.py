@@ -63,6 +63,8 @@ def _bare_mla_backend(
     """A CuteDSLMLABackend with only the attributes the CUDA-graph metadata
     paths touch — the full ctor JIT-compiles CuteDSL kernels (GPU only)."""
     backend = object.__new__(CuteDSLMLABackend)
+    backend._dcp = None
+    backend._logged_block_layouts = set()
     backend.device = "cpu"
     backend.kernel_page_size = _PAGE_SIZE
     backend.max_context_len = _MAX_CTX
@@ -342,10 +344,8 @@ def test_block_decode_stays_off_for_target_and_single_token_drafts() -> None:
     assert not one.block_decode_active
 
 
-def test_block_decode_hands_the_kernel_one_query_per_block_row() -> None:
-    """The expansion is only worth anything if it reaches the kernel: keeping
-    the block on the query axis would restore exactly the causal order the
-    draft must not have, and every other case here would still pass."""
+def test_block_decode_hands_the_kernel_a_noncausal_query_block() -> None:
+    """Block draft shares one cache length across its noncausal query block."""
     spec, bs, heads, dim = 4, 2, 3, 8
     backend = _bare_mla_backend(
         is_draft=True,
@@ -376,7 +376,7 @@ def test_block_decode_hands_the_kernel_one_query_per_block_row() -> None:
 
     def _spy(**kw):
         seen.update(kw)
-        return torch.zeros(bs * spec, 1, heads, _KV_LORA)
+        return torch.zeros(bs, spec, heads, _KV_LORA)
 
     # The real workspace sizing wants a CUDA device; the kernel itself is spied.
     with mock.patch.object(
@@ -394,6 +394,7 @@ def test_block_decode_hands_the_kernel_one_query_per_block_row() -> None:
             bs=bs,
         )
 
-    assert seen["query"].shape == (bs * spec, 1, heads, dim)
-    assert seen["block_tables"].shape[0] == bs * spec
-    assert seen["seq_lens"].tolist() == [40] * spec + [50] * spec
+    assert seen["query"].shape == (bs, spec, heads, dim)
+    assert seen["block_tables"].shape[0] == bs
+    assert seen["seq_lens"].tolist() == [40, 50]
+    assert seen["causal_mask"] is False

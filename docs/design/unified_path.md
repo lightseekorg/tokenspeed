@@ -478,6 +478,12 @@ the verify-shaped write window, so the write-window publication is a
 separate, explicit drafter-loop call (`publish_draft_step_locations`, see
 "Write locations have one owner").
 
+Backends with sharded KV must refresh derived local visibility in the same
+draft length-update hook as the global lengths. While page allocation and
+request order stay unchanged, they reuse the compact tables and ownership
+prefixes from the full refresh and update local visibility in place. Eager
+execution and CUDA graph replay use the same hooks and persistent buffers.
+
 **Step 0 narrows rows; the drafter owns the lengths, the model names the
 moment.** Eagle's step 0 runs over the target's verify window (`N` rows per
 decode request), writes KV for every row, and continues from one live row

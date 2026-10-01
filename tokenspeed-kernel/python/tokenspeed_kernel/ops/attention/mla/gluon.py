@@ -60,6 +60,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
         launch_gluon_mla_decode_projected_value_gfx950 as _mla_decode_projected_value_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.extend import (
+        launch_gluon_mla_extend_gfx950 as _mla_extend_gfx950_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.mla.normalize_project_query import (
         launch_gluon_mla_normalize_project_query_gfx950 as _mla_normalize_project_query_impl,
     )
@@ -608,6 +611,72 @@ if current_platform().is_amd:
     )
     def gluon_mla_extend_gfx1250(*args, **kwargs):
         return _mla_extend_gfx1250_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_extend_with_kvcache",
+        name="gluon_mla_extend_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            format_signature(
+                q=dense_tensor_format(q_dtype),
+                kv_cache=dense_tensor_format(torch.float8_e4m3fn),
+            )
+            for q_dtype in (torch.float8_e4m3fn, torch.bfloat16)
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            # Absorbed extend spends 512 + 576 MACs per (query, key) pair and
+            # head; prefix replay spends 192 + 128 plus a one-off expansion of
+            # every prefix token to per-head K/V. Absorbed wins below roughly
+            # 200 query tokens at this kernel's FP8 throughput.
+            "max_seqlen_q": frozenset(range(1, 257)),
+            "num_q_heads": frozenset(range(1, 129)),
+            "qk_nope_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
+            "is_causal": frozenset({True}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+        },
+    )
+    def gluon_mla_extend_gfx950(*args, **kwargs):
+        return _mla_extend_gfx950_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_extend_with_kvcache",
+        name="gluon_mla_extend_bf16_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(("q", "kv_cache"), "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits={
+            # Same cost model as the FP8-cache kernel, at the BF16 kernel's
+            # lower (register-bound) throughput.
+            "max_seqlen_q": frozenset(range(1, 17)),
+            "num_q_heads": frozenset(range(1, 129)),
+            "qk_nope_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
+            "is_causal": frozenset({True}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+        },
+    )
+    def gluon_mla_extend_bf16_gfx950(*args, **kwargs):
+        return _mla_extend_gfx950_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

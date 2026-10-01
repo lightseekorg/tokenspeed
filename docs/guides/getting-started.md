@@ -85,6 +85,23 @@ from `main` with `nightly=true` and `publish_github=true`, then run **Build and
 Release TokenSpeed** with the same settings and `version_date`. Pull request
 branches can use `publish_github=false` to build without publishing.
 
+To rebuild and replace an existing TokenSpeed nightly, select `main` in
+**Build and Release TokenSpeed** and set these **Run workflow** inputs:
+
+| Input | Value |
+| --- | --- |
+| `nightly` | `true` |
+| `replace_nightly` | `true` |
+| `publish_github` | `true` |
+| `version_date` | The date to replace as `YYYYMMDD`, or blank for today (UTC) |
+
+This rebuilds the distributions and refreshes their hashes and download URLs in
+both the CUDA and ROCm indexes. Replacement defaults to off; normal reruns keep
+existing files. TokenSpeed uses one pure-Python wheel for both backends, so it
+does not need the kernel workflow's CUDA build-variant inputs. To install a
+replacement of an already installed version, add `--no-cache-dir --force-reinstall`
+to the corresponding pinned installation command above.
+
 ### From source
 
 For H100/H200 with CUDA Toolkit 12.9, use the

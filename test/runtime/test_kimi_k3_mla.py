@@ -34,6 +34,9 @@ from test.runtime.conftest import MLA_LATENT_DIM as _LATENT_DIM
 from test.runtime.conftest import MLA_QK_ROPE_DIM as _QK_ROPE_DIM
 from test.runtime.conftest import full_attention_metadata_for as _metadata_for
 from test.runtime.conftest import kda_layer_id as _kda_layer_id
+from test.runtime.conftest import (
+    kimi_tp8_layout,
+)
 from test.runtime.conftest import make_kimi_pool as _make_pool
 from test.runtime.conftest import mla_layer_id as _mla_layer_id
 from test.runtime.conftest import (
@@ -222,8 +225,15 @@ def test_pool_write_location_oracle_page_id_times_p_plus_offset() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(
+    scope="module", params=[torch.float8_e4m3fn, torch.bfloat16], ids=["fp8", "bf16"]
+)
+def cache_dtype(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def cuda_env():
+def cuda_env(cache_dtype):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -232,7 +242,9 @@ def cuda_env():
         key: global_server_args_dict.get(key)
         for key in ("kv_cache_dtype", "chunked_prefill_size", "mla_chunk_multiplier")
     }
-    global_server_args_dict["kv_cache_dtype"] = "fp8_e4m3"
+    global_server_args_dict["kv_cache_dtype"] = (
+        "fp8_e4m3" if cache_dtype == torch.float8_e4m3fn else "bf16"
+    )
     global_server_args_dict["chunked_prefill_size"] = 256
     global_server_args_dict["mla_chunk_multiplier"] = 1
     yield
@@ -240,16 +252,37 @@ def cuda_env():
 
 
 @pytest.fixture(scope="module")
-def gpu_pool(cuda_env):
-    return _make_pool("cuda", usable_pages=6)
+def gpu_pool(cuda_env, cache_dtype):
+    from test.runtime.cache_pool_test_utils import make_pool
+
+    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
+        HybridKDATokenToKVPool,
+    )
+
+    recipe, groups, layout = kimi_tp8_layout(kv_cache_dtype=cache_dtype)
+    _, pool = make_pool(
+        HybridKDATokenToKVPool,
+        layout.bind(6),
+        device="cuda",
+        model_dtype=torch.bfloat16,
+        dtype=cache_dtype,
+        quant_method=None,
+        kv_lora_rank=_KV_LORA_RANK,
+        qk_rope_head_dim=_QK_ROPE_DIM,
+        layer_num=len(recipe.layer_types),
+        rank=0,
+        layer_types=recipe.layer_types,
+        cache_group_specs=tuple(spec for spec, _ in groups),
+    )
+    return pool
 
 
 @pytest.fixture(scope="module")
-def backend_factory(cuda_env, gpu_pool):
+def backend_factory(cuda_env, gpu_pool, cache_dtype):
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
-    def make():
+    def make(*, q_len: int):
         # The CuteDSL leaf is SM100 (Blackwell) only; everywhere else the
         # generic MLA leaf serves the same interface, so the parity claims
         # under test are identical.
@@ -287,12 +320,13 @@ def backend_factory(cuda_env, gpu_pool):
         config = AttnConfig(
             device="cuda",
             dtype=torch.bfloat16,
-            kv_cache_dtype=torch.float8_e4m3fn,
+            kv_cache_dtype=cache_dtype,
             prefix_granularity=_KERNEL_PAGE,
             kernel_page_size=_KERNEL_PAGE,
             context_len=4 * gpu_pool.arena.prefix_granularity,
             max_bs=8,
             kv_cache_quant_method="",
+            speculative_num_draft_tokens=q_len,
             components=(spec,),
         )
         backend = backend_cls(config, spec, kernel_page_size=_KERNEL_PAGE)
@@ -331,8 +365,9 @@ def _refresh_decode(backend, page_table, seq_lens_cpu):
 
 
 @requires_cuda
+@pytest.mark.parametrize("q_len", [1, 4])
 def test_decode_grouped_matches_single_table_and_reference(
-    backend_factory, gpu_pool
+    backend_factory, gpu_pool, cache_dtype, q_len
 ) -> None:
     pool = gpu_pool
     page_size = pool.arena.prefix_granularity
@@ -342,7 +377,7 @@ def test_decode_grouped_matches_single_table_and_reference(
     seq_lens_cpu = [page_size + 42, page_size]
     _write_history(pool, layer, logical_rows, seq_lens_cpu, seed=1)
 
-    grouped_backend = backend_factory()
+    grouped_backend = backend_factory(q_len=q_len)
     _refresh_decode(
         grouped_backend,
         _expand_via_stacks(grouped_backend, pool, logical_rows),
@@ -352,11 +387,13 @@ def test_decode_grouped_matches_single_table_and_reference(
 
     bs = len(logical_rows)
     torch.manual_seed(2)
-    q = torch.randn(bs, _HEADS, _LATENT_DIM, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(
+        bs * q_len, _HEADS, _LATENT_DIM, device="cuda", dtype=torch.bfloat16
+    )
     out_grouped = grouped_backend.forward_decode(q, None, None, layer, None, pool, bs)
 
     # Single-table arm: byte-equivalent hand-built kernel-page table.
-    single_table_backend = backend_factory()
+    single_table_backend = backend_factory(q_len=q_len)
     page_table = _kernel_page_table(
         logical_rows,
         page_size,
@@ -376,17 +413,42 @@ def test_decode_grouped_matches_single_table_and_reference(
     torch.cuda.synchronize()
     assert torch.equal(out_grouped, out_single_table)
 
-    # Naive fp32 reference over the fp8 history.
+    # Replay the same forward after changing live lengths at stable addresses.
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        graph_out = grouped_backend.forward_decode(
+            q, None, None, layer, None, pool, bs, save_kv_cache=False
+        )
+    seq_lens_cpu = [length - 3 for length in seq_lens_cpu]
+    _refresh_decode(grouped_backend, page_table, seq_lens_cpu)
+    graph.replay()
+    out_grouped = grouped_backend.forward_decode(
+        q, None, None, layer, None, pool, bs, save_kv_cache=False
+    )
+    torch.testing.assert_close(graph_out, out_grouped, atol=0, rtol=0)
+
+    # Naive fp32 reference over stored KV and each query's causal prefix.
     key_buffer = pool.get_key_buffer(layer.layer_id).float()
     for row, (pages, seq_len) in enumerate(zip(logical_rows, seq_lens_cpu)):
         positions = torch.arange(seq_len, device="cuda", dtype=torch.int64)
         history = key_buffer[_token_locs(pages, positions, page_size), 0]
-        q_fp8 = q[row].to(torch.float8_e4m3fn).float()
-        weights = torch.softmax((q_fp8 @ history.T) * layer.scaling, dim=-1)
+        q_ref = q.view(bs, q_len, _HEADS, _LATENT_DIM)[row].to(cache_dtype).float()
+        scores = (q_ref @ history.T) * layer.scaling
+        visible = seq_len - q_len + 1 + torch.arange(q_len, device="cuda")
+        scores.masked_fill_(
+            torch.arange(seq_len, device="cuda")[None, None, :]
+            >= visible[:, None, None],
+            float("-inf"),
+        )
+        weights = torch.softmax(scores, dim=-1)
         reference = weights @ history[:, :_KV_LORA_RANK]
-        got = out_grouped[row].view(_HEADS, _KV_LORA_RANK).float()
-        max_err = (reference - got).abs().max().item()
-        assert max_err < 0.05 * reference.abs().max().item(), max_err
+        got = out_grouped.view(bs, q_len, _HEADS, _KV_LORA_RANK)[row].float()
+        if cache_dtype == torch.bfloat16:
+            torch.testing.assert_close(got, reference, atol=2e-3, rtol=1e-2)
+        else:
+            max_err = (reference - got).abs().max().item()
+            assert max_err < 0.05 * reference.abs().max().item(), max_err
 
 
 def _init_prefill(backend, page_table, prefix, extend):
@@ -413,7 +475,7 @@ def _init_prefill(backend, page_table, prefix, extend):
 
 @requires_cuda
 def test_chunked_prefill_grouped_matches_single_table_and_reference(
-    backend_factory, gpu_pool
+    backend_factory, gpu_pool, cache_dtype
 ) -> None:
     from tokenspeed_kernel.ops.attention import attn_merge_state
 
@@ -427,8 +489,8 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
     extend = [300, 40]
     _write_history(pool, layer, logical_rows, prefix, seed=4)
 
-    grouped_backend = backend_factory()
-    single_table_backend = backend_factory()
+    grouped_backend = backend_factory(q_len=1)
+    single_table_backend = backend_factory(q_len=1)
     _init_prefill(
         grouped_backend,
         _expand_via_stacks(grouped_backend, pool, logical_rows),
@@ -526,7 +588,7 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
     torch.cuda.synchronize()
     assert torch.equal(out_grouped, out_single_table)
 
-    # Naive fp32 reference (history read back through the fp8 cache).
+    # Naive fp32 reference (history read back through the configured cache).
     key_buffer = pool.get_key_buffer(layer.layer_id)
     offset = 0
     for row, (pages, prefix_len, extend_len) in enumerate(
@@ -550,6 +612,9 @@ def test_chunked_prefill_grouped_matches_single_table_and_reference(
         scores = scores.masked_fill(~causal_mask.unsqueeze(0), float("-inf"))
         reference = torch.einsum("hts,shd->thd", torch.softmax(scores, dim=-1), v_all)
         got = out_grouped[offset : offset + extend_len].float()
-        max_err = (reference - got).abs().max().item()
-        assert max_err < 0.05 * reference.abs().max().item(), (row, max_err)
+        if cache_dtype == torch.bfloat16:
+            torch.testing.assert_close(got, reference, atol=2e-3, rtol=1e-2)
+        else:
+            max_err = (reference - got).abs().max().item()
+            assert max_err < 0.05 * reference.abs().max().item(), (row, max_err)
         offset += extend_len

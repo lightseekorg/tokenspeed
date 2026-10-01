@@ -13,6 +13,10 @@ on:
         description: "Build a dated nightly with the same-date tokenspeed-kernel dependency."
         type: boolean
         default: false
+      replace_nightly:
+        description: "Replace existing nightly assets and refresh their pip index hashes (main only)."
+        type: boolean
+        default: false
       publish_github:
         description: "Publish nightly distributions and the pip index from main."
         type: boolean
@@ -50,9 +54,14 @@ jobs:
         id: metadata
         env:
           NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
           PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
           VERSION_DATE: ${{ inputs.version_date }}
         run: |
+          if [ "$REPLACE_NIGHTLY" = "true" ] && { [ "$NIGHTLY" != "true" ] || [ "$PUBLISH_GITHUB" != "true" ] || [ "$GITHUB_REF" != "refs/heads/main" ]; }; then
+            echo "Replacing nightly assets requires nightly publication from main." >&2
+            exit 1
+          fi
           echo "nightly=${NIGHTLY}" >> "$GITHUB_OUTPUT"
           if [ "$NIGHTLY" != "true" ]; then
             exit 0
@@ -145,6 +154,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           VERSION: ${{ needs.build.outputs.version }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
           test "$(gh api user --jq .login)" = lightseek-bot
           for repository in lightseekorg/whl lightseekorg/tokenspeed; do
@@ -155,17 +165,24 @@ jobs:
           notes="${title} built from lightseekorg/tokenspeed@${GITHUB_SHA}"
           assets=(dist/tokenspeed-dist/*.whl dist/tokenspeed-dist/*.tar.gz)
           if gh release view "$tag" --repo lightseekorg/whl >/dev/null 2>&1; then
-            existing_assets=$(gh release view "$tag" --repo lightseekorg/whl --json assets --jq '.assets[].name')
-            for asset in "${assets[@]}"; do
-              if ! grep -Fxq "$(basename "$asset")" <<< "$existing_assets"; then
-                existing_notes=$(gh release view "$tag" --repo lightseekorg/whl --json body --jq .body)
-                if [ "$existing_notes" != "$notes" ]; then
-                  echo "Cannot complete a nightly release from a different source commit." >&2
-                  exit 1
+            if [ "$REPLACE_NIGHTLY" = "true" ]; then
+              gh release upload "$tag" "${assets[@]}" --repo lightseekorg/whl --clobber
+              printf '%s\n\n%s\n' "$notes" \
+                "Replacement build; reinstall with --no-cache-dir --force-reinstall if already installed." > release-notes.txt
+              gh release edit "$tag" --repo lightseekorg/whl --notes-file release-notes.txt
+            else
+              existing_assets=$(gh release view "$tag" --repo lightseekorg/whl --json assets --jq '.assets[].name')
+              for asset in "${assets[@]}"; do
+                if ! grep -Fxq "$(basename "$asset")" <<< "$existing_assets"; then
+                  existing_notes=$(gh release view "$tag" --repo lightseekorg/whl --json body --jq .body)
+                  if [ "$existing_notes" != "$notes" ]; then
+                    echo "Cannot complete a nightly release from a different source commit." >&2
+                    exit 1
+                  fi
+                  gh release upload "$tag" "$asset" --repo lightseekorg/whl
                 fi
-                gh release upload "$tag" "$asset" --repo lightseekorg/whl
-              fi
-            done
+              done
+            fi
           else
             gh release create "$tag" "${assets[@]}" --repo lightseekorg/whl \
               --title "$title" --notes "$notes" --prerelease
@@ -183,8 +200,13 @@ jobs:
       - name: Publish nightly pip index
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
-          python .github/scripts/update-nightly-index.py \
+          replace_args=()
+          if [ "$REPLACE_NIGHTLY" = "true" ]; then
+            replace_args+=(--replace)
+          fi
+          python .github/scripts/update-nightly-index.py "${replace_args[@]}" \
             --package tokenspeed --variant cu130 wheelhouse nightly-release.json dist
           cd wheelhouse
           git config user.name lightseek-bot
@@ -269,10 +291,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           VERSION: ${{ needs.build.outputs.version }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
           test "$(gh api user --jq .login)" = lightseek-bot
           gh api "repos/lightseekorg/whl/releases/tags/tokenspeed-nightly-v${VERSION}" > nightly-release.json
-          python .github/scripts/update-nightly-index.py \
+          replace_args=()
+          if [ "$REPLACE_NIGHTLY" = "true" ]; then
+            replace_args+=(--replace)
+          fi
+          python .github/scripts/update-nightly-index.py "${replace_args[@]}" \
             --package tokenspeed --variant rocm72 wheelhouse nightly-release.json dist
           cd wheelhouse
           git config user.name lightseek-bot

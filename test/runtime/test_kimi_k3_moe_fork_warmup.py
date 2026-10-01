@@ -154,6 +154,7 @@ def _run(*, graph_phase: bool, capture_mode: bool, num_tokens: int) -> dict[str,
             torch.zeros(num_tokens, 4),
             num_global_tokens=num_tokens,
             max_num_tokens_per_gpu=num_tokens,
+            prefix_is_sharded=False,
         )
     assert len(fork.calls) == 1
     assert fork.events == (
@@ -205,6 +206,7 @@ def test_moe_passes_projection_payload_to_experts(prequantized):
             hidden,
             num_global_tokens=8,
             max_num_tokens_per_gpu=8,
+            prefix_is_sharded=False,
         )
     projection.assert_called_once_with(hidden)
     assert moe._routed_experts.call_args.args[0] is payload
@@ -361,7 +363,9 @@ def test_row_sharded_moe_tail_selection_and_fallback(
     monkeypatch.setattr(mod, "acquire_all_reduce_outputs", acquire)
     monkeypatch.setattr(mod, "_amd_moe_join_lane", lambda *args: None)
 
-    output = KimiLinearMoE.forward(moe, prefix, prefix, rows, rows)
+    output = KimiLinearMoE.forward(
+        moe, prefix, prefix, rows, rows, prefix_is_sharded=False
+    )
 
     assert fork.calls == [{"enable": graph_phase, "overlap": capture_mode}]
     assert moe.experts._situ_output_buffer is (routed if producer_direct else None)
@@ -375,6 +379,7 @@ def test_row_sharded_moe_tail_selection_and_fallback(
             shared,
             prefix,
             projection.weight,
+            prefix_is_sharded=False,
             norm_weight=norm.weight if has_norm else None,
             eps=norm.variance_epsilon if has_norm else None,
             group=process_group,
@@ -429,8 +434,134 @@ def test_row_sharded_moe_tail_skips_iris_import_on_other_platform(monkeypatch):
     monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: False)
     monkeypatch.setattr(mod, "get_is_capture_mode", lambda: False)
 
-    result = KimiLinearMoE.forward(moe, prefix, prefix, 512, 512)
+    result = KimiLinearMoE.forward(
+        moe, prefix, prefix, 512, 512, prefix_is_sharded=False
+    )
     assert result._base is fallback
+
+
+@pytest.mark.parametrize(
+    "producer_direct,accepted", [(True, True), (True, False), (False, False)]
+)
+def test_sharded_attention_residual_is_gathered_before_moe_fallback(
+    monkeypatch, producer_direct, accepted
+):
+    from tokenspeed.runtime.models import kimi_k3 as mod
+
+    group = tuple(range(8))
+    routed = torch.empty((4096, 3584), dtype=torch.bfloat16, device="meta")
+    shared = torch.empty((4096, 7168), dtype=torch.bfloat16, device="meta")
+    shard = torch.empty((512, 7168), dtype=torch.bfloat16, device="meta")
+    full = torch.empty_like(shared)
+    expected = torch.empty_like(shared)
+    fork = _SpyFork()
+
+    def project(routed, prefix, shared):
+        assert prefix is full
+        fork.events.append("project")
+        return expected
+
+    moe = _make_amd_moe(
+        fork,
+        routed=routed,
+        shared=shared,
+        projection=SimpleNamespace(
+            narrowed=False,
+            solution="auto",
+            weight=torch.empty((7168, 3584), dtype=torch.bfloat16, device="meta"),
+            forward_add3=mock.Mock(side_effect=project),
+        ),
+        norm=None,
+        mapping=SimpleNamespace(
+            pp_size=1,
+            attn=SimpleNamespace(dp_size=1, tp_size=8, tp_group=group),
+            moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
+        ),
+    )
+
+    def gather_prefix(*args, **kwargs):
+        assert not fork.inside_scope
+        fork.events.append("gather")
+        return full
+
+    def reduce_partials(*args, **kwargs):
+        fork.events.append("reduce")
+        return routed, shared
+
+    candidate = mock.Mock(return_value=expected if accepted else None)
+    gather = mock.Mock(side_effect=gather_prefix)
+    joined = mock.Mock(side_effect=reduce_partials)
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_kernel.ops.communication.iris",
+        SimpleNamespace(iris_kimi3_moe_tail=candidate),
+    )
+    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
+    monkeypatch.setattr(mod, "all_gather", gather)
+    monkeypatch.setattr(mod, "all_reduce", joined)
+    monkeypatch.setattr(mod, "_get_process_group", lambda _: "owner")
+    monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: False)
+    monkeypatch.setattr(mod, "get_is_capture_mode", lambda: False)
+    monkeypatch.setattr(
+        mod, "can_acquire_all_reduce_outputs", lambda *args: producer_direct
+    )
+    monkeypatch.setattr(
+        mod, "acquire_all_reduce_outputs", lambda *args: (routed, shared)
+    )
+    monkeypatch.setattr(mod, "_amd_moe_join_lane", lambda *args: None)
+
+    result = KimiLinearMoE.forward(moe, full, shard, 4096, 4096, prefix_is_sharded=True)
+
+    if producer_direct:
+        assert candidate.call_args.kwargs["prefix_is_sharded"] is True
+        assert candidate.call_args.args[2] is shard
+    else:
+        candidate.assert_not_called()
+    if accepted:
+        assert result is expected
+        gather.assert_not_called()
+        joined.assert_not_called()
+        moe.routed_expert_up_proj.forward_add3.assert_not_called()
+    else:
+        assert result._base is expected
+        gather.assert_called_once_with(shard, group, dim=0, backend=None)
+        moe.routed_expert_up_proj.forward_add3.assert_called_once_with(
+            routed, full, shared
+        )
+        assert fork.events == ["fork", "join", "gather", "reduce", "project"]
+
+
+@pytest.mark.parametrize("rows", [32, 64])
+def test_non_iris_moe_tail_materializes_a_sharded_residual(monkeypatch, rows):
+    from tokenspeed.runtime.models import kimi_k3 as mod
+
+    group = tuple(range(8))
+    fork = _SpyFork()
+    moe = _make_moe(fork, num_tokens=rows)
+    moe.mapping = SimpleNamespace(
+        attn=SimpleNamespace(dp_size=1, tp_size=8, tp_group=group),
+        moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
+    )
+    shard = torch.empty((rows // 8, 4))
+    full = torch.empty((rows, 4))
+
+    def gather_prefix(*args, **kwargs):
+        assert not fork.inside_scope and fork.events[-1] == "join"
+        return full
+
+    gather = mock.Mock(side_effect=gather_prefix)
+    monkeypatch.setattr(mod, "all_gather", gather)
+    monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: False)
+    monkeypatch.setattr(mod, "get_is_capture_mode", lambda: False)
+    moe.comm.up_proj_ag = mock.Mock(side_effect=moe.comm.up_proj_ag)
+    moe.comm.up_proj_inject_ar = mock.Mock(side_effect=moe.comm.up_proj_inject_ar)
+
+    result = KimiLinearMoE.forward(moe, full, shard, rows, rows, prefix_is_sharded=True)
+
+    assert result.shape == full.shape
+    gather.assert_called_once_with(shard, group, dim=0, backend=None)
+    stage2 = moe.comm.up_proj_ag if rows <= 32 else moe.comm.up_proj_inject_ar
+    assert stage2.call_count == 1 and stage2.call_args.args[2] is full
 
 
 if __name__ == "__main__":

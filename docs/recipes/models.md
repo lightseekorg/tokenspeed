@@ -277,6 +277,8 @@ Notes:
   and CUDA graph capture. When K3's 128-token logical cache pages feed the
   64-token TRT-LLM MLA kernel, the backend expands each logical page into its
   two physical kernel pages before draft attention.
+- K3 DSpark does not support DCP yet: its context KV injection path does not
+  translate virtual slots into shard-local addresses or mask nonowner writes.
 - A K3 DFlash2 draft declares `sliding_attention` layers, so it needs a drafter
   backend that applies per-layer sliding windows: `--drafter-attention-backend
   mla`. Those layers dispatch to the CuteDSL windowed decode on Blackwell,

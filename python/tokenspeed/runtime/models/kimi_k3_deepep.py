@@ -190,7 +190,11 @@ class KimiLinearMoEDeepEP(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext | None,
+        *,
+        prefix_is_sharded: bool,
     ) -> torch.Tensor:
+        if prefix_is_sharded:
+            raise ValueError("DeepEP requires a replicated residual")
         if ctx is None:
             raise RuntimeError("Kimi-K3 DeepEP requires a ForwardContext")
         tp = self.mapping.attn

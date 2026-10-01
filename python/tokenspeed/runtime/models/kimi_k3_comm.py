@@ -54,7 +54,9 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_all_reduce_outputs,
     all_reduce,
+    can_acquire_all_reduce_outputs,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
@@ -64,6 +66,10 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 logger = logging.getLogger(__name__)
 
 _MULTIMEM_AR_MIN_TOKENS = 1024
+
+_IRIS_MAX_TOKENS = 8192
+_IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS = 16
+_IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS = 56
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
 ATTN_AR_MAX_TOKENS = 8
@@ -168,6 +174,105 @@ class K3AttnComm:
             else "not armed; the existing backends serve every M"
         )
         logger.info(f"Kimi K3 attention reduce: {attention_reduce_backend}")
+
+    def acquire_prefill_projection_output(
+        self,
+        like: torch.Tensor,
+        projection,
+        *,
+        is_prefill: bool,
+        sharded_moe_supported: bool,
+    ) -> torch.Tensor | None:
+        """Return prepared storage for an eligible attention producer, or None."""
+        from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
+
+        if (
+            not is_prefill
+            or not sharded_moe_supported
+            or not current_platform().is_cdna4
+            or like.ndim != 2
+            or not _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS
+            <= like.shape[0]
+            <= _IRIS_MAX_TOKENS
+            or like.dtype != torch.bfloat16
+            or self.mapping.attn.tp_size != 8
+            or self.mapping.moe.tp_size != 8
+            or self.mapping.moe.ep_size != 1
+            or self.mapping.attn.tp_group != self.mapping.moe.tp_ep_group
+            or self.mapping.pp_size != 1
+            or type(projection.quant_method) is not UnquantizedLinearMethod
+            or projection.weight.dtype != torch.bfloat16
+            or projection.weight.shape[0] != 7168
+            or projection.bias is not None
+            or projection.reduce_results
+            or not projection.input_is_parallel
+        ):
+            return None
+        shapes = ((like.shape[0], 7168),)
+        group = self.mapping.attn.tp_group
+        if not can_acquire_all_reduce_outputs(
+            shapes, like, group, backend=None, op=dist.ReduceOp.SUM
+        ):
+            return None
+        return acquire_all_reduce_outputs(
+            shapes, like, group, backend=None, op=dist.ReduceOp.SUM
+        )[0]
+
+    def prefill_reduce_for_attnres(
+        self,
+        partial: torch.Tensor,
+        prefix: torch.Tensor | None,
+        *,
+        producer_direct: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return the residual and optional delta consumed by the AttnRes mixer."""
+        if producer_direct:
+            # Prepared Iris inputs reduce into owned storage, which remains
+            # valid as a residual after the next producer reuses its input.
+            reduced = all_reduce((partial,), self.mapping.attn.tp_group)[0]
+        else:
+            reduced = all_reduce(partial, self.mapping.attn.tp_group)
+        return (reduced, None) if prefix is None else (prefix, reduced)
+
+    def prefill_mix_for_moe(
+        self,
+        partial: torch.Tensor,
+        prefix: torch.Tensor | None,
+        block_residual: torch.Tensor,
+        res_weight: torch.Tensor,
+        rms_weight: torch.Tensor,
+        *,
+        eps: float,
+        out_norm_weight: torch.Tensor,
+        out_norm_eps: float,
+        num_valid_blocks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Mix a prepared projection, retaining the MoE's local residual rows."""
+        if (
+            not current_platform().is_cdna4
+            or partial.ndim != 2
+            or not _IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS
+            <= partial.shape[0]
+            <= _IRIS_MAX_TOKENS
+            or partial.shape[0] % 8 != 0
+        ):
+            return None
+        from tokenspeed_kernel.ops.communication.iris import (
+            iris_attention_mix,
+        )
+
+        return iris_attention_mix(
+            partial,
+            prefix,
+            block_residual,
+            res_weight,
+            rms_weight,
+            eps=eps,
+            out_norm_weight=out_norm_weight,
+            out_norm_eps=out_norm_eps,
+            num_valid_blocks=num_valid_blocks,
+            group=_get_process_group(self.mapping.attn.tp_group),
+        )
 
     def fused_attnres_reduce_available(
         self,

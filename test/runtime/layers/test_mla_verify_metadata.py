@@ -316,6 +316,7 @@ def _run_cutedsl_decode(
         cutedsl_backend, "tokenspeed_mla_decode", fake_tokenspeed_mla_decode
     )
     backend = object.__new__(cutedsl_backend.CuteDSLMLABackend)
+    backend._dcp = None
     spec = block_size if draft_block_decode else 1
     seq_lens = torch.tensor([64, 128], dtype=torch.int32)[:bs]
     backend.forward_decode_metadata = cutedsl_backend.CuteDSLMLADecodeMetadata(
@@ -407,6 +408,7 @@ def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None
 
     bs, spec, pages = 2, 4, 3
     backend = object.__new__(cutedsl_backend.CuteDSLMLABackend)
+    backend._dcp = None
     backend.spec_num_tokens = spec
     backend.max_context_len = 256
     backend.draft_block_decode = True

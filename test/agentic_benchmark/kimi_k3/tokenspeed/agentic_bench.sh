@@ -23,6 +23,7 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 # Sweep configs
 CONFIGS=(
     attn_tp8_moe_tp8
+    attn_tp8_dcp4_moe_tp8
     attn_tp8_moe_ep8
 )
 

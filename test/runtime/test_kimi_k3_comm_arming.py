@@ -404,5 +404,136 @@ def test_arming_declines_unsupported_collectives(monkeypatch, multicast, shape_o
     builder.assert_not_called()
 
 
+@needs_iris
+@pytest.mark.parametrize(
+    "rows,is_prefill,sharded_moe_supported,eligible",
+    [
+        (0, True, True, False),
+        (15, True, True, False),
+        (16, True, True, True),
+        (37, True, True, True),
+        (8192, True, True, True),
+        (8193, True, True, False),
+        (8192, False, True, False),
+        (8192, True, False, False),
+    ],
+)
+def test_attention_prefill_producer_window(
+    monkeypatch, rows, is_prefill, sharded_moe_supported, eligible
+):
+    from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    group = tuple(range(8))
+    mapping = SimpleNamespace(
+        pp_size=1,
+        attn=SimpleNamespace(tp_size=8, tp_group=group),
+        moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_group=group),
+    )
+    comm = module.K3AttnComm.__new__(module.K3AttnComm)
+    comm.mapping = mapping
+    like = torch.empty((rows, 7168), dtype=torch.bfloat16)
+    projection = SimpleNamespace(
+        quant_method=UnquantizedLinearMethod(),
+        weight=torch.empty((7168, 1536), dtype=torch.bfloat16),
+        bias=None,
+        reduce_results=False,
+        input_is_parallel=True,
+    )
+    destination = Mock()
+    acquire = Mock(return_value=(destination,))
+    capability = Mock(return_value=True)
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
+    )
+    monkeypatch.setattr(module, "can_acquire_all_reduce_outputs", capability)
+    monkeypatch.setattr(module, "acquire_all_reduce_outputs", acquire)
+    out = comm.acquire_prefill_projection_output(
+        like,
+        projection,
+        is_prefill=is_prefill,
+        sharded_moe_supported=sharded_moe_supported,
+    )
+    assert (out is destination) == eligible
+    assert acquire.call_count == int(eligible)
+    if rows == 16 and eligible:
+        projection.reduce_results = True
+        assert (
+            comm.acquire_prefill_projection_output(
+                like, projection, is_prefill=True, sharded_moe_supported=True
+            )
+            is None
+        )
+        projection.reduce_results = False
+        mapping.moe.ep_size = 8
+        assert (
+            comm.acquire_prefill_projection_output(
+                like, projection, is_prefill=True, sharded_moe_supported=True
+            )
+            is None
+        )
+
+
+@pytest.mark.parametrize(
+    "rows,is_cdna4,eligible",
+    [
+        (48, True, False),
+        (56, True, True),
+        (57, True, False),
+        (8192, True, True),
+        (8200, True, False),
+        (512, False, False),
+    ],
+)
+def test_attention_prefill_mix_window(monkeypatch, rows, is_cdna4, eligible):
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    group = tuple(range(8))
+    comm = module.K3AttnComm.__new__(module.K3AttnComm)
+    comm.mapping = SimpleNamespace(attn=SimpleNamespace(tp_group=group))
+    partial = torch.empty((rows, 7168), dtype=torch.bfloat16, device="meta")
+    history = torch.empty((4, rows, 7168), dtype=torch.bfloat16, device="meta")
+    weight = torch.empty((7168,), dtype=torch.bfloat16, device="meta")
+    expected = (object(), object())
+    operation = Mock(return_value=expected)
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_kernel.ops.communication.iris",
+        SimpleNamespace(iris_attention_mix=operation),
+    )
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_cdna4=is_cdna4)
+    )
+    monkeypatch.setattr(module, "_get_process_group", lambda _: "owner")
+    result = comm.prefill_mix_for_moe(
+        partial,
+        None,
+        history,
+        weight,
+        weight,
+        eps=1e-6,
+        out_norm_weight=weight,
+        out_norm_eps=1e-5,
+        num_valid_blocks=4,
+    )
+    if eligible:
+        assert result is expected
+        operation.assert_called_once_with(
+            partial,
+            None,
+            history,
+            weight,
+            weight,
+            eps=1e-6,
+            out_norm_weight=weight,
+            out_norm_eps=1e-5,
+            num_valid_blocks=4,
+            group="owner",
+        )
+    else:
+        assert result is None
+        operation.assert_not_called()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

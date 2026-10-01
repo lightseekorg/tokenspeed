@@ -80,6 +80,7 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     linear_attnres_partials,
     linear_attnres_partials_available,
+    mm,
 )
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv,
@@ -612,6 +613,8 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         comm_manager,
         block_scale: torch.Tensor | None = None,
         attnres_partial_args: tuple | None = None,
+        *,
+        projection_out: torch.Tensor | None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -650,6 +653,9 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             # Fused in-place fp32 sigmoid+mul; the gate shard matches the
             # head-sharded attn_output.
             attn_output = sigmoid_mul(attn_output, gate)
+        if projection_out is not None:
+            # K3AttnComm supplies this only for the unbiased BF16 TP shard.
+            return mm(attn_output, self.o_proj.weight, bias=None, out=projection_out)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1293,6 +1299,8 @@ class KimiLinearKDA(nn.Module):
         comm_manager,
         block_scale: torch.Tensor | None = None,
         attnres_partial_args: tuple | None = None,
+        *,
+        projection_out: torch.Tensor | None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -1367,6 +1375,8 @@ class KimiLinearKDA(nn.Module):
                 hd,
                 enable_pdl=pdl_enabled(),
             )
+        if projection_out is not None:
+            return mm(core_out, self.o_proj.weight, bias=None, out=projection_out)
         output, _ = self.o_proj(core_out)
         return output
 
@@ -1595,6 +1605,8 @@ class KimiLinearMoE(nn.Module):
         self.config = config
         self.mapping = mapping
         self.comm: K3MoeTailComm | None = None
+        # Decoder layers inspect this even when attention DP skips native setup.
+        self.native_latent_moe: LatentMoELayer | None = None
         if mapping.attn.dp_size > 1:
             if not (mapping.attn.dp_size == mapping.moe.ep_size == mapping.world_size):
                 raise ValueError(
@@ -2107,6 +2119,8 @@ class KimiLinearMoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext | None,
+        *,
+        prefix_is_sharded: bool,
     ) -> torch.Tensor:
         """Run native EP, or join TP partials before norm and replicated up-projection.
 
@@ -2202,12 +2216,17 @@ class KimiLinearMoE(nn.Module):
                 shared_partial,
                 prefix_sum,
                 up_proj.weight,
+                prefix_is_sharded=prefix_is_sharded,
                 norm_weight=norm.weight if norm is not None else None,
                 eps=norm.variance_epsilon if norm is not None else None,
                 group=_get_process_group(group),
             )
             if output is not None:
                 return output
+        if prefix_is_sharded:
+            # The optimized tail declined before consuming the producers.
+            # Every ordinary projection epilogue requires a replicated prefix.
+            prefix_sum = all_gather(prefix_sum, group, dim=0, backend=None)
         # A producer may return its own tensor instead of filling its destination.
         if outputs is not None and all(
             partial.shape == output.shape and partial.data_ptr() == output.data_ptr()
@@ -2426,12 +2445,30 @@ class KimiLinearMoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext | None = None,
+        *,
+        prefix_is_sharded: bool,
     ) -> torch.Tensor:
         """Routed + shared experts, accumulated onto ``prefix_sum``.
 
         Reduce routed output and, for small batches, the shared shard inside
         the stream fork. Join before projecting and assembling the output.
+        When ``prefix_is_sharded`` is true, ``prefix_sum`` contains this rank's
+        consecutive one-eighth of the token rows. The AMD tail consumes them
+        directly or gathers the residual before a path that expects every row.
         """
+        if prefix_is_sharded and (
+            self.mapping.attn.dp_size > 1
+            or self.mapping.attn.tp_size != 8
+            or self.mapping.moe.tp_size != 8
+            or self.mapping.moe.ep_size != 1
+            or self.mapping.attn.tp_group != self.mapping.moe.tp_ep_group
+            or self.native_latent_moe is not None
+            or hidden_states.shape[0] % 8 != 0
+            or prefix_sum.shape != (hidden_states.shape[0] // 8, hidden_states.shape[1])
+        ):
+            raise ValueError(
+                "A residual with only this rank's rows requires matching TP8 groups and one eighth of the token rows"
+            )
         if self.mapping.attn.dp_size > 1:
             if ctx is None:
                 raise ValueError("Kimi-K3 attention DP requires a ForwardContext.")
@@ -2444,6 +2481,7 @@ class KimiLinearMoE(nn.Module):
                 num_global_tokens,
                 max_num_tokens_per_gpu,
                 ctx,
+                prefix_is_sharded=prefix_is_sharded,
             )
 
         num_tokens = hidden_states.shape[0]
@@ -2505,6 +2543,10 @@ class KimiLinearMoE(nn.Module):
             )
             routed_latent = self.comm.routed_ar_fusion(routed_partial, num_tokens)
 
+        if prefix_is_sharded:
+            prefix_sum = all_gather(
+                prefix_sum, self.mapping.moe.tp_ep_group, dim=0, backend=None
+            )
         if num_tokens <= K3_SHARED_RS_MAX_TOKENS:
             return self.comm.up_proj_ag(routed_latent, shared_shard, prefix_sum)
         else:
@@ -2839,32 +2881,61 @@ class KimiLinearDecoderLayer(nn.Module):
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
         )
 
+        projection_out = self.k3_comm.acquire_prefill_projection_output(
+            h,
+            self.self_attn.o_proj,
+            is_prefill=ctx.forward_mode.is_extend(),
+            sharded_moe_supported=(
+                self.is_moe_layer
+                and isinstance(self.block_sparse_moe, KimiLinearMoE)
+                and self.block_sparse_moe.native_latent_moe is None
+                and self.mapping.attn.dp_size == 1
+            ),
+        )
         attn_partial = self.self_attn(
             positions=positions,
             hidden_states=h,
             ctx=ctx,
             comm_manager=self.comm_manager,
             attnres_partial_args=None,
+            projection_out=projection_out,
         )
-        reduced = all_reduce(attn_partial, self.mapping.attn.tp_group)
-
-        if self.is_block_write_layer:
-            prefix_sum = reduced
-            delta = None
+        mixed = None
+        if projection_out is not None:
+            mixed = self.k3_comm.prefill_mix_for_moe(
+                attn_partial,
+                None if self.is_block_write_layer else prefix_sum,
+                block_residual,
+                self.mlp_res_proj.weight.reshape(-1),
+                self.mlp_res_norm.weight,
+                eps=self.mlp_res_norm.variance_epsilon,
+                out_norm_weight=self.post_attention_layernorm.weight,
+                out_norm_eps=self.post_attention_layernorm.variance_epsilon,
+                num_valid_blocks=self.prev_valid_blocks
+                + int(self.is_block_write_layer),
+            )
+        prefix_is_sharded = mixed is not None
+        if mixed is not None:
+            prefix_sum, h = mixed
         else:
-            delta = reduced
-        h = _apply_attn_res(
-            prefix_sum,
-            block_residual,
-            self.mlp_res_proj,
-            self.mlp_res_norm,
-            self.prev_valid_blocks + int(self.is_block_write_layer),
-            out_norm=self.post_attention_layernorm,
-            delta=delta,
-        )
+            prefix_sum, delta = self.k3_comm.prefill_reduce_for_attnres(
+                attn_partial,
+                None if self.is_block_write_layer else prefix_sum,
+                producer_direct=projection_out is not None,
+            )
+            h = _apply_attn_res(
+                prefix_sum,
+                block_residual,
+                self.mlp_res_proj,
+                self.mlp_res_norm,
+                self.prev_valid_blocks + int(self.is_block_write_layer),
+                out_norm=self.post_attention_layernorm,
+                delta=delta,
+            )
 
         # Before the MoE: the next layer's PDL combine prefetches this scratch early.
-        self._prepare_next_fallback_attnres_partial(prefix_sum, block_residual)
+        if not prefix_is_sharded:
+            self._prepare_next_fallback_attnres_partial(prefix_sum, block_residual)
         if self.is_moe_layer:
             num_global_tokens, max_num_tokens_per_gpu = (
                 self.comm_manager.get_num_tokens(ctx)
@@ -2876,6 +2947,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 # ctx is required by the cross-DP-EP token gather (was missing).
                 ctx=ctx,
+                prefix_is_sharded=prefix_is_sharded,
             )
         else:
             prefix_sum = prefix_sum + self.mlp(h)
@@ -3038,6 +3110,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 ctx=ctx,
                 comm_manager=self.comm_manager,
                 attnres_partial_args=attnres_partial_args,
+                projection_out=None,
             )
             if not reduce_consumes_scratch:
                 prefix_sum, h_fused = self._reduce_attn_accumulate(
@@ -3078,6 +3151,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 ctx=ctx,
+                prefix_is_sharded=False,
             )
         else:
             prefix_sum = prefix_sum + self.mlp(h)

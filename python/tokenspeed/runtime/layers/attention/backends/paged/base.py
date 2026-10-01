@@ -86,6 +86,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     # Declared here as well as on AttentionBackend: the refactor made the two
     # separate roots, so a paged leaf inherits only this one.
     supports_layer_sliding_window: bool = False
+    supports_mla_dcp: bool = False
 
     @classmethod
     def resolve_kernel_page_size(

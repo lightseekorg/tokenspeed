@@ -505,14 +505,15 @@ def test_acquire_all_reduce_outputs_preserves_trtllm(backend, monkeypatch):
     backend._triton_ar.acquire_all_reduce_outputs.assert_not_called()
 
 
-def test_symmetric_outputs_route_back_to_triton(backend, monkeypatch):
+@pytest.mark.parametrize("num_outputs", [1, 2])
+def test_symmetric_outputs_route_back_to_triton(backend, monkeypatch, num_outputs):
     monkeypatch.setattr(
         "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
         lambda: SimpleNamespace(is_amd=True),
     )
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     backend._triton_ar.can_reduce_outputs.return_value = True
-    outputs = (torch.empty(1, 4), torch.empty(1, 8))
+    outputs = (torch.empty(1, 4), torch.empty(1, 8))[:num_outputs]
     backend._triton_ar.all_reduce.return_value = outputs
 
     assert backend.all_reduce(outputs, (0, 1)) is outputs

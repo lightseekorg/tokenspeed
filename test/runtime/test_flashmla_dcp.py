@@ -285,10 +285,11 @@ def test_compaction_graph_replay_refreshes_lengths_and_owners():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("batch", [1, 3])
-def test_no_sink_combine_preserves_contiguous_mla_output(monkeypatch, batch):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_no_sink_combine_preserves_contiguous_mla_output(monkeypatch, batch, dtype):
     from tokenspeed.runtime.layers.attention.dcp import comm
 
-    output = torch.randn(batch, 8, 512, dtype=torch.bfloat16, device="cuda")
+    output = torch.randn(batch, 8, 512, dtype=dtype, device="cuda")
     lse = torch.zeros(batch, 8, dtype=torch.float32, device="cuda")
     # Identical shards let the expected head-owner slice be computed exactly.
     monkeypatch.setattr(
@@ -634,12 +635,13 @@ def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
         family="mla",
         server_args=SimpleNamespace(max_total_tokens=token_limit),
         model_config=SimpleNamespace(
-            num_attention_layers=2, hf_config=SimpleNamespace()
+            num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),
         attn_config=config,
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=24_576,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -677,12 +679,13 @@ def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
         family="dsa",
         server_args=SimpleNamespace(max_total_tokens=None),
         model_config=SimpleNamespace(
-            num_attention_layers=2, hf_config=SimpleNamespace()
+            num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),
         attn_config=config,
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1_048_576,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
