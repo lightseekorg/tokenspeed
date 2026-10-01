@@ -123,8 +123,6 @@ def check_pytorch_version(version_s: str = "2.4") -> bool:
 
 
 def _triton_backend_unavailable(cause: Exception) -> NoReturn:
-    # Chain the probe's own error: it is often not the platform at all (e.g. an
-    # unwritable TRITON_CACHE_DIR while the driver compiles its helper module).
     raise RuntimeError(
         f"Triton backend probe failed ({type(cause).__name__}: {cause}). "
         "Only NVIDIA CUDA and AMD HIP backends are supported."
