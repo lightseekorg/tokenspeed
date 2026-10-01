@@ -12,6 +12,8 @@ KV pool.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -108,6 +110,35 @@ def test_trtllm_mixed_prefill_metadata_uses_extend_rows():
     be.refresh_decode_metadata(3, 3, seq_lens, page_table, num_extends=2)
     assert be.forward_prefill_metadata is metadata
     assert torch.equal(be.forward_decode_metadata.cache_seqlens_int32, seq_lens)
+
+
+def test_trtllm_target_mixed_metadata_keeps_decode_rows():
+    cfg = replace(_cfg(), is_draft=False, speculative_num_draft_tokens=1)
+    be = TRTLLMMHAAttnBackend(
+        cfg, cfg.component(SoftmaxAttnConfig), kernel_page_size=64
+    )
+    # With no cached prefixes, the target context kernel handles the whole
+    # packed batch, including the final single-token decode request.
+    seq_lens = torch.tensor([3, 5, 1], dtype=torch.int32)
+    prefix_lens = torch.zeros(2, dtype=torch.int32)
+    page_table = torch.zeros((3, MAX_NUM_PAGES), dtype=torch.int32)
+    be.init_forward_metadata(
+        bs=3,
+        num_extends=2,
+        seq_lens=seq_lens,
+        page_table=page_table,
+        forward_mode=ForwardMode.MIXED,
+        extend_seq_lens=seq_lens[:2],
+        extend_seq_lens_cpu=seq_lens[:2],
+        extend_prefix_lens=prefix_lens,
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_with_prefix=False,
+    )
+
+    metadata = be.forward_prefill_metadata
+    assert metadata.cu_seqlens_q.tolist() == [0, 3, 8, 9]
+    assert torch.equal(metadata.cache_seqlens_int32, seq_lens)
+    assert torch.equal(metadata.page_table, page_table)
 
 
 @pytest.mark.parametrize("backend_cls", [MHAAttnBackend, TRTLLMMHAAttnBackend])
