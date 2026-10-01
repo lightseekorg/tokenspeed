@@ -2201,8 +2201,8 @@ def test_sorted_situ_dispatch_and_compilation_gfx950(monkeypatch, intermediate_s
         generator=generator,
     )
     preprocess_gluon_mxfp4_gfx950_moe_weights({}, module, preshuffle=True)
-    # Exercise the low-level sorted kernels at changing M without expanding
-    # the production dispatch bound, which currently admits only M=64.
+    # Exercise the low-level sorted kernels at changing M beyond the production
+    # dispatch bound, which admits M from 32 through 64.
     monkeypatch.setattr(moe, "_SITU_WARP_DECODE_MAX_M", 130)
     if intermediate_size != 384:
 
@@ -2255,5 +2255,5 @@ def test_sorted_situ_dispatch_and_compilation_gfx950(monkeypatch, intermediate_s
                 warp_decode._warp_decode_sorted_stage2_fp8_mxfp4_kernel,
             ):
                 stack.enter_context(assert_no_triton_compile(kernel))
-            for tokens in (70, 97, 130):
+            for tokens in (33, 48, 70, 97, 130):
                 run(tokens)

@@ -164,7 +164,10 @@ _DIRECT_STAGE2_BLOCK_N = 16
 _SITU_INTERMEDIATE_SCALES: dict[tuple[torch.device, float], torch.Tensor] = {}
 _A8W4_STAGE1_NUM_BUFFERS = 2
 _A8W4_STAGE2_NUM_WARPS = 1
-_A8W4_SORTED_STAGE1_MIN_M = 64
+# Expert-sorted decode tiles pay off once several routes share an expert. For
+# K3 TP8 (896 experts, top-16) the MoE apply drops 11% at 32 tokens (C8 EAGLE3
+# verification) and 29% at 64 tokens (C16).
+_A8W4_SORTED_STAGE1_MIN_M = 32
 _A8W4_SORTED_XCD_SWIZZLE = 1
 _A8W4_SORTED_STAGE2_N_TILES = 4
 
