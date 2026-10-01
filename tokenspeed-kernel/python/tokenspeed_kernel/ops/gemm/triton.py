@@ -1277,26 +1277,12 @@ def triton_mm_mxfp4(
 @register_kernel(
     "gemm",
     "mm",
-    name="triton_mm_fp8_scaled_cdna4",
-    solution="triton",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
-        vendors=frozenset({"amd"}),
-    ),
-    signatures=_FP8_SCALED_FORMAT_SIGNATURES,
-    traits={
-        "b_layout": frozenset({"KN"}),
-    },
-    priority=Priority.PERFORMANT + 2,
-)
-@register_kernel(
-    "gemm",
-    "mm",
     name="triton_mm_fp8_scaled",
     solution="triton",
+    # NVIDIA sm100+ and AMD gfx950+: no NVIDIA arch lies between 9.0 and 10.0.
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"nvidia", "amd"}),
     ),
     signatures=_FP8_SCALED_FORMAT_SIGNATURES,
     traits={
