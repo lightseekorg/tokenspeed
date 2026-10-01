@@ -215,7 +215,7 @@ def test_a_distributed_update_finishes_its_load_before_rejecting_a_scale(monkeyp
     runner = object.__new__(ModelRunner)
     runner._weight_update_pg = object()
     runner._weight_update_device = torch.device("cuda")
-    runner.model = SimpleNamespace(load_weights=load_weights)
+    runner.model = SimpleNamespace(load_weights=load_weights, modules=lambda: ())
     names = ["layers.0.self_attn.k_proj.k_scale", "layers.0.mlp.weight"]
     ok, message = runner.update_weights_from_distributed(
         SimpleNamespace(names=names, dtype_names=["float32"] * 2, shapes=[[], [2]])

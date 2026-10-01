@@ -51,8 +51,11 @@ _FP8_BLOCK_SCALE = ScaleFormat(
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
-        GLM53_BLOCK_FP8_PRIMARY_ROWS,
+        GLM53_BLOCK_FP8_PROJECTION_SHAPES,
         GLUON_BLOCK_FP8_WEIGHT_LAYOUT,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
+        launch_gluon_mm_fp8_blockscale_decode_gfx950 as _fp8_blockscale_decode_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
         launch_gluon_mm_fp8_blockscale_largem_gfx950 as _fp8_blockscale_largem_impl,
@@ -98,6 +101,28 @@ if current_platform().is_amd:
             )
         }
     )
+    _FP8_BLOCK_SCALE_SIGNATURES = frozenset(
+        {
+            format_signature(
+                a=tensor_format("mxfp8", _FP8_DTYPE, scale=_FP8_BLOCK_SCALE),
+                b=tensor_format("mxfp8", _FP8_DTYPE, scale=_FP8_BLOCK_SCALE),
+            )
+        }
+    )
+    _PACKED_FP8_TRAITS = {
+        "a_inner_stride_one": frozenset({True}),
+        "a_scales_inner_stride_one": frozenset({True}),
+        "b_inner_stride_one": frozenset({True}),
+        "b_scales_inner_stride_one": frozenset({True}),
+        "out_dtype": frozenset({torch.bfloat16}),
+        "block_scale_layout": frozenset({"canonical"}),
+        "weight_layout": frozenset({GLUON_BLOCK_FP8_WEIGHT_LAYOUT}),
+    }
+
+    def _supports_gluon_fp8_blockscale_decode(m: int, n: int, k: int) -> bool:
+        return (
+            1 <= m <= 128 and k != 512 and (n, k) in GLM53_BLOCK_FP8_PROJECTION_SHAPES
+        )
 
     @register_kernel(
         "gemm",
@@ -105,25 +130,11 @@ if current_platform().is_amd:
         name="gluon_mm_fp8_blockscale_largem_gfx950",
         solution="gluon",
         capability=_GFX950_CAPABILITY,
-        signatures=frozenset(
-            {
-                format_signature(
-                    a=tensor_format("mxfp8", _FP8_DTYPE, scale=_FP8_BLOCK_SCALE),
-                    b=tensor_format("mxfp8", _FP8_DTYPE, scale=_FP8_BLOCK_SCALE),
-                )
-            }
-        ),
+        signatures=_FP8_BLOCK_SCALE_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
-            "m": GLM53_BLOCK_FP8_PRIMARY_ROWS,
             "mnk_problem_filter": frozenset({supports_gluon_fp8_blockscale_largem}),
-            "a_inner_stride_one": frozenset({True}),
-            "a_scales_inner_stride_one": frozenset({True}),
-            "b_inner_stride_one": frozenset({True}),
-            "b_scales_inner_stride_one": frozenset({True}),
-            "out_dtype": frozenset({torch.bfloat16}),
-            "block_scale_layout": frozenset({"canonical"}),
-            "weight_layout": frozenset({GLUON_BLOCK_FP8_WEIGHT_LAYOUT}),
+            **_PACKED_FP8_TRAITS,
         },
     )
     def gluon_mm_fp8_blockscale_largem_gfx950(
@@ -143,6 +154,46 @@ if current_platform().is_amd:
         if A_scales is None or B_scales is None or block_size is None:
             raise ValueError("Gluon block-FP8 GEMM requires block scales")
         return _fp8_blockscale_largem_impl(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            block_size=block_size,
+            weight_layout=weight_layout,
+            out=out,
+        )
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_fp8_blockscale_decode_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=_FP8_BLOCK_SCALE_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "mnk_problem_filter": frozenset({_supports_gluon_fp8_blockscale_decode}),
+            **_PACKED_FP8_TRAITS,
+        },
+    )
+    def gluon_mm_fp8_blockscale_decode_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        weight_layout: str,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if alpha is not None:
+            raise ValueError("Gluon block-FP8 GEMM does not support alpha")
+        if A_scales is None or B_scales is None or block_size is None:
+            raise ValueError("Gluon block-FP8 GEMM requires block scales")
+        return _fp8_blockscale_decode_impl(
             A,
             B,
             A_scales,
@@ -551,6 +602,9 @@ if current_platform().is_amd:
 
 else:
 
+    def gluon_mm_fp8_blockscale_decode_gfx950(**kwargs):
+        raise ImportError("gluon_mm_fp8_blockscale_decode_gfx950 requires AMD gfx950")
+
     def gluon_mm_fp8_blockscale_largem_gfx950(**kwargs):
         raise ImportError("gluon_mm_fp8_blockscale_largem_gfx950 requires AMD gfx950")
 
@@ -580,6 +634,7 @@ else:
 
 
 __all__ = [
+    "gluon_mm_fp8_blockscale_decode_gfx950",
     "gluon_mm_fp8_blockscale_largem_gfx950",
     "gluon_mm_a16w16_prefill_gfx950",
     "gluon_mm_mxfp8_gfx950",

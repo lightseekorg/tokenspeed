@@ -36,10 +36,14 @@ from tokenspeed.runtime.execution.context import (
 from tokenspeed.runtime.layers.attention.dsa.utils import (
     _prepare_dsa_topk_for_mtp_decode,
 )
+from tokenspeed.runtime.layers.dense.fp8 import abort_packed_fp8_weight_updates
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.base_config import (
+    QuantizationConfig,
+    finalize_quantized_weights_after_loading,
+)
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -276,8 +280,13 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
                     name = name.replace(nextn_prefix, "model.decoder")
                 yield name, loaded_weight
 
-        load_glm53_flash_text_weights(self, nextn_weights())
-        self.post_load_weights()
+        try:
+            load_glm53_flash_text_weights(self, nextn_weights())
+            self.post_load_weights()
+            finalize_quantized_weights_after_loading(self)
+        except Exception as error:
+            abort_packed_fp8_weight_updates(self, original_error=error)
+            raise
 
     def post_load_weights(self) -> None:
         attention = self.model.decoder.self_attn

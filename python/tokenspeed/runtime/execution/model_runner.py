@@ -24,6 +24,7 @@ import inspect
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel import PackedFp8WeightCorruptionError
 
 from tokenspeed.runtime.configs.numerics import require_verified_numerics
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
@@ -31,7 +32,6 @@ from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.layers.quantization.base_config import (
     finalize_quantized_weights_after_loading,
-    invalidate_quantized_weights_before_loading,
 )
 from tokenspeed.runtime.model_loader.weight_utils import (
     non_unit_kv_scale_message,
@@ -344,7 +344,9 @@ class ModelRunner:
                     dist.broadcast(buf, src=0, group=pg)
                     yield name, buf
 
-            invalidate_quantized_weights_before_loading(self.model)
+            # Prior forwards can still be reading weights on another GPU stream
+            # after their host dispatch returns. Drain them before any reload write.
+            torch.cuda.synchronize(device)
             try:
                 # Finish loading before rejecting a non-unit KV-cache scale.
                 rejected: list[str] = []
@@ -359,6 +361,11 @@ class ModelRunner:
                     "resend the weights without KV-cache scales"
                 )
             return True, f"updated {len(names)} weights"
+        except PackedFp8WeightCorruptionError:
+            # A captured graph can replay without Python dispatch. Do not
+            # return a failed update and leave this worker serving corrupt bytes.
+            logger.exception("unrecoverable packed block-FP8 weight update")
+            raise
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_distributed failed")
             return False, str(e)

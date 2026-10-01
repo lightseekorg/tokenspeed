@@ -195,7 +195,7 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
         + 0.001
     )
 
-    plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
+    plan = prepare_fp8_linear(weight, weight_scales, [128, 128], packed_resident=False)
     planned = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
     prepacked = mm(
         x,
@@ -220,7 +220,7 @@ def test_prepared_plan_falls_back_above_the_padding_threshold(device: str) -> No
         + 0.001
     )
 
-    plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
+    plan = prepare_fp8_linear(weight, weight_scales, [128, 128], packed_resident=False)
     planned = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
     canonical = mm(
         x,
@@ -246,7 +246,7 @@ def test_prepared_plan_is_exact_for_partial_row_tiles(device: str, m: int) -> No
         torch.rand(n // 128, k // 128, device=device, dtype=torch.float32) + 0.5
     )
 
-    plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
+    plan = prepare_fp8_linear(weight, weight_scales, [128, 128], packed_resident=False)
     got = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
 
     # Compare against the exact product of the quantized operands.

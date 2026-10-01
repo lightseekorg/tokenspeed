@@ -20,20 +20,24 @@
 
 """gfx950 block-scaled FP8 GEMM kernels."""
 
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8.decode import (
+    launch_gluon_mm_fp8_blockscale_decode_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8.largem import (
-    GLM53_BLOCK_FP8_PRIMARY_ROWS,
     GLM53_BLOCK_FP8_PROJECTION_SHAPES,
     GLUON_BLOCK_FP8_WEIGHT_LAYOUT,
     launch_gluon_mm_fp8_blockscale_largem_gfx950,
     pack_gluon_fp8_blockscale_weight,
     supports_gluon_fp8_blockscale_largem,
+    unpack_gluon_fp8_blockscale_weight,
 )
 
 __all__ = [
-    "GLM53_BLOCK_FP8_PRIMARY_ROWS",
     "GLM53_BLOCK_FP8_PROJECTION_SHAPES",
     "GLUON_BLOCK_FP8_WEIGHT_LAYOUT",
+    "launch_gluon_mm_fp8_blockscale_decode_gfx950",
     "launch_gluon_mm_fp8_blockscale_largem_gfx950",
     "pack_gluon_fp8_blockscale_weight",
     "supports_gluon_fp8_blockscale_largem",
+    "unpack_gluon_fp8_blockscale_weight",
 ]

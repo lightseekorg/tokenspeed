@@ -561,7 +561,7 @@ def test_nextn_fused_qkv_fp8_scale_uses_block_row_offset() -> None:
     scale.weight_loader = weight_loader
     scale_name = "model.decoder.self_attn." "fused_qkv_a_proj_with_mqa.weight_scale_inv"
     model.named_parameters = lambda: [(scale_name, scale)]
-    model.named_modules = lambda: []
+    model.named_modules = lambda **_kwargs: []
     model.post_load_weights = lambda: None
 
     loaded_scale = torch.ones(4, 4)

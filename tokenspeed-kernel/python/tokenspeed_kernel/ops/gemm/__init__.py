@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import os
-import weakref
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from math import prod
@@ -100,6 +99,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "fp8_linear",
+    "export_fp8_linear_weight",
     "quantize_fp8_group32_for_linear",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
@@ -113,7 +113,10 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "invalidate_fp8_linear_weight",
+    "PackedFp8WeightCorruptionError",
     "prepare_fp8_linear",
+    "promote_fp8_linear_weight",
+    "rebind_fp8_linear_weight",
     "prepare_trtllm_cutedsl_fp8_linear",
     "refresh_fp8_linear_weight",
     "prepare_nvfp4_a16_weights",
@@ -123,19 +126,14 @@ __all__ = [
 _platform = Platform.get()
 _fp8_dtype = torch.float8_e4m3fn
 _GLUON_BLOCK_FP8_KERNEL = "gluon_mm_fp8_blockscale_largem_gfx950"
+_PACKED_BLOCK_FP8_KERNEL = "gluon_mm_fp8_blockscale_decode_gfx950"
 _GLUON_BLOCK_FP8_WEIGHT_LAYOUT = "gluon_gfx950_k128_n64"
-_GLUON_BLOCK_FP8_ROWS = frozenset({8144, 8192})
-_GLUON_BLOCK_FP8_PROJECTIONS = frozenset(
-    {
-        (1024, 4096),
-        (4096, 512),
-        (6144, 4096),
-        (4096, 3072),
-        (2048, 4096),
-        (4096, 1536),
-        (4096, 4096),
-    }
-)
+_GLUON_BLOCK_FP8_MIN_ROWS = 129
+
+
+class PackedFp8WeightCorruptionError(RuntimeError):
+    """The graph-visible packed weight could not be restored after an update."""
+
 
 # ---------------------------------------------------------------------------
 # Selection traits
@@ -169,10 +167,9 @@ class _PreparedFp8Linear(torch.nn.Module):
         *,
         override: str | None,
         block_size: tuple[int, int],
-        prepared_weight: torch.Tensor | None = None,
-        prepared_weight_source: torch.Tensor | None = None,
+        pack_candidate: bool = False,
+        packed_resident: bool = False,
         prepared_weight_layout: str | None = None,
-        eligible_rows: frozenset[int] | None = None,
         prepared_weight_scales: torch.Tensor | None = None,
         prepacked_scales: bool = False,
         activation: str | None = None,
@@ -182,47 +179,19 @@ class _PreparedFp8Linear(torch.nn.Module):
         super().__init__()
         self.override = override
         self.block_size = block_size
+        self.pack_candidate = pack_candidate
+        self.packed_resident = packed_resident
+        self.packed_valid = False
+        self.packed_intact = False
+        self.packed_weight_ptr: int | None = None
         self.prepared_weight_layout = prepared_weight_layout
-        self.eligible_rows = eligible_rows
         self.prepacked_scales = prepacked_scales
         self.activation = activation
         self.warmup = warmup
         self.warmup_key = warmup_key
-        self.register_buffer("prepared_weight", prepared_weight, persistent=False)
         self.register_buffer(
             "prepared_weight_scales", prepared_weight_scales, persistent=False
         )
-        self._prepared_weight_valid = prepared_weight_source is not None
-        self._prepared_weight_source_version = (
-            prepared_weight_source._version
-            if prepared_weight_source is not None
-            else None
-        )
-        self._prepared_weight_source_ref = (
-            weakref.ref(prepared_weight_source)
-            if prepared_weight_source is not None
-            else None
-        )
-
-    def prepared_weight_is_current(self, weight: torch.Tensor) -> bool:
-        source = (
-            self._prepared_weight_source_ref()
-            if self._prepared_weight_source_ref is not None
-            else None
-        )
-        return (
-            self._prepared_weight_valid
-            and source is weight
-            and weight._version == self._prepared_weight_source_version
-        )
-
-    def invalidate_prepared_weight(self) -> None:
-        self._prepared_weight_valid = False
-
-    def mark_prepared_weight_current(self, weight: torch.Tensor) -> None:
-        self._prepared_weight_source_ref = weakref.ref(weight)
-        self._prepared_weight_source_version = weight._version
-        self._prepared_weight_valid = True
 
 
 def prepare_fp8_linear(
@@ -230,6 +199,8 @@ def prepare_fp8_linear(
     weight_scales: torch.Tensor,
     block_size: tuple[int, int] | list[int],
     scale_format: str | None = None,
+    *,
+    packed_resident: bool,
 ) -> object:
     """Prepare an opaque block-FP8 linear implementation contract.
 
@@ -243,6 +214,8 @@ def prepare_fp8_linear(
         weight_scales: Canonical block scales loaded with the weight.
         block_size: Logical scale block shape ``[block_n, block_k]``.
         scale_format: Logical checkpoint scale encoding, such as ``"ue8m0"``.
+        packed_resident: Whether the model explicitly allows its weight to be
+            replaced by the gfx950 packed layout after loading.
 
     Returns:
         An opaque prepared FP8 linear plan.
@@ -292,27 +265,25 @@ def prepare_fp8_linear(
         )
 
     if (
-        os.environ.get("TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE") == "1"
+        packed_resident
+        and os.environ.get("TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE") == "1"
         and platform.is_cdna4
         and (block_n, block_k) == (128, 128)
-        and (n, k) in _GLUON_BLOCK_FP8_PROJECTIONS
         and weight.dtype == _fp8_dtype
         and weight_scales.dtype == torch.float32
         and tuple(weight_scales.shape) == (n // 128, k // 128)
         and KernelRegistry.get().get_by_name(_GLUON_BLOCK_FP8_KERNEL) is not None
     ):
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
-            pack_gluon_fp8_blockscale_weight,
+            GLM53_BLOCK_FP8_PROJECTION_SHAPES,
         )
 
-        return _PreparedFp8Linear(
-            override=_GLUON_BLOCK_FP8_KERNEL,
-            block_size=(128, 128),
-            prepared_weight=pack_gluon_fp8_blockscale_weight(weight),
-            prepared_weight_source=weight,
-            prepared_weight_layout=_GLUON_BLOCK_FP8_WEIGHT_LAYOUT,
-            eligible_rows=_GLUON_BLOCK_FP8_ROWS,
-        )
+        if (n, k) in GLM53_BLOCK_FP8_PROJECTION_SHAPES:
+            return _PreparedFp8Linear(
+                override=None,
+                block_size=(128, 128),
+                pack_candidate=True,
+            )
 
     if (
         (block_n, block_k) == (1, 32)
@@ -361,37 +332,119 @@ def prepare_fp8_linear(
     )
 
 
-def refresh_fp8_linear_weight(plan: object, weight: torch.Tensor) -> bool:
-    """Repack a graph-visible private weight buffer after a checkpoint update."""
+def promote_fp8_linear_weight(
+    plan: object, canonical_weight: torch.Tensor
+) -> torch.Tensor | None:
+    """Pack an opted-in weight for adoption as its sole persistent storage."""
     typed_plan = _require_fp8_linear_plan(plan)
-    if typed_plan.override != _GLUON_BLOCK_FP8_KERNEL:
-        return False
-    prepared = typed_plan.prepared_weight
-    if prepared is None:
-        return False
-    if (
-        prepared.shape != weight.shape
-        or prepared.dtype != weight.dtype
-        or prepared.device != weight.device
-    ):
-        raise RuntimeError("prepared block-FP8 weight storage changed across refresh")
+    if not typed_plan.pack_candidate:
+        return None
+    if typed_plan.packed_resident:
+        raise RuntimeError("block-FP8 weight is already packed")
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
         pack_gluon_fp8_blockscale_weight,
     )
 
-    typed_plan.invalidate_prepared_weight()
-    pack_gluon_fp8_blockscale_weight(weight, out=prepared)
-    typed_plan.mark_prepared_weight_current(weight)
+    packed = pack_gluon_fp8_blockscale_weight(canonical_weight)
+    typed_plan.packed_resident = True
+    typed_plan.packed_valid = True
+    typed_plan.packed_intact = True
+    typed_plan.packed_weight_ptr = packed.data_ptr()
+    typed_plan.prepared_weight_layout = _GLUON_BLOCK_FP8_WEIGHT_LAYOUT
+    return packed
+
+
+def rebind_fp8_linear_weight(plan: object, packed_weight: torch.Tensor) -> bool:
+    """Track packed storage after a device move or an aborted reload."""
+    typed_plan = _require_fp8_linear_plan(plan)
+    if not typed_plan.packed_resident:
+        return False
+    if packed_weight.dtype != _fp8_dtype or not packed_weight.is_contiguous():
+        raise RuntimeError("packed block-FP8 weight lost its storage layout")
+    if not typed_plan.packed_valid:
+        if (
+            not typed_plan.packed_intact
+            or packed_weight.data_ptr() != typed_plan.packed_weight_ptr
+        ):
+            raise RuntimeError("cannot rebind an invalid packed block-FP8 weight")
+        typed_plan.packed_valid = True
+    else:
+        typed_plan.packed_weight_ptr = packed_weight.data_ptr()
+    return True
+
+
+def refresh_fp8_linear_weight(
+    plan: object, canonical_weight: torch.Tensor, packed_weight: torch.Tensor
+) -> bool:
+    """Refresh graph-visible packed storage without changing its address."""
+    typed_plan = _require_fp8_linear_plan(plan)
+    if not typed_plan.packed_resident:
+        return False
+    if packed_weight.data_ptr() != typed_plan.packed_weight_ptr:
+        raise RuntimeError("packed block-FP8 weight storage changed across refresh")
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
+        pack_gluon_fp8_blockscale_weight,
+    )
+
+    try:
+        staged = pack_gluon_fp8_blockscale_weight(canonical_weight)
+        backup = packed_weight.clone()
+        if packed_weight.is_cuda:
+            torch.cuda.current_stream(packed_weight.device).synchronize()
+    except Exception:
+        typed_plan.packed_valid = typed_plan.packed_intact
+        raise
+    typed_plan.packed_valid = False
+    typed_plan.packed_intact = False
+    try:
+        packed_weight.copy_(staged)
+        if packed_weight.is_cuda:
+            torch.cuda.current_stream(packed_weight.device).synchronize()
+    except Exception as update_error:
+        try:
+            packed_weight.copy_(backup)
+            if packed_weight.is_cuda:
+                torch.cuda.current_stream(packed_weight.device).synchronize()
+        except Exception as restore_error:
+            raise PackedFp8WeightCorruptionError(
+                "packed block-FP8 weight could not be restored after update failure"
+            ) from restore_error
+        typed_plan.packed_intact = True
+        typed_plan.packed_valid = True
+        raise RuntimeError(
+            "packed block-FP8 update failed; old weight restored"
+        ) from update_error
+    typed_plan.packed_intact = True
+    typed_plan.packed_valid = True
     return True
 
 
 def invalidate_fp8_linear_weight(plan: object) -> bool:
-    """Stop using a private weight layout before its canonical weight changes."""
+    """Block execution during a packed-resident weight reload."""
     typed_plan = _require_fp8_linear_plan(plan)
-    if typed_plan.override != _GLUON_BLOCK_FP8_KERNEL:
+    if not typed_plan.packed_resident:
         return False
-    typed_plan.invalidate_prepared_weight()
+    typed_plan.packed_valid = False
     return True
+
+
+def export_fp8_linear_weight(plan: object, weight: torch.Tensor) -> torch.Tensor:
+    """Return a packed weight in canonical checkpoint order for export."""
+    typed_plan = _require_fp8_linear_plan(plan)
+    if not typed_plan.packed_resident:
+        return weight
+    if (
+        not typed_plan.packed_valid
+        or weight.data_ptr() != typed_plan.packed_weight_ptr
+        or weight.dtype != _fp8_dtype
+        or not weight.is_contiguous()
+    ):
+        raise RuntimeError("packed block-FP8 weight is not ready for export")
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
+        unpack_gluon_fp8_blockscale_weight,
+    )
+
+    return unpack_gluon_fp8_blockscale_weight(weight)
 
 
 def _require_fp8_linear_plan(plan: object) -> _PreparedFp8Linear:
@@ -494,7 +547,7 @@ def fp8_linear(
         plan: Opaque plan returned by :func:`prepare_fp8_linear`.
         x: Input matrix ``[M, K]``. It may be floating point for online
             quantization or FP8 when ``input_scales`` is supplied.
-        weight: FP8 weight matrix ``[N, K]``.
+        weight: FP8 weight matrix ``[N, K]`` in the plan's resident layout.
         weight_scales: Canonical persistent weight block scales.
         input_scales: Optional pre-quantized activation block scales.
         bias: Optional output bias.
@@ -504,39 +557,18 @@ def fp8_linear(
     """
     typed_plan = _require_fp8_linear_plan(plan)
     override = typed_plan.override
-    prepared_weight = typed_plan.prepared_weight
-    if override == _GLUON_BLOCK_FP8_KERNEL:
-        supported_input = (input_scales is None and x.dtype == torch.bfloat16) or (
-            input_scales is not None
-            and x.ndim == 2
-            and x.dtype == _fp8_dtype
-            and input_scales.dtype == torch.float32
-            and input_scales.stride(-1) == 1
-            and tuple(input_scales.shape) == (x.shape[0], x.shape[1] // 128)
+    if typed_plan.packed_resident:
+        if (
+            not typed_plan.packed_valid
+            or weight.data_ptr() != typed_plan.packed_weight_ptr
+        ):
+            raise RuntimeError("packed block-FP8 weight is not ready for execution")
+        override = (
+            _GLUON_BLOCK_FP8_KERNEL
+            if x.shape[0] >= _GLUON_BLOCK_FP8_MIN_ROWS
+            or tuple(weight.shape) == (4096, 512)
+            else _PACKED_BLOCK_FP8_KERNEL
         )
-        supported = (
-            prepared_weight is not None
-            and typed_plan.prepared_weight_is_current(weight)
-            and x.ndim == 2
-            and x.is_cuda
-            and x.shape[0] in typed_plan.eligible_rows
-            and x.shape[1] == weight.shape[1]
-            and x.stride(-1) == 1
-            and supported_input
-            and (out_dtype or x.dtype) == torch.bfloat16
-            and tuple(weight.shape) in _GLUON_BLOCK_FP8_PROJECTIONS
-            and weight.dtype == _fp8_dtype
-            and prepared_weight.dtype == _fp8_dtype
-            and weight_scales.dtype == torch.float32
-            and weight_scales.stride(-1) == 1
-            and tuple(weight_scales.shape)
-            == (weight.shape[0] // 128, weight.shape[1] // 128)
-            and prepared_weight.device == x.device == weight.device
-            and weight_scales.device == x.device
-            and (input_scales is None or input_scales.device == x.device)
-        )
-        if not supported:
-            override = None
     prepacked_scales = (
         typed_plan.prepacked_scales
         and input_scales is None
@@ -549,16 +581,11 @@ def fp8_linear(
         if typed_plan.prepared_weight_scales is not None and override is not None
         else weight_scales
     )
-    selected_weight = prepared_weight if override == _GLUON_BLOCK_FP8_KERNEL else weight
-    weight_layout = (
-        typed_plan.prepared_weight_layout
-        if override == _GLUON_BLOCK_FP8_KERNEL
-        else None
-    )
+    weight_layout = typed_plan.prepared_weight_layout
 
     return mm(
         x,
-        selected_weight,
+        weight,
         A_scales=input_scales,
         B_scales=selected_weight_scales,
         bias=bias,
@@ -1361,12 +1388,13 @@ def _online_quantize_mxfp8(
         )
     elif kernel_name in {
         _GLUON_BLOCK_FP8_KERNEL,
+        _PACKED_BLOCK_FP8_KERNEL,
         "gluon_mm_fp8_blockscale_gfx1250",
         "triton_mm_fp8_blockscale",
     }:
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 
-        if kernel_name == _GLUON_BLOCK_FP8_KERNEL:
+        if kernel_name in {_GLUON_BLOCK_FP8_KERNEL, _PACKED_BLOCK_FP8_KERNEL}:
             A = A.contiguous()
         return ensure_row_major_scales(
             *per_token_group_quant_fp8(A, block_k, column_major_scales=False),
@@ -1559,7 +1587,7 @@ def mm(
         )
     if weight_layout is not None and (
         weight_layout != _GLUON_BLOCK_FP8_WEIGHT_LAYOUT
-        or kernel.name != _GLUON_BLOCK_FP8_KERNEL
+        or kernel.name not in {_GLUON_BLOCK_FP8_KERNEL, _PACKED_BLOCK_FP8_KERNEL}
     ):
         raise ValueError(
             f"weight layout {weight_layout!r} does not match {kernel.name!r}"

@@ -20,14 +20,14 @@
 
 """Large-row block-scaled FP8 GEMM for GLM-5.3 on gfx950.
 
-The checkpoint remains canonical ``[N, K]``.  Model-load preparation creates a
-non-persistent K128-major copy while retaining the logical two-dimensional
-shape. The kernel uses N64 physical tiles. For each K128 quantization
-block it combines two native K64 FP8 dot instructions into one FP32
+The model stores its weight in K128-major order after loading, while checkpoint
+export restores canonical ``[N, K]`` order. The kernel uses N64 physical tiles.
+For each K128 quantization block, it combines two native K64 FP8 dot instructions into one FP32
 partial, then applies that block's activation and weight scales before adding
 the result to the FP32 accumulator.
 
-The path is opt-in and limited to the 8144/8192-row prefill contract.
+The path is opt-in and handles prefill rows from 129 upward, plus the short-K
+projection at smaller row counts.
 """
 
 from __future__ import annotations
@@ -36,7 +36,6 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, gluon_builtin, tl, triton
 
 GLUON_BLOCK_FP8_WEIGHT_LAYOUT = "gluon_gfx950_k128_n64"
-GLM53_BLOCK_FP8_PRIMARY_ROWS = frozenset({8144, 8192})
 GLM53_BLOCK_FP8_PROJECTION_SHAPES = frozenset(
     {
         (1024, 4096),
@@ -108,7 +107,7 @@ def _padded_shared_layout(operand_layout, shape, dtype, is_k_contig):
     )
 
 
-@gluon.jit(launch_metadata=_block_fp8_launch_metadata)
+@gluon.jit(launch_metadata=_block_fp8_launch_metadata, do_not_specialize=["M"])
 def gluon_mm_fp8_blockscale_largem_gfx950(
     a_ptr,
     packed_b_ptr,
@@ -132,60 +131,51 @@ def gluon_mm_fp8_blockscale_largem_gfx950(
     WARPS_M: gl.constexpr,
     WARPS_N: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
+    SPLIT_K: gl.constexpr = 1,
+    ONE_M_TILE: gl.constexpr = False,
 ):
     """Double-buffered K128 FP8 MFMA with FP32 block-scale accumulation."""
     tile_id = gl.program_id(axis=0)
-    num_pid_m = gl.cdiv(M, BLOCK_M)
-    num_pid_n = gl.cdiv(N, BLOCK_N)
-    tiles_per_group = GROUP_SIZE_M * num_pid_n
-    group_id = tile_id // tiles_per_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((tile_id % tiles_per_group) % group_m)
-    pid_n = (tile_id % tiles_per_group) // group_m
+    if ONE_M_TILE:
+        pid_m = 0
+        pid_n = tile_id
+    else:
+        num_pid_m = gl.cdiv(M, BLOCK_M)
+        num_pid_n = gl.cdiv(N, BLOCK_N)
+        tiles_per_group = GROUP_SIZE_M * num_pid_n
+        group_id = tile_id // tiles_per_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((tile_id % tiles_per_group) % group_m)
+        pid_n = (tile_id % tiles_per_group) // group_m
 
     gl.static_assert(BLOCK_M == 64, "candidate requires a 64-row tile")
     gl.static_assert(BLOCK_N == 64, "candidate requires a 64-column tile")
     gl.static_assert(BLOCK_K == 128, "one MFMA partial must equal one scale block")
-    gl.static_assert(
-        WARPS_M == 2 and WARPS_N == 2,
-        "candidate requires a 2x2 wave arrangement",
-    )
-    k_tiles: gl.constexpr = K // BLOCK_K
+    gl.static_assert(WARPS_M == 2 and WARPS_N == 2, "candidate requires four waves")
     gl.static_assert(K % BLOCK_K == 0, "K must contain complete K128 scale blocks")
+    gl.static_assert(K % (BLOCK_K * SPLIT_K) == 0, "split must contain full K tiles")
+    k_tiles: gl.constexpr = K // (BLOCK_K * SPLIT_K)
     gl.static_assert(k_tiles >= 4, "candidate requires at least four K128 blocks")
     gl.static_assert(k_tiles % 2 == 0, "double-buffered loop requires paired K tiles")
+    if SPLIT_K > 1:
+        k_tile_base = gl.program_id(axis=1) * k_tiles
+    else:
+        k_tile_base = 0
 
-    # Each of four waves moves one 32-byte slice per K128 tile.  Explicit
-    # linear layouts keep those DMA copies affine and make the packed B tile's
-    # N64 dimension the contiguous 16-byte vector.
     load_a_layout: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [32, 0]],
-        lane_bases=[
-            [0, 16],
-            [0, 32],
-            [0, 64],
-            [1, 0],
-            [2, 0],
-            [4, 0],
-        ],
+        lane_bases=[[0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0]],
         warp_bases=[[8, 0], [16, 0]],
         block_bases=[],
         shape=[BLOCK_M, BLOCK_K],
     )
     load_b_layout: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [64, 0]],
-        lane_bases=[
-            [0, 16],
-            [0, 32],
-            [1, 0],
-            [2, 0],
-            [4, 0],
-            [8, 0],
-        ],
+        lane_bases=[[0, 16], [0, 32], [1, 0], [2, 0], [4, 0], [8, 0]],
         warp_bases=[[16, 0], [32, 0]],
         block_bases=[],
-        shape=[BLOCK_K, 64],
+        shape=[BLOCK_K, BLOCK_N],
     )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
@@ -231,17 +221,26 @@ def gluon_mm_fp8_blockscale_largem_gfx950(
     load_n = gl.arange(0, 64, gl.SliceLayout(0, load_b_layout))
     global_load_m = pid_m * BLOCK_M + load_m
     a_mask = global_load_m[:, None] < M
+    if ONE_M_TILE:
+        # Async copies cannot mask rows; repeat a valid row and mask its output.
+        a_load_m = gl.minimum(global_load_m, M - 1)
+    else:
+        a_load_m = global_load_m
     a_offsets_0 = (
-        global_load_m[:, None] * stride_am + load_ak[None, :] * stride_ak
+        a_load_m[:, None] * stride_am
+        + (k_tile_base * BLOCK_K + load_ak[None, :]) * stride_ak
     ).to(gl.int32)
     a_offsets_1 = (a_offsets_0 + BLOCK_K * stride_ak).to(gl.int32)
 
-    # Packed order is [K/128, N/64, 128, 64].  Keeping the tensor's logical
-    # [N,K] shape makes checkpoint and model metadata independent of this copy.
+    # Packed order is [K/128, N/64, 128, 64]. The logical tensor shape stays
+    # [N,K] so model metadata and checkpoint dimensions are unchanged.
     packed_tile_base = pid_n * BLOCK_K * BLOCK_N
-    b_offsets_0 = (packed_tile_base + load_bk[:, None] * BLOCK_N + load_n[None, :]).to(
-        gl.int32
-    )
+    b_offsets_0 = (
+        packed_tile_base
+        + k_tile_base * BLOCK_K * N
+        + load_bk[:, None] * BLOCK_N
+        + load_n[None, :]
+    ).to(gl.int32)
     b_offsets_1 = (b_offsets_0 + BLOCK_K * N).to(gl.int32)
     a_pair_step = 2 * BLOCK_K * stride_ak
     b_pair_step = 2 * BLOCK_K * N
@@ -252,10 +251,16 @@ def gluon_mm_fp8_blockscale_largem_gfx950(
     global_output_n = pid_n * BLOCK_N + output_n
     output_mask = (global_output_m[:, None] < M) & (global_output_n[None, :] < N)
     async_copy: gl.constexpr = gl.amd.cdna4.async_copy
-    shared_a.index(0).store(gl.load(a_ptr + a_offsets_0, mask=a_mask, other=0))
+    if ONE_M_TILE:
+        async_copy.buffer_load_to_shared(shared_a.index(0), a_ptr, a_offsets_0)
+    else:
+        shared_a.index(0).store(gl.load(a_ptr + a_offsets_0, mask=a_mask, other=0))
     async_copy.buffer_load_to_shared(shared_b.index(0), packed_b_ptr, b_offsets_0)
     async_copy.commit_group()
-    shared_a.index(1).store(gl.load(a_ptr + a_offsets_1, mask=a_mask, other=0))
+    if ONE_M_TILE:
+        async_copy.buffer_load_to_shared(shared_a.index(1), a_ptr, a_offsets_1)
+    else:
+        shared_a.index(1).store(gl.load(a_ptr + a_offsets_1, mask=a_mask, other=0))
     async_copy.buffer_load_to_shared(shared_b.index(1), packed_b_ptr, b_offsets_1)
     async_copy.commit_group()
     a_offsets_0 = (a_offsets_0 + a_pair_step).to(gl.int32)
@@ -272,7 +277,7 @@ def gluon_mm_fp8_blockscale_largem_gfx950(
     accumulator = gl.zeros((BLOCK_M, 64), gl.float32, mfma_layout)
     main_loop_pairs: gl.constexpr = (k_tiles - 2) // 2
     for pair in tl.range(0, main_loop_pairs):
-        even_k_tile = pair * 2
+        even_k_tile = k_tile_base + pair * 2
         partial = gl.zeros((BLOCK_M, 64), gl.float32, mfma_layout)
         partial = _mfma_unscaled_fp8(activation, weight, partial)
         activation_scale = gl.amd.cdna4.buffer_load(
@@ -302,7 +307,10 @@ def gluon_mm_fp8_blockscale_largem_gfx950(
             gl.float8e4nv, bitcast=True
         )
         gl.barrier()
-        shared_a.index(0).store(gl.load(a_ptr + a_offsets_0, mask=a_mask, other=0))
+        if ONE_M_TILE:
+            async_copy.buffer_load_to_shared(shared_a.index(0), a_ptr, a_offsets_0)
+        else:
+            shared_a.index(0).store(gl.load(a_ptr + a_offsets_0, mask=a_mask, other=0))
         async_copy.buffer_load_to_shared(shared_b.index(0), packed_b_ptr, b_offsets_0)
         async_copy.commit_group()
 
@@ -336,7 +344,10 @@ def gluon_mm_fp8_blockscale_largem_gfx950(
             gl.float8e4nv, bitcast=True
         )
         gl.barrier()
-        shared_a.index(1).store(gl.load(a_ptr + a_offsets_1, mask=a_mask, other=0))
+        if ONE_M_TILE:
+            async_copy.buffer_load_to_shared(shared_a.index(1), a_ptr, a_offsets_1)
+        else:
+            shared_a.index(1).store(gl.load(a_ptr + a_offsets_1, mask=a_mask, other=0))
         async_copy.buffer_load_to_shared(shared_b.index(1), packed_b_ptr, b_offsets_1)
         async_copy.commit_group()
         a_offsets_0 = (a_offsets_0 + a_pair_step).to(gl.int32)
@@ -344,7 +355,7 @@ def gluon_mm_fp8_blockscale_largem_gfx950(
         b_offsets_0 = (b_offsets_0 + b_pair_step).to(gl.int32)
         b_offsets_1 = (b_offsets_1 + b_pair_step).to(gl.int32)
 
-    penultimate_k_tile: gl.constexpr = main_loop_pairs * 2
+    penultimate_k_tile = k_tile_base + main_loop_pairs * 2
     partial = gl.zeros((BLOCK_M, 64), gl.float32, mfma_layout)
     partial = _mfma_unscaled_fp8(activation, weight, partial)
     activation_scale = gl.amd.cdna4.buffer_load(
@@ -392,6 +403,8 @@ def gluon_mm_fp8_blockscale_largem_gfx950(
         accumulator,
     )
     c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
+    if SPLIT_K > 1:
+        c_base += gl.program_id(axis=1) * M * N
     c_offsets = output_m[:, None] * stride_cm + output_n[None, :] * stride_cn
     gl.amd.cdna4.buffer_store(
         ptr=c_base,
@@ -402,10 +415,9 @@ def gluon_mm_fp8_blockscale_largem_gfx950(
 
 
 def supports_gluon_fp8_blockscale_largem(m: int, n: int, k: int) -> bool:
-    """Return whether the experimental kernel owns the audited exact contract."""
-    return (
-        m in GLM53_BLOCK_FP8_PRIMARY_ROWS
-        and (n, k) in GLM53_BLOCK_FP8_PROJECTION_SHAPES
+    """Return whether the packed Gluon prefill kernel supports this shape."""
+    return (n, k) in GLM53_BLOCK_FP8_PROJECTION_SHAPES and (
+        m >= 129 or (m >= 1 and (n, k) == (4096, 512))
     )
 
 
@@ -414,11 +426,10 @@ def pack_gluon_fp8_blockscale_weight(
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Create a private K128-major candidate weight copy.
+    """Convert canonical checkpoint order to K128-major model storage.
 
-    The returned tensor deliberately retains the checkpoint's logical ``[N,K]``
-    shape.  The caller must pass the matching private layout marker when the
-    packed tensor is consumed.
+    The tensor retains the checkpoint's logical ``[N,K]`` shape. Consumers
+    must pass the corresponding packed layout marker.
     """
     if weight.ndim != 2:
         raise ValueError(f"block-FP8 weight must have shape [N,K], got {weight.shape}")
@@ -448,6 +459,17 @@ def pack_gluon_fp8_blockscale_weight(
     return out
 
 
+def unpack_gluon_fp8_blockscale_weight(packed_weight: torch.Tensor) -> torch.Tensor:
+    """Restore canonical checkpoint order from K128-major model storage."""
+    n, k = packed_weight.shape
+    return (
+        packed_weight.view(k // BLOCK_K, n // BLOCK_N, BLOCK_K, BLOCK_N)
+        .permute(1, 3, 0, 2)
+        .contiguous()
+        .view(n, k)
+    )
+
+
 def launch_gluon_mm_fp8_blockscale_largem_gfx950(
     activation: torch.Tensor,
     packed_weight: torch.Tensor,
@@ -459,7 +481,7 @@ def launch_gluon_mm_fp8_blockscale_largem_gfx950(
     weight_layout: str,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Execute the exact experimental GLM-5.3 large-row projection contract."""
+    """Execute the packed Gluon route for prefill and short-K projection."""
     if weight_layout != GLUON_BLOCK_FP8_WEIGHT_LAYOUT:
         raise ValueError("block-FP8 weight requires the N64 packed layout")
 
@@ -515,6 +537,7 @@ def launch_gluon_mm_fp8_blockscale_largem_gfx950(
         WARPS_M=WARPS_M,
         WARPS_N=WARPS_N,
         GROUP_SIZE_M=GROUP_SIZE_M,
+        ONE_M_TILE=m <= 64,
         num_warps=NUM_WARPS,
         num_stages=1,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
@@ -523,10 +546,10 @@ def launch_gluon_mm_fp8_blockscale_largem_gfx950(
 
 
 __all__ = [
-    "GLM53_BLOCK_FP8_PRIMARY_ROWS",
     "GLM53_BLOCK_FP8_PROJECTION_SHAPES",
     "GLUON_BLOCK_FP8_WEIGHT_LAYOUT",
     "launch_gluon_mm_fp8_blockscale_largem_gfx950",
     "pack_gluon_fp8_blockscale_weight",
+    "unpack_gluon_fp8_blockscale_weight",
     "supports_gluon_fp8_blockscale_largem",
 ]

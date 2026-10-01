@@ -24,12 +24,22 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import fp8_linear, prepare_fp8_linear
+from tokenspeed_kernel import (
+    fp8_linear,
+    prepare_fp8_linear,
+    promote_fp8_linear_weight,
+    rebind_fp8_linear_weight,
+    refresh_fp8_linear_weight,
+)
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8 import (
     GLUON_BLOCK_FP8_WEIGHT_LAYOUT,
     launch_gluon_mm_fp8_blockscale_largem_gfx950,
     pack_gluon_fp8_blockscale_weight,
 )
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp8.largem import (
+    gluon_mm_fp8_blockscale_largem_gfx950,
+)
+from utils import assert_no_triton_compile
 
 
 def _gfx950_device() -> torch.device:
@@ -98,12 +108,13 @@ def test_block_fp8_numerics_and_graph_replay(
     torch.testing.assert_close(result, expected, rtol=0.02, atol=0.03)
 
     monkeypatch.setenv("TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE", "1")
-    plan = prepare_fp8_linear(weight, weight_scales, (128, 128))
+    plan = prepare_fp8_linear(weight, weight_scales, (128, 128), packed_resident=True)
+    packed_weight = promote_fp8_linear_weight(plan, weight)
     assert plan.prepared_weight_layout == layout
     public_result = fp8_linear(
         plan,
         activation,
-        weight,
+        packed_weight,
         weight_scales,
         input_scales=activation_scales,
         out_dtype=torch.bfloat16,
@@ -112,7 +123,7 @@ def test_block_fp8_numerics_and_graph_replay(
     online_result = fp8_linear(
         plan,
         activation.to(torch.bfloat16),
-        weight,
+        packed_weight,
         weight_scales,
         out_dtype=torch.bfloat16,
     )
@@ -186,12 +197,232 @@ def test_online_bf16_quantization_accepts_padded_rows(
     weight_scales = torch.rand((n // 128, k // 128), device=device) * 0.05 + 0.05
 
     monkeypatch.setenv("TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE", "1")
-    plan = prepare_fp8_linear(weight, weight_scales, (128, 128))
+    plan = prepare_fp8_linear(weight, weight_scales, (128, 128), packed_resident=True)
+    packed_weight = promote_fp8_linear_weight(plan, weight)
     assert plan.prepared_weight_layout == GLUON_BLOCK_FP8_WEIGHT_LAYOUT
     actual = fp8_linear(
-        plan, activation, weight, weight_scales, out_dtype=torch.bfloat16
+        plan, activation, packed_weight, weight_scales, out_dtype=torch.bfloat16
     )
     expected = fp8_linear(
-        plan, activation.contiguous(), weight, weight_scales, out_dtype=torch.bfloat16
+        plan,
+        activation.contiguous(),
+        packed_weight,
+        weight_scales,
+        out_dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k"),
+    [
+        (1, 1024, 4096),
+        (2, 6144, 4096),
+        (4, 4096, 512),
+        (8, 4096, 1536),
+        (16, 4096, 4096),
+        (64, 4096, 3072),
+        (65, 4096, 512),
+        (128, 2048, 4096),
+        (129, 1024, 4096),
+        (848, 6144, 4096),
+        (3536, 4096, 4096),
+        (7120, 4096, 1536),
+    ],
+)
+@pytest.mark.parametrize("online", [False, True])
+def test_packed_short_and_tail_rows_match_canonical(
+    m: int, n: int, k: int, online: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    device = _gfx950_device()
+    monkeypatch.setenv("TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE", "1")
+    torch.manual_seed(91)
+    weight = (torch.randn((n, k), device=device) * 4).to(torch.float8_e4m3fn)
+    weight_scales = torch.rand((n // 128, k // 128), device=device) * 0.04 + 0.02
+    if online:
+        activation = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+        activation_scales = None
+    else:
+        activation = (torch.randn((m, k), device=device) * 4).to(torch.float8_e4m3fn)
+        activation_scales = torch.rand((m, k // 128), device=device) * 0.04 + 0.02
+
+    canonical_plan = prepare_fp8_linear(
+        weight, weight_scales, (128, 128), packed_resident=False
+    )
+    packed_plan = prepare_fp8_linear(
+        weight, weight_scales, (128, 128), packed_resident=True
+    )
+    packed_weight = promote_fp8_linear_weight(packed_plan, weight)
+    canonical = fp8_linear(
+        canonical_plan,
+        activation,
+        weight,
+        weight_scales,
+        input_scales=activation_scales,
+        out_dtype=torch.bfloat16,
+    )
+    packed = fp8_linear(
+        packed_plan,
+        activation,
+        packed_weight,
+        weight_scales,
+        input_scales=activation_scales,
+        out_dtype=torch.bfloat16,
+    )
+    torch.testing.assert_close(packed, canonical, rtol=0.01, atol=0.02)
+
+
+def test_packed_decode_graph_replay_and_in_place_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _gfx950_device()
+    monkeypatch.setenv("TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE", "1")
+    m, n, k = 4, 4096, 512
+    activation = torch.ones((m, k), device=device, dtype=torch.float8_e4m3fn)
+    weight = torch.ones((n, k), device=device, dtype=torch.float8_e4m3fn)
+    activation_scales = torch.ones((m, k // 128), device=device)
+    weight_scales = torch.ones((n // 128, k // 128), device=device)
+    plan = prepare_fp8_linear(weight, weight_scales, (128, 128), packed_resident=True)
+    packed_weight = promote_fp8_linear_weight(plan, weight)
+    packed_ptr = packed_weight.data_ptr()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = fp8_linear(
+            plan,
+            activation,
+            packed_weight,
+            weight_scales,
+            input_scales=activation_scales,
+            out_dtype=torch.bfloat16,
+        )
+    graph.replay()
+    assert torch.all(graph_output == k)
+
+    replacement = torch.full_like(weight, 2)
+    assert refresh_fp8_linear_weight(plan, replacement, packed_weight)
+    assert packed_weight.data_ptr() == packed_ptr
+    graph.replay()
+    assert torch.all(graph_output == 2 * k)
+    activation.zero_()
+    graph.replay()
+    assert not torch.count_nonzero(graph_output)
+
+
+def test_packed_graph_replay_keeps_old_weight_after_partial_refresh_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _gfx950_device()
+    monkeypatch.setenv("TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE", "1")
+    m, n, k = 4, 4096, 512
+    activation = torch.ones((m, k), device=device, dtype=torch.float8_e4m3fn)
+    weight = torch.ones((n, k), device=device, dtype=torch.float8_e4m3fn)
+    activation_scales = torch.ones((m, k // 128), device=device)
+    weight_scales = torch.ones((n // 128, k // 128), device=device)
+    plan = prepare_fp8_linear(weight, weight_scales, (128, 128), packed_resident=True)
+    packed_weight = promote_fp8_linear_weight(plan, weight)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = fp8_linear(
+            plan,
+            activation,
+            packed_weight,
+            weight_scales,
+            input_scales=activation_scales,
+            out_dtype=torch.bfloat16,
+        )
+    graph.replay()
+    assert torch.all(output == k)
+
+    original_copy = torch.Tensor.copy_
+    packed_ptr = packed_weight.data_ptr()
+    copies_to_resident = 0
+
+    def injected_copy(destination, source, *args, **kwargs):
+        nonlocal copies_to_resident
+        if destination.data_ptr() == packed_ptr:
+            copies_to_resident += 1
+            if copies_to_resident == 1:
+                original_copy(destination.flatten()[:64], source.flatten()[:64])
+                raise RuntimeError("injected partial packed copy")
+        return original_copy(destination, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", injected_copy)
+    with pytest.raises(RuntimeError, match="old weight restored"):
+        refresh_fp8_linear_weight(plan, torch.full_like(weight, 2), packed_weight)
+    assert copies_to_resident == 2
+    graph.replay()
+    assert torch.all(output == k)
+
+
+@pytest.mark.parametrize("rows", [(1, 4, 8, 16, 32, 64), (848, 896, 1616)])
+def test_packed_row_variation_does_not_recompile(
+    rows: tuple[int, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _gfx950_device()
+    monkeypatch.setenv("TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE", "1")
+    n, k = 4096, 512
+    weight = torch.ones((n, k), device=device, dtype=torch.float8_e4m3fn)
+    weight_scales = torch.ones((n // 128, k // 128), device=device)
+    plan = prepare_fp8_linear(weight, weight_scales, (128, 128), packed_resident=True)
+    packed_weight = promote_fp8_linear_weight(plan, weight)
+
+    def run(m: int) -> None:
+        activation = torch.ones((m, k), device=device, dtype=torch.float8_e4m3fn)
+        activation_scales = torch.ones((m, k // 128), device=device)
+        fp8_linear(
+            plan,
+            activation,
+            packed_weight,
+            weight_scales,
+            input_scales=activation_scales,
+            out_dtype=torch.bfloat16,
+        )
+
+    run(rows[0])
+    with assert_no_triton_compile(gluon_mm_fp8_blockscale_largem_gfx950):
+        for m in rows[1:]:
+            run(m)
+
+
+def test_packed_weight_survives_layout_preserving_device_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = _gfx950_device()
+    monkeypatch.setenv("TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE", "1")
+    m, n, k = 4, 4096, 512
+    activation = torch.ones((m, k), device=device, dtype=torch.float8_e4m3fn)
+    weight = torch.ones((n, k), device=device, dtype=torch.float8_e4m3fn)
+    activation_scales = torch.ones((m, k // 128), device=device)
+    weight_scales = torch.ones((n // 128, k // 128), device=device)
+    plan = prepare_fp8_linear(weight, weight_scales, (128, 128), packed_resident=True)
+    packed_weight = promote_fp8_linear_weight(plan, weight)
+    expected = fp8_linear(
+        plan,
+        activation,
+        packed_weight,
+        weight_scales,
+        input_scales=activation_scales,
+        out_dtype=torch.bfloat16,
+    )
+    moved = packed_weight.cpu().to(device)
+    with pytest.raises(RuntimeError, match="not ready"):
+        fp8_linear(
+            plan,
+            activation,
+            moved,
+            weight_scales,
+            input_scales=activation_scales,
+            out_dtype=torch.bfloat16,
+        )
+    assert rebind_fp8_linear_weight(plan, moved)
+    actual = fp8_linear(
+        plan,
+        activation,
+        moved,
+        weight_scales,
+        input_scales=activation_scales,
+        out_dtype=torch.bfloat16,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

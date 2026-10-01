@@ -224,10 +224,91 @@ class LinearBase(torch.nn.Module):
         raise NotImplementedError
 
     def _apply(self, fn, recurse: bool = True):
+        if isinstance(self.quant_method, Fp8LinearMethod):
+            self.quant_method.finalize_weights_after_loading(self)
         result = super()._apply(fn, recurse=recurse)
         if self.quant_method is not None:
             self.quant_method.finalize_weights_after_loading(self)
+            if (
+                isinstance(self.quant_method, Fp8LinearMethod)
+                and self.quant_method.packed_weight_resident
+            ):
+                self.weight._weight_loader = self._load_packed_fp8_weight
+                self.weight_scale_inv._weight_loader = self._load_packed_fp8_scale
+                self.quant_method.rebind_weight_after_move(self)
         return result
+
+    def _load_packed_fp8_weight(self, param: Parameter, *args, **kwargs):
+        """Stage only a written packed weight; preserve its shard loader."""
+        assert isinstance(self.quant_method, Fp8LinearMethod)
+        assert self.quant_method.original_weight_loader is not None
+        self.quant_method.begin_weight_update(self)
+        try:
+            return self.quant_method.original_weight_loader(param, *args, **kwargs)
+        except Exception:
+            self.quant_method.abort_weight_update(self)
+            raise
+
+    def _load_packed_fp8_scale(self, param: Parameter, *args, **kwargs):
+        assert isinstance(self.quant_method, Fp8LinearMethod)
+        assert self.quant_method.original_scale_loader is not None
+        self.quant_method.begin_scale_update(self)
+        try:
+            return self.quant_method.original_scale_loader(param, *args, **kwargs)
+        except Exception:
+            self.quant_method.abort_weight_update(self)
+            raise
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars) -> None:
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if (
+            isinstance(self.quant_method, Fp8LinearMethod)
+            and self.quant_method.packed_weight_resident
+        ):
+            weight = self.quant_method.export_canonical_weight(self)
+            destination[prefix + "weight"] = weight if keep_vars else weight.detach()
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        method = self.quant_method
+        packed = isinstance(method, Fp8LinearMethod) and method.packed_weight_resident
+        staged_weight = packed and prefix + "weight" in state_dict
+        staged_scale = packed and prefix + "weight_scale_inv" in state_dict
+        if staged_weight or staged_scale:
+            if local_metadata.get("assign_to_params_buffers", False):
+                raise RuntimeError("assign=True cannot replace a packed FP8 parameter")
+        if staged_weight:
+            method.begin_weight_update(self)
+        if staged_scale:
+            method.begin_scale_update(self)
+        previous_errors = len(error_msgs)
+        try:
+            super()._load_from_state_dict(
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            )
+        except Exception:
+            if staged_weight or staged_scale:
+                method.abort_weight_update(self)
+            raise
+        if staged_weight or staged_scale:
+            if len(error_msgs) > previous_errors:
+                method.abort_weight_update(self)
+            else:
+                method.finalize_weights_after_loading(self)
 
 
 class ReplicatedLinear(LinearBase):

@@ -24,13 +24,18 @@
 
 
 import logging
+from collections.abc import Callable
 
 import tokenspeed_kernel
 import torch
 from tokenspeed_kernel import (
+    PackedFp8WeightCorruptionError,
+    export_fp8_linear_weight,
     fp8_linear,
     invalidate_fp8_linear_weight,
     prepare_fp8_linear,
+    promote_fp8_linear_weight,
+    rebind_fp8_linear_weight,
     refresh_fp8_linear_weight,
 )
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
@@ -75,6 +80,12 @@ class Fp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
+        self.packed_resident_requested = False
+        self.packed_weight_resident = False
+        self._packed_weight_during_reload: torch.Tensor | None = None
+        self._scale_before_reload: torch.Tensor | None = None
+        self.original_weight_loader: Callable | None = None
+        self.original_scale_loader: Callable | None = None
 
     def create_weights(
         self,
@@ -237,6 +248,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.weight_scale_inv.data,
                 self.quant_config.weight_block_size,
                 scale_format=getattr(self.quant_config, "scale_fmt", None),
+                packed_resident=self.packed_resident_requested,
             )
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
@@ -291,16 +303,106 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
 
     def finalize_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self.block_quant:
-            plan = getattr(layer, "_prepared_fp8_linear", None)
-            if plan is not None:
-                refresh_fp8_linear_weight(plan, layer.weight)
+        if self._packed_weight_during_reload is None:
+            self._scale_before_reload = None
+            return
+        packed = self._packed_weight_during_reload
+        plan = layer._prepared_fp8_linear
+        try:
+            refresh_fp8_linear_weight(plan, layer.weight, packed)
+        except Exception:
+            self._restore_scale_after_failed_update(layer)
+            raise
+        finally:
+            # A failed refresh stays invalid, but must still restore the
+            # graph-visible pointer instead of leaving canonical storage here.
+            layer.weight.data = packed
+            self._packed_weight_during_reload = None
+            self.packed_weight_resident = True
+        self._scale_before_reload = None
 
-    def invalidate_weights_before_loading(self, layer: torch.nn.Module) -> None:
-        if self.block_quant:
-            plan = getattr(layer, "_prepared_fp8_linear", None)
-            if plan is not None:
-                invalidate_fp8_linear_weight(plan)
+    def abort_weight_update(self, layer: torch.nn.Module) -> None:
+        packed = self._packed_weight_during_reload
+        try:
+            if packed is not None:
+                rebind_fp8_linear_weight(layer._prepared_fp8_linear, packed)
+        finally:
+            if packed is not None:
+                layer.weight.data = packed
+                self._packed_weight_during_reload = None
+                self.packed_weight_resident = True
+            self._restore_scale_after_failed_update(layer)
+
+    def _restore_scale_after_failed_update(self, layer: torch.nn.Module) -> None:
+        previous = self._scale_before_reload
+        if previous is not None:
+            try:
+                layer.weight_scale_inv.data.copy_(previous)
+                if layer.weight_scale_inv.is_cuda:
+                    torch.cuda.current_stream(
+                        layer.weight_scale_inv.device
+                    ).synchronize()
+            except Exception as error:
+                invalidate_fp8_linear_weight(layer._prepared_fp8_linear)
+                raise PackedFp8WeightCorruptionError(
+                    "packed block-FP8 scale could not be restored after update failure"
+                ) from error
+            finally:
+                self._scale_before_reload = None
+
+    def begin_weight_update(self, layer: torch.nn.Module) -> None:
+        # Stage only a weight whose loader is called; distributed updates may
+        # touch one projection or only its scale, not the whole model.
+        if not self.packed_weight_resident:
+            return
+        plan = layer._prepared_fp8_linear
+        packed = layer.weight.data
+        canonical = export_fp8_linear_weight(plan, packed)
+        invalidate_fp8_linear_weight(plan)
+        self._packed_weight_during_reload = packed
+        layer.weight.data = canonical
+        self.packed_weight_resident = False
+
+    def begin_scale_update(self, layer: torch.nn.Module) -> None:
+        if (
+            self.packed_weight_resident or self._packed_weight_during_reload is not None
+        ) and self._scale_before_reload is None:
+            self._scale_before_reload = layer.weight_scale_inv.detach().clone()
+
+    def promote_weight_after_loading(self, layer: torch.nn.Module) -> None:
+        if not self.packed_resident_requested or self.packed_weight_resident:
+            return
+        plan = getattr(layer, "_prepared_fp8_linear", None)
+        if plan is None:
+            return
+        packed = promote_fp8_linear_weight(plan, layer.weight)
+        if packed is None:
+            return
+        self.original_weight_loader = layer.weight.weight_loader
+        self.original_scale_loader = layer.weight_scale_inv.weight_loader
+        layer.weight.data = packed
+        layer.weight._weight_loader = layer._load_packed_fp8_weight
+        layer.weight_scale_inv._weight_loader = layer._load_packed_fp8_scale
+        self.packed_weight_resident = True
+
+    def rebind_weight_after_move(self, layer: torch.nn.Module) -> None:
+        if self.packed_weight_resident:
+            if (
+                layer.weight.dtype != torch.float8_e4m3fn
+                or not layer.weight.is_contiguous()
+            ):
+                invalidate_fp8_linear_weight(layer._prepared_fp8_linear)
+                raise RuntimeError(
+                    "packed block-FP8 weight requires its original dtype and layout"
+                )
+            rebind_fp8_linear_weight(layer._prepared_fp8_linear, layer.weight)
+
+    def export_canonical_weight(self, layer: torch.nn.Module) -> torch.Tensor:
+        if not self.packed_weight_resident:
+            return layer.weight
+        if layer.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError("packed block-FP8 weight dtype changed")
+        return export_fp8_linear_weight(layer._prepared_fp8_linear, layer.weight)
 
     def apply(
         self,
@@ -395,3 +497,23 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def prepared_linear_plan(self, layer: torch.nn.Module) -> object | None:
         return getattr(layer, "_prepared_fp8_linear", None)
+
+
+def abort_packed_fp8_weight_updates(
+    model: torch.nn.Module, *, original_error: Exception
+) -> None:
+    first_error = None
+    for module in model.modules():
+        method = getattr(module, "quant_method", None)
+        if isinstance(method, Fp8LinearMethod):
+            try:
+                method.abort_weight_update(module)
+            except Exception as error:  # noqa: BLE001 - restore every staged layer
+                if first_error is None:
+                    first_error = error
+    if first_error is not None:
+        if isinstance(original_error, PackedFp8WeightCorruptionError):
+            raise original_error from first_error
+        raise PackedFp8WeightCorruptionError(
+            "packed block-FP8 weight could not be restored after reload failure"
+        ) from first_error

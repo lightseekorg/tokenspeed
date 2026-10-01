@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.communication import (
     create_allreduce_fusion_workspace,
 )
 from tokenspeed_kernel.ops.gemm import (
+    PackedFp8WeightCorruptionError,
     bmm,
     dsv4_grouped_output_projection,
     dsv4_grouped_output_projection_plan,
@@ -44,6 +45,7 @@ from tokenspeed_kernel.ops.gemm import (
     dsv4_grouped_output_projection_warmup,
     dsv4_grouped_output_projection_warmup_model,
     dsv4_linear_fp32,
+    export_fp8_linear_weight,
     fp8_linear,
     has_flashinfer_cute_dsl_nvfp4_a16,
     invalidate_fp8_linear_weight,
@@ -58,6 +60,8 @@ from tokenspeed_kernel.ops.gemm import (
     prepare_fp8_linear,
     prepare_nvfp4_a16_weights,
     prepare_trtllm_cutedsl_fp8_linear,
+    promote_fp8_linear_weight,
+    rebind_fp8_linear_weight,
     refresh_fp8_linear_weight,
     warmup_prepared_fp8_linears,
 )
@@ -95,6 +99,7 @@ from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.selection import NoKernelFoundError
 
 __all__ = [
+    "PackedFp8WeightCorruptionError",
     "AllReduceFusionPattern",
     "AllReduceFusionWorkspace",
     "allreduce_fusion",
@@ -110,6 +115,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup",
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
+    "export_fp8_linear_weight",
     "fp8_linear",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "invalidate_fp8_linear_weight",
@@ -122,6 +128,8 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
+    "promote_fp8_linear_weight",
+    "rebind_fp8_linear_weight",
     "prepare_trtllm_cutedsl_fp8_linear",
     "refresh_fp8_linear_weight",
     "prepare_nvfp4_a16_weights",

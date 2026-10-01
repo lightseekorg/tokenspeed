@@ -108,28 +108,36 @@ steps in one LDS tile, then splits the four MFMA fragments in registers. Two
 waves per EU avoid spills from the longer-lived fragments. Strided scales fall
 back to direct fragment loads, and output uses vectorized buffer stores.
 
-### gfx950 block-scaled FP8 prefill projection
+### gfx950 block-scaled FP8 projection
 
-This Gluon backend handles the large, fixed-row block-FP8 projections used by
-GLM-5.3-Flash prefill.
+GLM-5.3-Flash keeps one packed copy of each opted-in block-FP8 projection.
+The existing Gluon backend handles prefill from 129 rows upward and the
+short-K projection at all row counts. A packed-aware small-row backend handles
+the remaining decode and smaller prefill sizes.
 
 #### Contract
 
 - The route requires E4M3 operands, FP32 scales for 128-by-128 blocks, BF16
-  output, gfx950, and 8144 or 8192 activation rows. Other shapes use the normal
-  matrix-multiply selection path.
-- Enable it with `TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE=1` when weights
-  are prepared, before graph capture.
-- The packed buffer is derived state, not a checkpoint parameter. Model-load
-  and distributed weight-update paths refresh it in place after their final
-  canonical weight write, keeping captured graph addresses stable. A stale
-  packed copy or unsupported input falls back to the canonical weight.
+  output, gfx950, and an explicit model-level packed-weight opt-in. The Gluon
+  prefill launch covers 129 or more activation rows, plus the 4096-by-512
+  projection at smaller sizes. Other smaller row counts use the packed
+  small-row launch.
+- Enable it with `TOKENSPEED_EXPERIMENTAL_GLUON_FP8_BLOCKSCALE=1` before model
+  loading and graph capture. Ordinary block-FP8 layers remain canonical even
+  with the flag set.
+- After checkpoint loading, packing replaces the weight parameter's storage.
+  The plan keeps no full-size weight copy. Live updates repack into the stable
+  graph-visible storage, and checkpoint export restores canonical order.
+  Invalid or mismatched packed storage fails closed rather than falling back
+  to a canonical-layout kernel.
 
 #### Algorithm
 
-The checkpoint weight stays in its canonical layout. Preparation builds one
-non-persistent packed copy. The kernel groups 128 input channels by 64 output
-channels.
+The model weight uses `[K/128, N/64, 128, 64]` physical order while retaining
+its logical `[N,K]` shape. The prefill Gluon kernel groups 128 input channels
+by 64 output channels. Decode and short prefill reuse that kernel, splitting
+long K dimensions across workgroups and reducing transient FP32 partials. The
+partials are per-call scratch, not another copy of the weight.
 
 ### gfx1250 MXFP8 decode projection
 

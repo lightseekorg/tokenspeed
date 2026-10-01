@@ -43,10 +43,10 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     finalize_quantized_weights_after_loading,
-    invalidate_quantized_weights_before_loading,
 )
 from tokenspeed.runtime.model_loader.utils import (
     get_model_architecture,
@@ -113,6 +113,24 @@ def device_loading_context(
                 else:
                     p.data = p.data.to(original_device)
         # New parameters or parameters already on target device are untouched
+
+
+def promote_packed_fp8_weights_after_loading(
+    model: torch.nn.Module, target_device: torch.device
+) -> None:
+    """Commit prepared weight layouts after every checkpoint write has finished."""
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if not isinstance(quant_method, Fp8LinearMethod):
+            continue
+        if not quant_method.packed_resident_requested:
+            continue
+        try:
+            with device_loading_context(module, target_device):
+                quant_method.promote_weight_after_loading(module)
+        finally:
+            # CPU offload restores a new storage allocation on context exit.
+            quant_method.rebind_weight_after_move(module)
 
 
 from tokenspeed.runtime.utils.startup_timing import startup_phase
@@ -484,6 +502,9 @@ class DefaultModelLoader(BaseModelLoader):
                         with device_loading_context(module, target_device):
                             module.process_weights_after_loading(module)
 
+            with startup_phase("weights.promote"):
+                promote_packed_fp8_weights_after_loading(model, target_device)
+
             with startup_phase("weights.post_quant_warmup"):
                 post_quant_warmup = getattr(model, "post_quant_warmup", None)
                 if callable(post_quant_warmup):
@@ -555,9 +576,11 @@ class DummyModelLoader(BaseModelLoader):
 
             #  For accurate performance evaluation, we assign
             # random values to the weights.
-            invalidate_quantized_weights_before_loading(model)
             initialize_dummy_weights(model)
             finalize_quantized_weights_after_loading(model)
+            promote_packed_fp8_weights_after_loading(
+                model, torch.device(device_config.device)
+            )
         return model.eval()
 
 
@@ -662,7 +685,6 @@ class ShardedStateLoader(BaseModelLoader):
                     )
                     if process_method is not None:
                         module.process_weights_after_loading(module)
-            invalidate_quantized_weights_before_loading(model)
             rank = model_config.mapping.rank
             pattern = os.path.join(
                 local_model_path,
@@ -697,6 +719,9 @@ class ShardedStateLoader(BaseModelLoader):
             if state_dict:
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
             finalize_quantized_weights_after_loading(model)
+            promote_packed_fp8_weights_after_loading(
+                model, torch.device(device_config.device)
+            )
 
         post_quant_warmup = getattr(model, "post_quant_warmup", None)
         if callable(post_quant_warmup):

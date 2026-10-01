@@ -59,9 +59,14 @@ from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
 from tokenspeed.runtime.layers.attention.mm_encoder_attention import VisionAttention
+from tokenspeed.runtime.layers.dense.fp8 import (
+    Fp8LinearMethod,
+    abort_packed_fp8_weight_updates,
+)
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, LayerNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
+    LinearBase,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -73,7 +78,10 @@ from tokenspeed.runtime.layers.moe import (
 )
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.base_config import (
+    QuantizationConfig,
+    finalize_quantized_weights_after_loading,
+)
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
@@ -1350,6 +1358,34 @@ class Glm53FlashDecoderLayer(nn.Module):
                 requires_grad=False,
             )
 
+        # Only these BF16 GLM projections are audited for a packed-resident
+        # weight; the packed kernels do not support FP16 activations.
+        # Other projections, including ones read directly outside a linear
+        # forward, retain canonical storage even if their dimensions match.
+        packed_projections = (
+            {"mlp.shared_experts.gate_up_proj", "mlp.shared_experts.down_proj"}
+            if self.is_moe_layer
+            else {"mlp.gate_up_proj", "mlp.down_proj"}
+        )
+        if not self.is_kda_layer:
+            packed_projections.update(
+                {
+                    "self_attn.fused_qkv_a_proj_with_mqa",
+                    "self_attn.q_b_proj",
+                    "self_attn.o_proj",
+                }
+            )
+        for name, module in self.named_modules():
+            if (
+                name in packed_projections
+                and isinstance(module, LinearBase)
+                and isinstance(module.quant_method, Fp8LinearMethod)
+                and module.quant_method.block_quant
+                and module.quant_method.quant_config.is_checkpoint_fp8_serialized
+                and self.input_layernorm.weight.dtype == torch.bfloat16
+            ):
+                module.quant_method.packed_resident_requested = True
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1725,8 +1761,13 @@ class Glm53FlashForCausalLM(BaseCausalLM):
                         continue
                 yield name, loaded_weight
 
-        load_glm53_flash_text_weights(self, text_weights())
-        self.post_load_weights()
+        try:
+            load_glm53_flash_text_weights(self, text_weights())
+            self.post_load_weights()
+            finalize_quantized_weights_after_loading(self)
+        except Exception as error:
+            abort_packed_fp8_weight_updates(self, original_error=error)
+            raise
 
     def post_load_weights(self) -> None:
         for layer in self.model.layers:
