@@ -246,6 +246,36 @@ def test_preprocess_mxfp4_checkpoint_weights_adapts_fp8_and_mxfp4_modules(
     assert out["model.layers.0.self_attn.A_log"] is scale
 
 
+def test_preprocess_mxfp4_checkpoint_weights_without_overrides(monkeypatch) -> None:
+    # W4A8 metadata: no per-layer overrides and no dynamic MXFP4 activations.
+    _mock_platform(monkeypatch, is_amd=True)
+    quant_config = Mxfp4Config.from_config(
+        _amd_quark_mxfp4_config({"dtype": "fp8_e4m3"})
+    )
+    mxfp4 = torch.full((2, 16), 0x22, dtype=torch.uint8)  # 1.0 everywhere
+    e8m0 = torch.full((2, 1), 127, dtype=torch.uint8)
+    bf16 = torch.ones(2, 32, dtype=torch.bfloat16)
+    stream = [
+        ("model.layers.1.block_sparse_moe.shared_experts.up_proj.weight", mxfp4),
+        ("model.layers.1.block_sparse_moe.shared_experts.up_proj.weight_scale", e8m0),
+        ("model.layers.0.mlp.down_proj.weight", bf16),
+    ]
+
+    out = dict(
+        preprocess_mxfp4_checkpoint_weights(
+            stream,
+            quant_config,
+            dequantize_mxfp4_module=lambda module: ".shared_experts." in module
+            or ".mlp." in module,
+        )
+    )
+
+    shared = out["model.layers.1.block_sparse_moe.shared_experts.up_proj.weight"]
+    torch.testing.assert_close(shared, torch.ones(2, 32, dtype=torch.bfloat16))
+    # An MLP the checkpoint keeps in BF16 loads as-is.
+    assert out["model.layers.0.mlp.down_proj.weight"] is bf16
+
+
 def test_preprocess_mxfp4_checkpoint_weights_reports_unpaired_dequant_modules(
     monkeypatch,
 ) -> None:

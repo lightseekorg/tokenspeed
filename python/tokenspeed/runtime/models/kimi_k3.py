@@ -744,9 +744,11 @@ def _dense_mlp_quant_config(
 ) -> QuantizationConfig | None:
     """Quantization config for K3's shared-expert and dense MLPs.
 
-    Their fused SiTU/down kernels consume BF16 weights, so MXFP4 checkpoints
-    that serialize these MLPs dequantize them at load
-    (``preprocess_mxfp4_checkpoint_weights``) and build them unquantized.
+    Their fused SiTU/down kernels consume BF16 weights. Under an MXFP4 config
+    these MLPs are built unquantized: MXFP4-serialized MLP weights are
+    dequantized at load (``preprocess_mxfp4_checkpoint_weights``) and BF16
+    ones load as-is. Other configs, such as the compressed-tensors config of
+    ``moonshotai/Kimi-K3``, are passed through unchanged.
     """
     return None if isinstance(quant_config, Mxfp4Config) else quant_config
 

@@ -353,9 +353,7 @@ def preprocess_mxfp4_checkpoint_weights(
     Everything else passes through. At most one unpaired tensor is buffered
     per dequantized module.
     """
-    if not isinstance(quant_config, Mxfp4Config) or not (
-        quant_config.fp8_layer_patterns or quant_config.use_dynamic_mxfp4_activations
-    ):
+    if not isinstance(quant_config, Mxfp4Config):
         yield from weights
         return
 
