@@ -771,6 +771,7 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
         flashinfer_joint_bf16_supported=lambda *args: True,
         BF16_GEMM_MAX_M=32,
         resolve_kernel_override=lambda family, mode, explicit: override,
+        _as_2d_tensor_scale=lambda scale: scale,
         pdl_enabled=lambda: False,
         Platform=SimpleNamespace(get=lambda: SimpleNamespace(is_blackwell_plus=True)),
         _gemm_format_signature=lambda *args: SimpleNamespace(
