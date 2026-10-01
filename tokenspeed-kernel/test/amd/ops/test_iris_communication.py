@@ -477,6 +477,8 @@ def _ar_worker_fn(rank, world_size, port, error_dict):
 
 
 def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
+    from tokenspeed_kernel.ops.communication._iris.attnres import ATTNRES_KERNEL_CONFIG
+
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     # Iris's example uses gloo because heap-base exchange is host-side; nccl
@@ -496,10 +498,11 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             IRIS_ALL_REDUCE_KERNEL_CONFIG,
             _select_staged_all_reduce_path,
             create_iris_state,
+            get_or_create_iris_state,
         )
 
         kernel_config = IRIS_ALL_REDUCE_KERNEL_CONFIG
-        attnres_config = kernel_config.kimi_k3_attnres
+        attnres_config = ATTNRES_KERNEL_CONFIG
         output_shape_cases = _ar_output_shape_cases()
         staged_max_numel = max(
             max(int(torch.tensor(shape).prod()) for shape in _ar_shape_cases()),
@@ -509,10 +512,10 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             sum(int(torch.tensor(shape).prod()) for shape in shapes)
             for shapes in output_shape_cases
         )
-        attnres_max_rows = 16 if world_size == attnres_config.world_size else 0
+        attnres_max_rows = 8 if world_size == attnres_config.world_size else 0
         attnres_max_numel = attnres_max_rows * attnres_config.hidden_size
         staged_max_numel = max(staged_max_numel, attnres_max_numel)
-        state = create_iris_state(
+        state = get_or_create_iris_state(
             enable_lamport=False,
             moe_tail_max_rows=0,
             group=dist.group.WORLD,
@@ -522,7 +525,6 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             attnres_max_numel=attnres_max_numel,
             attnres_max_rows=attnres_max_rows,
             dtype=torch.bfloat16,
-            heap_size=None,
             device=device,
         )
         assert state._input_buf.numel() == producer_direct_max_numel
@@ -591,13 +593,13 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             assert state._staged_two_stage_scratch_buf is None
             assert state._staged_two_stage_ready_flags is None
         if attnres_max_numel:
-            assert state._attnres_push_inbox.shape == (
+            assert state.attnres.inbox.shape == (
                 2,
                 world_size,
                 attnres_max_numel,
             )
-            assert state._attnres_push_epochs.shape == (attnres_max_rows,)
-            assert state._attnres_push_ready_flags.shape == (
+            assert state.attnres.epochs.shape == (attnres_max_rows,)
+            assert state.attnres.ready_flags.shape == (
                 2,
                 attnres_max_rows,
                 world_size,
@@ -612,7 +614,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                 two_stage_supported=True,
             )
             assert use_two_stage
-            for safe in (False, True):
+            for inplace in (True, False):
                 _check_all_reduce_graph_replay(
                     state,
                     rank,
@@ -620,7 +622,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                     (1024,),
                     device,
                     storage_offset=rank % 2,
-                    safe=safe,
+                    inplace=inplace,
                 )
         if world_size == 4:
             for shape in _ar_graph_shape_cases():
@@ -631,7 +633,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                     shape,
                     device,
                     storage_offset=0,
-                    safe=False,
+                    inplace=True,
                 )
             if current_platform().is_cdna4:
                 _check_mixed_geometry_graph_replay(
@@ -686,7 +688,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
-            staged_max_numel=0,
+            staged_max_numel=1024,
             producer_direct_max_numel=other_dtype_max_numel,
             attnres_max_numel=0,
             attnres_max_rows=0,
@@ -709,6 +711,15 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                 ((16, 7168), (16, 3584)),
                 device,
             )
+            _check_all_reduce_graph_replay(
+                fp32_state,
+                rank,
+                world_size,
+                (1024,),
+                device,
+                storage_offset=rank % 2,
+                inplace=True,
+            )
         if world_size == attnres_config.world_size:
             _check_all_reduce_residual_attnres(state, rank, device)
     finally:
@@ -722,7 +733,9 @@ def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
     # is therefore ``sum(1..world_size) = world_size*(world_size+1)/2``.
     local = torch.full(shape, rank + 1, dtype=torch.bfloat16, device=device)
 
-    result = iris_all_reduce(state, local)
+    result = iris_all_reduce(
+        state, local, out=torch.empty_like(local), op=dist.ReduceOp.SUM
+    )
 
     expected_value = world_size * (world_size + 1) // 2
     expected = torch.full(shape, expected_value, dtype=torch.bfloat16, device=device)
@@ -740,24 +753,26 @@ def _check_all_reduce_graph_replay(
     shape,
     device,
     storage_offset: int,
-    safe: bool,
+    inplace: bool,
 ) -> None:
     from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
 
-    # Odd ranks can start one BF16 element into storage; retain guard elements.
+    # Odd ranks start one element into storage; retain guard elements.
     numel = math.prod(shape)
     storage = torch.full(
-        (numel + storage_offset + 1,), -1, dtype=torch.bfloat16, device=device
+        (numel + storage_offset + 1,), -1, dtype=state.dtype, device=device
     )
     local = storage[storage_offset : storage_offset + numel].view(shape)
-    assert local.is_contiguous() and local.data_ptr() % 8 == 2 * storage_offset
+    assert local.is_contiguous()
+    assert local.data_ptr() % 8 == state.dtype.itemsize * storage_offset
+    out = local if inplace else torch.empty_like(local)
     local.fill_(rank + 1)
-    result = iris_all_reduce(
-        state, local, op=dist.ReduceOp.SUM, safe=safe, async_op=False
-    )
-    assert (result.data_ptr() == local.data_ptr()) == (not safe)
+    result = iris_all_reduce(state, local, out=out, op=dist.ReduceOp.SUM)
+    assert (result.data_ptr() == local.data_ptr()) == inplace
     expected_value = world_size * (world_size + 1) // 2
-    torch.testing.assert_close(local, result, atol=0, rtol=0)
+    torch.testing.assert_close(
+        local, result if inplace else torch.full_like(local, rank + 1), atol=0, rtol=0
+    )
     torch.testing.assert_close(
         result,
         torch.full_like(result, expected_value),
@@ -766,14 +781,16 @@ def _check_all_reduce_graph_replay(
     )
 
     local.fill_(rank + 1)
+    allocations = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+    iris_all_reduce(state, local, out=out, op=dist.ReduceOp.SUM)
+    assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocations
+    local.fill_(rank + 1)
     torch.cuda.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_result = iris_all_reduce(
-            state, local, op=dist.ReduceOp.SUM, safe=safe, async_op=False
-        )
-    assert (graph_result.data_ptr() == local.data_ptr()) == (not safe)
+        graph_result = iris_all_reduce(state, local, out=out, op=dist.ReduceOp.SUM)
+    assert (graph_result.data_ptr() == local.data_ptr()) == inplace
 
     for replay_index in range(1, 5):
         scale = replay_index + 1
@@ -782,7 +799,12 @@ def _check_all_reduce_graph_replay(
         dist.barrier()
         graph.replay()
         torch.cuda.synchronize()
-        torch.testing.assert_close(local, graph_result, atol=0, rtol=0)
+        torch.testing.assert_close(
+            local,
+            graph_result if inplace else torch.full_like(local, scale * (rank + 1)),
+            atol=0,
+            rtol=0,
+        )
         torch.testing.assert_close(
             graph_result,
             torch.full_like(graph_result, scale * expected_value),
@@ -813,7 +835,7 @@ def _check_mixed_geometry_graph_replay(
         dist.barrier()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            iris_all_reduce(state, local, safe=False)
+            iris_all_reduce(state, local, out=local, op=dist.ReduceOp.SUM)
         graphs.append(graph)
 
     expected_rank_sum = world_size * (world_size + 1) // 2
@@ -923,6 +945,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
         attnres_combine,
         attnres_partial,
     )
+    from tokenspeed_kernel.ops.communication._iris.attnres import ATTNRES_KERNEL_CONFIG
     from tokenspeed_kernel.ops.communication.iris import (
         IRIS_ALL_REDUCE_KERNEL_CONFIG,
         iris_all_reduce,
@@ -932,7 +955,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
         allreduce_residual_attnres_combine_supported,
     )
 
-    config = IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
+    config = ATTNRES_KERNEL_CONFIG
     for num_tokens in (1, 2, 4, 8, 16):
         torch.manual_seed(101 + num_tokens)
         hidden = config.hidden_size
@@ -956,7 +979,9 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
         )
         attnres_partial(blocks, score_weight, 1e-6, scratch)
 
-        reduced = iris_all_reduce(state, local.clone(), safe=False)
+        reduced = iris_all_reduce(
+            state, local, out=torch.empty_like(local), op=dist.ReduceOp.SUM
+        )
         expected_residual = residual + reduced
         expected_hidden = attnres_combine(
             expected_residual,
@@ -977,6 +1002,7 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             local_world_size=8,
         )
         for _ in range(4):
+            prepared_epochs = state.attnres.epochs.clone()
             actual_hidden, actual_residual = allreduce_residual_attnres_combine(
                 local,
                 residual,
@@ -988,6 +1014,13 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
                 local_world_size=8,
                 eps=1e-6,
             )
+            if num_tokens <= state.attnres_max_rows:
+                torch.testing.assert_close(
+                    state.attnres.epochs[:num_tokens],
+                    prepared_epochs[:num_tokens] + 1,
+                    atol=0,
+                    rtol=0,
+                )
             torch.testing.assert_close(
                 actual_residual, expected_residual, atol=0, rtol=0
             )
@@ -1113,7 +1146,7 @@ def _ar_epoch_worker_main(rank, world_size, port, producer_direct, rows):
             if producer_direct:
                 return iris_all_reduce_symmetric(state, (local,))[0]
             return iris_all_reduce(
-                state, local, op=dist.ReduceOp.SUM, safe=True, async_op=False
+                state, local, out=torch.empty_like(local), op=dist.ReduceOp.SUM
             )
 
         local.fill_(rank + 1)
@@ -1224,6 +1257,51 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
             ((8, 7168), (8, 3584)),
             device,
         )
+        from tokenspeed_kernel.ops.communication.iris import (
+            create_iris_ar_rmsnorm_state,
+        )
+
+        local = torch.empty((3, 256), dtype=torch.bfloat16, device=device)
+        residual = torch.randn_like(local)
+        weight = torch.linspace(0.5, 1.5, 256, dtype=local.dtype, device=device)
+        group_sum = sum(global_rank + 1 for global_rank in groups[group_index])
+        for persistent in (False, True):
+            norm_state = create_iris_ar_rmsnorm_state(
+                group=group,
+                rank_in_group=group_rank,
+                max_token_num=3,
+                hidden_dim=256,
+                dtype=local.dtype,
+                device=device,
+                persistent=persistent,
+            )
+            local.fill_(rank + 1)
+            norm_state.fused(local, residual, weight, 1e-6)
+            torch.cuda.synchronize()
+            dist.barrier(group=group)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                norm_out, residual_out = norm_state.fused(local, residual, weight, 1e-6)
+            # The groups execute different call counts; a world barrier would hang.
+            for iteration in range(2 + group_index):
+                scale = iteration + 1
+                local.fill_(scale * (rank + 1))
+                graph.replay()
+                total = residual.float() + scale * group_sum
+                expected = total * torch.rsqrt(
+                    total.square().mean(-1, keepdim=True) + 1e-6
+                )
+                torch.testing.assert_close(
+                    residual_out, total.to(local.dtype), atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    norm_out,
+                    (expected * weight.float()).to(local.dtype),
+                    atol=0,
+                    rtol=0,
+                )
+            torch.cuda.synchronize()
+            dist.barrier()
     except Exception:
         error_dict[rank] = traceback.format_exc()
     finally:

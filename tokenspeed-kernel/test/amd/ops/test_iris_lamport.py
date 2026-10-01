@@ -20,6 +20,7 @@
 
 import re
 import socket
+from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -146,7 +147,6 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
         constexprs={
             "RANK": rank,
             "WORLD_SIZE": 8,
-            "TOTAL_ELEMENTS": 6 * 10752,
             "MAX_ELEMENTS": 6 * 10752,
             "NUM_STAGES": 3,
         },
@@ -203,10 +203,14 @@ def _new_state(rank, device, capacity, dtype):
 
 
 def _check_lamport_state(rank, device):
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        lamport_all_reduce_bf16,
+    )
     from tokenspeed_kernel.ops.communication.iris import (
         iris_acquire_outputs,
         iris_all_reduce_symmetric,
     )
+    from utils import assert_no_triton_compile
 
     state = _new_state(rank, device, 8 * 10752, torch.bfloat16)
     region = state._kimi_k3_moe_lamport_region
@@ -244,7 +248,12 @@ def _check_lamport_state(rank, device):
                     peers[rank, offset : offset + tensor.numel()].view(tensor.shape)
                 )
                 offset += tensor.numel()
-            actual = iris_all_reduce_symmetric(state, inputs)
+            with (
+                assert_no_triton_compile(lamport_all_reduce_bf16)
+                if rows <= 6 and (rows > 1 or reverse)
+                else nullcontext()
+            ):
+                actual = iris_all_reduce_symmetric(state, inputs)
             actual = torch.cat([tensor.flatten() for tensor in actual])
             torch.testing.assert_close(
                 actual.cpu(), expected.bfloat16(), atol=0, rtol=0, equal_nan=True

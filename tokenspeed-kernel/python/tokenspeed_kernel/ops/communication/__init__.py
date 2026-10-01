@@ -232,6 +232,102 @@ def allgather_dual_rmsnorm(
     )
 
 
+def attention_reduce_mix(
+    partial: torch.Tensor,
+    residual: torch.Tensor | None,
+    block_residual: torch.Tensor,
+    res_weight: torch.Tensor,
+    rms_weight: torch.Tensor,
+    *,
+    eps: float,
+    out_norm_weight: torch.Tensor,
+    out_norm_eps: float,
+    num_valid_blocks: int,
+    group: dist.ProcessGroup,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Reduce attention by row, mix its history, and gather normalized activations.
+
+    Args:
+        partial: Prepared projection output, [tokens, hidden].
+        residual: Replicated residual, or None to start a new residual block.
+        block_residual: Replicated history, [blocks, tokens, hidden].
+        res_weight: Attention-residual scorer weight, [hidden].
+        rms_weight: Score RMSNorm weight, [hidden].
+        eps: Score RMSNorm epsilon.
+        out_norm_weight: Output RMSNorm weight, [hidden].
+        out_norm_eps: Output RMSNorm epsilon.
+        num_valid_blocks: Number of leading history snapshots to mix.
+        group: Group owning the prepared projection storage.
+
+    Returns:
+        Owned local residual rows and a borrowed replicated activation, or None
+        before launch when unsupported. Consume the activation on the calling
+        stream before the next attention/MoE fusion reuses its prepared storage.
+        All ranks must supply the same shapes and collective order.
+    """
+    if not current_platform().is_cdna4:
+        return None
+    from tokenspeed_kernel.ops.communication.iris import iris_attention_mix
+
+    return iris_attention_mix(
+        partial,
+        residual,
+        block_residual,
+        res_weight,
+        rms_weight,
+        eps=eps,
+        out_norm_weight=out_norm_weight,
+        out_norm_eps=out_norm_eps,
+        num_valid_blocks=num_valid_blocks,
+        group=group,
+    )
+
+
+def moe_reduce_project(
+    routed_partial: torch.Tensor,
+    shared_partial: torch.Tensor,
+    prefix: torch.Tensor,
+    projection_weight: torch.Tensor,
+    *,
+    prefix_is_sharded: bool,
+    norm_weight: torch.Tensor | None,
+    eps: float | None,
+    group: dist.ProcessGroup,
+) -> torch.Tensor | None:
+    """Reduce MoE partials by row, project routed rows, add the prefix, and gather.
+
+    Args:
+        routed_partial: Prepared routed output, [tokens, latent].
+        shared_partial: Prepared shared output, [tokens, hidden].
+        prefix: Replicated residual or this rank's consecutive residual rows.
+        projection_weight: Replicated projection, [hidden, latent].
+        prefix_is_sharded: Whether prefix contains only this rank's rows.
+        norm_weight: Routed RMSNorm weight, [latent], or None.
+        eps: RMSNorm epsilon, or None when norm_weight is None.
+        group: Group owning both prepared producer outputs.
+
+    Returns:
+        A borrowed replicated result, or None before launch when unsupported.
+        Calls sharing prepared storage must run in order on one stream. Consume
+        or clone the result before the next attention/MoE fusion overwrites it.
+        All ranks must supply the same shapes and collective order.
+    """
+    if not current_platform().is_cdna4:
+        return None
+    from tokenspeed_kernel.ops.communication.iris import iris_kimi3_moe_tail
+
+    return iris_kimi3_moe_tail(
+        routed_partial,
+        shared_partial,
+        prefix,
+        projection_weight,
+        prefix_is_sharded=prefix_is_sharded,
+        norm_weight=norm_weight,
+        eps=eps,
+        group=group,
+    )
+
+
 __all__ = [
     "AllReduceFusionPattern",
     "AllReduceFusionWorkspace",
@@ -243,6 +339,8 @@ __all__ = [
     "allreduce_lane_latent_norm",
     "allreduce_lane_latent_norm_supported",
     "allreduce_residual_rmsnorm",
+    "attention_reduce_mix",
+    "moe_reduce_project",
     "prepare_allreduce_fusion",
     "reducescatter_residual_rmsnorm",
 ]

@@ -2282,10 +2282,10 @@ class KimiLinearMoE(nn.Module):
             and not up_proj.narrowed
             and up_proj.solution == "auto"
         ):
-            from tokenspeed_kernel.ops.communication.iris import iris_kimi3_moe_tail
+            from tokenspeed_kernel.ops.communication import moe_reduce_project
 
             norm = self.routed_expert_norm
-            output = iris_kimi3_moe_tail(
+            output = moe_reduce_project(
                 routed,
                 shared_partial,
                 prefix_sum,

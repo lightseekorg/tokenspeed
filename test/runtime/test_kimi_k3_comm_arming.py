@@ -479,10 +479,8 @@ def test_attention_mix_window(monkeypatch, rows, is_cdna4, eligible):
     weight = torch.empty((7168,), dtype=torch.bfloat16, device="meta")
     expected = (object(), object())
     operation = Mock(return_value=expected)
-    monkeypatch.setitem(
-        sys.modules,
-        "tokenspeed_kernel.ops.communication.iris",
-        SimpleNamespace(iris_attention_mix=operation),
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.communication.attention_reduce_mix", operation
     )
     monkeypatch.setattr(
         module, "current_platform", lambda: SimpleNamespace(is_cdna4=is_cdna4)

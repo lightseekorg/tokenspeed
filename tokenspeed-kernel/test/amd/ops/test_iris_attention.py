@@ -48,7 +48,7 @@ def _require_iris():
 def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
     """Runtime rows must preserve vector payload traffic, including tail tiles."""
     from tokenspeed_kernel._triton import gluon, triton
-    from tokenspeed_kernel.ops.communication.iris import (
+    from tokenspeed_kernel.ops.communication._iris.row_sharded import (
         iris_attention_push_gather_gluon_kernel,
         iris_attention_reduce_scatter_gluon_kernel,
     )
@@ -142,13 +142,15 @@ def _attention_worker(rank: int, port: int) -> None:
         timeout=timedelta(seconds=180),
     )
     group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
+    from tokenspeed_kernel.ops.communication import (
+        attention_reduce_mix,
+        moe_reduce_project,
+    )
     from tokenspeed_kernel.ops.communication import triton as comm
-    from tokenspeed_kernel.ops.communication.iris import (
-        iris_attention_mix,
+    from tokenspeed_kernel.ops.communication._iris.row_sharded import (
         iris_attention_mix_push_gluon_kernel,
         iris_attention_push_gather_gluon_kernel,
         iris_attention_reduce_scatter_gluon_kernel,
-        iris_kimi3_moe_tail,
     )
 
     backing = comm.TritonCommState(
@@ -172,8 +174,8 @@ def _attention_worker(rank: int, port: int) -> None:
         state._input_buf,
         state._producer_direct_scratch_buf,
         state._producer_direct_ready_flags,
-        state._moe_tail_output_buf,
-        state._moe_tail_ready_flags,
+        state.row_sharded.output,
+        state.row_sharded.gather_flags,
     )
     pointers = tuple(t.data_ptr() for t in buffers)
     gen = torch.Generator(device=device)
@@ -257,7 +259,7 @@ def _attention_worker(rank: int, port: int) -> None:
                             iris_attention_mix_push_gluon_kernel,
                         ):
                             stack.enter_context(assert_no_triton_compile(kernel))
-                    mixed = iris_attention_mix(
+                    mixed = attention_reduce_mix(
                         partial,
                         prefix,
                         history,
@@ -273,7 +275,7 @@ def _attention_worker(rank: int, port: int) -> None:
                 assert mixed is not None
                 shard, activation = mixed
                 assert shard.shape == (m // 8, 7168)
-                assert activation.data_ptr() == state._moe_tail_output_buf.data_ptr()
+                assert activation.data_ptr() == state.row_sharded.output.data_ptr()
                 assert shard.data_ptr() != state._producer_direct_scratch_buf.data_ptr()
                 torch.testing.assert_close(
                     shard, expected[rank * m // 8 : (rank + 1) * m // 8], atol=0, rtol=0
@@ -296,7 +298,7 @@ def _attention_worker(rank: int, port: int) -> None:
                     small_graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(small_graph):
                         partial.copy_(source)
-                        captured = iris_attention_mix(
+                        captured = attention_reduce_mix(
                             partial,
                             prefix,
                             history,
@@ -337,7 +339,7 @@ def _attention_worker(rank: int, port: int) -> None:
                 dist.barrier()
                 flags_before = state._producer_direct_ready_flags.clone()
                 assert (
-                    iris_attention_mix(
+                    attention_reduce_mix(
                         partial,
                         prefix,
                         history,
@@ -376,12 +378,12 @@ def _attention_worker(rank: int, port: int) -> None:
         (partial, residual, dist.group.WORLD),
         (partial, residual.float(), group),
         (partial, partial, group),
-        (partial, state._moe_tail_output_buf[1 : m + 1], group),
+        (partial, state.row_sharded.output[1 : m + 1], group),
         (partial, residual.as_strided(residual.shape, (1, m)), group),
         (partial.as_strided(partial.shape, (1, m)), None, group),
     ):
         assert (
-            iris_attention_mix(
+            attention_reduce_mix(
                 operand,
                 prefix,
                 history,
@@ -402,7 +404,7 @@ def _attention_worker(rank: int, port: int) -> None:
     # before publishing an entry flag, even when there is no history to read.
     oversized = comm.acquire_symm_outputs(backing, ((8200, 7168),), torch.bfloat16)[0]
     assert (
-        iris_attention_mix(
+        attention_reduce_mix(
             oversized,
             None,
             oversized.new_empty((0, 8200, 7168)),
@@ -428,7 +430,7 @@ def _attention_worker(rank: int, port: int) -> None:
         (history, score, float("nan"), group),
     ):
         assert (
-            iris_attention_mix(
+            attention_reduce_mix(
                 partial,
                 residual,
                 blocks,
@@ -455,10 +457,10 @@ def _attention_worker(rank: int, port: int) -> None:
     expected_activation = _reference_mix(moe_prefix, history, score, norm, 8)
     # The previous MoE result is the production residual. Each owner must finish
     # reading its rows before the attention gather overwrites those same rows.
-    stored_residual = state._moe_tail_output_buf[:m]
+    stored_residual = state.row_sharded.output[:m]
     stored_residual.copy_(residual)
     partial.copy_(source)
-    alias_result = iris_attention_mix(
+    alias_result = attention_reduce_mix(
         partial,
         stored_residual,
         history,
@@ -484,7 +486,7 @@ def _attention_worker(rank: int, port: int) -> None:
     inputs = comm.acquire_symm_outputs(backing, ((m, 3584), (m, 7168)), torch.bfloat16)
     for out, value in zip(inputs, moe_sources, strict=True):
         out.copy_(value)
-    expected_moe = iris_kimi3_moe_tail(
+    expected_moe = moe_reduce_project(
         *inputs,
         moe_prefix,
         weight,
@@ -501,7 +503,7 @@ def _attention_worker(rank: int, port: int) -> None:
         partial.copy_(source)
         first = comm.all_reduce_symmetric(backing, (partial,))[0].clone() + residual
         partial.copy_(source)
-        mixed = iris_attention_mix(
+        mixed = attention_reduce_mix(
             partial,
             residual,
             history,
@@ -521,7 +523,7 @@ def _attention_worker(rank: int, port: int) -> None:
         )
         for out, value in zip(inputs, moe_sources, strict=True):
             out.copy_(value)
-        moe = iris_kimi3_moe_tail(
+        moe = moe_reduce_project(
             *inputs,
             shard,
             weight,
@@ -558,7 +560,7 @@ def _attention_worker(rank: int, port: int) -> None:
         torch.cuda.synchronize()
         dist.barrier()
         state._producer_direct_ready_flags.fill_(initial_epoch)
-        state._moe_tail_ready_flags.fill_(initial_epoch)
+        state.row_sharded.gather_flags.fill_(initial_epoch)
         torch.cuda.synchronize()
         dist.barrier()
         for repeat in range(4):
@@ -570,7 +572,7 @@ def _attention_worker(rank: int, port: int) -> None:
             expected_activation = _reference_mix(moe_prefix, history, score, norm, 8)
             for out, value in zip(inputs, moe_sources, strict=True):
                 out.copy_(value)
-            reference_moe = iris_kimi3_moe_tail(
+            reference_moe = moe_reduce_project(
                 *inputs,
                 moe_prefix,
                 weight,

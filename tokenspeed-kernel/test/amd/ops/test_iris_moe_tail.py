@@ -45,7 +45,7 @@ def _require_iris():
 def test_moe_gather_vector_codegen(rank, prefix_is_sharded, tmp_path):
     """Runtime row counts must retain vectorized payload loads and peer stores."""
     from tokenspeed_kernel._triton import gluon, triton
-    from tokenspeed_kernel.ops.communication.iris import (
+    from tokenspeed_kernel.ops.communication._iris.row_sharded import (
         iris_moe_add_push_gather_gluon_kernel,
     )
 
@@ -106,12 +106,16 @@ def _moe_tail_worker(rank: int, port: int) -> None:
 
 
 def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -> None:
+    from tokenspeed_kernel.ops.communication import (
+        moe_reduce_project,
+    )
     from tokenspeed_kernel.ops.communication import triton as comm
-    from tokenspeed_kernel.ops.communication.iris import (
-        create_iris_ar_rmsnorm_state,
-        iris_kimi3_moe_tail,
+    from tokenspeed_kernel.ops.communication._iris.row_sharded import (
         iris_moe_add_push_gather_gluon_kernel,
         iris_moe_reduce_scatter_gluon_kernel,
+    )
+    from tokenspeed_kernel.ops.communication.iris import (
+        create_iris_ar_rmsnorm_state,
     )
     from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_latent_projection_add3
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
@@ -149,8 +153,8 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         state._input_buf,
         state._producer_direct_scratch_buf,
         state._producer_direct_ready_flags,
-        state._moe_tail_output_buf,
-        state._moe_tail_ready_flags,
+        state.row_sharded.output,
+        state.row_sharded.gather_flags,
     )
     allocation_pointers = tuple(t.data_ptr() for t in allocations)
     generator = torch.Generator(device=device).manual_seed(72391)
@@ -197,7 +201,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
                     iris_moe_add_push_gather_gluon_kernel,
                 ):
                     stack.enter_context(assert_no_triton_compile(kernel))
-            output = iris_kimi3_moe_tail(
+            output = moe_reduce_project(
                 *inputs,
                 prefix,
                 weight,
@@ -233,7 +237,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
             if rank == rows % 8:
                 torch.cuda._sleep(100_000)
             result = projected(inputs, prefix, norm_weight, prefix_is_sharded=False)
-            assert result.data_ptr() == state._moe_tail_output_buf.data_ptr()
+            assert result.data_ptr() == state.row_sharded.output.data_ptr()
             torch.testing.assert_close(result, expected, atol=0.03125, rtol=0.015625)
             output = result.clone()
             for tensor, source in zip(inputs, sources, strict=True):
@@ -298,7 +302,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     restore(inputs, tuple(t[:848] for t in sources))
     prefix = torch.zeros((848, 7168), dtype=torch.bfloat16, device=device)
     flags_before = state._producer_direct_ready_flags.clone()
-    gather_flags_before = state._moe_tail_ready_flags.clone()
+    gather_flags_before = state.row_sharded.gather_flags.clone()
     inputs_before = tuple(t.clone() for t in inputs)
     unsupported = [
         (inputs[0].clone(), inputs[1], prefix, norm, 1e-5, group),
@@ -321,7 +325,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     ]
     for routed, shared, residual, norm_weight, eps, owner in unsupported:
         assert (
-            iris_kimi3_moe_tail(
+            moe_reduce_project(
                 routed,
                 shared,
                 residual,
@@ -335,7 +339,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         )
     torch.testing.assert_close(state._producer_direct_ready_flags, flags_before)
     # Reject shifted prefixes and weights that overlap the output.
-    result_buffer = state._moe_tail_output_buf
+    result_buffer = state.row_sharded.output
     invalid_aliases = (
         (result_buffer[1:849], weight, norm),
         (result_buffer.flatten()[1 : 848 * 7168 + 1].view(848, 7168), weight, norm),
@@ -344,7 +348,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     )
     for residual, projection, norm_weight in invalid_aliases:
         assert (
-            iris_kimi3_moe_tail(
+            moe_reduce_project(
                 *inputs,
                 residual,
                 projection,
@@ -359,7 +363,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     # owner's push before this rank consumes it, even at the exact base pointer.
     for first_row in (0, rank * (848 // 8)):
         assert (
-            iris_kimi3_moe_tail(
+            moe_reduce_project(
                 *inputs,
                 result_buffer[first_row : first_row + 848 // 8],
                 weight,
@@ -371,7 +375,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
             is None
         )
     torch.testing.assert_close(state._producer_direct_ready_flags, flags_before)
-    torch.testing.assert_close(state._moe_tail_ready_flags, gather_flags_before)
+    torch.testing.assert_close(state.row_sharded.gather_flags, gather_flags_before)
     for tensor, before in zip(inputs, inputs_before, strict=True):
         torch.testing.assert_close(tensor, before, atol=0, rtol=0)
     # Finish checking flags on every rank before the next collective changes them.
@@ -442,7 +446,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     torch.cuda.synchronize()
     dist.barrier()
     state._producer_direct_ready_flags.fill_(-2)
-    state._moe_tail_ready_flags.fill_(-2)
+    state.row_sharded.gather_flags.fill_(-2)
     torch.cuda.synchronize()
     dist.barrier()
     result_graph.replay()
@@ -457,7 +461,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         restore(inputs, base_sources)
         residual = projected(inputs, residual, norm, prefix_is_sharded=False).clone()
         expected_chain.append(residual.clone())
-    inplace_prefix = state._moe_tail_output_buf[:848]
+    inplace_prefix = state.row_sharded.output[:848]
     chain_snapshots = [torch.empty_like(prefix) for _ in range(4)]
     torch.cuda.synchronize()
     dist.barrier()

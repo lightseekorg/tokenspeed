@@ -252,11 +252,11 @@ class K3AttnComm:
             or partial.shape[0] % 8 != 0
         ):
             return None
-        from tokenspeed_kernel.ops.communication.iris import (
-            iris_attention_mix,
+        from tokenspeed_kernel.ops.communication import (
+            attention_reduce_mix,
         )
 
-        return iris_attention_mix(
+        return attention_reduce_mix(
             partial,
             prefix,
             block_residual,
