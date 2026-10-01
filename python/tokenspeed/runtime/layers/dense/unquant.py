@@ -21,8 +21,8 @@
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
-from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
+from tokenspeed_kernel.selection import resolve_kernel_override
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
@@ -77,7 +77,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 override="aok",
             )
 
-        if bias is None and decode_gemv_routed(x, layer.weight):
+        if resolve_kernel_override("gemm", "mm", None) is not None:
+            return tokenspeed_kernel.mm(x, layer.weight, bias=bias)
+
+        if bias is None and use_decode_gemv(x, layer.weight):
             return decode_gemv(x, layer.weight)
         if bias is None:
             from tokenspeed_kernel.ops.gemm.kimi3 import _try_gluon_largem_gfx1250

@@ -31,6 +31,10 @@ from typing import Literal
 from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.numerics import (
+    NUMERICS_ENVELOPES,
+    RL_BITWISE_SAMPLING_BACKENDS,
+)
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
@@ -157,7 +161,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
-    enable_log_requests: bool = False
+    enable_log_requests: bool = True
     log_requests_level: int = 0
     enable_log_request_stats: bool = False
     enable_metrics: bool = False
@@ -289,7 +293,7 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
-    enable_replay_ssm: bool = False
+    enable_replay_ssm: bool = True
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
@@ -330,7 +334,7 @@ class ServerArgs:
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
     weight_loader_prefetch_checkpoints: bool = True
-    weight_loader_prefetch_num_threads: int = 4
+    weight_loader_prefetch_num_threads: int = 8
     enable_memory_saver: bool = False
     disable_cudagraph_memory_reserve: bool = False
     mla_disable_ragged: bool = False
@@ -795,16 +799,21 @@ class ServerArgs:
         ``rl-bitwise`` is the RL rollout contract: within one deployment the
         same request produces bitwise-identical tokens and logprobs across
         runs and regardless of batch composition. The umbrella only ever
-        tightens settings — a switch a user already set stays set — and each
-        derived switch remains individually available for auto mode.
+        tightens: it sets every switch it governs to its tight value and
+        refuses explicit choices it cannot tighten (a named MoE or sampling
+        backend without the guarantee). Each derived switch remains
+        individually available for auto mode. Whether the served model is
+        verified under the envelope is checked once its profile is known
+        (``require_verified_numerics``).
         Runs after ``resolve_communication`` so it can veto the fused
         all-reduce that resolver auto-enables.
         """
         if self.numerics == "auto":
             return
-        if self.numerics != "rl-bitwise":
+        if self.numerics not in NUMERICS_ENVELOPES:
             raise ValueError(
-                f"--numerics must be auto or rl-bitwise, got {self.numerics!r}"
+                f"--numerics must be one of {list(NUMERICS_ENVELOPES)}, got "
+                f"{self.numerics!r}"
             )
         # Collectives: rank-ordered NCCL instead of the symmetric-memory and
         # trtllm fused paths, and the all-reduce becomes an all-gather with a
@@ -819,11 +828,32 @@ class ServerArgs:
         self.disable_autotune = True
         self.disable_tf32 = True
         self.disable_pdl = True
-        # MoE: the batch-invariant grouped leaves. Only the auto default is
-        # folded; an explicitly chosen backend stands (and must then honour
-        # the contract itself).
+        # MoE: the batch-invariant grouped leaves. An explicitly chosen
+        # backend cannot honour the contract, so it is refused rather than
+        # kept (a draft left unset inherits the target's).
         if self.moe_backend == "auto":
             self.moe_backend = "aok"
+        elif self.moe_backend != "aok":
+            raise ValueError(
+                f"--numerics rl-bitwise needs the batch-invariant MoE solution "
+                f"'aok'; --moe-backend {self.moe_backend} makes no such claim"
+            )
+        if self.draft_moe_backend == "auto":
+            self.draft_moe_backend = "aok"
+        elif self.draft_moe_backend not in (None, "aok"):
+            raise ValueError(
+                f"--numerics rl-bitwise needs the batch-invariant MoE solution "
+                f"'aok'; --draft-moe-backend {self.draft_moe_backend} makes no "
+                "such claim"
+            )
+        # Sampling: greedy rows must break exact logit ties canonically.
+        if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
+            raise ValueError(
+                f"--numerics rl-bitwise needs a sampling backend with canonical "
+                f"greedy tie-breaking ({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); "
+                f"--sampling-backend {self.sampling_backend} resolves exact "
+                "ties in reduction order"
+            )
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -958,6 +988,78 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+    def validate_petit_moe_options(self):
+        """Validate shared backend, model, and scheduling options for Petit.
+
+        MoELayer owns hardware, MoE topology, and expert compatibility checks.
+        """
+        active_moe_backends = [("target", self.moe_backend)]
+        if self.speculative_algorithm is not None:
+            active_moe_backends.append(
+                ("draft", self.draft_moe_backend or self.moe_backend)
+            )
+        gluon_petit_roles = [
+            role for role, backend in active_moe_backends if backend == "gluon_petit"
+        ]
+        if self.all2all_backend == "gluon_petit":
+            mismatched_roles = [
+                f"{role}={backend}"
+                for role, backend in active_moe_backends
+                if backend != "gluon_petit"
+            ]
+            if mismatched_roles:
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires every active MoE backend to "
+                    "match --all2all-backend gluon_petit; incompatible "
+                    + ", ".join(mismatched_roles)
+                )
+        elif gluon_petit_roles:
+            raise ValueError(
+                "Gluon Petit MegaMoE requires --all2all-backend gluon_petit "
+                f"for the active {', '.join(gluon_petit_roles)} MoE backend"
+            )
+
+        if gluon_petit_roles:
+            if self.dtype != "bfloat16":
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires --dtype bfloat16; "
+                    f"configured dtype={self.dtype}"
+                )
+            if (
+                self.mapping.attn.tp_size != 1
+                or self.mapping.attn.cp_size != 1
+                or self.mapping.dense.tp_size != 1
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires attention TP1, CP1, and dense TP1"
+                )
+            decode_tokens_per_request = (
+                self.speculative_num_draft_tokens
+                if self.speculative_algorithm is not None
+                else 1
+            )
+            decode_tokens_per_rank = (
+                self.max_num_seqs // self.mapping.attn.dp_size
+            ) * decode_tokens_per_request
+            if decode_tokens_per_rank > 1024:
+                raise ValueError(
+                    "Gluon Petit MegaMoE supports at most 1024 decode tokens "
+                    "per rank; reduce --max-num-seqs or the speculative draft "
+                    f"token count (configured {decode_tokens_per_rank} tokens "
+                    "per rank)"
+                )
+            if (
+                self.chunked_prefill_size <= 0
+                or self.chunked_prefill_size > 1024
+                or self.max_prefill_tokens > 1024
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE supports at most 1024 prefill tokens "
+                    "per rank; set --chunked-prefill-size to a positive value "
+                    "no greater than 1024 and --max-prefill-tokens no greater "
+                    "than 1024"
+                )
+
     def validate(self):
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
@@ -966,6 +1068,8 @@ class ServerArgs:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
             if not self.disable_pdl:
                 raise ValueError("NPU execution requires --disable-pdl")
+
+        self.validate_petit_moe_options()
 
         if (
             self.max_num_seqs is not None
@@ -1153,9 +1257,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8"],
-            help='Data type for kv cache storage. "auto" will use model data type. '
-            '"bfloat16" explicitly selects BF16 storage. "fp8" is an alias for '
-            '"fp8_e4m3" (per-tensor scales). "mxfp8" stores '
+            help='Data type for kv cache storage. "auto" and "bfloat16" store BF16 '
+            'rows (fp16 activations convert on write). "fp8" is an alias for '
+            '"fp8_e4m3" (unit scale). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
             "requires --block-size 128 with an MHA attention backend.",
         )
@@ -1184,9 +1288,8 @@ class ServerArgs:
             type=nullable_str,
             default=None,
             help="Path to the JSON file containing the KV cache "
-            "scaling factors. This should generally be supplied, when "
-            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
-            "default to 1.0, which may cause accuracy issues. ",
+            "scaling factors. FP8 KV cache runs unscaled, so under FP8 every "
+            "factor in the file must be 1.0.",
         )
         parser.add_argument(
             "--max-model-len",
@@ -1381,7 +1484,7 @@ class ServerArgs:
             "--enable-log-requests",
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.enable_log_requests,
-            help="Log metadata, inputs, outputs of all requests. The verbosity is decided by --log-requests-level",
+            help="Log metadata, inputs, outputs of all requests (default on; --no-enable-log-requests to disable). The verbosity is decided by --log-requests-level",
         )
         parser.add_argument(
             "--log-requests-level",
@@ -1553,9 +1656,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
-            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, aok "
-            "(the batch-invariant leaves; --numerics rl-bitwise folds auto to "
-            "it)",
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, "
+            "gluon_petit, aok (the batch-invariant leaves; --numerics rl-bitwise "
+            "folds auto to it)",
         )
         parser.add_argument(
             "--moe-mxfp4-fp8-activation",
@@ -1580,9 +1683,10 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            choices=["none", "agrs", "deepep", "flashinfer"],
+            choices=["none", "agrs", "deepep", "flashinfer", "gluon_petit"],
             help="MoE communication backend. agrs and flashinfer explicitly select "
-            "the Kimi-K3 attention-DP transport; none preserves existing behavior.",
+            "the Kimi-K3 attention-DP transport; gluon_petit selects the fused "
+            "Petit MegaMoE transport; none preserves existing behavior.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -1911,10 +2015,19 @@ class ServerArgs:
             default=ServerArgs.speculative_num_draft_tokens,
         )
         parser.add_argument(
-            "--enable-replay-ssm",
-            action="store_true",
+            "--disable-replay-ssm",
+            dest="enable_replay_ssm",
+            action="store_false",
             default=ServerArgs.enable_replay_ssm,
-            help="Enable ReplaySSM for supported Qwen GDN target verification.",
+            help="Stage every verify position's GDN recurrent state instead of "
+            "replaying the accepted tokens (ReplaySSM, on by default for "
+            "supported Qwen GDN targets).",
+        )
+        parser.add_argument(
+            "--enable-replay-ssm",
+            dest="enable_replay_ssm",
+            action="store_true",
+            help="Deprecated: ReplaySSM is on by default.",
         )
         parser.add_argument(
             "--enable-output-logprobs",
@@ -1962,9 +2075,9 @@ class ServerArgs:
             "--disable-autotune",
             "--disable-flashinfer-autotune",
             action="store_true",
-            help="Skip the startup kernel-tuning pass; tunable kernels use each "
-            "library's heuristic tactics instead. Speeds up startup for "
-            "debugging at the cost of serving performance.",
+            help="Skip profiling missing kernel tactics during startup. A matching "
+            "persistent FlashInfer cache is still loaded; uncovered shapes use "
+            "the library's heuristic fallback.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",
@@ -2087,8 +2200,8 @@ class ServerArgs:
             help=(
                 "Disable prefetching safetensors checkpoint shards into the OS "
                 "page cache. Prefetch is enabled by default: shards are read "
-                "sequentially a bounded window ahead of weight loading "
-                "(min(80 GiB, 25%% of available host memory)), so weight copies "
+                "in parallel ranges a bounded window ahead of weight loading "
+                "(min(40 GiB, 25%% of available host memory)), so weight copies "
                 "hit the cache at streaming bandwidth instead of demand-faulting "
                 "cold pages from shared filesystems."
             ),
@@ -2097,7 +2210,7 @@ class ServerArgs:
             "--weight-loader-prefetch-num-threads",
             type=int,
             default=ServerArgs.weight_loader_prefetch_num_threads,
-            help="Number of background threads per rank for checkpoint prefetching.",
+            help="Maximum concurrent checkpoint range readers per rank.",
         )
         parser.add_argument(
             "--enable-memory-saver",
@@ -2179,7 +2292,7 @@ class ServerArgs:
         parser.add_argument(
             "--numerics",
             type=str,
-            choices=["auto", "rl-bitwise"],
+            choices=list(NUMERICS_ENVELOPES),
             default=ServerArgs.numerics,
             help="Numerics envelope. rl-bitwise folds the determinism "
             "switches (deterministic collectives, no autotune/TF32/PDL, no "

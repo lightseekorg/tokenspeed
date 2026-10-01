@@ -44,7 +44,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _make_dummy,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._layouts import (
-    _moe_partial_reduce,
     _moe_partial_reduce_shared,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.gemm_api import (
@@ -85,6 +84,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.warp_decode import (
     _gluon_mxfp4_fp8_warp_decode_moe,
     _warp_decode_precomputed_situ_stage1_kernel,
     _warp_decode_stage2_fp8_mxfp4_kernel,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
+    gluon_mxfp4_moe_stage2_reduce_kernel,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     MXFP4_BLOCK,
@@ -430,15 +432,22 @@ def gluon_mxfp4_fp8_precomputed_situ(
     reduce_block_n = 256
     reduce_programs = M * triton.cdiv(N, reduce_block_n)
     reduce_grid = reduce_programs + (M * num_shared_pid_n if fuse_shared_down else 0)
-    reduce = _moe_partial_reduce_shared if fuse_shared_down else _moe_partial_reduce
+    reduce = (
+        _moe_partial_reduce_shared
+        if fuse_shared_down
+        else gluon_mxfp4_moe_stage2_reduce_kernel
+    )
     reduce[(reduce_grid,)](
         partial,
         out,
         *((shared_input, shared_weight, shared_out) if fuse_shared_down else ()),
         M,
         N,
-        partial.stride(0),
-        TOPK * partial.stride(0),
+        *(
+            (partial.stride(0), TOPK * partial.stride(0))
+            if fuse_shared_down
+            else (TOPK * partial.stride(0), partial.stride(0))
+        ),
         partial.stride(1),
         out.stride(0),
         out.stride(1),
@@ -452,16 +461,16 @@ def gluon_mxfp4_fp8_precomputed_situ(
             if fuse_shared_down
             else ()
         ),
-        SPLIT_K=TOPK,
         BLOCK_N=reduce_block_n,
         **(
             {
+                "SPLIT_K": TOPK,
                 "NUM_REDUCE_PROGRAMS": reduce_programs,
                 "NUM_SHARED_PID_N": num_shared_pid_n,
                 "SHARED_BLOCK_N": shared_block_n,
             }
             if fuse_shared_down
-            else {}
+            else {"BLOCK_M": 1, "TOP_K": TOPK}
         ),
         num_warps=1,
     )
@@ -1054,9 +1063,15 @@ def _select_package_prefill_block_m(
     top_k: int,
     num_experts: int,
 ) -> int:
-    """Use 64 rows when average route density makes 128 over-pad."""
+    """Limit per-expert padding for sparse routes without shrinking dense tiles."""
 
     routed_rows = num_tokens * top_k
+    if routed_rows <= 8 * num_experts:
+        return 16
+    if routed_rows <= 32 * num_experts:
+        return 32
+    if routed_rows <= 64 * num_experts:
+        return 64
     if 128 * num_experts < routed_rows <= 192 * num_experts:
         return 64
     return 128
@@ -1206,11 +1221,12 @@ def _maybe_gluon_package_mxfp4_prefill(
     ):
         raise ValueError("local expert range exceeds global expert count")
     if force_reduce is None:
-        # EP ranks own only a fraction of each token's routes. For TP, keep the
-        # faster atomic path within the graph-captured EAGLE3 decode window and
-        # preserve deterministic FP32 reduction for larger batches.
+        # EP ranks own only a fraction of each token's routes. For TP E2M1,
+        # paired-column atomics avoid the partials/reduce cost through 2048
+        # rows. Larger outputs still favor scratch plus FP32 reduction.
         is_ep_shard = global_num_experts != n_experts or expert_start != 0
-        force_reduce = False if is_ep_shard else n_tokens > 64
+        atomic_max_m = 2048 if activation_format == "e2m1" else 64
+        force_reduce = False if is_ep_shard else n_tokens > atomic_max_m
     hidden_dim = int(hidden_states.shape[1])
     inter_dim = int(package_w13.shape[1]) // 2
     if (

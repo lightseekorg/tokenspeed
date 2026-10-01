@@ -554,36 +554,65 @@ def publish(
     repository: str,
     run_id: int,
     run_attempt: int,
-    pull_request_number: int,
+    pull_request_number: int | None,
+    expected_head_sha: str,
+    expected_head_repository: str,
+    expected_head_branch: str,
+    expected_base_branch: str,
 ) -> str:
-    """Validate the run artifact and publish it only to its current open PR."""
+    """Validate the run artifact and publish it only to its source PR."""
+    event_pull_request_number = pull_request_number
     report, artifact_exists = download_report(client, repository, run_id, run_attempt)
     if report is None:
         if not artifact_exists:
             return "task_missing"
-        remove_obsolete_comments(
-            client,
-            repository,
-            pull_request_number,
-            run_id,
-            run_attempt,
-        )
+        if pull_request_number is not None:
+            remove_obsolete_comments(
+                client,
+                repository,
+                pull_request_number,
+                run_id,
+                run_attempt,
+            )
         return "artifact_missing"
+
+    report_pull_request_number = report.get("pull_request_number")
+    if (
+        isinstance(report_pull_request_number, bool)
+        or not isinstance(report_pull_request_number, int)
+        or report_pull_request_number <= 0
+    ):
+        raise ValidationError("report pull_request_number must be a positive integer")
     expected = {
         "repository": repository,
         "github_run_id": run_id,
         "github_run_attempt": run_attempt,
-        "pull_request_number": pull_request_number,
+        "candidate_sha": expected_head_sha,
     }
+    if pull_request_number is not None:
+        expected["pull_request_number"] = pull_request_number
     for field, value in expected.items():
-        if report[field] != value:
+        if report.get(field) != value:
             raise ValidationError(f"report {field} does not match the triggering run")
 
+    pull_request_number = report_pull_request_number
     pull_request = _get_pull_request(client, repository, pull_request_number)
-    if pull_request.get("state") != "open":
-        return "pull_request_closed"
     head = pull_request["head"]
     base = pull_request["base"]
+    head_repository = head.get("repo") or {}
+    base_repository = base.get("repo") or {}
+    if (
+        head.get("ref") != expected_head_branch
+        or head_repository.get("full_name") != expected_head_repository
+        or base.get("ref") != expected_base_branch
+        or base_repository.get("full_name") != repository
+        or (event_pull_request_number is None and head.get("sha") != expected_head_sha)
+    ):
+        raise ValidationError(
+            "report pull_request_number does not match the triggering run"
+        )
+    if pull_request.get("state") != "open" and pull_request.get("merged") is not True:
+        return "pull_request_closed"
     stale_result = None
     if head["sha"] != report["candidate_sha"]:
         stale_result = "candidate_stale"
@@ -615,7 +644,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--run-attempt", required=True, type=int)
-    parser.add_argument("--pull-request-number", required=True, type=int)
+    parser.add_argument("--pull-request-number", type=int)
+    parser.add_argument("--head-sha", required=True)
+    parser.add_argument("--head-repository", required=True)
+    parser.add_argument("--head-branch", required=True)
+    parser.add_argument("--base-branch", required=True)
     return parser.parse_args(argv)
 
 
@@ -632,6 +665,10 @@ def main(argv: list[str] | None = None) -> int:
             args.run_id,
             args.run_attempt,
             args.pull_request_number,
+            args.head_sha,
+            args.head_repository,
+            args.head_branch,
+            args.base_branch,
         )
     except PublisherError as exc:
         print(f"Kernel benchmark comment publisher failed: {exc}", file=sys.stderr)
@@ -640,7 +677,7 @@ def main(argv: list[str] | None = None) -> int:
     messages = {
         "artifact_missing": "No benchmark report artifact was produced; nothing to publish.",
         "task_missing": "The benchmark task did not run; leaving its previous comment unchanged.",
-        "pull_request_closed": "The pull request is closed; skipping benchmark comment.",
+        "pull_request_closed": "The pull request was closed without merging; skipping benchmark comment.",
         "candidate_stale": "The pull request has a newer head commit; skipping stale results.",
         "target_stale": "The target branch has advanced; skipping stale results.",
         "newer_result_present": "A newer benchmark result is already published; skipping.",

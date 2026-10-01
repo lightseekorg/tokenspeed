@@ -309,7 +309,7 @@ def _uses_all_to_all_ep(a2a_backend: str | None) -> bool:
 
 
 def _validate_a2a_backend(a2a_backend: str | None) -> None:
-    if a2a_backend in {None, "none", "deepep"}:
+    if a2a_backend in {None, "none", "deepep", "gluon_petit"}:
         return
     raise NotImplementedError(f"MoE all-to-all backend is unsupported: {a2a_backend}")
 
@@ -403,6 +403,7 @@ def _build_traits(
 
     all_to_all_ep = _uses_all_to_all_ep(a2a_backend)
     traits["supports_all_to_all_ep"] = all_to_all_ep
+    traits["a2a_backend"] = a2a_backend
     if all_to_all_ep or (ep_size is not None and ep_size > 1):
         traits["supports_ep"] = True
     if ep_size is not None:

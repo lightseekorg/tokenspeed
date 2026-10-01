@@ -254,7 +254,6 @@ class GlmDsaIndexer(nn.Module):
 
 
 class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
-    _MLA_KERNEL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "dsa")
     _RAGGED_PREFILL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "dsa")
     rope_is_neox_style = False
 
@@ -627,6 +626,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 page_size=ctx.token_to_kv_pool.arena.kv_page_size,
                 topk=topk,
                 softmax_scale=self.indexer.weights_softmax_scale,
+                batch_invariant=False,
                 q_len_per_req=q_len_per_req,
                 index_k_cache=index_k_cache,
                 seq_lens_2d=seq_lens_2d,
@@ -807,6 +807,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 row_ends.to(torch.int32).contiguous(),
                 topk=topk,
                 softmax_scale=self.indexer.weights_softmax_scale,
+                batch_invariant=False,
                 index_k_cache=index_k_cache,
                 page_size=ctx.token_to_kv_pool.arena.kv_page_size,
                 max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
@@ -1013,7 +1014,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         prefill_topk: GlmDsaPrefillTopK,
         cache_num_tokens: int | None = None,
     ) -> torch.Tensor:
-        Q, _ = self.forward_absorb_qkv_proj(
+        Q = self.forward_absorb_qkv_proj(
             q,
             latent_cache,
             positions,
@@ -1053,7 +1054,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        Q, K = self.forward_absorb_qkv_proj(
+        Q = self.forward_absorb_qkv_proj(
             q,
             latent_cache,
             positions,
@@ -1062,7 +1063,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         )
         return self.forward_absorb_attn_v_proj(
             Q,
-            K,
             ctx,
             output,
             topk_indices=topk_indices,
@@ -1072,22 +1072,17 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     def forward_absorb_attn_v_proj(
         self,
         Q,
-        K,
         ctx: ForwardContext,
         output: torch.Tensor,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        need_save_kv = False
-        if self.attention_backend not in self._MLA_KERNEL_BACKENDS:
-            need_save_kv = not self.use_fused_set_kv_buffer
-
         attn_output = self.attn_mqa(
             Q,
-            K,
-            K[..., : self.kv_lora_rank] if K is not None else None,
-            ctx,
-            save_kv_cache=need_save_kv,
+            k=None,
+            v=None,
+            positions=None,
+            ctx=ctx,
             topk_indices=topk_indices,
             topk_lens=topk_lens,
         )

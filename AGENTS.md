@@ -95,6 +95,9 @@ change.
 * `docs/design/unified_path.md` — the unified decode path: one
   refresh-in-place metadata contract for eager and CUDA-graph decode, the
   padding contract, buffer sizing, and what stays graph-only.
+* `docs/design/attention-prologue.md` — the one entry between projections
+  and core attention: QK norm, RoPE, quantization and the KV write, the
+  numerics contract every solution meets, and who writes the cache.
 
 ## Public pull requests
 
@@ -121,7 +124,8 @@ change.
 
 * NVIDIA GPU support is currently limited to `sm90`, `sm100`, `sm103`, and
   `sm107`.
-* AMD GPU support is currently limited to `gfx950` and `gfx1250`.
+* AMD GPU support is currently limited to `gfx950`, `gfx1250`, and portable
+  kernels on `gfx1201`.
 * NPU support targets only one or two specific models. There are currently no
   plans to expand NPU model coverage.
 
@@ -185,12 +189,18 @@ Inside the root `tokenspeed-kernel/` directory:
   feature flags) or scalar knob specialization that matters greatly for kernel
   performance (e.g., block size, alignment). Values that vary per batch or
   request (e.g, token, request, row counts, sequence lengths, block-table
-  widths) must be runtime arguments, or be bucketed first (e.g.
-  `next_power_of_2`) when the kernel needs a compile-time bound. Reviews
-  should check every new or changed kernel signature and launch site for this.
-  Kernels should have tests to guard against excessive scalar parameter
-  specialization with `assert_no_triton_compile` from `test/utils.py`; for
-  tensor parameters no need to test.
+  widths), and values derived from them (e.g., the strides that follow those
+  widths, split counts computed from the batch size), must be runtime
+  arguments, or be bucketed first (e.g. `next_power_of_2`) when the kernel
+  needs a compile-time bound. The same holds for template arguments of other
+  JITs such as DeepGEMM. Reviews should check every new or changed kernel
+  signature and launch site for this. Kernels should have tests to guard
+  against excessive scalar parameter specialization with
+  `assert_no_triton_compile` from `test/utils.py`; for tensor parameters no
+  need to test. At runtime `tokenspeed_kernel.compile_monitor` logs every
+  Triton compilation after startup and names a parameter that keeps taking
+  new values; CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a
+  parameter fails the model tests.
 
 ## tokenspeed-kernel-amd
 

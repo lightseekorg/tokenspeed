@@ -145,9 +145,12 @@ def _compact_owned_pages(
     Lens,
     Out,
     LocalLens,
-    TSTRIDE: tl.constexpr,
-    OSTRIDE: tl.constexpr,
-    COLS: tl.constexpr,
+    PagePrefix,
+    # Table geometry follows the batch; runtime so every batch shape shares
+    # one binary. BLOCK buckets COLS for the column range.
+    TSTRIDE,
+    OSTRIDE,
+    COLS,
     PAGE: tl.constexpr,
     SUBPAGES: tl.constexpr,
     VIRTUAL_COUNT: tl.constexpr,
@@ -162,8 +165,13 @@ def _compact_owned_pages(
     block = page // SUBPAGES
     local_block, owner = virtual_block_to_local(block, DEGREE, RANK)
     owner &= block < VIRTUAL_COUNT
-    valid = (col < COLS) & (col * PAGE < length) & owner
+    valid = (col < COLS) & owner
+    if PagePrefix is None:
+        valid &= col * PAGE < length
     dest = tl.cumsum(valid.to(tl.int32)) - 1
+    if PagePrefix is not None:
+        tl.store(PagePrefix + row * (COLS + 1), 0)
+        tl.store(PagePrefix + row * (COLS + 1) + col + 1, dest + 1, col < COLS)
     local = local_block * SUBPAGES + page % SUBPAGES
     tl.store(Out + row * OSTRIDE + dest, local, valid)
     rows = tl.minimum(PAGE, tl.maximum(length - col * PAGE, 0))
@@ -182,13 +190,15 @@ def compact_dcp_pages(
     rank: int,
     out: torch.Tensor,
     local_lengths: torch.Tensor,
+    page_prefix: torch.Tensor | None = None,
 ) -> None:
     """Pack owned kernel pages in token order into persistent output buffers.
 
     ``table`` holds virtual kernel pages, not scheduler blocks. ``lengths``
     are global causal endpoints. Outputs are local physical pages and the
     number of valid local tokens, including a possibly partial last page.
-    Zero-length shards retain a zero page table for safe kernel padding.
+    Without page_prefix, zero-length shards retain a zero page table. With
+    page_prefix, local_lengths still excludes reserve pages from attention.
 
     Args:
         table: Int32 virtual kernel pages [batch, max_pages].
@@ -200,6 +210,10 @@ def compact_dcp_pages(
         rank: Owner index within the context group.
         out: Preallocated physical page table, with the same shape as table.
         local_lengths: Preallocated local token counts, shaped like lengths.
+        page_prefix: Optional int32 output [batch, max_pages + 1], contiguous.
+            When supplied, retain all allocated owned pages, including draft
+            reserve pages beyond lengths, and record exclusive owned-page counts.
+            Omitting it packs only pages intersecting the current lengths.
 
     Returns:
         None; both output buffers are refreshed in place.
@@ -225,6 +239,7 @@ def compact_dcp_pages(
             lengths,
             out,
             local_lengths,
+            page_prefix,
             table.stride(0),
             out.stride(0),
             table.shape[1],
@@ -234,20 +249,109 @@ def compact_dcp_pages(
             degree,
             rank,
             triton.next_power_of_2(table.shape[1]),
+            # The prefix output increases live scan state. More threads limit
+            # register spills on long rows, while short rows favor four warps.
+            num_warps=8 if page_prefix is not None and table.shape[1] > 2048 else 4,
         )
     else:
         subpages = block_granularity // page_size
         for row in range(table.shape[0]):
             count = 0
             tokens = 0
+            if page_prefix is not None:
+                page_prefix[row, 0] = 0
             for col, page in enumerate(table[row].tolist()):
                 block = page // subpages
-                if col * page_size >= int(lengths[row]):
+                if page_prefix is None and col * page_size >= int(lengths[row]):
                     break
                 if 0 < block < virtual_block_count and (block - 1) % degree == rank:
                     out[row, count] = (
                         (block - 1) // degree + 1
                     ) * subpages + page % subpages
                     count += 1
-                    tokens += min(page_size, int(lengths[row]) - col * page_size)
+                    tokens += min(
+                        page_size, max(int(lengths[row]) - col * page_size, 0)
+                    )
+                if page_prefix is not None:
+                    page_prefix[row, col + 1] = count
             local_lengths[row] = tokens
+
+
+@triton.jit(do_not_specialize=["PSTRIDE", "VSTRIDE", "OSTRIDE", "COLS", "QUERIES"])
+def _local_visible_lengths(
+    Prefix,
+    Visible,
+    Out,
+    LocalLens,
+    PSTRIDE,
+    VSTRIDE,
+    OSTRIDE,
+    COLS,
+    QUERIES,
+    PAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    q = tl.arange(0, BLOCK)
+    length = tl.load(Visible + row * VSTRIDE + q, q < QUERIES, 0)
+    page = length // PAGE
+    before = tl.load(Prefix + row * PSTRIDE + page, q < QUERIES, 0)
+    # At the exact table endpoint only the sentinel prefix is needed.
+    after = tl.load(
+        Prefix + row * PSTRIDE + page + 1,
+        (q < QUERIES) & (page < COLS),
+        0,
+    )
+    local = before * PAGE + tl.where(after > before, length % PAGE, 0)
+    tl.store(Out + row * OSTRIDE + q, local, q < QUERIES)
+    if LocalLens is not None:
+        tl.store(tl.broadcast_to(LocalLens + row, (BLOCK,)), local, q == QUERIES - 1)
+
+
+def dcp_local_visible_lengths(
+    page_prefix: torch.Tensor,
+    visible_lengths: torch.Tensor,
+    *,
+    page_size: int,
+    out: torch.Tensor,
+    local_lengths: torch.Tensor | None = None,
+) -> None:
+    """Translate global query endpoints through an owned-page prefix table.
+
+    Args:
+        page_prefix: Exclusive owned-page counts [batch, max_pages + 1] from
+            compact_dcp_pages. Includes allocated reserve pages.
+        visible_lengths: Int32 global exclusive endpoints [batch, queries],
+            each in [0, max_pages * page_size]. The last dimension is contiguous.
+            Causal verify supplies one endpoint per query; noncausal draft may
+            repeat the same endpoint. Reanchoring may decrease endpoints.
+        page_size: Tokens per kernel page.
+        out: Persistent int32 output with the same shape as visible_lengths
+            and a contiguous last dimension. Receives local token counts.
+        local_lengths: Optional contiguous [batch] output for the final query's
+            local endpoint. When supplied, query endpoints must be nondecreasing.
+
+    Returns:
+        None; out is refreshed without scanning or rebuilding page tables.
+    """
+    if visible_lengths.is_cuda:
+        _local_visible_lengths[(visible_lengths.shape[0],)](
+            page_prefix,
+            visible_lengths,
+            out,
+            local_lengths,
+            page_prefix.stride(0),
+            visible_lengths.stride(0),
+            out.stride(0),
+            page_prefix.shape[1] - 1,
+            visible_lengths.shape[1],
+            page_size,
+            triton.next_power_of_2(visible_lengths.shape[1]),
+        )
+    else:
+        page = visible_lengths.long() // page_size
+        before = page_prefix.gather(1, page)
+        after = page_prefix.gather(1, (page + 1).clamp_max(page_prefix.shape[1] - 1))
+        out.copy_(before * page_size + (after > before) * (visible_lengths % page_size))
+        if local_lengths is not None:
+            local_lengths.copy_(out[:, -1])

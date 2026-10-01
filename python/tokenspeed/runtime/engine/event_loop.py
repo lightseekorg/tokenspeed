@@ -31,6 +31,7 @@ import setproctitle
 import torch
 import torch.distributed as dist
 import zmq
+from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -47,11 +48,11 @@ from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationControll
 from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
+    RequestHistoryRows,
     advance_scheduler,
     engram_context_len,
     make_config,
     ngram_inputs_for_forward,
-    request_history_seeds_for_forward,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
     scheduler_pd_lifecycle,
@@ -93,9 +94,14 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
+from tokenspeed.runtime.utils.jit_compile_check import (
+    install_jit_compile_check,
+    mark_jit_compile_serving,
+)
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.process import register_usr_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.startup_timing import startup_phase
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
@@ -198,6 +204,11 @@ class EventLoop:
             raise NotImplementedError(
                 "Engram input history requires PP=1 and in-flight depth <= 1"
             )
+        self._request_history_rows: RequestHistoryRows | None = (
+            RequestHistoryRows()
+            if self.model_config.requires_request_token_history
+            else None
+        )
 
         decode_input_tokens = (
             server_args.speculative_num_draft_tokens
@@ -564,6 +575,7 @@ class EventLoop:
     # Helpers
     # ------------------------------------------------------------------
 
+    @startup_phase("model.config")
     def _load_model_config(
         self, model_path: str, is_draft_worker: bool = False
     ) -> ModelConfig:
@@ -588,6 +600,7 @@ class EventLoop:
             is_draft_worker=is_draft_worker,
         )
 
+    @startup_phase("distributed.init")
     def _init_distributed(self) -> float:
         max_num_input_tokens = (
             self.server_args.chunked_prefill_size
@@ -940,6 +953,7 @@ class EventLoop:
             num_total_pages=self._scheduler_cache_geometry.num_usable_pages,
             num_iteration_tokens=num_iteration_tokens,
         )
+        self.metrics.record_jit_compiles(compile_stats())
 
     # ------------------------------------------------------------------
     # Event loops
@@ -1084,10 +1098,10 @@ class EventLoop:
                             self._ngram_context_len,
                         )
                         request_history_seeds = (
-                            request_history_seeds_for_forward(
+                            self._request_history_rows.seeds_for_forward(
                                 forward_op, self.output_processor.rid_to_state
                             )
-                            if self.model_config.requires_request_token_history
+                            if self._request_history_rows is not None
                             else None
                         )
                         self._batch_logger.log_dispatch(forward_op, stats)
@@ -1259,6 +1273,9 @@ def run_event_loop(
 
     prefix = f" ATTN TP RANK {attn_tp_rank}"
     configure_logger(server_args, prefix=prefix)
+    # Before anything builds, so startup compilations are told apart from
+    # the serving ones reported after mark_jit_compile_serving().
+    install_jit_compile_check()
 
     event_loop = None
     shutdown_event = threading.Event()
@@ -1288,17 +1305,20 @@ def run_event_loop(
             previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
             signal.signal(signal.SIGTERM, request_shutdown)
 
-        maybe_warm_cupti_for_graph_capture()
+        with startup_phase(
+            "scheduler.init", rank=global_rank, role=server_args.disaggregation_mode
+        ):
+            maybe_warm_cupti_for_graph_capture()
 
-        event_loop = EventLoop(
-            server_args,
-            port_args,
-            gpu_id,
-            attn_tp_rank,
-            dp_rank,
-            global_rank,
-            shutdown_event,
-        )
+            event_loop = EventLoop(
+                server_args,
+                port_args,
+                gpu_id,
+                attn_tp_rank,
+                dp_rank,
+                global_rank,
+                shutdown_event,
+            )
         pipe_writer.send(
             {
                 "status": "ready",
@@ -1318,9 +1338,11 @@ def run_event_loop(
             # the loop and starts the first DP metadata collective.
             dist.barrier(group=event_loop.world_cpu_group)
 
-        # Everything before this point is startup and may synchronize; from
-        # here on a host synchronization on the data plane is a stall.
+        # Everything before this point is startup and may synchronize or
+        # JIT-compile; from here on a host synchronization or a kernel
+        # compilation on the data plane is a stall.
         arm_data_plane_sync_debug(server_args.device)
+        mark_jit_compile_serving()
         event_loop.event_loop()
 
     except Exception:  # noqa: BLE001 - process boundary; report and signal parent

@@ -669,6 +669,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
     backend.kv_lora_rank = 1
     backend.qk_rope_head_dim = 0
     backend.kernel_page_size = 64
+    backend.kernel_solution = None
     backend.step_counter = SimpleNamespace(record_cache=lambda: events.append("ready"))
 
     def fake_dsa_prefill(**_kwargs):
@@ -684,7 +685,6 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
             v_head_dim=1,
             head_dim=1,
             layer_id=0,
-            k_scale_float=None,
             scaling=1.0,
         ),
         token_to_kv_pool=SimpleNamespace(

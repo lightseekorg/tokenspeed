@@ -52,6 +52,8 @@ PULL_REQUEST = 77
 TARGET_SHA = "1" * 40
 BASE_SHA = "2" * 40
 CANDIDATE_SHA = "3" * 40
+HEAD_BRANCH = "feature/kernel-benchmark"
+BASE_BRANCH = "main"
 
 
 def comparison(
@@ -109,14 +111,24 @@ class FakeGitHub:
         *,
         report_archive: bytes | None = None,
         pull_state: str = "open",
+        merged: bool = False,
         head_sha: str = CANDIDATE_SHA,
         base_sha: str = TARGET_SHA,
+        head_repository: str = REPOSITORY,
+        head_branch: str = HEAD_BRANCH,
+        base_repository: str = REPOSITORY,
+        base_branch: str = BASE_BRANCH,
         comments: list[dict[str, Any]] | None = None,
     ) -> None:
         self.report_archive = report_archive
         self.pull_state = pull_state
+        self.merged = merged
         self.head_sha = head_sha
         self.base_sha = base_sha
+        self.head_repository = head_repository
+        self.head_branch = head_branch
+        self.base_repository = base_repository
+        self.base_branch = base_branch
         self.comments = list(comments or [])
         self.reads: list[str] = []
         self.writes: list[tuple[str, str, Any]] = []
@@ -140,8 +152,17 @@ class FakeGitHub:
         if path == f"/repos/{REPOSITORY}/pulls/{PULL_REQUEST}":
             return {
                 "state": self.pull_state,
-                "head": {"sha": self.head_sha},
-                "base": {"sha": self.base_sha},
+                "merged": self.merged,
+                "head": {
+                    "sha": self.head_sha,
+                    "ref": self.head_branch,
+                    "repo": {"full_name": self.head_repository},
+                },
+                "base": {
+                    "sha": self.base_sha,
+                    "ref": self.base_branch,
+                    "repo": {"full_name": self.base_repository},
+                },
             }
         if f"/repos/{REPOSITORY}/issues/{PULL_REQUEST}/comments?" in path:
             return self.comments
@@ -178,6 +199,24 @@ def bot_comment(
         ),
         "user": {"login": BOT_LOGIN, "type": "Bot"},
     }
+
+
+def publish_report(
+    client: FakeGitHub,
+    *,
+    pull_request_number: int | None = PULL_REQUEST,
+) -> str:
+    return publish(
+        client,
+        REPOSITORY,
+        RUN_ID,
+        RUN_ATTEMPT,
+        pull_request_number,
+        CANDIDATE_SHA,
+        REPOSITORY,
+        HEAD_BRANCH,
+        BASE_BRANCH,
+    )
 
 
 def test_validate_report_accepts_required_fields_and_ignores_extensions():
@@ -341,12 +380,32 @@ def test_render_comment_derives_status_from_comparisons(classifications, expecte
 def test_publish_creates_a_comment_for_the_current_open_pull_request():
     client = FakeGitHub(report_archive=artifact_zip())
 
-    result = publish(client, REPOSITORY, RUN_ID, RUN_ATTEMPT, PULL_REQUEST)
+    result = publish_report(client)
 
     assert result == "created"
     assert client.writes[0][0] == "POST"
     assert client.writes[0][1] == f"/repos/{REPOSITORY}/issues/{PULL_REQUEST}/comments"
     assert COMMENT_MARKER in client.writes[0][2]["body"]
+
+
+def test_publish_uses_validated_report_pr_when_event_omits_number():
+    client = FakeGitHub(report_archive=artifact_zip())
+
+    result = publish_report(client, pull_request_number=None)
+
+    assert result == "created"
+    assert client.writes[0][1] == f"/repos/{REPOSITORY}/issues/{PULL_REQUEST}/comments"
+
+
+def test_publish_creates_a_comment_for_an_already_merged_pull_request():
+    client = FakeGitHub(
+        report_archive=artifact_zip(),
+        pull_state="closed",
+        merged=True,
+    )
+
+    assert publish_report(client, pull_request_number=None) == "created"
+    assert client.writes[0][0] == "POST"
 
 
 def test_publish_leaves_comments_unchanged_when_the_benchmark_task_is_missing():
@@ -357,7 +416,7 @@ def test_publish_leaves_comments_unchanged_when_the_benchmark_task_is_missing():
         ]
     )
 
-    result = publish(client, REPOSITORY, RUN_ID, RUN_ATTEMPT, PULL_REQUEST)
+    result = publish_report(client)
 
     assert result == "task_missing"
     assert client.writes == []
@@ -375,12 +434,18 @@ def test_publish_removes_obsolete_comments_when_task_has_no_report():
         ],
     )
 
-    result = publish(client, REPOSITORY, RUN_ID, RUN_ATTEMPT, PULL_REQUEST)
+    result = publish_report(client)
 
     assert result == "artifact_missing"
     assert client.writes == [
         ("DELETE", f"/repos/{REPOSITORY}/issues/comments/10", None)
     ]
+
+    client.writes.clear()
+    result = publish_report(client, pull_request_number=None)
+
+    assert result == "artifact_missing"
+    assert client.writes == []
 
 
 @pytest.mark.parametrize(
@@ -402,7 +467,7 @@ def test_publish_skips_closed_or_stale_pull_requests(
         comments=[bot_comment(10)],
     )
 
-    assert publish(client, REPOSITORY, RUN_ID, RUN_ATTEMPT, PULL_REQUEST) == expected
+    assert publish_report(client) == expected
     expected_writes = (
         [("DELETE", f"/repos/{REPOSITORY}/issues/comments/10", None)]
         if removes_old_comment
@@ -419,6 +484,7 @@ def test_publish_skips_closed_or_stale_pull_requests(
         ("pull_request_number", PULL_REQUEST + 1),
         ("github_run_id", RUN_ID + 1),
         ("github_run_attempt", RUN_ATTEMPT + 1),
+        ("candidate_sha", "4" * 40),
     ],
 )
 def test_publish_rejects_artifact_identity_mismatches(field, value):
@@ -427,7 +493,40 @@ def test_publish_rejects_artifact_identity_mismatches(field, value):
     client = FakeGitHub(report_archive=artifact_zip(malformed))
 
     with pytest.raises(ValidationError, match="does not match the triggering run"):
-        publish(client, REPOSITORY, RUN_ID, RUN_ATTEMPT, PULL_REQUEST)
+        publish_report(client)
+    assert client.writes == []
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "77"])
+def test_publish_rejects_untrusted_pull_request_numbers(value):
+    malformed = report()
+    malformed["pull_request_number"] = value
+    client = FakeGitHub(report_archive=artifact_zip(malformed))
+
+    with pytest.raises(ValidationError, match="positive integer"):
+        publish_report(client, pull_request_number=None)
+    assert client.writes == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("head_repository", "attacker/repository"),
+        ("head_branch", "other-branch"),
+        ("head_sha", "4" * 40),
+        ("base_repository", "attacker/repository"),
+        ("base_branch", "release"),
+    ],
+)
+def test_publish_rejects_pull_requests_outside_the_trigger_source(field, value):
+    client = FakeGitHub(
+        report_archive=artifact_zip(),
+        comments=[bot_comment(10)],
+        **{field: value},
+    )
+
+    with pytest.raises(ValidationError, match="pull_request_number"):
+        publish_report(client, pull_request_number=None)
     assert client.writes == []
 
 
@@ -447,7 +546,7 @@ def test_publish_updates_one_bot_comment_and_deletes_older_duplicates():
         comments=[bot_comment(10), bot_comment(20), other_author, unrelated_bot],
     )
 
-    result = publish(client, REPOSITORY, RUN_ID, RUN_ATTEMPT, PULL_REQUEST)
+    result = publish_report(client, pull_request_number=None)
 
     assert result == "updated"
     assert [write[:2] for write in client.writes] == [
@@ -456,13 +555,17 @@ def test_publish_updates_one_bot_comment_and_deletes_older_duplicates():
     ]
 
 
-def test_publish_does_not_overwrite_a_newer_completed_run():
+@pytest.mark.parametrize(
+    ("run_id", "attempt"),
+    [(RUN_ID, RUN_ATTEMPT + 1), (RUN_ID + 1, 1)],
+)
+def test_publish_does_not_overwrite_a_newer_completed_run_or_rerun(run_id, attempt):
     client = FakeGitHub(
         report_archive=artifact_zip(),
-        comments=[bot_comment(10, run_id=RUN_ID + 1, attempt=1)],
+        comments=[bot_comment(10, run_id=run_id, attempt=attempt)],
     )
 
-    result = publish(client, REPOSITORY, RUN_ID, RUN_ATTEMPT, PULL_REQUEST)
+    result = publish_report(client)
 
     assert result == "newer_result_present"
     assert client.writes == []
@@ -486,6 +589,13 @@ def test_comment_workflow_has_a_minimal_trusted_contract():
     }
     job = workflow["jobs"]["publish"]
     assert "workflow_run.event == 'pull_request'" in job["if"]
+    assert "pull_requests" not in job["if"]
+    concurrency_group = workflow["concurrency"]["group"]
+    assert "workflow_run.head_repository.id" in concurrency_group
+    assert "workflow_run.head_branch" in concurrency_group
+    assert "pull_requests" not in concurrency_group
+    assert workflow["concurrency"]["queue"] == "max"
+    assert workflow["concurrency"]["cancel-in-progress"] is False
     checkout = next(
         step
         for step in job["steps"]
@@ -501,6 +611,20 @@ def test_comment_workflow_has_a_minimal_trusted_contract():
     assert publisher["env"]["EXPECTED_PULL_REQUEST"] == (
         "${{ github.event.workflow_run.pull_requests[0].number }}"
     )
+    assert publisher["env"]["EXPECTED_HEAD_SHA"] == (
+        "${{ github.event.workflow_run.head_sha }}"
+    )
+    assert publisher["env"]["EXPECTED_HEAD_REPOSITORY"] == (
+        "${{ github.event.workflow_run.head_repository.full_name }}"
+    )
+    assert publisher["env"]["EXPECTED_HEAD_BRANCH"] == (
+        "${{ github.event.workflow_run.head_branch }}"
+    )
+    assert publisher["env"]["EXPECTED_BASE_BRANCH"] == (
+        "${{ github.event.repository.default_branch }}"
+    )
     assert publisher["env"]["GITHUB_TOKEN"] == "${{ secrets.GITHUB_TOKEN }}"
+    assert 'if [ -n "$EXPECTED_PULL_REQUEST" ]' in publisher["run"]
+    assert '--head-sha "$EXPECTED_HEAD_SHA"' in publisher["run"]
     assert "test/ci_system/kernel_benchmark_comment.py" in publisher["run"]
     assert all("download-artifact" not in step.get("uses", "") for step in job["steps"])

@@ -602,8 +602,10 @@ def _scatter_checkpoint_output_kernel(
     indices,
     output,
     STRIDES: tl.constexpr,
-    SHAPE: tl.constexpr,
-    TOKENS: tl.constexpr,
+    FEATURES: tl.constexpr,
+    # Token counts follow the batch; runtime so every batch shape shares one
+    # binary. The feature geometry is fixed per layer.
+    TOKENS,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -611,9 +613,9 @@ def _scatter_checkpoint_output_kernel(
     token, feature = offset // WIDTH, offset % WIDTH
     destination = tl.load(indices + token, token < TOKENS, other=-1)
     source_offset = token * STRIDES[0]
-    for dim in tl.static_range(len(SHAPE) - 1, 0, -1):
-        source_offset += (feature % SHAPE[dim]) * STRIDES[dim]
-        feature = feature // SHAPE[dim]
+    for dim in tl.static_range(len(FEATURES) - 1, -1, -1):
+        source_offset += (feature % FEATURES[dim]) * STRIDES[dim + 1]
+        feature = feature // FEATURES[dim]
     live = (token < TOKENS) & (destination >= 0)
     value = tl.load(source + source_offset, live, other=0)
     tl.store(output + destination * WIDTH + offset % WIDTH, value, live)
@@ -628,9 +630,11 @@ def _gather_checkpoint_output_kernel(
     BODY_STRIDES: tl.constexpr,
     TAIL_STRIDES: tl.constexpr,
     FEATURES: tl.constexpr,
-    BODY_TOKENS: tl.constexpr,
-    TAIL_TOKENS: tl.constexpr,
-    TOKENS: tl.constexpr,
+    # Token counts follow the batch; runtime so every batch shape shares one
+    # binary. The feature geometry is fixed per layer.
+    BODY_TOKENS,
+    TAIL_TOKENS,
+    TOKENS,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -734,7 +738,7 @@ def merge_prefill_checkpoint_outputs(
             indices,
             output,
             STRIDES=source.stride()[token_dim:],
-            SHAPE=source.shape[token_dim:],
+            FEATURES=source.shape[token_dim + 1 :],
             TOKENS=indices.numel(),
             WIDTH=width,
             BLOCK=256,

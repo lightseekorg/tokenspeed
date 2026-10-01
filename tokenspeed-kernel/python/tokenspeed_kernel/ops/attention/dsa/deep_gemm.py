@@ -13,6 +13,7 @@ from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
 )
 from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
     deterministic_decode_topk,
+    has_deterministic_decode_topk,
 )
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     combine_topk_weights,
@@ -41,6 +42,35 @@ _CUTE_DSL_DECODE_TOPK_ENABLED = os.environ.get("TS_DSA_DECODE_TOPK_CUTEDSL", "1"
 def _use_cute_dsl_decode_topk() -> bool:
     """Whether the DSA decode top-k should use the CuTe DSL cluster kernel."""
     return _CUTE_DSL_DECODE_TOPK_ENABLED and has_cute_dsl_decode_topk()
+
+
+# Leaves can serve a batch-invariant selection only where the lowest-index
+# tie-break top-k exists.
+_TOPK_FEATURES = frozenset({"forced_initial_local"}) | (
+    frozenset({"batch_invariant"}) if has_deterministic_decode_topk() else frozenset()
+)
+
+
+def _row_invariant_topk(
+    logits: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor, topk: int
+) -> None:
+    """Select each row's top-k over its first ``lengths`` columns, row-locally.
+
+    Equal scores resolve toward the lowest column, so the selected set is a
+    function of the row alone: batch composition, row count and tiling cannot
+    change it (the cluster and ragged top-k kernels switch algorithms and
+    CTA splits with the row count). Columns past a row's length come back as
+    local offsets >= its length; ``logits`` is masked in place.
+    """
+    col_ids = torch.arange(logits.shape[1], dtype=torch.int32, device=logits.device)
+    logits.masked_fill_(
+        col_ids.view(1, -1) >= lengths.to(torch.int32).view(-1, 1), float("-inf")
+    )
+    if logits.shape[1] < int(topk):
+        logits = torch.nn.functional.pad(
+            logits, (0, int(topk) - logits.shape[1]), value=float("-inf")
+        )
+    deterministic_decode_topk(logits, out, int(topk))
 
 
 def _prepare_logits_for_topk(logits: torch.Tensor) -> torch.Tensor:
@@ -212,7 +242,7 @@ if platform.is_hopper_plus:
         "dsa_decode_topk",
         name="deep_gemm_dsa_decode_topk",
         solution="deep_gemm",
-        features={"forced_initial_local"},
+        features=_TOPK_FEATURES,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
@@ -258,6 +288,7 @@ if platform.is_hopper_plus:
         lens_out: torch.Tensor | None = None,
         initial_tokens: int = 0,
         local_tokens: int = 0,
+        batch_invariant: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert weights.dtype in (torch.float32, torch.bfloat16)
         # Raw weights may be a column-split view of the fused wk_weights_proj
@@ -349,7 +380,9 @@ if platform.is_hopper_plus:
             local_tokens=local_tokens,
         )
         local_topk_offsets = torch.empty_like(out)
-        if _use_cute_dsl_decode_topk():
+        if batch_invariant:
+            _row_invariant_topk(logits, seq_lens_per_token, local_topk_offsets, topk)
+        elif _use_cute_dsl_decode_topk():
             # CuTe DSL cluster radix top-k: length-aware via seq_lens/q_len_per_req,
             # so no pre-masking needed; same local offsets as the ragged path.
             # The widened view is safe: rows never read past their seq_len bound.
@@ -379,11 +412,7 @@ if platform.is_hopper_plus:
             # seq_lens_2d is a full-length broadcast (only its last column is
             # read on the hot path); seq_lens_per_token above carries the
             # per-token bound seq_lens[req] - (q_len_per_req - 1) + j.
-            col_ids = torch.arange(logits.shape[1], dtype=torch.int32, device=q.device)
-            logits.masked_fill_(
-                col_ids.view(1, -1) >= seq_lens_per_token.view(-1, 1), float("-inf")
-            )
-            deterministic_decode_topk(logits, local_topk_offsets, topk)
+            _row_invariant_topk(logits, seq_lens_per_token, local_topk_offsets, topk)
 
         return local_topk_to_global_slots(
             local_topk_offsets=local_topk_offsets,
@@ -400,7 +429,7 @@ if platform.is_hopper_plus:
         "dsa_prefill_topk",
         name="deep_gemm_dsa_prefill_topk",
         solution="deep_gemm",
-        features={"forced_initial_local"},
+        features=_TOPK_FEATURES,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
@@ -447,6 +476,7 @@ if platform.is_hopper_plus:
         lens_out: torch.Tensor | None = None,
         initial_tokens: int = 0,
         local_tokens: int = 0,
+        batch_invariant: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         q = q.contiguous()
@@ -547,13 +577,19 @@ if platform.is_hopper_plus:
                 initial_tokens=initial_tokens,
                 local_tokens=local_tokens,
             )
-            torch.ops.trtllm.indexer_topk_prefill(
-                logits.contiguous(),
-                local_starts_i32[start:end],
-                candidate_lens[start:end].to(torch.int32).contiguous(),
-                out[start:end],
-                int(topk),
-            )
+            if batch_invariant:
+                tile_lens = candidate_lens[start:end]
+                tile_out = out[start:end]
+                _row_invariant_topk(logits, tile_lens, tile_out, topk)
+                tile_out.masked_fill_(tile_out >= tile_lens.view(-1, 1), -1)
+            else:
+                torch.ops.trtllm.indexer_topk_prefill(
+                    logits.contiguous(),
+                    local_starts_i32[start:end],
+                    candidate_lens[start:end].to(torch.int32).contiguous(),
+                    out[start:end],
+                    int(topk),
+                )
         valid = out >= 0
         out.copy_(torch.where(valid, out + row_starts.unsqueeze(1), out))
         return out, lens_out

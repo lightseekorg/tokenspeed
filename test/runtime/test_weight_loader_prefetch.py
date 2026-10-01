@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -63,7 +64,7 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
         load_config = LoadConfig()
 
         self.assertTrue(load_config.weight_loader_prefetch_checkpoints)
-        self.assertEqual(load_config.weight_loader_prefetch_num_threads, 4)
+        self.assertEqual(load_config.weight_loader_prefetch_num_threads, 8)
 
     def _make_files(self, tmpdir, count, size):
         files = []
@@ -91,7 +92,7 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
             files = self._make_files(tmpdir, count=4, size=100)
             read_order = []
 
-            def record_read(path):
+            def record_read(path, start, end):
                 read_order.append(path)
                 return 100
 
@@ -100,7 +101,7 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
             with (
                 _fake_available_memory(1000),
                 mock.patch.object(
-                    CheckpointPrefetcher, "_read_file", side_effect=record_read
+                    CheckpointPrefetcher, "_read_range", side_effect=record_read
                 ),
             ):
                 prefetcher = CheckpointPrefetcher(files, num_threads=1)
@@ -132,8 +133,8 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                 _fake_available_memory(40),
                 mock.patch.object(
                     CheckpointPrefetcher,
-                    "_read_file",
-                    side_effect=lambda p: read_order.append(p) or 100,
+                    "_read_range",
+                    side_effect=lambda p, start, end: read_order.append(p) or 100,
                 ),
             ):
                 prefetcher = CheckpointPrefetcher(files, num_threads=1)
@@ -143,15 +144,90 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                 prefetcher.wait_file(1)
                 self.assertEqual(read_order, files)
 
+    def test_parallel_ranges_cover_shard_and_wait_for_every_range(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._make_files(tmpdir, count=1, size=261)[0]
+            release = threading.Event()
+            last_finished = threading.Event()
+            ranges = []
+            original = CheckpointPrefetcher._read_range
+
+            def read_range(file_path, start, end):
+                if start == 0:
+                    self.assertTrue(release.wait(_POLL_TIMEOUT_S))
+                count = original(file_path, start, end)
+                ranges.append((start, end))
+                if end == 261:
+                    last_finished.set()
+                return count
+
+            with (
+                mock.patch.object(CheckpointPrefetcher, "_BLOCK_SIZE", 32),
+                mock.patch.object(CheckpointPrefetcher, "_MIN_RANGE_SIZE", 64),
+                mock.patch.object(
+                    CheckpointPrefetcher, "_read_range", side_effect=read_range
+                ),
+            ):
+                prefetcher = CheckpointPrefetcher([path], num_threads=4)
+                prefetcher.start()
+                try:
+                    self.assertTrue(last_finished.wait(_POLL_TIMEOUT_S))
+                    self.assertFalse(prefetcher._ready[0].is_set())
+                finally:
+                    release.set()
+                    prefetcher.close()
+                self.assertTrue(prefetcher._ready[0].is_set())
+            ranges.sort()
+            self.assertEqual(ranges[0][0], 0)
+            self.assertEqual(ranges[-1][1], 261)
+            for previous, following in zip(ranges, ranges[1:]):
+                self.assertEqual(previous[1], following[0])
+
+    def test_iterator_close_stops_workers_waiting_for_window(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = [
+                os.path.join(tmpdir, f"weights-{idx}.safetensors") for idx in range(2)
+            ]
+            for path in files:
+                weight_utils.safetensors.torch.save_file(
+                    {"weight": weight_utils.torch.ones(1)}, path
+                )
+            for filtered in [False, True]:
+                with self.subTest(filtered=filtered), _fake_available_memory(
+                    os.path.getsize(files[0]) * 4
+                ):
+                    prefetcher = CheckpointPrefetcher(files, num_threads=2)
+                    with mock.patch.object(
+                        weight_utils, "CheckpointPrefetcher", return_value=prefetcher
+                    ):
+                        if filtered:
+                            iterator = (
+                                weight_utils.safetensors_filtered_weights_iterator(
+                                    files, lambda name: True, prefetch=True
+                                )
+                            )
+                        else:
+                            iterator = weight_utils.safetensors_weights_iterator(
+                                files, prefetch=True
+                            )
+                        try:
+                            next(iterator)
+                        finally:
+                            iterator.close()
+                    self.assertEqual(prefetcher._files_read, 1)
+                    self.assertTrue(
+                        all(not thread.is_alive() for thread in prefetcher._threads)
+                    )
+
     def test_read_failure_unblocks_consumer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             files = self._make_files(tmpdir, count=1, size=100)
 
-            def broken_read(path):
+            def broken_read(path, start, end):
                 raise OSError("boom")
 
             with mock.patch.object(
-                CheckpointPrefetcher, "_read_file", side_effect=broken_read
+                CheckpointPrefetcher, "_read_range", side_effect=broken_read
             ):
                 prefetcher = CheckpointPrefetcher(files, num_threads=1)
                 prefetcher.start()

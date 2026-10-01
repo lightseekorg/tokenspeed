@@ -31,12 +31,15 @@ import tokenspeed_kernel.ops.gemm.cuda  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
-import tokenspeed_kernel.ops.gemm.routed_gemv  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm_cutedsl  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.gemm.flashinfer import (
+    BF16_GEMM_MAX_M,
+    autotune_bf16_gemm,
+    flashinfer_bf16_gemm,
+    flashinfer_joint_bf16_supported,
     has_flashinfer_cute_dsl_nvfp4_a16,
     prepare_nvfp4_a16_weights,
 )
@@ -60,6 +63,7 @@ from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
     SelectedKernel,
+    resolve_kernel_override,
     select_kernel,
 )
 from tokenspeed_kernel.signature import (
@@ -557,6 +561,13 @@ _KERNELS_WITH_PDL: frozenset[str] = frozenset(
 )
 
 
+def _as_2d_tensor_scale(scale: torch.Tensor | None) -> torch.Tensor | None:
+    """A single-element scale of rank < 2 as its ``[1, 1]`` view."""
+    if scale is not None and scale.dim() < 2 and scale.numel() == 1:
+        return scale.view(1, 1)
+    return scale
+
+
 def _infer_scale_type(
     A_scales: torch.Tensor | None,
     B_scales: torch.Tensor | None,
@@ -760,10 +771,15 @@ def mm(
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
         solution: Restrict selection to a registered implementation family.
     """
+    override = resolve_kernel_override("gemm", "mm", override)
     enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
+    # Per-tensor scales may arrive as 0-dim or [1]; kernels take them as [1, 1].
+    A_scales = _as_2d_tensor_scale(A_scales)
+    B_scales = _as_2d_tensor_scale(B_scales)
 
     M = A.shape[0]
+    b_layout = "NK"
     if quant == "mxfp4":
         K = A.shape[-1] * 2
         N = B.shape[0]
@@ -772,7 +788,8 @@ def mm(
         N = B.shape[0]
     else:
         K = A.shape[-1]
-        N = B.shape[-1] if B.shape[0] == K else B.shape[0]
+        b_layout = "KN" if B.shape[0] == K else "NK"
+        N = B.shape[-1] if b_layout == "KN" else B.shape[0]
 
     if out is not None:
         _validate_gemm_out(
@@ -783,6 +800,41 @@ def mm(
             op="mm",
         )
 
+    # A dense layer's large-M arm reaches mm directly, while small M can
+    # select decode_gemv. Expose those branches at the shared kernel boundary.
+    if (
+        override is None
+        and alpha is None
+        and not prepacked_scales
+        and quant in (None, "none")
+        and A_scales is None
+        and B_scales is None
+        and out_dtype == torch.bfloat16
+        and B.shape[-1] == K
+    ):
+        # Row-parallel layers add bias only on rank 0. All ranks must expose
+        # the same bias-free tuning branch for FI's timing collectives, even
+        # when this rank's actual GEMM retains the generic biased path.
+        autotune_bf16_gemm(A, B)
+        if (
+            bias is None
+            and M <= BF16_GEMM_MAX_M
+            and flashinfer_joint_bf16_supported(A, B, out)
+        ):
+            shape_params = {"M": M, "N": N, "K": K}
+            ShapeCapture.get().record(
+                "gemm", "mm", "flashinfer_bf16_gemm", A.dtype, shape_params
+            )
+            with kernel_scope(
+                "gemm",
+                "mm",
+                A.dtype,
+                kernel_name="flashinfer_bf16_gemm",
+                **shape_params,
+                has_out=out is not None,
+            ):
+                return flashinfer_bf16_gemm(A, B, out)
+
     block_scale_layout = (
         "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
     )
@@ -790,6 +842,7 @@ def mm(
         "m": M,
         "n": N,
         "k": K,
+        "b_layout": b_layout,
         "a_inner_stride_one": A.stride(-1) == 1,
         "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
         "b_inner_stride_one": B.stride(-1) == 1,

@@ -209,7 +209,7 @@ class PlatformInfo:
 
     @property
     def is_cdna4_plus(self) -> bool:
-        return self.is_amd and self.arch_version >= ArchVersion(9, 5)
+        return self.is_cdna4 or self.is_cdna5_plus
 
     @property
     def is_cdna5_plus(self) -> bool:
@@ -253,6 +253,7 @@ class PlatformInfo:
         if self.is_amd:
             names = {
                 (9, 5): "CDNA4",  # MI350
+                (12, 0): "RDNA4",
                 (12, 5): "CDNA5",
             }
             return names.get(arch_version, f"GFX{arch_version[0]}.{arch_version[1]}")
@@ -469,6 +470,7 @@ def _detect_rocm_platform() -> PlatformInfo:
     # Map supported AMD architectures.
     arch_map = {
         "gfx950": ArchVersion(9, 5),  # MI350
+        "gfx1201": ArchVersion(12, 0),  # RDNA4
         "gfx1250": ArchVersion(12, 5),
     }
     try:
@@ -502,6 +504,8 @@ def _detect_rocm_platform() -> PlatformInfo:
 
 def _get_rocm_sm_features(arch: str) -> frozenset[str]:
     """Determine ROCm SM features from architecture."""
+    # gfx1201 uses portable kernels. Do not advertise CDNA matrix/async-copy
+    # capabilities until the corresponding implementations support RDNA4.
     features: set[str] = set()
 
     if arch in ("gfx950", "gfx1250"):

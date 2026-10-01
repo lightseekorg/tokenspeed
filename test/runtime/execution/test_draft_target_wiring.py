@@ -43,6 +43,7 @@ from tokenspeed.runtime.execution.drafter.dspark import DSpark  # noqa: E402
 from tokenspeed.runtime.execution.drafter.eagle import Eagle  # noqa: E402
 from tokenspeed.runtime.execution.drafter.mtp import Mtp  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.models.target_capture import (  # noqa: E402
     TargetCaptureConfigurator,
 )
@@ -120,6 +121,7 @@ def test_wire_eagle3_shares_embed_head_and_installs_capture_ids():
     draft.model_config.hf_config = {
         "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}
     }
+    draft.model_config.requires_request_token_history = False
 
     with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
         factory.configure_draft_target(_server_args("EAGLE3"), target, draft)
@@ -309,6 +311,7 @@ def _target_ctx(num_extends: int, num_tokens: int) -> ForwardContext:
         token_to_kv_pool=None,
         bs=2,
         num_extends=num_extends,
+        output_layout=ForwardOutputLayout(num_extends, num_extends, 2 - num_extends, 1),
         input_num_tokens=num_tokens,
         forward_mode=ForwardMode.DECODE,
     )

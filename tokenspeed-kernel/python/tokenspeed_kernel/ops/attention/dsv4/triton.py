@@ -2183,7 +2183,9 @@ def _dsv4_gather_indexer_mxfp4_cache_kernel(
     slot_mapping_ptr,
     values_out_ptr,
     scales_out_ptr,
-    rows: tl.constexpr,
+    # Gathered token count follows the batch; runtime so every batch shape
+    # shares one binary.
+    rows,
     slot_stride: tl.constexpr,
     value_stride: tl.constexpr,
     scale_stride: tl.constexpr,
@@ -3947,11 +3949,13 @@ def _dsv4_indexer_decode_metadata_kernel(
     block_table_ptr,
     block_table_stride,
     block_table_base_offsets_ptr,
-    rows: tl.constexpr,
-    cols: tl.constexpr,
+    # Block-table geometry follows the batch; runtime so every batch shape
+    # shares one binary.
+    rows,
+    cols,
     compress_ratio: tl.constexpr,
     cache_block_size: tl.constexpr,
-    max_blocks: tl.constexpr,
+    max_blocks,
     candidate_block: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -4260,3 +4264,61 @@ def triton_dsv4_index_candidates(
     scores = logits.gather(1, offsets.clamp_min(0).long())
     valid = (offsets >= 0) & (scores > -float("inf"))
     return torch.where(valid, offsets, -1), torch.where(valid, scores, -float("inf"))
+
+
+@register_kernel(
+    "attention",
+    "dsv4_index_candidates",
+    name="triton_dsv4_sharded_index_candidates",
+    solution="triton",
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(dtype),
+                weights=dense_tensor_format(torch.float32),
+                index_k_cache=dense_tensor_format(torch.uint8),
+            )
+            for dtype in (torch.bfloat16, torch.uint8)
+        }
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_dsv4_sharded_index_candidates(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    index_k_format: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if index_k_format == "mxfp4":
+        return triton_dsv4_index_candidates(
+            index_q,
+            weights,
+            index_k_cache,
+            local_page_table,
+            query_requests,
+            causal_lens,
+            page_size=page_size,
+            topk=topk,
+        )
+    from tokenspeed_kernel.ops.attention.dsa.triton import triton_dsa_index_candidates
+
+    return triton_dsa_index_candidates(
+        index_q[0],
+        weights,
+        index_k_cache,
+        local_page_table,
+        query_requests,
+        causal_lens,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        initial_tokens=0,
+        local_tokens=0,
+    )

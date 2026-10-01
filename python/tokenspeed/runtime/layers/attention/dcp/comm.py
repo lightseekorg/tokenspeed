@@ -45,9 +45,12 @@ def gather_query_heads(query: torch.Tensor, group: tuple[int, ...]) -> torch.Ten
     # symmetric buffer is sized for the prefill token budget although decode
     # only ever gathers max_decode_bs * spec_tokens rows; a per-collective
     # capacity needs the symmetric buffers managed in one place first.
-    gathered = all_gather(
-        query.reshape(tokens, heads * dim).contiguous(), group, dim=-1
-    )
+    payload = query.reshape(tokens, heads * dim).contiguous()
+    # NCCL wrappers need not expose FP8 dtypes for a byte-preserving gather.
+    # Reinterpret rather than cast: quantized values must retain their bits.
+    if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        payload = payload.view(torch.uint8)
+    gathered = all_gather(payload, group, dim=-1).view(query.dtype)
     return gathered.reshape(tokens, heads * len(group), dim)
 
 
@@ -85,7 +88,11 @@ def combine_attention_partials(
     weighted, lse = dcp_weight_for_reduce_scatter(local_output, gathered_lse, rank)
     output = reduce_scatter(weighted, group).movedim(0, 1)
     if sink is None:
-        return output.to(local_output.dtype).contiguous()
+        # Request token-major storage during the cast to avoid copying twice.
+        # Keep contiguous() for FP32, where to() can return the original view.
+        return output.to(
+            dtype=local_output.dtype, memory_format=torch.contiguous_format
+        ).contiguous()
     return dcp_apply_sink(output, lse, sink, dtype=local_output.dtype)
 
 

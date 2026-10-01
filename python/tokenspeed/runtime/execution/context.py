@@ -30,6 +30,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.dspark_context import (
@@ -114,6 +115,7 @@ class ForwardContext:
     num_extends: int
     input_num_tokens: int
     forward_mode: ForwardMode | None
+    output_layout: ForwardOutputLayout
     capture_hidden_mode: CaptureHiddenMode | None = CaptureHiddenMode.NULL
     # Normalized explicit decode input overrides for this forward, if any.
     decode_input_ids: list[int] | None = None
@@ -129,6 +131,9 @@ class ForwardContext:
     # back to ``input_num_tokens`` / ``global_num_tokens``.
     collective_num_tokens: int | None = None
     collective_global_num_tokens: list[int] | None = None
+
+    # Set by models that explicitly select their logits rows.
+    logits_rows_selected: bool = False
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None

@@ -50,6 +50,7 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackend,
     SamplingBackendConfig,
 )
+from tokenspeed.runtime.sampling.backends.greedy import _verify_chain_greedy
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
     slice_dp_vocab_mask,
@@ -66,6 +67,80 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+
+# Greedy requests normalize to top_k=1 and ride the pool route, whose
+# stochastic kernels resolve EXACT logit ties in reduction order: run-stable,
+# not batch-invariant. Under --numerics rl-bitwise the helpers below give
+# greedy rows the canonical lowest-index argmax instead. Both are
+# elementwise over rows, so the graph-captured path stays one path.
+
+
+def canonical_greedy_tokens(
+    logits: torch.Tensor, top_ks: torch.Tensor, token_ids: torch.Tensor
+) -> torch.Tensor:
+    """Replace greedy rows' sampled tokens with the lowest-index argmax.
+
+    Args:
+        logits: ``[bs, vocab]`` logits the greedy choice maximizes.
+        top_ks: ``[bs]`` per-row top-k; greedy rows carry 1.
+        token_ids: ``[bs]`` tokens the pool route sampled.
+
+    Returns:
+        ``[bs]`` tokens in ``token_ids``' dtype.
+    """
+    canonical = sampling_argmax(logits)
+    return torch.where(top_ks == 1, canonical.to(token_ids.dtype), token_ids)
+
+
+def canonical_greedy_verify(
+    *,
+    logits: torch.Tensor,
+    top_ks: torch.Tensor,
+    candidates: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+) -> None:
+    """Rewrite greedy rows' verify outputs with the exact-match chain rule.
+
+    Without ties the one-hot target makes chain speculative sampling accept
+    exactly the drafts that equal the argmax, so this changes only tied rows.
+
+    Args:
+        logits: ``[bs * n, vocab]`` flat verify logits.
+        top_ks: ``[bs * n]`` per-position top-k; greedy requests carry 1.
+        candidates: ``[bs, n]`` draft chains.
+        predict: ``[bs * n]`` int32 predictions, rewritten in place.
+        accept_index: ``[bs, n]`` int32 accepted positions, rewritten in place.
+        accept_length: ``[bs]`` int32 accepted draft counts (before the bonus
+            token is added), rewritten in place.
+    """
+    bs, n = candidates.shape
+    target_predict = sampling_argmax(logits).reshape(bs, n)
+    # The CUDA chain kernel writes only the accepted prefix and the bonus
+    # slot, but every slot is read (e.g. by the logprob gather): start from
+    # the argmax, which is what an accepted greedy slot holds anyway.
+    greedy_predict = target_predict.reshape(-1).to(predict.dtype)
+    greedy_index = torch.full_like(accept_index, -1)
+    greedy_length = torch.empty_like(accept_length)
+    _verify_chain_greedy(
+        predicts=greedy_predict,
+        accept_index=greedy_index,
+        accept_token_num=greedy_length,
+        candidates=candidates.to(torch.int32),
+        target_predict=target_predict,
+        batch_size=bs,
+        num_draft_tokens=n,
+    )
+    greedy_rows = top_ks.view(bs, n)[:, 0] == 1
+    predict.copy_(
+        torch.where(greedy_rows.repeat_interleave(n), greedy_predict, predict)
+    )
+    accept_index.copy_(
+        torch.where(greedy_rows.unsqueeze(1), greedy_index, accept_index)
+    )
+    accept_length.copy_(torch.where(greedy_rows, greedy_length, accept_length))
 
 
 class FlashInferSamplingBackend(SamplingBackend):
@@ -326,16 +401,8 @@ class FlashInferSamplingBackend(SamplingBackend):
             deterministic=True,
         )
         if global_server_args_dict["numerics"] == "rl-bitwise":
-            # The pool route serves greedy rows through the stochastic
-            # kernel, whose top-1 filter resolves EXACT logit ties in
-            # reduction order — run-stable but not batch-invariant. Overlay
-            # the canonical lowest-index argmax on greedy rows; elementwise,
-            # so the graph-captured path stays one path.
-            canonical = sampling_argmax(logits)
-            batch_next_token_ids = torch.where(
-                top_ks == 1,
-                canonical.to(batch_next_token_ids.dtype),
-                batch_next_token_ids,
+            batch_next_token_ids = canonical_greedy_tokens(
+                logits, top_ks, batch_next_token_ids
             )
 
         bs = logits.shape[0]
@@ -512,6 +579,15 @@ class FlashInferSamplingBackend(SamplingBackend):
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
             deterministic=not dp_sampling,
         )
+        if global_server_args_dict["numerics"] == "rl-bitwise":
+            canonical_greedy_verify(
+                logits=logits,
+                top_ks=top_ks,
+                candidates=candidates,
+                predict=predict,
+                accept_index=accept_index,
+                accept_length=accept_length,
+            )
 
         accept_length += 1
         logprobs_local = None

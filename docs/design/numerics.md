@@ -33,7 +33,8 @@ hierarchy, unimplemented):
 numerics.mode                       --numerics {auto, rl-bitwise}
 ├── kernels.deterministic           fixed-reduction-order compute
 │   ├── no autotune                 disable_autotune (tactic choice is shape-
-│   │                               and machine-dependent state)
+│   │                               and machine-dependent state); no
+│   │                               persistent tactic cache is loaded
 │   ├── no TF32                     disable_tf32 + NVIDIA_TF32_OVERRIDE=0
 │   ├── no PDL                      disable_pdl (serialize kernel chains)
 │   └── batch-invariant leaves      kernel registry: leaves declaring the
@@ -48,33 +49,48 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   ├── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
 │   │   NCCL_PROTO=Simple           size changes association order
 │   └── batch_invariant_collectives all-reduce = all-gather + fixed-rank-order
-│                                   fp32 fold; a ring all-reduce chunks by
-│                                   message size, so its per-element order is
-│                                   run-stable but not batch-size-invariant
-│                                   (world_size x traffic; the NVLS multimem
-│                                   in-switch reduction is the faster future
-│                                   citizen of this slot)
+│                                   fp32 fold, reduce-scatter (plain and
+│                                   token) = all-to-all + the same fold; a
+│                                   ring reduction chunks by message size, so
+│                                   its per-element order is run-stable but
+│                                   not batch-size-invariant (all-reduce pays
+│                                   world_size x traffic, reduce-scatter
+│                                   none; the NVLS multimem in-switch
+│                                   reduction is the faster future citizen of
+│                                   this slot)
 ├── sampling.deterministic          per-request Philox (seed=crc32(rid),
 │                                   offset=position) is run- and
 │                                   batch-invariant by construction; greedy
-│                                   rows additionally overlay the canonical
-│                                   lowest-index argmax, because EXACT logit
-│                                   ties happen in practice and the pool
-│                                   route's top-1 filter resolves them in
-│                                   batch-shape-dependent reduction order
+│                                   rows additionally take the canonical
+│                                   lowest-index argmax, in sampling and in
+│                                   speculative verify (exact-match chain),
+│                                   because EXACT logit ties happen in
+│                                   practice and the pool route's stochastic
+│                                   kernels resolve them in batch-shape-
+│                                   dependent reduction order; backends
+│                                   without the overlay are refused
 ├── invariance.batch                per-row-independent reductions
 │   ├── no split-KV attention       decode kernels whose split count scales
 │   │                               with batch/SM occupancy are excluded by
 │   │                               the batch_invariant feature
+│   ├── row-local top-k             the DSA indexer's selection resolves
+│   │                               equal scores toward the lowest candidate
+│   │                               within each row (dsa_*_topk
+│   │                               batch_invariant=True); the tuned top-k
+│   │                               kernels switch algorithm and CTA split
+│   │                               with the row count, which moves ties
 │   └── per-row GEMMs               fixed-order GEMM leaves (see aok below)
 ├── logprob.topology-invariant      (deferred) vocab-block fixed-tree
 │                                   log-softmax, TP-count-invariant
 └── alignment.trainer               (deferred) trainer operation order
 ```
 
-Precedence: an explicitly set individual switch always stands; the envelope
-only ever tightens. `resolve_numerics` runs after `resolve_communication` so
-it can veto the auto-enabled all-reduce fusion.
+Precedence: the envelope only ever tightens. It sets every switch it governs
+to its tight value, and it refuses an explicit choice it cannot tighten — a
+named MoE backend other than the batch-invariant one, a sampling backend
+without canonical greedy ties — rather than keeping it and silently voiding
+the contract. `resolve_numerics` runs after `resolve_communication` so it can
+veto the auto-enabled all-reduce fusion.
 
 ## Kernel selection
 
@@ -85,25 +101,22 @@ The registry's two matching mechanisms split the work:
   requested trait excludes only kernels that declare the opposite. Good for
   ranking, useless for guarantees.
 - **Features are buyer-required** (subset test, silent kernels excluded):
-  under rl-bitwise, callers on the model's hot path request
-  `features={"batch_invariant"}`. Only leaves that affirmatively declare the
-  feature can serve the call; a path with no such leaf refuses to start.
-  This is the FluentLLM discipline ("no silent fallback") expressed through
-  the existing registry.
+  a leaf that affirmatively declares `features={"batch_invariant"}` is the
+  only kind a batch-invariant request can be served by.
 
 Deterministic leaves live where any other vendor solution lives: registered
 under `solution="aok"` (the fixed-reduction-order operator kit: GEMM family
 including grouped MoE and BMM, lightning-indexer scoring, stable top-k with
-native forced initial/local windows, no-split sparse MLA attention) at plugin
-priority, alongside the performance leaves they mirror. `--numerics auto`
-never selects them; `rl-bitwise` requires them.
-
-Selection points a caller reaches through an existing solution switch reuse
-it: rl-bitwise folds `--moe-backend auto` to `"aok"`, so the routed-expert
-apply plans onto the batch-invariant grouped leaf through the ordinary
-`moe_plan(solution=...)` path — and fails at startup when no such leaf is
-registered. An explicitly chosen backend stands, like every other switch
-under the envelope.
+native forced initial/local windows, no-split sparse MLA attention) with the
+`batch_invariant` feature, at reference priority so `--numerics auto` never
+selects them. Under rl-bitwise each selection point on the served path pins
+that solution: the DSA backend's sparse decode and prefill, the MLA
+absorption and value projections, the dense and LM-head GEMMs, and the MoE
+plan (the envelope folds `--moe-backend auto` to `"aok"`, so the
+routed-expert apply plans through the ordinary `moe_plan(solution=...)`
+path). A pinned solution with no registered leaf fails selection at startup
+or at the first call instead of falling back — the FluentLLM discipline
+("no silent fallback") expressed through the existing registry.
 
 ## Acceptance
 
@@ -113,3 +126,12 @@ generates with returned logprobs for the same prompts (a) alone at bs=1,
 `torch.equal` on token ids and logprobs — base model and speculative decoding
 each. A deployment that passes the harness may advertise the rl-bitwise
 contract; one that fails it has a bug, not a tolerance.
+
+The pins above cover only the paths a verified model takes, so the
+verification is recorded per model and enforced at startup: a model profile
+lists the envelopes its model passes in `ModelProfile.numerics_envelopes`,
+and launching an envelope other than `auto` refuses any target or draft
+model that does not list it — every in-tree model included, since none has
+a profile. Quantized checkpoints are refused too: no batch-invariant
+quantized GEMM leaf exists, so their linears would select shape-dependent
+ones.

@@ -390,7 +390,7 @@ def launch_gluon_linear_attnres_partials_gfx950(
         num_tokens,
         attnres_program_offset,
         output_size,
-        num_warps=_NUM_WARPS,
+        num_warps=_NUM_WARPS.value,
         num_stages=1,
         waves_per_eu=1,
     )

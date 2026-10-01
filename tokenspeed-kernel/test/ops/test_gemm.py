@@ -662,3 +662,27 @@ def test_linear_attnres_partials_cuda_portable_strided_inputs() -> None:
             outputs[2],
             torch.einsum("bt,bth->th", unnormalized, values),
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("scale_shape", [(), (1,), (1, 1)])
+def test_mm_fp8_per_tensor_scale_any_rank(scale_shape) -> None:
+    """Checkpoints store per-tensor FP8 scales as 0-dim or [1]; mm takes any rank."""
+    fp8 = torch.float8_e4m3fn
+    gen = torch.Generator().manual_seed(0)
+    a = torch.randn(16, 256, generator=gen).cuda()
+    b = torch.randn(256, 128, generator=gen).cuda()
+    a_scale = (a.abs().max() / 448.0).float()
+    b_scale = (b.abs().max() / 448.0).float()
+    a_q = (a / a_scale).to(fp8)
+    b_q = (b / b_scale).to(fp8)
+    out = tokenspeed_kernel.mm(
+        a_q,
+        b_q,
+        A_scales=a_scale.reshape(scale_shape),
+        B_scales=b_scale.reshape(scale_shape),
+        out_dtype=torch.bfloat16,
+        quant="fp8",
+    )
+    ref = (a_q.float() * a_scale) @ (b_q.float() * b_scale)
+    torch.testing.assert_close(out.float(), ref, atol=1e-1, rtol=2e-2)

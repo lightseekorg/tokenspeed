@@ -376,6 +376,11 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--enable-log-requests"])
         self.assertTrue(args.enable_log_requests)
 
+    def test_log_requests_default_on(self):
+        args = self._parse_args(["--model", "test/model"])
+        self.assertTrue(args.enable_log_requests)
+        self.assertEqual(args.log_requests_level, 0)
+
     def test_disable_log_requests_arg(self):
         args = self._parse_args(["--model", "test/model", "--no-enable-log-requests"])
         self.assertFalse(args.enable_log_requests)
@@ -442,8 +447,12 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa.resolve_speculative_decoding()
         self.assertIsNone(sa.speculative_draft_model_quantization)
 
-    def test_replay_ssm_defaults_to_disabled(self):
+    def test_replay_ssm_defaults_to_enabled(self):
         args = self._parse_args(["--model", "test/model"])
+        self.assertTrue(self._from_cli_args_no_init(args).enable_replay_ssm)
+
+    def test_replay_ssm_can_be_disabled(self):
+        args = self._parse_args(["--model", "test/model", "--disable-replay-ssm"])
         self.assertFalse(self._from_cli_args_no_init(args).enable_replay_ssm)
 
     def test_replay_ssm_can_be_enabled(self):

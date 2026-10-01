@@ -83,6 +83,7 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     CDNA4_SCALE_K_BLOCK,
+    CDNA4_SCALE_N_BLOCK,
 )
 
 
@@ -918,7 +919,7 @@ def gluon_mxfp4_moe_stage1_kernel(
     """Stage 1 kernel with per-token A gather and fused SwiGLU.
 
     Tile config: ``BLOCK_M x 128 x 256`` (M x N x K), with ``BLOCK_M``
-    in ``{32, 64, 128}``; the 32-row variant is E4M3-only. MFMA target:
+    in ``{16, 32, 64, 128}``; 16-row tiles use E2M1 activations. MFMA target:
     ``v_mfma_scale_f32_16x16x128_f8f6f4`` (gfx950, AMDMFMALayout
     version=4). Each CTA owns ``BLOCK_N / 2`` output columns for interleaved
     GDOT128 W13 or ``BLOCK_N`` columns for separate gate/up layouts.
@@ -933,13 +934,16 @@ def gluon_mxfp4_moe_stage1_kernel(
     """
 
     gl.static_assert(
-        BLOCK_M == 64 or BLOCK_M == 128 or (BLOCK_M == 32 and A_FORMAT == "e4m3"),
-        "stage1 kernel requires BLOCK_M in {64, 128}, or 32 for E4M3",
+        BLOCK_M == 32
+        or BLOCK_M == 64
+        or BLOCK_M == 128
+        or (BLOCK_M == 16 and A_FORMAT == "e2m1"),
+        "stage1 kernel requires BLOCK_M in {32, 64, 128}, or 16 for E2M1",
     )
     gl.static_assert(BLOCK_N == 128, "stage1 kernel requires BLOCK_N=128")
     gl.static_assert(BLOCK_K == 256, "stage1 kernel requires BLOCK_K=256")
     gl.static_assert(
-        NUM_WARPS == BLOCK_M // 32 or (A_FORMAT == "e4m3" and NUM_WARPS == 8),
+        NUM_WARPS == max(1, BLOCK_M // 32) or (A_FORMAT == "e4m3" and NUM_WARPS == 8),
         "stage1 kernel requires the native E2M1 wave count or eight E4M3 waves",
     )
     gl.static_assert(not OUTPUT_QUANTIZED or OUTPUT_SORTED)
@@ -950,7 +954,7 @@ def gluon_mxfp4_moe_stage1_kernel(
     BLOCK_K_B: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // SCALE_GROUP
     NUM_BUFFERS: gl.constexpr = 2
-    GROUP_MFMA_M: gl.constexpr = 32
+    GROUP_MFMA_M: gl.constexpr = min(BLOCK_M, 32)
 
     pid = gl.program_id(axis=0)
     num_pid_m = gl.cdiv(EM, BLOCK_M)
@@ -1003,7 +1007,21 @@ def gluon_mxfp4_moe_stage1_kernel(
         [NUM_WARPS, 1],
         [1, 0],
     )
-    if BLOCK_M == 32:
+    if BLOCK_M == 16:
+        shared_a_bases: gl.constexpr = [
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+        ]
+    elif BLOCK_M == 32:
         if A_FORMAT == "e4m3":
             shared_a_bases: gl.constexpr = [
                 [0, 1],
@@ -1021,7 +1039,20 @@ def gluon_mxfp4_moe_stage1_kernel(
                 [16, 0],
             ]
         else:
-            shared_a_bases: gl.constexpr = []
+            shared_a_bases: gl.constexpr = [
+                [0, 1],
+                [0, 2],
+                [0, 4],
+                [0, 8],
+                [0, 16],
+                [0, 32],
+                [0, 64],
+                [1, 0],
+                [2, 0],
+                [4, 0],
+                [8, 0],
+                [16, 0],
+            ]
     elif BLOCK_M == 64:
         if A_FORMAT == "e4m3":
             shared_a_bases: gl.constexpr = [
@@ -2178,6 +2209,7 @@ def invoke_gluon_mxfp4_moe_stage1(
     token/slot order. ``output_quantized`` additionally writes E2M1 or E4M3
     values to ``out`` and CDNA4-swizzled e8m0 scales to ``out_scale``;
     ``output_k`` is the physical, padding-inclusive output width.
+    ``out_scale`` must reserve complete 32-row panels even for 16-row tiles.
     ``input_sorted`` consumes activation rows already ordered like
     ``sorted_token_ids``; ``source_tokens`` retains the original token bound
     used to identify padding routes. The function returns the same ``out``
@@ -2313,14 +2345,17 @@ def invoke_gluon_mxfp4_moe_stage1(
                 f"(>= {EM}, {output_k // output_div}), got {tuple(out.shape)}"
             )
         assert out_scale is not None
+        # Swizzled stores span a full panel even when only half its rows are used.
+        output_scale_rows = triton.cdiv(EM, CDNA4_SCALE_N_BLOCK) * CDNA4_SCALE_N_BLOCK
         if (
             out_scale.dim() != 2
-            or out_scale.shape[0] < EM
+            or out_scale.shape[0] < output_scale_rows
             or out_scale.shape[1] != output_k // 32
         ):
             raise ValueError(
                 "quantized stage1 out_scale must have shape "
-                f"(>= {EM}, {output_k // 32}), got {tuple(out_scale.shape)}"
+                f"(>= {output_scale_rows}, {output_k // 32}) for complete CDNA4 "
+                f"scale panels, got {tuple(out_scale.shape)}"
             )
         out_2d = out
     elif out.dim() == 3:
@@ -2373,15 +2408,15 @@ def invoke_gluon_mxfp4_moe_stage1(
             [int(num_valid_ids)], dtype=torch.int32, device=hidden_states.device
         )
     BLOCK_M = int(block_m)
-    if BLOCK_M not in (32, 64, 128) or (BLOCK_M == 32 and a_format != "e4m3"):
+    if BLOCK_M not in (16, 32, 64, 128) or (BLOCK_M == 16 and a_format != "e2m1"):
         raise ValueError(
-            "stage1 block_m must be 64 or 128, or 32 for E4M3; "
+            "stage1 block_m must be 32, 64 or 128, or 16 for E2M1; "
             f"got block_m={BLOCK_M}, a_format={a_format}"
         )
     BLOCK_N = 128
     BLOCK_K = 256
     GROUP_SIZE_M = 1
-    NUM_WARPS = 8 if a_format == "e4m3" else BLOCK_M // 32
+    NUM_WARPS = 8 if a_format == "e4m3" else max(1, BLOCK_M // 32)
     num_pid_m = triton.cdiv(EM, BLOCK_M)
     output_block_n = BLOCK_N // 2 if b_gdot128 else BLOCK_N
     num_pid_n = triton.cdiv(I_r, output_block_n)

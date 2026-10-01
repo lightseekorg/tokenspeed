@@ -31,6 +31,11 @@ except ImportError as exc:  # pragma: no cover
 
 
 SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
+# Task types that start a server. They serve with the JIT compile check armed
+# as an error: a compile-time kernel parameter that keeps taking new values
+# after startup (a per-batch constexpr) fails the run instead of stalling it.
+SERVING_TASK_TYPES = {"server_smoke", "eval", "perf"}
+JIT_COMPILE_CHECK_ENV = "TOKENSPEED_JIT_COMPILE_CHECK"
 SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug", "slurm"}
 WORKFLOW_STAGE_TYPES = {
     "unit-test": {"ut", "server_smoke"},
@@ -1810,6 +1815,12 @@ def execute_task(
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
     env.update(get_runner_specific_env(task, declared_runner))
+    if task["type"] in SERVING_TASK_TYPES:
+        # Only the task itself may relax the check; a value inherited from
+        # the runner's environment must not.
+        env[JIT_COMPILE_CHECK_ENV] = str(
+            task.get("env", {}).get(JIT_COMPILE_CHECK_ENV, "error")
+        )
 
     jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
     env.update(jit_cache_env)
@@ -1902,6 +1913,8 @@ def execute_task(
                     server_command = configure_slurm_server_command(
                         server_command, int(ready["timeout"])
                     )
+                elif not is_amd_runner(runner):
+                    ready["timeout"] = max(int(ready.get("timeout", 600)), 3600)
                 if serve_only:
                     if pgm is not None:
                         command_result = pgm.run(

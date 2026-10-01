@@ -34,6 +34,7 @@ import pytest
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext, ForwardMode
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 
 
 def _make_mapping(rank: int) -> Mapping:
@@ -55,6 +56,7 @@ def _draft_first_step_ctx(bs: int, global_bs, global_num_tokens) -> ForwardConte
         token_to_kv_pool=None,
         bs=bs,
         num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, bs, 1),
         input_num_tokens=bs,
         forward_mode=ForwardMode.DECODE,
         global_num_tokens=global_num_tokens,

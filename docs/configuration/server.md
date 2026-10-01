@@ -27,10 +27,10 @@ For a compact compatibility table, see
 | Parameter | Purpose |
 | --- | --- |
 | `--dtype` | Model weight and activation dtype. `auto` follows model metadata. |
-| `--kv-cache-dtype` | KV cache dtype. Lower precision reduces KV memory and may require scaling factors. |
+| `--kv-cache-dtype` | KV cache dtype. Lower precision reduces KV memory. |
 | `--kv-cache-quant-method` | KV cache quantization method. |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
-| `--quantization-param-path` | JSON file for KV cache scaling factors, commonly needed with FP8 KV cache. |
+| `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
 
 ## API Surface
 
@@ -215,6 +215,7 @@ the values accepted by the bundled `tokenspeed-smg` package.
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
 | `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |
 | `--eagle3-layers-to-capture` | EAGLE3 layers to capture. |
+| `--disable-replay-ssm` | Stage every verify position's GDN recurrent state instead of replaying the accepted tokens. ReplaySSM is on by default for supported Qwen GDN targets; `--enable-replay-ssm` is accepted as a deprecated no-op. |
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
@@ -261,7 +262,7 @@ widening the draft's attention to the full history.
 | Parameter | Purpose |
 | --- | --- |
 | `--log-level` | Runtime log level. |
-| `--enable-log-requests` | Log request metadata and optionally payloads. |
+| `--enable-log-requests` | Log request metadata and optionally payloads. On by default; `--no-enable-log-requests` disables. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable metrics reporting. |

@@ -418,12 +418,19 @@ def _apply_backend_overrides(
     """The one place family resolution writes back into ``server_args``.
 
     The mutation is deliberate, not a shortcut: ``_create_attn_config`` reads
-    the backend choice through the generate() protocol, and the
-    ``global_server_args_dict`` snapshot serves models that pick kernel paths
-    at build time (e.g. ``deepseek_v3.attention_backend``). Must run before
-    any ``_create_attn_config`` call. The user's pre-override choice survives
+    the backend choice through the generate() protocol. Must run before any
+    ``_create_attn_config`` call. The user's pre-override choice survives
     as ``profile.requested_backend``.
     """
+    if (
+        draft is not None
+        and "K3DSparkModel" in draft.architectures
+        and server_args.decode_context_parallel_size > 1
+    ):
+        raise ValueError(
+            "K3 DSpark does not support DCP: context KV injection does not "
+            "translate virtual slots or mask nonowner writes"
+        )
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
     elif target.is_deepseek_v4:
@@ -436,6 +443,24 @@ def _apply_backend_overrides(
         # hybrid_linear_attn. The user's original choice stays in the profile
         # for the full-attention sub-backend (MHA for GDN, MLA for KDA).
         server_args.attention_backend = HYBRID_LINEAR_ATTN_BACKEND
+        if (
+            draft is not None
+            and target.is_kda
+            and not target.is_dsa_kda
+            and server_args.decode_context_parallel_size > 1
+            and server_args.drafter_attention_backend
+            in (None, HYBRID_LINEAR_ATTN_BACKEND)
+        ):
+            # A K3 continuation must resolve its history consumer before
+            # AttnConfig validates DCP. Inherit the target's resolved leaf,
+            # while preserving an explicitly requested draft leaf.
+            server_args.drafter_attention_backend = _resolve_hybrid_full_backend_name(
+                target.requested_backend,
+                is_kda=True,
+                is_dsa=False,
+                is_qsa=False,
+                has_cache_plan=True,
+            )
     elif server_args.attention_backend == HYBRID_LINEAR_ATTN_BACKEND:
         logger.warning(
             "Ignoring hybrid_linear_attn backend for non-hybrid model architectures="
@@ -672,35 +697,46 @@ def _create_attn_config(
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
     # ``component()``).
-    profile_linear: str | None = None
+    linear_attn = _linear_attn_component(server_args, model_config, is_draft)
+    if linear_attn is not None:
+        config = dataclasses.replace(
+            config, components=config.components + (linear_attn,)
+        )
+    return config
+
+
+def _linear_attn_component(
+    server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
+) -> LinearAttnConfig | None:
+    """The linear-attention component, or None for a model without one.
+
+    A plugin profile that declares ``linear_attention`` must get it: serving
+    the model through full attention alone would be silently wrong. The
+    in-tree schema is the one linear-config reader today, so the checkpoint
+    config must expose ``linear_layer_ids`` and the geometry fields
+    ``LinearAttnConfig.generate`` reads.
+    """
     if model_config.model_profile is not None:
         profile_linear = model_config.model_profile.linear_attention
-        linear_cls = LinearAttnConfig if profile_linear is not None else None
-    else:
-        architectures = getattr(model_config.hf_config, "architectures", None) or ()
-        linear_cls = next(
-            (_LINEAR_ATTN_CLS[a] for a in architectures if a in _LINEAR_ATTN_CLS),
-            None,
-        )
-    if linear_cls is not None:
-        linear_attn = linear_cls.generate(server_args, model_config, is_draft)
-        if linear_attn is None and profile_linear is not None:
-            # The profile positively declared linear layers; serving the
-            # model through full attention alone would be silently wrong.
-            # The in-tree schema is the one linear-config reader today: a
-            # plugin's checkpoint config must expose ``linear_layer_ids``
-            # and the geometry fields ``LinearAttnConfig.generate`` reads.
+        if profile_linear is None:
+            return None
+        linear_attn = LinearAttnConfig.generate(server_args, model_config, is_draft)
+        if linear_attn is None:
             raise ValueError(
                 f"model profile declares linear_attention={profile_linear!r} "
                 "but the checkpoint config exposes no linear_layer_ids; "
                 "declare the linear geometry LinearAttnConfig reads, or drop "
                 "linear_attention from the profile"
             )
-        if linear_attn is not None:
-            config = dataclasses.replace(
-                config, components=config.components + (linear_attn,)
-            )
-    return config
+        return linear_attn
+    architectures = getattr(model_config.hf_config, "architectures", None) or ()
+    linear_cls = next(
+        (_LINEAR_ATTN_CLS[a] for a in architectures if a in _LINEAR_ATTN_CLS),
+        None,
+    )
+    if linear_cls is None:
+        return None
+    return linear_cls.generate(server_args, model_config, is_draft)
 
 
 def _create_attn_backend(
@@ -1192,6 +1228,38 @@ def _narrow_spec_for_pp(
     )
 
 
+def _validate_mla_dcp_backend(name: str | None, arch: AttentionArch) -> None:
+    backend_cls = _get_backend_cls(name, arch)
+    if not backend_cls.supports_mla_dcp:
+        raise ValueError(
+            f"Attention backend {name or _get_default_backend_name(arch)!r} "
+            "does not support MLA DCP "
+            "(supports_mla_dcp=False)"
+        )
+
+
+def _validate_hybrid_dcp_cache(spec: CachePoolSpec, *, dcp_size: int) -> None:
+    """Validate declared storage, independent of recipe name or inheritance."""
+    groups = spec.cache_group_specs
+    if not any(
+        group.family == "history" and group.retention == "full_history"
+        for group in groups
+    ):
+        raise ValueError("Hybrid MLA DCP requires a full-history cache group")
+    for group in groups:
+        if group.family == "history" and group.retention != "full_history":
+            raise ValueError(
+                f"Hybrid MLA DCP cache group {group.group_id!r} "
+                "must use full-history retention"
+            )
+        expected = dcp_size if group.family == "history" else 1
+        if group.shard_count != expected:
+            raise ValueError(
+                f"Hybrid MLA DCP cache group {group.group_id!r} ({group.family}) "
+                f"requires shard_count={expected}, got {group.shard_count}"
+            )
+
+
 def create_attn_components(
     server_args: ServerArgs,
     model_config: ModelConfig,
@@ -1242,11 +1310,18 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
+    # DeepSeek V4 validates its specialized DCP cache contract in its backend.
+    if (
+        config.dcp_size > 1
+        and not target.is_deepseek_v4
+        and (
+            model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+        )
+    ):
+        _validate_mla_dcp_backend(
+            target_full_attn_backend_name, model_config.attention_arch
+        )
     if config.dcp_size > 1 and target.is_hybrid_linear:
-        if cache_family != "kimi_k3" or target_full_attn_backend_name != "flashmla":
-            raise ValueError(
-                "Hybrid MLA DCP requires the MLA/KDA cache and FlashMLA backend"
-            )
         resolved_softmax = dataclasses.replace(
             softmax_attn, backend_name=target_full_attn_backend_name
         )
@@ -1319,6 +1394,8 @@ def create_attn_components(
         probe_batch_rows=probe_batch_rows,
     )
     spec = cache_setup.spec
+    if config.dcp_size > 1 and target.is_hybrid_linear:
+        _validate_hybrid_dcp_cache(spec, dcp_size=config.dcp_size)
     num_target_cache_layers = cache_setup.num_target_layers
     num_draft_cache_layers = cache_setup.num_draft_layers
     if server_args.mapping.has_pp:

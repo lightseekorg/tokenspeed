@@ -51,8 +51,8 @@ knows and only V4.1 plans from: `extend_replay_lens_cpu` (how many leading
 rows of each extend re-feed already-cached positions — bounded replay,
 `docs/design/scheduler.md`) and `extend_prompt_lens_cpu` (the whole prompt
 length, so the backend can tell a prompt-completing chunk from an open one).
-Leaves never see them: a paged leaf writes every input row unconditionally,
-so the router and every other runner-facing node call
+Leaves never see them: the attention prologue writes every input row
+unconditionally, so the router and every other runner-facing node call
 `reject_bounded_replay` and fail loud on a non-zero replay instead of
 rewriting rows the prefix hit already shares. No default values: the runner
 passes the `[:num_extends]` slices of its input buffers on every call (the
@@ -318,13 +318,37 @@ class-attribute-driven, so every DP rank derives the same answer
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
+### One output layout per forward
+
+Every ForwardContext and grammar completion carries a required, immutable
+ForwardOutputLayout. Ordinary prefill, mixed and decode batches use the same
+contract as compact outputs: each emitting prefill has one output row, and
+each decode has its fixed verify width. Ordinary models emit one row for
+every extend request; a backend that skips incomplete-prefill outputs
+shortens only the emitting prefill prefix. Missing layout is not an execution
+mode.
+
+Sampling parameters, cache progress and acceptance lengths remain indexed by
+the original requests. Logits and token storage use the output layout's
+prefill/decode slices and per-request offsets. Grammar masks retain a fixed
+width per original request: sampling selects the first mask of each emitting
+prefill and the full mask span of each decode. This rule applies equally to
+ordinary mixed batches and batches with zero-output prefills. Grammar
+candidate preparation reads only the decode suffix of the live input buffer.
+
+Graph capture uses the captured batch size in its layout. Replay temporarily
+pairs the padded context with a padded layout, then restores the original
+live layout before output/state processing. Queued grammar completions retain
+their immutable per-step layout, independently of later context updates.
+Idle graph warmup also supplies an explicit layout.
+
 ### Prefill graphs around a row narrowing
 
 A prefill forward whose row count drops once, at a fixed layer, by an amount
 that is not a function of the token bucket cannot be one token-shaped
 breakable graph. DeepSeek-V4.1 is the case: its CED decoder (layer 20 on)
 runs on a per-request tail of the prefill rows (`decoder_view()` — a
-completing prompt's last window, one row for an open chunk, every decode
+completing prompt's last window, no rows for an open chunk, every decode
 row), so the row count at layer 20 depends on which requests complete.
 
 The model declares the split instead of opting out: it implements
@@ -357,6 +381,77 @@ size their collectives from their own rows, which the DP metadata gather
 does not carry (the same gap that keeps narrowing itself unimplemented under
 DP).
 
+### Prefill requests without generated outputs
+
+The original execution batch and cache metadata always contain every request.
+A backend may declare `skips_incomplete_prefill_outputs` only when its model
+still produces all cache state required by later chunks. DeepSeek V4.1 uses
+this after the candidate-source layer writes global KV. Other backends keep
+the original output contract.
+
+The scheduler packs completing prefills first, at most one incomplete prefill
+last among prefills, then decode requests. An immutable `ForwardOutputLayout`
+records E original prefills, P output-bearing prefills, D decode requests and
+verify width K. Completing prefills must form a prefix (validated on the CPU).
+Every forward carries a layout; one with P=E is the identity layout, and the
+executor's fast paths (whole-batch `sample`, whole-batch `verify`) still apply
+to it.
+
+Logits and tokens use P+D*K rows. Accept lengths still use E+D request rows,
+with zero in [P,E). Sample uses the parameter prefix [:P]; verify uses the
+original [E:] suffix, retaining its batch-row coin offset. Grammar masks have
+a separate token axis. Each consumer uses the same token offset:
+`i` for i<P, P for P<=i<E (no storage), and P+(i-E)*K for decode.
+V4.1 explicitly marks selected logits rows so the logits processor never
+re-gathers them using original input indices.
+
+The layout owns host queries for the shared prefill prefix, the original
+decode request suffix, the compact decode output suffix, and each request's
+stored output width. Consumers use these queries instead of deriving the
+same offsets independently. The executor aligns sampling parameters and
+token-indexed grammar masks at the sampler boundary; sampler interfaces and
+result buffers stay unchanged. Grammar owns matcher advancement and rollback,
+and zero accepted lengths already suppress advancement. Existing consumers
+that only need token_offset keep that interface. Models without cropped
+outputs carry the identity layout, under which every slice and offset above
+reduces to the original request-indexed contract.
+
+Completion remains a local comparison in the executor and V4.1 attention
+metadata. Both use the same scheduled prefix, input count (including replay),
+and current prefill target, which may include previously generated tokens
+after re-admission. Contract tests keep those decisions consistent without
+adding state or parameters to the shared metadata initialization interface.
+
+Cache advancement still consumes all input lengths for prefill, independently
+of output lengths. Future input writes, NaN/OOV attribution, grammar advances
+and V4.1 DSpark anchors operate only on output-bearing requests. Grammar keeps
+one queue completion per forward, including zero-output rounds; both deferred
+hostfunc and host fallback consume the frozen layout. A zero-row decoder
+bypasses its graph, normalization, LM head, sampler and draft-context writes;
+the encoder and global KV producer have already executed.
+
+When the decoder view is nonempty, the candidate-source layer retains the
+original full-row mHC and QKV projection shapes, then gathers the selected
+rows. Moving that gather before the projections changes split-K or quantized
+GEMM arithmetic and can change the retained logits. Only an empty decoder
+view bypasses those projections; its global KV producer still runs on all
+encoder rows.
+
+Compute rows and output rows are distinct. When a batch contains a completing
+prefill or a decode, each incomplete prefill retains its original single
+decoder compute row. Removing that row changes quantized attention and MoE
+batch shapes and can alter other requests' logits even with identical input
+tokens and chunk boundaries. The retained row is omitted from `logits_rows`,
+so it still has no sampled token. Batches containing only incomplete prefills
+keep zero decoder rows and skip the entire decoder consumer stack. This
+preserves the optimization on cache-only rounds without changing the numerical
+shape of rounds that produce outputs.
+
+Final prefill windows, bootstrap tokens and PD candidate/cache handoff remain
+unchanged. V4.1 PD still requires layerwise transfer interval zero. This does
+not enable a cache-only prefill role or reduce resident model weights. PP and
+attention-DP narrowing retain their existing restrictions.
+
 ### One draft metadata contract
 
 The draft backend's decode metadata comes from `refresh_decode_metadata` and
@@ -382,6 +477,12 @@ seq-lens-only: Eagle's step-0 accepted-prefix publish fires
 the verify-shaped write window, so the write-window publication is a
 separate, explicit drafter-loop call (`publish_draft_step_locations`, see
 "Write locations have one owner").
+
+Backends with sharded KV must refresh derived local visibility in the same
+draft length-update hook as the global lengths. While page allocation and
+request order stay unchanged, they reuse the compact tables and ownership
+prefixes from the full refresh and update local visibility in place. Eager
+execution and CUDA graph replay use the same hooks and persistent buffers.
 
 **Step 0 narrows rows; the drafter owns the lengths, the model names the
 moment.** Eagle's step 0 runs over the target's verify window (`N` rows per
@@ -580,8 +681,8 @@ Draft views have no GDN or PLE child. PLE and QSA remain available on targets
 without linear-attention layers; the model retains their computation order.
 
 QSA's full-KV attention uses the ordinary router and an MHA-derived leaf.
-The leaf reuses MHA's KV writer; already-quantized FP8 inputs retain direct
-stores to avoid rescaling. Sparse attention has no MXFP8 block-scale input.
+The attention prologue writes its KV like any MHA layer's. Sparse attention
+has no MXFP8 block-scale input.
 Its compressed and recent cache groups belong to `QSAIndexerBackend`, not
 to extra attention leaves. The indexer backend refreshes stable raw group
 tables with the shared `GroupTableStacks` fill at expansion ratio one:
@@ -613,8 +714,8 @@ across layouts. Graph replay is compared with eager execution of the same
 layout so metadata-refresh checks do not depend on cross-layout rounding.
 
 Qwen4-Exp attention callers pass `topk_indices` explicitly, using `None` for
-dense attention. Sparse QSA requires `save_kv_cache=True` because it always
-writes the full KV cache; the dense fallback honors the caller's flag.
+dense attention. The prologue has written the full KV cache before either
+path runs.
 Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
@@ -758,17 +859,21 @@ leaves ignore it; it carries no table or page vocabulary.
 
 `write_locations(layer, forward_mode)` on the top-level backend is the ONLY
 accessor for KV write slots — models, drafters and the runner neither
-compute nor thread location vectors. `PagedAttention.forward`,
-`AttentionBackend.forward`, `model_runner.forward` and every model forward
-chain carry no `out_cache_loc` parameter; `InputBuffers` has no location
-buffer; `fill_input_buffers` takes no table.
+compute nor thread location vectors. `forward_write_locations(layer,
+forward_mode)` derives from it the slots the attention prologue writes: the
+mode's `write_locations`, with the decode window appended for a draft's first
+step over a MIXED round (`docs/design/attention-prologue.md`).
+`PagedAttention.forward`, `AttentionBackend.forward`, `model_runner.forward`
+and the model forward chains above the attention layers carry no
+`out_cache_loc` parameter; `InputBuffers` has no location buffer;
+`fill_input_buffers` takes no table.
 
 * **Extend**: `init_forward_metadata` computes each group's span over the
   stacks (`[sum(extend_seq_lens)]`, request-major); `write_locations(layer,
   EXTEND)` returns exactly that span.
 * **Decode / verify**: `refresh_decode_metadata` publishes the token-major
   `[bs * N]` window views (`decode_write_locations`, pointer-stable per
-  bs — the graph records them through the leaves' KV writes, and the
+  bs — the graph records them through the prologue's KV writes, and the
   pointer guard walks this slot). A MIXED round's draft refresh sets
   `_decode_request_offset = num_extends` so DECODE reads skip the extend
   requests.
@@ -788,16 +893,14 @@ buffer; `fill_input_buffers` takes no table.
   windows; DFLASH reads the TARGET router's windows through them to copy
   target-aligned KV into the draft cache (the pools share one page-id
   space).
-* **Model-side direct writes** (fused RoPE prewrite, MLA latent
-  `set_mla_kv_buffer`, V4 group writes, QSA) fetch
-  `ctx.attn_backend.write_locations(layer, mode)` immediately before the
-  write. A model path that writes multiple mode windows in one shot (the
-  MLA draft's step-0 whole-batch write) concatenates the EXTEND span and the
-  DECODE window — eager-only, MIXED rounds never run under a captured
-  graph. The router performs the same composition when a draft step-0
-  forward locally dispatches as DECODE while retaining the round's full K/V
-  rows; target MIXED decode halves and later draft steps keep their ordinary
-  decode-only windows. V4 composes the shared token-shaped resolve
+* **Writes outside the backend** (the attention prologue, V4 group writes)
+  fetch their slots immediately before the write. When a draft step-0
+  forward over a MIXED round writes the round's full K/V rows, dispatched as
+  MIXED or as DECODE (the MLA draft's whole-batch write, a GQA draft's
+  narrowed first step), `forward_write_locations` concatenates the EXTEND
+  span and the DECODE window — eager-only, MIXED rounds never run under a
+  captured graph. Target MIXED decode halves and later draft steps keep their
+  ordinary decode-only windows. V4 composes the shared token-shaped resolve
   (`page_table.group_slot_mapping_from_raw`) over its own group tables; a
   degraded mapping fails closed to `-1` (skipped write), never to a raw
   fallback vector.
@@ -886,13 +989,16 @@ consume the target's capture configuration; they do not change the tap
 selection or output layout.
 
 The reverse direction rides on the context as well: a target that captures
-its taps on a row subset reports it as `ctx.captured_rows`
-(`CapturedRows(positions, prefill_spans)`). V4.1's CED narrowing is the one
-producer — its taps sit in layers 37–39 and hold one row per open chunk and
-the last window of every completing one, so DSpark's prefill seeding
-(`_seed_prefill_windows`) reads the spans and positions from there instead
-of the input-length mirror. A target with one captured row per input row
-leaves it `None`, and the drafter keeps its buffer-based layout.
+its taps on a row subset reports it as ctx.captured_rows
+(CapturedRows(positions, prefill_spans)). V4.1's CED narrowing is the one
+producer: its taps in layers 37–39 contain no rows for incomplete prefill
+chunks, the last window of each completing prefill, and all decode rows.
+The reported prefill spans retain a zero-length entry for each incomplete
+request, preserving the original request order. DSpark's prefill seeding
+(_seed_prefill_windows) reads these spans and positions instead of the
+input-length mirror and skips zero-length spans. A target with one captured
+row per input row leaves ctx.captured_rows as None, and the drafter keeps
+its buffer-based layout.
 
 ## Shared prefill convolution preparation
 

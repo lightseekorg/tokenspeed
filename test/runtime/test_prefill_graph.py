@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -152,6 +153,7 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             disable_cuda_graph_padding=False,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
+            autotune_cache_key=None,
             prefill_only=False,
         )
         with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
@@ -330,44 +332,6 @@ class SliceMhaExtendInputsTest(unittest.TestCase):
         metadata = SimpleNamespace(cu_extend_seq_lens_cpu=[0, 4])
         q = self.torch.zeros(4, 2, 8)
         self.assertIs(self.slice_inputs(metadata, q, None, None)[0], q)
-
-
-class TrimKvToLocsTest(unittest.TestCase):
-    """mha.trim_kv_to_locs slices padded k/v tails to the write-loc count --
-    the shared fix point every leaf's KV write calls (mha, msa, trtllm).
-    Trimming (not loc-padding) keeps the null page 0 all-zero: trtllm does
-    not scrub padded tail rows before saving KV."""
-
-    def setUp(self):
-        try:
-            import torch
-
-            from tokenspeed.runtime.layers.attention.backends.paged.mha import (
-                trim_kv_to_locs,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
-        self.torch = torch
-        self.trim = trim_kv_to_locs
-
-    def test_padded_tail_trimmed(self):
-        k = self.torch.zeros(16, 2, 8)
-        v = self.torch.zeros(16, 2, 8)
-        locs = self.torch.zeros(5, dtype=self.torch.int32)
-        k2, v2 = self.trim(locs, k, v)
-        self.assertEqual((k2.shape[0], v2.shape[0]), (5, 5))
-
-    def test_equal_rows_identity(self):
-        k = self.torch.zeros(16, 2, 8)
-        v = self.torch.zeros(16, 2, 8)
-        locs = self.torch.zeros(16, dtype=self.torch.int32)
-        k2, v2 = self.trim(locs, k, v)
-        self.assertIs(k2, k)
-        self.assertIs(v2, v)
-
-    def test_none_kv_passthrough(self):
-        locs = self.torch.zeros(4, dtype=self.torch.int32)
-        self.assertEqual(self.trim(locs, None, None), (None, None))
 
 
 class DummyGroupTablesTest(unittest.TestCase):
@@ -577,6 +541,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             ],
             max_bs=1,
             max_tokens_per_req=1,
+            max_extend_tokens=0,
             device="cpu",
         )
         stacks.fill(1, 1, dict(tables))
@@ -606,6 +571,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             ],
             max_bs=1,
             max_tokens_per_req=1,
+            max_extend_tokens=0,
             device="cpu",
         )
         stacks.fill(1, 1, dict(tables))
@@ -1159,6 +1125,7 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
             token_to_kv_pool=None,
             bs=1,
             num_extends=1,
+            output_layout=ForwardOutputLayout(1, 1, 0, 1),
             input_num_tokens=num_tokens,
             forward_mode=ForwardMode.EXTEND,
         )
@@ -1219,34 +1186,15 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
 
 
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
-    """trtllm under the prefill graph: the extend prewrite must not bake
-    capture-time write locs into the graph, and the break's KV write must
-    trim padded tails like mha."""
+    """trtllm leaves reach the prefill graph through the cache-group router."""
 
     def setUp(self):
         try:
-            import torch
-
-            from tokenspeed.runtime.layers.attention.backends.paged import trtllm
+            from tokenspeed.runtime.layers.attention.backends.paged import (  # noqa: F401
+                trtllm,
+            )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
-        self.torch = torch
-        self.mod = trtllm
-
-    def _bare_backend(self):
-        b = self.mod.TRTLLMMHAAttnBackend.__new__(self.mod.TRTLLMMHAAttnBackend)
-        b.kv_cache_dtype = self.torch.bfloat16
-        return b
-
-    def test_prewrite_disabled_during_breakable_capture(self):
-        from unittest import mock
-
-        b = self._bare_backend()
-        self.assertTrue(b.support_kv_cache_prewrite(None))
-        with mock.patch.object(
-            self.mod, "is_breakable_capture_active", return_value=True
-        ):
-            self.assertFalse(b.support_kv_cache_prewrite(None))
 
     def test_router_declares_history_contract_family(self):
         # The family claim moved off the leaves: the runner-facing node in
@@ -1298,6 +1246,7 @@ class PrefillRoleGraphsTest(unittest.TestCase):
             disable_cuda_graph_padding=False,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
+            autotune_cache_key=None,
             prefill_only=prefill_only,
             prefill_graph_capture_batch_sizes=None,
             prefill_graph_max_tokens=256,
