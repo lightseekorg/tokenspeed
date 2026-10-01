@@ -1606,6 +1606,8 @@ class KimiLinearMoE(nn.Module):
         self.config = config
         self.mapping = mapping
         self.comm: K3MoeTailComm | None = None
+        # Decoder layers inspect this even when attention DP skips native setup.
+        self.native_latent_moe: LatentMoELayer | None = None
         if mapping.attn.dp_size > 1:
             if not (mapping.attn.dp_size == mapping.moe.ep_size == mapping.world_size):
                 raise ValueError(
