@@ -116,6 +116,7 @@ class AttnResTests(unittest.TestCase):
                 partial,
                 prefix,
                 combine,
+                producer_direct=False,
                 mlp_wp=mlp_wp,
             )
 
@@ -168,6 +169,7 @@ class AttnResTests(unittest.TestCase):
                 partial,
                 prefix,
                 combine,
+                producer_direct=False,
                 mlp_wp=torch.randn(_HIDDEN, dtype=torch.bfloat16),
             )
 
@@ -424,6 +426,9 @@ class AttnResTests(unittest.TestCase):
 
                 with (
                     mock.patch.object(kimi_k3, "_apply_attn_res", apply_attn_res),
+                    mock.patch.object(
+                        layer.k3_comm, "acquire_projection_output", return_value=None
+                    ),
                     mock.patch.object(kimi_k3_comm, "all_reduce", reduce_attention),
                 ):
                     result, actual_blocks = (
@@ -458,11 +463,14 @@ class AttnResTests(unittest.TestCase):
                     self.assertIs(post[2], reduced)
                     torch.testing.assert_close(result, original_prefix + reduced + 5)
 
-    def test_prefill_mixer_passes_an_explicit_residual_shard_to_moe(self):
+    def test_mixer_passes_an_explicit_residual_shard_to_moe(self):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
-        for writes_block in (False, True):
-            with self.subTest(writes_block=writes_block):
+        for writes_block, mode in (
+            (False, ForwardMode.DECODE),
+            (True, ForwardMode.MIXED),
+        ):
+            with self.subTest(writes_block=writes_block, mode=mode):
                 hidden = torch.empty((4096, 7168), dtype=torch.bfloat16, device="meta")
                 history = torch.empty(
                     (5, 4096, 7168), dtype=torch.bfloat16, device="meta"
@@ -475,9 +483,9 @@ class AttnResTests(unittest.TestCase):
                 moe = mock.Mock(spec=kimi_k3.KimiLinearMoE, return_value=output)
                 moe.native_latent_moe = None
                 comm = SimpleNamespace(
-                    acquire_prefill_projection_output=mock.Mock(return_value=partial),
-                    prefill_mix_for_moe=mock.Mock(return_value=(shard, normalized)),
-                    prefill_reduce_for_attnres=mock.Mock(
+                    acquire_projection_output=mock.Mock(return_value=partial),
+                    mix_for_moe=mock.Mock(return_value=(shard, normalized)),
+                    reduce_for_attnres=mock.Mock(
                         side_effect=AssertionError("mixed twice")
                     ),
                 )
@@ -499,7 +507,7 @@ class AttnResTests(unittest.TestCase):
                     comm_manager=SimpleNamespace(get_num_tokens=lambda _: (4096, 4096)),
                     _prepare_next_fallback_attnres_partial=mock.Mock(),
                 )
-                ctx = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+                ctx = SimpleNamespace(forward_mode=mode)
                 with mock.patch.object(
                     kimi_k3, "_apply_attn_res", return_value=hidden
                 ) as pre_mix:
@@ -511,17 +519,12 @@ class AttnResTests(unittest.TestCase):
                 self.assertIs(actual, output)
                 self.assertIs(actual_history, history)
                 self.assertEqual(pre_mix.call_count, 1)
-                self.assertTrue(
-                    comm.acquire_prefill_projection_output.call_args.kwargs[
-                        "sharded_moe_supported"
-                    ]
-                )
                 self.assertIs(
-                    comm.prefill_mix_for_moe.call_args.args[1],
+                    comm.mix_for_moe.call_args.args[1],
                     None if writes_block else hidden,
                 )
                 self.assertEqual(
-                    comm.prefill_mix_for_moe.call_args.kwargs["num_valid_blocks"],
+                    comm.mix_for_moe.call_args.kwargs["num_valid_blocks"],
                     4 + int(writes_block),
                 )
                 self.assertEqual(moe.call_count, 1)
@@ -685,6 +688,7 @@ class AttnResTests(unittest.TestCase):
             comm_manager=object(),
             k3_comm=SimpleNamespace(
                 attn_ar_fusion_ok=False,
+                acquire_projection_output=mock.Mock(return_value=None),
                 fused_attnres_reduce_available=mock.Mock(return_value=True),
             ),
             attn_fork=fork,
