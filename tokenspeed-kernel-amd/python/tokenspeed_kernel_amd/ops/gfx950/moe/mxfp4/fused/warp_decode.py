@@ -277,7 +277,8 @@ def _gluon_mxfp4_fp8_warp_decode_moe(
             out_partial, out, n_tokens, N,
             out_partial.stride(1), out_partial.stride(0), out_partial.stride(2),
             out.stride(0), out.stride(1),
-            BLOCK_M=1, BLOCK_N=R_BLOCK_N, TOP_K=s2_split_k, num_warps=1,
+            BLOCK_M=1, BLOCK_N=R_BLOCK_N, TOP_K=s2_split_k,
+            MASK_INVALID_ROUTES=False, num_warps=1,
         )
         # fmt: on
     return out

@@ -221,9 +221,6 @@ def gluon_mxfp4_fp8_precomputed_situ(
 
     ``expert_start`` and ``global_num_experts`` describe a contiguous local EP
     shard. Global top-k IDs outside that shard contribute zero to this rank.
-    The expert-sorted decode tiles (EP1 only) drop routes whose ID names no
-    expert, leaving their output undefined, so callers must pass valid expert
-    IDs there; Kimi K3's router always does.
     """
     if (
         hidden_states.ndim != 2
@@ -554,6 +551,14 @@ def gluon_mxfp4_fp8_precomputed_situ(
             BLOCK_M=1,
             BLOCK_N=reduce_block_n,
             TOP_K=TOPK,
+            # The sort drops routes that name no local expert, leaving their
+            # partial rows unwritten.
+            MASK_INVALID_ROUTES=True,
+            route_ids_ptr=topk_ids,
+            stride_rt=topk_ids.stride(0),
+            stride_rs=topk_ids.stride(1),
+            expert_start=expert_start,
+            num_experts=num_local_experts,
             num_warps=1,
         )
         return out
@@ -661,7 +666,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
                 "SHARED_BLOCK_N": shared_block_n,
             }
             if fuse_shared_down
-            else {"BLOCK_M": 1, "TOP_K": TOPK}
+            else {"BLOCK_M": 1, "TOP_K": TOPK, "MASK_INVALID_ROUTES": False}
         ),
         num_warps=1,
     )

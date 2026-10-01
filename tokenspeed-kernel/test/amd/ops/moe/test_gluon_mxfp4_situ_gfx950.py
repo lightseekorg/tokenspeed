@@ -987,9 +987,21 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     torch.testing.assert_close(captured, eager, atol=3e-4, rtol=3e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 32, 64])
+@pytest.mark.parametrize(
+    ("num_tokens", "invalid_routes"),
+    [
+        (1, False),
+        (2, False),
+        (4, False),
+        (32, False),
+        (64, False),
+        (32, True),
+        (64, True),
+    ],
+)
 def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
     num_tokens: int,
+    invalid_routes: bool,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260818 + num_tokens)
     num_experts, latent_size, intermediate_size, top_k = 16, 3584, 384, 16
@@ -1008,6 +1020,10 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         generator=generator,
     )
     topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+    if invalid_routes:
+        # Routes that name no expert contribute zero, including on the
+        # expert-sorted path, whose sort drops them.
+        topk_ids.view(-1)[::7] = -1
     router_logits = torch.zeros(
         (num_tokens, num_experts), dtype=torch.float32, device="cuda"
     )
@@ -2085,6 +2101,7 @@ def test_situ_warp_decode_matches_reference_above_old_bound_gfx950(
         (8192, 16, 3584, 1),
     ],
 )
+@pytest.mark.parametrize("mask_invalid_routes", [False, True])
 def test_partial_reduce_matches_reference_gfx950(
     num_tokens: int,
     topk: int,
@@ -2092,6 +2109,7 @@ def test_partial_reduce_matches_reference_gfx950(
     column_stride: int,
     partial_dtype: torch.dtype,
     split_major: bool,
+    mask_invalid_routes: bool,
 ) -> None:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
         gluon_mxfp4_moe_stage2_reduce_kernel,
@@ -2107,9 +2125,25 @@ def test_partial_reduce_matches_reference_gfx950(
     if split_major:
         partials = partials.transpose(0, 1).contiguous().transpose(0, 1)
     partials = partials[:, :, ::column_stride]
+    num_experts = 4
+    route_ids = (
+        torch.arange(num_tokens * topk, dtype=torch.int32, device="cuda").view(
+            num_tokens, topk
+        )
+        % num_experts
+    )
+    if mask_invalid_routes:
+        route_ids.view(-1)[::3] = -1
+        route_ids.view(-1)[1::5] = num_experts
+        # A producer never writes these rows; reading one would yield NaN.
+        partials[(route_ids < 0) | (route_ids >= num_experts)] = float("nan")
+    valid = (route_ids >= 0) & (route_ids < num_experts)
     expected = torch.zeros((num_tokens, width), dtype=torch.float32, device="cuda")
     for slot in range(topk):
-        expected += partials[:, slot].float()
+        rows = partials[:, slot].float()
+        if mask_invalid_routes:
+            rows = torch.where(valid[:, slot, None], rows, 0.0)
+        expected += rows
     expected = expected.to(torch.bfloat16)
     actual = torch.empty(
         (num_tokens, width * column_stride), dtype=torch.bfloat16, device="cuda"
@@ -2128,6 +2162,12 @@ def test_partial_reduce_matches_reference_gfx950(
         BLOCK_N=256,
         BLOCK_M=1,
         TOP_K=topk,
+        MASK_INVALID_ROUTES=mask_invalid_routes,
+        route_ids_ptr=route_ids,
+        stride_rt=route_ids.stride(0),
+        stride_rs=route_ids.stride(1),
+        expert_start=0,
+        num_experts=num_experts,
         num_warps=1,
     )
 
