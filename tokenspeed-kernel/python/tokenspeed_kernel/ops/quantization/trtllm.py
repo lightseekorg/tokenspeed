@@ -60,7 +60,9 @@ if platform.is_nvidia:
     ) -> None:
         q, s = torch.ops.tensorrt_llm.quantize_e4m3_activation(input)
         output.copy_(q)
-        scale.copy_(s.float().squeeze(-1))
+        # One scale per token, in the caller's buffer shape: [M] for
+        # quantize_fp8_with_scale, [M, 1] for fp8_utils.per_token_quant_fp8.
+        scale.copy_(s.float().reshape(scale.shape))
 
     def trtllm_fp8_token_group_128(x: torch.Tensor) -> torch.Tensor:
         qweight, _scale = _per_token_group_quant_8bit(
