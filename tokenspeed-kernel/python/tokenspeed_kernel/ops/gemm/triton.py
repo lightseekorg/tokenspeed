@@ -1279,10 +1279,12 @@ def triton_mm_mxfp4(
     "mm",
     name="triton_mm_fp8_scaled",
     solution="triton",
-    # NVIDIA sm100+ and AMD gfx950+: no NVIDIA arch lies between 9.0 and 10.0.
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
         vendors=frozenset({"nvidia", "amd"}),
+        vendor_min_arch_versions={
+            "nvidia": ArchVersion(10, 0),
+            "amd": ArchVersion(9, 5),
+        },
     ),
     signatures=_FP8_SCALED_FORMAT_SIGNATURES,
     traits={
