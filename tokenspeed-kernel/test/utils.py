@@ -26,6 +26,7 @@ from typing import Any
 from unittest.mock import patch
 
 import torch
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -69,6 +70,17 @@ def is_cdna4() -> bool:
 def is_cdna5() -> bool:
     platform = detected_platform()
     return platform is not None and platform.is_cdna5
+
+
+def kernel_supported(name: str) -> bool:
+    """Whether the registered kernel ``name`` can run on the detected device."""
+    platform = detected_platform()
+    spec = KernelRegistry.get().get_by_name(name)
+    return (
+        platform is not None
+        and spec is not None
+        and spec.capability.satisfied_by(platform)
+    )
 
 
 @contextmanager
@@ -155,6 +167,22 @@ def make_mxfp4_moe_weights(
         ),
         "w2_scale": scales(num_experts, hidden_size, intermediate_size // 32),
     }
+
+
+def make_fp8_per_channel_gemm_operands(m: int, n: int, k: int, seed: int):
+    """Per-token FP8 activations and per-channel FP8 weights for ``A @ B.T``.
+
+    Returns ``(a, a_scales, b, b_scales)``: ``a`` is ``[m, k]`` E4M3 with FP32
+    ``[m, 1]`` scales and ``b`` is ``[n, k]`` E4M3 with FP32 ``[n, 1]`` scales.
+    The weights are scaled so outputs have roughly unit variance.
+    """
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, generator=generator)
+    b = torch.randn(n, k, device="cuda", generator=generator) / k**0.5
+    b_scales = b.abs().amax(dim=1, keepdim=True) / 448.0
+    b_fp8 = (b / b_scales).to(torch.float8_e4m3fn)
+    a_fp8, a_scales = quantize_fp8(a, granularity="token")
+    return a_fp8, a_scales, b_fp8, b_scales
 
 
 def make_round_robin_topk(

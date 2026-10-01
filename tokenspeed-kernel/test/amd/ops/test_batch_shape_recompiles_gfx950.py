@@ -186,7 +186,13 @@ def test_mxfp4_moe_sorting_route_count():
         weights = torch.rand(tokens, topk, device=DEVICE, generator=generator)
         sorted_ids, sorted_weights, block_experts, valid, _ = (
             moe_sorting.gluon_moe_sorting(
-                ids, weights, experts, 128, torch.bfloat16, block
+                ids,
+                weights,
+                experts,
+                128,
+                torch.bfloat16,
+                block,
+                compact_route_programs=False,
             )
         )
         assert int(valid[1]) == tokens

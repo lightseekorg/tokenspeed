@@ -1,4 +1,4 @@
-name: Run PR Test Stage
+name: Run CI Task Matrix
 
 on:
   workflow_call:

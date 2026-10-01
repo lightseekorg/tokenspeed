@@ -36,7 +36,7 @@ Every task declares one `workflow_stage`:
 - `kernel-benchmark` for registration-level kernel performance tests
 - `model-test` for model evaluation and performance tests
 
-The NVIDIA PR workflows run unit tests before model tests. The normal AMD flow
+The NVIDIA B200 Tests workflow runs unit tests before model tests. The normal AMD flow
 runs unit tests, then kernel benchmarks, then model tests. Matrix entries within
 each stage run in parallel. A stage with no matching tasks is treated as
 successfully satisfied.
@@ -132,10 +132,10 @@ map that to GitHub Actions `continue-on-error`.
 # whole task can fail without blocking the workflow
 optional: true
 
-# only the MI355 bench entry is non-blocking; the MI350 entry of the same
-# task still blocks on failure
+# only the MI35x 1-GPU entry is non-blocking; other entries of the same
+# task still block on failure
 optional:
-  amd-mi355-1gpu-bench: true
+  amd-mi35x-1gpu-test: true
 ```
 
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
@@ -240,9 +240,9 @@ The CI system derives `SM` from common runner label prefixes by default:
 `sm103`. Use `runner.env.<label>` only for environment variables that should
 override or extend the defaults for a single runner label.
 
-PR workflows split runner labels by vendor and host architecture. `PR Test
-NVIDIA` uses the `nvidia-x86` runner group, while `PR Test NVIDIA ARM` uses
-the `nvidia-arm` runner group. GB300 is classified as NVIDIA ARM, but is not
+PR workflows split runner labels by vendor and host architecture. `NVIDIA
+B200 Tests` uses the `nvidia-x86` runner group, while the disabled `PR Test
+NVIDIA ARM` workflow uses the `nvidia-arm` runner group. GB300 is classified as NVIDIA ARM, but is not
 declared in task YAMLs and therefore does not enter default CI matrices.
 
 ### Vendor path filtering
@@ -288,23 +288,23 @@ the top level rather than in either vendor subtree.
 ## Registration-Level Kernel Benchmarks
 
 The `kernel-benchmark-amd-gfx950` performance task compares exact kernel
-registrations between two revisions. `PR Test AMD` discovers it as a dedicated
+registrations between two revisions. `AMD Tests` discovers it as a dedicated
 `kernel-benchmark` stage. In the normal flow, it runs after unit tests and must
 succeed before model tests can start. The high-priority model path remains eager
 and does not wait for either stage. All stages contribute to the workflow's final
 status.
 
 Pull request runs compare the pull request's merge base with its head commit.
-Main-branch pushes compare the previous and new commits. A manual `PR Test AMD`
+Main-branch pushes compare the previous and new commits. A manual `AMD Tests`
 run uses its selected commit for both sides as a runner smoke test. For a
 meaningful manual comparison, use `K8s Dispatch`: selecting a pull request uses
 its target and head revisions, while selecting a commit compares it with the
 latest `main`. Both revisions always execute serially in one task allocation.
 
-The task requests the `amd-mi355-1gpu-bench` runner pool and exposes logical
-device 0. Each allocation must provide one exclusive `gfx950` GPU, working ROCm
-device permissions, Git, Bash, Python virtual-environment support, sufficient
-temporary storage, and access to the configured package indexes. The normal AMD
+The task requests the ci-infra-managed `amd-mi35x-1gpu-test` runner pool and
+exposes logical device 0. Each allocation must provide one `gfx950` GPU,
+working ROCm device permissions, Git, Bash, Python virtual-environment support,
+sufficient temporary storage, and access to the configured package indexes. The normal AMD
 task executor provides runner cleanup and setup before invoking the benchmark.
 
 The coordinator creates independent worktrees and Python environments inside
@@ -319,7 +319,7 @@ infrastructure failures fail the task.
 
 The shared task executor uploads the task result and the benchmark's published
 comparison in one Actions artifact. A separate `AMD Kernel Benchmark PR
-Comment` workflow runs trusted code from the default branch after `PR Test AMD`
+Comment` workflow runs trusted code from the default branch after `AMD Tests`
 finishes. It validates the untrusted artifact and exact source revision before
 creating or replacing one bot-owned comment, including for fork runs whose
 completion event omits the pull request association and for runs that finish
@@ -506,7 +506,7 @@ hardware. A selected YAML follows the same rule; YAMLs that already declare a
 `slurm-dispatch-gb300` coordinators form one shared pool for manual, nightly,
 and per-commit submissions.
 
-The `GB200` workflow runs single-node `slurm-gb200-*`
+The `NVIDIA GB200 Tests` workflow runs single-node `slurm-gb200-*`
 tasks through the `slurm-dispatch` coordinator. Qwen four-GPU tasks migrated
 from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation, 35B FP8
 DeepEP GSM8K evaluation, and 122B EPD OCRBench evaluation and unit test.
@@ -523,7 +523,7 @@ the approved-PR and latest-main retry workflows also cover this workflow.
 Its default `eval,perf` selection covers the three migrated evaluations;
 select `ut` explicitly to include the EPD unit test.
 
-The `GB300` workflow selects only multi-node model tasks with
+The `NVIDIA GB300 Tests` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
 `slurm-dispatch-gb300` coordinator pool used by manual dispatch. It runs for
 pushes to `main` and for non-draft pull requests whose head branch belongs to
@@ -541,13 +541,13 @@ cannot filter the multi-node matrix here. During this workflow's
 bootstrap only, leave the switch unset; after dispatcher support reaches
 `main`, set it to `true` and re-run the merge commit's workflow.
 
-`Retry Failed Latest Main CI` also covers `GB300`. Its hourly
+`Retry Failed Latest Main CI` also covers `NVIDIA GB300 Tests`. Its hourly
 or manual scan retries failed jobs from completed, failed push runs on the
 latest `main` commit, using the original run and commit. The retry workflow
 stops after three total attempts (the original plus two retries); older
 commits are skipped.
 
-The `GB300 Slurm Nightly` workflow runs every day at 18:17 UTC and can also be
+The `NVIDIA GB300 Nightly Tests` workflow runs every day at 18:17 UTC and can also be
 started manually from `main`. It selects only multi-node model tests with the
 `nightly` trigger, then restricts the generated matrix to `slurm-gb300-*`
 runners before submitting through the GB300 coordinator pool. The runner filter

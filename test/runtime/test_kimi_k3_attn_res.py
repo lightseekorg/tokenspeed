@@ -1056,6 +1056,7 @@ class KimiKDAMergedProjTests(unittest.TestCase):
                 head_dim=head_dim,
                 tp_rank=rank,
                 tp_size=tp,
+                fp8_channel_quant=False,
             )
             for sid, w in ws.items():
                 m.weight.weight_loader(m.weight, w, sid)
@@ -1088,7 +1089,13 @@ class KimiKDAMergedProjTests(unittest.TestCase):
 
     def test_decode_single_row_slice_is_zero_copy(self):
         m = kimi_k3.KimiKDAMergedProj(
-            hidden_size=8, proj=8, num_heads=2, head_dim=4, tp_rank=0, tp_size=1
+            hidden_size=8,
+            proj=8,
+            num_heads=2,
+            head_dim=4,
+            tp_rank=0,
+            tp_size=1,
+            fp8_channel_quant=False,
         )
         torch.nn.init.normal_(m.weight)
         mixed, gate, _, _ = m(torch.randn(1, 8, dtype=torch.bfloat16))
