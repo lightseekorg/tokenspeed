@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from unittest import mock
 
@@ -32,17 +33,23 @@ from tokenspeed_kernel.selection import (
     AutotuneParams,
     NoKernelFoundError,
     ScoreBreakdown,
+    SelectionEvent,
     SelectionOracle,
     SelectionPolicy,
     SelectionStrategy,
     _filter_by_traits,
+    _listeners,
     _make_cache_key,
     _rank,
     _score,
     _score_priority,
+    _witnessed_overrides,
+    add_selection_listener,
     explain_selection,
     kernel_override,
+    override_env_key,
     register_oracle,
+    remove_selection_listener,
     select_kernel,
     set_selection_policy,
     spec_matches_shape_traits,
@@ -970,6 +977,287 @@ class TestExplainSelection:
             platform=h100_platform,
         )
         assert "0 matched" in explanation
+
+
+@pytest.fixture
+def selection_witness_state():
+    """Leave no listener or override-witness state behind for later tests."""
+    saved_listeners = list(_listeners)
+    _witnessed_overrides.clear()
+    yield
+    _listeners[:] = saved_listeners
+    _witnessed_overrides.clear()
+
+
+def _select_attention_decode(platform: PlatformInfo):
+    return select_kernel("attention", "decode", ATTN_DECODE_BF16, platform=platform)
+
+
+class TestSelectionListener:
+    def test_ranked_then_cache_hit_events(
+        self, sample_specs, h100_platform, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        events: list[SelectionEvent] = []
+        add_selection_listener(events.append)
+
+        first = _select_attention_decode(h100_platform)
+        second = _select_attention_decode(h100_platform)
+
+        assert second is first
+        assert [(e.source, e.kernel_name, e.override) for e in events] == [
+            ("ranked", first.name, None),
+            ("cache", first.name, None),
+        ]
+        assert events[0].family == "attention"
+        assert events[0].mode == "decode"
+        assert events[0].format_signature == ATTN_DECODE_BF16
+        assert events[0].platform_arch == h100_platform.arch
+
+    def test_override_fires_on_every_call(
+        self, sample_specs, h100_platform, selection_witness_state
+    ):
+        """The override path is uncached, so a listener registered around a
+        code region sees one event per dispatch there, not one per process."""
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        events: list[SelectionEvent] = []
+        add_selection_listener(events.append)
+
+        with kernel_override("attention", "decode", "reference_decode"):
+            for _ in range(3):
+                assert _select_attention_decode(h100_platform)() == "reference_decode"
+        assert [(e.source, e.kernel_name, e.override) for e in events] == [
+            ("override", "reference_decode", "reference_decode")
+        ] * 3
+
+        events.clear()
+        with mock.patch.dict(
+            os.environ, {"TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE": "triton"}
+        ):
+            assert _select_attention_decode(h100_platform)() == "triton_decode"
+        # A solution-string target reports the resolved kernel and the target.
+        assert [(e.source, e.kernel_name, e.override) for e in events] == [
+            ("override", "triton_decode", "triton")
+        ]
+
+    def test_explicit_override_argument_fires(
+        self, sample_specs, h100_platform, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        events: list[SelectionEvent] = []
+        add_selection_listener(events.append)
+
+        select_kernel(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            override="reference_decode",
+        )
+        assert [(e.source, e.kernel_name, e.override) for e in events] == [
+            ("override", "reference_decode", "reference_decode")
+        ]
+
+    def test_remove_listener_stops_events(
+        self, sample_specs, h100_platform, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        events: list[SelectionEvent] = []
+        add_selection_listener(events.append)
+        add_selection_listener(events.append)  # second add is a no-op
+        _select_attention_decode(h100_platform)
+        assert len(events) == 1
+
+        remove_selection_listener(events.append)
+        remove_selection_listener(events.append)  # unknown listener is ignored
+        _select_attention_decode(h100_platform)
+        with kernel_override("attention", "decode", "reference_decode"):
+            _select_attention_decode(h100_platform)
+        assert len(events) == 1
+
+    def test_listener_may_remove_itself(
+        self, sample_specs, h100_platform, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        events: list[SelectionEvent] = []
+
+        def once(event: SelectionEvent) -> None:
+            remove_selection_listener(once)
+            events.append(event)
+
+        add_selection_listener(once)
+        add_selection_listener(events.append)
+        _select_attention_decode(h100_platform)
+        _select_attention_decode(h100_platform)
+        # The listener after the one that removed itself still sees the event.
+        assert [e.source for e in events] == ["ranked", "ranked", "cache"]
+
+
+class TestOverrideWitnessLogging:
+    def test_override_logged_once_per_kernel_name(
+        self, sample_specs, h100_platform, caplog, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        with (
+            mock.patch.dict(os.environ, {"TOKENSPEED_KERNEL_VERBOSE": "1"}),
+            caplog.at_level(logging.INFO, logger="tokenspeed_kernel.selection"),
+        ):
+            with kernel_override("attention", "decode", "reference_decode"):
+                for _ in range(3):
+                    _select_attention_decode(h100_platform)
+            with kernel_override("attention", "decode", "triton_decode"):
+                _select_attention_decode(h100_platform)
+            # The same (family, mode, name) again: already witnessed.
+            with kernel_override("attention", "decode", "reference_decode"):
+                _select_attention_decode(h100_platform)
+
+        override_lines = [
+            record.getMessage()
+            for record in caplog.records
+            if "(override" in record.getMessage()
+        ]
+        assert len(override_lines) == 2
+        assert "attention.decode" in override_lines[0]
+        assert (
+            f"-> reference_decode (override reference_decode, {h100_platform.arch})"
+            in override_lines[0]
+        )
+        assert (
+            f"-> triton_decode (override triton_decode, {h100_platform.arch})"
+            in override_lines[1]
+        )
+
+    def test_override_witness_is_silent_without_verbose(
+        self, sample_specs, h100_platform, caplog, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        events: list[SelectionEvent] = []
+        add_selection_listener(events.append)
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key != "TOKENSPEED_KERNEL_VERBOSE"
+        }
+        with (
+            mock.patch.dict(os.environ, environment, clear=True),
+            caplog.at_level(logging.INFO, logger="tokenspeed_kernel.selection"),
+            kernel_override("attention", "decode", "reference_decode"),
+        ):
+            _select_attention_decode(h100_platform)
+
+        assert not [r for r in caplog.records if "(override" in r.getMessage()]
+        # The listener witness does not depend on the verbose flag.
+        assert [e.kernel_name for e in events] == ["reference_decode"]
+
+    def test_ranked_log_line_is_unchanged(
+        self, sample_specs, h100_platform, caplog, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        with (
+            mock.patch.dict(os.environ, {"TOKENSPEED_KERNEL_VERBOSE": "1"}),
+            caplog.at_level(logging.INFO, logger="tokenspeed_kernel.selection"),
+        ):
+            selected = _select_attention_decode(h100_platform)
+            _select_attention_decode(h100_platform)  # cache hit: not logged
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert len(messages) == 1
+        assert f"attention.decode({ATTN_DECODE_BF16}) -> {selected.name} (ora=" in (
+            messages[0]
+        )
+        assert "(override" not in messages[0]
+
+
+class TestExplainSelectionOverride:
+    def test_reports_no_override_by_default(
+        self, sample_specs, h100_platform, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        explanation = explain_selection(
+            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+        )
+        assert "Override: none" in explanation
+        assert "[SELECTED]" in explanation
+        assert "[SELECTED (override)]" not in explanation
+
+    def test_reports_context_override(
+        self, sample_specs, h100_platform, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        ranked = _select_attention_decode(h100_platform).name
+        with kernel_override("attention", "decode", "reference_decode"):
+            explanation = explain_selection(
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+            )
+        assert "Override: reference_decode (kernel_override())" in explanation
+        assert "reference_decode  [SELECTED (override)]" in explanation
+        assert f"{ranked}  [SELECTED]" not in explanation
+
+    def test_env_override_outranks_context(
+        self, sample_specs, h100_platform, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        env_key = override_env_key("attention", "decode")
+        assert env_key == "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE"
+        with (
+            mock.patch.dict(os.environ, {env_key: "triton_decode"}),
+            kernel_override("attention", "decode", "reference_decode"),
+        ):
+            explanation = explain_selection(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+                override="flashinfer_decode",
+            )
+        assert (
+            "Override: triton_decode (env TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE)"
+            in explanation
+        )
+        assert "triton_decode  [SELECTED (override)]" in explanation
+
+    def test_reports_explicit_argument(
+        self, sample_specs, h100_platform, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        explanation = explain_selection(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            override="reference_decode",
+        )
+        assert "Override: reference_decode (explicit override= argument)" in (
+            explanation
+        )
+        assert "reference_decode  [SELECTED (override)]" in explanation
+
+    def test_reports_unresolvable_override(
+        self, sample_specs, h100_platform, selection_witness_state
+    ):
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        with kernel_override("attention", "decode", "nonexistent_kernel"):
+            explanation = explain_selection(
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+            )
+        assert "Override: nonexistent_kernel (kernel_override())" in explanation
+        assert "Override does not resolve:" in explanation
+        assert "[SELECTED" not in explanation
+
+    def test_reports_override_outside_the_candidates(
+        self, sample_specs, h100_platform, selection_witness_state
+    ):
+        """A name override bypasses filtering; the explanation says so when the
+        forced kernel would have been filtered out (here: AMD-only on H100)."""
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        with kernel_override("attention", "decode", "aiter_decode"):
+            explanation = explain_selection(
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+            )
+        assert "Override selects aiter_decode, which is not among the matched" in (
+            explanation
+        )
+        assert "[SELECTED (override)]" not in explanation
 
 
 class TestWarmupSelection:
