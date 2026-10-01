@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.communication._iris import iris
 
 @gluon.jit
 def _iris_drain_subgroup_vmem():
+    """Wait for this subgroup's outstanding vector-memory operations."""
     gl.inline_asm_elementwise(
         "s_waitcnt vmcnt(0)",
         "=r,~{memory}",
@@ -37,7 +38,7 @@ def _iris_drain_subgroup_vmem():
 
 
 @triton.jit
-def iris_stage_one_shot_allreduce_kernel(
+def iris_pull_oneshot_staged(
     input_ptr,
     input_sym_ptr,
     output_ptr,
@@ -50,26 +51,10 @@ def iris_stage_one_shot_allreduce_kernel(
     SLOT_STRIDE: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
 ):
-    """One-shot all-reduce over rotating staging slots.
+    """Stage local tiles, wait for peer publication, then pull and sum in FP32.
 
-    A single staging slot is not safe across calls. Each rank stages, publishes
-    a ready epoch, waits for its peers, sums their slots and returns -- but the
-    store happens *before* the wait, so a rank called straight back overwrites
-    the slot a slower peer is still summing, and that peer silently sums the
-    next collective's data. No error, no hang, just wrong numbers on whichever
-    ranks lagged.
-
-    Rotating over at least two slots closes it, and the existing entry barrier
-    makes two sufficient. Writing epoch E+1 lands on a different slot. Before a
-    rank can wrap back to E's slot, it must pass the entry wait at E+1; a peer
-    publishes ready(E+1) only after it has finished reading E. By the time a
-    slot is reused, every peer is provably done with it, and no consumption flag
-    or exit barrier has to be paid for.
-
-    Epochs are per-block, so a grid that shrinks between calls leaves the higher
-    blocks' counters where they were. That is consistent across ranks -- every
-    rank launches the same grid for the same collective -- and blocks never read
-    each other's slots, so they may sit on different slots at once.
+    Per-tile epochs rotate through at least two slots. The next epoch's entry
+    wait protects the previous slot from reuse without an exit barrier.
     """
     block_id = tl.program_id(0)
     offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -116,6 +101,7 @@ def iris_stage_one_shot_allreduce_kernel(
 
 @gluon.jit
 def _iris_sanitize_lamport_bf16(values):
+    """Map negative zero to positive zero to reserve its bits as a sentinel."""
     bits = values.to(gl.uint16, bitcast=True)
     return gl.where(bits == 0x8000, 0, bits).to(gl.bfloat16, bitcast=True)
 
@@ -131,16 +117,15 @@ def _iris_wait_lamport_peers(
     MAX_ELEMENTS: gl.constexpr,
     LAYOUT: gl.constexpr,
 ):
+    """Poll peer BF16 packs until none contain the negative-zero sentinel."""
     values = ()
     for _ in gl.static_range(1, WORLD_SIZE):
         values += (gl.full([64, 8], 0, gl.bfloat16, LAYOUT),)
     active = valid
     while gl.max(active.to(gl.int32), 0) != 0:
         loaded = ()
-        # A lane reloads every peer until all seven packs are ready. Issue the
-        # independent reads before checking them; retired lanes keep their data.
-        # .cv controls hardware caches, not compiler volatility. The compiler
-        # regression test checks that these reads remain in the polling cycle.
+        # Reload every peer for active lanes; completed lanes retain their packs.
+        # These reads must stay in the loop: .cv alone does not imply volatility.
         for delta in gl.static_range(1, WORLD_SIZE):
             peer = (RANK + delta) % WORLD_SIZE
             pointer = (
@@ -169,7 +154,7 @@ def _iris_wait_lamport_peers(
 
 
 @gluon.jit
-def lamport_all_reduce_bf16(
+def iris_lamport_allreduce(
     input_sym_ptr,
     region_sym_ptr,
     output_ptr,
@@ -187,10 +172,10 @@ def lamport_all_reduce_bf16(
     MAX_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
 ):
-    """Push complete BF16 tiles and poll peer packs, one subgroup per tile.
+    """Push 512-element BF16 tiles through at least three rotating inbox slots.
 
-    The launcher covers the payload with 512-element tiles. Its row count
-    affects only the grid, so different batches reuse this kernel.
+    Poll payloads directly, reserving negative zero as the unread sentinel.
+    Sum in FP32 rank order, round to BF16, and clear each consumed tile.
     """
     gl.static_assert(WORLD_SIZE == 8)
     gl.static_assert(NUM_STAGES >= 3)
@@ -247,8 +232,7 @@ def lamport_all_reduce_bf16(
         accumulator.to(gl.bfloat16), output_ptr, offsets, mask=mask
     )
 
-    # Clear only this tile's consumed generation. Skipped tiles keep their
-    # own epochs, so mixed row counts need no global counter or tail clearing.
+    # Clear only the consumed tile; skipped tiles retain their epochs.
     sentinel = (
         gl.where(offsets % 2 == 0, 0, 0x8000)
         .to(gl.uint16)
@@ -276,6 +260,7 @@ def _iris_heap_base(
     heap_base_6,
     heap_base_7,
 ):
+    """Select a rank's symmetric heap address at compile time."""
     if rank == 0:
         return heap_base_0
     if rank == 1:
@@ -312,6 +297,7 @@ def _iris_sync_rank_token(
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
 ):
+    """Publish a row's token to peers, then acquire their matching tokens."""
     layout: gl.constexpr = gl.BlockedLayout([1], [SUBGROUP_SIZE], [NUM_WARPS], [0])
     peers = gl.arange(0, WORLD_SIZE, layout=layout)
     peer_mask = peers != RANK
@@ -358,9 +344,7 @@ def _iris_sync_rank_token(
         scope="sys",
     )
     _iris_drain_subgroup_vmem()
-    # The acquire is subgroup-local. Keep every subgroup at the protocol
-    # boundary until all of them have observed the peer publications; the
-    # caller consumes the peer inbox immediately after this helper returns.
+    # Join subgroup-local acquires before any subgroup reads the peer inbox.
     gl.barrier()
 
 
@@ -384,7 +368,7 @@ def _iris_sync_rank_epoch(
     SUBGROUP_SIZE: gl.constexpr,
     PUBLISH: gl.constexpr,
 ):
-    """Synchronize by polling peer epochs or publishing them locally."""
+    """Publish or poll per-workgroup epochs until every peer reaches this epoch."""
     ready_layout: gl.constexpr = gl.BlockedLayout(
         [1], [SUBGROUP_SIZE], [NUM_WARPS], [0]
     )
@@ -424,8 +408,7 @@ def _iris_sync_rank_epoch(
         cache_modifier=".cv",
         volatile=True,
     )
-    # Compare modulo 32 bits, including when a peer has passed the wrap before
-    # this rank. A zero or negative epoch still requires observing every peer.
+    # Signed differences preserve ordering across 32-bit epoch wraparound.
     while gl.min((seen - epoch).to(gl.int32), axis=0) < 0:
         seen = gl.load(
             wait_flags,
@@ -438,6 +421,7 @@ def _iris_sync_rank_epoch(
 
 @gluon.jit
 def _unpack_16bitx4(packed, dtype: gl.constexpr):
+    """Unpack four 16-bit elements into FP32 accumulators."""
     value_0 = (packed & 0xFFFF).to(gl.uint16).to(dtype, bitcast=True).to(gl.float32)
     value_1 = (
         ((packed >> 16) & 0xFFFF).to(gl.uint16).to(dtype, bitcast=True).to(gl.float32)
@@ -453,6 +437,7 @@ def _unpack_16bitx4(packed, dtype: gl.constexpr):
 
 @gluon.jit
 def _pack_16bitx4(value_0, value_1, value_2, value_3, dtype: gl.constexpr):
+    """Round four FP32 values and pack their 16-bit representations."""
     bits_0 = value_0.to(dtype).to(gl.uint16, bitcast=True).to(gl.uint64)
     bits_1 = value_1.to(dtype).to(gl.uint16, bitcast=True).to(gl.uint64)
     bits_2 = value_2.to(dtype).to(gl.uint16, bitcast=True).to(gl.uint64)
@@ -462,6 +447,7 @@ def _pack_16bitx4(value_0, value_1, value_2, value_3, dtype: gl.constexpr):
 
 @gluon.jit
 def _unpack_word(packed, dtype: gl.constexpr, elements_per_word: gl.constexpr):
+    """Unpack a 64-bit word, duplicating the FP32 pair to keep four results."""
     # Explicit branches keep Gluon from type-checking the inactive bitcast.
     if elements_per_word == 4:
         return _unpack_16bitx4(packed, dtype)
@@ -480,6 +466,7 @@ def _pack_word(
     dtype: gl.constexpr,
     elements_per_word: gl.constexpr,
 ):
+    """Pack four 16-bit or two 32-bit elements into one 64-bit word."""
     if elements_per_word == 4:
         return _pack_16bitx4(value_0, value_1, value_2, value_3, dtype)
     else:
@@ -489,7 +476,7 @@ def _pack_word(
 
 
 @gluon.jit
-def iris_reduce_symmetric_gluon_kernel(
+def iris_pull_oneshot(
     input_sym_ptr,
     output_ptr,
     ready_flags,
@@ -503,8 +490,7 @@ def iris_reduce_symmetric_gluon_kernel(
     heap_base_7,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
-    # The reduced size and the tile/program counts derived from it follow the
-    # batch; runtime so every batch shape shares one binary.
+    # Batch-dependent sizes stay runtime values to reuse the compiled kernel.
     TOTAL_NUMEL,
     BLOCK_SIZE: gl.constexpr,
     NUM_PROGRAMS,
@@ -516,7 +502,10 @@ def iris_reduce_symmetric_gluon_kernel(
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
 ):
-    """Reduce producer outputs placed consecutively in symmetric memory."""
+    """Pull packed symmetric inputs from every peer and sum locally in FP32.
+
+    Entry epochs wait for producers; exit epochs protect input reuse.
+    """
     block_id = gl.program_id(0)
     local_heap = _iris_heap_base(
         RANK,
@@ -617,8 +606,7 @@ def iris_reduce_symmetric_gluon_kernel(
         )
         tile_id += NUM_PROGRAMS
 
-    # Do not return while a peer program can still be reading this rank's
-    # input. The next producer reuses the same symmetric buffer.
+    # Finish peer reads before the next producer reuses the symmetric input.
     completion_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_rank_epoch(
         ready_flags,
@@ -642,7 +630,7 @@ def iris_reduce_symmetric_gluon_kernel(
 
 
 @gluon.jit
-def iris_reduce_symmetric_two_stage_gluon_kernel(
+def iris_pull_twoshot(
     input_sym_ptr,
     scratch_sym_ptr,
     output_ptr,
@@ -657,8 +645,7 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
     heap_base_7,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
-    # The partition size and the tile/program counts derived from it follow
-    # the batch; runtime so every batch shape shares one binary.
+    # Batch-dependent sizes stay runtime values to reuse the compiled kernel.
     PARTITION_WORDS,
     BLOCK_WORDS: gl.constexpr,
     NUM_PROGRAMS,
@@ -671,7 +658,11 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
     ALIGNED_OUTPUT: gl.constexpr,
     EXIT_BARRIER: gl.constexpr,
 ):
-    """Reduce-scatter producer outputs, then all-gather the rank partitions."""
+    """Pull-reduce each rank's partition, then pull-gather the reduced shards.
+
+    Sum packed inputs in FP32, round into symmetric scratch, publish completion,
+    and gather every shard into the local output.
+    """
     block_id = gl.program_id(0)
     local_heap = _iris_heap_base(
         RANK,
@@ -841,13 +832,8 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
         tile_id += NUM_PROGRAMS
 
     if EXIT_BARRIER:
-        # Callers that stage into the symmetric input before launching cannot
-        # rotate buffers safely: under graph capture the staging copy records a
-        # fixed address and replays it, so a rank one invocation ahead would
-        # overwrite an input its slower peers are still reducing. Holding the
-        # kernel until every peer has finished reading makes a single staging
-        # buffer correct by construction, at the price of one more rendezvous.
-        # Producer-direct callers own their input and pass False.
+        # Staging copies replay a fixed address; wait for peers before reuse.
+        # Producer-direct callers manage input reuse and pass False.
         reads_done = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
         _iris_sync_rank_epoch(
             ready_flags,
@@ -871,7 +857,7 @@ def iris_reduce_symmetric_two_stage_gluon_kernel(
 
 
 @triton.jit
-def iris_allreduce_residual_rmsnorm_kernel(
+def iris_pull_oneshot_rmsnorm(
     input_sym_ptr,  # base of symmetric (M, HIDDEN_SIZE) input buffer
     residual_ptr,  # local (M, HIDDEN_SIZE)
     weight_ptr,  # local (HIDDEN_SIZE,)
@@ -887,7 +873,11 @@ def iris_allreduce_residual_rmsnorm_kernel(
     BLOCK_SIZE: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    """Pull peer rows, add the residual, and write FP32-accumulated RMSNorm."""
+    """Pull peer rows and fuse residual addition with RMSNorm.
+
+    One workgroup computes r = sum_p FP32(x_p) + FP32(residual) per row,
+    then writes r and RMSNorm(r). The caller supplies entry and exit barriers.
+    """
     row = tl.program_id(0)
     if row >= M:
         return
@@ -933,7 +923,7 @@ def iris_allreduce_residual_rmsnorm_kernel(
 
 
 @triton.jit
-def iris_allreduce_residual_rmsnorm_kernel_persistent(
+def iris_pull_oneshot_rmsnorm_persistent(
     input_sym_ptr,
     residual_ptr,
     weight_ptr,
@@ -949,7 +939,11 @@ def iris_allreduce_residual_rmsnorm_kernel_persistent(
     BLOCK_SIZE: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    """Run the same residual/RMSNorm epilogue with workgroups striding over rows."""
+    """Pull peer rows and fuse residual/RMSNorm with a grid striding over rows.
+
+    Compute r = sum_p FP32(x_p) + FP32(residual), then write r and RMSNorm(r).
+    The caller supplies entry and exit barriers.
+    """
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
 

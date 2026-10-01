@@ -18,23 +18,33 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Optional Iris imports, bound to TokenSpeed's Triton distribution."""
+"""Private Iris implementation behind the public communication API.
+
+The runtime supplies groups and tensors; Iris owns transport and storage.
+The host adapter in ../iris.py manages the shared heap, peer maps, and dispatch,
+and composes the workspaces in this package:
+
+* all_reduce.py: collectives and shared device synchronization.
+* attnres.py: K3 attn reduction and mixing of precomputed history partials.
+* row_sharded.py: K3 attn/MoE reduce-scatter, local compute, and all-gather.
+
+The row-sharded fusions share producer buffers and one replicated result.
+Each workspace owns its completion state. Capacity is prepared before capture;
+callers order producers and consumers before reusing borrowed buffers.
+
+This module binds optional Iris imports to TokenSpeed's Triton distribution.
+"""
 
 import importlib
 import pkgutil
 
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 
-# iris does plain ``import triton`` at module load time; route those bindings
-# to the vendored ``tokenspeed_triton`` so iris and tokenspeed-kernel share a
-# single triton distribution. See
-# :func:`redirect_triton_to_tokenspeed_triton` for details.
+# Bind Iris's plain Triton imports to the same distribution as TokenSpeed.
 with redirect_triton_to_tokenspeed_triton():
     import iris
 
-    # Pre-import every iris kernel module that does ``import triton`` at module
-    # load time (the CCL APIs above lazy-import them at call time, when the
-    # redirect is no longer active).
+    # Resolve lazy CCL kernel imports while the redirect is active.
     import iris.ccl.triton
     from iris.ccl import Config as _IrisConfig
     from iris.ccl.all_gather import all_gather as _iris_all_gather

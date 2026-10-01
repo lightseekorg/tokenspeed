@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Row-sharded attention and MoE fusions sharing one Iris result workspace."""
+"""Row-sharded K3 attn and MoE fusions sharing one Iris result workspace."""
 
 import math
 
@@ -42,7 +42,7 @@ def _row_partition_store_completion(
     RANK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    # Finish every subgroup's write-through stores before publishing completion.
+    """Finish local stores, publish the epoch, and wait for peer completion."""
     _iris_drain_subgroup_vmem()
     gl.barrier()
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
@@ -67,6 +67,7 @@ def _row_partition_entry_barrier(
     RANK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
+    """Publish the entry epoch and acquire each peer's producer completion."""
     # Prior producers complete on the calling stream before this entry barrier.
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)
@@ -93,6 +94,7 @@ def _row_partition_entry_barrier(
 
 @gluon.jit
 def _peer_buffers(pointer, heaps, RANK: gl.constexpr):
+    """Map a symmetric BF16 buffer to all eight peer heaps."""
     offset = pointer.to(gl.uint64) - heaps[RANK]
     result = ()
     for peer in gl.static_range(8):
@@ -104,6 +106,7 @@ def _peer_buffers(pointer, heaps, RANK: gl.constexpr):
 
 @gluon.jit
 def _peer_flags(pointer, heaps, RANK: gl.constexpr, NUM_WARPS: gl.constexpr):
+    """Map a symmetric flag buffer to all eight peer heaps."""
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)
     bases = gl.full((8,), 0, gl.uint64, layout)
@@ -113,17 +116,8 @@ def _peer_flags(pointer, heaps, RANK: gl.constexpr, NUM_WARPS: gl.constexpr):
     return (bases + offset).to(gl.pointer_type(gl.uint32))
 
 
-# Rank q owns L = ROWS/8 consecutive rows. For local row u and coordinate j,
-# r = q*L + u, reduce that row from all eight producer ranks:
-#
-#   scratch_routed_q[u,j] = BF16(sum_p FP32(routed_partial_p[r,j]))
-#   scratch_shared_q[u,j] = BF16(sum_p FP32(shared_partial_p[r,j]))
-#
-# The sum uses the kernel's fixed FP32 tree. Each peer's input packs all
-# routed rows before all shared rows; scratch packs only q's reduced rows
-# in that order.
 @gluon.jit(do_not_specialize=["ROWS"])
-def iris_moe_reduce_scatter_gluon_kernel(
+def iris_k3moe_pull_scatter(
     input_ptr,
     scratch_ptr,
     ready_flags,
@@ -143,7 +137,12 @@ def iris_moe_reduce_scatter_gluon_kernel(
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Reduce paired routed/shared inputs into this rank's consecutive rows."""
+    """Pull K3 routed/shared partials into each rank's consecutive row shard.
+
+    For r = q * (ROWS / 8) + u, scratch_q[u] = BF16(sum_p FP32(partial_p[r])).
+    A fixed FP32 tree reduces the routed and shared inputs, packed in that order.
+    The matching push-gather completes the input-reuse barrier.
+    """
     heaps = (
         heap_base_0,
         heap_base_1,
@@ -194,21 +193,10 @@ def iris_moe_reduce_scatter_gluon_kernel(
             )
         reduced = ((sums[0] + sums[1]) + (sums[2] + sums[3])).to(gl.bfloat16)
         gl.amd.cdna4.buffer_store(reduced, scratch_ptr, offsets, mask, cache=".wt")
-    # The matching gather waits for every rank after these reads complete.
-    # Its completion must precede the next producer's symmetric-input writes.
 
 
-# Rank q owns L = M/8 consecutive rows. For local row u, r = q*L + u,
-# set i = r for a replicated prefix or i = u when PREFIX_IS_SHARDED.
-# For every destination rank p:
-#
-#   output_p[r,j] = BF16((FP32(prefix_q[i,j])
-#                         + FP32(projected_q[u,j]))
-#                         + FP32(shared_reduced_q[u,j]))
-#
-# Rank q pushes its rows to every peer; other ranks write disjoint rows.
 @gluon.jit(do_not_specialize=["LOCAL_ROWS"])
-def iris_moe_add_push_gather_gluon_kernel(
+def iris_k3moe_push_gather(
     projection_ptr,
     shared_ptr,
     prefix_ptr,
@@ -229,7 +217,13 @@ def iris_moe_add_push_gather_gluon_kernel(
     NUM_WARPS: gl.constexpr,
     PREFIX_IS_SHARDED: gl.constexpr,
 ):
-    """Add projection, shared reduction, and prefix, then publish complete rows."""
+    """Add K3 routed/shared outputs and residual, then push rows to every peer.
+
+    For r = q * LOCAL_ROWS + u, use i = u for sharded prefixes, else i = r:
+        output_p[r] = BF16((FP32(prefix_q[i]) + FP32(projected_q[u]))
+                          + FP32(shared_q[u]))
+    Wait for peer publication before reusing the producer buffers.
+    """
     # Preserve row alignment for vector loads/stores without specializing M.
     PARTITION_ELEMENTS = LOCAL_ROWS * 7168
     # In-place prefixes are safe: ranks read then write disjoint rows.
@@ -306,18 +300,8 @@ def _mix_gather_metadata(grid, kernel, args):
     }
 
 
-# Rank q owns L = M/8 consecutive rows. For local row u, r = q*L + u,
-# reduce that row from all eight attention producers:
-#
-#   reduced_q[u,j] = BF16(sum_p FP32(partial_p[r,j]))
-#   prefix_q[u,j] = reduced_q[u,j]                         (no residual)
-#                 = BF16(FP32(reduced_q[u,j])
-#                      + FP32(residual_q[r,j]))            (with residual)
-#
-# The sum uses the even/odd FP32 tree. BF16 rounding precedes the residual
-# add; only rank q's rows are stored in its local prefix.
 @gluon.jit(launch_metadata=_reduce_metadata, do_not_specialize=["LOCAL_ROWS"])
-def iris_attention_reduce_scatter_gluon_kernel(
+def iris_k3attn_pull_scatter(
     input_ptr,
     residual_ptr,
     prefix_ptr,
@@ -337,7 +321,13 @@ def iris_attention_reduce_scatter_gluon_kernel(
     NUM_WARPS: gl.constexpr,
     HAS_RESIDUAL: gl.constexpr,
 ):
-    """Reduce attention rows and round before adding the optional residual."""
+    """Pull K3 attn rows into each rank's residual shard.
+
+    For r = q * LOCAL_ROWS + u:
+        reduced_q[u] = BF16(sum_p FP32(partial_p[r]))
+        prefix_q[u] = BF16(FP32(reduced_q[u]) + FP32(residual_q[r]))
+    Without a residual, store reduced directly. Matching push-gather orders reuse.
+    """
     # Whole rows preserve vector alignment without specializing the row count.
     PARTITION_ELEMENTS = LOCAL_ROWS * 7168
     heaps = (
@@ -391,18 +381,10 @@ def iris_attention_reduce_scatter_gluon_kernel(
             )
             prefix = (prefix.to(gl.float32) + residual.to(gl.float32)).to(gl.bfloat16)
         gl.amd.cdna4.buffer_store(prefix, prefix_ptr, offsets, mask, cache=".wb")
-    # Only local storage was written. The gather's completion orders every
-    # rank's input reads before the next producer reuses the symmetric input.
 
 
-# Rank q has mixed its L = M/8 local rows. For u in [0,L), r = q*L + u,
-# and every destination rank p:
-#
-#   output_p[r,j] = mixed_q[u,j]
-#
-# Each rank pushes its rows to every peer; other ranks write disjoint rows.
 @gluon.jit(launch_metadata=_gather_metadata, do_not_specialize=["LOCAL_ROWS"])
-def iris_attention_push_gather_gluon_kernel(
+def iris_k3attn_push_gather(
     mixed_ptr,
     output_ptr,
     ready_flags,
@@ -420,7 +402,11 @@ def iris_attention_push_gather_gluon_kernel(
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Publish already mixed local rows and wait for every peer's publication."""
+    """Push mixed K3 attn rows to every peer.
+
+    Each owner q writes output_p[q * LOCAL_ROWS + u] = mixed_q[u] for every p.
+    Wait for all peer stores before consuming the replicated output.
+    """
     PARTITION_ELEMENTS = LOCAL_ROWS * 7168
     heaps = (
         heap_base_0,
@@ -455,15 +441,8 @@ def iris_attention_push_gather_gluon_kernel(
     _row_partition_store_completion(flags, peers, pid, epoch, RANK, NUM_WARPS)
 
 
-# Rank q owns local prefix row u for global row r = q*L + u, L = M/8.
-# Mix that prefix with the first NUM_VALID_BLOCKS history candidates at r,
-# round to BF16, apply output RMSNorm, and round to BF16 again. For every peer p:
-#
-#   output_p[r,j] = mixed_q[u,j]
-#
-# Each rank pushes its rows to every peer; other ranks write disjoint rows.
 @gluon.jit(launch_metadata=_mix_gather_metadata, do_not_specialize=["LOCAL_ROWS"])
-def iris_attention_mix_push_gluon_kernel(
+def iris_k3attn_mix_push_gather(
     prefix_ptr,
     output_ptr,
     block_residual,
@@ -490,7 +469,12 @@ def iris_attention_mix_push_gluon_kernel(
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Mix and normalize local AttnRes rows, then publish them to all peers."""
+    """Mix K3 prefixes with AttnRes history, then push normalized rows.
+
+    For r = q * LOCAL_ROWS + u, every peer p receives:
+        output_p[r] = BF16(RMSNorm(BF16(AttnRes(prefix_q[u], history[r]))))
+    Owners write disjoint rows and wait for all peer stores.
+    """
     heaps = (
         heap_base_0,
         heap_base_1,
@@ -702,7 +686,7 @@ class IrisRowShardedWorkspace:
                 (local_rows, 7168), device=prefix.device, dtype=prefix.dtype
             )
         )
-        iris_moe_reduce_scatter_gluon_kernel[(programs,)](
+        iris_k3moe_pull_scatter[(programs,)](
             self.inputs,
             scratch,
             flags,
@@ -724,7 +708,7 @@ class IrisRowShardedWorkspace:
         kimi3_latent_projection(
             normalized, projection_weight, out=projected, solution="auto"
         )
-        iris_moe_add_push_gather_gluon_kernel[(gather_programs,)](
+        iris_k3moe_push_gather[(gather_programs,)](
             projected,
             shared,
             prefix,
@@ -741,7 +725,7 @@ class IrisRowShardedWorkspace:
         )
         return output
 
-    def attention_mix(
+    def attn_mix(
         self,
         partial: torch.Tensor,
         residual: torch.Tensor | None,
@@ -849,7 +833,7 @@ class IrisRowShardedWorkspace:
         prefix = torch.empty_like(partial[:rows])
         output = output_buffer[: partial.shape[0]]
         programs = REDUCE_PROGRAMS
-        iris_attention_reduce_scatter_gluon_kernel[(programs,)](
+        iris_k3attn_pull_scatter[(programs,)](
             partial,
             residual,
             prefix,
@@ -866,7 +850,7 @@ class IrisRowShardedWorkspace:
         if fuse_mix:
             gather_programs = GATHER_PROGRAMS
             num_subgroups = 8 if num_valid_blocks <= 7 else 4
-            iris_attention_mix_push_gluon_kernel[(gather_programs,)](
+            iris_k3attn_mix_push_gather[(gather_programs,)](
                 prefix,
                 output,
                 block_residual,
@@ -903,7 +887,7 @@ class IrisRowShardedWorkspace:
                 block_write_idx=-1,
             )
             gather_programs = 32
-            iris_attention_push_gather_gluon_kernel[(gather_programs,)](
+            iris_k3attn_push_gather[(gather_programs,)](
                 mixed,
                 output,
                 gather_flags,

@@ -267,9 +267,9 @@ def attention_reduce_mix(
     """
     if not current_platform().is_cdna4:
         return None
-    from tokenspeed_kernel.ops.communication.iris import iris_attention_mix
+    from tokenspeed_kernel.ops.communication.iris import iris_attn_mix
 
-    return iris_attention_mix(
+    return iris_attn_mix(
         partial,
         residual,
         block_residual,

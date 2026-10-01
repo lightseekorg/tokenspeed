@@ -33,12 +33,12 @@ from tokenspeed_kernel.ops.communication._iris import (
     iris,
 )
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-    iris_allreduce_residual_rmsnorm_kernel,
-    iris_allreduce_residual_rmsnorm_kernel_persistent,
-    iris_reduce_symmetric_gluon_kernel,
-    iris_reduce_symmetric_two_stage_gluon_kernel,
-    iris_stage_one_shot_allreduce_kernel,
-    lamport_all_reduce_bf16,
+    iris_lamport_allreduce,
+    iris_pull_oneshot,
+    iris_pull_oneshot_rmsnorm,
+    iris_pull_oneshot_rmsnorm_persistent,
+    iris_pull_oneshot_staged,
+    iris_pull_twoshot,
 )
 from tokenspeed_kernel.ops.communication._iris.attnres import (
     ATTNRES_KERNEL_CONFIG,
@@ -75,7 +75,7 @@ __all__ = [
     "create_iris_ar_rmsnorm_state",
     "iris_allreduce_residual_rmsnorm",
     "iris_kimi3_moe_tail",
-    "iris_attention_mix",
+    "iris_attn_mix",
     "IRIS_AR_STATES",
     "IRIS_AR_RMSNORM_STATES",
 ]
@@ -447,28 +447,7 @@ def _use_two_stage_plain(
     numel: int,
     dtype: torch.dtype,
 ) -> bool:
-    """Whether a plain all-reduce of ``numel`` should take the two-stage path.
-
-    Args:
-        world_size: Ranks participating in the reduction.
-        numel: Elements in the tensor being reduced.
-        dtype: Element type; sets how many elements pack into a 64-bit word.
-
-    Returns:
-        True when the two-stage reduce-scatter/all-gather can run this shape.
-
-    Unlike the producer-direct threshold this carries no minimum size. Measured
-    on gfx950 at world 8, the two forms are within noise of each other below
-    about 16 tokens of hidden 7168 (one-shot is marginally ahead at some of those
-    shapes), and two-stage pulls away above it: 1.11x at 16 tokens, 1.37x at 32,
-    1.82x at 64. A minimum would buy nothing at the small end and risks sitting
-    in the wrong place as shapes change, so the only condition kept is the
-    kernel's structural one -- the payload has to split evenly into per-rank
-    partitions of whole 64-bit words.
-    """
-    # The kernel packs elements into 64-bit words through
-    # _PRODUCER_DIRECT_GL_DTYPES; anything outside it (or wider than a word,
-    # which would make elements_per_word zero) stays on one-shot.
+    """Use two-shot when the input splits into whole packed words per rank."""
     if dtype not in _PRODUCER_DIRECT_GL_DTYPES:
         return False
     kernel_config = IRIS_ALL_REDUCE_KERNEL_CONFIG
@@ -1112,7 +1091,7 @@ class IrisAllReduce(object):
             input_buf, ready_flags = self._staged_tuning_workspaces[tuning]
             slot_stride = tuning.numel
         assert input_buf is not None and ready_flags is not None
-        iris_stage_one_shot_allreduce_kernel[(triton.cdiv(numel, block_size),)](
+        iris_pull_oneshot_staged[(triton.cdiv(numel, block_size),)](
             tensor.view(-1),
             input_buf.view(-1),
             out.view(-1),
@@ -1193,7 +1172,7 @@ class IrisAllReduce(object):
         )
         num_tiles = triton.cdiv(partition_words, block_words)
         num_programs = min(num_tiles, kernel_config.max_programs)
-        iris_reduce_symmetric_two_stage_gluon_kernel[(num_programs,)](
+        iris_pull_twoshot[(num_programs,)](
             staged,
             self._staged_two_stage_scratch_buf,
             out,
@@ -1258,7 +1237,7 @@ class IrisAllReduce(object):
         assert self._kimi_k3_moe_lamport_epochs is not None
         assert self._kimi_k3_moe_lamport_peer_addresses is not None
         num_programs = total_numel // config.lamport_block_elements
-        lamport_all_reduce_bf16[(num_programs,)](
+        iris_lamport_allreduce[(num_programs,)](
             self._input_buf,
             self._kimi_k3_moe_lamport_region,
             output,
@@ -1290,7 +1269,7 @@ class IrisAllReduce(object):
             )
             num_tiles = triton.cdiv(partition_words, block_words)
             num_programs = min(num_tiles, two_stage_config.max_programs)
-            iris_reduce_symmetric_two_stage_gluon_kernel[(num_programs,)](
+            iris_pull_twoshot[(num_programs,)](
                 self._input_buf,
                 self._producer_direct_scratch_buf,
                 output,
@@ -1315,7 +1294,7 @@ class IrisAllReduce(object):
             block_size = kernel_config.one_stage_block_size
             num_tiles = triton.cdiv(total_numel, block_size)
             num_programs = min(num_tiles, kernel_config.one_stage_max_programs)
-            iris_reduce_symmetric_gluon_kernel[(num_programs,)](
+            iris_pull_oneshot[(num_programs,)](
                 self._input_buf,
                 output,
                 self._producer_direct_ready_flags,
@@ -1443,10 +1422,10 @@ class IrisAllReduceResidualRMSNorm(object):
         heap_bases = self._group_heap_bases
         BLOCK_SIZE = triton.next_power_of_2(self.hidden_dim)
         if self.persistent:
-            kernel = iris_allreduce_residual_rmsnorm_kernel_persistent
+            kernel = iris_pull_oneshot_rmsnorm_persistent
             grid = (min(num_tokens, self._num_programs),)
         else:
-            kernel = iris_allreduce_residual_rmsnorm_kernel
+            kernel = iris_pull_oneshot_rmsnorm
             grid = (num_tokens,)
         kernel[grid](
             in_view,
@@ -1773,7 +1752,7 @@ def iris_kimi3_moe_tail(
     )
 
 
-def iris_attention_mix(
+def iris_attn_mix(
     partial: torch.Tensor,
     residual: torch.Tensor | None,
     block_residual: torch.Tensor,
@@ -1790,7 +1769,7 @@ def iris_attention_mix(
     state = find_iris_state(group, (partial,))
     if state is None or state.row_sharded is None:
         return None
-    return state.row_sharded.attention_mix(
+    return state.row_sharded.attn_mix(
         partial,
         residual,
         block_residual,

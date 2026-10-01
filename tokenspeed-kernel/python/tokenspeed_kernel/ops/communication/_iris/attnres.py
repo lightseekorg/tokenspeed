@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Attention all-reduce with an AttnRes epilogue using precomputed history partials."""
+"""K3 attn all-reduce with an AttnRes epilogue using precomputed history partials."""
 
 from dataclasses import dataclass
 
@@ -170,7 +170,7 @@ class IrisAttnResWorkspace:
 
         hidden = torch.empty_like(partial)
         residual_out = torch.empty_like(residual)
-        iris_push_one_shot_allreduce_residual_attnres_gluon_kernel[(num_tokens,)](
+        iris_k3attn_push_oneshot[(num_tokens,)](
             partial,
             residual,
             self.inbox,
@@ -218,6 +218,7 @@ def _iris_attnres_epilogue(
     HIDDEN: gl.constexpr,
     EPS: gl.constexpr,
 ):
+    """Add the residual, merge history softmax partials, and RMS-normalize."""
     reduced = reduced.to(gl.bfloat16).to(gl.float32)
     residual = gl.amd.cdna4.buffer_load(
         residual_ptr,
@@ -275,7 +276,7 @@ def _iris_attnres_epilogue(
 
 
 @gluon.jit
-def iris_push_one_shot_allreduce_residual_attnres_gluon_kernel(
+def iris_k3attn_push_oneshot(
     partial_ptr,
     residual_ptr,
     inbox_sym_ptr,
@@ -315,11 +316,10 @@ def iris_push_one_shot_allreduce_residual_attnres_gluon_kernel(
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
 ):
-    """Push Kimi-K3 attention rows into two-slot rank-ordered inboxes.
+    """Push K3 attn rows into two alternating inboxes and reduce in rank order.
 
-    Peer inboxes are host-computed byte addresses. Explicit BF16 pointer
-    annotations preserve their pointer ABI and element-wise device offsets
-    without a Python pointer wrapper. The Iris context owns the mappings.
+    Add the residual to the BF16 reduction, merge historical AttnRes partials,
+    and RMS-normalize the BF16 mixture. Per-row generations guard slot reuse.
     """
     row = gl.program_id(0)
     layout: gl.constexpr = gl.BlockedLayout(
@@ -371,8 +371,7 @@ def iris_push_one_shot_allreduce_residual_attnres_gluon_kernel(
             cache=".wt",
         )
     _iris_drain_subgroup_vmem()
-    # The drain is subgroup-local. Join all producer subgroups before the
-    # control subgroup publishes the generation to peer ranks.
+    # Join subgroup-local drains before publishing the generation to peers.
     gl.barrier()
 
     _iris_sync_rank_token(

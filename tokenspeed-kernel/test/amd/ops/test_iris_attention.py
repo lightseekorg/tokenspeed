@@ -49,15 +49,11 @@ def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
     """Runtime rows must preserve vector payload traffic, including tail tiles."""
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.row_sharded import (
-        iris_attention_push_gather_gluon_kernel,
-        iris_attention_reduce_scatter_gluon_kernel,
+        iris_k3attn_pull_scatter,
+        iris_k3attn_push_gather,
     )
 
-    fn = (
-        iris_attention_reduce_scatter_gluon_kernel
-        if operation == "reduce"
-        else iris_attention_push_gather_gluon_kernel
-    )
+    fn = iris_k3attn_pull_scatter if operation == "reduce" else iris_k3attn_push_gather
     constants = {
         "RANK": rank,
         "BLOCK_ELEMENTS": 2048,
@@ -148,9 +144,9 @@ def _attention_worker(rank: int, port: int) -> None:
     )
     from tokenspeed_kernel.ops.communication import triton as comm
     from tokenspeed_kernel.ops.communication._iris.row_sharded import (
-        iris_attention_mix_push_gluon_kernel,
-        iris_attention_push_gather_gluon_kernel,
-        iris_attention_reduce_scatter_gluon_kernel,
+        iris_k3attn_mix_push_gather,
+        iris_k3attn_pull_scatter,
+        iris_k3attn_push_gather,
     )
 
     backing = comm.TritonCommState(
@@ -254,9 +250,9 @@ def _attention_worker(rank: int, port: int) -> None:
                 with ExitStack() as stack:
                     if variant in warmed_variants:
                         for kernel in (
-                            iris_attention_reduce_scatter_gluon_kernel,
-                            iris_attention_push_gather_gluon_kernel,
-                            iris_attention_mix_push_gluon_kernel,
+                            iris_k3attn_pull_scatter,
+                            iris_k3attn_push_gather,
+                            iris_k3attn_mix_push_gather,
                         ):
                             stack.enter_context(assert_no_triton_compile(kernel))
                     mixed = attention_reduce_mix(

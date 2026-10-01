@@ -46,10 +46,10 @@ def test_moe_gather_vector_codegen(rank, prefix_is_sharded, tmp_path):
     """Runtime row counts must retain vectorized payload loads and peer stores."""
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.row_sharded import (
-        iris_moe_add_push_gather_gluon_kernel,
+        iris_k3moe_push_gather,
     )
 
-    fn = iris_moe_add_push_gather_gluon_kernel
+    fn = iris_k3moe_push_gather
     constants = {
         "RANK": rank,
         "BLOCK_ELEMENTS": 2048,
@@ -111,8 +111,8 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
     )
     from tokenspeed_kernel.ops.communication import triton as comm
     from tokenspeed_kernel.ops.communication._iris.row_sharded import (
-        iris_moe_add_push_gather_gluon_kernel,
-        iris_moe_reduce_scatter_gluon_kernel,
+        iris_k3moe_pull_scatter,
+        iris_k3moe_push_gather,
     )
     from tokenspeed_kernel.ops.communication.iris import (
         create_iris_ar_rmsnorm_state,
@@ -197,8 +197,8 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         with ExitStack() as stack:
             if prefix_is_sharded in tail_kernels_warmed:
                 for kernel in (
-                    iris_moe_reduce_scatter_gluon_kernel,
-                    iris_moe_add_push_gather_gluon_kernel,
+                    iris_k3moe_pull_scatter,
+                    iris_k3moe_push_gather,
                 ):
                     stack.enter_context(assert_no_triton_compile(kernel))
             output = moe_reduce_project(

@@ -132,11 +132,11 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
     behavior in addition to the distributed numerical tests.
     """
     from tokenspeed_kernel._triton import gluon, triton
-    from tokenspeed_kernel.ops.communication.iris import (
-        lamport_all_reduce_bf16,
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_lamport_allreduce,
     )
 
-    fn = lamport_all_reduce_bf16
+    fn = iris_lamport_allreduce
     signature = {
         name: "*i32" if name == "epochs" else "*bf16" for name in fn.arg_names[:4]
     }
@@ -204,7 +204,7 @@ def _new_state(rank, device, capacity, dtype):
 
 def _check_lamport_state(rank, device):
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-        lamport_all_reduce_bf16,
+        iris_lamport_allreduce,
     )
     from tokenspeed_kernel.ops.communication.iris import (
         iris_acquire_outputs,
@@ -249,7 +249,7 @@ def _check_lamport_state(rank, device):
                 )
                 offset += tensor.numel()
             with (
-                assert_no_triton_compile(lamport_all_reduce_bf16)
+                assert_no_triton_compile(iris_lamport_allreduce)
                 if rows <= 6 and (rows > 1 or reverse)
                 else nullcontext()
             ):
