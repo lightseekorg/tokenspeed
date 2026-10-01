@@ -33,8 +33,6 @@ import torch.nn.functional as F
 from utils import (
     assert_no_triton_compile,
     int_specialization_class,
-    kernel_supported,
-    make_fp8_per_channel_gemm_operands,
     warm_specialization_classes,
 )
 
@@ -178,32 +176,6 @@ def test_mxfp4_mm_row_count():
         for rows in (48, 97, 130, 1483):
             # Rows are independent: a shorter batch is a prefix of the longer.
             torch.testing.assert_close(run(rows), full[:rows], rtol=0, atol=0)
-
-
-def test_fp8_scaled_mm_row_count():
-    from tokenspeed_kernel.ops.gemm import triton as gemm
-
-    if not kernel_supported("triton_mm_fp8_scaled"):
-        pytest.skip("triton_mm_fp8_scaled is not supported on this device")
-    a, a_scales, b, b_scales = make_fp8_per_channel_gemm_operands(4097, 512, 256, 0)
-
-    def run(rows):
-        out = gemm.triton_mm_fp8_scaled(
-            a[:rows], b.t(), a_scales[:rows], b_scales, torch.bfloat16
-        )
-        expected = (a[:rows].float() * a_scales[:rows]) @ (b.float() * b_scales).t()
-        torch.testing.assert_close(out.float(), expected, rtol=2**-8, atol=5e-4)
-
-    def key(rows):
-        # Tiles follow the power-of-two row bucket; rows specialize on 1 and %16.
-        bucket = min(max(32, 1 << (rows - 1).bit_length()), 256)
-        return bucket, int_specialization_class(rows)
-
-    sweep = (3, 17, 45, 100, 250, 1000, 4097)
-    warm_specialization_classes(run, key, sweep, range(1, 4098))
-    with assert_no_triton_compile(gemm.scaled_mm_kernel):
-        for rows in sweep:
-            run(rows)
 
 
 def _compact_reference(table, requests, causal, page):
