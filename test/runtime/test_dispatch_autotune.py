@@ -1228,7 +1228,8 @@ def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
         (16, 16384, dict(BM=16, BK=512, UNROLL=False, num_warps=8), False),
     ],
 )
-def test_fp32_rowcta_launch_configuration(m, k, launch, routed):
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_fp32_rowcta_launch_configuration(m, k, launch, routed, x_dtype):
     launches = []
 
     class Kernel:
@@ -1245,9 +1246,10 @@ def test_fp32_rowcta_launch_configuration(m, k, launch, routed):
             _rowcta_multirow_kernel=Kernel(),
         ),
     )
-    x = torch.empty(m, k, device="meta")
+    x = torch.empty(m, k, dtype=x_dtype, device="meta")
     weight = torch.empty(256, k, device="meta")
-    assert api.triton_rowcta_gemm_fp32(x, weight).shape == (m, 256)
+    result = api.triton_rowcta_gemm_fp32(x, weight)
+    assert result.shape == (m, 256) and result.dtype == torch.float32
     assert launches == [
         ((256,), dict(M=m, N=256, K=k, enable_fp_fusion=False, **launch))
     ]

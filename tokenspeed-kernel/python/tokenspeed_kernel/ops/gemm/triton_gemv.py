@@ -28,7 +28,10 @@ FP32 projections have no FlashInfer route and go straight to the registry.
 Narrow ones with up to 16 rows take a row-CTA kernel that streams each weight
 row once against every activation row, with FP32 products and accumulation and
 no fused multiply-add; a single row is reduced in one block over the whole row.
-Torch serves the other FP32 shapes.
+Torch serves the other FP32 shapes. The kernel also takes BF16 activations
+against an FP32 weight and widens each element as it loads it, which is exact,
+so the result equals the same call on ``x.float()`` without materializing that
+copy.
 
 BF16 activations against an FP32 weight give an FP32 result. Torch widens the
 activations first. A layer that keeps the weight split from
@@ -131,8 +134,10 @@ def _rows_dot_block(
     offs = kb + tl.arange(0, BK)
     col_mask = offs < K
     wv = tl.load(w_ptr + n * K + offs, mask=col_mask, other=0.0).to(tl.float32)
+    # Cap the activation vector at four elements, the FP32 width: a wider BF16
+    # load changes the accumulator layout and with it the reduction order.
     xv = tl.load(
-        x_ptr + rows[:, None] * K + offs[None, :],
+        tl.max_contiguous(x_ptr + rows[:, None] * K + offs[None, :], [1, 4]),
         mask=row_mask[:, None] & col_mask[None, :],
         other=0.0,
     ).to(tl.float32)
@@ -200,7 +205,7 @@ def _grouped_rowcta_gemv_kernel(
 
 
 # Registry dispatch: rowcta owns BF16 M == 1 and the FP32 row-CTA kernel
-# owns narrow FP32 projections with M <= 16.
+# owns narrow FP32-weight projections with M <= 16 (FP32 or BF16 activations).
 # From 17 rows, BF16 activations against an FP32 weight take
 # gluon_simt_gemm_fp32 up to 96 rows and, with a weight split,
 # triton_bf16x3_gemm_fp32, where their registrations match. Torch handles
@@ -296,7 +301,7 @@ def _fp32_rowcta_k_fits(m: int, n: int, k: int) -> bool:
     name="triton_rowcta_gemm_fp32",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_FP32_SIG,
+    signatures=_FP32_SIG | _BF16_FP32_SIG,
     traits={
         "m": frozenset(range(1, 17)),
         "n_max": frozenset({1024}),
@@ -322,7 +327,7 @@ def triton_rowcta_gemm_fp32(
     Torch.
 
     Args:
-        x: ``[M, K]`` contiguous FP32 activations, ``1 <= M <= 16``.
+        x: ``[M, K]`` contiguous FP32 or BF16 activations, ``1 <= M <= 16``.
         weight: ``[N, K]`` contiguous FP32 weight.
         out: optional contiguous ``[M, N]`` destination.
 
