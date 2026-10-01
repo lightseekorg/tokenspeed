@@ -35,22 +35,8 @@ callers order producers and consumers before reusing borrowed buffers.
 This module binds optional Iris imports to TokenSpeed's Triton distribution.
 """
 
-import importlib
-import pkgutil
-
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 
 # Bind Iris's plain Triton imports to the same distribution as TokenSpeed.
 with redirect_triton_to_tokenspeed_triton():
     import iris
-
-    # Resolve lazy CCL kernel imports while the redirect is active.
-    import iris.ccl.triton
-    from iris.ccl import Config as _IrisConfig
-    from iris.ccl.all_gather import all_gather as _iris_all_gather
-    from iris.ccl.reduce_scatter import reduce_scatter as _iris_reduce_scatter
-
-    for _info in pkgutil.walk_packages(
-        iris.ccl.triton.__path__, prefix="iris.ccl.triton."
-    ):
-        importlib.import_module(_info.name)

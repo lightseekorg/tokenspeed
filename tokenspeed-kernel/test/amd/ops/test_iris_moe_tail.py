@@ -146,7 +146,6 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
         dtype=torch.bfloat16,
         heap_size=None,
         device=device,
-        persistent=False,
     )
     assert rmsnorm_state._ctx is state._ctx
     allocations = (

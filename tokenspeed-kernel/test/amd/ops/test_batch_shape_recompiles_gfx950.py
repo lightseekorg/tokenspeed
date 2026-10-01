@@ -291,7 +291,6 @@ def test_iris_allreduce_sizes():
             NUM_PROGRAMS=min(tiles, 84),
             NUM_TILES=tiles,
             NUM_WARPS=1,
-            PUBLISH_READY=False,
             num_warps=1,
             grid=(1,),
             **common,

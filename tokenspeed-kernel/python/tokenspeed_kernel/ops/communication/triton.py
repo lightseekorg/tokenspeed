@@ -54,9 +54,6 @@ __all__ = [
 ]
 
 
-allreduce_residual_rmsnorm_states = {}
-
-
 @dataclass
 class TritonCommState:
     group: dist.ProcessGroup
@@ -1622,176 +1619,8 @@ def amd_rsag_all_gather(
 
 
 # ------------------------------------------------------------------------------
-# AMD Triton All-Reduce
+# All-Reduce + RMSNorm
 # ------------------------------------------------------------------------------
-
-
-@triton.jit
-def amd_all_reduce_kernel(
-    buffer_ptrs_dev,
-    signal_pad_ptrs_dev,
-    output_ptr,
-    NUMEL,
-    RANK: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    block_id = tl.program_id(0)
-    symm_mem_barrier(signal_pad_ptrs_dev, block_id, RANK, WORLD_SIZE)
-
-    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < NUMEL
-    buffer_ptrs = buffer_ptrs_dev.to(tl.pointer_type(tl.uint64))
-    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-
-    for peer in tl.static_range(0, WORLD_SIZE):
-        peer_base = tl.load(buffer_ptrs + peer).to(tl.pointer_type(tl.bfloat16))
-        acc += tl.load(peer_base + offsets, mask=mask, other=0.0).to(tl.float32)
-
-    tl.store(output_ptr + offsets, acc, mask=mask)
-
-    symm_mem_barrier(signal_pad_ptrs_dev, block_id, RANK, WORLD_SIZE)
-
-
-# ------------------------------------------------------------------------------
-# AMD Triton All-Reduce + RMSNorm
-# ------------------------------------------------------------------------------
-
-
-@triton.jit
-def amd_allreduce_residual_rmsnorm_kernel(
-    buffer_ptrs_dev,
-    signal_pad_ptrs_dev,
-    residual_ptr,
-    weight_ptr,
-    norm_out_ptr,
-    residual_out_ptr,
-    HIDDEN_SIZE: tl.constexpr,
-    EPS: tl.constexpr,
-    RANK: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row = tl.program_id(0)
-    symm_mem_barrier(signal_pad_ptrs_dev, row, RANK, WORLD_SIZE)
-
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < HIDDEN_SIZE
-    row_offsets = row * HIDDEN_SIZE + offsets
-    buffer_ptrs = buffer_ptrs_dev.to(tl.pointer_type(tl.uint64))
-    reduced = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-
-    for peer in tl.static_range(0, WORLD_SIZE):
-        peer_base = tl.load(buffer_ptrs + peer).to(tl.pointer_type(tl.bfloat16))
-        reduced += tl.load(peer_base + row_offsets, mask=mask, other=0.0).to(tl.float32)
-
-    residual = tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
-    residual_out = reduced + residual
-    tl.store(residual_out_ptr + row_offsets, residual_out, mask=mask)
-
-    variance = tl.sum(residual_out * residual_out, axis=0) / HIDDEN_SIZE
-    scale = tl.rsqrt(variance + EPS)
-    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    tl.store(norm_out_ptr + row_offsets, residual_out * scale * weight, mask=mask)
-
-    symm_mem_barrier(signal_pad_ptrs_dev, row, RANK, WORLD_SIZE)
-
-
-def create_allreduce_residual_rmsnorm_state(
-    group: dist.ProcessGroup,
-    rank_in_group: int,
-    max_token_num: int,
-    hidden_dim: int,
-    device: torch.device = None,
-) -> TritonCommState:
-    assert (
-        type(group) == dist.ProcessGroup
-    ), f"Expected dist.ProcessGroup, got {type(group)}"
-    device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
-    world_size = group.size()
-    comm_buff = None
-    symm_mem_hdl = None
-
-    platform = current_platform()
-    if platform.is_amd:
-        pad_bytes = max_token_num * world_size * 4
-        symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), pad_bytes))
-        free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
-        comm_buff = symm_mem.empty(
-            (max_token_num, hidden_dim), dtype=torch.bfloat16, device=device
-        )
-        symm_mem_hdl = symm_mem.rendezvous(comm_buff, group=group)
-        free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
-        logger.info(
-            f"Triton AR+RMSNorm AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
-        )
-        assert rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
-    else:
-        assert platform.is_nvidia, f"Unsupported platform: {platform}"
-
-    return TritonCommState(
-        enable_lamport=False,
-        moe_tail_max_rows=0,
-        group=group,
-        rank_in_group=rank_in_group,
-        world_size=world_size,
-        device=device,
-        attnres_max_numel=0,
-        max_numel=0,
-        max_bytes=0,
-        max_token_num=max_token_num,
-        hidden_dim=hidden_dim,
-        comm_buff=comm_buff,
-        symm_mem_hdl=symm_mem_hdl,
-    )
-
-
-def allreduce_residual_rmsnorm_get_state(
-    group: dist.ProcessGroup,
-    rank_in_group: int,
-    max_token_num: int,
-    hidden_dim: int,
-    device: torch.device = None,
-) -> TritonCommState:
-    key = (id(group), max_token_num, hidden_dim)
-    state = allreduce_residual_rmsnorm_states.get(key)
-    if state is None:
-        state = create_allreduce_residual_rmsnorm_state(
-            group=group,
-            rank_in_group=rank_in_group,
-            max_token_num=max_token_num,
-            hidden_dim=hidden_dim,
-            device=device,
-        )
-        allreduce_residual_rmsnorm_states[key] = state
-    return state
-
-
-def allreduce_residual_rmsnorm_can_run(
-    state: TritonCommState,
-    input_tensor: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-) -> bool:
-    platform = current_platform()
-    return (
-        platform.is_amd
-        and state.symm_mem_hdl is not None
-        and input_tensor.is_cuda
-        and residual.is_cuda
-        and weight.is_cuda
-        and input_tensor.is_contiguous()
-        and residual.is_contiguous()
-        and weight.is_contiguous()
-        and input_tensor.dtype == torch.bfloat16
-        and residual.dtype == torch.bfloat16
-        and input_tensor.shape == residual.shape
-        and input_tensor.dim() == 2
-        and input_tensor.shape[0] <= state.max_token_num
-        and input_tensor.shape[1] == state.hidden_dim
-        and weight.shape[0] == state.hidden_dim
-        and state.world_size > 1
-    )
 
 
 def allreduce_residual_rmsnorm(
@@ -1849,7 +1678,6 @@ def allreduce_residual_rmsnorm(
                     max_token_num=max_token_num,
                     hidden_dim=hidden_dim,
                     dtype=input_tensor.dtype,
-                    persistent=False,
                 )
                 _iris_mod.IRIS_AR_RMSNORM_STATES[key] = iris_state
             norm_out, residual_out = _iris_mod.iris_allreduce_residual_rmsnorm(
@@ -1861,36 +1689,7 @@ def allreduce_residual_rmsnorm(
             )
             return norm_out, residual_out, None, None
 
-        state = allreduce_residual_rmsnorm_get_state(
-            group=group,
-            rank_in_group=rank,
-            max_token_num=max_token_num,
-            hidden_dim=hidden_dim,
-            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
-        )
-        if not allreduce_residual_rmsnorm_can_run(
-            state, input_tensor, residual, weight
-        ):
-            return None, None, None, None
-
-        state.comm_buff[:token_num, :].copy_(input_tensor)
-        norm_out = torch.empty_like(input_tensor)
-        residual_out = torch.empty_like(residual)
-        amd_allreduce_residual_rmsnorm_kernel[(token_num,)](
-            state.symm_mem_hdl.buffer_ptrs_dev,
-            state.symm_mem_hdl.signal_pad_ptrs_dev,
-            residual,
-            weight,
-            norm_out,
-            residual_out,
-            HIDDEN_SIZE=hidden_dim,
-            EPS=eps,
-            RANK=state.symm_mem_hdl.rank,
-            WORLD_SIZE=state.symm_mem_hdl.world_size,
-            BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
-            num_warps=8,
-        )
-        return norm_out, residual_out, None, None
+        return None, None, None, None
     else:
         assert platform.is_nvidia, f"Unsupported platform: {platform}"
         return None, None, None, None

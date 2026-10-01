@@ -498,7 +498,6 @@ def iris_pull_oneshot(
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
-    PUBLISH_READY: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
 ):
@@ -537,7 +536,7 @@ def iris_pull_oneshot(
         WORLD_SIZE,
         NUM_WARPS,
         SUBGROUP_SIZE,
-        PUBLISH=PUBLISH_READY,
+        PUBLISH=False,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
@@ -625,7 +624,7 @@ def iris_pull_oneshot(
         WORLD_SIZE,
         NUM_WARPS,
         SUBGROUP_SIZE,
-        PUBLISH=PUBLISH_READY,
+        PUBLISH=False,
     )
 
 
@@ -920,73 +919,3 @@ def iris_pull_oneshot_rmsnorm(
         norm.to(norm_dtype),
         mask=mask,
     )
-
-
-@triton.jit
-def iris_pull_oneshot_rmsnorm_persistent(
-    input_sym_ptr,
-    residual_ptr,
-    weight_ptr,
-    norm_out_ptr,
-    residual_out_ptr,
-    M,
-    heap_bases,
-    iris_rank: tl.constexpr,
-    world_size: tl.constexpr,
-    rank_start: tl.constexpr,
-    rank_stride: tl.constexpr,
-    HIDDEN_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    """Pull peer rows and fuse residual/RMSNorm with a grid striding over rows.
-
-    Compute r = sum_p FP32(x_p) + FP32(residual), then write r and RMSNorm(r).
-    The caller supplies entry and exit barriers.
-    """
-    pid = tl.program_id(0)
-    num_programs = tl.num_programs(0)
-
-    offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < HIDDEN_SIZE
-    weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-
-    res_out_dtype = residual_out_ptr.type.element_ty
-    norm_dtype = norm_out_ptr.type.element_ty
-
-    for row in range(pid, M, num_programs):
-        row_offsets = row * HIDDEN_SIZE + offsets
-        in_row_ptr = input_sym_ptr + row_offsets
-
-        acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-        for i in tl.static_range(0, world_size):
-            remote_rank = rank_start + i * rank_stride
-            acc += iris.load(
-                in_row_ptr,
-                iris_rank,
-                remote_rank,
-                heap_bases,
-                mask=mask,
-                other=0.0,
-            ).to(tl.float32)
-
-        residual = tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(
-            tl.float32
-        )
-        residual_out = acc + residual
-
-        tl.store(
-            residual_out_ptr + row_offsets,
-            residual_out.to(res_out_dtype),
-            mask=mask,
-        )
-
-        variance = tl.sum(residual_out * residual_out, axis=0) / HIDDEN_SIZE
-        scale = tl.rsqrt(variance + EPS)
-        norm = residual_out * scale * weight
-
-        tl.store(
-            norm_out_ptr + row_offsets,
-            norm.to(norm_dtype),
-            mask=mask,
-        )

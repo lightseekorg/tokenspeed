@@ -1265,43 +1265,39 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
         residual = torch.randn_like(local)
         weight = torch.linspace(0.5, 1.5, 256, dtype=local.dtype, device=device)
         group_sum = sum(global_rank + 1 for global_rank in groups[group_index])
-        for persistent in (False, True):
-            norm_state = create_iris_ar_rmsnorm_state(
-                group=group,
-                rank_in_group=group_rank,
-                max_token_num=3,
-                hidden_dim=256,
-                dtype=local.dtype,
-                device=device,
-                persistent=persistent,
+        norm_state = create_iris_ar_rmsnorm_state(
+            group=group,
+            rank_in_group=group_rank,
+            max_token_num=3,
+            hidden_dim=256,
+            dtype=local.dtype,
+            device=device,
+        )
+        local.fill_(rank + 1)
+        norm_state.fused(local, residual, weight, 1e-6)
+        torch.cuda.synchronize()
+        dist.barrier(group=group)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            norm_out, residual_out = norm_state.fused(local, residual, weight, 1e-6)
+        # The groups execute different call counts; a world barrier would hang.
+        for iteration in range(2 + group_index):
+            scale = iteration + 1
+            local.fill_(scale * (rank + 1))
+            graph.replay()
+            total = residual.float() + scale * group_sum
+            expected = total * torch.rsqrt(total.square().mean(-1, keepdim=True) + 1e-6)
+            torch.testing.assert_close(
+                residual_out, total.to(local.dtype), atol=0, rtol=0
             )
-            local.fill_(rank + 1)
-            norm_state.fused(local, residual, weight, 1e-6)
-            torch.cuda.synchronize()
-            dist.barrier(group=group)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                norm_out, residual_out = norm_state.fused(local, residual, weight, 1e-6)
-            # The groups execute different call counts; a world barrier would hang.
-            for iteration in range(2 + group_index):
-                scale = iteration + 1
-                local.fill_(scale * (rank + 1))
-                graph.replay()
-                total = residual.float() + scale * group_sum
-                expected = total * torch.rsqrt(
-                    total.square().mean(-1, keepdim=True) + 1e-6
-                )
-                torch.testing.assert_close(
-                    residual_out, total.to(local.dtype), atol=0, rtol=0
-                )
-                torch.testing.assert_close(
-                    norm_out,
-                    (expected * weight.float()).to(local.dtype),
-                    atol=0,
-                    rtol=0,
-                )
-            torch.cuda.synchronize()
-            dist.barrier()
+            torch.testing.assert_close(
+                norm_out,
+                (expected * weight.float()).to(local.dtype),
+                atol=0,
+                rtol=0,
+            )
+        torch.cuda.synchronize()
+        dist.barrier()
     except Exception:
         error_dict[rank] = traceback.format_exc()
     finally:
@@ -1317,134 +1313,7 @@ def test_iris_all_reduce_noncontiguous_subgroups():
 
 
 # ---------------------------------------------------------------------------
-# Suite 2: IrisRSAG (reduce-scatter / all-gather)
-# ---------------------------------------------------------------------------
-
-
-def _rsag_uniform_token_cases(world_size: int) -> List[List[int]]:
-    return [
-        [8] * world_size,
-        [16] * world_size,
-        [64] * world_size,
-    ]
-
-
-def _rsag_worker_fn(rank, world_size, port, hidden_size, error_dict):
-    try:
-        _rsag_worker_main(rank, world_size, port, hidden_size)
-    except Exception:
-        error_dict[rank] = traceback.format_exc()
-
-
-def _rsag_worker_main(rank: int, world_size: int, port: int, hidden_size: int) -> None:
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    # Match the upstream iris example - gloo for the host-side rendezvous.
-    dist.init_process_group(
-        backend="gloo",
-        init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=world_size,
-    )
-
-    try:
-        from tokenspeed_kernel.ops.communication.iris import create_iris_rsag_state
-
-        cases = _rsag_uniform_token_cases(world_size)
-        max_tokens = max(sum(tokens) for tokens in cases)
-        rsag = create_iris_rsag_state(
-            group=dist.group.WORLD,
-            rank_in_group=rank,
-            max_tokens=max_tokens,
-            hidden_size=hidden_size,
-        )
-
-        # The generic ``all_gather`` / ``reduce_scatter`` dispatchers in
-        # ``communication.triton`` route AMD calls to ``amd_rsag_*`` (which
-        # require ``state.symm_mem_hdl``); we deliberately bypass that
-        # dispatcher and call the iris RSAG state directly. ``rsag`` IS the
-        # IrisRSAG instance now (no TritonCommState wrapper).
-        ag_fn = lambda state, t, **kw: rsag.all_gather(t, **kw)  # noqa: E731
-        rs_fn = lambda state, t, **kw: rsag.reduce_scatter(t, **kw)  # noqa: E731
-
-        for tokens in cases:
-            _check_all_gather(
-                rsag, rank, world_size, tokens, hidden_size, device, ag_fn
-            )
-            _check_reduce_scatter(
-                rsag, rank, world_size, tokens, hidden_size, device, rs_fn
-            )
-    finally:
-        dist.destroy_process_group()
-
-
-def _check_all_gather(rsag, rank, world_size, tokens, hidden_size, device, all_gather):
-    local_tokens = tokens[rank]
-    local = torch.full(
-        (local_tokens, hidden_size),
-        rank + 1,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-
-    result = all_gather(rsag, local, token_list_in_group=tokens)
-
-    expected = torch.empty(
-        (sum(tokens), hidden_size), dtype=torch.bfloat16, device=device
-    )
-    offset = 0
-    for peer, peer_tokens in enumerate(tokens):
-        expected[offset : offset + peer_tokens].fill_(peer + 1)
-        offset += peer_tokens
-
-    assert result.shape == expected.shape, f"{result.shape} vs {expected.shape}"
-    torch.testing.assert_close(result, expected, atol=0, rtol=0)
-
-
-def _check_reduce_scatter(
-    rsag, rank, world_size, tokens, hidden_size, device, reduce_scatter
-):
-    full = torch.full(
-        (sum(tokens), hidden_size),
-        rank + 1,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-
-    result = reduce_scatter(rsag, full, token_list_in_group=tokens)
-
-    expected_value = world_size * (world_size + 1) // 2
-    expected = torch.full(
-        (tokens[rank], hidden_size),
-        expected_value,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-
-    assert result.shape == expected.shape, f"{result.shape} vs {expected.shape}"
-    torch.testing.assert_close(result, expected, atol=0, rtol=0)
-
-
-def _run_rsag_test(world_size: int, hidden_size: int) -> None:
-    _skip_if_unsupported(world_size, "IrisRSAG tests")
-    port = _get_open_port()
-    _spawn_and_collect(_rsag_worker_fn, (world_size, port, hidden_size), world_size)
-
-
-def test_iris_rsag_correctness_world2():
-    _run_rsag_test(world_size=2, hidden_size=2880)
-
-
-def test_iris_rsag_correctness_world4():
-    _run_rsag_test(world_size=4, hidden_size=2880)
-
-
-def test_iris_rsag_correctness_world8():
-    _run_rsag_test(world_size=8, hidden_size=2880)
-
-
-# ---------------------------------------------------------------------------
-# Suite 3: fused allreduce + residual + RMSNorm
+# Suite 2: fused allreduce + residual + RMSNorm
 # ---------------------------------------------------------------------------
 
 
@@ -1457,14 +1326,14 @@ _ARRMS_HIDDEN_DIM = 2880
 _ARRMS_EPS = 1e-6
 
 
-def _arrms_worker_fn(rank, world_size, port, persistent, error_dict):
+def _arrms_worker_fn(rank, world_size, port, error_dict):
     try:
-        _arrms_worker_main(rank, world_size, port, persistent)
+        _arrms_worker_main(rank, world_size, port)
     except Exception:
         error_dict[rank] = traceback.format_exc()
 
 
-def _arrms_worker_main(rank: int, world_size: int, port: int, persistent: bool) -> None:
+def _arrms_worker_main(rank: int, world_size: int, port: int) -> None:
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     # NCCL is fine here — iris's heap-base exchange is host-side and works
@@ -1488,7 +1357,6 @@ def _arrms_worker_main(rank: int, world_size: int, port: int, persistent: bool) 
             max_token_num=max_token_num,
             hidden_dim=_ARRMS_HIDDEN_DIM,
             dtype=torch.bfloat16,
-            persistent=persistent,
         )
 
         # Use a fixed RMSNorm weight that is *not* identity, so a bug in
@@ -1555,29 +1423,23 @@ def _check_arrms_one(state, rank, world_size, tokens, weight, device) -> None:
     torch.testing.assert_close(norm_out.float(), ref_norm, atol=2e-2, rtol=2e-2)
 
 
-def _run_arrms_test(world_size: int, persistent: bool) -> None:
+def _run_arrms_test(world_size: int) -> None:
     _skip_if_unsupported(world_size, "Iris fused tests")
     port = _get_open_port()
-    _spawn_and_collect(_arrms_worker_fn, (world_size, port, persistent), world_size)
+    _spawn_and_collect(_arrms_worker_fn, (world_size, port), world_size)
 
 
-@pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
-def test_iris_allreduce_residual_rmsnorm_world1(persistent: bool):
-    # Single-rank smoke test: exercises the inline-barrier self-signal/wait
-    # path (rank sends to itself) and the v1 device_barrier no-op case.
-    _run_arrms_test(world_size=1, persistent=persistent)
+def test_iris_allreduce_residual_rmsnorm_world1():
+    _run_arrms_test(world_size=1)
 
 
-@pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
-def test_iris_allreduce_residual_rmsnorm_world2(persistent: bool):
-    _run_arrms_test(world_size=2, persistent=persistent)
+def test_iris_allreduce_residual_rmsnorm_world2():
+    _run_arrms_test(world_size=2)
 
 
-@pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
-def test_iris_allreduce_residual_rmsnorm_world4(persistent: bool):
-    _run_arrms_test(world_size=4, persistent=persistent)
+def test_iris_allreduce_residual_rmsnorm_world4():
+    _run_arrms_test(world_size=4)
 
 
-@pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
-def test_iris_allreduce_residual_rmsnorm_world8(persistent: bool):
-    _run_arrms_test(world_size=8, persistent=persistent)
+def test_iris_allreduce_residual_rmsnorm_world8():
+    _run_arrms_test(world_size=8)
