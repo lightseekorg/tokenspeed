@@ -190,7 +190,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
     assert layer.shared_experts.down_proj.tp_group is None
     assert layer.experts.kwargs["routing_mode"] == "precomputed_topk"
     assert layer.comm is None
-    assert not hasattr(layer, "native_latent_moe")
+    assert layer.native_latent_moe is None
 
 
 @pytest.mark.parametrize(
