@@ -544,7 +544,7 @@ def _gdn_replay_commit_kernel(
         tl.extra.cuda.gdc_wait()
         # Release successor setup; its wait still guards all dependent reads.
         tl.extra.cuda.gdc_launch_dependents()
-    i_k, i_v, i_lnh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_lnh, i_v, i_k = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_hv = i_lnh % HV
     i_ln = i_lnh // HV
     i_n = i_ln % B
@@ -696,7 +696,7 @@ def triton_gdn_replay_commit(
     NK, NV = triton.cdiv(head_k_dim, BK), triton.cdiv(head_v_dim, BV)
     if NK != 1:
         raise ValueError("GDN replay does not support head dimensions above one tile")
-    _gdn_replay_commit_kernel[(NK, NV, num_layers * batch_size * num_v_heads)](
+    _gdn_replay_commit_kernel[(num_layers * batch_size * num_v_heads, NV, NK)](
         payload=payload,
         parameters=parameters,
         state_addresses=state_addresses,

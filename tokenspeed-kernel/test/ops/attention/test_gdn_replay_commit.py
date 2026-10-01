@@ -471,3 +471,32 @@ def test_gdn_replay_commit_replays_disjoint_layer_pools_in_one_launch(
             rtol=2e-2,
             atol=3e-2,
         )
+
+
+def test_gdn_replay_commit_batch_heads_exceed_grid_z_limit(device: str, require):
+    require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
+    torch.manual_seed(23)
+    batch, draft_tokens, num_k_heads, num_v_heads = 8200, 2, 2, 8
+    head_k_dim, head_v_dim = 32, 16
+    assert batch * num_v_heads > 65535
+    k = torch.randn(batch, draft_tokens, num_k_heads, head_k_dim, device=device)
+    v = torch.randn(batch, draft_tokens, num_v_heads, head_v_dim, device=device)
+    k, v = k.bfloat16(), v.bfloat16()
+    a = torch.randn(batch, draft_tokens, num_v_heads, device=device).bfloat16()
+    b = torch.randn_like(a)
+    A_log = torch.randn(num_v_heads, device=device) * 0.1
+    dt_bias = torch.randn(num_v_heads, device=device) * 0.1
+    pool = torch.randn(
+        2 * batch, num_v_heads, head_v_dim, head_k_dim, device=device
+    ).mul_(0.02)
+    read = torch.arange(batch, device=device, dtype=torch.int32)
+    write = read + batch
+    accepted = torch.randint(0, draft_tokens + 1, (batch,), device=device)
+    accepted = accepted.to(torch.int32)
+    expected = _reference_states(
+        k, v, a, b, A_log, dt_bias, pool[read.long()], accepted
+    )
+
+    _replay(k, v, a, b, A_log, dt_bias, pool, read, write, accepted)
+
+    torch.testing.assert_close(pool[write.long()], expected, rtol=2e-2, atol=3e-2)
