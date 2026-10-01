@@ -103,3 +103,14 @@ def test_tokenspeed_index_preserves_kernel_and_history(tmp_path, variant):
     if variant == "rocm72":
         assert 'href="rocm7.2/"' in (wheelhouse / "nightly/index.html").read_text()
         assert not (wheelhouse / "rocm7.2/nightly").exists()
+
+    release["assets"][0]["digest"] = f"sha256:{'b' * 64}"
+    UPDATE(wheelhouse, release, dist.parent, "tokenspeed", variant, replace=True)
+    updated = index.read_text()
+    assert updated.startswith("older tokenspeed nightly\n")
+    assert f'{url}?sha256={"b" * 64}#sha256={"b" * 64}' in updated
+    assert f'#sha256={"a" * 64}' not in updated
+    assert updated.count(f">{name}</a>") == 1
+    assert kernel.read_text() == "existing kernel links\n"
+    UPDATE(wheelhouse, release, dist.parent, "tokenspeed", variant, replace=True)
+    assert index.read_text() == updated
