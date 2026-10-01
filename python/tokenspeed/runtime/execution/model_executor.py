@@ -175,8 +175,14 @@ def _cache_arena_attr(pool, name: str, default):
 def _autotune_cache_key(
     server_args: ServerArgs,
     model_config: ModelConfig,
-) -> dict[str, object]:
-    """Rank-independent identity for tactics that may safely share a cache."""
+) -> dict[str, object] | None:
+    """Rank-independent identity for tactics that may safely share a cache.
+
+    Returns None under deterministic numerics, which keep heuristic tactics
+    and so must not read a cache that tuned runs wrote.
+    """
+    if server_args.numerics != "auto":
+        return None
     mapping = server_args.mapping
     return {
         "model": model_config.model_path,

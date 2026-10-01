@@ -374,11 +374,8 @@ def test_read_only_cache_load_does_not_rewrite_files(
         assert tuner.active
         installer.assert_not_called()
         loaded_path = Path(loader.call_args.args[0])
-        if rank in (None, 0):
-            assert loaded_path == path
-        else:
-            assert loaded_path != path
-            assert not loaded_path.exists()
+        assert loaded_path != path
+        assert not loaded_path.exists()
         if local_payload is None:
             assert not path.exists()
         else:
@@ -387,6 +384,26 @@ def test_read_only_cache_load_does_not_rewrite_files(
         directory.chmod(0o755)
         if path.exists():
             path.chmod(0o644)
+
+
+def test_owner_loads_the_bytes_it_broadcast(monkeypatch, tmp_path):
+    tuner, _ = _install_fake_flashinfer(monkeypatch, metadata={})
+    path = tmp_path / "configs.json"
+    path.write_bytes(b"tactics")
+    monkeypatch.setattr(tuning.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(tuning.dist, "get_world_size", lambda group: 2)
+
+    def broadcast(payload_box, *, src, group):
+        # Another engine replaces the file after the owner has read it.
+        path.write_bytes(b"rewritten")
+
+    def gather(states, loaded, *, group):
+        states[:] = [loaded, loaded]
+
+    monkeypatch.setattr(tuning.dist, "broadcast_object_list", broadcast)
+    monkeypatch.setattr(tuning.dist, "all_gather_object", gather)
+    assert load_autotune_cache(str(path), object(), 0)
+    assert tuner.active
 
 
 @pytest.mark.parametrize("available", [False, True])

@@ -349,14 +349,11 @@ def load_autotune_cache(
             payload = payload_box[0]
         if payload is not None:
             try:
-                if is_owner:
-                    loaded = bool(tuner.load_configs(path))
-                else:
-                    # A peer's persistent cache directory may also be read-only.
-                    with tempfile.NamedTemporaryFile() as tmp:
-                        tmp.write(payload)
-                        tmp.flush()
-                        loaded = bool(tuner.load_configs(tmp.name))
+                # All ranks load the broadcast bytes; a rewrite cannot split them.
+                with tempfile.NamedTemporaryFile() as tmp:
+                    tmp.write(payload)
+                    tmp.flush()
+                    loaded = bool(tuner.load_configs(tmp.name))
             except Exception:
                 logger.warning(f"Could not load FlashInfer cache {path}", exc_info=True)
     if process_group is not None:

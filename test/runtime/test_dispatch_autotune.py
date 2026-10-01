@@ -1104,6 +1104,7 @@ def test_pipeline_stages_share_shape_keyed_cache_identity():
     args = SimpleNamespace(
         mapping=mapping,
         disaggregation_mode="null",
+        numerics="auto",
         dtype="bfloat16",
         moe_backend="auto",
         attention_backend="auto",
@@ -1129,6 +1130,8 @@ def test_pipeline_stages_share_shape_keyed_cache_identity():
     args.disaggregation_mode = "null"
     mapping.moe.ep_size = 2
     assert api._autotune_cache_key(args, model) != full_model
+    args.numerics = "rl-bitwise"
+    assert api._autotune_cache_key(args, model) is None
 
 
 @pytest.mark.parametrize(

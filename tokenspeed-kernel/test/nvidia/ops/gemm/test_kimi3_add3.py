@@ -141,5 +141,5 @@ def test_skinny_add3_changed_input_replay_and_out(m):
     graph.replay()
     torch.cuda.synchronize()
     expected = prefix.float() + x.float() @ weight.float().T + shared.float()
-    torch.testing.assert_close(out.float(), expected, atol=0.5, rtol=2e-2)
+    torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=2e-2)
     assert torch.all(storage[m * n :] == 42)
