@@ -1300,6 +1300,7 @@ def mm(
     B_scales = _as_2d_tensor_scale(B_scales)
 
     M = A.shape[0]
+    b_layout = "NK"
     if quant == "mxfp4":
         K = A.shape[-1] * 2
         N = B.shape[0]
@@ -1308,7 +1309,8 @@ def mm(
         N = B.shape[0]
     else:
         K = A.shape[-1]
-        N = B.shape[-1] if B.shape[0] == K else B.shape[0]
+        b_layout = "KN" if B.shape[0] == K else "NK"
+        N = B.shape[-1] if b_layout == "KN" else B.shape[0]
 
     if out is not None:
         _validate_gemm_out(
@@ -1329,6 +1331,7 @@ def mm(
         "m": M,
         "n": N,
         "k": K,
+        "b_layout": b_layout,
         "a_inner_stride_one": A.stride(-1) == 1,
         "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
         "b_inner_stride_one": B.stride(-1) == 1,
