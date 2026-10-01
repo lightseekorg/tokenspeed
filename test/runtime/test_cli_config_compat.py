@@ -447,8 +447,12 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa.resolve_speculative_decoding()
         self.assertIsNone(sa.speculative_draft_model_quantization)
 
-    def test_replay_ssm_defaults_to_disabled(self):
+    def test_replay_ssm_defaults_to_enabled(self):
         args = self._parse_args(["--model", "test/model"])
+        self.assertTrue(self._from_cli_args_no_init(args).enable_replay_ssm)
+
+    def test_replay_ssm_can_be_disabled(self):
+        args = self._parse_args(["--model", "test/model", "--disable-replay-ssm"])
         self.assertFalse(self._from_cli_args_no_init(args).enable_replay_ssm)
 
     def test_replay_ssm_can_be_enabled(self):

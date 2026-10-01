@@ -104,6 +104,7 @@ CI_MODELS = [
             "speculative_num_steps": 3,
             "speculative_eagle_topk": 1,
             "speculative_num_draft_tokens": 4,
+            "enable_replay_ssm": False,
             "gpu_memory_utilization": 0.9,
         },
     ),
