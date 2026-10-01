@@ -189,7 +189,7 @@ def test_amd_quark_rejects_unsupported_layer_quant_config(monkeypatch) -> None:
     per_tensor["weight"]["qscheme"] = "per_tensor"
     config["layer_quant_config"] = {"*self_attn*": per_tensor}
 
-    with pytest.raises(ValueError, match="Unsupported Quark layer_quant_config"):
+    with pytest.raises(ValueError, match="Unsupported per-layer quantization scheme"):
         Mxfp4Config.from_config(config)
 
 

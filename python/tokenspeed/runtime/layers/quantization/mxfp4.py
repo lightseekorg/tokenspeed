@@ -102,9 +102,12 @@ _QUARK_FP8_DEQUANT_LEAVES = frozenset({"f_b_proj", "kv_b_proj"})
 
 
 def _is_quark_fp8_per_channel_w8a8(spec: object) -> bool:
-    """Whether a Quark layer spec is static per-channel FP8 weights with
-    dynamic per-token FP8 activations (Quark labels per-token activation
-    scaling ``per_channel`` on the token axis)."""
+    """Whether a per-layer override is FP8 W8A8 with per-channel weight scales.
+
+    Weights are static FP8 E4M3 with one scale per output channel; activations
+    are quantized to FP8 per token at runtime, which the config labels
+    ``per_channel`` on the token axis.
+    """
     if not isinstance(spec, Mapping):
         return False
     weight = spec.get("weight") or {}
@@ -124,20 +127,23 @@ def _is_quark_fp8_per_channel_w8a8(spec: object) -> bool:
 
 
 def _quark_fp8_layer_patterns(config: Mapping[str, Any]) -> list[str]:
-    """Normalize Quark ``layer_quant_config`` globs to ignore-style patterns.
+    """Collect the module globs of the checkpoint's per-layer FP8 overrides.
 
-    Only the FP8 per-channel W8A8 scheme is supported; any other per-layer
-    override would otherwise silently load under the global MXFP4 scheme.
+    ``layer_quant_config`` maps module globs (e.g. ``*self_attn*``) to a scheme
+    that replaces the global MXFP4 one for matching modules. Only FP8 W8A8 with
+    per-channel weight scales is supported; any other scheme would otherwise
+    silently load as MXFP4, so it is rejected. The globs are normalized like
+    ignored-layer patterns.
     """
     layer_quant_config = config.get("layer_quant_config") or {}
     if not isinstance(layer_quant_config, Mapping):
-        raise ValueError("Quark layer_quant_config must be a mapping")
+        raise ValueError("layer_quant_config must map module globs to schemes")
     patterns: list[str] = []
     for glob, spec in layer_quant_config.items():
         if not _is_quark_fp8_per_channel_w8a8(spec):
             raise ValueError(
-                f"Unsupported Quark layer_quant_config scheme for {glob!r}; "
-                "only static per-channel FP8 E4M3 weights with dynamic FP8 "
+                f"Unsupported per-layer quantization scheme for {glob!r}; only "
+                "static per-channel FP8 E4M3 weights with dynamic per-token FP8 "
                 "activations are supported"
             )
         patterns.append(glob)
@@ -173,7 +179,7 @@ def _normalize_ignored_layer_patterns(patterns: list[str] | None) -> list[str]:
     """Normalize ignored-layer patterns into the form understood by
     ``should_ignore_quant_layer``.
 
-    Some exporters (notably AMD-Quark) accept shell-style globs such as
+    Some checkpoint exporters write shell-style globs such as
     ``"*lm_head"`` or ``"*self_attn*"``. ``should_ignore_quant_layer``
     expects either an exact name or a regex prefixed with ``re:``. Convert
     glob-like entries to regex while passing through plain literals.
@@ -211,8 +217,9 @@ class Mxfp4Config(QuantizationConfig):
         self.use_dynamic_mxfp4_activations = use_dynamic_mxfp4_activations
         self.quant_method = quant_method
         self.group_size = 32
-        # Quark per-layer FP8 overrides (e.g. ``*self_attn*``), matched like
-        # ignored-layer patterns against runtime and checkpoint module names.
+        # Per-layer FP8 overrides from the checkpoint (e.g. ``*self_attn*``),
+        # matched like ignored-layer patterns against runtime and checkpoint
+        # module names.
         self.fp8_layer_patterns = fp8_layer_patterns or []
         self.fp8_config: W8A8Fp8Config | None = (
             W8A8Fp8Config(is_checkpoint_fp8_serialized=True)
@@ -247,7 +254,7 @@ class Mxfp4Config(QuantizationConfig):
         )
 
     def quark_fp8_route(self, module_name: str) -> str | None:
-        """Route a module covered by a Quark FP8 per-layer override.
+        """Return how a module under a per-layer FP8 override is loaded and run.
 
         Returns ``"w8a8"`` for FP8-resident modules, ``"dequant"`` for weights
         model code consumes raw (dequantized to BF16 at load), or ``None``
@@ -266,7 +273,7 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
-        """Promote AMD Quark MXFP4 checkpoint metadata to mxfp4."""
+        """Select mxfp4 for AMD checkpoints whose global scheme has MXFP4 weights."""
         if user_quant in {"mxfp4", None} and _is_amd_quark_mxfp4_checkpoint(
             hf_quant_cfg
         ):
@@ -335,7 +342,7 @@ def preprocess_quark_weights(
     quant_config: QuantizationConfig | None,
     dequantize_mxfp4_module: Callable[[str], bool],
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Adapt an AMD Quark MXFP4 checkpoint stream with per-layer FP8 overrides.
+    """Adapt an MXFP4 checkpoint stream with per-layer FP8 overrides to runtime.
 
     * FP8 ``"w8a8"`` modules pass their codes through; the per-channel
       ``weight_scale`` ``[N]`` is reshaped to the ``[N, 1]`` parameter layout.
@@ -385,6 +392,6 @@ def preprocess_quark_weights(
         yield module + ".weight", dequantized
     if pending:
         raise RuntimeError(
-            "Quark dequantized modules missing their weight/weight_scale pair "
+            "Dequantized modules missing their weight/weight_scale pair "
             f"at end of checkpoint stream: {sorted(pending)}"
         )
