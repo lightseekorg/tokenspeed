@@ -3,13 +3,17 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.activation.triton import (
+    _relu2_kernel,
     fused_gate_sigmoid_mul_add,
+    relu2,
     sigmoid_mul,
     silu_and_mul,
     situ_and_mul,
     swiglu_oai,
 )
+from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from utils import assert_no_triton_compile
 
 platform = current_platform()
 torch.manual_seed(42)
@@ -413,3 +417,61 @@ def test_fused_swiglu_fp8_ue8m0_partial_pack_keeps_padding_zero(device: str) -> 
     _, packed_scale = fused_swiglu_fp8_ue8m0(gate_up, enable_pdl=False)
     tail = packed_scale[:, 1]
     assert bool(((tail >> 8) == 0).all()), "padding scale bytes must remain zero"
+
+
+@pytest.mark.parametrize("shape", [(1, 5376), (33, 1024), (7, 100)])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_relu2_matches_eager(shape: tuple[int, int], pdl: bool, device: str) -> None:
+    if pdl and not platform.is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA SM90+")
+    pdl_enabled(overwrite=pdl)
+    x = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    out = relu2(x, torch.empty_like(x), fp8_scale=None)
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.relu(x).square())
+
+
+@pytest.mark.skipif(not platform.is_nvidia, reason="requires float8_e4m3fn CUDA")
+@pytest.mark.parametrize("pdl", [False, True])
+def test_relu2_fp8_quantizes_the_bf16_square(pdl: bool, device: str) -> None:
+    """Bit-identical to the BF16 activation followed by the linear's static quantization."""
+    if pdl and not platform.is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA SM90+")
+    pdl_enabled(overwrite=pdl)
+    x = torch.randn(9, 5376, device=device, dtype=torch.bfloat16) * 3
+    # 1.03125**2 rounds to BF16 1.0625 and then FP8 1.0, but straight to FP8 1.125.
+    x[0, :4] = 1.03125
+    scale = torch.tensor([16.0 / 448.0], device=device)
+    for fp8_scale in (scale, torch.ones(1, device=device)):
+        out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        relu2(x, out, fp8_scale=fp8_scale)
+        expected, _ = static_quant_fp8(torch.relu(x).square(), fp8_scale)
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_relu2_in_place_from_strided_rows(device: str) -> None:
+    wide = torch.randn(4, 2048, device=device, dtype=torch.bfloat16)
+    x = wide[:, :1500]
+    expected = torch.relu(x).square()
+    untouched = wide[:, 1500:].clone()
+    relu2(x, x, fp8_scale=None)
+    assert torch.equal(x, expected)
+    assert torch.equal(wide[:, 1500:], untouched)
+
+
+def test_relu2_compiles_once_across_batch_sizes(device: str) -> None:
+    x = torch.randn(300, 1536, device=device, dtype=torch.bfloat16)
+    relu2(x[:3], torch.empty_like(x[:3]), fp8_scale=None)
+    with assert_no_triton_compile(_relu2_kernel):
+        for rows in (1, 16, 37, 300):
+            relu2(x[:rows], torch.empty_like(x[:rows]), fp8_scale=None)
+
+
+def test_relu2_contract(device: str) -> None:
+    x = torch.randn(3, 64, device=device, dtype=torch.bfloat16)
+    assert relu2(x[:0], x[:0], fp8_scale=None).shape == (0, 64)
+    with pytest.raises(ValueError, match="FP8 exactly"):
+        relu2(x, torch.empty_like(x), fp8_scale=torch.ones(1, device=device))
+    with pytest.raises(ValueError, match="dense columns"):
+        relu2(x.t(), x.t(), fp8_scale=None)

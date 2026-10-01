@@ -54,3 +54,20 @@ GEMMs. On the measured BS1 MTP3 graph, FlashInfer 0.7's isolated-kernel tuner
 selected tile 8, leaving an idle interval before routing. This policy keeps
 tile 32 available for that shape while retaining upstream routing and GEMM
 implementations.
+
+## NVFP4 squared ReLU
+
+Nemotron-H experts use a non-gated `relu(x)**2` activation. GEMM1 holds only
+the up projection, so `w13` is `[E, I, H]` rather than `[E, 2I, H]`. The weight
+preprocessor skips the gate/up half swap and permutes with
+`is_gated_act_gemm=False`. FlashInfer tiles non-gated GEMM1 rows by 128, so
+the kernels declare an `ispp_alignment` of 128 instead of 64.
+
+The kernel applies `output1_scale_gate_scalar` to the GEMM1 accumulator before
+squaring and `output1_scale_scalar` after. Squaring is not linear, so the
+GEMM1 dequant `a13 * w13_scale_2` must go in the first scale and the second
+scale carries only the GEMM2-input requant `1 / a2`. This is the SiTU recipe.
+The SwiGLU recipe folds the up-half dequant into the second scale, which would
+be wrong here. The kernel test checks non-unit input scales against a
+dequantized reference, and checks in-kernel sigmoid-plus-bias routing with 512
+experts and top-22.

@@ -57,6 +57,7 @@ from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata imp
 )
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
+    _reject_skip_term,
     logger,
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -642,6 +643,7 @@ class KdaAttnBackend(MambaAttnBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -653,6 +655,7 @@ class KdaAttnBackend(MambaAttnBackend):
         norm_weight: torch.Tensor | None,
         norm_eps: float | None,
     ) -> torch.Tensor:
+        _reject_skip_term(D)
         seq_len = query.shape[0]
         num_heads = query.shape[2]
         head_k_dim = query.shape[3]
@@ -861,6 +864,7 @@ class KdaAttnBackend(MambaAttnBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -873,6 +877,7 @@ class KdaAttnBackend(MambaAttnBackend):
         lower_bound: float | None,
     ) -> torch.Tensor:
 
+        _reject_skip_term(D)
         from tokenspeed_kernel.ops.attention.kda.triton import (
             kda_recurrent_decode_mtp,
         )
@@ -995,6 +1000,7 @@ class KdaAttnBackend(MambaAttnBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -1022,6 +1028,7 @@ class KdaAttnBackend(MambaAttnBackend):
         ``inputs_packed`` carries the producer promise defined by the kernel
         facade; being inside a graph alone does not establish that promise.
         """
+        _reject_skip_term(D)
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
 

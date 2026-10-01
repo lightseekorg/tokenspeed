@@ -216,9 +216,13 @@ class QwenGDNRecipe(CacheRecipe):
             and torch.device(self.attn_config.device).type == "cuda"
         ):
             return False
+        return self._replay_commit_supported(self.attn_config.dtype)
+
+    def _replay_commit_supported(self, dtype: torch.dtype) -> bool:
+        """Whether this family's replay kernel runs here for ``dtype`` payloads."""
         from tokenspeed_kernel.ops.attention.gdn import gdn_replay_commit_supported
 
-        return bool(gdn_replay_commit_supported(self.attn_config.dtype))
+        return bool(gdn_replay_commit_supported(dtype))
 
     @override
     def workspace_bytes(self) -> int:

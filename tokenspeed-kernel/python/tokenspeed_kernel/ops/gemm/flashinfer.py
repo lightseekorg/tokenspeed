@@ -439,6 +439,85 @@ if mm_mxfp8 is not error_fn:
         return output
 
 
+# ---- FlashInfer per-tensor FP8 (cuBLASLt) -------------------------------
+
+_FP8_TENSOR_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
+bmm_fp8 = error_fn
+
+if platform.is_nvidia and platform.is_blackwell:
+    try:
+        from flashinfer import bmm_fp8
+    except ImportError:
+        pass
+
+if bmm_fp8 is not error_fn:
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="flashinfer_mm_fp8_tensor_scaled",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_TENSOR_SCALE
+        ),
+        # cuBLASLt reads B column-major: a transposed [N, K] weight.
+        traits={
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({False}),
+        },
+        priority=Priority.PERFORMANT + 3,
+    )
+    def flashinfer_mm_fp8_tensor_scaled(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Per-tensor scaled FP8 GEMM on FlashInfer's cuBLASLt backend.
+
+        Args:
+            A: ``[M, K]`` row-major FP8 activations.
+            B: ``[K, N]`` column-major FP8 weights (a transposed ``[N, K]``).
+            A_scales: One-element FP32 activation dequant scale.
+            B_scales: One-element FP32 weight dequant scale.
+            out_dtype: BF16 or FP16 output dtype.
+            alpha: Must be None; the per-tensor scales carry the dequant.
+            block_size: Must be None; the scales are per tensor.
+            out: Optional ``[M, N]`` output buffer.
+
+        Returns:
+            ``[M, N]`` output, ``out`` when given.
+        """
+        if alpha is not None or block_size is not None:
+            raise ValueError("per-tensor FP8 GEMM takes no alpha or block_size")
+        # cuBLASLt reads dense operands: row-major A and column-major B.
+        A = A.contiguous()
+        B = B.t().contiguous().t()
+        direct = out is not None and out.is_contiguous()
+        result = bmm_fp8(
+            A.unsqueeze(0),
+            B.unsqueeze(0),
+            A_scales,
+            B_scales,
+            out_dtype,
+            out=out.unsqueeze(0) if direct else None,
+            backend="cublas",
+        ).squeeze(0)
+        if out is None or direct:
+            return result
+        # cuBLASLt writes dense rows; a strided view gets a copy.
+        return out.copy_(result)
+
+
 # ---- FlashInfer FP4 -----------------------------------------------------
 
 mm_fp4 = error_fn

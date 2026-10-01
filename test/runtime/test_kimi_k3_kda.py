@@ -119,6 +119,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         scan_boundaries,
         A_log=torch.empty(2),
         dt_bias=torch.empty(2, 3),
+        D=None,
         a=None,
         b=None,
         g_raw=torch.empty_like(query),

@@ -22,6 +22,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Activations applied to the up projection alone; their w13 has no gate half.
+NON_GATED_ACTIVATIONS = frozenset({"relu2"})
+
 
 @dataclass(frozen=True)
 class MoELayerSpec:
@@ -37,6 +40,11 @@ class MoELayerSpec:
     ep_size: int
     prefix: str = ""
     a2a_backend: str = "none"
+
+    @property
+    def gated(self) -> bool:
+        """Whether GEMM1 stacks gate and up projections (``w13`` is ``2 * I`` rows)."""
+        return self.activation not in NON_GATED_ACTIVATIONS
 
     @property
     def use_deepep(self) -> bool:
