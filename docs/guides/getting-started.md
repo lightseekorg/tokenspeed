@@ -151,3 +151,26 @@ tokenspeed serve openai/gpt-oss-20b \
 ```
 
 For model-specific examples, continue with [Model Recipes](../recipes/models.md).
+
+### AMD RDNA4 (`gfx1201`)
+
+`gfx1201` devices, including the Radeon AI PRO R9700, use the existing portable
+Triton kernels and ROCm library implementations. Install a ROCm PyTorch build
+that includes `gfx1201` device support. Dense BF16 inference is the initial
+supported path; the `gfx950` and `gfx1250` specialized kernels are not enabled
+for this architecture.
+
+For a small single-GPU model, start with Triton attention and eager execution:
+
+```bash
+tokenspeed serve Qwen/Qwen3-0.6B \
+  --host 127.0.0.1 \
+  --dtype bfloat16 \
+  --world-size 1 \
+  --attention-backend triton \
+  --enforce-eager \
+  --disable-prefill-graph
+```
+
+Architecture detection reports RDNA4 separately from CDNA4/CDNA5. CDNA-specific
+matrix and async-copy capabilities remain disabled for `gfx1201`.
