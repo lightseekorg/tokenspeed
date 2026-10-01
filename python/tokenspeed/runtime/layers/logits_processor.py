@@ -24,6 +24,7 @@ import dataclasses
 
 import torch
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
+from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     DistArgmaxState,
@@ -751,12 +752,14 @@ class LogitsProcessor(nn.Module):
                     lm_head.weight,
                     override="aok",
                 )
-            elif self._use_fused_lm_head:
-                logits = _lm_head_matmul(hidden_states, lm_head.weight)
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                cast_hidden = hidden_states.to(lm_head.weight.dtype)
+                if use_decode_gemv(cast_hidden, lm_head.weight):
+                    logits = decode_gemv(cast_hidden, lm_head.weight)
+                elif self._use_fused_lm_head:
+                    logits = _lm_head_matmul(cast_hidden, lm_head.weight)
+                else:
+                    logits = torch.matmul(cast_hidden, lm_head.weight.T)
         else:
             # GGUF models
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)

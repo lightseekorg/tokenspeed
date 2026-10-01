@@ -50,8 +50,9 @@ regress perf even when the generated kernel remains correct.
 
 ### gfx950 dense BF16 projections
 
-The gfx950 package provides dense BF16 projection kernels, including an
-eight-wave prefill kernel adapted from the gfx950 Gluon tutorials.
+The gfx950 package provides dense BF16 projection kernels: an eight-wave
+warp-pipeline prefill kernel, and a split-K tiled MFMA kernel for Kimi K3
+decode batches.
 
 #### Contract
 
@@ -60,9 +61,15 @@ eight-wave prefill kernel adapted from the gfx950 Gluon tutorials.
 - Padded row strides and caller-owned outputs are supported when their inner
   stride is one. Quantization scales and block sizes are not supported.
 - Automatic selection uses the prefill kernel when `2816 <= M <= 4096`, `M` is
-  divisible by 256, and `(N, K) = (3072, 512)`. Other shapes retain the default
-  PyTorch path. The small- and medium-M kernels remain available for direct use
-  but are not registered for automatic selection.
+  divisible by 256, and `(N, K) = (3072, 512)`.
+- The decode kernel takes contiguous inputs with `2 <= M <= 64` and writes BF16
+  or FP32 (the MoE router). It runs only `(N, K)` and M buckets
+  (`4, 8, 16, 32, 64`) with a measured config in `_DECODE_CONFIGS`; each
+  entry beat `torch.mm` (hipBLASLt) by at least 4% in cold-cache sweeps at
+  Kimi K3 TP8 shapes.
+- Other shapes retain the default PyTorch path. The small- and medium-M
+  kernels remain available for direct use but are not registered for
+  automatic selection.
 
 #### Algorithm
 
@@ -75,6 +82,16 @@ MFMA work on one buffer overlaps loading the next K tile into the other buffer.
 The epilogue converts each accumulator quadrant to BF16 and stores it with
 vectorized buffer operations. XCD-aware grouped tile ordering distributes
 adjacent output tiles across the eight XCDs.
+
+Decode GEMMs are weight-bandwidth bound, so the decode kernel uses 16- or
+32-row tiles over one- to three-buffer LDS pipelines and splits K when the
+output alone has too few tiles to fill the GPU. Each split writes an FP32
+partial through to memory, waits for its stores, and bumps a per-tile counter
+with a relaxed atomic; the last split to arrive sums all partials in split
+order with cache-bypassing loads, writes C, and resets the counter, so one
+launch does both phases without an acquire-release fence and results are
+deterministic. An optional XCD remap keeps the M tiles that
+share a weight tile on one XCD's L2.
 
 ### gfx950 MXFP8 projection
 
