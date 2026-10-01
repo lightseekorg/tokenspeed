@@ -406,19 +406,20 @@ def _fp64_reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 @_requires_nvidia
-def test_fp32_selection_follows_dtype_and_rows():
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_fp32_selection_follows_dtype_and_rows(x_dtype):
     from tokenspeed_kernel.ops.gemm.triton_gemv import (
         torch_decode_gemv,
         triton_rowcta_gemm_fp32,
     )
 
-    fp32 = (torch.float32, torch.float32, False)
+    fp32 = (x_dtype, torch.float32, False)
     _select.cache_clear()
     for n, k in _ROUTER_SHAPES:
         for m in (1, 2, 9, 16):
             assert _select(m, n, k, True, *fp32) is triton_rowcta_gemm_fp32
         for m in (17, 32):
-            assert _select(m, n, k, True, *fp32) is torch_decode_gemv
+            assert _select(m, n, k, True, *fp32) is not triton_rowcta_gemm_fp32
         assert _select(1, n, k, False, *fp32) is torch_decode_gemv
     # The multi-row kernel is FP32 only, and FP16 has no registered leaf.
     bf16 = (torch.bfloat16, torch.bfloat16, False)
@@ -443,14 +444,15 @@ def test_fp32_selection_follows_dtype_and_rows():
         (8, 256, 7679, False),
     ],
 )
-def test_fp32_selection_keeps_the_measured_envelope(m, n, k, expected):
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_fp32_selection_keeps_the_measured_envelope(m, n, k, expected, x_dtype):
     from tokenspeed_kernel.ops.gemm.triton_gemv import (
         torch_decode_gemv,
         triton_rowcta_gemm_fp32,
     )
 
     _select.cache_clear()
-    selected = _select(m, n, k, True, torch.float32, torch.float32, False)
+    selected = _select(m, n, k, True, x_dtype, torch.float32, False)
     assert selected is (triton_rowcta_gemm_fp32 if expected else torch_decode_gemv)
 
 
@@ -466,6 +468,31 @@ def test_fp32_decode_gemv_matches_fp64(m, n, k):
     torch.testing.assert_close(out, _fp64_reference(x, weight), rtol=2e-5, atol=2e-4)
     # One fixed reduction order: an allocating call agrees bit for bit.
     assert torch.equal(decode_gemv(x, weight), out)
+
+
+@_requires_nvidia
+@pytest.mark.parametrize("m", [1, 2, 8, 16, 17])
+@pytest.mark.parametrize("n,k", _ROUTER_SHAPES + [(19, 132), (3, 4100)])
+def test_bf16_rows_with_fp32_weight_skip_the_widening_copy(m, n, k):
+    torch.manual_seed(m + n + k)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="cuda")
+    out = torch.full((m, n), float("nan"), device="cuda")
+    assert decode_gemv(x, weight, out) is out
+    # BF16 to FP32 is exact, so the mixed call is its kernel's call on
+    # x.float(), and the FP32 call wherever one kernel serves both activation
+    # dtypes. From 17 rows BF16 activations may take a kernel that FP32
+    # activations do not; then the two calls share only the FP32 error bound.
+    bf16_kernel = _select(m, n, k, True, torch.bfloat16, torch.float32, False)
+    assert torch.equal(out, bf16_kernel(x.float(), weight))
+    widened = decode_gemv(x.float(), weight)
+    if bf16_kernel is _select(m, n, k, True, torch.float32, torch.float32, False):
+        assert torch.equal(out, widened)
+    reference = _fp64_reference(x, weight)
+    torch.testing.assert_close(out, reference, rtol=2e-5, atol=2e-4)
+    torch.testing.assert_close(widened, reference, rtol=2e-5, atol=2e-4)
+    with pytest.raises(ValueError):
+        decode_gemv(x, weight, torch.empty(m, n, device="cuda", dtype=x.dtype))
 
 
 @_requires_nvidia
@@ -485,10 +512,11 @@ def test_fp32_rowcta_empty_odd_and_wide_rows(m, n, k):
 
 
 @_requires_nvidia
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("m", [1, 8, 16])
-def test_fp32_decode_gemv_graph_replay(m):
+def test_fp32_decode_gemv_graph_replay(m, x_dtype):
     n, k = _ROUTER_SHAPES[1]
-    x = torch.randn(m, k, device="cuda")
+    x = torch.randn(m, k, device="cuda", dtype=x_dtype)
     weight = torch.randn(n, k, device="cuda")
     out = torch.empty(m, n, device="cuda")
     decode_gemv(x, weight, out)  # compile before capture
