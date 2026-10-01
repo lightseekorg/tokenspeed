@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -42,7 +43,33 @@ __all__ = ["prepare_kda_paged_decode", "prepare_kda_paged_prefill"]
 _IMPLEMENTED_DTYPES = {
     "bfloat16": torch.bfloat16,
 }
-_IMPLEMENTED_MODEL_PROFILES = frozenset({"glm53_flash_tp4"})
+
+
+@dataclass(frozen=True)
+class _KdaModelProfile:
+    """Per-rank KDA geometry and the packed input projection it slices from.
+
+    Models project every KDA input in one GEMM and hand the kernels strided
+    views of its rows, so the row width and view offsets are part of the
+    benchmarked layout.
+    """
+
+    heads: int
+    head_dim: int
+    projection_width: int
+    beta_offset: int
+
+
+_MODEL_PROFILES = {
+    # Rows are [q | k | v | beta | f_a | f_b].
+    "glm53_flash_tp4": _KdaModelProfile(
+        heads=16, head_dim=128, projection_width=6416, beta_offset=6144
+    ),
+    # KimiKDAMergedProj rows are [q | k | v | g | f_a | beta | pad].
+    "kimi_k3_tp8": _KdaModelProfile(
+        heads=12, head_dim=128, projection_width=6288, beta_offset=6272
+    ),
+}
 _IMPLEMENTED_RECURRENT_LAYOUTS = frozenset({"k_major", "v_major"})
 _IMPLEMENTED_STATE_PAGE_RELATIONS = frozenset({"in_place", "distinct"})
 _DISTINCT_WRITE_PAGE_OFFSET = 16
@@ -71,7 +98,7 @@ def _parse_model_profile(parameters: dict[str, Any]) -> str:
     return _implemented_value(
         "model_profile",
         parameters["model_profile"],
-        _IMPLEMENTED_MODEL_PROFILES,
+        _MODEL_PROFILES,
     )
 
 
@@ -144,21 +171,18 @@ def _cu_seqlens(
 
 def _packed_beta_logits(
     tokens: int,
-    heads: int,
-    key_dim: int,
-    value_dim: int,
+    profile: _KdaModelProfile,
     *,
     dtype: torch.dtype,
     generator: torch.Generator,
 ) -> torch.Tensor:
-    qkv_width = heads * (2 * key_dim + value_dim)
-    projection_width = qkv_width + heads + 2 * key_dim
     projection = _randn(
-        (tokens, projection_width),
+        (tokens, profile.projection_width),
         dtype=dtype,
         generator=generator,
     )
-    return projection[:, qkv_width : qkv_width + heads].view(1, tokens, heads)
+    beta = projection[:, profile.beta_offset : profile.beta_offset + profile.heads]
+    return beta.view(1, tokens, profile.heads)
 
 
 def _packed_decode_qkv(
@@ -186,22 +210,19 @@ def _packed_decode_qkv(
 
 def _packed_prefill_inputs(
     tokens: int,
-    heads: int,
-    key_dim: int,
-    value_dim: int,
+    profile: _KdaModelProfile,
     *,
     dtype: torch.dtype,
     generator: torch.Generator,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q = _randn((1, tokens, heads, key_dim), dtype=dtype, generator=generator)
-    k = _randn((1, tokens, heads, key_dim), dtype=dtype, generator=generator)
-    v = _randn((1, tokens, heads, value_dim), dtype=dtype, generator=generator)
-    g_raw = _randn((1, tokens, heads, key_dim), dtype=dtype, generator=generator)
+    shape = (1, tokens, profile.heads, profile.head_dim)
+    q = _randn(shape, dtype=dtype, generator=generator)
+    k = _randn(shape, dtype=dtype, generator=generator)
+    v = _randn(shape, dtype=dtype, generator=generator)
+    g_raw = _randn(shape, dtype=dtype, generator=generator)
     beta_logits = _packed_beta_logits(
         tokens,
-        heads,
-        key_dim,
-        value_dim,
+        profile,
         dtype=dtype,
         generator=generator,
     )
@@ -284,6 +305,17 @@ def _normalize_common_parameters(
     heads = request.parameters["heads"]
     key_dim = request.parameters["key_dim"]
     value_dim = request.parameters["value_dim"]
+    profile = _MODEL_PROFILES[model_profile]
+    if (heads, key_dim, value_dim) != (
+        profile.heads,
+        profile.head_dim,
+        profile.head_dim,
+    ):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"KDA {model_profile} uses {profile.heads} heads of width "
+            f"{profile.head_dim}",
+        )
     dtype = _parse_dtype(request.parameters["dtype"])
     lower_bound = request.parameters["lower_bound"]
     recurrent_layout = _parse_recurrent_layout(request.parameters)
@@ -344,9 +376,7 @@ def prepare_kda_paged_prefill(
     generator = _generator(request.seed)
     q, k, v, g_raw, beta_logits = _packed_prefill_inputs(
         total_tokens,
-        heads,
-        key_dim,
-        value_dim,
+        _MODEL_PROFILES[model_profile],
         dtype=dtype,
         generator=generator,
     )
@@ -474,9 +504,7 @@ def prepare_kda_paged_decode(
     g_raw = _randn((1, batch, heads, key_dim), dtype=dtype, generator=generator)
     beta_logits = _packed_beta_logits(
         batch,
-        heads,
-        key_dim,
-        value_dim,
+        _MODEL_PROFILES[model_profile],
         dtype=dtype,
         generator=generator,
     )

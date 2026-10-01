@@ -21,12 +21,15 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
+from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
+
 from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiK3Config,
     KimiK3VisionConfig,
     KimiLinearConfig,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
     FULL_ATTENTION,
     LINEAR_ATTENTION,
@@ -177,7 +180,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
         """Construct one MoE block on a chosen plan; report what it wired."""
         from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
         from tokenspeed.runtime.models import kimi_k3
-        from tokenspeed.runtime.models.kimi_k3_comm import K3MoeTailCommState
 
         linear_calls: list[dict] = []
         multicast_calls: list[dict] = []
@@ -215,8 +217,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.components = kwargs
 
         config = KimiLinearConfig(
-            # Distinct widths: the MoE tail comm state is negotiated once per
-            # process, and another test already claimed 64/32.
             hidden_size=128,
             routed_expert_hidden_size=routed_hidden,
             moe_intermediate_size=64,
@@ -248,8 +248,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
         with (
             _model_dtype(torch.bfloat16),
-            # Negotiated once per process; another test already claimed it.
-            mock.patch.object(K3MoeTailCommState, "_instance", None),
             mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
             mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
             mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
@@ -257,9 +255,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
             mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
             mock.patch.object(
                 kimi_k3.Kimi3MoEExecutionPlan, "build", return_value=plan
-            ),
-            mock.patch.object(
-                kimi_k3, "load_packaged_flashinfer_tuning_cache", lambda *a, **kw: None
             ),
             mock.patch.object(
                 kimi_k3.KimiK3LatentDownOp,
@@ -361,7 +356,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
         # Not get_process_group("nccl", ...): that spelling passes either way,
         # since the manager's device backend defaults to "nccl" in a test.
         get_pg.assert_called_with(mapping.moe.tp_ep_group)
-        self.assertFalse(layer.execution_plan.join_moe_reduce)
 
     def test_the_column_group_needs_a_divisible_latent(self):
         """The group would otherwise raise at construction and kill the boot.
@@ -661,6 +655,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             token_to_kv_pool=None,
             bs=3,
             num_extends=1,
+            output_layout=ForwardOutputLayout(1, 1, 2, 1),
             input_num_tokens=4,
             forward_mode=ForwardMode.DECODE,
         )
@@ -669,7 +664,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         attention.num_local_heads = 2
         attention.v_head_dim = 3
         attention.attn_mha = SimpleNamespace(group_id="full_attention")
-        attention.forward_normal_chunked = mock.Mock()
+        attention.forward_normal_chunked_kv_core = mock.Mock()
         attention.forward_absorb = mock.Mock()
 
         output_gate = torch.arange(24).reshape(4, 6)
@@ -678,6 +673,11 @@ class KimiK3RegistrationTests(unittest.TestCase):
             q=torch.empty(4, 2, 8),
             latent_cache=torch.empty(4, 1, 8),
             ctx=ctx,
+            expanded=MLAPrologueOutput(
+                query=torch.empty(4, 2, 8),
+                key=torch.empty(4, 2, 8),
+                value=torch.empty(4, 2, 3),
+            ),
             output_gate=output_gate,
         )
 
@@ -888,6 +888,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                             hidden_states=torch.empty(rows, 64, dtype=torch.bfloat16),
                             ctx=ctx,
                             comm_manager=None,
+                            projection_out=None,
                         )
 
                 self.assertEqual(captured[0].is_contiguous(), expect_contiguous)
@@ -1024,6 +1025,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             layer.topk.topk_config.output_format, TopKOutputFormat.STANDARD
         )
         self.assertTrue(layer.native_latent_moe.components["joint_reduce"])
+        self.assertIsNone(layer.native_latent_moe.components["shared_reduce"])
         self._assert_latent_projection_sharding(linear_calls, mapping)
         self.assertEqual(len(multicast_calls), 1)
         wired = multicast_calls[0]
@@ -1145,7 +1147,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         self.assertIsNone(unsharded["routed_expert_up_proj"].get("shard_group"))
 
         self.assertIsNone(tp_layer.native_latent_moe)
-        self.assertEqual(tp_layer.comm.mapping.moe.tp_ep_group, ep_group)
+        self.assertIsNone(tp_layer.comm)
         routed_input = torch.zeros(1, config.routed_expert_hidden_size)
         torch.testing.assert_close(
             tp_layer._routed_experts(
@@ -1169,10 +1171,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
         layer = SimpleNamespace(
             mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
+            execution_plan=SimpleNamespace(use_native=True),
             native_latent_moe=native_latent_moe,
             _use_fused_decode_pipeline=True,
             _forward_fused_decode_pipeline=fused_pipeline,
         )
+
+        layer._forward_amd = KimiLinearMoE._forward_amd.__get__(layer)
 
         output = KimiLinearMoE.forward(
             layer,
@@ -1180,6 +1185,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             prefix_sum,
             num_global_tokens=0,
             max_num_tokens_per_gpu=0,
+            prefix_is_sharded=False,
         )
 
         torch.testing.assert_close(output, prefix_sum)

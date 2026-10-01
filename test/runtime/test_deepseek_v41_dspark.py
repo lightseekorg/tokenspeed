@@ -52,6 +52,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention import registry as attention_registry
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
@@ -524,6 +525,7 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
     history.copy_(_history_slots(starts, 128, 64))
     ctx = _ctx(None, 10, ForwardMode.DECODE)
     ctx.bs, ctx.num_extends = 2, 0
+    ctx.output_layout = ForwardOutputLayout(0, 0, 2, 5)
 
     def forward():
         return model.forward_backbone(bonus, starts, history, pool, ctx)
@@ -615,6 +617,7 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
         )
         ctx = _ctx(None, n * width, ForwardMode.DECODE)
         ctx.bs, ctx.num_extends = n, 0
+        ctx.output_layout = ForwardOutputLayout(0, 0, n, width)
         ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
         windows.zero_()
         return drafter.run(
@@ -712,6 +715,7 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
     ib.extend_seq_lens_cpu[:1] = 5
     ctx = _ctx(None, 3 + width, ForwardMode.MIXED)
     ctx.bs, ctx.num_extends = 2, 1
+    ctx.output_layout = ForwardOutputLayout(1, 1, 1, width)
     ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
     hidden = torch.randn(
         3 + width, drafter.hidden_width, dtype=torch.bfloat16, device="cuda:0"

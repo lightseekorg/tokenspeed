@@ -35,8 +35,49 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     zero_byte_ranges,
     zero_page_fields,
 )
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
+    _local_visible_lengths,
+    dcp_local_visible_lengths,
+)
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
+
+
+def test_dcp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> None:
+    def run(batch, cols, queries, padding):
+        owned = torch.arange(cols) % 3 == 0
+        prefix = torch.zeros((batch, cols + 1 + padding), dtype=torch.int32)
+        prefix[:, 1 : cols + 1] = owned.int().cumsum(0)
+        visible = torch.zeros((batch, queries + padding), dtype=torch.int32)
+        visible[:, :queries] = torch.linspace(0, cols * 64, queries).int()
+        endpoints = visible[:, :queries]
+        # Count each owned page's intersection with [0, endpoint).
+        expected = (
+            ((endpoints[..., None] - torch.arange(cols) * 64).clamp(0, 64) * owned)
+            .sum(-1)
+            .int()
+        )
+        prefix = prefix.to(device)[:, : cols + 1]
+        visible = visible.to(device)[:, :queries]
+        backing = torch.full(
+            (batch, queries + padding), -1, dtype=torch.int32, device=device
+        )
+        out = backing[:, :queries]
+        local = torch.empty(batch, dtype=torch.int32, device=device)
+        dcp_local_visible_lengths(
+            prefix, visible, page_size=64, out=out, local_lengths=local
+        )
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(local.cpu(), expected[:, -1], rtol=0, atol=0)
+        assert (backing[:, queries:] == -1).all()
+
+    # Queries 3 and 4 share the BLOCK=4 bucket. Exact widths and row strides,
+    # including their integer alignment classes, must not select new binaries.
+    run(1, 17, 3, 0)
+    with assert_no_triton_compile(_local_visible_lengths):
+        run(3, 63, 4, 0)
+        run(2, 129, 3, 13)
+        run(5, 1024, 4, 16)
 
 
 @pytest.mark.parametrize("extra_ranges", [0, 60])

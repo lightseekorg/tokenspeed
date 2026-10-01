@@ -857,6 +857,26 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
     assert tensor_scaled.dtype == torch.bfloat16
 
 
+@pytest.mark.parametrize("b_layout", ["KN", "NK"])
+def test_mm_fp8_reference_selection_follows_b_layout(monkeypatch, b_layout) -> None:
+    monkeypatch.setattr(
+        _gemm_pkg,
+        "select_kernel",
+        partial(_gemm_pkg.select_kernel, solution="reference"),
+    )
+    gen = torch.Generator().manual_seed(0)
+    a = torch.randn((4, 256), generator=gen).to(_fp8_dtype())
+    b_kn = torch.randn((256, 128), generator=gen).to(_fp8_dtype())
+    b = b_kn if b_layout == "KN" else b_kn.t().contiguous()
+    scale = torch.ones((1,), dtype=torch.float32)
+
+    out = tokenspeed_kernel.mm(
+        a, b, A_scales=scale, B_scales=scale, out_dtype=torch.float32, quant="fp8"
+    )
+
+    torch.testing.assert_close(out, a.float() @ b_kn.float())
+
+
 def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
     fp8_dtype = _fp8_dtype()
     a = torch.zeros((2, 4, 128), dtype=fp8_dtype)

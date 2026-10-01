@@ -46,6 +46,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
@@ -186,6 +187,9 @@ def _sample(ib, runtime, ids, num_extends, accept_lengths, has_drafter):
         torch.tensor(accept_lengths, dtype=torch.int32, device=ib.device),
         ib.input_lengths_buf[:bs],
         num_extends,
+        output_layout=ForwardOutputLayout(
+            num_extends, num_extends, bs - num_extends, executor.config.output_length
+        ),
     )
 
 
@@ -561,6 +565,7 @@ def test_runtime_update_replay_shrink_idle_and_slot_reuse(buffers, record_update
             accepts,
             ib.input_lengths_buf[:4],
             0,
+            output_layout=ForwardOutputLayout(0, 0, 4, 4),
         )
 
     graph = None
@@ -747,8 +752,9 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         value.fill_(1)
 
     @contextmanager
-    def tuner():
+    def tuner(*, tune_mode, tuning_buckets, round_up):
         nonlocal tuning
+        assert (tune_mode, tuning_buckets, round_up) == (True, None, None)
         events.append("tuner-enter")
         tuning = True
         yield
@@ -804,6 +810,10 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         physical_context_len=context_len,
         pp_size=1,
         world_size=1,
+        world_group=(),
+        global_rank=0,
+        autotune_cache_key=None,
+        prefill_only=False,
         disable_autotune=False,
         model_is_mrope=False,
         device=ib.device,
@@ -832,7 +842,14 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         lambda group: events.append(("group", group)),
     )
     monkeypatch.setattr(
-        model_executor.dist, "barrier", lambda: events.append("barrier")
+        model_executor,
+        "load_autotune_cache",
+        lambda path, group, rank: events.append(("load", path, group, rank)),
+    )
+    monkeypatch.setattr(
+        model_executor,
+        "save_autotune_cache",
+        lambda path, group, rank: events.append(("save", path, group, rank)),
     )
 
     executor.autotune()
@@ -842,13 +859,14 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     assert len(metadata) == 1
     assert events == [
         ("max_tokens", num_tokens),
+        ("load", None, None, 0),
         ("group", None),
         "tuner-enter",
         "metadata",
         "forward",
         "tuner-exit",
         ("group", None),
-        "barrier",
+        ("save", None, None, 0),
     ]
 
 

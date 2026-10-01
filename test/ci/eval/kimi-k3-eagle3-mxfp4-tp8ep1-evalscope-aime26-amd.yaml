@@ -15,6 +15,8 @@ env:
   CI: "true"
 install:
   - bash test/ci_system/install_deps_rocm.sh
+  # The general kernel suite has one GPU; exercise TP8 attention and tail before serving.
+  - python3 -m pytest tokenspeed-kernel/test/amd/ops/test_iris_moe_tail.py tokenspeed-kernel/test/amd/ops/test_iris_attention.py -v
 # --disable-prefill-graph: prefill graphs want 40 buckets on top of the decode
 # ones and OOM at this memory fraction. Decode graphs, which speculative
 # decoding rides on, capture cleanly at every bucket.

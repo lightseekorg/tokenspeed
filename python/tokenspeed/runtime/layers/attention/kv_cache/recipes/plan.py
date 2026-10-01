@@ -56,10 +56,7 @@ _CACHE_DTYPE_BYTES = {
     "float64": 8,
 }
 
-# Elementwise scatter (Tensor.index_put) has no fp8 kernel, so pools that
-# write KV that way view the bytes as uint8 instead. Pools whose writes go
-# through a dtype-aware kernel (MXFP8, via store_sf_interleaved and
-# quantize_store_kv_mxfp8) keep the fp8 view.
+# index_put has no fp8 kernel: pools writing through it view fp8 as uint8.
 _INDEX_PUT_UNSUPPORTED = ("float8_e5m2", "float8_e4m3fn")
 
 
@@ -260,23 +257,28 @@ class CacheMemoryPlan:
             resident_block_bytes=resident,
         )
 
+    # Lookups are hot on transfer paths that resolve a field per page; index
+    # the immutable layout once instead of scanning it per call.
+    @cached_property
+    def _groups_by_id(self) -> dict[str, CacheGroupLayout]:
+        return {group.group_id: group for group in self.groups}
+
+    @cached_property
+    def _fields_by_id(self) -> dict[str, CacheFieldLayout]:
+        return {field.field_id: field for field in self.fields}
+
+    @cached_property
+    def _planes_by_id(self) -> dict[str, CachePlaneLayout]:
+        return {plane.plane_id: plane for plane in self.planes}
+
     def group(self, group_id: str) -> CacheGroupLayout:
-        for group in self.groups:
-            if group.group_id == group_id:
-                return group
-        raise KeyError(group_id)
+        return self._groups_by_id[group_id]
 
     def field(self, field_id: str) -> CacheFieldLayout:
-        for field in self.fields:
-            if field.field_id == field_id:
-                return field
-        raise KeyError(field_id)
+        return self._fields_by_id[field_id]
 
     def plane(self, plane_id: str) -> CachePlaneLayout:
-        for plane in self.planes:
-            if plane.plane_id == plane_id:
-                return plane
-        raise KeyError(plane_id)
+        return self._planes_by_id[plane_id]
 
     def field_page_byte_offset(self, field_id: str, page_id: int) -> int:
         """Return one field page's byte offset in the shared cache arena."""

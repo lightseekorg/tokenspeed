@@ -115,8 +115,8 @@ def mha_plan(
     Returns:
         A dict containing:
         - "extend_mode":
-          "postwrite" means run prefill before writing KV cache;
-          "prewrite" means write KV cache first and run cached extend.
+          "postwrite" means prefill attends the new K/V rows directly;
+          "prewrite" means extend attention reads them from the KV cache.
     """
     if dtype == torch.float8_e4m3fn:
         return {"extend_mode": "prewrite"}

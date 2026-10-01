@@ -88,7 +88,11 @@ def combine_attention_partials(
     weighted, lse = dcp_weight_for_reduce_scatter(local_output, gathered_lse, rank)
     output = reduce_scatter(weighted, group).movedim(0, 1)
     if sink is None:
-        return output.to(local_output.dtype).contiguous()
+        # Request token-major storage during the cast to avoid copying twice.
+        # Keep contiguous() for FP32, where to() can return the original view.
+        return output.to(
+            dtype=local_output.dtype, memory_format=torch.contiguous_format
+        ).contiguous()
     return dcp_apply_sink(output, lse, sink, dtype=local_output.dtype)
 
 

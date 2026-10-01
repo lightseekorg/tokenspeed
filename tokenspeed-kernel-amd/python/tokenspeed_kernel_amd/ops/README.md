@@ -380,6 +380,52 @@ FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
 asm statements keep LLVM from moving each cluster's results across cluster
 barriers.
 
+### gfx950 MLA extend
+
+`gluon_mla_extend_gfx950` computes absorbed MLA attention for cached extend
+(chunked prefill over a prefix cache) directly on the paged latent cache.
+`gluon_mla_extend_bf16_gfx950` registers the same launcher for a BF16 cache.
+
+#### Contract
+
+- Queries are `(total_q, heads, 576)`, already projected into the 512-dim
+  latent space plus 64 RoPE dimensions; the cache is
+  `(pages, 64, 1, 576)` and already holds the new tokens. Values are the first
+  512 dimensions of the cache rows, and the output is BF16
+  `(total_q, heads, 512)`.
+- Supported `(q, cache)` dtypes are `(FP8 E4M3, FP8 E4M3)`,
+  `(BF16, FP8 E4M3)` (the query is cast to FP8 on load) and `(BF16, BF16)`.
+- Attention is causal: query `i` of a request sees keys up to
+  `cache_len - q_len + i`. `logit_cap` and LSE output are unsupported.
+- Registration limits `max_seqlen_q` to 256 for an FP8 cache and 16 for BF16.
+  Absorbed attention spends 512 + 576 MACs per (query, key) pair and head
+  against 192 + 128 for prefix replay, which also expands every prefix token
+  once; these bounds are where the kernel's throughput stops paying for the
+  extra MACs.
+- The grid is ragged over `cu_seqlens_q` and the KV split count depends only
+  on `max_seqlen_k` and the grid size, so batch composition and lengths are
+  runtime values and reuse the warmed binaries.
+
+#### Algorithm
+
+Each program packs query positions of a head group into 128 MFMA rows, so a
+KV tile read from LDS serves every packed head. Four waves each own 32 rows
+and the full 512-wide FP32 accumulator, which keeps the kernel MFMA-bound
+rather than LDS-bound. FP8 uses 64-key tiles (one page); BF16 uses 32-key
+tiles.
+
+KV tiles stream into a four-stage LDS ring with direct-to-LDS buffer loads,
+swizzled so both the K reads and the transposed V reads are conflict-free.
+The loop is software-pipelined one tile deep: the current tile's softmax runs
+in the MFMA shadows of the next tile's Q @ K^T, and the next copy is issued
+under the first P @ V chunk. The running maximum only moves when a tile
+raises it by more than 8 (base 2), keeping P within FP8 range.
+
+When the grid leaves CUs idle, the KV stream is split and
+`gluon_mla_extend_reduce_gfx950` merges the partials by LSE. Splits fill at
+most one wave of CTAs and stream at least four pages each, since every split
+pays a fixed prologue and an FP32 partial store.
+
 ### gfx1250 MLA prefill
 
 `gluon_mla_prefill_gfx1250` computes the same dense, non-absorbed attention
@@ -633,3 +679,48 @@ weights:
 The row tile is resolved from the gathered row count and expert count unless
 the caller pins it. Ragged M and N edges are masked rather than peeled, so a
 trailing partial tile loads only the rows that exist.
+
+### Causal MLA verification on gfx950
+
+`gluon_mla_decode_fp8_query_blocks_gfx950` decodes 2–16 causal queries per
+request using one page-table row and one cache length per request. The cache
+length includes all queries in the block; query `i` sees
+`cache_seqlens - q_len + i + 1` tokens. It requires E4M3 queries and cache,
+512 latent plus 64 RoPE coordinates, and 64-, 128- or 256-token pages.
+Non-causal draft blocks and single-query decode keep their existing kernels.
+
+Each request selects a path using its length on the GPU, so one graph replay
+can contain:
+
+- Histories below the batch-size cutoff, with 64-token pages and at most
+  16 heads, use the existing single-query scan when the launch has at least
+  one workgroup per query. Workgroups are divided among the query positions, and
+  each scans a separate portion of the history for its query. Up to sixteen
+  partial results per query are merged within each thread; larger split
+  buckets distribute the reduction across threads.
+- Requests with 64-token pages and `R = queries * heads` between 65 and 128
+  can use one 128-row tile instead of two 64-row tiles. Each row represents
+  one query position and one head. The larger tile is selected when
+  `ceil(ceil(length / 64) / splits) >= ceil(R / 4) + 8`, using its split count.
+  The measured margin amortizes its extra output and reduction work over
+  the saved KV loads.
+- Other requests flatten the query and head dimensions into 64-row tiles,
+  each of which loads a 64-token KV tile once for all its rows. This path
+  also handles the page sizes and head counts unsupported by the existing
+  single-query scan.
+
+The existing FP8 MLA occupancy policy sets each tile's split count.
+The single-query cutoffs are 12,288, 8,193, 5,377, 10,241, 4,609, 4,096,
+4,096 and 5,121 tokens for batch sizes 1–8, respectively, and 4,096 otherwise.
+The launcher passes the cutoff as a runtime scalar shared by the scan and
+reduction.
+Each request reserves partial-result storage for the larger split count,
+with rows packed to the selected count's bucket. Its reduction reads only
+the splits its scan wrote. Split counts are bucketed to powers of two, so
+nearby counts share one compiled kernel. The actual split counts, page-table
+stride and softmax scale are runtime arguments. Partial attention outputs
+are combined using their log-sum-exp values. Both FP8 scans multiply
+probabilities by 256 before the E4M3 cast to preserve small weights, and
+divide out that factor at normalization. The projected-value API applies
+the existing value projection to the latent output. Graph replay reads
+updated page tables and lengths in place.
