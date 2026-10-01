@@ -252,6 +252,18 @@ def test_decode_gemv_writes_preallocated_output() -> None:
     torch.testing.assert_close(out, x @ weight.t())
 
 
+def test_decode_gemv_widens_bf16_rows_for_an_fp32_weight() -> None:
+    from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+    x = torch.randn(2, 8, dtype=torch.bfloat16)
+    weight = torch.randn(4, 8)
+
+    returned = decode_gemv(x, weight)
+
+    assert returned.dtype == torch.float32
+    torch.testing.assert_close(returned, x.float() @ weight.t(), rtol=0, atol=0)
+
+
 def test_linear_attnres_partials_portable_composition() -> None:
     torch.manual_seed(13)
     hidden = torch.randn(2, 6, dtype=torch.bfloat16)

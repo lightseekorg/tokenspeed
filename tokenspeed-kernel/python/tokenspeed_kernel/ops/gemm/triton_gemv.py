@@ -28,7 +28,10 @@ FP32 projections have no FlashInfer route and go straight to the registry.
 Narrow ones with up to 16 rows take a row-CTA kernel that streams each weight
 row once against every activation row, with FP32 products and accumulation and
 no fused multiply-add; a single row is reduced in one block over the whole row.
-Torch serves the other FP32 shapes.
+Torch serves the other FP32 shapes. The kernel also takes BF16 activations
+against an FP32 weight and widens each element as it loads it, which is exact,
+so the result equals the same call on ``x.float()`` without materializing that
+copy.
 """
 
 from __future__ import annotations
@@ -115,8 +118,10 @@ def _rows_dot_block(
     offs = kb + tl.arange(0, BK)
     col_mask = offs < K
     wv = tl.load(w_ptr + n * K + offs, mask=col_mask, other=0.0).to(tl.float32)
+    # Cap the activation vector at four elements, the FP32 width: a wider BF16
+    # load changes the accumulator layout and with it the reduction order.
     xv = tl.load(
-        x_ptr + rows[:, None] * K + offs[None, :],
+        tl.max_contiguous(x_ptr + rows[:, None] * K + offs[None, :], [1, 4]),
         mask=row_mask[:, None] & col_mask[None, :],
         other=0.0,
     ).to(tl.float32)
@@ -200,10 +205,20 @@ _FP32_SIG = frozenset(
         )
     }
 )
+# BF16 activations against an FP32 weight, with an FP32 result.
+_BF16_FP32_SIG = frozenset(
+    {
+        format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.float32),
+        )
+    }
+)
 # Registry signature of each served (x dtype, weight dtype) pair.
 _SIGNATURES = {
     (torch.bfloat16, torch.bfloat16): next(iter(_BF16_SIG)),
     (torch.float32, torch.float32): next(iter(_FP32_SIG)),
+    (torch.bfloat16, torch.float32): next(iter(_BF16_FP32_SIG)),
 }
 
 
@@ -265,7 +280,7 @@ def _fp32_rowcta_k_fits(m: int, n: int, k: int) -> bool:
     name="triton_rowcta_gemm_fp32",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_FP32_SIG,
+    signatures=_FP32_SIG | _BF16_FP32_SIG,
     traits={
         "m": frozenset(range(1, 17)),
         "n_max": frozenset({1024}),
@@ -291,7 +306,7 @@ def triton_rowcta_gemm_fp32(
     Torch.
 
     Args:
-        x: ``[M, K]`` contiguous FP32 activations, ``1 <= M <= 16``.
+        x: ``[M, K]`` contiguous FP32 or BF16 activations, ``1 <= M <= 16``.
         weight: ``[N, K]`` contiguous FP32 weight.
         out: optional contiguous ``[M, N]`` destination.
 
@@ -374,7 +389,7 @@ def gluon_wmma_dense_gemv_gfx1250(
     "decode_gemv",
     name="torch_decode_gemv",
     solution="torch",
-    signatures=_BF16_SIG | _FP32_SIG,
+    signatures=_BF16_SIG | _FP32_SIG | _BF16_FP32_SIG,
     traits={},
     priority=Priority.PORTABLE,
 )
@@ -383,6 +398,8 @@ def torch_decode_gemv(
     weight: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if x.dtype == torch.bfloat16 and weight.dtype == torch.float32:
+        x = x.float()
     if out is not None:
         return torch.mm(x, weight.t(), out=out)
     return x @ weight.t()
@@ -463,14 +480,15 @@ def decode_gemv(
 
     FlashInfer owns runner/tactic selection on the supported BF16 range.
     The registry retains other architectures, unsupported input layouts and
-    FP32 projections. Noncontiguous inputs and other dtypes take Torch.
+    FP32 weights, which also take BF16 activations and return FP32.
+    Noncontiguous inputs and other dtypes take Torch.
     """
 
     expected = (x.shape[0], weight.shape[0])
     if out is not None:
         if (
             tuple(out.shape) != expected
-            or out.dtype != x.dtype
+            or out.dtype != torch.promote_types(x.dtype, weight.dtype)
             or out.device != x.device
             or out.stride(-1) != 1
         ):
