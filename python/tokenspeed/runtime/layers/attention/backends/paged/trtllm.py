@@ -173,9 +173,11 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         assert (
             seq_lens.dtype == torch.int32
         ), f"seq_lens must be int32, got {seq_lens.dtype}"
-        cache_seqlens_int32 = seq_lens[:bs]
+        # Mixed batches put extend requests first; only those rows belong
+        # to the prefill slot. Decode metadata is refreshed separately.
+        cache_seqlens_int32 = seq_lens[:num_extends]
         cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(seq_lens[:bs], dim=0, dtype=torch.int32), (1, 0)
+            torch.cumsum(seq_lens[:num_extends], dim=0, dtype=torch.int32), (1, 0)
         )
 
         # Read the max from the pinned-CPU mirror — avoids a per-iter
@@ -184,10 +186,10 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # max(new tokens per request); for a no-prefix extend that's
         # seq_lens, for a prefix-cached extend it's seq_lens-prefix_lens —
         # extend_seq_lens_cpu holds those new-token counts in either case.
-        max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
+        max_seq_len_q = int(extend_seq_lens_cpu[:num_extends].max().item())
 
-        if extend_with_prefix and bool(extend_prefix_lens_cpu[:bs].any()):
-            extend_lens = seq_lens[:bs] - extend_prefix_lens[:bs]
+        if extend_with_prefix and bool(extend_prefix_lens_cpu[:num_extends].any()):
+            extend_lens = seq_lens[:num_extends] - extend_prefix_lens[:num_extends]
             cu_seqlens_q = torch.nn.functional.pad(
                 torch.cumsum(extend_lens, dim=0, dtype=torch.int32), (1, 0)
             )
@@ -199,7 +201,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             max_seq_len_q=max_seq_len_q,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            page_table=page_table[:bs],
+            page_table=page_table[:num_extends],
         )
 
     # ------------------------------------------------------------------

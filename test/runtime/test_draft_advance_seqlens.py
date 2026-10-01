@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.paged.msa import (
     MSAAttnBackend,
@@ -72,6 +73,41 @@ def _seqlens_field(be, metadata):
 def _capture(be, bs, seq_lens):
     page_table = torch.zeros((bs, be.max_num_pages), dtype=torch.int32)
     be.init_forward_metadata_capture_cuda_graph(bs, seq_lens, page_table)
+
+
+def test_trtllm_mixed_prefill_metadata_uses_extend_rows():
+    be = _mha_backend(TRTLLMMHAAttnBackend)
+    be.init_cuda_graph_state(8)
+    seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
+    extend_lens = torch.tensor([3, 5], dtype=torch.int32)
+    prefix_lens = torch.tensor([7, 15], dtype=torch.int32)
+    page_table = torch.arange(3 * MAX_NUM_PAGES, dtype=torch.int32).reshape(
+        3, MAX_NUM_PAGES
+    )
+
+    be.init_forward_metadata(
+        bs=3,
+        num_extends=2,
+        seq_lens=seq_lens,
+        page_table=page_table,
+        forward_mode=ForwardMode.MIXED,
+        extend_seq_lens=extend_lens,
+        extend_seq_lens_cpu=extend_lens,
+        extend_prefix_lens=prefix_lens,
+        extend_prefix_lens_cpu=prefix_lens,
+        extend_with_prefix=True,
+    )
+
+    metadata = be.forward_prefill_metadata
+    assert metadata.cache_seqlens_int32.tolist() == [10, 20]
+    assert metadata.cu_seqlens_q.tolist() == [0, 3, 8]
+    assert metadata.cu_seqlens_k.tolist() == [0, 10, 30]
+    assert metadata.max_seq_len_q == 5
+    assert torch.equal(metadata.page_table, page_table[:2])
+
+    be.refresh_decode_metadata(3, 3, seq_lens, page_table, num_extends=2)
+    assert be.forward_prefill_metadata is metadata
+    assert torch.equal(be.forward_decode_metadata.cache_seqlens_int32, seq_lens)
 
 
 @pytest.mark.parametrize("backend_cls", [MHAAttnBackend, TRTLLMMHAAttnBackend])
