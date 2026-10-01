@@ -1036,6 +1036,8 @@ class MoEPipelinedProgram:
         gl.assume(main_iters >= 0)
 
         for _ in range(0, main_iters):
+            # All waves must finish reading a slot before its next async copy.
+            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
             self.async_wait(cfg.NUM_BUFFERS - 1)
 
@@ -1050,6 +1052,7 @@ class MoEPipelinedProgram:
 
         if not EVEN_K:
             # Masked tail iter (one more iter still has W to prefetch).
+            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
             self.async_wait(cfg.NUM_BUFFERS - 1)
             if W_PREFETCH:
