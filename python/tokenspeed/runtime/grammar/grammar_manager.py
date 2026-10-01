@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import time
 from concurrent import futures
+from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import torch
@@ -142,9 +143,13 @@ class GrammarManager:
             return True
 
         if self.grammar_backend is None:
+            # The request asks for something this server cannot do: report a
+            # client error (400) instead of an internal one, so clients do not
+            # retry it.
             state.set_finish_with_abort(
                 "Grammar-based generation (json_schema, regex, ebnf, structural_tag) "
-                "is not supported when the server is launched with --grammar-backend none"
+                "is not supported when the server is launched with --grammar-backend none",
+                status_code=HTTPStatus.BAD_REQUEST,
             )
 
             return True

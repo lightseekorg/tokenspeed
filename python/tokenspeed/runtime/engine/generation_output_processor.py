@@ -187,17 +187,24 @@ class RequestState:
         self.grammar_key: tuple[str, str] | None = None
         self.grammar_queued_ts: float = 0.0
 
-    def set_finish_with_abort(self, message: str, notify_client: bool = False) -> None:
+    def set_finish_with_abort(
+        self,
+        message: str,
+        notify_client: bool = False,
+        status_code: int | None = None,
+    ) -> None:
         """Mark this request as aborted with ``message``; finished_reason is
         materialized immediately so callers don't need a check_finished() pass.
 
         ``notify_client`` streams a terminating finish to the client (used for
         pause-initiated aborts, where the client did not tear down its state).
+        ``status_code`` is the HTTP status the frontend reports; None leaves
+        the abort an internal error.
         """
         self.to_abort = True
         self.to_abort_message = message
         self.abort_notify_client = notify_client
-        self.finished_reason = FINISH_ABORT(message=message)
+        self.finished_reason = FINISH_ABORT(message=message, status_code=status_code)
 
     @classmethod
     def from_recv_req(
