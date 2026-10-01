@@ -98,10 +98,10 @@ def _is_amd_quark_mxfp4_checkpoint(config: dict) -> bool:
 # Raw-consumed attention weights: model code reads these as BF16 tensors
 # (Kimi-K3's KDA backend GEMV reads f_b_proj; MLA absorbs kv_b_proj into
 # w_kc/w_vc after load), so FP8 checkpoints dequantize them during load.
-_QUARK_FP8_DEQUANT_LEAVES = frozenset({"f_b_proj", "kv_b_proj"})
+_FP8_OVERRIDE_DEQUANT_LEAVES = frozenset({"f_b_proj", "kv_b_proj"})
 
 
-def _is_quark_fp8_per_channel_w8a8(spec: object) -> bool:
+def _is_fp8_per_channel_w8a8_spec(spec: object) -> bool:
     """Whether a per-layer override is FP8 W8A8 with per-channel weight scales.
 
     Weights are static FP8 E4M3 with one scale per output channel; activations
@@ -126,7 +126,7 @@ def _is_quark_fp8_per_channel_w8a8(spec: object) -> bool:
     )
 
 
-def _quark_fp8_layer_patterns(config: Mapping[str, Any]) -> list[str]:
+def _fp8_override_layer_patterns(config: Mapping[str, Any]) -> list[str]:
     """Collect the module globs of the checkpoint's per-layer FP8 overrides.
 
     ``layer_quant_config`` maps module globs (e.g. ``*self_attn*``) to a scheme
@@ -140,7 +140,7 @@ def _quark_fp8_layer_patterns(config: Mapping[str, Any]) -> list[str]:
         raise ValueError("layer_quant_config must map module globs to schemes")
     patterns: list[str] = []
     for glob, spec in layer_quant_config.items():
-        if not _is_quark_fp8_per_channel_w8a8(spec):
+        if not _is_fp8_per_channel_w8a8_spec(spec):
             raise ValueError(
                 f"Unsupported per-layer quantization scheme for {glob!r}; only "
                 "static per-channel FP8 E4M3 weights with dynamic per-token FP8 "
@@ -239,7 +239,7 @@ class Mxfp4Config(QuantizationConfig):
         raw_ignored = cls.get_from_keys_or(config, ["ignored_layers", "exclude"], None)
         ignored_layers = _normalize_ignored_layer_patterns(raw_ignored)
         fp8_layer_patterns = (
-            _quark_fp8_layer_patterns(config)
+            _fp8_override_layer_patterns(config)
             if _is_amd_quark_mxfp4_checkpoint(config)
             else []
         )
@@ -253,7 +253,7 @@ class Mxfp4Config(QuantizationConfig):
             fp8_layer_patterns=fp8_layer_patterns,
         )
 
-    def quark_fp8_route(self, module_name: str) -> str | None:
+    def fp8_override_route(self, module_name: str) -> str | None:
         """Return how a module under a per-layer FP8 override is loaded and run.
 
         Returns ``"w8a8"`` for FP8-resident modules, ``"dequant"`` for weights
@@ -269,7 +269,7 @@ class Mxfp4Config(QuantizationConfig):
         ):
             return None
         leaf = module_name.rsplit(".", 1)[-1]
-        return "dequant" if leaf in _QUARK_FP8_DEQUANT_LEAVES else "w8a8"
+        return "dequant" if leaf in _FP8_OVERRIDE_DEQUANT_LEAVES else "w8a8"
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
@@ -337,7 +337,7 @@ def dequantize_mxfp4_to_bf16(
     return (values * scale).reshape(rows, -1).to(torch.bfloat16)
 
 
-def preprocess_quark_weights(
+def preprocess_mxfp4_checkpoint_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     quant_config: QuantizationConfig | None,
     dequantize_mxfp4_module: Callable[[str], bool],
@@ -366,7 +366,7 @@ def preprocess_quark_weights(
             yield name, weight
             continue
         module = name.rsplit(".", 1)[0]
-        route = quant_config.quark_fp8_route(module)
+        route = quant_config.fp8_override_route(module)
         if route == "w8a8":
             yield name, weight.reshape(-1, 1) if is_scale else weight
             continue

@@ -11,7 +11,7 @@ import tokenspeed.runtime.layers.quantization.mxfp4 as mxfp4_module
 from tokenspeed.runtime.layers.quantization.mxfp4 import (
     Mxfp4Config,
     dequantize_mxfp4_to_bf16,
-    preprocess_quark_weights,
+    preprocess_mxfp4_checkpoint_weights,
 )
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 
@@ -139,7 +139,7 @@ def test_incomplete_amd_quark_metadata_is_not_promoted(monkeypatch) -> None:
 
 
 def _fp8_per_channel_w8a8() -> dict:
-    """Quark's FP8 attention override (static per-channel W, per-token A)."""
+    """Per-layer FP8 attention override (static per-channel W, per-token A)."""
     return {
         "input_tensors": {
             "dtype": "fp8_e4m3",
@@ -157,7 +157,7 @@ def _fp8_per_channel_w8a8() -> dict:
     }
 
 
-def _quark_fp8_attention_config(monkeypatch) -> Mxfp4Config:
+def _fp8_attention_override_config(monkeypatch) -> Mxfp4Config:
     _mock_platform(monkeypatch, is_amd=True)
     config = _amd_quark_mxfp4_config(
         _fp4_e8m0_per_group(is_dynamic=True),
@@ -167,11 +167,11 @@ def _quark_fp8_attention_config(monkeypatch) -> Mxfp4Config:
     return Mxfp4Config.from_config(config)
 
 
-def test_amd_quark_layer_quant_config_routes_fp8_attention(monkeypatch) -> None:
-    quant_config = _quark_fp8_attention_config(monkeypatch)
+def test_layer_quant_config_routes_fp8_attention(monkeypatch) -> None:
+    quant_config = _fp8_attention_override_config(monkeypatch)
 
     assert quant_config.fp8_config.is_checkpoint_fp8_serialized is True
-    route = quant_config.quark_fp8_route
+    route = quant_config.fp8_override_route
     assert route("model.layers.0.self_attn.qkvgb_proj") == "w8a8"
     assert route("language_model.model.layers.3.self_attn.o_proj") == "w8a8"
     # Raw-consumed weights dequantize at load.
@@ -182,7 +182,7 @@ def test_amd_quark_layer_quant_config_routes_fp8_attention(monkeypatch) -> None:
     assert route("model.layers.1.block_sparse_moe.shared_experts.gate_up_proj") is None
 
 
-def test_amd_quark_rejects_unsupported_layer_quant_config(monkeypatch) -> None:
+def test_rejects_unsupported_layer_quant_config(monkeypatch) -> None:
     _mock_platform(monkeypatch, is_amd=True)
     config = _amd_quark_mxfp4_config(_fp4_e8m0_per_group(is_dynamic=True))
     per_tensor = _fp8_per_channel_w8a8()
@@ -205,8 +205,10 @@ def test_dequantize_mxfp4_uses_low_nibble_first_and_e8m0_scale() -> None:
     torch.testing.assert_close(values, expected, rtol=0, atol=0)
 
 
-def test_preprocess_quark_weights_adapts_fp8_and_mxfp4_modules(monkeypatch) -> None:
-    quant_config = _quark_fp8_attention_config(monkeypatch)
+def test_preprocess_mxfp4_checkpoint_weights_adapts_fp8_and_mxfp4_modules(
+    monkeypatch,
+) -> None:
+    quant_config = _fp8_attention_override_config(monkeypatch)
     fp8 = torch.tensor([[1.0, -2.0], [0.5, 4.0]]).to(torch.float8_e4m3fn)
     scale = torch.tensor([2.0, 0.5])
     mxfp4 = torch.full((2, 16), 0x22, dtype=torch.uint8)  # 1.0 everywhere
@@ -223,7 +225,7 @@ def test_preprocess_quark_weights_adapts_fp8_and_mxfp4_modules(monkeypatch) -> N
     ]
 
     out = dict(
-        preprocess_quark_weights(
+        preprocess_mxfp4_checkpoint_weights(
             stream,
             quant_config,
             dequantize_mxfp4_module=lambda module: ".shared_experts." in module,
@@ -244,16 +246,16 @@ def test_preprocess_quark_weights_adapts_fp8_and_mxfp4_modules(monkeypatch) -> N
     assert out["model.layers.0.self_attn.A_log"] is scale
 
 
-def test_preprocess_quark_weights_reports_unpaired_dequant_modules(
+def test_preprocess_mxfp4_checkpoint_weights_reports_unpaired_dequant_modules(
     monkeypatch,
 ) -> None:
-    quant_config = _quark_fp8_attention_config(monkeypatch)
+    quant_config = _fp8_attention_override_config(monkeypatch)
     fp8 = torch.ones(2, 2).to(torch.float8_e4m3fn)
     stream = [("model.layers.0.self_attn.f_b_proj.weight", fp8)]
 
     with pytest.raises(RuntimeError, match="missing their weight/weight_scale"):
         list(
-            preprocess_quark_weights(
+            preprocess_mxfp4_checkpoint_weights(
                 stream, quant_config, dequantize_mxfp4_module=lambda module: False
             )
         )

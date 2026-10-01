@@ -201,7 +201,7 @@ class LinearBase(torch.nn.Module):
             else:
                 self.quant_method = Nvfp4LinearMethod(quant_config)
         elif isinstance(quant_config, Mxfp4Config):
-            fp8_route = quant_config.quark_fp8_route(prefix)
+            fp8_route = quant_config.fp8_override_route(prefix)
             if fp8_route == "w8a8":
                 self.quant_method = W8A8Fp8LinearMethod(quant_config.fp8_config)
             elif fp8_route == "dequant":

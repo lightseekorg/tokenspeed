@@ -155,7 +155,7 @@ from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
 )
 from tokenspeed.runtime.layers.quantization.mxfp4 import (
     Mxfp4Config,
-    preprocess_quark_weights,
+    preprocess_mxfp4_checkpoint_weights,
 )
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.shared_expert_tp import (
@@ -745,8 +745,8 @@ def _dense_mlp_quant_config(
     """Quantization config for K3's shared-expert and dense MLPs.
 
     Their fused SiTU/down kernels consume BF16 weights, so MXFP4 checkpoints
-    that serialize these MLPs (AMD Quark) dequantize them at load
-    (``preprocess_quark_weights``) and build them unquantized.
+    that serialize these MLPs dequantize them at load
+    (``preprocess_mxfp4_checkpoint_weights``) and build them unquantized.
     """
     return None if isinstance(quant_config, Mxfp4Config) else quant_config
 
@@ -932,8 +932,8 @@ class KimiKDAMergedProj(nn.Module):
     requantization; the zero pad rows share ``b``'s trailing block scale and
     dequantize to exact zeros (pad lemma).
 
-    Per-channel FP8 checkpoints (``fp8_channel_quant=True``, e.g. AMD Quark
-    ``*self_attn*`` overrides): the buffer stays FP8-resident with one f32
+    Per-channel FP8 checkpoints (``fp8_channel_quant=True``, e.g. a per-layer
+    ``*self_attn*`` FP8 override): the buffer stays FP8-resident with one f32
     dequant scale per output row, so each segment's scales load row-for-row
     at the same offsets as its codes; rows keep the bf16 16-row alignment
     and the zero pad rows carry scale 1.
@@ -1200,11 +1200,11 @@ class KimiLinearKDA(nn.Module):
             fp8_pb_wo_route is not None
             and fp8_pb_wo_route(add_prefix("q_proj", prefix)) == "w8a8"
         )
-        # AMD Quark per-layer FP8 overrides keep the merged buffer FP8 with
+        # A per-layer FP8 attention override keeps the merged buffer FP8 with
         # per-channel scales (w8a8 per-token x per-channel GEMM).
         merged_fp8_channel = (
             isinstance(quant_config, Mxfp4Config)
-            and quant_config.quark_fp8_route(add_prefix("q_proj", prefix)) == "w8a8"
+            and quant_config.fp8_override_route(add_prefix("q_proj", prefix)) == "w8a8"
         )
         self.qkvgb_proj = KimiKDAMergedProj(
             hidden_size=hidden,
@@ -3711,7 +3711,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
         fused_qkv_a private layout below.
         """
         weights = preprocess_fp8_pb_wo_weights(weights, self.quant_config)
-        weights = preprocess_quark_weights(
+        weights = preprocess_mxfp4_checkpoint_weights(
             weights,
             self.quant_config,
             dequantize_mxfp4_module=lambda module: bool(
