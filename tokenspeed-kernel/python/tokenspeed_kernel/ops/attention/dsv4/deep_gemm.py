@@ -24,6 +24,7 @@ import logging
 from math import ceil
 
 import torch
+from tokenspeed_kernel.ops.residual.triton import compute_mhc_num_splits
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -361,6 +362,49 @@ def _dsv4_prefill_topk(
     return _prefill_topk(logits, seq_lens, topk, result), gathered_k
 
 
+def _paged_index_logits(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    page_size: int,
+    max_context_len: int,
+    plan: object,
+    index_k_format: str,
+) -> torch.Tensor:
+    q_values, q_scales = index_q
+    kv_cache = _mxfp4_cache_view(index_k_cache, page_size)
+    if index_k_format == "mxfp4":
+        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+            q=(
+                q_values.contiguous().view(torch.int8).unsqueeze(1),
+                q_scales.contiguous().unsqueeze(1),
+            ),
+            kv_cache=kv_cache,
+            weights=weights.contiguous(),
+            context_lens=context_lens,
+            block_table=block_table,
+            schedule_meta=plan,
+            max_context_len=max_context_len,
+            clean_logits=False,
+            logits_dtype=torch.float32,
+        )
+    else:
+        logits = deep_gemm.fp8_paged_mqa_logits(
+            q_values.contiguous().unsqueeze(1),
+            kv_cache,
+            weights.contiguous(),
+            context_lens,
+            block_table,
+            plan,
+            max_context_len,
+            clean_logits=False,
+        )
+    return logits
+
+
 def _dsv4_decode_topk(
     index_q: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
@@ -390,34 +434,80 @@ def _dsv4_decode_topk(
             "DeepSeek V4 decode top-k requires a plan returned by dsv4_plan"
         )
 
-    kv_cache = _mxfp4_cache_view(index_k_cache, page_size)
-    if index_k_format == "mxfp4":
-        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
-            q=(
-                q_values.contiguous().view(torch.int8).unsqueeze(1),
-                q_scales.contiguous().unsqueeze(1),
-            ),
-            kv_cache=kv_cache,
-            weights=weights.contiguous(),
-            context_lens=context_lens,
-            block_table=block_table,
-            schedule_meta=plan,
-            max_context_len=max_context_len,
-            clean_logits=False,
-            logits_dtype=torch.float32,
-        )
-    else:
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_values.contiguous().unsqueeze(1),
-            kv_cache,
-            weights.contiguous(),
-            context_lens,
-            block_table,
-            plan,
-            max_context_len,
-            clean_logits=False,
-        )
+    logits = _paged_index_logits(
+        index_q,
+        weights,
+        index_k_cache,
+        context_lens,
+        block_table,
+        page_size=page_size,
+        max_context_len=max_context_len,
+        plan=plan,
+        index_k_format=index_k_format,
+    )
     return _decode_topk(logits, context_lens, topk, result, persistent_topk_workspace)
+
+
+def _dsv4_index_candidates(
+    index_q: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    local_page_table: torch.Tensor,
+    query_requests: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    index_k_format: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
+        candidate_topk_offsets,
+        compact_index_pages,
+        gather_index_candidates,
+        mask_index_scores,
+    )
+    from tokenspeed_kernel.ops.attention.dsa.triton import combine_topk_weights
+    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+
+    pages, positions, lengths = compact_index_pages(
+        local_page_table,
+        query_requests,
+        causal_lens,
+        page_size,
+    )
+    if index_k_format == "fp8_scaled":
+        q = index_q[0].contiguous()
+        values, scales = quantize_fp8_with_scale(
+            q.reshape(-1, q.shape[-1]),
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="float32",
+        )
+        weights = combine_topk_weights(weights, scales.contiguous(), softmax_scale)
+        index_q = (values.view(q.shape), scales)
+    if deep_gemm.get_pdl() != pdl_enabled():
+        deep_gemm.set_pdl(pdl_enabled())
+    scoring_lengths = lengths.clamp_min(1)
+    plan = deep_gemm.get_paged_mqa_logits_metadata(
+        scoring_lengths,
+        page_size,
+        deep_gemm.get_num_sms(),
+    )
+    logits = _paged_index_logits(
+        index_q,
+        weights,
+        index_k_cache,
+        scoring_lengths,
+        pages,
+        page_size=page_size,
+        max_context_len=pages.shape[1] * page_size,
+        plan=plan,
+        index_k_format=index_k_format,
+    )
+    mask_index_scores(logits, positions, lengths, causal_lens, page_size, 0, 0)
+    offsets = candidate_topk_offsets(logits, topk)
+    return gather_index_candidates(offsets, logits, positions, page_size)
 
 
 _SIGNATURES = {
@@ -450,6 +540,19 @@ def _register(format_name: str, min_arch: ArchVersion) -> None:
         },
         priority=Priority.SPECIALIZED,
     )
+    candidate_signature = format_signature(
+        q=dense_tensor_format(
+            torch.uint8 if format_name == "mxfp4" else torch.bfloat16
+        ),
+        weights=dense_tensor_format(torch.float32),
+        index_k_cache=dense_tensor_format(torch.uint8),
+    )
+    register_kernel(
+        "attention",
+        "dsv4_index_candidates",
+        name=f"deep_gemm_dsv4_{format_name}_index_candidates",
+        **{**common, "signatures": frozenset({candidate_signature})},
+    )(_dsv4_index_candidates)
     register_kernel(
         "attention",
         "dsv4_prefill_topk",
@@ -479,14 +582,6 @@ def _warmup_m_values(max_tokens: int) -> list[int]:
     return sorted(values)
 
 
-def _compute_num_split(block_k: int, k: int, grid_size: int) -> int:
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    split_k = num_sms // grid_size
-    num_block_k = ceil(k / block_k)
-    split_k = min(split_k, num_block_k // 4)
-    return max(split_k, 1)
-
-
 def _warmup_tf32_hc_prenorm_gemm(
     shapes: list[dict],
     max_tokens: int,
@@ -508,7 +603,9 @@ def _warmup_tf32_hc_prenorm_gemm(
         fn = torch.ones(mix_hc, hc_dim, dtype=torch.float32, device=device)
         for num_tokens in _warmup_m_values(max_tokens):
             grid_size = ceil(num_tokens / block_m)
-            n_splits = _compute_num_split(block_k, hc_hidden_size, grid_size)
+            n_splits = compute_mhc_num_splits(
+                device, block_k, hc_hidden_size, grid_size
+            )
             x = torch.zeros(
                 num_tokens,
                 hc_hidden_size,

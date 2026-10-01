@@ -32,6 +32,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     dspark_greedy_workspace,
     sample_dspark_block_greedy,
@@ -478,6 +479,7 @@ class DeepseekV4DSpark(BaseDrafter):
             token_to_kv_pool=base_ctx.token_to_kv_pool,
             bs=num_decodes,
             num_extends=0,
+            output_layout=ForwardOutputLayout(0, 0, num_decodes, self.block_size),
             input_num_tokens=num_decodes * self.block_size,
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,

@@ -20,12 +20,37 @@
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._triton import gl, gluon, tl
+from tokenspeed_kernel_amd._triton import gl, gluon, gluon_builtin, tl
 
 _INV_LN2_VALUE = 1.4426950408889634
 _INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
 _LN2_VALUE = 0.6931471805599453
 _LN2 = tl.constexpr(_LN2_VALUE)
+
+# Upper bound of select_kv_splits. Reduce kernels take the split count at
+# runtime and must handle any value up to this bound.
+MAX_KV_SPLITS = 32
+
+
+@gluon_builtin
+def _mfma_unscaled_fp8(a, b, acc, *, _semantic):
+    # None scales select K=64 FP8 MFMA without block-scale operands.
+    # cdna4.mfma selects K=16 for this layout.
+    fmt = "e4m3" if a.dtype == gl.float8e4nv else "e5m2"
+    output = _semantic.dot_scaled(
+        a,
+        None,
+        fmt,
+        b,
+        None,
+        fmt,
+        acc,
+        fast_math=False,
+        lhs_k_pack=True,
+        rhs_k_pack=True,
+        out_dtype=gl.float32,
+    )
+    return gl.tensor(output.handle, acc.type)
 
 
 def select_kv_splits(*, base_ctas: int, num_pages: int, sm_count: int) -> int:
@@ -44,7 +69,7 @@ def select_kv_splits(*, base_ctas: int, num_pages: int, sm_count: int) -> int:
     wave_target = 2
     min_pages_per_split = 2
     min_page_splits = 8
-    max_page_splits = 32
+    max_page_splits = MAX_KV_SPLITS
 
     target_ctas = sm_count * wave_target
     splits_for_occupancy = (target_ctas + base_ctas - 1) // base_ctas

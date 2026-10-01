@@ -88,9 +88,7 @@ def test_kda_generator_builds_glm_decode_input_strides(monkeypatch) -> None:
     )
     beta = kda_generator._packed_beta_logits(
         4,
-        16,
-        128,
-        128,
+        kda_generator._MODEL_PROFILES["glm53_flash_tp4"],
         dtype=torch.bfloat16,
         generator=None,
     )
@@ -101,7 +99,13 @@ def test_kda_generator_builds_glm_decode_input_strides(monkeypatch) -> None:
     assert beta.stride() == (25664, 6416, 1)
 
 
-def test_kda_generator_builds_glm_prefill_input_layouts(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("model_profile", "head_stride", "projection_width"),
+    [("glm53_flash_tp4", 2048, 6416), ("kimi_k3_tp8", 1536, 6288)],
+)
+def test_kda_generator_builds_prefill_input_layouts(
+    monkeypatch, model_profile, head_stride, projection_width
+) -> None:
     def cpu_randn(shape, *, dtype, generator):
         _ = generator
         return torch.randn(shape, dtype=dtype)
@@ -109,18 +113,16 @@ def test_kda_generator_builds_glm_prefill_input_layouts(monkeypatch) -> None:
     monkeypatch.setattr(kda_generator, "_randn", cpu_randn)
     q, k, v, g_raw, beta = kda_generator._packed_prefill_inputs(
         4,
-        16,
-        128,
-        128,
+        kda_generator._MODEL_PROFILES[model_profile],
         dtype=torch.bfloat16,
         generator=None,
     )
 
-    assert q.stride() == (8192, 2048, 128, 1)
+    assert q.stride() == (4 * head_stride, head_stride, 128, 1)
     assert k.stride() == q.stride()
     assert v.stride() == q.stride()
     assert g_raw.stride() == q.stride()
-    assert beta.stride() == (25664, 6416, 1)
+    assert beta.stride() == (4 * projection_width, projection_width, 1)
 
 
 def test_kda_generator_builds_int64_prefill_boundaries() -> None:

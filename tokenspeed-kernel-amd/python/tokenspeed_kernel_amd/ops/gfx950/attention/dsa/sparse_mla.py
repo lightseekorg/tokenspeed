@@ -652,7 +652,7 @@ def _dsa_persistent_radix_topk_kernel(
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("block_table_cols",))
 def _dsa_trivial_topk_kernel(
     block_table,
     row_starts,
@@ -660,7 +660,7 @@ def _dsa_trivial_topk_kernel(
     out,
     lens_out,
     out_stride: gl.constexpr,
-    block_table_cols: gl.constexpr,
+    block_table_cols,
     page_size: gl.constexpr,
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,
@@ -1006,7 +1006,12 @@ def _emit_compact_final_topk(
     )
 
 
-@gluon.jit
+@gluon.jit(
+    do_not_specialize=(
+        "logits_stride",
+        "block_table_cols",
+    ),
+)
 def _dsa_oneblock_manual_radix_topk_kernel(
     logits,
     block_table,
@@ -1014,9 +1019,9 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     row_ends,
     out,
     lens_out,
-    logits_stride: gl.constexpr,
+    logits_stride,
     out_stride: gl.constexpr,
-    block_table_cols: gl.constexpr,
+    block_table_cols,
     page_size: gl.constexpr,
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,

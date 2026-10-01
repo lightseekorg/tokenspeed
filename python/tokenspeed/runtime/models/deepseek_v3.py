@@ -37,7 +37,7 @@ from tokenspeed_kernel.ops.attention.mla import (
     mla_project_value_prefers_contiguous_weight,
 )
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
-from tokenspeed_kernel.ops.embedding import apply_rope_mla, apply_rope_mla_set_kv
+from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
 from tokenspeed_kernel.ops.gemm import bmm
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.cute_dsl import (
@@ -46,7 +46,6 @@ from tokenspeed_kernel.ops.gemm.cute_dsl import (
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
@@ -75,7 +74,6 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
-    scrub_padding_tail,
 )
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -88,7 +86,6 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.dcp.cache import gather_mla_history
-from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -115,10 +112,8 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 )
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
-    kv_cache_scales_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
-from tokenspeed.runtime.models.utils import create_fused_mla_set_kv_buffer_arg
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
@@ -480,8 +475,6 @@ class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
 
 
 class DeepseekV3AttentionMLA(nn.Module):
-    # Backends that use non-absorbed MLA kernels (ragged prefill, paged KV decode).
-    _MLA_KERNEL_BACKENDS = ("mla", "gluon", "trtllm_mla", "tokenspeed_mla")
     # Backends that support chunked ragged prefill with prefix replay.
     _RAGGED_PREFILL_BACKENDS = ("mla", "trtllm_mla", "tokenspeed_mla")
 
@@ -527,7 +520,6 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.config = config
         self.alt_stream = alt_stream
-        self.attention_backend = global_server_args_dict["attention_backend"] or "mla"
         self.cli_factor = getattr(config, "cli_factor", 1)
         self.prefix = prefix
 
@@ -631,6 +623,8 @@ class DeepseekV3AttentionMLA(nn.Module):
             num_kv_heads=1,
             layer_id=layer_id,
             v_head_dim=self.kv_lora_rank,
+            rotary_emb=self.rotary_emb,
+            qk_norm=None,
         )
 
         self.attn_mha = PagedAttention(
@@ -640,6 +634,8 @@ class DeepseekV3AttentionMLA(nn.Module):
             num_kv_heads=self.num_local_heads,
             layer_id=layer_id,
             v_head_dim=self.v_head_dim,
+            rotary_emb=self.rotary_emb,
+            qk_norm=None,
         )
 
         self.w_kc = None
@@ -656,9 +652,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         """MLA attention with a NARROW prefill-graph break.
 
         The token-shaped input/output projections (q/kv-down, layernorm,
-        q_b_proj, o_proj) stay in the captured prefill graph; only the
-        data-dependent attention -- KV write + varlen prefill / absorb decode
-        kernels + the live prefill/decode split -- runs as the eager break
+        q_b_proj, o_proj) and, outside a decode round, the expanded prefill
+        prologue with its KV write stay in the captured prefill graph; only
+        the data-dependent attention -- varlen prefill / absorb decode kernels
+        + the live prefill/decode split -- runs as the eager break
         (``_attn``). This keeps the big projection GEMMs graphed instead of
         dispatch-bound eager, collapsing the inter-segment bubbles a coarse
         whole-attention break leaves. Outside capture the ``@break_point`` is
@@ -669,9 +666,29 @@ class DeepseekV3AttentionMLA(nn.Module):
         q, latent_cache = self._project_q_latent(
             hidden_states, ctx, comm_manager, block_scale
         )
-        attn_output = self._attn(positions, q, latent_cache, ctx)
+        expanded = self._prefill_prologue_before_break(positions, q, latent_cache, ctx)
+        attn_output = self._attn(positions, q, latent_cache, ctx, expanded=expanded)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _prefill_prologue_before_break(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> MLAPrologueOutput | None:
+        """Assemble the expanded prefill inputs and write every row's latent in
+        the captured segment. A decode round, or a narrowed draft step, keeps
+        its one-launch prologue inside the break instead (see :meth:`_attn`)."""
+        if ctx.forward_mode.is_decode() or ctx.draft_narrowing is not None:
+            return None
+        slots = ctx.attn_backend.padded_write_locations(
+            self.attn_mha, ctx.forward_mode, q.shape[0]
+        )
+        return self.forward_normal_chunked_kv_prepare(
+            positions, q, latent_cache, ctx, slots
+        )
 
     def _project_q_latent(
         self,
@@ -712,10 +729,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
+        *,
+        expanded: MLAPrologueOutput | None,
         output_gate: torch.Tensor | None = None,
         absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """The eager break: KV write + varlen prefill / absorb decode attention.
+        """The eager break: varlen prefill / absorb decode attention.
 
         Prefill/decode dispatch over the full rows; subclasses override (the
         draft variant narrows to live rows, see ``DeepseekV3DraftAttentionMLA``).
@@ -725,9 +744,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         token count). The decode token count comes from the live ctx; the real
         prefill token count from the live attention metadata (the same source
         the padding scrub uses). Padded tail rows produce discarded garbage.
-        Each half fetches its own KV write span from the backend by mode:
-        EXTEND returns exactly the extend token span, DECODE exactly the
-        decode rows' verify window — no full-batch vector to slice.
+        Outside a decode round the captured segment already ran the expanded
+        prologue over every row and stored the latent
+        (:meth:`_prefill_prologue_before_break`); the prefill half attends the
+        leading rows of that output, and the decode half of a MIXED round
+        assembles its absorbed query here and rewrites its own rows through
+        the backend's DECODE window.
         """
         spec = ctx.attn_backend.spec_num_tokens or 1
         num_decodes = max(ctx.bs - ctx.num_extends, 0)
@@ -753,28 +775,26 @@ class DeepseekV3AttentionMLA(nn.Module):
                 input_num_tokens=num_prefill_tokens,
                 forward_mode=ForwardMode.EXTEND,
             )
-            # Use absorbed attention for cached-prefix extend when supported by
-            # the backend and profitable for this query shape; otherwise use
-            # normal chunked prefill.
-            prefill_locs = ctx.attn_backend.write_locations(
-                self.attn_mha, ForwardMode.EXTEND
-            )
+            if expanded is None:
+                raise RuntimeError("prefill rows reached the break without a prologue")
             if getattr(cmeta, "use_absorbed_cached_extend", False):
+                # Absorbed cached extend (gluon) rebuilds its query here; its rows are stored.
                 self.forward_absorb(
                     positions[:num_prefill_tokens],
                     q[:num_prefill_tokens],
                     latent_cache[:num_prefill_tokens],
                     prefill_ctx,
-                    prefill_locs,
+                    ctx.attn_backend.write_locations(self.attn_mha, ForwardMode.EXTEND)[
+                        :0
+                    ],
                     attn_output[:num_prefill_tokens],
                 )
             else:
-                self.forward_normal_chunked(
-                    positions[:num_prefill_tokens],
-                    q[:num_prefill_tokens],
-                    latent_cache[:num_prefill_tokens],
+                self.forward_normal_chunked_kv_core(
+                    expanded.query[:num_prefill_tokens],
+                    expanded.key[:num_prefill_tokens],
+                    expanded.value[:num_prefill_tokens],
                     prefill_ctx,
-                    prefill_locs,
                     attn_output[:num_prefill_tokens],
                 )
 
@@ -818,7 +838,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         output_gate: torch.Tensor | None = None,
         absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        Q, K = self.forward_absorb_qkv_proj(
+        Q = self.forward_absorb_qkv_proj(
             q,
             latent_cache,
             positions,
@@ -828,25 +848,9 @@ class DeepseekV3AttentionMLA(nn.Module):
         )
         return self.forward_absorb_attn_v_proj(
             Q,
-            K,
             ctx,
-            out_cache_loc,
             output,
             output_gate=output_gate,
-        )
-
-    def _mla_kv_is_fp8(self, ctx, k_scale: float) -> bool:
-        """Whether the model may quantize KV itself and hand the backend fp8.
-
-        True when the MLA backend stores fp8 KV at unit scale. Hybrid models
-        keep ``data_type`` on the full-attention sub-backend, so resolve that
-        before reading it.
-        """
-        kv_backend = getattr(ctx.attn_backend, "full_attn_backend", ctx.attn_backend)
-        return (
-            self.attention_backend in self._MLA_KERNEL_BACKENDS
-            and getattr(kv_backend, "data_type", None) == torch.float8_e4m3fn
-            and k_scale == 1.0
         )
 
     def forward_absorb_qkv_proj(
@@ -858,11 +862,8 @@ class DeepseekV3AttentionMLA(nn.Module):
         out_cache_loc: torch.Tensor,
         absorbed_query: torch.Tensor | None = None,
         cache_num_tokens: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # The caller supplies the exact write span (fetched from the
-        # backend's write_locations); ``cache_num_tokens`` narrows the KV
-        # write to a leading subset of the query rows (GLM's sparse-prefill
-        # dispatch runs more query rows than it commits).
+    ) -> torch.Tensor:
+        # GLM's sparse prefill runs more rows than it commits: write the leading rows.
         query_tokens = q.shape[0]
         if cache_num_tokens is None:
             cache_num_tokens = query_tokens
@@ -871,7 +872,6 @@ class DeepseekV3AttentionMLA(nn.Module):
                 "MLA cache write count is outside the query capacity: "
                 f"writes={cache_num_tokens}, queries={query_tokens}"
             )
-        cache_out_cache_loc = out_cache_loc[:cache_num_tokens]
         if absorbed_query is None:
             q = q.view(-1, self.num_local_heads, self.qk_head_dim)
             q_nope, q_pe = q.split(
@@ -884,14 +884,10 @@ class DeepseekV3AttentionMLA(nn.Module):
                 dtype=q_nope.dtype,
                 device=q_nope.device,
             )
-            query_pe_written = False
         else:
             q_nope = q
             Q = absorbed_query
             q_pe = Q[..., self.kv_lora_rank :]
-            query_pe_written = True
-        # latent_cache contains normalized kv_a and k_pe before rotate.
-        K = latent_cache.unsqueeze(1)
         # The absorption projection must be per-row batch-invariant under
         # rl-bitwise: the cuBLAS batched GEMM retiles by the token count.
         bmm(
@@ -902,178 +898,24 @@ class DeepseekV3AttentionMLA(nn.Module):
                 "aok" if global_server_args_dict["numerics"] == "rl-bitwise" else None
             ),
         )
-        # Model-owned fused FP8 decode: RoPE + quantize + KV cache write
-        # all done here, so backend only needs to do attention.
-        k_scale = getattr(self.attn_mqa, "k_scale_float", 1.0)
-        use_fused_fp8_decode = self._mla_kv_is_fp8(ctx, k_scale)
-
-        if use_fused_fp8_decode:
-            q_nope_absorbed = Q[..., : self.kv_lora_rank]
-            k_nope_raw = K[..., : self.kv_lora_rank]
-            k_pe_raw = K[..., self.kv_lora_rank :]
-
-            fused_kv_arg = (
-                create_fused_mla_set_kv_buffer_arg(
-                    k_nope=k_nope_raw,
-                    rope_dim=self.qk_rope_head_dim,
-                    rotary_emb=self.rotary_emb,
-                    out_cache_loc=cache_out_cache_loc,
-                    token_to_kv_pool=ctx.token_to_kv_pool,
-                    layer_id=self.attn_mqa.layer_id,
-                    num_q_heads=self.num_local_heads,
-                    q_nope=q_nope_absorbed,
-                )
-                if cache_num_tokens == query_tokens
-                and ctx.attn_backend.cache_placement(self.attn_mqa) is None
-                else None
-            )
-            if fused_kv_arg is not None:
-                # One launch for RoPE (or its absence), the FP8 quantize, and
-                # the KV scatter. The key lands in the cache and never exists
-                # as a tensor, so K comes back None: the decode backends read
-                # the cache and only touch k under save_kv_cache, which the
-                # model owns here.
-                query_fp8 = torch.empty(
-                    Q.shape,
-                    dtype=torch.float8_e4m3fn,
-                    device=Q.device,
-                )
-                apply_rope_mla_set_kv(
-                    positions=positions,
-                    q_rope=q_pe,
-                    k_rope=k_pe_raw,
-                    fused_mla_set_kv_buffer_arg=fused_kv_arg,
-                    q_rope_out=query_fp8,
-                )
-                return query_fp8, None
-
-            query_fp8, key_fp8 = apply_rope_mla(
-                positions=positions,
-                q_rope=q_pe,
-                k_rope=k_pe_raw,
-                q_nope=q_nope_absorbed,
-                k_nope=k_nope_raw,
-                cos_sin_cache=(
-                    self.rotary_emb.cos_sin_cache
-                    if self.rotary_emb is not None
-                    else None
-                ),
-                is_neox=(
-                    getattr(self.rotary_emb, "is_neox_style", True)
-                    if self.rotary_emb is not None
-                    else False
-                ),
-                quant_scale_q=1.0,
-                quant_scale_kv=k_scale,
-            )
-
-            # Write FP8 KV cache (single write, no double-write)
-            local_slots, write_mask = resolve_cache_slots(
-                cache_out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
-            )
-            ctx.token_to_kv_pool.set_mla_kv_buffer(
-                self.attn_mqa,
-                local_slots,
-                cache_k_nope=key_fp8[:cache_num_tokens, ..., : self.kv_lora_rank],
-                cache_k_rope=key_fp8[:cache_num_tokens, ..., self.kv_lora_rank :],
-                write_mask=write_mask,
-            )
-            return query_fp8, key_fp8
-
-        elif self.rotary_emb is not None and q_nope.size(0) > 0:
-            fused_mla_kv_arg = (
-                create_fused_mla_set_kv_buffer_arg(
-                    k_nope=K[..., : self.kv_lora_rank],
-                    rope_dim=self.qk_rope_head_dim,
-                    rotary_emb=self.rotary_emb,
-                    out_cache_loc=cache_out_cache_loc,
-                    token_to_kv_pool=ctx.token_to_kv_pool,
-                    layer_id=self.attn_mqa.layer_id,
-                    num_q_heads=self.num_local_heads,
-                )
-                if self.attention_backend in self._MLA_KERNEL_BACKENDS
-                and cache_num_tokens == query_tokens
-                and ctx.attn_backend.cache_placement(self.attn_mqa) is None
-                else None
-            )
-            if fused_mla_kv_arg is not None:
-                # The same entry point the FP8 branch takes, so the gate's
-                # probe and the launch resolve one dispatch key. Routing this
-                # through ``rotary_emb`` instead would dispatch
-                # ``embedding.rope``, which an override can redirect to a
-                # solution that rejects the fused argument -- after the gate
-                # already answered for ``embedding.rope_mla_set_kv``.
-                apply_rope_mla_set_kv(
-                    positions=positions,
-                    q_rope=q_pe,
-                    k_rope=K[..., self.kv_lora_rank :],
-                    fused_mla_set_kv_buffer_arg=fused_mla_kv_arg,
-                    q_rope_out=Q[..., self.kv_lora_rank :],
-                )
-                K = None
-            else:
-                # Apply RoPE directly on Q and K slices
-                q_pe, k_pe = self.rotary_emb(
-                    positions,
-                    q_pe,
-                    K[..., self.kv_lora_rank :],
-                )
-                Q[..., self.kv_lora_rank :].copy_(q_pe)
-                K[..., self.kv_lora_rank :].copy_(k_pe)
-        else:
-            if not query_pe_written:
-                Q[..., self.kv_lora_rank :] = q_pe
-
-        # For MLA kernel backends, write KV cache here (model-owned) so the
-        # backend never has to. This unifies the FP8 fused path (written above)
-        # and the BF16 path into a single ownership model.
-        if self.attention_backend in self._MLA_KERNEL_BACKENDS and K is not None:
-            local_slots, write_mask = resolve_cache_slots(
-                cache_out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
-            )
-            ctx.token_to_kv_pool.set_mla_kv_buffer(
-                self.attn_mqa,
-                local_slots,
-                cache_k_nope=K[:cache_num_tokens, ..., : self.kv_lora_rank],
-                cache_k_rope=K[:cache_num_tokens, ..., self.kv_lora_rank :],
-                write_mask=write_mask,
-            )
-
-        return Q, K
+        return self.attn_mqa.latent_prologue(
+            Q,
+            q_pe,
+            latent_cache,
+            positions,
+            ctx,
+            slots=out_cache_loc[:cache_num_tokens],
+            expanded=None,
+        ).query
 
     def forward_absorb_attn_v_proj(
         self,
         Q,
-        K,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         output: torch.Tensor,
         record_kv_cache: bool | None = None,
         output_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # The KV write is model-owned on every arm: the MLA kernel backends
-        # wrote the latent in forward_absorb_qkv_proj; the others (FlashMLA)
-        # write here at the caller's explicit locations — the draft's
-        # one-shot first step covers the extend AND decode windows together,
-        # which no single backend-mode fetch describes.
-        if self.attention_backend in self._MLA_KERNEL_BACKENDS:
-            k_for_attn = K
-            v_for_attn = K[..., : self.kv_lora_rank] if K is not None else None
-        else:
-            k_for_attn = K
-            v_for_attn = K[..., : self.kv_lora_rank]
-            if K is not None:
-                local_slots, write_mask = resolve_cache_slots(
-                    out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
-                )
-                ctx.token_to_kv_pool.set_mla_kv_buffer(
-                    self.attn_mqa,
-                    local_slots,
-                    K[..., : self.kv_lora_rank],
-                    K[..., self.kv_lora_rank :],
-                    write_mask=write_mask,
-                )
-
         use_projected_value_decode = (
             output_gate is not None
             and ctx.num_extends == 0
@@ -1081,10 +923,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         )
         attn_output = self.attn_mqa(
             Q,
-            k_for_attn,
-            v_for_attn,
-            ctx,
-            save_kv_cache=False,
+            k=None,
+            v=None,
+            positions=None,
+            ctx=ctx,
             record_kv_cache=record_kv_cache,
             value_weight=self.w_vc if use_projected_value_decode else None,
             output_gate=output_gate if use_projected_value_decode else None,
@@ -1100,120 +942,31 @@ class DeepseekV3AttentionMLA(nn.Module):
             out=output,
         )
 
-    def forward_normal_chunked(
-        self,
-        positions: torch.Tensor,
-        q: torch.Tensor,
-        latent_cache: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        # Prefill-graph padding contract: zero garbage rows the per-row projections
-        # + FP8 quantize would otherwise touch (see scrub_padding_tail).
-        ntok = sum(ctx.attn_backend.chunked_prefill_metadata.extend_seq_lens_cpu)
-        scrub_padding_tail(ntok, q, latent_cache)
-        q, k, v = self.forward_normal_chunked_kv_prepare(
-            positions, q, latent_cache, ctx, out_cache_loc
-        )
-        return self.forward_normal_chunked_kv_core(q, k, v, ctx, output)
-
     def forward_normal_chunked_kv_prepare(
         self,
         positions: torch.Tensor,
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        kv_a, k_pe = latent_cache.split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
-        k_pe = k_pe.unsqueeze(1)
-
+        slots: torch.Tensor,
+    ) -> MLAPrologueOutput:
+        """The expanded prefill prologue over every row of ``q``: per-head keys
+        and values up-projected from the latent, the rotated query, and the
+        latent rows stored at ``slots``; the inputs are left as given."""
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        # kv_a is a split view of latent_cache (non-contiguous); the fp8 online-quant
-        # GEMM in kv_b_proj asserts contiguous input.
-        kv = self.kv_b_proj(kv_a.contiguous())[0]
+        # kv_b_proj's fp8 online-quant GEMM needs a contiguous latent, not this strided slice.
+        kv = self.kv_b_proj(latent_cache[..., : self.kv_lora_rank].contiguous())[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope = kv[..., : self.qk_nope_head_dim]
-        v = kv[..., self.qk_nope_head_dim :]
-
-        # FP8 prefill: fused RoPE + FP8 quantize, direct FP8 KV cache write.
-        # Disabled when k_scale != 1.0; mla_fp8_utils.py documents the current limitation.
-        # NoPE models (rotary_emb is None, e.g. Kimi-K3) quantize standalone:
-        # the quantize is otherwise fused into the RoPE kernel, and leaving
-        # them on the BF16 kernel meant a JIT compile of a variant the backend
-        # never pre-warms.
-        k_scale = getattr(self.attn_mha, "k_scale_float", 1.0)
-        use_fp8_prefill = self._mla_kv_is_fp8(ctx, k_scale)
-
-        if use_fp8_prefill:
-
-            if self.rotary_emb is not None:
-                k_rope = k_pe.expand(-1, self.num_local_heads, -1)
-                cos_sin_cache = self.rotary_emb.cos_sin_cache
-                is_neox = self.rotary_emb.is_neox_style
-            else:
-                k_rope = k_pe
-                cos_sin_cache = None
-                is_neox = False
-
-            q_fp8, k_fp8 = apply_rope_mla(
-                positions=positions,
-                q_rope=q_pe,
-                k_rope=k_rope,
-                q_nope=q_nope,
-                k_nope=k_nope,
-                cos_sin_cache=cos_sin_cache,
-                is_neox=is_neox,
-                quant_scale_q=1.0,
-                quant_scale_kv=k_scale,
-            )
-
-            v_fp8 = fp8_quantize(v)
-
-            # The cache scatter converts the compressed BF16 latent directly to FP8.
-            k_pe_for_cache = k_fp8[:, 0:1, self.qk_nope_head_dim :]
-            local_slots, write_mask = resolve_cache_slots(
-                out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mha)
-            )
-            ctx.token_to_kv_pool.set_mla_kv_buffer(
-                self.attn_mha,
-                local_slots,
-                cache_k_nope=kv_a.unsqueeze(1),
-                cache_k_rope=k_pe_for_cache,
-                write_mask=write_mask,
-            )
-
-            return q_fp8, k_fp8, v_fp8
-
-        # BF16 path: apply RoPE, assemble Q/K, write cache
-        if self.rotary_emb is not None:
-            q_pe, k_pe = self.rotary_emb(
-                positions,
-                q_pe,
-                k_pe,
-            )
-
-        q[..., self.qk_nope_head_dim :] = q_pe
-        k = torch.empty_like(q)
-        k[..., : self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim :] = k_pe
-
-        local_slots, write_mask = resolve_cache_slots(
-            out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mha)
+        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        return self.attn_mha.latent_prologue(
+            q,
+            q[..., self.qk_nope_head_dim :],
+            latent_cache,
+            positions,
+            ctx,
+            slots=slots,
+            expanded=MLAExpandedKV(k_nope=k_nope, value=v),
         )
-        ctx.token_to_kv_pool.set_mla_kv_buffer(
-            self.attn_mha,
-            local_slots,
-            cache_k_nope=kv_a.unsqueeze(1),
-            cache_k_rope=k_pe,
-            write_mask=write_mask,
-        )
-
-        return q, k, v
 
     def forward_normal_chunked_kv_core(
         self,
@@ -1226,11 +979,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         attn_backend = ctx.attn_backend
         chunk_meta = attn_backend.chunked_prefill_metadata
 
-        # Scale compensation for FP8 prefill: bmm1_scale = k_scale * softmax_scale
         scaling = self.attn_mha.scaling
-        k_scale = getattr(self.attn_mha, "k_scale_float", 1.0)
-        if q.dtype == torch.float8_e4m3fn:
-            scaling = k_scale * scaling
 
         # Causal self-attention over the new chunk tokens. q_lens == kv_lens ==
         # extend_seq_lens, so cum_seq_lens_q and cum_seq_lens_kv alias the same
@@ -1288,9 +1037,7 @@ class DeepseekV3AttentionMLA(nn.Module):
 
             if q.dtype == torch.float8_e4m3fn:
                 # FP8 Attention
-                k, v = mla_kv_pack_quantize_fp8(
-                    k_nope, k_pe, v, k_scale_inv=1.0 / k_scale
-                )
+                k, v = mla_kv_pack_quantize_fp8(k_nope, k_pe, v)
             else:
                 # BF16 Attention
                 k = torch.cat(
@@ -1339,6 +1086,8 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
+        *,
+        expanded: MLAPrologueOutput | None,
         absorbed_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if ctx.draft_narrowing is None:
@@ -1347,31 +1096,21 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
                 q,
                 latent_cache,
                 ctx,
+                expanded=expanded,
                 absorbed_query=absorbed_query,
             )
 
         # The live rows attend over the accepted prefix, not the verify window.
         ctx.draft_narrowing.publish_accepted_prefix()
 
-        # This step writes every input row's KV in one shot: the extend span
-        # (when a MIXED round carries prefill rows) followed by the decode
-        # rows' verify window. Mixed rounds never run under a captured graph,
-        # so the concatenation is eager-only.
-        backend = ctx.attn_backend
-        out_cache_loc = backend.write_locations(self.attn_mqa, ForwardMode.DECODE)
-        if ctx.num_extends > 0:
-            out_cache_loc = torch.cat(
-                (
-                    backend.write_locations(self.attn_mqa, ForwardMode.EXTEND),
-                    out_cache_loc,
-                )
-            )
+        # Every input row's KV is written: the extend rows, then the verify window.
+        out_cache_loc = ctx.attn_backend.forward_write_locations(
+            self.attn_mqa, ForwardMode.DECODE
+        )
 
-        # Full q/latent_cache write all KV cache rows; only the live rows
-        # (ctx.gather_ids) run the absorbed decode attention, so the output is
-        # narrowed to [bs, H] for o_proj / MLP / post-norms.
+        # Every row's KV is written; only the live rows attend, so the output is [bs, H].
         decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
-        Q, K = self.forward_absorb_qkv_proj(
+        Q = self.forward_absorb_qkv_proj(
             q,
             latent_cache,
             positions,
@@ -1381,16 +1120,11 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         )
         Q = Q.index_select(0, ctx.gather_ids)
         attn_output = q.new_empty(ctx.bs, self.num_local_heads * self.v_head_dim)
-        # gather_ids keeps one live row per request, so the decode runs on the
-        # full bs -- the page table and seq lens must span the same rows. Drop
-        # the [num_extends:] slice a MIXED target's first-step metadata sets up
-        # (mirrors the multi-step drafter loop's override_num_extends(0)).
+        # One live row per request: decode spans every request, not the MIXED tail.
         with ctx.attn_backend.override_num_extends(0):
             self.forward_absorb_attn_v_proj(
                 Q,
-                K,
                 decode_ctx,
-                out_cache_loc,
                 attn_output,
                 # Real-mode record: decode_ctx would skip the PD cache-step here.
                 record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
@@ -1933,24 +1667,6 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
                 w, self_attn
             )
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = self.mapping.attn.tp_size
-        tp_rank = self.mapping.attn.tp_rank
-        for layer_idx, scaling_factor in kv_cache_scales_loader(
-            quantization_param_path,
-            tp_rank,
-            tp_size,
-            self.config.num_hidden_layers,
-            self.config.__class__.model_type,
-        ):
-            if not isinstance(self.model.layers[layer_idx], nn.Identity):
-                self_attn = self.model.layers[layer_idx].self_attn
-                # Set on both attn_mha (non-absorbed prefill) and attn_mqa (absorbed decode).
-                for attn in (self_attn.attn_mha, self_attn.attn_mqa):
-                    if attn is not None and hasattr(attn, "k_scale"):
-                        attn.k_scale = scaling_factor
-                        attn.k_scale_float = scaling_factor
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

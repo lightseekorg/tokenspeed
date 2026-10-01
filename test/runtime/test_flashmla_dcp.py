@@ -29,6 +29,30 @@ from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
 )
 
 
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_fp8_query_gather_preserves_bytes(monkeypatch, dtype):
+    from tokenspeed.runtime.layers.attention.dcp import comm
+
+    query = torch.arange(256, dtype=torch.uint8).view(dtype).reshape(2, 8, 16)
+    query = query.transpose(1, 2)
+
+    def gather(payload, group, dim):
+        assert payload.dtype == torch.uint8 and payload.is_contiguous()
+        assert group == (0, 1) and dim == -1
+        return torch.cat((payload, payload), dim=dim)
+
+    monkeypatch.setattr(comm, "all_gather", gather)
+    result = comm.gather_query_heads(query, (0, 1))
+    assert result.dtype == dtype
+    torch.testing.assert_close(
+        result.view(torch.uint8),
+        torch.cat((query.view(torch.uint8), query.view(torch.uint8)), dim=1),
+        rtol=0,
+        atol=0,
+    )
+    assert comm.gather_query_heads(query, (0,)) is query
+
+
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_noncontiguous_pages_and_partial_tail(degree, device):
@@ -108,14 +132,7 @@ def test_flashmla_absorbed_extend_refuses_sharded_cache():
     leaf = flashmla.FlashMLABackend.__new__(flashmla.FlashMLABackend)
     leaf.dcp_group = (0, 1)
     with pytest.raises(RuntimeError, match="absorbed extend"):
-        leaf._forward_absorbed_extend(
-            torch.empty(0),
-            torch.empty(0),
-            None,
-            layer=None,
-            out_cache_loc=None,
-            token_to_kv_pool=None,
-        )
+        leaf._forward_absorbed_extend(torch.empty(0), layer=None, token_to_kv_pool=None)
 
 
 def test_kimi_capacity_shards_only_mla():
@@ -327,6 +344,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
     )
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
     plan = make_mla_memory_plan(
         size=8,
@@ -363,7 +381,16 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
         "full_attention"
     ]
     backend.kv_lora_rank = 512
-    layer = SimpleNamespace(layer_id=0)
+    layer = PagedAttention(
+        1,
+        192,
+        1.0,
+        num_kv_heads=1,
+        layer_id=0,
+        v_head_dim=128,
+        rotary_emb=None,
+        qk_norm=None,
+    )
     loc = torch.tensor([4, 8, 12], device="cuda")
     values = torch.arange(3 * 576, device="cuda", dtype=torch.bfloat16).reshape(
         3, 1, 576
@@ -383,7 +410,6 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
             kv_b_proj=lambda latent: (latent.new_zeros((latent.shape[0], 256)),),
             attn_mha=layer,
             rotary_emb=None,
-            _mla_kv_is_fp8=lambda ctx, scale: False,
         )
         DeepseekV3AttentionMLA.forward_normal_chunked_kv_prepare(
             model,
@@ -674,6 +700,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
 
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = 64
+    backend.kernel_solution = None
     backend.data_type = torch.bfloat16
     backend.kv_lora_rank = 128
     backend.qk_nope_head_dim = 128
@@ -726,13 +753,9 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     monkeypatch.setattr(dsa, "combine_attention_partials", combine)
     out = backend.forward_sparse_decode(
         q=query,
-        k=None,
-        v=None,
         layer=layer,
-        out_cache_loc=torch.tensor([64]),
         token_to_kv_pool=pool,
         bs=1,
-        save_kv_cache=False,
         topk_indices=slots,
         topk_lens=None,
     )

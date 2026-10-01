@@ -59,6 +59,8 @@ def _profile(**overrides) -> ModelProfile:
         default_prefix_granularity=64,
         request_token_history=True,
         tokenizer_kwargs={"fix_mistral_regex": True},
+        attention_instances_per_layer=1,
+        numerics_envelopes=frozenset({"auto"}),
     )
     fields.update(overrides)
     return ModelProfile(**fields)
@@ -242,14 +244,15 @@ def test_config_resolves_by_architecture_without_model_type(tmp_path, isolated) 
 
 def test_profile_resolution_follows_the_checkpoint(isolated) -> None:
     registry.register_model(FixtureForCausalLM)
-    hybrid = registry.resolve_model_profile(
+    architecture, hybrid = registry.resolve_model_profile(
         ["Unknown", "FixtureForCausalLM"], FixtureConfig()
     )
+    assert architecture == "FixtureForCausalLM"
     assert hybrid.linear_attention == "fixture_linear"
     assert hybrid.tokenizer_kwargs == {"fix_mistral_regex": True}
     with pytest.raises(TypeError):
         hybrid.tokenizer_kwargs["fix_mistral_regex"] = False
-    dense = registry.resolve_model_profile(
+    _, dense = registry.resolve_model_profile(
         ["FixtureForCausalLM"], FixtureConfig(fixture_linear_layers=False)
     )
     assert dense.linear_attention is None
@@ -546,3 +549,246 @@ def test_draft_profile_backend_default_lands_on_the_drafter_field() -> None:
     )
     assert args.attention_backend == "target_backend"
     assert args.drafter_attention_backend == "fixture_backend"
+
+
+def test_other_threads_wait_for_the_whole_load(isolated, monkeypatch) -> None:
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+    seen_by_waiter: list[bool] = []
+
+    def slow_register() -> None:
+        entered.set()
+        assert release.wait(timeout=10)
+        registry.register_model(FixtureForCausalLM)
+
+    _install(monkeypatch, _EntryPoint("slow", slow_register))
+
+    loader = threading.Thread(target=plugins.ensure_loaded)
+    loader.start()
+    assert entered.wait(timeout=10)
+
+    def wait_for_load() -> None:
+        plugins.ensure_loaded()
+        seen_by_waiter.append(
+            registry.registered_model("FixtureForCausalLM") is not None
+        )
+
+    waiter = threading.Thread(target=wait_for_load)
+    waiter.start()
+    waiter.join(timeout=0.2)
+    # The flag is already set, but the waiter must still block on the lock.
+    assert waiter.is_alive()
+    release.set()
+    loader.join(timeout=10)
+    waiter.join(timeout=10)
+    assert seen_by_waiter == [True]
+
+
+def test_autoconfig_mirror_honours_override_of_a_shipped_type(isolated) -> None:
+    from transformers import LlamaConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    class _LlamaOverride(LlamaConfig):
+        pass
+
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            with registry.recording():
+                registry.register_config(
+                    _LlamaOverride, model_type="llama", override=True
+                )
+                assert CONFIG_MAPPING["llama"] is _LlamaOverride
+                raise RuntimeError("boom")
+        assert CONFIG_MAPPING["llama"] is LlamaConfig
+    finally:
+        CONFIG_MAPPING._extra_content.pop("llama", None)
+
+
+def test_autoconfig_mirror_degrades_when_transformers_moves_its_table(
+    isolated, monkeypatch
+) -> None:
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    class _MovedConfig(PretrainedConfig):
+        model_type = "fixture_moved_type"
+
+    monkeypatch.delattr(CONFIG_MAPPING, "_extra_content")
+    registry.register_config(_MovedConfig, model_type="fixture_moved_type")
+    assert hf_transformers_utils._CONFIG_REGISTRY["fixture_moved_type"] is _MovedConfig
+
+
+def test_profiled_linear_attention_without_linear_layers_is_rejected() -> None:
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["FixtureForCausalLM"]),
+        model_profile=_profile(linear_attention="fixture_linear"),
+    )
+    with pytest.raises(ValueError, match="linear_layer_ids"):
+        attention_registry._linear_attn_component(
+            SimpleNamespace(), model_config, is_draft=False
+        )
+    model_config.model_profile = _profile(linear_attention=None)
+    assert (
+        attention_registry._linear_attn_component(
+            SimpleNamespace(), model_config, is_draft=False
+        )
+        is None
+    )
+
+
+def test_attention_instances_per_layer_has_no_fallback() -> None:
+    fields = dict(
+        configure_attention=configure_mla_attention,
+        cache_family="fixture_family",
+        linear_attention=None,
+        default_attention_backend=None,
+        default_prefix_granularity=None,
+        request_token_history=False,
+        tokenizer_kwargs={},
+    )
+    with pytest.raises(TypeError, match="attention_instances_per_layer"):
+        ModelProfile(**fields, numerics_envelopes=frozenset({"auto"}))
+
+
+def test_loader_rejects_a_profile_from_another_architecture(
+    isolated, monkeypatch
+) -> None:
+    from tokenspeed.runtime.model_loader.utils import get_model_architecture
+    from tokenspeed.runtime.models.registry import ModelRegistry
+
+    monkeypatch.setattr(ModelRegistry, "models", {"LlamaForCausalLM": torch.nn.Module})
+    registry.register_model(FixtureForCausalLM)
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=["LlamaForCausalLM", "FixtureForCausalLM"]
+        ),
+        quantization=None,
+        model_profile_architecture="FixtureForCausalLM",
+    )
+    with pytest.raises(ValueError, match="list the plugin architecture first"):
+        get_model_architecture(model_config)
+    model_config.hf_config.architectures = ["FixtureForCausalLM"]
+    assert get_model_architecture(model_config) == (
+        FixtureForCausalLM,
+        "FixtureForCausalLM",
+    )
+
+
+def test_superseded_draft_profile_default_is_reported(caplog) -> None:
+    from tokenspeed.runtime.configs.model_config import _apply_attention_defaults
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    args = ServerArgs(model="x")
+    args.drafter_attention_backend = "target_choice"
+    with caplog.at_level("INFO"):
+        _apply_attention_defaults(
+            args,
+            name="Fixture",
+            default_backend="draft_default",
+            default_prefix_granularity=None,
+            is_draft_worker=True,
+        )
+    assert args.drafter_attention_backend == "target_choice"
+    assert "superseded" in caplog.text
+
+
+def test_plugin_algorithm_without_a_draft_checkpoint_is_refused() -> None:
+    from tokenspeed.runtime.execution import drafter
+
+    registry.register_drafter(
+        "FIXTURE_SPEC", _FixtureDrafter, defaults_to_base_checkpoint=True
+    )
+    try:
+        args = SimpleNamespace(
+            speculative_algorithm="FIXTURE_SPEC", speculative_draft_model_path=None
+        )
+        with pytest.raises(ValueError, match="--draft-model-path-use-base"):
+            drafter.require_plugin_draft_checkpoint(args)
+        args.speculative_draft_model_path = "/ckpt"
+        drafter.require_plugin_draft_checkpoint(args)
+        # In-tree algorithms keep server-args resolution's own defaulting.
+        drafter.require_plugin_draft_checkpoint(
+            SimpleNamespace(speculative_algorithm="EAGLE3")
+        )
+    finally:
+        drafter._PLUGIN_DRAFTERS.pop("FIXTURE_SPEC", None)
+
+
+def test_hybrid_dcp_accepts_builtin_groups_and_requires_history() -> None:
+    from dataclasses import replace
+    from test.runtime.conftest import kimi_recipe
+
+    recipe = kimi_recipe(tp_size=8)
+    config = recipe.attn_config
+    recipe.attn_config = replace(
+        config,
+        device="cuda",
+        dcp_size=8,
+        dcp_group=tuple(range(8)),
+        components=(
+            replace(config.components[0], backend_name="flashmla"),
+            *config.components[1:],
+        ),
+    )
+    groups = tuple(group for group, _ in recipe.groups())
+    attention_registry._validate_hybrid_dcp_cache(
+        SimpleNamespace(cache_group_specs=groups),
+        dcp_size=8,
+    )
+    with pytest.raises(ValueError, match="full-history cache group"):
+        attention_registry._validate_hybrid_dcp_cache(
+            SimpleNamespace(
+                cache_group_specs=tuple(g for g in groups if g.family == "state")
+            ),
+            dcp_size=8,
+        )
+
+    window_only = tuple(
+        (
+            replace(g, retention="sliding_window", sliding_window_tokens=256)
+            if g.family == "history"
+            else g
+        )
+        for g in groups
+    )
+    with pytest.raises(ValueError, match="full-history cache group"):
+        attention_registry._validate_hybrid_dcp_cache(
+            SimpleNamespace(cache_group_specs=window_only),
+            dcp_size=8,
+        )
+
+    history = next(g for g in groups if g.family == "history")
+    for shard_count in (1, 8):
+        window = replace(
+            history,
+            group_id="window",
+            retention="sliding_window",
+            sliding_window_tokens=256,
+            shard_count=shard_count,
+        )
+        with pytest.raises(ValueError, match="must use full-history retention"):
+            attention_registry._validate_hybrid_dcp_cache(
+                SimpleNamespace(cache_group_specs=(*groups, window)),
+                dcp_size=8,
+            )
+
+
+def test_mla_dcp_checks_backend_capability(monkeypatch) -> None:
+    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
+        FlashMLABackend,
+    )
+
+    monkeypatch.setitem(
+        attention_registry._BACKEND_REGISTRY,
+        "fixture_dcp",
+        ({AttentionArch.MLA}, FlashMLABackend),
+    )
+    attention_registry._validate_mla_dcp_backend("fixture_dcp", AttentionArch.MLA)
+    monkeypatch.setitem(
+        attention_registry._BACKEND_REGISTRY,
+        "flashmla",
+        ({AttentionArch.MLA}, AttentionBackend),
+    )
+    with pytest.raises(ValueError, match="supports_mla_dcp=False"):
+        attention_registry._validate_mla_dcp_backend("flashmla", AttentionArch.MLA)

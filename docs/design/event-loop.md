@@ -155,6 +155,19 @@ Python location, `error` raises there. CI runs the serving paths with
 `error`; the control plane's event wait and non-blocking copies are not
 flagged, so a report is always a real stall.
 
+A JIT compilation on the forward thread is the same kind of stall, only
+longer: the round waits 100 ms to seconds while a kernel compiles for a new
+compile-cache key. Startup compiles on purpose (graph capture, tuning), so
+`run_event_loop` installs `tokenspeed_kernel.compile_monitor` before building
+anything and marks the end of startup right after arming the sync-debug
+mode; the encode loop marks it after its ready message. From then on every
+Triton compilation is logged with its duration and cause, exported as
+`tokenspeed:jit_serving_compiles` / `tokenspeed:jit_serving_compile_seconds`
+from the per-round metrics call, and a compile-time kernel parameter that
+keeps taking new values from one call site -- a per-batch value passed as
+`tl.constexpr` -- is reported by name. `TOKENSPEED_JIT_COMPILE_CHECK=error`
+raises there instead, and CI serving jobs run with it.
+
 ### The capture contract
 
 Information crosses to the data plane **only** inside the submitted closure,
@@ -382,6 +395,8 @@ For orientation, one iteration of `event_loop`:
 * Never issue CUDA work, or hold something that can, from the control plane.
 * Never synchronize with the device from the data plane's per-round path;
   run with `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error` while developing on it.
+* Never let a kernel's compile key follow the batch shape; run with
+  `TOKENSPEED_JIT_COMPILE_CHECK=error` while developing on the serving path.
 * L3 `batch_exists` registration is on the admit path, but only when
   `--kvstore-storage-backend` is set. Hashing every admitted prefix on the
   default (`--disable-kvstore`) path is a control-plane cost the loop must

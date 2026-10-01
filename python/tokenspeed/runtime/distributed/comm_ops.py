@@ -31,11 +31,6 @@ import torch
 import torch.distributed
 from tokenspeed_kernel.ops.communication import (
     allgather_dual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication import (
-    allreduce_lane_latent_norm as kernel_allreduce_lane_latent_norm,
-)
-from tokenspeed_kernel.ops.communication import (
     allreduce_residual_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication import (
@@ -50,9 +45,6 @@ from tokenspeed.runtime.distributed.comm_backend import (
     Group,
     get_global_backend,
 )
-
-# Re-exported for reduce-strategy callers (e.g. kimi3_join_reduce_moe):
-# tensor collections past the one-shot window take an NCCL path.
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # noqa: F401
     MAX_ONESHOT_BYTES as COMM_ONESHOT_MAX_BYTES,
 )
@@ -160,6 +152,7 @@ def prepare_all_reduce_buffers(
     attnres_max_numel: int,
     attnres_max_rows: int,
     enable_lamport: bool,
+    moe_tail_max_rows: int,
     dtype: torch.dtype,
     backend: CommBackend | None,
 ) -> bool:
@@ -172,6 +165,8 @@ def prepare_all_reduce_buffers(
         attnres_max_numel: Maximum fused AttnRes payload in elements.
         attnres_max_rows: Maximum fused AttnRes payload in rows.
         enable_lamport: Allow Lamport for eligible producer-direct payloads.
+        moe_tail_max_rows: Maximum rows in the reusable symmetric result buffer;
+            zero skips its allocation.
         dtype: Element type shared by the prepared paths.
         backend: Backend to prepare, or ``None`` to use the global backend.
 
@@ -188,6 +183,7 @@ def prepare_all_reduce_buffers(
         attnres_max_numel=attnres_max_numel,
         attnres_max_rows=attnres_max_rows,
         enable_lamport=enable_lamport,
+        moe_tail_max_rows=moe_tail_max_rows,
         dtype=dtype,
     )
 
@@ -209,30 +205,6 @@ def prepare_all_reduce_fusion(
         )
     except Exception:
         return False
-
-
-def all_reduce_latent_norm(
-    lane: torch.Tensor,
-    norm_weight: torch.Tensor,
-    latent_width: int,
-    group: Group,
-    *,
-    eps: float,
-    max_token_num: int,
-) -> torch.Tensor:
-    """All-reduce a routed/shared lane and RMS-normalize its routed prefix."""
-
-    process_group = _get_process_group(group)
-    return kernel_allreduce_lane_latent_norm(
-        lane,
-        norm_weight,
-        latent_width,
-        rank=process_group.rank(),
-        group=process_group,
-        eps=eps,
-        max_token_num=max_token_num,
-        trigger_completion_at_end=True,
-    )
 
 
 def can_acquire_all_reduce_outputs(

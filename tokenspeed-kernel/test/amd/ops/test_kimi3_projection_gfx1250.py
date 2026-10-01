@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 import tokenspeed_kernel
 import torch
@@ -452,3 +454,61 @@ def test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches() -> None:
     torch.cuda.synchronize()
     assert actual is not None
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("solution", ["auto", "torch"])
+@pytest.mark.parametrize("rows,width", [(2, 64), (17, 16)])
+def test_kimi3_shared_down_strided_output_contract(
+    dtype, solution, rows, width
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16 import mm as dense_module
+
+    torch.manual_seed(1796)
+    hidden_states = torch.randn(rows, 768, device="cuda", dtype=dtype)
+    weight = torch.randn(width, 768, device="cuda", dtype=dtype)
+    lane = torch.full((rows, width + 32), -7, device="cuda", dtype=dtype)
+    out = lane[:, 32:]
+    expected = torch.mm(hidden_states, weight.T)
+    with mock.patch.object(
+        dense_module,
+        "gluon_wmma_tdm_dense_gfx1250",
+        wraps=dense_module.gluon_wmma_tdm_dense_gfx1250,
+    ) as wmma:
+        actual = tokenspeed_kernel.kimi3_shared_down_projection(
+            hidden_states, weight, out=out, solution=solution
+        )
+        assert wmma.called == (dtype == torch.bfloat16 and solution == "auto")
+    assert actual is out
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    assert torch.all(lane[:, :32] == -7)
+    with pytest.raises(ValueError, match="unknown"):
+        tokenspeed_kernel.kimi3_shared_down_projection(
+            hidden_states, weight, out=out, solution="invalid"
+        )
+
+
+@pytest.mark.parametrize("noncontiguous", ["input", "weight"])
+def test_kimi3_shared_down_strided_inputs_use_torch(noncontiguous) -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16 import mm as dense_module
+
+    torch.manual_seed(1796)
+    hidden_states = torch.randn(2, 768, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(64, 768, device="cuda", dtype=torch.bfloat16)
+    if noncontiguous == "input":
+        hidden_states = hidden_states.T.contiguous().T
+    else:
+        weight = weight.T.contiguous().T
+    lane = torch.empty(2, 96, device="cuda", dtype=torch.bfloat16)
+    out = lane[:, 32:]
+    expected = torch.empty_strided(
+        out.shape, out.stride(), device=out.device, dtype=out.dtype
+    )
+    torch.mm(hidden_states, weight.T, out=expected)
+    with mock.patch.object(dense_module, "gluon_wmma_tdm_dense_gfx1250") as wmma:
+        actual = tokenspeed_kernel.kimi3_shared_down_projection(
+            hidden_states, weight, out=out, solution="auto"
+        )
+        wmma.assert_not_called()
+    assert actual is out
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

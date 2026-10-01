@@ -54,7 +54,9 @@ def test_skinny_add3_matches_reference(m):
     c = c_wide[:, n:]
     got = kimi3._skinny_gemv_add3(x, w, a, c, None).float()
     ref = a.float() + x.float() @ w.float().t() + c.float()
-    assert torch.allclose(got, ref, atol=0.5, rtol=2e-2)
+    # |out| ~ 8 (bf16 ulp 3e-2); atol spans the composed fallback's three
+    # roundings when the GEMM term cancels against the addends.
+    assert torch.allclose(got, ref, atol=5e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(
@@ -76,7 +78,7 @@ def test_kimi3_add3_auto_selects_the_skinny_epilogue():
         x, w, a, c, solution="composed"
     ).float()
     assert torch.allclose(auto, forced, atol=0.0, rtol=0.0)
-    assert torch.allclose(auto, composed, atol=0.5, rtol=2e-2)
+    assert torch.allclose(auto, composed, atol=5e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(
@@ -108,7 +110,7 @@ def test_skinny_add3_unwarmed_capture_falls_back(monkeypatch):
         g.replay()
     torch.cuda.current_stream().wait_stream(s)
     torch.cuda.synchronize()
-    assert torch.allclose(out.float(), ref, atol=0.5, rtol=2e-2)
+    assert torch.allclose(out.float(), ref, atol=5e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(

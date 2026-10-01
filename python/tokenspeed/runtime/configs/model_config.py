@@ -45,6 +45,7 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
     get_generation_config,
+    model_loader_architectures,
     resolve_architecture,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -408,6 +409,16 @@ def _apply_attention_defaults(
     if is_draft_worker:
         if server_args.drafter_attention_backend is None:
             server_args.drafter_attention_backend = default_backend
+        elif server_args.drafter_attention_backend != default_backend:
+            # Server-args resolution mirrors --attention-backend into the
+            # drafter before any model is known, so the two cannot be told
+            # apart here; say which one won.
+            logger.info(
+                f"{name!s} draft default attention backend {default_backend!r} "
+                f"is superseded by {server_args.drafter_attention_backend!r} "
+                "(--drafter-attention-backend, or --attention-backend mirrored "
+                "to the drafter); pass --drafter-attention-backend to choose."
+            )
     elif server_args.attention_backend is None:
         server_args.attention_backend = default_backend
 
@@ -451,10 +462,12 @@ class ModelConfig:
             # Post-discovery replacement for the CLI choices= this flag no
             # longer carries: plugins may have added algorithms.
             from tokenspeed.runtime.execution.drafter import (
+                require_plugin_draft_checkpoint,
                 validate_drafter_algorithm,
             )
 
             validate_drafter_algorithm(server_args.speculative_algorithm)
+            require_plugin_draft_checkpoint(server_args)
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
@@ -489,9 +502,17 @@ class ModelConfig:
         self.hf_text_config = get_hf_text_config(self.hf_config)
         # A registered model states its own family facts; in-tree models
         # without a profile still resolve through the architecture tables.
-        self.model_profile: ModelProfile | None = resolve_model_profile(
-            _model_architectures(self.hf_config, self.hf_text_config),
-            self.hf_config,
+        # Candidates are exactly the list the model loader walks, so the
+        # profile cannot come from a different architecture than the class
+        # that is built (the loader checks the pairing).
+        resolved_profile = resolve_model_profile(
+            model_loader_architectures(self.hf_config), self.hf_config
+        )
+        self.model_profile_architecture: str | None = (
+            resolved_profile[0] if resolved_profile is not None else None
+        )
+        self.model_profile: ModelProfile | None = (
+            resolved_profile[1] if resolved_profile is not None else None
         )
         self.spec_block_size: int | None = None
         if is_draft_worker:

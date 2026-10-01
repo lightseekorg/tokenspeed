@@ -33,8 +33,10 @@ def _refresh_conv_capacity_kernel(
     boundaries,
     batches,
     offsets,
-    CHUNKS: tl.constexpr,
-    SEQUENCES: tl.constexpr,
+    # Chunk and sequence counts follow the batch; runtime so every batch shape
+    # shares one binary.
+    CHUNKS,
+    SEQUENCES,
     BLOCK_M: tl.constexpr,
     BLOCK: tl.constexpr,
 ):

@@ -60,9 +60,11 @@ def test_matches_the_cuda_router_kernel(m: int) -> None:
     a, b = _inputs(m)
     got = kimi3_router_projection(a, b, solution="ll_bf16")
     expected = kimi3_router_projection(a, b, solution="cuda")
-    torch.testing.assert_close(got, expected, atol=2e-3, rtol=2e-3)
+    # rtol stays far below bf16's 2^-8 so any bf16 rounding inside the
+    # reduction fails; atol covers fp32 reordering noise near zero.
+    torch.testing.assert_close(got, expected, atol=2e-3, rtol=1e-4)
     reference = torch.nn.functional.linear(a.float(), b.float())
-    torch.testing.assert_close(got, reference, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(got, reference, atol=2e-3, rtol=1e-4)
 
 
 @pytest.mark.parametrize("m", [1, 8, 32])

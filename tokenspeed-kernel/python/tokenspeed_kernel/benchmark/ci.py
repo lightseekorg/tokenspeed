@@ -25,9 +25,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import platform as host_platform
+import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
@@ -41,6 +43,8 @@ from tokenspeed_kernel.benchmark.harness import (
     KernelBenchmarkHarness,
     KernelBenchmarkResult,
 )
+from tokenspeed_kernel.benchmark.profiler import BenchmarkProfiler, NullProfiler
+from tokenspeed_kernel.benchmark.proton import ProtonProfiler
 from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
@@ -260,8 +264,16 @@ def _read_json(path: Path) -> object:
         raise SuiteConfigError(f"cannot read {path}: {error}") from error
 
 
-def load_suite(path: str | Path) -> BenchmarkSuite:
+def load_suite(
+    path: str | Path,
+    case_filters: Sequence[str] = (),
+) -> BenchmarkSuite:
     """Load the fields needed to execute a benchmark suite."""
+
+    try:
+        patterns = tuple(re.compile(expression) for expression in case_filters)
+    except re.error as error:
+        raise SuiteConfigError(f"invalid case filter: {error}") from error
 
     suite_path = Path(path)
     suite = _object(_read_json(suite_path), "suite")
@@ -328,12 +340,22 @@ def load_suite(path: str | Path) -> BenchmarkSuite:
     if len(case_ids) != len(set(case_ids)):
         raise SuiteConfigError("duplicate case IDs are not allowed")
 
+    selected_cases = tuple(sorted(cases, key=lambda case: case.id))
+    if patterns:
+        selected_cases = tuple(
+            case
+            for case in selected_cases
+            if any(pattern.search(case.id) for pattern in patterns)
+        )
+        if not selected_cases:
+            raise SuiteConfigError("case filters matched no benchmark cases")
+
     return BenchmarkSuite(
         suite_id=suite_id,
         required_environment=required_environment,
         timer=timer,
         default_measurement_blocks=default_measurement_blocks,
-        cases=tuple(sorted(cases, key=lambda case: case.id)),
+        cases=selected_cases,
         schema_version=schema_version,
     )
 
@@ -455,6 +477,7 @@ def run_suite(
     *,
     harness_factory: Callable[[GraphBenchmarkConfig], KernelBenchmarkHarness],
     environment_provider: Callable[[], dict[str, Any]],
+    profiler: BenchmarkProfiler | None = None,
 ) -> dict[str, Any]:
     """Run a validated suite and return its coordinator-facing envelope."""
 
@@ -499,11 +522,17 @@ def run_suite(
         else:
             assert harness is not None
             try:
-                result_payload = _result_payload(
-                    harness.run(
-                        case.request,
-                        measurement_blocks=case.measurement_blocks,
+                run_options: dict[str, Any] = {
+                    "measurement_blocks": case.measurement_blocks
+                }
+                if profiler is not None:
+                    run_options["profile_invocation"] = (
+                        lambda phase, index, case_id=case.id: profiler.profile(
+                            case_id, phase, index
+                        )
                     )
+                result_payload = _result_payload(
+                    harness.run(case.request, **run_options)
                 )
             except Exception as error:  # noqa: BLE001 - benchmark failures are data
                 result_payload = _failure_payload(
@@ -544,6 +573,21 @@ def _write_output(payload: dict[str, Any], path: str | Path) -> None:
     output_path.write_text(serialized, encoding="utf-8")
 
 
+def _attach_profiles(
+    payload: dict[str, Any],
+    profiles: Mapping[str, dict[str, Any]],
+) -> None:
+    for case in payload["cases"]:
+        case["profile"] = profiles.get(case["id"])
+
+
+def _create_profiler(name: str | None) -> BenchmarkProfiler:
+    if name == "none" or (name is None and torch.version.hip is None):
+        return NullProfiler()
+    backend = "roctracer" if torch.version.hip is not None else None
+    return ProtonProfiler(backend=backend)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run a revision-local kernel benchmark suite for CI"
@@ -559,16 +603,33 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="Result JSON path, or '-' for standard output",
     )
+    parser.add_argument(
+        "--case-filter",
+        action="append",
+        default=[],
+        metavar="REGEX",
+        help="Run cases whose expanded IDs match this regex (repeatable)",
+    )
+    parser.add_argument(
+        "--profiler",
+        choices=("none", "proton"),
+        default=os.environ.get("TOKENSPEED_KERNEL_BENCHMARK_PROFILER"),
+        help="Optional diagnostic profiler; defaults to Proton on AMD",
+    )
     args = parser.parse_args(argv)
 
     try:
-        suite = load_suite(args.suite)
-        payload = run_suite(
-            suite,
-            args.revision,
-            harness_factory=_create_harness,
-            environment_provider=_collect_environment,
-        )
+        suite = load_suite(args.suite, args.case_filter)
+        profiler = _create_profiler(args.profiler)
+        with profiler:
+            payload = run_suite(
+                suite,
+                args.revision,
+                harness_factory=_create_harness,
+                environment_provider=_collect_environment,
+                profiler=None if isinstance(profiler, NullProfiler) else profiler,
+            )
+        _attach_profiles(payload, profiler.profiles)
         _write_output(payload, args.output)
     except (OSError, SuiteConfigError) as error:
         parser.exit(2, f"error: {error}\n")

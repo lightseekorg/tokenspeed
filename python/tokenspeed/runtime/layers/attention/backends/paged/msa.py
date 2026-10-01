@@ -31,9 +31,6 @@ from tokenspeed_kernel.ops.attention.msa import (
     msa_decode_with_kvcache,
     msa_extend_with_kvcache,
 )
-from tokenspeed_kernel.ops.kvcache.triton import (
-    fused_fp8_set_kv_buffer,
-)
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -47,7 +44,6 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.paged.mha import trim_kv_to_locs
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.msa import (
     MSAConfig,
@@ -111,11 +107,6 @@ class MSAAttnBackend(PagedAttentionBackend):
         self.tp_q_head_num = max(spec.num_attention_heads // spec.attn_tp_size, 1)
         self.tp_kv_head_num = max(spec.num_kv_heads // spec.attn_tp_size, 1)
         self.qkv_dtype = config.dtype
-        self.kv_cache_dtype = config.kv_cache_dtype
-        self.is_fp8 = self.kv_cache_dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        )
 
         # Sparse attention parameters
         self.index_head_dim = spec.index_head_dim
@@ -281,12 +272,11 @@ class MSAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         index_q: torch.Tensor | None = None,
         index_k: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Run sparse decode and update the standard and index-key caches."""
+        """Run sparse decode; the kernel writes the new index keys."""
         del bs, kwargs
         metadata = self.forward_decode_metadata
         assert (
@@ -295,16 +285,7 @@ class MSAAttnBackend(PagedAttentionBackend):
         assert (
             index_q is not None and index_k is not None
         ), "MSA requires index_q and index_k from the model layer."
-        assert save_kv_cache, (
-            "MSA does not support KV-cache prewrite because its "
-            "index-key side cache is backend-owned."
-        )
-        assert k is not None and v is not None, "MSA requires K/V inputs on every call."
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
-
-        self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
         k_cache, v_cache, index_k_cache = self._get_sparse_caches(
             layer, token_to_kv_pool
         )
@@ -331,8 +312,6 @@ class MSAAttnBackend(PagedAttentionBackend):
             local_blocks=self.index_local_blocks,
             max_seqlen_q=decode_query_len,
             max_seqlen_k=self.max_context_len,
-            k_scale=layer.k_scale if self.is_fp8 else None,
-            v_scale=layer.v_scale if self.is_fp8 else None,
             score_out=metadata.score_out,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -346,12 +325,11 @@ class MSAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         index_q: torch.Tensor | None = None,
         index_k: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Run sparse extend/prefill and update both cache components."""
+        """Run sparse extend/prefill; the kernel writes the new index keys."""
         del bs, kwargs
         metadata = self.forward_extend_metadata
         assert (
@@ -360,25 +338,14 @@ class MSAAttnBackend(PagedAttentionBackend):
         assert (
             index_q is not None and index_k is not None
         ), "MSA requires index_q and index_k from the model layer."
-        assert save_kv_cache, (
-            "MSA does not support KV-cache prewrite because its "
-            "index-key side cache is backend-owned."
-        )
-        assert k is not None and v is not None, "MSA requires K/V inputs on every call."
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-        v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
 
         total_tokens = q.shape[0]
         real_tokens = int(metadata.cu_extend_seq_lens_cpu[-1])
         q = q[:real_tokens]
-        k = k[:real_tokens]
-        v = v[:real_tokens]
         index_q = index_q[:real_tokens]
         index_k = index_k[:real_tokens]
-
         out_cache_loc = out_cache_loc[:real_tokens]
-        self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
         k_cache, v_cache, index_k_cache = self._get_sparse_caches(
             layer, token_to_kv_pool
         )
@@ -404,8 +371,6 @@ class MSAAttnBackend(PagedAttentionBackend):
             attention_scale=layer.scaling,
             init_blocks=self.index_init_blocks,
             local_blocks=self.index_local_blocks,
-            k_scale=layer.k_scale if self.is_fp8 else None,
-            v_scale=layer.v_scale if self.is_fp8 else None,
             query_lens_cpu=metadata.extend_seq_lens_cpu,
             seq_lens_cpu=metadata.seq_lens_cpu,
         )
@@ -414,43 +379,6 @@ class MSAAttnBackend(PagedAttentionBackend):
     # ------------------------------------------------------------------
     # Helper methods
     # ------------------------------------------------------------------
-
-    def _save_kv_cache(
-        self,
-        layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
-        token_to_kv_pool,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
-    ) -> None:
-        if k is None:
-            return
-        k, v = trim_kv_to_locs(out_cache_loc, k, v)
-
-        if (
-            self.kv_cache_dtype == torch.float8_e4m3fn
-            and k.dtype != torch.float8_e4m3fn
-        ):
-            k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            fused_fp8_set_kv_buffer(
-                k=k,
-                v=v,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_loc=out_cache_loc,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-                page_size=self.kernel_page_size,
-            )
-        else:
-            token_to_kv_pool.set_kv_buffer(
-                layer,
-                out_cache_loc,
-                k,
-                v,
-                layer.k_scale,
-                layer.v_scale,
-            )
 
     def _get_kv_cache(self, layer: PagedAttention, token_to_kv_pool):
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
@@ -523,16 +451,24 @@ class MSAHybridAttnBackend(AttentionBackend):
     def child_backends(self) -> tuple[AttentionBackend, ...]:
         return (self.full_router, self.sparse_router)
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
-        # A single model-wide answer must be safe for sparse layers too.
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        # One model-wide answer; sparse layers need index keys the narrowed dispatch never passes.
         del forward_mode
         return False
 
     def write_locations(self, layer, forward_mode):
         return self._router_for_layer(layer.layer_id).write_locations(
             layer, forward_mode
+        )
+
+    def forward_write_locations(self, layer, forward_mode):
+        return self._router_for_layer(layer.layer_id).forward_write_locations(
+            layer, forward_mode
+        )
+
+    def padded_write_locations(self, layer, forward_mode, rows):
+        return self._router_for_layer(layer.layer_id).padded_write_locations(
+            layer, forward_mode, rows
         )
 
     def init_forward_metadata(self, *args, **kwargs):
@@ -596,7 +532,7 @@ class MSAHybridAttnBackend(AttentionBackend):
         token_to_kv_pool,
         forward_mode: ForwardMode,
         bs: int,
-        save_kv_cache: bool = True,
+        save_kv_cache: bool,
         record_kv_cache: bool | None = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -609,10 +545,15 @@ class MSAHybridAttnBackend(AttentionBackend):
         if forward_mode.is_idle():
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
+        assert (
+            not save_kv_cache
+        ), "MSA KV is written by the prologue before core attention"
         router = self._router_for_layer(layer.layer_id)
         out_cache_loc = router.write_locations(layer, forward_mode)
         leaf = router._leaf_for(layer)
-        with self.record_pd_cache_step(forward_mode, save_kv_cache, record_kv_cache):
+        # A sparse layer's kernel stores its index keys, so the layer publishes after it.
+        writes_in_call = layer.layer_id in self.sparse_layer_ids
+        with self.record_pd_cache_step(forward_mode, writes_in_call, record_kv_cache):
             if forward_mode.is_decode():
                 return leaf.forward_decode(
                     q,
@@ -622,7 +563,6 @@ class MSAHybridAttnBackend(AttentionBackend):
                     out_cache_loc,
                     token_to_kv_pool,
                     bs,
-                    save_kv_cache=save_kv_cache,
                     **kwargs,
                 )
             return leaf.forward_extend(
@@ -633,7 +573,6 @@ class MSAHybridAttnBackend(AttentionBackend):
                 out_cache_loc,
                 token_to_kv_pool,
                 bs,
-                save_kv_cache=save_kv_cache,
                 forward_mode=forward_mode,
                 **kwargs,
             )

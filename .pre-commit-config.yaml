@@ -42,3 +42,12 @@ repos:
         args:
           - '--keep-output'
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.49.1
+    hooks:
+      - id: markdownlint
+        name: AMD ops README line length
+        files: ^tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/README\.md$
+        args:
+          - --config
+          - tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/.markdownlint.yaml

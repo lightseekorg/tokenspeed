@@ -383,6 +383,20 @@ their joint reduction before the fused latent up-projection epilogue. Other
 shapes and unsupported layouts retain the ordinary composed path. The fused
 sigmoid-bias top-k route supports the full scheduled token count.
 
+For Gluon Petit MegaMoE on one node with 8x gfx950 and MXFP4 expert weights,
+use attention DP8 and EP8, with at most 1024 tokens per rank:
+
+```bash
+TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve moonshotai/Kimi-K3 \
+  --trust-remote-code --dtype bfloat16 \
+  --tensor-parallel-size 1 --data-parallel-size 8 --ep-size 8 \
+  --attention-backend mla --kv-cache-dtype fp8 \
+  --moe-backend gluon_petit --all2all-backend gluon_petit \
+  --max-model-len 8192 --max-num-seqs 32 \
+  --chunked-prefill-size 1024 --max-prefill-tokens 1024 \
+  --disable-kvstore --disable-autotune
+```
+
 ## GLM5 / GLM5.2
 
 GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV
@@ -797,6 +811,27 @@ tokenspeed serve openai/gpt-oss-120b \
   --port 8000
 ```
 
+### Gluon Petit MegaMoE on AMD CDNA4
+
+GPT-OSS 120B with MXFP4 weights supports Gluon Petit MegaMoE on one node
+with eight gfx950 GPUs:
+
+```bash
+TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve openai/gpt-oss-120b \
+  --tensor-parallel-size 1 \
+  --data-parallel-size 8 \
+  --expert-parallel-size 8 \
+  --dtype bfloat16 \
+  --moe-backend gluon_petit \
+  --all2all-backend gluon_petit \
+  --chunked-prefill-size 1024 \
+  --max-prefill-tokens 1024 \
+  --disable-autotune \
+  --disable-kvstore
+```
+
+This backend supports at most 1024 prefill or decode tokens per rank.
+
 ## DeepSeek V4-Flash / V4-Pro
 
 DeepSeek V4 uses FP8 KV cache.
@@ -854,6 +889,12 @@ For the expert-parallel topology, swap `--tensor-parallel-size 8` for
 `--moe-backend flashinfer_trtllm` for `--moe-backend mega_moe`.
 
 ### AMD
+
+On eight gfx950 GPUs, DeepSeek V4 with serialized MXFP4 weights can use the
+topology and backend flags in the [Gluon Petit recipe](#gluon-petit-megamoe-on-amd-cdna4),
+alongside the V4 KV cache and indexer options. Petit ignores checkpoint
+activation clamps, which may affect accuracy; select it explicitly with
+`--moe-backend gluon_petit`.
 
 **V4-Flash** — 2× MI350-series (gfx950), tensor-parallel + MTP:
 

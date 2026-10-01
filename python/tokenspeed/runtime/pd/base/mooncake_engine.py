@@ -20,6 +20,8 @@
 
 import logging
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,12 +40,26 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id
         self.ib_device = ib_device
+        # Page-gathered batch WRITE (pages x fields expanded inside Mooncake)
+        # is the only way the CachePD sender moves whole fields, so an engine
+        # without it is a wrong install, not a slower one.
+        if not hasattr(self.engine, "batch_transfer_sync_write_pages"):
+            raise RuntimeError(
+                "Mooncake's TransferEngine lacks batch_transfer_sync_write_pages; "
+                "install tokenspeed-mooncake >= 0.3.13.post20260929."
+            )
 
         self.initialize(
             hostname=self.hostname,
             device_name=self.ib_device,
         )
         self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
+        # The peer identifies this rank by session_id in its transfer logs
+        # (Prefill's "session=..."), so name it once per process here.
+        logger.info(
+            f"Mooncake transfer engine ready: session_id={self.session_id} "
+            f"gpu_id={self.gpu_id} ib_device={self.ib_device}"
+        )
 
     def register(self, ptr, length):
         """Register ``ptr`` with Mooncake.
@@ -136,6 +152,31 @@ class MooncakeTransferEngine:
             logger.debug(
                 f"Failed to batch transfer data. Buffers: {buffers!s}, Session: "
                 f"{session_id!s}, Peer addresses: {peer_buffer_addresses!s}",
+            )
+        return ret
+
+    def batch_transfer_sync_pages(
+        self,
+        session_id: str,
+        src_pages: np.ndarray,
+        dst_pages: np.ndarray,
+        fields: np.ndarray,
+        *,
+        max_batch_size: int,
+    ) -> int:
+        """WRITE the pages x fields grid described by ``fields`` (see
+        ``PageFieldCopies``) in batches of at most ``max_batch_size``."""
+        try:
+            ret = self.engine.batch_transfer_sync_write_pages(
+                session_id, src_pages, dst_pages, fields, max_batch_size
+            )
+        except Exception:
+            logger.exception("Mooncake page-gathered batch transfer raised")
+            ret = -1
+        if ret < 0:
+            logger.debug(
+                f"Failed to batch transfer {fields.shape[0]} fields x "
+                f"{src_pages.shape[0]} pages to session {session_id!s}"
             )
         return ret
 
