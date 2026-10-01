@@ -22,15 +22,22 @@
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import logging
 import os
 import signal
 import sys
 import threading
+import time
+from collections.abc import Callable, Sequence
+from multiprocessing.process import BaseProcess
 
 import psutil
 
 logger = logging.getLogger(__name__)
+
+_PR_SET_PDEATHSIG = 1
 
 
 def register_usr_signal():
@@ -76,3 +83,55 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
+
+
+def run_with_parent_death_signal(parent_pid: int, target: Callable, *args):
+    """Run ``target(*args)`` in a process that is killed when its parent dies.
+
+    Meant as a ``multiprocessing.Process`` target, with ``parent_pid`` the
+    parent's ``os.getpid()``. The kernel sends SIGKILL even when the parent
+    itself was SIGKILLed. Linux only; elsewhere ``target`` just runs. The
+    signal follows the parent *thread* that started this process, so start
+    it from a thread that lives as long as the parent needs it.
+    """
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0) != 0:
+            errno = ctypes.get_errno()
+            raise OSError(errno, os.strerror(errno))
+        # The parent may have died before the signal was set up.
+        if os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGKILL)
+    return target(*args)
+
+
+def stop_processes(processes: Sequence[BaseProcess], timeout: float) -> None:
+    """Stop child ``processes`` and everything they started.
+
+    Each live one gets SIGTERM, and together they get ``timeout`` seconds to
+    exit. Then the ones still running, and every process that was below any
+    of them when this was called, get SIGKILL, and the killed ones get
+    ``timeout`` seconds more to be gone. Listing descendants first matters:
+    one whose parent exits in the meantime is no longer found below it.
+    """
+    processes = [process for process in processes if process.is_alive()]
+    descendants = []
+    for process in processes:
+        with contextlib.suppress(psutil.NoSuchProcess):
+            descendants += psutil.Process(process.pid).children(recursive=True)
+        process.terminate()
+
+    def join(waiting):
+        deadline = time.monotonic() + timeout
+        for process in waiting:
+            process.join(max(0.0, deadline - time.monotonic()))
+
+    join(processes)
+    stuck = [process for process in processes if process.exitcode is None]
+    for process in stuck:
+        logger.warning(f"Process {process.pid!s} still running after {timeout!s} s")
+        process.kill()
+    for descendant in descendants:
+        with contextlib.suppress(psutil.NoSuchProcess):
+            descendant.kill()
+    join(stuck)
