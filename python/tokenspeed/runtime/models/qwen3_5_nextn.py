@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from dataclasses import replace
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
@@ -34,7 +33,6 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -70,9 +68,9 @@ def _resolve_mtp_quant_config(
 class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
     """NextN draft variant: skip dead catch-up rows on the first draft step.
 
-    On the first draft step the backend runs in DECODE mode with ``q`` sliced
-    to ``bs`` while ``self.attn`` still writes the full ``N`` rope-d KV rows
-    from the just-drafted tokens. Multi-step decode delegates to base.
+    On the first draft step the prologue writes the full ``N`` KV rows from the
+    just-drafted tokens, then attention runs in DECODE mode with ``q`` sliced to
+    ``bs``. Multi-step decode delegates to base.
 
     MIXED catch-up requires a backend that populates a decode-slot metadata
     under EXTEND/MIXED at draft init (e.g. trtllm-mha); MHA-family backends
@@ -81,6 +79,7 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
 
     def _attn(
         self,
+        positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -88,28 +87,10 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         ctx: ForwardContext,
     ) -> torch.Tensor:
         if ctx.draft_narrowing is None:
-            return super()._attn(q, k, v, gate, ctx)
-
-        # The live rows attend over the accepted prefix, not the verify window.
-        ctx.draft_narrowing.publish_accepted_prefix()
-        q = q.index_select(0, ctx.gather_ids)
+            return super()._attn(positions, q, k, v, gate, ctx)
+        attn_output = self.attn.attend_live_rows(q, k, v, positions, ctx)
         if gate is not None:
-            gate = gate.index_select(0, ctx.gather_ids)
-        # Dispatch as DECODE over the sliced live rows via self.attn (see the
-        # class docstring), which keeps the standard k/v reshape and KV write.
-        # A ctx copy overrides only the forward mode; record_kv_cache (keyed off
-        # the real mode) forces the backend's PD layerwise cache-step record that
-        # DECODE would otherwise skip on an EXTEND/MIXED catch-up.
-        decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
-        attn_output = self.attn(
-            q,
-            k,
-            v,
-            decode_ctx,
-            record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
-        )
-        if gate is not None:
-            sigmoid_mul(attn_output, gate)
+            sigmoid_mul(attn_output, gate.index_select(0, ctx.gather_ids))
         return attn_output
 
     def _maybe_narrow_residual(

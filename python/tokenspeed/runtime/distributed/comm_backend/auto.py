@@ -289,6 +289,7 @@ class AutoBackend(CommBackend):
         attnres_max_numel: int,
         attnres_max_rows: int,
         enable_lamport: bool,
+        moe_tail_max_rows: int,
         dtype: torch.dtype,
     ) -> bool:
         if (
@@ -305,6 +306,7 @@ class AutoBackend(CommBackend):
             attnres_max_numel=attnres_max_numel,
             attnres_max_rows=attnres_max_rows,
             enable_lamport=enable_lamport,
+            moe_tail_max_rows=moe_tail_max_rows,
             dtype=dtype,
         )
 

@@ -203,10 +203,31 @@ def test_compare_reports_regression_with_minimal_schema():
         "delta_us",
         "delta_percent",
         "detail",
+        "base_profile",
+        "candidate_profile",
     }
     assert comparison["classification"] == "regression"
     assert comparison["delta_percent"] == pytest.approx(20.0)
     assert comparison_exit_code(report) == 1
+
+
+def test_compare_passes_through_profiles_without_affecting_classification():
+    base_case = _case(10.0)
+    candidate_case = _case(10.0)
+    base_case["profile"] = {"provider": "base", "data": {"anything": [1, None]}}
+    candidate_case["profile"] = {
+        "provider": "candidate",
+        "data": [{"kernel": "example", "tflops": 42.0}],
+    }
+
+    comparison = _compare(
+        _run(BASE_SHA, [base_case]),
+        _run(CANDIDATE_SHA, [candidate_case]),
+    )["comparisons"][0]
+
+    assert comparison["classification"] == "within_budget"
+    assert comparison["base_profile"] == base_case["profile"]
+    assert comparison["candidate_profile"] == candidate_case["profile"]
 
 
 @pytest.mark.parametrize(

@@ -48,6 +48,7 @@ from tokenspeed.runtime.execution.graph_ptr_guard import (
 from tokenspeed.runtime.execution.memory_delta import (
     MemoryDeltaObserver,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     compute_max_logical_pages_for_capture,
 )
@@ -260,6 +261,7 @@ class ForwardStepRunner:
             cache_group_page_counts=(token_to_kv_pool.arena.cache_group_page_counts),
             max_tokens_per_req=self.max_tokens_per_req,
             overlap_schedule_depth=self.overlap_schedule_depth,
+            max_extend_tokens=config.prefill_graph_max_tokens,
         )
         if draft_attn_backend is not None:
             draft_attn_backend.init_cuda_graph_state(
@@ -270,6 +272,7 @@ class ForwardStepRunner:
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
+                max_extend_tokens=config.prefill_graph_max_tokens,
             )
 
         # One placeholder table set serves capture, the idle replay and any
@@ -509,6 +512,7 @@ class ForwardStepRunner:
             token_to_kv_pool=self.token_to_kv_pool,
             bs=bs,
             num_extends=0,
+            output_layout=ForwardOutputLayout(0, 0, bs, self.max_tokens_per_req),
             input_num_tokens=bs * self.max_tokens_per_req,
             forward_mode=capture_forward_mode,
             # A decode graph is only ever replayed when every DP rank is
@@ -578,7 +582,10 @@ class ForwardStepRunner:
             # would otherwise raise queue.Empty.
             if self.capturable_grammar is not None:
                 self.capturable_grammar.add_batch(
-                    grammars=[None] * bs, bs=bs, has_candidates=False
+                    grammars=[None] * bs,
+                    bs=bs,
+                    has_candidates=False,
+                    output_layout=ctx.output_layout,
                 )
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
@@ -663,14 +670,19 @@ class ForwardStepRunner:
 
         return graph, out
 
-    def prewarm_comm_states(self, batch_sizes: tuple[int, ...] = (1,)) -> None:
-        """Initialize lazy comm state with capture-style dummy forwards."""
+    def warmup_decode_path(
+        self,
+        batch_sizes: tuple[int, ...],
+        *,
+        graph_phase: bool,
+    ) -> None:
+        """Run dummy decode with the requested graph/eager phase."""
         if self._forward_func is None:
             return
 
         global _is_cuda_graph_phase
         old_cuda_graph_phase = _is_cuda_graph_phase
-        _is_cuda_graph_phase = True
+        _is_cuda_graph_phase = graph_phase
         try:
             for bs in batch_sizes:
                 self._prepare_request_token_history_graph_inputs(
@@ -681,6 +693,9 @@ class ForwardStepRunner:
                     token_to_kv_pool=self.token_to_kv_pool,
                     bs=bs,
                     num_extends=0,
+                    output_layout=ForwardOutputLayout(
+                        0, 0, bs, self.max_tokens_per_req
+                    ),
                     input_num_tokens=bs * self.max_tokens_per_req,
                     forward_mode=ForwardMode.DECODE,
                     # Match _capture_one: the lazy state this warms up (DeepEP
@@ -728,12 +743,21 @@ class ForwardStepRunner:
                     bs=bs,
                     variant=CUDA_GRAPH_VARIANT_DEFAULT,
                 )
+                if self.capturable_grammar is not None:
+                    self.capturable_grammar.add_batch(
+                        grammars=[None] * bs,
+                        bs=bs,
+                        has_candidates=False,
+                        output_layout=ctx.output_layout,
+                    )
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
                 self._init_capture_metadata(bs)
                 self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
                 self.device_module.synchronize()
                 dist.barrier()
 
+                if self.capturable_grammar is not None:
+                    self.capturable_grammar.reset_state()
                 if self.sampling_backend is not None:
                     self.sampling_backend.reset_capture_state()
         finally:
@@ -1003,8 +1027,12 @@ class ForwardStepRunner:
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
+        live_output_layout = ctx.output_layout
         if use_graph and padded_bs != bs:
             ctx.bs = padded_bs
+            ctx.output_layout = ForwardOutputLayout(
+                0, 0, padded_bs, self.max_tokens_per_req
+            )
             pad = padded_bs - bs
             seq_lens = torch.nn.functional.pad(
                 self.input_buffers.seq_lens_buf[:bs], (0, pad), value=1
@@ -1118,6 +1146,7 @@ class ForwardStepRunner:
 
         if use_graph and padded_bs != bs:
             ctx.bs = bs
+            ctx.output_layout = live_output_layout
 
         if self.drafter is not None and (
             ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()

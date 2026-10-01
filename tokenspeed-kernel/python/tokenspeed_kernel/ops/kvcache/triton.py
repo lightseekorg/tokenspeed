@@ -69,6 +69,7 @@ __all__ = [
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
     "zero_byte_ranges",
+    "zero_page_fields",
 ]
 
 
@@ -444,6 +445,91 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     )
 
 
+@triton.jit(do_not_specialize=["num_fields"])
+def _zero_page_fields_kernel(
+    backing_ptr,
+    pages_ptr,
+    fields_ptr,
+    # Runtime: the field count follows the cache group and the page count the
+    # batch; neither may specialize the binary.
+    num_fields,
+    BLOCK_SIZE: tl.constexpr,
+):
+    entry = tl.program_id(0)
+    page = tl.load(pages_ptr + entry // num_fields).to(tl.int64)
+    field = fields_ptr + (entry % num_fields) * 3
+    range_offset = tl.load(field) + page * tl.load(field + 1)
+    range_size = tl.load(field + 2)
+    for start in range(
+        tl.program_id(1) * BLOCK_SIZE, range_size, tl.num_programs(1) * BLOCK_SIZE
+    ):
+        byte_offsets = start + tl.arange(0, BLOCK_SIZE)
+        tl.store(
+            backing_ptr + range_offset + byte_offsets,
+            0,
+            mask=byte_offsets < range_size,
+        )
+
+
+def zero_page_fields(
+    backing: torch.Tensor,
+    pages: torch.Tensor,
+    fields: torch.Tensor,
+    *,
+    max_field_bytes: int,
+) -> None:
+    """Zero every field payload of the given pages of one cache group.
+
+    The page x field expansion happens on the device: the host ships only the
+    page ids, and the group's field table is fixed once the memory plan is.
+    The expanded ranges are trusted: checking them against ``backing`` would
+    need the largest page id on the host, so the caller must guarantee that
+    every ``offset + page * stride + size`` lies within ``backing`` (the cache
+    arena asserts this once per field when it builds the table).
+
+    Args:
+        backing: Contiguous uint8 cache allocation.
+        pages: Device int32/int64 page ids within the group, ``[num_pages]``.
+        fields: Device int64 ``[num_fields, 3]`` rows of
+            ``(byte offset of page 0, page stride bytes, payload bytes)``.
+        max_field_bytes: The largest payload in ``fields``; sizes the grid.
+    """
+    if backing.dtype != torch.uint8 or not backing.is_contiguous():
+        raise ValueError("backing must be a contiguous uint8 tensor")
+    if pages.dim() != 1 or pages.dtype not in (torch.int32, torch.int64):
+        raise ValueError("pages must be a 1-D int32/int64 tensor")
+    if fields.dim() != 2 or fields.shape[1] != 3 or fields.dtype != torch.int64:
+        raise ValueError("fields must be an int64 [num_fields, 3] tensor")
+    if not (pages.is_contiguous() and fields.is_contiguous()):
+        raise ValueError("pages and fields must be contiguous")
+    # Triton keys the binary on 16-byte pointer alignment; a caller slicing a
+    # shared staging buffer must hand over aligned spans.
+    if pages.data_ptr() % 16 or fields.data_ptr() % 16:
+        raise ValueError("pages and fields must be 16-byte aligned")
+    if max_field_bytes <= 0:
+        raise ValueError("max_field_bytes must be positive")
+    num_ranges = pages.numel() * fields.shape[0]
+    if num_ranges == 0:
+        return
+
+    block_size = 1024
+    # Same CTA budget as zero_byte_ranges: bound short ranges, keep a few
+    # large ones wide enough to occupy the device.
+    tiles_per_range = max(32, triton.cdiv(1024, num_ranges))
+    grid = (
+        num_ranges,
+        min(tiles_per_range, triton.cdiv(max_field_bytes, block_size)),
+    )
+    _zero_page_fields_kernel[grid](
+        backing,
+        pages,
+        fields,
+        fields.shape[0],
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Batched state-row copies across per-layer slabs (pointer table)
 # -----------------------------------------------------------------------------
@@ -758,7 +844,7 @@ def _sf_interleaved_offset(slot, page_tokens, sf_page_stride):
 
 @triton.jit
 def _mxfp8_quantize_row(x, HEAD_DIM: tl.constexpr):
-    """Quantize one [HEAD_DIM] row to MXFP8 (flashinfer bit-parity).
+    """Quantize one [HEAD_DIM] row to MXFP8 (flashinfer bit-parity on finite inputs).
 
     Per 32-element group: amax -> ``e8m0 = clamp(ceil(log2(amax / 448)),
     -127, 127) + 127`` and ``fp8 = rn(x * 2^-exp)`` (zero groups quantize
@@ -910,7 +996,7 @@ def _set_mla_kv_buffer_kernel(
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
-    pid_loc = tl.program_id(0)
+    pid_loc = tl.program_id(0).to(tl.int64)
     pid_blk = tl.program_id(1)
 
     base = pid_blk * BLOCK
@@ -981,7 +1067,7 @@ def _set_mla_kv_buffer_per_loc_kernel(
         tl.extra.cuda.gdc_wait()
 
     pid = tl.program_id(0)
-    loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
+    loc_indices = (pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)).to(tl.int64)
     loc_mask = loc_indices < n_loc
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
     if write_mask_ptr is not None:
@@ -1332,7 +1418,7 @@ def _get_mla_kv_buffer_kernel(
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
-    pid_loc = tl.program_id(0)
+    pid_loc = tl.program_id(0).to(tl.int64)
     pid_blk = tl.program_id(1)
 
     base = pid_blk * BLOCK
@@ -1373,7 +1459,7 @@ def _get_mla_kv_buffer_per_loc_kernel(
         tl.extra.cuda.gdc_wait()
 
     pid = tl.program_id(0)
-    loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
+    loc_indices = (pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)).to(tl.int64)
     loc_mask = loc_indices < n_loc
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
 
@@ -1504,8 +1590,8 @@ def _store_kv_cache_kernel(
     requirement is ``stride(-1) == 1`` so we can use linear addressing on
     the flattened head_dim×num_kv_heads axis.
     """
-    is_v = tl.program_id(0)
-    row = tl.program_id(1)
+    row = tl.program_id(0).to(tl.int64)
+    is_v = tl.program_id(1)
     offsets = tl.arange(0, BLOCK)
     mask = offsets < n_kv_per_token
 
@@ -1571,7 +1657,7 @@ def store_kv_cache(
     kwargs = {}
     if use_pdl:
         kwargs["launch_pdl"] = True
-    _store_kv_cache_kernel[(2, n_tokens)](
+    _store_kv_cache_kernel[(n_tokens, 2)](
         k_src,
         v_src,
         k_dst,
@@ -1601,8 +1687,6 @@ def _process_fp8_kv_tensor(
     page_offset,
     input_ptr,
     cache_ptr,
-    inv_scale,
-    use_provided_scale: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     input_stride_token: tl.constexpr,
@@ -1635,18 +1719,13 @@ def _process_fp8_kv_tensor(
         )
         block = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
 
-        if use_provided_scale:
-            block_fp8 = (block * inv_scale).to(tl.float8e4nv)
-        else:
-            block_fp8 = block.to(tl.float8e4nv)
-
         cache_offsets = (
             page_id * cache_stride_page
             + page_offset * cache_stride_offset
             + head_offsets[:, None] * cache_stride_head
             + dim_offsets[None, :] * cache_stride_dim
         )
-        tl.store(cache_ptr + cache_offsets, block_fp8, mask=mask)
+        tl.store(cache_ptr + cache_offsets, block.to(tl.float8e4nv), mask=mask)
 
 
 @triton.jit
@@ -1656,9 +1735,6 @@ def _fused_fp8_set_kv_buffer_kernel(
     k_cache_ptr,
     v_cache_ptr,
     cache_loc_ptr,
-    inv_k_scale_ptr,
-    inv_v_scale_ptr,
-    use_provided_scale: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     page_size: tl.constexpr,
@@ -1680,7 +1756,7 @@ def _fused_fp8_set_kv_buffer_kernel(
     BLOCK_DIM: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    token_id = tl.program_id(0).to(tl.int64)
     head_block_id = tl.program_id(1)
     kv_idx = tl.program_id(2)
 
@@ -1692,10 +1768,6 @@ def _fused_fp8_set_kv_buffer_kernel(
     page_offset = cache_loc % page_size
 
     if kv_idx == 0:
-        if use_provided_scale:
-            inv_scale = tl.load(inv_k_scale_ptr)
-        else:
-            inv_scale = 1.0
         _process_fp8_kv_tensor(
             token_id,
             head_block_id,
@@ -1703,8 +1775,6 @@ def _fused_fp8_set_kv_buffer_kernel(
             page_offset,
             k_ptr,
             k_cache_ptr,
-            inv_scale,
-            use_provided_scale,
             num_kv_heads,
             head_dim,
             k_stride_token,
@@ -1718,10 +1788,6 @@ def _fused_fp8_set_kv_buffer_kernel(
             BLOCK_DIM,
         )
     else:
-        if use_provided_scale:
-            inv_scale = tl.load(inv_v_scale_ptr)
-        else:
-            inv_scale = 1.0
         _process_fp8_kv_tensor(
             token_id,
             head_block_id,
@@ -1729,8 +1795,6 @@ def _fused_fp8_set_kv_buffer_kernel(
             page_offset,
             v_ptr,
             v_cache_ptr,
-            inv_scale,
-            use_provided_scale,
             num_kv_heads,
             head_dim,
             v_stride_token,
@@ -1754,8 +1818,6 @@ def fused_fp8_set_kv_buffer(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     cache_loc: torch.Tensor,
-    k_scale: float | torch.Tensor | None = None,
-    v_scale: float | torch.Tensor | None = None,
     page_size: int = 16,
     enable_pdl: bool | None = None,
 ) -> None:
@@ -1771,10 +1833,6 @@ def fused_fp8_set_kv_buffer(
         v_cache: Destination V cache with the same shape convention as
             ``k_cache``.
         cache_loc: Cache slot index for each input token.
-        k_scale: Optional scalar K scale. When provided with ``v_scale``, K is
-            divided by this scale before FP8 conversion.
-        v_scale: Optional scalar V scale. When provided with ``k_scale``, V is
-            divided by this scale before FP8 conversion.
         page_size: Number of tokens per cache page.
         enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
             the platform policy; pass ``False`` to disable it explicitly.
@@ -1839,27 +1897,10 @@ def fused_fp8_set_kv_buffer(
         v_cache_stride_head = v_cache.stride(2)
         v_cache_stride_dim = v_cache.stride(3)
 
-    use_provided_scale = k_scale is not None and v_scale is not None
-
-    block_head = min(num_kv_heads, 8)
-    block_dim = min(head_dim, 128)
+    block_head = min(triton.next_power_of_2(num_kv_heads), 8)
+    block_dim = min(triton.next_power_of_2(head_dim), 128)
     num_head_blocks = (num_kv_heads + block_head - 1) // block_head
     grid = (num_tokens, num_head_blocks, 2)
-    device = k_3d.device
-
-    def _to_tensor_scale(scale):
-        if isinstance(scale, torch.Tensor):
-            return scale.to(device=device, dtype=torch.float32)
-        return torch.tensor(float(scale), device=device, dtype=torch.float32)
-
-    if use_provided_scale:
-        k_scale_tensor = _to_tensor_scale(k_scale)
-        v_scale_tensor = _to_tensor_scale(v_scale)
-        inv_k_scale_ptr = (1.0 / k_scale_tensor).to(device=device, dtype=torch.float32)
-        inv_v_scale_ptr = (1.0 / v_scale_tensor).to(device=device, dtype=torch.float32)
-    else:
-        inv_k_scale_ptr = k_3d
-        inv_v_scale_ptr = k_3d
 
     use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
@@ -1872,9 +1913,6 @@ def fused_fp8_set_kv_buffer(
         k_cache,
         v_cache,
         cache_loc,
-        inv_k_scale_ptr,
-        inv_v_scale_ptr,
-        use_provided_scale,
         num_kv_heads,
         head_dim,
         page_size,
@@ -2571,7 +2609,7 @@ def _quantize_store_kv_mxfp8_kernel(
 
     Replaces the five-launch sequence (k/v quantize_mxfp8, store_kv_cache,
     2x store_sf_interleaved) with one launch. Bit-parity contract with
-    flashinfer's mxfp8_quantize: per 32-element group,
+    flashinfer's mxfp8_quantize on finite inputs: per 32-element group,
     ``e8m0 = clamp(ceil(log2(amax / 448)), -127, 127) + 127`` and
     ``fp8 = rn(x * 2^-exp)`` (zero rows quantize to exponent -127, data 0).
     SF layout matches _store_sf_interleaved_kernel: page-major, per-head
@@ -2579,8 +2617,8 @@ def _quantize_store_kv_mxfp8_kernel(
     row -> (row % 32) * 4 + row // 32, 4 head_dim-group bytes packed
     little-endian in one u32.
     """
-    is_v = tl.program_id(0)
-    tok = tl.program_id(1)
+    tok = tl.program_id(0).to(tl.int64)
+    is_v = tl.program_id(1)
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -2638,6 +2676,18 @@ def quantize_store_kv_mxfp8(
             the platform policy; pass ``False`` to disable it explicitly.
     """
     assert page_tokens % 128 == 0
+    if (
+        k_dst.dim() != 3
+        or k_dst.shape[-1] != 128
+        or (k.dim() == 3 and k.shape[-1] != 128)
+        or k.shape[1:].numel() != k_dst.shape[1:].numel()
+    ):
+        raise ValueError(
+            f"MXFP8 KV caches store 128-wide heads, one row per token: "
+            f"{tuple(k.shape[1:])} into {tuple(k_dst.shape[1:])}"
+        )
+    if v.shape != k.shape or v_dst.shape != k_dst.shape or v_dst.dtype != k_dst.dtype:
+        raise ValueError("MXFP8 value rows and cache must match the key rows and cache")
     t = k.shape[0]
     if t == 0:
         return
@@ -2653,7 +2703,7 @@ def quantize_store_kv_mxfp8(
     chunks_per_page = page_tokens // 128
     sf_page_stride = nheads * chunks_per_page * 128
 
-    grid = (2, t)
+    grid = (t, 2)
     use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
     if use_pdl:
@@ -2765,7 +2815,7 @@ def _index_k_scatter_kernel(
     BLOCK_HD: tl.constexpr,  # next_pow2(HD); masked so HD need not be pow2
     BLOCK_NG: tl.constexpr,  # next_pow2(NG)
 ):
-    t = tl.program_id(0)
+    t = tl.program_id(0).to(tl.int64)
     # loc >= 0 makes // and % exact.
     loc = tl.load(loc_ptr + t).to(tl.int64)
     page = loc // PAGE_SIZE

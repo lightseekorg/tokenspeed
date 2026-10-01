@@ -418,12 +418,19 @@ def _apply_backend_overrides(
     """The one place family resolution writes back into ``server_args``.
 
     The mutation is deliberate, not a shortcut: ``_create_attn_config`` reads
-    the backend choice through the generate() protocol, and the
-    ``global_server_args_dict`` snapshot serves models that pick kernel paths
-    at build time (e.g. ``deepseek_v3.attention_backend``). Must run before
-    any ``_create_attn_config`` call. The user's pre-override choice survives
+    the backend choice through the generate() protocol. Must run before any
+    ``_create_attn_config`` call. The user's pre-override choice survives
     as ``profile.requested_backend``.
     """
+    if (
+        draft is not None
+        and "K3DSparkModel" in draft.architectures
+        and server_args.decode_context_parallel_size > 1
+    ):
+        raise ValueError(
+            "K3 DSpark does not support DCP: context KV injection does not "
+            "translate virtual slots or mask nonowner writes"
+        )
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
     elif target.is_deepseek_v4:
@@ -436,6 +443,24 @@ def _apply_backend_overrides(
         # hybrid_linear_attn. The user's original choice stays in the profile
         # for the full-attention sub-backend (MHA for GDN, MLA for KDA).
         server_args.attention_backend = HYBRID_LINEAR_ATTN_BACKEND
+        if (
+            draft is not None
+            and target.is_kda
+            and not target.is_dsa_kda
+            and server_args.decode_context_parallel_size > 1
+            and server_args.drafter_attention_backend
+            in (None, HYBRID_LINEAR_ATTN_BACKEND)
+        ):
+            # A K3 continuation must resolve its history consumer before
+            # AttnConfig validates DCP. Inherit the target's resolved leaf,
+            # while preserving an explicitly requested draft leaf.
+            server_args.drafter_attention_backend = _resolve_hybrid_full_backend_name(
+                target.requested_backend,
+                is_kda=True,
+                is_dsa=False,
+                is_qsa=False,
+                has_cache_plan=True,
+            )
     elif server_args.attention_backend == HYBRID_LINEAR_ATTN_BACKEND:
         logger.warning(
             "Ignoring hybrid_linear_attn backend for non-hybrid model architectures="

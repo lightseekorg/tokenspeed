@@ -167,6 +167,7 @@ class TestGenerationModels(unittest.TestCase):
 
         with RTRunner(
             model_path,
+            disable_autotune=True,
             world_size=model_case.tp_size,
             torch_dtype=torch_dtype,
             model_type="generation",

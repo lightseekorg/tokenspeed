@@ -26,8 +26,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
-from tokenspeed_kernel.ops.kvcache.triton import fused_fp8_set_kv_buffer
-from tokenspeed_kernel.ops.layernorm.triton import fused_qk_rmsnorm_rope
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
@@ -115,7 +113,6 @@ class DFlashAttention(nn.Module):
         eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.q_norm = RMSNorm(self.head_dim, eps=eps)
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
-        self._qk_norm_eps = eps
         rope_parameters = getattr(config, "rope_parameters", None)
         if rope_parameters is not None:
             rope_theta = float(rope_parameters["rope_theta"])
@@ -139,16 +136,9 @@ class DFlashAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=sliding_window_size,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
-
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        q = q.reshape(-1, self.head_dim)
-        k = k.reshape(-1, self.head_dim)
-        q = self.q_norm(q).view(-1, self.q_size)
-        k = self.k_norm(k).view(-1, self.kv_size)
-        return q, k
 
     def forward(
         self,
@@ -158,51 +148,7 @@ class DFlashAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = fused_qk_rmsnorm_rope(
-            q,
-            k,
-            self.q_norm.weight.data,
-            self.k_norm.weight.data,
-            self.rotary_emb.cos_sin_cache,
-            positions,
-            self._qk_norm_eps,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-        )
-        k_cache = k.view(-1, self.num_kv_heads, self.head_dim)
-        v_cache = v.view(-1, self.num_kv_heads, self.head_dim)
-        # Model-side pool write: slots come from the backend (the drafter
-        # publishes each step's window before the forward).
-        out_cache_loc = ctx.attn_backend.write_locations(self.attn, ctx.forward_mode)
-        if ctx.token_to_kv_pool.dtype == torch.float8_e4m3fn:
-            k_buf, v_buf = ctx.token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
-            fused_fp8_set_kv_buffer(
-                k=k_cache,
-                v=v_cache,
-                k_cache=k_buf,
-                v_cache=v_buf,
-                cache_loc=out_cache_loc,
-                k_scale=self.attn.k_scale,
-                v_scale=self.attn.v_scale,
-                page_size=ctx.token_to_kv_pool.arena.kv_page_size,
-            )
-        else:
-            ctx.token_to_kv_pool.set_kv_buffer(
-                self.attn,
-                out_cache_loc,
-                k_cache,
-                v_cache,
-                self.attn.k_scale,
-                self.attn.v_scale,
-            )
-        attn_output = self.attn(
-            q,
-            None,
-            None,
-            ctx,
-            save_kv_cache=False,
-        )
+        attn_output = self.attn(q, k, v, positions, ctx)
         if len(attn_output.size()) == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)
@@ -482,14 +428,7 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
             k = attn.apply_k_rope(positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            token_to_kv_pool.set_kv_buffer(
-                attn.attn,
-                cache_locs,
-                k,
-                v,
-                attn.attn.k_scale,
-                attn.attn.v_scale,
-            )
+            token_to_kv_pool.set_kv_buffer(attn.attn, cache_locs, k, v)
 
     def _zeroed_residual(self, template: torch.Tensor) -> torch.Tensor:
         """The residual stream the layers accumulate into, cleared in place.

@@ -133,13 +133,23 @@ class Qwen4ExpBackend(AttentionBackend):
     def supports_layer_sliding_window(self) -> bool:
         return self._full_attn_backend.supports_layer_sliding_window
 
-    def support_kv_cache_prewrite(self, forward_mode: ForwardMode | None) -> bool:
-        return self.attention_backend.support_kv_cache_prewrite(forward_mode)
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        return self.attention_backend.supports_narrowed_draft_decode(forward_mode)
 
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
     ) -> torch.Tensor:
         return self.attention_backend.write_locations(layer, forward_mode)
+
+    def forward_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        return self.attention_backend.forward_write_locations(layer, forward_mode)
+
+    def padded_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode, rows: int
+    ) -> torch.Tensor:
+        return self.attention_backend.padded_write_locations(layer, forward_mode, rows)
 
     def publish_draft_step_locations(
         self, cache_start: torch.Tensor, num_tokens: int

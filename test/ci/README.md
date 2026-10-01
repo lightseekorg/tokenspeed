@@ -309,17 +309,22 @@ task executor provides runner cleanup and setup before invoking the benchmark.
 
 The coordinator creates independent worktrees and Python environments inside
 that allocation. Each revision installs its own ROCm kernel requirements and
-uses isolated compilation caches. A benchmark fails only when it exceeds both
-its merge-base relative and absolute regression limits. Noisy measurements and
-successful added, changed, or missing cases remain informational. Correctness,
-execution, environment, and infrastructure failures fail the task.
+uses isolated compilation caches. The automated task explicitly disables
+profiling so regression measurements match production execution as closely as
+possible; direct manual worker runs on AMD retain Proton as their default.
+A benchmark fails only when it exceeds both its merge-base relative and absolute
+regression limits. Noisy measurements and successful added, changed, or missing
+cases remain informational. Correctness, execution, environment, and
+infrastructure failures fail the task.
 
 The shared task executor uploads the task result and the benchmark's published
 comparison in one Actions artifact. A separate `AMD Kernel Benchmark PR
 Comment` workflow runs trusted code from the default branch after `PR Test AMD`
-finishes. It validates the untrusted artifact and source revision before
-creating or replacing one bot-owned comment. Runs where the benchmark task was
-not selected have no report and are ignored.
+finishes. It validates the untrusted artifact and exact source revision before
+creating or replacing one bot-owned comment, including for fork runs whose
+completion event omits the pull request association and for runs that finish
+after the pull request merges. Closed, unmerged pull requests remain ignored.
+Runs where the benchmark task was not selected have no report and are ignored.
 
 A merge base that does not contain the suite yields a candidate-only
 bootstrap instead of a comparison. Changes to the comment workflow take effect
@@ -327,7 +332,7 @@ only after they merge, since `workflow_run` workflows execute from the default
 branch. Manual runs produce summaries and artifacts but not pull request
 comments.
 
-`CUDA_VISIBLE_DEVICES=0` does not limit the shared cleanup process scan, so the
+`ROCR_VISIBLE_DEVICES=0` does not limit the shared cleanup process scan, so the
 runner must provide scheduler-enforced GPU or process-namespace isolation. The
 runner fleet must prevent two jobs from sharing one physical GPU.
 

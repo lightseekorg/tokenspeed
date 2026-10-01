@@ -132,14 +132,7 @@ def test_flashmla_absorbed_extend_refuses_sharded_cache():
     leaf = flashmla.FlashMLABackend.__new__(flashmla.FlashMLABackend)
     leaf.dcp_group = (0, 1)
     with pytest.raises(RuntimeError, match="absorbed extend"):
-        leaf._forward_absorbed_extend(
-            torch.empty(0),
-            torch.empty(0),
-            None,
-            layer=None,
-            out_cache_loc=None,
-            token_to_kv_pool=None,
-        )
+        leaf._forward_absorbed_extend(torch.empty(0), layer=None, token_to_kv_pool=None)
 
 
 def test_kimi_capacity_shards_only_mla():
@@ -292,10 +285,11 @@ def test_compaction_graph_replay_refreshes_lengths_and_owners():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("batch", [1, 3])
-def test_no_sink_combine_preserves_contiguous_mla_output(monkeypatch, batch):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_no_sink_combine_preserves_contiguous_mla_output(monkeypatch, batch, dtype):
     from tokenspeed.runtime.layers.attention.dcp import comm
 
-    output = torch.randn(batch, 8, 512, dtype=torch.bfloat16, device="cuda")
+    output = torch.randn(batch, 8, 512, dtype=dtype, device="cuda")
     lse = torch.zeros(batch, 8, dtype=torch.float32, device="cuda")
     # Identical shards let the expected head-owner slice be computed exactly.
     monkeypatch.setattr(
@@ -351,6 +345,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
     )
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
     plan = make_mla_memory_plan(
         size=8,
@@ -387,7 +382,16 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
         "full_attention"
     ]
     backend.kv_lora_rank = 512
-    layer = SimpleNamespace(layer_id=0)
+    layer = PagedAttention(
+        1,
+        192,
+        1.0,
+        num_kv_heads=1,
+        layer_id=0,
+        v_head_dim=128,
+        rotary_emb=None,
+        qk_norm=None,
+    )
     loc = torch.tensor([4, 8, 12], device="cuda")
     values = torch.arange(3 * 576, device="cuda", dtype=torch.bfloat16).reshape(
         3, 1, 576
@@ -407,7 +411,6 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
             kv_b_proj=lambda latent: (latent.new_zeros((latent.shape[0], 256)),),
             attn_mha=layer,
             rotary_emb=None,
-            _mla_kv_is_fp8=lambda ctx, scale: False,
         )
         DeepseekV3AttentionMLA.forward_normal_chunked_kv_prepare(
             model,
@@ -632,12 +635,13 @@ def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
         family="mla",
         server_args=SimpleNamespace(max_total_tokens=token_limit),
         model_config=SimpleNamespace(
-            num_attention_layers=2, hf_config=SimpleNamespace()
+            num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),
         attn_config=config,
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=24_576,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -675,12 +679,13 @@ def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
         family="dsa",
         server_args=SimpleNamespace(max_total_tokens=None),
         model_config=SimpleNamespace(
-            num_attention_layers=2, hf_config=SimpleNamespace()
+            num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),
         attn_config=config,
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1_048_576,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )
@@ -751,13 +756,9 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     monkeypatch.setattr(dsa, "combine_attention_partials", combine)
     out = backend.forward_sparse_decode(
         q=query,
-        k=None,
-        v=None,
         layer=layer,
-        out_cache_loc=torch.tensor([64]),
         token_to_kv_pool=pool,
         bs=1,
-        save_kv_cache=False,
         topk_indices=slots,
         topk_lens=None,
     )

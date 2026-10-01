@@ -81,6 +81,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
@@ -1123,6 +1124,7 @@ class PrefillGraph:
             token_to_kv_pool=self.token_to_kv_pool,
             bs=bs,
             num_extends=bs,
+            output_layout=ForwardOutputLayout(bs, bs, 0, 1),
             input_num_tokens=num_tokens,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=(
@@ -1309,6 +1311,8 @@ class PrefillGraph:
 
     def _decoder_bucket(self, rows: int) -> int | None:
         """Smallest decoder bucket >= ``rows``, or ``None`` to run the decoder eager."""
+        if rows == 0:
+            return None
         idx = bisect.bisect_left(self.decoder_buckets, rows)
         if idx == len(self.decoder_buckets):
             return None

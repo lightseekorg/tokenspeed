@@ -223,6 +223,8 @@ class AttnConfig:
                     or self.is_draft
                 ):
                     raise ValueError("FlashMLA DCP does not yet support speculation")
+            elif softmax.backend_name == "tokenspeed_mla":
+                pass
             elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
                 if torch.device(self.device).type != "cuda":
                     raise ValueError("GPU DSA DCP requires CUDA")
@@ -239,7 +241,8 @@ class AttnConfig:
                 pass
             elif softmax.backend_name != "deepseek_v4":
                 raise ValueError(
-                    "DCP currently requires DeepSeek V4, GPU DSA or FlashMLA attention"
+                    "DCP currently requires DeepSeek V4, GPU DSA, FlashMLA "
+                    "or CuTe MLA attention"
                 )
             else:
                 platform = current_platform()

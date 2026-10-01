@@ -43,6 +43,7 @@ from tokenspeed.runtime.execution.drafter.dspark import DSpark  # noqa: E402
 from tokenspeed.runtime.execution.drafter.eagle import Eagle  # noqa: E402
 from tokenspeed.runtime.execution.drafter.mtp import Mtp  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.models.target_capture import (  # noqa: E402
     TargetCaptureConfigurator,
 )
@@ -310,6 +311,7 @@ def _target_ctx(num_extends: int, num_tokens: int) -> ForwardContext:
         token_to_kv_pool=None,
         bs=2,
         num_extends=num_extends,
+        output_layout=ForwardOutputLayout(num_extends, num_extends, 2 - num_extends, 1),
         input_num_tokens=num_tokens,
         forward_mode=ForwardMode.DECODE,
     )

@@ -47,6 +47,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -385,6 +386,7 @@ class Mtp(BaseDrafter):
             ctx = ForwardContext(
                 bs=bs,
                 num_extends=0,
+                output_layout=ForwardOutputLayout(0, 0, bs, 1),
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
                 input_num_tokens=bs * k,
@@ -492,6 +494,7 @@ class Mtp(BaseDrafter):
             ctx = ForwardContext(
                 bs=bs,
                 num_extends=bs,
+                output_layout=ForwardOutputLayout(bs, bs, 0, 1),
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
                 input_num_tokens=input_num_tokens,

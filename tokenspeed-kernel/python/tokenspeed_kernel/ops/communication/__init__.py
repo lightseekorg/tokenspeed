@@ -4,6 +4,13 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.allreduce_fusion import (
+    AllReduceFusionPattern,
+    AllReduceFusionWorkspace,
+    allreduce_fusion,
+    allreduce_fusion_supported,
+    create_allreduce_fusion_workspace,
+)
 from tokenspeed_kernel.ops.communication.trtllm import (
     allgather_dual_rmsnorm as _allgather_dual_rmsnorm,
 )
@@ -226,6 +233,11 @@ def allgather_dual_rmsnorm(
 
 
 __all__ = [
+    "AllReduceFusionPattern",
+    "AllReduceFusionWorkspace",
+    "allreduce_fusion",
+    "allreduce_fusion_supported",
+    "create_allreduce_fusion_workspace",
     "allgather_dual_rmsnorm",
     "allreduce_fusion_lane",
     "allreduce_lane_latent_norm",
