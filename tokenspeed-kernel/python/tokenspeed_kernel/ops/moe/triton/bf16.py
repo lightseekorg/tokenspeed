@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import TensorDescriptor, libdevice, tl, triton
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -211,6 +212,7 @@ def _validate(
 @triton.jit
 def _stage1_kernel(
     x_desc,
+    x_ptr,
     w13_desc,
     inter_ptr,
     expert_route_ids_ptr,
@@ -256,7 +258,15 @@ def _stage1_kernel(
             up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
             for k_offset in range(0, hidden_size, BLOCK_K):
-                x = x_desc.gather(token_ids, k_offset)
+                if x_ptr is None:
+                    x = x_desc.gather(token_ids, k_offset)
+                else:
+                    x = tl.load(
+                        x_ptr
+                        + token_ids.to(tl.int64)[:, None] * hidden_size
+                        + k_offset
+                        + tl.arange(0, BLOCK_K)[None, :]
+                    )
                 gate = w13_desc.load([expert_id, n_offset, k_offset]).reshape(
                     (BLOCK_N, BLOCK_K)
                 )
@@ -396,9 +406,14 @@ def _moe(
     x_desc = TensorDescriptor.from_tensor(x, [1, block_k])
     w13_desc = TensorDescriptor.from_tensor(w13, [1, stage1_block_n, block_k])
     w2_desc = TensorDescriptor.from_tensor(w2, [1, stage2_block_n, block_k])
+    # TMA gather lowers to tile::gather4, which needs sm_100+. Below that,
+    # stage1 gathers the x rows with plain pointer loads instead.
+    platform = current_platform()
+    x_ptr = x if platform.is_nvidia and not platform.is_blackwell_plus else None
 
     _stage1_kernel[(stage1_programs,)](
         x_desc,
+        x_ptr,
         w13_desc,
         intermediate,
         expert_route_ids,
