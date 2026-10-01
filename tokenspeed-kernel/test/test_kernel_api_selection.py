@@ -875,12 +875,7 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
 
 
 @pytest.mark.parametrize("b_layout", ["KN", "NK"])
-def test_mm_fp8_reference_selection_follows_b_layout(monkeypatch, b_layout) -> None:
-    monkeypatch.setattr(
-        _gemm_pkg,
-        "select_kernel",
-        partial(_gemm_pkg.select_kernel, solution="reference"),
-    )
+def test_mm_fp8_reference_selection_follows_b_layout(b_layout) -> None:
     gen = torch.Generator().manual_seed(0)
     a = torch.randn((4, 256), generator=gen).to(_fp8_dtype())
     b_kn = torch.randn((256, 128), generator=gen).to(_fp8_dtype())
@@ -888,7 +883,13 @@ def test_mm_fp8_reference_selection_follows_b_layout(monkeypatch, b_layout) -> N
     scale = torch.ones((1,), dtype=torch.float32)
 
     out = tokenspeed_kernel.mm(
-        a, b, A_scales=scale, B_scales=scale, out_dtype=torch.float32, quant="fp8"
+        a,
+        b,
+        A_scales=scale,
+        B_scales=scale,
+        out_dtype=torch.float32,
+        quant="fp8",
+        solution="reference",
     )
 
     torch.testing.assert_close(out, a.float() @ b_kn.float())
