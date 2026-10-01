@@ -64,6 +64,7 @@ class AttentionConfig:
     REVERSE_Q_BLOCKS: gl.constexpr
     DEEP_PIPELINE: gl.constexpr
     PACKED_GQA: gl.constexpr
+    GUARDED_QUERY_ROWS: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -96,6 +97,7 @@ class AttentionConfig:
         REVERSE_Q_BLOCKS,
         DEEP_PIPELINE,
         PACKED_GQA,
+        GUARDED_QUERY_ROWS,
         q_strides,
         k_strides,
         v_strides,
@@ -145,6 +147,7 @@ class AttentionConfig:
         self.REVERSE_Q_BLOCKS = gl.constexpr(REVERSE_Q_BLOCKS)
         self.DEEP_PIPELINE = gl.constexpr(DEEP_PIPELINE)
         self.PACKED_GQA = gl.constexpr(PACKED_GQA)
+        self.GUARDED_QUERY_ROWS = gl.constexpr(GUARDED_QUERY_ROWS)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -324,7 +327,7 @@ class AttentionProgram:
         offsets = cfg.q_strides.offsets(
             self.seq_base + q_pos[:, None], q_head[:, None], offs_d[None, :]
         )
-        if cfg.DEEP_PIPELINE:
+        if (cfg.DEEP_PIPELINE or cfg.PACKED_GQA) and not cfg.GUARDED_QUERY_ROWS:
             return cdna5.buffer_load(self.q_ptr, offsets)
         mask = q_pos[:, None] < self.seq_len
         return cdna5.buffer_load(self.q_ptr, offsets, mask=mask, other=0.0)
@@ -413,7 +416,11 @@ class AttentionProgram:
             q_head = self.row_qhead(offs_m)
             sink_log2 = gl.load(self.sink_ptr + q_head).to(gl.float32) * _INV_LN2
             sink_unscaled = sink_log2 / cfg.SM_SCALE
-            use_scaled_state: gl.constexpr = cfg.DEEP_PIPELINE and cfg.HEAD_DIM == 128
+            use_scaled_state: gl.constexpr = (
+                (cfg.DEEP_PIPELINE or cfg.PACKED_GQA)
+                and not cfg.GUARDED_QUERY_ROWS
+                and cfg.HEAD_DIM == 128
+            )
             sink_state = sink_log2 if use_scaled_state else sink_unscaled
             m_i = gl.full(
                 [cfg.BLOCK_M],
@@ -424,9 +431,16 @@ class AttentionProgram:
             m_i += sink_state
         else:
             sink_log2 = 0.0
+            # Packed tail rows can be fully masked. A finite seed keeps their
+            # max-difference arithmetic defined while exp2 still underflows to zero.
+            initial_max: gl.constexpr = (
+                -1.0e30
+                if cfg.DEEP_PIPELINE and cfg.GUARDED_QUERY_ROWS
+                else -float("inf")
+            )
             m_i = gl.full(
                 [cfg.BLOCK_M],
-                value=-float("inf"),
+                value=initial_max,
                 dtype=gl.float32,
                 layout=gl.SliceLayout(1, cfg.pv_layout),
             )
@@ -450,7 +464,10 @@ class AttentionProgram:
             0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
         )
         valid = offs_n[None, :] <= q_pos[:, None]
-        if not cfg.DEEP_PIPELINE:
+        full_query_rows: gl.constexpr = (
+            cfg.DEEP_PIPELINE or cfg.PACKED_GQA
+        ) and not cfg.GUARDED_QUERY_ROWS
+        if not full_query_rows:
             valid &= q_pos[:, None] < self.seq_len
             valid &= offs_n[None, :] < self.seq_len
         if cfg.WINDOW_LEFT >= 0:
@@ -521,7 +538,11 @@ class AttentionProgram:
     def apply_sinks(self, l_i, m_i, sink_log2):
         cfg = self.cfg
         if cfg.HAS_SINK:
-            use_scaled_state: gl.constexpr = cfg.DEEP_PIPELINE and cfg.HEAD_DIM == 128
+            use_scaled_state: gl.constexpr = (
+                (cfg.DEEP_PIPELINE or cfg.PACKED_GQA)
+                and not cfg.GUARDED_QUERY_ROWS
+                and cfg.HEAD_DIM == 128
+            )
             m_i_scaled = m_i if use_scaled_state else m_i * cfg.SM_SCALE
             l_i += gl.exp2(sink_log2 - m_i_scaled)
         return l_i
@@ -535,10 +556,14 @@ class AttentionProgram:
             q_head = self.row_qhead(offs_m)
             offsets = ((self.seq_base + q_pos) * cfg.N_HEADS + q_head).to(gl.int32)
             safe_l = gl.where(l_i > 0.0, l_i, 1.0)
-            use_scaled_state: gl.constexpr = cfg.DEEP_PIPELINE and cfg.HEAD_DIM == 128
+            use_scaled_state: gl.constexpr = (
+                (cfg.DEEP_PIPELINE or cfg.PACKED_GQA)
+                and not cfg.GUARDED_QUERY_ROWS
+                and cfg.HEAD_DIM == 128
+            )
             m_i_scaled = m_i if use_scaled_state else m_i * cfg.SM_SCALE
             lse = (m_i_scaled + gl.log2(safe_l)) * _LN2
-            if cfg.DEEP_PIPELINE:
+            if (cfg.DEEP_PIPELINE or cfg.PACKED_GQA) and not cfg.GUARDED_QUERY_ROWS:
                 cdna5.buffer_store(lse, self.lse_ptr, offsets)
             else:
                 mask = q_pos < self.seq_len
@@ -557,7 +582,7 @@ class AttentionProgram:
             + offs_d[None, :]
         ).to(gl.int32)
         output = output.to(self.output_ptr.dtype.element_ty)
-        if cfg.DEEP_PIPELINE:
+        if (cfg.DEEP_PIPELINE or cfg.PACKED_GQA) and not cfg.GUARDED_QUERY_ROWS:
             cdna5.buffer_store(output, self.output_ptr, offsets)
         else:
             mask = q_pos[:, None] < self.seq_len
@@ -580,6 +605,8 @@ def process_single_attention_tile(program: AttentionProgram, kv_start):
     qk = program.apply_mask(qk, kv_start)
     if cfg.DEEP_PIPELINE:
         p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+    elif cfg.PACKED_GQA and not cfg.GUARDED_QUERY_ROWS:
+        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
     else:
         p, alpha, m_i = program.softmax_part0(qk, m_i)
 
@@ -592,7 +619,7 @@ def process_single_attention_tile(program: AttentionProgram, kv_start):
     program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)[:, None]
-    if cfg.DEEP_PIPELINE:
+    if (cfg.DEEP_PIPELINE or cfg.PACKED_GQA) and not cfg.GUARDED_QUERY_ROWS:
         output = output.to(program.output_ptr.dtype.element_ty)
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
@@ -628,6 +655,8 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
         qk = program.apply_mask(qk, kv_start)
     if cfg.DEEP_PIPELINE:
         p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+    elif cfg.PACKED_GQA and not cfg.GUARDED_QUERY_ROWS:
+        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
     else:
         p, alpha, m_i = program.softmax_part0(qk, m_i)
 
@@ -656,15 +685,23 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
         else:
             if cfg.PACKED_GQA:
                 group_size: gl.constexpr = cfg.N_HEADS // cfg.N_KV_HEADS
-                last_query = gl.minimum(
-                    program.q_start + cfg.BLOCK_M // group_size - 1,
-                    program.seq_len - 1,
+                q_span: gl.constexpr = cfg.BLOCK_M // group_size
+                aligned_clean_interior: gl.constexpr = (
+                    not cfg.GUARDED_QUERY_ROWS
+                    and cfg.WINDOW_LEFT % cfg.BLOCK_N == 0
+                    and q_span <= cfg.BLOCK_N
+                    and cfg.BLOCK_N % q_span == 0
                 )
-                clean_window_tile = (cur_kv_start >= last_query - cfg.WINDOW_LEFT) & (
-                    cur_kv_start + cfg.BLOCK_N <= program.q_start
-                )
-                if not clean_window_tile:
-                    qk = program.apply_mask(qk, cur_kv_start)
+                if not aligned_clean_interior:
+                    last_query = gl.minimum(
+                        program.q_start + q_span - 1,
+                        program.seq_len - 1,
+                    )
+                    clean_window_tile = (
+                        cur_kv_start >= last_query - cfg.WINDOW_LEFT
+                    ) & (cur_kv_start + cfg.BLOCK_N <= program.q_start)
+                    if not clean_window_tile:
+                        qk = program.apply_mask(qk, cur_kv_start)
             else:
                 qk = program.apply_mask(qk, cur_kv_start)
 
@@ -676,6 +713,8 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
         program.tdm_load_global_to_shared_v(next_kv_start, next_buffer_index)
 
         if cfg.DEEP_PIPELINE:
+            p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+        elif cfg.PACKED_GQA and not cfg.GUARDED_QUERY_ROWS:
             p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
         else:
             p, alpha, m_i = program.softmax_part0(qk, m_i)
@@ -705,6 +744,8 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
     # SM0, SM1, LR_V, PV for t_last
     if cfg.DEEP_PIPELINE:
         p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+    elif cfg.PACKED_GQA and not cfg.GUARDED_QUERY_ROWS:
+        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
     else:
         p, alpha, m_i = program.softmax_part0(qk, m_i)
     p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
@@ -715,7 +756,7 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
     program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)[:, None]
-    if cfg.DEEP_PIPELINE:
+    if (cfg.DEEP_PIPELINE or cfg.PACKED_GQA) and not cfg.GUARDED_QUERY_ROWS:
         output = output.to(program.output_ptr.dtype.element_ty)
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
@@ -843,6 +884,7 @@ def gluon_mha_prefill_gfx1250(
     REVERSE_Q_BLOCKS: gl.constexpr,
     DEEP_PIPELINE: gl.constexpr,
     PACKED_GQA: gl.constexpr,
+    GUARDED_QUERY_ROWS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
@@ -863,6 +905,7 @@ def gluon_mha_prefill_gfx1250(
         REVERSE_Q_BLOCKS,
         DEEP_PIPELINE,
         PACKED_GQA,
+        GUARDED_QUERY_ROWS,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -1018,6 +1061,41 @@ def _select_deep_pipeline(
     )
 
 
+def _select_packed_gqa(
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+    n_heads: int,
+    n_kv_heads: int,
+    seqlens: list[int],
+    max_seqlen: int,
+    window_left: int,
+    has_sink: bool,
+    has_lse: bool,
+) -> bool:
+    """Select packed query-head rows only on measured gfx1250 workloads."""
+    if (
+        dtype not in (torch.bfloat16, torch.float16)
+        or head_dim != 128
+        or n_heads != 8
+        or n_kv_heads != 1
+        or has_sink
+        or has_lse
+        or not seqlens
+    ):
+        return False
+
+    uniform = all(seqlen == max_seqlen for seqlen in seqlens)
+    batch_size = len(seqlens)
+    if window_left == 512:
+        return uniform and batch_size == 4 and max_seqlen == 4096
+    if window_left >= 0:
+        return False
+    if uniform:
+        return (batch_size, max_seqlen) in ((8, 1024), (4, 2048))
+    return batch_size == 4 and max_seqlen == 4096
+
+
 def _select_m_tile(
     *, batch_size: int, n_heads: int, max_seqlen: int
 ) -> tuple[int, int]:
@@ -1147,6 +1225,37 @@ def launch_gluon_mha_prefill_gfx1250(
     )
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
+    seqlens = [
+        seq_end - seq_start
+        for seq_start, seq_end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:])
+    ]
+    selected_packed_gqa = _select_packed_gqa(
+        dtype=q.dtype,
+        head_dim=config.head_dim,
+        n_heads=config.n_heads,
+        n_kv_heads=config.n_kv_heads,
+        seqlens=seqlens,
+        max_seqlen=config.max_seqlen,
+        window_left=config.window_left,
+        has_sink=sinks is not None,
+        has_lse=return_lse,
+    )
+    if selected_packed_gqa:
+        group_size = config.n_heads // config.n_kv_heads
+        block_m = 128
+        block_n = 32 if config.window_left == 512 else 64
+        config = config._replace(
+            block_m=block_m,
+            block_n=block_n,
+            num_warps=4,
+            waves_per_eu=2,
+            packed_gqa=True,
+            grid=(
+                config.batch_size,
+                config.n_kv_heads,
+                triton_cdiv(config.max_seqlen * group_size, block_m),
+            ),
+        )
     tdm_warp_hint = _select_tdm_warp_hint(
         block_m=config.block_m,
         block_n=config.block_n,
@@ -1165,10 +1274,6 @@ def launch_gluon_mha_prefill_gfx1250(
         window_left=config.window_left,
         workgroups=live_workgroups,
     )
-    seqlens = [
-        seq_end - seq_start
-        for seq_start, seq_end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:])
-    ]
     positive_seqlens = [seqlen for seqlen in seqlens if seqlen > 0]
     min_positive_seqlen = min(positive_seqlens, default=0)
     deep_pipeline = _select_deep_pipeline(
@@ -1184,23 +1289,42 @@ def launch_gluon_mha_prefill_gfx1250(
         seqlens=seqlens,
         max_seqlen=config.max_seqlen,
     )
-    if config.packed_gqa:
+    guarded_query_rows = config.packed_gqa and not _has_full_query_tiles(
+        seqlens=seqlens,
+        max_seqlen=config.max_seqlen,
+        block_m=config.block_m,
+    )
+    if selected_packed_gqa:
+        tdm_warp_hint = guarded_query_rows
+        reverse_q_blocks = True
+        deep_pipeline = config.window_left < 0
+    elif config.packed_gqa:
         tdm_warp_hint = False
         reverse_q_blocks = False
         deep_pipeline = False
-    llvm_fn_attrs = (
-        "amdgpu-sched-strategy=coexec"
-        if deep_pipeline
-        else (
-            ""
-            if config.packed_gqa
-            else _select_llvm_fn_attrs(
-                head_dim=config.head_dim,
-                max_seqlen=config.max_seqlen,
-                window_left=config.window_left,
+    if selected_packed_gqa:
+        if config.window_left >= 0:
+            llvm_fn_attrs = "amdgpu-sched-strategy=max-memory-clause"
+        elif guarded_query_rows or (
+            q.dtype == torch.float16 and config.max_seqlen > 1024
+        ):
+            llvm_fn_attrs = "amdgpu-sched-strategy=max-ilp"
+        else:
+            llvm_fn_attrs = "amdgpu-sched-strategy=coexec"
+    else:
+        llvm_fn_attrs = (
+            "amdgpu-sched-strategy=coexec"
+            if deep_pipeline
+            else (
+                ""
+                if config.packed_gqa
+                else _select_llvm_fn_attrs(
+                    head_dim=config.head_dim,
+                    max_seqlen=config.max_seqlen,
+                    window_left=config.window_left,
+                )
             )
         )
-    )
 
     gluon_mha_prefill_gfx1250[config.grid](
         q,
@@ -1233,6 +1357,7 @@ def launch_gluon_mha_prefill_gfx1250(
         reverse_q_blocks,
         deep_pipeline,
         config.packed_gqa,
+        guarded_query_rows,
         config.num_warps,
         config.num_buffers,
         num_warps=config.num_warps,

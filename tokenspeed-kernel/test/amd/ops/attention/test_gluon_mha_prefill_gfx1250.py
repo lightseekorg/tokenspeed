@@ -131,7 +131,7 @@ def test_mha_prefill_selects_deep_pipeline(dtype, head_dim):
     """Check that a full, sufficiently occupied launch selects the deep path."""
     device = "cuda"
     seqlens = [2048] * 4 if head_dim == 64 else [1024] * 8
-    n_q_heads, n_kv_heads = 8, 1
+    n_q_heads, n_kv_heads = 8, 2
     q, k, v, cu, cu_cpu, max_seqlen = _inputs(
         seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
     )
@@ -249,6 +249,49 @@ def test_select_deep_pipeline():
         {"seqlens": [4097] * 4, "max_seqlen": 4097},
     ):
         assert not prefill._select_deep_pipeline(**(kwargs | override))
+
+
+def test_select_packed_gqa():
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "head_dim": 128,
+        "n_heads": 8,
+        "n_kv_heads": 1,
+        "seqlens": [1024] * 8,
+        "max_seqlen": 1024,
+        "window_left": -1,
+        "has_sink": False,
+        "has_lse": False,
+    }
+    assert prefill._select_packed_gqa(**kwargs)
+    assert prefill._select_packed_gqa(
+        **(
+            kwargs
+            | {
+                "seqlens": [4096, 3584, 2305, 1024],
+                "max_seqlen": 4096,
+            }
+        )
+    )
+    assert prefill._select_packed_gqa(
+        **(
+            kwargs
+            | {
+                "seqlens": [4096] * 4,
+                "max_seqlen": 4096,
+                "window_left": 512,
+            }
+        )
+    )
+
+    for override in (
+        {"dtype": torch.float8_e4m3fn},
+        {"head_dim": 64},
+        {"n_heads": 32, "n_kv_heads": 8},
+        {"seqlens": [4096] * 4, "max_seqlen": 4096},
+        {"has_sink": True},
+    ):
+        assert not prefill._select_packed_gqa(**(kwargs | override))
 
 
 def test_select_tdm_warp_hint():
