@@ -1,4 +1,4 @@
-name: GB200
+name: NVIDIA GB200 Tests
 
 on:
   push:
@@ -10,7 +10,7 @@ on:
       - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
-      - ".github/workflows/gb200-slurm-per-commit.yml"
+      - ".github/workflows/nvidia-gb200-tests.yml"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
@@ -21,7 +21,7 @@ on:
       - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
-      - ".github/workflows/gb200-slurm-per-commit.yml"
+      - ".github/workflows/nvidia-gb200-tests.yml"
   workflow_dispatch:
 
 permissions:

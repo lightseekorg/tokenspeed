@@ -1,10 +1,10 @@
-name: NVIDIA GPU Library Tests
+name: NVIDIA Kernel Library Tests
 
 on:
   push:
     branches: [main]
     paths:
-      - ".github/workflows/nvidia-arm-kernel-tests.yml"
+      - ".github/workflows/nvidia-kernel-library-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
       - "test/ci_system/kernel_gpu_worker.py"
       - "test/ci_system/run_kernel_gpu_ut.sh"
@@ -16,7 +16,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths:
-      - ".github/workflows/nvidia-arm-kernel-tests.yml"
+      - ".github/workflows/nvidia-kernel-library-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
       - "test/ci_system/kernel_gpu_worker.py"
       - "test/ci_system/run_kernel_gpu_ut.sh"
@@ -72,6 +72,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: nvidia-gpu-library-tests
+          name: nvidia-kernel-library-tests
           path: ${{ runner.temp }}/native-library-report
           if-no-files-found: ignore

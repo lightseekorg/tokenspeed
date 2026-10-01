@@ -31,7 +31,7 @@ def test_gb300_slurm_path_filter_covers_shared_and_own_workflow_changes():
         {"tokenspeed-mla/src/kernel.cu"}, group, "pull_request", REPO_ROOT
     )
     assert should_run(
-        {".github/workflows/gb300-slurm-per-commit.yml"},
+        {".github/workflows/nvidia-gb300-tests.yml"},
         group,
         "pull_request",
         REPO_ROOT,
