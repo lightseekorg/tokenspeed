@@ -402,6 +402,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
             16,
             compact_route_programs=True,
             expert_start=expert_start,
+            out=out,
         )
         inter = torch.empty(
             (int(sorted_ids.shape[0]), i_dim),

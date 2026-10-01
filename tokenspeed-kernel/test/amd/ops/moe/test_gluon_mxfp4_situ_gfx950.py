@@ -1081,13 +1081,22 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "num_experts", "top_k"),
-    [(257, 17, 4), (4097, 3, 1)],
+    ("num_tokens", "num_experts", "top_k", "block_m", "compact_route_programs"),
+    [
+        (257, 17, 4, 64, False),
+        (4097, 3, 1, 64, False),
+        (257, 17, 4, 64, True),
+        # K3 width-64 decode: 1,024 routes take the fused one-program
+        # histogram and prefix scan; most of the 896 experts stay empty.
+        (64, 896, 16, 16, True),
+    ],
 )
-def test_package_prefill_sort_contract_gfx950(
+def test_route_sort_contract_gfx950(
     num_tokens: int,
     num_experts: int,
     top_k: int,
+    block_m: int,
+    compact_route_programs: bool,
 ) -> None:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
         _max_padded_route_capacity,
@@ -1108,7 +1117,6 @@ def test_package_prefill_sort_contract_gfx950(
     ).view(num_tokens, top_k)
     topk_ids = topk_ids_cpu.to("cuda")
     topk_weights = topk_weights_cpu.to("cuda")
-    block_m = 64
 
     sorted_ids, sorted_weights, sorted_experts, num_valid, _ = gluon_moe_sorting(
         topk_ids,
@@ -1117,7 +1125,7 @@ def test_package_prefill_sort_contract_gfx950(
         1,
         torch.bfloat16,
         block_m,
-        compact_route_programs=False,
+        compact_route_programs=compact_route_programs,
     )
     valid_extent, reported_tokens = num_valid.cpu().tolist()
     assert reported_tokens == num_tokens
