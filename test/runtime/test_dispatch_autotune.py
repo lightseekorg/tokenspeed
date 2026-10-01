@@ -783,7 +783,10 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
         kernel_scope=scope,
     )
     api = _functions(
-        KERNEL / "ops/gemm/__init__.py", None, ("mm", "_validate_gemm_out"), ns
+        KERNEL / "ops/gemm/__init__.py",
+        None,
+        ("mm", "_validate_gemm_out", "_as_2d_tensor_scale"),
+        ns,
     )
     x = torch.randn(rows, 4, dtype=torch.bfloat16)
     w = torch.randn(8, 4, dtype=torch.bfloat16)
@@ -801,7 +804,6 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
         block_size=None,
         quant=None,
         override=None,
-        prepacked_scales=False,
     )
     assert got is out
     torch.testing.assert_close(

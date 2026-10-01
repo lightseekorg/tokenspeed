@@ -805,7 +805,6 @@ def mm(
     if (
         override is None
         and alpha is None
-        and not prepacked_scales
         and quant in (None, "none")
         and A_scales is None
         and B_scales is None
