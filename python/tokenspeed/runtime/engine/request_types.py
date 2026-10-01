@@ -92,8 +92,12 @@ class FINISH_ABORT(BaseFinishReason):
         self.err_type = err_type
 
     def to_json(self):
-        return {
+        out = {
             "type": "abort",
             "message": self.message,
             "err_type": self.err_type.value,
         }
+        # AsyncLLM raises a client error (EngineGenerateError) for a 400.
+        if self.status_code is not None:
+            out["status_code"] = int(self.status_code)
+        return out
