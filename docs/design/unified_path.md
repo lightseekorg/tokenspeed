@@ -484,6 +484,14 @@ request order stay unchanged, they reuse the compact tables and ownership
 prefixes from the full refresh and update local visibility in place. Eager
 execution and CUDA graph replay use the same hooks and persistent buffers.
 
+One named exception: draft-tree lanes (`docs/design/tree-speculation.md`)
+read `TreeDraftInputs`, which the drafter writes inside the round -- the
+frontier and lane window lengths once, then each step's lane masks, plus
+`active`, a Python flag set around each lane forward. The buffers are bound
+once, live at fixed addresses and are written by in-graph ops before each lane
+forward reads them; the draft leaf's decode metadata itself is still
+refreshed only as above.
+
 **Step 0 narrows rows; the drafter owns the lengths, the model names the
 moment.** Eagle's step 0 runs over the target's verify window (`N` rows per
 decode request), writes KV for every row, and continues from one live row
