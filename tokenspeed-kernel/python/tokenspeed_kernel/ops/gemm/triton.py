@@ -1277,6 +1277,21 @@ def triton_mm_mxfp4(
 @register_kernel(
     "gemm",
     "mm",
+    name="triton_mm_fp8_scaled_cdna4",
+    solution="triton",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    ),
+    signatures=_FP8_SCALED_FORMAT_SIGNATURES,
+    traits={
+        "b_layout": frozenset({"KN"}),
+    },
+    priority=Priority.PERFORMANT + 2,
+)
+@register_kernel(
+    "gemm",
+    "mm",
     name="triton_mm_fp8_scaled",
     solution="triton",
     capability=CapabilityRequirement(
@@ -1290,42 +1305,6 @@ def triton_mm_mxfp4(
     priority=Priority.PERFORMANT + 2,
 )
 def triton_mm_fp8_scaled(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    A_scales: torch.Tensor | None,
-    B_scales: torch.Tensor | None,
-    out_dtype: torch.dtype,
-    *,
-    alpha: torch.Tensor | None = None,
-    block_size: list[int] | None = None,
-    bias: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    return triton_scaled_mm(
-        A,
-        B,
-        A_scales,
-        B_scales,
-        out_dtype=out_dtype,
-        bias=bias,
-        out=out,
-    )
-
-
-@register_kernel(
-    "gemm",
-    "mm",
-    name="triton_mm_fp8_scaled_cdna4",
-    solution="triton",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(9, 5),
-        vendors=frozenset({"amd"}),
-    ),
-    signatures=_FP8_SCALED_FORMAT_SIGNATURES,
-    traits={},
-    priority=Priority.PERFORMANT + 2,
-)
-def triton_mm_fp8_scaled_cdna4(
     A: torch.Tensor,
     B: torch.Tensor,
     A_scales: torch.Tensor | None,
@@ -1353,7 +1332,6 @@ def triton_mm_fp8_scaled_cdna4(
     Returns:
         ``[M, N]`` tensor ``(A * A_scales) @ (B * B_scales^T)`` in ``out_dtype``.
     """
-    del alpha, block_size
     return triton_scaled_mm(
         A,
         B,
