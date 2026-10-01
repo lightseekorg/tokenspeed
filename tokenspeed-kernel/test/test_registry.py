@@ -537,8 +537,14 @@ def test_vendor_min_arch_versions_reject_ambiguous_requirements() -> None:
             vendors=frozenset({"amd"}),
             vendor_min_arch_versions={"amd": ArchVersion(9, 5)},
         )
-    with pytest.raises(ValueError, match="listed in vendors"):
+    with pytest.raises(ValueError, match="every vendor in vendors"):
         CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             vendor_min_arch_versions={"amd": ArchVersion(9, 5)},
+        )
+    # A vendor without a floor would silently accept every arch of it.
+    with pytest.raises(ValueError, match="every vendor in vendors"):
+        CapabilityRequirement(
+            vendors=frozenset({"nvidia", "amd"}),
+            vendor_min_arch_versions={"nvidia": ArchVersion(10, 0)},
         )

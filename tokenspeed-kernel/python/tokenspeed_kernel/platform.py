@@ -270,7 +270,7 @@ class CapabilityRequirement:
     vendors: frozenset[str] | None = None  # None = any vendor
     # Per-vendor minimum arch for kernels that serve several vendors, whose
     # arch numbering differs (e.g. NVIDIA sm100 vs AMD gfx950). Use instead
-    # of min_arch_version.
+    # of min_arch_version, with one floor for every vendor in ``vendors``.
     vendor_min_arch_versions: Mapping[str, ArchVersion] = field(
         default_factory=dict, hash=False
     )
@@ -282,10 +282,11 @@ class CapabilityRequirement:
             raise ValueError(
                 "set min_arch_version or vendor_min_arch_versions, not both"
             )
-        if self.vendors is None or not self.vendors >= set(
-            self.vendor_min_arch_versions
-        ):
-            raise ValueError("vendor_min_arch_versions keys must be listed in vendors")
+        if self.vendors is None or set(self.vendor_min_arch_versions) != self.vendors:
+            raise ValueError(
+                "vendor_min_arch_versions must give a floor for every vendor in "
+                "vendors, and only for those"
+            )
 
     def min_arch_version_for(self, vendor: str) -> ArchVersion | None:
         """The minimum arch version required on ``vendor``, if any."""
