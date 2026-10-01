@@ -1599,6 +1599,12 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     TOP_K: gl.constexpr,
+    MASK_INVALID_ROUTES: gl.constexpr,
+    route_ids_ptr=None,  # [token_num, topk] expert IDs, read when masking
+    stride_rt=0,
+    stride_rs=0,
+    expert_start=0,
+    num_experts=0,
 ):
     """Sum per-(token, slot) partials over the topk dim.
 
@@ -1607,6 +1613,11 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
     ``TOP_K`` slices from the partial buffer, accumulating in fp32 and
     casting to the output dtype at the end. ``TOP_K`` is a constexpr so the
     accumulation loop unrolls.
+
+    With ``MASK_INVALID_ROUTES``, a slot whose route ID lies outside
+    ``[expert_start, expert_start + num_experts)`` contributes zero instead of
+    reading its partial row, which a producer that drops such routes (the
+    expert-sorted decode tiles) never writes.
     """
     pid = gl.program_id(axis=0)
     num_pid_n = gl.cdiv(N, BLOCK_N)
@@ -1634,7 +1645,16 @@ def gluon_mxfp4_moe_stage2_reduce_kernel(
     )
     for s in gl.static_range(0, TOP_K):
         p = base + s * stride_ps
-        v = gl.load(p, mask=m_mask, other=0.0)
+        mask = m_mask
+        if MASK_INVALID_ROUTES:
+            ids = gl.load(
+                route_ids_ptr + offs_m.to(gl.int64) * stride_rt + s * stride_rs,
+                mask=offs_m < token_num,
+                other=-1,
+            )
+            valid = (ids >= expert_start) & (ids < expert_start + num_experts)
+            mask = mask & valid[:, None]
+        v = gl.load(p, mask=mask, other=0.0)
         acc += v.to(gl.float32)
 
     out_ptrs = (
@@ -1979,6 +1999,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
             BLOCK_M=BLOCK_M_R,
             BLOCK_N=BLOCK_N_R,
             TOP_K=topk,
+            MASK_INVALID_ROUTES=False,
             num_warps=NUM_WARPS_R,
         )
     if _USES_FP32_ATOMIC is None:

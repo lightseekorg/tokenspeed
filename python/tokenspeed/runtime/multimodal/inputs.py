@@ -169,6 +169,7 @@ class MultimodalDataItem(msgspec.Struct, eq=False, kw_only=True, array_like=True
     # tied to the request: when the request finishes the item is GC'd and
     # these tensors are released. ``encoded_deepstack`` is set only for
     # deepstack-enabled modalities. Scheduler-local: always None on the wire.
+    # Pinned host memory once every encoder token of the item is prefilled.
     encoded: torch.Tensor | None = None
     encoded_deepstack: torch.Tensor | None = None
     # EPD (encode-prefill-decode): when set, this item's embedding is received

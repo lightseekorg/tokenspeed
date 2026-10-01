@@ -201,7 +201,13 @@ class LinearBase(torch.nn.Module):
             else:
                 self.quant_method = Nvfp4LinearMethod(quant_config)
         elif isinstance(quant_config, Mxfp4Config):
-            if getattr(quant_config, "use_dynamic_mxfp4_activations", False):
+            fp8_route = quant_config.fp8_override_route(prefix)
+            if fp8_route == "w8a8":
+                self.quant_method = W8A8Fp8LinearMethod(quant_config.fp8_config)
+            elif fp8_route == "dequant":
+                # Raw-consumed weight, dequantized to BF16 during load.
+                self.quant_method = UnquantizedLinearMethod()
+            elif quant_config.use_dynamic_mxfp4_activations:
                 self.quant_method = Mxfp4LinearMethod(quant_config)
             else:
                 # Existing MXFP4 support applies to MoE weights; dense weights

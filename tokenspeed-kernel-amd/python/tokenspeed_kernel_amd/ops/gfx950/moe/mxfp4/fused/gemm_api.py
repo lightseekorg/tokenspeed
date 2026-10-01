@@ -526,6 +526,7 @@ def gluon_mxfp_combine(
                 BLOCK_M=1,
                 TOP_K=n_act_eff,
                 BLOCK_N=R_BLOCK_N,
+                MASK_INVALID_ROUTES=False,
                 num_warps=1,
             )
             y = y_reduced
