@@ -26,7 +26,8 @@ import math
 import os
 import site
 import sys
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -267,14 +268,39 @@ class CapabilityRequirement:
     max_arch_version: ArchVersion | None = None
     required_features: frozenset[str] = frozenset()
     vendors: frozenset[str] | None = None  # None = any vendor
+    # Per-vendor minimum arch for kernels that serve several vendors, whose
+    # arch numbering differs (e.g. NVIDIA sm100 vs AMD gfx950). Use instead
+    # of min_arch_version.
+    vendor_min_arch_versions: Mapping[str, ArchVersion] = field(
+        default_factory=dict, hash=False
+    )
+
+    def __post_init__(self) -> None:
+        if not self.vendor_min_arch_versions:
+            return
+        if self.min_arch_version is not None:
+            raise ValueError(
+                "set min_arch_version or vendor_min_arch_versions, not both"
+            )
+        if self.vendors is None or not self.vendors >= set(
+            self.vendor_min_arch_versions
+        ):
+            raise ValueError("vendor_min_arch_versions keys must be listed in vendors")
+
+    def min_arch_version_for(self, vendor: str) -> ArchVersion | None:
+        """The minimum arch version required on ``vendor``, if any."""
+        if self.vendor_min_arch_versions:
+            return self.vendor_min_arch_versions.get(vendor)
+        return self.min_arch_version
 
     def satisfied_by(self, platform: PlatformInfo) -> bool:
         """Check if platform satisfies these requirements."""
         if self.vendors and platform.vendor not in self.vendors:
             return False
 
-        if self.min_arch_version:
-            if not platform.arch_version >= self.min_arch_version:
+        min_arch_version = self.min_arch_version_for(platform.vendor)
+        if min_arch_version:
+            if not platform.arch_version >= min_arch_version:
                 return False
 
         if self.max_arch_version:

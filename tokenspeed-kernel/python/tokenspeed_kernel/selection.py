@@ -692,12 +692,10 @@ def explain_selection(
             missing = spec.capability.missing_features(platform)
             if missing:
                 reasons.append(f"missing features: {', '.join(missing)}")
-            if spec.capability.min_arch_version:
-                if not (platform.arch_version >= spec.capability.min_arch_version):
-                    reasons.append(
-                        f"arch mismatch (requires "
-                        f"{spec.capability.min_arch_version})"
-                    )
+            min_arch_version = spec.capability.min_arch_version_for(platform.vendor)
+            if min_arch_version:
+                if not (platform.arch_version >= min_arch_version):
+                    reasons.append(f"arch mismatch (requires {min_arch_version})")
             if format_signature and not spec.supports_format_signature(
                 format_signature
             ):
