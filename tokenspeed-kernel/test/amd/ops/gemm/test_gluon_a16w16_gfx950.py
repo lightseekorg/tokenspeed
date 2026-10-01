@@ -38,6 +38,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _choose_mfma_lds_mediumm_config,
     _get_partial_scratch,
+    _get_splitk_counters,
     _supports_mfma_lds_smallm,
     _use_mfma_lds_largem,
     _use_mfma_lds_mediumm,
@@ -352,6 +353,34 @@ def test_decode_gemm_correctness_across_repeated_calls(
         torch.testing.assert_close(
             out, _decode_reference(a, b, out_dtype), atol=1e-4, rtol=rtol
         )
+
+
+def test_decode_gemm_graph_does_not_share_eager_counters() -> None:
+    torch.manual_seed(0)
+    m, n, k = 4, 896, 7168
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    out = torch.empty((m, n), device="cuda", dtype=torch.float32)
+    device = torch.device("cuda")
+    # The router bucket uses 16x16 tiles with split-K 7.
+    num_tiles = n // 16
+
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        # Eager warmup on the capture stream fills the per-stream cache.
+        launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
+        eager = _get_splitk_counters(device, num_tiles)
+        with torch.cuda.graph(graph, stream=stream):
+            captured = _get_splitk_counters(device, num_tiles)
+            launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
+    stream.synchronize()
+
+    # The graph must use its own counters, not the eager stream's buffer.
+    assert captured.data_ptr() != eager.data_ptr()
+    a.copy_(torch.randn_like(a) * 0.25)
+    graph.replay()
+    torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
 
 
 def test_decode_gemm_writes_strided_out() -> None:

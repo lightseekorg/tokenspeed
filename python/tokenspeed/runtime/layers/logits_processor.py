@@ -754,7 +754,9 @@ class LogitsProcessor(nn.Module):
                 )
             else:
                 cast_hidden = hidden_states.to(lm_head.weight.dtype)
-                if use_decode_gemv(cast_hidden, lm_head.weight):
+                if current_platform().is_amd and use_decode_gemv(
+                    cast_hidden, lm_head.weight
+                ):
                     logits = decode_gemv(cast_hidden, lm_head.weight)
                 elif self._use_fused_lm_head:
                     logits = _lm_head_matmul(cast_hidden, lm_head.weight)

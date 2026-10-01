@@ -1855,15 +1855,18 @@ def _get_splitk_counters(device: torch.device, num_tiles: int) -> torch.Tensor:
     The last program of each tile resets its counter, so the buffer is zero
     again whenever a launch completes and same-stream launches can share it.
     """
+    if torch.cuda.is_current_stream_capturing():
+        # Keep captured launches on graph-private counters; never bake the
+        # shared eager buffer into a graph.
+        return torch.zeros((num_tiles,), dtype=torch.int32, device=device)
+
     device_index = torch.cuda.current_device() if device.index is None else device.index
     stream_id = torch.cuda.current_stream(device_index).cuda_stream
     key = (device_index, stream_id, num_tiles)
     counters = _counter_cache.get(key)
     if counters is None:
         counters = torch.zeros((num_tiles,), dtype=torch.int32, device=device)
-        # Never retain allocations from a graph-private pool for eager reuse.
-        if not torch.cuda.is_current_stream_capturing():
-            _counter_cache[key] = counters
+        _counter_cache[key] = counters
     return counters
 
 
