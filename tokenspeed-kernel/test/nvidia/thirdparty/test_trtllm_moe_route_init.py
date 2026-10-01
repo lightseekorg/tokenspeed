@@ -18,55 +18,27 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compatibility and isolation checks for the private routing initializer."""
+"""Isolation checks for the private FlashInfer routing adapter."""
 
 import functools
 import inspect
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
     _clone,
     _entrypoints,
-    _initialize_routing_map,
     _prefer_qwen38_decode_tile_32,
     _register_private,
     _require_runner_rebinding,
     _require_tactic_hooks,
+    _routing_initialized_spec,
 )
-
-_ALLOCATION = """
-  void prepare_routing_common() {
-    expanded_idx_to_permuted_idx = alloc_tensor({num_tokens * top_k}, dl_int32, device);
-    permuted_idx_to_token_idx =
-        alloc_tensor({max_num_padded_tokens + 1}, dl_int32, hidden_states.device());
-    prepare_other_workspace();
-  }
-"""
 
 _CLONE_VALUE = object()
-
-
-@pytest.mark.parametrize("guard", [" + 1", ""])
-def test_initializer_uses_native_capacity_and_stream(guard):
-    source = _ALLOCATION.replace(" + 1", guard)
-    actual = _initialize_routing_map(source)
-    assert actual.count("cudaMemsetAsync(") == 1
-    assert "permuted_idx_to_token_idx.numel()" in actual
-    assert "get_stream(hidden_states.device())" in actual
-    assert "data_ptr(), 0xff," in actual
-    assert actual.index("cudaMemsetAsync(") > actual.index("alloc_tensor({max_num")
-    assert actual.index("cudaMemsetAsync(") < actual.index("prepare_other_workspace()")
-    # The original allocation, including upstream's optional guard, is retained.
-    assert source[: source.index("    prepare_other_workspace")] in actual
-
-
-@pytest.mark.parametrize(
-    "source", ["", _ALLOCATION * 2, _ALLOCATION.replace("dl_int32", "dl_int64")]
-)
-def test_unrecognized_native_allocation_fails_closed(source):
-    with pytest.raises(RuntimeError, match="expected exactly one"):
-        _initialize_routing_map(source)
 
 
 def test_function_rebinding_does_not_mutate_upstream():
@@ -212,3 +184,40 @@ def test_upstream_dispatch_and_caches_are_unchanged():
     if factory is not None:
         assert isinstance(factory, functools._lru_cache_wrapper)
         assert factory is not core._get_trtllm_moe_sm100_module_impl
+
+
+@pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="FlashInfer native JIT requires NVIDIA"
+)
+def test_private_routing_build_keeps_upstream_sources():
+    from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
+
+    upstream = gen_trtllm_gen_fused_moe_sm100_module()
+    private = _routing_initialized_spec()
+    assert [Path(p).name for p in private.sources] == [
+        Path(p).name for p in upstream.sources
+    ]
+    header_name = "trtllm_fused_moe_routing_custom.cuh"
+    for original, copied in zip(upstream.sources, private.sources):
+        original, copied = Path(original), Path(copied)
+        if original.name.startswith("trtllm_fused_moe_routing_custom_"):
+            assert copied != original
+            assert (copied.parent / header_name).is_file()
+    private_include = Path(private.extra_include_dirs[0])
+    for name in ("RoutingKernel.h", "RoutingKernel.cuh", "runner.h"):
+        assert (private_include / "flashinfer/trtllm/fused_moe" / name).is_file()
+
+
+@pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="FlashInfer native JIT requires NVIDIA"
+)
+def test_private_routing_build_rejects_duplicate_source_names(monkeypatch):
+    from flashinfer.jit import fused_moe
+
+    upstream = fused_moe.gen_trtllm_gen_fused_moe_sm100_module()
+    duplicate = replace(upstream, sources=[*upstream.sources, upstream.sources[0]])
+    monkeypatch.setattr(
+        fused_moe, "gen_trtllm_gen_fused_moe_sm100_module", lambda: duplicate
+    )
+    with pytest.raises(RuntimeError, match="duplicate native source names"):
+        _routing_initialized_spec()
