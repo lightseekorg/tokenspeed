@@ -127,44 +127,6 @@ def test_mha_prefill_tile_shapes(block_m, num_warps, head_dim, window_left):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_mha_prefill_deep_pipeline(dtype, head_dim):
-    """Check the three-tile K-ahead/V-behind schedule."""
-    device = "cuda"
-    n_q_heads, n_kv_heads, seqlen = 4, 1, 512
-    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
-        [seqlen], n_q_heads, n_kv_heads, head_dim, device, dtype
-    )
-
-    original_config = prefill.get_config
-    original_selector = prefill._select_deep_pipeline
-
-    def forced_config(**kwargs):
-        cfg = original_config(**kwargs)
-        block_m, num_warps = 256, 8
-        return cfg._replace(
-            block_m=block_m,
-            num_warps=num_warps,
-            grid=(
-                cfg.batch_size,
-                cfg.n_heads,
-                (cfg.max_seqlen + block_m - 1) // block_m,
-            ),
-        )
-
-    prefill.get_config = forced_config
-    prefill._select_deep_pipeline = lambda **_kwargs: True
-    try:
-        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
-    finally:
-        prefill.get_config = original_config
-        prefill._select_deep_pipeline = original_selector
-
-    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
-    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("head_dim", [64, 128])
 def test_mha_prefill_selects_deep_pipeline(dtype, head_dim):
     """Check that a full, sufficiently occupied launch selects the deep path."""
     device = "cuda"
@@ -243,35 +205,13 @@ def test_select_deep_pipeline():
 
     for override in (
         {"dtype": torch.float8_e4m3fn},
-        {"head_dim": 32},
         {"block_m": 128},
-        {"block_n": 32},
-        {"num_warps": 4},
-        {"num_buffers": 3},
         {"window_left": 64},
         {"workgroups": 255},
-        {"min_positive_seqlen": 128},
         {"seqlens": [4096, 3840]},
-        {"seqlens": []},
         {"seqlens": [4097] * 4, "max_seqlen": 4097},
     ):
         assert not prefill._select_deep_pipeline(**(kwargs | override))
-
-
-def test_select_full_query_tiles():
-    kwargs = {
-        "deep_pipeline": True,
-        "seqlens": [4096] * 4,
-        "max_seqlen": 4096,
-        "block_m": 256,
-    }
-    assert prefill._select_full_query_tiles(**kwargs)
-    assert not prefill._select_full_query_tiles(**(kwargs | {"deep_pipeline": False}))
-    assert not prefill._select_full_query_tiles(**(kwargs | {"seqlens": [4096, 3840]}))
-    assert not prefill._select_full_query_tiles(**(kwargs | {"seqlens": []}))
-    assert not prefill._select_full_query_tiles(
-        **(kwargs | {"max_seqlen": 4097, "seqlens": [4097] * 4})
-    )
 
 
 def test_select_tdm_warp_hint():

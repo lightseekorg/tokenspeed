@@ -63,7 +63,6 @@ class AttentionConfig:
     TDM_WARP_HINT: gl.constexpr
     REVERSE_Q_BLOCKS: gl.constexpr
     DEEP_PIPELINE: gl.constexpr
-    FULL_QUERY_TILES: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -95,7 +94,6 @@ class AttentionConfig:
         TDM_WARP_HINT,
         REVERSE_Q_BLOCKS,
         DEEP_PIPELINE,
-        FULL_QUERY_TILES,
         q_strides,
         k_strides,
         v_strides,
@@ -144,7 +142,6 @@ class AttentionConfig:
         self.TDM_WARP_HINT = gl.constexpr(TDM_WARP_HINT)
         self.REVERSE_Q_BLOCKS = gl.constexpr(REVERSE_Q_BLOCKS)
         self.DEEP_PIPELINE = gl.constexpr(DEEP_PIPELINE)
-        self.FULL_QUERY_TILES = gl.constexpr(FULL_QUERY_TILES)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -301,7 +298,7 @@ class AttentionProgram:
         offsets = cfg.q_strides.offsets(
             self.seq_base + offs_m[:, None], self.q_head, offs_d[None, :]
         )
-        if cfg.FULL_QUERY_TILES:
+        if cfg.DEEP_PIPELINE:
             return cdna5.buffer_load(self.q_ptr, offsets)
         mask = offs_m[:, None] < self.seq_len
         return cdna5.buffer_load(self.q_ptr, offsets, mask=mask, other=0.0)
@@ -384,9 +381,7 @@ class AttentionProgram:
         if cfg.HAS_SINK:
             sink_log2 = gl.load(self.sink_ptr + self.q_head).to(gl.float32) * _INV_LN2
             sink_unscaled = sink_log2 / cfg.SM_SCALE
-            use_scaled_state: gl.constexpr = (
-                cfg.FULL_QUERY_TILES and cfg.HEAD_DIM == 128
-            )
+            use_scaled_state: gl.constexpr = cfg.DEEP_PIPELINE and cfg.HEAD_DIM == 128
             sink_state = sink_log2 if use_scaled_state else sink_unscaled
             m_i = gl.full(
                 [cfg.BLOCK_M],
@@ -424,7 +419,7 @@ class AttentionProgram:
             0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
         )
         valid = offs_n[None, :] <= offs_m[:, None]
-        if not cfg.FULL_QUERY_TILES:
+        if not cfg.DEEP_PIPELINE:
             valid &= offs_m[:, None] < self.seq_len
             valid &= offs_n[None, :] < self.seq_len
         if cfg.WINDOW_LEFT >= 0:
@@ -495,9 +490,7 @@ class AttentionProgram:
     def apply_sinks(self, l_i, m_i, sink_log2):
         cfg = self.cfg
         if cfg.HAS_SINK:
-            use_scaled_state: gl.constexpr = (
-                cfg.FULL_QUERY_TILES and cfg.HEAD_DIM == 128
-            )
+            use_scaled_state: gl.constexpr = cfg.DEEP_PIPELINE and cfg.HEAD_DIM == 128
             m_i_scaled = m_i if use_scaled_state else m_i * cfg.SM_SCALE
             l_i += gl.exp2(sink_log2 - m_i_scaled)
         return l_i
@@ -513,12 +506,10 @@ class AttentionProgram:
                 gl.int32
             )
             safe_l = gl.where(l_i > 0.0, l_i, 1.0)
-            use_scaled_state: gl.constexpr = (
-                cfg.FULL_QUERY_TILES and cfg.HEAD_DIM == 128
-            )
+            use_scaled_state: gl.constexpr = cfg.DEEP_PIPELINE and cfg.HEAD_DIM == 128
             m_i_scaled = m_i if use_scaled_state else m_i * cfg.SM_SCALE
             lse = (m_i_scaled + gl.log2(safe_l)) * _LN2
-            if cfg.FULL_QUERY_TILES:
+            if cfg.DEEP_PIPELINE:
                 cdna5.buffer_store(lse, self.lse_ptr, offsets)
             else:
                 mask = offs_m < self.seq_len
@@ -537,7 +528,7 @@ class AttentionProgram:
             + offs_d[None, :]
         ).to(gl.int32)
         output = output.to(self.output_ptr.dtype.element_ty)
-        if cfg.FULL_QUERY_TILES:
+        if cfg.DEEP_PIPELINE:
             cdna5.buffer_store(output, self.output_ptr, offsets)
         else:
             mask = offs_m[:, None] < self.seq_len
@@ -695,10 +686,7 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
             qk = program.apply_mask(qk, kv_start)
     else:
         qk = program.apply_mask(qk, kv_start)
-    if cfg.FULL_QUERY_TILES:
-        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
-    else:
-        p, alpha, m_i = program.softmax_part0(qk, m_i)
+    p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
 
     program.tdm_load_global_to_shared_k(kv_start + 2 * cfg.BLOCK_N, 0)
     program.tdm_load_global_to_shared_v(kv_start + cfg.BLOCK_N, 1)
@@ -723,10 +711,7 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
         )
 
         acc = program.compute_pv(p, v, acc)
-        if cfg.FULL_QUERY_TILES:
-            p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
-        else:
-            p, alpha, m_i = program.softmax_part0(qk, m_i)
+        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
         k = program.tdm_shared_load_k(iter_id % cfg.NUM_BUFFERS, wait_count=2)
 
         program.tdm_load_global_to_shared_v(
@@ -748,10 +733,7 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
             qk = program.apply_mask(qk, penultimate_kv_start)
     else:
         qk = program.apply_mask(qk, penultimate_kv_start)
-    if cfg.FULL_QUERY_TILES:
-        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
-    else:
-        p, alpha, m_i = program.softmax_part0(qk, m_i)
+    p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
 
     k = program.tdm_shared_load_k(iter_id % cfg.NUM_BUFFERS, wait_count=1)
     program.tdm_load_global_to_shared_v(last_kv_start, iter_id % cfg.NUM_BUFFERS)
@@ -762,10 +744,7 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
     v = program.tdm_shared_load_v((iter_id + 1) % cfg.NUM_BUFFERS, wait_count=1)
     acc = program.compute_pv(p, v, acc)
 
-    if cfg.FULL_QUERY_TILES:
-        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
-    else:
-        p, alpha, m_i = program.softmax_part0(qk, m_i)
+    p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
     p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
     v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=0)
     acc = program.compute_pv(p, v, acc)
@@ -810,7 +789,6 @@ def gluon_mha_prefill_gfx1250(
     TDM_WARP_HINT: gl.constexpr,
     REVERSE_Q_BLOCKS: gl.constexpr,
     DEEP_PIPELINE: gl.constexpr,
-    FULL_QUERY_TILES: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
@@ -830,7 +808,6 @@ def gluon_mha_prefill_gfx1250(
         TDM_WARP_HINT,
         REVERSE_Q_BLOCKS,
         DEEP_PIPELINE,
-        FULL_QUERY_TILES,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -947,7 +924,12 @@ def _select_deep_pipeline(
     seqlens: list[int],
     max_seqlen: int,
 ) -> bool:
-    """Select the measured deep schedule for complete causal query tiles."""
+    """Select the measured deep schedule for complete causal query tiles.
+
+    This is deliberately opportunistic. The paged backend calls MHA prefill for
+    no-prefix chunks; equal full scheduler chunks take this path, while ragged
+    or final chunks retain the original kernel.
+    """
     return (
         dtype in (torch.bfloat16, torch.float16)
         and head_dim in (64, 128)
@@ -965,21 +947,6 @@ def _select_deep_pipeline(
             max_seqlen=max_seqlen,
             block_m=block_m,
         )
-    )
-
-
-def _select_full_query_tiles(
-    *,
-    deep_pipeline: bool,
-    seqlens: list[int],
-    max_seqlen: int,
-    block_m: int,
-) -> bool:
-    """Specialize deep attention when every query tile is fully populated."""
-    return deep_pipeline and _has_full_query_tiles(
-        seqlens=seqlens,
-        max_seqlen=max_seqlen,
-        block_m=block_m,
     )
 
 
@@ -1148,12 +1115,6 @@ def launch_gluon_mha_prefill_gfx1250(
         seqlens=seqlens,
         max_seqlen=config.max_seqlen,
     )
-    full_query_tiles = _select_full_query_tiles(
-        deep_pipeline=deep_pipeline,
-        seqlens=seqlens,
-        max_seqlen=config.max_seqlen,
-        block_m=config.block_m,
-    )
     llvm_fn_attrs = (
         "amdgpu-sched-strategy=coexec"
         if deep_pipeline
@@ -1194,7 +1155,6 @@ def launch_gluon_mha_prefill_gfx1250(
         tdm_warp_hint,
         reverse_q_blocks,
         deep_pipeline,
-        full_query_tiles,
         config.num_warps,
         config.num_buffers,
         num_warps=config.num_warps,
