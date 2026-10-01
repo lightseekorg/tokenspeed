@@ -155,6 +155,43 @@ def test_mha_prefill_selects_deep_pipeline(dtype, head_dim):
     torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
+def test_mha_prefill_packed_gqa(dtype, group_size):
+    """Check packed (sequence, query-head) rows across GQA group sizes."""
+    device = "cuda"
+    seqlens = [257, 129]
+    n_q_heads, n_kv_heads, head_dim = group_size, 1, 128
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+
+    original_config = prefill.get_config
+
+    def packed_config(**kwargs):
+        cfg = original_config(**kwargs)
+        block_m, num_warps = 128, 4
+        return cfg._replace(
+            block_m=block_m,
+            num_warps=num_warps,
+            packed_gqa=True,
+            grid=(
+                cfg.batch_size,
+                cfg.n_kv_heads,
+                prefill.triton_cdiv(cfg.max_seqlen * group_size, block_m),
+            ),
+        )
+
+    prefill.get_config = packed_config
+    try:
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    finally:
+        prefill.get_config = original_config
+
+    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
 def test_select_llvm_fn_attrs():
     max_ilp = "amdgpu-sched-strategy=max-ilp"
 
