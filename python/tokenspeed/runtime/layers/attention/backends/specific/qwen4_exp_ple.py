@@ -80,9 +80,9 @@ class Qwen4ExpPLEBackend(AttentionBackend):
     """Bind PLE cache fields and own their metadata and verify workspace."""
 
     cache_consumer_families = frozenset({"state"})
-    # Prefill graph buckets pad tokens; PLE's request-shaped updates must stay
-    # eager so padding cannot advance n-gram or short-convolution state.
-    cuda_graph_support = CudaGraphSupport(prefill_graph=False)
+    # The PLE layer's break runs request-shaped state updates eagerly, using
+    # live query lengths to exclude padded rows from state writes.
+    cuda_graph_support = CudaGraphSupport(prefill_graph=True)
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         super().__init__(config, spec)

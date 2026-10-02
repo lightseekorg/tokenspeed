@@ -96,7 +96,7 @@ class ResolutionTest(_CudaGraphSupportCase):
 
 
 class BackendDeclarationTest(_CudaGraphSupportCase):
-    """The two backend-imposed restrictions the executor used to hardcode."""
+    """Backend graph capabilities are declared on their classes."""
 
     def test_dsa_declares_no_prefill_graph(self):
         try:
@@ -108,15 +108,19 @@ class BackendDeclarationTest(_CudaGraphSupportCase):
         self.assertFalse(DSABackend.cuda_graph_support.prefill_graph)
         self.assertTrue(DSABackend.cuda_graph_support.decode_graph)
 
-    def test_qwen4_exp_declares_no_prefill_graph(self):
+    def test_qwen4_exp_request_state_supports_breakable_prefill_graph(self):
         try:
+            from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
+                QSAIndexerBackend,
+            )
             from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
                 Qwen4ExpPLEBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs tokenspeed_kernel: {exc}")
-        self.assertFalse(Qwen4ExpPLEBackend.cuda_graph_support.prefill_graph)
-        self.assertTrue(Qwen4ExpPLEBackend.cuda_graph_support.decode_graph)
+        for backend in (Qwen4ExpPLEBackend, QSAIndexerBackend):
+            self.assertTrue(backend.cuda_graph_support.prefill_graph)
+            self.assertTrue(backend.cuda_graph_support.decode_graph)
 
     def test_declarations_are_class_attributes(self):
         # Rank-uniformity gate: support must not depend on per-rank instance
