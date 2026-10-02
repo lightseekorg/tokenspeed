@@ -48,6 +48,7 @@ __all__ = [
 
 
 _IMPLEMENTED_MODEL_PROFILES = frozenset({"kimi_k3_tp8"})
+_QUERY_LAYOUTS = ("flattened", "query_axis")
 _IMPLEMENTED_DTYPES = {
     "bfloat16": torch.bfloat16,
     "float8_e4m3fn": torch.float8_e4m3fn,
@@ -227,14 +228,18 @@ def _decode_page_table(
     cache_length: int,
     max_context_len: int,
     *,
+    query_axis: bool,
     config: _MLAConfig,
     device: torch.device | str,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Build the flattened decode page table and visible cache lengths.
+    """Build the decode page table and visible cache lengths.
 
     Each request owns distinct pages; its query rows share them. Multi-row
     requests follow target verification, where row ``i`` of ``n`` sees
-    ``cache_length - (n - 1 - i)`` tokens.
+    ``cache_length - (n - 1 - i)`` tokens. Flattened rows each carry their own
+    page-table row and visible length; on the query axis a request keeps one
+    page-table row and its final length, and the kernel derives each row's
+    causal boundary.
     """
 
     pages_per_request = math.ceil(cache_length / config.kv_page_size)
@@ -249,6 +254,12 @@ def _decode_page_table(
         dtype=torch.int32,
         device=device,
     ).view(requests, pages_per_request)
+    pages = requests * pages_per_request
+    if query_axis:
+        cache_seqlens = torch.full(
+            (requests,), cache_length, dtype=torch.int32, device=device
+        )
+        return table, cache_seqlens, pages
     offsets = torch.arange(
         1 - rows_per_request,
         1,
@@ -265,7 +276,7 @@ def _decode_page_table(
         + offsets
     )
     page_table = table.repeat_interleave(rows_per_request, dim=0)
-    return page_table, cache_seqlens, requests * pages_per_request
+    return page_table, cache_seqlens, pages
 
 
 def _resolve_decode_shape(
@@ -289,10 +300,27 @@ def _resolve_decode_shape(
         )
     q_dtype = _parse_dtype("q_dtype", parameters["q_dtype"])
     kv_cache_dtype = _parse_dtype("kv_cache_dtype", parameters["kv_cache_dtype"])
+    # One row per request is the same call in either layout; verify blocks
+    # must name the layout the backend sends.
+    query_layout = parameters.get("query_layout")
+    if query_layout is None and rows_per_request > 1:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "MLA rows_per_request > 1 requires query_layout",
+        )
+    if query_layout not in (None, *_QUERY_LAYOUTS):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"MLA query_layout must be one of {', '.join(_QUERY_LAYOUTS)}",
+        )
+    query_axis = query_layout == "query_axis"
     return {
         "requests": requests,
         "rows_per_request": rows_per_request,
         "rows": requests * rows_per_request,
+        "query_layout": query_layout,
+        "batch": requests if query_axis else requests * rows_per_request,
+        "q_len": rows_per_request if query_axis else 1,
         "cache_length": cache_length,
         "max_context_len": max_context_len,
         "q_dtype": q_dtype,
@@ -300,12 +328,12 @@ def _resolve_decode_shape(
     }
 
 
-def _decode_traits(rows: int, config: _MLAConfig) -> dict[str, object]:
-    # Target verification flattens its rows onto the batch axis, so every call
-    # here is a one-row causal query per batch entry.
+def _decode_traits(shape: dict[str, object], config: _MLAConfig) -> dict[str, object]:
+    # Causal verify rows sit on the batch axis when flattened and on the query
+    # axis otherwise; the operation reports both as a query-axis block.
     return {
-        "batch_size": rows,
-        "q_len": 1,
+        "batch_size": shape["batch"],
+        "q_len": shape["q_len"],
         "num_q_heads": config.local_heads,
         "qk_nope_head_dim": config.qk_nope_head_dim,
         "kv_lora_rank": config.kv_lora_rank,
@@ -325,20 +353,25 @@ def _decode_inputs(
     config: _MLAConfig,
     generator: torch.Generator,
 ) -> dict[str, object]:
-    rows = shape["rows"]
     page_table, cache_seqlens, pages = _decode_page_table(
         shape["requests"],
         shape["rows_per_request"],
         shape["cache_length"],
         shape["max_context_len"],
+        query_axis=shape["query_layout"] == "query_axis",
         config=config,
         device="cuda",
     )
     query = _randn(
-        (rows, config.local_heads, config.latent_cache_dim),
+        (shape["rows"], config.local_heads, config.latent_cache_dim),
         generator=generator,
         dtype=shape["q_dtype"],
-    ).view(rows, 1, config.local_heads, config.latent_cache_dim)
+    ).view(
+        shape["batch"],
+        shape["q_len"],
+        config.local_heads,
+        config.latent_cache_dim,
+    )
     kv_cache = _randn(
         (pages, config.kv_page_size, 1, config.latent_cache_dim),
         generator=generator,
@@ -363,6 +396,7 @@ def _decode_parameters(
         "requests": shape["requests"],
         "rows_per_request": shape["rows_per_request"],
         "rows": shape["rows"],
+        "query_layout": shape["query_layout"],
         "cache_length": shape["cache_length"],
         "max_context_len": shape["max_context_len"],
         "q_dtype": _dtype_name(shape["q_dtype"]),
@@ -493,7 +527,7 @@ def prepare_mla_decode(
             "q": shape["q_dtype"],
             "kv_cache": shape["kv_cache_dtype"],
         },
-        traits=_decode_traits(shape["rows"], config),
+        traits=_decode_traits(shape, config),
     )
 
     generator = _generator(request.seed)
@@ -538,6 +572,12 @@ def prepare_mla_decode_projected_value(
             BenchmarkStatus.INVALID_CASE,
             "MLA output_gate must be a boolean",
         )
+    if shape["q_len"] > 1:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "MLA projected-value decode fuses single-query rows only; query-axis "
+            "verify blocks run decode and mla_project_value separately",
+        )
     value_dtype = torch.bfloat16
     load_builtin_kernels()
     spec = _select_registration(
@@ -550,7 +590,7 @@ def prepare_mla_decode_projected_value(
             "out": value_dtype,
         },
         traits={
-            **_decode_traits(shape["rows"], config),
+            **_decode_traits(shape, config),
             "value_head_dim": config.v_head_dim,
             "gate_kind": "sigmoid" if output_gate else "none",
         },

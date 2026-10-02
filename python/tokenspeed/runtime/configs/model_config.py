@@ -108,6 +108,12 @@ _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
         "LongcatFlashForCausalLM",
     }
 )
+# Architectures whose config numbers only the cache-owning blocks as layers.
+_CACHE_LAYER_VIEW_ARCHITECTURES = frozenset(
+    {
+        "NemotronHForCausalLM",
+    }
+)
 
 
 class AttentionArch(IntEnum):
@@ -438,6 +444,8 @@ def _derive_num_attention_layers(
         num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
     if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
         num_attention_layers = num_hidden_layers * 2
+    if any(arch in _CACHE_LAYER_VIEW_ARCHITECTURES for arch in architectures):
+        num_attention_layers = len(hf_config.cache_layer_types)
     return num_attention_layers
 
 

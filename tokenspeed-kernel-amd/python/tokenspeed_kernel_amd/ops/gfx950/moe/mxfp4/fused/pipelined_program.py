@@ -1036,6 +1036,10 @@ class MoEPipelinedProgram:
         gl.assume(main_iters >= 0)
 
         for _ in range(0, main_iters):
+            # async_wait makes LDS data ready for MFMA, but a fast wave can
+            # refill a slot while a slower wave is still reading its old data.
+            # TODO: Drop these barriers once Triton a772561 is in TokenSpeed.
+            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
             self.async_wait(cfg.NUM_BUFFERS - 1)
 
@@ -1050,6 +1054,9 @@ class MoEPipelinedProgram:
 
         if not EVEN_K:
             # Masked tail iter (one more iter still has W to prefetch).
+            # Same slot reuse hazard as above.
+            # TODO: Drop these barriers once Triton a772561 is in TokenSpeed.
+            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
             self.async_wait(cfg.NUM_BUFFERS - 1)
             if W_PREFETCH:

@@ -2809,6 +2809,8 @@ class KimiLinearDecoderLayer(nn.Module):
         attn_partial: torch.Tensor,
         prefix_sum: torch.Tensor | None,
         combine: tuple | None = None,
+        *,
+        producer_direct: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """All-reduce the attention partial and accumulate the residual.
 
@@ -2817,7 +2819,11 @@ class KimiLinearDecoderLayer(nn.Module):
         B1 combine / plain reduce).
         """
         return self.k3_comm.attn_reduce(
-            attn_partial, prefix_sum, combine, mlp_wp=self._mlp_wp
+            attn_partial,
+            prefix_sum,
+            combine,
+            producer_direct=producer_direct,
+            mlp_wp=self._mlp_wp,
         )
 
     def capture_attnres(
@@ -2955,16 +2961,10 @@ class KimiLinearDecoderLayer(nn.Module):
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
         )
 
-        projection_out = self.k3_comm.acquire_prefill_projection_output(
+        # The collective depends on row count and topology in every forward mode.
+        projection_out = self.k3_comm.acquire_projection_output(
             h,
             self.self_attn.o_proj,
-            is_prefill=ctx.forward_mode.is_extend(),
-            sharded_moe_supported=(
-                self.is_moe_layer
-                and isinstance(self.block_sparse_moe, KimiLinearMoE)
-                and self.block_sparse_moe.native_latent_moe is None
-                and self.mapping.attn.dp_size == 1
-            ),
         )
         attn_partial = self.self_attn(
             positions=positions,
@@ -2975,8 +2975,14 @@ class KimiLinearDecoderLayer(nn.Module):
             projection_out=projection_out,
         )
         mixed = None
-        if projection_out is not None:
-            mixed = self.k3_comm.prefill_mix_for_moe(
+        if (
+            projection_out is not None
+            and self.is_moe_layer
+            and isinstance(self.block_sparse_moe, KimiLinearMoE)
+            and self.block_sparse_moe.native_latent_moe is None
+            and self.mapping.attn.dp_size == 1
+        ):
+            mixed = self.k3_comm.mix_for_moe(
                 attn_partial,
                 None if self.is_block_write_layer else prefix_sum,
                 block_residual,
@@ -2992,7 +2998,7 @@ class KimiLinearDecoderLayer(nn.Module):
         if mixed is not None:
             prefix_sum, h = mixed
         else:
-            prefix_sum, delta = self.k3_comm.prefill_reduce_for_attnres(
+            prefix_sum, delta = self.k3_comm.reduce_for_attnres(
                 attn_partial,
                 None if self.is_block_write_layer else prefix_sum,
                 producer_direct=projection_out is not None,
@@ -3144,6 +3150,9 @@ class KimiLinearDecoderLayer(nn.Module):
                 )
             )
         )
+        projection_out = self.k3_comm.acquire_projection_output(
+            h, self.self_attn.o_proj
+        )
         with self.attn_fork.scope(
             enable=(
                 get_is_capture_mode()
@@ -3184,15 +3193,21 @@ class KimiLinearDecoderLayer(nn.Module):
                 ctx=ctx,
                 comm_manager=self.comm_manager,
                 attnres_partial_args=attnres_partial_args,
-                projection_out=None,
+                projection_out=projection_out,
             )
             if not reduce_consumes_scratch:
                 prefix_sum, h_fused = self._reduce_attn_accumulate(
-                    attn_out, prefix_sum, combine=ar_combine
+                    attn_out,
+                    prefix_sum,
+                    combine=ar_combine,
+                    producer_direct=projection_out is not None,
                 )
         if reduce_consumes_scratch:
             prefix_sum, h_fused = self._reduce_attn_accumulate(
-                attn_out, prefix_sum, combine=ar_combine
+                attn_out,
+                prefix_sum,
+                combine=ar_combine,
+                producer_direct=projection_out is not None,
             )
         # --- mlp: AttnRes mixing -> norm -> FFN -> accumulate ---
         if h_fused is not None:
