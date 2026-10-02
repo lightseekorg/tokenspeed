@@ -1918,7 +1918,11 @@ class ServerArgs:
             type=str,
             choices=["xgrammar", "none"],
             default=ServerArgs.grammar_backend,
-            help="Grammar backend. 'none' disables grammar-guided decoding entirely ",
+            help=(
+                "Grammar backend. 'none' disables grammar-guided decoding "
+                "entirely; requests with json_schema, regex, ebnf or "
+                "structural_tag are then rejected as invalid requests."
+            ),
         )
         parser.add_argument(
             "--reasoning-parser",
