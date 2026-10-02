@@ -321,8 +321,9 @@ instead of all picking the same ones, and, with speculative decoding, set
 `TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN` to the `avg_accept_len` of a real run.
 
 The flag is currently supported on AMD GPUs, on one node, without pipeline,
-context or attention data parallelism, PD disaggregation, fused all-reduce or
-an `--all2all-backend` transport.
+context or attention data parallelism, an MoE TP x EP size other than the
+attention TP size, `--mm-encoder-tp-mode data`, PD disaggregation, fused
+all-reduce or an `--all2all-backend` transport.
 
 ## Runtime Notes
 

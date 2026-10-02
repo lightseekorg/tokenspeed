@@ -1086,6 +1086,10 @@ class ServerArgs:
             unsupported.append("attention context parallelism")
         if self.mapping.has_attn_dp:
             unsupported.append("attention data parallelism")
+        if self.mapping.moe.tp_ep_size != self.mapping.attn.tp_size:
+            unsupported.append("an MoE TP x EP size other than the attention TP size")
+        if self.mm_encoder_tp_mode == "data":
+            unsupported.append("--mm-encoder-tp-mode data")
         if self.disaggregation_mode != "null":
             unsupported.append(f"--disaggregation-mode {self.disaggregation_mode}")
         if self.all2all_backend != "none":
