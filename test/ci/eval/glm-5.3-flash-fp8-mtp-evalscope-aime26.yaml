@@ -39,7 +39,7 @@ server:
     --port 8000
     --policy round_robin
     --disable-health-check
-    --engine-startup-timeout 900
+    --engine-startup-timeout 3600
     --gateway-startup-timeout 600
     --speculative-algorithm MTP
     --speculative-num-steps 3

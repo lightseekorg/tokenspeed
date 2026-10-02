@@ -277,6 +277,8 @@ Notes:
   and CUDA graph capture. When K3's 128-token logical cache pages feed the
   64-token TRT-LLM MLA kernel, the backend expands each logical page into its
   two physical kernel pages before draft attention.
+- K3 DSpark does not support DCP yet: its context KV injection path does not
+  translate virtual slots into shard-local addresses or mask nonowner writes.
 - A K3 DFlash2 draft declares `sliding_attention` layers, so it needs a drafter
   backend that applies per-layer sliding windows: `--drafter-attention-backend
   mla`. Those layers dispatch to the CuteDSL windowed decode on Blackwell,
@@ -1091,8 +1093,16 @@ tokens, 621 vs 1552 at 192, 671 vs 2855 at 576, 4517 vs 7999 at an 8192-token
 prefill chunk. Two consequences:
 
 - Startup runs FlashInfer's tactic autotuner inside the kernel tuning window
-  (about five minutes for this kernel on H20). `--disable-autotune` skips it
-  and serves heuristic tactics, which is fine for bring-up.
+  (about five minutes for this kernel on H20), including each distinct draft
+  expert geometry. Decode-capable roles also traverse the shared speculative
+  path once to discover the draft model's other operators; prefill-only roles
+  skip that traversal because they do not allocate decode/verify scratch.
+  `--disable-autotune` loads a matching persistent cache and uses heuristic
+  tactics for uncovered shapes, which is fine for bring-up. Pipeline-parallel
+  launches skip tuning but can reuse a cache from a full-model run with the
+  same engine role, tensor/expert parallel layout and environment. Independent
+  prefill and decode roles keep separate caches. Cache directories are
+  created on the first successful save.
 - `--moe-mxfp4-fp8-activation` switches to the W4A8 variant (FP8 activations,
   Humming residual scales): 282/338/380/2195 µs at the same token counts,
   another 1.8x, at a few percent of relative error on the expert outputs

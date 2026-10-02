@@ -96,6 +96,8 @@ class NanGuard:
         so their legitimate ``-inf`` entries survive sanitize.
         """
         logits = logits_output.next_token_logits
+        if logits.shape[0] == 0:
+            return
         if logits_output.logits_layout_plan is None:
             self._or_per_request(torch.isnan(logits.amax(dim=-1)), ctx)
         torch.nan_to_num_(
@@ -120,16 +122,20 @@ class NanGuard:
     def _or_per_request(self, rows: torch.Tensor, ctx: ForwardContext) -> None:
         """OR a per-row bool vector into per-request flags.
 
-        Row layout mirrors ``_run_sampling``: ``[num_extends]`` extend rows,
-        then ``num_decodes * n`` decode/verify rows.
+        Prefill rows may be omitted; flags always use original request rows.
         """
         ne = ctx.num_extends
         nd = ctx.bs - ne
-        if ne > 0:
-            self.flags[:ne] |= rows[:ne].to(torch.int32)
+        layout = ctx.output_layout
+        prefill = layout.prefill_slice
+        decode_requests = layout.decode_request_slice
+        decode_outputs = layout.decode_output_slice
+        if layout.num_prefill_outputs:
+            self.flags[prefill] |= rows[prefill].to(torch.int32)
         if nd > 0:
-            n = (rows.shape[0] - ne) // nd
-            self.flags[ne : ctx.bs] |= rows[ne:].view(nd, n).any(dim=-1).to(torch.int32)
+            self.flags[decode_requests] |= (
+                rows[decode_outputs].view(nd, -1).any(dim=-1).to(torch.int32)
+            )
 
 
 class _DisabledNanGuard(NanGuard):

@@ -33,7 +33,8 @@ hierarchy, unimplemented):
 numerics.mode                       --numerics {auto, rl-bitwise}
 ├── kernels.deterministic           fixed-reduction-order compute
 │   ├── no autotune                 disable_autotune (tactic choice is shape-
-│   │                               and machine-dependent state)
+│   │                               and machine-dependent state); no
+│   │                               persistent tactic cache is loaded
 │   ├── no TF32                     disable_tf32 + NVIDIA_TF32_OVERRIDE=0
 │   ├── no PDL                      disable_pdl (serialize kernel chains)
 │   └── batch-invariant leaves      kernel registry: leaves declaring the

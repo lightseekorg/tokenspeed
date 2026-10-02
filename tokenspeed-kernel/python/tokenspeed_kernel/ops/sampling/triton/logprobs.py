@@ -41,7 +41,7 @@ def _selected_token_logprobs_kernel(
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_SIZE)
-    row_ptr = logits_ptr + row * logits_row_stride
+    row_ptr = logits_ptr + row.to(tl.int64) * logits_row_stride
 
     row_max = tl.full((), float("-inf"), tl.float32)
     for start in tl.range(0, vocab_size, BLOCK_SIZE, num_stages=3):

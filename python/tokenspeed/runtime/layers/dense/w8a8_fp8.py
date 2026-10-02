@@ -22,10 +22,7 @@ from __future__ import annotations
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
-    per_token_group_quant_fp8,
-    per_token_quant_fp8,
-)
+from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.parameter import (
@@ -34,6 +31,35 @@ from tokenspeed.runtime.layers.parameter import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+
+
+def w8a8_fp8_per_channel_mm(
+    x: torch.Tensor,
+    weight_kn: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """FP8 GEMM with dynamic per-token activations and per-channel weights.
+
+    Args:
+        x: ``[M, K]`` activations; quantized to FP8 E4M3 per token.
+        weight_kn: ``[K, N]`` FP8 E4M3 weight (a transposed ``[N, K]`` view).
+        weight_scale: FP32 ``[N, 1]`` per-output-channel dequant scales.
+        out_dtype: Output dtype.
+
+    Returns:
+        ``[M, N]`` output in ``out_dtype``.
+    """
+    # One quantization group spanning the row is per-token scaling.
+    qinput, x_scale = per_token_group_quant_fp8(x, x.shape[-1])
+    return tokenspeed_kernel.mm(
+        qinput,
+        weight_kn,
+        A_scales=x_scale,
+        B_scales=weight_scale,
+        out_dtype=out_dtype,
+        quant="fp8",
+    )
 
 
 class W8A8Fp8LinearMethod(LinearMethodBase):
@@ -116,17 +142,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         input_2d = input.view(-1, input.shape[-1])
         output_shape = [*input.shape[:-1], weight.shape[1]]
 
-        qinput, x_scale = per_token_quant_fp8(input_2d)
-
-        qinput = qinput.view(-1, qinput.shape[-1])
-
-        output = tokenspeed_kernel.mm(
-            qinput,
-            weight,
-            A_scales=x_scale,
-            B_scales=weight_scale,
-            out_dtype=input.dtype,
-        )
+        output = w8a8_fp8_per_channel_mm(input_2d, weight, weight_scale, input.dtype)
         if bias is not None:
             output = output + bias
         return output.view(*output_shape)

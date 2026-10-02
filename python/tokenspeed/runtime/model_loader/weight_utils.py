@@ -21,13 +21,16 @@
 
 """Utilities for downloading and initializing model weights."""
 
+import ctypes
 import fnmatch
 import glob
 import hashlib
 import importlib.util
 import json
+import mmap
 import os
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -41,7 +44,6 @@ import psutil
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
-from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from safetensors import safe_open
 from tokenspeed_kernel.platform import current_platform
 from tqdm.auto import tqdm
@@ -55,6 +57,16 @@ from tokenspeed.runtime.layers.quantization import (
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
+
+_KV_SCALE_SUFFIXES = (
+    ".k_scale",
+    ".v_scale",
+    ".kv_scale",
+    "_k_scale",
+    "_v_scale",
+    ".k_proj.output_scale",
+    ".v_proj.output_scale",
+)
 
 _AUXILIARY_SAFETENSORS_FILES = {"input_scales.safetensors"}
 
@@ -426,59 +438,73 @@ def safetensors_encrypted_weights_iterator(
 
 
 class CheckpointPrefetcher:
-    """Sequentially read checkpoint shards a bounded distance ahead of the consumer.
+    """Read bounded checkpoint shards ahead using parallel contiguous ranges.
 
-    Copying weights out of an mmap'd safetensors shard demand-faults one page
-    at a time; on cold network filesystems the sparse per-rank access pattern
-    defeats readahead and every page fault becomes a synchronous round trip.
-    Reading each shard sequentially first moves the bytes at streaming
-    bandwidth, so the consumer's copies hit the page cache instead.
+    A fixed set of reader threads claims contiguous ranges in shard order.
+    Readers are reused across shards, and a shard becomes ready only after
+    all its ranges finish. Completed shards remain in the window until the
+    consumer advances.
 
-    The read-ahead window is bounded so shards are consumed before cache
-    pressure evicts them again; an unbounded prefetch of a checkpoint larger
-    than the page cache evicts its own early work. The window defaults to
-    min(80 GiB, 25% of available host memory): it only needs to be much
-    larger than a few shards and much smaller than the page cache, and no
-    cross-rank agreement is needed since it only sizes each rank's
-    independent read-ahead. Every rank reads every shard in consumption
-    order; concurrent readers of the same shard are deduplicated by the page
-    cache, so the shared filesystem sees roughly one read per node.
+    The window is min(40 GiB, 25% of available host memory). It bounds ahead
+    bytes, not total page-cache occupancy. Local ranks share cached file pages.
 
     Args:
         files: Shard paths in the exact order the consumer will load them.
-        num_threads: Number of background reader threads.
+        num_threads: Maximum concurrent range readers per rank.
     """
 
-    _BLOCK_SIZE = 16 * 1024 * 1024
-    _WINDOW_MAX_BYTES = 80 * 1024**3
+    _BLOCK_SIZE = 4 * 1024**2
+    _MIN_RANGE_SIZE = 64 * 1024**2
+    _WINDOW_MAX_BYTES = 40 * 1024**3
     _WINDOW_MEM_FRACTION = 0.25
 
     @classmethod
-    def _read_file(cls, file_path: str) -> int:
-        """Sequentially read a file so its pages land in the OS page cache."""
-        bytes_read = 0
-        with open(file_path, "rb") as f:
-            while True:
-                data = f.read(cls._BLOCK_SIZE)
-                if not data:
-                    break
-                bytes_read += len(data)
-        return bytes_read
+    def _read_range(cls, file_path: str, start: int, end: int) -> int:
+        remaining = end - start
+        buffer = bytearray(min(cls._BLOCK_SIZE, remaining))
+        with open(file_path, "rb", buffering=0) as f, memoryview(buffer) as view:
+            f.seek(start)
+            while remaining:
+                count = f.readinto(view[: min(len(buffer), remaining)])
+                if not count:
+                    raise EOFError(
+                        f"Checkpoint shard ended before byte {end}: {file_path}"
+                    )
+                remaining -= count
+        return end - start
 
     def __init__(
         self,
         files: list[str],
-        num_threads: int = 4,
+        num_threads: int = 8,
     ) -> None:
         self._files = list(files)
         self._sizes = [os.path.getsize(path) for path in self._files]
-        self._num_threads = max(1, min(num_threads, max(len(self._files), 1)))
+        self._num_threads = max(1, num_threads)
+        self._range_sizes = []
+        self._ranges_remaining = []
+        for size in self._sizes:
+            readers = min(
+                self._num_threads,
+                max(1, (size + self._MIN_RANGE_SIZE - 1) // self._MIN_RANGE_SIZE),
+            )
+            range_size = max(
+                self._BLOCK_SIZE,
+                (size + readers * self._BLOCK_SIZE - 1)
+                // (readers * self._BLOCK_SIZE)
+                * self._BLOCK_SIZE,
+            )
+            self._range_sizes.append(range_size)
+            self._ranges_remaining.append(max(1, (size + range_size - 1) // range_size))
         self._window_bytes = min(
             self._WINDOW_MAX_BYTES,
             int(psutil.virtual_memory().available * self._WINDOW_MEM_FRACTION),
         )
         self._cond = threading.Condition()
         self._next_to_read = 0
+        self._next_offset = 0
+        self._stopped = False
+        self._threads: list[threading.Thread] = []
         self._files_read = 0
         self._inflight_bytes = 0  # claimed by a reader, not yet consumed
         self._ready = [threading.Event() for _ in self._files]
@@ -488,41 +514,52 @@ class CheckpointPrefetcher:
         logger.info(
             f"Prefetching {len(self._files)} checkpoint shards into the OS page "
             f"cache (window {self._window_bytes / 1024**3:.1f} GiB, "
-            f"{self._num_threads} reader threads)."
+            f"up to {self._num_threads} range-reader threads)."
         )
         self._start_time = time.perf_counter()
-        for _ in range(self._num_threads):
-            threading.Thread(target=self._reader, daemon=True).start()
+        for _ in range(min(self._num_threads, sum(self._ranges_remaining))):
+            thread = threading.Thread(target=self._reader, daemon=True)
+            self._threads.append(thread)
+            thread.start()
 
     def _reader(self) -> None:
         while True:
             with self._cond:
                 while True:
-                    if self._next_to_read >= len(self._files):
+                    if self._stopped or self._next_to_read >= len(self._files):
                         return
-                    size = self._sizes[self._next_to_read]
-                    # A shard larger than the window may still go alone.
-                    if (
-                        self._inflight_bytes == 0
-                        or self._inflight_bytes + size <= self._window_bytes
-                    ):
-                        break
-                    self._cond.wait()
-                idx = self._next_to_read
-                self._next_to_read += 1
-                self._inflight_bytes += size
+                    idx = self._next_to_read
+                    size = self._sizes[idx]
+                    if self._next_offset == 0:
+                        # An oversized shard is admitted alone; charge each shard once.
+                        if (
+                            self._inflight_bytes
+                            and self._inflight_bytes + size > self._window_bytes
+                        ):
+                            self._cond.wait()
+                            continue
+                        self._inflight_bytes += size
+                    start = self._next_offset
+                    end = min(size, start + self._range_sizes[idx])
+                    self._next_offset = end
+                    if end == size:
+                        self._next_to_read += 1
+                        self._next_offset = 0
+                    break
             try:
-                self._read_file(self._files[idx])
+                self._read_range(self._files[idx], start, end)
             except Exception:
                 logger.warning(
                     f"Failed to prefetch checkpoint shard {self._files[idx]}; "
                     f"the consumer will fall back to demand paging for it.",
                     exc_info=True,
                 )
-            finally:
-                # Unblock the consumer even on failure.
-                self._ready[idx].set()
             with self._cond:
+                self._ranges_remaining[idx] -= 1
+                if self._ranges_remaining[idx]:
+                    continue
+                # Failed ranges also release the consumer to use demand paging.
+                self._ready[idx].set()
                 self._files_read += 1
                 all_read = self._files_read == len(self._files)
             if all_read:
@@ -530,6 +567,14 @@ class CheckpointPrefetcher:
                     "Checkpoint prefetch finished after "
                     f"{time.perf_counter() - self._start_time:.2f}s."
                 )
+
+    def close(self) -> None:
+        """Stop admitting work and wait for active range reads to finish."""
+        with self._cond:
+            self._stopped = True
+            self._cond.notify_all()
+        for thread in self._threads:
+            thread.join()
 
     def wait_file(self, idx: int) -> None:
         """Block until shard ``idx`` has been prefetched."""
@@ -542,12 +587,43 @@ class CheckpointPrefetcher:
             self._cond.notify_all()
 
 
+def _madvise_sequential(tensors: Iterable[torch.Tensor]) -> None:
+    """Keep consumed file-backed storages from acquiring mmap reuse protection."""
+    if sys.platform != "linux":
+        return
+    ranges = []
+    for tensor in tensors:
+        storage = tensor.untyped_storage()
+        size = storage.nbytes()
+        if not size:
+            continue
+        address = storage.data_ptr()
+        start = address // mmap.PAGESIZE * mmap.PAGESIZE
+        end = (address + size + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE
+        ranges.append((start, end))
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    libc = ctypes.CDLL(None, use_errno=True)
+    madvise = libc.madvise
+    madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    madvise.restype = ctypes.c_int
+    for start, end in merged:
+        if madvise(start, end - start, mmap.MADV_SEQUENTIAL):
+            logger.debug(
+                f"Could not advise checkpoint mapping: {os.strerror(ctypes.get_errno())}"
+            )
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     is_all_weights_sharded: bool = False,
     decryption_key: str | None = None,
     prefetch: bool = False,
-    prefetch_num_threads: int = 4,
+    prefetch_num_threads: int = 8,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -577,27 +653,33 @@ def safetensors_weights_iterator(
         )
         prefetcher.start()
 
-    for file_idx, st_file in enumerate(
-        tqdm(
-            hf_weights_files,
-            desc="Loading safetensors checkpoint shards",
-            disable=not enable_tqdm,
-            bar_format=_BAR_FORMAT,
-        )
-    ):
+    try:
+        for file_idx, st_file in enumerate(
+            tqdm(
+                hf_weights_files,
+                desc="Loading safetensors checkpoint shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            )
+        ):
+            if prefetcher is not None:
+                prefetcher.wait_file(file_idx)
+            result = safetensors.torch.load_file(st_file, device="cpu")
+            if prefetcher is not None:
+                _madvise_sequential(result.values())
+            yield from result.items()
+            if prefetcher is not None:
+                prefetcher.advance(file_idx)
+    finally:
         if prefetcher is not None:
-            prefetcher.wait_file(file_idx)
-        result = safetensors.torch.load_file(st_file, device="cpu")
-        yield from result.items()
-        if prefetcher is not None:
-            prefetcher.advance(file_idx)
+            prefetcher.close()
 
 
 def safetensors_filtered_weights_iterator(
     hf_weights_files: list[str],
     accept: Callable[[str], bool],
     prefetch: bool = False,
-    prefetch_num_threads: int = 4,
+    prefetch_num_threads: int = 8,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield accepted tensors one at a time via ``get_tensor``, never load_file.
 
@@ -614,23 +696,27 @@ def safetensors_filtered_weights_iterator(
             num_threads=prefetch_num_threads,
         )
         prefetcher.start()
-    for file_idx, st_file in enumerate(
-        tqdm(
-            hf_weights_files,
-            desc="Loading safetensors checkpoint shards",
-            disable=not enable_tqdm,
-            bar_format=_BAR_FORMAT,
-        )
-    ):
+    try:
+        for file_idx, st_file in enumerate(
+            tqdm(
+                hf_weights_files,
+                desc="Loading safetensors checkpoint shards",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            )
+        ):
+            if prefetcher is not None:
+                prefetcher.wait_file(file_idx)
+            with safe_open(st_file, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if not accept(key):
+                        continue
+                    yield key, handle.get_tensor(key)
+            if prefetcher is not None:
+                prefetcher.advance(file_idx)
+    finally:
         if prefetcher is not None:
-            prefetcher.wait_file(file_idx)
-        with safe_open(st_file, framework="pt", device="cpu") as handle:
-            for key in handle.keys():
-                if not accept(key):
-                    continue
-                yield key, handle.get_tensor(key)
-        if prefetcher is not None:
-            prefetcher.advance(file_idx)
+            prefetcher.close()
 
 
 _SUB_BYTE_SAFETENSORS_DTYPES = frozenset({"F4", "F6_E2M3", "F6_E3M2"})
@@ -824,122 +910,56 @@ def initialize_dummy_weights(
                 param.uniform_(low, high, generator=generator)
 
 
-class KVCacheQuantSchema(BaseModel):
-    dtype: str
-    # Each key is a TP rank. Each value is a dictionary mapping a TP rank's
-    # layer indices to their per-tensor KV cache scaling factor.
-    # own schema class (tricky as its members are variable)
-    scaling_factor: dict[int, dict[int, float]]
-
-    @model_validator(mode="after")
-    def check_is_fp8(self) -> "KVCacheQuantSchema":
-        if self.dtype != "float8_e4m3fn":
-            raise ValueError(
-                "Loaded scaling factors intended for KV cache dtype = "
-                f"{self.dtype} rather than float8_e4m3fn!"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def check_tp_ranks(self, info: ValidationInfo) -> "KVCacheQuantSchema":
-        context = info.context
-        if context:
-            tp_size = context["tp_size"]
-            num_hidden_layers = context["num_hidden_layers"]
-            if len(self.scaling_factor) != tp_size:
-                raise ValueError(
-                    f"Loaded dictionary has TP size {len(self.scaling_factor)} "
-                    f"but LLM engine is currently running with TP size {tp_size}."
-                )
-            for tp_rank, layer_maps in self.scaling_factor.items():
-                if len(layer_maps) != num_hidden_layers:
-                    raise ValueError(
-                        f"KV cache scales map for TP rank {tp_rank} is malformed. "
-                        f"Expected {num_hidden_layers} layers, got "
-                        f"{len(layer_maps)}."
-                    )
-            for i in range(tp_size):
-                if i not in self.scaling_factor:
-                    raise ValueError(f"KV cache scales map for TP rank {i} not found.")
-        return self
-
-    @model_validator(mode="after")
-    def check_current_rank(self, info: ValidationInfo) -> "KVCacheQuantSchema":
-        context = info.context
-        if context:
-            tp_rank = context["tp_rank"]
-            num_hidden_layers = context["num_hidden_layers"]
-            layer_scales_map = self.scaling_factor[tp_rank]
-            for i in range(num_hidden_layers):
-                if i not in layer_scales_map:
-                    raise ValueError(
-                        f"Could not find KV cache scales for layer {i} in "
-                        f"TP rank {tp_rank}."
-                    )
-        return self
+def record_non_unit_kv_scales(
+    weights: Iterable[tuple[str, torch.Tensor]], rejected: list[str]
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Pass weights through, appending each KV-cache scale other than one to
+    ``rejected``; KV caches are written and read at unit scale."""
+    for name, tensor in weights:
+        if name.endswith(_KV_SCALE_SUFFIXES) and not bool(torch.all(tensor == 1)):
+            rejected.append(f"{name}={tensor.flatten()[:4].tolist()}")
+        yield name, tensor
 
 
-class QuantParamSchema(BaseModel):
-    # (e.g. weights/activations params) once functionality is enabled
-    model_config = ConfigDict(protected_namespaces=())
-    model_type: str | None
-    kv_cache: KVCacheQuantSchema
-
-    @model_validator(mode="after")
-    def check_model_type(self, info: ValidationInfo) -> "QuantParamSchema":
-        context = info.context
-        if context:
-            model_type = context.get("model_type", None)
-            if model_type is not None:
-                if model_type != self.model_type:
-                    raise ValueError(
-                        f"Model type is {model_type} but loaded "
-                        f"scaling factors belonging to different "
-                        f"model type {self.model_type}!"
-                    )
-        return self
-
-
-def kv_cache_scales_loader(
-    filename: str,
-    tp_rank: int,
-    tp_size: int,
-    num_hidden_layers: int,
-    model_type: str | None,
-) -> Iterable[tuple[int, float]]:
-    """
-    A simple utility to read in KV cache scaling factors that have been
-    previously serialized to disk. Used by the model to populate the appropriate
-    KV cache scaling factors. The serialization should represent a dictionary
-    whose keys are the TP ranks and values are another dictionary mapping layers
-    to their KV cache scaling factors.
-    """
-    try:
-        with open(filename) as f:
-            context = {
-                "model_type": model_type,
-                "num_hidden_layers": num_hidden_layers,
-                "tp_rank": tp_rank,
-                "tp_size": tp_size,
-            }
-            schema_dct = json.load(f)
-            schema = QuantParamSchema.model_validate(schema_dct, context=context)
-            layer_scales_map = schema.kv_cache.scaling_factor[tp_rank]
-            return layer_scales_map.items()
-    except FileNotFoundError:
-        logger.error(f"File or directory '{filename!s}' not found.")
-    except json.JSONDecodeError:
-        logger.error(f"Error decoding JSON in file '{filename!s}'.")
-    except Exception:
-        logger.error(f"An error occurred while reading '{filename!s}'.")
-    # This section is reached if and only if any of the excepts are hit
-    # Return an empty iterable (list) => no KV cache scales are loaded
-    # which ultimately defaults to 1.0 scales
-    logger.warning(
-        "Defaulting to KV cache scaling factors = 1.0 for all "
-        f"layers in TP rank {tp_rank:d} as an error occurred during loading.",
+def non_unit_kv_scale_message(rejected: list[str]) -> str:
+    return (
+        f"checkpoint KV-cache scales {', '.join(rejected)}; "
+        "only unit KV-cache scales are supported"
     )
-    return []
+
+
+def require_unit_kv_scales(
+    weights: Iterable[tuple[str, torch.Tensor]],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Pass checkpoint weights through, raising once the stream is drained if
+    a KV-cache scale is not one."""
+    rejected: list[str] = []
+    yield from record_non_unit_kv_scales(weights, rejected)
+    if rejected:
+        raise ValueError(non_unit_kv_scale_message(rejected))
+
+
+def require_unit_kv_scale_file(path: str) -> None:
+    """Reject a ``--quantization-param-path`` file with a KV scale other than one."""
+    try:
+        with open(path) as f:
+            scaling_factor = json.load(f)["kv_cache"]["scaling_factor"]
+        scales = [
+            (tp_rank, layer, float(scale))
+            for tp_rank, layer_scales in scaling_factor.items()
+            for layer, scale in layer_scales.items()
+        ]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        raise ValueError(
+            f"{path}: expected a JSON file with kv_cache.scaling_factor "
+            f"{{tp_rank: {{layer: scale}}}} ({e!r})"
+        ) from e
+    for tp_rank, layer, scale in scales:
+        if scale != 1.0:
+            raise ValueError(
+                f"{path}: KV-cache scale {scale} for TP rank {tp_rank} layer "
+                f"{layer}; only unit KV-cache scales are supported"
+            )
 
 
 def mamba_v2_sharded_weight_loader(

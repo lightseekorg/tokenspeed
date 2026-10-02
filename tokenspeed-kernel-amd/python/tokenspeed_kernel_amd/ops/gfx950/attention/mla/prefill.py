@@ -25,11 +25,12 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon, gluon_builtin
+from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
     _LN2,
     InputStrides,
+    _mfma_unscaled_fp8,
     attention_layouts,
     max,
     maximum,
@@ -38,29 +39,6 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
-
-
-@gluon_builtin
-def _mfma_unscaled_fp8(a, b, acc, *, _semantic):
-    # dot_scaled with None scales emits the unscaled
-    # v_mfma_f32_32x32x64_f8f6f4 instruction, without scale operands.
-    # Use this compiler builtin because the public mfma_scaled wrapper inserts
-    # unit scales, while ordinary mfma selects K16 for this FP8 tile.
-    fmt = "e4m3" if a.dtype == gl.float8e4nv else "e5m2"
-    output = _semantic.dot_scaled(
-        a,
-        None,
-        fmt,
-        b,
-        None,
-        fmt,
-        acc,
-        fast_math=False,
-        lhs_k_pack=True,
-        rhs_k_pack=True,
-        out_dtype=gl.float32,
-    )
-    return gl.tensor(output.handle, acc.type)
 
 
 # ===-----------------------------------------------------------------------===#

@@ -91,11 +91,13 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
             )
             gate = None
             absorbed_query = None
+        expanded = self._prefill_prologue_before_break(positions, q, latent_cache, ctx)
         attn_output = self._attn(
             positions,
             q,
             latent_cache,
             ctx,
+            expanded=expanded,
             absorbed_query=absorbed_query,
         )
         if gate is not None:
@@ -212,6 +214,7 @@ class KimiK3DraftDecoderLayer(nn.Module):
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             ctx=ctx,
+            prefix_is_sharded=False,
         )
         return prefix.view(residual.shape)
 

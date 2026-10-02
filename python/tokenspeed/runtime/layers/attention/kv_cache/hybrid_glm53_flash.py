@@ -26,8 +26,6 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import set_mla_kv_buffer_triton
-from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
@@ -48,6 +46,9 @@ class _KPoolTailWorkspace:
 
 class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
     """KDA/DSA pages with pooled-index fields and a request-local KPool tail."""
+
+    # Unlike the KDA hybrid it extends, its latent writes keep non-finite values.
+    latent_write_sanitizes: ClassVar[bool] = False
 
     def __init__(self, *args, pool_options: Glm53FlashPoolOptions, **kwargs):
         self.index_head_dim = pool_options.index_head_dim
@@ -141,58 +142,6 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
             buf.storage_offset() + rows_per_page * self.index_head_dim,
         ).view(torch.float32)
         return values, scales
-
-    @override
-    def set_mla_kv_buffer(
-        self,
-        layer: PagedAttention,
-        loc: torch.Tensor,
-        cache_k_nope: torch.Tensor,
-        cache_k_rope: torch.Tensor,
-        sanitize: bool = False,
-        *,
-        write_mask: torch.Tensor | None,
-    ) -> None:
-        if self.qk_rope_head_dim != 0:
-            super().set_mla_kv_buffer(
-                layer,
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-                sanitize=sanitize,
-                write_mask=write_mask,
-            )
-            return
-
-        kv_buffer = self.kv_buffer[layer.layer_id]
-        if sanitize:
-            float_maxes = [
-                torch.finfo(tensor.dtype).max
-                for tensor in (cache_k_nope, self.get_key_buffer(layer.layer_id))
-                if tensor.dtype.is_floating_point
-            ]
-            max_finite = min(float_maxes)
-            cache_k_nope = torch.nan_to_num(
-                cache_k_nope.float(),
-                nan=0.0,
-                posinf=max_finite,
-                neginf=-max_finite,
-            )
-        if self.store_dtype != self.dtype:
-            cache_k_nope = cache_k_nope.to(self.dtype)
-            cache_k_rope = cache_k_rope.to(self.dtype)
-            kv_buffer = kv_buffer.view(self.dtype)
-        elif cache_k_nope.dtype != kv_buffer.dtype:
-            cache_k_nope = cache_k_nope.to(kv_buffer.dtype)
-        set_mla_kv_buffer_triton(
-            kv_buffer,
-            loc,
-            cache_k_nope,
-            cache_k_rope,
-            enable_pdl=pdl_enabled(),
-            sanitize=False,
-            write_mask=write_mask,
-        )
 
     def get_mla_kv_buffer(
         self,

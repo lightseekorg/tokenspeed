@@ -56,6 +56,12 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         launch_gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        launch_gluon_mm_a16w16_decode_gfx950 as _mm_a16w16_decode_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
         launch_gluon_mm_mxfp8_gfx950 as _mm_mxfp8_impl,
     )
@@ -136,6 +142,38 @@ if current_platform().is_amd:
         if output is None:
             raise RuntimeError("registered gfx950 prefill shape was rejected")
         return output
+
+    @register_kernel(
+        "gemm",
+        "decode_gemv",
+        name="gluon_mm_a16w16_decode_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={"mnk_problem_filter": frozenset({_supports_mm_a16w16_decode})},
+    )
+    def gluon_mm_a16w16_decode_gfx950(
+        x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``x @ weight.T`` for the measured K3 decode shapes (M >= 2).
+
+        Args:
+            x: ``[M, K]`` contiguous bf16 activation.
+            weight: ``[N, K]`` contiguous bf16 weight.
+            out: optional ``[M, N]`` destination.
+
+        Returns:
+            ``[M, N]`` output in ``x``'s dtype.
+        """
+        return _mm_a16w16_decode_impl(x, weight, x.dtype, out=out)
 
     _MXFP8_SIGNATURES = frozenset(
         {
