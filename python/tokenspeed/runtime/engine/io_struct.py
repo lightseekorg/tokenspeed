@@ -890,6 +890,13 @@ class IsSchedulerPausedReqOutput(BaseReq, kw_only=True):
     is_paused: bool
 
 
+# Weight-update sources the scheduler's request dispatcher implements (see the
+# isinstance chain in the control-request handler). The in-engine RL control app
+# refuses the others up front instead of forwarding a request the scheduler
+# cannot handle, and advertises this set to gateways as `rl.update_from`.
+SUPPORTED_WEIGHT_UPDATE_SOURCES: frozenset[str] = frozenset({"distributed"})
+
+
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     # The model path with the new weights
     model_path: str
