@@ -32,7 +32,10 @@ if not is_cdna5():
     )
 
 import tokenspeed_kernel  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import fused  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (  # noqa: E402
+    fused,
+    persistent_decode,
+)
 
 _KERNEL_NAME = "gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply"
 
@@ -212,6 +215,9 @@ def _situ_apply_recording_kernels(
 ) -> tuple[torch.Tensor, list]:
     kernels: list = []
     original_matmul = fused.matmul
+    original_persistent_combine = (
+        persistent_decode.launch_gluon_mxfp4_a8w4_persistent_combine_gfx1250
+    )
 
     def recording_matmul(*args, **kwargs):
         kwargs["partial_tdm"] = partial_tdm
@@ -219,7 +225,18 @@ def _situ_apply_recording_kernels(
         kernels.append(kernel)
         return out, kernel
 
+    def recording_persistent_combine(*args, **kwargs):
+        kwargs["partial_tdm"] = partial_tdm
+        out, kernel = original_persistent_combine(*args, **kwargs)
+        kernels.append(kernel)
+        return out, kernel
+
     monkeypatch.setattr(fused, "matmul", recording_matmul)
+    monkeypatch.setattr(
+        persistent_decode,
+        "launch_gluon_mxfp4_a8w4_persistent_combine_gfx1250",
+        recording_persistent_combine,
+    )
     try:
         result = tokenspeed_kernel.moe_apply(
             plan,
