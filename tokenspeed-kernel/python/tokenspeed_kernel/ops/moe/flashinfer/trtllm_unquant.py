@@ -31,6 +31,8 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
+# Intermediate-size multiple these kernels (gated activations only) accept.
+TRTLLM_UNQUANT_ISPP_ALIGNMENT = 128
 
 
 if platform.is_nvidia:
@@ -43,6 +45,14 @@ if platform.is_nvidia:
         convert_to_block_layout,
         get_w2_permute_indices_with_cache,
     )
+    from tokenspeed_kernel.thirdparty.flashinfer import (
+        trtllm_bf16_moe as ispp64_launcher,
+    )
+
+    # Only the SM100-SM103 kernels below use the private launcher; other GPUs
+    # keep 128 without checking it or FlashInfer's JIT.
+    if ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3):
+        TRTLLM_UNQUANT_ISPP_ALIGNMENT = ispp64_launcher.gated_ispp_alignment()
 
     def flashinfer_trtllm_unquant_moe_weights(plan: dict, w: torch.nn.Module):
         cache_permute_indices = {}
@@ -111,12 +121,15 @@ if platform.is_nvidia:
         do_finalize: bool,
         enable_pdl: bool,
         routed: bool,
+        fp32_correction_bias: bool,
     ):
         """Shared body for the in-kernel-routing and precomputed-topk variants.
 
         ``routed`` selects between ``trtllm_bf16_moe`` (in-kernel routing from
         ``router_logits``) and ``trtllm_bf16_routed_moe`` (precomputed
         ``topk_ids``/``topk_weights``); everything else is identical.
+        ``fp32_correction_bias`` routes on a module that adds the DeepSeekV3
+        correction bias in FP32.
         """
         if x.shape[0] == 0:
             # Idle DP ranks run a dummy forward with 0 tokens; the fused kernel
@@ -130,6 +143,15 @@ if platform.is_nvidia:
             )
 
         local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
+        intermediate_size = getattr(w, "intermediate_size") // getattr(w, "tp_size", 1)
+        # Sizes the stock launcher rejects run on the 64-aligned private one.
+        bf16_moe, bf16_routed_moe = (
+            (ispp64_launcher.trtllm_bf16_moe, ispp64_launcher.trtllm_bf16_routed_moe)
+            if intermediate_size % ispp64_launcher.STOCK_ISPP_ALIGNMENT
+            else (trtllm_bf16_moe, trtllm_bf16_routed_moe)
+        )
+        if fp32_correction_bias and not ispp64_launcher.stock_routing_keeps_fp32_bias():
+            bf16_moe = ispp64_launcher.trtllm_bf16_fp32_routing_bias_moe
         # GEMM and sizing arguments shared by both kernel entry points.
         common_kwargs = dict(
             hidden_states=x,
@@ -137,8 +159,7 @@ if platform.is_nvidia:
             gemm2_weights=w.w2_weight,
             num_experts=getattr(w, "num_experts"),
             top_k=getattr(w, "top_k"),
-            intermediate_size=getattr(w, "intermediate_size")
-            // getattr(w, "tp_size", 1),
+            intermediate_size=intermediate_size,
             local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
             local_num_experts=local_experts,
             do_finalize=do_finalize,
@@ -156,7 +177,7 @@ if platform.is_nvidia:
                 & 0xFFFF
             )
             packed_topk = (topk_ids.to(torch.int32) << 16) | weight_bits
-            result = trtllm_bf16_routed_moe(
+            result = bf16_routed_moe(
                 topk_ids=packed_topk,
                 n_group=None,
                 topk_group=None,
@@ -179,7 +200,7 @@ if platform.is_nvidia:
             routing_bias = routing_value("correction_bias", None)
             if routing_bias is not None:
                 routing_bias = routing_bias.to(routing_logits_dtype)
-            result = trtllm_bf16_moe(
+            result = bf16_moe(
                 routing_logits=router_logits.to(routing_logits_dtype),
                 routing_bias=routing_bias,
                 n_group=routing_value("n_group", None),
@@ -229,7 +250,7 @@ if platform.is_nvidia:
             "supports_deferred_finalize": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({128}),
+            "ispp_alignment": frozenset({TRTLLM_UNQUANT_ISPP_ALIGNMENT}),
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },
@@ -256,7 +277,14 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=False,
+            fp32_correction_bias=plan["fp32_correction_bias"],
         )
+
+    # moe_plan keeps in-kernel routing for an FP32 correction bias only if
+    # this returns True.
+    flashinfer_trtllm_unquant_moe_apply._tokenspeed_fp32_correction_bias = (  # type: ignore[attr-defined]
+        ispp64_launcher.fp32_routing_bias_ready
+    )
 
     @register_kernel(
         "moe",
@@ -281,7 +309,7 @@ if platform.is_nvidia:
             "supports_deferred_finalize": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({128}),
+            "ispp_alignment": frozenset({TRTLLM_UNQUANT_ISPP_ALIGNMENT}),
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },
@@ -312,4 +340,5 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=True,
+            fp32_correction_bias=False,
         )

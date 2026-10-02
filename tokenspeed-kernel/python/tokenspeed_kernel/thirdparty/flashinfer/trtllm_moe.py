@@ -67,38 +67,58 @@ def _initialize_routing_map(source: str) -> str:
     return source[: match.end()] + initialization + source[match.end() :]
 
 
-def _routing_initialized_spec(*args, **kwargs):
+def _patched_sources_spec(transforms: dict, tag: str, *args, **kwargs):
+    """Stock TRT-LLM MoE JIT spec whose sources are ``transforms``-ed.
+
+    ``transforms`` maps JIT source file names to source transforms. The module
+    is named after ``tag`` and the transformed sources' digest.
+    """
     from filelock import FileLock
     from flashinfer.jit import env as jit_env
     from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 
     spec = gen_trtllm_gen_fused_moe_sm100_module(*args, **kwargs)
-    launchers = [
-        Path(path)
-        for path in spec.sources
-        if Path(path).name == "trtllm_fused_moe_kernel_launcher.cu"
-    ]
-    if len(launchers) != 1:
-        raise RuntimeError("Unsupported FlashInfer TRT-LLM JIT source list")
-    source = _initialize_routing_map(launchers[0].read_text())
-    digest = hashlib.sha256(source.encode()).hexdigest()[:16]
-    name = f"tokenspeed_{spec.name}_route_init_{digest}"
+    patched = {}
+    for filename, transform in transforms.items():
+        paths = [Path(path) for path in spec.sources if Path(path).name == filename]
+        if len(paths) != 1:
+            raise RuntimeError("Unsupported FlashInfer TRT-LLM JIT source list")
+        patched[paths[0]] = transform(paths[0].read_text())
+    # In JIT source order, so one transformed source keeps its digest.
+    sources = "".join(patched.get(Path(path), "") for path in spec.sources)
+    digest = hashlib.sha256(sources.encode()).hexdigest()[:16]
+    name = f"tokenspeed_{spec.name}_{tag}_{digest}"
     directory = jit_env.FLASHINFER_GEN_SRC_DIR / name
     directory.mkdir(parents=True, exist_ok=True)
-    launcher = directory / launchers[0].name
     # Concurrent TP workers produce identical content; never rewrite a source
     # another worker's compiler may currently be reading.
     with FileLock(str(directory / "source.lock")):
-        if not launcher.exists():
-            launcher.write_text(source)
-        elif launcher.read_text() != source:
-            raise RuntimeError("FlashInfer routing adapter source-cache mismatch")
+        for path, source in patched.items():
+            target = directory / path.name
+            if not target.exists():
+                target.write_text(source)
+            elif target.read_text() != source:
+                raise RuntimeError(f"FlashInfer {tag} adapter source-cache mismatch")
     return replace(
         spec,
         name=name,
         sources=[
-            launcher if Path(path) == launchers[0] else path for path in spec.sources
+            directory / Path(path).name if Path(path) in patched else path
+            for path in spec.sources
         ],
+    )
+
+
+def _patched_launcher_spec(transform, tag: str, *args, **kwargs):
+    """Stock TRT-LLM MoE JIT spec whose launcher source is ``transform``-ed."""
+    return _patched_sources_spec(
+        {"trtllm_fused_moe_kernel_launcher.cu": transform}, tag, *args, **kwargs
+    )
+
+
+def _routing_initialized_spec(*args, **kwargs):
+    return _patched_launcher_spec(
+        _initialize_routing_map, "route_init", *args, **kwargs
     )
 
 
@@ -113,11 +133,13 @@ def _clone(function, namespace):
     return clone
 
 
-def _register_private(register, name, *args, **kwargs):
+def _register_private(
+    register, name, *args, prefix="tokenspeed_flashinfer_route_init", **kwargs
+):
     namespace, separator, operator = name.partition("::")
     if namespace != "flashinfer" or not separator:
         raise RuntimeError(f"Unexpected FlashInfer operator name: {name}")
-    return register(f"tokenspeed_flashinfer_route_init::{operator}", *args, **kwargs)
+    return register(f"{prefix}::{operator}", *args, **kwargs)
 
 
 def _is_qwen38_decode_shape(
