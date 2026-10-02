@@ -7,7 +7,7 @@ triggers:
   - manual
 runner:
   labels:
-    - amd-mi35x-1gpu-test
+    - amd-mi350-1gpu-bench
 env:
   CI: "true"
   ROCR_VISIBLE_DEVICES: "0"

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip(
@@ -38,16 +38,20 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _choose_mfma_lds_mediumm_config,
     _get_partial_scratch,
+    _get_splitk_counters,
     _supports_mfma_lds_smallm,
     _use_mfma_lds_largem,
     _use_mfma_lds_mediumm,
     _use_mfma_lds_smallm,
     _use_warp_reduce_smallm,
     gluon_mm_a16w16_gfx950,
+    gluon_mm_a16w16_medium_gfx950,
     launch_gluon_bmm_a16w16_gfx950,
+    launch_gluon_mm_a16w16_decode_gfx950,
     launch_gluon_mm_a16w16_medium_gfx950,
     launch_gluon_mm_a16w16_splitk_gfx950,
     launch_gluon_mm_a16w16_warp_gfx950,
+    supports_gluon_mm_a16w16_decode_gfx950,
 )
 
 # Kernels and references accumulate in FP32 and round once to BF16, so outputs
@@ -312,3 +316,115 @@ def test_use_largem_routes_only_dispatch_target_shapes() -> None:
     assert _use_mfma_lds_largem(2048, 4096, 4096)
     assert not _use_mfma_lds_largem(1024, 8192, 8192)
     assert not _use_mfma_lds_largem(2048, 1280, 2880)
+
+
+# Kimi K3 TP8 decode shapes covering split-K (router with FP32 output, shared
+# expert gate/up), N not a multiple of BLOCK_N (qkvfab), M not a multiple of
+# BLOCK_M, and the single-pass path.
+_DECODE_CASES = [
+    pytest.param((4, 896, 7168), torch.float32, id="router-splitk-fp32"),
+    pytest.param((20, 1536, 7168), torch.bfloat16, id="shared-gu-splitk"),
+    pytest.param((8, 6288, 7168), torch.bfloat16, id="qkvfab-ragged-n"),
+    pytest.param((40, 7168, 768), torch.bfloat16, id="shared-dn-ragged-m"),
+]
+
+
+def _decode_reference(a, b, out_dtype):
+    if out_dtype == torch.float32:
+        return a.float() @ b.float().T
+    return torch.mm(a, b.T)
+
+
+@pytest.mark.parametrize("shape,out_dtype", _DECODE_CASES)
+def test_decode_gemm_correctness_across_repeated_calls(
+    shape: tuple[int, int, int], out_dtype: torch.dtype
+) -> None:
+    torch.manual_seed(0)
+    m, n, k = shape
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    # Split-K reuses per-tile arrival counters; the last program of each tile
+    # resets them, so back-to-back launches must stay correct.
+    for _ in range(3):
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+        out = launch_gluon_mm_a16w16_decode_gfx950(a, b, out_dtype)
+        assert out.dtype == out_dtype
+        # FP32 output differs from the reference only by summation order.
+        rtol = 1e-5 if out_dtype == torch.float32 else _RTOL
+        torch.testing.assert_close(
+            out, _decode_reference(a, b, out_dtype), atol=1e-4, rtol=rtol
+        )
+
+
+def test_decode_gemm_graph_does_not_share_eager_counters() -> None:
+    torch.manual_seed(0)
+    m, n, k = 4, 896, 7168
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    out = torch.empty((m, n), device="cuda", dtype=torch.float32)
+    device = torch.device("cuda")
+    # The router bucket uses 16x16 tiles with split-K 7.
+    num_tiles = n // 16
+
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        # Eager warmup on the capture stream fills the per-stream cache.
+        launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
+        eager = _get_splitk_counters(device, num_tiles)
+        with torch.cuda.graph(graph, stream=stream):
+            captured = _get_splitk_counters(device, num_tiles)
+            launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
+    stream.synchronize()
+
+    # The graph must use its own counters, not the eager stream's buffer.
+    assert captured.data_ptr() != eager.data_ptr()
+    a.copy_(torch.randn_like(a) * 0.25)
+    graph.replay()
+    torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
+
+
+def test_decode_gemm_writes_strided_out() -> None:
+    torch.manual_seed(0)
+    m, n, k = 4, 896, 7168
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    backing = torch.empty((m, n + 17), device="cuda", dtype=torch.float32)
+    out = backing[:, :n]
+
+    actual = launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
+
+    assert actual is out
+    torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
+
+
+def test_decode_gemm_supports_only_measured_buckets() -> None:
+    # Every measured K3 shape from M=2 up to its fastest bucket.
+    assert supports_gluon_mm_a16w16_decode_gfx950(2, 896, 7168)
+    assert supports_gluon_mm_a16w16_decode_gfx950(64, 896, 7168)
+    assert supports_gluon_mm_a16w16_decode_gfx950(3, 2304, 1536)
+    # M=1 keeps the GEMV kernels; larger M and unknown shapes keep torch.
+    assert not supports_gluon_mm_a16w16_decode_gfx950(1, 896, 7168)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(65, 896, 7168)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(4, 4096, 4096)
+    # A bucket missing from a shape's table falls back instead of borrowing
+    # the next bucket's config: dense gate/up is measured only for 9..32.
+    assert not supports_gluon_mm_a16w16_decode_gfx950(8, 8448, 7168)
+    assert supports_gluon_mm_a16w16_decode_gfx950(9, 8448, 7168)
+
+
+def test_decode_gemm_row_count_does_not_recompile() -> None:
+    torch.manual_seed(0)
+    n, k = 1536, 7168
+    a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+
+    def run(rows):
+        out = launch_gluon_mm_a16w16_decode_gfx950(a[:rows], b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
+
+    # Warm both integer classes (divisible by 16 or not) of each bucket.
+    for rows in (3, 4, 5, 8, 9, 16, 17, 32, 33, 64):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
+            run(rows)

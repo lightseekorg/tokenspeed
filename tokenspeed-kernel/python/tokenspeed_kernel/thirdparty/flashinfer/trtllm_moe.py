@@ -23,8 +23,9 @@
 Keep the upstream routing, tuner and GEMM implementations. The native routing
 workspace allocation gains a stream-ordered initialization, recorded during
 capture and executed on every replay. One Qwen3.8 decode shape narrows the
-valid MoE tactics to tile 32. The installed package, upstream Python globals
-and upstream JIT artifacts remain untouched.
+valid MoE tactics to tile 32. A cache-key hook applies that policy to the target
+profile for this private runner only. The installed package and upstream JIT
+artifacts remain untouched.
 """
 
 from __future__ import annotations
@@ -156,6 +157,35 @@ def _require_tactic_hooks(runner_type: type) -> None:
             )
 
 
+def _install_profile_cache_key(tuner_type: type, runner_type: type) -> None:
+    # FlashInfer's extras hook receives caller inputs on lookup and synthesized
+    # inputs on store. Its key builder is the point where both have the target
+    # profile, including bucket mapping for the final serving lookup.
+    original = tuner_type._get_cache_key.__func__
+    if tuple(inspect.signature(original).parameters) != (
+        "cls",
+        "custom_op",
+        "runner",
+        "input_shapes",
+        "tuning_config",
+        "extras",
+    ):
+        raise RuntimeError(
+            "Unsupported FlashInfer cache-key builder; review the profile adapter."
+        )
+
+    @functools.wraps(original)
+    def profile_cache_key(
+        cls, custom_op, runner, input_shapes, tuning_config, extras=()
+    ):
+        key = original(cls, custom_op, runner, input_shapes, tuning_config, extras)
+        if isinstance(runner, runner_type):
+            return runner.cache_key_for_profile(key)
+        return key
+
+    tuner_type._get_cache_key = classmethod(profile_cache_key)
+
+
 def _require_runner_rebinding(namespace: dict) -> None:
     names = (
         "trtllm_fp4_block_scale_moe",
@@ -188,9 +218,9 @@ def _entrypoints():
     class TokenSpeedFP4MoERunner(core.TrtllmMoERunner):
         """Keep low-M MoE tile selection separate from upstream tuning caches."""
 
-        def _matches_qwen38_decode_shape(self, inputs):
+        def _matches_qwen38_decode_shape(self, num_tokens):
             return _is_qwen38_decode_shape(
-                num_tokens=MoeRunnerInputs.from_list(inputs).hidden_states.shape[0],
+                num_tokens=num_tokens,
                 top_k=self.top_k,
                 num_experts=self.num_experts,
                 num_local_experts=self.num_local_experts,
@@ -199,18 +229,21 @@ def _entrypoints():
                 nvfp4=self.dtype_weights == DtypeTrtllmGen.E2m1,
             )
 
-        def get_cache_key_extras(self, inputs):
-            extras = super().get_cache_key_extras(inputs)
-            if self._matches_qwen38_decode_shape(inputs):
-                return (*extras, "tokenspeed-qwen38-tile32-v1")
-            return extras
+        def cache_key_for_profile(self, key):
+            hidden_index = MoeRunnerInputs._FIELDS.index("hidden_states")
+            num_tokens = key.nearest_profile[hidden_index][0]
+            if self._matches_qwen38_decode_shape(num_tokens):
+                return replace(key, extras=(*key.extras, "tokenspeed-qwen38-tile32-v1"))
+            return key
 
         def get_valid_tactics(self, inputs, profile):
             tactics = super().get_valid_tactics(inputs, profile)
-            if self._matches_qwen38_decode_shape(inputs):
+            num_tokens = MoeRunnerInputs.from_list(inputs).hidden_states.shape[0]
+            if self._matches_qwen38_decode_shape(num_tokens):
                 return _prefer_qwen38_decode_tile_32(tactics)
             return tactics
 
+    _install_profile_cache_key(core.AutoTuner, TokenSpeedFP4MoERunner)
     namespace = dict(vars(core))
     namespace["TrtllmMoERunner"] = TokenSpeedFP4MoERunner
     namespace["gen_trtllm_gen_fused_moe_sm100_module"] = _routing_initialized_spec

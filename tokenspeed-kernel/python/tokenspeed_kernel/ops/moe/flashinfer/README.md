@@ -43,8 +43,17 @@ tile 32 for a profile, all native tactics remain available. Other models and
 larger token counts use the full tuner. Only the matching shape gets a separate
 tuning-cache key, so a previously cached tile-8 choice cannot bypass this
 policy without forcing unrelated shapes to retune. The adapter raises an error
-if FlashInfer removes either tuning hook or moves runner construction outside
-the cloned entrypoints.
+if FlashInfer removes either tuning hook, changes the cache-key builder
+signature, or moves runner construction outside the cloned entrypoints.
+
+The policy tag is derived from the target profile in the generated cache key.
+During autotuning this is the profile selected by `p.get_opt_shapes()`; during
+serving it is the bucket matched to the request. FlashInfer passes caller
+tensors when checking a profile, but synthesized tensors when storing its
+winner, so token-dependent tags must not be computed from those tensors. A
+scoped hook on FlashInfer's shared cache-key builder adjusts only the private
+runner's keys. Other runners, cache persistence and measurement remain
+unchanged. Different token profiles continue to store independent winners.
 
 This is a temporary workaround for FlashInfer 0.7's MoE tactic selection.
 Remove it when upstream tuning handles the full decode graph.

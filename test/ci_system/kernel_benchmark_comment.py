@@ -292,7 +292,11 @@ def _artifact_names(run_id: int, run_attempt: int) -> tuple[str, ...]:
     suffix = f"-{run_id}-{run_attempt}"
     return tuple(
         f"{prefix}{label}{suffix}"
-        for label in ("amd-mi35x-1gpu-test", "amd-mi355-1gpu-bench")
+        for label in (
+            "amd-mi350-1gpu-bench",
+            "amd-mi35x-1gpu-test",
+            "amd-mi355-1gpu-bench",
+        )
     )
 
 
