@@ -36,7 +36,9 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import os
 import re
+import shutil
 
 from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
     _clone,
@@ -120,6 +122,26 @@ def _relaxed_spec(*args, **kwargs):
     )
 
 
+def _require_jit_compiler() -> None:
+    """Raise unless FlashInfer's JIT can compile the private module.
+
+    The private module is not part of FlashInfer's AOT jit-cache, and FlashInfer
+    reuses a module from its JIT workspace only when ninja finds it up to date
+    with the current build, so a module built earlier does not count. This
+    checks what that build needs: JIT enabled, FlashInfer's CUDA home and its
+    nvcc. Nothing is generated or compiled here.
+    """
+    from flashinfer.jit import cpp_ext
+
+    if os.environ.get("FLASHINFER_DISABLE_JIT"):
+        raise RuntimeError("FLASHINFER_DISABLE_JIT is set")
+    # The compiler FlashInfer's generated build.ninja runs.
+    cuda_home = cpp_ext.get_cuda_path()
+    nvcc = os.environ.get("FLASHINFER_NVCC", f"{cuda_home}/bin/nvcc")
+    if shutil.which(nvcc) is None:
+        raise RuntimeError(f"FlashInfer's CUDA compiler {nvcc} is missing")
+
+
 @functools.cache
 def _entrypoints() -> dict:
     from flashinfer.fused_moe import core
@@ -154,8 +176,9 @@ def gated_ispp_alignment() -> int:
     """Intermediate-size multiple gated BF16 MoE needs on the installed FlashInfer.
 
     ``GATED_ISPP_ALIGNMENT`` when the private launcher applies to the installed
-    sources, otherwise the stock launcher's ``STOCK_ISPP_ALIGNMENT``. Only
-    reads the installed sources; nothing is compiled.
+    sources and FlashInfer's JIT can compile it, otherwise the stock launcher's
+    ``STOCK_ISPP_ALIGNMENT``. Decided once per process; only reads the
+    installed sources and FlashInfer's JIT settings, nothing is compiled.
     """
     try:
         from flashinfer.jit import env as jit_env
@@ -164,8 +187,10 @@ def gated_ispp_alignment() -> int:
             (jit_env.FLASHINFER_CSRC_DIR / _LAUNCHER).read_text()
         )
         _entrypoints()
+        _require_jit_compiler()
     # Called at kernel registration: any FlashInfer layout this adapter does
-    # not recognize keeps the stock launcher instead of failing the import.
+    # not recognize, or a private module FlashInfer cannot compile, keeps the
+    # stock launcher instead of failing the import or warmup.
     except Exception as error:
         logger.warning(
             "Gated BF16 TRT-LLM MoE keeps FlashInfer's multiple of %d: %s",
