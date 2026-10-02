@@ -112,15 +112,21 @@ def test_finalize_no_shared():
     or current_platform().arch_version != ArchVersion(10, 0),
     reason="routed trtllm MoE kernels need SM100",
 )
-def test_routed_deferred_finalize_matches_finalized():
+@pytest.mark.parametrize("num_tokens,enable_pdl", [(1, False), (33, True)])
+def test_routed_deferred_finalize_matches_finalized(
+    monkeypatch, num_tokens, enable_pdl
+):
     """trtllm routed unquant MoE: do_finalize=False + our fused finalize must
     reproduce do_finalize=True. Also proves the deferred gemm2 rows are
     un-weighted (the finalize applies the only weighting)."""
     import tokenspeed_kernel
+    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant
+
+    monkeypatch.setattr("tokenspeed_kernel.ops.moe.pdl_enabled", lambda: enable_pdl)
 
     torch.manual_seed(0)
     num_experts, top_k, hidden, inter = 16, 6, 256, 256
-    num_tokens, num_shared = 33, 2
+    num_shared = 2
 
     plan = tokenspeed_kernel.moe_plan(
         "unquant",
@@ -178,8 +184,35 @@ def test_routed_deferred_finalize_matches_finalized():
             do_finalize=do_finalize,
         )
 
-    finalized = apply(do_finalize=True)
+    finalized = apply(do_finalize=True).clone()
     gemm2_out, _, expanded_idx = apply(do_finalize=False)
+
+    # Compare the native unpacked route with the previous packed ABI using
+    # the same BF16 weights, including the strided shared-expert input.
+    native_apply = trtllm_unquant.trtllm_bf16_routed_moe
+
+    def packed_apply(**kwargs):
+        ids, weights = kwargs["topk_ids"]
+        assert ids.dtype == torch.int32 and ids.is_contiguous()
+        assert weights.dtype == torch.bfloat16 and weights.is_contiguous()
+        torch.testing.assert_close(weights, full_weights[:, :top_k].bfloat16())
+        kwargs["topk_ids"] = (ids << 16) | (weights.view(torch.int16).int() & 0xFFFF)
+        return native_apply(**kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(trtllm_unquant, "trtllm_bf16_routed_moe", packed_apply)
+        packed_finalized = apply(do_finalize=True)
+    torch.testing.assert_close(finalized, packed_finalized, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = apply(do_finalize=True)
+    original_weights = full_weights.clone()
+    full_weights.mul_(0.75)
+    graph.replay()
+    torch.testing.assert_close(replayed, apply(do_finalize=True), rtol=0, atol=0)
+    # Restore weights for the existing deferred-finalize comparison.
+    full_weights.copy_(original_weights)
 
     shared = torch.randn(
         num_shared, num_tokens, hidden, dtype=torch.bfloat16, device="cuda"
