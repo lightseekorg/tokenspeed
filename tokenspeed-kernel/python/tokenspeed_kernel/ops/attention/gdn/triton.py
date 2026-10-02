@@ -560,8 +560,8 @@ def _gdn_replay_commit_kernel(
     key_width: tl.constexpr = H * K
     value_width: tl.constexpr = HV * V
     payload_width: tl.constexpr = key_width + value_width + 2 * HV
-    layer_base = i_l * PAYLOAD_LAYER_STRIDE
-    request_base = layer_base + i_n * T * payload_width
+    layer_base = i_l.to(tl.int64) * PAYLOAD_LAYER_STRIDE
+    request_base = layer_base + i_n.to(tl.int64) * T * payload_width
     p_k = payload + request_base + i_h * K + o_k
     p_v = payload + request_base + key_width + i_hv * V + o_v
     p_a = payload + request_base + key_width + value_width + i_hv

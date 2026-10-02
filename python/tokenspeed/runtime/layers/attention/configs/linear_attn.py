@@ -144,3 +144,40 @@ class LinearAttnConfig(AttnComponentSpec):
             layer_ids=tuple(linear_layer_ids),
             tp_size=tp_size,
         )
+
+
+@dataclass(kw_only=True)
+class Mamba2Config(LinearAttnConfig):
+    """Linear-attention component of a Mamba2 (SSD) hybrid such as Nemotron-H.
+
+    The shared geometry maps as: ``num_k_heads`` = B/C groups,
+    ``head_k_dim`` = SSM state size, ``num_v_heads`` = Mamba heads and
+    ``head_v_dim`` = Mamba head dim. So ``conv_dim`` is the x/B/C conv width
+    and ``temporal_state_shape`` is the SSD state ``(heads, head_dim, d_state)``.
+    """
+
+    chunk_size: int
+    dt_limit: tuple[float, float]
+
+    @classmethod
+    def generate(
+        cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
+    ) -> Mamba2Config | None:
+        """Build the Mamba2 component, or None for a view without Mamba2 layers."""
+        del is_draft
+        text_config = model_config.hf_text_config
+        linear_layer_ids = text_config.linear_layer_ids
+        if not linear_layer_ids:
+            return None
+        low, high = text_config.time_step_limit
+        return cls(
+            num_k_heads=int(text_config.n_groups),
+            num_v_heads=int(text_config.mamba_num_heads),
+            head_k_dim=int(text_config.ssm_state_size),
+            head_v_dim=int(text_config.mamba_head_dim),
+            conv_kernel_size=int(text_config.conv_kernel),
+            layer_ids=tuple(linear_layer_ids),
+            tp_size=server_args.mapping.linear_attn.tp_size,
+            chunk_size=int(text_config.chunk_size),
+            dt_limit=(float(low), float(high)),
+        )

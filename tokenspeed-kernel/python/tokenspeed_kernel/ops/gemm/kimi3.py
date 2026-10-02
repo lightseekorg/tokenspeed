@@ -58,6 +58,16 @@ except ImportError:
         return False
 
 
+try:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        supports_gluon_mm_a16w16_decode_gfx950,
+    )
+except ImportError:
+
+    def supports_gluon_mm_a16w16_decode_gfx950(m: int, n: int, k: int) -> bool:
+        return False
+
+
 # FP8 storage dtypes served by the w8a8 projection branch (matches the
 # runtime quantization layers' width: e4m3fn on NVIDIA, e4m3fnuz on ROCm).
 _FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -92,10 +102,6 @@ def _use_gluon_mediumm(m: int, k: int, n: int) -> bool:
     if (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE):
         return 384 <= m <= 512 and m % 64 == 0
     return False
-
-
-def _use_gluon_smallm(m: int, k: int, n: int) -> bool:
-    return m in (2, 4) and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
 
 
 def _use_gluon_largem(m: int, k: int, n: int) -> bool:
@@ -370,8 +376,9 @@ def kimi3_latent_projection(
     ``solution='gluon_smallm'`` forces the split-K small-M gfx950 kernel,
     ``solution='gluon_mediumm'`` forces the middle-M gfx950 kernel, and
     ``solution='gluon_largem'`` forces the large-M gfx950 kernel. ``auto``
-    uses their measured gfx950 crossovers for canonical K3 shapes and retains
-    the vendor GEMM for other shapes and architectures.
+    uses their measured gfx950 crossovers for canonical K3 shapes, routes
+    decode batches through the ``decode_gemv`` registry, and retains the
+    vendor GEMM for other shapes and architectures.
     """
 
     m, n, k = _validate_fallback_projection(
@@ -403,8 +410,6 @@ def kimi3_latent_projection(
         autotune_bf16_gemm(hidden_states, weight)
         if Platform.get().is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
-        elif Platform.get().is_cdna4 and specialized and _use_gluon_smallm(m, k, n):
-            solution = "gluon_smallm"
         elif Platform.get().is_cdna4 and specialized and _use_gluon_mediumm(m, k, n):
             solution = "gluon_mediumm"
         elif Platform.get().is_cdna4 and specialized and _use_gluon_largem(m, k, n):
@@ -1485,7 +1490,15 @@ def kimi3_router_projection(
         name="Kimi K3 router projection",
         out_dtype=torch.float32,
     )
-    if solution not in {"auto", "ll_bf16", "cuda", "cublas", "triton_gemv", "torch"}:
+    if solution not in {
+        "auto",
+        "ll_bf16",
+        "cuda",
+        "cublas",
+        "triton_gemv",
+        "gluon_decode",
+        "torch",
+    }:
         raise ValueError(f"unknown Kimi K3 router solution {solution!r}")
     specialized = (
         hidden_states.is_cuda
@@ -1500,6 +1513,12 @@ def kimi3_router_projection(
         platform = Platform.get()
         if platform.is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
+        elif (
+            platform.is_cdna4
+            and specialized
+            and supports_gluon_mm_a16w16_decode_gfx950(m, output_width, input_width)
+        ):
+            solution = "gluon_decode"
         elif platform.is_hopper_plus and specialized:
             if _ll_bf16_usable(hidden_states, weight, m):
                 solution = "ll_bf16"
@@ -1545,6 +1564,20 @@ def kimi3_router_projection(
             out=out,
             config=((4, 1024, 4, 1) if m == 1 else (8, 256, 8, 1)),
             validate=False,
+        )
+    if solution == "gluon_decode":
+        if not specialized:
+            raise ValueError(
+                "Kimi K3 router Gluon decode GEMM requires contiguous gfx950 "
+                "BF16 [M, 7168] input and [896, 7168] weight"
+            )
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+            launch_gluon_mm_a16w16_decode_gfx950,
+        )
+
+        # FP32 accumulate and FP32 store, matching the other router paths.
+        return launch_gluon_mm_a16w16_decode_gfx950(
+            hidden_states, weight, torch.float32, out=out
         )
     if solution == "cuda":
         if not specialized:

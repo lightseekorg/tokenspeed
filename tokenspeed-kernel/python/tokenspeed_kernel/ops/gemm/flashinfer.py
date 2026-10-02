@@ -205,6 +205,225 @@ if gemm_fp8_nt_groupwise is not error_fn:
         return output
 
 
+# ---- FlashInfer MXFP8 (1,32) ue8m0, cute-dsl backend ---------------------
+
+mm_mxfp8 = error_fn
+
+if platform.is_nvidia and platform.is_blackwell:
+    try:
+        from tokenspeed_kernel.thirdparty.flashinfer.mxfp8 import mm_mxfp8
+    except ImportError:
+        pass
+
+_MXFP8_UE8M0_1X32_SCALE = ScaleFormat(
+    storage_dtype=torch.uint8,
+    granularity="block",
+    block_shape=(1, 32),
+)
+_MXFP8_FLOAT_1X32_SCALE = ScaleFormat(
+    storage_dtype=torch.float32,
+    granularity="block",
+    block_shape=(1, 32),
+)
+_MXFP8_1X32_FORMAT_SIGNATURES = frozenset(
+    format_signature(
+        a=tensor_format("mxfp8", _fp8_dtype, scale=a_scale),
+        b=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_UE8M0_1X32_SCALE),
+    )
+    for a_scale in (_MXFP8_FLOAT_1X32_SCALE, _MXFP8_UE8M0_1X32_SCALE)
+)
+
+
+def has_flashinfer_mxfp8() -> bool:
+    """Whether the flashinfer cute-dsl MXFP8 (1,32) GEMM is usable here.
+
+    Returns:
+        True when running on an NVIDIA Blackwell (SM10x) GPU with a
+        flashinfer build that provides ``mm_mxfp8``.
+    """
+    return mm_mxfp8 is not error_fn
+
+
+def swizzle_mxfp8_scale(sf: torch.Tensor, m: int, k: int) -> torch.Tensor:
+    m_tiles = (m + 127) // 128
+    k_tiles = (k + 127) // 128
+    padded = torch.zeros((m_tiles * 128, k_tiles * 4), dtype=sf.dtype, device=sf.device)
+    padded[:m, : k // 32] = sf
+    return padded.view(m_tiles, 4, 32, k_tiles, 4).transpose(1, 3).contiguous().view(-1)
+
+
+if mm_mxfp8 is not error_fn:
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="flashinfer_mm_mxfp8",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 7),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=_MXFP8_1X32_FORMAT_SIGNATURES,
+        traits={
+            "k_align": frozenset({32}),
+            "n_min": frozenset({128}),
+            "k_min": frozenset({128}),
+            "pdl_enabled": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED + 2,
+    )
+    def flashinfer_mm_mxfp8(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """MXFP8 (1,32)-block ue8m0 GEMM via flashinfer's cute-dsl backend.
+
+        Args:
+            A: ``[M, K]`` float8_e4m3fn activations.
+            B: ``[N, K]`` (or ``[K, N]`` column-major) float8_e4m3fn weight.
+            A_scales: uint8 e8m0 activation scales, either 1D in the
+                F8_128x4 swizzled layout or ``[M, K // 32]`` row-major
+                (re-swizzled per call; prefer pre-swizzled).
+            B_scales: uint8 e8m0 weight scales, same layout options with
+                ``[N, K // 32]`` row-major.
+            out_dtype: Output dtype (bf16/fp16).
+            alpha: Unused.
+            block_size: Must be ``[1, 32]``.
+            out: Optional output buffer.
+
+        Returns:
+            ``[M, N]`` tensor of ``out_dtype``.
+        """
+        assert (
+            A_scales is not None
+        ), "A_scales is required; online quantization should be done by the caller"
+        assert B_scales is not None, "B_scales is required for MXFP8 GEMM"
+        assert block_size == [1, 32], f"expected block_size [1, 32], got {block_size}"
+        k = A.shape[1]
+        # B follows the dispatch convention of a [N, K] weight (row-major,
+        # like the Triton kernel assumes); mm_mxfp8 wants the [K, N]
+        # column-major view. Shape alone cannot disambiguate square weights,
+        # so decide by memory layout.
+        if B.shape[0] == k and B.stride(0) == 1:
+            b = B
+        else:
+            b = B.t()
+        n = b.shape[1]
+        if k < 128 or k % 32 != 0 or n < 128:
+            raise ValueError(
+                f"flashinfer_mm_mxfp8 requires K >= 128, K % 32 == 0 and "
+                f"N >= 128, got K={k}, N={n}"
+            )
+        if A_scales.dtype != torch.uint8 or B_scales.dtype != torch.uint8:
+            raise ValueError(
+                "flashinfer_mm_mxfp8 requires uint8 e8m0 scales, got "
+                f"A_scales={A_scales.dtype}, B_scales={B_scales.dtype}"
+            )
+        if A_scales.dim() != 1:
+            A_scales = swizzle_mxfp8_scale(A_scales.contiguous(), A.shape[0], k)
+        if B_scales.dim() != 1:
+            B_scales = swizzle_mxfp8_scale(B_scales.contiguous(), n, k)
+        output = mm_mxfp8(
+            A,
+            b,
+            A_scales,
+            B_scales,
+            out_dtype=out_dtype,
+            backend="cute-dsl",
+        )
+        if out is not None:
+            out.copy_(output)
+            return out
+        return output
+
+
+# ---- FlashInfer per-tensor FP8 (cuBLASLt) -------------------------------
+
+_FP8_TENSOR_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
+bmm_fp8 = error_fn
+
+if platform.is_nvidia and platform.is_blackwell:
+    try:
+        from flashinfer import bmm_fp8
+    except ImportError:
+        pass
+
+if bmm_fp8 is not error_fn:
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="flashinfer_mm_fp8_tensor_scaled",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_TENSOR_SCALE
+        ),
+        # cuBLASLt reads B column-major: a transposed [N, K] weight.
+        traits={
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({False}),
+        },
+        priority=Priority.PERFORMANT + 3,
+    )
+    def flashinfer_mm_fp8_tensor_scaled(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Per-tensor scaled FP8 GEMM on FlashInfer's cuBLASLt backend.
+
+        Args:
+            A: ``[M, K]`` row-major FP8 activations.
+            B: ``[K, N]`` column-major FP8 weights (a transposed ``[N, K]``).
+            A_scales: One-element FP32 activation dequant scale.
+            B_scales: One-element FP32 weight dequant scale.
+            out_dtype: BF16 or FP16 output dtype.
+            alpha: Must be None; the per-tensor scales carry the dequant.
+            block_size: Must be None; the scales are per tensor.
+            out: Optional ``[M, N]`` output buffer.
+
+        Returns:
+            ``[M, N]`` output, ``out`` when given.
+        """
+        if alpha is not None or block_size is not None:
+            raise ValueError("per-tensor FP8 GEMM takes no alpha or block_size")
+        # cuBLASLt reads dense operands: row-major A and column-major B.
+        A = A.contiguous()
+        B = B.t().contiguous().t()
+        direct = out is not None and out.is_contiguous()
+        result = bmm_fp8(
+            A.unsqueeze(0),
+            B.unsqueeze(0),
+            A_scales,
+            B_scales,
+            out_dtype,
+            out=out.unsqueeze(0) if direct else None,
+            backend="cublas",
+        ).squeeze(0)
+        if out is None or direct:
+            return result
+        # cuBLASLt writes dense rows; a strided view gets a copy.
+        return out.copy_(result)
+
+
 # ---- FlashInfer FP4 -----------------------------------------------------
 
 mm_fp4 = error_fn
@@ -520,6 +739,14 @@ def flashinfer_joint_bf16_supported(
     )
 
 
+def _canonical_bf16_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Normalize singleton strides of an already-contiguous matrix without copying."""
+    strides = (tensor.shape[1], 1)
+    if tensor.stride() != strides:
+        return tensor.as_strided(tensor.shape, strides)
+    return tensor
+
+
 def flashinfer_bf16_gemm(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
@@ -542,12 +769,14 @@ def flashinfer_bf16_gemm(
     # WAR: the public auto heuristic excludes cute-dsl. Reuse the existing FI
     # dispatcher so eligible families enter one choose_one, including cache
     # lookup. A backend that cannot handle K must not exclude the other one.
+    # Contiguous singleton rows can retain a sliced tensor's larger row stride;
+    # FI's dynamic-M kernels require the canonical compact stride even at M=1.
     _fi_gemm.bf16_gemm_sm100(
-        a=x.detach(),
+        a=_canonical_bf16_view(x.detach()),
         b=weight.detach().t(),
         bias=None,
         pdl=pdl_enabled(),
-        out=out,
+        out=_canonical_bf16_view(out),
         workspace_buffer=workspace,
         runner_names=_bf16_gemm_runner_names(weight.shape[1]),
     )

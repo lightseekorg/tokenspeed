@@ -184,6 +184,59 @@ def test_cdna5_route_declines_unregistered_calls():
     not torch.cuda.is_available() or not _is_joint_fi_arch(),
     reason="Blackwell required",
 )
+def test_joint_fi_direct_singleton_strides(monkeypatch):
+    """A contiguous single-row slice must work with the dynamic-M Direct runner."""
+    from flashinfer.autotuner import AutoTuner
+    from tokenspeed_kernel.ops.gemm import flashinfer as fi_adapter
+
+    n, k = 6144, 1536
+    x = torch.randn(1, k + 64, device="cuda", dtype=torch.bfloat16)[:, 32:-32]
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    buffer = torch.full((1, n + 64), 42, device="cuda", dtype=torch.bfloat16)
+    out = buffer[:, 32:-32]
+    assert x.is_contiguous() and out.is_contiguous()
+    if not fi_adapter.flashinfer_joint_bf16_supported(x, weight, out):
+        pytest.skip("FI joint adapter unavailable")
+
+    def choose_direct(_name, runners, _config, _inputs):
+        return (
+            next(
+                runner
+                for runner in runners
+                if type(runner).__name__ == "CuteDSLDirectBf16Runner"
+            ),
+            -1,
+        )
+
+    # Exercise the runner that exposed the layout bug, independent of tuning noise.
+    monkeypatch.setattr(AutoTuner.get(), "choose_one", choose_direct)
+    assert fi_adapter.flashinfer_bf16_gemm(x, weight, out) is out
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fi_adapter.flashinfer_bf16_gemm(x, weight, out)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        fi_adapter.flashinfer_bf16_gemm(x, weight, out)
+    x.mul_(0.875)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    ref = x.float() @ weight.float().T
+    assert torch.isfinite(out).all()
+    assert (
+        torch.linalg.vector_norm(out.float() - ref) / torch.linalg.vector_norm(ref)
+        < 0.01
+    )
+    assert torch.all(buffer[:, :32] == 42)
+    assert torch.all(buffer[:, -32:] == 42)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_joint_fi_arch(),
+    reason="Blackwell required",
+)
 @pytest.mark.parametrize(
     "n,k,expected_runners",
     [
