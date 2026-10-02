@@ -27,6 +27,7 @@ until the HCA/CSA cache kernels are wired into TokenSpeed.
 
 from __future__ import annotations
 
+import functools
 import gc
 import re
 from collections.abc import Iterable
@@ -125,7 +126,12 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
-from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopK, TopKOutput
+from tokenspeed.runtime.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutput,
+    simulated_router_logits,
+)
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
     get_all2all_backend,
@@ -1558,6 +1564,16 @@ class DeepseekV4MLP(nn.Module):
         return out
 
 
+def _random_expert_ids(
+    param: torch.Tensor, generator: torch.Generator, num_experts: int
+) -> None:
+    """Give each token distinct experts, chosen uniformly at random."""
+    scores = torch.rand(
+        param.shape[0], num_experts, generator=generator, device=param.device
+    )
+    param.data.copy_(scores.topk(param.shape[1], dim=1).indices)
+
+
 class DeepseekV4MoEGate(nn.Module):
     def __init__(
         self,
@@ -1578,6 +1594,9 @@ class DeepseekV4MoEGate(nn.Module):
                     dtype=hash_indices_dtype,
                 ),
                 requires_grad=False,
+            )
+            self.tid2eid.dummy_initializer = functools.partial(
+                _random_expert_ids, num_experts=config.n_routed_experts
             )
             self.e_score_correction_bias = None
         elif getattr(config, "topk_method", None) == "noaux_tc":
@@ -1627,6 +1646,8 @@ class DeepseekV4TopK(TopK):
             if routing_correction_bias is None
             else routing_correction_bias
         )
+        if self.simulate_routing:
+            router_logits = simulated_router_logits(router_logits)
         topk_weights, topk_ids = moe_topk(
             router_logits,
             self.topk_config.top_k,

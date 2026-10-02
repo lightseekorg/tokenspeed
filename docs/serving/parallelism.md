@@ -292,6 +292,38 @@ Apply the same NCCL transport and channel settings on every node as well. In
 particular, do not mix IB and Socket selection or different
 `NCCL_MIN_NCHANNELS` / `NCCL_MAX_NCHANNELS` values across ranks.
 
+## Emulating Rank 0 on One GPU
+
+`--emulate-rank-zero` runs only global rank 0 of the configured layout, so the
+per-rank work of a multi-GPU deployment can be profiled on a single GPU:
+
+```bash
+tokenspeed serve <model> --tp 8 --emulate-rank-zero --load-format dummy
+```
+
+The layout resolves as usual (TP8 here), so the rank builds the weight shards,
+kernels and cache sizing rank 0 of the full deployment would. Its collectives
+are local stand-ins that return the real shapes and dtypes, filled from this
+rank's operand alone.
+
+Compared with the real rank:
+
+- Communication takes no time, and the fused all-reduce paths are off because
+  they need peers; their epilogues run as separate kernels.
+- Values after a reduction are this rank's partial results, so outputs are not
+  meaningful and data-dependent work such as MoE routing follows the emulated
+  values.
+
+The flag is often combined with `--load-format dummy`, which reads only the
+model's config and tokenizer, not its weights. With dummy weights, also set
+`TOKENSPEED_MOE_ROUTING_SIMULATION=uniform` so tokens spread over experts
+instead of all picking the same ones, and, with speculative decoding, set
+`TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN` to the `avg_accept_len` of a real run.
+
+The flag is currently supported on AMD GPUs, on one node, without pipeline,
+context or attention data parallelism, PD disaggregation, fused all-reduce or
+an `--all2all-backend` transport.
+
 ## Runtime Notes
 
 Overlap scheduling can prepare the next forward on the CPU while the previous

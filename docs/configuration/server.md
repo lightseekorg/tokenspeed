@@ -158,6 +158,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--nnodes` | Number of nodes. |
 | `--node-rank` | Rank of the current node. |
 | `--dist-init-addr` | Distributed initialization address. |
+| `--emulate-rank-zero` | Run only global rank 0 of the configured layout on one GPU, with local stand-ins for its collectives. For single-GPU performance work; outputs are not meaningful. See [Emulating Rank 0 on One GPU](../serving/parallelism.md#emulating-rank-0-on-one-gpu). |
 
 Use `--tensor-parallel-size` for simple launches. Use the
 TokenSpeed-specific split knobs when attention, dense, and MoE layers need
