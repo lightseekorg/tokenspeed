@@ -301,7 +301,7 @@ meaningful manual comparison, use `K8s Dispatch`: selecting a pull request uses
 its target and head revisions, while selecting a commit compares it with the
 latest `main`. Both revisions always execute serially in one task allocation.
 
-The task requests the ci-infra-managed `amd-mi35x-1gpu-test` runner pool and
+The task requests the ci-infra-managed `amd-mi350-1gpu-bench` runner pool and
 exposes logical device 0. Each allocation must provide one `gfx950` GPU,
 working ROCm device permissions, Git, Bash, Python virtual-environment support,
 sufficient temporary storage, and access to the configured package indexes. The normal AMD

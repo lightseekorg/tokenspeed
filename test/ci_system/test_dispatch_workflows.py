@@ -296,7 +296,7 @@ def test_kernel_benchmark_task_uses_shared_ci_contract():
     assert task["type"] == "perf"
     assert task["workflow_stage"] == "kernel-benchmark"
     assert task["triggers"] == ["per-commit", "manual"]
-    assert task["runner"]["labels"] == ["amd-mi35x-1gpu-test"]
+    assert task["runner"]["labels"] == ["amd-mi350-1gpu-bench"]
     assert task["env"]["TOKENSPEED_KERNEL_BENCHMARK_PROFILER"] == "none"
     assert ".ci-artifacts/published" in task["perf"]["command"]
     for variable in ("BASE_REF", "CANDIDATE_REF", "PR_NUMBER", "MERGE_SHA"):

@@ -7,7 +7,7 @@ triggers:
   - manual
 runner:
   labels:
-    - amd-mi35x-1gpu-test
+    - amd-mi350-1gpu-bench
 env:
   CI: "true"
 install:
@@ -37,7 +37,7 @@ perf:
     MODEL=amd/gpt-oss-120b-w-mxfp4-a-fp8 &&
     URL=http://127.0.0.1:21000/v1/completions &&
     GPU_LABEL=${CI_RUNNER_LABEL#amd-} &&
-    GPU_LABEL=${GPU_LABEL%-1gpu-test} &&
+    GPU_LABEL=${GPU_LABEL%-1gpu-bench} &&
     OUTPUTS_DIR=/tmp/tokenspeed-gpt-oss-${GPU_LABEL}-perf &&
     TOKENIZER_PATH="$OUTPUTS_DIR/tokenizer" &&
     trap 'rm -rf "$OUTPUTS_DIR"' EXIT &&
