@@ -312,7 +312,7 @@ mm_mxfp8 = error_fn
 
 if platform.is_nvidia and platform.is_blackwell:
     try:
-        from flashinfer.gemm import mm_mxfp8
+        from tokenspeed_kernel.thirdparty.flashinfer.mxfp8 import mm_mxfp8
     except ImportError:
         pass
 
