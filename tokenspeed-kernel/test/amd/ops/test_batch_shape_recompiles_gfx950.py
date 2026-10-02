@@ -363,3 +363,48 @@ def test_kda_fused_replay_batch_size():
     with assert_no_triton_compile(decode.gluon_kda_fused_replay_gfx950):
         for batch in (5, 7, 11, 13, 15):
             compile_for(batch)
+
+
+def test_kda_fused_decode_batch_size():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda import decode
+
+    heads, head_dim, pages = 12, 128, 96
+    width = heads * head_dim
+    # Q/K/V, output gate, f_a, and beta are column slices of one projection.
+    packed = torch.randn(48, 4 * width + head_dim + heads, device=DEVICE).bfloat16()
+    conv_weights = torch.randn(3 * width, 4, device=DEVICE).bfloat16()
+    conv_states = torch.zeros(pages, 3 * width, 3, device=DEVICE).bfloat16()
+    f_b_weight = torch.randn(width, head_dim, device=DEVICE).bfloat16()
+    state_pool = torch.zeros(pages, heads, head_dim, head_dim, device=DEVICE)
+
+    def run(batch):
+        rows = packed[:batch]
+        decode.gluon_kda_fused_decode_gfx950(
+            mixed_qkv=rows[:, : 3 * width],
+            conv_weights=conv_weights,
+            conv_states=conv_states,
+            f_a_out=rows[:, 4 * width : 4 * width + head_dim],
+            f_b_weight=f_b_weight,
+            beta_logits=rows[:, 4 * width + head_dim :],
+            A_log=torch.zeros(heads, device=DEVICE),
+            dt_bias=torch.zeros(width, device=DEVICE),
+            output_gate=rows[:, 3 * width : 4 * width],
+            norm_weight=torch.ones(head_dim, device=DEVICE).bfloat16(),
+            norm_eps=1e-6,
+            state_pool=state_pool,
+            read_indices=torch.arange(batch, device=DEVICE, dtype=torch.int32),
+            write_indices=torch.arange(
+                batch, 2 * batch, device=DEVICE, dtype=torch.int32
+            ),
+            num_heads=heads,
+            head_dim=head_dim,
+            cu_seqlens=torch.arange(batch + 1, device=DEVICE, dtype=torch.int32),
+            lower_bound=-5.0,
+        )
+
+    # The state pipeline depth is bucketed by programs per CU.
+    for batch in (16, 32, 48):
+        run(batch)
+    with assert_no_triton_compile(decode.gluon_kda_fused_paged_decode_vmajor_gfx950):
+        for batch in (1, 3, 7, 21, 22, 33, 42, 43, 47):
+            run(batch)

@@ -107,19 +107,7 @@ def test_qwen38_decode_tactic_filter_accepts_ffi_arrays():
     assert _prefer_qwen38_decode_tile_32(without_tile_32) is without_tile_32
 
 
-@pytest.mark.parametrize(
-    ("num_tokens", "hidden_size", "weight_dtype", "targeted"),
-    [
-        (4, 2560, "E2m1", True),
-        (32, 2560, "E2m1", True),
-        (33, 2560, "E2m1", False),
-        (4, 4096, "E2m1", False),
-        (4, 2560, "Bfloat16", False),
-    ],
-)
-def test_tactic_cache_key_changes_only_for_target_shape(
-    num_tokens, hidden_size, weight_dtype, targeted
-):
+def _moe_runner_and_inputs(num_tokens, hidden_size, weight_dtype):
     core = pytest.importorskip("flashinfer.fused_moe.core")
     inputs_module = pytest.importorskip("flashinfer.fused_moe.shared.inputs")
     enums = pytest.importorskip("flashinfer.tllm_enums")
@@ -144,15 +132,126 @@ def test_tactic_cache_key_changes_only_for_target_shape(
     inputs = [None] * len(inputs_module.MoeRunnerInputs._FIELDS)
     hidden_index = inputs_module.MoeRunnerInputs._FIELDS.index("hidden_states")
     inputs[hidden_index] = torch.empty((num_tokens, hidden_size))
+    return core, runner, inputs, tactics, hidden_index
 
-    upstream_key = core.TrtllmMoERunner.get_cache_key_extras(runner, inputs)
-    actual_key = runner.get_cache_key_extras(inputs)
+
+def _input_shapes(inputs):
+    return tuple(tuple(tensor.shape) if tensor is not None else () for tensor in inputs)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size", "weight_dtype", "targeted"),
+    [
+        (4, 2560, "E2m1", True),
+        (32, 2560, "E2m1", True),
+        (33, 2560, "E2m1", False),
+        (4, 4096, "E2m1", False),
+        (4, 2560, "Bfloat16", False),
+    ],
+)
+def test_tactic_cache_key_changes_only_for_target_shape(
+    num_tokens, hidden_size, weight_dtype, targeted
+):
+    core, runner, inputs, tactics, _ = _moe_runner_and_inputs(
+        num_tokens, hidden_size, weight_dtype
+    )
+    autotuner = pytest.importorskip("flashinfer.autotuner")
+    upstream_extras = core.TrtllmMoERunner.get_cache_key_extras(runner, inputs)
+    # Tensor properties stay invariant; the target profile adds the policy tag.
+    assert runner.get_cache_key_extras(inputs) == upstream_extras
+    key = core.AutoTuner._get_cache_key(
+        "test_moe",
+        runner,
+        _input_shapes(inputs),
+        autotuner.TuningConfig(),
+        upstream_extras,
+    )
     if targeted:
-        assert actual_key == (*upstream_key, "tokenspeed-qwen38-tile32-v1")
+        assert key.extras == (*upstream_extras, "tokenspeed-qwen38-tile32-v1")
         assert runner.get_valid_tactics(inputs, None) == [tactics[1]]
     else:
-        assert actual_key == upstream_key
+        assert key.extras == upstream_extras
         assert runner.get_valid_tactics(inputs, None) is tactics
+
+
+@pytest.mark.parametrize(
+    "caller_tokens,profile_tokens", [(4, 64), (8192, 1), (8192, 32)]
+)
+def test_profile_cache_lookup_matches_stored_winner(caller_tokens, profile_tokens):
+    core, runner, caller_inputs, tactics, hidden_index = _moe_runner_and_inputs(
+        caller_tokens, 2560, "E2m1"
+    )
+    autotuner = pytest.importorskip("flashinfer.autotuner")
+    profile_inputs = list(caller_inputs)
+    profile_inputs[hidden_index] = torch.empty((profile_tokens, 2560))
+    profile_shapes = _input_shapes(profile_inputs)
+    config = autotuner.TuningConfig()
+    tuner = core.AutoTuner()
+    stored = core.AutoTuner._get_cache_key(
+        "test_moe",
+        runner,
+        profile_shapes,
+        config,
+        runner.get_cache_key_extras(profile_inputs),
+    )
+    winner = tactics[1] if profile_tokens <= 32 else tactics[0]
+    tuner.profiling_cache[stored] = (winner, None)
+    # This is choose_one's lookup: target profile shapes plus caller tensors.
+    hit, _, actual, _ = tuner.search_cache(
+        "test_moe", [runner], profile_shapes, config, inputs=caller_inputs
+    )
+    assert hit
+    assert actual is winner
+    assert ("tokenspeed-qwen38-tile32-v1" in stored.extras) == (profile_tokens <= 32)
+    other = core.AutoTuner._get_cache_key(
+        "test_moe",
+        runner,
+        _input_shapes(caller_inputs),
+        config,
+        runner.get_cache_key_extras(caller_inputs),
+    )
+    assert stored != other  # Different token profiles still select independently.
+
+
+def test_serving_lookup_uses_mapped_profile_for_policy_tag():
+    core, runner, inputs, _, hidden_index = _moe_runner_and_inputs(33, 2560, "E2m1")
+    autotuner = pytest.importorskip("flashinfer.autotuner")
+    config = autotuner.TuningConfig(
+        dynamic_tensor_specs=(
+            autotuner.DynamicTensorSpec(
+                input_idx=(hidden_index,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(32, 64),
+                map_to_tuning_buckets=lambda tokens: 32,
+            ),
+        )
+    )
+    key = core.AutoTuner._get_cache_key(
+        "test_moe",
+        runner,
+        _input_shapes(inputs),
+        config,
+        runner.get_cache_key_extras(inputs),
+    )
+    assert key.nearest_profile[hidden_index][0] == 32
+    assert key.extras[-1] == "tokenspeed-qwen38-tile32-v1"
+
+
+def test_cache_key_hook_preserves_stock_runner_keys():
+    core = pytest.importorskip("flashinfer.fused_moe.core")
+    autotuner = pytest.importorskip("flashinfer.autotuner")
+    stock_runner = object()
+    shapes = ((4, 2560),)
+    config = autotuner.TuningConfig()
+    expected = core.AutoTuner._get_cache_key(
+        "test_stock", stock_runner, shapes, config, ("explicit-extra",)
+    )
+    _entrypoints()
+    actual = core.AutoTuner._get_cache_key(
+        "test_stock", stock_runner, shapes, config, ("explicit-extra",)
+    )
+    assert actual == expected
+    assert actual.extras == ("explicit-extra",)
 
 
 def test_tactic_hooks_must_exist_on_upstream_runner():

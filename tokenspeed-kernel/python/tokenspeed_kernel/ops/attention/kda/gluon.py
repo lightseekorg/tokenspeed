@@ -184,15 +184,15 @@ if current_platform().is_amd:
         norm_weight: torch.Tensor | None,
         norm_eps: float | None,
     ):
-        """Run the decay projection and V-major gfx950 fused decode."""
+        """Run V-major gfx950 fused decode, decay projection included."""
         if output_gate is None or norm_weight is None or norm_eps is None:
             raise ValueError("gfx950 fused KDA decode requires output normalization")
-        raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
         return _kda_fused_decode_impl(
             mixed_qkv=mixed_qkv,
             conv_weights=conv_weights,
             conv_states=conv_states,
-            raw_g=raw_g,
+            f_a_out=f_a_out,
+            f_b_weight=f_b_weight,
             beta_logits=beta_logits,
             A_log=A_log,
             dt_bias=dt_bias,

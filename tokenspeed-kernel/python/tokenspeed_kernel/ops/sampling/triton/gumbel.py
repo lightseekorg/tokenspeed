@@ -57,7 +57,7 @@ def _gumbel_sample_pool_stage1_kernel(
     pool_idx = tl.load(req_pool_indices_ptr + req_row)
 
     logits = tl.load(
-        logits_ptr + row * logits_row_stride + token_offsets,
+        logits_ptr + row.to(tl.int64) * logits_row_stride + token_offsets,
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
@@ -142,7 +142,7 @@ def _gumbel_sample_compact_pool_kernel(
         cols = start + token_offsets
         mask = cols < vocab_size
         logits = tl.load(
-            logits_ptr + row * logits_row_stride + cols,
+            logits_ptr + row.to(tl.int64) * logits_row_stride + cols,
             mask=mask,
             other=float("-inf"),
         ).to(tl.float32)

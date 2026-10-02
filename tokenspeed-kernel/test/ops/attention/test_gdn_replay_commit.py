@@ -500,3 +500,51 @@ def test_gdn_replay_commit_batch_heads_exceed_grid_z_limit(device: str, require)
     _replay(k, v, a, b, A_log, dt_bias, pool, read, write, accepted)
 
     torch.testing.assert_close(pool[write.long()], expected, rtol=2e-2, atol=3e-2)
+
+
+def test_gdn_replay_commit_layer_offsets_beyond_int32(device: str, require):
+    """Qwen3.8 TP1 payload [48 layers, 88 x 64 rows, 8288]: the last layer's base
+    is past 2**31 elements and must commit like a payload holding only it."""
+    require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
+    L, H, HV, K, V, T, B, rows = 48, 16, 48, 128, 128, 64, 2, 88 * 64
+    width = H * K + HV * V + 2 * HV
+    assert (L - 1) * rows * width > 2**31
+    gen = torch.Generator(device=device).manual_seed(0)
+    payload = torch.empty(L, rows, width, dtype=torch.bfloat16, device=device)
+    payload[:, : B * T] = torch.randn(
+        L, B * T, width, generator=gen, device=device
+    ).bfloat16()
+    parameters = torch.randn(L, 2, HV, generator=gen, device=device)
+    pools = torch.randn(L, 4, HV, V, K, generator=gen, device=device) * 0.1
+    initial = pools.clone()
+
+    def commit(payload, parameters, pools):
+        layers = payload.shape[0]
+        gdn_replay_commit(
+            payload,
+            parameters,
+            state_addresses=torch.tensor(
+                [pools[i].data_ptr() for i in range(layers)],
+                dtype=torch.uint64,
+                device=device,
+            ),
+            state_row_strides=torch.full(
+                (layers,), HV * V * K, dtype=torch.int64, device=device
+            ),
+            read_indices=torch.tensor(
+                [[0, 1]] * layers, dtype=torch.int32, device=device
+            ),
+            write_indices=torch.tensor(
+                [[2, 3]] * layers, dtype=torch.int32, device=device
+            ),
+            accepted_length=torch.tensor([5, 7], dtype=torch.int32, device=device),
+            draft_token_num=T,
+            geometry=(H, HV, K, V),
+            state_dtype=torch.float32,
+            solution="triton",
+        )
+
+    commit(payload, parameters, pools)
+    last = initial[L - 1 :].clone()
+    commit(payload[L - 1 :, : B * T].contiguous(), parameters[L - 1 :], last)
+    assert torch.equal(pools[L - 1, 2:4], last[0, 2:4])
