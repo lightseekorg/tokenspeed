@@ -110,13 +110,60 @@ def test_trtllm_ispp_padding_noop_for_other_backends(monkeypatch):
 def test_unquant_padding_follows_the_trtllm_kernel_alignment(
     monkeypatch, activation, kernel_alignment, ispp, planned
 ):
+    monkeypatch.setattr(expert_mod, "TRTLLM_UNQUANT_ISPP_ALIGNMENT", kernel_alignment)
+    assert _planned_unquant_ispp(monkeypatch, activation, ispp) == planned
+
+
+@pytest.mark.parametrize("nvcc, planned", [(False, 256), (True, 192)])
+def test_unquant_padding_keeps_128_when_flashinfer_cannot_build_the_launcher(
+    monkeypatch, tmp_path, nvcc, planned
+):
+    adapter = pytest.importorskip(
+        "tokenspeed_kernel.thirdparty.flashinfer.trtllm_bf16_moe"
+    )
+    cpp_ext = pytest.importorskip("flashinfer.jit.cpp_ext")
+    # FlashInfer's CUDA home, with or without its nvcc.
+    cuda_home = tmp_path / "cuda"
+    (cuda_home / "bin").mkdir(parents=True)
+    if nvcc:
+        (cuda_home / "bin" / "nvcc").write_text("#!/bin/sh\n")
+        (cuda_home / "bin" / "nvcc").chmod(0o755)
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: str(cuda_home))
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC", raising=False)
+    adapter.gated_ispp_alignment.cache_clear()
+    try:
+        alignment = adapter.gated_ispp_alignment()
+    finally:
+        adapter.gated_ispp_alignment.cache_clear()
+    # MoELayer pads to the alignment the kernels registered with at import.
+    monkeypatch.setattr(expert_mod, "TRTLLM_UNQUANT_ISPP_ALIGNMENT", alignment)
+    assert _planned_unquant_ispp(monkeypatch, "silu", 192) == planned
+
+
+def test_unquant_padding_uses_the_registered_trtllm_alignment():
+    unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant")
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    alignment = expert_mod.TRTLLM_UNQUANT_ISPP_ALIGNMENT
+    assert alignment == unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT
+    for name in (
+        "flashinfer_trtllm_unquant_moe_apply",
+        "flashinfer_trtllm_unquant_routed_moe_apply",
+    ):
+        spec = KernelRegistry.get().get_by_name(name)
+        if spec is not None:
+            assert spec.traits["ispp_alignment"] == frozenset({alignment})
+
+
+def _planned_unquant_ispp(monkeypatch, activation: str, ispp: int) -> int:
+    """Per-rank intermediate size a BF16 MoELayer plans under flashinfer_trtllm."""
     plans = []
     monkeypatch.setattr(
         expert_mod,
         "get_moe_backend",
         lambda: SimpleNamespace(value="flashinfer_trtllm"),
     )
-    monkeypatch.setattr(expert_mod, "TRTLLM_UNQUANT_ISPP_ALIGNMENT", kernel_alignment)
     monkeypatch.setattr(
         expert_mod.tokenspeed_kernel,
         "moe_plan",
@@ -139,5 +186,5 @@ def test_unquant_padding_follows_the_trtllm_kernel_alignment(
         activation=activation,
         activation_situ_beta=1.0 if activation == "situ" else None,
     )
-
-    assert [plan["ispp"] for plan in plans] == [planned]
+    (plan,) = plans
+    return plan["ispp"]
