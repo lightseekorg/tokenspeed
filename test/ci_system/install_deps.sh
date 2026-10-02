@@ -92,9 +92,9 @@ apt_install_with_retry() {
 }
 
 ensure_flashinfer_jit_cache() {
-    # GB200 and B200 runner images preinstall flashinfer-jit-cache; it must
+    # Blackwell runner images preinstall flashinfer-jit-cache; it must
     # match the flashinfer-python pin exactly or flashinfer refuses to import.
-    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != b200* && "${CI_RUNNER_LABEL:-}" != slurm-gb200-* ]]; then
+    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != gb300* && "${CI_RUNNER_LABEL:-}" != b200* && "${CI_RUNNER_LABEL:-}" != slurm-gb200-* && "${CI_RUNNER_LABEL:-}" != slurm-gb300-* ]]; then
         return 0
     fi
 
@@ -161,9 +161,9 @@ python3 -m pip install --upgrade --ignore-installed --break-system-packages \
     pip setuptools wheel
 
 # ============================================================
-# Step 3: Sync FlashInfer JIT cache on GB200/B200
+# Step 3: Sync FlashInfer JIT cache on Blackwell runners
 # ============================================================
-echo "=== Step 3: Sync FlashInfer JIT cache on GB200/B200 ==="
+echo "=== Step 3: Sync FlashInfer JIT cache on Blackwell runners ==="
 ensure_flashinfer_jit_cache
 
 # ============================================================
@@ -350,7 +350,9 @@ expected_cuda = f"{sys.argv[3][:-1]}.{sys.argv[3][-1]}"
 print(f"Torch CUDA runtime: {torch.version.cuda}", flush=True)
 if torch.version.cuda != expected_cuda:
     raise SystemExit(f"Expected Torch CUDA {expected_cuda}, got {torch.version.cuda}")
-if os.environ.get("CI_RUNNER_LABEL", "").startswith(("gb200", "b200", "slurm-gb200-")):
+if os.environ.get("CI_RUNNER_LABEL", "").startswith(
+    ("gb200", "gb300", "b200", "slurm-gb200-", "slurm-gb300-")
+):
     url, expected, installed = install_url_if_needed(Path(sys.argv[1]), sys.argv[3])
     print(f"Installed flashinfer-jit-cache=={installed}", flush=True)
     if url is not None:

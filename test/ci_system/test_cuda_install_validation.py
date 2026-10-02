@@ -127,8 +127,9 @@ def test_cuda_install_rejects_final_flashinfer_version_drift(installed_stack, na
         exec(script, {})
 
 
-def test_cuda_install_rejects_missing_jit_provider(installed_stack):
+def test_cuda_install_rejects_missing_jit_provider(installed_stack, monkeypatch):
     script, _, versions = installed_stack
+    monkeypatch.setenv("CI_RUNNER_LABEL", "slurm-gb300-8gpu")
     del versions["flashinfer-jit-cache-sm100a"]
     with pytest.raises(SystemExit, match="JIT cache or providers do not match"):
         exec(script, {})
