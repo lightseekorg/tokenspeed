@@ -81,25 +81,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 ]
 
 
-def warmup_prepared_fp8_linears(model: torch.nn.Module, max_tokens: int) -> None:
-    """Warm the backend implementations prepared by block-FP8 linear layers."""
-    plans: list[object] = []
-    for module in model.modules():
-        quant_method = getattr(module, "quant_method", None)
-        if quant_method is None:
-            continue
-        prepared_linear_plan = getattr(quant_method, "prepared_linear_plan", None)
-        if prepared_linear_plan is None:
-            continue
-        plan = prepared_linear_plan(module)
-        if plan is not None:
-            plans.append(plan)
-
-    from tokenspeed_kernel import warmup_prepared_fp8_linears as warmup
-
-    warmup(plans, max_tokens)
-
-
 def adjust_marlin_shard(param, shard_size, shard_offset):
     marlin_tile_size = getattr(param, "marlin_tile_size", None)
     if marlin_tile_size is None:

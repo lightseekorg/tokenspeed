@@ -80,7 +80,7 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     rope_pad_query,
 )
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32, grouped_bf16_projection
-from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -169,7 +169,7 @@ def v41_quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             "V4.1 FP8 activations require a last dimension divisible by 32"
         )
     if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16):
-        return quantize_fp8_with_scale(
+        return quantize_fp8(
             x.reshape(-1, x.shape[-1]),
             granularity="token_group",
             group_size=32,
@@ -240,19 +240,7 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     ) -> torch.Tensor:
         if x.shape[0] == 0:
             return x.new_empty((*x.shape[:-1], layer.weight.shape[0]))
-        plan = getattr(layer, "_prepared_fp8_linear", None)
-        if (
-            x.is_cuda
-            and x.dtype in (torch.bfloat16, torch.float16)
-            and plan is not None
-        ):
-            from tokenspeed_kernel.ops.gemm import quantize_fp8_group32_for_linear
-
-            codes, scales = quantize_fp8_group32_for_linear(
-                plan, x.reshape(-1, x.shape[-1])
-            )
-        else:
-            codes, scales = v41_quantize_fp8(x)
+        codes, scales = v41_quantize_fp8(x)
         return super().apply(layer, codes, bias, scales, x.dtype)
 
     def apply_with_activation(

@@ -32,7 +32,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
-from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import Mamba2Config
@@ -588,7 +588,7 @@ def test_gated_norm_quantizes_for_a_static_fp8_out_proj():
     )
 
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
-    expected, _ = static_quant_fp8(out, scale)
+    expected, _ = quantize_fp8(out, scale=scale)
     assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
 
 
@@ -618,7 +618,7 @@ def test_add_norm_folds_both_moe_halves_into_the_residual(with_fp8: bool):
     torch.testing.assert_close(normed.float(), ref, atol=2e-2, rtol=2e-2)
     assert (normed_fp8 is not None) == with_fp8
     if with_fp8:
-        expected, _ = static_quant_fp8(normed, scale)
+        expected, _ = quantize_fp8(normed, scale=scale)
         assert torch.equal(normed_fp8.view(torch.uint8), expected.view(torch.uint8))
 
 
@@ -1039,7 +1039,7 @@ def test_static_per_tensor_checkpoint_runs_a_merged_projection(
     assert error.item() < 1e-2
 
     # A producer that already quantized with the layer's scale gets the same GEMM.
-    x_prequantized, _ = static_quant_fp8(x, layer.input_scale)
+    x_prequantized, _ = quantize_fp8(x, scale=layer.input_scale)
     out_prequantized = method.apply(layer, x_prequantized)
     assert out_prequantized.dtype == torch.bfloat16
     assert torch.equal(out_prequantized, out)

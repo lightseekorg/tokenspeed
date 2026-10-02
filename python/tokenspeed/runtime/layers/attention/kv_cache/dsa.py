@@ -24,7 +24,7 @@ from typing import ClassVar
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
-from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 from tokenspeed.runtime.layers.attention.kv_cache.mla import (
     MLATokenToKVPool,
@@ -69,7 +69,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_k = index_k.to(self.model_dtype)
         index_k = index_k.view(-1, self.index_head_dim)
         buf = self.index_k_buffer[layer_id]
-        index_k_fp8, index_k_scale = quantize_fp8_with_scale(
+        index_k_fp8, index_k_scale = quantize_fp8(
             index_k,
             granularity="token_group",
             group_size=_INDEX_K_FP8_GROUP_SIZE,

@@ -128,82 +128,8 @@ def has_flashinfer_fp8_blockscale() -> bool:
     return gemm_fp8_nt_groupwise is not error_fn and platform.is_blackwell
 
 
-# Past ~224 rows (GB300, K=7168) padding M costs more than the transpose it saves.
-_PREPACKED_PAD_TOKEN_LIMIT = 256
-
-
-def use_flashinfer_fp8_blockscale_prepacked(num_tokens: int) -> bool:
-    """Whether MN-major prepacked scales beat canonical scales for this M.
-
-    Args:
-        num_tokens: Row count ``M`` of the activation matrix.
-
-    Returns:
-        True when the prepared MN-major path avoids more work than it adds.
-        Row counts that are already a multiple of four need no padding at all,
-        so the quantizer's native output is used as-is.
-    """
-    return num_tokens % 4 == 0 or num_tokens <= _PREPACKED_PAD_TOKEN_LIMIT
-
-
-def prepare_flashinfer_fp8_blockscale_weight_scales(
-    scales: torch.Tensor,
-) -> torch.Tensor:
-    """Pack canonical weight scales into FlashInfer's MN-major layout.
-
-    Args:
-        scales: Contiguous canonical scales shaped ``[N / 128, K / 128]``.
-
-    Returns:
-        A contiguous tensor shaped ``[K / 128, N / 128]``. This conversion is
-        intended to run once after weight loading rather than in every GEMM.
-    """
-    if scales.ndim != 2:
-        raise ValueError(f"weight scales must be 2-D, got shape {tuple(scales.shape)}")
-    if scales.dtype != torch.float32:
-        raise ValueError(
-            "FlashInfer FP8 block-scale weight scales must use float32, "
-            f"got {scales.dtype}"
-        )
-    return scales.transpose(0, 1).contiguous()
-
-
-def _validate_flashinfer_fp8_blockscale_prepacked(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    A_scales: torch.Tensor,
-    B_scales: torch.Tensor,
-    original_m: int,
-    block_size: list[int] | None,
-) -> None:
-    """Validate the prepared-layout contract without modifying its inputs."""
-    if block_size is not None and tuple(block_size) != (128, 128):
-        raise ValueError(
-            "prepacked FlashInfer scales require block_size=[128, 128], "
-            f"got {block_size}"
-        )
-    if not 0 < original_m <= A.shape[0]:
-        raise ValueError(f"original_m must be in [1, {A.shape[0]}], got {original_m}")
-    if A.shape[0] % 4:
-        raise ValueError(
-            "prepacked FlashInfer activations must have an M dimension "
-            f"divisible by four, got {A.shape[0]}"
-        )
-
-    expected_a_scales = (A.shape[1] // 128, A.shape[0])
-    expected_b_scales = (B.shape[1] // 128, B.shape[0] // 128)
-    if tuple(A_scales.shape) != expected_a_scales or not A_scales.is_contiguous():
-        raise ValueError(
-            "prepacked activation scales must be contiguous with shape "
-            f"{expected_a_scales}, got shape={tuple(A_scales.shape)} "
-            f"stride={tuple(A_scales.stride())}"
-        )
-    if tuple(B_scales.shape) != expected_b_scales or not B_scales.is_contiguous():
-        raise ValueError(
-            "prepacked weight scales must be contiguous with shape "
-            f"{expected_b_scales}, got shape={tuple(B_scales.shape)} "
-            f"stride={tuple(B_scales.stride())}"
-        )
+def _supports_flashinfer_fp8_blockscale(m: int, _n: int, _k: int) -> bool:
+    return not 17 <= m <= 32
 
 
 if gemm_fp8_nt_groupwise is not error_fn:
@@ -221,9 +147,8 @@ if gemm_fp8_nt_groupwise is not error_fn:
         traits={
             "n_align": frozenset({128}),
             "k_align": frozenset({128}),
-            "block_scale_layout": frozenset(
-                {"canonical", "canonical_blackwell", "flashinfer_mn"}
-            ),
+            "mnk_problem_filter": frozenset({_supports_flashinfer_fp8_blockscale}),
+            "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
         },
         priority=Priority.SPECIALIZED + 3,
     )
@@ -237,43 +162,17 @@ if gemm_fp8_nt_groupwise is not error_fn:
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
         out: torch.Tensor | None = None,
-        prepacked_scales: bool = False,
-        original_m: int | None = None,
     ) -> torch.Tensor:
-        """Run FlashInfer FP8 GEMM with canonical or prepared scales.
-
-        Set ``prepacked_scales`` only when ``A_scales`` and ``B_scales`` already
-        use FlashInfer's contiguous MN-major layout. The default canonical path
-        passes the native K-major layouts through without copies.
-        """
+        """Run FlashInfer FP8 GEMM with canonical scales."""
         assert (
             A_scales is not None
         ), "A_scales is required; online quantization should be done by the caller"
         assert B_scales is not None, "B_scales is required for FP8 blockscale GEMM"
-        orig_m = A.shape[0] if original_m is None else int(original_m)
-        if prepacked_scales:
-            _validate_flashinfer_fp8_blockscale_prepacked(
-                A,
-                B,
-                A_scales,
-                B_scales,
-                orig_m,
-                block_size,
+        orig_m = A.shape[0]
+        if not _supports_flashinfer_fp8_blockscale(orig_m, B.shape[0], A.shape[1]):
+            raise ValueError(
+                "FlashInfer FP8 block-scale GEMM does not support 17 <= M <= 32"
             )
-            output = gemm_fp8_nt_groupwise(
-                A,
-                B,
-                A_scales,
-                B_scales,
-                scale_major_mode="MN",
-                out_dtype=out_dtype,
-            )
-            output = output[:orig_m] if output.shape[0] != orig_m else output
-            if out is not None:
-                out.copy_(output)
-                return out
-            return output
-
         # K-major mode reads the quant kernel's native (m, k//128) activation
         # scales and the checkpoint's native (n//128, k//128) weight scales,
         # so no padding, transposes, or scale copies are needed per call.
@@ -345,8 +244,15 @@ def has_flashinfer_mxfp8() -> bool:
     return mm_mxfp8 is not error_fn
 
 
+def swizzle_mxfp8_scale(sf: torch.Tensor, m: int, k: int) -> torch.Tensor:
+    m_tiles = (m + 127) // 128
+    k_tiles = (k + 127) // 128
+    padded = torch.zeros((m_tiles * 128, k_tiles * 4), dtype=sf.dtype, device=sf.device)
+    padded[:m, : k // 32] = sf
+    return padded.view(m_tiles, 4, 32, k_tiles, 4).transpose(1, 3).contiguous().view(-1)
+
+
 if mm_mxfp8 is not error_fn:
-    from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
 
     @register_kernel(
         "gemm",

@@ -27,7 +27,7 @@
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel import prepare_fp8_linear_activation, silu_and_mul
+from tokenspeed_kernel import silu_and_mul
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils import (
@@ -112,17 +112,6 @@ class SiluAndMul(torch.nn.Module):
             gate = gate.clamp_max(self.swiglu_limit)
             up = up.clamp(-self.swiglu_limit, self.swiglu_limit)
         return (torch.nn.functional.silu(gate) * up).to(x.dtype)
-
-    def prepare_for_fp8_linear(
-        self, x: torch.Tensor, plan: object
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Fuse SwiGLU and quantization when the prepared linear supports it."""
-        return prepare_fp8_linear_activation(
-            plan,
-            x,
-            activation="swiglu",
-            limit=self.swiglu_limit,
-        )
 
 
 class SituAndMul(torch.nn.Module):
