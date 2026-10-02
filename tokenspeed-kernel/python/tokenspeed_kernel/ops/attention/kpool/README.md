@@ -40,3 +40,12 @@ table.
 Scoring workspaces are row-tiled under `max_logits_bytes`. The cap includes
 the persistent sort or radix intermediates as well as logits; one row remains
 legal when its workspace exceeds the cap.
+
+The runtime can partition identical prefill query rows across the attention TP
+ranks when there is at least one row per rank and the largest history in the
+batch contains more than twice the selected pool budget. This heuristic amortizes
+the gather over longer histories; it is not a measured crossover for every workload. Smaller cases keep
+the full row batch on each rank. Uneven partitions are padded for the collective
+and trimmed in rank order, restoring the original query order before attention.
+Explicit per-row request IDs, causal lengths, and workspace ranges are sliced
+with the queries; the shared workspace and request boundaries remain global.

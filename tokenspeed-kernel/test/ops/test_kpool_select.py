@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.kpool.triton import (
     _prepare_kpool_decode_metadata,
     expand_kpool_to_flat_kv,
     score_kpool_dense,
+    triton_kpool_prefill_topk,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -652,3 +653,45 @@ def test_decode_cuda_graph_tracks_dynamic_lengths() -> None:
     assert captured[0] is out
     assert captured[1] is lens_out
     _assert_selection(captured, expected)
+
+
+def test_prefill_row_shards_match_full_batch() -> None:
+    q, cache, _, weights, seq_lens, index_table, kv_table = _setup(
+        [4101, 5203], q_len_per_req=3, seed=57
+    )
+    req_ids = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32, device="cuda")
+    causal_lens = seq_lens[req_ids.long()] - torch.tensor(
+        [2, 1, 0, 2, 1, 0], dtype=torch.int32, device="cuda"
+    )
+    positions = causal_lens - 1
+    boundaries = torch.tensor([0, 3, 6], dtype=torch.int32, device="cuda")
+
+    def select(start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return triton_kpool_prefill_topk(
+            q[start:end],
+            cache,
+            weights[start:end],
+            positions[start:end],
+            boundaries,
+            index_table,
+            kv_table,
+            pool_size=_POOL,
+            page_size=_PAGE,
+            kv_page_size=_KV_PAGE,
+            topk_pools=512,
+            softmax_scale=_DIM**-0.5,
+            req_ids=req_ids[start:end],
+            causal_lens=causal_lens[start:end],
+            max_num_pools=5203 // _POOL,
+        )
+
+    full_slots, full_lens = select(0, 6)
+    # A shard crosses a request boundary; request IDs remain global.
+    first_slots, first_lens = select(0, 4)
+    last_slots, last_lens = select(4, 6)
+    torch.testing.assert_close(
+        torch.cat([first_lens, last_lens]), full_lens, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        torch.cat([first_slots, last_slots]), full_slots, rtol=0, atol=0
+    )
