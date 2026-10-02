@@ -250,6 +250,7 @@ def reserve_and_rebind(
     gpu_id: int,
     *,
     profiled_cache_bytes: int,
+    startup_resident_bytes: int,
 ) -> AttentionBuild:
     """Measure a capture on the probe pool, then rebuild the real one under it.
 
@@ -258,7 +259,9 @@ def reserve_and_rebind(
     backends are handed back rather than rebuilt, so what serves is what was
     measured.
     """
-    graph_reserve_bytes = probe_cudagraph_memory(executor, server_args, gpu_id)
+    graph_reserve_bytes = probe_cudagraph_memory(
+        executor, server_args, gpu_id, startup_resident_bytes=startup_resident_bytes
+    )
     executor.release_graphs()
     attention = build_components(
         graph_reserve_bytes=graph_reserve_bytes,
@@ -274,16 +277,23 @@ def reserve_and_rebind(
 
 
 def probe_cudagraph_memory(
-    executor: ModelExecutor, server_args: ServerArgs, gpu_id: int
+    executor: ModelExecutor,
+    server_args: ServerArgs,
+    gpu_id: int,
+    *,
+    startup_resident_bytes: int,
 ) -> int:
     """Capture a few entries of each ladder, measure them, and project the rest.
 
     The reserve is what the captures themselves took plus the projected cost
     of the entries skipped -- what a boot without a probe pays inside
     its capture windows, the one-time bytes the first captures allocate
-    there included. One-time bytes outside every capture (warmups,
-    workspaces) are left to the utilization headroom, which funds them on a
-    boot without a reserve too.
+    there included -- plus the startup residue, what startup kept resident
+    between the probe build and the probe (``startup_resident_bytes``, net,
+    floored at zero), summed on each rank before the cross-rank MAX.
+    One-time bytes outside every capture (warmups, workspaces) are left to
+    the utilization headroom, which funds them on a boot without a reserve
+    too.
     """
     device_module = torch.get_device_module(server_args.device)
     observer = DriverMemoryDeltaObserver(device_module, gpu_id)
@@ -291,8 +301,10 @@ def probe_cudagraph_memory(
 
     ladders = _ladders(executor, PROBE_ENTRIES_PER_LADDER)
     estimate = estimate_cudagraph_memory(observer.samples, ladders)
+    # A net release over startup never lowers the reserve below the graphs' projection.
+    startup = max(startup_resident_bytes, 0)
     reserve = _hungriest_rank(
-        server_args, estimate.measured_total + estimate.unsampled_total
+        server_args, startup + estimate.measured_total + estimate.unsampled_total
     )
     per_series = ", ".join(
         f"{name} {estimate.series[name].measured} measured + "
@@ -300,8 +312,9 @@ def probe_cudagraph_memory(
         for name, ladder in sorted(ladders.items())
     )
     logger.info(
-        f"CUDA-graph memory reserve: {reserve} bytes (this rank: captured "
-        f"{estimate.measured_total}, unsampled entries {estimate.unsampled_total}; {per_series})"
+        f"CUDA-graph memory reserve: {reserve} bytes (this rank: startup residue "
+        f"{startup}, captured {estimate.measured_total}, unsampled "
+        f"entries {estimate.unsampled_total}; {per_series})"
     )
     # Per series: one ladder reading free is invisible in a non-zero total.
     for name, ladder in sorted(ladders.items()):

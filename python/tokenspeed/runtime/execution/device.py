@@ -1085,6 +1085,8 @@ def _rebind_under_reserve(
     gpu_id: int,
     probe: AttentionBuild,
     requested_backends: tuple[str | None, str | None],
+    *,
+    startup_resident_bytes: int,
 ) -> tuple[AttentionBuild, PoolViews]:
     """Rebuild the real pool under the probe's reserve, and its views with it.
 
@@ -1104,6 +1106,7 @@ def _rebind_under_reserve(
         server_args,
         gpu_id,
         profiled_cache_bytes=probe.profiled_cache_bytes,
+        startup_resident_bytes=startup_resident_bytes,
     )
     return attention, pool_views(attention)
 
@@ -1194,7 +1197,10 @@ def build_device_side(
         create_model_executor,
         create_model_runner,
     )
-    from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+    from tokenspeed.runtime.execution.memory_delta import (
+        NULL_MEMORY_DELTA_OBSERVER,
+        DriverMemoryDeltaObserver,
+    )
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -1261,7 +1267,9 @@ def build_device_side(
     )
     refusal = _cudagraph_probe_refusal(server_args, target.model)
     if refusal is not None:
-        logger.info(f"CUDA-graph memory reserve off: {refusal}")
+        logger.info(
+            f"CUDA-graph memory reserve off, startup residue unreserved: {refusal}"
+        )
     probing = refusal is None
     attention = build_components(
         graph_reserve_bytes=0,
@@ -1292,7 +1300,13 @@ def build_device_side(
             )
             server_args.chunked_prefill_size = aligned
 
-    with startup_phase("executor.init"):
+    # What startup keeps resident after the probe build joins the CUDA-graph reserve.
+    startup_memory = (
+        DriverMemoryDeltaObserver(torch.get_device_module(server_args.device), gpu_id)
+        if probing
+        else NULL_MEMORY_DELTA_OBSERVER
+    )
+    with startup_phase("executor.init"), startup_memory.measure("startup"):
         executor = create_model_executor(
             server_args=server_args,
             config=ModelExecutorConfig.from_server_args(
@@ -1312,7 +1326,7 @@ def build_device_side(
             draft_token_to_kv_pool=views.draft_token_to_kv_pool,
         )
     # Once per process, before the probe: a graph keeps its capture-time tactic.
-    with startup_phase("kernels.autotune"):
+    with startup_phase("kernels.autotune"), startup_memory.measure("startup"):
         executor.autotune()
     if probing:
         # Consumers above keep the probe's: they read only block-count-invariant fields.
@@ -1324,6 +1338,7 @@ def build_device_side(
                 gpu_id,
                 attention,
                 requested_backends,
+                startup_resident_bytes=sum(startup_memory.samples["startup"]),
             )
 
     with startup_phase("graph.capture"):

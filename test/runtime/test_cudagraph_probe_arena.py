@@ -241,6 +241,120 @@ def _callee(node: ast.Call) -> str | None:
     return getattr(node.func, "id", getattr(node.func, "attr", None))
 
 
+class _ServingCapture(Exception):
+    """Ends a fabricated boot where the serving capture would begin."""
+
+
+def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager):
+    """Boot with fakes; returns (startup bytes each rebind got, devices read)."""
+    from tokenspeed.runtime.execution import factory
+
+    free, reads, charged = [1 << 40], [], []
+
+    class Executor:
+        attn_backend = draft_attn_backend = None
+
+        def __init__(self):
+            free[0] -= init_keeps
+
+        def autotune(self):
+            free[0] -= tune_keeps
+
+        def capture_graphs(self, *, entries, observer):
+            raise _ServingCapture
+
+    def build(*args, **kwargs):
+        # The probe build and the rebind take memory too: neither is startup's.
+        free[0] -= 192 << 20
+        return built
+
+    def rebind(executor, build, args, gpu, probe, backends, *, startup_resident_bytes):
+        charged.append(startup_resident_bytes)
+        free[0] -= 1 << 30
+        return probe, views(probe)
+
+    def views(attention):
+        return SimpleNamespace(
+            token_to_kv_pool=None,
+            draft_token_to_kv_pool=None,
+            cache_geometry=SimpleNamespace(prefix_granularity=1),
+            cache_groups=[],
+        )
+
+    target = SimpleNamespace(
+        model=SimpleNamespace(),
+        prepare_multimodal_runtime=lambda: None,
+        prepare_communication_runtime=lambda _tokens: None,
+    )
+    built = SimpleNamespace(
+        attn_backend=None,
+        draft_attn_backend=None,
+        token_to_kv_pool=None,
+        draft_token_to_kv_pool=None,
+    )
+    driver = SimpleNamespace(
+        synchronize=lambda gpu: reads.append(gpu),
+        empty_cache=lambda: None,
+        mem_get_info=lambda gpu: reads.append(gpu) or (free[0], 1 << 40),
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda _device: driver)
+    monkeypatch.setattr(factory, "create_model_runner", lambda *a: (target, None))
+    monkeypatch.setattr(factory, "create_model_executor", lambda **_: Executor())
+    monkeypatch.setattr(
+        factory, "ModelExecutorConfig", SimpleNamespace(from_server_args=lambda **_: 0)
+    )
+    monkeypatch.setattr(registry, "create_attn_components", build)
+    monkeypatch.setattr(device, "probe_arena_floor", lambda *_: 1)
+    monkeypatch.setattr(device, "pool_views", views)
+    monkeypatch.setattr(device, "_rebind_under_reserve", rebind)
+    server_args = SimpleNamespace(
+        disaggregation_mode="null",
+        chunked_prefill_size=8192,
+        attention_backend=None,
+        drafter_attention_backend=None,
+        disable_cudagraph_memory_reserve=False,
+        enforce_eager=enforce_eager,
+        enable_prefix_caching=False,
+        enable_memory_saver=False,
+        device="cuda",
+    )
+    with pytest.raises(_ServingCapture):
+        device.build_device_side(
+            server_args=server_args,
+            model_config=SimpleNamespace(context_len=4096, is_multimodal_active=False),
+            draft_model_config=None,
+            gpu_id=3,
+            global_rank=7,
+            attn_tp_rank=1,
+            min_per_gpu_mem=0,
+            overlap_schedule_depth=0,
+            decode_input_tokens=1,
+            max_batch_size=8,
+        )
+    return charged, set(reads)
+
+
+@pytest.mark.parametrize(
+    "init_keeps, tune_keeps", [(256 << 20, 384 << 20), (256 << 20, -512 << 20)]
+)
+def test_the_rebind_is_charged_what_executor_init_and_tuning_kept(
+    monkeypatch, init_keeps, tune_keeps
+) -> None:
+    charged, devices = _startup_charge(
+        monkeypatch, init_keeps=init_keeps, tune_keeps=tune_keeps, enforce_eager=False
+    )
+    # The signed net of both; the probe floors it.
+    assert charged == [init_keeps + tune_keeps]
+    assert devices == {3}
+
+
+def test_a_boot_without_a_probe_reads_no_startup_memory(monkeypatch) -> None:
+    charged, devices = _startup_charge(
+        monkeypatch, init_keeps=1 << 30, tune_keeps=1 << 30, enforce_eager=True
+    )
+    assert charged == [] and devices == set()
+
+
 def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
     build = _function("execution/device.py", "build_device_side")
     steps = {
