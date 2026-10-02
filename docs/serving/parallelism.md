@@ -292,6 +292,21 @@ Apply the same NCCL transport and channel settings on every node as well. In
 particular, do not mix IB and Socket selection or different
 `NCCL_MIN_NCHANNELS` / `NCCL_MAX_NCHANNELS` values across ranks.
 
+### Stopping
+
+Stop every node. A node that stops does not stop the others: they find out
+at their next collective with it, which fails or can hang.
+
+A node of rank 1 or higher that receives SIGTERM or SIGINT, or whose
+scheduler fails, sends SIGTERM to the processes it started (the schedulers,
+or the data-parallel controller with attention data parallelism) and gives
+them `TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT` seconds (default 10) to
+exit. It then kills whatever is left of them and of the processes they
+started, and exits by the signal it received. On Linux the processes it
+started are also killed when the node process itself is killed, for example
+with SIGKILL at the end of a grace period; this does not reach the
+schedulers of a data-parallel controller.
+
 ## Runtime Notes
 
 Overlap scheduling can prepare the next forward on the CPU while the previous

@@ -276,6 +276,9 @@ class Envs:
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
+    # Seconds a blocking node of rank >= 1 gives its schedulers to exit on
+    # SIGTERM before it kills them, when it is stopped.
+    TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT = EnvFloat(10.0)
 
     # Mooncake
     TOKENSPEED_KVSTORE_MOONCAKE_CONFIG_PATH = EnvStr(None)
