@@ -2220,7 +2220,8 @@ class ServerArgs:
         parser.add_argument(
             "--disable-cudagraph-memory-reserve",
             action="store_true",
-            help="Do not reserve the projected CUDA-graph pool memory in the KV cache budget.",
+            help="Do not reserve the projected CUDA-graph pool memory, nor what startup "
+            "keeps resident, in the KV cache budget.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
