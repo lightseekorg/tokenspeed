@@ -221,7 +221,7 @@ class MoELayer(torch.nn.Module):
         if self._quant_kind == "unquant":
             # The flashinfer_trtllm unquant kernels (SiLU/SwiGLU) declare
             # ispp_alignment={TRTLLM_UNQUANT_ISPP_ALIGNMENT}: 64, or 128 when
-            # the installed FlashInfer launcher cannot be relaxed
+            # the installed FlashInfer launcher cannot be relaxed or built
             # (ops/moe/flashinfer/trtllm_unquant.py); without padding
             # moe_plan does not select them for a misaligned intermediate
             # size. Other activations keep 128. The padded tail rows/columns

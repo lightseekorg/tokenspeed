@@ -50,7 +50,13 @@ non-gated activations. Like the NVFP4 adapter, it uses a source-keyed JIT
 module, private operator names and cloned entry points, and refuses a launcher
 whose check it does not find exactly once. `trtllm_unquant.py`'s SiLU/SwiGLU
 kernels declare `ispp_alignment` 64 when the adapter applies to the installed
-FlashInfer and 128 otherwise. The ReLU2 kernels in that file keep 128. Only
+FlashInfer and FlashInfer's JIT can compile the private module, and 128
+otherwise, with a warning that names the reason. The ReLU2 kernels in that file
+keep 128. The private module is not in FlashInfer's AOT jit-cache, and ninja
+rebuilds a module left in the JIT workspace whenever the build changes, so this
+needs `FLASHINFER_DISABLE_JIT` unset and FlashInfer's nvcc (`FLASHINFER_NVCC`,
+else `bin/nvcc` under its CUDA home). This is decided once per process at
+import, without compiling, so kernel selection and layer padding agree. Only
 sizes that are not multiples of 128 run on the private launcher; the first such
 layer JIT-compiles the whole private TRT-LLM MoE module during warmup. Other
 sizes keep FlashInfer's stock module. The NVFP4 routing-map initialization is

@@ -21,7 +21,9 @@
 """The 64-aligned FlashInfer BF16 MoE launcher: transform, admission, outputs."""
 
 import functools
+import importlib
 import inspect
+import logging
 
 import pytest
 import torch
@@ -142,40 +144,199 @@ def test_mutated_installed_launcher_is_refused():
         adapter._relax_bf16_intermediate_check(mutated)
 
 
-def test_gated_alignment_falls_back_to_the_stock_launcher(monkeypatch):
+@pytest.fixture
+def flashinfer_jit(monkeypatch, tmp_path):
+    """FlashInfer's JIT with an empty workspace and no nvcc; yields its CUDA home."""
     _installed_launcher()
+    cpp_ext = pytest.importorskip("flashinfer.jit.cpp_ext")
+    jit_env = pytest.importorskip("flashinfer.jit.env")
+    cuda_home = tmp_path / "cuda"
+    (cuda_home / "bin").mkdir(parents=True)
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: str(cuda_home))
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "cached_ops")
+    monkeypatch.setattr(jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path / "generated")
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    monkeypatch.delenv("FLASHINFER_NVCC", raising=False)
+    adapter.gated_ispp_alignment.cache_clear()
+    yield cuda_home
+    adapter.gated_ispp_alignment.cache_clear()
 
+
+def _executable(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+
+
+def _build_private_module(monkeypatch):
+    """Leave a private module built earlier in FlashInfer's JIT workspace."""
+    jit_env = pytest.importorskip("flashinfer.jit.env")
+    fused_moe = pytest.importorskip("flashinfer.jit.fused_moe")
+    from flashinfer.jit.core import JitSpecNvcc
+
+    # FlashInfer's SM100 module, reduced to its name and launcher source.
+    launcher = jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_kernel_launcher.cu"
+    stock = JitSpecNvcc("fused_moe_trtllm_sm100", [launcher], None, None, None, None)
+    monkeypatch.setattr(
+        fused_moe, "gen_trtllm_gen_fused_moe_sm100_module", lambda: stock
+    )
+    library = adapter._relaxed_spec().jit_library_path
+    library.parent.mkdir(parents=True)
+    library.touch()
+
+
+def test_gated_alignment_falls_back_to_the_stock_launcher(flashinfer_jit, monkeypatch):
     def refuse(source):
         raise RuntimeError("unrecognized launcher")
 
+    _executable(flashinfer_jit / "bin" / "nvcc")
+    assert adapter.gated_ispp_alignment() == adapter.GATED_ISPP_ALIGNMENT
     adapter.gated_ispp_alignment.cache_clear()
-    try:
-        assert adapter.gated_ispp_alignment() == adapter.GATED_ISPP_ALIGNMENT
-        adapter.gated_ispp_alignment.cache_clear()
-        monkeypatch.setattr(adapter, "_relax_bf16_intermediate_check", refuse)
-        assert adapter.gated_ispp_alignment() == adapter.STOCK_ISPP_ALIGNMENT
-    finally:
-        adapter.gated_ispp_alignment.cache_clear()
+    monkeypatch.setattr(adapter, "_relax_bf16_intermediate_check", refuse)
+    assert adapter.gated_ispp_alignment() == adapter.STOCK_ISPP_ALIGNMENT
 
 
 @pytest.mark.parametrize("drift", ["wrapped-entry-point", "no-csrc-dir"])
-def test_gated_alignment_falls_back_on_unrecognized_flashinfer(monkeypatch, drift):
-    _installed_launcher()
+def test_gated_alignment_falls_back_on_unrecognized_flashinfer(
+    flashinfer_jit, monkeypatch, drift
+):
     core = pytest.importorskip("flashinfer.fused_moe.core")
     jit_env = pytest.importorskip("flashinfer.jit.env")
+    _executable(flashinfer_jit / "bin" / "nvcc")
     if drift == "wrapped-entry-point":
         routed = functools.partial(core.trtllm_bf16_routed_moe)
         monkeypatch.setattr(core, "trtllm_bf16_routed_moe", routed)
     else:
         monkeypatch.delattr(jit_env, "FLASHINFER_CSRC_DIR")
     adapter._entrypoints.cache_clear()
-    adapter.gated_ispp_alignment.cache_clear()
     try:
         assert adapter.gated_ispp_alignment() == adapter.STOCK_ISPP_ALIGNMENT
     finally:
         monkeypatch.undo()
         adapter._entrypoints.cache_clear()
-        adapter.gated_ispp_alignment.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "jit, alignment",
+    [
+        ("no-nvcc", adapter.STOCK_ISPP_ALIGNMENT),
+        ("built", adapter.STOCK_ISPP_ALIGNMENT),
+        ("nvcc", adapter.GATED_ISPP_ALIGNMENT),
+        ("FLASHINFER_NVCC", adapter.GATED_ISPP_ALIGNMENT),
+        ("FLASHINFER_DISABLE_JIT", adapter.STOCK_ISPP_ALIGNMENT),
+    ],
+)
+def test_gated_alignment_needs_flashinfer_nvcc(
+    flashinfer_jit, monkeypatch, tmp_path, caplog, jit, alignment
+):
+    nvcc = flashinfer_jit / "bin" / "nvcc"
+    if jit == "built":
+        # ninja rebuilds it whenever the build changes (CUDA home, flags,
+        # headers), which needs nvcc.
+        _build_private_module(monkeypatch)
+    elif jit == "nvcc":
+        _executable(nvcc)
+    elif jit == "FLASHINFER_NVCC":
+        _executable(tmp_path / "toolchain" / "nvcc")
+        monkeypatch.setenv("FLASHINFER_NVCC", str(tmp_path / "toolchain" / "nvcc"))
+    elif jit == "FLASHINFER_DISABLE_JIT":
+        # Without JIT, FlashInfer neither compiles nor reuses JIT-built modules.
+        _executable(nvcc)
+        _build_private_module(monkeypatch)
+        monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
+
+    with caplog.at_level(logging.WARNING, logger=adapter.logger.name):
+        assert adapter.gated_ispp_alignment() == alignment
+        # Decided once per process: a compiler that appears later is ignored.
+        _executable(nvcc)
+        assert adapter.gated_ispp_alignment() == alignment
+    warnings = [record.getMessage() for record in caplog.records]
+    if alignment == adapter.GATED_ISPP_ALIGNMENT:
+        assert warnings == []
+    else:
+        reason = jit if jit == "FLASHINFER_DISABLE_JIT" else "nvcc is missing"
+        assert len(warnings) == 1
+        assert "keeps FlashInfer's multiple of 128" in warnings[0]
+        assert reason in warnings[0]
+
+
+@pytest.mark.parametrize("routing_mode", [None, "precomputed_topk"])
+def test_unbuildable_private_module_keeps_trtllm_at_128(
+    b200_platform, flashinfer_jit, monkeypatch, routing_mode
+):
+    """Without nvcc, only multiples of 128 select TRT-LLM."""
+    import tokenspeed_kernel
+    from tokenspeed_kernel.platform import Platform
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant")
+    cutlass = pytest.importorskip(
+        "tokenspeed_kernel.ops.moe.flashinfer.cutlass_unquant"
+    )
+    if KernelRegistry.get().get_by_name("flashinfer_trtllm_unquant_moe_apply") is None:
+        pytest.skip("flashinfer_trtllm unquant MoE kernels are not registered")
+
+    def planned(ispp, **kwargs):
+        return tokenspeed_kernel.moe_plan(
+            "unquant",
+            input_dtype=torch.bfloat16,
+            activation="silu",
+            routing_mode=routing_mode,
+            ep_size=1,
+            ispp=ispp,
+            hidden=2048,
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            internal_activation_dtype="input",
+            fast_math=True,
+            combine_order="rank",
+            **kwargs,
+        )["solution"]
+
+    # Register both solutions again, as at import, into a scratch registry; the
+    # reload rebinds the module's alignment, which teardown restores.
+    alignment = unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT
+    monkeypatch.setattr(unquant, "TRTLLM_UNQUANT_ISPP_ALIGNMENT", alignment)
+    real_platform, real_registry = Platform.get(), KernelRegistry.get()
+    try:
+        Platform.override(b200_platform)
+        KernelRegistry.reset()
+        importlib.reload(unquant)
+        importlib.reload(cutlass)
+        assert unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT == adapter.STOCK_ISPP_ALIGNMENT
+        for ispp in (64, 192):
+            assert planned(ispp) == "flashinfer_cutlass"
+            with pytest.raises(NoKernelFoundError):
+                planned(ispp, solution="flashinfer_trtllm")
+        assert planned(256) == "flashinfer_trtllm"
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry._instance = real_registry
+
+
+def test_other_gpus_keep_128_without_checking_flashinfer_jit(
+    h100_platform, flashinfer_jit, monkeypatch, caplog
+):
+    """Outside SM100-SM103 the private launcher is neither checked nor warned about."""
+    from tokenspeed_kernel.platform import Platform
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant")
+    alignment = unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT
+    monkeypatch.setattr(unquant, "TRTLLM_UNQUANT_ISPP_ALIGNMENT", alignment)
+    real_platform, real_registry = Platform.get(), KernelRegistry.get()
+    try:
+        Platform.override(h100_platform)
+        KernelRegistry.reset()
+        with caplog.at_level(logging.WARNING, logger=adapter.logger.name):
+            importlib.reload(unquant)
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry._instance = real_registry
+    assert unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT == adapter.STOCK_ISPP_ALIGNMENT
+    assert adapter.logger.name not in [record.name for record in caplog.records]
 
 
 def test_entrypoints_keep_upstream_untouched():
@@ -219,14 +380,22 @@ def test_trtllm_unquant_admits_gated_sizes_the_launcher_accepts(
     b200_platform, ispp, routing_mode
 ):
     import tokenspeed_kernel
-    from tokenspeed_kernel.platform import Platform
+    from tokenspeed_kernel.platform import ArchVersion, Platform
     from tokenspeed_kernel.registry import KernelRegistry
 
     unquant = pytest.importorskip("tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant")
     registry = KernelRegistry.get()
     if registry.get_by_name("flashinfer_trtllm_unquant_moe_apply") is None:
         pytest.skip("flashinfer_trtllm unquant MoE kernels are not registered")
-    assert unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT == adapter.gated_ispp_alignment()
+    spec = registry.get_by_name("flashinfer_trtllm_unquant_moe_apply")
+    assert spec.traits["ispp_alignment"] == frozenset(
+        {unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT}
+    )
+    # Registration adopts the launcher's alignment only on SM100-SM103.
+    expected = adapter.STOCK_ISPP_ALIGNMENT
+    if ArchVersion(10, 0) <= Platform.get().arch_version <= ArchVersion(10, 3):
+        expected = adapter.gated_ispp_alignment()
+    assert unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT == expected
 
     real_platform = Platform.get()
     try:
@@ -285,7 +454,7 @@ def test_64_aligned_outputs_match_128_padded(
     from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as unquant
 
     if unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT != adapter.GATED_ISPP_ALIGNMENT:
-        pytest.skip("the installed FlashInfer launcher cannot be relaxed")
+        pytest.skip("the installed FlashInfer launcher cannot be relaxed or built")
 
     # Record which launcher each run reaches.
     launchers = []

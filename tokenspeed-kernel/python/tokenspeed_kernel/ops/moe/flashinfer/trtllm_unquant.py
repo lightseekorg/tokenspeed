@@ -60,7 +60,10 @@ if platform.is_nvidia:
         trtllm_bf16_moe as ispp64_launcher,
     )
 
-    TRTLLM_UNQUANT_ISPP_ALIGNMENT = ispp64_launcher.gated_ispp_alignment()
+    # Only the SM100-SM103 kernels below use the private launcher; other GPUs
+    # keep 128 without checking it or FlashInfer's JIT.
+    if ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3):
+        TRTLLM_UNQUANT_ISPP_ALIGNMENT = ispp64_launcher.gated_ispp_alignment()
 
     def _flashinfer_trtllm_unquant_moe_weights(w: torch.nn.Module, *, gated: bool):
         cache_permute_indices = {}
