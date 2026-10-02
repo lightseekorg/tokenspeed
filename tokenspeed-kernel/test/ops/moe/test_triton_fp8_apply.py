@@ -6,8 +6,19 @@ import pytest
 import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.platform import current_platform
-from utils import assert_no_triton_compile
+from tokenspeed_kernel.platform import ArchVersion, current_platform
+from utils import (
+    assert_no_triton_compile,
+    int_specialization_class,
+    warm_specialization_classes,
+)
+
+
+def _skip_unless_supported() -> None:
+    platform = current_platform()
+    floor = {"amd": ArchVersion(9, 5), "nvidia": ArchVersion(8, 9)}.get(platform.vendor)
+    if floor is None or not platform.arch_version >= floor:
+        pytest.skip("Triton FP8 MoE requires gfx950+ or SM89+")
 
 
 def _block_fp8(
@@ -96,8 +107,7 @@ def _plan(
 def test_triton_fp8_moe_matches_torch(
     num_tokens: int, activation: str, swiglu_limit: float | None
 ) -> None:
-    if not current_platform().is_amd:
-        pytest.skip("Triton FP8 MoE is registered for AMD GPUs")
+    _skip_unless_supported()
 
     num_experts, top_k, hidden_size, intermediate_size = 4, 2, 384, 256
     generator = torch.Generator(device="cuda").manual_seed(0)
@@ -155,9 +165,8 @@ def test_triton_fp8_moe_matches_torch(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_triton_fp8_moe_token_count():
-    if not current_platform().is_amd:
-        pytest.skip("Triton FP8 MoE is registered for AMD GPUs")
-    from tokenspeed_kernel.ops.moe.triton import fp8
+    _skip_unless_supported()
+    from tokenspeed_kernel.ops.moe.triton import _common, fp8
 
     num_experts, top_k, hidden_size, intermediate_size = 4, 2, 256, 128
     max_tokens = 1500
@@ -189,12 +198,29 @@ def test_triton_fp8_moe_token_count():
             topk_ids=topk_ids[:tokens],
         )
 
-    full = run(max_tokens)
-    # From 256 tokens both stages launch one program per SM, so the program
-    # count stops following the batch; 256 and 257 warm both integer classes.
-    run(256)
-    run(257)
-    with assert_no_triton_compile(fp8._stage1_kernel, fp8._stage2_kernel):
-        for tokens in (300, 512, 1000, 1483):
-            # Tokens are independent: a shorter batch is a prefix.
-            torch.testing.assert_close(run(tokens), full[:tokens], rtol=0, atol=0)
+    def key(tokens):
+        routes = tokens * top_k
+        counts = (
+            tokens,
+            routes,
+            _common._num_programs(x.device, routes, intermediate_size, 32),
+            _common._num_programs(x.device, routes, hidden_size, 32),
+        )
+        # Up to 16 tokens take the small row tile, up to 128 routes the small
+        # routing block.
+        return (*map(int_specialization_class, counts), tokens <= 16, routes <= 128)
+
+    # Tokens are independent: a shorter batch is a prefix of one that uses
+    # the same row tile.
+    small, full = run(16), run(max_tokens)
+    sweep = (3, 7, 12, 24, 100, 300, 1000, 1483)
+    warm_specialization_classes(run, key, sweep, range(1, max_tokens))
+    with assert_no_triton_compile(
+        fp8._stage1_kernel,
+        fp8._stage2_kernel,
+        _common._routing_kernel,
+        _common._combine_kernel,
+    ):
+        for tokens in sweep:
+            expected = small if tokens <= 16 else full
+            torch.testing.assert_close(run(tokens), expected[:tokens], rtol=0, atol=0)

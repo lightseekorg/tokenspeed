@@ -31,7 +31,7 @@ from tokenspeed_kernel.ops.moe.triton._common import (
     _validate_launch,
     _validate_topk,
 )
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -112,6 +112,7 @@ def _stage1_kernel(
     expert_route_ids_ptr,
     expert_counts_ptr,
     num_tokens,
+    num_programs,
     hidden_size: tl.constexpr,
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
@@ -121,7 +122,6 @@ def _stage1_kernel(
     swiglu_beta: tl.constexpr,
     HAS_LIMIT: tl.constexpr,
     SCALE_BLOCK: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -191,7 +191,7 @@ def _stage1_kernel(
             ).to(tl.bfloat16)
             inter_offsets = route_ids[:, None] * intermediate_size + gate_rows[None, :]
             tl.store(inter_ptr + inter_offsets, activated, mask=row_mask[:, None])
-            tile_idx += NUM_PROGRAMS
+            tile_idx += num_programs
 
         problem_start += problem_tiles
 
@@ -205,12 +205,12 @@ def _stage2_kernel(
     expert_route_ids_ptr,
     expert_counts_ptr,
     num_tokens,
+    num_programs,
     hidden_size: tl.constexpr,
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
     top_k: tl.constexpr,
     SCALE_BLOCK: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -269,7 +269,7 @@ def _stage2_kernel(
 
             output_offsets = route_ids[:, None] * hidden_size + weight_rows[None, :]
             tl.store(route_output_ptr + output_offsets, acc, mask=row_mask[:, None])
-            tile_idx += NUM_PROGRAMS
+            tile_idx += num_programs
 
         problem_start += problem_tiles
 
@@ -309,6 +309,7 @@ def _moe(
         expert_route_ids,
         expert_counts,
         num_tokens,
+        stage1_programs,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
@@ -318,7 +319,6 @@ def _moe(
         swiglu_beta=swiglu_beta,
         HAS_LIMIT=swiglu_limit is not None,
         SCALE_BLOCK=_FP8_BLOCK,
-        NUM_PROGRAMS=stage1_programs,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=_FP8_BLOCK,
@@ -333,12 +333,12 @@ def _moe(
         expert_route_ids,
         expert_counts,
         num_tokens,
+        stage2_programs,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         top_k=top_k,
         SCALE_BLOCK=_FP8_BLOCK,
-        NUM_PROGRAMS=stage2_programs,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=_FP8_BLOCK,
@@ -359,7 +359,13 @@ def _moe(
     "apply",
     name="triton_fp8_block_precomputed_moe_apply",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd", "nvidia"}),
+        vendor_min_arch_versions={
+            "amd": ArchVersion(9, 5),
+            "nvidia": ArchVersion(8, 9),
+        },
+    ),
     signatures=format_signatures("x", "dense", {torch.bfloat16}),
     traits={
         "weight_dtype": frozenset({"fp8"}),
