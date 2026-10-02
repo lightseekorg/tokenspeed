@@ -97,3 +97,14 @@ offsets, masking padding and handling partial tails and empty shards. Query
 quantization and head padding match the unsharded path; portable Triton provides
 the same interface. Query tiling bounds scratch memory, and fixed-shape GPU
 metadata supports CUDA graph replay without host reads.
+
+The portable selected-slot kernel groups query heads into tensor-core tiles
+and gathers each latent KV tile for both scoring and value accumulation.
+Small grids split the selected keys across programs and combine their FP32
+partial outputs using base-2 log-sum-exp weights. The public `return_lse`
+result remains FP32 in natural-log units for both split and unsplit launches.
+Empty selections produce zero output and negative-infinity LSE. Negative slots
+inside the live prefix are ignored; live lengths are clamped to the slot width.
+Packed FP8 keys retain a BF16 residual when scoring so dequantization rounding
+does not reduce LSE accuracy. FP16 and FP32 dense keys retain the same residual.
+Value tiles and probabilities use BF16 with FP32 accumulation.
