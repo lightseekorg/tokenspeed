@@ -67,6 +67,8 @@ from tokenspeed.runtime.engine.io_struct import (
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
 )
@@ -324,14 +326,15 @@ class RequestHandler:
                 self.send_func.send_pyobj(
                     InitWeightsUpdateGroupReqOutput(success=ok, message=msg)
                 )
-            elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
+            elif isinstance(
+                recv_req,
+                (UpdateWeightsFromDistributedReqInput, UpdateWeightFromDiskReqInput),
+            ):
                 ok, msg = self._require_weight_version_for_l3_flush(recv_req)
                 if ok:
                     ok, msg = self._require_flush_for_l3_version_switch(recv_req)
                 if not ok:
-                    self.send_func.send_pyobj(
-                        UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
-                    )
+                    self._send_weight_update_output(recv_req, ok, msg)
                 else:
                     pending_weight_updates.append(recv_req)
             elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
@@ -440,9 +443,16 @@ class RequestHandler:
             ok, msg = self._device.update_weights(recv_req)
             if ok:
                 ok, msg = self._commit_l3_weight_version(recv_req, msg)
-        self.send_func.send_pyobj(
-            UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
-        )
+        self._send_weight_update_output(recv_req, ok, msg)
+
+    def _send_weight_update_output(self, recv_req, ok: bool, msg: str) -> None:
+        """Reply with the output type the frontend awaits for this request."""
+
+        if isinstance(recv_req, UpdateWeightFromDiskReqInput):
+            output = UpdateWeightFromDiskReqOutput(success=ok, message=msg)
+        else:
+            output = UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+        self.send_func.send_pyobj(output)
 
     def _try_clear_replica_cache(self) -> bool:
         """MIN-reduce clearability, delete L3, then mutate Device/Host.

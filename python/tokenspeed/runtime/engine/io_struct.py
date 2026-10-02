@@ -897,6 +897,8 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     load_format: str | None = None
     # Optional: update the weight version after a successful load.
     weight_version: str | None = None
+    # Drop cached KV before loading: it was computed under the old weights.
+    flush_cache: bool = True
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
