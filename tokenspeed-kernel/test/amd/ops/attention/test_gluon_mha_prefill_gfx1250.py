@@ -192,6 +192,91 @@ def test_mha_prefill_packed_gqa(dtype, group_size):
     torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
 
 
+def test_mha_prefill_addresses_past_four_gib():
+    """Sequence and head bases must not wrap through 32-bit buffer offsets."""
+    device, dtype = "cuda", torch.bfloat16
+    tokens, n_heads, head_dim = 2, 17, 64
+    head_stride = 2**27
+    boundary = 2**31
+    storage_elements = boundary + tokens * head_dim
+    storage_bytes = storage_elements * torch.tensor([], dtype=dtype).element_size()
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if free_bytes < storage_bytes + 512 * 1024**2:
+        pytest.skip("large-offset regression requires about 4.5 GiB free")
+
+    storage = torch.empty(storage_elements, dtype=dtype, device=device)
+    qkv = storage.as_strided(
+        (tokens, n_heads, head_dim),
+        (head_dim, head_stride, 1),
+    )
+    assert prefill._requires_wide_addressing(qkv)
+    generator = torch.Generator(device=device).manual_seed(20261002)
+    compact = torch.randn(qkv.shape, dtype=dtype, device=device, generator=generator)
+    qkv.copy_(compact)
+    cu_cpu = [0, tokens]
+    cu = torch.tensor(cu_cpu, dtype=torch.int32, device=device)
+    out = prefill.launch_gluon_mha_prefill_gfx1250(qkv, qkv, qkv, cu, cu_cpu, tokens)
+    expected = _reference(compact, compact, compact, cu_cpu, n_heads, n_heads, head_dim)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+    # Exercise a sequence/output base at exactly 4 GiB with one sparse allocation.
+    base_token = boundary // head_dim
+    sentinel = torch.full((head_dim,), -7.0, dtype=dtype, device=device)
+    value = torch.randn((head_dim,), dtype=dtype, device=device, generator=generator)
+    storage[:head_dim].copy_(sentinel)
+    storage[boundary : boundary + head_dim].copy_(value)
+    large_cu = torch.tensor(
+        [base_token, base_token + 1], dtype=torch.int32, device=device
+    )
+    prefill.gluon_mha_prefill_gfx1250[(1, 1, 1)](
+        storage,
+        storage,
+        storage,
+        large_cu,
+        storage,
+        storage,
+        storage,
+        head_dim,
+        head_dim,
+        1,
+        head_dim,
+        head_dim,
+        1,
+        head_dim,
+        head_dim,
+        1,
+        1,
+        1,
+        head_dim,
+        (1.0 / math.sqrt(head_dim)) * prefill._INV_LN2_VALUE,
+        128,
+        64,
+        False,
+        False,
+        False,
+        -1,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+        4,
+        2,
+        num_warps=4,
+        waves_per_eu=1,
+        llvm_fn_attrs="",
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(storage[:head_dim], sentinel)
+    torch.testing.assert_close(
+        storage[boundary : boundary + head_dim].float(),
+        value.float(),
+        rtol=8e-2,
+        atol=8e-2,
+    )
+
+
 def test_select_llvm_fn_attrs():
     max_ilp = "amdgpu-sched-strategy=max-ilp"
 
@@ -262,6 +347,7 @@ def test_select_packed_gqa():
         "window_left": -1,
         "has_sink": False,
         "has_lse": False,
+        "packed_q_block_bytes": 1024 * 1024,
     }
     assert prefill._select_packed_gqa(**kwargs)
     assert prefill._select_packed_gqa(
@@ -290,6 +376,7 @@ def test_select_packed_gqa():
         {"n_heads": 32, "n_kv_heads": 8},
         {"seqlens": [4096] * 4, "max_seqlen": 4096},
         {"has_sink": True},
+        {"packed_q_block_bytes": 2**32 + 1},
     ):
         assert not prefill._select_packed_gqa(**(kwargs | override))
 

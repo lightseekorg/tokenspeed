@@ -65,6 +65,7 @@ class AttentionConfig:
     DEEP_PIPELINE: gl.constexpr
     PACKED_GQA: gl.constexpr
     GUARDED_QUERY_ROWS: gl.constexpr
+    WIDE_ADDRESSING: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -98,6 +99,7 @@ class AttentionConfig:
         DEEP_PIPELINE,
         PACKED_GQA,
         GUARDED_QUERY_ROWS,
+        WIDE_ADDRESSING,
         q_strides,
         k_strides,
         v_strides,
@@ -148,6 +150,7 @@ class AttentionConfig:
         self.DEEP_PIPELINE = gl.constexpr(DEEP_PIPELINE)
         self.PACKED_GQA = gl.constexpr(PACKED_GQA)
         self.GUARDED_QUERY_ROWS = gl.constexpr(GUARDED_QUERY_ROWS)
+        self.WIDE_ADDRESSING = gl.constexpr(WIDE_ADDRESSING)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -258,8 +261,28 @@ class AttentionProgram:
         seq_base = gl.load(cu_seqlens_ptr + batch)
         seq_end = gl.load(cu_seqlens_ptr + batch + 1)
         seq_len = seq_end - seq_base
+        if cfg.WIDE_ADDRESSING:
+            query_token_base = seq_base + q_start
+            q_base_ptr = q_ptr + cfg.q_strides.base_offset(query_token_base, q_head)
+            k_base_ptr = k_ptr + cfg.k_strides.base_offset(seq_base, kv_head)
+            v_base_ptr = v_ptr + cfg.v_strides.base_offset(seq_base, kv_head)
+            output_base = query_token_base.to(gl.int64) * cfg.N_HEADS + q_head.to(
+                gl.int64
+            )
+            output_base_ptr = output_ptr + output_base * cfg.HEAD_DIM
+            lse_base_ptr = lse_ptr + output_base
+            k_desc_base = k_base_ptr
+            v_desc_base = v_base_ptr
+        else:
+            q_base_ptr = q_ptr
+            k_base_ptr = k_ptr
+            v_base_ptr = v_ptr
+            output_base_ptr = output_ptr
+            lse_base_ptr = lse_ptr
+            k_desc_base = k_ptr + cfg.k_strides.offsets(seq_base, kv_head, 0)
+            v_desc_base = v_ptr + cfg.v_strides.offsets(seq_base, kv_head, 0)
         k_desc = cdna5.tdm.make_tensor_descriptor(
-            base=k_ptr + cfg.k_strides.offsets(seq_base, kv_head, 0),
+            base=k_desc_base,
             shape=(seq_len, cfg.HEAD_DIM),
             strides=(cfg.k_strides.stride_t, cfg.k_strides.stride_d),
             block_shape=(cfg.BLOCK_N, cfg.HEAD_DIM),
@@ -271,7 +294,7 @@ class AttentionProgram:
             layout=k_desc.layout,
         )
         v_desc = cdna5.tdm.make_tensor_descriptor(
-            base=v_ptr + cfg.v_strides.offsets(seq_base, kv_head, 0),
+            base=v_desc_base,
             shape=(seq_len, cfg.HEAD_DIM),
             strides=(cfg.v_strides.stride_t, cfg.v_strides.stride_d),
             block_shape=(cfg.BLOCK_N, cfg.HEAD_DIM),
@@ -284,12 +307,12 @@ class AttentionProgram:
         )
         return AttentionProgram(
             cfg,
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            output_ptr,
+            q_base_ptr,
+            k_base_ptr,
+            v_base_ptr,
+            output_base_ptr,
             sink_ptr,
-            lse_ptr,
+            lse_base_ptr,
             seq_base,
             seq_len,
             q_start,
@@ -318,15 +341,38 @@ class AttentionProgram:
         return offs_m * 0 + self.q_head
 
     @gluon.jit
+    def row_local_qpos(self, offs_m):
+        if self.cfg.PACKED_GQA:
+            group_size: gl.constexpr = self.cfg.N_HEADS // self.cfg.N_KV_HEADS
+            return offs_m // group_size
+        return offs_m
+
+    @gluon.jit
+    def row_local_qhead(self, offs_m):
+        if self.cfg.PACKED_GQA:
+            group_size: gl.constexpr = self.cfg.N_HEADS // self.cfg.N_KV_HEADS
+            return offs_m % group_size
+        return offs_m * 0
+
+    @gluon.jit
     def load_q(self):
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
         q_pos = self.row_qpos(offs_m)
-        q_head = self.row_qhead(offs_m)
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
-        offsets = cfg.q_strides.offsets(
-            self.seq_base + q_pos[:, None], q_head[:, None], offs_d[None, :]
-        )
+        if cfg.WIDE_ADDRESSING:
+            offsets = cfg.q_strides.offsets(
+                self.row_local_qpos(offs_m)[:, None],
+                self.row_local_qhead(offs_m)[:, None],
+                offs_d[None, :],
+            )
+        else:
+            q_head = self.row_qhead(offs_m)
+            offsets = cfg.q_strides.offsets(
+                self.seq_base + q_pos[:, None],
+                q_head[:, None],
+                offs_d[None, :],
+            )
         if (cfg.DEEP_PIPELINE or cfg.PACKED_GQA) and not cfg.GUARDED_QUERY_ROWS:
             return cdna5.buffer_load(self.q_ptr, offsets)
         mask = q_pos[:, None] < self.seq_len
@@ -339,9 +385,12 @@ class AttentionProgram:
         offs_n = kv_start + gl.arange(
             0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.k_layout)
         )
-        offsets = cfg.k_strides.offsets(
-            self.seq_base + offs_n[None, :], self.kv_head, offs_d[:, None]
-        )
+        if cfg.WIDE_ADDRESSING:
+            offsets = cfg.k_strides.offsets(offs_n[None, :], 0, offs_d[:, None])
+        else:
+            offsets = cfg.k_strides.offsets(
+                self.seq_base + offs_n[None, :], self.kv_head, offs_d[:, None]
+            )
         mask = offs_n[None, :] < self.seq_len
         return cdna5.buffer_load(self.k_ptr, offsets, mask=mask, other=0.0)
 
@@ -352,9 +401,12 @@ class AttentionProgram:
             0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.v_layout)
         )
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.v_layout))
-        offsets = cfg.v_strides.offsets(
-            self.seq_base + offs_n[:, None], self.kv_head, offs_d[None, :]
-        )
+        if cfg.WIDE_ADDRESSING:
+            offsets = cfg.v_strides.offsets(offs_n[:, None], 0, offs_d[None, :])
+        else:
+            offsets = cfg.v_strides.offsets(
+                self.seq_base + offs_n[:, None], self.kv_head, offs_d[None, :]
+            )
         mask = offs_n[:, None] < self.seq_len
         return cdna5.buffer_load(self.v_ptr, offsets, mask=mask, other=0.0)
 
@@ -553,8 +605,14 @@ class AttentionProgram:
         if cfg.HAS_LSE:
             offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
             q_pos = self.row_qpos(offs_m)
-            q_head = self.row_qhead(offs_m)
-            offsets = ((self.seq_base + q_pos) * cfg.N_HEADS + q_head).to(gl.int32)
+            if cfg.WIDE_ADDRESSING:
+                offsets = (
+                    self.row_local_qpos(offs_m) * cfg.N_HEADS
+                    + self.row_local_qhead(offs_m)
+                ).to(gl.int32)
+            else:
+                q_head = self.row_qhead(offs_m)
+                offsets = ((self.seq_base + q_pos) * cfg.N_HEADS + q_head).to(gl.int32)
             safe_l = gl.where(l_i > 0.0, l_i, 1.0)
             use_scaled_state: gl.constexpr = (
                 (cfg.DEEP_PIPELINE or cfg.PACKED_GQA)
@@ -574,13 +632,22 @@ class AttentionProgram:
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         q_pos = self.row_qpos(offs_m)
-        q_head = self.row_qhead(offs_m)
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
-        offsets = (
-            ((self.seq_base + q_pos[:, None]) * cfg.N_HEADS + q_head[:, None])
-            * cfg.HEAD_DIM
-            + offs_d[None, :]
-        ).to(gl.int32)
+        if cfg.WIDE_ADDRESSING:
+            offsets = (
+                (
+                    self.row_local_qpos(offs_m)[:, None] * cfg.N_HEADS
+                    + self.row_local_qhead(offs_m)[:, None]
+                )
+                * cfg.HEAD_DIM
+                + offs_d[None, :]
+            ).to(gl.int32)
+        else:
+            q_head = self.row_qhead(offs_m)
+            offsets = (
+                (self.seq_base + q_pos[:, None]) * cfg.N_HEADS + q_head[:, None]
+            ) * cfg.HEAD_DIM + offs_d[None, :]
+            offsets = offsets.to(gl.int32)
         output = output.to(self.output_ptr.dtype.element_ty)
         if (cfg.DEEP_PIPELINE or cfg.PACKED_GQA) and not cfg.GUARDED_QUERY_ROWS:
             cdna5.buffer_store(output, self.output_ptr, offsets)
@@ -885,6 +952,7 @@ def gluon_mha_prefill_gfx1250(
     DEEP_PIPELINE: gl.constexpr,
     PACKED_GQA: gl.constexpr,
     GUARDED_QUERY_ROWS: gl.constexpr,
+    WIDE_ADDRESSING: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
@@ -906,6 +974,7 @@ def gluon_mha_prefill_gfx1250(
         DEEP_PIPELINE,
         PACKED_GQA,
         GUARDED_QUERY_ROWS,
+        WIDE_ADDRESSING,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -1072,6 +1141,7 @@ def _select_packed_gqa(
     window_left: int,
     has_sink: bool,
     has_lse: bool,
+    packed_q_block_bytes: int,
 ) -> bool:
     """Select packed query-head rows only on measured gfx1250 workloads."""
     if (
@@ -1081,6 +1151,7 @@ def _select_packed_gqa(
         or n_kv_heads != 1
         or has_sink
         or has_lse
+        or packed_q_block_bytes > 2**32
         or not seqlens
     ):
         return False
@@ -1169,6 +1240,20 @@ def triton_cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def _requires_wide_addressing(*tensors: torch.Tensor | None) -> bool:
+    """Return whether any tensor exceeds one 32-bit byte-offset window."""
+    for tensor in tensors:
+        if tensor is None or tensor.numel() == 0:
+            continue
+        max_element_offset = sum(
+            (size - 1) * abs(stride)
+            for size, stride in zip(tensor.shape, tensor.stride())
+        )
+        if (max_element_offset + 1) * tensor.element_size() > 2**32:
+            return True
+    return False
+
+
 def _count_live_workgroups(
     *, cu_seqlens_cpu: list[int], n_heads: int, block_m: int
 ) -> int:
@@ -1225,10 +1310,13 @@ def launch_gluon_mha_prefill_gfx1250(
     )
     sink_arg = sinks if sinks is not None else q
     lse_arg = lse if lse is not None else q
+    wide_addressing = _requires_wide_addressing(q, k, v, output, lse)
     seqlens = [
         seq_end - seq_start
         for seq_start, seq_end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:])
     ]
+    packed_group_size = config.n_heads // config.n_kv_heads
+    packed_query_span = 128 // packed_group_size
     selected_packed_gqa = _select_packed_gqa(
         dtype=q.dtype,
         head_dim=config.head_dim,
@@ -1239,9 +1327,15 @@ def launch_gluon_mha_prefill_gfx1250(
         window_left=config.window_left,
         has_sink=sinks is not None,
         has_lse=return_lse,
+        packed_q_block_bytes=(
+            (packed_query_span - 1) * q.stride(0)
+            + (packed_group_size - 1) * q.stride(1)
+            + (config.head_dim - 1) * q.stride(2)
+            + 1
+        )
+        * q.element_size(),
     )
     if selected_packed_gqa:
-        group_size = config.n_heads // config.n_kv_heads
         block_m = 128
         block_n = 32 if config.window_left == 512 else 64
         config = config._replace(
@@ -1253,7 +1347,7 @@ def launch_gluon_mha_prefill_gfx1250(
             grid=(
                 config.batch_size,
                 config.n_kv_heads,
-                triton_cdiv(config.max_seqlen * group_size, block_m),
+                triton_cdiv(config.max_seqlen * packed_group_size, block_m),
             ),
         )
     tdm_warp_hint = _select_tdm_warp_hint(
@@ -1358,6 +1452,7 @@ def launch_gluon_mha_prefill_gfx1250(
         deep_pipeline,
         config.packed_gqa,
         guarded_query_rows,
+        wide_addressing,
         config.num_warps,
         config.num_buffers,
         num_warps=config.num_warps,
