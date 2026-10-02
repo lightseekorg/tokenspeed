@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.communication import (
     AllReduceFusionPattern,
     AllReduceFusionWorkspace,
     allreduce_fusion,
+    allreduce_fusion_supported,
     create_allreduce_fusion_workspace,
 )
 from tokenspeed_kernel.ops.communication.multimem import (
@@ -87,17 +88,30 @@ def attn_ar_eligible(
     return armed and has_prefix and 0 < num_tokens <= window
 
 
+def _fusion_supported(mapping, latent_size: int, top_k: int) -> bool:
+    """Ask the fused kernel's own probe (arch range, multicast, interfaces)."""
+    if mapping.moe.tp_ep_size not in (4, 8, 16):
+        return False
+    return allreduce_fusion_supported(
+        group=_get_process_group(mapping.moe.tp_ep_group),
+        hidden_size=latent_size,
+        top_k=top_k,
+        max_num_tokens=1,
+        dtype=torch.bfloat16,
+    )
+
+
 def _unified_tail_applicable(
     *,
     mapping,
     hidden_size: int,
     latent_size: int,
     top_k: int,
-    is_blackwell: bool,
+    fusion_supported: bool,
     has_routed_norm: bool,
 ) -> bool:
     return (
-        is_blackwell
+        fusion_supported
         and mapping.moe.tp_ep_size in (4, 8, 16)
         and mapping.attn.tp_size == mapping.moe.tp_ep_size
         and hidden_size == 7168
@@ -466,7 +480,7 @@ class K3MoeTailComm:
             hidden_size=hidden_size,
             latent_size=routed_hidden,
             top_k=top_k,
-            is_blackwell=current_platform().is_blackwell,
+            fusion_supported=_fusion_supported(mapping, routed_hidden, top_k),
             has_routed_norm=routed_norm is not None,
         )
         self.defer_finalize = (

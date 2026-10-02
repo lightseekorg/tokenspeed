@@ -89,9 +89,7 @@ def test_workspace_uses_serving_capacity_once(monkeypatch, tp, ep, capacity):
     monkeypatch.setattr(mod, "multimem_prealloc", prealloc)
     monkeypatch.setattr(mod, "_get_process_group", lambda ranks: group)
     monkeypatch.setattr(mod, "create_allreduce_fusion_workspace", create)
-    monkeypatch.setattr(
-        mod, "current_platform", lambda: SimpleNamespace(is_blackwell=True)
-    )
+    monkeypatch.setattr(mod, "allreduce_fusion_supported", lambda **kwargs: True)
     monkeypatch.setattr(mod, "global_server_args_dict", {"disable_pdl": True})
     mapping = SimpleNamespace(
         moe=SimpleNamespace(
@@ -264,3 +262,42 @@ def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem):
         multimem.assert_not_called()
         stage.assert_not_called()
     torch.testing.assert_close(output, torch.full_like(output, 21), rtol=0, atol=0)
+
+
+def test_unsupported_fusion_probe_falls_back_to_the_unfused_tail(monkeypatch):
+    """A rank the fused kernel rejects keeps the all-reduce + RMSNorm tail."""
+    group = SimpleNamespace(group_name="moe_tp8_ep1")
+    create = Mock()
+    small = Mock()
+    probe = Mock(return_value=False)
+    monkeypatch.setattr(mod, "KimiK3LatentTailOp", small)
+    monkeypatch.setattr(mod, "multimem_prealloc", Mock(return_value=True))
+    monkeypatch.setattr(mod, "_get_process_group", lambda ranks: group)
+    monkeypatch.setattr(mod, "create_allreduce_fusion_workspace", create)
+    monkeypatch.setattr(mod, "allreduce_fusion_supported", probe)
+    mod.K3MoeTailComm._routed_workspace = None
+    mod.K3MoeTailComm._stage2_capacity = None
+    mod.K3MoeTailComm._workspace_config = None
+    mapping = SimpleNamespace(
+        moe=SimpleNamespace(
+            tp_size=8, ep_size=1, tp_ep_size=8, tp_ep_group=tuple(range(8))
+        ),
+        attn=SimpleNamespace(tp_size=8),
+    )
+    comm = mod.K3MoeTailComm(
+        mapping=mapping,
+        hidden_size=7168,
+        routed_hidden=3584,
+        top_k=16,
+        routed_norm=SimpleNamespace(variance_epsilon=1e-5),
+        up_proj=SimpleNamespace(shard_group=mapping.moe.tp_ep_group),
+        experts_supports_deferred_finalize=True,
+    )
+    probe.assert_called_once_with(
+        group=group, hidden_size=3584, top_k=16, max_num_tokens=1, dtype=torch.bfloat16
+    )
+    assert not comm.use_allreduce_fusion
+    assert not comm.defer_finalize
+    assert comm.prepare(1024)
+    create.assert_not_called()
+    small.assert_called_once_with(group=group, hidden_size=7168, latent_size=3584)
