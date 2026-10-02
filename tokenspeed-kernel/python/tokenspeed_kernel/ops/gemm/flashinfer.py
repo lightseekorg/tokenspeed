@@ -754,6 +754,14 @@ def flashinfer_joint_bf16_supported(
     )
 
 
+def _canonical_bf16_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Normalize singleton strides of an already-contiguous matrix without copying."""
+    strides = (tensor.shape[1], 1)
+    if tensor.stride() != strides:
+        return tensor.as_strided(tensor.shape, strides)
+    return tensor
+
+
 def flashinfer_bf16_gemm(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
@@ -776,12 +784,14 @@ def flashinfer_bf16_gemm(
     # WAR: the public auto heuristic excludes cute-dsl. Reuse the existing FI
     # dispatcher so eligible families enter one choose_one, including cache
     # lookup. A backend that cannot handle K must not exclude the other one.
+    # Contiguous singleton rows can retain a sliced tensor's larger row stride;
+    # FI's dynamic-M kernels require the canonical compact stride even at M=1.
     _fi_gemm.bf16_gemm_sm100(
-        a=x.detach(),
+        a=_canonical_bf16_view(x.detach()),
         b=weight.detach().t(),
         bias=None,
         pdl=pdl_enabled(),
-        out=out,
+        out=_canonical_bf16_view(out),
         workspace_buffer=workspace,
         runner_names=_bf16_gemm_runner_names(weight.shape[1]),
     )
