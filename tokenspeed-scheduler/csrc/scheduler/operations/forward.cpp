@@ -308,6 +308,11 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     std::int32_t tokens_this_round = 0;
     std::int32_t decode_reserve = 0;
     std::int32_t promotion_boundary_tokens = 0;
+    // Promotion alignment ends a chunk on a prefix page, so a chunk budget
+    // below one page could never reach the boundary and the request would
+    // wait forever. The boundary is a reuse opportunity, not an invariant
+    // (PrefillChunkTokens passes it inside the final window too): pass it.
+    const bool passes_promotion_boundary = config_.max_scheduled_tokens < prefix_granularity;
 
     // L3 Host prefetch can allocate fewer pages than ProbePrefix reported.
     // Retry admission from that shortened boundary so the first-chunk window
@@ -347,7 +352,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
         const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
         tokens_this_round = PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
-                                               promotion_boundary_tokens);
+                                               passes_promotion_boundary ? 0 : promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return std::nullopt;
         }
@@ -456,7 +461,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     fsm::CacheProgress cache_progress{
         .prefix_hashes = std::move(match.prefix_hashes),
         .access_epoch = admission->access_epoch,
-        .promotion_boundary_tokens = admission->promotion_boundary_tokens,
+        .promotion_boundary_tokens = passes_promotion_boundary ? 0 : admission->promotion_boundary_tokens,
     };
     recordPrefillStateCheckpoint(cache_progress, source, hit_tokens + tokens_this_round, prefix_granularity);
     return fsm::SchedulePrefillFirstChunkEvent{
