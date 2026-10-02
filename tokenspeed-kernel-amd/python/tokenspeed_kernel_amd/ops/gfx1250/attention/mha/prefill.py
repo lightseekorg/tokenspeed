@@ -686,8 +686,7 @@ def process_single_attention_tile(program: AttentionProgram, kv_start):
     program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)[:, None]
-    if (cfg.DEEP_PIPELINE or cfg.PACKED_GQA) and not cfg.GUARDED_QUERY_ROWS:
-        output = output.to(program.output_ptr.dtype.element_ty)
+    output = output.to(program.output_ptr.dtype.element_ty)
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
 
@@ -823,8 +822,7 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
     program.store_lse(l_i, m_i)
     denom = gl.where(l_i > 0.0, l_i, 1.0)
     output = acc * (1.0 / denom)[:, None]
-    if (cfg.DEEP_PIPELINE or cfg.PACKED_GQA) and not cfg.GUARDED_QUERY_ROWS:
-        output = output.to(program.output_ptr.dtype.element_ty)
+    output = output.to(program.output_ptr.dtype.element_ty)
     output = gl.convert_layout(output, cfg.store_layout)
     program.store_output(output)
 
