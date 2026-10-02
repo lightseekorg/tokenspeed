@@ -180,9 +180,15 @@ class PrefillCaptureStreamTest(unittest.TestCase):
             self.skipTest("requires CUDA")
 
         class StreamProbe(PrefillGraph):
+            """Minimal owner with the shared buffers used by real bucket captures."""
+
             def __init__(self):
                 self.num_warmup = 2
                 self._pool = None
+                self._handoff_storage = {}
+                self._outputs: list[torch.Tensor] | None = None
+                self._narrowing = None
+                self.capture_buckets = [8]
                 self.warmed_streams: set[int] = set()
                 self.values = torch.arange(8, device="cuda", dtype=torch.float32)
 
@@ -204,6 +210,9 @@ class PrefillCaptureStreamTest(unittest.TestCase):
                 self.assertEqual(
                     owner.warmed_streams, {int(capture.stream.cuda_stream)}
                 )
+                torch.testing.assert_close(output.hidden_states, owner.values * 2)
+                owner.values.add_(3)
+                capture.replay()
                 torch.testing.assert_close(output.hidden_states, owner.values * 2)
 
 
