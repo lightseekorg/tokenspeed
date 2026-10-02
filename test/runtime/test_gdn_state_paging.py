@@ -584,6 +584,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
             num_real_tokens=15,
             A_log=torch.empty(1),
             dt_bias=torch.empty(1),
+            D=None,
             a=per_token,
             b=per_token,
             g_raw=per_token,
@@ -734,6 +735,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
             num_real_tokens=5,
             A_log=torch.empty(1),
             dt_bias=torch.empty(1),
+            D=None,
             a=per_token,
             b=per_token,
             g_raw=per_token,
@@ -1730,6 +1732,7 @@ class TritonCheckpointContinuationTest(unittest.TestCase):
                 kwargs = dict(
                     A_log=torch.zeros(h, device="cuda"),
                     dt_bias=torch.zeros(h, device="cuda"),
+                    D=None,
                     a=torch.randn(n, h, device="cuda", dtype=torch.bfloat16),
                     b=torch.randn(n, h, device="cuda", dtype=torch.bfloat16),
                     g_raw=None,

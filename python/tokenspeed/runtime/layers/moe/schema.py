@@ -25,7 +25,8 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class ExpertCheckpointSchema:
-    gate_proj_name: str = "gate_proj"
+    # None: non-gated experts ship only an up projection, loaded as all of w13.
+    gate_proj_name: str | None = "gate_proj"
     up_proj_name: str = "up_proj"
     down_proj_name: str = "down_proj"
     gate_up_fused_name: str | None = None
@@ -33,6 +34,8 @@ class ExpertCheckpointSchema:
 
     def get_semantic_name(self, semantic: str) -> str:
         if semantic == "gate_proj":
+            if self.gate_proj_name is None:
+                raise KeyError("non-gated experts have no gate_proj")
             return self.gate_proj_name
         if semantic == "up_proj":
             return self.up_proj_name

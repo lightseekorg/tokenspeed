@@ -89,7 +89,16 @@ _RECIPES = {
     "deepseek_v4": _deepseek_v4_recipe,
     "deepseek_v41": _deepseek_v41_recipe,
 }
-_NO_FIXTURE = {"mha", "mla", "dsa", "msa", "qwen_gdn", "qwen4_exp", "inkling"}
+_NO_FIXTURE = {
+    "mha",
+    "mla",
+    "dsa",
+    "msa",
+    "qwen_gdn",
+    "qwen4_exp",
+    "inkling",
+    "mamba2",
+}
 
 
 def _function(module: str, name: str) -> ast.FunctionDef:

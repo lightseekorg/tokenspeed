@@ -282,7 +282,7 @@ def load_per_tensor_weight_scale(
     if shard_id in {"w1", "w3"}:
         idx = 0 if shard_id == "w1" else 1
         param.data[local_expert_id][idx] = loaded_weight
-    elif shard_id == "w2":
+    elif shard_id in {"w13", "w2"}:
         param.data[local_expert_id] = loaded_weight
     else:
         raise ValueError(f"Unknown shard_id: {shard_id}")

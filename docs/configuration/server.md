@@ -215,7 +215,7 @@ the values accepted by the bundled `tokenspeed-smg` package.
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
 | `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |
 | `--eagle3-layers-to-capture` | EAGLE3 layers to capture. |
-| `--disable-replay-ssm` | Stage every verify position's GDN recurrent state instead of replaying the accepted tokens. ReplaySSM is on by default for supported Qwen GDN targets; `--enable-replay-ssm` is accepted as a deprecated no-op. |
+| `--disable-replay-ssm` | Stage every verify position's recurrent state instead of replaying the accepted tokens. ReplaySSM is on by default for supported Qwen GDN and Nemotron-H Mamba2 targets; `--enable-replay-ssm` is accepted as a deprecated no-op. |
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.

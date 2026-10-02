@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
@@ -196,6 +196,12 @@ def _slice_prefill_recurrent_inputs(
         f_a_out=None if f_a_out is None else f_a_out[token_start:token_end],
         beta_raw=None if beta_raw is None else beta_raw[token_start:token_end],
     )
+
+
+def _reject_skip_term(D: torch.Tensor | None) -> None:
+    """GDN and KDA recurrences have no ``D * x`` skip term; refuse one."""
+    if D is not None:
+        raise ValueError("the GDN/KDA recurrence has no D skip term")
 
 
 def _prepare_gdn_decode_state_path(
@@ -429,6 +435,7 @@ class MambaAttnBackend(AttentionBackend):
     cache_consumer_families = frozenset({"state"})
     _verify_reads_committed_recurrent_state: bool = False
     _verify_packed_qkv_views: bool = False
+    _decode_packed_qkv_views: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -911,6 +918,16 @@ class MambaAttnBackend(AttentionBackend):
             )
         return write_stack, steps
 
+    def _replay_commit(
+        self, payload: torch.Tensor, parameters: torch.Tensor, **tables: Any
+    ) -> None:
+        """Rebuild every layer's accepted state from the replay payload.
+
+        Families with another recurrence replace the kernel; the payload,
+        tables and page resolution stay shared.
+        """
+        gdn_replay_commit(payload, parameters, **tables)
+
     def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
         """Commit the accepted draft prefix with fused per-group page resolves."""
         ctx = self._verify_commit_ctx
@@ -948,7 +965,7 @@ class MambaAttnBackend(AttentionBackend):
         )
         if self.replay_ssm:
             replay = self._gdn_replay
-            gdn_replay_commit(
+            self._replay_commit(
                 replay.payload,
                 replay.parameters,
                 state_addresses=copy_tables["ssm_comp"],
@@ -1555,6 +1572,7 @@ class MambaAttnBackend(AttentionBackend):
         num_real_tokens: int,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -1593,6 +1611,7 @@ class MambaAttnBackend(AttentionBackend):
                 scan_query_start_loc,
                 A_log=A_log,
                 dt_bias=dt_bias,
+                D=D,
                 a=a,
                 b=b,
                 g_raw=g_raw,
@@ -1648,6 +1667,7 @@ class MambaAttnBackend(AttentionBackend):
             checkpoint_batch.body_query_start_loc,
             A_log=A_log,
             dt_bias=dt_bias,
+            D=D,
             a=body.a,
             b=body.b,
             g_raw=body.g_raw,
@@ -1714,6 +1734,7 @@ class MambaAttnBackend(AttentionBackend):
             checkpoint_batch.tail_query_start_loc,
             A_log=A_log,
             dt_bias=dt_bias,
+            D=D,
             a=tail.a,
             b=tail.b,
             g_raw=tail.g_raw,
@@ -1810,6 +1831,7 @@ class MambaAttnBackend(AttentionBackend):
         gate_lower_bound = kwargs.get("lower_bound")
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
+        D = kwargs.get("D")
         layer_id = kwargs["layer_id"]
 
         # Read the page holding position n-1 and write the page holding
@@ -1844,7 +1866,8 @@ class MambaAttnBackend(AttentionBackend):
 
         # Stride-aware fused decoders consume packed projection views directly.
         # Preserve the shared fallback's established compact input layout.
-        mixed_qkv = mixed_qkv.contiguous()
+        if not self._decode_packed_qkv_views:
+            mixed_qkv = mixed_qkv.contiguous()
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
@@ -1882,6 +1905,7 @@ class MambaAttnBackend(AttentionBackend):
             state_out_blocks,
             A_log=A_log,
             dt_bias=dt_bias,
+            D=D,
             a=a,
             b=b,
             g_raw=g_raw,
@@ -1962,6 +1986,7 @@ class MambaAttnBackend(AttentionBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -1990,6 +2015,7 @@ class MambaAttnBackend(AttentionBackend):
             write_indices: Per-request state page receiving position n.
             A_log: Per-channel decay parameter.
             dt_bias: Per-channel timestep bias.
+            D: Mamba2 per-head skip coefficient; None for GDN and KDA.
             a: GDN scalar-per-head decay input.
             b: GDN scalar-per-head beta input.
             g_raw: KDA per-channel gate, when the model precomputed it.
@@ -2004,6 +2030,7 @@ class MambaAttnBackend(AttentionBackend):
         Returns:
             ``[1, B, Hv, V]`` layer output.
         """
+        _reject_skip_term(D)
         (
             decode_initial_indices,
             decode_output_indices,
@@ -2065,6 +2092,7 @@ class MambaAttnBackend(AttentionBackend):
         gate_lower_bound = kwargs.get("lower_bound")
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
+        D = kwargs.get("D")
         layer_id = kwargs["layer_id"]
         seq_len = kwargs["seq_len"]
 
@@ -2192,10 +2220,11 @@ class MambaAttnBackend(AttentionBackend):
                 replay.parameters[layer_slot, 0].copy_(A_log)
                 replay.parameters[layer_slot, 1].copy_(dt_bias)
                 replay.initialized_layers.add(layer_id)
+            # A family without a beta gate (Mamba2) repeats a in the unused b slot.
             replay_inputs = (
                 replay.payload[layer_slot, :seq_len],
                 a.view(seq_len, -1),
-                b.view(seq_len, -1),
+                (a if b is None else b).view(seq_len, -1),
             )
 
         # KDA can consume zero-copy strided views. The checkpoint packer also
@@ -2246,6 +2275,7 @@ class MambaAttnBackend(AttentionBackend):
                 output_indices,
                 A_log=A_log,
                 dt_bias=dt_bias,
+                D=D,
                 a=a,
                 b=b,
                 g_raw=g_raw,
@@ -2270,6 +2300,7 @@ class MambaAttnBackend(AttentionBackend):
                 num_real_tokens=num_real_tokens,
                 A_log=A_log,
                 dt_bias=dt_bias,
+                D=D,
                 a=a,
                 b=b,
                 g_raw=g_raw,
@@ -2371,6 +2402,7 @@ class MambaAttnBackend(AttentionBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -2400,6 +2432,7 @@ class MambaAttnBackend(AttentionBackend):
             output_indices: ``[bs, T]`` verify scratch row grid.
             A_log: Per-channel decay parameter.
             dt_bias: Per-channel timestep bias.
+            D: Mamba2 per-head skip coefficient; None for GDN and KDA.
             a: GDN scalar-per-head decay input.
             b: GDN scalar-per-head beta input.
             g_raw: KDA per-channel gate, when the model precomputed it.
@@ -2414,6 +2447,7 @@ class MambaAttnBackend(AttentionBackend):
         Returns:
             ``[1, seq_len, Hv, V]`` layer output.
         """
+        _reject_skip_term(D)
         num_heads = query.shape[2]
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
@@ -2470,6 +2504,7 @@ class MambaAttnBackend(AttentionBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -2499,6 +2534,7 @@ class MambaAttnBackend(AttentionBackend):
             query_start_loc: Varlen cumulative token offsets.
             A_log: Per-channel decay parameter.
             dt_bias: Per-channel timestep bias.
+            D: Mamba2 per-head skip coefficient; None for GDN and KDA.
             a: GDN scalar-per-head decay input.
             b: GDN scalar-per-head beta input.
             g_raw: KDA per-channel gate, when the model precomputed it.
@@ -2521,6 +2557,7 @@ class MambaAttnBackend(AttentionBackend):
         Returns:
             ``(core_attn_out, last_recurrent_state)``.
         """
+        _reject_skip_term(D)
         head_k_dim = query.shape[3]
         beta = b.sigmoid()
         g = fused_gdn_gating(A_log, a, dt_bias)
