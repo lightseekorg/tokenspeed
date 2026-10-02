@@ -140,6 +140,7 @@ from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
 from tokenspeed_kernel.ops.moe.triton import (
     decode_sigmoid_topk as _moe_triton_decode_sigmoid_topk,
 )
+from tokenspeed_kernel.ops.moe.triton import fp8 as _moe_triton_fp8
 from tokenspeed_kernel.ops.moe.triton import (
     kimi3_sigmoid_topk as _moe_triton_kimi3_sigmoid_topk,
 )
@@ -238,6 +239,7 @@ _RELOAD_MODULES = [
     _moe_native,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
+    _moe_triton_fp8,
     _moe_triton_kimi3_sigmoid_topk,
     _moe_triton_sqrt_softplus,
     _moe_triton_mxfp4,
@@ -4266,6 +4268,36 @@ def _moe_apply_mxfp4_triton() -> object:
     )
 
 
+def _moe_apply_fp8_block(ispp: int, apply: str, preprocessor: str | None) -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=1,
+        ispp=ispp,
+        fp8_scale_block_shape=(128, 128),
+        internal_activation_dtype="input",
+        hidden=6144,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+    )
+    _assert_moe_plan(plan, apply=apply, preprocessor=preprocessor)
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
 def _moe_apply_unquant_triton() -> object:
     plan = tokenspeed_kernel.moe_plan(
         "unquant",
@@ -5776,6 +5808,39 @@ _CASES = [
         "apply",
         "gluon_mxfp4_dynamic_moe_apply",
         _moe_apply_mxfp4_dynamic_tp,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "moe",
+        "apply",
+        "triton_fp8_block_precomputed_moe_apply",
+        partial(
+            _moe_apply_fp8_block, 256, "triton_fp8_block_precomputed_moe_apply", None
+        ),
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_fp8_block_precomputed_moe_apply",
+        partial(
+            _moe_apply_fp8_block, 256, "triton_fp8_block_precomputed_moe_apply", None
+        ),
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "gluon_fp8_block_precomputed_moe_apply",
+        partial(
+            _moe_apply_fp8_block,
+            512,
+            "gluon_fp8_block_precomputed_moe_apply",
+            "gluon_fp8_moe_weights",
+        ),
     ),
 ]
 
