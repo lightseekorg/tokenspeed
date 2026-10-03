@@ -97,6 +97,19 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     stop_str_max_len: int = 0  # set by normalize()
     is_normalized: bool = False  # set by normalize()
 
+    # --- Score API (label scoring at the prefill boundary) ---
+    # Appended tail: array_like declaration order is the wire contract.
+    # Token ids of the label set to score at the answer boundary (the last
+    # prefill position). Setting this makes the request score-only: it must
+    # carry max_new_tokens=0 (enforced by verify()). The sampled bootstrap
+    # token still advances the scheduler FSM but is not part of the contract.
+    score_label_token_ids: list[int] | None = None
+    # When True, the returned scores are normalized across the label set
+    # (label-restricted softmax); when False they are raw logprobs gathered
+    # from the full-vocab log_softmax. Normalized scores are NOT calibrated
+    # correctness probabilities — see docs/design/scoring.md.
+    score_apply_softmax: bool = False
+
     def __post_init__(self) -> None:
         # Runs after msgpack decode too; once normalize() resolved the
         # derived fields on the sender, do not re-derive them here.
@@ -195,6 +208,28 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
             raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+
+        if self.score_label_token_ids is not None:
+            if len(self.score_label_token_ids) == 0:
+                raise ValueError("score_label_token_ids must be a non-empty list.")
+            for token_id in self.score_label_token_ids:
+                if not 0 <= token_id < vocab_size:
+                    raise ValueError(
+                        f"score_label_token_ids must be in [0, {vocab_size - 1}], "
+                        f"got {token_id}."
+                    )
+            # Scores are read at the answer boundary, i.e. the last prefill
+            # position; decoding past it would leave the contract undefined.
+            if self.max_new_tokens != 0:
+                raise ValueError(
+                    "score_label_token_ids requires max_new_tokens=0 (score-only "
+                    f"request), got max_new_tokens={self.max_new_tokens}."
+                )
+        elif self.score_apply_softmax:
+            raise ValueError(
+                "score_apply_softmax is only meaningful together with "
+                "score_label_token_ids."
+            )
 
     def requested_features(self) -> "set[str]":
         """Return the set of backend-facing feature names this request needs.

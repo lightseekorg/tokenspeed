@@ -45,6 +45,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_update_reserve_tokens_event,
 )
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+from tokenspeed.runtime.sampling.score_utils import finalize_score_row
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.io_struct import TokenizedGenerateReqInput
@@ -143,6 +144,10 @@ class RequestState:
         self.grammar: BaseGrammarObject | None = None
         self.grammar_key: tuple[str, str] | None = None
         self.grammar_queued_ts: float = 0.0
+
+        # Score API readout for this request, populated at the prefill
+        # boundary by post_process_forward_op (None for non-score requests).
+        self.score_vals: list[float] | None = None
 
     def set_finish_with_abort(self, message: str, notify_client: bool = False) -> None:
         """Mark this request as aborted with ``message``; finished_reason is
@@ -676,6 +681,12 @@ class OutputProcesser:
             if model_execution_results.output_logprobs is not None
             else None
         )
+        # Per-extend-row Score API readout (aligned with forward_op.request_ids).
+        score_logprobs_list = (
+            model_execution_results.score_logprobs.tolist()
+            if model_execution_results.score_logprobs is not None
+            else None
+        )
         # NaN-guard flags, aligned with forward_op.request_ids (None when disabled).
         nan_flags_list = (
             model_execution_results.output_nan_flags.tolist()
@@ -729,6 +740,24 @@ class OutputProcesser:
             # Do not output chunking result
             if not request_state.prefill_finished:
                 continue
+
+            # Score API: read this request's label logprobs at the answer
+            # boundary. Only fires on the final prefill chunk (mid-chunk
+            # slots continue above) and on extend rows, which lead the
+            # score_logprobs tensor.
+            score_label_ids = request_state.sampling_params.score_label_token_ids
+            if score_label_ids is not None and i < num_extends:
+                if score_logprobs_list is None:
+                    logger.warning(
+                        f"Req {rid!s} carries score labels but the batch "
+                        "produced no score readout (fully-cached prefill?); "
+                        "finishing without scores."
+                    )
+                else:
+                    request_state.score_vals = finalize_score_row(
+                        score_logprobs_list[i][: len(score_label_ids)],
+                        request_state.sampling_params.score_apply_softmax,
+                    )
 
             request_state.stats.mark_prefill_done(stats_now)
             if i >= num_extends:
@@ -1036,6 +1065,7 @@ class OutputProcesser:
         output_extra_infos: list[dict] = []
         output_token_logprobs_val: list[list[float]] = []
         output_token_logprobs_idx: list[list[int]] = []
+        output_score_vals: list[list[float]] = []
 
         for i, rs in enumerate(output_states):
             # For finished requests, always output (unless already output)
@@ -1115,6 +1145,8 @@ class OutputProcesser:
                 output_token_logprobs_val.append([])
                 output_token_logprobs_idx.append([])
 
+            output_score_vals.append(rs.score_vals if rs.score_vals is not None else [])
+
         # Don't send empty batch to detokenizer
         if len(rids_to_send) == 0:
             return
@@ -1150,6 +1182,7 @@ class OutputProcesser:
             batch_accept_draft_tokens=batch_accept_draft_tokens,
             output_extra_infos=output_extra_infos,
             generated_time=time.time(),
+            output_score_vals=output_score_vals,
         )
 
         # Push BatchTokenIDOut directly to AsyncLLM via the shared

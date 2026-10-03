@@ -43,6 +43,11 @@ from collections.abc import AsyncIterator, Iterator
 import zmq
 import zmq.asyncio
 
+from tokenspeed.runtime.decision import (
+    DecisionRequest,
+    DecisionResult,
+    get_decision_adapter,
+)
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
 from tokenspeed.runtime.engine.llm import LLM
 
@@ -266,6 +271,113 @@ class Engine(EngineBase):
             return wrapped_output_generator(generator)
         else:
             return await generator.__anext__()
+
+    def score(
+        self,
+        *,
+        query: str,
+        items: list[str],
+        label_token_ids: list[int],
+        apply_softmax: bool,
+    ) -> dict:
+        """Blocking variant of ``async_score``; see there."""
+        return self.llm.run(
+            self.async_score(
+                query=query,
+                items=items,
+                label_token_ids=label_token_ids,
+                apply_softmax=apply_softmax,
+            )
+        )
+
+    async def async_score(
+        self,
+        *,
+        query: str,
+        items: list[str],
+        label_token_ids: list[int],
+        apply_softmax: bool,
+    ) -> dict:
+        """Score each ``query + item`` sequence over the label token set.
+
+        The low-level ``/v1/score`` contract: every item runs as an
+        independent prefill-only sequence (SIS execution; the shared query
+        prefix is reused through the radix cache), and at each item's answer
+        boundary the full-vocab logprobs are gathered at ``label_token_ids``.
+        Unlike top-k generation logprobs, the declared labels are always all
+        scored.
+
+        Args:
+            query: Shared context + question text every item sees.
+            items: Candidate texts, one score row each, in response order.
+            label_token_ids: Label set to score; each must be a single token
+                id valid for the served model (derive from its tokenizer).
+            apply_softmax: True returns label-restricted softmax scores per
+                row; False returns raw logprobs. Normalized scores are not
+                calibrated probabilities (see docs/design/scoring.md).
+
+        Returns:
+            ``{"scores": [[...], ...]}`` — one row per item, columns in
+            ``label_token_ids`` order.
+        """
+        if not items:
+            raise ValueError("score requires a non-empty items list.")
+        if not label_token_ids:
+            raise ValueError("score requires a non-empty label_token_ids list.")
+        sampling_params = [
+            {
+                "max_new_tokens": 0,
+                "score_label_token_ids": label_token_ids,
+                "score_apply_softmax": apply_softmax,
+            }
+            for _ in items
+        ]
+        obj = GenerateReqInput(
+            text=[query + item for item in items],
+            sampling_params=sampling_params,
+        )
+        generator = self.tokenizer_manager.generate_request(obj)
+        outputs = await generator.__anext__()
+        rows = []
+        for i, out in enumerate(outputs):
+            row = out.get("scores")
+            if row is None:
+                raise RuntimeError(
+                    f"score item {i} finished without a score readout "
+                    f"(finish_reason={out.get('meta_info', {}).get('finish_reason')!r})."
+                )
+            rows.append(row)
+        return {"scores": rows}
+
+    def decision(self, request: DecisionRequest) -> DecisionResult:
+        """Blocking variant of ``async_decision``; see there."""
+        return self.llm.run(self.async_decision(request))
+
+    async def async_decision(self, request: DecisionRequest) -> DecisionResult:
+        """Run a high-level decision request (Jev-style typed output).
+
+        The request's adapter owns the model-specific scaffold and label
+        vocabulary; this call compiles the request through it and drives the
+        low-level score path. Requires an engine with a tokenizer (not
+        ``skip_tokenizer_init``) so label strings resolve to token ids.
+        """
+        tokenizer = self.tokenizer_manager.tokenizer
+        if tokenizer is None:
+            raise ValueError(
+                "async_decision requires the engine tokenizer to resolve "
+                "label strings to token ids; this engine runs with "
+                "skip_tokenizer_init=True. Compile the request yourself and "
+                "call async_score with explicit label_token_ids."
+            )
+        adapter = get_decision_adapter(request.adapter)
+        call = adapter.compile(request, tokenizer)
+        out = await self.async_score(
+            query=call.query,
+            items=call.items,
+            label_token_ids=call.label_token_ids,
+            apply_softmax=call.apply_softmax,
+        )
+        return adapter.extract(request, out["scores"])
 
     def shutdown(self):
         """Shutdown the engine"""

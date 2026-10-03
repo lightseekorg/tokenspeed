@@ -82,6 +82,7 @@ class _ExecutionResult:
     output_nan_flags = None
     grammar_completion = None
     next_input_ids = None
+    score_logprobs = None
 
 
 def _state(input_ids: list[int], *, computed_length: int = 0) -> RequestState:
@@ -594,6 +595,7 @@ class _PrefillExecutionResult:
     output_nan_flags = None
     grammar_completion = None
     next_input_ids = torch.tensor([[101, 102, 103]], dtype=torch.int32)
+    score_logprobs = None
 
 
 class _EmptyPrefillExecutionResult(_PrefillExecutionResult):

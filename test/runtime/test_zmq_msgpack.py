@@ -168,7 +168,7 @@ def test_generate_request_is_tagged_positional_tuple():
     assert raw[2] is None  # http_worker_ipc
     assert raw[3] is None  # input_text
     assert raw[4] == [9]  # input_ids
-    assert isinstance(raw[5], list) and len(raw[5]) == 29  # SamplingParams
+    assert isinstance(raw[5], list) and len(raw[5]) == 31  # SamplingParams
     assert raw[6] is False  # return_logprob
     assert raw[10] is True  # stream
 
@@ -207,6 +207,8 @@ def test_sampling_params_wire_order():
         "stop_strs",
         "stop_str_max_len",
         "is_normalized",
+        "score_label_token_ids",
+        "score_apply_softmax",
     ]
 
 
@@ -317,7 +319,7 @@ def test_slim_out_carries_logprob_columns():
 
 
 def test_slim_out_is_tagged_positional_tuple():
-    """The wire form pins SMG's exact 14-element positional contract."""
+    """The wire form pins SMG's exact 15-element positional contract."""
     out = _make_batch_out(
         output_token_logprobs_val=[[-0.5]], output_token_logprobs_idx=[[10]]
     )
@@ -332,7 +334,7 @@ def test_slim_out_is_tagged_positional_tuple():
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     assert isinstance(raw, list)
     assert raw[0] == "BatchTokenIDOutSlim"
-    assert len(raw) == 14
+    assert len(raw) == 15
     assert raw[1] == ["r1"]  # rids
     assert raw[2] == [[10, 11]]  # output_ids
     assert raw[3] == ["length"]  # finished_reasons
@@ -343,6 +345,7 @@ def test_slim_out_is_tagged_positional_tuple():
     assert raw[11] == 3  # num_waiting
     assert raw[12] == 4  # kv_active_pages
     assert raw[13] == 20  # kv_total_pages
+    assert raw[14] == [[]]  # output_score_vals (appended)
 
 
 def test_slim_out_finish_reason_none_maps_to_empty():
