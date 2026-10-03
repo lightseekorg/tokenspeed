@@ -46,7 +46,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.engine.scheduler_utils import engram_context_len
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import ForwardContext, InputLogprobRows
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -60,10 +60,15 @@ from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-from tokenspeed.runtime.execution.prefill_graph import PrefillGraph, dummy_batch_size
+from tokenspeed.runtime.execution.prefill_graph import (
+    PrefillGraph,
+    dummy_batch_size,
+    narrowing_prefill_model,
+)
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
+    InputLogprobPlan,
     ModelExecutionResult,
     NGramInputs,
     RequestHistorySeeds,
@@ -97,7 +102,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     setup_dp_sampling,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
-from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
@@ -243,6 +248,11 @@ class ModelExecutorConfig:
     prefill_only: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
+    # Prompt-logprob gather: how many prompt rows go through the LM head at
+    # once (``--input-logprob-chunk-tokens``). Bounds the transient
+    # ``[rows, vocab]`` logits; log-softmax is row-local so the value never
+    # changes a result.
+    input_logprob_chunk_tokens: int
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -351,6 +361,7 @@ class ModelExecutorConfig:
             prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
             model_is_mrope=model_is_mrope,
             prefill_only=server_args.disaggregation_mode == "prefill",
+            input_logprob_chunk_tokens=server_args.input_logprob_chunk_tokens,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -673,6 +684,17 @@ class ModelExecutor:
             logger.info("Prewarming Triton RSAG communication states")
             self.forward_step.warmup_decode_path(batch_sizes=(1,), graph_phase=True)
             logger.info("Finished prewarming Triton RSAG communication states")
+
+        # Prompt (input) logprobs need the LM head to score every prompt row on
+        # this rank: one activation row per input token, which a model that
+        # narrows its prefill rows (NarrowingPrefillModel) does not keep, and
+        # the logits themselves, which only the last pipeline stage has.
+        # Decided here, once, so the ingress refuses such requests instead of
+        # the data plane finding out.
+        self.supports_prompt_logprobs: bool = (
+            self.config.pp_size == 1
+            and narrowing_prefill_model(self.model_runner.model) is None
+        )
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
         # the decode wrapper above; borrows the decode capture stream so all
@@ -1251,10 +1273,17 @@ class ModelExecutor:
             self._pp_send_stage_state(logits_output)
             output_tokens = torch.zeros(bs, dtype=torch.int32, device=self.device)
             accept_lengths = torch.ones(bs, dtype=torch.int32, device=self.device)
-            return output_tokens, accept_lengths, None
+            return output_tokens, accept_lengths, None, None
 
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)
+        if logits_output.input_token_logprobs is not None:
+            # The prompt rows ship their logprobs as values, so audit those.
+            self.nan_guard.audit_input_logprobs(
+                logits_output.input_token_logprobs,
+                ctx.input_logprob_rows.slots,
+                ctx.num_extends,
+            )
 
         candidates = self._decode_candidates(ctx)
 
@@ -1297,7 +1326,12 @@ class ModelExecutor:
             self._record_draft_final_cache_step(ctx.num_extends)
 
         output_logprobs = logits_output.next_token_logprobs
-        return output_tokens, accept_lengths, output_logprobs
+        return (
+            output_tokens,
+            accept_lengths,
+            output_logprobs,
+            logits_output.input_token_logprobs,
+        )
 
     @nvtx_range("update_runtime_state", color="orange")
     def _update_runtime_state(
@@ -1628,6 +1662,7 @@ class ModelExecutor:
         *,
         ngram_inputs: NGramInputs | None,
         request_history_seeds: RequestHistorySeeds | None,
+        input_logprob_plan: InputLogprobPlan | None,
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -1705,11 +1740,16 @@ class ModelExecutor:
 
             grammar_completion = None
 
+            input_token_logprobs = None
             if total_tokens == 0:
                 # Fully prefix-cached prefill: no tokens to process.
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
                 output_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
                 output_logprobs = None
+                if input_logprob_plan is not None:
+                    raise RuntimeError(
+                        "prompt logprobs planned for a forward without input rows"
+                    )
             else:
                 gather_ids = None
                 if num_extends > 0:
@@ -1775,6 +1815,9 @@ class ModelExecutor:
                         else CaptureHiddenMode.NULL
                     ),
                     gather_ids=gather_ids,
+                    input_logprob_rows=self._input_logprob_rows(
+                        input_logprob_plan, num_extends, total_tokens
+                    ),
                     decode_input_ids=decode_input_ids,
                     output_layout=output_layout,
                 )
@@ -1835,7 +1878,12 @@ class ModelExecutor:
                             else bs
                         )
                         forward_step_start = time.perf_counter()
-                    output_tokens, output_lengths, output_logprobs = self.forward_step(
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        input_token_logprobs,
+                    ) = self.forward_step(
                         bs=bs,
                         ctx=ctx,
                         sampling_info=sampling_info,
@@ -1928,6 +1976,10 @@ class ModelExecutor:
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
+                if input_token_logprobs is not None:
+                    input_token_logprobs = input_token_logprobs.to(
+                        "cpu", non_blocking=True
+                    )
 
                 output_nan_flags = self.nan_guard.flags_cpu
 
@@ -1965,6 +2017,52 @@ class ModelExecutor:
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
             spec_candidate_tokens=spec_candidate_tokens,
+            input_token_logprobs=input_token_logprobs,
+            input_logprob_plan=(
+                input_logprob_plan if input_token_logprobs is not None else None
+            ),
+        )
+
+    def _input_logprob_rows(
+        self, plan: InputLogprobPlan | None, num_extends: int, total_tokens: int
+    ) -> InputLogprobRows | None:
+        """Expand the plan into device rows, targets and slots for the logits processor.
+
+        The per-slot triples become the flat row index (an ``arange`` per
+        slot) and the slot of every row on the host, staged pinned and copied
+        non-blocking like the other per-forward inputs: the forward thread
+        never synchronizes on its per-round path. Each row's target is the next
+        prompt token, read from the scheduler's shifted input ids that
+        ``fill_input_buffers`` landed for this prefill (they cover the chunk
+        boundary). A target outside the vocabulary flags its request through
+        the NaN guard, which terminates it; the clamp only keeps the gather
+        from faulting on a flagged row.
+        """
+        if plan is None:
+            return None
+        if max(map(sum, zip(plan.row_starts, plan.counts))) > total_tokens:
+            raise RuntimeError("input logprob plan names rows past the forward's input")
+        counts = torch.tensor(plan.counts, dtype=torch.int64)
+        slots_cpu = torch.repeat_interleave(torch.arange(len(plan.counts)), counts)
+        first_row = torch.tensor(plan.row_starts, dtype=torch.int64) - (
+            torch.cumsum(counts, dim=0) - counts
+        )
+        rows_cpu = torch.arange(plan.num_rows, dtype=torch.int64) + first_row[slots_cpu]
+        staged = torch.stack((rows_cpu, slots_cpu))
+        if is_pin_memory_available():
+            staged = staged.pin_memory()
+        rows, slots = staged.to(self.device, non_blocking=True)
+        targets = self.input_buffers.shifted_prefill_ids_buf[rows].to(torch.int64)
+        self.nan_guard.audit_input_logprob_targets(
+            targets, slots, num_extends, self.runtime_states.vocab_size
+        )
+        targets.clamp_(0, self.runtime_states.vocab_size - 1)
+        return InputLogprobRows(
+            rows=rows,
+            targets=targets,
+            slots=slots,
+            num_input_rows=total_tokens,
+            chunk_tokens=self.config.input_logprob_chunk_tokens,
         )
 
     def write_remote_spec_candidate_ids(

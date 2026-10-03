@@ -384,7 +384,7 @@ class DFlash(BaseDrafter):
         ):
             metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
             logits = self.logits_processor._get_logits(
-                hidden_states, self.lm_head, metadata
+                hidden_states, self.lm_head, metadata, require_full_vocab=False
             )
             if bias_fn is not None:
                 logits = logits + bias_fn(0, int(logits.shape[-1])).to(logits.dtype)

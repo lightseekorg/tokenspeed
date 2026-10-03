@@ -155,6 +155,7 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             model_is_mrope=False,
             autotune_cache_key=None,
             prefill_only=False,
+            input_logprob_chunk_tokens=1024,
         )
         with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
             ModelExecutorConfig(**config_args)
@@ -1248,6 +1249,7 @@ class PrefillRoleGraphsTest(unittest.TestCase):
             model_is_mrope=False,
             autotune_cache_key=None,
             prefill_only=prefill_only,
+            input_logprob_chunk_tokens=1024,
             prefill_graph_capture_batch_sizes=None,
             prefill_graph_max_tokens=256,
         )

@@ -71,7 +71,10 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
-from tokenspeed.runtime.engine.scheduler_utils import make_spec
+from tokenspeed.runtime.engine.scheduler_utils import (
+    UNBOUNDED_CACHED_PREFIX_TOKENS,
+    make_spec,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
@@ -541,14 +544,28 @@ class RequestHandler:
         if recv_req.bootstrap_port is None:
             recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
-        req_spec = make_spec(
-            rid=recv_req.rid,
-            tokens=recv_req.input_ids,
-        )
+        # The decode role never computes prompt rows (the prefill node returns
+        # the prompt logprobs), so it neither accumulates them nor caps its
+        # admission probe for them.
+        computes_prompt_logprobs = self.server_args.disaggregation_mode != "decode"
         req_state = RequestState.from_recv_req(
             recv_req,
             tokenizer=self.tokenizer,
             eos_token_ids=self.hf_eos_token_id,
+            computes_prompt_logprobs=computes_prompt_logprobs,
+        )
+        # Prompt logprobs need logits for every position from the start on, so
+        # the admission probe may not match those positions from the prefix
+        # cache.
+        max_cached_prefix_tokens = (
+            req_state.logprob_start_len
+            if req_state.wants_input_logprobs
+            else UNBOUNDED_CACHED_PREFIX_TOKENS
+        )
+        req_spec = make_spec(
+            rid=recv_req.rid,
+            tokens=recv_req.input_ids,
+            max_cached_prefix_tokens=max_cached_prefix_tokens,
         )
 
         # A transport that validates requests itself (msgpack ZMQ) marks

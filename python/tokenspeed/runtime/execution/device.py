@@ -149,6 +149,11 @@ class DeviceSpecs:
         supports_disaggregation: The KV arena can hand pages to a peer node.
         supports_pd_layerwise_finalization: The drafter can finalize
             layerwise KV writes, required for PD layerwise transfer.
+        supports_prompt_logprobs: This engine can serve a request that asks
+            for prompt (input) logprobs: either it never computes the prompt
+            rows (the PD decode role, whose prefill node returns them) or its
+            LM head scores every prompt row on this rank (no row narrowing,
+            no pipeline split). The ingress refuses such requests otherwise.
         cache_state_group_ids: Group ids of the state-family cache groups,
             for the per-group page-usage debug line. Empty for pools with no
             recurrent/conv state.
@@ -166,6 +171,7 @@ class DeviceSpecs:
     uses_eager_grammar: bool
     supports_disaggregation: bool
     supports_pd_layerwise_finalization: bool
+    supports_prompt_logprobs: bool
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
 
@@ -450,6 +456,7 @@ class DeviceHandle:
                 capture_next_input_ids=capture_next_input_ids,
                 ngram_inputs=planned.ngram_inputs,
                 request_history_seeds=planned.request_history_seeds,
+                input_logprob_plan=planned.input_logprob_plan,
             )
 
         return PendingExecution(self._thread.submit(_forward))
@@ -1306,6 +1313,10 @@ def build_device_side(
                 "supports_pd_layerwise_finalization",
                 False,
             )
+        ),
+        supports_prompt_logprobs=(
+            server_args.disaggregation_mode == "decode"
+            or executor.supports_prompt_logprobs
         ),
         cache_state_group_ids=tuple(
             str(spec.group_id)

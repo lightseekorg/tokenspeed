@@ -51,6 +51,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     RequestHistoryRows,
     advance_scheduler,
     engram_context_len,
+    input_logprob_plan_for_forward,
     make_config,
     ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
@@ -240,6 +241,8 @@ class EventLoop:
         specs = device.specs
         self.multimodal_encoder_dtype = specs.multimodal_encoder_dtype
         self.cache_storage = specs.cache_storage
+        # Republished to the ingress (engine ready info, msgpack handshake).
+        self.supports_prompt_logprobs: bool = specs.supports_prompt_logprobs
         self._scheduler_cache_geometry = specs.cache_geometry
         geometry = self._scheduler_cache_geometry
         # The contract is the one source of admitted capacity.
@@ -1104,6 +1107,9 @@ class EventLoop:
                             if self._request_history_rows is not None
                             else None
                         )
+                        input_logprob_plan = input_logprob_plan_for_forward(
+                            forward_op, self.output_processor.rid_to_state
+                        )
                         self._batch_logger.log_dispatch(forward_op, stats)
 
                         if in_flight and self._dispatch_depends_on_pending_commit(
@@ -1119,6 +1125,7 @@ class EventLoop:
                             grammar_inputs=grammar_inputs,
                             ngram_inputs=ngram_inputs,
                             request_history_seeds=request_history_seeds,
+                            input_logprob_plan=input_logprob_plan,
                             multimodal_context=(
                                 multimodal_context_for_forward(
                                     forward_op, self.output_processor.rid_to_state
@@ -1341,6 +1348,7 @@ def run_event_loop(
                 "max_model_len": event_loop.max_model_len,
                 "multimodal_encoder_dtype": event_loop.multimodal_encoder_dtype,
                 "cache_storage": getattr(event_loop, "cache_storage", None),
+                "supports_prompt_logprobs": event_loop.supports_prompt_logprobs,
             }
         )
 

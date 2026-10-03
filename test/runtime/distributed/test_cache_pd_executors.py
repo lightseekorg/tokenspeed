@@ -543,8 +543,10 @@ def test_terminal_events_clear_transport_room_state(
         bootstrap_token_table={9: 42},
         spec_candidate_ids_table={9: [1]},
         cached_tokens_table={9: remote_hits},
+        bootstrap_logprob_table={9: -0.25},
         _pending_bootstrap_token_table={},
         _pending_spec_candidate_ids_table={},
+        _pending_bootstrap_logprob_table={},
         connection_lock=nullcontext(),
         addr_to_rooms_tracker={"bootstrap": {9}},
     )
@@ -566,6 +568,7 @@ def test_terminal_events_clear_transport_room_state(
     decode._admissions = {}
     decode._remote_cache_slots = {}
     decode._remote_cached_tokens = {}
+    decode._remote_bootstrap_logprobs = {}
     decode._remote_spec_candidate_ids = {}
     decode.cache_layout = _layout()
     admission = _op()
@@ -575,12 +578,15 @@ def test_terminal_events_clear_transport_room_state(
     assert len(decode.generate_events()) == 1
     assert decode.pop_remote_cache_slot("request") == 7
     assert decode.pop_remote_cached_tokens("request") == max(2, remote_hits)
+    assert decode.pop_remote_bootstrap_logprob("request") == -0.25
     assert decode.pop_remote_spec_candidate_ids("request") == (7, [1])
     assert decode._admissions == {}
     assert decode._remote_cache_slots == {}
     assert decode._remote_cached_tokens == {}
+    assert decode._remote_bootstrap_logprobs == {}
     assert decode._remote_spec_candidate_ids == {}
     assert decode_manager.cached_tokens_table == {}
+    assert decode_manager.bootstrap_logprob_table == {}
     assert decode.receivers == {}
     assert decode_manager.request_status == {}
     assert decode_manager.expected_prefill_ranks_table == {}
@@ -597,6 +603,7 @@ def test_terminal_cleanup_wakes_prefill_metadata_waiter() -> None:
     manager.bootstrap_token_cond = threading.Condition()
     manager.prefill_metadata = {}
     manager.cached_tokens = {}
+    manager.bootstrap_logprobs = {}
     manager.transfer_infos = {9: {}}
     manager.request_status = {9: TransferPoll.WaitingForInput}
     result = []
@@ -1406,8 +1413,10 @@ def test_decode_accepts_only_the_planned_prefill_rank_completion_set() -> None:
         value.bootstrap_token_table = {}
         value.spec_candidate_ids_table = {}
         value.cached_tokens_table = {}
+        value.bootstrap_logprob_table = {}
         value._pending_bootstrap_token_table = {}
         value._pending_spec_candidate_ids_table = {}
+        value._pending_bootstrap_logprob_table = {}
         value.failure_records = {}
         value.record_failure = lambda room, reason: value.failure_records.__setitem__(
             room, reason
@@ -1415,19 +1424,22 @@ def test_decode_accepts_only_the_planned_prefill_rank_completion_set() -> None:
         return value
 
     complete = manager()
-    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280)
+    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280, -0.5)
     assert complete.request_status[9] == TransferPoll.WaitingForInput
-    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280)
+    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280, -0.5)
     assert complete.cached_tokens_table[9] == 1280
-    complete._handle_prefill_status(9, TransferPoll.Success, 2, -1, None, 1280)
+    # The rank completing last carries no bootstrap metadata; the first valid
+    # token and logprob seen are kept.
+    complete._handle_prefill_status(9, TransferPoll.Success, 2, -1, None, 1280, None)
     assert complete.request_status[9] == TransferPoll.Success
     assert complete.bootstrap_token_table[9] == 42
-    assert complete.pop_prefill_metadata(9) == (42, None, 1280)
+    assert complete.pop_prefill_metadata(9) == (42, None, 1280, -0.5)
     assert complete.cached_tokens_table == {}
+    assert complete.bootstrap_logprob_table == {}
 
     wrong_rank = manager()
-    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 0, -1, None, 1280)
-    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 1, -1, None, 1280)
+    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 0, -1, None, 1280, None)
+    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 1, -1, None, 1280, None)
     assert wrong_rank.request_status[9] == TransferPoll.Failed
     assert wrong_rank.prefill_response_tracker[9] == {0}
     assert "unexpected Prefill TP rank" in wrong_rank.failure_records[9]
@@ -1503,12 +1515,14 @@ def test_prefill_usage_status_wire_roundtrip():
     manager.request_status = {9: TransferPoll.Bootstrapped}
     manager.prefill_metadata = {}
     manager.cached_tokens = {}
+    manager.bootstrap_logprobs = {}
     messages = []
     manager._connect = lambda endpoint: (
         SimpleNamespace(send_multipart=messages.append),
         nullcontext(),
     )
     manager.record_cached_tokens(9, 1280)
+    manager.record_bootstrap_logprob(9, -0.123456789012345678)
     manager.sync_status_to_decode_endpoint(
         "127.0.0.1",
         1234,
@@ -1519,12 +1533,31 @@ def test_prefill_usage_status_wire_roundtrip():
         spec_candidate_ids=[5, 6],
     )
     parsed = parse_prefill_status_message(messages[0])
-    assert parsed == (9, TransferPoll.Success, 0, 42, [5, 6], 1280)
-    # Older senders lack the optional trailing usage frame.
-    assert parse_prefill_status_message(messages[0][:-1])[-1] == 0
+    # The logprob frame is an IEEE double: exact, not a decimal rendering.
+    assert parsed == (
+        9,
+        TransferPoll.Success,
+        0,
+        42,
+        [5, 6],
+        1280,
+        -0.123456789012345678,
+    )
+    # Older senders lack the optional trailing frames: no logprob, then no usage.
+    assert parse_prefill_status_message(messages[0][:-1])[-2:] == (1280, None)
+    assert parse_prefill_status_message(messages[0][:-2])[-2:] == (0, None)
     manager.begin_room(9)
     assert manager.prefill_metadata == {}
     assert manager.cached_tokens == {}
+    assert manager.bootstrap_logprobs == {}
+
+    # A request without logprobs ships an empty logprob frame.
+    manager.request_status = {9: TransferPoll.Bootstrapped}
+    manager.sync_status_to_decode_endpoint(
+        "127.0.0.1", 1234, 9, TransferPoll.Success, 0, bootstrap_token=42
+    )
+    assert messages[1][-1] == b""
+    assert parse_prefill_status_message(messages[1])[-1] is None
 
 
 def test_usage_alone_does_not_release_layerwise_bootstrap_waiter():
@@ -1538,7 +1571,9 @@ def test_usage_alone_does_not_release_layerwise_bootstrap_waiter():
     manager.request_status = {9: TransferPoll.WaitingForInput}
     manager.prefill_metadata = {}
     manager.cached_tokens = {}
+    manager.bootstrap_logprobs = {}
     manager.record_cached_tokens(9, 1280)
+    manager.record_bootstrap_logprob(9, -1.5)
     done = threading.Event()
     result = []
 
@@ -1557,6 +1592,7 @@ def test_usage_alone_does_not_release_layerwise_bootstrap_waiter():
     assert result == [(42, [5, 6])]
     assert manager.prefill_metadata[9] == (42, [5, 6])
     assert manager.cached_tokens[9] == 1280
+    assert manager.bootstrap_logprobs[9] == -1.5
 
 
 if __name__ == "__main__":

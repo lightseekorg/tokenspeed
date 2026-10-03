@@ -70,6 +70,74 @@ would leave the cache namespace on the old checkpoint. Use
 `POST /update_weights_from_distributed` with an explicit `weight_version` and
 `flush_cache=True` to coordinate the weight load and cache namespace change.
 
+### Logprobs
+
+| Parameter | Purpose |
+| --- | --- |
+| `--enable-output-logprobs` | Gate for every logprob request. Off by default; the sampler gathers logprobs only when on, and a request asking for them on a server without the flag is rejected. |
+| `--input-logprob-chunk-tokens` | Prompt rows pushed through the LM head per chunk when a request asks for prompt (input) logprobs. Defaults to `256`. A sizing knob only: the transient per-chunk cost is about `chunk × vocab × (2 + 2 + 4)` bytes (the bf16 logits shard, the bf16 TP-gathered logits, the fp32 log-softmax), so the default costs about 256 MiB at a 128K vocabulary, and the value never changes a result (log-softmax is row-local). |
+
+Two request dialects share one compute path. The vLLM dialect
+(`sampling_params.logprobs`) returns the sampled tokens' logprobs under
+`meta_info["logprobs"]`. The SGLang dialect (`/generate` with
+`return_logprob=true`) returns `meta_info["output_token_logprobs"]` as
+`(logprob, token_id, text|null)` triples and, with `logprob_start_len`,
+prompt (input) logprobs under `meta_info["input_token_logprobs"]`:
+
+- `logprob_start_len=-1` (the default) returns the single entry
+  `[(null, input_ids[-1], text)]` and computes nothing extra.
+- `logprob_start_len=s` with `0 <= s < len(input_ids)` returns
+  `len(input_ids) - s` entries: `(null, input_ids[s], text)` first, then the
+  logprob of each following prompt token given its prefix. `s >= len(input_ids)`
+  is a 400.
+- `return_text_in_logprobs` fills the text field; `logprob_format` selects
+  `"vllm"`, `"sglang"`, or `"both"`.
+
+Prompt logprobs are computed with the same fp32 log-softmax as the output
+logprobs (see `docs/design/numerics.md`), accumulated across chunked-prefill
+chunks and shipped once, on the first frame after the prompt finished. A
+request that returns them from position `s` skips the prefix cache for
+positions `>= s`, so those positions are recomputed and always have logits;
+positions before `s` reuse the cache as usual. Mixed prefill/decode batches
+(`--enable-mixed-batch`) are supported. A NaN or infinite prompt logprob
+terminates the request with a `NumericalError` exactly like NaN logits on a
+sampled token (`--enable-nan-detection`); the response never carries a
+non-finite value.
+
+A request with `logprob_start_len >= 0` that asks for at least one prompt
+logprob is refused at the ingress with a 400 when the engine cannot score
+every prompt position: models that narrow their prefill rows (DeepSeek V4.1's
+CED decoder keeps only each prompt's last window for the LM head) and
+pipeline-parallel deployments (`--pp-size > 1`, where the logits live on the
+last stage only). The scheduler reports this capability at startup and the
+frontend checks it before admitting the request, so the data plane never has
+to. Multimodal prompts are refused too (their media positions carry
+content-hash ids, not tokens), as is a prompt whose client-supplied
+`input_ids` fall outside the vocabulary. `logprob_start_len=-1` is always
+accepted.
+
+In a disaggregated deployment the prefill node and the decode node each
+return their own frames, exactly as SGLang's do: the prefill node's finished
+frame carries `meta_info.input_token_logprobs` (and the bootstrap token under
+`output_token_logprobs`), while the decode node's frames carry
+`output_token_logprobs` only and never `input_token_logprobs`. The prefill
+node forwards the bootstrap token's logprob to the decode node, so the decode
+node's `output_token_logprobs` covers every generated token. Merging the two
+into one response is the router's job -- an SGLang `mini_lb`-style router or
+the Dynamo compatibility frontend joins the prefill node's prompt logprobs
+with the decode node's output, just as it does for SGLang. The direct msgpack
+scheduler drive (SMG) carries sampled-token logprobs only: it refuses a
+`logprob_start_len` that would produce prompt logprobs rather than compute
+and drop them.
+
+`top_logprobs_num > 0` and `token_ids_logprob` are not supported yet. Output
+logprobs are not propagated across pipeline-parallel stages (`--pp-size > 1`).
+
+This runtime requires a `tokenspeed-scheduler` build that has
+`RequestSpec.max_cached_prefix_tokens` (the admission-probe bound; see
+`docs/design/scheduler.md` §1): every admission sets it, so an older scheduler
+fails at the first request, not only at the first prompt-logprob request.
+
 ### Slime RL Compatibility
 
 TokenSpeed exposes the SGLang HTTP surface used by slime. The supported path is
