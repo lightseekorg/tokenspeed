@@ -802,6 +802,10 @@ class DFlash(BaseDrafter):
                 return decline("the latent down-projection is quantized")
             if getattr(attn, "rotary_emb", None) is not rotary:
                 return decline("the draft's layers do not share one RoPE table")
+            if attn.kv_lora_scale is not None:
+                # The fused write norms the latent but applies no runtime
+                # scale (--mla-lora-scale runtime); the per-layer path does.
+                return decline("the latent carries a runtime LoRA norm scale")
             start = int(attn.q_lora_rank)
             weight_rows.append(weight[start : start + kv_width])
             norm_rows.append(attn.kv_a_layernorm.weight)

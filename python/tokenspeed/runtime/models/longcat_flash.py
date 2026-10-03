@@ -33,7 +33,7 @@ from tokenspeed_kernel.thirdparty.cuda import (
 )
 from transformers import PretrainedConfig as _PretrainedConfig
 
-from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES, MLA_LORA_SCALES
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping as _Mapping
@@ -469,6 +469,25 @@ class _RuntimeLongcatMoE(nn.Module):
         return routed_expert_output
 
 
+def _lora_norm_scales(config: _PretrainedConfig) -> tuple[float | None, float | None]:
+    """LongCat's ``sqrt(hidden / lora_rank)`` factors on its q and kv LoRA norms.
+
+    Returns:
+        ``(q_scale, kv_scale)``; an entry is None when the checkpoint does not
+        apply that scale (``mla_scale_q_lora`` / ``mla_scale_kv_lora`` unset).
+    """
+    q_scale = None
+    if (
+        getattr(config, "mla_scale_q_lora", False)
+        and getattr(config, "q_lora_rank", None) is not None
+    ):
+        q_scale = (config.hidden_size / config.q_lora_rank) ** 0.5
+    kv_scale = None
+    if getattr(config, "mla_scale_kv_lora", False):
+        kv_scale = (config.hidden_size / config.kv_lora_rank) ** 0.5
+    return q_scale, kv_scale
+
+
 class _RuntimeLongcatDecoderLayer(nn.Module):
     """One LongCat layer: two attention/dense-MLP branches beside one MoE.
 
@@ -502,6 +521,18 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             rope_scaling = None
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
+        # --mla-lora-scale: "runtime" hands the norm scales to the attention
+        # as separate multiplies; "folded" leaves them to post_load_weights.
+        mla_lora_scale = global_server_args_dict["mla_lora_scale"]
+        if mla_lora_scale not in MLA_LORA_SCALES:
+            raise ValueError(
+                f"mla_lora_scale must be one of {list(MLA_LORA_SCALES)}, got "
+                f"{mla_lora_scale!r}"
+            )
+        q_lora_scale, kv_lora_scale = (
+            _lora_norm_scales(config) if mla_lora_scale == "runtime" else (None, None)
+        )
+
         self.self_attn = nn.ModuleList(
             [
                 _DeepseekV3AttentionMLA(
@@ -526,6 +557,8 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
                     reduce_attn_results=False,
                     alt_stream=alt_stream,
                     mapping=self.mapping,
+                    q_lora_scale=q_lora_scale,
+                    kv_lora_scale=kv_lora_scale,
                 )
                 for branch_id in range(2)
             ]
@@ -1063,6 +1096,8 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         ``kv_a_layernorm`` -- which multiplies the parameter in place and so
         must happen exactly once per loaded value -- is applied only to the
         norms this update reloaded. The initial load reloads all of them.
+        Under ``--mla-lora-scale runtime`` there is no fold at all: the
+        attention multiplies the scales in its forward.
         """
         reloaded = self._weight_update_loaded_names
         param_names = (
@@ -1104,20 +1139,21 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
                     w, self_attn
                 )
-                if (
-                    getattr(self.config, "mla_scale_q_lora", False)
-                    and hasattr(self_attn, "q_a_layernorm")
-                    and _reloaded(self_attn.q_a_layernorm.weight)
-                ):
-                    self_attn.q_a_layernorm.weight.data *= (
-                        self.config.hidden_size / self.config.q_lora_rank
-                    ) ** 0.5
-                if getattr(self.config, "mla_scale_kv_lora", False) and _reloaded(
-                    self_attn.kv_a_layernorm.weight
-                ):
-                    self_attn.kv_a_layernorm.weight.data *= (
-                        self.config.hidden_size / self.config.kv_lora_rank
-                    ) ** 0.5
+                if global_server_args_dict["mla_lora_scale"] == "folded":
+                    # Under "runtime" the attention multiplies these scales in
+                    # its forward and the norm weights stay as loaded (so a
+                    # weight update can never fold them twice). The fold
+                    # multiplies the parameter in place, so it is applied only
+                    # to the norms this load (re)loaded.
+                    q_scale, kv_scale = _lora_norm_scales(self.config)
+                    if q_scale is not None and _reloaded(
+                        self_attn.q_a_layernorm.weight
+                    ):
+                        self_attn.q_a_layernorm.weight.data *= q_scale
+                    if kv_scale is not None and _reloaded(
+                        self_attn.kv_a_layernorm.weight
+                    ):
+                        self_attn.kv_a_layernorm.weight.data *= kv_scale
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight

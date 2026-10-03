@@ -60,6 +60,11 @@ SAMPLING_STREAMS = ("batch", "per-request")
 # the host.
 YARN_RAMP_MASK_DEVICES = ("cuda", "cpu")
 
+# ``--mla-lora-scale``: where LongCat-style MLA applies its sqrt(hidden /
+# lora_rank) norm scales — folded into the q_a/kv_a layernorm weights at load,
+# or multiplied at runtime after q_b_proj / kv_a_layernorm as the trainer does.
+MLA_LORA_SCALES = ("folded", "runtime")
+
 
 def require_verified_numerics(
     numerics: str,
@@ -106,6 +111,7 @@ def require_verified_numerics(
 
 __all__ = [
     "BITWISE_ENVELOPES",
+    "MLA_LORA_SCALES",
     "NUMERICS_ENVELOPES",
     "RL_BITWISE_SAMPLING_BACKENDS",
     "SAMPLING_STREAMS",

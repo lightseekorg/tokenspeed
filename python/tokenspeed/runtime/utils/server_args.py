@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_S
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
+    MLA_LORA_SCALES,
     NUMERICS_ENVELOPES,
     RL_BITWISE_SAMPLING_BACKENDS,
     SAMPLING_STREAMS,
@@ -426,6 +427,10 @@ class ServerArgs:
     # folded to the trainer's form by --numerics trainer-aligned.
     # Device that computes the YaRN linear ramp mask of deepseek_yarn RoPE.
     yarn_ramp_mask_device: str = "cuda"
+    # Where LongCat-style MLA applies its sqrt(hidden / lora_rank) norm scales:
+    # folded into the q_a/kv_a layernorm weights at load, or multiplied at
+    # runtime after q_b_proj / kv_a_layernorm as the trainer does.
+    mla_lora_scale: str = "folded"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -651,6 +656,11 @@ class ServerArgs:
                 "--yarn-ramp-mask-device must be one of "
                 f"{list(YARN_RAMP_MASK_DEVICES)}, got "
                 f"{self.yarn_ramp_mask_device!r}"
+            )
+        if self.mla_lora_scale not in MLA_LORA_SCALES:
+            raise ValueError(
+                f"--mla-lora-scale must be one of {list(MLA_LORA_SCALES)}, got "
+                f"{self.mla_lora_scale!r}"
             )
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
@@ -1113,6 +1123,8 @@ class ServerArgs:
         # The trainer builds its RoPE inverse frequencies on the host; CPU and
         # CUDA division round the ramp differently at ulp level.
         self.yarn_ramp_mask_device = "cpu"
+        # The trainer multiplies the LoRA norm scales as separate bf16 ops.
+        self.mla_lora_scale = "runtime"
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -2786,6 +2798,18 @@ class ServerArgs:
             "trainer builds it on the host, and CPU and CUDA division round "
             "differently at ulp level. Folded to cpu by --numerics "
             "trainer-aligned.",
+        )
+        parser.add_argument(
+            "--mla-lora-scale",
+            type=str,
+            choices=list(MLA_LORA_SCALES),
+            default=ServerArgs.mla_lora_scale,
+            help="Where LongCat-style MLA applies its sqrt(hidden / lora_rank) "
+            "norm scales. 'folded': into the q_a_layernorm / kv_a_layernorm "
+            "weights after loading. 'runtime': as separate bf16 multiplies "
+            "after q_b_proj and after kv_a_layernorm, as the trainer does; the "
+            "norm weights are never rewritten and the DSA indexer reads the "
+            "unscaled q_lora. Folded to runtime by --numerics trainer-aligned.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

@@ -114,6 +114,18 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--yarn-ramp-mask-device"):
             ServerArgs(model="x", yarn_ramp_mask_device="npu")
 
+    def test_trainer_aligned_applies_the_mla_lora_scale_at_runtime(self):
+        self.assertEqual(ServerArgs(model="x").mla_lora_scale, "folded")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").mla_lora_scale, "folded"
+        )
+        self.assertEqual(
+            ServerArgs(model="x", numerics="trainer-aligned").mla_lora_scale,
+            "runtime",
+        )
+        with self.assertRaisesRegex(ValueError, "--mla-lora-scale"):
+            ServerArgs(model="x", mla_lora_scale="both")
+
     def test_bitwise_envelopes_cover_every_pinning_envelope(self):
         from tokenspeed.runtime.configs.numerics import (
             BITWISE_ENVELOPES,
