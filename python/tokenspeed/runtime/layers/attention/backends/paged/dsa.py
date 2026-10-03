@@ -32,7 +32,7 @@ from tokenspeed_kernel.ops.attention.dsa import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES, DSA_SLOT_ORDERS
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
@@ -134,11 +134,6 @@ class DSABackend(PagedAttentionBackend):
         # --dsa-slot-order: how the cores reduce the selected slots
         # (docs/design/numerics.md, invariance.batch).
         self.slot_order: str = global_server_args_dict["dsa_slot_order"]
-        if self.slot_order not in DSA_SLOT_ORDERS:
-            raise ValueError(
-                f"dsa_slot_order must be one of {list(DSA_SLOT_ORDERS)}, got "
-                f"{self.slot_order!r}"
-            )
         self._prefill_page_table: torch.Tensor | None = None
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)

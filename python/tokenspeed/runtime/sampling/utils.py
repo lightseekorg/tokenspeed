@@ -23,7 +23,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.ops.sampling import vocab_parallel_logprobs
 
-from tokenspeed.runtime.configs.numerics import LOGPROB_ORDERS, MEGATRON_VOCAB_BLOCK
+from tokenspeed.runtime.configs.numerics import MEGATRON_VOCAB_BLOCK
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -92,17 +92,14 @@ def gather_token_logprobs(
         tokens: ``[rows]`` integer token ids.
         logprob_order: ``"torch"`` for ``torch.log_softmax``; ``"megatron"``
             for the trainer's vocab-parallel cross-entropy order over fixed
-            32768-wide vocab blocks (``--logprob-order``).
+            32768-wide vocab blocks (``--logprob-order``, validated by
+            ServerArgs).
 
     Returns:
         ``[rows]`` fp32 log probabilities.
     """
-    if logprob_order == "torch":
-        return gather_token_logprobs_torch(logits, tokens)
     if logprob_order == "megatron":
         return vocab_parallel_logprobs(
             logits, tokens.to(torch.int64), vocab_block=MEGATRON_VOCAB_BLOCK
         )
-    raise ValueError(
-        f"logprob_order must be one of {list(LOGPROB_ORDERS)}, got {logprob_order!r}"
-    )
+    return gather_token_logprobs_torch(logits, tokens)

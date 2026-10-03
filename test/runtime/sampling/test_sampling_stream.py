@@ -224,11 +224,6 @@ def test_full_backend_passes_its_min_p_pool(cpu_kernels):
     assert call["min_p_pool"][4].item() == pytest.approx(0.05)
 
 
-def test_unknown_stream_is_refused():
-    with pytest.raises(ValueError, match="sampling_stream"):
-        FlashInferSamplingBackend(_config("philox", "cpu"))
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("top_k", [-1, 50])
 def test_per_request_stream_is_batch_invariant(top_k: int):

@@ -188,12 +188,6 @@ def test_correction_bias_route_can_take_the_torch_order(
     assert torch.equal(output.topk_weights, ref_weights)
     assert output.topk_ids.dtype == torch.int64
 
-    config.renormalize = True
-    with pytest.raises(ValueError, match="--router-topk torch"):
-        select_experts(
-            hidden_states=torch.empty((3, 4)), router_logits=logits, topk_config=config
-        )
-
 
 def test_topk_reads_the_router_topk_switch(monkeypatch: pytest.MonkeyPatch) -> None:
     from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -202,6 +196,28 @@ def test_topk_reads_the_router_topk_switch(monkeypatch: pytest.MonkeyPatch) -> N
     assert TopK(top_k=2).topk_config.router_topk == "torch"
     monkeypatch.setitem(global_server_args_dict, "router_topk", "fused")
     assert TopK(top_k=2).topk_config.router_topk == "fused"
-    monkeypatch.setitem(global_server_args_dict, "router_topk", "cuda")
-    with pytest.raises(ValueError, match="router_topk"):
-        TopK(top_k=2)
+
+
+def test_torch_router_refuses_renormalization_at_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    bias = torch.zeros(8)
+    monkeypatch.setitem(global_server_args_dict, "router_topk", "torch")
+    with pytest.raises(ValueError, match="--router-topk torch"):
+        TopK(top_k=2, renormalize=True, correction_bias=bias)
+    # Only the correction-bias route is the torch order's; other routes keep
+    # their own renormalization, and the fused route always may.
+    TopK(top_k=2, renormalize=False, correction_bias=bias)
+    TopK(top_k=2, renormalize=True)
+    TopK(
+        top_k=2,
+        renormalize=True,
+        correction_bias=bias,
+        use_grouped_topk=True,
+        num_expert_group=2,
+        topk_group=1,
+    )
+    monkeypatch.setitem(global_server_args_dict, "router_topk", "fused")
+    TopK(top_k=2, renormalize=True, correction_bias=bias)

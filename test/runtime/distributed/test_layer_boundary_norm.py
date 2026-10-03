@@ -140,8 +140,3 @@ def test_final_norm_follows_the_switch(monkeypatch):
     manager = _manager("fused", monkeypatch, norm)
     manager.final_norm(hidden.clone(), residual.clone(), ctx, norm)
     assert norm.calls == [2]
-
-
-def test_unknown_mode_is_refused(monkeypatch):
-    with pytest.raises(ValueError, match="layer_boundary_norm"):
-        _manager("half", monkeypatch, StubNorm())

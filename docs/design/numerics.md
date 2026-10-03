@@ -124,7 +124,10 @@ to its tight value, and it refuses an explicit choice it cannot tighten — a
 named MoE backend other than the batch-invariant one, a sampling backend
 without canonical greedy ties — rather than keeping it and silently voiding
 the contract. `resolve_numerics` runs after `resolve_communication` so it can
-veto the auto-enabled all-reduce fusion. `trainer-aligned` runs the
+veto the auto-enabled all-reduce fusion. Every closed-set switch is validated
+once, in `ServerArgs`; the layers that read a resolved switch trust it, and
+a constraint that needs more than the launch (a model's vocabulary, its
+routing) is checked when that module is constructed, never per forward. `trainer-aligned` runs the
 rl-bitwise block and then its own; every selection point that pins a
 batch-invariant leaf tests `numerics in BITWISE_ENVELOPES`, never the one
 name, so a tighter envelope inherits every pin.

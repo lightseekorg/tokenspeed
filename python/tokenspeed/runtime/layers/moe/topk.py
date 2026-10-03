@@ -34,7 +34,6 @@ from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 
-from tokenspeed.runtime.configs.numerics import ROUTER_TOPKS
 from tokenspeed.runtime.moe.dispatch_algorithm import STATIC_EP_DISPATCH_ALGORITHMS
 from tokenspeed.runtime.moe.expert_load_rows import LayerExpertLoad
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -487,9 +486,19 @@ class TopK(torch.nn.Module):
             assert sink_global_scale is not None
             assert routed_scaling_factor is not None
         router_topk = global_server_args_dict["router_topk"]
-        if router_topk not in ROUTER_TOPKS:
+        # The correction-bias route (select_experts) is the one --router-topk
+        # selects; the trainer's torch order has no renormalization step, so a
+        # model asking for one is refused here, at construction.
+        if (
+            router_topk == "torch"
+            and renormalize
+            and correction_bias is not None
+            and not use_grouped_topk
+            and num_sink_experts == 0
+        ):
             raise ValueError(
-                f"router_topk must be one of {list(ROUTER_TOPKS)}, got {router_topk!r}"
+                "--router-topk torch routes unnormalized probabilities, as the "
+                "trainer does; this model asks to renormalize them"
             )
 
         self.topk_config = TopKConfig(
@@ -743,12 +752,7 @@ def select_experts(
     elif correction_bias is not None:
         num_real_experts = router_logits.shape[1] - topk_config.zero_expert_num
         if topk_config.router_topk == "torch":
-            # The trainer's order; it has no renormalization step.
-            if renormalize:
-                raise ValueError(
-                    "--router-topk torch routes unnormalized probabilities, as "
-                    "the trainer does; this model asks to renormalize them"
-                )
+            # The trainer's order; TopK.__init__ refused renormalize with it.
             topk_weights, topk_ids = torch_router_topk(
                 router_logits,
                 correction_bias,

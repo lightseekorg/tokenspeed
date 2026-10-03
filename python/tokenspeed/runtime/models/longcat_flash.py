@@ -33,7 +33,7 @@ from tokenspeed_kernel.thirdparty.cuda import (
 )
 from transformers import PretrainedConfig as _PretrainedConfig
 
-from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES, MLA_LORA_SCALES
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping as _Mapping
@@ -532,14 +532,10 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
 
         # --mla-lora-scale: "runtime" hands the norm scales to the attention
         # as separate multiplies; "folded" leaves them to post_load_weights.
-        mla_lora_scale = global_server_args_dict["mla_lora_scale"]
-        if mla_lora_scale not in MLA_LORA_SCALES:
-            raise ValueError(
-                f"mla_lora_scale must be one of {list(MLA_LORA_SCALES)}, got "
-                f"{mla_lora_scale!r}"
-            )
         q_lora_scale, kv_lora_scale = (
-            _lora_norm_scales(config) if mla_lora_scale == "runtime" else (None, None)
+            _lora_norm_scales(config)
+            if global_server_args_dict["mla_lora_scale"] == "runtime"
+            else (None, None)
         )
 
         self.self_attn = nn.ModuleList(

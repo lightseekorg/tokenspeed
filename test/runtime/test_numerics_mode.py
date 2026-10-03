@@ -196,6 +196,26 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--moe-combine-order"):
             ServerArgs(model="x", moe_combine_order="tree")
 
+    def test_slot_combine_is_validated_against_the_launch_at_startup(self):
+        # The slot fold runs over the EP group inside the leaf: a K-split down
+        # projection would need a second fold, and DeepEP owns the exchange.
+        ServerArgs(model="x", moe_combine_order="slot", world_size=2, ep_size=2)
+        # MoE TP defaults to the stage world over EP, so world_size=2 alone
+        # is MoE TP 2.
+        with self.assertRaisesRegex(ValueError, "needs MoE TP 1"):
+            ServerArgs(model="x", moe_combine_order="slot", world_size=2)
+        with self.assertRaisesRegex(ValueError, "--all2all-backend deepep"):
+            ServerArgs(
+                model="x",
+                moe_combine_order="slot",
+                world_size=2,
+                ep_size=2,
+                all2all_backend="deepep",
+            )
+        # The envelope inherits both refusals.
+        with self.assertRaisesRegex(ValueError, "needs MoE TP 1"):
+            ServerArgs(model="x", numerics="trainer-aligned", world_size=2)
+
     def test_bitwise_envelopes_cover_every_pinning_envelope(self):
         from tokenspeed.runtime.configs.numerics import (
             BITWISE_ENVELOPES,

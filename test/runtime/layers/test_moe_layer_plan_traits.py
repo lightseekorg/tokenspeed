@@ -138,13 +138,28 @@ def test_slot_order_hands_the_leaf_the_ep_group(monkeypatch):
     assert plan["process_group"] is process_group
 
 
-def test_slot_order_refuses_moe_tensor_parallelism(monkeypatch):
+def test_slot_order_hands_the_leaf_the_ep_device_group_over_the_planned_one(
+    monkeypatch,
+):
+    # A solution that already carries a group (mega_moe) gets the same EP
+    # device group; the slot fold runs on it whatever the plan's solution.
+    ep_group = (0, 1)
+    process_group = object()
     monkeypatch.setitem(global_server_args_dict, "moe_combine_order", "slot")
-    with pytest.raises(ValueError, match="needs MoE TP 1"):
-        _plan_kwargs(monkeypatch, activation="swiglu", tp_rank=0, tp_size=2)
-
-
-def test_unknown_combine_order_is_refused(monkeypatch):
-    monkeypatch.setitem(global_server_args_dict, "moe_combine_order", "tree")
-    with pytest.raises(ValueError, match="moe_combine_order"):
-        _plan_kwargs(monkeypatch, activation="swiglu")
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "mapping",
+        SimpleNamespace(moe=SimpleNamespace(ep_group=ep_group)),
+    )
+    monkeypatch.setattr(
+        expert_module, "get_moe_backend", lambda: SimpleNamespace(value="mega_moe")
+    )
+    monkeypatch.setattr(
+        expert_module.pg_manager,
+        "get_device_process_group",
+        lambda group: process_group if group == ep_group else None,
+    )
+    plan = _plan_kwargs(
+        monkeypatch, activation="swiglu", ep_rank=0, ep_size=2, tp_rank=0, tp_size=1
+    )
+    assert plan["process_group"] is process_group

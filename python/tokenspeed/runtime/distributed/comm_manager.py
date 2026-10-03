@@ -22,7 +22,6 @@ from collections.abc import Sequence
 
 import torch
 
-from tokenspeed.runtime.configs.numerics import LAYER_BOUNDARY_NORMS
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     token_all_gather,
@@ -127,11 +126,6 @@ class CommManager:
         # --layer-boundary-norm: how input_reduce_norm and final_norm add the
         # residual (docs/design/numerics.md, alignment.trainer).
         self.layer_boundary_norm: str = global_server_args_dict["layer_boundary_norm"]
-        if self.layer_boundary_norm not in LAYER_BOUNDARY_NORMS:
-            raise ValueError(
-                f"layer_boundary_norm must be one of {list(LAYER_BOUNDARY_NORMS)}, "
-                f"got {self.layer_boundary_norm!r}"
-            )
 
     # ---- Scattered token counts ----
 

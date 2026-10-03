@@ -46,7 +46,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
 )
 from tokenspeed_kernel.platform import pdl_enabled
 
-from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES, SAMPLING_STREAMS
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
@@ -172,11 +172,6 @@ class FlashInferSamplingBackend(SamplingBackend):
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         super().__init__(config)
-        if config.sampling_stream not in SAMPLING_STREAMS:
-            raise ValueError(
-                f"sampling_stream must be one of {list(SAMPLING_STREAMS)}, got "
-                f"{config.sampling_stream!r}"
-            )
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)

@@ -69,8 +69,6 @@ def test_gather_dispatches_on_the_order():
         vocab_parallel_logprobs(logits, tokens, vocab_block=MEGATRON_VOCAB_BLOCK),
     )
     torch.testing.assert_close(megatron, torch_order, rtol=1e-5, atol=1e-5)
-    with pytest.raises(ValueError, match="logprob_order"):
-        gather_token_logprobs(logits, tokens, logprob_order="apex")
 
 
 def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch):
@@ -128,10 +126,12 @@ def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch):
     )
 
 
-def _processor(order: str, monkeypatch) -> LogitsProcessor:
+def _processor(order: str, monkeypatch, vocab_size: int = VOCAB) -> LogitsProcessor:
     monkeypatch.setitem(global_server_args_dict, "logprob_order", order)
     return LogitsProcessor(
-        SimpleNamespace(model_type="test", vocab_size=VOCAB, final_logit_softcapping=None)
+        SimpleNamespace(
+            model_type="test", vocab_size=vocab_size, final_logit_softcapping=None
+        )
     )
 
 
@@ -177,9 +177,16 @@ def test_prompt_logprobs_follow_the_order(monkeypatch):
     torch.testing.assert_close(megatron, torch_order, rtol=1e-5, atol=1e-5)
 
 
-def test_processor_refuses_an_unknown_order(monkeypatch):
-    with pytest.raises(ValueError, match="logprob_order"):
-        _processor("apex", monkeypatch)
+def test_megatron_order_needs_a_block_multiple_vocabulary_at_construction(
+    monkeypatch,
+):
+    # The fold runs over fixed-width blocks of the sliced logits; a vocabulary
+    # that does not tile is refused when the processor is built, not when
+    # the first logprob request reaches the forward thread.
+    _processor("megatron", monkeypatch, vocab_size=3 * MEGATRON_VOCAB_BLOCK)
+    _processor("torch", monkeypatch, vocab_size=MEGATRON_VOCAB_BLOCK + 1)
+    with pytest.raises(ValueError, match="multiple of it"):
+        _processor("megatron", monkeypatch, vocab_size=MEGATRON_VOCAB_BLOCK + 1)
 
 
 def test_megatron_order_dispatches_to_a_registered_vendor_leaf():

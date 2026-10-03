@@ -166,6 +166,16 @@ def validate_dcp_disaggregation_role(
         )
 
 
+def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
+    """Refuse a launch value outside ``flag``'s closed set of ``choices``.
+
+    ServerArgs is the one place a closed-set flag is validated; consumers
+    read the resolved value and trust it.
+    """
+    if value not in choices:
+        raise ValueError(f"{flag} must be one of {list(choices)}, got {value!r}")
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
@@ -668,49 +678,25 @@ class ServerArgs:
                 self.max_num_seqs = 160
 
     def resolve_kernel_backends(self):
-        if self.dense_gemm_backend not in {"auto", "trtllm_cutedsl"}:
-            raise ValueError("--dense-gemm-backend must be auto or trtllm_cutedsl")
-        if self.sampling_stream not in SAMPLING_STREAMS:
-            raise ValueError(
-                f"--sampling-stream must be one of {list(SAMPLING_STREAMS)}, got "
-                f"{self.sampling_stream!r}"
-            )
-        if self.yarn_ramp_mask_device not in YARN_RAMP_MASK_DEVICES:
-            raise ValueError(
-                "--yarn-ramp-mask-device must be one of "
-                f"{list(YARN_RAMP_MASK_DEVICES)}, got "
-                f"{self.yarn_ramp_mask_device!r}"
-            )
-        if self.mla_lora_scale not in MLA_LORA_SCALES:
-            raise ValueError(
-                f"--mla-lora-scale must be one of {list(MLA_LORA_SCALES)}, got "
-                f"{self.mla_lora_scale!r}"
-            )
-        if self.layer_boundary_norm not in LAYER_BOUNDARY_NORMS:
-            raise ValueError(
-                "--layer-boundary-norm must be one of "
-                f"{list(LAYER_BOUNDARY_NORMS)}, got {self.layer_boundary_norm!r}"
-            )
-        if self.router_topk not in ROUTER_TOPKS:
-            raise ValueError(
-                f"--router-topk must be one of {list(ROUTER_TOPKS)}, got "
-                f"{self.router_topk!r}"
-            )
-        if self.logprob_order not in LOGPROB_ORDERS:
-            raise ValueError(
-                f"--logprob-order must be one of {list(LOGPROB_ORDERS)}, got "
-                f"{self.logprob_order!r}"
-            )
-        if self.moe_combine_order not in MOE_COMBINE_ORDERS:
-            raise ValueError(
-                "--moe-combine-order must be one of "
-                f"{list(MOE_COMBINE_ORDERS)}, got {self.moe_combine_order!r}"
-            )
-        if self.dsa_slot_order not in DSA_SLOT_ORDERS:
-            raise ValueError(
-                f"--dsa-slot-order must be one of {list(DSA_SLOT_ORDERS)}, got "
-                f"{self.dsa_slot_order!r}"
-            )
+        _require_choice(
+            "--dense-gemm-backend", self.dense_gemm_backend, ("auto", "trtllm_cutedsl")
+        )
+        # The numerics switches (docs/design/numerics.md) are closed sets.
+        for flag, value, choices in (
+            ("--sampling-stream", self.sampling_stream, SAMPLING_STREAMS),
+            (
+                "--yarn-ramp-mask-device",
+                self.yarn_ramp_mask_device,
+                YARN_RAMP_MASK_DEVICES,
+            ),
+            ("--mla-lora-scale", self.mla_lora_scale, MLA_LORA_SCALES),
+            ("--layer-boundary-norm", self.layer_boundary_norm, LAYER_BOUNDARY_NORMS),
+            ("--router-topk", self.router_topk, ROUTER_TOPKS),
+            ("--logprob-order", self.logprob_order, LOGPROB_ORDERS),
+            ("--moe-combine-order", self.moe_combine_order, MOE_COMBINE_ORDERS),
+            ("--dsa-slot-order", self.dsa_slot_order, DSA_SLOT_ORDERS),
+        ):
+            _require_choice(flag, value, choices)
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
             # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
@@ -1109,17 +1095,15 @@ class ServerArgs:
         Runs after ``resolve_communication`` so it can veto the fused
         all-reduce that resolver auto-enables.
         """
+        _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
         if self.numerics != "auto":
-            if self.numerics not in NUMERICS_ENVELOPES:
-                raise ValueError(
-                    f"--numerics must be one of {list(NUMERICS_ENVELOPES)}, got "
-                    f"{self.numerics!r}"
-                )
             self._resolve_rl_bitwise()
             if self.numerics == "trainer-aligned":
                 self._resolve_trainer_aligned()
         # Individual switches that veto a fusion resolve_communication may
-        # have auto-enabled, whatever the envelope.
+        # have auto-enabled, whatever the envelope. CommManager.should_fuse
+        # re-derives the veto from the switches, so the fused kernels stay off
+        # even where this flag is read before the fold.
         if self.layer_boundary_norm == "unfused":
             # The fused all-reduce+norm kernels add the residual inside the
             # fusion; the unfused boundary norm needs the bf16 sum first.
@@ -1128,6 +1112,23 @@ class ServerArgs:
             # The MoE leaf returns complete rows; a fused all-reduce+norm at
             # the next layer boundary would sum them tp_size times.
             self.enable_allreduce_fusion = False
+            # The slot-order fold runs over the EP group inside the MoE leaf:
+            # a K-split (MoE TP) down projection would need a second,
+            # rank-ordered fold after it, and DeepEP's all-to-all owns that
+            # exchange itself (and hands the leaf a NCCL group, not the EP
+            # device group the fold runs on).
+            if self.mapping.moe.tp_size != 1:
+                raise ValueError(
+                    "--moe-combine-order slot needs MoE TP 1: a K-split down "
+                    "projection would need a second, rank-ordered fold after "
+                    f"the slot-order one (got --moe-tp-size {self.mapping.moe.tp_size})"
+                )
+            if self.all2all_backend == "deepep":
+                raise ValueError(
+                    "--moe-combine-order slot folds the routed outputs over the "
+                    "EP group inside the MoE leaf; --all2all-backend deepep "
+                    "performs that exchange itself and cannot be combined with it"
+                )
 
     def _resolve_rl_bitwise(self):
         """The rl-bitwise block: every envelope beyond auto runs it."""
