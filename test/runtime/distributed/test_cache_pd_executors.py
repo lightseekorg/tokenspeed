@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -440,12 +441,16 @@ def test_failed_room_fanout_never_restores_state(
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     layout = _layout()
-    registration = _registration(
-        layout,
-        session="session",
-        endpoint="127.0.0.1",
-        pointer=0x1000,
-        expected_decode_ranks=(0,),
+    # A registration the table holds has had its route planned.
+    registration = replace(
+        _registration(
+            layout,
+            session="session",
+            endpoint="127.0.0.1",
+            pointer=0x1000,
+            expected_decode_ranks=(0,),
+        ),
+        transfer_owner_filters={},
     )
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.decode_kv_args_table = {"session": registration}
@@ -1586,9 +1591,10 @@ def test_transfer_blocks_keep_only_owned_pages_translated_to_local() -> None:
 
     source_layout = _sharded_history_layout(2)
     destination_layout = _sharded_history_layout(1)
-    # Virtual IDs 1..6 are dealt to two owners; rank 1 owns 2, 4, 6, which
-    # live in its local pages 1, 2, 3. The destination keeps the same
-    # manifest positions (FluentLLM's sharded-source/whole-destination case).
+    # Virtual IDs 1..6 are dealt to two owners; rank 1 holds only the blocks
+    # whose (v - 1) % 2 == 1, that is 2, 4, 6, in its local pages 1, 2, 3.
+    # The destination holds every block, so its entries stay at the same
+    # manifest positions.
     source_manifest = _single_group_block_manifest("history", (1, 2, 3, 4, 5, 6))
     destination_manifest = _single_group_block_manifest(
         "history", (10, 11, 12, 13, 14, 15)
@@ -1674,27 +1680,39 @@ def test_transfer_blocks_apply_owner_filter_to_layerwise_selection() -> None:
     assert item.src_pages.tolist() == [2] and item.dst_pages.tolist() == [13]
 
 
-def test_transfer_blocks_reject_a_sharded_group_without_an_owner_filter() -> None:
-    from tokenspeed.runtime.pd.transfer_plan import CachePageOwnerFilter
-
+def test_transfer_blocks_send_nothing_for_a_sharded_group_decided_none() -> None:
+    """A None decision skips the group; the sender never infers from absence."""
     manager, _ = _recording_transfer_manager(_sharded_history_layout(2), 0x1000)
     manifest = _single_group_block_manifest("history", (1, 2))
 
-    def blocks(owner_filters):
-        return list(
+    assert (
+        list(
             manager._cache_transfer_blocks(
                 dst_ptr=0x2000,
                 src_block_manifest=manifest,
                 dst_block_manifest=manifest,
-                owner_filters=owner_filters,
+                owner_filters={"history": None},
+                dst_cache_layout=_sharded_history_layout(1),
+            )
+        )
+        == []
+    )
+    with pytest.raises(KeyError):
+        list(
+            manager._cache_transfer_blocks(
+                dst_ptr=0x2000,
+                src_block_manifest=manifest,
+                dst_block_manifest=manifest,
+                owner_filters={},
                 dst_cache_layout=_sharded_history_layout(1),
             )
         )
 
-    with pytest.raises(ValueError, match="carries no owner filter"):
-        blocks({})
-    with pytest.raises(ValueError, match="disagrees with its shard count"):
-        blocks({"history": CachePageOwnerFilter(0, 4)})
+
+def test_transfer_blocks_reject_an_out_of_range_virtual_block() -> None:
+    from tokenspeed.runtime.pd.transfer_plan import CachePageOwnerFilter
+
+    manager, _ = _recording_transfer_manager(_sharded_history_layout(2), 0x1000)
     # A virtual ID past the group's virtual count never reaches the wire.
     with pytest.raises(IndexError):
         list(
@@ -1706,6 +1724,56 @@ def test_transfer_blocks_reject_a_sharded_group_without_an_owner_filter() -> Non
                 dst_cache_layout=_sharded_history_layout(1),
             )
         )
+
+
+def test_registration_validates_owner_filter_decisions_once() -> None:
+    from tokenspeed.runtime.pd.transfer_plan import (
+        CachePageOwnerFilter,
+        validate_rank_owner_filters,
+    )
+
+    group_specs = make_layout(
+        make_group(
+            "history",
+            make_segment("layer.0.kv", dtype="bfloat16", shape=(8,), stride=32),
+            shard_count=2,
+        ),
+        make_group(
+            "state",
+            make_segment("layer.1.state", dtype="bfloat16", shape=(8,), stride=32),
+        ),
+        capacity=16,
+        page_bytes=64,
+    ).group_specs
+    history = CacheTransferFragment(
+        group_id="history",
+        field_id="layer.0.kv",
+        src_byte_offset=0,
+        dst_byte_offset=0,
+        src_row_stride_bytes=16,
+        dst_row_stride_bytes=16,
+        bytes_per_row=16,
+        rows_per_page=1,
+    )
+    state = replace(history, group_id="state", field_id="layer.1.state")
+
+    def check(fragments, owner_filters):
+        validate_rank_owner_filters(
+            group_specs=group_specs, fragments=fragments, owner_filters=owner_filters
+        )
+
+    check((history, state), {"history": CachePageOwnerFilter(1, 2)})
+    check((state,), {"history": None})
+    with pytest.raises(ValueError, match="no owner-filter decision"):
+        check((history,), {})
+    with pytest.raises(ValueError, match="disagrees with its shard count"):
+        check((history,), {"history": CachePageOwnerFilter(0, 4)})
+    with pytest.raises(ValueError, match="but no owner filter"):
+        check((history,), {"history": None})
+    with pytest.raises(ValueError, match="carries no fragment of it"):
+        check((state,), {"history": CachePageOwnerFilter(0, 2)})
+    with pytest.raises(ValueError, match="which is not sharded"):
+        check((state,), {"history": None, "state": CachePageOwnerFilter(0, 2)})
 
 
 def test_every_sharded_prefill_rank_serves_every_decode_rank() -> None:

@@ -1194,6 +1194,14 @@ already counts completions from a rank set. Replicated groups keep the
 single-source route. A sharded decode cache, and a field that is both
 head-partitioned and page-sharded, are rejected by the planner.
 
+The plan records one decision per (source rank, sharded group), never by
+omission: the owner filter when the rank's fragments name the group, an
+explicit `None` when they do not -- a rank routed only for another group's
+head partition (Kimi K3's KDA state against its MLA subgroup), or a pipeline
+stage whose fields miss the group -- so that rank sends nothing for it. The
+prefill checks those decisions against its cache groups once, when the decode
+registers (`validate_rank_owner_filters`); the sender applies them as given.
+
 The runtime derives compact DCP page tables and local visible lengths from
 the scheduler's virtual block tables, without introducing new scheduler-owned
 request state. To support draft length changes, the read table retains

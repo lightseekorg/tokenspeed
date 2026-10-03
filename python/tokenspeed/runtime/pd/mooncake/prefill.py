@@ -60,6 +60,7 @@ from tokenspeed.runtime.pd.transfer_plan import (
     CachePageOwnerFilter,
     CacheTransferFragment,
     CacheTransferPlanner,
+    validate_rank_owner_filters,
 )
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
@@ -265,6 +266,11 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             raise ValueError(
                 "CachePD request references an unregistered Decode session"
             )
+        if registration.transfer_owner_filters is None:
+            raise ValueError(
+                "CachePD request references a Decode session whose route was "
+                "never planned"
+            )
         return registration
 
     def _reject_decode_registration(
@@ -314,24 +320,32 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         if local_tp_rank in route.target_prefill_ranks:
             # A DCP-sharded source is never idle: every rank of the chosen
             # subgroup serves the decode rank with the blocks it owns.
-            return replace(
-                registration,
-                transfer_fragments=route.fragments_by_prefill_rank[local_tp_rank],
-                transfer_owner_filters=route.owner_filters_by_prefill_rank.get(
-                    local_tp_rank, {}
-                ),
-                is_dummy=False,
-                expected_decode_ranks=expected_decode_ranks,
+            fragments = route.fragments_by_prefill_rank[local_tp_rank]
+            owner_filters = route.owner_filters_by_prefill_rank[local_tp_rank]
+            is_dummy = False
+        elif registration.decode_tp_rank == 0 and not expected_decode_ranks:
+            fragments = ()
+            # A rendezvous-only rank sends nothing of any group.
+            owner_filters = dict.fromkeys(planner.sharded_group_ids)
+            is_dummy = True
+            expected_decode_ranks = frozenset({0})
+        else:
+            raise ValueError(
+                "CachePD Decode registration targets the wrong Prefill TP rank"
             )
-        if registration.decode_tp_rank == 0 and not expected_decode_ranks:
-            return replace(
-                registration,
-                transfer_fragments=(),
-                is_dummy=True,
-                expected_decode_ranks=frozenset({0}),
-            )
-        raise ValueError(
-            "CachePD Decode registration targets the wrong Prefill TP rank"
+        # The sender applies the route's owner-filter decisions as given, so
+        # they are checked against the local cache groups once, here.
+        validate_rank_owner_filters(
+            group_specs=self.kv_args.cache_layout.group_specs,
+            fragments=fragments,
+            owner_filters=owner_filters,
+        )
+        return replace(
+            registration,
+            transfer_fragments=fragments,
+            transfer_owner_filters=owner_filters,
+            is_dummy=is_dummy,
+            expected_decode_ranks=expected_decode_ranks,
         )
 
     def _validate_cache_room_fanout(self, reqs: tuple[TransferInfo, ...]) -> None:
@@ -412,7 +426,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         src_block_manifest: CachePDBlockManifest | None,
         dst_block_manifest: CachePDBlockManifest,
         transfer_fragments: tuple[CacheTransferFragment, ...] = (),
-        owner_filters: Mapping[str, CachePageOwnerFilter],
+        owner_filters: Mapping[str, CachePageOwnerFilter | None],
         dst_cache_layout: CacheTransferContract,
         block_selection: CachePDLayerwiseBlockSelection | None = None,
         field_ids: frozenset[str] | None = None,
@@ -420,12 +434,14 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         """Yield the copies that move this rank's part of one request's blocks.
 
         Args:
-            owner_filters: Per DCP-sharded group, which of the manifest's
-                scheduler blocks this rank owns (from its registration route).
-                Only those blocks are copied, from their local pages to the
-                destination blocks at the same manifest positions; a group
-                without a filter is copied whole. Scheduler IDs of a replicated
-                group are already its local pages.
+            owner_filters: The registration route's decision for every
+                DCP-sharded group of the layout (``validate_rank_owner_filters``
+                checked it): the filter selecting the manifest blocks this
+                rank owns, copied from their local pages to the destination
+                blocks at the same manifest positions, or None when the route
+                carries no block of the group and nothing is sent for it.
+                Replicated groups are copied whole; their scheduler IDs are
+                already local pages.
         """
         layout = self.kv_args.cache_layout
 
@@ -470,16 +486,13 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 raise ValueError(
                     "cache transfer source and destination pages differ in count"
                 )
-            owner_filter = owner_filters.get(group_spec.group_id)
-            if owner_filter is not None:
-                if owner_filter.owner_count != group_spec.shard_count:
-                    raise ValueError(
-                        f"cache group {group_spec.group_id!r} owner filter "
-                        f"({owner_filter.owner_count} owners) disagrees with its "
-                        f"shard count {group_spec.shard_count}"
-                    )
-                # FluentLLM's sharded-source/whole-destination case: owned
-                # local pages against the destination entries at the same
+            if group_spec.shard_count != 1:
+                owner_filter = owner_filters[group_spec.group_id]
+                if owner_filter is None:
+                    continue
+                # This rank holds only the blocks whose (v - 1) % shard_count
+                # == owner_rank, in its local pages; the destination holds
+                # every block, so keep the destination entries at the same
                 # manifest positions.
                 owned, source_block_ids = owned_local_pages(
                     source_block_ids,
@@ -490,11 +503,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 destination_block_ids = np.asarray(
                     destination_block_ids, dtype=np.int64
                 )[owned]
-            elif group_spec.shard_count != 1:
-                raise ValueError(
-                    f"cache group {group_spec.group_id!r} is sharded but the "
-                    "registration route carries no owner filter"
-                )
             group_transfers.append(
                 (
                     group_spec,
