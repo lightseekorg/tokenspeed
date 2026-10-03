@@ -44,7 +44,12 @@ from tokenspeed.runtime.configs.numerics import (
     BITWISE_ENVELOPES,
     MEGATRON_VOCAB_BLOCK,
 )
-from tokenspeed.runtime.distributed.comm_ops import all_gather_single
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_gather,
+    all_gather_single,
+    all_to_all_transpose,
+    token_all_gather,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -259,7 +264,16 @@ class LogitsProcessor(nn.Module):
         tp_rank: int | None = None,
         tp_size: int | None = None,
         tp_group: tuple[int, ...] | None = None,
+        dp_lm_head_tp: bool = False,
     ):
+        """``tp_*`` describe the group ``lm_head`` is vocab-sharded over.
+
+        ``dp_lm_head_tp`` selects the layout where that group's ranks are
+        data-parallel for attention and hold different rows: the rows are
+        all-gathered before the logits GEMM and the vocab shards transposed
+        back to each rank's own rows afterwards (``skip_all_gather`` is then
+        required, as the plain vocab all-gather does not apply).
+        """
         super().__init__()
         self.config = config
         self.skip_all_gather = skip_all_gather
@@ -297,6 +311,12 @@ class LogitsProcessor(nn.Module):
         if tp_size != 1 and tp_group is None:
             raise ValueError("tp_group is required when tp_size > 1.")
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
+        if dp_lm_head_tp and (tp_size == 1 or not skip_all_gather):
+            raise ValueError(
+                "dp_lm_head_tp needs a vocab-sharded head (tp_size > 1) and "
+                "skip_all_gather=True"
+            )
+        self.dp_lm_head_tp = dp_lm_head_tp
 
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
         self._dist_argmax_state = self._LOGITS_DIST_ARGMAX_UNINITIALIZED
@@ -700,6 +720,21 @@ class LogitsProcessor(nn.Module):
             del logits
         return out
 
+    def _lm_head_tp_row_counts(self, hidden_states: torch.Tensor) -> list[int]:
+        """Rows each LM-head TP rank brings to the logits GEMM.
+
+        The logits rows follow no host-side table in general (a prefill keeps
+        one row per request, or the logprob rows; a MIXED round mixes both),
+        so the counts are exchanged. Under CUDA graph capture every DP rank
+        runs the same padded decode batch, so the counts are uniform and no
+        device sync is recorded.
+        """
+        rows = hidden_states.shape[0]
+        if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+            return [rows] * self.tp_size
+        counts = torch.tensor([rows], dtype=torch.int64, device=hidden_states.device)
+        return all_gather(counts, self.tp_group, dim=0).tolist()
+
     def _get_logits(
         self,
         hidden_states: torch.Tensor,
@@ -740,6 +775,15 @@ class LogitsProcessor(nn.Module):
                 hidden_states, plan
             )
 
+        lm_head_tp_row_counts: list[int] | None = None
+        if self.dp_lm_head_tp:
+            if dp_sampling:
+                raise RuntimeError("dp_lm_head_tp cannot combine with DP sampling")
+            lm_head_tp_row_counts = self._lm_head_tp_row_counts(hidden_states)
+            hidden_states = token_all_gather(
+                hidden_states, self.tp_group, lm_head_tp_row_counts
+            )
+
         quant_method = getattr(lm_head, "quant_method", None)
         if should_apply_lm_head_quant_method(lm_head, quant_method):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
@@ -771,7 +815,13 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        if dp_sampling and not self.skip_all_gather:
+        if lm_head_tp_row_counts is not None:
+            # [T_full, V / W] -> [T_own, V]: this rank's rows with every
+            # rank's vocab shard, in rank order like the plain all-gather.
+            logits = all_to_all_transpose(
+                logits, self.tp_group, input_split_sizes=lm_head_tp_row_counts
+            )
+        elif dp_sampling and not self.skip_all_gather:
             if self._logits_layout_executor is None:
                 raise RuntimeError(
                     "dp_sampling logits layout executor is not configured"

@@ -263,7 +263,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             config, mapping=self.mapping, quant_config=quant_config
         )
 
-        if self.mapping.attn.has_dp:
+        # The draft shares the target's LM-head layout (mapping.lm_head):
+        # replicated under attention DP unless --lm-head-tp-size shards it.
+        if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,
                 config.vocab_size,
@@ -274,17 +276,18 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
+                tp_rank=self.mapping.lm_head.tp_rank,
+                tp_size=self.mapping.lm_head.tp_size,
+                tp_group=self.mapping.lm_head.tp_group,
             )
         self.logits_processor = LogitsProcessor(
             config,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
+            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
 
     @torch.no_grad()

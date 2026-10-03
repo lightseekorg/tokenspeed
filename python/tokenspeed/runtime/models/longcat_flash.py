@@ -579,6 +579,11 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             if "mlps" in getattr(config, "disable_quant_module", [])
             else quant_config
         )
+        # --tp-batch-invariant attn+dense: column-parallel down_proj and a
+        # transposing dense tail (no cross-rank sum outside MoE).
+        dense_batch_invariant = (
+            global_server_args_dict["tp_batch_invariant"] == "attn+dense"
+        )
         self.mlps = nn.ModuleList(
             [
                 _DeepseekV3MLP(
@@ -589,6 +594,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
                     quant_config=dense_quant_config,
                     prefix=add_prefix(f"mlps.{branch_id}", prefix),
                     is_shared_expert=False,
+                    batch_invariant=dense_batch_invariant,
                 )
                 for branch_id in range(2)
             ]
@@ -622,6 +628,11 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             is_moe=True,
             prev_is_moe=False,
         )
+        # --tp-batch-invariant attn+dense: the dense tail transposes rows
+        # instead of reduce-scattering channel partials (see the MLPs).
+        dense_batch_invariant = (
+            global_server_args_dict["tp_batch_invariant"] == "attn+dense"
+        )
         self.branch_comm = [
             _CommManager(
                 mapping=self.mapping,
@@ -630,6 +641,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
                 prev_is_moe=False,
                 input_layernorm=self.input_layernorm[branch_id],
                 post_attn_layernorm=self.post_attention_layernorm[branch_id],
+                dense_batch_invariant=dense_batch_invariant,
             )
             for branch_id in range(2)
         ]
@@ -745,6 +757,15 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         num_global_tokens, max_num_tokens_per_gpu = self.moe_comm.get_num_tokens(ctx)
 
         if ctx.forward_mode.is_idle():
+            if self.self_attn[0].has_head_tp:
+                return self._forward_idle_head_tp(
+                    positions,
+                    hidden_states,
+                    ctx,
+                    residual,
+                    num_global_tokens,
+                    max_num_tokens_per_gpu,
+                )
             return self._forward_idle(
                 hidden_states,
                 residual,
@@ -810,6 +831,45 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         )
 
         hidden_states = hidden_states + moe_hidden_states
+        return hidden_states, residual
+
+    def _forward_idle_head_tp(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: _ForwardContext,
+        residual: torch.Tensor | None,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """An idle rank's forward under attention head TP.
+
+        With no rows of its own the rank still holds a head shard of its
+        group's tokens, so both attentions run their exchanges and
+        projections; the dense branches run their group collectives as well,
+        in the active ranks' order, so every collective of the layer stays in
+        lockstep. All activations are empty and the result is the input.
+        """
+        hidden_states, residual = self.moe_comm.input_reduce_norm(
+            hidden_states, residual
+        )
+        self.self_attn[0](
+            positions=positions,
+            hidden_states=hidden_states,
+            ctx=ctx,
+            comm_manager=self.moe_comm,
+        )
+        self._forward_moe(
+            hidden_states, residual, ctx, num_global_tokens, max_num_tokens_per_gpu
+        )
+        self._forward_dense_mlp(0, hidden_states, residual, ctx)
+        self.self_attn[1](
+            positions=positions,
+            hidden_states=hidden_states,
+            ctx=ctx,
+            comm_manager=self.branch_comm[1],
+        )
+        self._forward_dense_mlp(1, hidden_states, residual, ctx)
         return hidden_states, residual
 
 

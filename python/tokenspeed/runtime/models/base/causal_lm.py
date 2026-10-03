@@ -233,7 +233,9 @@ class BaseCausalLM(nn.Module):
         if getattr(config, "tie_word_embeddings", False):
             return self.model.embed_tokens
 
-        if self.mapping.attn.has_dp:
+        # mapping.lm_head follows attention TP without attention DP and is
+        # replicated (tp 1) under it unless --lm-head-tp-size widens it.
+        if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
             return ReplicatedLinear(
                 config.hidden_size,
                 config.vocab_size,
@@ -247,9 +249,9 @@ class BaseCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
         )
 
     def resolve_logits_processor(self, config: PretrainedConfig) -> LogitsProcessor:
@@ -257,9 +259,10 @@ class BaseCausalLM(nn.Module):
         return LogitsProcessor(
             config,
             skip_all_gather=self.mapping.attn.has_dp,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
+            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
 
     def post_init(self) -> None:

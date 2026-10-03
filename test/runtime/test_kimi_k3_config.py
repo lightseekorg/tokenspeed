@@ -661,6 +661,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
         attention = DeepseekV3AttentionMLA.__new__(DeepseekV3AttentionMLA)
         torch.nn.Module.__init__(attention)
+        attention.has_head_tp = False
         attention.num_local_heads = 2
         attention.v_head_dim = 3
         attention.attn_mha = SimpleNamespace(group_id="full_attention")

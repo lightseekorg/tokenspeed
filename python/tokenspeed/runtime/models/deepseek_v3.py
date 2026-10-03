@@ -72,7 +72,19 @@ _FUSED_A_MAX_M = 16  # measured cliff: wins to M=16, flat ~1.35x loss from 18 to
 
 
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.distributed.comm_manager import CommManager
+from tokenspeed.runtime.distributed.comm_manager import (
+    CommManager,
+    dp_group_row_counts,
+    forward_collective_row_table,
+    forward_input_row_table,
+)
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_gather,
+    all_to_all_head_scatter,
+    all_to_all_transpose,
+    token_all_gather,
+    token_reduce_scatter,
+)
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
 )
@@ -162,6 +174,16 @@ def _prepare_mla_kv_b_proj_weights(
 
 
 class DeepseekV3MLP(nn.Module):
+    """Dense SwiGLU MLP sharded over the dense (or shared-expert) TP group.
+
+    ``batch_invariant`` selects the TP-batch-invariant layout: ``down_proj``
+    is column-parallel on hidden and consumes the whole intermediate
+    activation, all-gathered along its channels, so every output element is
+    one full-K GEMM result and the layer's tail moves rows instead of
+    summing partials (``CommManager(dense_batch_invariant=True)``). The
+    layout needs a dense TP group and unquantized weights.
+    """
+
     def __init__(
         self,
         hidden_size: int,
@@ -171,6 +193,7 @@ class DeepseekV3MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_shared_expert: bool = False,
+        batch_invariant: bool = False,
     ) -> None:
         super().__init__()
         self.mapping = mapping
@@ -182,6 +205,22 @@ class DeepseekV3MLP(nn.Module):
             tp_rank = self.mapping.dense.tp_rank
             tp_size = self.mapping.dense.tp_size
             tp_group = self.mapping.dense.tp_group
+        self.batch_invariant = batch_invariant
+        self.tp_group = tp_group
+        if batch_invariant:
+            if is_shared_expert:
+                raise ValueError(
+                    "the batch-invariant dense layout applies to dense layers, "
+                    "not shared experts"
+                )
+            if tp_size == 1:
+                raise ValueError(
+                    "the batch-invariant dense layout needs a dense TP group"
+                )
+            if quant_config is not None:
+                raise ValueError(
+                    "the batch-invariant dense layout needs an unquantized down_proj"
+                )
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -193,17 +232,31 @@ class DeepseekV3MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            reduce_results=False,  # Communication is handled externally and manually controlled
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            tp_group=tp_group,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-        )
+        if batch_invariant:
+            # Full K (the whole intermediate dim) on every rank; the output
+            # is this rank's hidden shard of every gathered token.
+            self.down_proj = ColumnParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                tp_group=tp_group,
+                quant_config=None,
+                prefix=add_prefix("down_proj", prefix),
+            )
+        else:
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                reduce_results=False,  # Communication is handled externally and manually controlled
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                tp_group=tp_group,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+            )
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -220,6 +273,18 @@ class DeepseekV3MLP(nn.Module):
         )
 
     def forward(self, x):
+        if self.batch_invariant:
+            if x.size(0) == 0:
+                # Keep the [T_full, H / W] shape the transposing tail expects.
+                return x.new_empty(0, self.down_proj.output_size_per_partition)
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+            # Rank order along the channels matches the column shards of
+            # gate_up_proj, so the gathered activation is in global order.
+            x = all_gather(x, self.tp_group, dim=-1)
+            x, _ = self.down_proj(x)
+            return x
+
         if x.size(0) == 0:
             return x
 
@@ -532,11 +597,42 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.q_lora_scale = q_lora_scale
         self.kv_lora_scale = kv_lora_scale
         self.num_heads = num_heads
-        if num_heads % self.mapping.attn.tp_size != 0:
+        # The head projections (q_b/kv_b/o_proj) shard over the head-TP
+        # group: the attention TP group today, or a wider group of
+        # attention-DP ranks under head TP, where every rank keeps its own KV
+        # and the forward exchanges heads for tokens around core attention.
+        self.has_head_tp = self.mapping.attn.has_head_tp
+        self.head_tp_size = self.mapping.attn.head_tp_size
+        self.head_tp_rank = self.mapping.attn.head_tp_rank
+        self.head_tp_group = self.mapping.attn.head_tp_group
+        if num_heads % self.head_tp_size != 0:
             raise ValueError(
-                f"num_heads={num_heads} must be divisible by attn_tp_size={self.mapping.attn.tp_size}."
+                f"num_heads={num_heads} must be divisible by the head TP size "
+                f"{self.head_tp_size} (attn_tp_size={self.mapping.attn.tp_size})."
             )
-        self.num_local_heads = num_heads // self.mapping.attn.tp_size
+        self.num_local_heads = num_heads // self.head_tp_size
+        # TP batch invariance: o_proj is column-parallel on hidden over the
+        # head group (full K on every rank), so the attention tail moves rows
+        # instead of reduce-scattering head partials.
+        self.o_proj_batch_invariant = (
+            global_server_args_dict["tp_batch_invariant"] != "none"
+        )
+        if self.o_proj_batch_invariant and not self.has_head_tp:
+            raise ValueError(
+                "--tp-batch-invariant needs the head-sharded o_proj of "
+                "--attn-head-tp-size > 1"
+            )
+        if self.o_proj_batch_invariant and quant_config is not None:
+            raise ValueError(
+                "--tp-batch-invariant needs an unquantized o_proj; this layer's "
+                "o_proj is quantized"
+            )
+        if self.has_head_tp and not self.supports_head_tp:
+            raise NotImplementedError(
+                f"{type(self).__name__} overrides the attention forward without "
+                "the head-TP exchange; --attn-head-tp-size > 1 is not supported "
+                "for this model"
+            )
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -565,20 +661,25 @@ class DeepseekV3AttentionMLA(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
+                tp_rank=self.head_tp_rank,
+                tp_size=self.head_tp_size,
+                tp_group=self.head_tp_group,
             )
         else:
+            if self.has_head_tp:
+                raise ValueError(
+                    "attention head TP gathers the normalized q latent over the "
+                    "head group and needs q_lora_rank"
+                )
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.num_heads * self.qk_head_dim,
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
+                tp_rank=self.head_tp_rank,
+                tp_size=self.head_tp_size,
+                tp_group=self.head_tp_group,
             )
 
             self.kv_a_proj_with_mqa = ReplicatedLinear(
@@ -595,22 +696,38 @@ class DeepseekV3AttentionMLA(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.head_tp_rank,
+            tp_size=self.head_tp_size,
+            tp_group=self.head_tp_group,
         )
         # O projection.
-        self.o_proj = RowParallelLinear(
-            self.num_heads * self.v_head_dim,
-            self.hidden_size,
-            bias=False,
-            reduce_results=reduce_attn_results,
-            quant_config=quant_config,
-            prefix=add_prefix("o_proj", prefix),
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
-        )
+        if self.o_proj_batch_invariant:
+            # Full K (every head's values, all-gathered) on every rank; the
+            # output is this rank's hidden shard of every gathered token.
+            self.o_proj = ColumnParallelLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                bias=False,
+                quant_config=None,
+                prefix=add_prefix("o_proj", prefix),
+                tp_rank=self.head_tp_rank,
+                tp_size=self.head_tp_size,
+                tp_group=self.head_tp_group,
+            )
+        else:
+            self.o_proj = RowParallelLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                bias=False,
+                # Under head TP the partials are reduce-scattered to each
+                # rank's own rows in project_output, never all-reduced.
+                reduce_results=reduce_attn_results and not self.has_head_tp,
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+                tp_rank=self.head_tp_rank,
+                tp_size=self.head_tp_size,
+                tp_group=self.head_tp_group,
+            )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         # Fusion layer
@@ -638,8 +755,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         else:
             self.rotary_emb = None
 
+        # Under head TP the absorbed decode attends every head of this
+        # rank's own tokens (the heads arrive through the exchange).
         self.attn_mqa = PagedAttention(
-            self.num_local_heads,
+            self.num_heads if self.has_head_tp else self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,
@@ -663,6 +782,22 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.w_kc = None
         self.w_vc = None
 
+    @property
+    def supports_head_tp(self) -> bool:
+        """Whether this class's ``forward`` runs the head-TP exchange.
+
+        The base forward and break do, and so does the draft's break; a
+        subclass that overrides ``forward`` or ``_attn`` and threads the
+        head-TP hooks (``head_tp_gather_tokens``, ``forward_absorb_qkv_proj``,
+        ``forward_absorb_attn_v_proj``, ``project_output``) declares it with
+        ``supports_head_tp = True``.
+        """
+        cls = type(self)
+        return cls.forward is DeepseekV3AttentionMLA.forward and cls._attn in (
+            DeepseekV3AttentionMLA._attn,
+            DeepseekV3DraftAttentionMLA._attn,
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -682,16 +817,103 @@ class DeepseekV3AttentionMLA(nn.Module):
         dispatch-bound eager, collapsing the inter-segment bubbles a coarse
         whole-attention break leaves. Outside capture the ``@break_point`` is
         a direct call, so the eager path is unchanged.
+
+        Under head TP every rank of the head group takes part even with no
+        rows of its own (an idle DP rank): its head shard of the group's
+        tokens is computed here, and the exchanges are collectives.
         """
-        if hidden_states.shape[0] == 0:
+        if hidden_states.shape[0] == 0 and not self.has_head_tp:
             return hidden_states
         q, latent_cache = self._project_q_latent(
             hidden_states, ctx, comm_manager, block_scale
         )
         expanded = self._prefill_prologue_before_break(positions, q, latent_cache, ctx)
         attn_output = self._attn(positions, q, latent_cache, ctx, expanded=expanded)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return self.project_output(
+            attn_output, ctx, self.attention_output_rows(hidden_states, ctx)
+        )
+
+    # ---- Head-TP hooks -------------------------------------------------
+    #
+    # Under head TP the per-layer data flow is, per rank with T_own rows of
+    # a head group of W ranks holding T_full rows together:
+    #   q latent [T_own, q_lora]  --token all-gather-->  [T_full, q_lora]
+    #   q_b_proj + absorb         -->  Q [T_full, H/W, kv_lora + rope]
+    #   all_to_all_transpose      -->  Q [T_own, H, kv_lora + rope]
+    #   latent prologue (RoPE, KV write) and core attention on own KV
+    #   all_to_all_head_scatter   -->  [T_full, H/W, kv_lora]
+    #   value projection (w_vc)   -->  [T_full, H/W * v]
+    #   o_proj tail               -->  [T_own, hidden]
+    # The exchange precedes the prologue so the prologue sees one row count
+    # for the query, the latent and the write slots, and RoPE (a per-row
+    # rotation of each head) commutes with the head permutation.
+    #
+    # Row counts come from the forward's DP tables, by phase: the legs up to
+    # core attention move the forward's input rows; the legs after it move
+    # its collective rows, which a narrowing drafter has reduced to the live
+    # rows (``forward_collective_row_table``). Every rank of the group,
+    # including one with no rows of its own, picks the table the same way.
+
+    def head_tp_input_row_counts(self, ctx: ForwardContext, num_rows: int) -> list[int]:
+        """Input rows every head-group rank holds; ``num_rows`` is this rank's."""
+        return dp_group_row_counts(
+            forward_input_row_table(ctx),
+            self.head_tp_group,
+            self.mapping.rank,
+            num_rows,
+        )
+
+    def head_tp_row_counts(self, ctx: ForwardContext, num_rows: int) -> list[int]:
+        """Collective rows every head-group rank holds; ``num_rows`` is this rank's."""
+        return dp_group_row_counts(
+            forward_collective_row_table(ctx),
+            self.head_tp_group,
+            self.mapping.rank,
+            num_rows,
+        )
+
+    def head_tp_gather_tokens(
+        self, x: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        """Token all-gather of this rank's input rows ``[T_own, F]`` over the
+        head group."""
+        return token_all_gather(
+            x,
+            group=self.head_tp_group,
+            scattered_num_tokens=self.head_tp_input_row_counts(ctx, x.shape[0]),
+        )
+
+    def attention_output_rows(
+        self, hidden_states: torch.Tensor, ctx: ForwardContext
+    ) -> int:
+        """Rows this rank's attention output has; a narrowing draft overrides."""
+        return hidden_states.shape[0]
+
+    def project_output(
+        self, attn_output: torch.Tensor, ctx: ForwardContext, num_rows: int
+    ) -> torch.Tensor:
+        """``o_proj`` and, under head TP, the return to this rank's own rows.
+
+        ``attn_output`` is ``[T, H_local * v]``; ``num_rows`` is the rows this
+        rank owns (``T`` itself without head TP, where the output is the
+        plain ``o_proj`` result). Under head TP the batch-invariant tail
+        all-gathers the heads, runs the column-parallel ``o_proj`` and
+        transposes the hidden shards back; the plain tail runs the
+        row-parallel ``o_proj`` and reduce-scatters its partial sums.
+        """
+        if not self.has_head_tp:
+            return self.o_proj(attn_output)[0]
+        counts = self.head_tp_row_counts(ctx, num_rows)
+        if self.o_proj_batch_invariant:
+            attn_output = all_gather(attn_output, self.head_tp_group, dim=-1)
+            partial_hidden, _ = self.o_proj(attn_output)
+            return all_to_all_transpose(
+                partial_hidden, self.head_tp_group, input_split_sizes=counts
+            )
+        partial, _ = self.o_proj(attn_output)
+        return token_reduce_scatter(
+            partial, group=self.head_tp_group, scattered_num_tokens=counts
+        )
 
     def _prefill_prologue_before_break(
         self,
@@ -702,8 +924,9 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> MLAPrologueOutput | None:
         """Assemble the expanded prefill inputs and write every row's latent in
         the captured segment. A decode round, or a narrowed draft step, keeps
-        its one-launch prologue inside the break instead (see :meth:`_attn`)."""
-        if ctx.forward_mode.is_decode() or ctx.draft_narrowing is not None:
+        its one-launch prologue inside the break instead (see :meth:`_attn`).
+        An idle rank only reaches here under head TP, with no rows of its own."""
+        if ctx.forward_mode.is_decode_or_idle() or ctx.draft_narrowing is not None:
             return None
         slots = ctx.attn_backend.padded_write_locations(
             self.attn_mha, ctx.forward_mode, q.shape[0]
@@ -719,7 +942,9 @@ class DeepseekV3AttentionMLA(nn.Module):
         comm_manager: CommManager,
         block_scale: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """QKV projection producing absorbed ``q`` and raw ``latent_cache``.
+        """QKV projection producing the ``q_b_proj`` output ``q`` and this
+        rank's raw ``latent_cache``. Under head TP ``q`` covers the head
+        group's gathered tokens (this rank's head shard of each).
 
         The LoRA norm scales, when applied at runtime (``--mla-lora-scale
         runtime``), multiply exactly where the trainer does: the latent right
@@ -744,6 +969,8 @@ class DeepseekV3AttentionMLA(nn.Module):
                 )
                 if self.kv_lora_scale is not None:
                     kv_a.mul_(self.kv_lora_scale)
+            if self.has_head_tp:
+                q_norm = self.head_tp_gather_tokens(q_norm, ctx)
             q = self.q_b_proj(q_norm)[0]
             if self.q_lora_scale is not None:
                 q = q * self.q_lora_scale
@@ -795,12 +1022,52 @@ class DeepseekV3AttentionMLA(nn.Module):
         else:
             num_prefill_tokens = 0
         real_total = num_prefill_tokens + num_decode_tokens
+        # Under head TP ``q`` holds the head group's gathered rows (this
+        # rank's head shard), and so does the output; the latent, positions
+        # and slots are this rank's own rows.
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
             dtype=q.dtype,
             device=q.device,
         )
+
+        if self.has_head_tp:
+            if num_prefill_tokens > 0:
+                raise RuntimeError(
+                    "attention head TP serves decode rows only: the head-sharded "
+                    "kv_b_proj cannot expand every head's K/V for a prefill; this "
+                    f"forward carries {num_prefill_tokens} prefill tokens"
+                )
+            if output_gate is not None or absorbed_query is not None:
+                raise NotImplementedError(
+                    "attention head TP does not support an output gate or a "
+                    "pre-absorbed query"
+                )
+            # Every rank of the head group takes part, with or without rows
+            # of its own, so an idle rank runs the exchanges too; it writes no
+            # KV and asks the backend for no slots.
+            decode_ctx = replace(
+                ctx,
+                bs=num_decodes,
+                num_extends=0,
+                input_num_tokens=num_decode_tokens,
+                forward_mode=ForwardMode.DECODE,
+            )
+            slots = (
+                ctx.attn_backend.write_locations(self.attn_mha, ForwardMode.DECODE)
+                if num_decode_tokens > 0
+                else positions.new_empty(0, dtype=torch.int64)
+            )
+            self.forward_absorb(
+                positions[:real_total],
+                q,
+                latent_cache[:real_total],
+                decode_ctx,
+                slots,
+                attn_output,
+            )
+            return attn_output
 
         if num_prefill_tokens > 0:
             prefill_ctx = replace(
@@ -888,25 +1155,20 @@ class DeepseekV3AttentionMLA(nn.Module):
             output_gate=output_gate,
         )
 
-    def forward_absorb_qkv_proj(
+    def absorb_query(
         self,
         q: torch.Tensor,
-        latent_cache: torch.Tensor,
-        positions: torch.Tensor,
-        ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
-        absorbed_query: torch.Tensor | None = None,
-        cache_num_tokens: int | None = None,
-    ) -> torch.Tensor:
-        # GLM's sparse prefill runs more rows than it commits: write the leading rows.
-        query_tokens = q.shape[0]
-        if cache_num_tokens is None:
-            cache_num_tokens = query_tokens
-        if cache_num_tokens < 0 or cache_num_tokens > query_tokens:
-            raise RuntimeError(
-                "MLA cache write count is outside the query capacity: "
-                f"writes={cache_num_tokens}, queries={query_tokens}"
-            )
+        absorbed_query: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Absorb the ``q_b_proj`` output into latent space.
+
+        ``q`` is ``[T, H_local * qk_head_dim]`` (or the non-RoPE part alone
+        when ``absorbed_query`` supplies the pre-allocated
+        ``[T, H_local, kv_lora_rank + rope]`` query whose RoPE channels are
+        already filled). Returns the absorbed query, whose leading channels
+        are ``q_nope @ w_kc``, and the unrotated RoPE part: a view of ``q``
+        (the prologue rotates it into the query) or of ``absorbed_query``.
+        """
         if absorbed_query is None:
             q = q.view(-1, self.num_local_heads, self.qk_head_dim)
             q_nope, q_pe = q.split(
@@ -935,15 +1197,102 @@ class DeepseekV3AttentionMLA(nn.Module):
                 else None
             ),
         )
+        return Q, q_pe
+
+    def head_tp_scatter_query(
+        self, Q: torch.Tensor, ctx: ForwardContext, num_rows: int
+    ) -> torch.Tensor:
+        """Heads-to-tokens leg: ``[T_full, H_local, D]`` of this rank's head
+        shard becomes ``[num_rows, H, D]`` of its own input rows with every head."""
+        rows_full, heads_local, dim = Q.shape
+        counts = self.head_tp_input_row_counts(ctx, num_rows)
+        if sum(counts) != rows_full:
+            raise RuntimeError(
+                f"head-TP query rows {rows_full} do not match the group's row "
+                f"counts {counts}"
+            )
+        return all_to_all_transpose(
+            Q.reshape(rows_full, heads_local * dim),
+            self.head_tp_group,
+            input_split_sizes=counts,
+        ).view(-1, self.head_tp_size * heads_local, dim)
+
+    def head_tp_gather_heads(
+        self, attn_output: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        """Tokens-to-heads leg: ``[T_own, H, D]`` of this rank's tokens becomes
+        ``[T_full, H_local, D]`` of its head shard over the group's tokens."""
+        return all_to_all_head_scatter(
+            attn_output,
+            self.head_tp_group,
+            output_split_sizes=self.head_tp_row_counts(ctx, attn_output.shape[0]),
+        )
+
+    def latent_prologue(
+        self,
+        Q: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """The absorbed MLA prologue: rotate the query and the latent key
+        part, write the latent rows to ``slots`` and return the attention
+        query. One row count across the query, latent and positions."""
         return self.attn_mqa.latent_prologue(
             Q,
             q_pe,
             latent_cache,
             positions,
             ctx,
-            slots=out_cache_loc[:cache_num_tokens],
+            slots=slots,
             expanded=None,
         ).query
+
+    def forward_absorb_qkv_proj(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        out_cache_loc: torch.Tensor,
+        absorbed_query: torch.Tensor | None = None,
+        cache_num_tokens: int | None = None,
+    ) -> torch.Tensor:
+        """Absorb ``q`` and run the latent prologue over this rank's rows.
+
+        Under head TP ``q`` carries the head group's gathered rows and the
+        exchange to this rank's own rows happens between the absorption and
+        the prologue, so the prologue sees one row count; a rank with no rows
+        of its own skips the prologue and returns an empty query.
+        """
+        Q, q_pe = self.absorb_query(q, absorbed_query)
+        if self.has_head_tp:
+            # The RoPE part travels inside the query through the exchange;
+            # the prologue then rotates the query's own RoPE channels.
+            Q[..., self.kv_lora_rank :] = q_pe
+            Q = self.head_tp_scatter_query(Q, ctx, latent_cache.shape[0])
+            q_pe = Q[..., self.kv_lora_rank :]
+            if Q.shape[0] == 0:
+                return Q
+        # GLM's sparse prefill runs more rows than it commits: write the leading rows.
+        query_tokens = Q.shape[0]
+        if cache_num_tokens is None:
+            cache_num_tokens = query_tokens
+        if cache_num_tokens < 0 or cache_num_tokens > query_tokens:
+            raise RuntimeError(
+                "MLA cache write count is outside the query capacity: "
+                f"writes={cache_num_tokens}, queries={query_tokens}"
+            )
+        return self.latent_prologue(
+            Q,
+            q_pe,
+            latent_cache,
+            positions,
+            ctx,
+            slots=out_cache_loc[:cache_num_tokens],
+        )
 
     def forward_absorb_attn_v_proj(
         self,
@@ -953,6 +1302,33 @@ class DeepseekV3AttentionMLA(nn.Module):
         record_kv_cache: bool | None = None,
         output_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Core absorbed attention over this rank's KV, then the value
+        projection into ``output``. Under head TP the attention runs every
+        head of this rank's tokens, the heads are exchanged back and the
+        local ``w_vc`` projects this rank's head shard of the group's rows."""
+        if self.has_head_tp:
+            if output_gate is not None:
+                raise NotImplementedError(
+                    "attention head TP does not support an output gate"
+                )
+            if Q.shape[0] > 0:
+                attn_output = self.attn_mqa(
+                    Q,
+                    k=None,
+                    v=None,
+                    positions=None,
+                    ctx=ctx,
+                    record_kv_cache=record_kv_cache,
+                )
+            else:
+                attn_output = Q.new_empty(0, self.num_heads * self.kv_lora_rank)
+            attn_output = self.head_tp_gather_heads(
+                attn_output.view(-1, self.num_heads, self.kv_lora_rank), ctx
+            )
+            if attn_output.shape[0] == 0:
+                # The whole head group is idle this forward.
+                return output
+            return mla_project_value(attn_output, self.w_vc, out=output)
         use_projected_value_decode = (
             output_gate is not None
             and ctx.num_extends == 0
@@ -1156,7 +1532,12 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
             absorbed_query=absorbed_query,
         )
         Q = Q.index_select(0, ctx.gather_ids)
-        attn_output = q.new_empty(ctx.bs, self.num_local_heads * self.v_head_dim)
+        if self.has_head_tp:
+            # The exchanged rows after narrowing are the group's live rows.
+            output_rows = sum(self.head_tp_row_counts(ctx, ctx.bs))
+        else:
+            output_rows = ctx.bs
+        attn_output = q.new_empty(output_rows, self.num_local_heads * self.v_head_dim)
         # One live row per request: decode spans every request, not the MIXED tail.
         with ctx.attn_backend.override_num_extends(0):
             self.forward_absorb_attn_v_proj(
@@ -1167,6 +1548,14 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
                 record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
             )
         return attn_output
+
+    def attention_output_rows(
+        self, hidden_states: torch.Tensor, ctx: ForwardContext
+    ) -> int:
+        # A narrowing step keeps one live row per request (see _attn).
+        if ctx.draft_narrowing is None:
+            return hidden_states.shape[0]
+        return ctx.bs
 
 
 class DeepseekV3DecoderLayer(nn.Module):
@@ -1219,6 +1608,11 @@ class DeepseekV3DecoderLayer(nn.Module):
 
         self.layer_id = layer_id
         self.is_moe_layer = self._is_moe_layer(layer_id, is_nextn, config)
+        # --tp-batch-invariant attn+dense: the dense tail transposes rows
+        # instead of reduce-scattering head/channel partials.
+        dense_batch_invariant = (
+            global_server_args_dict["tp_batch_invariant"] == "attn+dense"
+        )
         if self.is_moe_layer:
             self.mlp = DeepseekV3MoE(
                 config=config,
@@ -1245,6 +1639,7 @@ class DeepseekV3DecoderLayer(nn.Module):
                 ),
                 prefix=add_prefix("mlp", prefix),
                 is_shared_expert=False,
+                batch_invariant=dense_batch_invariant,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1257,6 +1652,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             prev_is_moe=self._is_moe_layer(layer_id - 1, is_nextn, config),
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            dense_batch_invariant=dense_batch_invariant and not self.is_moe_layer,
         )
 
     @staticmethod
@@ -1304,6 +1700,16 @@ class DeepseekV3DecoderLayer(nn.Module):
                 max_num_tokens_per_gpu,
             )
         else:
+            if self.self_attn.has_head_tp:
+                # An idle rank still owns a head shard of its group's tokens:
+                # run the attention's exchanges and projections with no rows
+                # of its own (the output is empty and discarded).
+                self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    ctx=ctx,
+                    comm_manager=self.comm_manager,
+                )
             hidden_states = self.forward_mlp(
                 hidden_states,
                 residual,
