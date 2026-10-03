@@ -230,6 +230,12 @@ class MtpDraftInput:
 class Mtp(BaseDrafter):
     """
     Draft model runner for original multi-depth MTP heads.
+
+    Attention DP: every depth on an active rank runs the target's rows of
+    that round (the ``k``-window per decode request, the prompt chunk's rows
+    on extend), so each depth's collectives are sized by the target's
+    ``global_num_tokens``; an idle rank mirrors that with ``spec_num_steps``
+    IDLE forwards (:meth:`idle_step_global_num_tokens`).
     """
 
     shares_target_embed_head = True
@@ -258,16 +264,6 @@ class Mtp(BaseDrafter):
         )
 
         self.device = draft_model_runner.device
-
-        # Multi-depth drafting has no DP support: idle rounds (a DP rank
-        # keeping collectives in sync with no work of its own) have no
-        # window to run.
-        dp_size = draft_model_runner.mapping.attn.dp_size
-        if dp_size > 1:
-            raise NotImplementedError(
-                "multi-depth MTP drafting does not support data parallelism "
-                f"(dp_size={dp_size})"
-            )
 
         # Drafter-owned seq_lens the CUDA-graph wrapper aliases into every
         # draft metadata init (it copies the round's live lengths in; on
@@ -308,6 +304,18 @@ class Mtp(BaseDrafter):
             dtype=model_config.dtype,
             device=self.device,
         )
+
+    @override
+    def idle_step_global_num_tokens(
+        self,
+        step_idx: int,
+        global_num_tokens: list[int],
+        global_bs: list[int] | None,
+    ) -> list[int]:
+        # Every depth re-runs the target's rows (the k-window per decode
+        # request, the prompt chunk on extend) — never one row per request.
+        del step_idx, global_bs
+        return global_num_tokens
 
     # ------------------------------------------------------------------
     # Internal helpers

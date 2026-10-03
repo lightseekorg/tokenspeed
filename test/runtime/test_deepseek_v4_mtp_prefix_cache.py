@@ -26,10 +26,8 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
+from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.model_executor import (
-    _draft_idle_global_num_tokens_for_step,
-)
 from tokenspeed.runtime.models.deepseek_v4 import _deepseek_v4_swa_slot_mapping
 
 
@@ -182,23 +180,27 @@ def test_deepseek_v4_swa_slot_mapping_falls_back_for_incompatible_draft_metadata
 
 
 def test_draft_idle_global_num_tokens_match_multi_step_decode_shape():
+    # The chained drafters' default: step 0 runs the target's rows, the
+    # multi-step chain one row per request.
+    drafter = BaseDrafter(spec_num_tokens=4, spec_num_steps=3)
     global_num_tokens = [6, 0, 3]
     global_bs = [2, 0, 1]
 
+    assert drafter.idle_forward_steps == 3
     assert (
-        _draft_idle_global_num_tokens_for_step(0, global_num_tokens, global_bs)
+        drafter.idle_step_global_num_tokens(0, global_num_tokens, global_bs)
         is global_num_tokens
     )
     assert (
-        _draft_idle_global_num_tokens_for_step(1, global_num_tokens, global_bs)
+        drafter.idle_step_global_num_tokens(1, global_num_tokens, global_bs)
         is global_bs
     )
     assert (
-        _draft_idle_global_num_tokens_for_step(2, global_num_tokens, global_bs)
+        drafter.idle_step_global_num_tokens(2, global_num_tokens, global_bs)
         is global_bs
     )
     assert (
-        _draft_idle_global_num_tokens_for_step(1, global_num_tokens, None)
+        drafter.idle_step_global_num_tokens(1, global_num_tokens, None)
         is global_num_tokens
     )
 
