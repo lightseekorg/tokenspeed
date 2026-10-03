@@ -56,6 +56,7 @@ def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
         enable_speculative_sampling=False,
         sampling_stream="batch",
+        logprob_order="torch",
         max_bs=MAX_BS,
         max_draft_tokens_per_req=MAX_N,
         max_req_pool_size=POOL,

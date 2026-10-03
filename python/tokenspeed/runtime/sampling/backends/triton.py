@@ -51,7 +51,7 @@ from tokenspeed.runtime.sampling.backends.base import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, _TOP_K_DISABLED
 from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
-from tokenspeed.runtime.sampling.utils import nan_guard_logits
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs, nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -277,6 +277,13 @@ class TritonSamplingBackend(SamplingBackend):
         if not self.config.enable_output_logprobs:
             return
 
+        if self.config.logprob_order != "torch":
+            # Megatron's order is a torch-level reduction tree; the fused
+            # Triton gather below is torch.log_softmax's order.
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, sampled, logprob_order=self.config.logprob_order
+            )
+            return
         rows = logits.shape[0]
         selected_out = self._selected_logprob_out[:rows]
         logits_output.next_token_logprobs = selected_token_logprobs(

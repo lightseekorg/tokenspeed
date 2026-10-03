@@ -55,6 +55,7 @@ from tokenspeed.runtime.sampling.backends.flashinfer import (
     canonical_greedy_verify,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -277,7 +278,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones.
-        # Applied before raw_logprobs capture so constrained logprobs reflect
+        # Applied before the raw logits are kept so constrained logprobs reflect
         # the grammar-masked distribution.
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
@@ -285,12 +286,9 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             )
 
         # Raw-distribution logprobs (pre-penalty, pre-temperature) when the
-        # server flag is on. Gather is done after we know the sampled id.
-        raw_logprobs = (
-            torch.log_softmax(logits, dim=-1)
-            if self.config.enable_output_logprobs
-            else None
-        )
+        # server flag is on: keep the pre-penalty logits (the penalties return
+        # a new tensor) and gather once the sampled id is known.
+        raw_logits = logits if self.config.enable_output_logprobs else None
 
         logits = self._apply_penalties_and_bias(logits, sampling_info)
 
@@ -353,11 +351,10 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         ):
             self.maybe_broadcast(sampled)
 
-        if raw_logprobs is not None:
-
-            logits_output.next_token_logprobs = raw_logprobs.gather(
-                -1, sampled.unsqueeze(-1)
-            ).squeeze(-1)
+        if raw_logits is not None:
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                raw_logits, sampled, logprob_order=self.config.logprob_order
+            )
 
         # Accumulate sampled tokens into counts (greedy path accumulates too
         # so mixed later batches see the correct history).
@@ -400,7 +397,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
-        # Applied before raw_logprobs capture so constrained logprobs reflect
+        # Applied before the raw logits are kept so constrained logprobs reflect
         # the grammar-masked distribution.
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
@@ -408,13 +405,9 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 vocab_mask=sampling_info.vocab_mask,
             )
 
-        # Raw (pre-penalty) logprobs captured before penalty application to
-        # match sample()'s semantics.
-        raw_logprobs = (
-            torch.log_softmax(logits, dim=-1)
-            if self.config.enable_output_logprobs
-            else None
-        )
+        # Raw (pre-penalty) logits kept for the logprob gather, matching
+        # sample()'s semantics.
+        raw_logits = logits if self.config.enable_output_logprobs else None
 
         logits = self._apply_penalties_and_bias(
             logits,
@@ -521,11 +514,10 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             valid.reshape(-1).to(torch.int32),
         )
 
-        if raw_logprobs is not None:
-
-            logits_output.next_token_logprobs = raw_logprobs.gather(
-                -1, predict.unsqueeze(-1)
-            ).squeeze(-1)
+        if raw_logits is not None:
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                raw_logits, predict, logprob_order=self.config.logprob_order
+            )
 
         return predict, accept_length
 

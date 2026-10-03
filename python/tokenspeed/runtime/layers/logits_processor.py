@@ -40,7 +40,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
-from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES, LOGPROB_ORDERS
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -60,7 +60,7 @@ from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
     LogitsLayoutPlan,
 )
-from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.triton import tl, triton
 
@@ -251,6 +251,15 @@ class LogitsProcessor(nn.Module):
         self.dp_sampling_min_bs = 0
         self.logit_scale = logit_scale
         self._logits_layout_executor: LogitsLayoutExecutor | None = None
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        # --logprob-order: the log-softmax behind input (prompt) logprobs.
+        self.logprob_order: str = global_server_args_dict["logprob_order"]
+        if self.logprob_order not in LOGPROB_ORDERS:
+            raise ValueError(
+                f"logprob_order must be one of {list(LOGPROB_ORDERS)}, got "
+                f"{self.logprob_order!r}"
+            )
 
         if tp_rank is None:
             if tp_size is not None or tp_group is not None:
@@ -615,9 +624,10 @@ class LogitsProcessor(nn.Module):
         LM head ``chunk_tokens`` at a time so the transient ``[rows, vocab]``
         logits stay bounded; each chunk takes the same ``_get_logits`` route
         as the sampled rows (quantized head, rl-bitwise GEMM, TP gather,
-        softcap) and the sampler's own ``gather_token_logprobs_torch``, so
-        prompt and output logprobs of one token agree bitwise. Log-softmax is
-        row-local, so the chunk size never changes a value. The chunks ask for
+        softcap) and the sampler's own ``gather_token_logprobs`` in the
+        launch's ``--logprob-order``, so prompt and output logprobs of one
+        token agree bitwise. Both orders are row-local, so the chunk size
+        never changes a value. The chunks ask for
         a private full-vocab tensor (``require_full_vocab=True``): the
         multicast gather returns a view of the TP group's shared buffer that
         the next chunk's gather on a faster rank would overwrite while this
@@ -659,8 +669,8 @@ class LogitsProcessor(nn.Module):
                 plan=None,
                 require_full_vocab=True,
             )
-            out[begin:end] = gather_token_logprobs_torch(
-                logits, plan.targets[begin:end]
+            out[begin:end] = gather_token_logprobs(
+                logits, plan.targets[begin:end], logprob_order=self.logprob_order
             )
             del logits
         return out

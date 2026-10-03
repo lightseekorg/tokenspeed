@@ -68,6 +68,9 @@ class SamplingBackendConfig:
     # "per-request", see ServerArgs.sampling_stream). Behaviour-selecting, so
     # it has no default: every constructor names the stream it wants.
     sampling_stream: str
+    # Order of the selected-token log-softmax ("torch" or "megatron", see
+    # ServerArgs.logprob_order). Behaviour-selecting, so no default either.
+    logprob_order: str
 
     enable_nan_detection: bool = False
 
@@ -114,6 +117,7 @@ class SamplingBackendConfig:
 
         return cls(
             sampling_stream=server_args.sampling_stream,
+            logprob_order=server_args.logprob_order,
             enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
             enable_speculative_sampling=server_args.enable_speculative_sampling,

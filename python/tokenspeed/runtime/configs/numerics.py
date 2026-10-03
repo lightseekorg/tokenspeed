@@ -75,6 +75,12 @@ LAYER_BOUNDARY_NORMS = ("fused", "unfused")
 # with ``-1`` zero-expert ids, as the trainer does.
 ROUTER_TOPKS = ("fused", "torch")
 
+# ``--logprob-order``: the selected-token log-softmax behind every returned
+# logprob — ``torch.log_softmax``, or Megatron's vocab-parallel cross-entropy
+# order over fixed ``MEGATRON_VOCAB_BLOCK``-wide vocab blocks. Logprobs only.
+LOGPROB_ORDERS = ("torch", "megatron")
+MEGATRON_VOCAB_BLOCK = 32768
+
 
 def require_verified_numerics(
     numerics: str,
@@ -122,6 +128,8 @@ def require_verified_numerics(
 __all__ = [
     "BITWISE_ENVELOPES",
     "LAYER_BOUNDARY_NORMS",
+    "LOGPROB_ORDERS",
+    "MEGATRON_VOCAB_BLOCK",
     "MLA_LORA_SCALES",
     "NUMERICS_ENVELOPES",
     "RL_BITWISE_SAMPLING_BACKENDS",

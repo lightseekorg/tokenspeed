@@ -58,6 +58,7 @@ def _config(logprobs: bool) -> SamplingBackendConfig:
         enable_output_logprobs=logprobs,
         enable_speculative_sampling=False,
         sampling_stream="batch",
+        logprob_order="torch",
     )
 
 

@@ -148,6 +148,7 @@ def _build_backend(*, max_bs: int, max_n: int, vocab: int, device, group):
     cfg = SamplingBackendConfig(
         enable_speculative_sampling=False,
         sampling_stream="batch",
+        logprob_order="torch",
         enable_output_logprobs=False,
         max_bs=max_bs,
         max_draft_tokens_per_req=max_n,

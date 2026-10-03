@@ -63,7 +63,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import (
     coin_eps,
-    gather_token_logprobs_torch,
+    gather_token_logprobs,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -564,8 +564,8 @@ class FlashInferSamplingBackend(SamplingBackend):
         self.maybe_broadcast(sampled)
 
         if self.config.enable_output_logprobs:
-            logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                logits, sampled
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, sampled, logprob_order=self.config.logprob_order
             )
 
         return sampled, lengths
@@ -758,9 +758,9 @@ class FlashInferSamplingBackend(SamplingBackend):
             # Compute scalar logprobs for local predictions before gathering
             # predictions to full-batch shape; the non-DP writer requires
             # matching logits/token row counts.
-            logprobs_local = gather_token_logprobs_torch(logits, predict).view(
-                bs, num_tokens_per_req
-            )
+            logprobs_local = gather_token_logprobs(
+                logits, predict, logprob_order=self.config.logprob_order
+            ).view(bs, num_tokens_per_req)
 
         if dp_sampling:
             n = num_tokens_per_req
@@ -797,8 +797,8 @@ class FlashInferSamplingBackend(SamplingBackend):
             self.broadcast_verify_outputs()
 
         if self.config.enable_output_logprobs and not dp_sampling:
-            logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                logits, predict
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, predict, logprob_order=self.config.logprob_order
             )
 
         return predict, accept_length

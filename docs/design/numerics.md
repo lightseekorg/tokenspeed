@@ -141,7 +141,7 @@ and only the reported log-probabilities change.
 | `--mla-lora-scale runtime` | The `sqrt(hidden / lora_rank)` norm scales of LongCat-style MLA stay out of the `q_a_layernorm` / `kv_a_layernorm` weights and multiply `q` after `q_b_proj` and the latent after `kv_a_layernorm` in bf16, as the trainer does; the DSA indexer reads the unscaled `q_lora` | forward values |
 | `--layer-boundary-norm unfused` | The norm that opens each physical layer and the final norm read a bf16 `hidden + residual` materialized first (`residual = hidden`), then a standalone RMSNorm, instead of the fused add+norm kernel whose sum stays fp32; all-reduce+norm fusion is vetoed with it | forward values |
 | `--router-topk torch` | The correction-bias router runs fp32 `torch.softmax`, `torch.topk(probs + bias, sorted=True)` (PyTorch tie order), weights = unbiased probs x `routed_scaling_factor`, zero experts (`id >= num_real`) become `-1` and keep their weight for the identity residual | forward values (expert selection at near-ties, weights) |
-| `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (pairwise tile tree, then a rank-ordered fp32 left fold across blocks), `logp = -(log(sum_exp) - target)`; temperature- or top-p-normalised logprob requests are refused | logprobs only |
+| `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (pairwise tile tree, then a rank-ordered fp32 left fold across blocks), `logp = -(log(sum_exp) - target)`, for output and prompt (input) logprobs alike | logprobs only |
 
 Trainer alignment is a stronger claim than invariance and cannot be checked
 by the engine alone: a model earns `trainer-aligned` in
@@ -177,9 +177,11 @@ or at the first call instead of falling back — the FluentLLM discipline
 
 ## Logprobs: one arithmetic for prompt and output
 
-A returned logprob is `log_softmax(logits, -1, dtype=float32)` gathered at
-the token -- `gather_token_logprobs_torch` in `sampling/utils.py`, the one
-function both consumers call -- with the logits produced by the same LM-head
+A returned logprob is the launch's `--logprob-order` applied to the row --
+`gather_token_logprobs` in `sampling/utils.py`, the one function both
+consumers call: `log_softmax(logits, -1, dtype=float32)` gathered at the token
+under `torch`, Megatron's vocab-parallel cross-entropy order under `megatron`
+(alignment.trainer above) -- with the logits produced by the same LM-head
 route the sampler takes (`LogitsProcessor._get_logits`: quantized or dense
 GEMM, the `aok` GEMM under rl-bitwise, the TP gather, softcap). The sampler's
 output logprobs and the prompt (input) logprobs of the SGLang dialect

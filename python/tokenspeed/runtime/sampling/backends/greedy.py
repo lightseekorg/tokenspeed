@@ -36,7 +36,7 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
-from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -173,8 +173,8 @@ class GreedySamplingBackend(SamplingBackend):
         self.maybe_broadcast(tokens)
 
         if self.config.enable_output_logprobs:
-            logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                logits, tokens
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, tokens, logprob_order=self.config.logprob_order
             )
 
         return tokens, self._ones_buf[:bs]
@@ -239,15 +239,12 @@ class GreedySamplingBackend(SamplingBackend):
         # composition and deadlocks the model all-reduce.
         self.broadcast_verify_outputs()
 
-        if tree is not None:
-            if self.config.enable_output_logprobs:
+        if self.config.enable_output_logprobs:
+            if tree is not None:
                 # predict is packed along the path; score it against the path's own rows.
-                logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                    logits.index_select(0, accepted_path_rows(accept_index)), predict
-                )
-        elif self.config.enable_output_logprobs:
-            logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                logits, predict
+                logits = logits.index_select(0, accepted_path_rows(accept_index))
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, predict, logprob_order=self.config.logprob_order
             )
 
         return predict, accept_length

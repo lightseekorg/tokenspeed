@@ -154,6 +154,18 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--router-topk"):
             ServerArgs(model="x", router_topk="cuda")
 
+    def test_trainer_aligned_reports_megatron_order_logprobs(self):
+        self.assertEqual(ServerArgs(model="x").logprob_order, "torch")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").logprob_order, "torch"
+        )
+        self.assertEqual(
+            ServerArgs(model="x", numerics="trainer-aligned").logprob_order,
+            "megatron",
+        )
+        with self.assertRaisesRegex(ValueError, "--logprob-order"):
+            ServerArgs(model="x", logprob_order="apex")
+
     def test_bitwise_envelopes_cover_every_pinning_envelope(self):
         from tokenspeed.runtime.configs.numerics import (
             BITWISE_ENVELOPES,

@@ -33,6 +33,7 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
     LAYER_BOUNDARY_NORMS,
+    LOGPROB_ORDERS,
     MLA_LORA_SCALES,
     NUMERICS_ENVELOPES,
     RL_BITWISE_SAMPLING_BACKENDS,
@@ -440,6 +441,10 @@ class ServerArgs:
     # Correction-bias MoE routing: the fused CUDA kernel, or fp32 torch.softmax
     # + torch.topk(probs + bias) in PyTorch tie order as the trainer does.
     router_topk: str = "fused"
+    # Order of the selected-token log-softmax: torch.log_softmax, or
+    # Megatron's vocab-parallel cross-entropy over fixed 32768-wide vocab
+    # blocks. Changes the reported logprobs only, never the sampled tokens.
+    logprob_order: str = "torch"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -680,6 +685,11 @@ class ServerArgs:
             raise ValueError(
                 f"--router-topk must be one of {list(ROUTER_TOPKS)}, got "
                 f"{self.router_topk!r}"
+            )
+        if self.logprob_order not in LOGPROB_ORDERS:
+            raise ValueError(
+                f"--logprob-order must be one of {list(LOGPROB_ORDERS)}, got "
+                f"{self.logprob_order!r}"
             )
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
@@ -1154,6 +1164,8 @@ class ServerArgs:
         self.layer_boundary_norm = "unfused"
         # The trainer's router is softmax + topk(scores + bias) in torch.
         self.router_topk = "torch"
+        # The trainer's logprobs come from its vocab-parallel cross-entropy.
+        self.logprob_order = "megatron"
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -2864,6 +2876,20 @@ class ServerArgs:
             "weights = unbiased probs x routed_scaling_factor, zero experts "
             "become id -1 and keep their weight, as the trainer does. Folded "
             "to torch by --numerics trainer-aligned.",
+        )
+        parser.add_argument(
+            "--logprob-order",
+            type=str,
+            choices=list(LOGPROB_ORDERS),
+            default=ServerArgs.logprob_order,
+            help="Order of the selected-token log-softmax behind every "
+            "returned logprob. 'torch': torch.log_softmax. 'megatron': the "
+            "trainer's vocab-parallel cross-entropy order (row max, shift, "
+            "sum(exp) over fixed 32768-wide vocab blocks folded in block "
+            "order, logp = -(log(sum_exp) - target)); requests asking for "
+            "temperature- or top-p-normalised logprobs are refused. Changes "
+            "logprobs only, never the sampled tokens. Folded to megatron by "
+            "--numerics trainer-aligned.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

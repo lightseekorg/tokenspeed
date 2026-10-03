@@ -54,6 +54,7 @@ def _config(sampling_stream: str, device: str) -> SamplingBackendConfig:
     return SamplingBackendConfig(
         enable_speculative_sampling=False,
         sampling_stream=sampling_stream,
+        logprob_order="torch",
         max_bs=MAX_BS,
         max_draft_tokens_per_req=2,
         max_req_pool_size=POOL,
