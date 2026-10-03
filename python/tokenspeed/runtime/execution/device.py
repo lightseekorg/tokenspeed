@@ -77,18 +77,24 @@ import os
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     PendingExecution,
     PlannedForward,
 )
+from tokenspeed.runtime.moe.expert_location import get_global_expert_location_metadata
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.host_sync import allow_host_sync
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
@@ -747,6 +753,68 @@ class DeviceHandle:
         # decode, and PD completions are rare enough to afford the wait.
         self._thread.run(_land)
 
+    def reset_expert_load(self) -> None:
+        """Zero the router's expert load counters, ordered against forwards.
+
+        The counters are bumped on the execution stream by every forward's
+        routing, so the reset rides that stream too: it lands after the
+        forwards already issued and before the next one.
+        """
+        placement = _recording_expert_placement()
+        executor = self._executor
+
+        def _reset():
+            with executor.device_module.stream(executor.execution_stream):
+                placement.reset_load()
+
+        self._thread.run(_reset)
+
+    def dump_expert_load(self, path: str) -> dict[str, torch.Tensor]:
+        """Write the expert load counted since the last reset to ``path``.
+
+        The counters are summed over the MoE EP group (each rank of an
+        all-to-all EP layer routes only its own tokens; the replicated-input
+        path counts every token on every rank, a uniform factor the placement
+        algorithm and the balancedness ratio are blind to), read back on the
+        data plane (the one deliberate host wait), then saved in the format
+        ``--init-expert-location`` reads (``logical_count``) together with the
+        physical counts, the placement that produced them and the per-layer
+        balancedness (mean rank load over the busiest rank's load).
+
+        The reduction is a collective: every rank of the group must stop the
+        profile with the same forwards issued, which holds when the stop is
+        broadcast with the request stream (attention TP, PP) or the server is
+        idle.
+
+        Args:
+            path: Destination ``.pt`` file; parent directories are created.
+
+        Returns:
+            The saved record.
+        """
+        placement = _recording_expert_placement()
+        executor = self._executor
+        moe_mapping = executor.model_runner.mapping.moe
+        group = (
+            pg_manager.get_device_process_group(moe_mapping.tp_ep_group)
+            if moe_mapping.tp_ep_size > 1
+            else None
+        )
+
+        def _dump():
+            with executor.device_module.stream(executor.execution_stream):
+                counts = placement.physical_load.clone()
+                if group is not None:
+                    torch.distributed.all_reduce(counts, group=group)
+                with allow_host_sync("expert load dump"):
+                    physical = counts.cpu()
+            record = placement.load_record(physical)
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(record, path)
+            return record
+
+        return self._thread.run(_dump)
+
     def update_weights(self, req) -> tuple[bool, str]:
         """Apply one in-place RL weight-sync request, ordered against forwards.
 
@@ -794,6 +862,16 @@ class DeviceHandle:
             return result
 
         return self._thread.run(_apply_update)
+
+
+def _recording_expert_placement():
+    placement = get_global_expert_location_metadata()
+    if placement is None or placement.physical_load is None:
+        raise RuntimeError(
+            "expert load is not being recorded; start the server with "
+            "--expert-distribution-recorder-mode stat"
+        )
+    return placement
 
 
 def arm_data_plane_sync_debug(device: str) -> None:

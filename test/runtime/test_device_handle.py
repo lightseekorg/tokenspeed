@@ -780,6 +780,8 @@ def test_the_handle_stays_a_closed_list_of_named_operations():
         "run_kv_repair",
         "run_remote_prefill_landing",
         "update_weights",
+        "reset_expert_load",
+        "dump_expert_load",
     }
     assert {name for name in public if name.endswith("_work")} == {
         "run_multimodal_work"
@@ -893,3 +895,62 @@ def test_prefill_usage_hook_records_committed_totals_and_skips_retired_requests(
     loop.kv_transfer = None
     hooks.record_prefill_usage(["hit"])
     assert recorded == [(9, 1280), (9, 1536)]
+
+
+def test_expert_load_reset_and_dump_ride_the_data_plane_on_the_execution_stream(
+    tmp_path,
+):
+    """The load counters are zeroed and read back through the forward thread,
+    on the execution stream the routing kernels bump them on."""
+    import contextlib
+
+    from tokenspeed.runtime.moe import expert_location
+
+    placement = expert_location.ExpertLocationMetadata.from_physical_to_logical_map(
+        torch.tensor([[0, 1, 2, 0], [2, 1, 0, 1]]),
+        3,
+        ep_size=2,
+        ep_rank=0,
+        num_nodes=1,
+        dispatch_algorithm=None,
+    )
+    placement.enable_load_recording()
+    placement.physical_load.copy_(
+        torch.tensor([[3, 1, 2, 5], [0, 4, 0, 4]], dtype=torch.int32)
+    )
+    trace: list = []
+    streams: list = []
+
+    class _DeviceModule:
+        @staticmethod
+        def stream(stream):
+            streams.append(stream)
+            return contextlib.nullcontext()
+
+    handle = DeviceHandle(
+        SimpleNamespace(
+            forward_thread=_ForwardThread(trace),
+            device_module=_DeviceModule(),
+            execution_stream="execution-stream",
+            model_runner=SimpleNamespace(
+                mapping=SimpleNamespace(moe=SimpleNamespace(tp_ep_size=1))
+            ),
+        )
+    )
+    expert_location.set_global_expert_location_metadata(placement)
+    try:
+        record = handle.dump_expert_load(str(tmp_path / "load.pt"))
+        handle.reset_expert_load()
+    finally:
+        expert_location.set_global_expert_location_metadata(None)
+    assert trace == ["run", "run"]
+    assert streams == ["execution-stream", "execution-stream"]
+    saved = torch.load(tmp_path / "load.pt", weights_only=True)
+    assert torch.equal(saved["logical_count"], record["logical_count"])
+    # Logical 0 owns physical 0 and 3 in layer 0, physical 2 in layer 1.
+    assert record["logical_count"].tolist() == [[8, 1, 2], [0, 8, 0]]
+    assert record["rank_count"].tolist() == [[4, 7], [4, 4]]
+    assert record["balancedness"].tolist() == pytest.approx([5.5 / 7, 1.0])
+    assert not placement.physical_load.any()
+    with pytest.raises(RuntimeError, match="not being recorded"):
+        handle.dump_expert_load(str(tmp_path / "none.pt"))
