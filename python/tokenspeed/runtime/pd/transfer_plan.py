@@ -58,8 +58,38 @@ MAX_CACHE_TP_SIZE = 1024
 
 
 @dataclass(frozen=True)
+class CachePageOwnerFilter:
+    """Which of a sharded group's scheduler blocks one source rank holds.
+
+    A DCP-sharded group deals virtual blocks cyclically to ``owner_count``
+    ranks; the rank with ``owner_rank`` holds block ``v`` when
+    ``(v - 1) % owner_count == owner_rank`` (block 0 is the null block). The
+    sender keeps only those blocks of a manifest, translated to its local
+    pages, and the matching destination subsequence. The same placement the
+    runtime's zeroing and device translation use; see
+    ``kv_cache/virtual_blocks.py``.
+    """
+
+    owner_rank: int
+    owner_count: int
+
+    def __post_init__(self) -> None:
+        if self.owner_count < 2 or not 0 <= self.owner_rank < self.owner_count:
+            raise ValueError("cache page owner filter needs 0 <= rank < count >= 2")
+
+
+@dataclass(frozen=True)
 class RankTransferPlan:
     fragments_by_prefill_rank: dict[int, tuple[CacheTransferFragment, ...]]
+    # Sharded groups only, keyed by source rank then group id. A source rank
+    # without an entry for a group sends that group's blocks whole.
+    owner_filters_by_prefill_rank: dict[int, dict[str, CachePageOwnerFilter]]
+
+    def __post_init__(self) -> None:
+        if not set(self.owner_filters_by_prefill_rank) <= set(
+            self.fragments_by_prefill_rank
+        ):
+            raise ValueError("owner filters name a rank outside the route")
 
     @property
     def target_prefill_ranks(self) -> tuple[int, ...]:
@@ -90,7 +120,13 @@ class _RankPartition:
 
 
 class CacheTransferPlanner:
-    """Plan model-neutral dense cache fields across unequal TP sizes."""
+    """Plan model-neutral dense cache fields across unequal TP sizes.
+
+    Two source geometries compose here: head partitions split a page's rows
+    over TP ranks, and DCP page sharding (``CacheGroupSpec.shard_count``)
+    deals whole pages over a consecutive TP subgroup. The destination is
+    always unsharded.
+    """
 
     def __init__(
         self,
@@ -127,6 +163,29 @@ class CacheTransferPlanner:
             field.field_id: prefill_layout.transfer_schema.partition_for(field.field_id)
             for field in prefill_layout.plan.fields
         }
+        # DCP page sharding on the source: a sharded group's virtual blocks are
+        # dealt cyclically over a consecutive subgroup of shard_count Prefill
+        # TP ranks, so every rank of the chosen subgroup is a source and sends
+        # only the blocks it owns. The destination must hold every block
+        # whole; landing a block on its Decode owner only has no receive path.
+        self._shard_counts: dict[str, int] = {}
+        for prefill_spec, decode_spec in zip(
+            prefill_layout.group_specs, decode_layout.group_specs, strict=True
+        ):
+            if decode_spec.shard_count != 1:
+                raise UnsupportedPDLayoutError(
+                    f"cache group {decode_spec.group_id!r} is sharded on Decode; "
+                    "PD transfer into a DCP-sharded destination is not supported"
+                )
+            if prefill_spec.shard_count == 1:
+                continue
+            if prefill_tp_size % prefill_spec.shard_count:
+                raise UnsupportedPDLayoutError(
+                    f"cache group {prefill_spec.group_id!r} shard count "
+                    f"{prefill_spec.shard_count} does not divide Prefill "
+                    f"TP={prefill_tp_size}"
+                )
+            self._shard_counts[prefill_spec.group_id] = prefill_spec.shard_count
         self._segment_pairs = tuple(
             (prefill_spec.group_id, prefill_segment, decode_segment)
             for prefill_spec, decode_spec in zip(
@@ -142,8 +201,19 @@ class CacheTransferPlanner:
             if prefill_field_ids is None
             or prefill_segment.field_id in prefill_field_ids
         )
-        for _, prefill_segment, decode_segment in self._segment_pairs:
+        for group_id, prefill_segment, decode_segment in self._segment_pairs:
             self._validate_tp_mapping(prefill_segment, decode_segment)
+            if (
+                group_id in self._shard_counts
+                and self._partitions[prefill_segment.field_id] is not None
+            ):
+                # Head partitions place a page's rows on distinct TP ranks and
+                # page sharding places whole pages on distinct ranks; a field
+                # under both would need rows no single rank holds.
+                raise UnsupportedPDLayoutError(
+                    f"cache field {prefill_segment.field_id!r} is both "
+                    "head-partitioned and page-sharded on Prefill"
+                )
         self._decode_ranks_by_prefill_rank = self._calc_source_decode_ranks()
 
     @property
@@ -151,19 +221,32 @@ class CacheTransferPlanner:
         """Decode ranks served by each Prefill rank."""
         return dict(self._decode_ranks_by_prefill_rank)
 
+    @property
+    def has_sharded_groups(self) -> bool:
+        return bool(self._shard_counts)
+
     def plan_for_decode_rank(self, decode_tp_rank: int) -> RankTransferPlan:
         if not 0 <= decode_tp_rank < self.decode_tp_size:
             raise UnsupportedPDLayoutError(
                 f"decode_tp_rank={decode_tp_rank} is out of range"
             )
         # Equal-TP fast path: empty fragments mean "copy every field whole".
-        # A stage owning only a subset must keep its explicit fragment route.
-        if self.prefill_tp_size == self.decode_tp_size and self._field_ids is None:
+        # A stage owning only a subset must keep its explicit fragment route,
+        # and so must a sharded source: its blocks come from a rank set, not
+        # from the one same-index rank.
+        if (
+            self.prefill_tp_size == self.decode_tp_size
+            and self._field_ids is None
+            and not self.has_sharded_groups
+        ):
             return RankTransferPlan(
                 fragments_by_prefill_rank={decode_tp_rank: ()},
+                owner_filters_by_prefill_rank={},
             )
 
-        fragments_by_rank = self._fragments_for_decode_rank(decode_tp_rank)
+        fragments_by_rank, owner_filters_by_rank = self._fragments_for_decode_rank(
+            decode_tp_rank
+        )
         target_ranks = tuple(fragments_by_rank)
         if not target_ranks:
             raise UnsupportedPDLayoutError(
@@ -171,6 +254,7 @@ class CacheTransferPlanner:
             )
         return RankTransferPlan(
             fragments_by_prefill_rank=fragments_by_rank,
+            owner_filters_by_prefill_rank=owner_filters_by_rank,
         )
 
     def _validate_tp_mapping(self, prefill_segment, decode_segment) -> None:
@@ -188,18 +272,15 @@ class CacheTransferPlanner:
         self._rank_partitions(prefill_segment, partition, self.prefill_tp_size, 0)
         self._rank_partitions(decode_segment, partition, self.decode_tp_size, 0)
 
-    def _fragments_for_decode_rank(
-        self, decode_tp_rank: int
-    ) -> dict[int, tuple[CacheTransferFragment, ...]]:
+    def _fragments_for_decode_rank(self, decode_tp_rank: int) -> tuple[
+        dict[int, tuple[CacheTransferFragment, ...]],
+        dict[int, dict[str, CachePageOwnerFilter]],
+    ]:
         fragments: dict[int, list[CacheTransferFragment]] = {}
+        owner_filters: dict[int, dict[str, CachePageOwnerFilter]] = {}
         for group_id, prefill_segment, decode_segment in self._segment_pairs:
             partition = self._partitions[prefill_segment.field_id]
             if partition is None:
-                prefill_rank = self._replicated_source_tp_rank(
-                    self.prefill_tp_size,
-                    self.decode_tp_size,
-                    decode_tp_rank,
-                )
                 fragment = self._make_fragment(
                     group_id=group_id,
                     prefill_segment=prefill_segment,
@@ -209,7 +290,25 @@ class CacheTransferPlanner:
                     prefill_interval=None,
                     decode_interval=None,
                 )
-                fragments.setdefault(prefill_rank, []).append(fragment)
+                replica_rank = self._replicated_source_tp_rank(
+                    self.prefill_tp_size,
+                    self.decode_tp_size,
+                    decode_tp_rank,
+                )
+                shard_count = self._shard_counts.get(group_id, 1)
+                if shard_count == 1:
+                    fragments.setdefault(replica_rank, []).append(fragment)
+                    continue
+                # The replica this decode rank would read whole is spread over
+                # its DCP subgroup (consecutive TP ranks); every member sends
+                # the blocks it owns.
+                subgroup_base = replica_rank - replica_rank % shard_count
+                for owner_rank in range(shard_count):
+                    prefill_rank = subgroup_base + owner_rank
+                    fragments.setdefault(prefill_rank, []).append(fragment)
+                    owner_filters.setdefault(prefill_rank, {})[group_id] = (
+                        CachePageOwnerFilter(owner_rank, shard_count)
+                    )
                 continue
 
             decode_partitions = self._rank_partitions(
@@ -249,10 +348,13 @@ class CacheTransferPlanner:
                         decode_local_offset=decode_partition.local_offset,
                     )
                     fragments.setdefault(prefill_rank, []).append(fragment)
-        return {
-            rank: tuple(rank_fragments)
-            for rank, rank_fragments in sorted(fragments.items())
-        }
+        return (
+            {
+                rank: tuple(rank_fragments)
+                for rank, rank_fragments in sorted(fragments.items())
+            },
+            {rank: owner_filters[rank] for rank in sorted(owner_filters)},
+        )
 
     @staticmethod
     def _make_fragment(
@@ -358,11 +460,12 @@ class CacheTransferPlanner:
         return (decode_tp_rank * prefill_tp_size) // decode_tp_size
 
     def _calc_source_decode_ranks(self) -> dict[int, frozenset[int]]:
-        if self.prefill_tp_size == self.decode_tp_size:
+        if self.prefill_tp_size == self.decode_tp_size and not self.has_sharded_groups:
             return {rank: frozenset({rank}) for rank in range(self.prefill_tp_size)}
         decode_ranks = {rank: set() for rank in range(self.prefill_tp_size)}
         for decode_tp_rank in range(self.decode_tp_size):
-            for prefill_rank in self._fragments_for_decode_rank(decode_tp_rank):
+            fragments_by_rank, _ = self._fragments_for_decode_rank(decode_tp_rank)
+            for prefill_rank in fragments_by_rank:
                 decode_ranks[prefill_rank].add(decode_tp_rank)
         return {rank: frozenset(ranks) for rank, ranks in decode_ranks.items()}
 
@@ -391,6 +494,7 @@ def build_pipeline_transfer_plan(
     """
     validate_cache_stage_fields(prefill_layout, cache_fields_by_stage)
     fragments: dict[int, tuple[CacheTransferFragment, ...]] = {}
+    owner_filters: dict[int, dict[str, CachePageOwnerFilter]] = {}
     dummy_ranks: list[int] = []
     for stage, field_ids in enumerate(cache_fields_by_stage):
         planner = CacheTransferPlanner(
@@ -404,15 +508,18 @@ def build_pipeline_transfer_plan(
         base = stage * prefill_tp_size
         for rank, stage_fragments in stage_plan.fragments_by_prefill_rank.items():
             fragments[base + rank] = stage_fragments
+        for rank, filters in stage_plan.owner_filters_by_prefill_rank.items():
+            owner_filters[base + rank] = filters
         if decode_tp_rank == 0:
             dummy_ranks.extend(
                 base + rank
                 for rank, decode_ranks in planner.decode_ranks_by_prefill_rank.items()
                 if not decode_ranks
             )
-    return RankTransferPlan(fragments_by_prefill_rank=fragments), tuple(
-        sorted(dummy_ranks)
-    )
+    return RankTransferPlan(
+        fragments_by_prefill_rank=fragments,
+        owner_filters_by_prefill_rank=owner_filters,
+    ), tuple(sorted(dummy_ranks))
 
 
 def validate_cache_stage_fields(

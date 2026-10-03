@@ -20,6 +20,7 @@
 
 import dataclasses
 import struct
+from collections.abc import Mapping
 
 from tokenspeed.runtime.pd.cache_protocol import (
     CachePDBlockManifest,
@@ -30,6 +31,7 @@ from tokenspeed.runtime.pd.cache_protocol import (
 from tokenspeed.runtime.pd.topology import PDParallelTopology
 from tokenspeed.runtime.pd.transfer_plan import (
     MAX_CACHE_TP_SIZE,
+    CachePageOwnerFilter,
     CacheTransferFragment,
 )
 
@@ -155,6 +157,10 @@ class KVArgsRegisterInfo:
     decode_tp_rank: int
     # Computed once by the receiving Prefill rank from the typed registration.
     transfer_fragments: tuple[CacheTransferFragment, ...] = ()
+    # Per sharded group, the blocks this Prefill rank owns and sends.
+    transfer_owner_filters: Mapping[str, CachePageOwnerFilter] = dataclasses.field(
+        default_factory=dict
+    )
     is_dummy: bool = False
     expected_decode_ranks: frozenset[int] = frozenset()
 

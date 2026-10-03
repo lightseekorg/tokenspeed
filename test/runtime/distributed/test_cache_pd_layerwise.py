@@ -490,6 +490,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
                 src_block_manifest=None,
                 dst_block_manifest=destination_block_manifest,
                 transfer_fragments=rank_one_fragments,
+                owner_filters={},
                 dst_cache_layout=destination_layout,
                 block_selection=selection,
                 field_ids=schedule.fields_in_range(begin, end),
@@ -528,6 +529,7 @@ def _layerwise_fanout_context():
             dst_port=9000 + rank,
             peer_cache_layout=layout,
             transfer_fragments=(),
+            transfer_owner_filters={},
         )
         for rank, request in enumerate(requests)
     }

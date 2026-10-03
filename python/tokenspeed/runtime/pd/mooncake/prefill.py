@@ -24,13 +24,16 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from itertools import chain, islice
 
 import numpy as np
 import requests
 
+from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
+    owned_local_pages,
+)
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
     CachePDBlockManifest,
@@ -54,6 +57,7 @@ from tokenspeed.runtime.pd.mooncake.pack import (
     flatten_transfer_blocks,
 )
 from tokenspeed.runtime.pd.transfer_plan import (
+    CachePageOwnerFilter,
     CacheTransferFragment,
     CacheTransferPlanner,
 )
@@ -308,9 +312,14 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         route = planner.plan_for_decode_rank(registration.decode_tp_rank)
         expected_decode_ranks = planner.decode_ranks_by_prefill_rank[local_tp_rank]
         if local_tp_rank in route.target_prefill_ranks:
+            # A DCP-sharded source is never idle: every rank of the chosen
+            # subgroup serves the decode rank with the blocks it owns.
             return replace(
                 registration,
                 transfer_fragments=route.fragments_by_prefill_rank[local_tp_rank],
+                transfer_owner_filters=route.owner_filters_by_prefill_rank.get(
+                    local_tp_rank, {}
+                ),
                 is_dummy=False,
                 expected_decode_ranks=expected_decode_ranks,
             )
@@ -403,10 +412,21 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         src_block_manifest: CachePDBlockManifest | None,
         dst_block_manifest: CachePDBlockManifest,
         transfer_fragments: tuple[CacheTransferFragment, ...] = (),
+        owner_filters: Mapping[str, CachePageOwnerFilter],
         dst_cache_layout: CacheTransferContract,
         block_selection: CachePDLayerwiseBlockSelection | None = None,
         field_ids: frozenset[str] | None = None,
     ) -> Iterator[PageFieldCopies | PackedCopy | tuple[int, int, int]]:
+        """Yield the copies that move this rank's part of one request's blocks.
+
+        Args:
+            owner_filters: Per DCP-sharded group, which of the manifest's
+                scheduler blocks this rank owns (from its registration route).
+                Only those blocks are copied, from their local pages to the
+                destination blocks at the same manifest positions; a group
+                without a filter is copied whole. Scheduler IDs of a replicated
+                group are already its local pages.
+        """
         layout = self.kv_args.cache_layout
 
         cache_fragments = tuple(transfer_fragments)
@@ -446,6 +466,35 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 if block_selection is not None
                 else dst_group.block_ids
             )
+            if len(source_block_ids) != len(destination_block_ids):
+                raise ValueError(
+                    "cache transfer source and destination pages differ in count"
+                )
+            owner_filter = owner_filters.get(group_spec.group_id)
+            if owner_filter is not None:
+                if owner_filter.owner_count != group_spec.shard_count:
+                    raise ValueError(
+                        f"cache group {group_spec.group_id!r} owner filter "
+                        f"({owner_filter.owner_count} owners) disagrees with its "
+                        f"shard count {group_spec.shard_count}"
+                    )
+                # FluentLLM's sharded-source/whole-destination case: owned
+                # local pages against the destination entries at the same
+                # manifest positions.
+                owned, source_block_ids = owned_local_pages(
+                    source_block_ids,
+                    shard_count=owner_filter.owner_count,
+                    rank=owner_filter.owner_rank,
+                    virtual_block_count=layout.virtual_block_count(group_spec.group_id),
+                )
+                destination_block_ids = np.asarray(
+                    destination_block_ids, dtype=np.int64
+                )[owned]
+            elif group_spec.shard_count != 1:
+                raise ValueError(
+                    f"cache group {group_spec.group_id!r} is sharded but the "
+                    "registration route carries no owner filter"
+                )
             group_transfers.append(
                 (
                     group_spec,
@@ -515,10 +564,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 continue
 
             group_fields = layout.fields_for_group(group_spec.group_id)
-            if len(group_src_indices) != len(group_dst_indices):
-                raise ValueError(
-                    "cache transfer source and destination pages differ in count"
-                )
             if group_fields and len(group_src_indices):
                 # One pages x fields item per group: the descriptors are
                 # expanded inside Mooncake, never here.
@@ -654,6 +699,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     src_block_manifest=None,
                     dst_block_manifest=req.block_manifest,
                     transfer_fragments=registration.transfer_fragments,
+                    owner_filters=registration.transfer_owner_filters,
                     dst_cache_layout=registration.peer_cache_layout,
                     block_selection=block_selection,
                     field_ids=producer_schedule.fields_in_range(begin_step, end_step),
@@ -856,6 +902,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         src_block_manifest=kv_chunk.block_manifest,
                         dst_block_manifest=req.block_manifest,
                         transfer_fragments=registration.transfer_fragments,
+                        owner_filters=registration.transfer_owner_filters,
                         dst_cache_layout=registration.peer_cache_layout,
                     )
                     prepared.append(
