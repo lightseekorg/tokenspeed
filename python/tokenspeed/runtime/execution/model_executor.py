@@ -966,6 +966,16 @@ class ModelExecutor:
             pp_send(tensor, self.config.pp_rank + 1, self.config.pp_group)
 
     @property
+    def draft_model_runner(self) -> ModelRunner | None:
+        """The speculative draft's runner, or None without speculation.
+
+        Present on every pipeline stage that loaded draft weights, including
+        stages whose ``drafter`` is None (the draft only proposes on the last
+        stage). Live weight updates read it to refresh the draft in place.
+        """
+        return self._draft_model_runner
+
+    @property
     def _pp_is_last_stage(self) -> bool:
         return self.config.pp_rank == self.config.pp_size - 1
 

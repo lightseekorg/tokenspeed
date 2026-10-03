@@ -751,10 +751,10 @@ class DeviceHandle:
         """Apply one in-place RL weight-sync request, ordered against forwards.
 
         Type-dispatched on the request — join the trainer's NCCL group,
-        receive and apply one broadcast, or tear the group down. One entry
-        point because it is one capability: rewriting model parameters in
-        place, which must be ordered against forwards rather than raced with
-        them.
+        receive and apply one broadcast, read one committed version from the
+        Mooncake weight store, or tear the group down. One entry point because
+        it is one capability: rewriting model parameters in place, which must
+        be ordered against forwards rather than raced with them.
 
         Args:
             req: An ``io_struct`` weight-update request.
@@ -769,6 +769,7 @@ class DeviceHandle:
             DestroyWeightsUpdateGroupReqInput,
             InitWeightsUpdateGroupReqInput,
             UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
         )
 
         runner = self._executor.model_runner
@@ -777,23 +778,44 @@ class DeviceHandle:
             UpdateWeightsFromDistributedReqInput: (
                 runner.update_weights_from_distributed
             ),
+            UpdateWeightsFromMooncakeReqInput: (
+                lambda req: runner.update_weights_from_mooncake(
+                    req.version, self._mooncake_update_models()
+                )
+            ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
         }
         handler = handlers.get(type(req))
         if handler is None:
             raise TypeError(f"unsupported weight-update request {type(req).__name__}")
+        loads_weights = type(req) in (
+            UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
+        )
 
         def _apply_update():
             result = handler(req)
-            if (
-                type(req) is UpdateWeightsFromDistributedReqInput
-                and result[0]
-                and self._executor.drafter is not None
-            ):
+            if loads_weights and result[0] and self._executor.drafter is not None:
                 self._executor.drafter.on_target_weights_updated()
             return result
 
         return self._thread.run(_apply_update)
+
+    def _mooncake_update_models(self) -> list:
+        """The modules a Mooncake update streams into, target first.
+
+        ``--model-update-draft-weights refresh`` adds the speculative draft
+        model when one is loaded; ``retain`` keeps the draft's weights.
+        """
+        runner = self._executor.model_runner
+        models = [runner.model]
+        draft_runner = self._executor.draft_model_runner
+        if (
+            runner.server_args.model_update_draft_weights == "refresh"
+            and draft_runner is not None
+        ):
+            models.append(draft_runner.model)
+        return models
 
 
 def arm_data_plane_sync_debug(device: str) -> None:

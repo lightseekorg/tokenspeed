@@ -44,6 +44,10 @@ For a compact compatibility table, see
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
 | `--weight-version` | Initial model-weight version stamped into generation metadata. Defaults to `default`. |
+| `--model-update-config` | JSON object handed to the Model Updater SDK for `POST /update_weights_from_mooncake`. Requires the three flags below; see [Mooncake Weight Updates](#mooncake-weight-updates). |
+| `--model-update-sdk-module` | Import path of the Model Updater SDK module. Imported in the scheduler process on the first Mooncake update, not at startup. Required with `--model-update-config`. |
+| `--model-update-engine-type` | SDK `EngineType` member name for this engine, resolved as `EngineType[value.upper()]`. Required with `--model-update-config`. |
+| `--model-update-draft-weights` | `retain` or `refresh`: whether a Mooncake update also streams the speculative draft model's weights. Required with `--model-update-config`. |
 
 ### Weight Version Metadata
 
@@ -52,7 +56,8 @@ Every generation response includes the current version in
 policy version that produced a sample.
 
 The SGLang-compatible `update_weights_from_distributed`,
-`update_weights_from_tensor`, and `update_weights_from_disk` requests accept an
+`update_weights_from_mooncake`, `update_weights_from_tensor`, and
+`update_weights_from_disk` requests accept an
 optional `weight_version`. The version changes only after the update succeeds.
 `Engine.update_weights_from_distributed` requires `weight_version`; pass
 `None` to keep the current value on an intermediate update. Flushed L3
@@ -74,7 +79,10 @@ would leave the cache namespace on the old checkpoint. Use
 
 TokenSpeed exposes the SGLang HTTP surface used by slime. The supported path is
 an externally launched TokenSpeed rollout engine on separate GPUs, using full
-NCCL weight updates and TokenSpeed data-parallel size 1:
+NCCL weight updates. Attention data parallelism of any size is supported:
+each weight op fans out to every DP worker and the frontend ANDs the
+replies, and the scheduler completes an op only in a round where every DP
+rank holds it (see [Weight Updates Under Attention DP](#weight-updates-under-attention-dp)).
 
 - rollout: `POST /generate`, `POST /abort_request`, `GET /v1/loads`, and
   `GET /health_generate`;
@@ -99,9 +107,73 @@ The following slime paths are not yet supported end to end:
   `--rollout-top-p 1.0` until TokenSpeed returns that metadata;
 - rollout routing replay (`--use-rollout-routing-replay`).
 
-The HTTP route for `update_weights_from_tensor` remains for SGLang clients, but
-TokenSpeed's scheduler does not yet implement its CUDA-IPC receive path. Use the
-distributed update mode until that implementation is added.
+The HTTP routes for `update_weights_from_tensor` and `update_weights_from_disk`
+remain for SGLang clients, but TokenSpeed's scheduler does not implement their
+receive paths: the scheduler replies `success=false` with
+"not supported on this engine". Use the distributed or Mooncake update mode.
+
+### Weight Updates Under Attention DP
+
+With `--data-parallel-size > 1`, `init_weights_update_group`,
+`update_weights_from_distributed`, `update_weights_from_mooncake`, and
+`destroy_weights_update_group` are sent to every attention-DP worker and the
+frontend ANDs the replies (distinct messages are joined with ` | `). Each
+scheduler queues the op and completes it only in a round where every DP rank
+holds the same kind of op at the head of its queue, decided on the per-round
+DP all-reduce that already carries flush intent; one op completes per round.
+The device result is then MIN-reduced across the replica before the L3
+weight version is published, so a failure on one rank fails the update
+everywhere. A rank whose peer never receives the op waits indefinitely, as
+with `/flush_cache`. The design rationale is in `docs/design/event-loop.md`.
+
+### Mooncake Weight Updates
+
+`POST /update_weights_from_mooncake` loads one committed checkpoint version
+that the RL trainer published to a Mooncake weight store through the Model
+Updater SDK. Body: `{"version": int, "flush_cache": bool = true,
+"weight_version": str | null}`; a missing or non-integer `version` is a 400.
+Every scheduler process reads its own shard with its global rank as the
+SDK reader rank, on the forward thread, ordered against forwards like the
+distributed update. The reply arrives only after every worker finished its
+read, so the control server proxies this route with a longer inactivity
+timeout (3600 s) than the other RL routes.
+
+The server must be started with the four `--model-update-*` flags (table
+above): the SDK module is imported lazily on the first update and a missing
+module fails that update with a clear message rather than failing startup.
+`--model-update-draft-weights retain` updates the target model only;
+`refresh` streams the target and the speculative draft model (every pipeline
+stage that holds draft weights). Both policies notify the drafter afterwards
+like the distributed update does.
+
+`flush_cache` and `weight_version` follow the distributed update's rules
+with one default: a flushed Mooncake update publishes `weight_version =
+str(version)` when none is given (an explicit value wins); an unflushed
+update keeps the current namespace unless one is given, and with L3 storage
+a new `weight_version` still requires `flush_cache=true`. A successful update
+stamps the version into generation metadata.
+
+Trainer-side contract:
+
+- Pause dispatch at the router before calling and resume after the reply.
+  The scheduler's control thread blocks for the duration of the SDK read,
+  so load reporting, PD transfer polling, and health responses stall on
+  every worker; the frontend's writer lock only drains requests already
+  admitted on this engine.
+- `flush_cache=true` is rejected (and the load skipped) while PD transfers
+  or Host write-backs are in flight on any replica rank; retry after they
+  drain, or send intermediate updates with `flush_cache=false` and flush on
+  the last one.
+- Model update session: the SDK streams `(name, tensor)` pairs into each
+  model's `load_weights` in many partial calls. The runtime brackets the
+  models in a weight-update session (`begin_weight_update` /
+  `end_weight_update` on `BaseCausalLM`) so a model derives its post-load
+  state once, after the last chunk: the absorbed MLA `w_kc`/`w_vc` are
+  rewritten in their existing storage (captured CUDA graphs keep valid
+  addresses) and in-place one-shot transforms such as the LoRA norm scale
+  fold apply only to the parameters this update reloaded. Models outside
+  `BaseCausalLM` take no session hooks. The distributed update uses the
+  same session.
 
 ## Scheduler And Memory
 
