@@ -409,8 +409,9 @@ class ServerArgs:
     disable_sampling_tp_sync: bool = False
     # Numerics envelope: "auto" keeps every performance default; "rl-bitwise"
     # asks for bitwise run-to-run and batch-composition invariance and folds
-    # the determinism switches below (resolve_numerics). Each folded switch
-    # can still be set individually; the umbrella only ever tightens.
+    # the determinism switches below (resolve_numerics); "trainer-aligned"
+    # folds those and then the trainer-operation-order switches. Each folded
+    # switch can still be set individually; the umbrella only ever tightens.
     numerics: str = "auto"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
@@ -1014,13 +1015,14 @@ class ServerArgs:
 
         ``rl-bitwise`` is the RL rollout contract: within one deployment the
         same request produces bitwise-identical tokens and logprobs across
-        runs and regardless of batch composition. The umbrella only ever
-        tightens: it sets every switch it governs to its tight value and
-        refuses explicit choices it cannot tighten (a named MoE or sampling
-        backend without the guarantee). Each derived switch remains
-        individually available for auto mode. Whether the served model is
-        verified under the envelope is checked once its profile is known
-        (``require_verified_numerics``).
+        runs and regardless of batch composition. ``trainer-aligned`` tightens
+        it further toward the training framework's operation order
+        (``_resolve_trainer_aligned``). The umbrella only ever tightens: it
+        sets every switch it governs to its tight value and refuses explicit
+        choices it cannot tighten (a named MoE or sampling backend without the
+        guarantee). Each derived switch remains individually available for
+        auto mode. Whether the served model is verified under the envelope is
+        checked once its profile is known (``require_verified_numerics``).
         Runs after ``resolve_communication`` so it can veto the fused
         all-reduce that resolver auto-enables.
         """
@@ -1031,6 +1033,12 @@ class ServerArgs:
                 f"--numerics must be one of {list(NUMERICS_ENVELOPES)}, got "
                 f"{self.numerics!r}"
             )
+        self._resolve_rl_bitwise()
+        if self.numerics == "trainer-aligned":
+            self._resolve_trainer_aligned()
+
+    def _resolve_rl_bitwise(self):
+        """The rl-bitwise block: every envelope beyond auto runs it."""
         # Collectives: rank-ordered NCCL instead of the symmetric-memory and
         # trtllm fused paths, and the all-reduce becomes an all-gather with a
         # fixed-rank-order fp32 fold: NCCL's ring chunks by message size, so
@@ -1051,25 +1059,31 @@ class ServerArgs:
             self.moe_backend = "aok"
         elif self.moe_backend != "aok":
             raise ValueError(
-                f"--numerics rl-bitwise needs the batch-invariant MoE solution "
-                f"'aok'; --moe-backend {self.moe_backend} makes no such claim"
+                f"--numerics {self.numerics} needs the batch-invariant MoE "
+                f"solution 'aok'; --moe-backend {self.moe_backend} makes no such "
+                "claim"
             )
         if self.draft_moe_backend == "auto":
             self.draft_moe_backend = "aok"
         elif self.draft_moe_backend not in (None, "aok"):
             raise ValueError(
-                f"--numerics rl-bitwise needs the batch-invariant MoE solution "
-                f"'aok'; --draft-moe-backend {self.draft_moe_backend} makes no "
-                "such claim"
+                f"--numerics {self.numerics} needs the batch-invariant MoE "
+                f"solution 'aok'; --draft-moe-backend {self.draft_moe_backend} "
+                "makes no such claim"
             )
         # Sampling: greedy rows must break exact logit ties canonically.
         if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
             raise ValueError(
-                f"--numerics rl-bitwise needs a sampling backend with canonical "
-                f"greedy tie-breaking ({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); "
-                f"--sampling-backend {self.sampling_backend} resolves exact "
-                "ties in reduction order"
+                f"--numerics {self.numerics} needs a sampling backend with "
+                "canonical greedy tie-breaking "
+                f"({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); --sampling-backend "
+                f"{self.sampling_backend} resolves exact ties in reduction order"
             )
+
+    def _resolve_trainer_aligned(self):
+        """The trainer-alignment block: the training framework's operation
+        order on top of rl-bitwise. Each switch it tightens is documented in
+        ``docs/design/numerics.md`` under "alignment.trainer"."""
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -2714,7 +2728,10 @@ class ServerArgs:
             help="Numerics envelope. rl-bitwise folds the determinism "
             "switches (deterministic collectives, no autotune/TF32/PDL, no "
             "fused all-reduce) so outputs and logprobs are bitwise identical "
-            "across runs and batch compositions within one deployment.",
+            "across runs and batch compositions within one deployment. "
+            "trainer-aligned folds those and then the trainer-operation-order "
+            "switches (docs/design/numerics.md, alignment.trainer); a model "
+            "serves it only once its forward is verified against the trainer.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

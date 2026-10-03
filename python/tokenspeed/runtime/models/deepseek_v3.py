@@ -50,6 +50,7 @@ from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
@@ -901,7 +902,9 @@ class DeepseekV3AttentionMLA(nn.Module):
             self.w_kc.transpose(1, 2),
             out=Q[..., : self.kv_lora_rank].transpose(0, 1),
             override=(
-                "aok" if global_server_args_dict["numerics"] == "rl-bitwise" else None
+                "aok"
+                if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+                else None
             ),
         )
         return self.attn_mqa.latent_prologue(

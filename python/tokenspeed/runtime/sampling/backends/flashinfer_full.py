@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     min_p_renorm_prob,
 )
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
     SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
@@ -328,7 +329,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             offset=offsets,
             deterministic=True,
         )
-        if global_server_args_dict["numerics"] == "rl-bitwise":
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
             # Greedy maximizes the penalized logits.
             batch_next_token_ids = canonical_greedy_tokens(
                 logits, top_ks, batch_next_token_ids
@@ -473,7 +474,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             use_draft_prob=use_draft_prob,
             reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
         )
-        if global_server_args_dict["numerics"] == "rl-bitwise":
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
             canonical_greedy_verify(
                 logits=logits,
                 top_ks=top_ks,

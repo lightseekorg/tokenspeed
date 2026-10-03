@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.layers.parameter import BaseWeightParameter
@@ -87,8 +88,8 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
-        if global_server_args_dict["numerics"] == "rl-bitwise":
-            # Bitwise envelope: the logits GEMM must be batch-invariant like
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+            # Bitwise envelopes: the logits GEMM must be batch-invariant like
             # every other row-parallel projection (see layers/dense/unquant).
             import tokenspeed_kernel
 

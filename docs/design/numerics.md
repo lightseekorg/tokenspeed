@@ -17,20 +17,27 @@ parallel layout, model, kernels):
    which other requests share its batches, or on how the scheduler happened
    to chunk and batch it.
 
-It deliberately does **not** promise (yet — the layers exist in the
+It deliberately does **not** promise (yet — the layer exists in the
 hierarchy, unimplemented):
 
 3. **Topology invariance** — the same logprobs under a different TP/DP
-   factorization (needs vocab-block-invariant log-softmax and TP-invariant
-   projection layouts).
-4. **Trainer alignment** — bitwise equality with the training framework's
-   forward (needs the trainer's operation order: CPU-computed YaRN ramp
-   masks, unscaled LoRA norms, unfused first RMSNorm, matching collectives).
+   factorization (needs TP-invariant projection layouts on top of the
+   vocab-block log-softmax below).
+
+`--numerics trainer-aligned` is the next envelope up. It promises 1 and 2
+(it runs the whole rl-bitwise block first) and then:
+
+4. **Trainer alignment** — the forward follows the training framework's
+   operation order wherever the two engines are known to differ, so that a
+   teacher-forced pass over a trainer-generated sequence reproduces the
+   trainer's per-token logprobs bitwise. The switches it tightens are listed
+   under `alignment.trainer` below; each exists individually for `auto`.
 
 ## The hierarchy
 
 ```
-numerics.mode                       --numerics {auto, rl-bitwise}
+numerics.mode                       --numerics {auto, rl-bitwise,
+                                                trainer-aligned}
 ├── kernels.deterministic           fixed-reduction-order compute
 │   ├── no autotune                 disable_autotune (tactic choice is shape-
 │   │                               and machine-dependent state); no
@@ -88,9 +95,11 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               kernels switch algorithm and CTA split
 │   │                               with the row count, which moves ties
 │   └── per-row GEMMs               fixed-order GEMM leaves (see aok below)
-├── logprob.topology-invariant      (deferred) vocab-block fixed-tree
-│                                   log-softmax, TP-count-invariant
-└── alignment.trainer               (deferred) trainer operation order
+├── logprob.topology-invariant      (deferred) TP-invariant projection
+│                                   layouts on top of the vocab-block
+│                                   log-softmax of alignment.trainer
+└── alignment.trainer               --numerics trainer-aligned: the trainer's
+                                    operation order (section below)
 ```
 
 Precedence: the envelope only ever tightens. It sets every switch it governs
@@ -98,7 +107,36 @@ to its tight value, and it refuses an explicit choice it cannot tighten — a
 named MoE backend other than the batch-invariant one, a sampling backend
 without canonical greedy ties — rather than keeping it and silently voiding
 the contract. `resolve_numerics` runs after `resolve_communication` so it can
-veto the auto-enabled all-reduce fusion.
+veto the auto-enabled all-reduce fusion. `trainer-aligned` runs the
+rl-bitwise block and then its own; every selection point that pins a
+batch-invariant leaf tests `numerics in BITWISE_ENVELOPES`, never the one
+name, so a tighter envelope inherits every pin.
+
+## alignment.trainer
+
+The invariance layers make a deployment agree with itself. Trainer alignment
+makes it agree with a different program: the training framework's forward,
+whose arithmetic was never written to match an inference engine. Each switch
+below replaces one operation the engine performs differently from the trainer
+with the trainer's form. The table says what each switch changes: **forward
+values** means every activation downstream moves (tokens can flip at ties,
+logprobs change); **logprobs only** means the sampled tokens are untouched
+and only the reported log-probabilities change.
+
+| Switch | Trainer form | Changes |
+| --- | --- | --- |
+| `--sampling-stream per-request` | Non-greedy rows draw from a Philox stream keyed by `(request seed, position)` only (`sampling.deterministic` above); the trainer plays back the sampled ids, so this is an invariance switch the envelope needs for T>0 rollouts | tokens at T>0 (not logprobs) |
+| `--yarn-ramp-mask-device cpu` | The YaRN linear ramp mask of `deepseek_yarn` RoPE is computed on the host and copied to the device, as the trainer builds its `inv_freq` on the host; CPU and CUDA division round differently at ulp level, and every rotated q/k inherits the difference | forward values |
+| `--mla-lora-scale runtime` | The `sqrt(hidden / lora_rank)` norm scales of LongCat-style MLA stay out of the `q_a_layernorm` / `kv_a_layernorm` weights and multiply `q` after `q_b_proj` and the latent after `kv_a_layernorm` in bf16, as the trainer does; the DSA indexer reads the unscaled `q_lora` | forward values |
+| `--layer-boundary-norm unfused` | The norm that opens each physical layer and the final norm read a bf16 `hidden + residual` materialized first (`residual = hidden`), then a standalone RMSNorm, instead of the fused add+norm kernel whose sum stays fp32; all-reduce+norm fusion is vetoed with it | forward values |
+| `--router-topk torch` | The correction-bias router runs fp32 `torch.softmax`, `torch.topk(probs + bias, sorted=True)` (PyTorch tie order), weights = unbiased probs x `routed_scaling_factor`, zero experts (`id >= num_real`) become `-1` and keep their weight for the identity residual | forward values (expert selection at near-ties, weights) |
+| `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (pairwise tile tree, then a rank-ordered fp32 left fold across blocks), `logp = -(log(sum_exp) - target)`; temperature- or top-p-normalised logprob requests are refused | logprobs only |
+
+Trainer alignment is a stronger claim than invariance and cannot be checked
+by the engine alone: a model earns `trainer-aligned` in
+`ModelProfile.numerics_envelopes` only through the teacher-forced comparison
+against a trainer dump described under Acceptance. In-tree models do not
+declare it; the out-of-tree LongCat 2.0 plugin is the first candidate.
 
 ## Kernel selection
 

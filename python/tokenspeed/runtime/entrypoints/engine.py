@@ -61,6 +61,7 @@ from tokenspeed.runtime.cache.l3.backend import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     resolve_l3_weight_version,
 )
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.engine.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -555,8 +556,8 @@ def _set_envs_and_config(server_args: ServerArgs):
         # explicit env wins; --disable-tf32 is the documented opt-out.
         os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
         os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
-    if server_args.numerics == "rl-bitwise":
-        # Bitwise envelope: no TF32 anywhere, and pin NCCL to one
+    if server_args.numerics in BITWISE_ENVELOPES:
+        # Bitwise envelopes: no TF32 anywhere, and pin NCCL to one
         # algorithm/protocol so the reduction association order cannot switch
         # with message size. The envelope's promise beats ambient
         # environment: a conflicting value is replaced, loudly, instead of
@@ -569,7 +570,8 @@ def _set_envs_and_config(server_args: ServerArgs):
             prior = os.environ.get(key)
             if prior is not None and prior != value:
                 logger.warning(
-                    f"--numerics rl-bitwise replaces {key}={prior} with {value}"
+                    f"--numerics {server_args.numerics} replaces {key}={prior} "
+                    f"with {value}"
                 )
             os.environ[key] = value
 

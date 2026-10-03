@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.dsa import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
@@ -128,7 +129,7 @@ class DSABackend(PagedAttentionBackend):
         # leaves; without one registered, selection fails at the first decode
         # instead of silently serving an occupancy-split kernel.
         self.kernel_solution: str | None = (
-            "aok" if global_server_args_dict["numerics"] == "rl-bitwise" else None
+            "aok" if global_server_args_dict["numerics"] in BITWISE_ENVELOPES else None
         )
         self._prefill_page_table: torch.Tensor | None = None
         self.kpool_runtime = (

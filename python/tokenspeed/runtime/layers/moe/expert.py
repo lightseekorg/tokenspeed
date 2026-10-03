@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
 )
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -375,7 +376,7 @@ class MoELayer(torch.nn.Module):
             solution=moe_backend,
             # rl-bitwise promises one reduction order; fast-math epilogues
             # trade exactly that away.
-            fast_math=global_server_args_dict["numerics"] != "rl-bitwise",
+            fast_math=global_server_args_dict["numerics"] not in BITWISE_ENVELOPES,
         )
 
         create_layer_weights(

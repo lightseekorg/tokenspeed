@@ -33,6 +33,7 @@ from tokenspeed_kernel.thirdparty.cuda import (
 )
 from transformers import PretrainedConfig as _PretrainedConfig
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping as _Mapping
@@ -230,7 +231,7 @@ class _RuntimeLongcatRouter(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor):
-        if global_server_args_dict["numerics"] == "rl-bitwise":
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
             # The classifier's logits feed expert selection, so they must be
             # batch-invariant or top-k flips at near-ties. cuBLAS and the
             # dsv3 router kernel tile by shape; the aok leaf does not.

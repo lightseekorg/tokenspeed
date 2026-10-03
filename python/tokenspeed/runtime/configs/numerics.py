@@ -34,7 +34,15 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_profile import ModelProfile
 
 # Every envelope name, the default first. A model always serves ``auto``.
-NUMERICS_ENVELOPES = ("auto", "rl-bitwise")
+# ``trainer-aligned`` tightens ``rl-bitwise``: it folds every rl-bitwise switch
+# and then the trainer-order switches (``docs/design/numerics.md``,
+# "alignment.trainer").
+NUMERICS_ENVELOPES = ("auto", "rl-bitwise", "trainer-aligned")
+
+# Envelopes that promise the rl-bitwise contract (run and batch invariance).
+# Selection points that pin batch-invariant leaves test membership here, so a
+# tighter envelope inherits every pin.
+BITWISE_ENVELOPES = frozenset({"rl-bitwise", "trainer-aligned"})
 
 # Sampling backends whose greedy rows break exact logit ties toward the lowest
 # token id in every batch shape: ``greedy`` is a canonical argmax, the
@@ -66,11 +74,16 @@ def require_verified_numerics(
     if numerics == "auto":
         return
     if model_profile is None or numerics not in model_profile.numerics_envelopes:
+        harness = (
+            "the teacher-forced logprob comparison against the trainer passes"
+            if numerics == "trainer-aligned"
+            else "the bitwise invariance harness passes"
+        )
         raise ValueError(
             f"--numerics {numerics} is a contract verified per model, and "
             f"{architecture} has not been verified under it: its model profile "
             f"must list {numerics!r} in numerics_envelopes, which a model "
-            "declares once the bitwise invariance harness passes for it"
+            f"declares once {harness} for it"
         )
     if quantization is not None:
         raise ValueError(
@@ -81,6 +94,7 @@ def require_verified_numerics(
 
 
 __all__ = [
+    "BITWISE_ENVELOPES",
     "NUMERICS_ENVELOPES",
     "RL_BITWISE_SAMPLING_BACKENDS",
     "require_verified_numerics",

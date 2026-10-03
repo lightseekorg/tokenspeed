@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -710,7 +711,7 @@ class LogitsProcessor(nn.Module):
         elif hasattr(lm_head, "weight"):
             from tokenspeed.runtime.utils.env import global_server_args_dict
 
-            if global_server_args_dict["numerics"] == "rl-bitwise":
+            if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
                 import tokenspeed_kernel
 
                 logits = tokenspeed_kernel.mm(

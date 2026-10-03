@@ -73,6 +73,33 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rl-bitwise"):
             ServerArgs(model="x", numerics="bitwise")
 
+    def test_trainer_aligned_runs_the_rl_bitwise_block(self):
+        tight = ServerArgs(model="x", numerics="rl-bitwise")
+        args = ServerArgs(model="x", numerics="trainer-aligned")
+        for name in (
+            "force_deterministic_rsag",
+            "batch_invariant_collectives",
+            "enable_allreduce_fusion",
+            "comm_fusion_max_num_tokens",
+            "disable_autotune",
+            "disable_tf32",
+            "disable_pdl",
+            "moe_backend",
+            "draft_moe_backend",
+        ):
+            self.assertEqual(getattr(args, name), getattr(tight, name), name)
+        # It inherits the refusals too, under its own name.
+        with self.assertRaisesRegex(ValueError, "trainer-aligned.*--moe-backend"):
+            ServerArgs(model="x", numerics="trainer-aligned", moe_backend="triton")
+
+    def test_bitwise_envelopes_cover_every_pinning_envelope(self):
+        from tokenspeed.runtime.configs.numerics import (
+            BITWISE_ENVELOPES,
+            NUMERICS_ENVELOPES,
+        )
+
+        self.assertEqual(BITWISE_ENVELOPES, set(NUMERICS_ENVELOPES) - {"auto"})
+
     def test_ordered_fold_matches_the_sum_and_only_depends_on_rank_order(self):
         import torch
 
@@ -191,6 +218,24 @@ class TestModelVerificationGate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must include 'auto'"):
             self._profile({"auto", "bitwise"})
         self.assertIsInstance(self._profile(["auto"]).numerics_envelopes, frozenset)
+
+    def test_trainer_aligned_is_its_own_verification(self):
+        from tokenspeed.runtime.configs.numerics import require_verified_numerics
+
+        # rl-bitwise passing does not earn trainer-aligned.
+        with self.assertRaisesRegex(ValueError, "teacher-forced"):
+            require_verified_numerics(
+                "trainer-aligned",
+                model_profile=self._profile({"auto", "rl-bitwise"}),
+                architecture="X",
+                quantization=None,
+            )
+        require_verified_numerics(
+            "trainer-aligned",
+            model_profile=self._profile({"auto", "rl-bitwise", "trainer-aligned"}),
+            architecture="X",
+            quantization=None,
+        )
 
 
 class TestCanonicalGreedyTies(unittest.TestCase):

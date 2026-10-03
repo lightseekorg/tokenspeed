@@ -64,9 +64,11 @@ class ModelProfile:
             the cache plans one plane per branch. Cache geometry, so it has
             no fallback: an omitted count would undersize the cache.
         numerics_envelopes: The ``--numerics`` envelopes the model is verified
-            under, always including ``"auto"``. A model lists another one
-            (e.g. ``"rl-bitwise"``) only once the bitwise invariance harness
-            passes for it; launching an unlisted envelope is refused.
+            under, always including ``"auto"``. A model lists ``"rl-bitwise"``
+            only once the bitwise invariance harness passes for it, and
+            ``"trainer-aligned"`` only once the teacher-forced logprob
+            comparison against the trainer passes too; launching an unlisted
+            envelope is refused.
     """
 
     configure_attention: Callable[[ModelConfig], None]

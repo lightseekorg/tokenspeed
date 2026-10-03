@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
 from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
 from tokenspeed_kernel.platform import pdl_enabled
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
@@ -73,8 +74,9 @@ if TYPE_CHECKING:
 
 # Greedy requests normalize to top_k=1 and ride the pool route, whose
 # stochastic kernels resolve EXACT logit ties in reduction order: run-stable,
-# not batch-invariant. Under --numerics rl-bitwise the helpers below give
-# greedy rows the canonical lowest-index argmax instead. Both are
+# not batch-invariant. Under the bitwise envelopes (rl-bitwise and
+# trainer-aligned) the helpers below give greedy rows the canonical
+# lowest-index argmax instead. Both are
 # elementwise over rows, so the graph-captured path stays one path.
 
 
@@ -461,7 +463,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             offset=offsets,
             deterministic=True,
         )
-        if global_server_args_dict["numerics"] == "rl-bitwise":
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
             batch_next_token_ids = canonical_greedy_tokens(
                 logits, top_ks, batch_next_token_ids
             )
@@ -656,7 +658,7 @@ class FlashInferSamplingBackend(SamplingBackend):
             use_draft_prob=use_draft_prob,
             reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
         )
-        if global_server_args_dict["numerics"] == "rl-bitwise":
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
             canonical_greedy_verify(
                 logits=logits,
                 top_ks=top_ks,

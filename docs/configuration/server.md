@@ -32,6 +32,22 @@ For a compact compatibility table, see
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
 
+## Numerics
+
+`--numerics` names the numerical contract a deployment promises; the design
+and the per-model verification gate are in `docs/design/numerics.md`. Every
+switch an envelope folds is also available individually under `auto`.
+
+| Parameter | Purpose |
+| --- | --- |
+| `--numerics {auto,rl-bitwise,trainer-aligned}` | `auto` keeps every performance default. `rl-bitwise` folds the determinism switches (`--force-deterministic-rsag`, `--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, `--moe-backend aok`) so tokens and logprobs are bitwise identical across runs and batch compositions. `trainer-aligned` folds those and then the trainer-operation-order switches below. A model serves an envelope only once its profile lists it. |
+| `--sampling-stream {batch,per-request}` | `per-request` draws every non-greedy row from a stream keyed by the request's seed and position only, so a request samples the same tokens alone and inside any batch. Folded in by `rl-bitwise` and `trainer-aligned`. |
+| `--yarn-ramp-mask-device {cuda,cpu}` | Device that computes the YaRN linear ramp mask of `deepseek_yarn` RoPE; the trainer builds it on the host. Folded to `cpu` by `trainer-aligned`. |
+| `--mla-lora-scale {folded,runtime}` | Where LongCat-style MLA applies its `sqrt(hidden / lora_rank)` norm scales: folded into the norm weights at load, or multiplied at runtime after `q_b_proj` / `kv_a_layernorm` as the trainer does. Folded to `runtime` by `trainer-aligned`. |
+| `--layer-boundary-norm {fused,unfused}` | `unfused` materializes `hidden + residual` in bf16 before the norm that opens each physical layer and before the final norm, instead of the fused add+norm kernel; also vetoes all-reduce+norm fusion. Folded to `unfused` by `trainer-aligned`. |
+| `--router-topk {fused,torch}` | Correction-bias MoE routing: the fused CUDA kernel, or fp32 `torch.softmax` + `torch.topk(probs + bias)` with PyTorch tie order and `-1` zero-expert ids. Folded to `torch` by `trainer-aligned`. |
+| `--logprob-order {torch,megatron}` | Order of the selected-token log-softmax: `torch.log_softmax`, or Megatron's vocab-parallel cross-entropy order over fixed 32768-wide vocab blocks. `megatron` refuses temperature- or top-p-normalised logprob requests. Changes logprobs only. Folded to `megatron` by `trainer-aligned`. |
+
 ## API Surface
 
 | Parameter | Purpose |
