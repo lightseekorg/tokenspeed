@@ -181,7 +181,9 @@ def _worker_comm(rank: int, rendezvous: str) -> None:
             ROW_COUNTS
         )
         narrowed = replace(ctx, collective_global_num_tokens=[1, 0, 1, 1])
-        assert cm.head_tp_group_scattered_num_tokens(narrowed, 1 if rank != 1 else 0) == [
+        assert cm.head_tp_group_scattered_num_tokens(
+            narrowed, 1 if rank != 1 else 0
+        ) == [
             1,
             0,
             1,
@@ -190,7 +192,9 @@ def _worker_comm(rank: int, rendezvous: str) -> None:
         with pytest.raises(ValueError, match="holds"):
             cm.head_tp_group_scattered_num_tokens(ctx, ROW_COUNTS[rank] + 1)
 
-        hidden_full = torch.randn(rows_full, HIDDEN, generator=torch.Generator().manual_seed(7))
+        hidden_full = torch.randn(
+            rows_full, HIDDEN, generator=torch.Generator().manual_seed(7)
+        )
         gathered = cm.pre_dense_comm(hidden_full[_own_rows(rank)].contiguous(), ctx)
         torch.testing.assert_close(gathered, hidden_full)
         shard_w = HIDDEN // WORLD
@@ -203,9 +207,7 @@ def _worker_comm(rank: int, rendezvous: str) -> None:
 
 
 def test_transpose_round_trip_and_dense_tail(tmp_path):
-    mp.spawn(
-        _worker_comm, args=((tmp_path / "rv").as_uri(),), nprocs=WORLD, join=True
-    )
+    mp.spawn(_worker_comm, args=((tmp_path / "rv").as_uri(),), nprocs=WORLD, join=True)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +229,14 @@ def _worker_dense(rank: int, rendezvous: str) -> None:
         x_full = torch.randn(rows_full, HIDDEN, generator=gen)
 
         sharded = DeepseekV3MLP(
-            HIDDEN, intermediate, "silu", mapping, None, "mlp", False, batch_invariant=True
+            HIDDEN,
+            intermediate,
+            "silu",
+            mapping,
+            None,
+            "mlp",
+            False,
+            batch_invariant=True,
         )
         # The merged loader takes gate and up separately; the column loader narrows.
         gate_w, up_w = gate_up_w.split(intermediate, dim=0)
@@ -251,7 +260,11 @@ def _worker_dense(rank: int, rendezvous: str) -> None:
         replicated.down_proj.weight_loader(replicated.down_proj.weight, down_w)
 
         cm = CommManager(
-            mapping, layer_id=1, is_moe=False, prev_is_moe=False, dense_batch_invariant=True
+            mapping,
+            layer_id=1,
+            is_moe=False,
+            prev_is_moe=False,
+            dense_batch_invariant=True,
         )
         ctx = _ctx(SimpleNamespace(), rank)
         own = x_full[_own_rows(rank)].contiguous()
@@ -260,7 +273,9 @@ def _worker_dense(rank: int, rendezvous: str) -> None:
         assert tuple(hidden.shape) == (rows_full, HIDDEN // WORLD)
         hidden, _ = cm.post_dense_comm(hidden, None, ctx)
         expected = replicated(own)
-        assert tuple(hidden.shape) == tuple(expected.shape) == (ROW_COUNTS[rank], HIDDEN)
+        assert (
+            tuple(hidden.shape) == tuple(expected.shape) == (ROW_COUNTS[rank], HIDDEN)
+        )
         torch.testing.assert_close(hidden, expected, atol=1e-4, rtol=1e-4)
         dist.barrier()
     finally:
@@ -268,9 +283,7 @@ def _worker_dense(rank: int, rendezvous: str) -> None:
 
 
 def test_batch_invariant_dense_matches_replicated(tmp_path):
-    mp.spawn(
-        _worker_dense, args=((tmp_path / "rv").as_uri(),), nprocs=WORLD, join=True
-    )
+    mp.spawn(_worker_dense, args=((tmp_path / "rv").as_uri(),), nprocs=WORLD, join=True)
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +355,9 @@ class _StubCoreAttention:
         self.layer_id = layer_id
         self.calls = 0
 
-    def latent_prologue(self, query, q_pe, latent_cache, positions, ctx, *, slots, expanded):
+    def latent_prologue(
+        self, query, q_pe, latent_cache, positions, ctx, *, slots, expanded
+    ):
         assert expanded is None
         assert query.shape[0] == q_pe.shape[0] == latent_cache.shape[0]
         assert query.shape[0] == positions.shape[0] == slots.shape[0]
@@ -451,7 +466,9 @@ def _worker_attention(rank: int, rendezvous: str, tp_batch_invariant: str) -> No
         sharded = _build_attention(mapping, weights)
         assert sharded.has_head_tp and sharded.num_local_heads == NUM_HEADS // WORLD
         assert type(sharded.o_proj).__name__ == (
-            "ColumnParallelLinear" if tp_batch_invariant == "attn" else "RowParallelLinear"
+            "ColumnParallelLinear"
+            if tp_batch_invariant == "attn"
+            else "RowParallelLinear"
         )
         assert sharded.attn_mqa.layer_id == 0
 
@@ -504,11 +521,26 @@ def test_dp_group_row_counts_reads_the_group_and_checks_this_rank():
 def test_dense_batch_invariant_needs_a_token_scatter_tail():
     same_tp = Mapping(rank=0, world_size=8, attn_tp_size=8)
     with pytest.raises(ValueError, match="dense TP group"):
-        CommManager(same_tp, layer_id=0, is_moe=False, prev_is_moe=False, dense_batch_invariant=True)
+        CommManager(
+            same_tp,
+            layer_id=0,
+            is_moe=False,
+            prev_is_moe=False,
+            dense_batch_invariant=True,
+        )
     dp_dense_tp = Mapping(
-        rank=0, world_size=8, attn_tp_size=1, attn_cp_size=1, attn_dp_size=8, dense_tp_size=8
+        rank=0,
+        world_size=8,
+        attn_tp_size=1,
+        attn_cp_size=1,
+        attn_dp_size=8,
+        dense_tp_size=8,
     )
     cm = CommManager(
-        dp_dense_tp, layer_id=0, is_moe=False, prev_is_moe=False, dense_batch_invariant=True
+        dp_dense_tp,
+        layer_id=0,
+        is_moe=False,
+        prev_is_moe=False,
+        dense_batch_invariant=True,
     )
     assert cm.dense_batch_invariant

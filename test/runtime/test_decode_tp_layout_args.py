@@ -151,7 +151,9 @@ def _causal_lm(mapping: Mapping) -> _StubModel:
 class TestLmHeadResolution:
     def test_dp_default_is_replicated(self):
         model = _causal_lm(
-            Mapping(rank=1, world_size=4, attn_tp_size=1, attn_cp_size=1, attn_dp_size=4)
+            Mapping(
+                rank=1, world_size=4, attn_tp_size=1, attn_cp_size=1, attn_dp_size=4
+            )
         )
         assert isinstance(model.lm_head, ReplicatedLinear)
         assert model.logits_processor.skip_all_gather
@@ -208,17 +210,31 @@ class TestModuleRefusals:
         from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MLP
 
         dp = Mapping(
-            rank=0, world_size=4, attn_tp_size=1, attn_cp_size=1, attn_dp_size=4, dense_tp_size=4
+            rank=0,
+            world_size=4,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=4,
+            dense_tp_size=4,
         )
         with pytest.raises(ValueError, match="shared experts"):
             DeepseekV3MLP(16, 32, "silu", dp, None, "m", True, batch_invariant=True)
         with pytest.raises(ValueError, match="unquantized"):
-            DeepseekV3MLP(16, 32, "silu", dp, object(), "m", False, batch_invariant=True)
+            DeepseekV3MLP(
+                16, 32, "silu", dp, object(), "m", False, batch_invariant=True
+            )
         single = Mapping(
-            rank=0, world_size=4, attn_tp_size=1, attn_cp_size=1, attn_dp_size=4, dense_tp_size=1
+            rank=0,
+            world_size=4,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=4,
+            dense_tp_size=1,
         )
         with pytest.raises(ValueError, match="dense TP group"):
-            DeepseekV3MLP(16, 32, "silu", single, None, "m", False, batch_invariant=True)
+            DeepseekV3MLP(
+                16, 32, "silu", single, None, "m", False, batch_invariant=True
+            )
         mlp = DeepseekV3MLP(16, 32, "silu", dp, None, "m", False, batch_invariant=True)
         assert mlp.down_proj.weight.shape == (16 // 4, 32)
         assert mlp(torch.empty(0, 16)).shape == (0, 16 // 4)
@@ -278,7 +294,9 @@ class TestModuleRefusals:
         monkeypatch.setitem(global_server_args_dict, "tp_batch_invariant", "attn")
         with pytest.raises(ValueError, match="attn-head-tp-size"):
             self._attention(
-                Mapping(rank=0, world_size=4, attn_tp_size=1, attn_cp_size=1, attn_dp_size=4)
+                Mapping(
+                    rank=0, world_size=4, attn_tp_size=1, attn_cp_size=1, attn_dp_size=4
+                )
             )
         attn = self._attention(
             Mapping(
@@ -315,5 +333,7 @@ class TestModuleRefusals:
             self._attention(head_tp, Overriding)
         assert self._attention(head_tp, OptedIn).has_head_tp
         # Without head TP an overriding subclass is untouched.
-        plain = Mapping(rank=0, world_size=4, attn_tp_size=1, attn_cp_size=1, attn_dp_size=4)
+        plain = Mapping(
+            rank=0, world_size=4, attn_tp_size=1, attn_cp_size=1, attn_dp_size=4
+        )
         assert not self._attention(plain, Overriding).has_head_tp
