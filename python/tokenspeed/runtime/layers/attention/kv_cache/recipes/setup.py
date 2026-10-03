@@ -59,6 +59,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
+    CacheStoragePlan,
+)
 
 # A cache family names one registered recipe and pool factory. The in-tree
 # families are mha, mla, dsa, msa, qwen_gdn, qwen4_exp, mamba2, inkling,
@@ -79,6 +82,7 @@ class CachePoolSpec:
     token_capacity: int
     layer_kv_head_counts: tuple[int, ...] | None = None
     pool_options: object | None = None
+    storage_plan: CacheStoragePlan | None = None
 
     def layer_view(
         self,

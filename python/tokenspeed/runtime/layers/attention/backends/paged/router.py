@@ -70,6 +70,9 @@ from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.paged.offload_adapter import (
+        KVOffloadAdapter,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
@@ -146,6 +149,7 @@ class CacheGroupRouter(AttentionBackend):
         self._consumed_group_ids = consumed_group_ids
         self.leaves: dict[str, PagedAttentionBackend] = {}
         self._geometry: CacheGroupGeometry | None = None
+        self._offload_adapter: KVOffloadAdapter | None = None
         self.is_draft = bool(is_draft)
         self.spec_num_tokens = max(int(spec_num_tokens or 1), 1)
         self.device = device
@@ -180,6 +184,7 @@ class CacheGroupRouter(AttentionBackend):
 
     def _forget_bound_pool_state(self) -> None:
         """The table stacks and write locations built for a bound pool; init rebuilds them."""
+        self._offload_adapter = None
         self._stacks: GroupTableStacks | None = None
         self._decode_views: dict[tuple[int, int], RouterDecodeWriteLocations] = {}
         # Published write locations: the decode slot (graph-recorded views,
@@ -250,8 +255,16 @@ class CacheGroupRouter(AttentionBackend):
             for leaf in self.leaves.values():
                 leaf.set_cache_pool(cache_pool)
         super()._publish_cache_pool(cache_pool)
+        if cache_pool.arena.offload is not None and not self.is_draft:
+            from tokenspeed.runtime.layers.attention.backends.paged.offload_adapter import (
+                KVOffloadAdapter,
+            )
+
+            self._offload_adapter = KVOffloadAdapter(self, cache_pool)
 
     def configure_runtime(self, **kwargs) -> None:
+        if self._offload_adapter is not None:
+            self._offload_adapter.validate_slots(kwargs["request_slot_capacity"])
         specs = {
             spec.group_id: spec for spec in self.cache_pool.arena.cache_group_specs
         }
@@ -413,11 +426,52 @@ class CacheGroupRouter(AttentionBackend):
         gid = self.group_ids[self._draft_history_index()]
         return self._extend_write_locations[gid]
 
+    def prepare_cache_batch(self, request_slots, *, num_extends, stream):
+        """Begin target KV offloading residency; ordinary arenas do nothing."""
+        if self._offload_adapter is not None:
+            self._offload_adapter.begin(
+                request_slots, num_extends=num_extends, stream=stream
+            )
+
+    def writeback_accepted_kv(self, accept_lengths):
+        """Write accepted offloaded KV to Host and join before completion."""
+        if self._offload_adapter is not None:
+            self._offload_adapter.engine.commit(accept_lengths)
+
+    def invalidate_cache_residency(self, request_slots, *, stream):
+        """Fence offloading streams and discard recycled slots' hot tags."""
+        if self._offload_adapter is not None:
+            self._offload_adapter.engine.reset_requests(request_slots, stream=stream)
+
+    def prepare_sparse_kv_access(self, layer, selection, positions, *, forward_mode):
+        """Return offloading compute writes after loading or joining prefetch.
+
+        Extend reserves projection staging instead; sparse prefill later
+        flushes and gathers history in bounded tiles. Non-offloaded layers
+        keep their ordinary history addresses.
+        """
+        if self._offload_adapter is not None:
+            return self._offload_adapter.prepare(
+                layer, selection, positions, forward_mode
+            )
+        return self.write_locations(layer, forward_mode)
+
+    def prefetch_sparse_kv(self, layer, selection, positions):
+        """Prefetch offloaded consumer fields sharing this layer's selection.
+
+        This producer hook does not prepare the consumer's compute access.
+        """
+        if self._offload_adapter is not None:
+            self._offload_adapter.prefetch(layer, selection, positions)
+
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        """This layer's KV write slots for the requests the forward covers.
+        """Return history IDs without entering the KV offloading access path.
 
+        Index-K writers query these before selection exists. IDs belong to
+        layer.group_id and never refer to hot/staging storage; metadata must
+        already have been initialized/refreshed. No KV is copied here.
         Decode (and the decode half of a MIXED round) returns the token-major
         ``[bs * N]`` window view over the location stack; extend returns the
         ``[sum(extend_seq_lens)]`` span computed at ``init_forward_metadata``.
@@ -469,6 +523,8 @@ class CacheGroupRouter(AttentionBackend):
         decode rows, whether it dispatches as MIXED or locally as DECODE."""
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
+        if self._offload_adapter is not None:
+            return self._offload_adapter.compute_write_locations(layer, forward_mode)
         mixed_draft_step_zero = (
             (forward_mode.is_decode() or forward_mode.is_mixed())
             and self.is_draft
@@ -567,6 +623,8 @@ class CacheGroupRouter(AttentionBackend):
                 extend_with_prefix=extend_with_prefix,
             )
             leaf.set_request_slots(req_pool_indices[:bs])
+        if self._offload_adapter is not None and num_extends:
+            self._offload_adapter.set_extend_writes(self._extend_write_locations)
 
     def refresh_decode_metadata(
         self,
@@ -796,6 +854,10 @@ class CacheGroupRouter(AttentionBackend):
         # No ambient-ctx override: a MIXED round's halves pass sub-context modes this must honor.
         assert not save_kv_cache, _PREWRITTEN
         leaf = self._leaf_for(layer)
+        if self._offload_adapter is not None and "topk_indices" in kwargs:
+            kwargs["topk_indices"] = self._offload_adapter.read_indices(
+                layer, kwargs["topk_indices"]
+            )
         out_cache_loc = self.forward_write_locations(layer, forward_mode)
         with self.record_pd_cache_step(
             forward_mode, writes_in_call=False, record_kv_cache=record_kv_cache
@@ -839,6 +901,10 @@ class CacheGroupRouter(AttentionBackend):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
         leaf = self._leaf_for(layer)
+        if self._offload_adapter is not None and "topk_indices" in kwargs:
+            kwargs["topk_indices"] = self._offload_adapter.read_indices(
+                layer, kwargs["topk_indices"]
+            )
         out_cache_loc = self.forward_write_locations(layer, ForwardMode.DECODE)
         return leaf.forward_decode(
             q,
@@ -868,7 +934,7 @@ class CacheGroupRouter(AttentionBackend):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
         leaf = self._leaf_for(layer)
-        out_cache_loc = self.write_locations(layer, ForwardMode.EXTEND)
+        out_cache_loc = self.forward_write_locations(layer, ForwardMode.EXTEND)
         return leaf.forward_extend(
             q,
             k,
@@ -928,6 +994,15 @@ class CacheGroupRouter(AttentionBackend):
         )
 
     def forward_sparse_prefill(self, *args, **kwargs):
+        """Attach offloading recovery tiles before dispatching sparse prefill.
+
+        Iteration flushes the projected chunk to Host, then reuses staging
+        for each gathered tile; the leaf must consume a tile before next().
+        """
+        if self._offload_adapter is not None:
+            kwargs["kv_tiles"] = self._offload_adapter.prefill_tiles(
+                kwargs["layer"], kwargs["topk_slots"]
+            )
         return self._sole_leaf("forward_sparse_prefill").forward_sparse_prefill(
             *args, **kwargs
         )

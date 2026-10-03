@@ -151,6 +151,12 @@ extend span, then a MIXED round's decode rows, then the dummy slot 0 for the
 padding. Per-mode callers, such as MLA models that split a MIXED round, keep
 using `write_locations`.
 
+Sparse KV offloading keeps `write_locations` as the authoritative-history
+accessor. Before the latent write, the caller supplies selection and positions
+to `prepare_sparse_kv_access`. The router's `forward_write_locations` and
+`padded_write_locations` then expose the prepared hot or recovery-staging
+slots to the prologue. Index-K continues to address history directly.
+
 A pool describes its destination with `kv_write_target(layer_id, slots,
 write_mask)`: buffers, scale planes and whether the write sanitizes. Pools do
 not override the prologue's write.

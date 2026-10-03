@@ -88,6 +88,7 @@ def get_kv_args(
     return KVArgs(
         engine_rank=engine_rank,
         kv_data_ptr=base_addr,
+        registration_regions=token_to_kv_pool.arena.registration_regions(),
         ib_device=ib_device,
         gpu_id=gpu_id,
         cache_layout=layout,

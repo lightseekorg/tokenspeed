@@ -28,6 +28,7 @@ from runtime.cache_pool_test_utils import (
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -517,6 +518,7 @@ class CacheGroupRouterTest(unittest.TestCase):
         pool = SimpleNamespace(
             paged_group_ids=groups,
             arena=SimpleNamespace(
+                offload=None,
                 cache_group_specs=tuple(
                     SimpleNamespace(
                         group_id=gid,
@@ -528,7 +530,7 @@ class CacheGroupRouterTest(unittest.TestCase):
                         sliding_window_tokens=None,
                     )
                     for gid in groups
-                )
+                ),
             ),
         )
         router = CacheGroupRouter(
@@ -626,6 +628,40 @@ class CacheGroupRouterTest(unittest.TestCase):
                 2,
                 save_kv_cache=False,
             )
+
+    def test_ordinary_sparse_prepare_returns_history_writes(self):
+        router, leaves = self._router()
+        router.refresh_decode_metadata(
+            2,
+            2,
+            torch.arange(2, dtype=torch.int32),
+            torch.tensor([9, 4], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._tables(),
+        )
+        layer = _layer(FULL)
+        history = router.write_locations(layer, ForwardMode.DECODE)
+        selected = torch.tensor([[4096, -1, 4096], [8192, 0, -1]])
+        before = selected.clone()
+        positions = torch.tensor([8, 3], dtype=torch.int32)
+        self.assertIs(
+            router.prepare_sparse_kv_access(
+                layer, selected, positions, forward_mode=ForwardMode.DECODE
+            ),
+            history,
+        )
+        self.assertIs(
+            AttentionBackend.prepare_sparse_kv_access(
+                router, layer, selected, positions, forward_mode=ForwardMode.DECODE
+            ),
+            history,
+        )
+        self.assertTrue(torch.equal(selected, before))
+        q = torch.zeros(2)
+        router.forward(
+            q, None, None, layer, None, ForwardMode.DECODE, 2, save_kv_cache=False
+        )
+        self.assertIs(leaves[FULL].calls[-1][2], history)
 
     def test_decode_write_location_views_are_pointer_stable_per_bs(self):
         router, _ = self._router(spec=2)
@@ -1211,7 +1247,7 @@ def _spec(
 
 def _pool(*specs, paged=(FULL, SWA)):
     return SimpleNamespace(
-        arena=SimpleNamespace(cache_group_specs=tuple(specs)),
+        arena=SimpleNamespace(cache_group_specs=tuple(specs), offload=None),
         paged_group_ids=tuple(paged),
     )
 

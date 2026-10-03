@@ -22,6 +22,21 @@ For a compact compatibility table, see
 | `--download-dir` | Hugging Face download/cache directory. |
 | `--hf-overrides` | JSON overrides for model configuration values. |
 
+## Sparse KV Offloading
+
+`--kv-offload-config` accepts a JSON object with four required fields:
+`layers` (unique target attention layer IDs), `hot_tokens` (a positive power of
+two), `host_gb` (a finite positive budget in GiB), and `overlap` (an explicit
+boolean enabling cross-layer prefetch). Omitting the argument disables offload.
+The model cache recipe validates supported fields, selection capacity and
+execution constraints; unsupported recipes reject the configuration.
+
+Model-specific behavior stays in `--hf-overrides`. For a plugin supporting a
+window ring, set its `kv_offload_window_ring` option explicitly. Do not put
+`window_ring` in the runtime object or use the legacy `hf_overrides.kv_offload`
+entry; both are rejected. This option does not enable MTP, CUDA Graph, scheduler
+overlap, or change numerical settings implicitly.
+
 ## Precision And Quantization
 
 | Parameter | Purpose |

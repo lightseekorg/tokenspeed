@@ -27,6 +27,7 @@ from collections.abc import Mapping, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar
 
+from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
 )
@@ -51,8 +52,15 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
     group,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
+    compute_offload_capacity,
+    plan_cache_storage,
+)
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.offload_config import (
+        KVOffloadPolicy,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         CacheModelFamily,
         CacheSetup,
@@ -123,13 +131,43 @@ class CacheRecipe(ABC):
             max_padding_fraction=self.max_padding_fraction,
         )
         self.check_layout(layout)
-        # One parent block per fabricated row, and a floor, not a size.
-        num_lcm_blocks = (
-            self.num_lcm_blocks(layout)
-            if self.probe_batch_rows is None
-            else max(self.probe_batch_rows, self.parents_needed(layout, 1))
+        specs = tuple(spec for spec, _ in groups)
+        policy = self.offload_policy()
+        offload = (
+            None
+            if policy is None
+            else policy.bind(
+                request_slots=RequestSlotLayout(self.attn_config.max_bs).capacity,
+                device_rows=max(
+                    RequestSlotLayout(self.attn_config.max_bs).capacity
+                    * (policy.hot_tokens + policy.reserved_tokens),
+                    self.server_args.chunked_prefill_size + 1,
+                ),
+                max_extend_tokens=self.server_args.chunked_prefill_size,
+            )
         )
+        if offload is not None:
+            num_lcm_blocks, offload = compute_offload_capacity(
+                layout,
+                specs,
+                offload=offload,
+                device_budget_bytes=self.cache_budget_bytes - self.workspace_bytes(),
+                max_lcm_blocks=self._capped_parents(
+                    2**31 - 1,
+                    parent_tokens=self._max_packing(layout) * layout.prefix_granularity,
+                ),
+                probe_lcm_blocks=(
+                    max(self.probe_batch_rows, self.parents_needed(layout, 1))
+                    if self.probe_batch_rows is not None
+                    else None
+                ),
+            )
+        elif self.probe_batch_rows is not None:
+            num_lcm_blocks = max(self.probe_batch_rows, self.parents_needed(layout, 1))
+        else:
+            num_lcm_blocks = self.num_lcm_blocks(layout)
         memory_plan = layout.bind(num_lcm_blocks)
+        storage_plan = plan_cache_storage(memory_plan, specs, offload=offload)
         return CacheSetup(
             spec=CachePoolSpec(
                 family=self.family,
@@ -141,16 +179,27 @@ class CacheRecipe(ABC):
                 token_capacity=self.token_capacity(layout, num_lcm_blocks),
                 layer_kv_head_counts=self.layer_kv_head_counts,
                 pool_options=self.pool_options(),
+                storage_plan=storage_plan,
             ),
             num_draft_layers=self.num_draft_layers,
             cache_budget_bytes=(
                 self.cache_budget_bytes
                 if self.probe_batch_rows is None
-                else self.workspace_bytes() + memory_plan.arena_bytes
+                else self.workspace_bytes() + storage_plan.device_budget_bytes
             ),
             fixed_workspace_bytes=self.workspace_bytes(),
             uses_paged_state_verify=self.uses_paged_state_verify,
         )
+
+    def offload_policy(self) -> KVOffloadPolicy | None:
+        """Reject enabled offloading by default; return None when disabled.
+
+        Recipes supporting offloading must override this method to translate
+        the runtime configuration into a model-specific storage policy.
+        """
+        if self.server_args.kv_offload_config is not None:
+            raise ValueError("this cache recipe does not support --kv-offload-config")
+        return None
 
     # ------------------------------------------------------------------
     # Seams: the layer vocabulary

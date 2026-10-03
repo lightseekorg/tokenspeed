@@ -279,6 +279,7 @@ def _v4_recipe(
     num_layers = len(hf_config.compress_ratios)
     return DeepseekV4Recipe(
         server_args=SimpleNamespace(
+            kv_offload_config=None,
             max_total_tokens=None,
             chunked_prefill_size=prefix_granularity,
             attention_use_fp4_indexer_cache=True,
@@ -6840,6 +6841,7 @@ def test_v4_merged_solve_draft_is_a_continuation_layer():
 def test_v4_pd_recipe_and_readiness_follow_cache_producers():
     setup = DeepseekV4Recipe(
         server_args=SimpleNamespace(
+            kv_offload_config=None,
             speculative_algorithm=None,
             attention_use_fp4_indexer_cache=False,
             max_total_tokens=64 * 1024,

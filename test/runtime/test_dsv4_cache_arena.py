@@ -57,6 +57,7 @@ def _recipe(degree, fp4):
     )
     return DeepseekV4Recipe(
         server_args=SimpleNamespace(
+            kv_offload_config=None,
             max_total_tokens=None,
             chunked_prefill_size=8192,
             disaggregation_mode="null",

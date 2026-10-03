@@ -58,6 +58,7 @@ class KVArgs:
     gpu_id: int
     cache_layout: CacheTransferContract
     cache_fields_by_stage: tuple[tuple[str, ...], ...]
+    registration_regions: tuple[tuple[int, int], ...] = ()
     cache_producer_schedule: CacheProducerSchedule | None = None
     # Full-model logical contract for the PD wire when the local arena/plan
     # is narrowed to a stage window; None means cache_layout is already it.
@@ -65,11 +66,14 @@ class KVArgs:
 
     @property
     def wire_layout(self) -> CacheTransferContract:
-        return (
+        layout = (
             self.wire_cache_layout
             if self.wire_cache_layout is not None
             else self.cache_layout
         )
+        # Bootstrap compares the logical layout across ranks. Physical bindings
+        # are rank-local and belong only to the transfer endpoint contract.
+        return dataclasses.replace(layout, field_addresses=None)
 
 
 class KVTransferError(Exception):

@@ -168,6 +168,19 @@ def _op(page_offset: int = 0) -> SimpleNamespace:
     return SimpleNamespace(block_tables_arrays=lambda: tables)
 
 
+@pytest.mark.parametrize("missing", [False, True])
+def test_transfer_contract_rejects_group_mismatch_with_field_addresses(missing):
+    contract = _layout()
+    specs = contract.group_specs
+    specs = specs[:-1] if missing else (*specs, replace(specs[0], group_id="extra"))
+    with pytest.raises(CacheContractError, match="group IDs disagree"):
+        replace(
+            contract,
+            group_specs=specs,
+            field_addresses={field.field_id: 1024 for field in contract.plan.fields},
+        )
+
+
 def test_recipe_layer_owns_transfer_schema_api() -> None:
     schema = build_cache_transfer_schema(
         _two_plane_lcm_plan(3),
