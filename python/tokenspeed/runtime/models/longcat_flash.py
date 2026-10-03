@@ -779,6 +779,14 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
+    @property
+    def expert_placement(self) -> _ExpertLocationMetadata | None:
+        """The placement the MoE layers were built with; None routes trivially."""
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, _RuntimeLongcatMoE):
+                return layer.mlp.expert_placement
+        return None
+
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
         self.capture_aux_hidden_states = True
         if layer_ids is None:
@@ -808,6 +816,10 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         ]
         fuse_qkv_a_proj = getattr(self.config, "q_lora_rank", None) is not None
         params_dict = dict(self.named_parameters())
+        # The placement the MoE layers were built with: every local slot is
+        # filled from the logical expert it holds (replicas included), and RL
+        # weight sync through this same path lands in every replica.
+        expert_placement = self.expert_placement
         moe_loader = _build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=_ExpertCheckpointSchema(
@@ -815,9 +827,14 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 down_proj_name="down_proj",
                 up_proj_name="up_proj",
             ),
-            num_experts=self.config.n_routed_experts,
+            num_experts=(
+                self.config.n_routed_experts
+                if expert_placement is None
+                else expert_placement.num_physical_experts
+            ),
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
+            expert_placement=expert_placement,
         )
 
         for name, loaded_weight in weights:
