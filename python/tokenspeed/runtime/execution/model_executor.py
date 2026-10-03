@@ -1892,7 +1892,7 @@ class ModelExecutor:
 
                 if (
                     LOG_SPEC_ACCEPT_LENGTHS
-                    and self.config.spec_num_steps
+                    and self.config.spec_algo is not None
                     and num_extends == 0
                 ):
                     spec_candidate_tokens = self.input_buffers.input_ids_buf[
