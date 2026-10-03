@@ -1546,6 +1546,7 @@ def _attention_dsa_decode() -> object:
     topk_slots = torch.empty((2, 512), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1749,6 +1750,7 @@ def _attention_dsa_decode_fp8_dense_rank128_q4(
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1776,6 +1778,7 @@ def _attention_dsa_decode_fp8_dense_rank512(
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1803,6 +1806,7 @@ def _attention_dsa_decode_fp8_sparse_rank512(
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1828,6 +1832,7 @@ def _attention_dsa_decode_glm53_flash_bf16_dense() -> object:
     topk_slots = torch.empty((4, 2051), dtype=torch.int32)
     topk_lens = torch.empty((4,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1856,6 +1861,7 @@ def _attention_dsa_prefill() -> object:
     topk_slots = torch.empty((2, 512), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1876,6 +1882,7 @@ def _attention_dsa_prefill_glm53_flash_bf16_dense() -> object:
     topk_slots = torch.empty((1, 2051), dtype=torch.int32)
     topk_lens = torch.empty((1,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1898,6 +1905,7 @@ def _attention_dsa_prefill_glm53_flash_fp8_dense(
     topk_slots = torch.empty((1, 2051), dtype=torch.int32)
     topk_lens = torch.empty((1,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1924,6 +1932,7 @@ def _attention_dsa_prefill_fp8_dense(
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1948,6 +1957,7 @@ def _attention_dsa_decode_fp8_dense_rank128() -> object:
     topk_slots = torch.empty((2, 2048), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1968,6 +1978,7 @@ def _attention_dsa_prefill_bf16_dense_rank128() -> object:
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1988,6 +1999,7 @@ def _attention_dsa_prefill_fp8_dense_rank128() -> object:
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -2008,6 +2020,7 @@ def _attention_dsa_prefill_fp8_packed_rank512() -> object:
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -2341,26 +2354,50 @@ def test_dsa_topk_selection_receives_index_heads(
     assert captured["index_heads"] == index_heads
 
 
-def test_dsa_prefill_topk_forwards_cpu_candidate_lens_to_deep_gemm(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("takes_keyword", [True, False])
+def test_dsa_prefill_topk_forwards_cpu_candidate_lens_to_leaves_taking_it(
+    monkeypatch: pytest.MonkeyPatch, takes_keyword: bool
 ) -> None:
-    """The optional host mirror reaches DeepGEMM without affecting selection."""
+    """The optional host mirror reaches exactly the leaves whose signature
+    names it, whatever their solution, without affecting selection."""
     captured: dict[str, object] = {}
+    empty = (
+        torch.full((2, 1), -1, dtype=torch.int32),
+        torch.zeros((2,), dtype=torch.int32),
+    )
 
-    class _SelectedKernel:
-        name = "deep_gemm_dsa_prefill_topk"
+    if takes_keyword:
 
-        def __call__(self, **kwargs):
-            captured.update(kwargs)
-            return (
-                torch.full((2, 1), -1, dtype=torch.int32),
-                torch.zeros((2,), dtype=torch.int32),
-            )
+        def leaf(*, candidate_lens_cpu=None, **kwargs):
+            captured["candidate_lens_cpu"] = candidate_lens_cpu
+            return empty
+
+    else:
+
+        def leaf(
+            *,
+            q,
+            weights,
+            kv_workspace_slots,
+            row_starts,
+            row_ends,
+            topk,
+            softmax_scale,
+            index_k_cache,
+            page_size,
+            index_k_fp8,
+            index_k_scale,
+            max_logits_bytes,
+            out,
+            lens_out,
+        ):
+            captured["called"] = True
+            return empty
 
     monkeypatch.setattr(
         _attention_dsa_pkg,
         "select_kernel",
-        lambda *args, **kwargs: _SelectedKernel(),
+        lambda *args, **kwargs: SelectedKernel("unit_dsa_prefill_topk", leaf),
     )
     candidate_lens_cpu = torch.tensor([8, 16], dtype=torch.int64)
 
@@ -2378,7 +2415,10 @@ def test_dsa_prefill_topk_forwards_cpu_candidate_lens_to_deep_gemm(
         candidate_lens_cpu=candidate_lens_cpu,
     )
 
-    assert captured["candidate_lens_cpu"] is candidate_lens_cpu
+    if takes_keyword:
+        assert captured["candidate_lens_cpu"] is candidate_lens_cpu
+    else:
+        assert captured == {"called": True}
 
 
 def test_deep_gemm_prefill_bound_resolution_preserves_both_host_inputs() -> None:

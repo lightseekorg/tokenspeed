@@ -105,6 +105,12 @@ numerics.mode                       --numerics {auto, rl-bitwise,
 │   │                               batch_invariant=True); the tuned top-k
 │   │                               kernels switch algorithm and CTA split
 │   │                               with the row count, which moves ties
+│   ├── sorted slot reduction       dsa_slot_order=sorted: the sparse cores
+│   │                               reduce a token's selected slots in
+│   │                               ascending order, not in the top-k leaf's
+│   │                               tie order (dsa_decode / dsa_prefill
+│   │                               slot_order trait; silent cores are
+│   │                               refused rather than assumed)
 │   └── per-row GEMMs               fixed-order GEMM leaves (see aok below)
 ├── logprob.topology-invariant      (deferred) TP-invariant projection
 │                                   layouts on top of the vocab-block
@@ -152,6 +158,20 @@ leaf declaring `combine_order={"rank", "slot"}` whose slot form applies the
 routing probabilities inside the activation and combines the zero-expert
 residual in fp32 slot order, BF16 index-K indexer scoring and top-k leaves,
 and the same LoRA-scale placement in the draft model.
+
+The host's side of the indexer is the plane and the facades. A DSA model
+config names its index-key storage (`DSAConfig.index_k_format`, from the
+model config's `index_k_format`; `fp8_scaled` — FP8 keys plus per-128 fp32
+scales, the in-tree leaves' plane — when it names none, or `bf16`, the
+checkpoint's keys unquantized); the ordinary recipe plans that plane, the
+pool writes keys in the plane's own dtype and never converts between the
+two, and `dsa_decode_topk` / `dsa_prefill_topk` read `index_k_format` and
+`index_k_layout` off the plane's dtype and shape, so a bf16 plane selects
+only a leaf declaring `index_k_format={"bf16"}` (the kernel package's DSA
+README has the table). `candidate_lens_cpu` reaches every top-k leaf whose
+signature takes it. In-tree drafts fold no LoRA norm scale; a draft that
+does must read `--mla-lora-scale` exactly as the target does, folding only
+under `folded`.
 
 Trainer alignment is a stronger claim than invariance and cannot be checked
 by the engine alone: a model earns `trainer-aligned` in

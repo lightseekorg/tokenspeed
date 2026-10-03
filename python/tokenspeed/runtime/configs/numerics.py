@@ -90,6 +90,14 @@ MEGATRON_VOCAB_BLOCK = 32768
 # ``moe.COMBINE_ORDERS``.
 MOE_COMBINE_ORDERS = ("rank", "slot")
 
+# ``--dsa-slot-order``: the order the sparse attention cores reduce a token's
+# selected KV slots in — ``selection``: as the top-k leaf emitted them (what
+# every core does); ``sorted``: ascending slot order, so the reduction is
+# batch-invariant whenever the selected set is; served only by cores
+# declaring the ``slot_order`` trait (the ``aok`` leaves). Mirrors
+# ``tokenspeed_kernel``'s ``attention.dsa.SLOT_ORDERS``.
+DSA_SLOT_ORDERS = ("selection", "sorted")
+
 
 def require_verified_numerics(
     numerics: str,
@@ -136,6 +144,7 @@ def require_verified_numerics(
 
 __all__ = [
     "BITWISE_ENVELOPES",
+    "DSA_SLOT_ORDERS",
     "LAYER_BOUNDARY_NORMS",
     "LOGPROB_ORDERS",
     "MEGATRON_VOCAB_BLOCK",

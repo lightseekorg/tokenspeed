@@ -234,6 +234,7 @@ def main() -> None:
         softmax_scale=0.1,
         page_size=64,
         return_lse=True,
+        slot_order="selection",
     )
     ref_out, _ = dsa_decode(
         q=all_q, kv_cache=latent, topk_slots=virtual_slots, **kwargs

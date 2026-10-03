@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_S
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
+    DSA_SLOT_ORDERS,
     LAYER_BOUNDARY_NORMS,
     LOGPROB_ORDERS,
     MLA_LORA_SCALES,
@@ -450,6 +451,10 @@ class ServerArgs:
     # group: per-rank partials summed by the host (rank), or folded in fp32
     # slot order inside the MoE leaf as the trainer does (slot).
     moe_combine_order: str = "rank"
+    # The order the sparse attention cores reduce a token's selected KV slots
+    # in: as the top-k leaf emitted them (selection), or ascending (sorted,
+    # batch-invariant whenever the selected set is).
+    dsa_slot_order: str = "selection"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -700,6 +705,11 @@ class ServerArgs:
             raise ValueError(
                 "--moe-combine-order must be one of "
                 f"{list(MOE_COMBINE_ORDERS)}, got {self.moe_combine_order!r}"
+            )
+        if self.dsa_slot_order not in DSA_SLOT_ORDERS:
+            raise ValueError(
+                f"--dsa-slot-order must be one of {list(DSA_SLOT_ORDERS)}, got "
+                f"{self.dsa_slot_order!r}"
             )
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
@@ -1163,6 +1173,10 @@ class ServerArgs:
                 f"{self.sampling_backend} resolves exact ties in reduction order"
             )
         self.sampling_stream = "per-request"
+        # Sparse attention: the tuned top-k kernels' tie order moves with the
+        # batch shape, so the cores reduce the selected slots sorted; the
+        # batch-invariant cores the envelope pins declare the trait.
+        self.dsa_slot_order = "sorted"
 
     def _resolve_trainer_aligned(self):
         """The trainer-alignment block: the training framework's operation
@@ -2924,6 +2938,19 @@ class ServerArgs:
             "combine_order trait with slot (the batch-invariant 'aok' leaf), "
             "and vetoes all-reduce+norm fusion. Folded to slot by --numerics "
             "trainer-aligned.",
+        )
+        parser.add_argument(
+            "--dsa-slot-order",
+            type=str,
+            choices=list(DSA_SLOT_ORDERS),
+            default=ServerArgs.dsa_slot_order,
+            help="The order the sparse (DSA) attention cores reduce a token's "
+            "selected KV slots in. 'selection': as the top-k leaf emitted "
+            "them (every core). 'sorted': ascending slot order, so the "
+            "reduction is batch-invariant whenever the selected set is; "
+            "served only by cores declaring the slot_order trait (the "
+            "batch-invariant 'aok' leaves). Folded to sorted by --numerics "
+            "rl-bitwise and trainer-aligned.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

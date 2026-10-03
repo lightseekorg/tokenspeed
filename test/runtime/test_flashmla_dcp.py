@@ -666,7 +666,13 @@ def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
     base = _mla_config()
     fields = asdict(base.components[0])
     fields.update(backend_name="dsa")
-    spec = DSAConfig(**fields, index_topk=2048, index_n_heads=16, index_head_dim=128)
+    spec = DSAConfig(
+        **fields,
+        index_topk=2048,
+        index_n_heads=16,
+        index_head_dim=128,
+        index_k_format="fp8_scaled",
+    )
     config = replace(
         base,
         device="cuda",
@@ -704,6 +710,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = 64
     backend.kernel_solution = None
+    backend.slot_order = "selection"
     backend.data_type = torch.bfloat16
     backend.kv_lora_rank = 128
     backend.qk_nope_head_dim = 128

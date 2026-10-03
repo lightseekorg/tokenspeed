@@ -24,6 +24,44 @@ the online softmax; unused entries remain `-1`.
 Portable Triton implementations remain the fallback for trait combinations
 without a matching native registration.
 
+## Index-K plane formats
+
+`dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key
+plane off its dtype and pass it to selection as the `index_k_format` and
+`index_k_layout` traits; a top-k leaf declares the planes it scores and is
+never handed another one. One layout per dtype, and the facades never
+convert a plane:
+
+| dtype | `index_k_format` | `index_k_layout` | row |
+| --- | --- | --- | --- |
+| `uint8` | `fp8_scaled` | `packed` | `[slots, head_dim + 4 * head_dim / 128]`: FP8 E4M3 keys followed by one fp32 scale per 128 elements |
+| `uint8` | `fp8_scaled` | `page_planar` | any other uint8 shape: per-page planes of keys and scales, the outer page stride possibly padded |
+| `bfloat16` | `bf16` | `packed` | `[slots, head_dim]`: the keys as the indexer produced them, no scale plane |
+
+`dsa_prefill_topk`'s workspace-row form (`index_k_fp8` + `index_k_scale`) is
+always `fp8_scaled`. The in-tree DeepGEMM, Triton and Gluon leaves score
+`fp8_scaled` planes; a leaf scoring the checkpoint's bf16 keys (the
+trainer-aligned indexer) registers `index_k_format={"bf16"}`,
+`index_k_layout={"packed"}` and the `batch_invariant` and
+`forced_initial_local` features, so a bf16 plane selects it and nothing
+else. A plane of any other dtype is a `TypeError`.
+
+`candidate_lens_cpu` (the CPU mirror of each prefill token's candidate count)
+goes to every selected leaf whose signature takes the keyword and to no
+other, so a leaf that can size its launches from it declares the parameter.
+
+## Slot order of the sparse cores
+
+`dsa_decode` and `dsa_prefill` take a required `slot_order` in
+`SLOT_ORDERS = ("sorted", "selection")`, passed to selection as the
+`slot_order` trait: `selection` reduces a token's selected slots in the order
+the top-k leaf emitted them and is what every core does by default (a core
+need not declare the trait); `sorted` reduces them in ascending slot order,
+so the reduction is batch-invariant whenever the selected set is, and is
+served only by cores declaring `slot_order={"sorted", ...}`, which receive
+the choice as the `slot_order` keyword. Asking a silent core for `sorted`
+is a `ValueError`, not a silent fallback.
+
 ## Row top-k selection in CuTe DSL (`_cute_dsl/deep_select.py`)
 
 `deepselect_topk(scores, ends, topk, capacity=..., cluster_size=...)` selects

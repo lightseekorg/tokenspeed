@@ -65,10 +65,30 @@ class DSATokenToKVPool(MLATokenToKVPool):
         *,
         write_mask: torch.Tensor | None,
     ) -> None:
+        """Write one layer's index keys into its plane, in the plane's format.
+
+        The plane's dtype is its format (``configs/dsa.py`` INDEX_K_FORMATS):
+        a uint8 plane takes FP8 keys with per-128 fp32 scales, a bf16 plane
+        takes the keys unquantized. Nothing is converted between formats.
+        """
         if index_k.dtype != self.model_dtype:
             index_k = index_k.to(self.model_dtype)
         index_k = index_k.view(-1, self.index_head_dim)
         buf = self.index_k_buffer[layer_id]
+        if buf.dtype == torch.bfloat16:
+            rows = index_k.to(buf.dtype)
+            slots = loc.to(torch.int64)
+            if write_mask is not None:
+                # Rows this rank does not own keep what the plane holds; the
+                # gather keeps the shapes static for graph capture.
+                rows = torch.where(write_mask.unsqueeze(1), rows, buf[slots])
+            buf[slots] = rows
+            return
+        if buf.dtype != torch.uint8:
+            raise TypeError(
+                f"index-K plane dtype {buf.dtype} has no write path: uint8 "
+                "(fp8_scaled) or bfloat16 (bf16)"
+            )
         index_k_fp8, index_k_scale = quantize_fp8_with_scale(
             index_k,
             granularity="token_group",

@@ -34,8 +34,29 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 _INDEX_K_FP8_GROUP_SIZE = 128
 _INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
 
+# Storage of the indexer's key rows (``tokenspeed_kernel`` DSA README, "Index-K
+# plane formats"): ``fp8_scaled`` packs FP8 keys with one fp32 scale per 128
+# elements into uint8 rows and is what the in-tree scoring leaves read;
+# ``bf16`` keeps the keys as the indexer produced them, no scale plane. The
+# model config selects one (``index_k_format``); the pool writes exactly that
+# layout and the top-k facades read it off the plane's dtype, so a plane is
+# never converted on the way in or out.
+INDEX_K_FORMATS = ("fp8_scaled", "bf16")
+_INDEX_K_PLANE_DTYPES = {"fp8_scaled": torch.uint8, "bf16": torch.bfloat16}
+
+
+def index_k_plane_dtype(index_k_format: str) -> torch.dtype:
+    """The storage dtype of an index-K plane in ``index_k_format``."""
+    if index_k_format not in _INDEX_K_PLANE_DTYPES:
+        raise ValueError(
+            f"index_k_format must be one of {list(INDEX_K_FORMATS)}, got "
+            f"{index_k_format!r}"
+        )
+    return _INDEX_K_PLANE_DTYPES[index_k_format]
+
 
 def dsa_index_k_row_bytes(index_head_dim: int) -> int:
+    """Bytes of one ``fp8_scaled`` index-K row (FP8 keys plus fp32 scales)."""
     if index_head_dim <= 0 or index_head_dim % _INDEX_K_FP8_GROUP_SIZE != 0:
         raise ValueError(
             f"DSA index_head_dim must be a positive multiple of {_INDEX_K_FP8_GROUP_SIZE}, got {index_head_dim}"
@@ -46,13 +67,27 @@ def dsa_index_k_row_bytes(index_head_dim: int) -> int:
     )
 
 
+def index_k_row_bytes(index_head_dim: int, index_k_format: str) -> int:
+    """Bytes of one index-K row in ``index_k_format``."""
+    if index_k_format == "fp8_scaled":
+        return dsa_index_k_row_bytes(index_head_dim)
+    return index_head_dim * torch._utils._element_size(
+        index_k_plane_dtype(index_k_format)
+    )
+
+
 @dataclass(kw_only=True)
 class DSAConfig(MLAConfig):
     is_dsa: ClassVar[bool] = True
     index_topk: int
     index_head_dim: int
     index_n_heads: int
+    # Storage of the index-key plane, one of INDEX_K_FORMATS.
+    index_k_format: str
     index_kpool: int | None = None
+
+    def __post_init__(self) -> None:
+        index_k_plane_dtype(self.index_k_format)
 
     @classmethod
     def _spec_kwargs(
@@ -63,6 +98,10 @@ class DSAConfig(MLAConfig):
             index_topk=model_config.index_topk,
             index_head_dim=model_config.index_head_dim,
             index_n_heads=model_config.index_n_heads,
+            # A model that names no plane keeps the FP8-with-scale rows every
+            # in-tree scoring leaf reads; a model (or its plugin) that wants the
+            # checkpoint's bf16 keys declares index_k_format="bf16".
+            index_k_format=getattr(model_config, "index_k_format", "fp8_scaled"),
             index_kpool=getattr(model_config, "index_kpool", None),
         )
 
@@ -86,7 +125,5 @@ class DSAConfig(MLAConfig):
         return config
 
     def cache_cell_size(self, config: AttnConfig) -> int:
-        index_k_cell_size = dsa_index_k_row_bytes(
-            self.index_head_dim,
-        )
+        index_k_cell_size = index_k_row_bytes(self.index_head_dim, self.index_k_format)
         return super().cache_cell_size(config) + index_k_cell_size

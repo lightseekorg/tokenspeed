@@ -166,6 +166,18 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--logprob-order"):
             ServerArgs(model="x", logprob_order="apex")
 
+    def test_bitwise_envelopes_reduce_dsa_slots_sorted(self):
+        self.assertEqual(ServerArgs(model="x").dsa_slot_order, "selection")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").dsa_slot_order, "sorted"
+        )
+        self.assertEqual(
+            ServerArgs(model="x", numerics="trainer-aligned").dsa_slot_order,
+            "sorted",
+        )
+        with self.assertRaisesRegex(ValueError, "--dsa-slot-order"):
+            ServerArgs(model="x", dsa_slot_order="shuffled")
+
     def test_trainer_aligned_combines_moe_slots_in_the_leaf(self):
         self.assertEqual(ServerArgs(model="x").moe_combine_order, "rank")
         self.assertEqual(
