@@ -1296,8 +1296,17 @@ def build_device_side(
         cache_groups=views.cache_groups,
         cache_storage=attention.cache_storage,
         multimodal_encoder_dtype=target.multimodal_encoder_dtype,
-        spec_num_steps=executor.config.spec_num_steps or 0,
-        spec_num_tokens=executor.config.spec_num_tokens or 0,
+        # The server-args widths keep their defaults with speculation off.
+        spec_num_steps=(
+            executor.config.spec_num_steps or 0
+            if executor.config.spec_algo is not None
+            else 0
+        ),
+        spec_num_tokens=(
+            executor.config.spec_num_tokens or 0
+            if executor.config.spec_algo is not None
+            else 0
+        ),
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
         supports_pd_layerwise_finalization=bool(
