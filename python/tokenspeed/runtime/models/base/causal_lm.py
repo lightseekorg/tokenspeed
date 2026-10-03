@@ -58,6 +58,13 @@ class BaseCausalLM(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
         self.capture_aux_hidden_states: bool = False
+        # Live weight-update session (see ``begin_weight_update``). While
+        # active, ``load_weights`` may be called many times with partial
+        # streams and must not run ``post_load_weights`` per call.
+        self._weight_update_active: bool = False
+        # Parameter names ``load_weights`` touched during the active session;
+        # None outside a session (the initial load touches everything).
+        self._weight_update_loaded_names: set[str] | None = None
 
         self.encoder_only = encoder_only
         if encoder_only:
@@ -230,11 +237,18 @@ class BaseCausalLM(nn.Module):
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs: Any
-    ) -> None:
+    ) -> set[str]:
+        """Load a (possibly partial) stream of checkpoint tensors.
+
+        Returns the names of the parameters that received data. During a
+        weight-update session the stream arrives in many partial calls; the
+        names accumulate for ``end_weight_update``.
+        """
 
         stacked_params_mapping = self.get_stacked_params_mapping()
         skip_patterns = self.get_skip_weight_names()
         params_dict: dict[str, nn.Parameter] = dict(self.named_parameters())
+        loaded: set[str] = set()
 
         for name, loaded_weight in weights:
 
@@ -256,6 +270,7 @@ class BaseCausalLM(nn.Module):
 
                 param = params_dict[name]
                 param.weight_loader(param, loaded_weight, shard_id)
+                loaded.add(name)
 
                 break
 
@@ -270,6 +285,75 @@ class BaseCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded.add(name)
+
+        self.record_loaded_weights(loaded)
+        if not self._weight_update_active:
+            self.post_load_weights()
+        return loaded
+
+    # Live weight updates.
+    #
+    # An RL trainer rewrites the parameters of a serving model in place. The
+    # weights arrive as many partial ``load_weights`` calls (one per NCCL
+    # broadcast, or whatever chunking the Model Updater SDK streams), so the
+    # per-call ``post_load_weights`` a checkpoint load relies on would run
+    # once per chunk, on a half-updated model. A session brackets the update:
+    # ``begin_weight_update`` suspends the per-call derivation,
+    # ``end_weight_update`` runs it once over the whole update.
+
+    def begin_weight_update(self) -> None:
+        """Enter a live weight-update session.
+
+        Raises:
+            RuntimeError: A session is already active.
+        """
+        if self._weight_update_active:
+            raise RuntimeError(
+                f"{type(self).__name__}: a weight-update session is already active"
+            )
+        self._weight_update_active = True
+        self._weight_update_loaded_names = set()
+
+    def end_weight_update(self) -> None:
+        """Leave the session and derive post-load state once for the update.
+
+        ``post_load_weights`` runs with ``_weight_update_loaded_names`` still
+        populated so a model can restrict derivations that are not idempotent
+        to the parameters this update actually replaced.
+
+        Raises:
+            RuntimeError: No session is active.
+        """
+        if not self._weight_update_active:
+            raise RuntimeError(
+                f"{type(self).__name__}: no weight-update session is active"
+            )
+        try:
+            self.post_load_weights()
+        finally:
+            self.abort_weight_update()
+
+    def abort_weight_update(self) -> None:
+        """Leave the session without deriving state (the update failed)."""
+        self._weight_update_active = False
+        self._weight_update_loaded_names = None
+
+    def record_loaded_weights(self, names: Iterable[str]) -> None:
+        """Remember which parameters this session's ``load_weights`` touched."""
+        if self._weight_update_loaded_names is not None:
+            self._weight_update_loaded_names.update(names)
+
+    def post_load_weights(self) -> None:
+        """Derive state from the loaded parameters.
+
+        Runs once after the initial checkpoint load and once per live
+        weight-update session (from ``end_weight_update``). Implementations
+        must be safe to re-run: write into derived tensors that already exist
+        instead of rebinding them (captured CUDA graphs hold their addresses)
+        and apply one-shot transforms only to parameters that were reloaded
+        (``_weight_update_loaded_names``; None means the initial load).
+        """
 
     def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
 

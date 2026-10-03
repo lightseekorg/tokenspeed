@@ -53,7 +53,10 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.model_loader.weight_utils import (
+    bind_or_copy,
+    default_weight_loader,
+)
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3DecoderLayer,
     DeepseekV3DraftAttentionMLA,
@@ -507,8 +510,12 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         w_kc, w_vc = w.unflatten(
             0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
         ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-        self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-        self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+        # Write into the existing pair on a live update: captured CUDA graphs
+        # hold these addresses.
+        self_attn.w_kc = bind_or_copy(
+            self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+        )
+        self_attn.w_vc = bind_or_copy(self_attn.w_vc, w_vc.contiguous().transpose(1, 2))
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

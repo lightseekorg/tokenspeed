@@ -111,6 +111,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from tokenspeed.runtime.model_loader.weight_utils import (
+    bind_or_copy,
     default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
@@ -137,6 +138,12 @@ _OPTIONAL_MISSING_WEIGHT_SUFFIXES = (
 def _prepare_mla_kv_b_proj_weights(
     w: torch.Tensor, self_attn
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split ``kv_b_proj`` into the absorbed ``w_kc``/``w_vc`` pair.
+
+    When ``self_attn`` already holds a pair of the same geometry (a live
+    weight update re-running ``post_load_weights``), the new values are
+    copied into it so captured CUDA graphs keep valid addresses.
+    """
     w_kc, w_vc = w.unflatten(
         0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
     ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
@@ -146,10 +153,13 @@ def _prepare_mla_kv_b_proj_weights(
         latent_dim=w_vc.shape[2],
         value_dim=w_vc.shape[1],
     ):
-        return w_kc.contiguous(), w_vc.transpose(1, 2).contiguous()
+        w_kc, w_vc = w_kc.contiguous(), w_vc.transpose(1, 2).contiguous()
+    else:
+        w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+        w_vc = w_vc.contiguous().transpose(1, 2)
     return (
-        w_kc.transpose(1, 2).contiguous().transpose(1, 2),
-        w_vc.contiguous().transpose(1, 2),
+        bind_or_copy(self_attn.w_kc, w_kc),
+        bind_or_copy(self_attn.w_vc, w_vc),
     )
 
 
@@ -1500,7 +1510,13 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         logger.warning(f"The {name!s} is not in the model.")
         return None
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load a (possibly partial) checkpoint stream.
+
+        Returns the ``named_parameters()`` names that received data. Inside a
+        weight-update session the per-call ``post_load_weights`` is skipped;
+        ``end_weight_update`` runs it once over the whole update.
+        """
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -1511,6 +1527,9 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         fuse_qkv_a_proj = getattr(self.config, "q_lora_rank", None) is not None
 
         params_dict = dict(self.named_parameters())
+        # ``get_param`` remaps checkpoint names; report the parameter's own.
+        param_names = {id(param): name for name, param in params_dict.items()}
+        loaded: set[str] = set()
         moe_params_dict = dict(params_dict)
         for param_name, param in params_dict.items():
             if param_name.startswith("model."):
@@ -1580,13 +1599,14 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                     continue
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded.add(param_names[id(param)])
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if moe_loader.matches(name):
-                    moe_loader.load(name, loaded_weight)
+                    loaded.add(moe_loader.load(name, loaded_weight))
                     continue
 
                 if fuse_qkv_a_proj and (
@@ -1623,6 +1643,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                     if "scale_inv" in name:
                         begin_size //= quant_block_size
                     weight_loader(param, loaded_weight, begin_size=begin_size)
+                    loaded.add(param_names[id(param)])
                 else:
                     # Owned-expert weights were already consumed by ``moe_loader.load(...)`` above (matches() == True branch).
                     # Anything reaching here that still looks like an expert weight is for an expert this rank does ot own under ep_size > 1.
@@ -1637,10 +1658,15 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+                    loaded.add(param_names[id(param)])
 
-        self.post_load_weights()
+        self.record_loaded_weights(loaded)
+        if not self._weight_update_active:
+            self.post_load_weights()
+        return loaded
 
     def post_load_weights(self):
+        """Derive the absorbed MLA weights; re-runs write into the same storage."""
         for layer_id in range(self.config.num_hidden_layers):
             self_attn = self.model.layers[layer_id].self_attn
             if hasattr(
@@ -2114,7 +2140,7 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
                 self.load_lm_head_from_target = False
             remapped.append((new_name, loaded_weight))
 
-        super().load_weights(remapped)
+        return super().load_weights(remapped)
 
     def post_load_weights(self):
         self_attn = self.model.midlayer.self_attn
