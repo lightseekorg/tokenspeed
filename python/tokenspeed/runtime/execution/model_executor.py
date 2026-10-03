@@ -132,16 +132,6 @@ def _sampling_info_for_requests(
     return info
 
 
-def _draft_idle_global_num_tokens_for_step(
-    step_idx: int,
-    global_num_tokens: list[int],
-    global_bs: list[int] | None,
-) -> list[int]:
-    if step_idx == 0 or global_bs is None:
-        return global_num_tokens
-    return global_bs
-
-
 PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
 
 
@@ -1431,15 +1421,12 @@ class ModelExecutor:
         )
 
         # If a drafter is active, its model also has MoE layers that issue
-        # NCCL collectives. Idle ranks must match those collectives:
-        # 1 first-step forward + (spec_num_steps - 1) multi-step decode forwards.
+        # NCCL collectives. Idle ranks must match those collectives: the
+        # drafter lists the draft forwards the active ranks run per round,
+        # each as the per-rank token counts sizing its collectives
+        # (idle_forward_global_num_tokens); every step runs the IDLE forward
+        # over an empty window with its own spec_step_idx.
         if self.drafter is not None:
-            # DFLASH is a block drafter (idle_forward_steps=1); EAGLE3/MTP
-            # default to spec_num_steps. Mirror the active rank's per-step
-            # collective sizing either way.
-            idle_forward_steps = getattr(
-                self.drafter, "idle_forward_steps", self.drafter.spec_num_steps
-            )
             # A draft model that reads request-token history takes the view
             # on every forward; the idle rank hands it an empty one, as the
             # target's idle forward above does.
@@ -1456,14 +1443,10 @@ class ModelExecutor:
                         committed_lengths=self.runtime_states.valid_cache_lengths,
                     )
                 )
-            for step_idx in range(idle_forward_steps or 0):
-                # Mirror active rank's catch-up step: when all non-idle ranks
-                # are decoding, step 0 sizes collectives from bs/global_bs.
-                draft_global_num_tokens = _draft_idle_global_num_tokens_for_step(
-                    step_idx,
-                    dp_metadata.global_num_tokens,
-                    dp_metadata.global_batch_size,
-                )
+            step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
+                dp_metadata.global_num_tokens, dp_metadata.global_batch_size
+            )
+            for step_idx, draft_global_num_tokens in enumerate(step_global_num_tokens):
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,

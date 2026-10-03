@@ -269,8 +269,11 @@ def attention_root(request):
 def test_draft_hooks_and_sparse_share_reach_the_full_router(attention_root):
     root, router = attention_root
     seq_lens = torch.zeros(2, dtype=torch.int32)
+    # The router hands each hook to the leaf's hook of the same name (a leaf
+    # with per-row metadata re-expands its k-row shape in update_...).
     leaf = SimpleNamespace(
         advance_draft_forward_metadata=Mock(wraps=seq_lens.copy_),
+        update_draft_forward_metadata=Mock(wraps=seq_lens.copy_),
         fill_block_decode_seq_lens=lambda bs, out: out[:bs].copy_(seq_lens[:bs]),
     )
     router.leaves = {FULL_ATTENTION: leaf}
@@ -288,7 +291,8 @@ def test_draft_hooks_and_sparse_share_reach_the_full_router(attention_root):
     lengths = torch.full((3,), -1, dtype=torch.int32)
     root.fill_block_decode_seq_lens(2, lengths)
     assert lengths.tolist() == [5, 9, -1]
-    assert leaf.advance_draft_forward_metadata.call_count == 2
+    leaf.advance_draft_forward_metadata.assert_called_once_with(advance)
+    leaf.update_draft_forward_metadata.assert_called_once_with(frontier)
     indexer.advance_draft_forward_metadata.assert_called_once_with(advance)
     indexer.update_draft_forward_metadata.assert_called_once_with(frontier)
     indexer.fill_block_decode_seq_lens.assert_called_once_with(2, lengths)

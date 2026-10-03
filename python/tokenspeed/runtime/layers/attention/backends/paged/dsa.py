@@ -62,6 +62,15 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 
+def _k_row_context_lengths(seq_lens: torch.Tensor, k: int) -> torch.Tensor:
+    """``[bs]`` request lengths as the indexer's per-token rows: ``k`` query
+    rows per request, each carrying its request's context length
+    (``[bs * k, 1]``; the top-k applies the per-row causal bound downstream,
+    see ``dsa_decode_topk``). A view over ``seq_lens``; callers that keep it
+    make it contiguous."""
+    return seq_lens.unsqueeze(1).expand(-1, k).reshape(-1, 1)
+
+
 def _make_dense_leaf(
     config: AttnConfig, spec: DSAConfig, platform, kernel_page_size: int
 ) -> PagedAttentionBackend:
@@ -259,8 +268,8 @@ class DSABackend(PagedAttentionBackend):
         self._dense_backend.init_cuda_graph_state(max_bs)
 
     # Capture is inherited: the leaf default routes through this wrapper's
-    # refresh, whose lazy arm builds the piggybacked _dsa_seq_lens_2d /
-    # _dsa_plan once per bs on the dense leaf's cached metadata.
+    # refresh, whose lazy arm fills the dense leaf's per-bs cached metadata
+    # fields _dsa_seq_lens_2d / _dsa_plan once per bs.
 
     # ------------------------------------------------------------------
     # Metadata
@@ -285,31 +294,44 @@ class DSABackend(PagedAttentionBackend):
             for_graph_replay=for_graph_replay,
         )
         metadata = self.forward_decode_metadata
-        if getattr(metadata, "_dsa_seq_lens_2d", None) is None:
+        if metadata._dsa_seq_lens_2d is None:
             # First refresh at a lazily-built bs (no capture ran): allocate the
-            # per-token view once; subsequent refreshes update it in place.
-            metadata._dsa_seq_lens_2d = (
-                seq_lens[:bs]
-                .unsqueeze(1)
-                .expand(-1, self.spec_num_tokens)
-                .reshape(-1, 1)
-                .contiguous()
-            )
+            # per-token rows once on the dense leaf's per-bs view; later
+            # refreshes (and the drafter's re-anchor) rewrite them in place.
+            metadata._dsa_seq_lens_2d = _k_row_context_lengths(
+                seq_lens[:bs], self.spec_num_tokens
+            ).contiguous()
             metadata._dsa_plan = dsa_plan(
                 seq_lens_2d=metadata._dsa_seq_lens_2d,
                 page_size=self.kernel_page_size,
             )
             return
-        metadata._dsa_seq_lens_2d.copy_(
-            seq_lens[:bs].unsqueeze(1).expand(-1, self.spec_num_tokens).reshape(-1, 1)
-        )
+        self._publish_k_row_indexer_rows(metadata, seq_lens, bs)
+
+    def _publish_k_row_indexer_rows(
+        self, metadata, seq_lens: torch.Tensor, bs: int
+    ) -> None:
+        """Rewrite the per-token indexer rows to ``seq_lens[:bs]`` (``k`` rows
+        per request) and refresh their plan, both in place: fixed shapes and
+        storage, so a captured graph replays the edit."""
+        k = self.spec_num_tokens
+        rows = metadata._dsa_seq_lens_2d
+        if rows.shape[0] != bs * k:
+            raise RuntimeError(
+                "DSA draft per-token rows do not match the decode batch: "
+                f"rows={rows.shape[0]}, requests={bs}, width={k}"
+            )
+        rows.copy_(_k_row_context_lengths(seq_lens[:bs], k))
         dsa_plan(
-            seq_lens_2d=metadata._dsa_seq_lens_2d,
+            seq_lens_2d=rows,
             page_size=self.kernel_page_size,
             out=metadata._dsa_plan,
         )
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        """Eagle chain step: one query row per request, so the plan is
+        rebuilt from the ``[bs, 1]`` request lengths (the per-token
+        ``_dsa_seq_lens_2d`` is left as the round's refresh published it)."""
         metadata = self.forward_decode_metadata
         if metadata is None or metadata.seq_lens_k is None:
             raise RuntimeError("DSA draft decode metadata was not initialized")
@@ -320,6 +342,26 @@ class DSABackend(PagedAttentionBackend):
             page_size=self.kernel_page_size,
             out=metadata._dsa_plan,
         )
+
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        """Multi-depth MTP re-anchor: every depth re-runs ``spec_num_tokens``
+        query rows per request ending at ``frontier``, the same k-row shape
+        the round's :meth:`refresh_decode_metadata` published. The k-row
+        top-k reads one context length per query row (``_dsa_seq_lens_2d``,
+        ``[bs * k, 1]``) and its plan, so both are rewritten in place to
+        the frontier; the kernel derives row ``j``'s causal bound as
+        ``frontier - (k - 1) + j``."""
+        metadata = self.forward_decode_metadata
+        if metadata is None or metadata.seq_lens_k is None:
+            raise RuntimeError("DSA draft decode metadata was not initialized")
+        if metadata._dsa_seq_lens_2d is None:
+            raise RuntimeError(
+                "DSA draft per-token rows were not published: the round's "
+                "refresh_decode_metadata must run before the re-anchor"
+            )
+        bs = metadata.seq_lens_k.numel()
+        metadata.seq_lens_k.copy_(frontier[:bs])
+        self._publish_k_row_indexer_rows(metadata, frontier, bs)
 
     def init_forward_metadata(
         self,
@@ -361,14 +403,10 @@ class DSABackend(PagedAttentionBackend):
             metadata = self.forward_decode_metadata
             # Per-token context lengths: the paged-MQA-logits kernel only supports
             # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
-            # rows). The per-token causal bound is applied downstream in the top-k.
-            # See deep_gemm_dsa_decode_topk.
-            metadata._dsa_seq_lens_2d = (
-                seq_lens.unsqueeze(1)
-                .expand(-1, self.spec_num_tokens)
-                .reshape(-1, 1)
-                .contiguous()
-            )
+            # rows).
+            metadata._dsa_seq_lens_2d = _k_row_context_lengths(
+                seq_lens, self.spec_num_tokens
+            ).contiguous()
             if num_extends < bs:
                 # Decode rows only: skip the extend requests' per-token block.
                 seq_lens_2d = metadata._dsa_seq_lens_2d[

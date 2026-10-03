@@ -97,9 +97,17 @@ class HybridLinearAttnBackend(AttentionBackend):
     def forward_extend_chunked(self, *args, **kwargs):
         return self.full_attn_backend.forward_extend_chunked(*args, **kwargs)
 
+    # Composite: the full-attention child owns the per-request decode lengths
+    # the draft reads, so every drafter length-edit hook reaches it (the
+    # linear child's state follows the committed position, not seq_lens).
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
-        # Composite: the full-attention child owns the seq_lens the draft reads.
         self.full_attn_backend.advance_draft_forward_metadata(seq_lens)
+
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        self.full_attn_backend.update_draft_forward_metadata(frontier)
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        self.full_attn_backend.fill_block_decode_seq_lens(bs, block_seq_lens)
 
     def draft_history_view(self):
         return self.full_attn_backend.draft_history_view()

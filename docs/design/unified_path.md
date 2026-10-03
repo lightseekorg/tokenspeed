@@ -172,7 +172,15 @@ are padding and must resolve to the null page 0 / dummy slot so they never
 touch a live request's cache. Eager passes `bs == actual_bs` (unpadded — no
 wasted FLOPs);
 `actual_bs == 0` is the idle replay. Eager idle bypasses the wrapper entirely
-(`execute_idle_forward` calls `model_runner.forward(IDLE)` directly).
+(`execute_idle_forward` calls `model_runner.forward(IDLE)` directly). With a
+drafter, the eager idle then asks the drafter for its round
+(`idle_forward_global_num_tokens`): one list of per-rank token counts per
+draft forward the active ranks run, and runs one IDLE draft forward per
+entry over an empty window, entry `i` with `spec_step_idx=i` and that
+entry's counts — the row shape the active ranks' step `i` runs (the Eagle
+chain: the target's rows at step 0, one row per request after; multi-depth
+MTP: the target's rows at every depth; block drafters: one forward). The
+executor never derives a drafter's step count or shape itself.
 
 ### Pointer-stable per-bs views from one builder
 
@@ -476,7 +484,19 @@ seq-lens-only: Eagle's step-0 accepted-prefix publish fires
 `advance_draft_forward_metadata` BEFORE the step-0 attention has consumed
 the verify-shaped write window, so the write-window publication is a
 separate, explicit drafter-loop call (`publish_draft_step_locations`, see
-"Write locations have one owner").
+"Write locations have one owner"). The router hands each hook to the
+leaf's hook of the same name, because the two edits describe different
+row shapes: the Eagle chain runs one row per request after step 0, the
+multi-depth MTP window `k` rows per request at every depth. A leaf whose
+decode kernels derive each row's causal bound from the request's single
+cache length needs the same seq_lens edit for both (the
+`PagedAttentionBackend` default routes `update_` to `advance_`); a leaf
+holding per-row decode metadata re-expands it in `update_` — DSA rewrites
+its per-token indexer rows (`_dsa_seq_lens_2d`, `[bs * k, 1]`) and their
+plan to the frontier, in place, while its `advance_` re-plans `[bs, 1]`
+rows and leaves the per-token rows as the round's refresh published them.
+Neither hook clears the layer-shared sparse selection: the depth loop is
+one forward's worth of top-k reuse.
 
 Backends with sharded KV must refresh derived local visibility in the same
 draft length-update hook as the global lengths. While page allocation and
@@ -546,6 +566,20 @@ anchor and real draft candidates with the target and draft caches. Decode
 installs that window before its first ordinary verify round. Stage ownership
 changes where context and proposals are produced; candidate handoff and
 verification follow the same path as other speculative prefills.
+
+Known limitation, multi-depth MTP (`Mtp`): the drafter's cross-round
+stash — per request-pool slot, the last `k-1` committed tokens and the
+target hiddens one position behind them, which seed the rows of the
+frontier-anchored decode window that lie before this round's verify window
+— is drafter-private state the prefill node fills during its extend
+catch-up and the bootstrap payload does not carry. After a PD landing the
+decode node's first rounds read the slot's stash as it stands (never
+filled for this request), so the depth loop rewrites up to `k-1` draft-KV
+positions in the prompt tail from wrong inputs until the stash has rolled
+those entries out (at most `k-1` rounds; the prompt-tail planes the
+prefill node transferred were correct). Draft quality only: verification
+is exact. Intended fix: ship the slot's stash rows with the bootstrap
+payload, the way K3 DSpark hands over its anchor and candidates.
 
 ### PD prefill nodes
 
