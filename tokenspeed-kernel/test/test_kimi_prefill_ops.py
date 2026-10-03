@@ -177,7 +177,9 @@ def test_kimi3_shared_down_preserves_strided_cpu_output(dtype, solution, rows) -
     torch.mm(hidden_states, weight.T, out=expected)
     with (
         mock.patch.object(
-            kimi3_module.Platform, "get", return_value=SimpleNamespace(is_cdna5=True)
+            kimi3_module.Platform,
+            "get",
+            return_value=SimpleNamespace(is_cdna4=False, is_cdna5=True),
         ),
         mock.patch.object(
             kimi3_module, "use_gluon_wmma_dense_gfx1250", return_value=True

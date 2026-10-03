@@ -10,6 +10,7 @@ from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.ops.moe.sigmoid_topk import (
     _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
 )
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import largem
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -54,7 +55,10 @@ def test_kimi3_latent_projection_matches_torch(
     actual = tokenspeed_kernel.kimi3_latent_projection(hidden_states, weight)
 
     if _use_gluon_largem(num_tokens, input_size, output_size):
-        assert torch.equal(actual, expected)
+        # FP32 accumulation rounded once to BF16, as the vendor GEMM does;
+        # its accumulation order varies by kernel, so allow one BF16 ULP plus
+        # FP32 reordering noise on near-zero outputs.
+        torch.testing.assert_close(actual, expected, rtol=2**-7, atol=1e-3)
     else:
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
@@ -75,12 +79,14 @@ def test_kimi3_latent_projection_matches_torch(
     ],
 )
 def test_kimi3_latent_projection_dispatch_boundaries(
+    monkeypatch,
     m: int,
     k: int,
     n: int,
     uses_medium: bool,
     uses_large: bool,
 ) -> None:
+    monkeypatch.setattr(largem, "_num_compute_units", lambda _: 256)
     assert _use_gluon_mediumm(m, k, n) is uses_medium
     assert _use_gluon_largem(m, k, n) is uses_large
 
