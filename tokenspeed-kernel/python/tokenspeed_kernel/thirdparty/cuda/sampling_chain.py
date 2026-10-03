@@ -109,18 +109,14 @@ def chain_speculative_sampling_target_only(
             residual ``norm(relu(p - q))``) instead of the target-only rule.
         reject_draft_prob_threshold: ``draft_probs`` entries above this are
             the "no recorded proposal" sentinel: the candidate is rejected and
-            the row samples the full target. Must be at least 1.0.
+            the row samples the full target. The binding rejects values below
+            1.0 (a real probability would read as the sentinel); the serving
+            layer validates the full usable range once at server-args time.
     """
     if use_draft_prob and draft_probs is None:
         raise ValueError(
             "chain_speculative_sampling_target_only: use_draft_prob requires the "
             "recorded draft_probs"
-        )
-    if reject_draft_prob_threshold < 1.0:
-        raise ValueError(
-            "chain_speculative_sampling_target_only: reject_draft_prob_threshold "
-            f"must be >= 1.0 so no real probability reads as the sentinel, got "
-            f"{reject_draft_prob_threshold}"
         )
     enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _load_sampling_chain_module().chain_speculative_sampling_target_only(
