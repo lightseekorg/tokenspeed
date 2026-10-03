@@ -938,12 +938,17 @@ layers. Neither count means captured target taps or draft execution depth.
 `distributed/pp_stage.py::pp_stage_windows` owns the target execution-window
 calculation, shared by pipeline stages, model construction and PD topology.
 The model/cache construction boundary maps those execution windows to explicit
-`target_cache_windows`, then `CacheLayerOwnership` adds the final stage's draft
-cache window. Cache ownership consumes cache-ID windows; execution partitioning
-belongs to the distributed layer. Current PP targets K3 and V4 have one cache
-layer per execution block; non-PP ownership covers the complete cache namespace
-without assuming that equality. Resident windows, transfer filtering and
-producer-field groups all use cache-layer IDs.
+`target_cache_windows` with `pp_stage_cache_windows`: both ends of every
+window scale by the model's attention instances per decoder layer
+(`ModelProfile.attention_instances_per_layer`; one for K3 and V4, which
+declare no profile, two for LongCat's paired layer), so a block's cache layers
+stay with the stage that executes it. `CacheLayerOwnership` then adds the
+final stage's draft cache window. Cache ownership consumes cache-ID windows;
+execution partitioning belongs to the distributed layer, and non-PP ownership
+covers the complete cache namespace without any per-block arithmetic. Resident
+windows, transfer filtering and producer-field groups all use cache-layer IDs;
+PD consumes the resulting `cache_fields_by_stage` and never recomputes windows
+from layer counts.
 Cache construction resolves ownership into explicit field IDs once:
 `cache_fields_by_stage` describes residency, and `producer_fields_by_step`
 describes the local readiness barriers. These sets cover resident fields
