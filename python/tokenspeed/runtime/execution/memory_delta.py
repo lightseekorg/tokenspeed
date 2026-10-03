@@ -75,7 +75,7 @@ class DriverMemoryDeltaObserver:
 
 @dataclass(frozen=True)
 class _NullMemoryDeltaObserver:
-    """Measure nothing, for the paths that only ever capture."""
+    """Measure nothing, for the paths that only ever capture or skip the probe."""
 
     samples: dict[str, list[int]] = field(default_factory=dict)
 

@@ -153,16 +153,22 @@ from one first bound to that pool:
   a reserve takes it -- minus the projection. The reserve covers the bytes
   inside the capture windows as projected -- what a boot without a probe
   captures there, one-time bytes the first captures take included; the
-  probe releases them and the serving capture pays them again. The
-  utilization headroom covers everything else: activations, fragmentation,
-  the warmups and workspaces a capture allocates around its windows, and any
-  shortfall of the projection, as it covers every graph on a boot without a
-  reserve. Profiling again after the probe would charge the cache a second
-  time for what tuning and the probe left allocated. The deltas read the
-  whole device, so the probe assumes no other process allocates on it during
-  startup. Not covered: a ladder every one of whose sampled marginals was
-  served from slack, which is priced at nothing and says so in the
-  log.
+  probe releases them and the serving capture pays them again. What executor
+  init and kernel tuning keep resident between the probe build and the probe
+  -- buffers, and on a cold tuning cache the kernels of every tactic tried --
+  is measured the same way, including the free space a kept block pins in an
+  allocator segment, and this startup residue joins each rank's projection
+  before the MAX; its net is floored at zero. The utilization
+  headroom covers everything else: activations, fragmentation, the warmups
+  and workspaces a capture allocates around its windows, and any shortfall of
+  the projection, as it covers every graph and all of startup on a boot
+  without a reserve. Profiling again after the probe would charge the cache a
+  second time for what startup and the probe left allocated. The deltas read
+  the whole device, so the probe assumes no other process allocates on it
+  during startup. Not covered: a ladder every one of whose sampled marginals
+  was served from slack, which is priced at nothing and says so in the log;
+  and what the probe build allocates after its profile, such as attention
+  backend workspaces, which the headroom funds.
 
 ### Padding contract
 
