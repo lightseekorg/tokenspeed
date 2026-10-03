@@ -362,6 +362,18 @@ class _RuntimeLongcatMoE(nn.Module):
 
 
 class _RuntimeLongcatDecoderLayer(nn.Module):
+    """One LongCat layer: two attention/dense-MLP branches beside one MoE.
+
+    Row layout: the residual stream runs through the dense branches
+    (attention 0 -> MLP 0 -> attention 1 -> MLP 1), so the layer's rows follow
+    the dense comm pattern -- all-reduce (every attention-TP rank holds every
+    row of its attention DP group) or RSAG (each rank holds its scattered
+    share). The MoE is a side branch fed from attention 0's output; its own
+    pattern may differ (attention TP equal to the dense TP but not to the MoE
+    TP-EP width, e.g. attention DP with EP), so ``_forward_moe`` bridges its
+    rows into and out of the dense layout around the MoE collectives.
+    """
+
     def __init__(
         self,
         config: _PretrainedConfig,
@@ -448,13 +460,21 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
+        self._init_comm()
+
+    def _init_comm(self) -> None:
+        """Build the comm managers (see the class docstring for the row layout).
+
+        Subclasses that build their modules themselves call this after
+        ``input_layernorm`` and ``post_attention_layernorm`` exist.
+        """
+        # Attention 0 and MLP 0 share branch_comm[0]; the MoE manager only
+        # drives the MoE collectives.
         self.moe_comm = _CommManager(
             mapping=self.mapping,
             layer_id=self.layer_id,
             is_moe=True,
             prev_is_moe=False,
-            input_layernorm=self.input_layernorm[0],
-            post_attn_layernorm=self.post_attention_layernorm[0],
         )
         self.branch_comm = [
             _CommManager(
@@ -468,6 +488,39 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             for branch_id in range(2)
         ]
         self.final_norm_comm = self.branch_comm[1]
+        self.moe_rows_differ: bool = self.moe_comm.use_all_reduce(
+            is_moe=True
+        ) != self.moe_comm.use_all_reduce(is_moe=False)
+        if self.moe_rows_differ and global_server_args_dict.get(
+            "enable_allreduce_fusion", False
+        ):
+            # A fused norm reduces the un-reduced sum of both MLP outputs;
+            # the bridged MoE output is already reduced in another layout.
+            raise ValueError(
+                "LongCat all-reduce fusion requires the MoE and dense MLPs to "
+                "share one comm pattern (attention TP equal to both the dense "
+                "TP and the MoE TP-EP width, or to neither)"
+            )
+
+    def _to_moe_rows(
+        self, hidden_states: torch.Tensor, ctx: _ForwardContext
+    ) -> torch.Tensor:
+        """Re-lay dense-layout rows for the MoE collectives."""
+        if not self.moe_rows_differ:
+            return hidden_states
+        if self.moe_comm.use_all_reduce(is_moe=False):
+            return self.moe_comm.slice_scattered_rows(hidden_states, ctx)
+        return self.moe_comm.gather_scattered_rows(hidden_states, ctx)
+
+    def _to_dense_rows(
+        self, hidden_states: torch.Tensor, ctx: _ForwardContext
+    ) -> torch.Tensor:
+        """Return the reduced MoE output to the dense layout."""
+        if not self.moe_rows_differ:
+            return hidden_states
+        if self.moe_comm.use_all_reduce(is_moe=False):
+            return self.moe_comm.gather_scattered_rows(hidden_states, ctx)
+        return self.moe_comm.slice_scattered_rows(hidden_states, ctx)
 
     def _forward_dense_mlp(
         self,
@@ -490,6 +543,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ):
+        hidden_states = self._to_moe_rows(hidden_states, ctx)
         hidden_states = self.moe_comm.pre_mlp_comm(hidden_states, ctx)
         hidden_states = self.mlp(
             hidden_states,
@@ -501,6 +555,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             residual,
             ctx,
         )
+        hidden_states = self._to_dense_rows(hidden_states, ctx)
         return hidden_states, residual
 
     def forward(
@@ -522,7 +577,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             )
             return hidden_states, residual
 
-        hidden_states, residual = self.moe_comm.input_reduce_norm(
+        hidden_states, residual = self.branch_comm[0].input_reduce_norm(
             hidden_states,
             residual,
         )
@@ -530,9 +585,9 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            comm_manager=self.moe_comm,
+            comm_manager=self.branch_comm[0],
         )
-        hidden_states, residual = self.moe_comm.post_attn_reduce_norm(
+        hidden_states, residual = self.branch_comm[0].post_attn_reduce_norm(
             hidden_states,
             residual,
             ctx,

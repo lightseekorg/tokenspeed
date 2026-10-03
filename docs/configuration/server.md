@@ -186,6 +186,12 @@ and request `swiglu` for their gated SiLU activation. These requirements apply t
 both unquantized and block-FP8 expert layers, including when selecting
 `--moe-backend flashinfer_trtllm` on Blackwell.
 
+A LongCat layer runs two dense MLPs and one MoE off the same attention output.
+Its rows follow the dense comm pattern; when the MoE pattern differs (attention
+TP equal to the dense TP but not to the MoE TP x EP width, as under attention
+DP with `--enable-expert-parallel`), the MoE output is re-gathered into the
+dense layout. `--enable-allreduce-fusion` is rejected for that layout.
+
 When `--dp-sampling` is enabled, the logits processor owns the per-forward
 logits layout decision and carries the resulting plan to the sampling backend
 with the logits output.
