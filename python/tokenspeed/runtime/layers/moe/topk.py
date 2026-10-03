@@ -34,8 +34,10 @@ from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 
+from tokenspeed.runtime.configs.numerics import ROUTER_TOPKS
 from tokenspeed.runtime.moe.dispatch_algorithm import STATIC_EP_DISPATCH_ALGORITHMS
 from tokenspeed.runtime.moe.expert_load_rows import LayerExpertLoad
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 class TopKOutputFormat(Enum):
@@ -292,6 +294,42 @@ def torch_native_fused_topk(
     return topk_weights, topk_ids
 
 
+def torch_router_topk(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    top_k: int,
+    num_real_experts: int,
+    routed_scaling_factor: float,
+    indices_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Correction-bias routing in the trainer's torch order (``--router-topk torch``).
+
+    fp32 ``torch.softmax`` keeps every probability bit; ``torch.topk`` on the
+    biased probabilities with ``sorted=True`` gives PyTorch's tie order; the
+    weights are the UNBIASED probabilities times ``routed_scaling_factor``.
+    Zero experts (ids past the real experts) become ``-1`` and keep their
+    weight so the model can apply its identity residual.
+
+    Args:
+        router_logits: ``[tokens, num_candidates]`` router logits (any float
+            dtype); candidates are the real experts followed by zero experts.
+        correction_bias: ``[num_candidates]`` fp32 selection bias.
+        top_k: Experts selected per token.
+        num_real_experts: Candidates below this id are real experts.
+        routed_scaling_factor: Multiplier on the selected probabilities.
+        indices_dtype: dtype of the returned ids.
+
+    Returns:
+        ``(weights, ids)`` with shapes ``[tokens, top_k]``; weights fp32, ids
+        in ``indices_dtype`` with ``-1`` for zero experts.
+    """
+    probs = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    _, ids = torch.topk(probs + correction_bias, k=top_k, dim=-1, sorted=True)
+    weights = probs.gather(1, ids) * routed_scaling_factor
+    ids = ids.masked_fill(ids >= num_real_experts, -1).to(indices_dtype)
+    return weights, ids
+
+
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -350,6 +388,9 @@ def grouped_topk_gpu(
 @dataclass
 class TopKConfig:
     top_k: int
+    # --router-topk: how the correction-bias route selects experts ("fused" or
+    # "torch"). Behaviour-selecting, so it has no default.
+    router_topk: str
     # The MoE layer this router serves; an expert placement's dispatch info
     # must come from the same layer.
     layer_id: int | None = None
@@ -445,9 +486,15 @@ class TopK(torch.nn.Module):
             assert correction_bias is not None
             assert sink_global_scale is not None
             assert routed_scaling_factor is not None
+        router_topk = global_server_args_dict["router_topk"]
+        if router_topk not in ROUTER_TOPKS:
+            raise ValueError(
+                f"router_topk must be one of {list(ROUTER_TOPKS)}, got {router_topk!r}"
+            )
 
         self.topk_config = TopKConfig(
             top_k=top_k,
+            router_topk=router_topk,
             layer_id=layer_id,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
@@ -694,27 +741,44 @@ def select_experts(
         if routed_scaling_factor is not None:
             topk_weights *= routed_scaling_factor
     elif correction_bias is not None:
-        # Bias-corrected top-k uses the CUDA fused_topk_bias kernel.
-        num_tokens = router_logits.shape[0]
-        topk_ids = torch.empty(
-            num_tokens,
-            top_k,
-            device=router_logits.device,
-            dtype=topk_config.topk_indices_dtype,
-        )
-        topk_weights = torch.empty(
-            num_tokens, top_k, device=router_logits.device, dtype=torch.float32
-        )
         num_real_experts = router_logits.shape[1] - topk_config.zero_expert_num
-        cuda_routing_flash(
-            router_logits,
-            correction_bias,
-            topk_ids,
-            topk_weights,
-            num_real_experts,
-            routed_scaling_factor,
-            renormalize,
-        )
+        if topk_config.router_topk == "torch":
+            # The trainer's order; it has no renormalization step.
+            if renormalize:
+                raise ValueError(
+                    "--router-topk torch routes unnormalized probabilities, as "
+                    "the trainer does; this model asks to renormalize them"
+                )
+            topk_weights, topk_ids = torch_router_topk(
+                router_logits,
+                correction_bias,
+                top_k,
+                num_real_experts,
+                1.0 if routed_scaling_factor is None else float(routed_scaling_factor),
+                topk_config.topk_indices_dtype,
+            )
+        else:
+            # Bias-corrected top-k uses the CUDA fused_topk_bias kernel.
+            num_tokens = router_logits.shape[0]
+            topk_ids = torch.empty(
+                num_tokens,
+                top_k,
+                device=router_logits.device,
+                dtype=topk_config.topk_indices_dtype,
+            )
+            topk_weights = torch.empty(
+                num_tokens, top_k, device=router_logits.device, dtype=torch.float32
+            )
+            cuda_routing_flash(
+                router_logits,
+                correction_bias,
+                topk_ids,
+                topk_weights,
+                num_real_experts,
+                routed_scaling_factor,
+                renormalize,
+            )
+        # Either router marks zero experts -1; the placement maps the rest.
         if expert_location_dispatch_info is not None:
             topk_ids = map_zero_expert_routes(
                 topk_ids, expert_location_dispatch_info, num_real_experts

@@ -70,6 +70,11 @@ MLA_LORA_SCALES = ("folded", "runtime")
 # a standalone RMSNorm, as the trainer does.
 LAYER_BOUNDARY_NORMS = ("fused", "unfused")
 
+# ``--router-topk``: correction-bias MoE routing — the fused CUDA kernel, or
+# fp32 ``torch.softmax`` + ``torch.topk(probs + bias)`` in PyTorch tie order
+# with ``-1`` zero-expert ids, as the trainer does.
+ROUTER_TOPKS = ("fused", "torch")
+
 
 def require_verified_numerics(
     numerics: str,
@@ -120,6 +125,7 @@ __all__ = [
     "MLA_LORA_SCALES",
     "NUMERICS_ENVELOPES",
     "RL_BITWISE_SAMPLING_BACKENDS",
+    "ROUTER_TOPKS",
     "SAMPLING_STREAMS",
     "YARN_RAMP_MASK_DEVICES",
     "require_verified_numerics",

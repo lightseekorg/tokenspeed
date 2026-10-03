@@ -36,6 +36,7 @@ from tokenspeed.runtime.configs.numerics import (
     MLA_LORA_SCALES,
     NUMERICS_ENVELOPES,
     RL_BITWISE_SAMPLING_BACKENDS,
+    ROUTER_TOPKS,
     SAMPLING_STREAMS,
     YARN_RAMP_MASK_DEVICES,
 )
@@ -436,6 +437,9 @@ class ServerArgs:
     # final norm): the fused add+norm kernel, or a bf16 `hidden + residual`
     # materialized first as the trainer does.
     layer_boundary_norm: str = "fused"
+    # Correction-bias MoE routing: the fused CUDA kernel, or fp32 torch.softmax
+    # + torch.topk(probs + bias) in PyTorch tie order as the trainer does.
+    router_topk: str = "fused"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -671,6 +675,11 @@ class ServerArgs:
             raise ValueError(
                 "--layer-boundary-norm must be one of "
                 f"{list(LAYER_BOUNDARY_NORMS)}, got {self.layer_boundary_norm!r}"
+            )
+        if self.router_topk not in ROUTER_TOPKS:
+            raise ValueError(
+                f"--router-topk must be one of {list(ROUTER_TOPKS)}, got "
+                f"{self.router_topk!r}"
             )
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
@@ -1143,6 +1152,8 @@ class ServerArgs:
         # The trainer materializes each layer's bf16 output before the next
         # layer's norm reads it.
         self.layer_boundary_norm = "unfused"
+        # The trainer's router is softmax + topk(scores + bias) in torch.
+        self.router_topk = "torch"
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -2841,6 +2852,18 @@ class ServerArgs:
             "standalone RMSNorm, as the trainer does; all-reduce+norm fusion "
             "is vetoed with it. Folded to unfused by --numerics "
             "trainer-aligned.",
+        )
+        parser.add_argument(
+            "--router-topk",
+            type=str,
+            choices=list(ROUTER_TOPKS),
+            default=ServerArgs.router_topk,
+            help="Correction-bias MoE routing (LongCat). 'fused': the fused "
+            "CUDA softmax+bias+top-k kernel. 'torch': fp32 torch.softmax, "
+            "torch.topk(probs + bias, sorted=True) in PyTorch tie order, "
+            "weights = unbiased probs x routed_scaling_factor, zero experts "
+            "become id -1 and keep their weight, as the trainer does. Folded "
+            "to torch by --numerics trainer-aligned.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

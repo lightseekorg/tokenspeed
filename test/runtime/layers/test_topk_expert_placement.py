@@ -159,4 +159,4 @@ def test_record_expert_load_skips_the_filler_rows_of_a_padded_batch():
 def test_topk_config_carries_the_layer_id():
     topk = TopK(top_k=2, layer_id=7, correction_bias=torch.zeros(4))
     assert topk.topk_config.layer_id == 7
-    assert TopKConfig(top_k=2).layer_id is None
+    assert TopKConfig(top_k=2, router_topk="fused").layer_id is None

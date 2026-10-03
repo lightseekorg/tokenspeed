@@ -143,6 +143,17 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--layer-boundary-norm"):
             ServerArgs(model="x", layer_boundary_norm="half")
 
+    def test_trainer_aligned_routes_with_the_torch_router_topk(self):
+        self.assertEqual(ServerArgs(model="x").router_topk, "fused")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").router_topk, "fused"
+        )
+        self.assertEqual(
+            ServerArgs(model="x", numerics="trainer-aligned").router_topk, "torch"
+        )
+        with self.assertRaisesRegex(ValueError, "--router-topk"):
+            ServerArgs(model="x", router_topk="cuda")
+
     def test_bitwise_envelopes_cover_every_pinning_envelope(self):
         from tokenspeed.runtime.configs.numerics import (
             BITWISE_ENVELOPES,
