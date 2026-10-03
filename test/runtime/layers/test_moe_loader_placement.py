@@ -27,6 +27,7 @@ import torch
 
 from tokenspeed.runtime.layers.moe.loader import (
     _build_placed_expert_plan,
+    _select_local_experts,
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -207,3 +208,15 @@ def test_without_a_placement_the_plan_is_the_contiguous_one():
     loader.load("model.layers.0.mlp.experts.3.down_proj.weight", torch.ones(4, 4))
     assert layers[0].writes == [("w2", 1)]
     assert not loader.matches("model.layers.0.mlp.experts.0.down_proj.weight")
+
+
+def test_fused_local_experts_slice_a_contiguous_range_and_gather_otherwise():
+    stacked = torch.arange(6).view(6, 1)
+    contiguous = _select_local_experts(stacked, [2, 3, 4])
+    assert contiguous.tolist() == [[2], [3], [4]]
+    assert contiguous.data_ptr() == stacked[2].data_ptr()  # a view, no copy
+    gathered = _select_local_experts(stacked, [0, 1, 1])
+    assert gathered.tolist() == [[0], [1], [1]]
+    assert gathered.data_ptr() != stacked.data_ptr()
+    assert _select_local_experts(stacked, [4, 3]).tolist() == [[4], [3]]
+    assert _select_local_experts(stacked, []).shape[0] == 0

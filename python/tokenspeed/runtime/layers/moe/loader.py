@@ -296,6 +296,22 @@ def _local_slot_experts(
     return expert_placement.local_slot_logical_experts(layer_id, ep_rank)
 
 
+def _select_local_experts(
+    stacked: torch.Tensor, slot_experts: list[int]
+) -> torch.Tensor:
+    """Rows of a ``[logical experts, ...]`` tensor for this rank's slots.
+
+    A contiguous ascending range slices (a view, no copy); anything else --
+    a placement replicating or reordering experts -- gathers.
+    """
+    if not slot_experts:
+        return stacked[0:0]
+    first = slot_experts[0]
+    if slot_experts == list(range(first, first + len(slot_experts))):
+        return stacked[first : first + len(slot_experts)]
+    return stacked[slot_experts]
+
+
 def _load_fused_expert_tensor(
     param,
     loaded_weight,
@@ -505,9 +521,11 @@ class MoECheckpointLoader:
                         f"{mapped_name} holds {local_num_experts} local experts, "
                         f"the loader plans {len(slot_experts)} slots"
                     )
-                # A fused checkpoint tensor stacks every logical expert; gather
-                # this rank's slots (a contiguous range without a placement).
-                local_experts = tensor_to_load[slot_experts]
+                # A fused checkpoint tensor stacks every logical expert. This
+                # rank's slots are a view when they form a contiguous range
+                # (always without a placement); a placement that repeats or
+                # reorders experts needs the gather.
+                local_experts = _select_local_experts(tensor_to_load, slot_experts)
                 if getattr(param, "block_scale_inv", None) is not None:
                     raise MoECheckpointLoadError(
                         f"{mapped_name} needs online FP8 block quantization, "
