@@ -1167,13 +1167,18 @@ partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reconstructs bounded history chunks with an owner-masked sum reduction;
 GPU DSA sparse prefill instead combines local sparse-attention partials.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
-DCP does not make unsupported kernels portable. CuTe MLA supports speculative
-decoding. FlashMLA and GPU DSA still exclude speculative decoding: their
-`AttnConfig` rejects any speculative width, draft or target, under DCP, and
-the ordinary recipe refuses to shard a cache that holds a draft group. The
-draft's decode steps would run the same sparse/dense DCP branches as the
-target's, but that path has not been validated, so the exclusion is a gate
-rather than a geometry limit. All DCP paths exclude the Host KVStore: the L2
+DCP does not make unsupported kernels portable. DCP excludes speculative
+decoding for every model on the ordinary MLA/DSA recipe, whichever dense
+kernel runs it: `OrdinaryRecipe.groups()` refuses to shard a cache that holds
+a draft group, so a CuTe MLA engine that would accept the draft kernels still
+cannot combine DCP with a draft; FlashMLA and GPU DSA `AttnConfig` additionally
+reject any speculative width, draft or target, under DCP. Only the recipes
+that declare their own groups shard with a draft present: DeepSeek V4 (its
+draft layers join the compressed-KV chains) and Kimi K3 (its draft layers join
+the sharded MLA history group), each subject to its backend's `AttnConfig`
+gate. The draft's decode steps would run the same sparse/dense DCP branches as
+the target's, but that path has not been validated for the ordinary recipe, so
+its exclusion is a gate rather than a geometry limit. All DCP paths exclude the Host KVStore: the L2
 copies address device pages by scheduler block ID with no ownership
 translation (`cache/l2/executor.py`), so a sharded engine must pass
 `--disable-kvstore`.
