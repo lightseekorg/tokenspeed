@@ -489,6 +489,13 @@ class ServerArgs:
     nprocs_per_node: int | None = None
     world_size: int | None = None
     attn_tp_size: int | None = None
+    # Decode-side layouts under attention DP: head-shard the MLA head
+    # projections / vocab-shard the LM head over contiguous DP ranks, and
+    # make the sharded o_proj / dense down_proj column-parallel on hidden so
+    # no cross-rank reduction remains outside MoE (TP batch invariance).
+    attn_head_tp_size: int | None = None
+    lm_head_tp_size: int | None = None
+    tp_batch_invariant: Literal["none", "attn", "attn+dense"] = "none"
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
     mapping: Mapping | None = None
@@ -844,6 +851,8 @@ class ServerArgs:
             attn_cp_size=attn_cp_size,
             attn_dp_size=attn_dp_size,
             attn_dcp_size=self.decode_context_parallel_size,
+            attn_head_tp_size=self.attn_head_tp_size,
+            lm_head_tp_size=self.lm_head_tp_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
@@ -866,6 +875,7 @@ class ServerArgs:
         )
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
+        self._validate_decode_tp_layouts()
 
         if self.mm_encoder_tp_mode == "data":
             if self.disaggregation_mode not in ("null", "prefill"):
@@ -882,6 +892,59 @@ class ServerArgs:
                 )
 
         logger.info(f"Parallelism configuration:\n{self.mapping!s}")
+
+    def _validate_decode_tp_layouts(self):
+        """Constraints of the decode-side TP layouts under attention DP.
+
+        The structural rules (head TP needs attention TP 1 and CP 1, tiles the
+        stage world; LM head TP under DP needs attention TP 1) live in
+        ``Mapping``. This checks what only the server knows: the engine role,
+        the batch-invariance selection and the quantization.
+        """
+        attn = self.mapping.attn
+        if attn.has_head_tp:
+            # The head exchange serves absorbed decode rows only: an
+            # expanded prefill would need every head's K/V for the cached
+            # prefix, which the head-sharded kv_b_proj cannot produce.
+            if self.disaggregation_mode != "decode":
+                raise ValueError(
+                    "--attn-head-tp-size > 1 serves decode rows only and "
+                    "requires --disaggregation-mode decode"
+                )
+            if self.mapping.nprocs_per_node % attn.head_tp_size:
+                logger.warning(
+                    f"attention head TP group of {attn.head_tp_size} ranks spans "
+                    f"nodes ({self.mapping.nprocs_per_node} ranks per node); the "
+                    "per-layer head exchanges will cross the network"
+                )
+        if self.tp_batch_invariant not in ("none", "attn", "attn+dense"):
+            raise ValueError(
+                "--tp-batch-invariant must be one of none, attn, attn+dense; got "
+                f"{self.tp_batch_invariant!r}"
+            )
+        if self.tp_batch_invariant != "none":
+            if not attn.has_head_tp:
+                raise ValueError(
+                    f"--tp-batch-invariant {self.tp_batch_invariant} makes o_proj "
+                    "column-parallel over the attention head TP group and needs "
+                    "--attn-head-tp-size > 1"
+                )
+            if self.quantization is not None:
+                raise ValueError(
+                    "--tp-batch-invariant needs unquantized o_proj / down_proj "
+                    f"weights; --quantization {self.quantization} was given"
+                )
+        if self.tp_batch_invariant == "attn+dense" and not self.mapping.dense.has_tp:
+            raise ValueError(
+                "--tp-batch-invariant attn+dense makes the dense down_proj "
+                "column-parallel over the dense TP group and needs "
+                "--dense-tp-size > 1"
+            )
+        if attn.has_dp and self.mapping.lm_head.has_tp and self.dp_sampling:
+            raise ValueError(
+                "--lm-head-tp-size > 1 under attention DP transposes the logits "
+                "back to each rank's own rows and cannot combine with --dp-sampling"
+            )
 
     def resolve_cache(self):
         # Handle KVStore settings.
@@ -1198,6 +1261,18 @@ class ServerArgs:
         # The trainer's grouped MLP applies the router weight inside the
         # activation and folds a token's slots in fp32 slot order.
         self.moe_combine_order = "slot"
+        # Layouts stay explicit: the envelope does not fold them in. A
+        # head-sharded o_proj that still reduce-scatters folds the head
+        # partials in rank order -- batch-invariant, but not the bits of the
+        # full-K GEMM a replicated or column-parallel o_proj computes, so a
+        # prefill side with the other layout disagrees with this decode side.
+        if self.mapping.attn.has_head_tp and self.tp_batch_invariant == "none":
+            logger.warning(
+                "--numerics rl-bitwise with --attn-head-tp-size > 1 but without "
+                "--tp-batch-invariant attn: the o_proj reduce-scatter is an "
+                "ordered fold, which is batch-invariant but differs from the "
+                "full-K o_proj of a TP1 prefill engine"
+            )
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -2807,6 +2882,41 @@ class ServerArgs:
             "compressed KV) cyclically over a consecutive subgroup of attention "
             "TP. Allowed on aggregated engines and the PD prefill role; the "
             "decode role and the Host KVStore are not supported yet.",
+        )
+        parser.add_argument(
+            "--attn-head-tp-size",
+            type=int,
+            default=ServerArgs.attn_head_tp_size,
+            help="Shard the MLA head projections (q_b_proj, kv_b_proj, o_proj) "
+            "by heads over this many contiguous attention-DP ranks while every "
+            "rank keeps its own KV cache; the attention exchanges heads for "
+            "tokens around core attention. Requires attention TP 1, attention "
+            "DP, and a decode engine (--disaggregation-mode decode). Defaults "
+            "to the attention TP size (no head exchange).",
+        )
+        parser.add_argument(
+            "--lm-head-tp-size",
+            type=int,
+            default=ServerArgs.lm_head_tp_size,
+            help="Vocab-shard the LM head over this many contiguous ranks. "
+            "Under attention DP (which needs attention TP 1) the default 1 "
+            "keeps the head replicated; a wider group gathers the ranks' rows "
+            "before the logits GEMM and transposes the vocab shards back. "
+            "Without attention DP it must equal the attention TP size.",
+        )
+        parser.add_argument(
+            "--tp-batch-invariant",
+            type=str,
+            choices=["none", "attn", "attn+dense"],
+            default=ServerArgs.tp_batch_invariant,
+            help="Replace the reduce-scatter after a head-sharded o_proj "
+            "(attn) and after a TP dense down_proj (attn+dense) with "
+            "column-parallel GEMMs on hidden fed by an all-gather of the "
+            "reduction dimension and followed by an all-to-all back to each "
+            "rank's own rows. Every collective is then a permutation, so the "
+            "bits match a TP1 full-K GEMM. attn needs --attn-head-tp-size > 1; "
+            "attn+dense also needs --dense-tp-size > 1; both need unquantized "
+            "o_proj / down_proj weights.",
         )
         parser.add_argument(
             "--dense-tp-size",

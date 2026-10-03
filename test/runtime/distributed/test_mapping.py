@@ -3,6 +3,7 @@ import pytest
 from tokenspeed.runtime.distributed.mapping import (
     AttentionLayerMapping,
     DenseLayerMapping,
+    LmHeadMapping,
     Mapping,
     MappingBase,
     MoeLayerMapping,
@@ -378,6 +379,157 @@ class TestAttentionLayerMapping:
             AttentionLayerMapping(
                 rank=0, world_size=16, tp_size=2, cp_size=3, dp_size=4
             )
+
+
+# =============================================================================
+# Attention head TP
+# =============================================================================
+
+
+class TestAttentionHeadTp:
+
+    @pytest.mark.parametrize("tp", [1, 2, 8])
+    def test_default_is_the_attention_tp_group(self, tp):
+        """Omitting head TP keeps the head projections on attention TP."""
+        for rank in range(8):
+            m = AttentionLayerMapping(rank=rank, world_size=8, tp_size=tp, cp_size=1)
+            assert m.head_tp_size == tp
+            assert not m.has_head_tp
+            assert m.head_tp_rank == m.tp_rank
+            assert m.head_tp_group == m.tp_group
+
+    def test_head_tp_over_dp_ranks(self):
+        # DP8 with heads sharded over contiguous groups of 4.
+        m = AttentionLayerMapping(
+            rank=6, world_size=8, tp_size=1, cp_size=1, head_tp_size=4
+        )
+        assert m.has_head_tp
+        assert m.dp_size == 8
+        assert m.head_tp_rank == 2
+        assert m.head_tp_group == (4, 5, 6, 7)
+        assert m.tp_group == (6,)
+        groups = {
+            AttentionLayerMapping(
+                rank=r, world_size=8, tp_size=1, cp_size=1, head_tp_size=4
+            ).head_tp_group
+            for r in range(8)
+        }
+        assert groups == {(0, 1, 2, 3), (4, 5, 6, 7)}
+
+    def test_head_tp_equal_to_tp_is_a_no_op(self):
+        m = AttentionLayerMapping(
+            rank=3, world_size=8, tp_size=4, cp_size=1, head_tp_size=4
+        )
+        assert not m.has_head_tp
+
+    def test_head_tp_needs_attention_tp_1(self):
+        with pytest.raises(ValueError, match="attention TP 1"):
+            AttentionLayerMapping(
+                rank=0, world_size=8, tp_size=2, cp_size=1, head_tp_size=4
+            )
+
+    def test_head_tp_needs_no_cp(self):
+        with pytest.raises(ValueError, match="CP"):
+            AttentionLayerMapping(
+                rank=0, world_size=8, tp_size=1, cp_size=2, head_tp_size=4
+            )
+
+    def test_head_tp_must_tile_the_stage(self):
+        with pytest.raises(ValueError, match="divide"):
+            AttentionLayerMapping(
+                rank=0, world_size=8, tp_size=1, cp_size=1, head_tp_size=3
+            )
+
+    @pytest.mark.parametrize("bad", [0, -1, True])
+    def test_head_tp_rejects_non_positive(self, bad):
+        with pytest.raises(ValueError):
+            AttentionLayerMapping(
+                rank=0, world_size=8, tp_size=1, cp_size=1, head_tp_size=bad
+            )
+
+
+# =============================================================================
+# LmHeadMapping
+# =============================================================================
+
+
+class TestLmHeadMapping:
+
+    def test_follows_attention_tp_without_dp(self):
+        for tp in (1, 4, 8):
+            m = Mapping(rank=5, world_size=8, attn_tp_size=tp)
+            assert m.lm_head.tp_size == tp
+            assert m.lm_head.has_tp == (tp > 1)
+            assert m.lm_head.tp_group == m.attn.tp_group
+            assert m.lm_head.tp_rank == m.attn.tp_rank
+
+    def test_replicated_under_dp_by_default(self):
+        m = Mapping(rank=5, world_size=8, attn_tp_size=1, attn_dp_size=8)
+        assert m.lm_head.tp_size == 1
+        assert not m.lm_head.has_tp
+        assert m.lm_head.tp_group == (5,)
+
+    def test_explicit_width_under_dp(self):
+        m = Mapping(
+            rank=5, world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=4
+        )
+        assert m.lm_head.has_tp
+        assert m.lm_head.tp_rank == 1
+        assert m.lm_head.tp_group == (4, 5, 6, 7)
+        assert m.lm_head.dp_size == 2
+        assert m.lm_head.dp_group == (1, 5)
+
+    def test_shares_the_head_group_tuple(self):
+        """The decode preset reuses one node-local group for heads, dense and
+        the LM head; identical tuples dedupe in the process-group manager."""
+        m = Mapping(
+            rank=10,
+            world_size=16,
+            attn_tp_size=1,
+            attn_dp_size=16,
+            attn_head_tp_size=8,
+            lm_head_tp_size=8,
+            dense_tp_size=8,
+        )
+        assert m.attn.head_tp_group == m.lm_head.tp_group == m.dense.tp_group
+        assert m.attn.head_tp_group == tuple(range(8, 16))
+
+    def test_rank_propagates_when_deferred(self):
+        m = Mapping(world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=8)
+        m.rank = 3
+        assert m.lm_head.tp_rank == 3
+        assert m.attn.head_tp_rank == 0
+
+    def test_explicit_width_without_dp_must_match_attention_tp(self):
+        with pytest.raises(ValueError, match="attention TP group"):
+            Mapping(rank=0, world_size=8, attn_tp_size=8, lm_head_tp_size=1)
+        with pytest.raises(ValueError, match="attention TP group"):
+            Mapping(rank=0, world_size=8, attn_tp_size=4, lm_head_tp_size=8)
+
+    def test_under_dp_needs_attention_tp_1(self):
+        with pytest.raises(ValueError, match="attention TP 1"):
+            Mapping(
+                rank=0,
+                world_size=8,
+                attn_tp_size=2,
+                attn_dp_size=4,
+                lm_head_tp_size=8,
+            )
+
+    def test_must_tile_the_stage(self):
+        with pytest.raises(ValueError, match="divide"):
+            Mapping(
+                rank=0,
+                world_size=8,
+                attn_tp_size=1,
+                attn_dp_size=8,
+                lm_head_tp_size=3,
+            )
+
+    def test_standalone_mapping(self):
+        m = LmHeadMapping(rank=6, world_size=8, tp_size=4)
+        assert m.tp_group == (4, 5, 6, 7)
+        assert m.dp_rank == 1
 
 
 # =============================================================================

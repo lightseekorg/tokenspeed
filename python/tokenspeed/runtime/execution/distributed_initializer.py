@@ -188,6 +188,10 @@ class DistributedInitializer:
         # No-op at the default linear_attn.tp == attn.tp (same group,
         # idempotent).
         pg_manager.init_process_group(config.mapping.linear_attn.tp_group)
+        # Head-sharded attention projections and the vocab-sharded LM head
+        # under attention DP; both default to groups created above.
+        pg_manager.init_process_group(config.mapping.attn.head_tp_group)
+        pg_manager.init_process_group(config.mapping.lm_head.tp_group)
         pg_manager.init_process_group(config.mapping.dense.tp_group)
         pg_manager.init_process_group(config.mapping.moe.tp_ep_group)
         if config.mapping.has_pp:

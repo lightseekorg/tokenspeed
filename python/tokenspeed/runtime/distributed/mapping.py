@@ -139,6 +139,41 @@ class DenseLayerMapping(MappingBase):
         return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
 
 
+def _resolve_head_tp_size(
+    tp_size: int, cp_size: int, world_size: int, head_tp_size: int | None
+) -> int:
+    """Resolve the attention head-TP width.
+
+    ``None`` keeps the head projections on the attention TP group (today's
+    layout). A wider head group shards ``q_b_proj`` / ``kv_b_proj`` /
+    ``o_proj`` by heads over ranks that are data-parallel for attention, so
+    it requires attention TP 1 and CP 1 and must tile the stage world.
+    """
+    if head_tp_size is None:
+        return tp_size
+    if (
+        isinstance(head_tp_size, bool)
+        or not isinstance(head_tp_size, int)
+        or head_tp_size < 1
+    ):
+        raise ValueError("attention head TP size must be a positive integer")
+    if head_tp_size == tp_size:
+        return head_tp_size
+    if tp_size != 1:
+        raise ValueError(
+            "attention head TP shards heads over data-parallel ranks and needs "
+            f"attention TP 1, got attn_tp_size={tp_size}"
+        )
+    if cp_size != 1:
+        raise ValueError("attention head TP is incompatible with attention CP")
+    if world_size % head_tp_size:
+        raise ValueError(
+            f"attention head TP size {head_tp_size} must divide the stage "
+            f"world size {world_size}"
+        )
+    return head_tp_size
+
+
 class AttentionLayerMapping(MappingBase):
 
     def __init__(
@@ -149,12 +184,34 @@ class AttentionLayerMapping(MappingBase):
         cp_size: int | None = None,
         dp_size: int | None = None,
         dcp_size: int = 1,
+        head_tp_size: int | None = None,
     ):
         super().__init__(rank, world_size)
         self.tp_size, self.cp_size, self.dp_size = _resolve_parallelism_sizes(
             self.world_size, tp_size, cp_size, dp_size
         )
         self.dcp_size = _resolve_dcp_size(self.tp_size, self.cp_size, dcp_size)
+        # Width of the group the head projections (q_b/kv_b/o_proj) shard
+        # over. Equal to tp_size unless head TP widens it over DP ranks.
+        self.head_tp_size = _resolve_head_tp_size(
+            self.tp_size, self.cp_size, self.world_size, head_tp_size
+        )
+
+    @property
+    def has_head_tp(self) -> bool:
+        """Heads are sharded over a group wider than attention TP, so the
+        attention forward exchanges heads for tokens around core attention."""
+        return self.head_tp_size != self.tp_size
+
+    @cached_property
+    def head_tp_rank(self) -> int:
+        return _make_parallelism_rank(self.rank, self.head_tp_size, stride=1)
+
+    @cached_property
+    def head_tp_group(self) -> Group:
+        """Contiguous ranks sharing one set of head projections; equals
+        ``tp_group`` without head TP."""
+        return _make_parallelism_group(self.rank, self.head_tp_size, stride=1)
 
     @property
     def has_dcp(self) -> bool:
@@ -388,6 +445,87 @@ class LinearAttnLayerMapping(MappingBase):
         return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
 
 
+class LmHeadMapping(MappingBase):
+    """Parallel mapping for the vocabulary-sharded LM head.
+
+    Without attention DP the head follows the attention TP group, as it
+    always has. Under attention DP the head is replicated by default
+    (``tp_size`` 1); a wider ``tp_size`` vocab-shards it over a contiguous
+    group of attention-DP ranks, which then gather their tokens before the
+    logits GEMM and transpose the vocab shards back to their own rows.
+    """
+
+    def __init__(
+        self,
+        rank: int | None = None,
+        world_size: int = 1,
+        tp_size: int | None = None,
+    ):
+        super().__init__(rank, world_size)
+        self.tp_size, self.dp_size = _resolve_parallelism_sizes(
+            self.world_size, tp_size, None
+        )
+
+    @cached_property
+    def has_tp(self) -> bool:
+        return self.tp_size > 1
+
+    @cached_property
+    def tp_rank(self) -> int:
+        return _make_parallelism_rank(self.rank, self.tp_size, stride=1)
+
+    @cached_property
+    def tp_group(self) -> Group:
+        return _make_parallelism_group(self.rank, self.tp_size, stride=1)
+
+    @cached_property
+    def dp_rank(self) -> int:
+        return _make_parallelism_rank(self.rank, self.dp_size, stride=self.tp_size)
+
+    @cached_property
+    def dp_group(self) -> Group:
+        return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
+
+
+def _resolve_lm_head_tp_size(
+    attn: AttentionLayerMapping, lm_head_tp_size: int | None
+) -> int:
+    """Resolve the LM-head TP width against the attention layout.
+
+    The default is today's layout: the attention TP width without attention
+    DP, replicated (1) with it. An explicit width under attention DP needs
+    attention TP 1 (the logits path gathers whole rows from each rank) and
+    must tile the stage world; without DP it must equal the attention TP.
+    """
+    if lm_head_tp_size is None:
+        return 1 if attn.has_dp else attn.tp_size
+    if (
+        isinstance(lm_head_tp_size, bool)
+        or not isinstance(lm_head_tp_size, int)
+        or lm_head_tp_size < 1
+    ):
+        raise ValueError("LM head TP size must be a positive integer")
+    if not attn.has_dp:
+        if lm_head_tp_size != attn.tp_size:
+            raise ValueError(
+                "without attention DP the LM head follows the attention TP "
+                f"group; got lm_head_tp_size={lm_head_tp_size} with "
+                f"attn_tp_size={attn.tp_size}"
+            )
+        return lm_head_tp_size
+    if lm_head_tp_size > 1 and attn.tp_size != 1:
+        raise ValueError(
+            "LM head TP under attention DP needs attention TP 1, got "
+            f"attn_tp_size={attn.tp_size}"
+        )
+    if attn.world_size % lm_head_tp_size:
+        raise ValueError(
+            f"LM head TP size {lm_head_tp_size} must divide the stage world "
+            f"size {attn.world_size}"
+        )
+    return lm_head_tp_size
+
+
 class Mapping(MappingBase):
 
     def __init__(
@@ -399,6 +537,8 @@ class Mapping(MappingBase):
         attn_cp_size: int | None = None,
         attn_dp_size: int | None = None,
         attn_dcp_size: int = 1,
+        attn_head_tp_size: int | None = None,
+        lm_head_tp_size: int | None = None,
         dense_tp_size: int | None = None,
         dense_dp_size: int | None = None,
         moe_tp_size: int | None = None,
@@ -441,6 +581,12 @@ class Mapping(MappingBase):
             cp_size=attn_cp_size,
             dp_size=attn_dp_size,
             dcp_size=attn_dcp_size,
+            head_tp_size=attn_head_tp_size,
+        )
+        self.lm_head = LmHeadMapping(
+            rank=rank,
+            world_size=stage_world_size,
+            tp_size=_resolve_lm_head_tp_size(self.attn, lm_head_tp_size),
         )
         self.dense = DenseLayerMapping(
             rank=rank,
@@ -485,6 +631,7 @@ class Mapping(MappingBase):
 
     def _on_rank_initialized(self, rank: int):
         self.attn.rank = rank
+        self.lm_head.rank = rank
         self.dense.rank = rank
         self.moe.rank = rank
         self.vision.rank = rank
@@ -560,8 +707,9 @@ class Mapping(MappingBase):
             f"Mapping(rank={rank_str}, world_size={self.world_size})",
             f"  Cluster : {self.nnodes} node(s) x {self.nprocs_per_node} proc(s)",
             f"  Pipeline: pp={self.pp_size}",
-            f"  Attention: tp={self.attn.tp_size}  dcp={self.attn.dcp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}",
+            f"  Attention: tp={self.attn.tp_size}  dcp={self.attn.dcp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}  head_tp={self.attn.head_tp_size}",
             f"    Vision: tp={self.vision.tp_size}  item_dp={self.vision.dp_size}",
+            f"  LM head : tp={self.lm_head.tp_size}",
             f"  Dense   : tp={self.dense.tp_size}  dp={self.dense.dp_size}",
             f"  MoE     : tp={self.moe.tp_size}  ep={self.moe.ep_size}  dp={self.moe.dp_size}",
         ]
