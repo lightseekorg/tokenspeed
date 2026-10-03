@@ -70,10 +70,8 @@ def test_draft_probs_start_as_sentinel_with_a_zero_bonus_slot():
     assert torch.equal(probs[:, -1], torch.zeros(5, 32))
 
 
-def test_init_draft_probs_rejects_a_threshold_a_real_probability_could_reach():
+def test_init_draft_probs_needs_a_verify_column():
     states = RuntimeStates(4, 32, 3, "cpu")
-    with pytest.raises(ValueError, match=">= 1.0"):
-        states.init_draft_probs(spec_num_tokens=3, reject_threshold=0.5)
     with pytest.raises(ValueError, match="verify column"):
         states.init_draft_probs(spec_num_tokens=0, reject_threshold=2.0)
 
@@ -103,13 +101,21 @@ def test_reset_states_restores_the_sentinel_rows_only():
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the candidate upload pins host memory"
 )
-def test_remote_landing_leaves_the_slot_at_the_sentinel():
-    # A PD landing carries candidates without their draft distribution.
+def test_remote_landing_relies_on_the_receive_time_reset():
+    # A PD decode destination seeds the landing slot's cache length through
+    # reset_states when it receives the prompt (the one sentinel reset site);
+    # the later candidate landing carries no draft distribution and leaves
+    # draft_probs alone.
     states = _recorded_states()
     probs = states.draft_probs
+    states.reset_states(
+        torch.tensor([2], dtype=torch.int64), torch.tensor([40], dtype=torch.int32)
+    )
+    before = probs.clone()
     states.write_remote_spec_candidate_ids(2, [5, 6, 7])
     assert states.future_input_map[2].tolist() == [5, 6, 7]
     assert bool(states.remote_spec_candidate_ready[2])
+    assert torch.equal(probs, before)
     for slot in range(5):
         expected = 3.0 if slot == 2 else 0.25
         assert torch.equal(probs[slot, :-1], torch.full((2, 32), expected))

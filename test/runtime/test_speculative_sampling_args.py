@@ -22,21 +22,11 @@
 
 import pytest
 
-from tokenspeed.runtime.utils.env import (
-    global_server_args_dict,
-    global_server_args_dict_update,
+from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.server_args import (
+    SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX,
+    ServerArgs,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs
-
-
-@pytest.fixture(autouse=True)
-def _restore_global_server_args():
-    # global_server_args_dict_update mutates process-global state other tests
-    # (the logits processor's argmax gate) read.
-    saved = dict(global_server_args_dict)
-    yield
-    global_server_args_dict.clear()
-    global_server_args_dict.update(saved)
 
 
 def _args(**overrides) -> ServerArgs:
@@ -51,13 +41,14 @@ def _args(**overrides) -> ServerArgs:
     return ServerArgs(**kwargs)
 
 
-def test_default_is_off_and_published():
+def test_default_is_off_and_the_flags_travel_by_config_not_global_dict():
     args = ServerArgs(model="x")
     assert args.enable_speculative_sampling is False
     assert args.spec_reject_draft_prob_threshold == 2.0
-    global_server_args_dict_update(args)
-    assert global_server_args_dict["enable_speculative_sampling"] is False
-    assert global_server_args_dict["spec_reject_draft_prob_threshold"] == 2.0
+    # The executor and sampling-backend configs carry the flags explicitly;
+    # nothing reads them from the process-global dict.
+    assert "enable_speculative_sampling" not in global_server_args_dict
+    assert "spec_reject_draft_prob_threshold" not in global_server_args_dict
 
 
 @pytest.mark.parametrize("algorithm", ["EAGLE3", "MTP"])
@@ -69,9 +60,14 @@ def test_chain_drafters_with_a_draft_prob_verifier_resolve(algorithm, backend):
         spec_reject_draft_prob_threshold=1.5,
     )
     assert args.enable_speculative_sampling
-    global_server_args_dict_update(args)
-    assert global_server_args_dict["enable_speculative_sampling"] is True
-    assert global_server_args_dict["spec_reject_draft_prob_threshold"] == 1.5
+    assert args.spec_reject_draft_prob_threshold == 1.5
+
+
+def test_decode_role_accepts_the_flag_and_the_prefill_role_refuses_it():
+    args = _args(disaggregation_mode="decode")
+    assert args.enable_speculative_sampling
+    with pytest.raises(ValueError, match="prefill role"):
+        _args(disaggregation_mode="prefill")
 
 
 def test_rl_bitwise_accepts_the_flag_with_a_flashinfer_verifier():
@@ -101,11 +97,24 @@ def test_refuses_the_triton_verifiers(backend):
         _args(sampling_backend=backend)
 
 
-def test_refuses_a_threshold_a_real_probability_could_reach():
+def test_threshold_must_lie_in_the_fp32_sentinel_range():
     with pytest.raises(ValueError, match="spec-reject-draft-prob-threshold"):
         _args(spec_reject_draft_prob_threshold=0.9)
     # Exactly 1.0 is the lowest safe value: no probability exceeds it.
-    assert _args(spec_reject_draft_prob_threshold=1.0).spec_reject_draft_prob_threshold == 1.0
+    assert (
+        _args(spec_reject_draft_prob_threshold=1.0).spec_reject_draft_prob_threshold
+        == 1.0
+    )
+    # The sentinel is threshold + 1.0 in fp32; the cap keeps it distinguishable.
+    top = SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX
+    assert (
+        _args(spec_reject_draft_prob_threshold=top).spec_reject_draft_prob_threshold
+        == top
+    )
+    with pytest.raises(ValueError, match="spec-reject-draft-prob-threshold"):
+        _args(spec_reject_draft_prob_threshold=top * 2)
+    with pytest.raises(ValueError, match="spec-reject-draft-prob-threshold"):
+        _args(spec_reject_draft_prob_threshold=float("nan"))
 
 
 def test_cli_flags_parse():

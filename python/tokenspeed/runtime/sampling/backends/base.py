@@ -56,6 +56,13 @@ class SpeculativeSamplingPools:
 @dataclass
 class SamplingBackendConfig:
 
+    # Draft-prob rejection sampling: verify gathers the drafter's recorded
+    # distributions by pool index into a persistent [max_pad_bs, N, vocab]
+    # fp32 buffer and runs the chain kernel's coin * q(x) < p(x) rule
+    # instead of the target-only rule. Selects the verify rule, so it is
+    # explicit.
+    enable_speculative_sampling: bool
+
     enable_nan_detection: bool = False
 
     # Optional logprob features — OFF by default. These are checked at server
@@ -63,11 +70,8 @@ class SamplingBackendConfig:
     # Enabling any of these enlarges the captured graph footprint.
     enable_output_logprobs: bool = False
 
-    # Draft-prob rejection sampling: verify gathers the drafter's recorded
-    # distributions by pool index into a persistent [max_pad_bs, N, vocab]
-    # fp32 buffer and runs the chain kernel's coin * q(x) < p(x) rule.
-    # Entries above the threshold are the "no proposal yet" sentinel.
-    enable_speculative_sampling: bool = False
+    # Recorded draft probabilities above this are the "no proposal yet"
+    # sentinel; only read under enable_speculative_sampling.
     spec_reject_draft_prob_threshold: float = 2.0
 
     # Sizing for pre-allocated per-backend buffers (e.g. coin buffers for

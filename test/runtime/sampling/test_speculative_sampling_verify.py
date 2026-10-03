@@ -44,18 +44,20 @@ POOL, VOCAB, MAX_BS, N = 6, 16, 4, 3
 
 def _config(enable: bool) -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        enable_speculative_sampling=enable,
         max_bs=MAX_BS,
         max_draft_tokens_per_req=N,
         max_req_pool_size=POOL,
         vocab_size=VOCAB,
         device="cpu",
-        enable_speculative_sampling=enable,
         spec_reject_draft_prob_threshold=1.5,
     )
 
 
 def _fake_kernels(monkeypatch, module, seen: dict) -> None:
-    def gather(index, *, temperature, top_k, top_p, min_p=None, seed=None, offsets=None, n=1):
+    def gather(
+        index, *, temperature, top_k, top_p, min_p=None, seed=None, offsets=None, n=1
+    ):
         idx = index.repeat_interleave(n)
         return (
             temperature[idx],
@@ -109,7 +111,9 @@ def test_verify_gathers_recorded_rows_and_selects_the_draft_prob_rule(
     seen: dict = {}
     _fake_kernels(monkeypatch, module, seen)
     backend_cls = (
-        fi.FlashInferSamplingBackend if module is fi else ff.FlashInferFullSamplingBackend
+        fi.FlashInferSamplingBackend
+        if module is fi
+        else ff.FlashInferFullSamplingBackend
     )
     backend = backend_cls(_config(enable=True))
     assert backend._draft_probs_gather_buf.shape == (MAX_BS, N, VOCAB)
@@ -118,7 +122,9 @@ def test_verify_gathers_recorded_rows_and_selects_the_draft_prob_rule(
     recorded = _recorded_draft_probs()
     logits = torch.randn(2 * N, VOCAB)
     candidates = torch.randint(0, VOCAB, (2, N), dtype=torch.int64)
-    backend.verify(LogitsProcessorOutput(next_token_logits=logits), _info(recorded), candidates)
+    backend.verify(
+        LogitsProcessorOutput(next_token_logits=logits), _info(recorded), candidates
+    )
 
     assert seen["use_draft_prob"] is True
     assert seen["reject_draft_prob_threshold"] == 1.5
@@ -131,7 +137,9 @@ def test_verify_gathers_recorded_rows_and_selects_the_draft_prob_rule(
 
     # Without recorded distributions the target-only call is unchanged.
     seen.clear()
-    backend.verify(LogitsProcessorOutput(next_token_logits=logits), _info(None), candidates)
+    backend.verify(
+        LogitsProcessorOutput(next_token_logits=logits), _info(None), candidates
+    )
     assert seen["use_draft_prob"] is False and seen["draft_probs"] is None
 
 

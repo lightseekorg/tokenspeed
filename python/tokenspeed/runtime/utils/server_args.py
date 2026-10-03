@@ -61,6 +61,14 @@ ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
 # distribution never enters either.
 SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full"})
 
+# Usable range of --spec-reject-draft-prob-threshold. The sentinel rows are
+# written as threshold + 1.0 in fp32 and detected by ``draft_prob > threshold``:
+# below 1.0 a real probability would read as the sentinel, and from 2**23 on
+# fp32 (24 significand bits) can no longer resolve the + 1.0; 2**20 leaves a
+# wide margin, and nothing is gained from a larger sentinel.
+SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN = 1.0
+SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX = float(1 << 20)
+
 # Spec-decode overshoot spans the physical KV extent must absorb past the
 # logical context_len. The overlap scheduler steps a finished request at most
 # ONE extra iteration (the depth-1 event loop commits the previous step every
@@ -308,7 +316,8 @@ class ServerArgs:
     enable_speculative_sampling: bool = False
     # Recorded draft probabilities above this value mark a slot with no
     # proposal (fresh admission, PD landing): always reject. Sentinel rows
-    # are written as threshold + 1, so it must be at least 1.0.
+    # are written as threshold + 1, so it must lie within
+    # [SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN, SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX].
     spec_reject_draft_prob_threshold: float = 2.0
     enable_replay_ssm: bool = True
     eagle3_layers_to_capture: str | None = None
@@ -791,8 +800,22 @@ class ServerArgs:
         block drafters propose a whole block greedily), and the verifier must
         be a backend that runs the draft-prob chain kernel: ``greedy`` verifies
         by exact match and ``triton`` by a target-sampled exact match, so q
-        never enters either.
+        never enters either. The prefill role of a disaggregated deployment
+        never verifies a chain of its own and its drafted candidates ship to
+        the decode node without q, so there the flag would only allocate the
+        per-slot distribution buffer; it is refused. The sentinel threshold
+        is validated here once for every layer below: at least 1.0 so no
+        real probability reads as the sentinel, and at most 2**20 so the
+        fp32 sentinel ``threshold + 1.0`` stays distinguishable from it.
         """
+        if self.disaggregation_mode == "prefill":
+            raise ValueError(
+                "--enable-speculative-sampling has no effect on the prefill role "
+                "of a disaggregated deployment: it never verifies a chain and its "
+                "candidates reach the decode node without their draft "
+                "distribution, so the flag would only cost the draft_probs "
+                "buffer. Pass it to the decode role only."
+            )
         if self.speculative_algorithm is None:
             raise ValueError(
                 "--enable-speculative-sampling needs speculative decoding: pass "
@@ -824,11 +847,18 @@ class ServerArgs:
                 f"chain kernel ({sorted(SPECULATIVE_SAMPLING_BACKENDS)}); "
                 f"--sampling-backend {self.sampling_backend} {why}"
             )
-        if self.spec_reject_draft_prob_threshold < 1.0:
+        threshold = self.spec_reject_draft_prob_threshold
+        if not (
+            SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN
+            <= threshold
+            <= SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX
+        ):
             raise ValueError(
-                "--spec-reject-draft-prob-threshold must be >= 1.0 so no real "
-                "probability reads as the no-proposal sentinel, got "
-                f"{self.spec_reject_draft_prob_threshold}"
+                "--spec-reject-draft-prob-threshold must be within "
+                f"[{SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN}, "
+                f"{SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX}]: at least 1.0 so no real "
+                "probability reads as the no-proposal sentinel, and small enough "
+                f"that the fp32 sentinel threshold + 1.0 stays above it; got {threshold}"
             )
 
     def resolve_communication(self):
@@ -2083,7 +2113,8 @@ class ServerArgs:
             "temperature; greedy rows stay argmax) and verify accepts with "
             "coin * q(x) < p(x) instead of the target-only rule. Needs EAGLE3 "
             "or MTP with --speculative-eagle-topk 1 and the flashinfer or "
-            "flashinfer_full sampling backend. Costs a per-request fp32 draft "
+            "flashinfer_full sampling backend; refused on the prefill role of "
+            "a disaggregated deployment. Costs a per-request fp32 draft "
             "distribution buffer; see docs/configuration/server.md.",
         )
         parser.add_argument(
@@ -2092,7 +2123,8 @@ class ServerArgs:
             default=ServerArgs.spec_reject_draft_prob_threshold,
             help="With --enable-speculative-sampling, recorded draft probabilities "
             "above this value mark a request with no proposal yet (fresh "
-            "admission, PD landing) and always reject. Must be >= 1.0.",
+            "admission, PD landing) and always reject. Must lie within "
+            "[1.0, 2**20].",
         )
         parser.add_argument(
             "--disable-replay-ssm",

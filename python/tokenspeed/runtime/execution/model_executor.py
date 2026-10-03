@@ -243,6 +243,11 @@ class ModelExecutorConfig:
     prefill_only: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
+    # Draft-prob rejection sampling: the drafter records its per-step
+    # proposal distributions in RuntimeStates.draft_probs and verify accepts
+    # with coin * q(x) < p(x) (see --enable-speculative-sampling). Selects
+    # the verify rule, so it is explicit.
+    enable_speculative_sampling: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -262,10 +267,8 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
     spec_num_tokens: int | None = None
-    # Draft-prob rejection sampling: the drafter records its per-step
-    # proposal distributions in RuntimeStates.draft_probs and verify accepts
-    # with coin * q(x) < p(x) (see --enable-speculative-sampling).
-    enable_speculative_sampling: bool = False
+    # Recorded draft probabilities above this value mark a slot with no
+    # proposal (always reject); only read under enable_speculative_sampling.
     spec_reject_draft_prob_threshold: float = 2.0
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False

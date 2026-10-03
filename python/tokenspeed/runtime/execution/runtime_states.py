@@ -74,16 +74,14 @@ class RuntimeStates:
         drafter has not recorded this round (fresh admission, PD landing)
         rejects every candidate and samples its first token from the full
         target distribution. The last step slot pairs with the bonus token,
-        which has no proposal; it is never read and stays zero. Returns None.
+        which has no proposal; it is never read and stays zero. The server
+        args validate the threshold's range (at least 1.0, so no real
+        probability reads as the sentinel, and small enough that ``+ 1.0``
+        is representable in fp32). Returns None.
         """
         if spec_num_tokens < 1:
             raise ValueError(
                 f"draft_probs needs at least one verify column, got {spec_num_tokens}"
-            )
-        if reject_threshold < 1.0:
-            raise ValueError(
-                "the draft-prob sentinel threshold must be >= 1.0 so no real "
-                f"probability reads as a sentinel, got {reject_threshold}"
             )
         pool_size = self.valid_cache_lengths.shape[0]
         self.draft_probs_sentinel = float(reject_threshold) + 1.0
@@ -98,6 +96,12 @@ class RuntimeStates:
     def reset_draft_probs(self, pool_indices: torch.Tensor) -> None:
         """Mark ``pool_indices`` as having no recorded proposal.
 
+        One reset site, ``reset_states``, covers every way a slot (re)enters
+        service: a local prefill resets its rows in the forward prologue, and
+        a PD decode destination resets a landing request's row when it seeds
+        the remote cache length (``_receive``), which the same data-plane FIFO
+        orders ahead of the candidate landing and of the request's first
+        local forward, the earliest point a drafter records into the row.
         Tensor-only (index_fill_), so it is stream-ordered without a host
         wait and legal inside a captured graph. Returns None.
         """
@@ -296,8 +300,7 @@ class RuntimeStates:
         ).to(self.device, non_blocking=True)
         self.future_input_map[req_pool_idx, :width] = ids
         self.remote_spec_candidate_ready[req_pool_idx] = True
-        # The prefill node's candidates come without their draft distribution:
-        # the first local verify rejects them at column 1 and samples token 0
-        # from the full target, the same outcome as a single-token verify.
-        if self.draft_probs is not None:
-            self.draft_probs[req_pool_idx, :-1].fill_(self.draft_probs_sentinel)
+        # The candidates come without their draft distribution; the row's
+        # draft_probs still hold the sentinel reset_states wrote when the
+        # remote cache length was seeded, so the first local verify rejects
+        # them at column 1 and samples token 0 from the full target.
