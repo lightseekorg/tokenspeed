@@ -32,9 +32,10 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from functools import cached_property
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
-    virtual_block_count,
+    virtual_block_count as sharded_virtual_block_count,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldLayout,
@@ -87,7 +88,9 @@ def _load_wire_json(raw: bytes, *, name: str, maximum: int) -> dict:
     return value
 
 
-@dataclass(frozen=True, slots=True)
+# No ``slots``: like ``CacheMemoryPlan``, the frozen contract caches its
+# lookup index in ``__dict__``; dataclass fields alone define the wire form.
+@dataclass(frozen=True)
 class CacheTransferContract:
     """Thin PD wire envelope around the cache-owned plan and group specs."""
 
@@ -106,11 +109,14 @@ class CacheTransferContract:
             )
         )
 
+    # Resolved per manifest group on the transfer paths; index the immutable
+    # spec tuple once instead of scanning it per call.
+    @cached_property
+    def _specs_by_id(self) -> dict[str, CacheGroupSpec]:
+        return {spec.group_id: spec for spec in self.group_specs}
+
     def group_spec(self, group_id: str) -> CacheGroupSpec:
-        for spec in self.group_specs:
-            if spec.group_id == group_id:
-                return spec
-        raise KeyError(group_id)
+        return self._specs_by_id[group_id]
 
     def virtual_block_count(self, group_id: str) -> int:
         """Exclusive bound of the scheduler block IDs a manifest may carry.
@@ -119,7 +125,7 @@ class CacheTransferContract:
         group's IDs run over ``shard_count`` times its physical page count;
         the physical count bounds local arena addressing only.
         """
-        return virtual_block_count(
+        return sharded_virtual_block_count(
             self.plan.group(group_id).page_count,
             self.group_spec(group_id).shard_count,
         )
