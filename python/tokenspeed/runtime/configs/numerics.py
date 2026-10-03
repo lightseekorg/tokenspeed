@@ -65,6 +65,11 @@ YARN_RAMP_MASK_DEVICES = ("cuda", "cpu")
 # or multiplied at runtime after q_b_proj / kv_a_layernorm as the trainer does.
 MLA_LORA_SCALES = ("folded", "runtime")
 
+# ``--layer-boundary-norm``: the norm at each physical layer boundary — the
+# fused add+norm kernel, or a bf16 ``hidden + residual`` materialized first and
+# a standalone RMSNorm, as the trainer does.
+LAYER_BOUNDARY_NORMS = ("fused", "unfused")
+
 
 def require_verified_numerics(
     numerics: str,
@@ -111,6 +116,7 @@ def require_verified_numerics(
 
 __all__ = [
     "BITWISE_ENVELOPES",
+    "LAYER_BOUNDARY_NORMS",
     "MLA_LORA_SCALES",
     "NUMERICS_ENVELOPES",
     "RL_BITWISE_SAMPLING_BACKENDS",

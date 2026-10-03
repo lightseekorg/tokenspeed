@@ -780,7 +780,9 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             branch_residual,
             ctx,
         )
-        hidden_states, residual = self.branch_comm[1].input_reduce_norm(
+        # Mid-layer, not a layer boundary: stays fused under every
+        # --layer-boundary-norm, as the trainer does.
+        hidden_states, residual = self.branch_comm[1].intra_layer_add_norm(
             hidden_states,
             residual,
         )

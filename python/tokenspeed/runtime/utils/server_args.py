@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_S
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
+    LAYER_BOUNDARY_NORMS,
     MLA_LORA_SCALES,
     NUMERICS_ENVELOPES,
     RL_BITWISE_SAMPLING_BACKENDS,
@@ -431,6 +432,10 @@ class ServerArgs:
     # folded into the q_a/kv_a layernorm weights at load, or multiplied at
     # runtime after q_b_proj / kv_a_layernorm as the trainer does.
     mla_lora_scale: str = "folded"
+    # The norm at each physical layer boundary (a layer's first norm, the
+    # final norm): the fused add+norm kernel, or a bf16 `hidden + residual`
+    # materialized first as the trainer does.
+    layer_boundary_norm: str = "fused"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -661,6 +666,11 @@ class ServerArgs:
             raise ValueError(
                 f"--mla-lora-scale must be one of {list(MLA_LORA_SCALES)}, got "
                 f"{self.mla_lora_scale!r}"
+            )
+        if self.layer_boundary_norm not in LAYER_BOUNDARY_NORMS:
+            raise ValueError(
+                "--layer-boundary-norm must be one of "
+                f"{list(LAYER_BOUNDARY_NORMS)}, got {self.layer_boundary_norm!r}"
             )
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
@@ -1060,16 +1070,21 @@ class ServerArgs:
         Runs after ``resolve_communication`` so it can veto the fused
         all-reduce that resolver auto-enables.
         """
-        if self.numerics == "auto":
-            return
-        if self.numerics not in NUMERICS_ENVELOPES:
-            raise ValueError(
-                f"--numerics must be one of {list(NUMERICS_ENVELOPES)}, got "
-                f"{self.numerics!r}"
-            )
-        self._resolve_rl_bitwise()
-        if self.numerics == "trainer-aligned":
-            self._resolve_trainer_aligned()
+        if self.numerics != "auto":
+            if self.numerics not in NUMERICS_ENVELOPES:
+                raise ValueError(
+                    f"--numerics must be one of {list(NUMERICS_ENVELOPES)}, got "
+                    f"{self.numerics!r}"
+                )
+            self._resolve_rl_bitwise()
+            if self.numerics == "trainer-aligned":
+                self._resolve_trainer_aligned()
+        # Individual switches that veto a fusion resolve_communication may
+        # have auto-enabled, whatever the envelope.
+        if self.layer_boundary_norm == "unfused":
+            # The fused all-reduce+norm kernels add the residual inside the
+            # fusion; the unfused boundary norm needs the bf16 sum first.
+            self.enable_allreduce_fusion = False
 
     def _resolve_rl_bitwise(self):
         """The rl-bitwise block: every envelope beyond auto runs it."""
@@ -1125,6 +1140,9 @@ class ServerArgs:
         self.yarn_ramp_mask_device = "cpu"
         # The trainer multiplies the LoRA norm scales as separate bf16 ops.
         self.mla_lora_scale = "runtime"
+        # The trainer materializes each layer's bf16 output before the next
+        # layer's norm reads it.
+        self.layer_boundary_norm = "unfused"
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -2810,6 +2828,19 @@ class ServerArgs:
             "after q_b_proj and after kv_a_layernorm, as the trainer does; the "
             "norm weights are never rewritten and the DSA indexer reads the "
             "unscaled q_lora. Folded to runtime by --numerics trainer-aligned.",
+        )
+        parser.add_argument(
+            "--layer-boundary-norm",
+            type=str,
+            choices=list(LAYER_BOUNDARY_NORMS),
+            default=ServerArgs.layer_boundary_norm,
+            help="The norm at each physical layer boundary (a layer's first "
+            "norm and the final norm). 'fused': the fused add+norm kernel, "
+            "whose residual sum stays fp32 into the norm. 'unfused': "
+            "hidden + residual is materialized in bf16 first, then a "
+            "standalone RMSNorm, as the trainer does; all-reduce+norm fusion "
+            "is vetoed with it. Folded to unfused by --numerics "
+            "trainer-aligned.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

@@ -126,6 +126,23 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--mla-lora-scale"):
             ServerArgs(model="x", mla_lora_scale="both")
 
+    def test_trainer_aligned_unfuses_the_layer_boundary_norm(self):
+        self.assertEqual(ServerArgs(model="x").layer_boundary_norm, "fused")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm, "fused"
+        )
+        self.assertEqual(
+            ServerArgs(model="x", numerics="trainer-aligned").layer_boundary_norm,
+            "unfused",
+        )
+        # On its own, under auto, it still vetoes the fused all-reduce+norm.
+        args = ServerArgs(
+            model="x", layer_boundary_norm="unfused", enable_allreduce_fusion=True
+        )
+        self.assertFalse(args.enable_allreduce_fusion)
+        with self.assertRaisesRegex(ValueError, "--layer-boundary-norm"):
+            ServerArgs(model="x", layer_boundary_norm="half")
+
     def test_bitwise_envelopes_cover_every_pinning_envelope(self):
         from tokenspeed.runtime.configs.numerics import (
             BITWISE_ENVELOPES,
