@@ -227,12 +227,20 @@ class TestNextNModelFilters(unittest.TestCase):
 
         inner = object.__new__(KimiK3NextNForCausalLM)
         inner.config = SimpleNamespace(num_hidden_layers=48)
+        # A single stage (or a pipeline's last) holds the draft; a stage
+        # before the last is an empty shell that accepts nothing.
+        inner.is_draft_stage = True
         self.assertTrue(
             inner.checkpoint_weight_name_filter("model.layers.48.eh_proj.weight")
         )
         self.assertFalse(
             inner.checkpoint_weight_name_filter("model.layers.47.mlp.gate.weight")
         )
+        inner.is_draft_stage = False
+        self.assertFalse(
+            inner.checkpoint_weight_name_filter("model.layers.48.eh_proj.weight")
+        )
+        inner.is_draft_stage = True
 
         wrapper = object.__new__(KimiK3ForConditionalGenerationNextN)
         # Bypass nn.Module.__setattr__: the wrapper is deliberately not

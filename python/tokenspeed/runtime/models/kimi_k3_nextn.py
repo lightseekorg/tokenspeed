@@ -289,7 +289,14 @@ class KimiK3ModelNextN(nn.Module):
 
 
 class KimiK3NextNForCausalLM(nn.Module):
-    """Text-side NextN causal LM (draft worker)."""
+    """Text-side NextN causal LM (draft worker).
+
+    On a prefill chunk pipeline only the last stage samples, so it alone runs
+    the drafter: the other stages build an empty shell that loads nothing and
+    never forwards. The last stage keeps the checkpoint's ``embed_tokens``
+    shard (the target embedding lives on the first stage) and shares only
+    the target's head; off the pipeline both are shared from the target.
+    """
 
     def __init__(
         self,
@@ -302,6 +309,15 @@ class KimiK3NextNForCausalLM(nn.Module):
         self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
+        self.is_draft_stage: bool = not mapping.has_pp or mapping.is_last_pp_rank
+        # Pipeline stages read different checkpoint subsets (the shell reads
+        # none), so a distributed loader synchronizes within the stage only.
+        self.checkpoint_load_group = mapping.attn.tp_group if mapping.has_pp else None
+        self.model: KimiK3ModelNextN | None = None
+        self.lm_head: nn.Module | None = None
+        self.logits_processor: nn.Module | None = None
+        if not self.is_draft_stage:
+            return
         self.model = KimiK3ModelNextN(
             config, mapping, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -329,18 +345,34 @@ class KimiK3NextNForCausalLM(nn.Module):
             tp_group=mapping.attn.tp_group,
         )
 
+    def _require_draft_stage(self) -> KimiK3ModelNextN:
+        if self.model is None:
+            raise RuntimeError(
+                "Kimi-K3 NextN runs on the last pipeline stage only; stage "
+                f"{self.mapping.pp_rank} holds an empty draft shell."
+            )
+        return self.model
+
     def get_input_embeddings(self) -> nn.Module:
-        return self.model.embed_tokens
+        return self._require_draft_stage().embed_tokens
 
     def get_hot_token_id(self):
         return None
 
     def set_embed_and_head(self, embed, head):
-        # DeepSeek MTP convention: the draft shares the target's embedding
-        # and lm head (the checkpoint's per-layer copies are skipped).
-        del self.model.embed_tokens.weight
+        """Alias the target's weights; ``embed=None`` keeps the checkpoint shard.
+
+        DeepSeek MTP convention: the draft shares the target's embedding and
+        lm head, dropping the checkpoint's per-layer copies. A pipeline's last
+        stage has no target embedding to share (it lives on the first stage),
+        so it passes ``embed=None`` and the draft keeps the shard it loaded
+        (``load_weights`` rejects a pipeline checkpoint without one).
+        """
+        model = self._require_draft_stage()
+        if embed is not None:
+            del model.embed_tokens.weight
+            model.embed_tokens.weight = embed
         del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -352,7 +384,7 @@ class KimiK3NextNForCausalLM(nn.Module):
         positions: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states, _ = self.model(
+        hidden_states, _ = self._require_draft_stage()(
             input_ids,
             positions,
             ctx,
@@ -367,11 +399,18 @@ class KimiK3NextNForCausalLM(nn.Module):
         """Shard preselection for ``load_weights`` (see DefaultModelLoader).
 
         Accepts a superset of the checkpoint names ``load_weights`` consumes:
-        everything under the NextN layer prefix.
+        everything under the NextN layer prefix. A pipeline stage without the
+        draft accepts nothing, so its shards are neither read nor prefetched.
         """
+        if not self.is_draft_stage:
+            return False
         return name.startswith(f"model.layers.{self.config.num_hidden_layers}.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        if not self.is_draft_stage:
+            # An empty shell: do not consume the lazy checkpoint iterator or
+            # join its collectives, and there is nothing to post-process.
+            return
         config = self.config
         nextn_prefix = f"model.layers.{config.num_hidden_layers}."
         stacked_params_mapping = [
@@ -388,6 +427,7 @@ class KimiK3NextNForCausalLM(nn.Module):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
         )
+        embed_tokens_loaded = False
 
         for name, loaded_weight in weights:
             if not name.startswith(nextn_prefix):
@@ -461,11 +501,21 @@ class KimiK3NextNForCausalLM(nn.Module):
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                if name == "model.embed_tokens.weight":
+                    embed_tokens_loaded = True
 
+        if self.mapping.has_pp and not embed_tokens_loaded:
+            # Off the pipeline the target's embedding replaces this shard, so
+            # a checkpoint without one is harmless there; the pipeline's last
+            # stage drafts with it.
+            raise ValueError(
+                "Kimi-K3 NextN on a pipeline needs the checkpoint's "
+                f"model.layers.{config.num_hidden_layers}.embed_tokens.weight"
+            )
         self.post_load_weights()
 
     def post_load_weights(self) -> None:
-        attn = self.model.decoder.self_attn
+        attn = self._require_draft_stage().decoder.self_attn
         attn.w_kc, attn.w_vc = _prepare_mla_kv_b_proj_weights(
             attn.kv_b_proj.weight, attn
         )
@@ -487,6 +537,9 @@ class KimiK3ForConditionalGenerationNextN(nn.Module):
         self.language_model = KimiK3NextNForCausalLM(
             text_config, mapping, quant_config, prefix=prefix
         )
+        # The loader reads the stage's checkpoint subset contract off the
+        # entry module; a pipeline stage without the draft holds a shell.
+        self.checkpoint_load_group = self.language_model.checkpoint_load_group
         self.logits_processor = self.language_model.logits_processor
         self.lm_head = self.language_model.lm_head
 
