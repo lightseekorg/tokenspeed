@@ -18,24 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compatibility interface for the original experimental Lamport A2A API.
+"""NVIDIA CUDA communication kernels with caller-managed persistent state.
 
-New callers should import ``TokenSpeedA2ALamportState`` and
-``tokenspeed_a2a_lamport`` from ``tokenspeed_kernel.ops.communication.cuda``.
+The Lamport A2A APIs exchange TP4 BF16 channel shards directly, optionally
+quantizing received 128-element groups for a prepared FP8 GEMM. Callers must
+construct the state collectively before CUDA-graph capture, serialize calls
+and consumers on one stream, pad empty owners so every peer participates, and
+select any fallback outside this module. Returned buffers are borrowed until
+the next call unless an explicit destination is supplied.
 """
 
-from tokenspeed_kernel.ops.communication.cuda import (
+from tokenspeed_kernel.ops.communication._cuda.lamport_a2a import (
     TokenSpeedA2ALamportState,
     tokenspeed_a2a_lamport,
+    tokenspeed_a2a_lamport_fp8_quantize,
 )
 
-CudaLamportA2AState = TokenSpeedA2ALamportState
-
-
-def cuda_lamport_a2a(state, inputs, inverse):
-    """Run the original borrowed-output API through the maintained kernel."""
-
-    return tokenspeed_a2a_lamport(state, inputs, inverse, out=None)
-
-
-__all__ = ["CudaLamportA2AState", "cuda_lamport_a2a"]
+__all__ = [
+    "TokenSpeedA2ALamportState",
+    "tokenspeed_a2a_lamport",
+    "tokenspeed_a2a_lamport_fp8_quantize",
+]

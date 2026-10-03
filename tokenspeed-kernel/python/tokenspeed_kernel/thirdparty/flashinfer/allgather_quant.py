@@ -18,24 +18,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compatibility interface for the original experimental Lamport A2A API.
+"""Optional JIT extension of the vendored TRT-LLM Lamport AllGather protocol."""
 
-New callers should import ``TokenSpeedA2ALamportState`` and
-``tokenspeed_a2a_lamport`` from ``tokenspeed_kernel.ops.communication.cuda``.
-"""
-
-from tokenspeed_kernel.ops.communication.cuda import (
-    TokenSpeedA2ALamportState,
-    tokenspeed_a2a_lamport,
-)
-
-CudaLamportA2AState = TokenSpeedA2ALamportState
+from functools import cache
+from pathlib import Path
 
 
-def cuda_lamport_a2a(state, inputs, inverse):
-    """Run the original borrowed-output API through the maintained kernel."""
+@cache
+def load_allgather_quant_module():
+    """Compile before graph capture; leave the installed AOT library untouched."""
+    from flashinfer.jit.core import gen_jit_spec
 
-    return tokenspeed_a2a_lamport(state, inputs, inverse, out=None)
-
-
-__all__ = ["CudaLamportA2AState", "cuda_lamport_a2a"]
+    root = Path(__file__).resolve().parent
+    return gen_jit_spec(
+        "tokenspeed_allgather_fp8_quant_v1",
+        [root / "allgather_quant.cu"],
+        extra_include_paths=[root.parent, root.parent / "cuda" / "csrc"],
+    ).build_and_load()

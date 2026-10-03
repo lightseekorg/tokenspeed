@@ -192,6 +192,13 @@ def _validate_flashinfer_fp8_blockscale_prepacked(
 
     expected_a_scales = (A.shape[1] // 128, A.shape[0])
     expected_b_scales = (B.shape[1] // 128, B.shape[0] // 128)
+    if (
+        A_scales.dtype != torch.float32
+        or B_scales.dtype != torch.float32
+        or A_scales.device != A.device
+        or B_scales.device != B.device
+    ):
+        raise ValueError("Prepacked scales must be FP32 on their operand's device")
     if tuple(A_scales.shape) != expected_a_scales or not A_scales.is_contiguous():
         raise ValueError(
             "prepacked activation scales must be contiguous with shape "
@@ -260,16 +267,26 @@ if gemm_fp8_nt_groupwise is not error_fn:
                 orig_m,
                 block_size,
             )
+            # A padded GEMM must not write past the caller's unpadded output.
+            # Aligned projection batches can write straight into communication
+            # scratch; strided or padded destinations retain the copy fallback.
+            direct_out = (
+                out is not None
+                and out.is_contiguous()
+                and out.shape == (A.shape[0], B.shape[0])
+                and orig_m == A.shape[0]
+            )
             output = gemm_fp8_nt_groupwise(
                 A,
                 B,
                 A_scales,
                 B_scales,
                 scale_major_mode="MN",
+                out=out if direct_out else None,
                 out_dtype=out_dtype,
             )
             output = output[:orig_m] if output.shape[0] != orig_m else output
-            if out is not None:
+            if out is not None and not direct_out:
                 out.copy_(output)
                 return out
             return output

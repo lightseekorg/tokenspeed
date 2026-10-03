@@ -18,24 +18,4 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compatibility interface for the original experimental Lamport A2A API.
-
-New callers should import ``TokenSpeedA2ALamportState`` and
-``tokenspeed_a2a_lamport`` from ``tokenspeed_kernel.ops.communication.cuda``.
-"""
-
-from tokenspeed_kernel.ops.communication.cuda import (
-    TokenSpeedA2ALamportState,
-    tokenspeed_a2a_lamport,
-)
-
-CudaLamportA2AState = TokenSpeedA2ALamportState
-
-
-def cuda_lamport_a2a(state, inputs, inverse):
-    """Run the original borrowed-output API through the maintained kernel."""
-
-    return tokenspeed_a2a_lamport(state, inputs, inverse, out=None)
-
-
-__all__ = ["CudaLamportA2AState", "cuda_lamport_a2a"]
+"""Private NVIDIA CUDA communication implementations."""
