@@ -136,12 +136,20 @@ and only the reported log-probabilities change.
 
 | Switch | Trainer form | Changes |
 | --- | --- | --- |
-| `--sampling-stream per-request` | Non-greedy rows draw from a Philox stream keyed by `(request seed, position)` only (`sampling.deterministic` above); the trainer plays back the sampled ids, so this is an invariance switch the envelope needs for T>0 rollouts | tokens at T>0 (not logprobs) |
+| `--sampling-stream per-request` | Non-greedy rows draw from a Philox stream keyed by `(request seed, position)` only (`sampling.deterministic` above); the trainer plays back the sampled ids, so this is an invariance switch both bitwise envelopes fold — T>0 rollouts need it | tokens at T>0 (not logprobs) |
 | `--yarn-ramp-mask-device cpu` | The YaRN linear ramp mask of `deepseek_yarn` RoPE is computed on the host and copied to the device, as the trainer builds its `inv_freq` on the host; CPU and CUDA division round differently at ulp level, and every rotated q/k inherits the difference | forward values |
 | `--mla-lora-scale runtime` | The `sqrt(hidden / lora_rank)` norm scales of LongCat-style MLA stay out of the `q_a_layernorm` / `kv_a_layernorm` weights and multiply `q` after `q_b_proj` and the latent after `kv_a_layernorm` in bf16, as the trainer does; the DSA indexer reads the unscaled `q_lora` | forward values |
 | `--layer-boundary-norm unfused` | The norm that opens each physical layer and the final norm read a bf16 `hidden + residual` materialized first (`residual = hidden`), then a standalone RMSNorm, instead of the fused add+norm kernel whose sum stays fp32; all-reduce+norm fusion is vetoed with it | forward values |
 | `--router-topk torch` | The correction-bias router runs fp32 `torch.softmax`, `torch.topk(probs + bias, sorted=True)` (PyTorch tie order), weights = unbiased probs x `routed_scaling_factor`, zero experts (`id >= num_real`) become `-1` and keep their weight for the identity residual | forward values (expert selection at near-ties, weights) |
-| `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (pairwise tile tree, then a rank-ordered fp32 left fold across blocks), `logp = -(log(sum_exp) - target)`, for output and prompt (input) logprobs alike | logprobs only |
+| `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (the in-block tree is the registered `sampling.block_sumexp` leaf's; the fold across blocks is a rank-ordered fp32 left fold), `logp = -(log(sum_exp) - target)`, for output and prompt (input) logprobs alike | logprobs only |
+
+These are the switches the host can mirror with no new vendor dependency.
+The rest of the trainer's form lives in kernel leaves and model code the host
+does not own and is the out-of-tree model's part of the bargain: a
+`sampling.block_sumexp` leaf with the trainer's in-block order, MoE experts
+that apply the routing probabilities inside the activation and combine the
+zero-expert residual in fp32 slot order, BF16 index-K indexer scoring and
+top-k leaves, and the same LoRA-scale placement in the draft model.
 
 Trainer alignment is a stronger claim than invariance and cannot be checked
 by the engine alone: a model earns `trainer-aligned` in
@@ -238,16 +246,46 @@ already) and drafts stay trivially placed.
 
 ## Acceptance
 
-The envelope is verified end to end, not per switch: the invariance harness
-generates with returned logprobs for the same prompts (a) alone at bs=1,
-(b) packed with random co-batches, (c) across repeated runs, and asserts
-`torch.equal` on token ids and logprobs — base model and speculative decoding
-each. A deployment that passes the harness may advertise the rl-bitwise
-contract; one that fails it has a bug, not a tolerance.
+An envelope is verified end to end, not per switch. For `rl-bitwise` the
+invariance harness generates with returned logprobs for the same prompts
+(a) alone at bs=1, (b) packed with random co-batches, (c) across repeated
+runs, and asserts `torch.equal` on token ids and logprobs — base model and
+speculative decoding each, greedy and at `temperature=1.0` with fixed seeds
+(the T>0 case is what `sampling_stream=per-request` exists for). A
+deployment that passes the harness may advertise the rl-bitwise contract;
+one that fails it has a bug, not a tolerance.
+
+`trainer-aligned` is earned against a second program, so its harness has a
+reference the engine does not produce: a **trainer dump**. For a fixed prompt
+set (the invariance prompts plus longer, chat-formatted ones), the trainer
+runs its forward over each `prompt + response` sequence and records, per
+sequence:
+
+```
+ids          int64[T]       prompt followed by response token ids
+logprob      float32[T-1]   log p(ids[t+1] | ids[:t+1]) at every position,
+                            from the trainer's own log-softmax
+layout       str            the trainer's TP/PP/EP factorization and dtype
+commit       str            trainer commit that produced the dump
+```
+
+(an optional `logits[:8, :]` of the first positions helps bisect a
+mismatch to a layer). The engine then teacher-forces the same `ids` under
+`--numerics trainer-aligned` with `return_logprob, logprob_start_len=0` and
+asserts `torch.equal` on the fp32 `input_token_logprobs` vector, reporting
+the first divergent position otherwise. Two self-consistency checks ride
+along: the response part of the teacher-forced `input_token_logprobs` must
+equal the `output_token_logprobs` the engine reported while generating that
+response, and the result must hold alone and packed exactly as for
+rl-bitwise. Agreement up to a tolerance is a finding to bisect, not a pass.
+The portable `block_sumexp` leaf and the vendor leaf reproducing the
+trainer's in-block order differ at ulp level, so the vendor leaf is what
+the comparison runs with.
 
 The pins above cover only the paths a verified model takes, so the
 verification is recorded per model and enforced at startup: a model profile
-lists the envelopes its model passes in `ModelProfile.numerics_envelopes`,
+lists the envelopes its model passes in `ModelProfile.numerics_envelopes`
+(`trainer-aligned` only after the teacher-forced comparison passes for it),
 and launching an envelope other than `auto` refuses any target or draft
 model that does not list it — every in-tree model included, since none has
 a profile. Quantized checkpoints are refused too: no batch-invariant
