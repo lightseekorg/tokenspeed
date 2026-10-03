@@ -347,7 +347,7 @@ class _RuntimeLongcatMoE(nn.Module):
         # --moe-combine-order (docs/design/numerics.md): under "slot" the MoE
         # leaf folds a token's slots across the EP group itself, identity
         # zero-expert residual included, so this module hands it the raw
-        # top-k and adds nothing, and the decoder layer skips post_moe_comm.
+        # top-k and adds nothing (post_moe_comm then reduces nothing either).
         self.combine_order: str = self.experts.combine_order
         self.topk = _TopK(
             top_k=config.moe_topk,
@@ -700,19 +700,11 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             num_global_tokens,
             max_num_tokens_per_gpu,
         )
-        if self.mlp.combine_order == "slot":
-            # The leaf returned the EP-combined rows: nothing to reduce.
-            hidden_states, residual = self.moe_comm.post_moe_combined(
-                hidden_states,
-                residual,
-                ctx,
-            )
-        else:
-            hidden_states, residual = self.moe_comm.post_mlp_fused(
-                hidden_states,
-                residual,
-                ctx,
-            )
+        hidden_states, residual = self.moe_comm.post_mlp_fused(
+            hidden_states,
+            residual,
+            ctx,
+        )
         hidden_states = self._to_dense_rows(hidden_states, ctx)
         return hidden_states, residual
 

@@ -126,6 +126,9 @@ class CommManager:
         # --layer-boundary-norm: how input_reduce_norm and final_norm add the
         # residual (docs/design/numerics.md, alignment.trainer).
         self.layer_boundary_norm: str = global_server_args_dict["layer_boundary_norm"]
+        # --moe-combine-order: whether the MoE leaf already combined the routed
+        # output across the MoE TP-EP group (post_moe_comm).
+        self.moe_combine_order: str = global_server_args_dict["moe_combine_order"]
 
     # ---- Scattered token counts ----
 
@@ -371,8 +374,25 @@ class CommManager:
     def post_moe_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
+        """Bring the routed-expert output back to this rank's layout.
+
+        Under ``--moe-combine-order rank`` the MoE leaf returned this rank's
+        partial and the group sums them here (all-reduce, or reduce-scatter
+        in the RSAG layout). Under ``slot`` the leaf already folded every
+        token's slots across the EP group, so the rows are complete on every
+        rank and nothing is reduced; in the RSAG layout this rank still takes
+        back its own token rows, as the reduce-scatter would have.
+        """
         if not self.mapping.moe.has_tp_ep:
             return hidden_states, residual
+
+        if self.moe_combine_order == "slot":
+            if self.use_all_reduce(is_moe=True):
+                return hidden_states, residual
+            token_list = self.moe_tp_ep_group_scattered_num_tokens(ctx)
+            offset = sum(token_list[: self.mapping.moe.tp_ep_rank])
+            own = token_list[self.mapping.moe.tp_ep_rank]
+            return hidden_states[offset : offset + own], residual
 
         if self.use_all_reduce(is_moe=True):
             hidden_states = all_reduce(hidden_states, self.mapping.moe.tp_ep_group)
@@ -383,20 +403,6 @@ class CommManager:
             scattered_num_tokens=self.moe_tp_ep_group_scattered_num_tokens(ctx),
         )
         return hidden_states, residual
-
-    def post_moe_combined(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
-    ):
-        """After a MoE leaf that already combined the expert outputs across the
-        MoE TP-EP group (``--moe-combine-order slot``): no reduction, since the
-        rows are complete on every rank; in the RSAG layout this rank still
-        takes back its own token rows, as the reduce-scatter would have."""
-        if not self.mapping.moe.has_tp_ep or self.use_all_reduce(is_moe=True):
-            return hidden_states, residual
-        token_list = self.moe_tp_ep_group_scattered_num_tokens(ctx)
-        offset = sum(token_list[: self.mapping.moe.tp_ep_rank])
-        own = token_list[self.mapping.moe.tp_ep_rank]
-        return hidden_states[offset : offset + own], residual
 
     def needs_final_all_gather(self) -> bool:
         """Whether the model output must gather the final layer's rows."""
@@ -426,8 +432,18 @@ class CommManager:
         )
 
     def should_fuse(self, num_tokens: int) -> bool:
+        """Whether this launch's fused all-reduce+norm kernel runs here.
+
+        The trainer-order switches veto it at the point that relies on the
+        veto, not only in ``resolve_numerics``: the unfused boundary norm needs
+        the bf16 ``hidden + residual`` materialized first, and the slot-order
+        MoE combine returns complete rows a fused all-reduce would sum
+        ``tp_size`` times.
+        """
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
+        if self.layer_boundary_norm == "unfused" or self.moe_combine_order == "slot":
+            return False
         return (
             self.use_all_reduce_norm_fusion()
             and num_tokens > 0

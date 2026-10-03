@@ -55,6 +55,7 @@ class StubNorm:
 
 def _manager(mode: str, monkeypatch, norm: StubNorm) -> CommManager:
     monkeypatch.setitem(global_server_args_dict, "layer_boundary_norm", mode)
+    monkeypatch.setitem(global_server_args_dict, "moe_combine_order", "rank")
     monkeypatch.setitem(global_server_args_dict, "enable_allreduce_fusion", False)
     mapping = SimpleNamespace(
         has_attn_tp=False,
@@ -140,3 +141,26 @@ def test_final_norm_follows_the_switch(monkeypatch):
     manager = _manager("fused", monkeypatch, norm)
     manager.final_norm(hidden.clone(), residual.clone(), ctx, norm)
     assert norm.calls == [2]
+
+
+def test_unfused_vetoes_the_fused_all_reduce_norm_where_it_is_relied_upon(
+    monkeypatch,
+):
+    # Even with the fusion flag left on and a TP topology that would fuse,
+    # should_fuse itself says no: the unfused boundary norm needs the bf16
+    # sum materialized first.
+    monkeypatch.setitem(global_server_args_dict, "moe_combine_order", "rank")
+    monkeypatch.setitem(global_server_args_dict, "comm_fusion_max_num_tokens", 1024)
+    mapping = SimpleNamespace(
+        has_attn_tp=True,
+        attn=SimpleNamespace(tp_rank=0, tp_group=(0, 1), tp_size=2, dp_size=1),
+        dense=SimpleNamespace(tp_size=2),
+        moe=SimpleNamespace(tp_ep_size=2),
+    )
+    for mode, fuses in (("fused", True), ("unfused", False)):
+        monkeypatch.setitem(global_server_args_dict, "layer_boundary_norm", mode)
+        monkeypatch.setitem(global_server_args_dict, "enable_allreduce_fusion", True)
+        manager = CommManager(
+            mapping=mapping, layer_id=1, is_moe=False, prev_is_moe=False
+        )
+        assert manager.should_fuse(4) is fuses, mode

@@ -542,8 +542,6 @@ class TestLongcatRowLayout(unittest.TestCase):
             rows_seen["moe"] = hidden.shape[0]
             return hidden
 
-        # The rank-order combine: the layer reduces the MoE partial itself.
-        moe.combine_order = "rank"
         layer.mlp = moe
         layer._init_comm()
         return layer

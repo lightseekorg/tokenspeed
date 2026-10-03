@@ -18,11 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``CommManager.post_moe_combined``: after a slot-order MoE leaf, no reduction.
+"""``CommManager.post_moe_comm`` under ``--moe-combine-order slot``: no reduction.
 
-The leaf already holds the complete routed rows on every rank; the host must
-not sum them again. In the RSAG layout the reduce-scatter also handed each
-rank its own token rows, so that slice still happens.
+The slot-order MoE leaf already holds the complete routed rows on every rank;
+the one MoE reduction point must not sum them again, whichever model runs the
+layer. In the RSAG layout the reduce-scatter also handed each rank its own
+token rows, so that slice still happens; and the fused all-reduce+norm that
+``post_mlp_fused`` would otherwise defer to is vetoed by ``should_fuse``.
 """
 
 from __future__ import annotations
@@ -37,9 +39,20 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
-def _manager(monkeypatch, *, attn_tp_size: int, tp_ep_size: int, tp_ep_rank: int):
+def _manager(
+    monkeypatch,
+    *,
+    attn_tp_size: int,
+    tp_ep_size: int,
+    tp_ep_rank: int,
+    combine_order: str = "slot",
+):
     monkeypatch.setitem(global_server_args_dict, "layer_boundary_norm", "fused")
-    monkeypatch.setitem(global_server_args_dict, "enable_allreduce_fusion", False)
+    monkeypatch.setitem(global_server_args_dict, "moe_combine_order", combine_order)
+    # As if resolve_communication had auto-enabled the fusion and nothing
+    # upstream had vetoed it: the manager must veto it itself.
+    monkeypatch.setitem(global_server_args_dict, "enable_allreduce_fusion", True)
+    monkeypatch.setitem(global_server_args_dict, "comm_fusion_max_num_tokens", 1024)
     mapping = SimpleNamespace(
         has_attn_tp=attn_tp_size > 1,
         attn=SimpleNamespace(
@@ -82,7 +95,7 @@ def test_all_reduce_layout_returns_the_rows_untouched(monkeypatch):
         input_num_tokens=6,
     )
 
-    out, out_residual = manager.post_moe_combined(rows, residual, ctx)
+    out, out_residual = manager.post_mlp_fused(rows, residual, ctx)
 
     assert out is rows and out_residual is residual
 
@@ -104,8 +117,38 @@ def test_rsag_layout_takes_back_this_ranks_rows(monkeypatch, rank):
         input_num_tokens=counts[rank],
     )
 
-    out, out_residual = manager.post_moe_combined(rows, residual, ctx)
+    out, out_residual = manager.post_mlp_fused(rows, residual, ctx)
 
     start = sum(counts[:rank])
     assert torch.equal(out, rows[start : start + counts[rank]])
     assert out_residual is residual
+
+
+def test_rank_order_still_reduces_and_slot_order_vetoes_the_fusion(monkeypatch):
+    reduced = []
+    monkeypatch.setattr(
+        comm_manager_module,
+        "all_reduce",
+        lambda rows, group: reduced.append(group) or rows * 2,
+    )
+    ctx = SimpleNamespace(
+        collective_global_num_tokens=None,
+        global_num_tokens=None,
+        collective_num_tokens=None,
+        input_num_tokens=6,
+    )
+    rows = torch.ones(6, 2)
+
+    rank = _manager(
+        monkeypatch, attn_tp_size=4, tp_ep_size=4, tp_ep_rank=1, combine_order="rank"
+    )
+    # Under "rank" the fused all-reduce+norm is allowed (post_mlp_fused then
+    # leaves the reduction to the next norm) and post_moe_comm reduces.
+    assert rank.should_fuse(6)
+    out, _ = rank.post_moe_comm(rows, None, ctx)
+    assert reduced == [(0, 1, 2, 3)] and torch.equal(out, rows * 2)
+
+    slot = _manager(monkeypatch, attn_tp_size=4, tp_ep_size=4, tp_ep_rank=1)
+    assert not slot.should_fuse(6)
+    out, _ = slot.post_moe_comm(rows, None, ctx)
+    assert out is rows and len(reduced) == 1
