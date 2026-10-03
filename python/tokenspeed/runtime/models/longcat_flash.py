@@ -219,6 +219,11 @@ class _RuntimeLongcatMoE(nn.Module):
         self.zero_expert_num = config.zero_expert_num
         self.zero_expert_type = config.zero_expert_type
         self.routed_scaling_factor = config.routed_scaling_factor
+        # The routed output leaves this module as one partial per MoE TP-EP
+        # rank and post_moe_comm sums the group (all-reduce or reduce-scatter),
+        # so the identity zero-expert residual, which every rank could compute
+        # from its replicated input, must enter exactly one partial.
+        self.adds_zero_expert_residual: bool = self.mapping.moe.tp_ep_rank == 0
         self.stream_fork = _StreamFork(alt_stream)
 
         if self.mapping.moe.ep_size > config.n_routed_experts:
@@ -292,6 +297,14 @@ class _RuntimeLongcatMoE(nn.Module):
         ]
 
     def _apply_zero_experts(self, hidden_states: torch.Tensor, topk_output):
+        """Mask the zero-expert slots out of the routing and return this rank's
+        share of the identity residual (None when it adds none).
+
+        The residual ``hidden * sum(zero-slot weights)`` is added to the routed
+        partial BEFORE post_moe_comm sums the partials over the MoE TP-EP
+        group, so only one rank (``adds_zero_expert_residual``) materializes
+        it; the others contribute exactly 0 and the reduction counts it once.
+        """
         if self.zero_expert_num <= 0:
             return None
 
@@ -309,6 +322,8 @@ class _RuntimeLongcatMoE(nn.Module):
         topk_output.topk_weights[zero_expert_mask] = 0.0
 
         if self.zero_expert_type in ("identity", "copy"):
+            if not self.adds_zero_expert_residual:
+                return None
             zero_weight = zero_expert_weights.sum(dim=-1, keepdim=True).to(
                 hidden_states.dtype
             )
@@ -357,6 +372,8 @@ class _RuntimeLongcatMoE(nn.Module):
             )
 
         if zero_expert_output is not None:
+            # Pre-reduction add: the caller's post_moe_comm sums this partial
+            # with the other MoE TP-EP ranks', which hold None here.
             routed_expert_output = routed_expert_output + zero_expert_output
         return routed_expert_output
 

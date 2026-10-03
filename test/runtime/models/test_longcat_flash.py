@@ -103,21 +103,31 @@ class TestLongcatMixedFp8Config(unittest.TestCase):
             )
 
 
+def _zero_expert_moe(*, adds_residual: bool) -> _RuntimeLongcatMoE:
+    moe = object.__new__(_RuntimeLongcatMoE)
+    moe.zero_expert_num = 1
+    moe.n_routed_experts = 3
+    moe.zero_expert_type = "identity"
+    moe.adds_zero_expert_residual = adds_residual
+    return moe
+
+
+def _zero_expert_topk() -> StandardTopKOutput:
+    return StandardTopKOutput(
+        topk_weights=torch.tensor([[0.25, 0.75], [0.5, 0.5]]),
+        topk_ids=torch.tensor([[0, -1], [3, 1]]),
+        router_logits=torch.zeros(2, 4),
+    )
+
+
 class TestLongcatZeroExpert(unittest.TestCase):
     def test_identity_zero_expert_masks_and_adds_hidden_state(self):
-        moe = object.__new__(_RuntimeLongcatMoE)
-        moe.zero_expert_num = 1
-        moe.n_routed_experts = 3
-        moe.zero_expert_type = "identity"
+        moe = _zero_expert_moe(adds_residual=True)
         hidden_states = torch.tensor(
             [[2.0, 4.0], [6.0, 8.0]],
             dtype=torch.float32,
         )
-        topk_output = StandardTopKOutput(
-            topk_weights=torch.tensor([[0.25, 0.75], [0.5, 0.5]]),
-            topk_ids=torch.tensor([[0, -1], [3, 1]]),
-            router_logits=torch.zeros(2, 4),
-        )
+        topk_output = _zero_expert_topk()
 
         zero_output = _RuntimeLongcatMoE._apply_zero_experts(
             moe,
@@ -129,6 +139,26 @@ class TestLongcatZeroExpert(unittest.TestCase):
             zero_output,
             torch.tensor([[1.5, 3.0], [3.0, 4.0]]),
         )
+        torch.testing.assert_close(
+            topk_output.topk_weights,
+            torch.tensor([[0.25, 0.0], [0.0, 0.5]]),
+        )
+        torch.testing.assert_close(
+            topk_output.topk_ids,
+            torch.tensor([[0, 0], [0, 1]]),
+        )
+
+    def test_residual_enters_one_partial_of_the_moe_group(self):
+        # post_moe_comm sums the per-rank partials, so a rank other than the
+        # designated one masks the slots but adds nothing.
+        moe = _zero_expert_moe(adds_residual=False)
+        topk_output = _zero_expert_topk()
+
+        zero_output = _RuntimeLongcatMoE._apply_zero_experts(
+            moe, torch.ones(2, 2), topk_output
+        )
+
+        self.assertIsNone(zero_output)
         torch.testing.assert_close(
             topk_output.topk_weights,
             torch.tensor([[0.25, 0.0], [0.0, 0.5]]),
