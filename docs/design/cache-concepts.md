@@ -980,6 +980,16 @@ ratio limit through `max_padding_fraction`; the common packer still validates
 field geometry, strides and block-size limits, and the profiled byte budget
 still bounds capacity. Grouping, packing and allocation are unchanged.
 
+Hybrid recurrent recipes keep their groups balanced instead: every group's page
+spans the whole parent, so a parent is fully used only when every group fills
+the same planes. Qwen3.5 groups state layers by position within its fixed
+state-state-state-full period. Nemotron-H's Mamba2 runs are four or five layers
+long, so its recipe deals state layers round-robin instead and splits the
+attention layers into two KV groups whose K and V pages pack to the size of
+one SSM state; `recipes/mamba2.py` documents the layout. State pages carry no
+padding; KV pages pad only by their share of the conv planes, about 1.5% for
+Nemotron-3 Super.
+
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
 

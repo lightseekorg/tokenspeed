@@ -149,6 +149,7 @@ def test_flashinfer_mxfp8_matches_triton_on_identical_operands(
 
 @requires_flashinfer_mxfp8
 def test_flashinfer_mxfp8_selected_with_online_quant(device: str) -> None:
+    from flashinfer import autotune
     from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
     from tokenspeed_kernel.selection import select_kernel
     from tokenspeed_kernel.signature import (
@@ -191,14 +192,16 @@ def test_flashinfer_mxfp8_selected_with_online_quant(device: str) -> None:
 
     # Production layout: bf16 activations (online ue8m0 quant inside mm),
     # weight scales pre-swizzled at load time.
-    out = mm(
-        a,
-        b_q,
-        B_scales=swizzle_mxfp8_scale(b_s, n, k),
-        out_dtype=torch.bfloat16,
-        quant="mxfp8",
-        block_size=[1, 32],
-    )
+    # Exercise candidate selection: rc2 admitted invalid narrow persistent tiles.
+    with autotune(tuning_buckets=[m]):
+        out = mm(
+            a,
+            b_q,
+            B_scales=swizzle_mxfp8_scale(b_s, n, k),
+            out_dtype=torch.bfloat16,
+            quant="mxfp8",
+            block_size=[1, 32],
+        )
     # mm() quantizes the activation online with the same FlashInfer quantizer;
     # dequantizing that result keeps quantization noise out of the comparison.
     a_q, a_s = _quantize_mxfp8(a)

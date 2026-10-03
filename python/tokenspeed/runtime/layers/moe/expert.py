@@ -27,6 +27,7 @@ import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
+    TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -228,7 +229,11 @@ class MoELayer(torch.nn.Module):
             )
         if self._quant_kind == "nvfp4":
             self._apply_trtllm_ispp_padding(
-                TRTLLM_NVFP4_ISPP_ALIGNMENT,
+                (
+                    TRTLLM_NVFP4_ISPP_ALIGNMENT
+                    if self._spec.gated
+                    else TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT
+                ),
                 "the flashinfer_trtllm NVFP4 weight layout accepts it",
             )
         if self._quant_kind == "mxfp4":
@@ -406,7 +411,10 @@ class MoELayer(torch.nn.Module):
                 ``ispp_alignment``).
             reason: Log fragment describing why the padding is required.
         """
-        if get_moe_backend().value != "flashinfer_trtllm":
+        backend = get_moe_backend().value
+        # Only the trtllm kernels run non-gated experts, so ``auto`` selects them.
+        trtllm_only = backend == "auto" and not self._spec.gated
+        if backend != "flashinfer_trtllm" and not trtllm_only:
             return
         ispp = self.intermediate_size // self.tp_size
         if ispp % alignment == 0:

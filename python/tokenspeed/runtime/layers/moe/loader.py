@@ -70,6 +70,18 @@ def _ep_partition(num_experts: int, ep_rank: int, ep_size: int) -> int:
     return num_experts // ep_size
 
 
+def _expert_shards(schema: ExpertCheckpointSchema) -> tuple[tuple[str, str, str], ...]:
+    """(param prefix, checkpoint semantic, shard id) of one expert's projections."""
+    if schema.gate_proj_name is None:
+        w13 = (("experts.w13_", "up_proj", "w13"),)
+    else:
+        w13 = (
+            ("experts.w13_", "gate_proj", "w1"),
+            ("experts.w13_", "up_proj", "w3"),
+        )
+    return (*w13, ("experts.w2_", "down_proj", "w2"))
+
+
 def _build_default_expert_plan(
     schema: ExpertCheckpointSchema,
     *,
@@ -85,32 +97,15 @@ def _build_default_expert_plan(
     for local_expert_id in range(num_local_experts):
         expert_id = start_expert + local_expert_id
         expert_plan.extend(
-            (
-                ExpertWeightPlanEntry(
-                    param_name="experts.w13_",
-                    checkpoint_weight_name=schema.make_expert_weight_name(
-                        expert_id, "gate_proj"
-                    ),
-                    shard_id="w1",
-                    local_expert_id=local_expert_id,
+            ExpertWeightPlanEntry(
+                param_name=param_name,
+                checkpoint_weight_name=schema.make_expert_weight_name(
+                    expert_id, semantic
                 ),
-                ExpertWeightPlanEntry(
-                    param_name="experts.w13_",
-                    checkpoint_weight_name=schema.make_expert_weight_name(
-                        expert_id, "up_proj"
-                    ),
-                    shard_id="w3",
-                    local_expert_id=local_expert_id,
-                ),
-                ExpertWeightPlanEntry(
-                    param_name="experts.w2_",
-                    checkpoint_weight_name=schema.make_expert_weight_name(
-                        expert_id, "down_proj"
-                    ),
-                    shard_id="w2",
-                    local_expert_id=local_expert_id,
-                ),
+                shard_id=shard_id,
+                local_expert_id=local_expert_id,
             )
+            for param_name, semantic, shard_id in _expert_shards(schema)
         )
     return expert_plan
 
@@ -123,29 +118,14 @@ def _build_global_expert_name_plan(
     expert_plan: list[CheckpointPlanEntry] = []
     for expert_id in range(num_experts):
         expert_plan.extend(
-            (
-                CheckpointPlanEntry(
-                    param_name="experts.w13_",
-                    checkpoint_weight_name=schema.make_expert_weight_name(
-                        expert_id, "gate_proj"
-                    ),
-                    shard_id="w1",
+            CheckpointPlanEntry(
+                param_name=param_name,
+                checkpoint_weight_name=schema.make_expert_weight_name(
+                    expert_id, semantic
                 ),
-                CheckpointPlanEntry(
-                    param_name="experts.w13_",
-                    checkpoint_weight_name=schema.make_expert_weight_name(
-                        expert_id, "up_proj"
-                    ),
-                    shard_id="w3",
-                ),
-                CheckpointPlanEntry(
-                    param_name="experts.w2_",
-                    checkpoint_weight_name=schema.make_expert_weight_name(
-                        expert_id, "down_proj"
-                    ),
-                    shard_id="w2",
-                ),
+                shard_id=shard_id,
             )
+            for param_name, semantic, shard_id in _expert_shards(schema)
         )
     return expert_plan
 
