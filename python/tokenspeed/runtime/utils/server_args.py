@@ -300,8 +300,10 @@ class ServerArgs:
     # server started without the matching flag will receive empty logprobs.
     enable_output_logprobs: bool = False
     # Sizing knob for prompt (input) logprobs: prompt rows pushed through the
-    # LM head per chunk, bounding the transient [rows, vocab] logits.
-    input_logprob_chunk_tokens: int = 1024
+    # LM head per chunk, bounding the transient [rows, vocab] logits
+    # (chunk x vocab x (2 + 2 + 4) bytes: bf16 shard, bf16 gathered, fp32
+    # log-softmax).
+    input_logprob_chunk_tokens: int = 256
 
     # Runtime options
     disable_pdl: bool = False
@@ -2035,7 +2037,7 @@ class ServerArgs:
             "--input-logprob-chunk-tokens",
             type=int,
             default=ServerArgs.input_logprob_chunk_tokens,
-            help="Prompt rows pushed through the LM head per chunk when a request asks for prompt (input) logprobs (SGLang logprob_start_len). A sizing knob only: it bounds the transient [rows, vocab] logits (bf16 + fp32 log-softmax) and never changes a value.",
+            help="Prompt rows pushed through the LM head per chunk when a request asks for prompt (input) logprobs (SGLang logprob_start_len). A sizing knob only: the transient per-chunk cost is about chunk x vocab x 8 bytes (bf16 logits shard, bf16 TP-gathered logits, fp32 log-softmax) and the value never changes a result.",
         )
         parser.add_argument(
             "--eagle3-layers-to-capture",

@@ -143,6 +143,7 @@ def test_tp_logits_gather_preserves_dtype(monkeypatch, dtype, cached):
         logits_metadata=None,
         embedding_bias=None,
         plan=None,
+        require_full_vocab=False,
     )
     assert output.dtype == dtype
     torch.testing.assert_close(
@@ -510,7 +511,7 @@ def test_get_logits_skips_gather_when_dist_argmax_active(monkeypatch):
     hidden = torch.randn(4, 2, dtype=torch.float32)
     lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))  # 4*2 == 8
     md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
-    out = proc._get_logits(hidden, lm_head, md)
+    out = proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
     assert out.shape == (4, 4)  # local shard width retained, not gathered to 8
 
 
@@ -550,7 +551,7 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(monkeypatc
     hidden = torch.randn(4, 2, dtype=torch.float32)
     lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))
     md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
-    out = proc._get_logits(hidden, lm_head, md)
+    out = proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
 
     assert out.shape == (4, 8)
     assert proc._all_gather_state is LogitsProcessor._LOGITS_AG_STATE_UNINITIALIZED
@@ -587,7 +588,7 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch):
         weight=torch.randn(4, 2, dtype=torch.bfloat16)
     )  # 4*2 == 8
     md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
-    out = proc._get_logits(hidden, lm_head, md)
+    out = proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
     assert called.get("ag")  # gathered (softcap on full vocab), not early-returned
     assert out.shape == (4, 8)
 
@@ -604,9 +605,29 @@ def _input_logprob_rows(rows, targets, *, num_input_rows, chunk_tokens, device):
     return InputLogprobRows(
         rows=torch.tensor(rows, dtype=torch.int64, device=device),
         targets=torch.tensor(targets, dtype=torch.int64, device=device),
+        slots=torch.zeros(len(rows), dtype=torch.int64, device=device),
         num_input_rows=num_input_rows,
         chunk_tokens=chunk_tokens,
     )
+
+
+def test_gather_token_logprobs_widens_inside_the_kernel_bitwise():
+    """The ``dtype=float32`` log-softmax (no fp32 copy of the logits) is the
+    same arithmetic as ``log_softmax(logits.float())``, bit for bit."""
+    from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
+
+    torch.manual_seed(3)
+    for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        logits = (torch.randn(7, 1000) * 8).to(dtype)
+        tokens = torch.randint(0, 1000, (7,))
+        got = gather_token_logprobs_torch(logits, tokens)
+        reference = (
+            torch.log_softmax(logits.float(), dim=-1)
+            .gather(-1, tokens.unsqueeze(-1))
+            .squeeze(-1)
+        )
+        assert got.dtype == torch.float32
+        assert torch.equal(got, reference), dtype
 
 
 @pytest.mark.parametrize("chunk_tokens", [1, 2, 3, 64])
@@ -789,3 +810,57 @@ def test_input_logprobs_bypass_the_sharded_argmax_shortcut(monkeypatch):
     assert gathered == [(2, 4)]
     assert out.input_token_logprobs.shape == (2,)
     assert out.next_token_logits.shape == (1, 4)
+
+
+def test_input_logprob_chunks_never_take_the_multicast_gather(monkeypatch):
+    """The multicast all-gather hands back a view of the TP group's shared
+    buffer with no entry barrier; the next chunk's gather on a faster rank
+    would overwrite it under this rank's log-softmax. The chunk loop must go
+    through the NCCL collective into a private tensor, while the sampled rows
+    keep the multicast path."""
+    proc = LogitsProcessor(
+        config=SimpleNamespace(
+            model_type="test", vocab_size=8, final_logit_softcapping=None
+        ),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    multicast_state = object()
+    monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: multicast_state)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    multicast_rows: list[int] = []
+    collective_rows: list[int] = []
+
+    def multicast(state, logits, *, tp_hidden_dim, skip_entry_sync, safe):
+        assert state is multicast_state and skip_entry_sync and not safe
+        multicast_rows.append(logits.shape[0])
+        return torch.cat((logits, logits), dim=-1)
+
+    def collective(output, logits, group):
+        collective_rows.append(logits.shape[0])
+        output.copy_(torch.cat((logits, logits), dim=0))
+
+    monkeypatch.setattr(logits_processor_module, "all_gather_inner", multicast)
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    # bf16 logits: the only dtype the multicast path accepts.
+    hidden = torch.randn(5, 2, dtype=torch.bfloat16)
+    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.bfloat16))
+    md = LogitsMetadata(
+        forward_mode=ForwardMode.EXTEND,
+        gather_ids=torch.tensor([4]),
+        input_logprob_rows=_input_logprob_rows(
+            [0, 1, 2, 3], [1, 6, 2, 5], num_input_rows=5, chunk_tokens=3, device="cpu"
+        ),
+    )
+
+    out = proc(
+        input_ids=None, hidden_states=hidden, lm_head=lm_head, logits_metadata=md
+    )
+
+    # Two prompt chunks (3 + 1 rows) through the collective; one sampled row
+    # through the multicast buffer.
+    assert collective_rows == [3, 1]
+    assert multicast_rows == [1]
+    assert out.input_token_logprobs.shape == (4,)
+    assert out.next_token_logits.shape == (1, 8)

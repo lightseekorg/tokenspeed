@@ -241,6 +241,8 @@ class EventLoop:
         specs = device.specs
         self.multimodal_encoder_dtype = specs.multimodal_encoder_dtype
         self.cache_storage = specs.cache_storage
+        # Republished to the ingress (engine ready info, msgpack handshake).
+        self.supports_prompt_logprobs: bool = specs.supports_prompt_logprobs
         self._scheduler_cache_geometry = specs.cache_geometry
         geometry = self._scheduler_cache_geometry
         # The contract is the one source of admitted capacity.
@@ -1346,6 +1348,7 @@ def run_event_loop(
                 "max_model_len": event_loop.max_model_len,
                 "multimodal_encoder_dtype": event_loop.multimodal_encoder_dtype,
                 "cache_storage": getattr(event_loop, "cache_storage", None),
+                "supports_prompt_logprobs": event_loop.supports_prompt_logprobs,
             }
         )
 

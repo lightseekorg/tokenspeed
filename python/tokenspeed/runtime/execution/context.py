@@ -98,14 +98,16 @@ class InputLogprobRows:
     """Device-side form of an ``InputLogprobPlan`` for the logits processor.
 
     ``rows`` indexes the forward's full ``[num_input_rows, hidden]``
-    activations and ``targets`` names the token each row predicts; both are
-    int64 device tensors of equal length. ``chunk_tokens`` bounds how many
+    activations, ``targets`` names the token each row predicts and ``slots``
+    the extend slot each row belongs to (for per-request NaN flags); all three
+    are int64 device tensors of equal length. ``chunk_tokens`` bounds how many
     rows the processor pushes through the LM head at once (a memory knob, not
     a numerics one: log-softmax is row-local).
     """
 
     rows: torch.Tensor
     targets: torch.Tensor
+    slots: torch.Tensor
     num_input_rows: int
     chunk_tokens: int
 

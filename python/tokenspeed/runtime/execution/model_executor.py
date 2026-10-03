@@ -60,7 +60,11 @@ from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-from tokenspeed.runtime.execution.prefill_graph import PrefillGraph, dummy_batch_size
+from tokenspeed.runtime.execution.prefill_graph import (
+    PrefillGraph,
+    dummy_batch_size,
+    narrowing_prefill_model,
+)
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -681,6 +685,16 @@ class ModelExecutor:
             self.forward_step.warmup_decode_path(batch_sizes=(1,), graph_phase=True)
             logger.info("Finished prewarming Triton RSAG communication states")
 
+        # Prompt (input) logprobs need the LM head to score every prompt row on
+        # this rank: one activation row per input token, which a model that
+        # narrows its prefill rows (NarrowingPrefillModel) does not keep, and
+        # the logits themselves, which only the last pipeline stage has.
+        # Decided here, once, so the ingress refuses such requests instead of
+        # the data plane finding out.
+        self.supports_prompt_logprobs: bool = (
+            config.pp_size == 1 and narrowing_prefill_model(model_runner.model) is None
+        )
+
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
         # the decode wrapper above; borrows the decode capture stream so all
         # graphs share one mempool-reuse domain.
@@ -1262,6 +1276,13 @@ class ModelExecutor:
 
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)
+        if logits_output.input_token_logprobs is not None:
+            # The prompt rows ship their logprobs as values, so audit those.
+            self.nan_guard.audit_input_logprobs(
+                logits_output.input_token_logprobs,
+                ctx.input_logprob_rows.slots,
+                ctx.num_extends,
+            )
 
         candidates = self._decode_candidates(ctx)
 
@@ -1794,7 +1815,7 @@ class ModelExecutor:
                     ),
                     gather_ids=gather_ids,
                     input_logprob_rows=self._input_logprob_rows(
-                        input_logprob_plan, total_tokens
+                        input_logprob_plan, num_extends, total_tokens
                     ),
                     decode_input_ids=decode_input_ids,
                     output_layout=output_layout,
@@ -2002,31 +2023,43 @@ class ModelExecutor:
         )
 
     def _input_logprob_rows(
-        self, plan: InputLogprobPlan | None, total_tokens: int
+        self, plan: InputLogprobPlan | None, num_extends: int, total_tokens: int
     ) -> InputLogprobRows | None:
-        """Stage the plan's rows and targets on the device for the logits processor.
+        """Expand the plan into device rows, targets and slots for the logits processor.
 
-        Pinned host staging and a non-blocking copy, like the other per-forward
-        inputs: the forward thread never synchronizes on its per-round path.
-        Targets are clamped into the vocab so a stray id (an unpadded prompt
-        that still carries a hash) indexes a real column instead of faulting.
+        The per-slot triples become the flat row index (an ``arange`` per
+        slot) and the slot of every row on the host, staged pinned and copied
+        non-blocking like the other per-forward inputs: the forward thread
+        never synchronizes on its per-round path. Each row's target is the next
+        prompt token, read from the scheduler's shifted input ids that
+        ``fill_input_buffers`` landed for this prefill (they cover the chunk
+        boundary). A target outside the vocabulary flags its request through
+        the NaN guard, which terminates it; the clamp only keeps the gather
+        from faulting on a flagged row.
         """
         if plan is None:
             return None
-        pin_memory = is_pin_memory_available()
-        rows = torch.tensor(
-            plan.row_indices, dtype=torch.int64, device="cpu", pin_memory=pin_memory
-        ).to(self.device, non_blocking=True)
-        targets = torch.tensor(
-            plan.target_token_ids,
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=pin_memory,
-        ).to(self.device, non_blocking=True)
+        if max(map(sum, zip(plan.row_starts, plan.counts))) > total_tokens:
+            raise RuntimeError("input logprob plan names rows past the forward's input")
+        counts = torch.tensor(plan.counts, dtype=torch.int64)
+        slots_cpu = torch.repeat_interleave(torch.arange(len(plan.counts)), counts)
+        first_row = torch.tensor(plan.row_starts, dtype=torch.int64) - (
+            torch.cumsum(counts, dim=0) - counts
+        )
+        rows_cpu = torch.arange(plan.num_rows, dtype=torch.int64) + first_row[slots_cpu]
+        staged = torch.stack((rows_cpu, slots_cpu))
+        if is_pin_memory_available():
+            staged = staged.pin_memory()
+        rows, slots = staged.to(self.device, non_blocking=True)
+        targets = self.input_buffers.shifted_prefill_ids_buf[rows].to(torch.int64)
+        self.nan_guard.audit_input_logprob_targets(
+            targets, slots, num_extends, self.runtime_states.vocab_size
+        )
         targets.clamp_(0, self.runtime_states.vocab_size - 1)
         return InputLogprobRows(
             rows=rows,
             targets=targets,
+            slots=slots,
             num_input_rows=total_tokens,
             chunk_tokens=self.config.input_logprob_chunk_tokens,
         )

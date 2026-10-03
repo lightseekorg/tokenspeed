@@ -59,6 +59,7 @@ from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
     LogitsLayoutPlan,
 )
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.triton import tl, triton
 
@@ -542,7 +543,11 @@ class LogitsProcessor(nn.Module):
             pruned_states, logits_metadata
         )
         sampled_logits = self._get_logits(
-            pruned_states, lm_head, logits_metadata, plan=logits_layout_plan
+            pruned_states,
+            lm_head,
+            logits_metadata,
+            plan=logits_layout_plan,
+            require_full_vocab=False,
         )
 
         hidden_states_to_store: torch.Tensor | None = None
@@ -594,10 +599,13 @@ class LogitsProcessor(nn.Module):
         LM head ``chunk_tokens`` at a time so the transient ``[rows, vocab]``
         logits stay bounded; each chunk takes the same ``_get_logits`` route
         as the sampled rows (quantized head, rl-bitwise GEMM, TP gather,
-        softcap) and the same fp32 ``log_softmax(...).gather`` arithmetic as
-        the sampler's output logprobs, so prompt and output logprobs of one
-        token agree bitwise. Log-softmax is row-local, so the chunk size never
-        changes a value.
+        softcap) and the sampler's own ``gather_token_logprobs_torch``, so
+        prompt and output logprobs of one token agree bitwise. Log-softmax is
+        row-local, so the chunk size never changes a value. The chunks ask for
+        a private full-vocab tensor (``require_full_vocab=True``): the
+        multicast gather returns a view of the TP group's shared buffer that
+        the next chunk's gather on a faster rank would overwrite while this
+        rank still reads it, so the chunk loop never takes that path.
 
         Args:
             hidden_states: The forward's full ``[num_input_rows, hidden]``
@@ -635,10 +643,8 @@ class LogitsProcessor(nn.Module):
                 plan=None,
                 require_full_vocab=True,
             )
-            out[begin:end] = (
-                torch.log_softmax(logits.float(), dim=-1)
-                .gather(-1, plan.targets[begin:end].unsqueeze(-1))
-                .squeeze(-1)
+            out[begin:end] = gather_token_logprobs_torch(
+                logits, plan.targets[begin:end]
             )
             del logits
         return out
@@ -651,14 +657,21 @@ class LogitsProcessor(nn.Module):
         embedding_bias: torch.Tensor | None = None,
         plan: LogitsLayoutPlan | None = None,
         *,
-        require_full_vocab: bool = False,
+        require_full_vocab: bool,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
-        Returns full-vocab logits, except that a ``do_argmax`` processor with
-        the distributed argmax active keeps them TP-sharded for ``_argmax``;
-        ``require_full_vocab`` disables that shortcut for callers that read
-        the whole distribution (prompt logprobs).
+        Args:
+            require_full_vocab: The caller reads the whole distribution of
+                every row and keeps the tensor across further device work
+                (prompt logprobs). Under TP this disables two shortcuts the
+                sampled rows take: a ``do_argmax`` processor with the
+                distributed argmax active keeps its logits TP-sharded for
+                ``_argmax``, and the multicast all-gather returns a view of the
+                group's shared comm buffer without an entry barrier (safe only
+                because a whole forward separates consecutive sampled-row
+                gathers). With it set the TP gather is the NCCL collective
+                into a private tensor. ``False`` is the sampled-row route.
         """
         dp_sampling = plan is not None
         if dp_sampling and not self.dp_sampling_enabled:
@@ -732,7 +745,12 @@ class LogitsProcessor(nn.Module):
 
             # The multicast buffer/kernel is BF16-only; retain other logits dtypes
             # through the existing collective, including when a state is cached.
-            state = self._all_gather_state if logits.dtype == torch.bfloat16 else None
+            # A private full-vocab result never uses the shared buffer either.
+            state = (
+                self._all_gather_state
+                if logits.dtype == torch.bfloat16 and not require_full_vocab
+                else None
+            )
             if state is self._LOGITS_AG_STATE_UNINITIALIZED:
                 # create_state rendezvouses; leave it for an eager call.
                 if torch.cuda.is_current_stream_capturing():

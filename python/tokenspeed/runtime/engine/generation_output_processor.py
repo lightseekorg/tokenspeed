@@ -74,16 +74,25 @@ class RequestState:
         sampling_params: SamplingParams,
         stream: bool,
         tokenizer,
+        *,
+        computes_prompt_logprobs: bool,
         eos_token_ids: list[int] = None,
         return_logprob: bool = False,
         logprob_start_len: int = -1,
-        computes_prompt_logprobs: bool = True,
         top_logprobs_num: int = 0,
         token_ids_logprob: list[int] | None = None,
         multimodal_inputs=None,
         prompt_input_ids_unpadded: list[int] | None = None,
         created_time: float = 0.0,
     ) -> None:
+        """Per-request output state.
+
+        Args:
+            computes_prompt_logprobs: Whether this engine runs the prompt rows
+                (False on the PD decode role, whose prefill node returns the
+                prompt logprobs). Selects what ``return_logprob`` accumulates,
+                so it is always stated.
+        """
         # --- Extracted from recv_req (immutable) ---
         self.prompt_input_ids: list[int] = prompt_input_ids
         self.prompt_input_ids_unpadded: list[int] = (
@@ -147,6 +156,11 @@ class RequestState:
         self.input_token_logprobs_val: list[float | None] | None = None
         self.input_token_logprobs_idx: list[int] | None = None
         self.input_logprob_sent: bool = False
+        # The NaN guard flagged this request on a prefill chunk that owed no
+        # token yet (a NaN prompt logprob, or NaN logits of the chunk's last
+        # row). The abort is issued when the prompt completes, like a flag on
+        # the final chunk.
+        self.numerical_error_detected: bool = False
 
         # --- Streaming bookkeeping (internal) ---
         self._surr_offset: int | None = None
@@ -209,15 +223,15 @@ class RequestState:
             sampling_params=recv_req.sampling_params,
             stream=recv_req.stream,
             tokenizer=tokenizer,
-            eos_token_ids=eos_token_ids,
-            return_logprob=getattr(recv_req, "return_logprob", False),
-            logprob_start_len=getattr(recv_req, "logprob_start_len", -1),
             computes_prompt_logprobs=computes_prompt_logprobs,
-            top_logprobs_num=getattr(recv_req, "top_logprobs_num", 0),
-            token_ids_logprob=getattr(recv_req, "token_ids_logprob", None),
-            multimodal_inputs=getattr(recv_req, "multimodal_inputs", None),
-            prompt_input_ids_unpadded=getattr(recv_req, "input_ids_unpadded", None),
-            created_time=getattr(recv_req, "created_time", 0.0),
+            eos_token_ids=eos_token_ids,
+            return_logprob=recv_req.return_logprob,
+            logprob_start_len=recv_req.logprob_start_len,
+            top_logprobs_num=recv_req.top_logprobs_num,
+            token_ids_logprob=recv_req.token_ids_logprob,
+            multimodal_inputs=recv_req.multimodal_inputs,
+            prompt_input_ids_unpadded=recv_req.input_ids_unpadded,
+            created_time=recv_req.created_time,
         )
 
     @property
@@ -276,9 +290,10 @@ class RequestState:
             else []
         )
         if any(lp is None for lp in logprobs):
-            # A pipeline stage without logits commits None rows; keep the
-            # engine alive and make the gap visible instead of raising.
-            logger.warning(
+            # Every scored position was recomputed by a chunk that commits its
+            # rows before the prompt completes (the admission probe is capped
+            # at the start), so a gap is a planning bug, not a runtime state.
+            raise RuntimeError(
                 "prompt logprobs incomplete: "
                 f"{sum(lp is None for lp in logprobs)} of {len(logprobs)} positions "
                 "have no value"
@@ -824,7 +839,11 @@ class OutputProcesser:
                 # It owes no token, but the chunk's KV has landed -- report
                 # that much, so the scheduler stops counting a forward
                 # against these pages and may retract the request if the
-                # next round needs them.
+                # next round needs them. A NaN flag on this chunk (its prompt
+                # logprobs, or its last row's logits) terminates the request
+                # when the prompt completes.
+                if nan_flags_list is not None and nan_flags_list[i]:
+                    request_state.numerical_error_detected = True
                 request_changes.append(make_extend_result_event(rid))
                 continue
 
@@ -838,7 +857,9 @@ class OutputProcesser:
             if i >= num_extends:
                 request_state.stats.record_decode_step(step_dt, prefilling_others)
 
-            nan_detected = nan_flags_list is not None and nan_flags_list[i]
+            nan_detected = (
+                nan_flags_list is not None and nan_flags_list[i]
+            ) or request_state.numerical_error_detected
             if nan_detected and not request_state.finished:
                 request_state.finished_reason = FINISH_ABORT(
                     message=(
@@ -1029,19 +1050,19 @@ class OutputProcesser:
         if plan is None or logprobs is None:
             return
         values = logprobs.tolist()
-        if len(values) != len(plan.row_indices):
+        if len(values) != plan.num_rows:
             raise RuntimeError(
                 f"prompt logprob result has {len(values)} rows for a plan of "
-                f"{len(plan.row_indices)}"
+                f"{plan.num_rows}"
             )
         cursor = 0
-        for i, count in enumerate(plan.per_slot_counts):
+        for i, count in enumerate(plan.counts):
             if count == 0:
                 continue
             state = self.rid_to_state.get(forward_op.request_ids[i])
             if state is not None and state.input_token_logprobs is not None:
                 state.record_input_token_logprobs(
-                    plan.per_slot_starts[i], values[cursor : cursor + count]
+                    plan.position_starts[i], values[cursor : cursor + count]
                 )
             cursor += count
 

@@ -95,36 +95,43 @@ class RequestHistorySeeds:
 class InputLogprobPlan:
     """Which prompt rows of one forward need their next-token logprob.
 
-    Built on the control plane for the batch's extend rows and captured into
-    the submitted closure as plain tuples; the forward thread gathers exactly
-    these rows out of the full ``[num_tokens, hidden]`` activations (position
-    chunked, so the ``[rows, vocab]`` logits never materialize at once), and
-    the commit path slices the flat result back per request with
-    ``per_slot_counts`` and places it at ``per_slot_starts``.
+    Built on the control plane as one ``(row_start, count, position_start)``
+    triple per extend slot and captured into the submitted closure as plain
+    tuples, so the plan stays O(slots) whatever the prompt length. The
+    forward thread expands the triples into the device row index (an
+    ``arange`` per slot) and reads each row's target -- the next prompt
+    token -- from the scheduler's shifted input ids, which every prefill
+    already lands on the device; the logits processor then gathers exactly
+    those rows out of the full ``[num_tokens, hidden]`` activations (position
+    chunked, so the ``[rows, vocab]`` logits never materialize at once). The
+    commit path slices the flat result back per slot by ``counts`` and places
+    it at ``position_starts``.
 
     Attributes:
-        row_indices: Flat input-row index of every gathered position, extend
-            slots in batch order, positions ascending within a slot.
-        target_token_ids: The prompt token at ``position + 1`` for every row:
-            the token whose logprob the row predicts.
-        per_slot_starts: Per extend slot, the first prompt position gathered
-            (meaningful only where the count is non-zero).
-        per_slot_counts: Per extend slot, how many rows belong to it; sums to
-            ``len(row_indices)``.
+        row_starts: Per extend slot, the flat input-row index of its first
+            gathered row (meaningful only where the count is non-zero).
+        counts: Per extend slot, how many consecutive rows are gathered;
+            0 for a slot that needs none.
+        position_starts: Per extend slot, the prompt position of its first
+            gathered row (meaningful only where the count is non-zero).
     """
 
-    row_indices: tuple[int, ...]
-    target_token_ids: tuple[int, ...]
-    per_slot_starts: tuple[int, ...]
-    per_slot_counts: tuple[int, ...]
+    row_starts: tuple[int, ...]
+    counts: tuple[int, ...]
+    position_starts: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if len(self.row_indices) != len(self.target_token_ids):
-            raise ValueError("input logprob rows and targets must have equal lengths")
-        if len(self.per_slot_starts) != len(self.per_slot_counts):
-            raise ValueError("input logprob per-slot starts and counts must align")
-        if sum(self.per_slot_counts) != len(self.row_indices):
-            raise ValueError("input logprob per-slot counts must sum to the row count")
+        if not len(self.row_starts) == len(self.counts) == len(self.position_starts):
+            raise ValueError("input logprob plan fields must have equal lengths")
+        if any(count < 0 for count in self.counts):
+            raise ValueError("input logprob plan counts must be non-negative")
+        if self.num_rows == 0:
+            raise ValueError("an input logprob plan must name at least one row")
+
+    @property
+    def num_rows(self) -> int:
+        """Rows gathered by the whole batch (the flat result's length)."""
+        return sum(self.counts)
 
 
 @dataclass(frozen=True)

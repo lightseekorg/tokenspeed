@@ -177,6 +177,39 @@ class InputProcessor:
                     f"data_parallel_rank must be in [0, {dp_size}), got {rank}"
                 )
 
+    def _verify_prompt_logprobs_servable(
+        self, input_ids: list[int], multimodal_inputs
+    ) -> None:
+        """Refuse a request whose prompt logprobs this engine cannot compute.
+
+        Everything the data plane would otherwise trip over is a 400 here:
+        the engine's capability (a model that narrows its prefill rows has no
+        activations for the prompt positions; a pipeline split leaves the
+        logits on another stage -- ``AsyncLLM.supports_prompt_logprobs``,
+        reported by the scheduler at startup), a multimodal prompt (its media
+        positions carry content-hash ids, not tokens, so they have no logprob)
+        and a client-supplied token id outside the vocabulary (its logprob
+        column does not exist).
+        """
+        if not self.engine.supports_prompt_logprobs:
+            raise ValueError(
+                "logprob_start_len >= 0 (prompt logprobs) is not supported by this "
+                "engine: the model narrows its prefill rows or runs pipeline "
+                "parallel, so it cannot score every prompt position. Use "
+                "logprob_start_len=-1."
+            )
+        if multimodal_inputs is not None:
+            raise ValueError(
+                "logprob_start_len >= 0 (prompt logprobs) is not supported for "
+                "multimodal prompts; use logprob_start_len=-1."
+            )
+        vocab_size = self.engine.model_config.vocab_size
+        if min(input_ids) < 0 or max(input_ids) >= vocab_size:
+            raise ValueError(
+                "prompt logprobs need every prompt token id inside the vocabulary "
+                f"[0, {vocab_size}); input_ids contains one outside it."
+            )
+
     async def tokenize_batch(
         self,
         objs: list[GenerateReqInput | EmbeddingReqInput],
@@ -323,7 +356,7 @@ class InputProcessor:
         # returns prompt (input) logprobs from ``logprob_start_len`` on. The
         # response dialect is chosen at render time. Gate unsupported
         # CAPABILITIES loudly here rather than silently clamping the request.
-        sglang_req = bool(getattr(obj, "return_logprob", False))
+        sglang_req = isinstance(obj, GenerateReqInput) and bool(obj.return_logprob)
         return_logprob = sampling_params.logprobs is not None or sglang_req
         # Logprobs are gated by the static server arg enable_output_logprobs
         # (the sampler only gathers them when on). Reject loudly instead of
@@ -342,12 +375,12 @@ class InputProcessor:
         if sglang_req:
             # vLLM top-k / full-vocab are gated in SamplingParams.verify(); gate
             # the SGLang capability knobs here for parity.
-            if getattr(obj, "top_logprobs_num", 0):
+            if obj.top_logprobs_num:
                 raise ValueError(
                     "top_logprobs_num > 0 (output top-k logprobs) is not supported "
                     "yet; use top_logprobs_num=0 (the sampled token's logprob)."
                 )
-            if getattr(obj, "token_ids_logprob", None):
+            if obj.token_ids_logprob:
                 raise ValueError("token_ids_logprob is not supported yet.")
             if input_ids is None:
                 raise ValueError(
@@ -355,8 +388,10 @@ class InputProcessor:
                     "cannot return prompt logprobs."
                 )
             logprob_start_len = resolve_logprob_start_len(
-                getattr(obj, "logprob_start_len", -1), len(input_ids)
+                obj.logprob_start_len, len(input_ids)
             )
+            if logprob_start_len < len(input_ids) - 1:
+                self._verify_prompt_logprobs_servable(input_ids, multimodal_inputs)
 
         if isinstance(obj, GenerateReqInput):
             return TokenizedGenerateReqInput(

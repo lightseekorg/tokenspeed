@@ -264,7 +264,9 @@ def _test_dp_chain_matches_legacy(
     req_pool_indices = torch.arange(bs, dtype=torch.int64, device=device)
 
     legacy_meta = _build_metadata()
-    legacy_logits = processor._get_logits(hidden_states.clone(), lm_head, legacy_meta)
+    legacy_logits = processor._get_logits(
+        hidden_states.clone(), lm_head, legacy_meta, require_full_vocab=False
+    )
     assert legacy_logits.shape == (
         bs * n,
         vocab,
@@ -291,7 +293,7 @@ def _test_dp_chain_matches_legacy(
         num_tokens_per_req=n,
     )
     dp_logits = processor._get_logits(
-        hidden_states.clone(), lm_head, dp_meta, plan=dp_plan
+        hidden_states.clone(), lm_head, dp_meta, plan=dp_plan, require_full_vocab=False
     )
     reqs_per_rank = pad_bs // tp_size
     assert dp_logits.shape == (

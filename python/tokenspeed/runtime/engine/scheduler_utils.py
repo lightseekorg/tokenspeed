@@ -127,6 +127,9 @@ def input_logprob_plan_for_forward(
     predicts the first generated token, which is the output logprob's job.
     Positions past the prompt (a retracted request's rebased generation) and
     requests that already finalized their prompt logprobs contribute nothing.
+    The plan is one triple per extend slot; the targets (each row's next
+    prompt token) are read on the device from the scheduler's shifted input
+    ids, which cover the chunk boundary, so nothing per row crosses here.
 
     Returns:
         The plan, or None when no row of the batch needs a prompt logprob.
@@ -134,10 +137,9 @@ def input_logprob_plan_for_forward(
     num_extends = forward_op.num_extends()
     if num_extends <= 0:
         return None
-    row_indices: list[int] = []
-    target_token_ids: list[int] = []
-    per_slot_starts: list[int] = []
-    per_slot_counts: list[int] = []
+    row_starts: list[int] = []
+    counts: list[int] = []
+    position_starts: list[int] = []
     row_offset = 0
     for i in range(num_extends):
         state = rid_to_state[forward_op.request_ids[i]]
@@ -150,25 +152,20 @@ def input_logprob_plan_for_forward(
             or state.input_token_logprobs_val is not None
             or lo >= hi
         ):
-            per_slot_starts.append(0)
-            per_slot_counts.append(0)
+            row_starts.append(0)
+            counts.append(0)
+            position_starts.append(0)
         else:
-            row_indices.extend(
-                range(row_offset + lo - chunk_start, row_offset + hi - chunk_start)
-            )
-            # Tokenizer-valid ids: multimodal pad hashes live only in
-            # ``prompt_input_ids`` and would index past the vocab.
-            target_token_ids.extend(state.prompt_input_ids_unpadded[lo + 1 : hi + 1])
-            per_slot_starts.append(lo)
-            per_slot_counts.append(hi - lo)
+            row_starts.append(row_offset + lo - chunk_start)
+            counts.append(hi - lo)
+            position_starts.append(lo)
         row_offset += chunk_len
-    if not row_indices:
+    if not any(counts):
         return None
     return InputLogprobPlan(
-        row_indices=tuple(row_indices),
-        target_token_ids=tuple(target_token_ids),
-        per_slot_starts=tuple(per_slot_starts),
-        per_slot_counts=tuple(per_slot_counts),
+        row_starts=tuple(row_starts),
+        counts=tuple(counts),
+        position_starts=tuple(position_starts),
     )
 
 

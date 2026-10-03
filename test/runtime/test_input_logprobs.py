@@ -89,7 +89,9 @@ class _StubTokenizer:
         return [0] * len(text)
 
 
-def _input_processor(*, enable_output_logprobs: bool = True) -> InputProcessor:
+def _input_processor(
+    *, enable_output_logprobs: bool = True, supports_prompt_logprobs: bool = True
+) -> InputProcessor:
     engine = SimpleNamespace(
         context_len=100,
         max_req_input_len=99,
@@ -100,16 +102,28 @@ def _input_processor(*, enable_output_logprobs: bool = True) -> InputProcessor:
             reasoning_parser=None,
             enable_prefix_caching=True,
             enable_output_logprobs=enable_output_logprobs,
+            disaggregation_mode="null",
+            language_model_only=False,
         ),
-        model_config=SimpleNamespace(vocab_size=32000, is_multimodal_active=False),
+        model_config=SimpleNamespace(
+            vocab_size=32000, is_multimodal=False, is_multimodal_active=False
+        ),
+        supports_prompt_logprobs=supports_prompt_logprobs,
     )
     return InputProcessor(engine)
 
 
-def _tokenize(**kwargs) -> TokenizedGenerateReqInput:
-    obj = GenerateReqInput(input_ids=list(range(10)), sampling_params={}, **kwargs)
+def _tokenize(
+    *, input_ids=None, processor: InputProcessor | None = None, **kwargs
+) -> TokenizedGenerateReqInput:
+    obj = GenerateReqInput(
+        input_ids=list(range(10)) if input_ids is None else input_ids,
+        sampling_params={},
+        **kwargs,
+    )
     obj.normalize_batch_and_arguments()
-    return asyncio.run(_input_processor().tokenize_one_request(obj))
+    processor = processor if processor is not None else _input_processor()
+    return asyncio.run(processor.tokenize_one_request(obj))
 
 
 def test_input_processor_accepts_and_resolves_logprob_start_len():
@@ -128,6 +142,48 @@ def test_input_processor_rejects_out_of_range_start_and_unsupported_knobs():
         _tokenize(return_logprob=True, top_logprobs_num=3)
     with pytest.raises(ValueError, match="token_ids_logprob"):
         _tokenize(return_logprob=True, token_ids_logprob=[1, 2])
+
+
+def test_input_processor_refuses_prompt_logprobs_the_engine_cannot_compute():
+    """A narrowing model or a pipeline split is a 400 at the ingress; the
+    default start (no prompt rows) stays accepted, and so does a vLLM-dialect
+    request, whatever its logprob_start_len says."""
+    cannot = _input_processor(supports_prompt_logprobs=False)
+    with pytest.raises(ValueError, match="not supported by this engine"):
+        _tokenize(return_logprob=True, logprob_start_len=0, processor=cannot)
+    with pytest.raises(ValueError, match="not supported by this engine"):
+        _tokenize(return_logprob=True, logprob_start_len=8, processor=cannot)
+    assert (
+        _tokenize(
+            return_logprob=True, logprob_start_len=-1, processor=cannot
+        ).logprob_start_len
+        == 9
+    )
+    assert (
+        _tokenize(
+            return_logprob=True, logprob_start_len=9, processor=cannot
+        ).logprob_start_len
+        == 9
+    )
+    assert _tokenize(logprob_start_len=0, processor=cannot).logprob_start_len == 9
+    # Until the scheduler reported the capability, the engine cannot promise it.
+    unknown = _input_processor(supports_prompt_logprobs=None)
+    with pytest.raises(ValueError, match="not supported by this engine"):
+        _tokenize(return_logprob=True, logprob_start_len=0, processor=unknown)
+
+
+def test_input_processor_refuses_prompt_logprobs_for_out_of_vocab_ids():
+    """The targets are read from the device input ids, so every prompt token
+    must own a logits column; a client id past the vocab is a 400, not a
+    device fault."""
+    with pytest.raises(ValueError, match="inside the vocabulary"):
+        _tokenize(return_logprob=True, logprob_start_len=0, input_ids=[1, 2, 32000])
+    with pytest.raises(ValueError, match="inside the vocabulary"):
+        _tokenize(return_logprob=True, logprob_start_len=0, input_ids=[1, -1, 3])
+    # Without prompt rows the ids are not the logprob path's concern.
+    assert (
+        _tokenize(return_logprob=True, input_ids=[1, 2, 32000]).logprob_start_len == 2
+    )
 
 
 # --------------------------------------------------------------------------
@@ -166,7 +222,9 @@ def test_request_state_resolves_the_start_and_sizes_the_accumulator():
     # Positions 1 and 2 need logits; position 3 predicts the first output.
     assert wanting.input_token_logprobs == [None, None]
 
-    assert not _state([1, 2, 3, 4], start=1, return_logprob=False).returns_input_logprobs
+    assert not _state(
+        [1, 2, 3, 4], start=1, return_logprob=False
+    ).returns_input_logprobs
     decode_role = _state([1, 2, 3, 4], start=1, computes_prompt_logprobs=False)
     assert not decode_role.wants_input_logprobs
     assert decode_role.input_token_logprobs is None
@@ -178,14 +236,26 @@ def test_request_state_resolves_the_start_and_sizes_the_accumulator():
 
 
 class _Op:
-    def __init__(self, request_ids, input_lengths, extend_prefix_lens, num_extends):
+    def __init__(
+        self,
+        request_ids,
+        input_lengths,
+        extend_prefix_lens,
+        num_extends,
+        prefill_lengths=None,
+    ):
         self.request_ids = request_ids
         self.input_lengths = input_lengths
         self.extend_prefix_lens = extend_prefix_lens
         self.extend_replay_lens = [0] * len(extend_prefix_lens)
-        self.prefill_lengths = [
-            p + n for p, n in zip(extend_prefix_lens, input_lengths[:num_extends])
-        ]
+        # The C++ op's per-slot total prefill size; defaults to the chunk end.
+        self.prefill_lengths = (
+            prefill_lengths
+            if prefill_lengths is not None
+            else [
+                p + n for p, n in zip(extend_prefix_lens, input_lengths[:num_extends])
+            ]
+        )
         self._num_extends = num_extends
 
     def num_extends(self):
@@ -196,45 +266,38 @@ def _plan(op, states) -> InputLogprobPlan | None:
     return input_logprob_plan_for_forward(op, states)
 
 
+def _triples(plan: InputLogprobPlan) -> tuple[tuple[int, int, int], ...]:
+    return tuple(zip(plan.row_starts, plan.counts, plan.position_starts))
+
+
 def test_plan_single_chunk_from_position_zero():
     ids = [10, 11, 12, 13, 14]
     plan = _plan(_Op(["a"], [5], [0], 1), {"a": _state(ids, start=0)})
     # Rows 0..3 predict ids[1..4]; the last row predicts the first output.
-    assert plan.row_indices == (0, 1, 2, 3)
-    assert plan.target_token_ids == (11, 12, 13, 14)
-    assert plan.per_slot_starts == (0,)
-    assert plan.per_slot_counts == (4,)
+    assert _triples(plan) == ((0, 4, 0),)
+    assert plan.num_rows == 4
 
 
 def test_plan_follows_three_chunks_of_one_prompt():
     ids = list(range(100, 110))
     state = _state(ids, start=0)
     chunks = [_plan(_Op(["a"], [4], [p], 1), {"a": state}) for p in (0, 4, 8)]
-    assert chunks[0].row_indices == (0, 1, 2, 3)
-    assert chunks[0].target_token_ids == (101, 102, 103, 104)
-    assert chunks[1].row_indices == (0, 1, 2, 3)
-    assert chunks[1].target_token_ids == (105, 106, 107, 108)
-    assert (chunks[1].per_slot_starts, chunks[1].per_slot_counts) == ((4,), (4,))
+    assert _triples(chunks[0]) == ((0, 4, 0),)
+    assert _triples(chunks[1]) == ((0, 4, 4),)
     # The final chunk feeds positions 8 and 9; only 8 predicts a prompt token.
-    assert chunks[2].row_indices == (0,)
-    assert chunks[2].target_token_ids == (109,)
-    assert (chunks[2].per_slot_starts, chunks[2].per_slot_counts) == ((8,), (1,))
+    assert _triples(chunks[2]) == ((0, 1, 8),)
 
 
 def test_plan_with_a_prefix_hit_at_the_start_and_a_start_inside_a_chunk():
     ids = list(range(100, 110))
     # Hit exactly at the start: the whole chunk is wanted.
     plan = _plan(_Op(["a"], [6], [4], 1), {"a": _state(ids, start=4)})
-    assert plan.row_indices == (0, 1, 2, 3, 4)
-    assert plan.target_token_ids == (105, 106, 107, 108, 109)
-    assert plan.per_slot_starts == (4,)
+    assert _triples(plan) == ((0, 5, 4),)
     # Start inside the second chunk: rows before it are skipped.
     state = _state(ids, start=6)
     assert _plan(_Op(["a"], [4], [0], 1), {"a": state}) is None
     plan = _plan(_Op(["a"], [6], [4], 1), {"a": state})
-    assert plan.row_indices == (2, 3, 4)
-    assert plan.target_token_ids == (107, 108, 109)
-    assert (plan.per_slot_starts, plan.per_slot_counts) == ((6,), (3,))
+    assert _triples(plan) == ((2, 3, 6),)
 
 
 def test_plan_clips_a_rebased_window_and_skips_finalized_requests():
@@ -244,8 +307,7 @@ def test_plan_clips_a_rebased_window_and_skips_finalized_requests():
     # prompt; only prompt positions are gathered.
     op = _Op(["a"], [13], [0], 1)
     plan = _plan(op, {"a": state})
-    assert plan.row_indices == (5, 6, 7, 8)
-    assert plan.target_token_ids == (106, 107, 108, 109)
+    assert _triples(plan) == ((5, 4, 5),)
     state.input_token_logprobs_val = [None]
     assert _plan(op, {"a": state}) is None
 
@@ -262,26 +324,17 @@ def test_plan_ignores_default_starts_decode_rows_and_mixes_requests():
     # Two extend rows then a decode row: the second extend's rows are offset
     # by the first extend's length; the decode row is never considered.
     plan = _plan(_Op(["default", "want", "decode"], [10, 5, 1], [0, 0], 2), states)
-    assert plan.row_indices == (12, 13, 14)
-    assert plan.target_token_ids == (103, 104, 105)
-    assert plan.per_slot_starts == (0, 2)
-    assert plan.per_slot_counts == (0, 3)
-
-
-def test_plan_targets_use_tokenizer_valid_ids():
-    padded = [1, 2, 7_000_000_000, 7_000_000_000, 5]
-    unpadded = [1, 2, 3, 3, 5]
-    plan = _plan(
-        _Op(["a"], [5], [0], 1), {"a": _state(padded, start=0, unpadded=unpadded)}
-    )
-    assert plan.target_token_ids == (2, 3, 3, 5)
+    assert _triples(plan) == ((0, 0, 0), (12, 3, 2))
+    assert plan.num_rows == 3
 
 
 def test_plan_validates_its_shape():
     with pytest.raises(ValueError, match="equal lengths"):
-        InputLogprobPlan((0, 1), (5,), (0,), (2,))
-    with pytest.raises(ValueError, match="sum to the row count"):
-        InputLogprobPlan((0, 1), (5, 6), (0,), (1,))
+        InputLogprobPlan((0, 1), (5,), (0, 0))
+    with pytest.raises(ValueError, match="non-negative"):
+        InputLogprobPlan((0,), (-1,), (0,))
+    with pytest.raises(ValueError, match="at least one row"):
+        InputLogprobPlan((0, 0), (0, 0), (0, 0))
 
 
 # --------------------------------------------------------------------------
@@ -298,13 +351,19 @@ class _Sender:
 
 
 class _Result:
-    def __init__(self, output_tokens, plan=None, input_token_logprobs=None):
+    def __init__(
+        self, output_tokens, plan=None, input_token_logprobs=None, nan_flags=None
+    ):
         self.output_tokens = torch.tensor(output_tokens, dtype=torch.int32)
         self.output_lengths = torch.ones(len(output_tokens), dtype=torch.int32)
         self.output_logprobs = (
             torch.full((len(output_tokens),), -0.5) if output_tokens else None
         )
-        self.output_nan_flags = None
+        self.output_nan_flags = (
+            torch.tensor(nan_flags, dtype=torch.int32)
+            if nan_flags is not None
+            else None
+        )
         self.grammar_completion = None
         self.next_input_ids = None
         self.input_logprob_plan = plan
@@ -323,14 +382,21 @@ def _processor(sender=None) -> OutputProcesser:
     )
 
 
-def _run_chunk(processor, state, rid, ids, prefix, length, logprobs, *, prefill=False):
+def _run_chunk(
+    processor, state, rid, ids, prefix, length, logprobs, *, prefill=False, nan=False
+):
     """Commit one prefill chunk of ``rid`` with its planned prompt logprobs."""
-    op = _Op([rid], [length], [prefix], 1)
+    op = _Op([rid], [length], [prefix], 1, prefill_lengths=[len(ids)])
     plan = input_logprob_plan_for_forward(op, {rid: state})
     final = prefix + length >= len(ids)
     if plan is not None:
-        assert len(logprobs) == len(plan.row_indices)
-    result = _Result([77] if final else [0], plan, logprobs if plan else None)
+        assert len(logprobs) == plan.num_rows
+    result = _Result(
+        [77] if final else [0],
+        plan,
+        logprobs if plan else None,
+        nan_flags=[int(nan)],
+    )
     return processor.post_process_forward_op(op, result, is_prefill_instance=prefill)
 
 
@@ -346,10 +412,21 @@ def test_chunks_accumulate_and_finalize_into_the_sglang_lists():
     assert state.input_token_logprobs_val is None
     assert sender.items == []
     _run_chunk(processor, state, "a", ids, 4, 4, [-3.0, -4.0, -5.0, -6.0])
-    _run_chunk(processor, state, "a", ids, 8, 2, [-7.0])  # position 8; 9 is the output's
+    _run_chunk(
+        processor, state, "a", ids, 8, 2, [-7.0]
+    )  # position 8; 9 is the output's
 
     # len(ids) - start entries: (None, ids[2]) then one logprob per prompt token.
-    assert state.input_token_logprobs_val == [None, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0]
+    assert state.input_token_logprobs_val == [
+        None,
+        -1.0,
+        -2.0,
+        -3.0,
+        -4.0,
+        -5.0,
+        -6.0,
+        -7.0,
+    ]
     assert state.input_token_logprobs_idx == ids[2:]
     assert state.input_token_logprobs is None
     assert state.output_ids == [77]
@@ -380,6 +457,39 @@ def test_a_re_prefill_after_retraction_overwrites_the_same_positions():
     _run_chunk(processor, state, "a", ids, 6, 4, [-2.0] * 3)
     assert state.input_token_logprobs_val == [None] + [-1.0] * 6 + [-2.0] * 3
     assert len(state.input_token_logprobs_val) == len(ids)
+
+
+def test_a_nan_flag_on_an_intermediate_chunk_terminates_the_request_at_completion():
+    """The NaN guard flags the chunk whose prompt logprobs (or last-row logits)
+    were corrupt; the chunk owes no token, so the flag is kept on the request
+    and the abort is issued when the prompt completes, like a flag on the
+    final chunk. The sanitized values ship with the aborted request, never a
+    NaN."""
+    from tokenspeed.runtime.engine.request_types import ABORT_CODE
+
+    ids = list(range(100, 108))
+    sender = _Sender()
+    processor = _processor(sender)
+    state = _state(ids, start=0)
+    processor.rid_to_state["a"] = state
+    # The guard already sanitized the corrupt row (here to -4.0) and set the flag.
+    _run_chunk(processor, state, "a", ids, 0, 4, [-1.0, -4.0, -1.0, -1.0], nan=True)
+    assert state.numerical_error_detected
+    assert not state.finished
+    _run_chunk(processor, state, "a", ids, 4, 4, [-2.0, -2.0, -2.0])
+    assert state.finished
+    assert state.finished_reason.err_type == ABORT_CODE.NumericalError
+    [out] = sender.items
+    assert out.input_token_logprobs_val == [
+        [None, -1.0, -4.0, -1.0, -1.0, -2.0, -2.0, -2.0]
+    ]
+
+
+def test_finalize_refuses_a_gap_in_the_prompt_logprobs():
+    state = _state([1, 2, 3, 4], start=0)
+    state.record_input_token_logprobs(0, [-1.0, -2.0])
+    with pytest.raises(RuntimeError, match="incomplete"):
+        state.finalize_input_token_logprobs()
 
 
 def test_default_start_yields_only_the_none_entry_without_gpu_work():
@@ -469,24 +579,80 @@ def test_result_rows_must_match_the_plan():
 # --------------------------------------------------------------------------
 
 
-def test_executor_stages_rows_and_clamped_targets_for_the_logits_processor(monkeypatch):
+def _staging_executor(monkeypatch, *, shifted_ids: list[int], vocab_size: int = 32):
     from tokenspeed.runtime.execution import model_executor as executor_module
+    from tokenspeed.runtime.execution.nan_guard import NanGuard
 
     monkeypatch.setattr(executor_module, "is_pin_memory_available", lambda: False)
     executor = object.__new__(executor_module.ModelExecutor)
     executor.device = "cpu"
-    executor.runtime_states = SimpleNamespace(vocab_size=8)
+    executor.runtime_states = SimpleNamespace(vocab_size=vocab_size)
     executor.config = SimpleNamespace(input_logprob_chunk_tokens=3)
+    executor.input_buffers = SimpleNamespace(
+        shifted_prefill_ids_buf=torch.tensor(shifted_ids, dtype=torch.int32)
+    )
+    executor.nan_guard = NanGuard(max_bs=4, device="cpu")
+    executor.nan_guard.reset(4)
+    return executor
 
-    assert executor._input_logprob_rows(None, 5) is None
-    plan = InputLogprobPlan((1, 2, 4), (7, 9, 0), (1,), (3,))
-    staged = executor._input_logprob_rows(plan, 5)
-    assert staged.rows.tolist() == [1, 2, 4]
-    # A stray out-of-vocab target indexes a real column instead of faulting.
-    assert staged.targets.tolist() == [7, 7, 0]
-    assert staged.rows.dtype == staged.targets.dtype == torch.int64
-    assert staged.num_input_rows == 5
+
+def test_executor_expands_the_plan_into_rows_targets_and_slots(monkeypatch):
+    """The per-slot triples become one arange per slot; each row's target is
+    the next prompt token read from the scheduler's shifted input ids, which
+    cover the chunk boundary (row 2 of slot 0 predicts a token of the next
+    chunk)."""
+    # Two extend slots: rows 0..2 (slot 0) and 3..5 (slot 1) of a 6-row forward.
+    shifted = [11, 12, 13, 21, 22, 23]
+    executor = _staging_executor(monkeypatch, shifted_ids=shifted)
+    assert executor._input_logprob_rows(None, 2, 6) is None
+
+    plan = InputLogprobPlan(row_starts=(0, 4), counts=(3, 2), position_starts=(5, 0))
+    staged = executor._input_logprob_rows(plan, 2, 6)
+    assert staged.rows.tolist() == [0, 1, 2, 4, 5]
+    assert staged.targets.tolist() == [11, 12, 13, 22, 23]
+    assert staged.slots.tolist() == [0, 0, 0, 1, 1]
+    assert (
+        staged.rows.dtype == staged.targets.dtype == staged.slots.dtype == torch.int64
+    )
+    assert staged.num_input_rows == 6
     assert staged.chunk_tokens == 3
+    assert executor.nan_guard.flags.tolist() == [0, 0, 0, 0]
+
+    # A slot without rows contributes nothing and shifts no other slot.
+    plan = InputLogprobPlan(
+        row_starts=(0, 0, 3), counts=(2, 0, 1), position_starts=(0, 0, 7)
+    )
+    staged = executor._input_logprob_rows(plan, 3, 6)
+    assert staged.rows.tolist() == [0, 1, 3]
+    assert staged.slots.tolist() == [0, 0, 2]
+
+    with pytest.raises(RuntimeError, match="past the forward"):
+        executor._input_logprob_rows(
+            InputLogprobPlan(row_starts=(4,), counts=(3,), position_starts=(0,)), 1, 6
+        )
+
+
+def test_executor_flags_an_out_of_vocab_target_instead_of_scoring_it(monkeypatch):
+    """The ingress keeps such ids out; one that slips through terminates its
+    request through the NaN guard, exactly like a NaN sample, and is clamped
+    only so the gather cannot fault."""
+    executor = _staging_executor(monkeypatch, shifted_ids=[1, 9, 2, 3], vocab_size=8)
+    plan = InputLogprobPlan(row_starts=(0, 2), counts=(2, 2), position_starts=(0, 0))
+    staged = executor._input_logprob_rows(plan, 2, 4)
+    assert staged.targets.tolist() == [1, 7, 2, 3]
+    assert executor.nan_guard.flags.tolist() == [1, 0, 0, 0]
+
+
+def test_nan_guard_flags_the_slot_of_a_non_finite_prompt_logprob():
+    from tokenspeed.runtime.execution.nan_guard import NanGuard
+
+    guard = NanGuard(max_bs=3, device="cpu")
+    guard.reset(3)
+    logprobs = torch.tensor([-1.0, float("nan"), -2.0, float("-inf")])
+    guard.audit_input_logprobs(logprobs, torch.tensor([0, 0, 1, 2]), 3)
+    assert guard.flags.tolist() == [1, 0, 1]
+    assert torch.isfinite(logprobs).all()
+    assert logprobs[0].item() == -1.0 and logprobs[2].item() == -2.0
 
 
 # --------------------------------------------------------------------------
@@ -526,7 +692,11 @@ def _recv_req(**overrides) -> TokenizedGenerateReqInput:
         ("decode", {}, UNBOUNDED_CACHED_PREFIX_TOKENS),
         ("null", {"logprob_start_len": -1}, UNBOUNDED_CACHED_PREFIX_TOKENS),
         ("null", {"logprob_start_len": 0}, 0),
-        ("null", {"return_logprob": False, "logprob_start_len": 0}, UNBOUNDED_CACHED_PREFIX_TOKENS),
+        (
+            "null",
+            {"return_logprob": False, "logprob_start_len": 0},
+            UNBOUNDED_CACHED_PREFIX_TOKENS,
+        ),
     ],
 )
 def test_handle_generate_request_caps_the_prefix_probe_at_the_start(
@@ -541,9 +711,12 @@ def test_handle_generate_request_caps_the_prefix_probe_at_the_start(
 def test_make_spec_passes_the_cap_explicitly():
     spec = make_spec("r", [1, 2, 3], max_cached_prefix_tokens=2)
     assert spec.max_cached_prefix_tokens == 2
-    assert make_spec(
-        "r", [1, 2, 3], max_cached_prefix_tokens=UNBOUNDED_CACHED_PREFIX_TOKENS
-    ).max_cached_prefix_tokens == 2**31 - 1
+    assert (
+        make_spec(
+            "r", [1, 2, 3], max_cached_prefix_tokens=UNBOUNDED_CACHED_PREFIX_TOKENS
+        ).max_cached_prefix_tokens
+        == 2**31 - 1
+    )
 
 
 # --------------------------------------------------------------------------

@@ -128,6 +128,7 @@ def _state(input_ids: list[int]) -> RequestState:
         sampling_params=SamplingParams(max_new_tokens=8, stop=[], ignore_eos=True),
         stream=False,
         tokenizer=_Tokenizer(),
+        computes_prompt_logprobs=True,
     )
 
 

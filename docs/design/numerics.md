@@ -120,17 +120,28 @@ or at the first call instead of falling back — the FluentLLM discipline
 
 ## Logprobs: one arithmetic for prompt and output
 
-A returned logprob is `log_softmax(logits.float(), -1)` gathered at the
-token, with the logits produced by the same LM-head route the sampler takes
-(`LogitsProcessor._get_logits`: quantized or dense GEMM, the `aok` GEMM under
-rl-bitwise, the TP gather, softcap). The sampler's output logprobs
-(`gather_token_logprobs_torch`, the flashinfer full-vocab backend) and the
-prompt (input) logprobs of the SGLang dialect
+A returned logprob is `log_softmax(logits, -1, dtype=float32)` gathered at
+the token -- `gather_token_logprobs_torch` in `sampling/utils.py`, the one
+function both consumers call -- with the logits produced by the same LM-head
+route the sampler takes (`LogitsProcessor._get_logits`: quantized or dense
+GEMM, the `aok` GEMM under rl-bitwise, the TP gather, softcap). The sampler's
+output logprobs and the prompt (input) logprobs of the SGLang dialect
 (`LogitsProcessor.compute_input_token_logprobs`, requested through
-`return_logprob` + `logprob_start_len`) share that arithmetic, so the logprob
-of one token is the same number whether it was scored as a prompt position or
+`return_logprob` + `logprob_start_len`) share that function, so the logprob of
+one token is the same number whether it was scored as a prompt position or
 sampled as an output -- the property an RL trainer relies on when it rescores
-a rollout.
+a rollout. The `dtype=float32` form widens bf16 logits inside the kernel (an
+exact conversion) instead of materializing an fp32 copy of the `[rows, vocab]`
+tensor first; because both paths go through the one function, whatever
+rounding the kernel applies is applied to both.
+
+The TP gather differs in one respect that is not numerics: the sampled rows
+may take the multicast all-gather, whose result is a view of the group's
+shared buffer (safe because a whole forward separates consecutive calls),
+while the prompt-row chunks ask `_get_logits` for a private full-vocab tensor
+(`require_full_vocab=True`) and gather through the NCCL collective -- a chunk's
+log-softmax may still be reading its result when a faster rank issues the next
+chunk's gather. The gathered values are identical either way.
 
 Prompt logprobs are gathered in position chunks of
 `--input-logprob-chunk-tokens` rows so the transient `[rows, vocab]` logits
