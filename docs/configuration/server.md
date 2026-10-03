@@ -214,11 +214,65 @@ the values accepted by the bundled `tokenspeed-smg` package.
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
 | `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |
+| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters (see below). Off by default. |
+| `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
 | `--eagle3-layers-to-capture` | EAGLE3 layers to capture. |
 | `--disable-replay-ssm` | Stage every verify position's recurrent state instead of replaying the accepted tokens. ReplaySSM is on by default for supported Qwen GDN and Nemotron-H Mamba2 targets; `--enable-replay-ssm` is accepted as a deprecated no-op. |
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+### Draft-prob rejection sampling
+
+By default the chain drafters (`EAGLE3`, `MTP`) propose the argmax of their
+logits and the verifier runs the target-only rule: draft `x` is accepted with
+probability `p(x)` and a rejection samples the target with `x` removed. The
+served distribution is the target's `p` whatever the drafter proposed, so no
+draft distribution is needed. `--enable-speculative-sampling` switches to the
+standard rule: each draft step samples its token from the drafter's own
+distribution `q = softmax(draft logits / T)` at the request's `temperature`
+(greedy requests keep the argmax and a one-hot `q`), records `q`, and the next
+round's verify accepts with `coin * q(x) < p(x)` and resamples from
+`norm(relu(p - q))`. Both rules serve `p`; the draft-prob rule accepts
+`1 - TV(p, q)` of the drafts, which is markedly higher than `p(argmax q)` when
+requests sample at temperature. Greedy requests behave identically under both
+rules. `top_k`, `top_p`, `min_p`, penalties and `logit_bias` stay on the
+verifier's side; `q` only follows the temperature.
+
+A request admitted (or re-admitted after retraction) has no recorded `q` for
+its first chain: its rows hold a sentinel above
+`--spec-reject-draft-prob-threshold`, which rejects at the first draft and
+samples the first token from the full target. The sentinel is written as
+`threshold + 1.0` in fp32, hence the range: below `1.0` a real probability
+would read as the sentinel, and the cap keeps the `+ 1.0` representable.
+Under PD disaggregation the prefill node's candidates land the same way, so
+the decode node's first verify of a landed request accepts nothing. The flag
+is refused on the prefill role (`--disaggregation-mode prefill`): that role
+never verifies a chain and its candidates ship without `q`, so it would only
+allocate the distribution buffer. Pass it to the decode role only.
+
+Requirements: `--speculative-algorithm EAGLE3` or `MTP` (block drafters
+`DFLASH`/`DSPARK` propose a whole block greedily), `--speculative-eagle-topk 1`,
+and `--sampling-backend flashinfer` or `flashinfer_full` (`greedy` verifies by
+exact match, the Triton backends by target-sampled exact match; neither reads
+`q`). The drafter switches its draft model's fused TP-sharded argmax off so
+the full-vocab logits reach it, which adds the logits all-gather to every
+draft step under tensor parallelism.
+
+Known limits, kept as in the reference engine for now: a landed PD request's
+first verify always rejects its shipped candidates (sentinel rows) rather than
+verifying them target-only, and the verifier gathers the full `[bs, N, vocab]`
+block of recorded rows per step instead of only the entries the accept test
+reads. A draft step whose logits are all NaN proposes a junk token and records
+a NaN `q`, which the accept test rejects; it never raises a device error.
+
+Memory: the recorded distributions take
+`(max_num_seqs + 2) x num_draft_tokens x vocab_size x 4` bytes
+(`--speculative-num-draft-tokens` fp32 rows per request-pool slot), plus a
+batch-ordered gather buffer of `max_num_seqs x num_draft_tokens x vocab_size x
+4` bytes on the verifier; 80 requests at 4 draft tokens over a 129K vocabulary
+cost about 330 MB in total. Both come out of the `--gpu-memory-utilization`
+headroom, not the KV-cache budget.
 
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.

@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
-from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -92,6 +91,7 @@ class Eagle(BaseDrafter):
     shares_target_embed_head = True
     supports_pd_layerwise_finalization = True
     supports_request_token_history = True
+    supports_speculative_sampling = True
 
     def __init__(
         self,
@@ -212,6 +212,10 @@ class Eagle(BaseDrafter):
     def _map_hot(self, ids: torch.Tensor) -> torch.Tensor:
         """Map token ids through hot_token_ids if available, otherwise return as-is."""
         return self.hot_token_ids[ids] if self.hot_token_ids is not None else ids
+
+    @override
+    def draft_vocab_map(self) -> torch.Tensor | None:
+        return self.hot_token_ids
 
     def _get_first_step_input(
         self,
@@ -477,10 +481,7 @@ class Eagle(BaseDrafter):
                 )
 
             with nvtx_range("draft_sample", color="yellow"):
-                if logits_output.next_token_ids is not None:
-                    draft_ids = logits_output.next_token_ids
-                else:
-                    draft_ids = sampling_argmax(logits_output.next_token_logits)
+                draft_ids = self.sample_draft_step(logits_output, step=i)
                 # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
                 next_tokens[:, i + 1] = self._map_hot(draft_ids)
                 if i + 1 < self.spec_num_steps:
@@ -539,10 +540,7 @@ class Eagle(BaseDrafter):
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
         logits_output, dsa_topk = self._run_first_step(bs, draft_input, narrowing)
 
-        if logits_output.next_token_ids is not None:
-            draft_ids = logits_output.next_token_ids
-        else:
-            draft_ids = sampling_argmax(logits_output.next_token_logits)
+        draft_ids = self.sample_draft_step(logits_output, step=0)
         next_tokens[:, 1] = self._map_hot(draft_ids)
 
         if self.spec_num_steps <= 1:
