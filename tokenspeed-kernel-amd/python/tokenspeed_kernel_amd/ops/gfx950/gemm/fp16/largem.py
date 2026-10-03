@@ -51,9 +51,8 @@ LARGEM_MIN_K = 4 * LARGEM_BLOCK_K
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 
 # Kimi K3 TP8 per-rank BF16 projections, as (N, K), where cold-cache rocprofv3
-# sweeps on MI355X find this kernel ahead of hipBLASLt once its last wave of
-# tiles is full enough. The MLA q_b projection (2304, 1536) trails hipBLASLt
-# at every token count and is left out.
+# sweeps on MI355X find this kernel ahead of hipBLASLt when its workgroups keep
+# enough CUs busy.
 _PREFILL_SHAPES = frozenset(
     {
         (6288, 7168),  # KDA fused q/k/v/gate/f_a/beta
@@ -69,10 +68,12 @@ _PREFILL_SHAPES = frozenset(
         (7168, 3584),  # latent up
     }
 )
-# One 256x256 tile occupies a CU, so the tiles run in waves of one per CU.
-# hipBLASLt's tile shapes track the problem more closely; this kernel wins
-# when its last wave is at least this full and loses when it is mostly idle.
-_PREFILL_MIN_WAVE_FILL = 0.77
+# Each workgroup computes one 256x256 output block and occupies a whole CU, so
+# the workgroups run in rounds of one per CU and a partly filled final round
+# costs as much as a full one. This is the minimum fraction of CU time doing
+# work over all rounds; hipBLASLt picks among many block shapes and wins when
+# this kernel leaves more CUs idle.
+_PREFILL_MIN_CU_UTILIZATION = 0.77
 
 
 def _dense16_mm_launch_metadata(grid, kernel, args):
@@ -564,15 +565,15 @@ def supports_gluon_mm_a16w16_prefill_gfx950(M: int, N: int, K: int) -> bool:
         K: Reduction width.
 
     Returns:
-        True for a measured K3 ``(N, K)`` whose tiles fill the last wave of the
-        current device's CUs at least ``_PREFILL_MIN_WAVE_FILL`` full.
+        True for a measured K3 ``(N, K)`` whose workgroups keep the current
+        device's CUs at least ``_PREFILL_MIN_CU_UTILIZATION`` busy.
     """
     if M < 1 or (N, K) not in _PREFILL_SHAPES:
         return False
-    tiles = triton.cdiv(M, LARGEM_BLOCK_M) * triton.cdiv(N, LARGEM_BLOCK_N)
+    workgroups = triton.cdiv(M, LARGEM_BLOCK_M) * triton.cdiv(N, LARGEM_BLOCK_N)
     num_cus = _num_compute_units(torch.cuda.current_device())
-    waves = triton.cdiv(tiles, num_cus)
-    return tiles >= _PREFILL_MIN_WAVE_FILL * waves * num_cus
+    rounds = triton.cdiv(workgroups, num_cus)
+    return workgroups >= _PREFILL_MIN_CU_UTILIZATION * rounds * num_cus
 
 
 def _resolve_largem_output(

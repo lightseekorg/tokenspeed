@@ -323,10 +323,11 @@ def test_largem_masks_partial_tiles(shape: tuple[int, int, int]) -> None:
     assert torch.all(backing[:, n:] == 7.0)
 
 
-def test_prefill_routes_k3_shapes_with_full_last_wave(monkeypatch) -> None:
+def test_prefill_routes_k3_shapes_with_busy_cus(monkeypatch) -> None:
     monkeypatch.setattr(largem, "_num_compute_units", lambda _: 256)
-    # qkvfab has 25 tile columns: 4096 tokens fill 400 of 512 slots in two
-    # waves, while 3072 tokens leave the second wave mostly idle.
+    # qkvfab spans 25 workgroups across N. 4096 tokens launch 400 workgroups,
+    # busying 78% of 256 CUs over two rounds; 3072 tokens launch 300, which
+    # leaves most CUs idle in the second round.
     assert supports_gluon_mm_a16w16_prefill_gfx950(4096, 6288, 7168)
     assert supports_gluon_mm_a16w16_prefill_gfx950(4000, 6288, 7168)
     assert not supports_gluon_mm_a16w16_prefill_gfx950(3072, 6288, 7168)

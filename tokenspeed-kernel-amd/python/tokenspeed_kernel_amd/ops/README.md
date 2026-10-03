@@ -63,7 +63,8 @@ decode batches.
 - The prefill kernel takes any `M` and `N`; `K` must be a multiple of 128 and
   at least 256.
 - Automatic selection uses the prefill kernel for the Kimi K3 projection shapes
-  in `_PREFILL_SHAPES` when its tiles fill most of the last wave of CUs.
+  in `_PREFILL_SHAPES` when its workgroups, one 256x256 output block per CU,
+  keep most CUs busy.
 - The decode kernel takes contiguous inputs with `2 <= M <= 64` and writes BF16
   or FP32 (the MoE router). It runs only `(N, K)` and M buckets
   (`4, 8, 16, 32, 64`) with a measured config in `_DECODE_CONFIGS`; each
