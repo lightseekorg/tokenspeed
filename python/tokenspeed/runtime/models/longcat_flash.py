@@ -71,6 +71,9 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA as _DeepseekV3AttentionMLA,
 )
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MLP as _DeepseekV3MLP
+from tokenspeed.runtime.models.deepseek_v3 import (
+    _prepare_mla_kv_b_proj_weights,
+)
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder as _get_global_expert_distribution_recorder,
 )
@@ -731,13 +734,21 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         _longcat_logger.warning(f"The {name!s} is not in the model.")
         return None
 
-    def load_weights(self, weights: _Iterable[tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: _Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load a (possibly partial) checkpoint stream.
+
+        Returns the ``named_parameters()`` names that received data (the
+        ``BaseCausalLM`` weight-update contract).
+        """
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
         fuse_qkv_a_proj = getattr(self.config, "q_lora_rank", None) is not None
         params_dict = dict(self.named_parameters())
+        # ``get_param`` remaps checkpoint names; report the parameter's own.
+        param_names = {id(param): name for name, param in params_dict.items()}
+        loaded: set[str] = set()
         moe_loader = _build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=_ExpertCheckpointSchema(
@@ -776,12 +787,13 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 if param is None:
                     break
                 param.weight_loader(param, loaded_weight, shard_id)
+                loaded.add(param_names[id(param)])
                 break
             else:
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if moe_loader.matches(name):
-                    moe_loader.load(name, loaded_weight)
+                    loaded.add(moe_loader.load(name, loaded_weight))
                     continue
 
                 if fuse_qkv_a_proj and (
@@ -817,6 +829,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                     if "scale_inv" in name:
                         begin_size //= quant_block_size
                     param.weight_loader(param, loaded_weight, begin_size=begin_size)
+                    loaded.add(param_names[id(param)])
                     continue
 
                 if "q_a_proj" in name and name not in params_dict:
@@ -826,10 +839,31 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                     continue
                 weight_loader = getattr(param, "weight_loader", _default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded.add(param_names[id(param)])
 
         self.post_load_weights()
+        return loaded
 
     def post_load_weights(self):
+        """Derive the absorbed MLA weights and fold the LoRA norm scales.
+
+        Safe to re-run after a live update: ``w_kc``/``w_vc`` are written
+        into their existing storage (captured graphs hold those addresses),
+        and the ``sqrt(hidden/rank)`` fold into ``q_a_layernorm`` /
+        ``kv_a_layernorm`` -- which multiplies the parameter in place and so
+        must happen exactly once per loaded value -- is applied only to the
+        norms this update reloaded. The initial load reloads all of them.
+        """
+        reloaded = self._weight_update_loaded_names
+        param_names = (
+            {id(param): name for name, param in self.named_parameters()}
+            if reloaded is not None
+            else None
+        )
+
+        def _reloaded(param: torch.Tensor) -> bool:
+            return param_names is None or param_names[id(param)] in reloaded
+
         for layer in self.model.layers:
             for self_attn in layer.self_attn:
                 if hasattr(
@@ -855,20 +889,20 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 else:
                     w = self_attn.kv_b_proj.weight
 
-                w_kc, w_vc = w.unflatten(
-                    0,
-                    (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim),
-                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-                if getattr(self.config, "mla_scale_q_lora", False) and hasattr(
-                    self_attn,
-                    "q_a_layernorm",
+                self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
+                    w, self_attn
+                )
+                if (
+                    getattr(self.config, "mla_scale_q_lora", False)
+                    and hasattr(self_attn, "q_a_layernorm")
+                    and _reloaded(self_attn.q_a_layernorm.weight)
                 ):
                     self_attn.q_a_layernorm.weight.data *= (
                         self.config.hidden_size / self.config.q_lora_rank
                     ) ** 0.5
-                if getattr(self.config, "mla_scale_kv_lora", False):
+                if getattr(self.config, "mla_scale_kv_lora", False) and _reloaded(
+                    self_attn.kv_a_layernorm.weight
+                ):
                     self_attn.kv_a_layernorm.weight.data *= (
                         self.config.hidden_size / self.config.kv_lora_rank
                     ) ** 0.5

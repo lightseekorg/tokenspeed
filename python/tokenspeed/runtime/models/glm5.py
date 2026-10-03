@@ -1319,6 +1319,62 @@ def pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn) -> None:
 class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
     model_cls = GlmMoeDsaModel
 
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mapping: Mapping,
+        model: GlmMoeDsaModel | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            config,
+            mapping,
+            model=model,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self._init_indexer_pairing_state()
+
+    def _init_indexer_pairing_state(self) -> None:
+        """Declare the indexer pairing caches (also for subclasses that skip
+        ``__init__``, such as the NextN draft)."""
+        # FP8 indexer ``wk`` weight and block scale waiting for each other
+        # before the bf16 fused projection shard is written; a live update
+        # streams the checkpoint in chunks, so the pair may straddle a
+        # ``load_weights`` call.
+        self._pending_fp8_wk: dict[str, dict[str, torch.Tensor]] = {}
+        # Fused indexer projection shards seen so far, per module; both must
+        # arrive before the module switches to the fused path.
+        self._loaded_fused_indexer_shards: dict[str, set[int]] = {}
+
+    def begin_weight_update(self) -> None:
+        super().begin_weight_update()
+        self._pending_fp8_wk.clear()
+        self._loaded_fused_indexer_shards.clear()
+
+    def abort_weight_update(self) -> None:
+        super().abort_weight_update()
+        self._pending_fp8_wk.clear()
+        self._loaded_fused_indexer_shards.clear()
+
+    def end_weight_update(self) -> None:
+        """Close the session; an FP8 indexer weight without its scale fails it.
+
+        Raises:
+            RuntimeError: An FP8 ``indexer.wk`` weight or its block scale was
+                streamed without the other, so the bf16 fused projection still
+                holds the previous values.
+        """
+        if self._pending_fp8_wk:
+            unpaired = sorted(self._pending_fp8_wk)
+            self.abort_weight_update()
+            raise RuntimeError(
+                f"{type(self).__name__}: the update streamed an FP8 indexer wk "
+                f"weight or scale without its partner for {unpaired}"
+            )
+        super().end_weight_update()
+
     def _record_fused_indexer_projection_shard(
         self,
         *,
@@ -1457,11 +1513,14 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                 loaded_shards=loaded_shards,
             )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
         modules_dict = dict(self.named_modules())
-        pending_fp8_wk: dict[str, dict[str, torch.Tensor]] = {}
-        loaded_fused_indexer_shards: dict[str, set[int]] = {}
+        pending_fp8_wk = self._pending_fp8_wk
+        loaded_fused_indexer_shards = self._loaded_fused_indexer_shards
+        # ``get_param`` remaps checkpoint names; report the parameter's own.
+        param_names = {id(param): name for name, param in params_dict.items()}
+        loaded: set[str] = set()
 
         def base_weights():
             for name, loaded_weight in weights:
@@ -1481,6 +1540,7 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded.add(param_names[id(param)])
                 self._try_load_fused_indexer_projection(
                     name=name,
                     loaded_weight=loaded_weight,
@@ -1490,8 +1550,9 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                     loaded_shards=loaded_fused_indexer_shards,
                 )
 
-        super().load_weights(base_weights())
+        loaded |= super().load_weights(base_weights())
         self._pad_fused_qkv_a_proj_for_fp8_blockscale()
+        return loaded
 
     def _pad_fused_qkv_a_proj_for_fp8_blockscale(self) -> None:
         """Pad each decoder layer's fused QKV-A projection to a 128-multiple.

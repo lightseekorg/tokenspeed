@@ -418,7 +418,17 @@ For orientation, one iteration of `event_loop`:
   MAX-reduce flush intent across attention DP so every DP worker enters
   the same collectives — the frontend sends `FlushCacheReqInput`
   separately, and a rank that reduced inside request handling would wait
-  on a peer still in `_dp_sync_and_check`. They then MIN-reduce a
+  on a peer still in `_dp_sync_and_check`. The same MAX all-reduce gates
+  the weight ops themselves (NCCL group init/teardown, distributed and
+  Mooncake loads): `RequestHandler` queues each op and completes the
+  head only in a round where every DP rank reports one of the same kind
+  at its head (a mismatch raises — the frontend sends every op to every
+  worker in one order). The device call blocks the control thread in a
+  collective the trainer drives or an SDK read; a DP peer that had not
+  yet dequeued its copy would keep looping and wait for this rank in the
+  per-round all-reduce, a deadlock. One op completes per round, and its
+  result is MIN-reduced across the replica before the L3 weight version
+  is published or the reply sent. They then MIN-reduce a
   non-mutating `can_clear_cache` probe across the replica (attention TP,
   then CP, then PP) and then across attention DP — DP replicas share
   Mooncake objects — then MIN-reduce an error-returning L3

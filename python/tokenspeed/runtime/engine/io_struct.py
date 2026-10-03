@@ -968,6 +968,46 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class UpdateWeightsFromMooncakeReqInput(BaseReq, kw_only=True):
+    """Load one committed checkpoint version through the Model Updater SDK.
+
+    The trainer publishes weights to a Mooncake weight store and names the
+    version to serve; every scheduler reads its own shard. Requires the
+    server to be started with ``--model-update-config``.
+    """
+
+    # The committed weight-store version to load.
+    version: int
+    # Required: whether Device/Host KV is flushed before the load.
+    flush_cache: bool
+    # Required. The L3 namespace to publish after a successful load, or
+    # ``None`` for the default ``mooncake_load_weight_version`` resolves.
+    weight_version: str | None
+
+
+def mooncake_load_weight_version(
+    *, version: int, flush_cache: bool, weight_version: str | None
+) -> str | None:
+    """The L3 namespace a Mooncake load publishes on success.
+
+    The one place this rule lives, used by the HTTP route, the Python engine
+    API and the scheduler. An explicit ``weight_version`` wins. A flushed
+    load without one takes the committed version's own identity,
+    ``str(version)``: the checkpoint it reads is already named. An unflushed
+    load without one keeps the current namespace (``None``).
+    """
+    if weight_version is not None:
+        return str(weight_version)
+    if flush_cache:
+        return str(version)
+    return None
+
+
+class UpdateWeightsFromMooncakeReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     name: str
     truncate_size: int = 100

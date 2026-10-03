@@ -22,7 +22,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import functools
+import inspect
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import torch
@@ -40,9 +42,84 @@ from tokenspeed.runtime.models.base.transformer_model import BaseTransformerMode
 from tokenspeed.runtime.utils import add_prefix
 
 
+def _record_loaded_names(load_weights: Callable) -> Callable:
+    """Record the parameter names a ``load_weights`` override returns."""
+
+    @functools.wraps(load_weights)
+    def wrapper(self: BaseCausalLM, *args: Any, **kwargs: Any) -> Any:
+        loaded = load_weights(self, *args, **kwargs)
+        if isinstance(loaded, set):
+            self.record_loaded_weights(loaded)
+        return loaded
+
+    return wrapper
+
+
+def _derive_once(post_load_weights: Callable) -> Callable:
+    """Defer a ``post_load_weights`` override while a session is active."""
+
+    @functools.wraps(post_load_weights)
+    def wrapper(self: BaseCausalLM, *args: Any, **kwargs: Any) -> None:
+        if self._weight_update_active:
+            self._weight_update_derive_pending = True
+            return
+        post_load_weights(self, *args, **kwargs)
+
+    return wrapper
+
+
 class BaseCausalLM(nn.Module):
+    """Model + lm_head + logits_processor, plus the live weight-update session.
+
+    Weight-loading contract for subclasses:
+
+    * ``load_weights(weights)`` consumes a (possibly partial) checkpoint
+      stream, ends by calling ``post_load_weights()`` and returns the
+      ``named_parameters()`` names that received data (``set[str]``) when it
+      can tell; the base class records the returned names for the session.
+    * ``post_load_weights()`` derives state from the loaded parameters. It
+      must be safe to re-run: write into derived tensors that already exist
+      (``bind_or_copy``; captured CUDA graphs hold their addresses) and apply
+      one-shot in-place transforms only to parameters that were reloaded
+      (``_weight_update_loaded_names``; None means the initial load).
+
+    An RL trainer rewrites the parameters of a serving model in place through
+    many partial ``load_weights`` calls (one per NCCL broadcast, or whatever
+    chunking the Model Updater SDK streams), so the per-call derivation would
+    run once per chunk on a half-updated model. ``begin_weight_update`` /
+    ``end_weight_update`` bracket the update: ``__init_subclass__`` wraps
+    every subclass-defined ``post_load_weights`` so that, while the session
+    is active, it only marks the derivation pending, and ``end_weight_update``
+    runs it exactly once over the whole update. Overrides therefore need no
+    session awareness of their own; subclasses that keep pairing state across
+    chunks (a fused parameter assembled from several checkpoint tensors)
+    extend ``begin_weight_update`` / ``end_weight_update`` /
+    ``abort_weight_update`` to reset and verify it.
+
+    The session fields are class-level defaults so a subclass that builds
+    itself without ``BaseCausalLM.__init__`` (the speculative drafts) still
+    takes part in sessions.
+    """
 
     model_cls: type[BaseTransformerModel]
+
+    # Live weight-update session (see the class docstring). Declared here
+    # with defaults and assigned again in ``__init__``.
+    _weight_update_active: bool = False
+    # Parameter names ``load_weights`` touched during the active session;
+    # None outside a session (the initial load touches everything).
+    _weight_update_loaded_names: set[str] | None = None
+    # A ``post_load_weights`` call was deferred by the session.
+    _weight_update_derive_pending: bool = False
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        load_weights = cls.__dict__.get("load_weights")
+        if inspect.isfunction(load_weights):
+            cls.load_weights = _record_loaded_names(load_weights)
+        post_load_weights = cls.__dict__.get("post_load_weights")
+        if inspect.isfunction(post_load_weights):
+            cls.post_load_weights = _derive_once(post_load_weights)
 
     def __init__(
         self,
@@ -58,6 +135,9 @@ class BaseCausalLM(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
         self.capture_aux_hidden_states: bool = False
+        self._weight_update_active = False
+        self._weight_update_loaded_names = None
+        self._weight_update_derive_pending = False
 
         self.encoder_only = encoder_only
         if encoder_only:
@@ -228,13 +308,20 @@ class BaseCausalLM(nn.Module):
 
         return ["rotary_emb.inv_freq"]
 
+    @_record_loaded_names
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs: Any
-    ) -> None:
+    ) -> set[str]:
+        """Load a (possibly partial) stream of checkpoint tensors.
+
+        Returns the names of the parameters that received data; see the
+        class docstring for the session contract.
+        """
 
         stacked_params_mapping = self.get_stacked_params_mapping()
         skip_patterns = self.get_skip_weight_names()
         params_dict: dict[str, nn.Parameter] = dict(self.named_parameters())
+        loaded: set[str] = set()
 
         for name, loaded_weight in weights:
 
@@ -256,6 +343,7 @@ class BaseCausalLM(nn.Module):
 
                 param = params_dict[name]
                 param.weight_loader(param, loaded_weight, shard_id)
+                loaded.add(name)
 
                 break
 
@@ -270,6 +358,69 @@ class BaseCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded.add(name)
+
+        self.post_load_weights()
+        return loaded
+
+    # Live weight updates (see the class docstring).
+
+    def begin_weight_update(self) -> None:
+        """Enter a live weight-update session.
+
+        Raises:
+            RuntimeError: A session is already active.
+        """
+        if self._weight_update_active:
+            raise RuntimeError(
+                f"{type(self).__name__}: a weight-update session is already active"
+            )
+        self._weight_update_active = True
+        self._weight_update_loaded_names = set()
+        self._weight_update_derive_pending = False
+
+    def end_weight_update(self) -> None:
+        """Leave the session and run the deferred derivation once.
+
+        ``post_load_weights`` runs only if a chunk asked for it, and with
+        ``_weight_update_loaded_names`` still populated so a model can
+        restrict derivations that are not idempotent to the parameters this
+        update actually replaced. The session is closed whether or not the
+        derivation raises.
+
+        Raises:
+            RuntimeError: No session is active.
+        """
+        if not self._weight_update_active:
+            raise RuntimeError(
+                f"{type(self).__name__}: no weight-update session is active"
+            )
+        # Leave the session first: the ``post_load_weights`` wrapper defers
+        # only while one is active.
+        self._weight_update_active = False
+        try:
+            if self._weight_update_derive_pending:
+                self.post_load_weights()
+        finally:
+            self.abort_weight_update()
+
+    def abort_weight_update(self) -> None:
+        """Leave the session without deriving state (the update failed)."""
+        self._weight_update_active = False
+        self._weight_update_loaded_names = None
+        self._weight_update_derive_pending = False
+
+    def record_loaded_weights(self, names: Iterable[str]) -> None:
+        """Remember which parameters this session's ``load_weights`` touched.
+
+        The base class records what ``load_weights`` returns; calling this
+        explicitly is harmless.
+        """
+        if self._weight_update_loaded_names is not None:
+            self._weight_update_loaded_names.update(names)
+
+    def post_load_weights(self) -> None:
+        """Derive state from the loaded parameters (see the class docstring)."""
 
     def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
 

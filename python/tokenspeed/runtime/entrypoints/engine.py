@@ -76,7 +76,9 @@ from tokenspeed.runtime.engine.io_struct import (
     RpcReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromMooncakeReqInput,
     UpdateWeightsFromTensorReqInput,
+    mooncake_load_weight_version,
 )
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
 from tokenspeed.runtime.utils import (
@@ -402,6 +404,40 @@ class Engine(EngineBase):
         result = self.llm.run(
             self.tokenizer_manager.update_weights_from_distributed(obj)
         )
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if success and weight_version is not None:
+            self.server_args.weight_version = str(weight_version)
+        return result
+
+    def update_weights_from_mooncake(
+        self,
+        version: int,
+        flush_cache: bool = True,
+        *,
+        weight_version: str | None,
+    ):
+        """Load one committed Model Updater SDK version on every worker.
+
+        ``weight_version`` is required. Pass ``None`` to publish
+        ``str(version)`` on a flushed load, or to keep the current namespace
+        on an intermediate (unflushed) one (``mooncake_load_weight_version``).
+        """
+        weight_version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            mooncake_load_weight_version(
+                version=version,
+                flush_cache=flush_cache,
+                weight_version=weight_version,
+            ),
+            flush_cache=flush_cache,
+            storage_backend=self.server_args.kvstore_storage_backend,
+        )
+        obj = UpdateWeightsFromMooncakeReqInput(
+            version=version,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
+        result = self.llm.run(self.tokenizer_manager.update_weights_from_mooncake(obj))
         success = result[0] if isinstance(result, tuple) else bool(result)
         if success and weight_version is not None:
             self.server_args.weight_version = str(weight_version)

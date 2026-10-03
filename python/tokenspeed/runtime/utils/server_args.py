@@ -181,6 +181,18 @@ class ServerArgs:
     # sample. Updated atomically after a successful weight push when the trainer
     # supplies a new version string.
     weight_version: str = "default"
+    # Model Updater SDK (``/update_weights_from_mooncake``). The config is an
+    # opaque JSON object handed to the SDK; the other three are required with
+    # it and must stay unset without it (validated in ``validate``).
+    model_update_config: str | None = None
+    # Import path of the SDK module exposing ``make_model_updater``,
+    # ``ModelUpdaterConfig``, ``EngineType``, ``MooncakeWeightStore``,
+    # ``FluentLlmEngineConfig`` and ``FluentLlmModelUpdateInitConfig``.
+    model_update_sdk_module: str | None = None
+    # ``EngineType`` member name the SDK resolves this engine as.
+    model_update_engine_type: str | None = None
+    # Whether an update also streams the speculative draft model's weights.
+    model_update_draft_weights: Literal["retain", "refresh"] | None = None
 
     # Data parallelism
     data_parallel_size: int | None = None
@@ -979,6 +991,37 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+    def validate_model_update_options(self):
+        """Require the Model Updater SDK flags together, or none of them.
+
+        The config alone cannot select the SDK module, the engine type, or
+        the draft policy, so those three are mandatory with it and
+        meaningless without it.
+        """
+        companions = {
+            "--model-update-sdk-module": self.model_update_sdk_module,
+            "--model-update-engine-type": self.model_update_engine_type,
+            "--model-update-draft-weights": self.model_update_draft_weights,
+        }
+        if self.model_update_config is None:
+            given = [flag for flag, value in companions.items() if value is not None]
+            if given:
+                raise ValueError(f"{', '.join(given)} require --model-update-config")
+            return
+        missing = [flag for flag, value in companions.items() if value is None]
+        if missing:
+            raise ValueError(f"--model-update-config requires {', '.join(missing)}")
+        try:
+            parsed = json.loads(self.model_update_config)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--model-update-config must be valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("--model-update-config must be a JSON object")
+        if self.model_update_draft_weights not in ("retain", "refresh"):
+            raise ValueError(
+                "--model-update-draft-weights must be 'retain' or 'refresh'"
+            )
+
     def validate_petit_moe_options(self):
         """Validate shared backend, model, and scheduling options for Petit.
 
@@ -1072,6 +1115,8 @@ class ServerArgs:
 
         if self.mapping.has_attn_cp and self.max_num_seqs > 1:
             raise ValueError("CP attention is enabled but max_num_seqs > 1")
+
+        self.validate_model_update_options()
 
         if self.mapping.has_attn_dp:
             if self.chunked_prefill_size > self.max_prefill_tokens:
@@ -2407,6 +2452,37 @@ class ServerArgs:
             type=str,
             default=ServerArgs.weight_version,
             help="Initial model-weight version stamped into generation metadata.",
+        )
+        parser.add_argument(
+            "--model-update-config",
+            type=str,
+            default=ServerArgs.model_update_config,
+            help="JSON object handed to the Model Updater SDK for "
+            "/update_weights_from_mooncake. Requires --model-update-sdk-module, "
+            "--model-update-engine-type and --model-update-draft-weights.",
+        )
+        parser.add_argument(
+            "--model-update-sdk-module",
+            type=str,
+            default=ServerArgs.model_update_sdk_module,
+            help="Import path of the Model Updater SDK module (imported lazily "
+            "on the first /update_weights_from_mooncake).",
+        )
+        parser.add_argument(
+            "--model-update-engine-type",
+            type=str,
+            default=ServerArgs.model_update_engine_type,
+            help="Model Updater SDK EngineType member name for this engine "
+            "(resolved as EngineType[value.upper()]).",
+        )
+        parser.add_argument(
+            "--model-update-draft-weights",
+            type=str,
+            choices=["retain", "refresh"],
+            default=ServerArgs.model_update_draft_weights,
+            help="Whether /update_weights_from_mooncake also streams the "
+            "speculative draft model's weights: 'retain' updates the target "
+            "only, 'refresh' updates target and draft.",
         )
 
     @classmethod

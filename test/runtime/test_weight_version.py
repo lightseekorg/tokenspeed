@@ -247,6 +247,7 @@ class TestWeightVersionHTTP(unittest.TestCase):
         self.assertIn(("/get_weight_version", frozenset({"GET"})), routes)
         self.assertIn(("/model_info", frozenset({"GET"})), routes)
         self.assertIn(("/update_weight_version", frozenset({"POST"})), routes)
+        self.assertIn(("/update_weights_from_mooncake", frozenset({"POST"})), routes)
         self.assertIn(("/v1/loads", frozenset({"GET"})), routes)
         removed_vllm_routes = {
             ("/init_weight_transfer_engine", frozenset({"POST"})),

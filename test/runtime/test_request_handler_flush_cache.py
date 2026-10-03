@@ -1,6 +1,7 @@
 import ast
 import inspect
 import unittest
+from collections import deque
 from pathlib import Path
 from unittest import mock
 
@@ -36,7 +37,8 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         handler.attn_dp_size = 1
         handler.attn_dp_cpu_group = None
         handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-        handler._replica_flush_want_buf = torch.zeros(1, dtype=torch.int32)
+        handler._replica_flush_want_buf = torch.zeros(4, dtype=torch.int32)
+        handler._pending_weight_ops = deque()
         handler._device = mock.Mock()
         handler._device.delete_l3_namespace.return_value = True
         return handler
@@ -282,7 +284,8 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         handler.attn_dp_size = 1
         handler.attn_dp_cpu_group = None
         handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-        handler._replica_flush_want_buf = torch.zeros(1, dtype=torch.int32)
+        handler._replica_flush_want_buf = torch.zeros(4, dtype=torch.int32)
+        handler._pending_weight_ops = deque()
         handler.can_clear_cache_fn = mock.Mock(return_value=True)
         handler._device.delete_l3_namespace.return_value = True
         return handler
@@ -588,7 +591,8 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
             handler.process_requests([req])
 
-        self.assertEqual(groups_seen, ["cp", "cp"])
+        # Preflight MIN, L3-delete MIN, then the update result MIN.
+        self.assertEqual(groups_seen, ["cp", "cp", "cp"])
         handler._device.update_weights.assert_called_once_with(req)
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertTrue(output.success)
