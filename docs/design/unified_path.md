@@ -567,6 +567,20 @@ installs that window before its first ordinary verify round. Stage ownership
 changes where context and proposals are produced; candidate handoff and
 verification follow the same path as other speculative prefills.
 
+Known limitation, multi-depth MTP (`Mtp`): the drafter's cross-round
+stash — per request-pool slot, the last `k-1` committed tokens and the
+target hiddens one position behind them, which seed the rows of the
+frontier-anchored decode window that lie before this round's verify window
+— is drafter-private state the prefill node fills during its extend
+catch-up and the bootstrap payload does not carry. After a PD landing the
+decode node's first rounds read the slot's stash as it stands (never
+filled for this request), so the depth loop rewrites up to `k-1` draft-KV
+positions in the prompt tail from wrong inputs until the stash has rolled
+those entries out (at most `k-1` rounds; the prompt-tail planes the
+prefill node transferred were correct). Draft quality only: verification
+is exact. Intended fix: ship the slot's stash rows with the bootstrap
+payload, the way K3 DSpark hands over its anchor and candidates.
+
 ### PD prefill nodes
 
 The prefill role is not an eager role; it is a role with no decode step.

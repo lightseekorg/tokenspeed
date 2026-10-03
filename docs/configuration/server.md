@@ -229,7 +229,14 @@ draft checkpoint needs at least that many depths. Both shapes run under
 attention data parallelism (idle ranks mirror the depth loop with empty
 forwards) and with PD layerwise transfer
 (`--disaggregation-layerwise-interval`), where the draft's per-depth cache
-planes become ready together after the drafter's run.
+planes become ready together after the drafter's run. Known PD limitation
+of the multi-depth head: the drafter's cross-round stash (the last `k-1`
+committed tokens and their target hiddens per request) is not transferred
+with the KV, so for up to `k-1` decode rounds after a request lands on the
+decode node the draft rewrites prompt-tail draft-KV positions from an
+unfilled stash. Draft acceptance may dip for those rounds; verification
+stays exact. Shipping the stash with the bootstrap payload is a planned
+follow-up.
 
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.
