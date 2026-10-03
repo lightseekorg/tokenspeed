@@ -47,9 +47,12 @@ A draft model served by this drafter implements:
   ``ForwardMode.IDLE`` with zero rows (``captured_hidden_states=None``) must
   run the model's collectives without attention — that is what an idle
   attention-DP rank calls.
-* Depth selection ``layers[spec_step_idx % num_depths]``; depth ``d``
-  writes its KV to the draft cache layer ``d`` (per-depth planes, cache
-  layer ids ``0..N-1``), so ``num_depths >= spec_num_steps``.
+* ``num_mtp_layers``: the number of depth layers built. Depth selection is
+  ``layers[spec_step_idx % num_mtp_layers]`` and depth ``d`` writes its KV
+  to the draft cache layer ``d`` (per-depth planes, cache layer ids
+  ``0..N-1``), so a step count above it would wrap onto plane 0 and
+  overwrite it; ``Mtp`` refuses ``num_mtp_layers < spec_num_steps`` at
+  construction.
 * Every input row flows through the depth's MoE / dense collectives (there
   is no per-request narrowing: the decode window is ``k`` rows per request
   at every depth), so the model keeps the default collective sizing and
@@ -79,12 +82,12 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -304,13 +307,22 @@ class Mtp(BaseDrafter):
         # Depth selection rides on spec_step_idx, which ModelRunner forwards
         # only to a forward that declares it: a draft without the parameter
         # would run depth 0 at every step and draft silently wrong tokens.
-        if not ModelRunner._forward_accepts_kwarg(
-            draft_model_runner.model, "spec_step_idx"
-        ):
+        model_name = type(draft_model_runner.model).__name__
+        if not draft_model_runner.forward_accepts_spec_step_idx:
             raise TypeError(
-                f"{type(draft_model_runner.model).__name__}.forward must declare "
-                "spec_step_idx: the multi-depth MTP drafter selects depth d by "
-                "passing spec_step_idx=d (see the drafter module docstring)"
+                f"{model_name}.forward must declare spec_step_idx: the "
+                "multi-depth MTP drafter selects depth d by passing "
+                "spec_step_idx=d (see the drafter module docstring)"
+            )
+        # Depth d writes cache plane d; a step past the last depth would wrap
+        # (layers[d % num_mtp_layers]) and overwrite plane 0 with a later
+        # step's KV.
+        num_mtp_layers = int(draft_model_runner.model.num_mtp_layers)
+        if num_mtp_layers < spec_num_steps:
+            raise ValueError(
+                f"{model_name} builds {num_mtp_layers} MTP depth layer(s) but "
+                f"--speculative-num-steps {spec_num_steps} runs one depth per "
+                "step: the step count must not exceed the draft's depth count"
             )
 
         # Drafter-owned seq_lens the CUDA-graph wrapper aliases into every

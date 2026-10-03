@@ -99,6 +99,8 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
+        # Set by load_model from the model's forward signature.
+        self._model_forward_accepts_spec_step_idx: bool = False
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
         self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
         # Target and draft alike: the envelope covers every model that serves.
@@ -154,6 +156,17 @@ class ModelRunner:
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
             self.model, "spec_step_idx"
         )
+
+    @property
+    def forward_accepts_spec_step_idx(self) -> bool:
+        """Whether the model's ``forward`` declares ``spec_step_idx``.
+
+        :meth:`forward` passes ``spec_step_idx`` through only when this holds
+        (``**kwargs`` alone does not count); a drafter that selects depth by
+        step must check it at construction rather than discover at serve time
+        that every step ran depth 0.
+        """
+        return self._model_forward_accepts_spec_step_idx
 
     @property
     def multimodal_encoder_dtype(self) -> str | None:
@@ -224,9 +237,7 @@ class ModelRunner:
             kwargs["input_embeds"] = input_embeds
         if multimodal_context is not None:
             kwargs["multimodal_context"] = multimodal_context
-        if spec_step_idx is not None and getattr(
-            self, "_model_forward_accepts_spec_step_idx", False
-        ):
+        if spec_step_idx is not None and self.forward_accepts_spec_step_idx:
             kwargs["spec_step_idx"] = spec_step_idx
         if kv_sync_event is not None:
             kwargs["kv_sync_event"] = kv_sync_event

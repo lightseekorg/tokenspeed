@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -83,13 +84,17 @@ def _make_mtp(
     *,
     spec_num_tokens: int = 4,
     spec_num_steps: int = 3,
+    num_mtp_layers: int | None = None,
     max_bs: int = 16,
     request_pool_rows: int = 18,
     dp_size: int = 1,
     draft_forward=None,
     model_forward=_multi_depth_forward,
 ) -> Mtp:
-    """An ``Mtp`` over stubbed runner/buffers (no weights, no kernels)."""
+    """An ``Mtp`` over stubbed runner/buffers (no weights, no kernels); the
+    draft model builds ``num_mtp_layers`` depths (default: one per step)."""
+    if num_mtp_layers is None:
+        num_mtp_layers = spec_num_steps
     input_buffers = SimpleNamespace(
         max_bs=max_bs,
         seq_lens_buf=torch.zeros(max_bs, dtype=torch.int32),
@@ -97,7 +102,11 @@ def _make_mtp(
     model_runner = SimpleNamespace(
         device="cpu",
         mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=dp_size)),
-        model=SimpleNamespace(forward=model_forward),
+        model=SimpleNamespace(forward=model_forward, num_mtp_layers=num_mtp_layers),
+        # What ModelRunner.load_model derives from the forward signature.
+        forward_accepts_spec_step_idx=(
+            "spec_step_idx" in inspect.signature(model_forward).parameters
+        ),
         model_config=SimpleNamespace(
             hidden_size=8,
             dtype=torch.float32,
@@ -203,6 +212,17 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         with self.assertRaisesRegex(TypeError, "spec_step_idx"):
             _make_mtp(model_forward=eagle_shaped_forward)
+
+    def test_mtp_refuses_more_steps_than_the_draft_has_depths(self):
+        # Step d runs layers[d % num_mtp_layers] onto cache plane d % N: a
+        # step count past the depth count would wrap onto plane 0 and
+        # overwrite it, so construction refuses it; equal or more depths
+        # are fine.
+        with self.assertRaisesRegex(ValueError, "2 MTP depth layer"):
+            _make_mtp(spec_num_steps=3, num_mtp_layers=2)
+
+        _make_mtp(spec_num_steps=3, num_mtp_layers=3)
+        _make_mtp(spec_num_steps=3, num_mtp_layers=8)
 
     def test_mtp_runs_under_attention_dp_and_sizes_every_depth_like_the_target(
         self,
