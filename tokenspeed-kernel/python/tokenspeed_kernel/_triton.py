@@ -28,23 +28,35 @@ import importlib.abc
 import importlib.util
 import sys
 
-import tokenspeed_triton.experimental.gluon.language as gl
 import torch
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.language.core import _aggregate as aggregate
-from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
+
+try:
+    importlib.import_module("tokenspeed_triton")
+    _TRITON_PACKAGE = "tokenspeed_triton"
+except ModuleNotFoundError as exc:
+    if exc.name != "tokenspeed_triton":
+        raise
+    importlib.import_module("triton")
+    _TRITON_PACKAGE = "triton"
+
+gl = importlib.import_module(f"{_TRITON_PACKAGE}.experimental.gluon.language")
+gluon = importlib.import_module(f"{_TRITON_PACKAGE}.experimental.gluon")
+aggregate = importlib.import_module(f"{_TRITON_PACKAGE}.language.core")._aggregate
+TensorDescriptor = importlib.import_module(
+    f"{_TRITON_PACKAGE}.tools.tensor_descriptor"
+).TensorDescriptor
 
 _IS_NPU = hasattr(torch, "npu") and torch.npu.is_available()
 
 if _IS_NPU:
     from tokenspeed_kernel_npu._triton import libdevice, proton, tl, triton
 else:
-    import tokenspeed_triton as triton
-    from tokenspeed_triton import language as tl
-    from tokenspeed_triton.language.extra import libdevice
+    triton = importlib.import_module(_TRITON_PACKAGE)
+    tl = importlib.import_module(f"{_TRITON_PACKAGE}.language")
+    libdevice = importlib.import_module(f"{_TRITON_PACKAGE}.language.extra.libdevice")
 
     try:
-        import tokenspeed_triton.profiler as proton
+        proton = importlib.import_module(f"{_TRITON_PACKAGE}.profiler")
     except ImportError:
         proton = None
 
@@ -62,7 +74,7 @@ __all__ = [
 
 
 _TRITON_SRC = "triton"
-_TRITON_DST = "tokenspeed_triton"
+_TRITON_DST = _TRITON_PACKAGE
 
 
 class _ReuseModuleLoader(importlib.abc.Loader):
@@ -119,7 +131,7 @@ def redirect_triton_to_tokenspeed_triton():
     Outside the ``with`` block ``sys.modules`` is restored to its prior
     state, so unrelated code is unaffected.
     """
-    if _IS_NPU:
+    if _IS_NPU or _TRITON_DST == _TRITON_SRC:
         yield
         return
 
