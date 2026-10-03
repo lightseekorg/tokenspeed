@@ -23,6 +23,8 @@
 from __future__ import annotations
 
 import threading
+import time
+from collections import deque
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import NamedTuple
@@ -92,6 +94,72 @@ class _Ack(NamedTuple):
     op_ids: list[int]
     backup_pages: list[StoragePage]
     success: bool
+
+
+class _BackupTicket(NamedTuple):
+    """One L3 backup queued on the single-worker pool, with queue timing.
+
+    ``enqueued_at`` anchors the queue wait; a retry re-enqueues with a fresh
+    timestamp so the first attempt's PUT time is not charged to the queue.
+    """
+
+    future: Future
+    op_ids: list[int]
+    pages: list[StoragePage]
+    enqueued_at: float
+    payload_bytes: int
+
+
+class _BackupCompletion(NamedTuple):
+    """One finished backup attempt's timing, kept for diagnostics."""
+
+    pages: int
+    payload_bytes: int
+    queue_seconds: float
+    put_seconds: float
+    failed: bool
+
+
+class L3BackupBacklog(NamedTuple):
+    """Point-in-time pending backup queue state.
+
+    A slow PUT retains Host pages (and, for ordinary stores, Device pages)
+    until the ACK; ``pending_pages`` / ``pending_bytes`` /
+    ``oldest_pending_seconds`` make that admission pressure visible.
+    """
+
+    pending_tasks: int
+    pending_pages: int
+    pending_bytes: int
+    oldest_pending_seconds: float
+
+
+class _BackupStats:
+    """Cumulative L3 backup diagnostics, mutated under the executor's lock.
+
+    ``recent`` keeps the last few completions (oldest first) so tests and
+    operators can attribute queue wait vs. PUT time to individual backups
+    without parsing logs.
+    """
+
+    def __init__(self) -> None:
+        self.completed = 0
+        self.failed = 0
+        self.retried = 0
+        self.completed_bytes = 0
+        self.queue_seconds = 0.0
+        self.put_seconds = 0.0
+        self.recent: deque[_BackupCompletion] = deque(maxlen=128)
+
+    def record(self, completion: _BackupCompletion) -> None:
+        if completion.failed:
+            self.failed += 1
+        else:
+            self.completed += 1
+            self.completed_bytes += completion.payload_bytes
+        self.queue_seconds += completion.queue_seconds
+        self.put_seconds += completion.put_seconds
+        self.recent.append(completion)
 
 
 class _WriteLane:
@@ -310,7 +378,8 @@ class L2CacheExecutor:
         self._load_poisoned = False
         self._ready_load_acks: list[tuple[int, bool]] = []
         self._l3_prefetch_ok: dict[StoragePage, bool] = {}
-        self._backup_futures: list[tuple[Future, list[int], list[StoragePage]]] = []
+        self._backup_futures: list[_BackupTicket] = []
+        self._backup_stats = _BackupStats()
         self._backup_poll_failed = False
         self._l3_workers: ThreadPoolExecutor | None = None
 
@@ -361,8 +430,8 @@ class L2CacheExecutor:
     def _wait_l3_backups(self) -> None:
         with self._ack_lock:
             inflight = list(self._backup_futures)
-        for future, _op_ids, _pages in inflight:
-            future.result()
+        for ticket in inflight:
+            ticket.future.result()
 
     def submit_write_backs(self, plan, *, prerequisite_stream, fence_stream) -> None:
         """Enqueue the plan's D2H copies on the write stream.
@@ -1010,22 +1079,126 @@ class L2CacheExecutor:
         if workers is None:
             workers = ThreadPoolExecutor(max_workers=1, thread_name_prefix="l3-backup")
             self._l3_workers = workers
-        future = workers.submit(self._backup_to_storage, list(ack.backup_pages))
+        ticket = self._submit_backup(
+            workers,
+            op_ids=list(ack.op_ids),
+            pages=list(ack.backup_pages),
+            payload_bytes=self._backup_payload_bytes(ack.backup_pages),
+        )
         with self._ack_lock:
-            self._backup_futures.append(
-                (future, list(ack.op_ids), list(ack.backup_pages))
+            self._backup_futures.append(ticket)
+
+    def _backup_payload_bytes(self, pages: Sequence[StoragePage]) -> int:
+        """Total Host payload bytes covered by a backup, for backlog gauges.
+
+        Runs on the control plane inside ``poll_results``: this is pure
+        arithmetic on the scheduler-owned page geometry (no I/O), so it
+        cannot block the round.
+        """
+        total = 0
+        for group_id, host_block_id, _content_hash, _page_offset in pages:
+            _offset, size = self.host_storage.host_block_range(
+                int(group_id), int(host_block_id)
             )
+            total += int(size)
+        return total
+
+    def _submit_backup(
+        self,
+        workers: ThreadPoolExecutor,
+        *,
+        op_ids: list[int],
+        pages: list[StoragePage],
+        payload_bytes: int,
+    ) -> _BackupTicket:
+        enqueued_at = time.monotonic()
+        future = workers.submit(
+            self._run_backup_ticket,
+            pages=pages,
+            enqueued_at=enqueued_at,
+            payload_bytes=payload_bytes,
+        )
+        return _BackupTicket(
+            future=future,
+            op_ids=op_ids,
+            pages=pages,
+            enqueued_at=enqueued_at,
+            payload_bytes=payload_bytes,
+        )
+
+    def _run_backup_ticket(
+        self, *, pages: list[StoragePage], enqueued_at: float, payload_bytes: int
+    ) -> None:
+        """Worker entry: run the PUT and record queue wait vs. transfer time."""
+        started = time.monotonic()
+        failed = True
+        try:
+            self._backup_to_storage(pages)
+            failed = False
+        finally:
+            completion = _BackupCompletion(
+                pages=len(pages),
+                payload_bytes=payload_bytes,
+                queue_seconds=max(started - enqueued_at, 0.0),
+                put_seconds=max(time.monotonic() - started, 0.0),
+                failed=failed,
+            )
+            self._record_backup_completion(completion)
+
+    def _record_backup_completion(self, completion: _BackupCompletion) -> None:
+        with self._ack_lock:
+            self._backup_stats.record(completion)
+            # The completing ticket still sits in ``_backup_futures`` until the
+            # control plane collects it, so this backlog counts it: its pages
+            # stay pinned until the WriteBackDone is actually emitted.
+            backlog = self._backup_backlog_locked(now=time.monotonic())
+        if completion.failed:
+            # ``_collect_finished_backups`` logs the failure and the retry.
+            return
+        logger.info(
+            f"[L3] backup done pages={completion.pages} "
+            f"bytes={completion.payload_bytes} "
+            f"queue_ms={completion.queue_seconds * 1e3:.2f} "
+            f"put_ms={completion.put_seconds * 1e3:.2f} "
+            f"pending_pages={backlog.pending_pages} "
+            f"pending_bytes={backlog.pending_bytes} "
+            f"oldest_pending_ms={backlog.oldest_pending_seconds * 1e3:.1f}"
+        )
+
+    def _backup_backlog_locked(self, *, now: float) -> L3BackupBacklog:
+        pending_pages = 0
+        pending_bytes = 0
+        oldest: float | None = None
+        for ticket in self._backup_futures:
+            pending_pages += len(ticket.pages)
+            pending_bytes += ticket.payload_bytes
+            oldest = (
+                ticket.enqueued_at
+                if oldest is None
+                else min(oldest, ticket.enqueued_at)
+            )
+        return L3BackupBacklog(
+            pending_tasks=len(self._backup_futures),
+            pending_pages=pending_pages,
+            pending_bytes=pending_bytes,
+            oldest_pending_seconds=(0.0 if oldest is None else max(now - oldest, 0.0)),
+        )
+
+    def l3_backup_backlog(self) -> L3BackupBacklog:
+        """Snapshot of pending L3 backup pages/bytes and oldest queue wait."""
+        with self._ack_lock:
+            return self._backup_backlog_locked(now=time.monotonic())
 
     def _collect_finished_backups(self, results: list) -> None:
         with self._ack_lock:
             inflight = list(getattr(self, "_backup_futures", ()))
             self._backup_futures = []
-        still: list[tuple[Future, list[int], list[StoragePage]]] = []
-        for future, op_ids, pages in inflight:
-            if not future.done():
-                still.append((future, op_ids, pages))
+        still: list[_BackupTicket] = []
+        for ticket in inflight:
+            if not ticket.future.done():
+                still.append(ticket)
                 continue
-            failed = future.exception()
+            failed = ticket.future.exception()
             if failed is not None:
                 logger.error(
                     "L3 backup failed; retrying and reporting a rank-local "
@@ -1035,14 +1208,21 @@ class L2CacheExecutor:
                 self._backup_poll_failed = True
                 workers = getattr(self, "_l3_workers", None)
                 if workers is not None:
+                    with self._ack_lock:
+                        self._backup_stats.retried += 1
                     still.append(
-                        (workers.submit(self._backup_to_storage, pages), op_ids, pages)
+                        self._submit_backup(
+                            workers,
+                            op_ids=ticket.op_ids,
+                            pages=ticket.pages,
+                            payload_bytes=ticket.payload_bytes,
+                        )
                     )
                 else:
-                    still.append((future, op_ids, pages))
+                    still.append(ticket)
                 continue
-            future.result()
-            results.extend(self._write_done(op_id) for op_id in op_ids)
+            ticket.future.result()
+            results.extend(self._write_done(op_id) for op_id in ticket.op_ids)
         with self._ack_lock:
             self._backup_futures.extend(still)
 
@@ -1117,8 +1297,8 @@ class L2CacheExecutor:
         # acknowledge work in memory and silently lose the remote object.
         for ack in pending_writes:
             self._backup_to_storage(ack.backup_pages)
-        for future, _op_ids, _pages in inflight:
-            future.result()
+        for ticket in inflight:
+            ticket.future.result()
         workers = getattr(self, "_l3_workers", None)
         if workers is not None:
             workers.shutdown(wait=True)
