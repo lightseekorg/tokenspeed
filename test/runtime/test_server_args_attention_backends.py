@@ -481,6 +481,88 @@ class TestDisaggregationGraphFlags(unittest.TestCase):
             )
         self.assertTrue(args.enforce_eager)
 
+    @staticmethod
+    def _pipeline_prefill_args(algorithm: str, *extra: str) -> list[str]:
+        return [
+            "--model",
+            "x",
+            "--disaggregation-mode",
+            "prefill",
+            "--pipeline-parallel-size",
+            "2",
+            "--speculative-algorithm",
+            algorithm,
+            *extra,
+        ]
+
+    def test_pipeline_prefill_accepts_last_stage_drafters(self):
+        # The drafter runs on the last stage, the only stage that samples;
+        # DSPARK additionally produces context across stages.
+        for algorithm in ("MTP", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                args = prepare_server_args(self._pipeline_prefill_args(algorithm))
+                self.assertEqual(args.speculative_algorithm, algorithm)
+                self.assertTrue(args.enforce_eager)
+
+    def test_pipeline_speculation_requires_the_prefill_role(self):
+        with self.assertRaisesRegex(ValueError, "disaggregation-mode prefill"):
+            prepare_server_args(
+                [
+                    "--model",
+                    "x",
+                    "--disaggregation-mode",
+                    "decode",
+                    "--pipeline-parallel-size",
+                    "2",
+                    "--speculative-algorithm",
+                    "MTP",
+                ]
+            )
+        # The PP debug escape hatch runs without PD; it has no decode token
+        # feedback to draft against either.
+        with (
+            mock.patch.dict(os.environ, {"TS_PP_DEBUG_ALLOW_NON_PREFILL": "1"}),
+            self.assertRaisesRegex(ValueError, "only on a prefill server"),
+        ):
+            prepare_server_args(
+                [
+                    "--model",
+                    "x",
+                    "--pipeline-parallel-size",
+                    "2",
+                    "--speculative-algorithm",
+                    "MTP",
+                ]
+            )
+
+    def test_pipeline_rejects_drafts_that_read_taps_from_several_stages(self):
+        # DFLASH has no cross-stage context production; EAGLE3's aux taps
+        # are not carried through the stage boundary.
+        for algorithm in ("DFLASH", "EAGLE3"):
+            with (
+                self.subTest(algorithm=algorithm),
+                self.assertRaisesRegex(ValueError, f"{algorithm} is not supported"),
+            ):
+                prepare_server_args(self._pipeline_prefill_args(algorithm))
+
+    def test_pipeline_dspark_keeps_matching_dense_and_attention_tp(self):
+        # The DSPARK draft reduces attention-TP embedding partials over the
+        # dense TP group; MTP embeds with a reduced lookup and carries no
+        # such rule.
+        narrow_dense = (
+            "--world-size",
+            "4",
+            "--attn-tp-size",
+            "2",
+            "--dense-tp-size",
+            "1",
+        )
+        with self.assertRaisesRegex(ValueError, "matching dense/attention TP"):
+            prepare_server_args(self._pipeline_prefill_args("DSPARK", *narrow_dense))
+        args = prepare_server_args(self._pipeline_prefill_args("MTP", *narrow_dense))
+        self.assertEqual(args.mapping.dense.tp_size, 1)
+        self.assertEqual(args.mapping.attn.tp_size, 2)
+
 
 class TestL3StorageBackend(unittest.TestCase):
     def test_cli_accepts_mooncake_and_memory(self):

@@ -69,6 +69,15 @@ ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
 # evicted with the request one step later.
 _SPEC_OVERSHOOT_SPANS = 3
 
+# Speculative algorithms a prefill server runs on the chunk pipeline
+# (--pipeline-parallel-size > 1). The drafter executes on the last stage, the
+# only stage that samples: an MTP (NextN) draft needs only that stage's final
+# hidden states, and DSPARK produces its draft context across stages. EAGLE3
+# is excluded because its aux taps come from several stages and nothing
+# carries them through the stage boundary. See
+# ServerArgs.resolve_disaggregation.
+PIPELINE_SPEC_ALGORITHMS = ("DSPARK", "MTP")
+
 
 def str_to_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
@@ -878,20 +887,35 @@ class ServerArgs:
                     "supported yet"
                 )
             if self.speculative_algorithm is not None:
-                if (
-                    self.speculative_algorithm != "DSPARK"
-                    or self.disaggregation_mode != "prefill"
-                ):
+                # Pipeline speculation is a prefill-server feature: only the
+                # last stage samples, so it alone runs the drafter and owns
+                # the draft cache; the candidates ride the remote decode to
+                # the peer. A decode role (or the PP debug mode) has no
+                # token feedback on the chunk pipeline to draft against.
+                if self.disaggregation_mode != "prefill":
                     raise ValueError(
                         "--pipeline-parallel-size > 1 supports speculation only "
-                        "as DSPARK context production on a prefill server"
+                        "on a prefill server (--disaggregation-mode prefill)"
+                    )
+                # DSPARK produces its draft context across stages (each stage
+                # projects the target taps it owns); an MTP (NextN) draft
+                # needs only the last stage's captured hidden states.
+                if self.speculative_algorithm not in PIPELINE_SPEC_ALGORITHMS:
+                    raise ValueError(
+                        f"--speculative-algorithm {self.speculative_algorithm} "
+                        "is not supported with --pipeline-parallel-size > 1; "
+                        f"pipeline speculation supports {PIPELINE_SPEC_ALGORITHMS}"
                     )
                 # Current CachePD / draft layout limits rather than PP limits:
-                # CachePD has no CP partition contract, and the draft reduces
-                # its attention-TP embedding partials over the dense TP group.
-                if (
+                # CachePD has no CP partition contract, and the DSPARK draft
+                # reduces its attention-TP embedding partials over the dense
+                # TP group. MTP drafts embed with an ordinary reduced
+                # vocab-parallel lookup, so only DSPARK carries the rule.
+                # Both TP groups are stride-1 over the stage, so equal widths
+                # mean equal groups (the mapping has no rank yet here).
+                if self.speculative_algorithm == "DSPARK" and (
                     self.mapping.attn.cp_size != 1
-                    or self.mapping.dense.tp_group != self.mapping.attn.tp_group
+                    or self.mapping.dense.tp_size != self.mapping.attn.tp_size
                 ):
                     raise ValueError(
                         "Pipeline DSPARK requires attention CP=1 and matching "
