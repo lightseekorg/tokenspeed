@@ -347,6 +347,10 @@ def all_to_all_transpose(
         return x
     rows = input_split_sizes[group.index(torch.distributed.get_rank())]
     width = x.shape[1]
+    if x.shape[0] == 0:
+        # Nothing to move for the whole group (every rank reads the same
+        # counts, so every rank skips the collective together).
+        return x.new_empty(0, world_size * width)
     received = x.new_empty(world_size * rows, width)
     all_to_all_single(
         received,
@@ -400,6 +404,9 @@ def all_to_all_head_scatter(
             f"{output_split_sizes} give it "
             f"{output_split_sizes[group.index(torch.distributed.get_rank())]}"
         )
+    if rows_full == 0:
+        # Nothing to move for the whole group; every rank skips together.
+        return x.new_empty(0, heads_local, dim)
     # Head block i (destined for rank i) becomes send chunk i.
     sent = (
         x.view(rows_own, world_size, heads_local * dim)
