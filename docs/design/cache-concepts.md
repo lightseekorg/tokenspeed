@@ -1168,8 +1168,31 @@ prefill reconstructs bounded history chunks with an owner-masked sum reduction;
 GPU DSA sparse prefill instead combines local sparse-attention partials.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
 DCP does not make unsupported kernels portable. CuTe MLA supports speculative
-decoding. FlashMLA and GPU DSA still
-exclude speculative decoding; all these paths exclude PD transfer and KVStore.
+decoding. FlashMLA and GPU DSA still exclude speculative decoding: their
+`AttnConfig` rejects any speculative width, draft or target, under DCP, and
+the ordinary recipe refuses to shard a cache that holds a draft group. The
+draft's decode steps would run the same sparse/dense DCP branches as the
+target's, but that path has not been validated, so the exclusion is a gate
+rather than a geometry limit. All DCP paths exclude the Host KVStore: the L2
+copies address device pages by scheduler block ID with no ownership
+translation (`cache/l2/executor.py`), so a sharded engine must pass
+`--disable-kvstore`.
+
+PD transfer supports a sharded **prefill** role against an unsharded decode
+role. Manifests carry scheduler (virtual) IDs on both sides and are bounded
+by each side's virtual count, `1 + (page_count - 1) * shard_count`, never by
+the physical page count. The route planner (`pd/transfer_plan.py`) reads
+`shard_count` from the wire `group_specs`: for a sharded group it fans a
+decode rank's replica out to the whole DCP subgroup (consecutive attention-TP
+ranks), tagging every member with an owner filter `(owner_rank, owner_count)`;
+the sender keeps the manifest blocks with `(v - 1) % owner_count ==
+owner_rank`, translates them to local pages through the same
+`owned_local_pages` placement zeroing uses, and copies them to the destination
+blocks at the same manifest positions. Every rank of the subgroup therefore
+serves every decode rank and none is a control-only dummy; the decode receiver
+already counts completions from a rank set. Replicated groups keep the
+single-source route. A sharded decode cache, and a field that is both
+head-partitioned and page-sharded, are rejected by the planner.
 
 The runtime derives compact DCP page tables and local visible lengths from
 the scheduler's virtual block tables, without introducing new scheduler-owned

@@ -96,6 +96,25 @@ def _nonempty_str(value: str) -> str:
     return value
 
 
+def validate_dcp_disaggregation_role(
+    *, has_dcp: bool, disaggregation_mode: str
+) -> None:
+    """Reject DCP on PD roles whose transfer path cannot shard pages yet.
+
+    An aggregated engine and the prefill role may shard: the prefill sender
+    copies only the pages each rank owns and every rank of the DCP subgroup
+    serves every decode rank. The decode role receives into an unsharded
+    cache only -- no receive path lands a block on its owner alone -- and the
+    encode role has no KV cache to shard.
+    """
+    if has_dcp and disaggregation_mode not in ("null", "prefill"):
+        raise ValueError(
+            "--decode-context-parallel-size > 1 requires --disaggregation-mode "
+            f"null or prefill (got {disaggregation_mode!r}): only the prefill "
+            "side of a PD transfer can be DCP-sharded"
+        )
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
@@ -686,8 +705,10 @@ class ServerArgs:
         )
 
         # Impl constraints:
-        if self.mapping.attn.has_dcp and self.disaggregation_mode != "null":
-            raise ValueError("DCP cache transfer does not yet support PD")
+        validate_dcp_disaggregation_role(
+            has_dcp=self.mapping.attn.has_dcp,
+            disaggregation_mode=self.disaggregation_mode,
+        )
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
 
@@ -961,10 +982,14 @@ class ServerArgs:
     def validate_cache_options(self):
         # Runs after _handle_kvstore() has applied the KVStore default, so the
         # check sees the effective setting rather than the pre-resolution flag.
+        # The Host L2 copies address device pages by scheduler block ID with
+        # no ownership translation (cache/l2/executor.py), so a sharded group
+        # would read and write the wrong local pages.
         if self.decode_context_parallel_size > 1 and self.enable_kvstore:
             raise ValueError(
-                "DCP cache transfer does not yet support KVStore; "
-                "use --disable-kvstore."
+                "--decode-context-parallel-size > 1 does not yet support the Host "
+                "KVStore (L2 addresses device pages without DCP ownership "
+                "translation); pass --disable-kvstore."
             )
         # Same-checkpoint DSpark's KVStore support depends on where the draft
         # keeps its context; the engine decides once the draft config resolves
@@ -2238,7 +2263,10 @@ class ServerArgs:
             "--decode-context-parallel-size",
             type=int,
             default=ServerArgs.decode_context_parallel_size,
-            help="Shard DeepSeek V4 compressed KV over a subgroup of attention TP.",
+            help="Shard full-history KV pages (MLA/DSA latent, DeepSeek V4 "
+            "compressed KV) cyclically over a consecutive subgroup of attention "
+            "TP. Allowed on aggregated engines and the PD prefill role; the "
+            "decode role and the Host KVStore are not supported yet.",
         )
         parser.add_argument(
             "--dense-tp-size",
