@@ -142,6 +142,7 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
     backend = SharedBufferSampler()
     executor = SimpleNamespace(
         sampling_backend=backend,
+        _apply_simulated_accept_length=lambda lengths, *args: lengths,
         _apply_force_single_token_verify=lambda lengths, *args: lengths,
     )
     ctx = SimpleNamespace(
@@ -460,6 +461,7 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
     backend = SharedBufferSampler()
     executor = SimpleNamespace(
         sampling_backend=backend,
+        _apply_simulated_accept_length=lambda lengths, *args: lengths,
         _apply_force_single_token_verify=lambda lengths, *args: lengths,
     )
     info = info_cls(req_pool_indices=torch.tensor([3, 7]))
