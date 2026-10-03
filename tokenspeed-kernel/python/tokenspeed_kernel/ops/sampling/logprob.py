@@ -31,6 +31,28 @@ is exact, adding the other shards' exact zeros cannot move the target, and
 the all-gathered block partials fold in the same order. The one solution-
 specific piece is the in-block ``sum(exp)``, the registered
 ``sampling.block_sumexp`` leaf.
+
+The leaf contract (``register_kernel("sampling", "block_sumexp", ...)``):
+
+* signature ``format_signatures("shifted", "dense", {torch.float32})`` and
+  the ``batch_invariant`` feature, which the op REQUIRES — a leaf's tree must
+  depend on the block width only, never on the row count;
+* call ``leaf(shifted, *, block_size)`` with ``shifted`` fp32 ``[rows,
+  vocab]`` already shifted by the row max (``vocab`` a multiple of
+  ``block_size``), returning fp32 ``[rows, vocab // block_size]`` where
+  column ``j`` is ``sum(exp(shifted[:, j * block_size:(j + 1) *
+  block_size]))`` reduced in the leaf's own fixed order;
+* the op folds the columns left to right in fp32 (``((p0 + p1) + p2) ...``),
+  Megatron's rank-ordered reduction of the per-shard partials: a shard
+  narrower than a block pairs back into the block's own tree at its top
+  level, so one full-vocabulary call and the trainer's sharded sum agree
+  bitwise whenever the leaf's in-block tree is pairwise over its tiles.
+
+The portable ``torch`` leaf registers at ``Priority.PORTABLE``; a vendor leaf
+with the trainer's in-block order (the fixed-order operator kit's
+``sumexp`` over 32768-wide blocks) registers the same op above it, so
+normal selection prefers it wherever it is installed, and ``solution=`` /
+``override=`` pin one explicitly.
 """
 
 from __future__ import annotations
@@ -64,10 +86,14 @@ def vocab_parallel_logprobs(
             32768); the fold across blocks is a fp32 left fold in block order.
         solution: Optional kernel solution for the block ``sum(exp)`` leaf;
             only leaves declaring the ``batch_invariant`` feature are eligible.
+            None takes the highest-priority eligible leaf (a vendor leaf
+            registered above the portable one wins).
         override: Optional exact kernel-name or solution override.
 
     Returns:
-        ``[rows]`` fp32 log-probabilities.
+        ``[rows]`` fp32 log-probabilities, ``-(log(sum_exp) - target)`` with
+        ``target = logits[row, id] - max`` and ``sum_exp`` the fp32 left fold
+        of the leaf's ``[rows, vocab // vocab_block]`` block partials.
     """
     if logits.ndim != 2:
         raise ValueError(f"logits must be [rows, vocab], got {tuple(logits.shape)}")

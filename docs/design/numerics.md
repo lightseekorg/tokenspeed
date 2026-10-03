@@ -304,6 +304,22 @@ The portable `block_sumexp` leaf and the vendor leaf reproducing the
 trainer's in-block order differ at ulp level, so the vendor leaf is what
 the comparison runs with.
 
+The leaf contract behind `--logprob-order megatron` is
+`tokenspeed_kernel.ops.sampling.vocab_parallel_logprobs`'s: a leaf
+registers `("sampling", "block_sumexp")` with the signature
+`format_signatures("shifted", "dense", {torch.float32})` and the
+`batch_invariant` feature (the op requires it), is called as
+`leaf(shifted, *, block_size)` with the fp32 `[rows, vocab]` logits already
+shifted by the row max, and returns fp32 `[rows, vocab // block_size]` block
+partials in vocabulary order, each block reduced in its own fixed tree. The
+op folds the columns left to right in fp32 — Megatron's rank-ordered
+reduction of the per-shard partials; a shard narrower than a block pairs
+back into the block's tree at its top level, so one full-vocabulary call
+equals the trainer's sharded sum bitwise when the in-block tree is pairwise
+over its tiles. The in-tree `torch_block_sumexp` sits at `Priority.PORTABLE`;
+the vendor leaf registers above it (any higher band), so plain selection
+takes it wherever it is installed and no host code names the vendor.
+
 The pins above cover only the paths a verified model takes, so the
 verification is recorded per model and enforced at startup: a model profile
 lists the envelopes its model passes in `ModelProfile.numerics_envelopes`

@@ -180,3 +180,55 @@ def test_prompt_logprobs_follow_the_order(monkeypatch):
 def test_processor_refuses_an_unknown_order(monkeypatch):
     with pytest.raises(ValueError, match="logprob_order"):
         _processor("apex", monkeypatch)
+
+
+def test_megatron_order_dispatches_to_a_registered_vendor_leaf():
+    """A leaf registered under ("sampling", "block_sumexp") with the
+    batch_invariant feature above the portable one is what `megatron` runs.
+
+    The fake follows the leaf contract: ``leaf(shifted, *, block_size)`` ->
+    fp32 ``[rows, vocab // block_size]`` block partials in vocabulary order.
+    It adds a marker to every block sum so the result proves which leaf ran.
+    """
+    from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, Priority
+    from tokenspeed_kernel.signature import format_signatures
+
+    marker = 0.5
+    calls: list[tuple[tuple[int, ...], int]] = []
+
+    def vendor_block_sumexp(shifted: torch.Tensor, *, block_size: int):
+        calls.append((tuple(shifted.shape), block_size))
+        blocks = shifted.shape[1] // block_size
+        return torch.exp(shifted).view(-1, blocks, block_size).sum(-1) + marker
+
+    registry = KernelRegistry.get()
+    spec = KernelSpec(
+        name="unit_vendor_block_sumexp",
+        family="sampling",
+        mode="block_sumexp",
+        solution="unit_vendor",
+        features=frozenset({"batch_invariant"}),
+        format_signatures=frozenset(
+            format_signatures("shifted", "dense", {torch.float32})
+        ),
+        priority=Priority.PERFORMANT,
+    )
+    registry.register(spec, vendor_block_sumexp)
+    try:
+        logits = _logits(2)
+        tokens = torch.tensor([3, 40000], dtype=torch.int32)
+        got = gather_token_logprobs(logits, tokens, logprob_order="megatron")
+    finally:
+        registry._unregister(spec.name)
+
+    assert calls == [((2, VOCAB), MEGATRON_VOCAB_BLOCK)]
+    shifted = logits - logits.max(-1, keepdim=True).values
+    partials = torch.exp(shifted).view(2, -1, MEGATRON_VOCAB_BLOCK).sum(-1) + marker
+    sum_exp = partials[:, 0]
+    for block in range(1, partials.shape[1]):
+        sum_exp = sum_exp + partials[:, block]
+    target = shifted.gather(1, tokens.long()[:, None]).squeeze(1)
+    assert torch.equal(got, -(torch.log(sum_exp) - target))
+    # The torch order never consults the leaf.
+    gather_token_logprobs(logits, tokens, logprob_order="torch")
+    assert len(calls) == 1
