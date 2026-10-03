@@ -3960,6 +3960,65 @@ TEST_F(PrefixReplayHeterogeneousSuite, ReplayTailIsPrivateAcrossPackedGroups) {
     EXPECT_GT(state[16], 0);
 }
 
+// A request returning prompt logprobs from position `s` caps its probe at `s`
+// (RequestSpec::max_cached_prefix_tokens) so positions >= s are recomputed.
+TEST_F(PrefixHitSuite, MaxCachedPrefixTokensCapsTheProbe) {
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/6);  // 12 tokens
+    const auto first_rows = RunLifecycle(first);
+
+    // Logprobs from position 5: the probe may claim at most 5 tokens, which
+    // rounds down to two 2-token pages; positions 4.. are recomputed.
+    RequestSpec capped = MakeSpecWithTokens("r2", first.tokens);
+    capped.max_cached_prefix_tokens = 5;
+    Submit(capped);
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 4);
+    EXPECT_EQ(op->input_lengths.at(0), 8);
+    EXPECT_EQ(op->input_ids, MakeTokens(/*count=*/8, /*start=*/5));
+    const auto& row = op->block_tables.at("full").at(0);
+    ASSERT_GE(row.size(), 3u);
+    EXPECT_EQ(row[0], first_rows.at("full")[0]);
+    EXPECT_EQ(row[1], first_rows.at("full")[1]);
+    EXPECT_NE(row[2], first_rows.at("full")[2]) << "a recomputed page must not alias the cached one";
+    SendForwardDone("r2", {9001});
+    PlanOnce();
+    SendForwardDone("r2", {9002});
+    SendFinish("r2");
+    PlanOnce();
+
+    // A cap of zero means every position is recomputed: no hit at all.
+    RequestSpec uncached = MakeSpecWithTokens("r3", first.tokens);
+    uncached.max_cached_prefix_tokens = 0;
+    Submit(uncached);
+    plan = PlanOnce();
+    op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(op->input_lengths.at(0), 12);
+    EXPECT_EQ(op->input_ids, first.tokens);
+}
+
+TEST_F(PrefixHitSuite, MaxCachedPrefixTokensDefaultLeavesTheProbeUnbounded) {
+    const RequestSpec first = MakeRequestSpec("r1", /*num_pages=*/6);  // 12 tokens
+    RunLifecycle(first);
+
+    // The default (INT32_MAX) keeps the ordinary replay-tail rule: 12 - 1
+    // cacheable tokens -> 5 pages hit, one recomputed tail page.
+    Submit(MakeSpecWithTokens("r2", first.tokens));
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 10);
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+
+    RequestSpec negative = MakeSpecWithTokens("r3", first.tokens);
+    negative.max_cached_prefix_tokens = -1;
+    EXPECT_THROW(Submit(negative), std::invalid_argument);
+}
+
 TEST(PrefixReplayConfigTest, RejectsNegativeReplayTokens) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = 2;

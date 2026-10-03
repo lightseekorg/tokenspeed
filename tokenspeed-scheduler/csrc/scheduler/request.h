@@ -99,6 +99,10 @@ public:
         return std::max(0, max_new_tokens_ - (PrefillSize() - submitted_prompt_size_));
     }
 
+    // Longest prompt prefix the admission probe may claim from the prefix
+    // cache (RequestSpec::max_cached_prefix_tokens); INT32_MAX means unbounded.
+    std::int32_t MaxCachedPrefixTokens() const { return max_cached_prefix_tokens_; }
+
     template <typename Event>
     void Apply(Event&& event) {
         state_ = std::visit(
@@ -238,6 +242,7 @@ private:
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};
+    std::int32_t max_cached_prefix_tokens_{0};
     std::int32_t retraction_count_{0};
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};
