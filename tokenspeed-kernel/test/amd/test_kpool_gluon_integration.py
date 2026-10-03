@@ -270,6 +270,7 @@ def test_public_kpool_prefill_dispatch_forwards_complete_plan(
         kv_page_size=64,
         topk_pools=512,
         softmax_scale=128**-0.5,
+        prepared_query=None,
         req_ids=req_ids,
         causal_lens=causal_lens,
         pool_workspace_slots=pool_workspace_slots,

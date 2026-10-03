@@ -29,6 +29,7 @@ import torch
 from tokenspeed_kernel.ops.attention.kpool import (
     kpool_decode_append,
     kpool_decode_topk,
+    kpool_prefill_prepare_query,
     kpool_prefill_tail_write,
     kpool_prefill_topk,
     kpool_prefill_write,
@@ -521,12 +522,40 @@ class KPoolRuntime:
             lens_out=lens_out[decode_start : decode_start + num_decode_tokens],
         )
 
+    def prepare_prefill_query(
+        self,
+        *,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        softmax_scale: float,
+        ctx: ForwardContext,
+        layer_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Build the query-side top-k inputs that need no pooled-cache reads.
+
+        Returns whatever the planned prefill top-k solution consumes ahead of
+        time, so the caller can issue it while this layer's pools are still
+        being compressed and written.
+        """
+        index_cache = ctx.token_to_kv_pool.get_kpool_buffers(layer_id)[0]
+        return kpool_prefill_prepare_query(
+            query.contiguous(),
+            index_cache,
+            weights,
+            pool_size=self.pool_size,
+            page_size=index_cache.shape[1],
+            topk_pools=self.index_topk // self.pool_size,
+            softmax_scale=softmax_scale,
+            apply_relu=True,
+        )
+
     def select_prefill(
         self,
         *,
         query: torch.Tensor,
         weights: torch.Tensor,
         softmax_scale: float,
+        prepared_query: tuple[torch.Tensor, torch.Tensor] | None,
         ctx: ForwardContext,
         backend: Any,
         layer_id: int,
@@ -577,6 +606,7 @@ class KPoolRuntime:
             kv_page_size=ctx.token_to_kv_pool.arena.kv_page_size,
             topk_pools=self.index_topk // self.pool_size,
             softmax_scale=softmax_scale,
+            prepared_query=prepared_query,
             req_ids=shared_plan.req_ids,
             causal_lens=shared_plan.causal_lens,
             pool_workspace_slots=shared_plan.pool_workspace_slots,

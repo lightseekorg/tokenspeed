@@ -755,6 +755,7 @@ def _prepare_kpool_topk(
                 kv_page_size=config.kv_page_size,
                 topk_pools=config.topk_pools,
                 softmax_scale=config.kpool_softmax_scale,
+                prepared_query=None,
                 req_ids=metadata["req_ids"],
                 causal_lens=metadata["causal_lens"],
                 pool_workspace_slots=metadata["pool_workspace_slots"],
