@@ -78,6 +78,7 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
     UpdateWeightsFromTensorReqInput,
+    mooncake_load_weight_version,
 )
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
 from tokenspeed.runtime.utils import (
@@ -419,13 +420,15 @@ class Engine(EngineBase):
 
         ``weight_version`` is required. Pass ``None`` to publish
         ``str(version)`` on a flushed load, or to keep the current namespace
-        on an intermediate (unflushed) one.
+        on an intermediate (unflushed) one (``mooncake_load_weight_version``).
         """
-        if weight_version is None and flush_cache:
-            weight_version = str(version)
         weight_version = resolve_l3_weight_version(
             self.server_args.weight_version,
-            weight_version,
+            mooncake_load_weight_version(
+                version=version,
+                flush_cache=flush_cache,
+                weight_version=weight_version,
+            ),
             flush_cache=flush_cache,
             storage_backend=self.server_args.kvstore_storage_backend,
         )

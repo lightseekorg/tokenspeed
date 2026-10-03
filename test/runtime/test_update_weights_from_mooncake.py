@@ -38,6 +38,7 @@ from fastapi.testclient import TestClient
 from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
+    mooncake_load_weight_version,
 )
 from tokenspeed.runtime.entrypoints import control_server
 from tokenspeed.runtime.entrypoints.sglang_compat_http import (
@@ -46,7 +47,10 @@ from tokenspeed.runtime.entrypoints.sglang_compat_http import (
 from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.model_runner import ModelRunner
-from tokenspeed.runtime.execution.model_update import ModelUpdateAdapter
+from tokenspeed.runtime.execution.model_update import (
+    ModelUpdateAdapter,
+    model_update_adapter_for,
+)
 from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
 
 # --------------------------------------------------------------------------
@@ -117,6 +121,27 @@ def test_failure_leaves_the_version_alone():
     assert llm.server_args.weight_version == "default"
 
 
+def test_request_fields_are_explicit_and_the_default_lives_in_one_helper():
+    # The wire default is the HTTP route's; the request object takes every
+    # field explicitly.
+    with pytest.raises(TypeError):
+        UpdateWeightsFromMooncakeReqInput(version=3)
+    assert (
+        mooncake_load_weight_version(version=3, flush_cache=True, weight_version=None)
+        == "3"
+    )
+    assert (
+        mooncake_load_weight_version(version=3, flush_cache=False, weight_version=None)
+        is None
+    )
+    assert (
+        mooncake_load_weight_version(
+            version=3, flush_cache=False, weight_version="ckpt"
+        )
+        == "ckpt"
+    )
+
+
 def test_control_server_proxies_the_route_with_a_long_read_timeout():
     routes = {
         (route.path, frozenset(route.methods or []))
@@ -131,6 +156,12 @@ def test_control_server_proxies_the_route_with_a_long_read_timeout():
 # --------------------------------------------------------------------------
 # Device dispatch: which models the SDK updates
 # --------------------------------------------------------------------------
+
+
+def _mooncake_req(version: int) -> UpdateWeightsFromMooncakeReqInput:
+    return UpdateWeightsFromMooncakeReqInput(
+        version=version, flush_cache=True, weight_version=None
+    )
 
 
 def _executor(*, draft_policy, with_draft: bool):
@@ -163,7 +194,7 @@ def test_device_dispatches_the_model_list_by_draft_policy(
 ):
     executor = _executor(draft_policy=draft_policy, with_draft=with_draft)
     handle = DeviceHandle(executor)
-    req = UpdateWeightsFromMooncakeReqInput(version=3)
+    req = _mooncake_req(3)
 
     assert handle.update_weights(req) == (True, "applied")
 
@@ -180,10 +211,7 @@ def test_device_does_not_notify_the_drafter_on_failure():
     executor.model_runner.update_weights_from_mooncake.return_value = (False, "no")
     handle = DeviceHandle(executor)
 
-    assert handle.update_weights(UpdateWeightsFromMooncakeReqInput(version=3)) == (
-        False,
-        "no",
-    )
+    assert handle.update_weights(_mooncake_req(3)) == (False, "no")
     executor.drafter.on_target_weights_updated.assert_not_called()
 
 
@@ -284,13 +312,12 @@ def _adapter(reader_rank=5, engine_type="fluent_llm", module="fake_model_updater
 
 def test_adapter_builds_the_sdk_client_once_on_first_update(sdk):
     adapter = _adapter(reader_rank=5)
-    assert not adapter.initialized
+    assert sdk.stores == []
     model = mock.MagicMock()
 
     assert adapter.update([model], 9) == "{'version': 9}"
     assert adapter.update([model], 10) == "{'version': 10}"
 
-    assert adapter.initialized
     (store,) = sdk.stores
     assert (store.store_config, store.local_host) == (
         _CONFIG["weight_store_config"],
@@ -320,19 +347,14 @@ def test_adapter_rejects_an_unknown_engine_type(sdk):
         adapter.update([mock.MagicMock()], 1)
 
 
-def _runner(server_args, global_rank=3):
+def _runner(server_args, global_rank=3, is_draft_worker=False):
     runner = object.__new__(ModelRunner)
     runner.server_args = server_args
     runner.global_rank = global_rank
     runner.gpu_id = 0
-    runner.model_update = None
-    if server_args.model_update_config is not None:
-        runner.model_update = ModelUpdateAdapter(
-            sdk_module=server_args.model_update_sdk_module,
-            config_json=server_args.model_update_config,
-            engine_type=server_args.model_update_engine_type,
-            reader_rank=global_rank,
-        )
+    runner.model_update = model_update_adapter_for(
+        server_args, global_rank=global_rank, is_draft_worker=is_draft_worker
+    )
     return runner
 
 
@@ -382,7 +404,8 @@ def test_runner_turns_an_sdk_error_into_a_failed_result(sdk, monkeypatch):
         False,
         "store unreachable",
     )
-    torch.cuda.empty_cache.assert_not_called()
+    # The SDK's staging buffers are released on the failure path too.
+    torch.cuda.empty_cache.assert_called_once_with()
 
 
 def test_runner_without_model_update_config_fails_the_request():
@@ -390,6 +413,19 @@ def test_runner_without_model_update_config_fails_the_request():
     ok, message = runner.update_weights_from_mooncake(4, [mock.MagicMock()])
     assert not ok
     assert "--model-update-config" in message
+
+
+def test_only_the_target_runner_owns_an_adapter():
+    args = _model_update_args()
+    assert isinstance(
+        model_update_adapter_for(args, global_rank=0, is_draft_worker=False),
+        ModelUpdateAdapter,
+    )
+    assert model_update_adapter_for(args, global_rank=0, is_draft_worker=True) is None
+    draft = _runner(args, is_draft_worker=True)
+    ok, message = draft.update_weights_from_mooncake(4, [mock.MagicMock()])
+    assert not ok
+    assert "target runner" in message
 
 
 # --------------------------------------------------------------------------

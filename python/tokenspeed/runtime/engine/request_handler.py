@@ -76,6 +76,7 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromMooncakeReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    mooncake_load_weight_version,
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
@@ -118,6 +119,22 @@ _WEIGHT_GATE_WIDTH = 4
 
 def _weight_op_wants_flush(recv_req) -> bool:
     return isinstance(recv_req, _WEIGHT_LOAD_OPS) and bool(recv_req.flush_cache)
+
+
+def _requested_weight_version(recv_req) -> str | None:
+    """The L3 namespace a load op asks to publish, read off the request.
+
+    A flushed Mooncake load without an explicit ``weight_version`` publishes
+    the committed version's own identity (``mooncake_load_weight_version``);
+    the request object is left as it arrived.
+    """
+    if isinstance(recv_req, UpdateWeightsFromMooncakeReqInput):
+        return mooncake_load_weight_version(
+            version=recv_req.version,
+            flush_cache=recv_req.flush_cache,
+            weight_version=recv_req.weight_version,
+        )
+    return recv_req.weight_version
 
 
 def _profile_rank_tag(attn_mapping) -> str:
@@ -369,14 +386,6 @@ class RequestHandler:
                 # like the loads: the rendezvous blocks this thread too.
                 self._pending_weight_ops.append(recv_req)
             elif isinstance(recv_req, _WEIGHT_LOAD_OPS):
-                if (
-                    isinstance(recv_req, UpdateWeightsFromMooncakeReqInput)
-                    and recv_req.flush_cache
-                    and recv_req.weight_version is None
-                ):
-                    # A flushed Mooncake load always has a checkpoint
-                    # identity: the committed version it reads.
-                    recv_req.weight_version = str(recv_req.version)
                 ok, msg = self._require_weight_version_for_l3_flush(recv_req)
                 if ok:
                     ok, msg = self._require_flush_for_l3_version_switch(recv_req)
@@ -426,7 +435,7 @@ class RequestHandler:
         if (
             storage_backend is None
             or not recv_req.flush_cache
-            or recv_req.weight_version is not None
+            or _requested_weight_version(recv_req) is not None
         ):
             return True, ""
         return False, L3_FLUSH_REQUIRES_WEIGHT_VERSION
@@ -446,7 +455,7 @@ class RequestHandler:
             return True, ""
         version = resolve_l3_weight_version(
             self.server_args.weight_version,
-            recv_req.weight_version,
+            _requested_weight_version(recv_req),
             flush_cache=False,
             storage_backend=storage_backend,
         )
@@ -632,7 +641,7 @@ class RequestHandler:
             return False, err
         version = resolve_l3_weight_version(
             self.server_args.weight_version,
-            recv_req.weight_version,
+            _requested_weight_version(recv_req),
             flush_cache=recv_req.flush_cache,
             storage_backend=getattr(self.server_args, "kvstore_storage_backend", None),
         )

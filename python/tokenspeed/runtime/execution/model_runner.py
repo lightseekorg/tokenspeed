@@ -26,7 +26,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.configs.numerics import require_verified_numerics
-from tokenspeed.runtime.execution.model_update import ModelUpdateAdapter
+from tokenspeed.runtime.execution.model_update import (
+    ModelUpdateAdapter,
+    model_update_adapter_for,
+)
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
@@ -102,16 +105,12 @@ class ModelRunner:
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
         # Model Updater SDK client for /update_weights_from_mooncake; None
-        # without --model-update-config. Holds only the arguments until the
-        # first update imports the SDK (on the forward thread).
-        self.model_update: ModelUpdateAdapter | None = None
-        if server_args.model_update_config is not None:
-            self.model_update = ModelUpdateAdapter(
-                sdk_module=server_args.model_update_sdk_module,
-                config_json=server_args.model_update_config,
-                engine_type=server_args.model_update_engine_type,
-                reader_rank=global_rank,
-            )
+        # without --model-update-config and on the draft runner. Holds only
+        # the arguments until the first update imports the SDK (on the
+        # forward thread).
+        self.model_update: ModelUpdateAdapter | None = model_update_adapter_for(
+            server_args, global_rank=global_rank, is_draft_worker=is_draft_worker
+        )
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
         self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
         # Target and draft alike: the envelope covers every model that serves.
@@ -376,8 +375,9 @@ class ModelRunner:
 
         Runs on the forward thread. The SDK streams partial ``load_weights``
         calls, so the models are bracketed in a weight-update session; the
-        SDK's device staging buffers are released afterwards because PyTorch
-        would otherwise keep the blocks cached against the KV arena.
+        SDK's device staging buffers are released afterwards -- also when the
+        read failed partway -- because PyTorch would otherwise keep the blocks
+        cached against the KV arena.
 
         Args:
             version: The committed version to load.
@@ -390,17 +390,18 @@ class ModelRunner:
         if self.model_update is None:
             return False, (
                 "update_weights_from_mooncake requires the server to start with "
-                "--model-update-config"
+                "--model-update-config (target runner only)"
             )
         try:
             with weight_update_session(models):
                 result = self.model_update.update(models, version)
-            torch.cuda.empty_cache()
             torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
             return True, f"applied model version {version}: {result}"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_mooncake failed")
             return False, str(e)
+        finally:
+            torch.cuda.empty_cache()
 
     def destroy_weights_update_group(self, obj) -> tuple[bool, str]:
         """Tear down the trainer weight-update NCCL group joined in ``init``.

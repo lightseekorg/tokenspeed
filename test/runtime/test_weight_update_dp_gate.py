@@ -263,7 +263,9 @@ class TestSameRoundGate(unittest.TestCase):
                 handler.send_func.send_pyobj.assert_not_called()
 
                 ready = _DpPeer(head=req_type)
-                with mock.patch.object(torch.distributed, "all_reduce", ready.all_reduce):
+                with mock.patch.object(
+                    torch.distributed, "all_reduce", ready.all_reduce
+                ):
                     handler.process_requests([])
                 handler._device.update_weights.assert_called_once_with(req)
                 # Gate MAX, then the result MIN; no flush collectives.
@@ -347,9 +349,23 @@ class TestMooncakeOp(unittest.TestCase):
         handler._device.update_weights.assert_called_once_with(req)
         handler._device.set_l3_weight_version.assert_called_once_with("12")
         self.assertEqual(handler.server_args.weight_version, "12")
+        # The default is resolved at the point of use; the request is not
+        # rewritten on its way to the device.
+        self.assertIsNone(req.weight_version)
         reply = _replies(handler)[0]
         self.assertIsInstance(reply, UpdateWeightsFromMooncakeReqOutput)
         self.assertTrue(reply.success)
+
+    def test_flushed_load_default_satisfies_the_l3_identity_rule(self):
+        handler = _handler()
+        handler.server_args.kvstore_storage_backend = "memory"
+        req = _mooncake(version=12, flush_cache=True)
+
+        handler.process_requests([req])
+
+        handler._device.update_weights.assert_called_once_with(req)
+        handler._device.set_l3_weight_version.assert_called_once_with("12")
+        self.assertIsNone(req.weight_version)
 
     def test_explicit_weight_version_wins(self):
         handler = _handler()
@@ -469,30 +485,42 @@ class TestSchedulerControlClientFanIn(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.model_update_lock.writer_lock.entered, 1)
 
     async def test_init_destroy_and_mooncake_fan_in(self):
-        for method, req, out in (
+        # Only the loads rewrite weights; group init/teardown must not wait
+        # for in-flight generation behind the writer lock.
+        for method, req, out, takes_writer_lock in (
             (
                 SchedulerControlClient.init_weights_update_group,
                 InitWeightsUpdateGroupReqInput(
                     master_address="h", master_port=1, rank_offset=0, world_size=3
                 ),
                 InitWeightsUpdateGroupReqOutput,
+                False,
             ),
             (
                 SchedulerControlClient.destroy_weights_update_group,
                 DestroyWeightsUpdateGroupReqInput(),
                 DestroyWeightsUpdateGroupReqOutput,
+                False,
             ),
             (
                 SchedulerControlClient.update_weights_from_mooncake,
                 _mooncake(),
                 UpdateWeightsFromMooncakeReqOutput,
+                True,
             ),
         ):
             with self.subTest(op=type(req).__name__):
                 client, _ = self._client(
-                    [out(success=True, message="done"), out(success=True, message="done")]
+                    [
+                        out(success=True, message="done"),
+                        out(success=True, message="done"),
+                    ]
                 )
                 self.assertEqual(await method(client, req), (True, "done"))
+                self.assertEqual(
+                    client.model_update_lock.writer_lock.entered,
+                    1 if takes_writer_lock else 0,
+                )
 
 
 if __name__ == "__main__":

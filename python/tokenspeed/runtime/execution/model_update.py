@@ -47,13 +47,35 @@ from __future__ import annotations
 
 import importlib
 import json
-from types import ModuleType
+from typing import TYPE_CHECKING
 
 from torch import nn
 
 from tokenspeed.runtime.utils import get_colorful_logger
 
+if TYPE_CHECKING:
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
 logger = get_colorful_logger(__name__)
+
+
+def model_update_adapter_for(
+    server_args: ServerArgs, *, global_rank: int, is_draft_worker: bool
+) -> ModelUpdateAdapter | None:
+    """The adapter a ``ModelRunner`` owns, or None.
+
+    Only the target runner holds one: a Mooncake update streams into the
+    draft model through the target runner's call, so the draft runner never
+    reads the store itself. None as well without ``--model-update-config``.
+    """
+    if server_args.model_update_config is None or is_draft_worker:
+        return None
+    return ModelUpdateAdapter(
+        sdk_module=server_args.model_update_sdk_module,
+        config_json=server_args.model_update_config,
+        engine_type=server_args.model_update_engine_type,
+        reader_rank=global_rank,
+    )
 
 
 class ModelUpdateAdapter:
@@ -85,18 +107,9 @@ class ModelUpdateAdapter:
         self._config_json = config_json
         self._engine_type = engine_type
         self._reader_rank = reader_rank
-        self._sdk: ModuleType | None = None
+        # The store is kept alive alongside the updater that reads from it.
         self._weight_store: object | None = None
         self._updater: object | None = None
-
-    @property
-    def reader_rank(self) -> int:
-        return self._reader_rank
-
-    @property
-    def initialized(self) -> bool:
-        """Whether the SDK client exists (built on the first update)."""
-        return self._updater is not None
 
     def _ensure_updater(self) -> object:
         if self._updater is not None:
@@ -134,7 +147,6 @@ class ModelUpdateAdapter:
             ),
             weight_store=weight_store,
         )
-        self._sdk = sdk
         self._weight_store = weight_store
         self._updater = updater
         logger.info(

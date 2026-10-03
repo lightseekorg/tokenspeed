@@ -51,6 +51,7 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
     UpdateWeightsFromTensorReqInput,
+    mooncake_load_weight_version,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -206,9 +207,12 @@ async def update_weights_from_mooncake(request: Request) -> JSONResponse:
     """Load one committed Model Updater SDK version on every worker.
 
     Body: ``{"version": int, "flush_cache": bool = true,
-    "weight_version": str | null}``. A flushed load publishes
-    ``weight_version`` (default ``str(version)``); an unflushed load keeps
-    the current namespace unless one is given, and with L3 storage a new
+    "weight_version": str | null}``. The ``flush_cache`` wire default mirrors
+    the reference engine's (FluentLLM's) API so its trainer clients work
+    unchanged; the request object itself carries every field explicitly. A
+    flushed load publishes ``weight_version`` (default ``str(version)``,
+    see ``mooncake_load_weight_version``); an unflushed load keeps the current
+    namespace unless one is given, and with L3 storage a new
     ``weight_version`` requires ``flush_cache``.
     """
     body = await request.json()
@@ -222,13 +226,15 @@ async def update_weights_from_mooncake(request: Request) -> JSONResponse:
         flush_cache = bool(body.get("flush_cache", True))
         llm = _llm(request)
         requested_version = body.get("weight_version")
-        if requested_version is not None:
-            requested_version = str(requested_version)
-        elif flush_cache:
-            requested_version = str(version)
         weight_version = resolve_l3_weight_version(
             llm.server_args.weight_version,
-            requested_version,
+            mooncake_load_weight_version(
+                version=version,
+                flush_cache=flush_cache,
+                weight_version=(
+                    None if requested_version is None else str(requested_version)
+                ),
+            ),
             flush_cache=flush_cache,
             storage_backend=getattr(llm.server_args, "kvstore_storage_backend", None),
         )

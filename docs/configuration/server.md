@@ -126,17 +126,24 @@ weight version is published, so a failure on one rank fails the update
 everywhere. A rank whose peer never receives the op waits indefinitely, as
 with `/flush_cache`. The design rationale is in `docs/design/event-loop.md`.
 
+Only the two loads take the frontend's model-update writer lock (generation
+is kept out while parameters are rewritten); `init_weights_update_group` and
+`destroy_weights_update_group` rewrite nothing and do not wait for in-flight
+generation, so the trainer's rendezvous is not held up by long requests.
+
 ### Mooncake Weight Updates
 
 `POST /update_weights_from_mooncake` loads one committed checkpoint version
 that the RL trainer published to a Mooncake weight store through the Model
 Updater SDK. Body: `{"version": int, "flush_cache": bool = true,
 "weight_version": str | null}`; a missing or non-integer `version` is a 400.
-Every scheduler process reads its own shard with its global rank as the
-SDK reader rank, on the forward thread, ordered against forwards like the
-distributed update. The reply arrives only after every worker finished its
-read, so the control server proxies this route with a longer inactivity
-timeout (3600 s) than the other RL routes.
+The `flush_cache` wire default mirrors the reference engine's (FluentLLM's)
+API so its trainer clients work unchanged. Every scheduler process reads its
+own shard with its global rank as the SDK reader rank, on the forward
+thread, ordered against forwards like the distributed update. The reply
+arrives only after every worker finished its read, so the control server
+proxies this route with a longer inactivity timeout (3600 s) than the other
+RL routes.
 
 The server must be started with the four `--model-update-*` flags (table
 above): the SDK module is imported lazily on the first update and a missing

@@ -352,15 +352,16 @@ class SchedulerControlClient:
     # broadcasts control requests) and the scheduler completes each one only
     # once every DP rank holds it at the head of its queue, so the replies
     # arrive together and are ANDed here. The writer lock keeps generation
-    # out while the model is rewritten.
+    # out while the model is rewritten; group init/teardown rewrite nothing
+    # and take no lock, so a trainer's rendezvous does not wait for every
+    # in-flight generation to finish.
 
     async def init_weights_update_group(
         self: AsyncLLM,
         obj: InitWeightsUpdateGroupReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        async with self.model_update_lock.writer_lock:
-            results = await self.init_weights_update_group_communicator(obj)
+        results = await self.init_weights_update_group_communicator(obj)
         return combined_weight_update_output(results)
 
     async def destroy_weights_update_group(
@@ -368,8 +369,7 @@ class SchedulerControlClient:
         obj: DestroyWeightsUpdateGroupReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        async with self.model_update_lock.writer_lock:
-            results = await self.destroy_weights_update_group_communicator(obj)
+        results = await self.destroy_weights_update_group_communicator(obj)
         return combined_weight_update_output(results)
 
     async def update_weights_from_distributed(
