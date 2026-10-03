@@ -932,6 +932,21 @@ A last pipeline stage borrows its local draft embedding when the target
 embedding lives elsewhere; this is resource binding, not a different proposal
 algorithm. Per-forward capture hooks consume the established configuration.
 
+Embed/head sharing (`shares_target_embed_head`) follows the same stage
+ownership. `get_embed_and_head` returns None for a side the stage does not
+hold -- the embedding lives on the first stage, the head on the last -- and
+never dereferences an absent module. Stages before the last bind nothing: a
+draft built there only produces context. The last stage binds what the target
+reports, which is the head alone (`embed=None`); a pipeline-capable draft then
+keeps the `embed_tokens` shard its checkpoint ships for that layer, its loader
+rejects a pipeline checkpoint without one, and the factory checks afterwards
+that the draft's own `get_embed_and_head` still reports an embedding -- a
+draft that aliases None into its embedding is named at construction rather
+than failing at its first forward (`BaseCausalLM.set_embed_and_head` refuses
+`embed=None` outright, since a generic draft keeps none). Off the pipeline
+both sides are shared and the draft's copies are dropped before the KV-cache
+budget is profiled, as before.
+
 Checkpoint tap labels remain zero-based completed-layer IDs. Prefix tap L is
 produced after L. AttnRes tap L is produced at L+1's entry by that layer's
 mixer, before input-layer normalization or snapshot mutation; the final tap
@@ -950,12 +965,70 @@ Pipeline stages use `DSparkContextProducer`: each stage normalizes the taps it
 owns if configured, applies their projection columns and sums in FP32; the
 accumulator travels with the chunk's PP state and the final stage applies
 context normalization once and writes native context KV. The executor selects
-the producer from the pipeline configuration alone (`pp_size > 1` with a
-speculative algorithm) and requires the draft model to implement
-`DSparkContextModel`. Off the pipeline every tap is local, so the drafter keeps
-its concatenated projection and its own context writes -- including the
-quantization-aware path, since raw per-tap weight slicing is not a quantized
-linear operation. PP drafts require unquantized projection weights.
+the producer from the pipeline configuration and the draft model's class
+(`select_dspark_context_producer`): on a pipeline a draft implementing
+`DSparkContextModel` gets a producer on every stage, a block drafter whose
+model does not implement it is rejected (it would draft from one stage's taps
+alone), EAGLE3 is refused (its aux taps span stages), and any other draft gets
+none. Off the pipeline every tap is local, so
+the drafter keeps its concatenated projection and its own context writes --
+including the quantization-aware path, since raw per-tap weight slicing is
+not a quantized linear operation. PP drafts require unquantized projection
+weights.
+
+### Pipeline speculation is not DSPARK-only
+
+An MTP (NextN) draft runs on a prefill pipeline without any cross-stage
+production: it consumes the post-final-norm hidden states the last stage
+already computes, so only that stage drafts. EAGLE3 stays off the pipeline:
+its aux taps come from several stages and the stage boundary bundle does not
+carry them; `ServerArgs` rejects it and `select_dspark_context_producer`
+refuses it again at executor construction. The MTP shape is
+
+* **Construction.** `ServerArgs` accepts `DSPARK` and `MTP` with
+  `--pipeline-parallel-size > 1` on the prefill role only (the chunk pipeline
+  has no decode token feedback to draft against anywhere else); the dense ==
+  attention TP / CP = 1 rule stays DSPARK's, whose draft reduces attention-TP
+  embedding partials over the dense TP group. Which stages build the draft
+  model at all is the factory's decision, not each model's
+  (`factory.pipeline_stage_builds_draft`): a block drafter is built on every
+  stage because it produces context from every stage's taps, while an MTP
+  draft is built on the last stage alone -- the other stages construct no
+  draft runner, load no draft shard and wire nothing, so `ModelExecutor` and
+  `configure_draft_target` see `draft_model_runner=None` there and the in-tree
+  K3 and V4 NextN drafts need no stage-aware shell. The skip is safe because
+  nothing in draft construction is a world collective the skipping stages
+  would have to join: the KV-budget all-reduce runs on every stage with or
+  without a draft, the DeepEP/MoE communicators a draft layer reuses are the
+  target's and scoped to the stage, and the only world-scoped step -- the
+  InstantTensor weight iterator, which synchronizes over `group.WORLD` when a
+  model declares no `checkpoint_load_group` -- is bounded by the factory,
+  which loads a pipeline draft with the stage's rank set
+  (`ModelRunner(checkpoint_load_group=...)`, surfaced as
+  `LoadConfig.checkpoint_load_group`; a model's own declaration, such as K3
+  DSpark's stage-subset filter group, still wins). With no producer configured
+  the last stage's target forward captures `CaptureHiddenMode.FULL` for its
+  drafter.
+* **Cache.** Nothing changes: `CacheLayerOwnership` already places the draft
+  cache layers as the last stage's trailing producer step, the draft backend
+  and pool exist only there, and the merged plan, bootstrap placement and
+  transfer routes are the same as for DSPARK.
+* **Layerwise CachePD.** `supports_pd_layerwise_finalization` is decided per
+  stage (`device._supports_pd_layerwise_finalization`): a stage owning no
+  draft fields has nothing to finalize and answers True; the owning stage
+  answers for `ModelExecutor.draft_field_writer` -- the producer when
+  configured, else the drafter -- exactly as a non-PP engine does, and
+  `register_draft_final_step_counter` reads the same property. The last stage
+  registers the draft-final step counter; the others count target layers only.
+* **Handoff.** The last stage samples, runs the drafter over the completing
+  chunk and writes the candidate block into the reserved decode slot; the
+  event loop broadcasts `(output_tokens, output_lengths, next_input_ids)`
+  over the PP gloo group at commit so every rank's scheduler stamps the same
+  bootstrap token and candidate window onto the remote decode. The PD wire
+  and the decode side are untouched.
+
+Expect a larger last-stage bubble (NextN layer plus draft extend and
+multi-step drafting); rebalance with `--pp-layer-partition`.
 
 The producer is stateless across forwards. Each chunk owns its accumulator;
 queued chunks cannot alias it. A configured `ctx.dspark_context_producer`

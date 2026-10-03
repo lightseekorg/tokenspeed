@@ -165,6 +165,32 @@ class TestLoaderSkipsFilteredShards(unittest.TestCase):
             names = [name for name, _ in loader._get_all_weights(model_config, model)]
             self.assertEqual(names, ["model.layers.0.w"])
 
+    def test_checkpoint_load_group_falls_back_to_the_load_config(self):
+        # A model reading a stage-specific checkpoint subset names its own
+        # group; otherwise the ranks the caller says load this model (a
+        # pipeline stage's draft) bound the distributed loader's collectives.
+        groups = []
+
+        def capture(source, weight_name_filter, checkpoint_load_group):
+            groups.append(checkpoint_load_group)
+            return iter(())
+
+        loader = DefaultModelLoader(LoadConfig(checkpoint_load_group=(4, 5, 6, 7)))
+        loader._get_weights_iterator = capture
+        model_config = SimpleNamespace(model_path="unused", revision=None)
+        declaring = SimpleNamespace(
+            checkpoint_load_group=(4, 5),
+            fall_back_to_pt_during_load=False,
+            secondary_weights=(),
+        )
+        silent = SimpleNamespace(
+            fall_back_to_pt_during_load=False, secondary_weights=()
+        )
+
+        list(loader._get_all_weights(model_config, declaring))
+        list(loader._get_all_weights(model_config, silent))
+        self.assertEqual(groups, [(4, 5), (4, 5, 6, 7)])
+
 
 class TestNextNModelFilters(unittest.TestCase):
     """The predicates must accept every name each ``load_weights`` consumes."""

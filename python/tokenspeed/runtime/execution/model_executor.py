@@ -203,6 +203,62 @@ def _autotune_cache_key(
     }
 
 
+def select_dspark_context_producer(
+    *,
+    spec_algo: str | None,
+    pp_size: int,
+    draft_model: torch.nn.Module | None,
+    draft_token_to_kv_pool,
+):
+    """Return the stage's DSpark context producer, or None when nothing is produced.
+
+    A DSpark draft reads target taps that live on several pipeline stages, so
+    each stage projects its own during the target forward and the final stage
+    writes the draft context; off the pipeline the drafter keeps projecting
+    and writing context itself. An MTP (NextN) draft consumes only the last
+    stage's captured hidden states, so no stage produces anything for it: the
+    executor then captures FULL hidden states for its drafter. EAGLE3 is
+    refused here as well as in ``ServerArgs``: its aux taps live on several
+    stages and nothing carries them through the stage boundary.
+
+    Args:
+        spec_algo: The speculative algorithm, or None without speculation.
+        pp_size: Pipeline stage count; a single stage never produces.
+        draft_model: The loaded draft model, or None when this stage builds
+            none (``pipeline_stage_builds_draft``).
+        draft_token_to_kv_pool: The draft cache pool this stage owns, or None.
+
+    Returns:
+        A ``DSparkContextProducer`` for a pipeline DSpark draft, else None.
+
+    Raises:
+        ValueError: EAGLE3 on the pipeline.
+        TypeError: A block drafter (DFLASH/DSPARK) on the pipeline whose model
+            cannot produce context across stages; it would draft from one
+            stage's taps alone.
+    """
+    if spec_algo is None or pp_size <= 1:
+        return None
+    if spec_algo == "EAGLE3":
+        raise ValueError(
+            "EAGLE3 cannot run on a pipeline: its aux taps live on several "
+            "stages and nothing carries them through the stage boundary."
+        )
+    from tokenspeed.runtime.execution.dspark_context import (
+        DSparkContextModel,
+        DSparkContextProducer,
+    )
+
+    if isinstance(draft_model, DSparkContextModel):
+        return DSparkContextProducer(draft_model, draft_token_to_kv_pool)
+    if is_block_drafter(spec_algo, is_draft=True):
+        raise TypeError(
+            f"{type(draft_model).__name__} cannot produce DSpark context across "
+            "pipeline stages."
+        )
+    return None
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -447,25 +503,14 @@ class ModelExecutor:
             max_bs,
             self.device,
         )
-        self.dspark_context_producer = None
-        if config.spec_algo is not None and config.pp_size > 1:
-            # Pipeline speculation: the target taps live on several stages, so
-            # each stage projects its own during the target forward and the
-            # final stage writes the draft context. Off the pipeline the
-            # drafter keeps projecting and writing context itself.
-            from tokenspeed.runtime.execution.dspark_context import (
-                DSparkContextModel,
-                DSparkContextProducer,
-            )
-
-            if not isinstance(draft_model_runner.model, DSparkContextModel):
-                raise TypeError(
-                    f"{type(draft_model_runner.model).__name__} cannot produce "
-                    "DSpark context across pipeline stages."
-                )
-            self.dspark_context_producer = DSparkContextProducer(
-                draft_model_runner.model, draft_token_to_kv_pool
-            )
+        self.dspark_context_producer = select_dspark_context_producer(
+            spec_algo=config.spec_algo,
+            pp_size=config.pp_size,
+            draft_model=(
+                draft_model_runner.model if draft_model_runner is not None else None
+            ),
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+        )
         if self.config.spec_algo is not None and self._pp_is_last_stage:
             # Model-to-model wiring (shared embed/head, eagle3 capture ids)
             # already happened in create_model_runner, right after both
@@ -1978,16 +2023,23 @@ class ModelExecutor:
                 req_pool_idx, candidate_ids
             )
 
+    @property
+    def draft_field_writer(self):
+        """Whoever writes this rank's draft cache fields, or None.
+
+        The context producer when configured (pipeline DSpark), else the
+        drafter. Its ``supports_pd_layerwise_finalization`` says whether the
+        rank can finalize layerwise CachePD writes with speculation on; this
+        is the one place that choice is made.
+        """
+        if self.dspark_context_producer is not None:
+            return self.dspark_context_producer
+        return self.drafter
+
     def register_draft_final_step_counter(self, step_counter) -> None:
         """Publish one CachePD step after a supported drafter's complete run."""
-        producer = (
-            self.dspark_context_producer
-            if self.dspark_context_producer is not None
-            else self.drafter
-        )
-        if producer is None or not getattr(
-            producer, "supports_pd_layerwise_finalization", False
-        ):
+        writer = self.draft_field_writer
+        if writer is None or not writer.supports_pd_layerwise_finalization:
             raise RuntimeError(
                 "the speculative drafter cannot finalize layerwise CachePD writes"
             )

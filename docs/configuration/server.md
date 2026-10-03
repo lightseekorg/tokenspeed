@@ -153,6 +153,8 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--mm-encoder-tp-mode` | Multimodal encoder parallelism: `weights` shards encoder weights with attention TP; `data` uses TP1 whole-item DP and currently requires aggregate serving and no attention context parallelism. |
 | `--enable-expert-parallel` | Set expert parallelism across the selected world size. |
 | `--expert-parallel-size`, `--ep-size` | Explicit expert parallel size. |
+| `--pipeline-parallel-size` | Pipeline stages for prefill chunk pipelining. Requires `--disaggregation-mode prefill`; forces eager execution; every per-layer parallelism resolves inside one stage's world. |
+| `--pp-layer-partition` | Explicit per-stage layer counts, front to back (`"24,24,24,21"`); one entry per stage, summing to the model's layer count. Default: even split with the remainder on the front stages. |
 | `--world-size` | Total worker process count across all nodes. |
 | `--nprocs-per-node` | Worker process count per node. |
 | `--nnodes` | Number of nodes. |
@@ -246,6 +248,19 @@ walked by one Triton kernel per verify step. A request's `temperature`,
 `top_k` and `top_p` are applied by the target's verification step, never by
 the proposal, so the served distribution is the target's whatever the drafter
 proposed.
+
+On a prefill server with `--pipeline-parallel-size > 1`, speculation is
+accepted for `MTP` and `DSPARK` only. The drafter runs on the last stage, the
+only stage that samples; it writes the candidate block the remote decode
+carries to the decode server, which verifies it as usual. `DSPARK` also
+produces its draft context across stages and keeps requiring attention CP = 1
+and matching dense/attention TP groups. An `MTP` (NextN) draft reads only the
+last stage's final hidden states: the other stages build and load no draft
+model at all, and the NextN checkpoint must ship its `embed_tokens` weight
+because the target embedding lives on the first stage. `DFLASH` and `EAGLE3` read
+target taps from several stages and are rejected on a pipeline. Layerwise
+transfer (`--disaggregation-layerwise-interval`) works with both accepted
+algorithms on every stage.
 
 A block drafter writes its KV at the target's cache locations, so it shares the
 target's page table: `--block-size` is a target-side choice and the draft

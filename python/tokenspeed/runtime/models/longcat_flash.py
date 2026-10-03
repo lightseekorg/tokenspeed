@@ -697,11 +697,14 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         )
 
     def post_init(self) -> None:
+        # Pipeline stages hold PPMissingLayer slots for the other stages'
+        # layers; only resident layers carry routed experts.
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_routed_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, _RuntimeLongcatMoE)
+                if isinstance(layer, _RuntimeLongcatDecoderLayer)
+                and isinstance(layer.mlp, _RuntimeLongcatMoE)
             }
         )
 
@@ -831,6 +834,8 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
 
     def post_load_weights(self):
         for layer in self.model.layers:
+            if not isinstance(layer, _RuntimeLongcatDecoderLayer):
+                continue  # PPMissingLayer: another pipeline stage owns it
             for self_attn in layer.self_attn:
                 if hasattr(
                     self.quant_config, "weight_block_size"
@@ -872,9 +877,6 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                     self_attn.kv_a_layernorm.weight.data *= (
                         self.config.hidden_size / self.config.kv_lora_rank
                     ) ** 0.5
-
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
