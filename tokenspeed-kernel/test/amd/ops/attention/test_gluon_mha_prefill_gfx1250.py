@@ -261,6 +261,8 @@ def test_mha_prefill_addresses_past_four_gib():
         False,
         False,
         True,
+        False,
+        False,
         4,
         2,
         num_warps=4,
@@ -389,6 +391,38 @@ def test_select_packed_gqa():
         {"packed_q_block_bytes": 2**32 + 1},
     ):
         assert not prefill._select_packed_gqa(**(kwargs | override))
+
+
+def test_select_fixed_reference():
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "batch_size": 4,
+        "max_seqlen": 4096,
+        "window_left": -1,
+        "uniform": True,
+        "n_heads": 8,
+        "n_kv_heads": 1,
+    }
+    assert prefill._select_fixed_reference(**kwargs)
+    assert prefill._select_fixed_reference(
+        **(kwargs | {"batch_size": 4, "max_seqlen": 2048})
+    )
+    assert prefill._select_fixed_reference(
+        **(kwargs | {"batch_size": 2, "max_seqlen": 8192})
+    )
+    for n_heads, n_kv_heads in ((8, 8), (32, 8), (32, 1)):
+        assert prefill._select_fixed_reference(
+            **(kwargs | {"n_heads": n_heads, "n_kv_heads": n_kv_heads})
+        )
+
+    for override in (
+        {"dtype": torch.float16},
+        {"batch_size": 8, "max_seqlen": 1024},
+        {"window_left": 512},
+        {"uniform": False},
+        {"n_heads": 16, "n_kv_heads": 2},
+    ):
+        assert not prefill._select_fixed_reference(**(kwargs | override))
 
 
 def test_select_tdm_warp_hint():
