@@ -169,6 +169,19 @@ class SamplingBackend(ABC):
             pool_rows = config.max_req_pool_size + 1
             self._last_rid_per_slot: list[str | None] = [None] * pool_rows
 
+        # Pool-indexed kernels (the Triton Gumbel-max routes, the FlashInfer
+        # backends' per-request stream) take int32 pool indices and a
+        # pool-indexed offsets table; see _req_pool_indices_for_kernels and
+        # _offsets_pool_for_kernels. Backends with DP padding re-carve them.
+        self._req_pool_indices_i32: torch.Tensor = torch.empty(
+            (0,), dtype=torch.int32, device=config.device
+        )
+        self._zero_offsets_pool: torch.Tensor = torch.zeros(
+            (config.max_req_pool_size + 1,), dtype=torch.int64, device=config.device
+        )
+        if self._HAS_POOL_STATE:
+            self._allocate_pool_index_buffer(config.max_bs)
+
         # Resolved once; None means maybe_broadcast is a no-op.
         self._tp_pg = None
         self._tp_src_global_rank: int | None = None
@@ -216,6 +229,41 @@ class SamplingBackend(ABC):
             self._predict_max : self._predict_max + max_rows
         ]
         self._accept_index_buf = self._output_pack_buf[self._predict_max + max_rows :]
+
+    def _allocate_pool_index_buffer(self, max_rows: int) -> None:
+        """Size the int32 pool-index staging buffer for up to ``max_rows`` rows."""
+        self._req_pool_indices_i32 = torch.empty(
+            (max_rows,), dtype=torch.int32, device=self.config.device
+        )
+
+    def _req_pool_indices_for_kernels(
+        self, req_pool_indices: torch.Tensor, rows: int
+    ) -> torch.Tensor:
+        """The first ``rows`` pool indices as the int32 the pool kernels take.
+
+        int64 indices (the scheduler's) are staged into a persistent buffer
+        with an in-graph copy; int32 ones are handed over as they are.
+        """
+        req_pool_indices = req_pool_indices[:rows]
+        if req_pool_indices.dtype == torch.int32:
+            return req_pool_indices
+        if req_pool_indices.dtype != torch.int64:
+            raise ValueError(
+                "pool-indexed sampling requires int32/int64 req_pool_indices, "
+                f"got {req_pool_indices.dtype}"
+            )
+        out = self._req_pool_indices_i32[:rows]
+        out.copy_(req_pool_indices, non_blocking=True)
+        return out
+
+    def _offsets_pool_for_kernels(
+        self, sampling_info: SamplingBatchInfo
+    ) -> torch.Tensor:
+        """The pool-indexed cache lengths that position each request's stream,
+        or an all-zero pool when the step carries none (capture warm-up)."""
+        if sampling_info.valid_cache_lengths is not None:
+            return sampling_info.valid_cache_lengths
+        return self._zero_offsets_pool
 
     def broadcast_verify_outputs(self) -> None:
         """Broadcast the packed verify triple from tp_group[0] in one collective.

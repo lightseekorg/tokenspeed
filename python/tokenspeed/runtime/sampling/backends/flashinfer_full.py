@@ -292,23 +292,22 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         logits = self._apply_penalties_and_bias(logits, sampling_info)
 
-        temperatures, top_ks, top_ps, min_ps, seeds, offsets = (
-            gather_and_expand_scalars(
-                sampling_info.req_pool_indices,
-                temperature=self._temperature_pool,
-                top_k=self._top_k_pool,
-                top_p=self._top_p_pool,
-                min_p=self._min_p_pool,
-                seed=self._seed_pool,
-                offsets=sampling_info.valid_cache_lengths,
-            )
-        )
-
         if self.config.sampling_stream == "per-request":
-            batch_next_token_ids = self._sample_per_request(
+            batch_next_token_ids, top_ks = self._sample_per_request(
                 logits, sampling_info, min_p_pool=self._min_p_pool
             )
         else:
+            temperatures, top_ks, top_ps, min_ps, seeds, offsets = (
+                gather_and_expand_scalars(
+                    sampling_info.req_pool_indices,
+                    temperature=self._temperature_pool,
+                    top_k=self._top_k_pool,
+                    top_p=self._top_p_pool,
+                    min_p=self._min_p_pool,
+                    seed=self._seed_pool,
+                    offsets=sampling_info.valid_cache_lengths,
+                )
+            )
             probs = softmax(logits, temperature=temperatures.view(-1, 1))
 
             if _FUSED_TOPK_TOPP_AVAILABLE:

@@ -336,6 +336,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         # DP padding may need more verify rows than max_bs.
         if max_pad_bs != config.max_bs:
             self._allocate_verify_outputs(max_pad_bs, max_n)
+            self._allocate_pool_index_buffer(max_pad_bs)
 
         self._predict_local_buf: torch.Tensor | None = None
         self._accept_index_local_buf: torch.Tensor | None = None
@@ -358,18 +359,10 @@ class FlashInferSamplingBackend(SamplingBackend):
                 device=config.device,
             )
 
-        # The per-request stream route (``_sample_per_request``): its kernel
-        # takes int32 pool indices and writes into a caller-owned buffer, and
-        # a zero offsets pool stands in when the step carries no cache
-        # lengths (capture warm-up).
+        # The per-request stream route (``_sample_per_request``) writes its
+        # token ids into a caller-owned buffer.
         self._per_request_out = torch.empty(
             (max_pad_bs,), dtype=torch.int32, device=config.device
-        )
-        self._per_request_pool_indices = torch.empty(
-            (max_pad_bs,), dtype=torch.int32, device=config.device
-        )
-        self._zero_offsets_pool = torch.zeros(
-            (config.max_req_pool_size + 1,), dtype=torch.int64, device=config.device
         )
 
     def _gather_draft_probs(
@@ -413,7 +406,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         sampling_info: SamplingBatchInfo,
         *,
         min_p_pool: torch.Tensor | None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample every row from its request's own Gumbel-max stream.
 
         flashinfer's ``*_sampling_from_probs`` kernels read one seed and
@@ -422,8 +415,8 @@ class FlashInferSamplingBackend(SamplingBackend):
         ``(seed_pool[pool_idx], offsets_pool[pool_idx])`` — the request's seed
         and cache length — so the draw is the same alone and in any batch
         (``--sampling-stream per-request``). Temperature, top-k, top-p and
-        min-p are read from the pool rows; finite top-k is capped at the
-        kernel's 128 candidates.
+        min-p are read from the pool rows (no expanded per-row scalars are
+        built); finite top-k is capped at the kernel's 128 candidates.
 
         Args:
             logits: ``[bs, vocab]`` logits (penalties already applied).
@@ -433,30 +426,25 @@ class FlashInferSamplingBackend(SamplingBackend):
                 without min-p.
 
         Returns:
-            ``[bs]`` int32 token ids.
+            ``(token_ids, top_ks)``: the ``[bs]`` int32 token ids and each
+            row's top-k, which the bitwise envelopes' greedy overlay reads.
         """
         bs = logits.shape[0]
-        pool_indices = sampling_info.req_pool_indices[:bs]
-        if pool_indices.dtype != torch.int32:
-            pool_indices_i32 = self._per_request_pool_indices[:bs]
-            pool_indices_i32.copy_(pool_indices, non_blocking=True)
-            pool_indices = pool_indices_i32
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
+        pool_indices = self._req_pool_indices_for_kernels(
+            sampling_info.req_pool_indices, bs
         )
-        return gumbel_sample_from_pools_generic(
+        token_ids = gumbel_sample_from_pools_generic(
             logits,
             pool_indices,
             self._temperature_pool,
             self._top_k_pool,
             self._top_p_pool,
             self._seed_pool,
-            offsets_pool,
+            self._offsets_pool_for_kernels(sampling_info),
             self._per_request_out[:bs],
             min_p_pool=min_p_pool,
         )
+        return token_ids, self._top_k_pool.index_select(0, pool_indices)
 
     def _prepare_step_hook(
         self,
@@ -514,20 +502,19 @@ class FlashInferSamplingBackend(SamplingBackend):
         # so the pool route serves them too — same path the CUDA graph
         # captures. Equivalence to argmax is pinned by
         # test_greedy_route_equivalence.py.
-        temperatures, top_ks, top_ps, _, seeds, offsets = gather_and_expand_scalars(
-            sampling_info.req_pool_indices,
-            temperature=self._temperature_pool,
-            top_k=self._top_k_pool,
-            top_p=self._top_p_pool,
-            seed=self._seed_pool,
-            offsets=sampling_info.valid_cache_lengths,
-        )
-
         if self.config.sampling_stream == "per-request":
-            batch_next_token_ids = self._sample_per_request(
+            batch_next_token_ids, top_ks = self._sample_per_request(
                 logits, sampling_info, min_p_pool=None
             )
         else:
+            temperatures, top_ks, top_ps, _, seeds, offsets = gather_and_expand_scalars(
+                sampling_info.req_pool_indices,
+                temperature=self._temperature_pool,
+                top_k=self._top_k_pool,
+                top_p=self._top_p_pool,
+                seed=self._seed_pool,
+                offsets=sampling_info.valid_cache_lengths,
+            )
             probs = softmax(
                 logits,
                 temperature=temperatures.view(-1, 1),

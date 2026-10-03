@@ -86,7 +86,7 @@ def _info(pool_indices: list[int], device: str) -> SamplingBatchInfo:
 @pytest.fixture
 def cpu_kernels(monkeypatch: pytest.MonkeyPatch):
     """Mock every Triton/flashinfer kernel the sample() paths touch."""
-    calls: dict[str, list] = {"gumbel": [], "flashinfer": []}
+    calls: dict[str, list] = {"gumbel": [], "flashinfer": [], "gather": []}
 
     def fake_gumbel(
         logits,
@@ -118,6 +118,7 @@ def cpu_kernels(monkeypatch: pytest.MonkeyPatch):
         return out[: logits.shape[0]]
 
     def fake_gather(req_pool_indices, **pools):
+        calls["gather"].append(req_pool_indices)
         order = ("temperature", "top_k", "top_p", "min_p", "seed", "offsets")
         outs = []
         for name in order:
@@ -171,6 +172,9 @@ def test_per_request_route_reads_the_request_pools(cpu_kernels):
     )
 
     assert cpu_kernels["flashinfer"] == []
+    # The per-request route reads the pools directly: the expanded per-row
+    # scalars of the batch route are never built.
+    assert cpu_kernels["gather"] == []
     (call,) = cpu_kernels["gumbel"]
     # Pool indices reach the kernel as int32, the pools as the backend's own
     # buffers, and the offsets as the step's pool-indexed cache lengths.
@@ -199,6 +203,27 @@ def test_per_request_route_without_cache_lengths_uses_zero_offsets(cpu_kernels):
     assert call["offsets_pool"] is backend._zero_offsets_pool
 
 
+def test_per_request_route_feeds_the_greedy_overlay_each_rows_top_k(
+    cpu_kernels, monkeypatch
+):
+    # Under a bitwise envelope greedy rows take the canonical lowest-index
+    # argmax; the per-request route must still hand the overlay each row's
+    # top-k (from the pool, not from the skipped scalar gather).
+    monkeypatch.setitem(
+        flashinfer_module.global_server_args_dict, "numerics", "rl-bitwise"
+    )
+    backend = FlashInferSamplingBackend(_config("per-request", "cpu"))
+    greedy = _sp("g", temperature=0.0, top_k=1)
+    backend.prepare_step(["g", "s"], [2, 6], [greedy, _sp("s", top_k=-1)])
+    logits = torch.zeros(2, VOCAB)
+    logits[:, 3] = logits[:, 9] = 5.0  # an exact tie; canonical is id 3
+    sampled, _ = backend.sample(
+        LogitsProcessorOutput(next_token_logits=logits), _info([2, 6], "cpu")
+    )
+    # The mocked pool kernel returned [0, 1]; only the greedy row is overlaid.
+    assert sampled.tolist() == [3, 1]
+
+
 def test_batch_stream_keeps_the_flashinfer_kernel(cpu_kernels):
     backend = FlashInferSamplingBackend(_config("batch", "cpu"))
     backend.prepare_step(["a"], [2], [_sp("a")])
@@ -207,6 +232,7 @@ def test_batch_stream_keeps_the_flashinfer_kernel(cpu_kernels):
         _info([2], "cpu"),
     )
     assert cpu_kernels["gumbel"] == []
+    assert len(cpu_kernels["gather"]) == 1
     (call,) = cpu_kernels["flashinfer"]
     assert call["seed"].tolist() == [backend._seed_pool[2].item()]
 

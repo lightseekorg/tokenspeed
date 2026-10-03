@@ -127,11 +127,6 @@ class TritonSamplingBackend(SamplingBackend):
         )
 
     def _init_triton_buffers(self, config: SamplingBackendConfig) -> None:
-        pool_rows = config.max_req_pool_size + 1
-        self._zero_offsets_pool = torch.zeros(
-            (pool_rows,), dtype=torch.int64, device=config.device
-        )
-
         vocab_size = max(int(config.vocab_size), 1)
         gumbel_scratch = gumbel_scratch_shape(config.max_bs, vocab_size)
         self._gumbel_local_ids = torch.empty(
@@ -141,9 +136,6 @@ class TritonSamplingBackend(SamplingBackend):
             gumbel_scratch, dtype=torch.float32, device=config.device
         )
         self._gumbel_out = torch.empty(
-            (config.max_bs,), dtype=torch.int32, device=config.device
-        )
-        self._req_pool_indices_i32 = torch.empty(
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
         self._gumbel_verify_out = torch.empty(
@@ -252,21 +244,6 @@ class TritonSamplingBackend(SamplingBackend):
         self._selected_logprob_out = torch.empty(
             (top_p_rows,), dtype=torch.float32, device=config.device
         )
-
-    def _req_pool_indices_for_kernels(
-        self, req_pool_indices: torch.Tensor, rows: int
-    ) -> torch.Tensor:
-        req_pool_indices = req_pool_indices[:rows]
-        if req_pool_indices.dtype == torch.int32:
-            return req_pool_indices
-        if req_pool_indices.dtype != torch.int64:
-            raise ValueError(
-                "Triton sampling requires int32/int64 req_pool_indices, "
-                f"got {req_pool_indices.dtype}"
-            )
-        out = self._req_pool_indices_i32[:rows]
-        out.copy_(req_pool_indices, non_blocking=True)
-        return out
 
     def _write_logprob_outputs(
         self,
@@ -433,11 +410,7 @@ class TritonSamplingBackend(SamplingBackend):
         # so the pool route below serves them too — same path the CUDA graph
         # captures. Equivalence to argmax is pinned by
         # test_greedy_route_equivalence.py.
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         bs = logits.shape[0]
         req_pool_indices = self._req_pool_indices_for_kernels(
             sampling_info.req_pool_indices, bs
@@ -692,11 +665,7 @@ class TritonSamplingBackend(SamplingBackend):
             )
 
         # Greedy verifies through the same pool route (top_k=1); see sample().
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         req_pool_indices = self._req_pool_indices_for_kernels(
             sampling_info.req_pool_indices, bs
         )
