@@ -51,6 +51,84 @@ Kimi-K3 TP8 deployments must combine `--tensor-parallel-size 8` with
 `--mm-encoder-tp-mode data`. This keeps the text model at TP8 while running the
 wide-QKV MoonViT encoder at TP1 with whole-item DP8.
 
+### Decode-side TP layouts under attention DP
+
+An MLA decode engine runs attention at TP1 with DP across the world: the
+per-token latent KV cannot shard by heads, so every rank keeps its own KV.
+That layout replicates every non-MoE weight on every rank: the MLA head
+projections (`q_b_proj`, `kv_b_proj`, `o_proj`), the dense MLPs and the LM
+head. On a large model that is tens of GB per rank that could hold KV
+instead. Three knobs shard those weights over contiguous groups of DP ranks
+(one node, typically) while attention and the KV stay TP1/DP:
+
+| Parameter | Use |
+| --- | --- |
+| `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj` and `o_proj` by heads over `W` contiguous DP ranks. Requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). |
+| `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); without attention DP it must equal the attention TP size (today's layout). |
+| `--dense-tp-size W` | Already shards the dense MLPs over `W` ranks (token all-gather in, token reduce-scatter out). |
+| `--tp-batch-invariant {none,attn,attn+dense}` | Make the sharded `o_proj` (`attn`) and dense `down_proj` (`attn+dense`) column-parallel on hidden so no cross-rank sum remains outside MoE; see below. |
+
+`--attn-head-tp-size` is the one that changes the attention data flow. With
+`W` ranks holding `T_full` decode rows together and this rank owning `T_own`
+of them, each attention layer runs:
+
+1. token all-gather of the normalized q latent: `[T_own, q_lora]` to
+   `[T_full, q_lora]`;
+2. `q_b_proj` and the absorption on this rank's `H / W` heads:
+   `[T_full, H / W, kv_lora + rope]`;
+3. all-to-all, heads to tokens: `[T_own, H, kv_lora + rope]` -- every head
+   of this rank's own tokens;
+4. the attention prologue (RoPE, KV write) and core attention on this rank's
+   own KV, with the full head count;
+5. all-to-all, tokens to heads: `[T_full, H / W, kv_lora]`;
+6. the value projection with the local `w_vc`: `[T_full, H / W * v]`;
+7. the `o_proj` tail back to `[T_own, hidden]`: row-parallel `o_proj` and a
+   token reduce-scatter of the head partials, or, under
+   `--tp-batch-invariant attn`, an all-gather of the heads, the
+   column-parallel `o_proj` (`[T_full, hidden / W]`) and an all-to-all back
+   to this rank's rows.
+
+The head exchange precedes the prologue, so the prologue sees one row count
+for the query, the latent and the write slots (RoPE commutes with the head
+permutation); the KV write and any sparse-attention indexer stay as they are.
+The head group's ranks all take part in every leg, including a DP rank with
+no rows this step: it still owns a head shard of the group's tokens. Head TP
+serves decode rows only: an expanded prefill needs every head's K/V for the
+cached prefix, which the head-sharded `kv_b_proj` cannot produce, so the
+layout is refused outside `--disaggregation-mode decode` and a prefill row
+reaching it is an error (a decode node's local recovery prefill included).
+The exchange counts come from the gathered per-rank token counts, so there
+is no device sync; decode CUDA graphs pad every DP rank to the same batch.
+
+`--lm-head-tp-size` under attention DP gathers the ranks' logits rows,
+runs the vocab-shard GEMM and transposes the shards back to each rank's own
+rows (`[T_own, V]`), so sampling and logprobs downstream see the same
+full-vocab rows as a replicated head. The row counts are exchanged (a prefill
+keeps one row per request, a MIXED round mixes both), except under CUDA
+graph capture where every rank runs the same padded decode batch. It cannot
+combine with `--dp-sampling`.
+
+`--tp-batch-invariant` replaces the two reduce-scatters of these layouts
+(after `o_proj`, after the dense `down_proj`) with column-parallel GEMMs on
+hidden: the reduction dimension (heads, intermediate channels) is
+all-gathered, every rank computes its hidden shard of every token with full
+K, and an all-to-all returns the rows. Every collective is then a pure
+permutation of bytes, so the result is bitwise the full-K GEMM a TP1 or
+replicated layer computes -- the point when a prefill engine with such a
+layer must agree with the decode engine. It moves about the bytes of the
+reduce-scatter it replaces and needs unquantized `o_proj` / `down_proj`;
+`attn` requires head TP and `attn+dense` also requires dense TP.
+
+The decode preset for a 128-way DP MLA model is thus one node-local group
+of 8 reused three times:
+
+```bash
+tokenspeed serve <model> \
+  --world-size 128 --nprocs-per-node 8 --attn-tp-size 1 --data-parallel-size 128 \
+  --attn-head-tp-size 8 --dense-tp-size 8 --lm-head-tp-size 8 \
+  --tp-batch-invariant attn+dense --disaggregation-mode decode ...
+```
+
 ### Pinning a request to an attention-DP rank
 
 Each attention-DP rank owns a private prefix cache, so multi-turn requests

@@ -219,7 +219,11 @@ an MLA format.
 ## MLA shapes
 
 Absorbed attention reads the latent cache. Its query's non-RoPE part is
-`kv_lora_rank` wide, and the prologue returns only the query.
+`kv_lora_rank` wide, and the prologue returns only the query. Under attention
+head TP (`--attn-head-tp-size`) the heads-to-tokens exchange runs before the
+prologue, so the query, the latent and the write slots still arrive with one
+row count -- this rank's own rows -- and every head; the RoPE part travels
+inside the query and is the query's own RoPE channels when it arrives.
 
 Non-absorbed prefill attends per-head keys up-projected from the latent. It
 passes `MLAExpandedKV(k_nope, value)`, and the prologue returns per-head keys

@@ -330,6 +330,9 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
 | `--decode-context-parallel-size` | Shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages. Allowed on aggregated engines and with `--disaggregation-mode prefill` (every rank of the subgroup sends its owned pages to an unsharded decode). Not supported yet: the decode role; speculative decoding on any ordinary MLA/DSA model (the recipe refuses to shard a cache holding a draft group, whichever dense kernel runs it -- only the DeepSeek V4 and Kimi K3 recipes shard with a draft, and FlashMLA/GPU DSA reject speculation under DCP outright); and the Host KVStore, so pass `--disable-kvstore`. |
+| `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous attention-DP ranks; each rank keeps its own KV and the attention exchanges heads for tokens. Needs attention TP 1, attention DP and `--disaggregation-mode decode`. Defaults to the attention TP size (no exchange). See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
+| `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers the ranks' rows before the logits GEMM and transposes the shards back. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`. |
+| `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs `--dense-tp-size` > 1; both need unquantized `o_proj` / `down_proj`. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention replica width (attn TP x CP): the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |
@@ -664,6 +667,9 @@ features directly:
 - `--max-prefill-tokens`
 - `--chunked-prefill-size`
 - `--attn-tp-size`
+- `--attn-head-tp-size`
+- `--lm-head-tp-size`
+- `--tp-batch-invariant`
 - `--dense-tp-size`
 - `--moe-tp-size`
 - `--kvstore-*`

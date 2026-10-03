@@ -76,6 +76,10 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               so a site cannot change route with the
 │   │                               batch; a payload past the switch buffer
 │   │                               raises rather than reroutes
+│   ├── data movement               all-gather, token all-gather, all-to-all
+│   │                               (even or uneven, the transposes of the
+│   │                               decode TP layouts) move bytes without
+│   │                               reducing: nothing to fold, no branch
 │   └── force_deterministic_rsag    the user's "NCCL and the fold only" knob:
 │                                   no symmetric-memory path at all (multicast
 │                                   gathers, in-switch reduction, the trtllm
@@ -256,6 +260,38 @@ logs it, and the route honours the pin. A deployment whose attention TP
 groups are several sets of three or more GPUs therefore keeps its attention
 all-reduce on the fold and its single MoE group on the switch; one TP group
 of everything, or TP-2 replicas, run the switch throughout.
+
+## Parallel layouts and the envelope
+
+The decode-side TP layouts under attention DP (`--attn-head-tp-size`,
+`--lm-head-tp-size`, `--dense-tp-size`, `--tp-batch-invariant`; see
+[Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp))
+are explicit deployment choices. The envelope does not fold them in: a
+layout is part of the deployment the contract is stated for, not a switch
+the contract tightens, and `rl-bitwise` neither selects nor refuses one.
+Within one deployment they keep the contract as follows.
+
+- Run and batch invariance hold under every layout. The head, dense and
+  LM-head GEMMs take the same `aok` pins as their replicated forms; the
+  exchanges (token all-gather, all-gather of a reduction dimension, the
+  even and uneven all-to-all transposes) are permutations of bytes and need
+  no fold; the remaining reductions (`o_proj` and `down_proj` reduce-scatter
+  without `--tp-batch-invariant`) go through `batch_invariant_collectives`.
+- `--tp-batch-invariant` is the stronger property: with it the decode layer
+  has **no cross-rank reduction outside MoE**. `o_proj` and `down_proj`
+  become column-parallel on hidden fed by an all-gather of the reduction
+  dimension, so every output element is one full-K GEMM result — bitwise the
+  value a TP1 or replicated layer computes, independent of the width `W`.
+  An ordered-fold reduce-scatter is batch-invariant too, but its fp32 fold
+  of `W` partials is not the full-K GEMM's association, so a decode engine
+  on that path disagrees in the last bits with a prefill engine whose
+  `o_proj` / `down_proj` run replicated or at TP1. `resolve_numerics`
+  therefore warns when head TP runs under `rl-bitwise` without
+  `--tp-batch-invariant attn`.
+- Topology invariance across layouts is not promised beyond that: the
+  vocab-sharded log-softmax and the trainer-aligned fold remain the deferred
+  layers above, and a deployment advertising `rl-bitwise` with one of these
+  layouts must pass the invariance harness with that layout.
 
 ## Kernel selection
 
