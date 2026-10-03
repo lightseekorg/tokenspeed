@@ -203,6 +203,53 @@ def _autotune_cache_key(
     }
 
 
+def select_dspark_context_producer(
+    *,
+    spec_algo: str | None,
+    pp_size: int,
+    draft_model: torch.nn.Module | None,
+    draft_token_to_kv_pool,
+):
+    """Return the stage's DSpark context producer, or None when nothing is produced.
+
+    A DSpark draft reads target taps that live on several pipeline stages, so
+    each stage projects its own during the target forward and the final stage
+    writes the draft context; off the pipeline the drafter keeps projecting
+    and writing context itself. An EAGLE-style draft (NextN/MTP) consumes only
+    the last stage's captured hidden states, so no stage produces anything
+    for it: the executor then captures FULL hidden states for its drafter.
+
+    Args:
+        spec_algo: The speculative algorithm, or None without speculation.
+        pp_size: Pipeline stage count; a single stage never produces.
+        draft_model: The loaded draft model, or None without one.
+        draft_token_to_kv_pool: The draft cache pool this stage owns, or None.
+
+    Returns:
+        A ``DSparkContextProducer`` for a pipeline DSpark draft, else None.
+
+    Raises:
+        TypeError: A block drafter (DFLASH/DSPARK) on the pipeline whose model
+            cannot produce context across stages; it would draft from one
+            stage's taps alone.
+    """
+    if spec_algo is None or pp_size <= 1:
+        return None
+    from tokenspeed.runtime.execution.dspark_context import (
+        DSparkContextModel,
+        DSparkContextProducer,
+    )
+
+    if isinstance(draft_model, DSparkContextModel):
+        return DSparkContextProducer(draft_model, draft_token_to_kv_pool)
+    if is_block_drafter(spec_algo, is_draft=True):
+        raise TypeError(
+            f"{type(draft_model).__name__} cannot produce DSpark context across "
+            "pipeline stages."
+        )
+    return None
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -447,25 +494,14 @@ class ModelExecutor:
             max_bs,
             self.device,
         )
-        self.dspark_context_producer = None
-        if config.spec_algo is not None and config.pp_size > 1:
-            # Pipeline speculation: the target taps live on several stages, so
-            # each stage projects its own during the target forward and the
-            # final stage writes the draft context. Off the pipeline the
-            # drafter keeps projecting and writing context itself.
-            from tokenspeed.runtime.execution.dspark_context import (
-                DSparkContextModel,
-                DSparkContextProducer,
-            )
-
-            if not isinstance(draft_model_runner.model, DSparkContextModel):
-                raise TypeError(
-                    f"{type(draft_model_runner.model).__name__} cannot produce "
-                    "DSpark context across pipeline stages."
-                )
-            self.dspark_context_producer = DSparkContextProducer(
-                draft_model_runner.model, draft_token_to_kv_pool
-            )
+        self.dspark_context_producer = select_dspark_context_producer(
+            spec_algo=config.spec_algo,
+            pp_size=config.pp_size,
+            draft_model=(
+                draft_model_runner.model if draft_model_runner is not None else None
+            ),
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+        )
         if self.config.spec_algo is not None and self._pp_is_last_stage:
             # Model-to-model wiring (shared embed/head, eagle3 capture ids)
             # already happened in create_model_runner, right after both

@@ -64,6 +64,17 @@ def _draft_runner(model) -> SimpleNamespace:
     )
 
 
+def _mapping(*, has_pp: bool = False, is_last_pp_rank: bool = True) -> SimpleNamespace:
+    """The pipeline facts resource binding reads off the target runner."""
+    return SimpleNamespace(has_pp=has_pp, is_last_pp_rank=is_last_pp_rank)
+
+
+def _target_runner(model, mapping=None) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=model, mapping=_mapping() if mapping is None else mapping
+    )
+
+
 def test_get_drafter_impl_routing():
     from tokenspeed.runtime.models.deepseek_v4_dspark import (
         DeepseekV4ForCausalLMDSpark,
@@ -117,6 +128,7 @@ def test_pd_layerwise_finalization_capability_matches_supported_drafters():
 
 def test_wire_eagle3_shares_embed_head_and_installs_capture_ids():
     target, draft = mock.MagicMock(), mock.MagicMock()
+    target.mapping = _mapping()
     target.model.get_embed_and_head.return_value = ("EMBED", "HEAD")
     draft.model_config.hf_config = {
         "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}
@@ -142,10 +154,18 @@ class _ModuleSharingDraft:
         self.legacy = (embed, head)
 
 
+class _WeightSharingDraft:
+    def __init__(self):
+        self.shared = None
+
+    def set_embed_and_head(self, embed, head):
+        self.shared = (embed, head)
+
+
 def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
     lm_head = object()
-    target = SimpleNamespace(
-        model=SimpleNamespace(
+    target = _target_runner(
+        SimpleNamespace(
             lm_head=lm_head,
             get_embed_and_head=lambda: ("EMBED", "HEAD_WEIGHT"),
         )
@@ -161,8 +181,8 @@ def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
 
 
 def test_wire_mtp_module_sharing_requires_target_lm_head():
-    target = SimpleNamespace(
-        model=SimpleNamespace(get_embed_and_head=lambda: ("EMBED", "HEAD_WEIGHT"))
+    target = _target_runner(
+        SimpleNamespace(get_embed_and_head=lambda: ("EMBED", "HEAD_WEIGHT"))
     )
     draft = _draft_runner(_ModuleSharingDraft())
 
@@ -173,8 +193,67 @@ def test_wire_mtp_module_sharing_requires_target_lm_head():
         factory.configure_draft_target(_server_args("MTP"), target, draft)
 
 
+def test_wire_off_pipeline_requires_both_target_weights():
+    draft = _draft_runner(_WeightSharingDraft())
+    for embed, head, message in (
+        (None, "HEAD", "embedding weight"),
+        ("EMBED", None, "lm_head weight"),
+    ):
+        target = _target_runner(
+            SimpleNamespace(get_embed_and_head=lambda e=embed, h=head: (e, h))
+        )
+        with (
+            mock.patch.object(factory, "get_drafter_impl", return_value=Eagle),
+            pytest.raises(ValueError, match=message),
+        ):
+            factory.configure_draft_target(_server_args("MTP"), target, draft)
+
+
+@pytest.mark.parametrize("drafter_cls", [Eagle, Mtp])
+def test_wire_skips_embed_head_sharing_before_the_last_pipeline_stage(drafter_cls):
+    # Stages before the last run no drafter: their draft modules are empty
+    # shells, and the target holds neither side there (embedding on the
+    # first stage, head on the last). Nothing is read or bound.
+    target_model = SimpleNamespace(
+        get_embed_and_head=mock.Mock(side_effect=AssertionError("read a shell"))
+    )
+    target = _target_runner(target_model, _mapping(has_pp=True, is_last_pp_rank=False))
+    for draft_model in (_WeightSharingDraft(), _ModuleSharingDraft()):
+        with mock.patch.object(factory, "get_drafter_impl", return_value=drafter_cls):
+            factory.configure_draft_target(
+                _server_args("MTP"), target, _draft_runner(draft_model)
+            )
+        assert draft_model.shared is None
+    target_model.get_embed_and_head.assert_not_called()
+
+
+def test_wire_last_pipeline_stage_shares_only_the_head():
+    # The last stage owns the target head but not its embedding, so the draft
+    # keeps the embedding shard its checkpoint provides (embed=None).
+    lm_head = object()
+    target = _target_runner(
+        SimpleNamespace(
+            lm_head=lm_head, get_embed_and_head=lambda: (None, "HEAD_WEIGHT")
+        ),
+        _mapping(has_pp=True, is_last_pp_rank=True),
+    )
+    weight_draft, module_draft = _WeightSharingDraft(), _ModuleSharingDraft()
+    with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
+        factory.configure_draft_target(
+            _server_args("MTP"), target, _draft_runner(weight_draft)
+        )
+    with mock.patch.object(factory, "get_drafter_impl", return_value=Mtp):
+        factory.configure_draft_target(
+            _server_args("MTP"), target, _draft_runner(module_draft)
+        )
+    assert weight_draft.shared == (None, "HEAD_WEIGHT")
+    assert module_draft.shared == (None, lm_head)
+    assert module_draft.legacy is None
+
+
 def test_wire_eagle3_explicit_capture_ids_override_checkpoint():
     target, draft = mock.MagicMock(), mock.MagicMock()
+    target.mapping = _mapping()
     target.model.get_embed_and_head.return_value = ("E", "H")
     draft.model_config.hf_config = {
         "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}
@@ -186,6 +265,136 @@ def test_wire_eagle3_explicit_capture_ids_override_checkpoint():
         )
 
     target.model.set_eagle3_layers_to_capture.assert_called_once_with([7, 8])
+
+
+class _ContextDraft:
+    """A draft implementing the DSparkContextModel protocol on one stage."""
+
+    hidden_size = 8
+
+    def __init__(self, is_last_pp_rank: bool):
+        self.mapping = SimpleNamespace(
+            is_first_pp_rank=not is_last_pp_rank, is_last_pp_rank=is_last_pp_rank
+        )
+
+    def project_target_tap(self, capture_idx, hidden):
+        raise AssertionError("unused")
+
+    def finalize_target_projection(self, projected):
+        raise AssertionError("unused")
+
+    def write_context_kv(self, ctx_hidden, positions, cache_locs, token_to_kv_pool):
+        raise AssertionError("unused")
+
+
+@pytest.mark.parametrize("is_last_pp_rank", [False, True])
+def test_pipeline_dspark_draft_gets_a_context_producer_on_every_stage(is_last_pp_rank):
+    from tokenspeed.runtime.execution.dspark_context import DSparkContextProducer
+    from tokenspeed.runtime.execution.model_executor import (
+        select_dspark_context_producer,
+    )
+
+    draft_pool = object() if is_last_pp_rank else None
+    producer = select_dspark_context_producer(
+        spec_algo="DSPARK",
+        pp_size=4,
+        draft_model=_ContextDraft(is_last_pp_rank),
+        draft_token_to_kv_pool=draft_pool,
+    )
+    assert isinstance(producer, DSparkContextProducer)
+    assert producer.token_to_kv_pool is draft_pool
+
+
+@pytest.mark.parametrize("spec_algo", ["MTP", "EAGLE3"])
+@pytest.mark.parametrize("draft_pool", [None, object()])
+def test_pipeline_eagle_style_draft_produces_no_context(spec_algo, draft_pool):
+    # A NextN/MTP draft reads only the last stage's captured hidden states;
+    # neither a mid stage (no draft pool) nor the last stage builds a producer.
+    from tokenspeed.runtime.execution.model_executor import (
+        select_dspark_context_producer,
+    )
+
+    assert (
+        select_dspark_context_producer(
+            spec_algo=spec_algo,
+            pp_size=2,
+            draft_model=torch.nn.Module(),
+            draft_token_to_kv_pool=draft_pool,
+        )
+        is None
+    )
+
+
+def test_pipeline_block_drafter_without_context_production_is_rejected():
+    from tokenspeed.runtime.execution.model_executor import (
+        select_dspark_context_producer,
+    )
+
+    with pytest.raises(TypeError, match="cannot produce DSpark context"):
+        select_dspark_context_producer(
+            spec_algo="DSPARK",
+            pp_size=2,
+            draft_model=torch.nn.Module(),
+            draft_token_to_kv_pool=None,
+        )
+
+
+def test_single_stage_never_builds_a_context_producer():
+    from tokenspeed.runtime.execution.model_executor import (
+        select_dspark_context_producer,
+    )
+
+    assert (
+        select_dspark_context_producer(
+            spec_algo="DSPARK",
+            pp_size=1,
+            draft_model=_ContextDraft(is_last_pp_rank=True),
+            draft_token_to_kv_pool=object(),
+        )
+        is None
+    )
+    assert (
+        select_dspark_context_producer(
+            spec_algo=None, pp_size=2, draft_model=None, draft_token_to_kv_pool=None
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "has_pp,is_last_pp_rank,producer,drafter,expected",
+    [
+        # Stages before the last own no draft fields: nothing to finalize.
+        (True, False, None, None, True),
+        # The last stage answers for the draft-field writer, like a non-PP engine.
+        (True, True, None, Eagle, True),
+        (True, True, None, Mtp, False),
+        (False, True, None, Eagle, True),
+        (False, True, None, Mtp, False),
+        # A configured context producer owns the draft writes.
+        (True, True, "producer", DSpark, True),
+        # No speculation: unused, and nothing claims support.
+        (False, True, None, None, False),
+    ],
+)
+def test_pd_layerwise_finalization_is_decided_per_pipeline_stage(
+    has_pp, is_last_pp_rank, producer, drafter, expected
+):
+    from tokenspeed.runtime.execution.device import (
+        _supports_pd_layerwise_finalization,
+    )
+    from tokenspeed.runtime.execution.dspark_context import DSparkContextProducer
+
+    executor = SimpleNamespace(
+        dspark_context_producer=(
+            DSparkContextProducer.__new__(DSparkContextProducer)
+            if producer is not None
+            else None
+        ),
+        drafter=drafter.__new__(drafter) if drafter is not None else None,
+    )
+    mapping = SimpleNamespace(has_pp=has_pp, is_last_pp_rank=is_last_pp_rank)
+    assert _supports_pd_layerwise_finalization(executor, mapping) is expected
 
 
 def test_wire_dflash_keeps_own_embed_head():

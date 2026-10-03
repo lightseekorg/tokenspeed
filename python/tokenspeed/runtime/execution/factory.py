@@ -77,6 +77,38 @@ def _eagle_aux_layer_ids(hf_config) -> list[int] | None:
     return None
 
 
+def _share_target_embed_and_head(model_runner: ModelRunner, draft_model) -> None:
+    """Alias the target's embedding/LM head into an EAGLE-style draft.
+
+    On a pipeline only the last stage runs the drafter, so the other stages'
+    draft modules are empty shells with nothing to bind. The last stage holds
+    the target head but not the embedding (that lives on the first stage):
+    it shares the head alone and the draft keeps the embedding shard its
+    checkpoint provides. Off the pipeline both sides are shared and the
+    draft's copies are dropped before the KV-cache budget is profiled.
+    """
+    mapping = model_runner.mapping
+    if mapping.has_pp and not mapping.is_last_pp_rank:
+        return
+    embed, head = model_runner.model.get_embed_and_head()
+    if mapping.has_pp:
+        embed = None
+    elif embed is None:
+        raise ValueError("Draft model requires the target's embedding weight.")
+    module_setter = getattr(type(draft_model), "set_embed_and_head_module", None)
+    if module_setter is not None:
+        lm_head = getattr(model_runner.model, "lm_head", None)
+        if lm_head is None:
+            raise ValueError(
+                "Draft model requires the target's complete lm_head module."
+            )
+        module_setter(draft_model, embed, lm_head)
+    else:
+        if head is None:
+            raise ValueError("Draft model requires the target's lm_head weight.")
+        draft_model.set_embed_and_head(embed, head)
+
+
 def configure_draft_target(
     server_args: ServerArgs,
     model_runner: ModelRunner,
@@ -108,18 +140,7 @@ def configure_draft_target(
             model_runner.model, model_runner.model_config.hf_text_config
         )
     if DrafterImpl.shares_target_embed_head:
-        embed, head = model_runner.model.get_embed_and_head()
-        draft_model = draft_model_runner.model
-        module_setter = getattr(type(draft_model), "set_embed_and_head_module", None)
-        if module_setter is not None:
-            lm_head = getattr(model_runner.model, "lm_head", None)
-            if lm_head is None:
-                raise ValueError(
-                    "Draft model requires the target's complete lm_head module."
-                )
-            module_setter(draft_model, embed, lm_head)
-        else:
-            draft_model.set_embed_and_head(embed, head)
+        _share_target_embed_and_head(model_runner, draft_model)
     if server_args.speculative_algorithm == "EAGLE3" and hasattr(
         model_runner.model, "set_eagle3_layers_to_capture"
     ):

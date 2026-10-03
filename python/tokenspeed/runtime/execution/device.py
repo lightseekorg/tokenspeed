@@ -147,8 +147,11 @@ class DeviceSpecs:
             (rather than by the capturable side-stream executor), which is
             what makes a grammar batch depend on the pending commit.
         supports_disaggregation: The KV arena can hand pages to a peer node.
-        supports_pd_layerwise_finalization: The drafter can finalize
-            layerwise KV writes, required for PD layerwise transfer.
+        supports_pd_layerwise_finalization: This rank can finalize layerwise
+            KV writes with speculation on, required for PD layerwise
+            transfer: the draft-field writer (producer or drafter) declares
+            it, and a pipeline stage owning no draft fields has nothing to
+            finalize.
         cache_state_group_ids: Group ids of the state-family cache groups,
             for the per-group page-usage debug line. Empty for pools with no
             recurrent/conv state.
@@ -1300,12 +1303,8 @@ def build_device_side(
         spec_num_tokens=executor.config.spec_num_tokens or 0,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
-        supports_pd_layerwise_finalization=bool(
-            getattr(
-                executor.dspark_context_producer or executor.drafter,
-                "supports_pd_layerwise_finalization",
-                False,
-            )
+        supports_pd_layerwise_finalization=_supports_pd_layerwise_finalization(
+            executor, server_args.mapping
         ),
         cache_state_group_ids=tuple(
             str(spec.group_id)
@@ -1455,6 +1454,26 @@ def _resolve_role(kv_transfer) -> DeviceRole:
     if isinstance(kv_transfer, DisaggPrefillExecutor):
         return DeviceRole.PD_PREFILL
     raise TypeError("kv_transfer must be a Disagg{Prefill,Decode}Executor.")
+
+
+def _supports_pd_layerwise_finalization(executor, mapping) -> bool:
+    """Whether this rank can finalize layerwise CachePD writes with speculation on.
+
+    The draft cache fields are the last pipeline stage's trailing producer
+    step (``CacheLayerOwnership``), so a stage before it owns none: its
+    readiness is the target layers' alone and nothing remains to finalize.
+    The owning stage, like a non-PP engine, answers for whoever writes the
+    draft fields -- the context producer when configured, else the drafter.
+    Without speculation the answer is unused.
+    """
+    if mapping.has_pp and not mapping.is_last_pp_rank:
+        return True
+    writer = (
+        executor.dspark_context_producer
+        if executor.dspark_context_producer is not None
+        else executor.drafter
+    )
+    return writer is not None and writer.supports_pd_layerwise_finalization
 
 
 def _build_kv_transfer(
