@@ -170,6 +170,42 @@ class TestLongcatZeroExpert(unittest.TestCase):
 
 
 class TestLongcatMoePlan(unittest.TestCase):
+    def test_deepep_all2all_is_refused(self):
+        # The decoder layer reduces the routed output through the host's MoE
+        # all-reduce / reduce-scatter (and counts the zero-expert residual on
+        # that assumption); DeepEP's combine already reduces in the kernel.
+        from tokenspeed.runtime.distributed.mapping import Mapping
+        from tokenspeed.runtime.layers.moe import utils as moe_utils
+
+        config = SimpleNamespace(
+            hidden_size=16,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            zero_expert_num=0,
+            zero_expert_type="",
+            moe_topk=2,
+            hidden_act="silu",
+            routed_scaling_factor=1.0,
+            norm_topk_prob=False,
+            router_bias=False,
+            router_dtype="float32",
+        )
+        mapping = Mapping(rank=0, world_size=2, attn_tp_size=2, moe_ep_size=2)
+        with (
+            mock.patch.object(
+                moe_utils, "ALL2ALL_BACKEND", moe_utils.All2AllBackend.DEEPEP
+            ),
+            self.assertRaisesRegex(ValueError, "--all2all-backend deepep"),
+        ):
+            _RuntimeLongcatMoE(
+                config=config,
+                mapping=mapping,
+                quant_config=None,
+                layer_index=0,
+                prefix="model.layers.0.mlp",
+                alt_stream=None,
+            )
+
     def test_blackwell_ep4_plans_accept_zero_expert_routing(self):
         from tokenspeed_kernel.platform import current_platform
 
@@ -222,10 +258,7 @@ class TestLongcatMoePlan(unittest.TestCase):
             mock.patch.object(
                 moe_utils, "ALL2ALL_BACKEND", moe_utils.All2AllBackend.NONE
             ),
-            mock.patch.dict(
-                global_server_args_dict,
-                {"ep_num_redundant_experts": 0, "enable_deep_ep": False},
-            ),
+            mock.patch.dict(global_server_args_dict, {"ep_num_redundant_experts": 0}),
         ):
             for quant_config in (None, fp8_config):
                 with self.subTest(quantized=quant_config is not None):

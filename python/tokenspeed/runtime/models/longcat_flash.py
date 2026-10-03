@@ -52,6 +52,9 @@ from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK as _TopK
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat as _TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType as _RoutingMethodType
+from tokenspeed.runtime.layers.moe.utils import (
+    get_all2all_backend as _get_all2all_backend,
+)
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig as _QuantizationConfig,
 )
@@ -231,6 +234,18 @@ class _RuntimeLongcatMoE(nn.Module):
                 f"EP size {self.mapping.moe.ep_size} is greater than the number "
                 f"of LongCat routed experts {config.n_routed_experts}."
             )
+        if _get_all2all_backend().is_deepep():
+            # The decoder layer gathers the MoE input over the MoE TP-EP group
+            # and reduces the routed output through post_moe_comm, and the
+            # identity zero-expert residual enters one rank's partial on that
+            # assumption. DeepEP's combine already reduces inside the kernel
+            # and keeps each rank's own token rows, so the two cannot compose.
+            raise ValueError(
+                "LongCat-Flash does not support --all2all-backend deepep: its MoE "
+                "layer reduces the routed output through the host's MoE "
+                "all-reduce / reduce-scatter, which DeepEP's in-kernel combine "
+                "already performs; launch with --all2all-backend none"
+            )
         if config.hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {config.hidden_act}. "
@@ -282,11 +297,8 @@ class _RuntimeLongcatMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             output_format=_TopKOutputFormat.STANDARD,
             zero_expert_num=config.zero_expert_num,
-            topk_indices_dtype=(
-                torch.int64
-                if global_server_args_dict.get("enable_deep_ep", False)
-                else torch.int32
-            ),
+            # DeepEP, the one consumer of int64 ids, is refused above.
+            topk_indices_dtype=torch.int32,
         )
 
     def get_moe_routed_weights(self):
