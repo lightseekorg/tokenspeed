@@ -473,6 +473,7 @@ def _super_cache_recipe(tp: int, kv_dtype: torch.dtype, *, draft_tokens: int):
             prefix_granularity=128,
             max_total_tokens=None,
             speculative_num_draft_tokens=draft_tokens,
+            speculative_eagle_topk=1,
             enable_replay_ssm=with_draft,
         ),
         model_config=SimpleNamespace(
@@ -781,10 +782,22 @@ def test_mamba2_decode_reads_the_projection_view_in_place():
     indices = torch.tensor([1, 2, 3], device="cuda", dtype=torch.int32)
 
     compact = causal_conv1d_update(
-        view.clone(), compact_states, weight, None, "silu", conv_state_indices=indices
+        view.clone(),
+        compact_states,
+        weight,
+        None,
+        "silu",
+        conv_state_indices=indices,
+        parent_indices=None,
     )
     strided = causal_conv1d_update(
-        view, states, weight, None, "silu", conv_state_indices=indices
+        view,
+        states,
+        weight,
+        None,
+        "silu",
+        conv_state_indices=indices,
+        parent_indices=None,
     )
     assert strided.data_ptr() == view.data_ptr()
     assert torch.equal(strided, compact)
@@ -982,7 +995,7 @@ def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype):
             )
         )
         backend.commit_verified_state(
-            torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+            torch.tensor([1, 3], dtype=torch.int32, device="cuda"), accepted_path=None
         )
         pools.append(pool)
     torch.cuda.synchronize()

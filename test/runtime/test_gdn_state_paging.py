@@ -72,6 +72,7 @@ def _mamba_config_pair(
     max_bs=8,
     device="cpu",
     replay_ssm=False,
+    draft_tree=False,
 ):
     """(AttnConfig, softmax spec) for MambaAttnBackend: model-wide facts live on
     the config, softmax geometry on the softmax spec, and the GDN geometry plus
@@ -97,6 +98,7 @@ def _mamba_config_pair(
         layer_ids=(0,),
         tp_size=1,
         replay_ssm=replay_ssm,
+        draft_tree=draft_tree,
     )
     config = AttnConfig(
         device=device,
@@ -1101,7 +1103,7 @@ class VerifyMetadataTest(unittest.TestCase):
             patch.object(mamba_module, "copy_state_rows", recorded_copy),
             patch.object(mamba_module, "state_verify_commit_rows", reference_rows),
         ):
-            self.backend.commit_verified_state(accepted)
+            self.backend.commit_verified_state(accepted, accepted_path=None)
 
         self.assertEqual(len(resolve_calls), 2)
         self.assertEqual(
@@ -1212,7 +1214,9 @@ class VerifyCommitGPUTest(unittest.TestCase):
                                 torch.profiler.ProfilerActivity.CUDA,
                             ]
                         ) as profile:
-                            backend.commit_verified_state(accepted[:live_bs])
+                            backend.commit_verified_state(
+                                accepted[:live_bs], accepted_path=None
+                            )
                             torch.cuda.synchronize()
                     events = profile.events()
                     gpu_kernels = [
