@@ -529,6 +529,10 @@ class TestLongcatRowLayout(unittest.TestCase):
 
         def attention(branch):
             def run(*, positions, hidden_states, ctx, comm_manager):
+                if hidden_states.shape[0] == 0:
+                    # Like DeepseekV3AttentionMLA without head TP: an idle
+                    # rank's attention has no collective to join.
+                    return hidden_states
                 hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
                 rows_seen[f"attn{branch}"] = hidden_states.shape[0]
                 return hidden_states

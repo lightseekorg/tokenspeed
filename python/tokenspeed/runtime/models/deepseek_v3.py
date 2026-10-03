@@ -193,7 +193,8 @@ class DeepseekV3MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_shared_expert: bool = False,
-        batch_invariant: bool = False,
+        *,
+        batch_invariant: bool,
     ) -> None:
         super().__init__()
         self.mapping = mapping
@@ -381,6 +382,7 @@ class DeepseekV3MoE(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("shared_experts", prefix),
                 is_shared_expert=True,
+                batch_invariant=False,
             )
 
         self.experts = MoELayer(
@@ -818,13 +820,18 @@ class DeepseekV3AttentionMLA(nn.Module):
         whole-attention break leaves. Outside capture the ``@break_point`` is
         a direct call, so the eager path is unchanged.
 
-        Under head TP every rank of the head group takes part even with no
-        rows of its own (an idle DP rank): its head shard of the group's
-        tokens is computed here, and the exchanges are collectives.
+        Every decoder layer calls this on an idle forward too, with its empty
+        input rows. Without head TP that is a no-op; under head TP the rank
+        still owns a head shard of its group's tokens, so it computes that
+        shard here and joins every exchange (they are collectives) -- the one
+        place idle participation lives, so no layer branches on the layout.
         """
         if hidden_states.shape[0] == 0 and not self.has_head_tp:
-            return hidden_states
+            # The o_proj output shape (the Eagle3 input is twice as wide).
+            return hidden_states.new_empty(0, self.hidden_size)
         if self.has_head_tp and ctx.num_extends > 0:
+            # Unreachable by configuration (see _validate_decode_tp_layouts):
+            # a guard against a prefill row reaching a decode-only layout.
             raise RuntimeError(
                 "attention head TP serves decode rows only: the head-sharded "
                 "kv_b_proj cannot expand every head's K/V for a prefill; this "
@@ -883,10 +890,13 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> torch.Tensor:
         """Token all-gather of this rank's input rows ``[T_own, F]`` over the
         head group."""
+        counts = self.head_tp_input_row_counts(ctx, x.shape[0])
+        if sum(counts) == 0:
+            # The whole head group is idle this forward: nothing to gather,
+            # and every rank reads the same table so every rank skips.
+            return x
         return token_all_gather(
-            x,
-            group=self.head_tp_group,
-            scattered_num_tokens=self.head_tp_input_row_counts(ctx, x.shape[0]),
+            x, group=self.head_tp_group, scattered_num_tokens=counts
         )
 
     def attention_output_rows(
@@ -910,6 +920,9 @@ class DeepseekV3AttentionMLA(nn.Module):
         if not self.has_head_tp:
             return self.o_proj(attn_output)[0]
         counts = self.head_tp_row_counts(ctx, num_rows)
+        if sum(counts) == 0:
+            # The whole head group is idle: no rows anywhere, no collective.
+            return attn_output.new_empty(0, self.hidden_size)
         if self.o_proj_batch_invariant:
             attn_output = all_gather(attn_output, self.head_tp_group, dim=-1)
             partial_hidden, _ = self.o_proj(attn_output)
@@ -959,9 +972,17 @@ class DeepseekV3AttentionMLA(nn.Module):
         unscaled, which is the ``q_lora`` a DSA indexer must read.
         """
         if self.q_lora_rank is not None:
-            qkv = self.fused_qkv_a_proj_with_mqa(
-                hidden_states, block_scale, torch.bfloat16
-            )
+            if hidden_states.shape[0] == 0:
+                # An idle rank under head TP: no rows to project (the
+                # quantized GEMMs do not take empty inputs), but the head
+                # group's gathered rows below still need this rank's shard.
+                qkv = hidden_states.new_empty(
+                    0, self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+                )
+            else:
+                qkv = self.fused_qkv_a_proj_with_mqa(
+                    hidden_states, block_scale, torch.bfloat16
+                )
             qkv = comm_manager.pre_attn_comm(qkv, ctx)
             q_a, latent_cache = qkv.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -1028,28 +1049,23 @@ class DeepseekV3AttentionMLA(nn.Module):
         else:
             num_prefill_tokens = 0
         real_total = num_prefill_tokens + num_decode_tokens
-        # Under head TP ``q`` holds the head group's gathered rows (this
-        # rank's head shard), and so does the output; the latent, positions
-        # and slots are this rank's own rows.
-        attn_output = torch.empty(
-            q.size(0),
-            self.num_local_heads * self.v_head_dim,
-            dtype=q.dtype,
-            device=q.device,
-        )
 
         if self.has_head_tp:
-            if num_prefill_tokens > 0:
-                raise RuntimeError(
-                    "attention head TP serves decode rows only: the head-sharded "
-                    "kv_b_proj cannot expand every head's K/V for a prefill; this "
-                    f"forward carries {num_prefill_tokens} prefill tokens"
-                )
+            # ``forward`` refused extending rows before the projections.
             if output_gate is not None or absorbed_query is not None:
                 raise NotImplementedError(
                     "attention head TP does not support an output gate or a "
                     "pre-absorbed query"
                 )
+            # ``q`` holds the head group's gathered input rows (this rank's
+            # head shard); the output holds the group's collective rows,
+            # which a narrowing drafter on a peer rank may have reduced to
+            # its live rows (this rank, idle in that step, has none either
+            # way). The latent, positions and slots are this rank's own rows.
+            attn_output = q.new_empty(
+                sum(self.head_tp_row_counts(ctx, real_total)),
+                self.num_local_heads * self.v_head_dim,
+            )
             # Every rank of the head group takes part, with or without rows
             # of its own, so an idle rank runs the exchanges too; it writes no
             # KV and asks the backend for no slots.
@@ -1074,6 +1090,13 @@ class DeepseekV3AttentionMLA(nn.Module):
                 attn_output,
             )
             return attn_output
+
+        attn_output = torch.empty(
+            q.size(0),
+            self.num_local_heads * self.v_head_dim,
+            dtype=q.dtype,
+            device=q.device,
+        )
 
         if num_prefill_tokens > 0:
             prefill_ctx = replace(
@@ -1211,16 +1234,11 @@ class DeepseekV3AttentionMLA(nn.Module):
         """Heads-to-tokens leg: ``[T_full, H_local, D]`` of this rank's head
         shard becomes ``[num_rows, H, D]`` of its own input rows with every head."""
         rows_full, heads_local, dim = Q.shape
-        counts = self.head_tp_input_row_counts(ctx, num_rows)
-        if sum(counts) != rows_full:
-            raise RuntimeError(
-                f"head-TP query rows {rows_full} do not match the group's row "
-                f"counts {counts}"
-            )
+        # all_to_all_transpose checks the counts against the rows.
         return all_to_all_transpose(
             Q.reshape(rows_full, heads_local * dim),
             self.head_tp_group,
-            input_split_sizes=counts,
+            input_split_sizes=self.head_tp_input_row_counts(ctx, num_rows),
         ).view(-1, self.head_tp_size * heads_local, dim)
 
     def head_tp_gather_heads(
@@ -1685,19 +1703,15 @@ class DeepseekV3DecoderLayer(nn.Module):
             ctx
         )
 
-        if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
-            )
-            hidden_states = self.self_attn(
+        if ctx.forward_mode.is_idle():
+            # No rows of its own: the attention joins its group's collectives
+            # if the layout has any (the attention decides), then the MLP's.
+            self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 ctx=ctx,
                 comm_manager=self.comm_manager,
             )
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
-            )
             hidden_states = self.forward_mlp(
                 hidden_states,
                 residual,
@@ -1705,25 +1719,36 @@ class DeepseekV3DecoderLayer(nn.Module):
                 num_global_tokens,
                 max_num_tokens_per_gpu,
             )
-        else:
-            if self.self_attn.has_head_tp:
-                # An idle rank still owns a head shard of its group's tokens:
-                # run the attention's exchanges and projections with no rows
-                # of its own (the output is empty and discarded).
-                self.self_attn(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    ctx=ctx,
-                    comm_manager=self.comm_manager,
-                )
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
+            return hidden_states, residual
+
+        hidden_states, residual = self.comm_manager.input_reduce_norm(
+            hidden_states, residual
+        )
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            ctx=ctx,
+            comm_manager=self.comm_manager,
+        )
+        residual = self.narrow_residual(residual, ctx)
+        hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
+            hidden_states, residual, ctx
+        )
+        hidden_states = self.forward_mlp(
+            hidden_states,
+            residual,
+            ctx,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+        )
         return hidden_states, residual
+
+    def narrow_residual(
+        self, residual: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        """Align the residual with the attention output's rows; the draft
+        layer narrows it to the live rows on a narrowing step."""
+        return residual
 
     def input_layer_norm_fn(self, hidden_states, residual):
         if residual is None:
@@ -2233,6 +2258,10 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 ),
             )
 
+        # --tp-batch-invariant attn+dense applies to this dense layer as well.
+        dense_batch_invariant = (
+            global_server_args_dict["tp_batch_invariant"] == "attn+dense"
+        )
         self.mlp = DeepseekV3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=getattr(
@@ -2242,6 +2271,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
             mapping=self.mapping,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            batch_invariant=dense_batch_invariant,
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -2259,6 +2289,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=False,
             prev_is_moe=False,
+            dense_batch_invariant=dense_batch_invariant,
             post_attn_layernorm=self.post_attention_layernorm,
         )
 
@@ -2272,13 +2303,16 @@ class Eagle3MlaDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
 
+        # [embeds || hidden_states] after the two norms; empty on an idle
+        # forward, which skips the norm kernels but still runs the attention
+        # (its head group's collectives, if the layout has any).
+        fused_norm_out = torch.empty(
+            embeds.size(0),
+            self.hidden_size * 2,
+            dtype=embeds.dtype,
+            device=embeds.device,
+        )
         if not ctx.forward_mode.is_idle():
-            fused_norm_out = torch.empty(
-                embeds.size(0),
-                self.hidden_size * 2,
-                dtype=embeds.dtype,
-                device=embeds.device,
-            )
             # FusedRMSNorm's q_a/kv_a kwargs are MLA-specific names.
             # Here embeds and hidden_states corresponds to q_a and kv_a, separately.
             self.fused_input_hidden_norm(
@@ -2288,13 +2322,14 @@ class Eagle3MlaDecoderLayer(nn.Module):
                 output_kv_a=fused_norm_out[..., self.hidden_size :],
             )
 
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=fused_norm_out,
-                ctx=ctx,
-                comm_manager=self.comm_manager,
-            )
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=fused_norm_out,
+            ctx=ctx,
+            comm_manager=self.comm_manager,
+        )
 
+        if not ctx.forward_mode.is_idle():
             # Active first draft step narrows attn output to [bs, H]; align the
             # residual to the same live rows before the post-attn reduce-norm.
             if ctx.draft_narrowing is not None:
@@ -2495,6 +2530,11 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         self.load_lm_head_from_target = False
         self._embed_loaded_from_checkpoint = False
         if self.config.tie_word_embeddings:
+            if self.mapping.attn.has_dp and self.mapping.lm_head.has_tp:
+                raise ValueError(
+                    "--lm-head-tp-size > 1 vocab-shards the LM head, but this "
+                    "draft ties it to its replicated embedding (tie_word_embeddings)"
+                )
             self.lm_head = self.model.embed_tokens
         else:
             draft_vocab_size = (
@@ -2502,13 +2542,16 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
             )
             if not hasattr(config, "draft_vocab_size"):
                 self.load_lm_head_from_target = True
+            # The draft's head follows the target's LM-head layout
+            # (mapping.lm_head): the shared target head arrives in that
+            # layout, and a draft-vocab head shards the same way.
             self.lm_head = ParallelLMHead(
                 draft_vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
+                tp_rank=self.mapping.lm_head.tp_rank,
+                tp_size=self.mapping.lm_head.tp_size,
+                tp_group=self.mapping.lm_head.tp_group,
                 prefix=add_prefix("lm_head", prefix),
             )
 
@@ -2516,9 +2559,10 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
             config,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
+            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
         self.capture_aux_hidden_states = True
         self.hot_token_id = None

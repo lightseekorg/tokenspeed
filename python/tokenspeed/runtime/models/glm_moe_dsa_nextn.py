@@ -230,6 +230,7 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
 
     prepare_dsa_topk_for_mtp_decode = staticmethod(_prepare_dsa_topk_for_mtp_decode)

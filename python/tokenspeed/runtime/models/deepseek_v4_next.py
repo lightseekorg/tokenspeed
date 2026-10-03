@@ -348,6 +348,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
 
     def get_hot_token_id(self):

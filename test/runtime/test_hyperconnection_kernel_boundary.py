@@ -323,6 +323,7 @@ def test_residual_fusion_gather_boundaries_match_communication(
         prev_is_moe=is_moe,
         input_layernorm=None,
         post_attn_layernorm=None,
+        dense_batch_invariant=False,
     )
     x = torch.arange(12).reshape(3, 4)
     gather = mock.Mock(side_effect=lambda value, **kwargs: value.repeat(2, 1))

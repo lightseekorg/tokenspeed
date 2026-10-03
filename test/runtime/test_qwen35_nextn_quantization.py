@@ -126,7 +126,8 @@ def test_mtp_shares_complete_quantized_lm_head(monkeypatch, tied):
     assert should_apply_lm_head_quant_method(draft.lm_head, draft.lm_head.quant_method)
 
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="qwen3_5", vocab_size=4)
+        config=SimpleNamespace(model_type="qwen3_5", vocab_size=4),
+        dp_lm_head_tp=False,
     )
     hidden_states = torch.ones((1, 4), dtype=torch.bfloat16)
     metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)

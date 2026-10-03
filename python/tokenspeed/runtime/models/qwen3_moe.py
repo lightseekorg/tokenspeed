@@ -92,6 +92,7 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayer):
             layer_id=layer_id,
             is_moe=is_moe,
             prev_is_moe=_is_moe_layer(layer_id - 1, config),
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
         )

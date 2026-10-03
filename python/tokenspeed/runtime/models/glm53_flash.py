@@ -1320,6 +1320,7 @@ class Glm53FlashDecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
             prev_is_moe=prev_is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
         )

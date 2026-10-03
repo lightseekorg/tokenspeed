@@ -282,6 +282,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             layer_id=layer_index,
             is_moe=True,
             prev_is_moe=_is_moe_layer(layer_index - 1, config),
+            dense_batch_invariant=False,
         )
 
         if self.tp_size > config.num_experts:

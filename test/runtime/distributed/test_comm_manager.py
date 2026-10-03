@@ -130,6 +130,7 @@ def _worker_main(rank, world_size, port, attn_tp, dense_tp, dp_tokens, hidden_si
         layer_id=1,
         is_moe=False,
         prev_is_moe=False,
+        dense_batch_invariant=False,
     )
 
     # --- Token distribution ---

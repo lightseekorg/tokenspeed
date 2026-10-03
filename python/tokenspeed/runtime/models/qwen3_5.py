@@ -609,6 +609,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=is_moe,
             prev_is_moe=is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
         )
@@ -805,6 +806,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=is_moe,
             prev_is_moe=is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
         )

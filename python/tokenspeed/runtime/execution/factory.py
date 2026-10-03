@@ -93,6 +93,7 @@ def _share_target_embed_and_head(model_runner: ModelRunner, draft_model) -> None
     mapping = model_runner.mapping
     if mapping.has_pp and not mapping.is_last_pp_rank:
         return
+    _check_shared_head_layout(model_runner.model, draft_model)
     embed, head = model_runner.model.get_embed_and_head()
     if embed is None and not mapping.has_pp:
         raise ValueError("Draft model requires the target's embedding weight.")
@@ -130,6 +131,31 @@ def _require_draft_embedding(draft_model) -> None:
             "checkpoint ships when embed is None and report it from "
             "get_embed_and_head."
         )
+
+
+def _check_shared_head_layout(target_model, draft_model) -> None:
+    """A draft sharing the target's LM head must shard it the same way.
+
+    The target's head follows ``mapping.lm_head`` (vocab-sharded over
+    attention-DP ranks under ``--lm-head-tp-size``); a draft still building
+    its head on the attention TP group would take the shard as a whole-vocab
+    weight and sample garbage silently. Compare the logits processors, which
+    carry the layout for both.
+    """
+    target = target_model.logits_processor
+    draft = draft_model.logits_processor
+    if (
+        target.tp_group == draft.tp_group
+        and target.tp_size == draft.tp_size
+        and target.dp_lm_head_tp == draft.dp_lm_head_tp
+    ):
+        return
+    raise ValueError(
+        f"{type(draft_model).__name__} builds its LM head over "
+        f"{draft.tp_size} rank(s) {draft.tp_group} but the target's head is "
+        f"sharded over {target.tp_size} rank(s) {target.tp_group} "
+        "(--lm-head-tp-size); this drafter cannot share a head in that layout"
+    )
 
 
 def configure_draft_target(

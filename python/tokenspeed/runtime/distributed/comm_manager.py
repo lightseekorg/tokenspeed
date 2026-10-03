@@ -159,9 +159,9 @@ class CommManager:
         layer_id: int,
         is_moe: bool,
         prev_is_moe: bool,
+        dense_batch_invariant: bool,
         input_layernorm: torch.nn.Module | None = None,
         post_attn_layernorm: torch.nn.Module | None = None,
-        dense_batch_invariant: bool = False,
     ) -> None:
         self.mapping = mapping
         self.layer_id = layer_id
@@ -233,31 +233,6 @@ class CommManager:
         start = self.mapping.dense.tp_size * self.mapping.dense.dp_rank
         end = start + self.mapping.dense.tp_size
         return self.scattered_num_tokens(ctx)[start:end]
-
-    def head_tp_group_scattered_input_num_tokens(
-        self, ctx: ForwardContext, num_tokens: int
-    ) -> list[int]:
-        """Input rows each attention head-TP rank owns (attention TP is 1
-        under head TP, so a rank's share is its whole DP batch); ``num_tokens``
-        is this rank's, checked against the table."""
-        return dp_group_row_counts(
-            forward_input_row_table(ctx),
-            self.mapping.attn.head_tp_group,
-            self.mapping.rank,
-            num_tokens,
-        )
-
-    def head_tp_group_scattered_num_tokens(
-        self, ctx: ForwardContext, num_tokens: int
-    ) -> list[int]:
-        """Collective rows each attention head-TP rank owns: the input rows,
-        or the live rows a narrowing drafter reported."""
-        return dp_group_row_counts(
-            forward_collective_row_table(ctx),
-            self.mapping.attn.head_tp_group,
-            self.mapping.rank,
-            num_tokens,
-        )
 
     def moe_tp_ep_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
         tp_ep_size = self.mapping.moe.tp_ep_size

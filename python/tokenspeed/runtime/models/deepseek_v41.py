@@ -1069,6 +1069,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=True,
             prev_is_moe=True,
+            dense_batch_invariant=False,
             input_layernorm=None,
             post_attn_layernorm=None,
         )
@@ -1737,7 +1738,9 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         """Keep the checkpoint head unquantized in the model loading dtype."""
         config = config.text_config
         params_dtype = torch.get_default_dtype()
-        if self.mapping.attn.has_dp:
+        # Same layout rule as BaseCausalLM.resolve_lm_head: replicated under
+        # attention DP unless --lm-head-tp-size vocab-shards it.
+        if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
             return ReplicatedLinear(
                 input_size=config.hidden_size,
                 output_size=config.vocab_size,
@@ -1756,9 +1759,9 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             padding_size=64,
             quant_config=None,
             prefix=add_prefix("lm_head", prefix),
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
             use_presharded_weights=False,
         )
 

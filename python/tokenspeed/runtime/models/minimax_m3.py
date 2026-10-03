@@ -720,6 +720,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
             prev_is_moe=previous_is_moe_layer,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
         )

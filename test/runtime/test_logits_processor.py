@@ -38,7 +38,9 @@ def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
 
     monkeypatch.setattr(logits_processor_module, "_lm_head_matmul", fake_lm_head_matmul)
 
-    non_kimi = LogitsProcessor(config=SimpleNamespace(model_type="test", vocab_size=2))
+    non_kimi = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=2), dp_lm_head_tp=False
+    )
     non_kimi(
         input_ids=None,
         hidden_states=hidden_states,
@@ -47,7 +49,9 @@ def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
     )
     assert calls["fused"] == 0
 
-    kimi = LogitsProcessor(config=SimpleNamespace(model_type="kimi_k2", vocab_size=2))
+    kimi = LogitsProcessor(
+        config=SimpleNamespace(model_type="kimi_k2", vocab_size=2), dp_lm_head_tp=False
+    )
     kimi(
         input_ids=None,
         hidden_states=hidden_states,
@@ -63,6 +67,7 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        dp_lm_head_tp=False,
     )
     hidden_states = torch.empty((0, 2), dtype=torch.float32)
     lm_head = SimpleNamespace(weight=torch.ones((3, 2), dtype=torch.float32))
@@ -103,6 +108,7 @@ def test_tp_logits_gather_preserves_dtype(monkeypatch, dtype, cached):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        dp_lm_head_tp=False,
     )
     state = object()
     if cached:
@@ -183,6 +189,7 @@ def test_force_deterministic_rsag_disables_logits_symm_mem(
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        dp_lm_head_tp=False,
     )
 
     assert getattr(processor, initializer_name)(SimpleNamespace()) is None
@@ -215,6 +222,7 @@ def test_tp_logits_custom_collectives_skip_host_spread_group_without_fabric(
         tp_rank=0,
         tp_size=8,
         tp_group=tuple(range(8)),
+        dp_lm_head_tp=False,
     )
     lm_head = SimpleNamespace(weight=torch.ones((8, 2), dtype=torch.float32))
 
@@ -250,6 +258,7 @@ def test_a_strided_tp_group_smaller_than_one_host_is_still_probed(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 4),
+        dp_lm_head_tp=False,
     )
     assert not processor._tp_group_multicast_reachable()
 
@@ -273,6 +282,7 @@ def test_a_peer_without_fabric_takes_the_whole_group_off_the_gather(monkeypatch)
         tp_rank=0,
         tp_size=8,
         tp_group=tuple(range(8)),
+        dp_lm_head_tp=False,
     )
     assert not processor._tp_group_multicast_reachable()
 
@@ -285,6 +295,7 @@ def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkey
         tp_rank=0,
         tp_size=8,
         tp_group=tuple(range(8)),
+        dp_lm_head_tp=False,
     )
     lm_head = SimpleNamespace(weight=torch.ones((8, 2), dtype=torch.float32))
     created = {}
@@ -351,6 +362,7 @@ def test_dist_argmax_probe_failure_falls_back_and_latches(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 4),
+        dp_lm_head_tp=False,
     )
     lm_head = SimpleNamespace(weight=torch.ones((4096, 2), dtype=torch.float32))
 
@@ -403,6 +415,7 @@ def test_dist_argmax_state_cache_separates_logits_dtypes(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        dp_lm_head_tp=False,
     )
     lm_head = SimpleNamespace(weight=torch.ones((4096, 2), dtype=torch.bfloat16))
 
@@ -450,6 +463,7 @@ def test_argmax_routes_sharded_to_kernel(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        dp_lm_head_tp=False,
     )
     proc._dist_argmax_state = object()  # non-None, non-sentinel => active
 
@@ -475,6 +489,7 @@ def test_argmax_falls_back_without_state(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        dp_lm_head_tp=False,
     )
     proc._dist_argmax_state = None  # gate failed (draft vocab != target vocab)
 
@@ -500,6 +515,7 @@ def test_get_logits_skips_gather_when_dist_argmax_active(monkeypatch):
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
+        dp_lm_head_tp=False,
     )
     monkeypatch.setattr(proc, "_init_dist_argmax_state", lambda lm_head: object())
     monkeypatch.setattr(
@@ -563,6 +579,7 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(monkeypatc
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        dp_lm_head_tp=False,
     )
     monkeypatch.setattr(
         proc,
@@ -601,6 +618,7 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch):
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
+        dp_lm_head_tp=False,
     )
     # Fused state is otherwise eligible; softcap must still force the gather.
     monkeypatch.setattr(proc, "_init_dist_argmax_state", lambda lm_head: object())
@@ -680,7 +698,8 @@ def test_input_logprobs_match_the_output_logprob_arithmetic(chunk_tokens):
     lm_head = SimpleNamespace(weight=weight)
     rows, targets = [1, 2, 3], [5, 2, 3]
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=vocab)
+        config=SimpleNamespace(model_type="test", vocab_size=vocab),
+        dp_lm_head_tp=False,
     )
     metadata = LogitsMetadata(
         forward_mode=ForwardMode.EXTEND,

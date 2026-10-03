@@ -1169,6 +1169,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 ),
                 prefix=add_prefix("mlp", prefix),
                 is_shared_expert=False,
+                batch_invariant=False,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1179,6 +1180,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
             layer_id=self.layer_id,
             is_moe=self.is_moe_layer,
             prev_is_moe=self._is_moe_layer(layer_id - 1, is_nextn, config),
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
         )

@@ -627,6 +627,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=True,
             prev_is_moe=False,
+            dense_batch_invariant=False,
         )
         # --tp-batch-invariant attn+dense: the dense tail transposes rows
         # instead of reduce-scattering channel partials (see the MLPs).
@@ -722,18 +723,28 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
 
     def _forward_idle(
         self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: _ForwardContext,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """An idle attention-DP rank joins every MLP collective over no rows.
+        """An idle attention-DP rank joins every collective over no rows, in
+        the active ranks' order.
 
         The MoE TP-EP group always spans the DP groups; the dense TP group
         does too when the dense TP is wider than the attention TP, so both
-        dense branches run as well, in the active ranks' order.
+        dense branches run as well. Each attention runs in its place and
+        decides for itself whether its layout has collectives to join (head
+        TP does; a no-op otherwise).
         """
+        self.self_attn[0](
+            positions=positions,
+            hidden_states=hidden_states,
+            ctx=ctx,
+            comm_manager=self.branch_comm[0],
+        )
         hidden_states, residual = self._forward_moe(
             hidden_states,
             residual,
@@ -741,10 +752,18 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             num_global_tokens,
             max_num_tokens_per_gpu,
         )
-        for branch_id in range(2):
-            hidden_states, residual = self._forward_dense_mlp(
-                branch_id, hidden_states, residual, ctx
-            )
+        hidden_states, residual = self._forward_dense_mlp(
+            0, hidden_states, residual, ctx
+        )
+        self.self_attn[1](
+            positions=positions,
+            hidden_states=hidden_states,
+            ctx=ctx,
+            comm_manager=self.branch_comm[1],
+        )
+        hidden_states, residual = self._forward_dense_mlp(
+            1, hidden_states, residual, ctx
+        )
         return hidden_states, residual
 
     def forward(
@@ -757,16 +776,8 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         num_global_tokens, max_num_tokens_per_gpu = self.moe_comm.get_num_tokens(ctx)
 
         if ctx.forward_mode.is_idle():
-            if self.self_attn[0].has_head_tp:
-                return self._forward_idle_head_tp(
-                    positions,
-                    hidden_states,
-                    ctx,
-                    residual,
-                    num_global_tokens,
-                    max_num_tokens_per_gpu,
-                )
             return self._forward_idle(
+                positions,
                 hidden_states,
                 residual,
                 ctx,
@@ -831,45 +842,6 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         )
 
         hidden_states = hidden_states + moe_hidden_states
-        return hidden_states, residual
-
-    def _forward_idle_head_tp(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: _ForwardContext,
-        residual: torch.Tensor | None,
-        num_global_tokens: int,
-        max_num_tokens_per_gpu: int,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """An idle rank's forward under attention head TP.
-
-        With no rows of its own the rank still holds a head shard of its
-        group's tokens, so both attentions run their exchanges and
-        projections; the dense branches run their group collectives as well,
-        in the active ranks' order, so every collective of the layer stays in
-        lockstep. All activations are empty and the result is the input.
-        """
-        hidden_states, residual = self.moe_comm.input_reduce_norm(
-            hidden_states, residual
-        )
-        self.self_attn[0](
-            positions=positions,
-            hidden_states=hidden_states,
-            ctx=ctx,
-            comm_manager=self.moe_comm,
-        )
-        self._forward_moe(
-            hidden_states, residual, ctx, num_global_tokens, max_num_tokens_per_gpu
-        )
-        self._forward_dense_mlp(0, hidden_states, residual, ctx)
-        self.self_attn[1](
-            positions=positions,
-            hidden_states=hidden_states,
-            ctx=ctx,
-            comm_manager=self.branch_comm[1],
-        )
-        self._forward_dense_mlp(1, hidden_states, residual, ctx)
         return hidden_states, residual
 
 

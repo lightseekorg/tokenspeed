@@ -181,6 +181,7 @@ class KimiK3DraftDecoderLayer(nn.Module):
             0,
             is_moe=True,
             prev_is_moe=False,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
         )
@@ -333,6 +334,7 @@ class KimiK3NextNForCausalLM(nn.Module):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
 
     def get_input_embeddings(self) -> nn.Module:
