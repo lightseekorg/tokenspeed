@@ -784,7 +784,6 @@ __all__ = [
     "mhc_mixes",
     "mhc_post",
     "mhc_pre",
-    "select_attn_res_fwd_kernel",
 ]
 
 
