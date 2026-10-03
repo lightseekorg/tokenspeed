@@ -237,6 +237,10 @@ def configure_dsa_attention(model_config) -> None:
     model_config.index_n_heads = mla_config.index_n_heads
     model_config.index_kpool = getattr(mla_config, "index_kpool", None)
     model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
+    # The indexer's key plane: the FP8-with-scale rows every in-tree scoring
+    # leaf reads. A plugin hook that scores the checkpoint's bf16 keys sets
+    # "bf16" after this (layers/attention/configs/dsa.py INDEX_K_FORMATS).
+    model_config.index_k_format = "fp8_scaled"
 
     model_config.scaling = 1 / math.sqrt(
         model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
@@ -698,6 +702,12 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
+
+        # Storage of the DSA index-key plane, one of INDEX_K_FORMATS
+        # (layers/attention/configs/dsa.py). A DSA model's configure-attention
+        # hook names it (configure_dsa_attention: "fp8_scaled"); None for a
+        # model without an indexer, and DSAConfig refuses None.
+        self.index_k_format: str | None = None
 
         # MLA/DSA families carry per-head dimension metadata that does not
         # follow the standard hidden_size / num_attention_heads derivation above.

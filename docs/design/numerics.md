@@ -162,17 +162,21 @@ routing probabilities inside the activation and combines the zero-expert
 residual in fp32 slot order, BF16 index-K indexer scoring and top-k leaves,
 and the same LoRA-scale placement in the draft model.
 
-The host's side of the indexer is the plane and the facades. A DSA model
-config names its index-key storage (`DSAConfig.index_k_format`, from the
-model config's `index_k_format`; `fp8_scaled` — FP8 keys plus per-128 fp32
-scales, the in-tree leaves' plane — when it names none, or `bf16`, the
-checkpoint's keys unquantized); the ordinary recipe plans that plane, the
+The host's side of the indexer is the plane and the facades. A DSA model's
+configure-attention hook names its index-key storage on the model config
+(`ModelConfig.index_k_format`, read by `DSAConfig`): the in-tree
+`configure_dsa_attention` names `fp8_scaled` — FP8 keys plus per-128 fp32
+scales, the in-tree leaves' plane — and a plugin hook that scores the
+checkpoint's keys unquantized names `bf16`; a hook that names none is a
+construction error. The ordinary recipe plans that plane, the
 pool writes keys in the plane's own dtype and never converts between the
 two, and `dsa_decode_topk` / `dsa_prefill_topk` read `index_k_format` and
 `index_k_layout` off the plane's dtype and shape, so a bf16 plane selects
 only a leaf declaring `index_k_format={"bf16"}` (the kernel package's DSA
-README has the table). `candidate_lens_cpu` reaches every top-k leaf whose
-signature takes it. In-tree drafts fold no LoRA norm scale; a draft that
+README has the table); the GLM-5.3-Flash recipe plans pooled `fp8_scaled`
+rows and refuses any other plane. `candidate_lens_cpu` reaches every top-k
+leaf registered with the `candidate_lens_cpu` feature and no other. In-tree
+drafts fold no LoRA norm scale; a draft that
 does must read `--mla-lora-scale` exactly as the target does, folding only
 under `folded`.
 

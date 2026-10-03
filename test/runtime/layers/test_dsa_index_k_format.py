@@ -108,6 +108,32 @@ def test_recipe_plans_the_declared_plane(index_k_format, dtype_name, width):
     assert field.dtype == dtype_name
 
 
+def test_the_configure_attention_hook_names_the_plane():
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.configs.model_config import configure_dsa_attention
+
+    text_config = SimpleNamespace(
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        index_topk=4,
+        index_head_dim=HEAD_DIM,
+        index_n_heads=4,
+    )
+    model_config = SimpleNamespace(
+        hf_text_config=text_config, hf_config=text_config, index_k_format=None
+    )
+    configure_dsa_attention(model_config)
+    # The in-tree hook keeps the FP8-with-scale plane; a plugin hook that
+    # scores the checkpoint's bf16 keys overrides it after.
+    assert model_config.index_k_format == "fp8_scaled"
+    # A hook that named no plane is a construction error, not a fallback.
+    with pytest.raises(ValueError, match="index_k_format"):
+        _dsa_spec(None)
+
+
 def test_bf16_plane_costs_its_own_rows():
     fp8 = _dsa_spec("fp8_scaled")
     bf16 = _dsa_spec("bf16")

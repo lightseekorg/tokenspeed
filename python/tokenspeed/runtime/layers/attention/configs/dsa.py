@@ -87,6 +87,7 @@ class DSAConfig(MLAConfig):
     index_kpool: int | None = None
 
     def __post_init__(self) -> None:
+        # None is a DSA configure-attention hook that named no plane.
         index_k_plane_dtype(self.index_k_format)
 
     @classmethod
@@ -98,10 +99,10 @@ class DSAConfig(MLAConfig):
             index_topk=model_config.index_topk,
             index_head_dim=model_config.index_head_dim,
             index_n_heads=model_config.index_n_heads,
-            # A model that names no plane keeps the FP8-with-scale rows every
-            # in-tree scoring leaf reads; a model (or its plugin) that wants the
-            # checkpoint's bf16 keys declares index_k_format="bf16".
-            index_k_format=getattr(model_config, "index_k_format", "fp8_scaled"),
+            # Named by the model's configure-attention hook: the in-tree hook
+            # keeps the FP8-with-scale rows every in-tree scoring leaf reads; a
+            # plugin that scores the checkpoint's bf16 keys names "bf16".
+            index_k_format=model_config.index_k_format,
             index_kpool=getattr(model_config, "index_kpool", None),
         )
 
