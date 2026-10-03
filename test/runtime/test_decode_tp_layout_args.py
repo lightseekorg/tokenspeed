@@ -96,15 +96,81 @@ class TestServerArgs:
                 tp_batch_invariant="attn+dense",
             )
 
-    def test_batch_invariant_refuses_quantized_weights(self):
-        with pytest.raises(ValueError, match="unquantized"):
-            ServerArgs(
-                **DP8,
-                attn_head_tp_size=8,
-                disaggregation_mode="decode",
-                tp_batch_invariant="attn",
-                quantization="fp8",
+    def test_head_tp_turns_the_prefill_graph_off(self):
+        # The prefill graph records extend forwards this layout never runs.
+        args = ServerArgs(**DP8, attn_head_tp_size=8, disaggregation_mode="decode")
+        assert args.disable_prefill_graph
+        plain = ServerArgs(**DP8, disaggregation_mode="decode")
+        assert not plain.disable_prefill_graph
+
+    def test_batch_invariant_judges_the_resolved_quantization(self):
+        # --quantization alone does not decide: the checkpoint's resolved
+        # method and its disable_quant_module do (checked from ModelConfig).
+        args = ServerArgs(
+            **DP8,
+            attn_head_tp_size=8,
+            dense_tp_size=8,
+            disaggregation_mode="decode",
+            tp_batch_invariant="attn+dense",
+            quantization="fp8",
+        )
+        args.validate_tp_batch_invariant_weights(None, ())
+        args.validate_tp_batch_invariant_weights("fp8", ("self_attn", "dense_mlp"))
+        args.validate_tp_batch_invariant_weights("fp8", ("self_attn", "mlps"))
+        with pytest.raises(ValueError, match="unquantized o_proj"):
+            args.validate_tp_batch_invariant_weights("fp8", ("dense_mlp",))
+        with pytest.raises(ValueError, match="unquantized dense down_proj"):
+            args.validate_tp_batch_invariant_weights("fp8", ("self_attn",))
+        attn_only = ServerArgs(
+            **DP8,
+            attn_head_tp_size=8,
+            disaggregation_mode="decode",
+            tp_batch_invariant="attn",
+        )
+        attn_only.validate_tp_batch_invariant_weights("fp8", ("self_attn",))
+        with pytest.raises(ValueError, match="unquantized o_proj"):
+            attn_only.validate_tp_batch_invariant_weights("fp8", ())
+        plain = ServerArgs(**DP8)
+        plain.validate_tp_batch_invariant_weights("fp8", ())
+
+    def test_head_tp_decode_engine_caps_the_generation_budget(self):
+        """The D-role scheduler never retracts a request whose generation
+        fits one safe-step window, so the engine, which cannot run a recovery
+        prefill under head TP, admits only those."""
+        from tokenspeed.runtime.engine.request_handler import RequestHandler
+        from tokenspeed.runtime.engine.scheduler_utils import RETRACTION_SAFE_STEPS
+
+        args = ServerArgs(**DP8, attn_head_tp_size=8, disaggregation_mode="decode")
+        args.mapping.rank = 0
+
+        def admit(server_args, max_new_tokens):
+            handler = RequestHandler.__new__(RequestHandler)
+            handler.max_req_len = 65536
+            handler.max_new_tokens_budget = (
+                RETRACTION_SAFE_STEPS if server_args.mapping.attn.has_head_tp else None
             )
+            spec = SimpleNamespace(max_new_tokens=0)
+            state = SimpleNamespace(
+                sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
+                prompt_input_ids=[1, 2, 3],
+                finished_reason=None,
+            )
+            RequestHandler._apply_generation_budget(handler, spec, state)
+            return spec, state
+
+        spec, state = admit(args, RETRACTION_SAFE_STEPS)
+        assert spec.max_new_tokens == RETRACTION_SAFE_STEPS
+        assert state.finished_reason is None
+        spec, state = admit(args, RETRACTION_SAFE_STEPS + 1)
+        assert state.finished_reason is not None
+        assert "attn-head-tp-size" in state.finished_reason.message
+        # Undeclared budgets clamp to the context and exceed the window too.
+        _, state = admit(args, None)
+        assert state.finished_reason is not None
+        plain = ServerArgs(**DP8, disaggregation_mode="decode")
+        plain.mapping.rank = 0
+        _, state = admit(plain, None)
+        assert state.finished_reason is None
 
     def test_batch_invariant_rejects_unknown_selection(self):
         with pytest.raises(ValueError, match="tp-batch-invariant"):

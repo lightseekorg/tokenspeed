@@ -92,21 +92,54 @@ The head exchange precedes the prologue, so the prologue sees one row count
 for the query, the latent and the write slots (RoPE commutes with the head
 permutation); the KV write and any sparse-attention indexer stay as they are.
 The head group's ranks all take part in every leg, including a DP rank with
-no rows this step: it still owns a head shard of the group's tokens. Head TP
-serves decode rows only: an expanded prefill needs every head's K/V for the
-cached prefix, which the head-sharded `kv_b_proj` cannot produce, so the
-layout is refused outside `--disaggregation-mode decode` and a prefill row
-reaching it is an error (a decode node's local recovery prefill included).
-The exchange counts come from the gathered per-rank token counts, so there
-is no device sync; decode CUDA graphs pad every DP rank to the same batch.
+no rows this step: it still owns a head shard of the group's tokens. That
+participation lives in the attention module alone -- every decoder layer
+calls its attention on an idle forward too, with its empty rows, and the
+attention joins the exchanges or returns at once depending on the layout --
+so no layer branches on the layout (the NextN and Eagle3 drafters' layers and
+LongCat's two-attention layer included). A head group whose ranks are all
+idle moves nothing and skips its collectives together. The exchange counts
+come from the gathered per-rank token tables, so there is no device sync: the
+legs up to core attention move the forward's input rows, the legs after it
+the rows a narrowing draft step reported as its collective sizing (one live
+row per request), and an idle rank sizes by the same tables. Decode CUDA
+graphs pad every DP rank to the same batch.
+
+**Decode rows only.** An expanded prefill needs every head's K and V for the
+cached prefix. Under head TP each rank holds `kv_b_proj` for its `H / W`
+heads and the latent cache for its own requests only, so no rank can expand
+the other heads of its prefix, and no other rank holds that prefix to expand
+it for it: the full-head K/V of a prefill is not available on the layout. The
+layout is therefore refused outside `--disaggregation-mode decode`, and the
+engine keeps every extend-shaped forward off its path:
+
+- startup tunes on a decode step instead of the usual extend-shaped dummy
+  forward, and the prefill CUDA graph (which records extend forwards) is
+  turned off (`--disable-prefill-graph` is set, with a log line);
+- the one prefill a decode node otherwise runs -- the local recovery after a
+  capacity retraction (`docs/design/scheduler.md`, sections 2 and 4) -- is
+  kept unreachable through the scheduler's own rule: a request whose declared
+  generation fits one retraction safe-step window (4096 new tokens) has its
+  whole generation reserved at admission and is never a retraction victim. A
+  head-TP decode engine therefore admits only requests with
+  `max_new_tokens <= 4096` (declared explicitly; an undeclared budget is the
+  context remainder) and finishes any other with an abort error.
+
+A prefill row reaching the attention is then an invariant violation and
+raises, not a configuration the operator can hit.
 
 `--lm-head-tp-size` under attention DP gathers the ranks' logits rows,
 runs the vocab-shard GEMM and transposes the shards back to each rank's own
 rows (`[T_own, V]`), so sampling and logprobs downstream see the same
-full-vocab rows as a replicated head. The row counts are exchanged (a prefill
-keeps one row per request, a MIXED round mixes both), except under CUDA
-graph capture where every rank runs the same padded decode batch. It cannot
-combine with `--dp-sampling`.
+full-vocab rows as a replicated head. On the decode path the row counts are
+read from the per-rank token tables (every rank's logits rows are its decode
+tokens, or the live rows a narrowing draft step reported), so the step has
+no host sync; the shapes without a table -- a prefill's one row per request
+or its logprob rows, a MIXED round, a model selecting its own logits rows --
+exchange the counts. A drafter sharing the target's head must build its own
+head on the same layout (the NextN, Eagle3-MLA and Llama-Eagle3 drafters do;
+the others are refused with a clear error). It cannot combine with
+`--dp-sampling`.
 
 `--tp-batch-invariant` replaces the two reduce-scatters of these layouts
 (after `o_proj`, after the dense `down_proj`) with column-parallel GEMMs on
@@ -128,6 +161,15 @@ tokenspeed serve <model> \
   --attn-head-tp-size 8 --dense-tp-size 8 --lm-head-tp-size 8 \
   --tp-batch-invariant attn+dense --disaggregation-mode decode ...
 ```
+
+`--tp-batch-invariant attn+dense` needs the checkpoint's `o_proj` and dense
+`down_proj` in the loading dtype. A quantized checkpoint qualifies only when
+its `disable_quant_module` keeps those modules unquantized (`self_attn` for
+`o_proj`; `dense_mlp`, or `mlps` for LongCat, for `down_proj`); the check
+runs against the checkpoint's resolved quantization, not only
+`--quantization`, and the layers check their own weights once built. Without
+such an exclusion drop `--tp-batch-invariant` (the ordered-fold
+reduce-scatter remains batch-invariant, see `docs/design/numerics.md`).
 
 ### Pinning a request to an attention-DP rank
 

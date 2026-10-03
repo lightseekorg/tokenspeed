@@ -82,6 +82,7 @@ from tokenspeed.runtime.engine.io_struct import (
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import (
+    RETRACTION_SAFE_STEPS,
     UNBOUNDED_CACHED_PREFIX_TOKENS,
     make_spec,
 )
@@ -321,6 +322,13 @@ class RequestHandler:
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
+        # Head TP serves decode rows only, so this engine cannot run the local
+        # recovery prefill a capacity retraction would need; it admits only
+        # requests the scheduler never retracts (generation budget within one
+        # safe-step window, docs/design/scheduler.md section 4).
+        self.max_new_tokens_budget: int | None = (
+            RETRACTION_SAFE_STEPS if mapping.attn.has_head_tp else None
+        )
         self.vocab_size = vocab_size
         self.clear_cache_fn = clear_cache_fn
         self.can_clear_cache_fn = can_clear_cache_fn
@@ -839,15 +847,7 @@ class RequestHandler:
                 ),
             )
 
-        req_state.sampling_params.max_new_tokens = min(
-            (
-                req_state.sampling_params.max_new_tokens
-                if req_state.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
-            self.max_req_len - len(req_state.prompt_input_ids) - 1,
-        )
-        req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
+        self._apply_generation_budget(req_spec, req_state)
         return (
             req_spec,
             req_state,
@@ -857,6 +857,30 @@ class RequestHandler:
                 recv_req.bootstrap_room,
             ),
         )
+
+    def _apply_generation_budget(self, req_spec, req_state) -> None:
+        """Clamp ``max_new_tokens`` to the context; refuse what exceeds this
+        engine's per-request budget (``max_new_tokens_budget``), finishing the
+        request with an abort instead of admitting work the engine cannot
+        complete."""
+        req_state.sampling_params.max_new_tokens = min(
+            (
+                req_state.sampling_params.max_new_tokens
+                if req_state.sampling_params.max_new_tokens is not None
+                else 1 << 30
+            ),
+            self.max_req_len - len(req_state.prompt_input_ids) - 1,
+        )
+        req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
+        if (
+            self.max_new_tokens_budget is not None
+            and req_spec.max_new_tokens > self.max_new_tokens_budget
+        ):
+            req_state.finished_reason = FINISH_ABORT(
+                "Invalid request: this decode engine (--attn-head-tp-size) serves "
+                f"at most {self.max_new_tokens_budget} new tokens per request; "
+                f"got max_new_tokens={req_spec.max_new_tokens}"
+            )
 
     # ------------------------------------------------------------------
     # Profiling: torch / cuda / viztracer / mem-snapshot / proton, driven

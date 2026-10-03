@@ -794,6 +794,13 @@ class ModelConfig:
 
         # Verify quantization
         self._verify_quantization()
+        if server_args is not None and not is_draft_worker:
+            # The decode TP layouts need unquantized o_proj / down_proj; judge
+            # the checkpoint's resolved method, not only --quantization.
+            server_args.validate_tp_batch_invariant_weights(
+                self.quantization,
+                getattr(self.hf_text_config, "disable_quant_module", None) or (),
+            )
 
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()

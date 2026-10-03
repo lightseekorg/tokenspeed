@@ -1579,6 +1579,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 speculative_algorithm=None,
                 load_format="auto",
                 ext_yaml=None,
+                validate_tp_batch_invariant_weights=lambda *args: None,
             )
             hf_config = make_hf_config()
             with (

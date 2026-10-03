@@ -300,6 +300,10 @@ class ModelExecutorConfig:
     # it never runs a decode/verify step of its own, so the decode graph is
     # never captured there while the prefill graph keeps its ordinary gating.
     prefill_only: bool
+    # The mirror image: an attention layout that serves decode rows only
+    # (head TP under attention DP), so startup never runs an extend-shaped
+    # dummy forward and tunes on a decode-shaped one instead.
+    decode_only_attention: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
     # Prompt-logprob gather: how many prompt rows go through the LM head at
@@ -424,6 +428,7 @@ class ModelExecutorConfig:
             model_is_mrope=model_is_mrope,
             prefill_only=server_args.disaggregation_mode == "prefill",
             input_logprob_chunk_tokens=server_args.input_logprob_chunk_tokens,
+            decode_only_attention=server_args.mapping.attn.has_head_tp,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -897,12 +902,22 @@ class ModelExecutor:
         if self.model_runner is None:
             return
         ib = self.input_buffers
-        num_tokens = min(
-            ib.input_ids_buf.numel(),
-            int(self.config.context_len) * per_rank_max_batch,
-        )
-        if self.config.chunked_prefill_size > 0:
-            num_tokens = min(num_tokens, int(self.config.chunked_prefill_size))
+        # The one traversal that discovers each operator is shaped like the
+        # forwards this engine runs: an extend over the prefill budget, or,
+        # for an attention layout that serves decode rows only (head TP), a
+        # decode step at the largest batch -- the shape capture records later.
+        decode_only = self.config.decode_only_attention
+        if decode_only:
+            num_tokens = (
+                self.forward_step.max_decode_bs * self.forward_step.max_tokens_per_req
+            )
+        else:
+            num_tokens = min(
+                ib.input_ids_buf.numel(),
+                int(self.config.context_len) * per_rank_max_batch,
+            )
+            if self.config.chunked_prefill_size > 0:
+                num_tokens = min(num_tokens, int(self.config.chunked_prefill_size))
         set_autotune_max_num_tokens(num_tokens)
         cpu_group = None
         if self.config.world_size > 1:
@@ -931,7 +946,10 @@ class ModelExecutor:
         # One traversal discovers each operator. Its dispatch exposes the
         # tunable branches; FI enumerates native buckets independently of the
         # graph ladder. Prefill stays inside the actual buffer/request limits.
-        logger.info(f"Kernel startup tuning with {num_tokens} prefill tokens")
+        logger.info(
+            f"Kernel startup tuning with {num_tokens} "
+            f"{'decode' if decode_only else 'prefill'} tokens"
+        )
 
         tic = time.time()
         set_autotune_process_group(cpu_group)
@@ -943,30 +961,41 @@ class ModelExecutor:
             ib.fill_dummy_decode_buffers(
                 batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
             )
-            bs = dummy_batch_size(num_tokens, self.config.context_len)
-            ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
-            positions = (
-                ib.mrope_positions_buf[:, :num_tokens]
-                if self.config.model_is_mrope
-                else ib.positions_buf[:num_tokens]
-            )
-            with active_forward(ctx):
-                self.model_runner.forward(
-                    ctx=ctx,
-                    input_ids=ib.input_ids_buf[:num_tokens],
-                    positions=positions,
-                    **self._model_input_kwargs(num_tokens, ctx.bs),
-                )
-            if self.drafter is not None:
-                self._autotune_draft_experts(num_tokens)
-            if self.drafter is not None and not self.config.prefill_only:
-                # Prefill-only roles do not allocate decode/verify scratch.
-                # The draft model is reached through the shared speculative
-                # forward, not model_runner.forward above. One request exposes
-                # its operators; FI still owns their bucket enumeration.
+            if decode_only:
+                # No extend forward exists on this layout; the decode step
+                # reaches the target and, through the speculative forward,
+                # the draft.
+                if self.drafter is not None:
+                    self._autotune_draft_experts(num_tokens)
                 self.forward_step.warmup_decode_path(
-                    batch_sizes=(1,), graph_phase=False
+                    batch_sizes=(self.forward_step.max_decode_bs,), graph_phase=False
                 )
+            else:
+                bs = dummy_batch_size(num_tokens, self.config.context_len)
+                ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
+                positions = (
+                    ib.mrope_positions_buf[:, :num_tokens]
+                    if self.config.model_is_mrope
+                    else ib.positions_buf[:num_tokens]
+                )
+                with active_forward(ctx):
+                    self.model_runner.forward(
+                        ctx=ctx,
+                        input_ids=ib.input_ids_buf[:num_tokens],
+                        positions=positions,
+                        **self._model_input_kwargs(num_tokens, ctx.bs),
+                    )
+                if self.drafter is not None:
+                    self._autotune_draft_experts(num_tokens)
+                if self.drafter is not None and not self.config.prefill_only:
+                    # Prefill-only roles do not allocate decode/verify scratch.
+                    # The draft model is reached through the shared speculative
+                    # forward, not model_runner.forward above. One request
+                    # exposes its operators; FI still owns their bucket
+                    # enumeration.
+                    self.forward_step.warmup_decode_path(
+                        batch_sizes=(1,), graph_phase=False
+                    )
         set_autotune_process_group(None)
 
         torch.get_device_module(self.device).synchronize()

@@ -26,6 +26,7 @@ import json
 import os
 import random
 import socket
+from collections.abc import Sequence
 from typing import Literal
 
 from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
@@ -898,8 +899,10 @@ class ServerArgs:
 
         The structural rules (head TP needs attention TP 1 and CP 1, tiles the
         stage world; LM head TP under DP needs attention TP 1) live in
-        ``Mapping``. This checks what only the server knows: the engine role,
-        the batch-invariance selection and the quantization.
+        ``Mapping``. This checks what only the server knows: the engine role
+        and the batch-invariance selection. The weights' quantization is
+        checked once the checkpoint's is resolved
+        (:meth:`validate_tp_batch_invariant_weights`).
         """
         attn = self.mapping.attn
         if attn.has_head_tp:
@@ -911,6 +914,16 @@ class ServerArgs:
                     "--attn-head-tp-size > 1 serves decode rows only and "
                     "requires --disaggregation-mode decode"
                 )
+            # The prefill CUDA graph records extend forwards, and startup
+            # would capture (and tune on) extend-shaped dummies this layout
+            # cannot run; the decode engine's warmup is decode-shaped instead
+            # (ModelExecutor.autotune).
+            if not self.disable_prefill_graph:
+                logger.info(
+                    "--attn-head-tp-size > 1 serves decode rows only: disabling "
+                    "the prefill CUDA graph (--disable-prefill-graph)"
+                )
+                self.disable_prefill_graph = True
             if self.mapping.nprocs_per_node % attn.head_tp_size:
                 logger.warning(
                     f"attention head TP group of {attn.head_tp_size} ranks spans "
@@ -922,18 +935,12 @@ class ServerArgs:
                 "--tp-batch-invariant must be one of none, attn, attn+dense; got "
                 f"{self.tp_batch_invariant!r}"
             )
-        if self.tp_batch_invariant != "none":
-            if not attn.has_head_tp:
-                raise ValueError(
-                    f"--tp-batch-invariant {self.tp_batch_invariant} makes o_proj "
-                    "column-parallel over the attention head TP group and needs "
-                    "--attn-head-tp-size > 1"
-                )
-            if self.quantization is not None:
-                raise ValueError(
-                    "--tp-batch-invariant needs unquantized o_proj / down_proj "
-                    f"weights; --quantization {self.quantization} was given"
-                )
+        if self.tp_batch_invariant != "none" and not attn.has_head_tp:
+            raise ValueError(
+                f"--tp-batch-invariant {self.tp_batch_invariant} makes o_proj "
+                "column-parallel over the attention head TP group and needs "
+                "--attn-head-tp-size > 1"
+            )
         if self.tp_batch_invariant == "attn+dense" and not self.mapping.dense.has_tp:
             raise ValueError(
                 "--tp-batch-invariant attn+dense makes the dense down_proj "
@@ -944,6 +951,41 @@ class ServerArgs:
             raise ValueError(
                 "--lm-head-tp-size > 1 under attention DP transposes the logits "
                 "back to each rank's own rows and cannot combine with --dp-sampling"
+            )
+
+    def validate_tp_batch_invariant_weights(
+        self,
+        resolved_quantization: str | None,
+        disable_quant_module: Sequence[str],
+    ) -> None:
+        """``--tp-batch-invariant`` needs an unquantized ``o_proj`` (and
+        ``down_proj`` for ``attn+dense``): the column-parallel GEMM's full-K
+        result is the point, and the quantized layouts do not offer it.
+
+        ``resolved_quantization`` is the checkpoint's method after
+        ``ModelConfig`` has merged ``--quantization`` with the checkpoint's own
+        declaration; a quantized checkpoint passes only when its
+        ``disable_quant_module`` keeps those modules in the loading dtype
+        (``self_attn`` for o_proj; ``dense_mlp`` or ``mlps`` for down_proj).
+        The layers check their own ``quant_config`` once built; this is the
+        early, whole-deployment form of that check.
+        """
+        if self.tp_batch_invariant == "none" or resolved_quantization is None:
+            return
+        excluded = set(disable_quant_module)
+        if "self_attn" not in excluded:
+            raise ValueError(
+                f"--tp-batch-invariant {self.tp_batch_invariant} needs an "
+                f"unquantized o_proj, but the {resolved_quantization} checkpoint "
+                "quantizes attention (disable_quant_module lacks 'self_attn')"
+            )
+        if self.tp_batch_invariant == "attn+dense" and not (
+            {"dense_mlp", "mlps"} & excluded
+        ):
+            raise ValueError(
+                "--tp-batch-invariant attn+dense needs an unquantized dense "
+                f"down_proj, but the {resolved_quantization} checkpoint quantizes "
+                "the dense MLPs (disable_quant_module lacks 'dense_mlp' / 'mlps')"
             )
 
     def resolve_cache(self):

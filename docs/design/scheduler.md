@@ -544,6 +544,15 @@ snapshot back (`LoadBackBatch`). A D-role victim recovers through this
 ordered path even when there is no host cache to snapshot into (from
 scratch), because the role has no other way back.
 
+This recovery prefill is the one extend forward a D node runs. A decode
+engine whose attention layout cannot run one (head TP,
+`--attn-head-tp-size`; see `docs/serving/parallelism.md`) relies on the
+§4 exemption instead of a scheduler switch: it admits only requests whose
+`max_new_tokens` fits one safe-step window, so every resident request has its
+generation prepaid and `chooseVictim` finds nobody — the readmission path
+stays unreachable by construction, and the runtime refuses larger budgets at
+admission (`RequestHandler`, mirroring `kRetractionSafeSteps`).
+
 ### 3.3 Fused — one engine, everything local
 
 **Phases, mixed mode** (`enable_mixed_prefill_decode`): decodes first — a
