@@ -37,7 +37,8 @@ Every task declares one `workflow_stage`:
 - `model-test` for model evaluation and performance tests
 
 The NVIDIA B200 Tests workflow runs unit tests before model tests. The normal AMD flow
-runs unit tests, then kernel benchmarks, then model tests. Matrix entries within
+runs unit tests, then kernel benchmarks and model tests concurrently; the
+workflow still fails if either fails. Matrix entries within
 each stage run in parallel. A stage with no matching tasks is treated as
 successfully satisfied.
 
