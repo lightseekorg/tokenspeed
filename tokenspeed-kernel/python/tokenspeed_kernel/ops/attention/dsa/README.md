@@ -97,3 +97,9 @@ offsets, masking padding and handling partial tails and empty shards. Query
 quantization and head padding match the unsharded path; portable Triton provides
 the same interface. Query tiling bounds scratch memory, and fixed-shape GPU
 metadata supports CUDA graph replay without host reads.
+
+The Triton FP8 indexer skips Q/K scoring for tiles with no causally visible,
+owned entries. Empty tiles still write negative-infinite logits, including
+when lengths or ownership change during graph replay. Partially valid tiles
+keep the per-entry mask and global forced-window policy. This avoids redundant
+arithmetic without changing the launch grid, logits capacity or Top-K scan.
