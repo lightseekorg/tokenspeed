@@ -514,9 +514,22 @@ class AutoBackend(CommBackend):
         return self._nccl.reduce_scatter(tensor, group)
 
     def all_to_all_single(
-        self, output: torch.Tensor, input: torch.Tensor, group: Group
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: Group,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
     ) -> None:
-        return self._nccl.all_to_all_single(output, input, group)
+        # Pure data movement: no reduction, so nothing to fold for the
+        # batch-invariant envelope and no symmetric-memory path to veto.
+        return self._nccl.all_to_all_single(
+            output,
+            input,
+            group,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+        )
 
     def send(self, tensor: torch.Tensor, dst: int, group: Group) -> None:
         return self._nccl.send(tensor, dst, group)

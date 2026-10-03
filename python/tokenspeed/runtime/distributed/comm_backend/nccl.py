@@ -173,7 +173,12 @@ class NcclBackend(CommBackend):
             )
 
     def all_to_all_single(
-        self, output: torch.Tensor, input: torch.Tensor, group: Group
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: Group,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
     ) -> None:
         res = self._get_or_create_resources(group)
         ws = res["world_size"]
@@ -181,7 +186,13 @@ class NcclBackend(CommBackend):
             output.copy_(input)
             return
         # PyNccl has no all_to_all wrapper
-        torch.distributed.all_to_all_single(output, input, group=res["device_group"])
+        torch.distributed.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=res["device_group"],
+        )
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         res = self._get_or_create_resources(group)
