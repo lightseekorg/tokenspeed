@@ -299,6 +299,9 @@ class ServerArgs:
     # captured CUDA-graph footprint; requests asking for logprobs on a
     # server started without the matching flag will receive empty logprobs.
     enable_output_logprobs: bool = False
+    # Sizing knob for prompt (input) logprobs: prompt rows pushed through the
+    # LM head per chunk, bounding the transient [rows, vocab] logits.
+    input_logprob_chunk_tokens: int = 1024
 
     # Runtime options
     disable_pdl: bool = False
@@ -1054,6 +1057,8 @@ class ServerArgs:
     def validate(self):
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
+        if self.input_logprob_chunk_tokens <= 0:
+            raise ValueError("--input-logprob-chunk-tokens must be positive")
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -2025,6 +2030,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_output_logprobs,
             help="Enable per-token sampled-token logprobs. OFF by default; enabling extends the captured CUDA-graph footprint. Requests asking for logprobs on a server without this flag receive empty logprobs.",
+        )
+        parser.add_argument(
+            "--input-logprob-chunk-tokens",
+            type=int,
+            default=ServerArgs.input_logprob_chunk_tokens,
+            help="Prompt rows pushed through the LM head per chunk when a request asks for prompt (input) logprobs (SGLang logprob_start_len). A sizing knob only: it bounds the transient [rows, vocab] logits (bf16 + fp32 log-softmax) and never changes a value.",
         )
         parser.add_argument(
             "--eagle3-layers-to-capture",

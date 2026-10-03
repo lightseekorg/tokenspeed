@@ -34,6 +34,7 @@ from tokenspeed.runtime.engine.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
+from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     structural_tag_for_reasoning_json_schema,
 )
@@ -315,15 +316,16 @@ class InputProcessor:
         sampling_params.normalize(self.engine.tokenizer)
         sampling_params.verify(self.engine.model_config.vocab_size)
 
-        # Output logprobs: two request dialects, one compute path. vLLM uses
+        # Logprobs: two request dialects, one compute path. vLLM uses
         # sampling_params.logprobs; SGLang uses GenerateReqInput.return_logprob
-        # (+ top_logprobs_num / logprob_start_len / token_ids_logprob). Either way
-        # the scheduler computes only the sampled token's logprob; the response
-        # dialect is chosen at render time. Gate unsupported CAPABILITIES loudly
-        # here rather than silently clamping the request shape.
+        # (+ top_logprobs_num / logprob_start_len / token_ids_logprob). Both
+        # return the sampled token's logprob; the SGLang dialect additionally
+        # returns prompt (input) logprobs from ``logprob_start_len`` on. The
+        # response dialect is chosen at render time. Gate unsupported
+        # CAPABILITIES loudly here rather than silently clamping the request.
         sglang_req = bool(getattr(obj, "return_logprob", False))
         return_logprob = sampling_params.logprobs is not None or sglang_req
-        # Output logprobs are gated by the static server arg enable_output_logprobs
+        # Logprobs are gated by the static server arg enable_output_logprobs
         # (the sampler only gathers them when on). Reject loudly instead of
         # silently returning empty logprobs when the server cannot honor it.
         if return_logprob and not self.engine.server_args.enable_output_logprobs:
@@ -332,6 +334,11 @@ class InputProcessor:
                 "enable_output_logprobs; restart with enable_output_logprobs=True "
                 "to return output logprobs."
             )
+        # The resolved default (-1 -> last prompt token) is what the scheduler
+        # stores; a vLLM-dialect request never computes prompt logprobs.
+        logprob_start_len = resolve_logprob_start_len(-1, input_token_num)
+        top_logprobs_num = 0
+        token_ids_logprob = None
         if sglang_req:
             # vLLM top-k / full-vocab are gated in SamplingParams.verify(); gate
             # the SGLang capability knobs here for parity.
@@ -340,15 +347,16 @@ class InputProcessor:
                     "top_logprobs_num > 0 (output top-k logprobs) is not supported "
                     "yet; use top_logprobs_num=0 (the sampled token's logprob)."
                 )
-            if (getattr(obj, "logprob_start_len", -1) or -1) >= 0:
-                raise ValueError(
-                    "logprob_start_len >= 0 (prompt logprobs) is not supported yet."
-                )
             if getattr(obj, "token_ids_logprob", None):
                 raise ValueError("token_ids_logprob is not supported yet.")
-        logprob_start_len = -1
-        top_logprobs_num = 0
-        token_ids_logprob = None
+            if input_ids is None:
+                raise ValueError(
+                    "return_logprob requires token inputs; input_embeds requests "
+                    "cannot return prompt logprobs."
+                )
+            logprob_start_len = resolve_logprob_start_len(
+                getattr(obj, "logprob_start_len", -1), len(input_ids)
+            )
 
         if isinstance(obj, GenerateReqInput):
             return TokenizedGenerateReqInput(

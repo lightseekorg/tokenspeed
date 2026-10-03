@@ -28,6 +28,7 @@ from tokenspeed.runtime.engine.io_struct import (
     MsgpackEncoder,
     TokenizedGenerateReqInput,
 )
+from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
 
 logger = logging.getLogger(__name__)
 
@@ -78,12 +79,39 @@ class MsgpackRecvSocket:
         self._pending: collections.deque = collections.deque()
 
     def _validation_error(self, obj: TokenizedGenerateReqInput) -> str | None:
-        """Return the reason ``obj`` must be rejected, or None if it is valid."""
+        """Return the reason ``obj`` must be rejected, or None if it is valid.
+
+        Mirrors the tokenizer-side ``InputProcessor`` gate for the SGLang
+        logprob knobs. ``logprob_start_len`` is resolved in place (-1 -> last
+        prompt token); a start that asks for prompt logprobs is refused because
+        the slim per-step output (``BatchTokenIDOutSlim``) has no prompt-logprob
+        columns -- computing them would silently drop them on the wire.
+        """
         if obj.return_logprob and not self._enable_output_logprobs:
             return (
                 "logprobs were requested but the server was started without "
                 "--enable-output-logprobs"
             )
+        if obj.return_logprob:
+            if obj.top_logprobs_num:
+                return (
+                    "top_logprobs_num > 0 (output top-k logprobs) is not supported yet"
+                )
+            if obj.token_ids_logprob:
+                return "token_ids_logprob is not supported yet"
+            if obj.input_ids is None:
+                return "return_logprob requires token inputs"
+            try:
+                obj.logprob_start_len = resolve_logprob_start_len(
+                    obj.logprob_start_len, len(obj.input_ids)
+                )
+            except ValueError as exc:
+                return str(exc)
+            if obj.logprob_start_len < len(obj.input_ids) - 1:
+                return (
+                    "logprob_start_len >= 0 (prompt logprobs) is not carried on the "
+                    "msgpack output wire; use logprob_start_len=-1"
+                )
         try:
             obj.sampling_params.verify(self._vocab_size)
         except ValueError as exc:

@@ -51,6 +51,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     RequestHistoryRows,
     advance_scheduler,
     engram_context_len,
+    input_logprob_plan_for_forward,
     make_config,
     ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
@@ -1104,6 +1105,9 @@ class EventLoop:
                             if self._request_history_rows is not None
                             else None
                         )
+                        input_logprob_plan = input_logprob_plan_for_forward(
+                            forward_op, self.output_processor.rid_to_state
+                        )
                         self._batch_logger.log_dispatch(forward_op, stats)
 
                         if in_flight and self._dispatch_depends_on_pending_commit(
@@ -1119,6 +1123,7 @@ class EventLoop:
                             grammar_inputs=grammar_inputs,
                             ngram_inputs=ngram_inputs,
                             request_history_seeds=request_history_seeds,
+                            input_logprob_plan=input_logprob_plan,
                             multimodal_context=(
                                 multimodal_context_for_forward(
                                     forward_op, self.output_processor.rid_to_state

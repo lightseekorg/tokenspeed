@@ -437,7 +437,43 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         vocab_size=32,
         enable_output_logprobs=True,
     )
-    assert recv_on.recv_pyobj().validation_error is None
+    io = recv_on.recv_pyobj()
+    assert io.validation_error is None
+    # -1 resolves to the last prompt token, as on the pickle path.
+    assert io.logprob_start_len == 2
+
+
+@pytest.mark.parametrize(
+    ("overrides", "needle"),
+    [
+        ({"logprob_start_len": 0}, "msgpack output wire"),
+        ({"logprob_start_len": 1}, "msgpack output wire"),
+        ({"logprob_start_len": 3}, "smaller than the prompt length"),
+        ({"logprob_start_len": -2}, "must be -1 or >= 0"),
+        ({"top_logprobs_num": 2}, "top_logprobs_num"),
+        ({"token_ids_logprob": [1]}, "token_ids_logprob"),
+    ],
+)
+def test_recv_socket_mirrors_the_sglang_logprob_gate(overrides, needle):
+    # The slim per-step output has no prompt-logprob columns, so a start that
+    # would produce them is refused loudly instead of computed and dropped.
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket(
+            [_add_frames("r1", SamplingParams(), return_logprob=True, **overrides)]
+        ),
+        vocab_size=32,
+        enable_output_logprobs=True,
+    )
+    io = recv.recv_pyobj()
+    assert io.validation_error and needle in io.validation_error
+
+    # The same knobs are inert without return_logprob (vLLM dialect).
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket([_add_frames("r2", SamplingParams(), **overrides)]),
+        vocab_size=32,
+        enable_output_logprobs=True,
+    )
+    assert recv.recv_pyobj().validation_error is None
 
 
 def test_recv_socket_drops_malformed_message_and_keeps_draining():

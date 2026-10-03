@@ -47,14 +47,25 @@ class PdTransferHooks:
         self._device = device
 
     def record_prefill_usage(self, request_ids: list[str]) -> None:
-        """Forward committed host-side usage before remote-decode dispatch."""
+        """Forward committed host-side usage before remote-decode dispatch.
+
+        Runs on the commit path, so a final chunk's bootstrap token (and its
+        logprob, when the request returns logprobs) is already on the state;
+        the remote decode that ships them is planned no earlier than the next
+        round.
+        """
         loop = self._loop
         if not isinstance(loop.kv_transfer, DisaggPrefillExecutor):
             return
         for request_id in request_ids:
             state = loop.output_processor.rid_to_state.get(request_id)
-            if state is not None:
-                loop.kv_transfer.record_cached_tokens(request_id, state.cached_tokens)
+            if state is None:
+                continue
+            loop.kv_transfer.record_cached_tokens(request_id, state.cached_tokens)
+            if state.output_token_logprobs_val:
+                loop.kv_transfer.record_bootstrap_logprob(
+                    request_id, state.output_token_logprobs_val[0]
+                )
 
     def poll_transfer_events(self) -> list:
         """Poll the KV transfer executor, act on its events, and return the
@@ -77,10 +88,13 @@ class PdTransferHooks:
                 req_id = event.request_id
                 bootstrap_token = event.bootstrap_token
                 cached_tokens = loop.kv_transfer.pop_remote_cached_tokens(req_id)
+                bootstrap_logprob = loop.kv_transfer.pop_remote_bootstrap_logprob(
+                    req_id
+                )
                 state = loop.output_processor.rid_to_state.get(req_id)
                 if state is None or not state.to_abort:
                     loop.output_processor.on_remote_prefill_done(
-                        req_id, bootstrap_token, cached_tokens
+                        req_id, bootstrap_token, cached_tokens, bootstrap_logprob
                     )
                 processed.extend(
                     loop.output_processor.finish_remote_prefill_only_request(req_id)

@@ -39,7 +39,11 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
-from tokenspeed.runtime.execution.types import NGramInputs, RequestHistorySeeds
+from tokenspeed.runtime.execution.types import (
+    InputLogprobPlan,
+    NGramInputs,
+    RequestHistorySeeds,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
@@ -108,6 +112,64 @@ def ngram_inputs_for_forward(
         )
         positions.append(start)
     return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
+
+
+def input_logprob_plan_for_forward(
+    forward_op, rid_to_state: Mapping
+) -> InputLogprobPlan | None:
+    """Name the prompt rows of this forward whose next-token logprob is wanted.
+
+    An extend row ``i`` feeds prompt positions ``[extend_prefix_lens[i],
+    extend_prefix_lens[i] + input_lengths[i])`` (bounded replay re-feeds the
+    leading rows; they never reach ``logprob_start_len`` because the admission
+    probe is capped there). The request wants position ``p`` when
+    ``logprob_start_len <= p < input_length - 1``: the last prompt position
+    predicts the first generated token, which is the output logprob's job.
+    Positions past the prompt (a retracted request's rebased generation) and
+    requests that already finalized their prompt logprobs contribute nothing.
+
+    Returns:
+        The plan, or None when no row of the batch needs a prompt logprob.
+    """
+    num_extends = forward_op.num_extends()
+    if num_extends <= 0:
+        return None
+    row_indices: list[int] = []
+    target_token_ids: list[int] = []
+    per_slot_starts: list[int] = []
+    per_slot_counts: list[int] = []
+    row_offset = 0
+    for i in range(num_extends):
+        state = rid_to_state[forward_op.request_ids[i]]
+        chunk_start = forward_op.extend_prefix_lens[i]
+        chunk_len = forward_op.input_lengths[i]
+        lo = max(chunk_start, state.logprob_start_len)
+        hi = min(chunk_start + chunk_len, state.input_length - 1)
+        if (
+            not state.wants_input_logprobs
+            or state.input_token_logprobs_val is not None
+            or lo >= hi
+        ):
+            per_slot_starts.append(0)
+            per_slot_counts.append(0)
+        else:
+            row_indices.extend(
+                range(row_offset + lo - chunk_start, row_offset + hi - chunk_start)
+            )
+            # Tokenizer-valid ids: multimodal pad hashes live only in
+            # ``prompt_input_ids`` and would index past the vocab.
+            target_token_ids.extend(state.prompt_input_ids_unpadded[lo + 1 : hi + 1])
+            per_slot_starts.append(lo)
+            per_slot_counts.append(hi - lo)
+        row_offset += chunk_len
+    if not row_indices:
+        return None
+    return InputLogprobPlan(
+        row_indices=tuple(row_indices),
+        target_token_ids=tuple(target_token_ids),
+        per_slot_starts=tuple(per_slot_starts),
+        per_slot_counts=tuple(per_slot_counts),
+    )
 
 
 class RequestHistoryRows:
@@ -254,11 +316,33 @@ def aligned_max_scheduled_tokens(
     return max_scheduled_tokens - max_scheduled_tokens % grain
 
 
-def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSpec:
+# "No bound" for RequestSpec.max_cached_prefix_tokens (the C++ default).
+UNBOUNDED_CACHED_PREFIX_TOKENS = 2**31 - 1
+
+
+def make_spec(
+    rid: str,
+    tokens: list[int],
+    *,
+    max_cached_prefix_tokens: int,
+    max_new_tokens: int = 0,
+) -> RequestSpec:
+    """Build the C++ scheduler's admission record for one request.
+
+    Args:
+        rid: Request id.
+        tokens: Prompt token ids.
+        max_cached_prefix_tokens: Longest prompt prefix the admission probe may
+            claim from the prefix cache. ``UNBOUNDED_CACHED_PREFIX_TOKENS``
+            keeps the ordinary rule; a request returning prompt logprobs from
+            position ``s`` passes ``s`` so those positions are recomputed.
+        max_new_tokens: Declared generation budget (0 = undeclared).
+    """
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
     spec.max_new_tokens = max_new_tokens
+    spec.max_cached_prefix_tokens = max_cached_prefix_tokens
     return spec
 
 

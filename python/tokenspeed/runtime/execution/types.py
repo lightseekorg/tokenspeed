@@ -92,6 +92,42 @@ class RequestHistorySeeds:
 
 
 @dataclass(frozen=True)
+class InputLogprobPlan:
+    """Which prompt rows of one forward need their next-token logprob.
+
+    Built on the control plane for the batch's extend rows and captured into
+    the submitted closure as plain tuples; the forward thread gathers exactly
+    these rows out of the full ``[num_tokens, hidden]`` activations (position
+    chunked, so the ``[rows, vocab]`` logits never materialize at once), and
+    the commit path slices the flat result back per request with
+    ``per_slot_counts`` and places it at ``per_slot_starts``.
+
+    Attributes:
+        row_indices: Flat input-row index of every gathered position, extend
+            slots in batch order, positions ascending within a slot.
+        target_token_ids: The prompt token at ``position + 1`` for every row:
+            the token whose logprob the row predicts.
+        per_slot_starts: Per extend slot, the first prompt position gathered
+            (meaningful only where the count is non-zero).
+        per_slot_counts: Per extend slot, how many rows belong to it; sums to
+            ``len(row_indices)``.
+    """
+
+    row_indices: tuple[int, ...]
+    target_token_ids: tuple[int, ...]
+    per_slot_starts: tuple[int, ...]
+    per_slot_counts: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.row_indices) != len(self.target_token_ids):
+            raise ValueError("input logprob rows and targets must have equal lengths")
+        if len(self.per_slot_starts) != len(self.per_slot_counts):
+            raise ValueError("input logprob per-slot starts and counts must align")
+        if sum(self.per_slot_counts) != len(self.row_indices):
+            raise ValueError("input logprob per-slot counts must sum to the row count")
+
+
+@dataclass(frozen=True)
 class PlannedForward:
     """One round's planned work, as the device side needs to see it.
 
@@ -119,6 +155,9 @@ class PlannedForward:
         multimodal_context: Per-batch multimodal state, None for text-only.
             Its ``mm_inputs`` are shallow copies taken at gather time; the
             items inside are the other registered exception.
+        input_logprob_plan: The prompt rows whose logprobs this forward
+            gathers, None when no extend row needs any. A frozen dataclass
+            of plain tuples.
     """
 
     forward_op: Any
@@ -128,6 +167,7 @@ class PlannedForward:
     multimodal_context: Any
     ngram_inputs: NGramInputs | None
     request_history_seeds: RequestHistorySeeds | None
+    input_logprob_plan: InputLogprobPlan | None
 
 
 @dataclass
@@ -158,6 +198,12 @@ class ModelExecutionResult:
     # Optional verify-input snapshot used by speculative diagnostics. Layout is
     # [batch, verify_width]: anchor followed by draft candidate token ids.
     spec_candidate_tokens: torch.Tensor | None = None
+    # Prompt (input) logprobs of the rows ``input_logprob_plan`` named, flat
+    # fp32 in plan order; None when the forward gathered none (no plan, or a
+    # pipeline stage without logits). The plan rides along so the commit path
+    # slices the flat tensor per request without re-deriving the rows.
+    input_token_logprobs: torch.Tensor | None = None
+    input_logprob_plan: InputLogprobPlan | None = None
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:

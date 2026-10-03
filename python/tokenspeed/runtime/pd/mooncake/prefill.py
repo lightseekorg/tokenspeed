@@ -21,6 +21,7 @@
 import concurrent.futures
 import os
 import socket
+import struct
 import threading
 import time
 from collections import defaultdict
@@ -104,6 +105,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         # Bootstrap metadata is published after the final forward commits.
         self.prefill_metadata: dict[int, tuple[int, list[int] | None]] = {}
         self.cached_tokens: dict[int, int] = {}
+        # The bootstrap token's logprob, recorded by the control plane at the
+        # final chunk's commit (like cached_tokens) and shipped in the status
+        # message so the decode node's output logprobs start with it.
+        self.bootstrap_logprobs: dict[int, float] = {}
         self.bootstrap_token_cond = threading.Condition()
         # Determine the number of threads to use for kv sender
         cpu_count = os.cpu_count()
@@ -169,11 +174,18 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             if self.request_status.get(room) not in (None, TransferPoll.Failed):
                 self.cached_tokens[room] = cached_tokens
 
+    def record_bootstrap_logprob(self, room: int, logprob: float) -> None:
+        """Publish the bootstrap token's logprob before the final transfer is submitted."""
+        with self.bootstrap_token_cond:
+            if self.request_status.get(room) not in (None, TransferPoll.Failed):
+                self.bootstrap_logprobs[room] = logprob
+
     def begin_room(self, room: int) -> None:
         """Reset request metadata before publishing a room."""
         with self.bootstrap_token_cond:
             self.prefill_metadata.pop(room, None)
             self.cached_tokens.pop(room, None)
+            self.bootstrap_logprobs.pop(room, None)
         self.update_status(room, TransferPoll.Bootstrapping)
 
     def discard_room(self, room: int) -> None:
@@ -183,6 +195,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         with self.bootstrap_token_cond:
             self.prefill_metadata.pop(room, None)
             self.cached_tokens.pop(room, None)
+            self.bootstrap_logprobs.pop(room, None)
             self.bootstrap_token_cond.notify_all()
 
     def _wait_prefill_metadata(
@@ -746,6 +759,14 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         )
         with self.bootstrap_token_cond:
             cached_tokens = self.cached_tokens.get(room, 0)
+            bootstrap_logprob = self.bootstrap_logprobs.get(room)
+        # Optional trailing frame: the bootstrap logprob as an IEEE double
+        # (exact), empty when the prefill node has none for this request.
+        bootstrap_logprob_payload = (
+            struct.pack("<d", bootstrap_logprob)
+            if bootstrap_logprob is not None
+            else b""
+        )
         socket, lock = self._connect("tcp://" + remote + ":" + str(dst_port))
         with lock:
             socket.send_multipart(
@@ -756,6 +777,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     str(bootstrap_token).encode("ascii"),
                     spec_candidate_payload,
                     str(cached_tokens).encode("ascii"),
+                    bootstrap_logprob_payload,
                 ]
             )
 

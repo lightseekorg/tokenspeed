@@ -450,6 +450,7 @@ class DeviceHandle:
                 capture_next_input_ids=capture_next_input_ids,
                 ngram_inputs=planned.ngram_inputs,
                 request_history_seeds=planned.request_history_seeds,
+                input_logprob_plan=planned.input_logprob_plan,
             )
 
         return PendingExecution(self._thread.submit(_forward))

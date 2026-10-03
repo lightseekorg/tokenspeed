@@ -118,6 +118,32 @@ path). A pinned solution with no registered leaf fails selection at startup
 or at the first call instead of falling back — the FluentLLM discipline
 ("no silent fallback") expressed through the existing registry.
 
+## Logprobs: one arithmetic for prompt and output
+
+A returned logprob is `log_softmax(logits.float(), -1)` gathered at the
+token, with the logits produced by the same LM-head route the sampler takes
+(`LogitsProcessor._get_logits`: quantized or dense GEMM, the `aok` GEMM under
+rl-bitwise, the TP gather, softcap). The sampler's output logprobs
+(`gather_token_logprobs_torch`, the flashinfer full-vocab backend) and the
+prompt (input) logprobs of the SGLang dialect
+(`LogitsProcessor.compute_input_token_logprobs`, requested through
+`return_logprob` + `logprob_start_len`) share that arithmetic, so the logprob
+of one token is the same number whether it was scored as a prompt position or
+sampled as an output -- the property an RL trainer relies on when it rescores
+a rollout.
+
+Prompt logprobs are gathered in position chunks of
+`--input-logprob-chunk-tokens` rows so the transient `[rows, vocab]` logits
+stay bounded. The chunk size is a sizing knob, not a numerics one: the
+reductions involved are row-local (the GEMM's row is independent of its
+neighbours under the per-row GEMM leaves of `invariance.batch`, and
+log-softmax reduces within a row), so no value depends on which chunk, or how
+large a chunk, a position landed in. The same holds across prefill chunks:
+positions are scored by the chunk that feeds them and assembled per request
+afterwards, so chunked prefill and prefix-cache hits do not change a prompt
+logprob either -- the admission probe is capped at `logprob_start_len`
+(`scheduler.md` §1) so every scored position is actually recomputed.
+
 ## Acceptance
 
 The envelope is verified end to end, not per switch: the invariance harness
