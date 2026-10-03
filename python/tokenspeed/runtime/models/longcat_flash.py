@@ -49,6 +49,9 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader as _build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
+from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo as _ExpertLocationDispatchInfo,
+)
 from tokenspeed.runtime.layers.moe.topk import TopK as _TopK
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat as _TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType as _RoutingMethodType
@@ -75,7 +78,13 @@ from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder as _get_global_expert_distribution_recorder,
 )
 from tokenspeed.runtime.moe.expert_location import (
+    ExpertLocationMetadata as _ExpertLocationMetadata,
+)
+from tokenspeed.runtime.moe.expert_location import (
     ModelConfigForExpertLocation as _ModelConfigForExpertLocation,
+)
+from tokenspeed.runtime.moe.expert_location import (
+    get_global_expert_location_metadata as _get_global_expert_location_metadata,
 )
 from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.cuda_stream import StreamFork as _StreamFork
@@ -161,6 +170,37 @@ def _get_longcat_moe_quant_config(
     )
 
 
+def _check_longcat_expert_placement(
+    placement: _ExpertLocationMetadata,
+    config: _PretrainedConfig,
+    layer_index: int,
+    mapping: _Mapping,
+) -> None:
+    """Refuse a placement whose geometry is not this model's."""
+    if placement.num_logical_experts != config.n_routed_experts:
+        raise ValueError(
+            f"expert placement has {placement.num_logical_experts} logical experts, "
+            f"LongCat routes {config.n_routed_experts}"
+        )
+    if not 0 <= layer_index < placement.num_layers:
+        raise ValueError(
+            f"LongCat MoE layer {layer_index} is outside the placement's "
+            f"{placement.num_layers} layers; the layer index must be passed"
+        )
+    if placement.ep_size != mapping.moe.ep_size:
+        raise ValueError(
+            f"expert placement spans ep_size={placement.ep_size}, the MoE mapping "
+            f"has ep_size={mapping.moe.ep_size}"
+        )
+    algorithm = global_server_args_dict["ep_dispatch_algorithm"]
+    if config.zero_expert_num > 0 and not str(algorithm).endswith("_with_zero_expert"):
+        raise ValueError(
+            f"LongCat routes {config.zero_expert_num} zero experts; use "
+            "--ep-dispatch-algorithm static_with_zero_expert (or "
+            f"dynamic_with_zero_expert), not {algorithm}"
+        )
+
+
 class _RuntimeLongcatRouter(nn.Module):
     def __init__(self, config: _PretrainedConfig, prefix: str = ""):
         super().__init__()
@@ -236,11 +276,22 @@ class _RuntimeLongcatMoE(nn.Module):
             config=config,
             prefix=add_prefix("router", prefix),
         )
+        # The target's expert placement (process-global while the target is
+        # built; None for drafts and plain serving): P = E + R physical slots,
+        # the router emits physical ids and the loader fills every replica.
+        self.expert_placement: _ExpertLocationMetadata | None = (
+            _get_global_expert_location_metadata()
+        )
+        if self.expert_placement is not None:
+            _check_longcat_expert_placement(
+                self.expert_placement, config, layer_index, self.mapping
+            )
         self.experts = _MoELayer(
             top_k=config.moe_topk,
             num_experts=(
                 config.n_routed_experts
-                + global_server_args_dict["ep_num_redundant_experts"]
+                if self.expert_placement is None
+                else self.expert_placement.num_physical_experts
             ),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -272,6 +323,7 @@ class _RuntimeLongcatMoE(nn.Module):
             )
         self.topk = _TopK(
             top_k=config.moe_topk,
+            layer_id=layer_index,
             renormalize=config.norm_topk_prob,
             correction_bias=self.router.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
@@ -283,6 +335,18 @@ class _RuntimeLongcatMoE(nn.Module):
                 else torch.int32
             ),
         )
+        # This layer's view of the placement tables for the router; the
+        # dispatch flavour follows the MoE kernel: all-to-all EP routes each
+        # rank's own tokens to its nearest replica, replicated-input EP routes
+        # every token on every rank and needs a rank-agnostic replica choice.
+        self.expert_dispatch_info: _ExpertLocationDispatchInfo | None = None
+        if self.expert_placement is not None:
+            self.expert_dispatch_info = _ExpertLocationDispatchInfo.init_new(
+                layer_id=layer_index,
+                ep_dispatch_algorithm=global_server_args_dict["ep_dispatch_algorithm"],
+                expert_location_metadata=self.expert_placement,
+                all_to_all_ep=self.experts.supports_all_to_all_ep,
+            )
 
     def get_moe_routed_weights(self):
         return [
@@ -295,9 +359,11 @@ class _RuntimeLongcatMoE(nn.Module):
         if self.zero_expert_num <= 0:
             return None
 
-        zero_expert_mask = (topk_output.topk_ids < 0) | (
-            topk_output.topk_ids >= self.n_routed_experts
-        )
+        zero_expert_mask = topk_output.topk_ids < 0
+        if self.expert_dispatch_info is None:
+            # Without a placement any id at or beyond the routed experts is a
+            # zero expert; with one, ids in [E, P) are real replicas.
+            zero_expert_mask |= topk_output.topk_ids >= self.n_routed_experts
         zero_expert_weights = torch.where(
             zero_expert_mask,
             topk_output.topk_weights,
@@ -328,7 +394,11 @@ class _RuntimeLongcatMoE(nn.Module):
         with self.stream_fork.scope(enable=_get_is_capture_mode()):
             router_logits = self.router(hidden_states)
             if hidden_states.shape[0] > 0:
-                topk_output = self.topk(hidden_states, router_logits)
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=self.expert_dispatch_info,
+                )
             else:
                 topk_output = self.topk.empty_topk_output(
                     hidden_states.device,

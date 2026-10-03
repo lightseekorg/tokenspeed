@@ -25,7 +25,11 @@ from typing import Any, Literal, NamedTuple, Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.moe import (
+    ExpertDispatch,
+    dispatch_topk_ids_reference,
+    moe_topk,
+)
 from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
@@ -46,8 +50,23 @@ class TopKOutputFormat(Enum):
         return self == TopKOutputFormat.BYPASSED
 
 
+_STATIC_DISPATCH_ALGORITHMS = frozenset({"static", "static_with_zero_expert"})
+
+
 @dataclass
 class ExpertLocationDispatchInfo:
+    """One MoE layer's view of the expert placement, for routing.
+
+    Views of the global ``ExpertLocationMetadata`` tables, so an in-place
+    placement update reaches captured graphs. Two static flavours exist:
+    all-to-all EP routes each rank's own tokens, so every rank dispatches to
+    its nearest replica (``partial_logical_to_rank_dispatch_physical_map``);
+    replicated-input EP routes every token on every rank and exactly one rank
+    must compute each route, so the replica is a pure function of the token
+    (``replica_dispatch``, see ``ExpertDispatch``).
+    """
+
+    layer_id: int
     ep_dispatch_algorithm: Literal[
         "static",
         "dynamic",
@@ -62,26 +81,52 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
+    # Rank-agnostic replica tables for replicated-input EP; None under
+    # all-to-all EP, where the per-rank static map applies.
+    replica_dispatch: ExpertDispatch | None
+    # (num_physical_experts,) int32 route counters of this layer, or None
+    # when load recording is off.
+    physical_load: torch.Tensor | None
 
     @classmethod
     def init_new(
         cls,
         layer_id: int,
-        ep_dispatch_algorithm: str | None = None,
-        expert_location_metadata: Any | None = None,
+        ep_dispatch_algorithm: str,
+        expert_location_metadata: Any,
+        *,
+        all_to_all_ep: bool,
     ):
-        if ep_dispatch_algorithm is None:
-            return None
+        """Slice ``layer_id``'s routing tables out of the placement.
 
+        Args:
+            layer_id: The MoE layer (row of the placement tables).
+            ep_dispatch_algorithm: ``--ep-dispatch-algorithm``.
+            expert_location_metadata: The ``ExpertLocationMetadata`` placement.
+            all_to_all_ep: Whether the layer's MoE kernel owns all-to-all
+                dispatch (DeepEP), so each rank routes only its own tokens.
+                Otherwise every rank routes every token and a static
+                algorithm must pick the same replica on every rank.
+        """
+        static = ep_dispatch_algorithm in _STATIC_DISPATCH_ALGORITHMS
+        if not all_to_all_ep and not static:
+            raise ValueError(
+                f"--ep-dispatch-algorithm {ep_dispatch_algorithm} draws replicas "
+                "at random per rank, but without all-to-all EP every rank routes "
+                "every token and must agree on one replica per route; use "
+                "static or static_with_zero_expert."
+            )
+        rank_map = expert_location_metadata.logical_to_rank_dispatch_physical_map
+        if static and all_to_all_ep and rank_map is None:
+            raise ValueError(
+                "the placement was built without a static dispatch map; pass "
+                f"dispatch_algorithm={ep_dispatch_algorithm!r} when building it"
+            )
         return cls(
+            layer_id=layer_id,
             ep_dispatch_algorithm=ep_dispatch_algorithm,
             partial_logical_to_rank_dispatch_physical_map=(
-                expert_location_metadata.logical_to_rank_dispatch_physical_map[
-                    layer_id, :
-                ]
-                if expert_location_metadata.logical_to_rank_dispatch_physical_map
-                is not None
-                else None
+                rank_map[layer_id, :] if rank_map is not None else None
             ),
             partial_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[
                 layer_id, :
@@ -90,6 +135,20 @@ class ExpertLocationDispatchInfo:
                 layer_id, :
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
+            replica_dispatch=(
+                ExpertDispatch(
+                    expert_location_metadata.dispatch_replicas[layer_id],
+                    expert_location_metadata.dispatch_num_replicas[layer_id],
+                    load=None,
+                )
+                if static and not all_to_all_ep
+                else None
+            ),
+            physical_load=(
+                expert_location_metadata.physical_load[layer_id]
+                if expert_location_metadata.physical_load is not None
+                else None
+            ),
         )
 
 
@@ -110,64 +169,69 @@ def topk_ids_logical_to_physical(
     info: ExpertLocationDispatchInfo | None,
     num_experts: int | None = None,
 ) -> torch.Tensor:
+    """Map logical expert ids onto the physical replicas routing dispatches to.
+
+    Args:
+        topk_ids: ``[tokens, top_k]`` logical ids; every entry must be a real
+            expert for the plain algorithms. The ``*_with_zero_expert``
+            algorithms leave ids outside ``[0, num_experts)`` (zero experts,
+            ``-1`` masked slots) untouched.
+        info: The layer's placement view, or None to keep logical ids.
+        num_experts: Routed expert count, required by the zero-expert
+            algorithms.
+
+    Returns:
+        Physical ids in ``topk_ids``' dtype.
+    """
     if info is None:
         return topk_ids
 
     if info.ep_dispatch_algorithm == "static":
-        return info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
+        return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm == "static_with_zero_expert":
         assert num_experts is not None
-        return _topk_ids_logical_to_physical_static_with_zero_expert(
-            topk_ids, info, num_experts
+        return _map_real_expert_ids(
+            topk_ids,
+            num_experts,
+            lambda ids: _topk_ids_logical_to_physical_static(ids, info),
         )
     if info.ep_dispatch_algorithm == "dynamic_with_zero_expert":
         assert num_experts is not None
-        return _topk_ids_logical_to_physical_dynamic_with_zero_expert(
-            topk_ids, info, num_experts
+        return _map_real_expert_ids(
+            topk_ids,
+            num_experts,
+            lambda ids: _topk_ids_logical_to_physical_dynamic(ids, info),
         )
     if info.ep_dispatch_algorithm in {"dynamic", "fake"}:
-        return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+        return _topk_ids_logical_to_physical_dynamic(topk_ids, info).to(topk_ids.dtype)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 
-def _topk_ids_logical_to_physical_static_with_zero_expert(
+def _topk_ids_logical_to_physical_static(
     topk_ids: torch.Tensor,
     info: ExpertLocationDispatchInfo,
-    num_experts: int,
 ) -> torch.Tensor:
-    topk_ids_original_shape = topk_ids.shape
-    topk_ids = topk_ids.flatten()
-    mask_less_than_num_experts = topk_ids < num_experts
-    converted_part = info.partial_logical_to_rank_dispatch_physical_map[
-        topk_ids[mask_less_than_num_experts]
-    ]
-    topk_ids[mask_less_than_num_experts] = converted_part
-    return topk_ids.view(topk_ids_original_shape)
-
-
-def _topk_ids_logical_to_physical_dynamic_with_zero_expert(
-    topk_ids: torch.Tensor,
-    info: ExpertLocationDispatchInfo,
-    num_experts: int,
-) -> torch.Tensor:
-    topk_ids_original_shape = topk_ids.shape
-    device = topk_ids.device
-    topk_ids = topk_ids.flatten()
-
-    mask_less_than_num_experts = topk_ids < num_experts
-    topk_ids_to_convert = topk_ids[mask_less_than_num_experts]
-
-    chosen_dispatch_index = (
-        torch.randint(
-            0, 65536, topk_ids_to_convert.shape, dtype=torch.int32, device=device
-        )
-        % info.partial_logical_to_all_physical_map_num_valid[topk_ids_to_convert]
+    if info.replica_dispatch is not None:
+        return dispatch_topk_ids_reference(topk_ids, info.replica_dispatch)
+    return info.partial_logical_to_rank_dispatch_physical_map[topk_ids].to(
+        topk_ids.dtype
     )
-    converted_topk_ids = info.partial_logical_to_all_physical_map[
-        topk_ids_to_convert, chosen_dispatch_index
-    ]
-    topk_ids[mask_less_than_num_experts] = converted_topk_ids
-    return topk_ids.view(topk_ids_original_shape)
+
+
+def _map_real_expert_ids(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    convert: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Apply ``convert`` to the ids in ``[0, num_experts)`` and keep the rest.
+
+    Zero experts (ids at or beyond ``num_experts``, or ``-1``) have no
+    physical slot. Written without boolean indexing so it captures into
+    CUDA graphs.
+    """
+    real = (topk_ids >= 0) & (topk_ids < num_experts)
+    converted = convert(topk_ids.masked_fill(~real, 0))
+    return torch.where(real, converted.to(topk_ids.dtype), topk_ids)
 
 
 def _topk_ids_logical_to_physical_dynamic(
@@ -194,6 +258,23 @@ def _mask_topk_ids_padded_region(
         return
     indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
     topk_ids[indices >= num_token_non_padded, :] = -1
+
+
+def record_expert_load(
+    physical_load: torch.Tensor | None, topk_ids: torch.Tensor
+) -> None:
+    """Count every real route of ``topk_ids`` into the layer's physical counters.
+
+    ``-1`` marks zero-expert and padded slots; they are not routes. One
+    ``scatter_add_`` with a zero weight for those keeps this graph-capturable.
+    """
+    if physical_load is None:
+        return
+    ids = topk_ids.reshape(-1)
+    valid = ids >= 0
+    physical_load.scatter_add_(
+        0, ids.masked_fill(~valid, 0).long(), valid.to(physical_load.dtype)
+    )
 
 
 def torch_native_fused_topk(
@@ -281,6 +362,9 @@ def grouped_topk_gpu(
 @dataclass
 class TopKConfig:
     top_k: int
+    # The MoE layer this router serves; an expert placement's dispatch info
+    # must come from the same layer.
+    layer_id: int | None = None
     use_grouped_topk: bool = False
     topk_group: int | None = None
     num_expert_group: int | None = None
@@ -349,6 +433,7 @@ class TopK(torch.nn.Module):
         self,
         top_k: int,
         *,
+        layer_id: int | None = None,
         use_grouped_topk: bool = False,
         topk_group: int | None = None,
         num_expert_group: int | None = None,
@@ -375,6 +460,7 @@ class TopK(torch.nn.Module):
 
         self.topk_config = TopKConfig(
             top_k=top_k,
+            layer_id=layer_id,
             use_grouped_topk=use_grouped_topk,
             renormalize=renormalize,
             topk_group=topk_group,
@@ -454,6 +540,25 @@ class TopK(torch.nn.Module):
         return StandardTopKOutput(topk_weights, topk_idx, router_logits)
 
 
+def map_zero_expert_routes(
+    topk_ids: torch.Tensor,
+    info: ExpertLocationDispatchInfo,
+    num_real_experts: int,
+) -> torch.Tensor:
+    """Map a zero-expert router's ids (``-1`` for zero experts) onto replicas.
+
+    Zero-expert slots have no physical expert: they are masked out of the
+    mapping and restored to ``-1`` afterwards, so a consumer that tests
+    ``ids < 0`` still finds them while ids in ``[num_real_experts, P)`` are
+    real replicas.
+    """
+    zero_mask = topk_ids < 0
+    mapped = topk_ids_logical_to_physical(
+        topk_ids.masked_fill(zero_mask, 0), info, num_experts=num_real_experts
+    )
+    return mapped.to(topk_ids.dtype).masked_fill(zero_mask, -1)
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -473,6 +578,23 @@ def select_experts(
     correction_bias = topk_config.correction_bias
     torch_native = topk_config.torch_native
     routed_scaling_factor = topk_config.routed_scaling_factor
+
+    if (
+        expert_location_dispatch_info is not None
+        and topk_config.layer_id is not None
+        and expert_location_dispatch_info.layer_id != topk_config.layer_id
+    ):
+        raise ValueError(
+            f"expert placement of layer {expert_location_dispatch_info.layer_id} "
+            f"handed to the router of layer {topk_config.layer_id}"
+        )
+    # Taken before the branches: the grouped path drops the dispatch info once
+    # its kernel has mapped the ids, and the counters still apply to those.
+    physical_load = (
+        expert_location_dispatch_info.physical_load
+        if expert_location_dispatch_info is not None
+        else None
+    )
 
     router_logits, correction_bias = transform_select_experts_inputs(
         router_logits=router_logits,
@@ -510,9 +632,12 @@ def select_experts(
         else:
             mapped_in_kernel = False
             logical_to_physical_map = None
+            # The kernels take the per-rank static map; the token-pure replica
+            # choice of replicated-input EP is applied after routing instead.
             if (
                 expert_location_dispatch_info is not None
                 and expert_location_dispatch_info.ep_dispatch_algorithm == "static"
+                and expert_location_dispatch_info.replica_dispatch is None
             ):
                 logical_to_physical_map = (
                     expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
@@ -602,6 +727,10 @@ def select_experts(
             routed_scaling_factor,
             renormalize,
         )
+        if expert_location_dispatch_info is not None:
+            topk_ids = map_zero_expert_routes(
+                topk_ids, expert_location_dispatch_info, num_real_experts
+            )
     elif custom_routing_function is None:
         assert (
             hidden_states.shape[0] == router_logits.shape[0]
@@ -638,6 +767,7 @@ def select_experts(
         if routed_scaling_factor is not None:
             topk_weights *= routed_scaling_factor
 
+    record_expert_load(physical_load, topk_ids)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

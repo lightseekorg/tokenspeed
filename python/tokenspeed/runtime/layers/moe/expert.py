@@ -453,17 +453,12 @@ class MoELayer(torch.nn.Module):
     def supports_deferred_finalize(self) -> bool:
         return self.plan["supports_deferred_finalize"]
 
-    def forward_zero_experts(self, topk_output):
-        zero_expert_limit = self.num_experts
-        if self.ep_num_redundant_experts is not None:
-            zero_expert_limit = zero_expert_limit - self.ep_num_redundant_experts
-
-        normal_expert_mask = topk_output.topk_ids >= zero_expert_limit
-        topk_output.topk_ids[normal_expert_mask] = -1
-        if self.zero_expert_type == "copy":
-            topk_output.topk_weights[normal_expert_mask] = 1.0
-        if self.zero_expert_type == "drop":
-            topk_output.topk_weights[normal_expert_mask] = 0.0
+    @property
+    def supports_all_to_all_ep(self) -> bool:
+        """Whether the kernel owns all-to-all dispatch, so each rank routes only
+        its own tokens. Otherwise every rank routes every token and an expert
+        placement must pick the same replica for a route on every rank."""
+        return self.plan["supports_all_to_all_ep"]
 
     def forward(
         self,

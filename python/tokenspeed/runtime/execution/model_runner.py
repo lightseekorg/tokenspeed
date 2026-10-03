@@ -33,6 +33,11 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     non_unit_kv_scale_message,
     record_non_unit_kv_scales,
 )
+from tokenspeed.runtime.moe.expert_location import (
+    build_expert_placement,
+    get_global_expert_location_metadata,
+    set_global_expert_location_metadata,
+)
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
@@ -137,7 +142,22 @@ class ModelRunner:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
-        self.load_model()
+        # The target's expert placement (redundant replicas, load counters) is
+        # process-global so its model picks it up while it is built and loaded.
+        # A draft routes its own experts trivially: the target's placement is
+        # hidden while the draft is built, then restored for serving.
+        if self.is_draft_worker:
+            target_placement = get_global_expert_location_metadata()
+            set_global_expert_location_metadata(None)
+            try:
+                self.load_model()
+            finally:
+                set_global_expert_location_metadata(target_placement)
+        else:
+            set_global_expert_location_metadata(
+                build_expert_placement(server_args, model_config)
+            )
+            self.load_model()
         if draft_moe_override:
             server_args.moe_backend = saved_moe_backend
             global_server_args_dict_update(server_args)

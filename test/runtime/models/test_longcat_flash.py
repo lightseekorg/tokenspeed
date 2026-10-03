@@ -109,6 +109,7 @@ class TestLongcatZeroExpert(unittest.TestCase):
         moe.zero_expert_num = 1
         moe.n_routed_experts = 3
         moe.zero_expert_type = "identity"
+        moe.expert_dispatch_info = None
         hidden_states = torch.tensor(
             [[2.0, 4.0], [6.0, 8.0]],
             dtype=torch.float32,
@@ -137,6 +138,161 @@ class TestLongcatZeroExpert(unittest.TestCase):
             topk_output.topk_ids,
             torch.tensor([[0, 0], [0, 1]]),
         )
+
+    def test_placed_replicas_beyond_the_routed_count_are_not_zero_experts(self):
+        # With a placement the router emits physical ids: E=3 routed experts on
+        # P=5 slots, so ids 3 and 4 are replicas, and only -1 is a zero expert.
+        moe = object.__new__(_RuntimeLongcatMoE)
+        moe.zero_expert_num = 1
+        moe.n_routed_experts = 3
+        moe.zero_expert_type = "identity"
+        moe.expert_dispatch_info = object()
+        hidden_states = torch.tensor([[2.0, 4.0], [6.0, 8.0]])
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.tensor([[0.25, 0.75], [0.5, 0.5]]),
+            topk_ids=torch.tensor([[4, -1], [3, 1]]),
+            router_logits=torch.zeros(2, 4),
+        )
+
+        zero_output = _RuntimeLongcatMoE._apply_zero_experts(
+            moe, hidden_states, topk_output
+        )
+
+        torch.testing.assert_close(zero_output, torch.tensor([[1.5, 3.0], [0.0, 0.0]]))
+        torch.testing.assert_close(
+            topk_output.topk_weights, torch.tensor([[0.25, 0.0], [0.5, 0.5]])
+        )
+        torch.testing.assert_close(topk_output.topk_ids, torch.tensor([[4, 0], [3, 1]]))
+
+
+def _longcat_moe_config(n_routed_experts: int = 4) -> SimpleNamespace:
+    return SimpleNamespace(
+        hidden_size=128,
+        moe_intermediate_size=128,
+        n_routed_experts=n_routed_experts,
+        zero_expert_num=2,
+        zero_expert_type="identity",
+        moe_topk=2,
+        hidden_act="silu",
+        routed_scaling_factor=1.0,
+        norm_topk_prob=False,
+        router_bias=False,
+        router_dtype="float32",
+    )
+
+
+class TestLongcatExpertPlacementWiring(unittest.TestCase):
+    """The MoE sizes its slots from the placement and routes through its view."""
+
+    def _build(self, placement, *, all_to_all_ep: bool, algorithm: str):
+        from tokenspeed.runtime.distributed.mapping import Mapping
+        from tokenspeed.runtime.layers.moe import expert as expert_module
+        from tokenspeed.runtime.moe import expert_location
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        def fake_moe_plan(weight_dtype: str, **kwargs) -> dict:
+            return {
+                "solution": "flashinfer_trtllm",
+                "support_routing": False,
+                "supports_precomputed_topk": True,
+                "supports_deferred_finalize": False,
+                "supports_all_to_all_ep": all_to_all_ep,
+            }
+
+        trtllm = SimpleNamespace(value="flashinfer_trtllm")
+        mapping = Mapping(
+            rank=1, world_size=2, attn_tp_size=2, moe_tp_size=1, moe_ep_size=2
+        )
+        expert_location.set_global_expert_location_metadata(placement)
+        self.addCleanup(expert_location.set_global_expert_location_metadata, None)
+        with (
+            torch.device("cpu"),
+            mock.patch.object(expert_module, "get_moe_backend", lambda: trtllm),
+            mock.patch.object(
+                expert_module.tokenspeed_kernel, "moe_plan", fake_moe_plan
+            ),
+            mock.patch.dict(
+                global_server_args_dict,
+                {
+                    "ep_num_redundant_experts": 2,
+                    "ep_dispatch_algorithm": algorithm,
+                    "enable_deep_ep": False,
+                },
+            ),
+        ):
+            return _RuntimeLongcatMoE(
+                config=_longcat_moe_config(),
+                mapping=mapping,
+                quant_config=None,
+                layer_index=1,
+                prefix="model.layers.1.mlp",
+                alt_stream=None,
+            )
+
+    def _placement(self, algorithm: str):
+        from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
+
+        return ExpertLocationMetadata.from_physical_to_logical_map(
+            torch.tensor([[0, 1, 2, 3, 0, 2], [3, 2, 1, 0, 1, 1]]),
+            4,
+            ep_size=2,
+            ep_rank=1,
+            num_nodes=1,
+            dispatch_algorithm=algorithm,
+        )
+
+    def test_without_a_placement_the_layer_keeps_its_routed_experts(self):
+        moe = self._build(None, all_to_all_ep=False, algorithm=None)
+        self.assertIsNone(moe.expert_placement)
+        self.assertIsNone(moe.expert_dispatch_info)
+        self.assertEqual(moe.experts.num_experts, 4)
+        self.assertEqual(moe.topk.topk_config.layer_id, 1)
+
+    def test_placement_sizes_slots_and_picks_the_dispatch_flavour(self):
+        placement = self._placement("static_with_zero_expert")
+        moe = self._build(
+            placement, all_to_all_ep=False, algorithm="static_with_zero_expert"
+        )
+        self.assertIs(moe.expert_placement, placement)
+        self.assertEqual(moe.experts.num_experts, 6)
+        self.assertEqual(moe.experts.num_local_experts, 3)
+        info = moe.expert_dispatch_info
+        self.assertEqual(info.layer_id, 1)
+        # Replicated-input EP: rank-agnostic replica tables, views of layer 1.
+        self.assertIsNotNone(info.replica_dispatch)
+        self.assertTrue(
+            info.replica_dispatch.replicas.data_ptr()
+            == placement.dispatch_replicas[1].data_ptr()
+        )
+        moe = self._build(
+            placement, all_to_all_ep=True, algorithm="static_with_zero_expert"
+        )
+        # All-to-all EP: this rank's static nearest-replica map.
+        self.assertIsNone(moe.expert_dispatch_info.replica_dispatch)
+        self.assertEqual(
+            moe.expert_dispatch_info.partial_logical_to_rank_dispatch_physical_map.tolist(),
+            placement.logical_to_rank_dispatch_physical_map[1].tolist(),
+        )
+
+    def test_placement_geometry_must_match_the_model(self):
+        from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
+
+        wrong_experts = ExpertLocationMetadata.from_physical_to_logical_map(
+            torch.tensor([[0, 1, 2, 3, 4, 0], [0, 1, 2, 3, 4, 1]]),
+            5,
+            ep_size=2,
+            ep_rank=1,
+            num_nodes=1,
+            dispatch_algorithm="static_with_zero_expert",
+        )
+        with self.assertRaisesRegex(ValueError, "logical experts"):
+            self._build(
+                wrong_experts, all_to_all_ep=False, algorithm="static_with_zero_expert"
+            )
+        with self.assertRaisesRegex(ValueError, "zero experts"):
+            self._build(
+                self._placement("static"), all_to_all_ep=False, algorithm="static"
+            )
 
 
 class TestLongcatMoePlan(unittest.TestCase):
