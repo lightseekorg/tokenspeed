@@ -1260,7 +1260,18 @@ def run_event_loop(
     dp_rank = mapping.attn.dp_rank
     global_rank = mapping.rank
 
-    setproctitle.setproctitle(f"tokenspeed::scheduler_{dp_rank}")
+    process_title = f"tokenspeed::scheduler_tp{attn_tp_rank}"
+    if mapping.moe.has_ep:
+        process_title += f"_ep{mapping.moe.ep_rank}"
+    if mapping.attn.has_dp:
+        process_title += f"_dp{dp_rank}"
+    if mapping.attn.has_cp:
+        process_title += f"_cp{mapping.attn.cp_rank}"
+    if mapping.attn.has_dcp:
+        process_title += f"_dcp{mapping.attn.dcp_rank}"
+    if mapping.has_pp:
+        process_title += f"_pp{mapping.pp_rank}"
+    setproctitle.setproctitle(process_title)
     # Re-assert the NVSHMEM IB traffic class in every inference process:
     # NVSHMEM reads it from the process environment at bootstrap, and worker
     # processes may be spawned without inheriting the launcher's setting.

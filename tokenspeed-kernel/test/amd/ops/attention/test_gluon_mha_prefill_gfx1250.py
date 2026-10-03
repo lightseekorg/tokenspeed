@@ -131,7 +131,7 @@ def test_mha_prefill_selects_deep_pipeline(dtype, head_dim):
     """Check that a full, sufficiently occupied launch selects the deep path."""
     device = "cuda"
     seqlens = [2048] * 4 if head_dim == 64 else [1024] * 8
-    n_q_heads, n_kv_heads = 8, 1
+    n_q_heads, n_kv_heads = 8, 2
     q, k, v, cu, cu_cpu, max_seqlen = _inputs(
         seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
     )
@@ -153,6 +153,128 @@ def test_mha_prefill_selects_deep_pipeline(dtype, head_dim):
     assert selected == [True]
     expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
     torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("group_size", [2, 4, 8])
+def test_mha_prefill_packed_gqa(dtype, group_size):
+    """Check packed (sequence, query-head) rows across GQA group sizes."""
+    device = "cuda"
+    seqlens = [257, 129]
+    n_q_heads, n_kv_heads, head_dim = group_size, 1, 128
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+
+    original_config = prefill.get_config
+
+    def packed_config(**kwargs):
+        cfg = original_config(**kwargs)
+        block_m, num_warps = 128, 4
+        return cfg._replace(
+            block_m=block_m,
+            num_warps=num_warps,
+            packed_gqa=True,
+            grid=(
+                cfg.batch_size,
+                cfg.n_kv_heads,
+                prefill.triton_cdiv(cfg.max_seqlen * group_size, block_m),
+            ),
+        )
+
+    prefill.get_config = packed_config
+    try:
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    finally:
+        prefill.get_config = original_config
+
+    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
+def test_mha_prefill_addresses_past_four_gib():
+    """Sequence and head bases must not wrap through 32-bit buffer offsets."""
+    device, dtype = "cuda", torch.bfloat16
+    tokens, n_heads, head_dim = 2, 17, 64
+    head_stride = 2**27
+    boundary = 2**31
+    storage_elements = boundary + tokens * head_dim
+    storage_bytes = storage_elements * torch.tensor([], dtype=dtype).element_size()
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if free_bytes < storage_bytes + 512 * 1024**2:
+        pytest.skip("large-offset regression requires about 4.5 GiB free")
+
+    storage = torch.empty(storage_elements, dtype=dtype, device=device)
+    qkv = storage.as_strided(
+        (tokens, n_heads, head_dim),
+        (head_dim, head_stride, 1),
+    )
+    assert prefill._requires_wide_addressing(qkv)
+    generator = torch.Generator(device=device).manual_seed(20261002)
+    compact = torch.randn(qkv.shape, dtype=dtype, device=device, generator=generator)
+    qkv.copy_(compact)
+    cu_cpu = [0, tokens]
+    cu = torch.tensor(cu_cpu, dtype=torch.int32, device=device)
+    out = prefill.launch_gluon_mha_prefill_gfx1250(qkv, qkv, qkv, cu, cu_cpu, tokens)
+    expected = _reference(compact, compact, compact, cu_cpu, n_heads, n_heads, head_dim)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+    # Exercise a sequence/output base at exactly 4 GiB with one sparse allocation.
+    base_token = boundary // head_dim
+    sentinel = torch.full((head_dim,), -7.0, dtype=dtype, device=device)
+    value = torch.randn((head_dim,), dtype=dtype, device=device, generator=generator)
+    storage[:head_dim].copy_(sentinel)
+    storage[boundary : boundary + head_dim].copy_(value)
+    large_cu = torch.tensor(
+        [base_token, base_token + 1], dtype=torch.int32, device=device
+    )
+    prefill.gluon_mha_prefill_gfx1250[(1, 1, 1)](
+        storage,
+        storage,
+        storage,
+        large_cu,
+        storage,
+        storage,
+        storage,
+        head_dim,
+        head_dim,
+        1,
+        head_dim,
+        head_dim,
+        1,
+        head_dim,
+        head_dim,
+        1,
+        1,
+        1,
+        head_dim,
+        (1.0 / math.sqrt(head_dim)) * prefill._INV_LN2_VALUE,
+        128,
+        64,
+        False,
+        False,
+        False,
+        -1,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+        4,
+        2,
+        num_warps=4,
+        waves_per_eu=1,
+        llvm_fn_attrs="",
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(storage[:head_dim], sentinel)
+    torch.testing.assert_close(
+        storage[boundary : boundary + head_dim].float(),
+        value.float(),
+        rtol=8e-2,
+        atol=8e-2,
+    )
 
 
 def test_select_llvm_fn_attrs():
@@ -212,6 +334,61 @@ def test_select_deep_pipeline():
         {"seqlens": [4097] * 4, "max_seqlen": 4097},
     ):
         assert not prefill._select_deep_pipeline(**(kwargs | override))
+
+
+def test_select_packed_gqa():
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "head_dim": 128,
+        "n_heads": 8,
+        "n_kv_heads": 1,
+        "seqlens": [1024] * 8,
+        "max_seqlen": 1024,
+        "window_left": -1,
+        "has_sink": False,
+        "has_lse": False,
+        "packed_q_block_bytes": 1024 * 1024,
+    }
+    assert prefill._select_packed_gqa(**kwargs)
+    assert prefill._select_packed_gqa(
+        **(
+            kwargs
+            | {
+                "seqlens": [4096, 3584, 2305, 1024],
+                "max_seqlen": 4096,
+            }
+        )
+    )
+    assert prefill._select_packed_gqa(
+        **(
+            kwargs
+            | {
+                "seqlens": [4096] * 4,
+                "max_seqlen": 4096,
+                "window_left": 512,
+            }
+        )
+    )
+    assert prefill._select_packed_gqa(
+        **(kwargs | {"seqlens": [4096] * 4, "max_seqlen": 4096})
+    )
+    assert prefill._select_packed_gqa(
+        **(kwargs | {"seqlens": [8192] * 2, "max_seqlen": 8192})
+    )
+
+    for override in (
+        {"dtype": torch.float8_e4m3fn},
+        {"head_dim": 64},
+        {"n_heads": 32, "n_kv_heads": 8},
+        {
+            "dtype": torch.float16,
+            "seqlens": [4096] * 4,
+            "max_seqlen": 4096,
+        },
+        {"has_sink": True},
+        {"packed_q_block_bytes": 2**32 + 1},
+    ):
+        assert not prefill._select_packed_gqa(**(kwargs | override))
 
 
 def test_select_tdm_warp_hint():

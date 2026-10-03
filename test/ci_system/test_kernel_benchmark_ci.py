@@ -536,7 +536,7 @@ def test_revision_environment_inherits_and_pins_prepared_rocm(monkeypatch, tmp_p
 
 
 def test_shared_task_runner_preserves_paired_benchmark_outputs():
-    path = REPO_ROOT / ".github/workflows/run-pr-test-stage.yml"
+    path = REPO_ROOT / ".github/workflows/run-ci-task-matrix.yml"
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
     triggers = workflow.get("on") or workflow.get(True)
     inputs = triggers["workflow_call"]["inputs"]

@@ -25,11 +25,11 @@ jobs:
         with:
           script: |
             const workflows = [
-              "pr-test-nvidia.yml",
-              "pr-test-amd.yml",
+              "nvidia-b200-tests.yml",
+              "amd-tests.yml",
               "pr-test-nvidia-arm.yml",
-              "gb200-slurm-per-commit.yml",
-              "gb300-slurm-per-commit.yml",
+              "nvidia-gb200-tests.yml",
+              "nvidia-gb300-tests.yml",
             ];
             const maxAttempts = 3;
             const { owner, repo } = context.repo;

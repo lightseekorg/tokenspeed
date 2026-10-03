@@ -1151,6 +1151,47 @@ InfiniBand fabric. Automatic discovery also includes Ethernet RNICs, which can
 cause incompatible RoCE/InfiniBand endpoint pairings during the RDMA handshake.
 Without `PD_SLURM=1`, the same launcher retains the single-node smoke topology.
 
+## Nemotron-3 Super
+
+`nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` is a Nemotron-H hybrid. Its
+88 blocks are 40 Mamba2 layers, 40 latent MoE layers and 8 grouped-query
+attention layers without positional encoding. Only the Mamba2 and attention
+blocks own cache state, so the cache plans 48 layers. The routed experts use
+squared ReLU with NVFP4 weights on the FlashInfer TRT-LLM MoE, routed inside
+the kernel. Some dense projections are FP8 and the rest are BF16, as the
+checkpoint's per-layer ModelOpt config says.
+
+The checkpoint's KV cache scheme is FP8 with unit scales, which TokenSpeed does
+not detect automatically, so pass `--kv-cache-dtype fp8`. The Mamba2 SSM state
+is FP32.
+
+```bash
+tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --max-model-len 16384 \
+  --world-size 1 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+The checkpoint's multi-token prediction head serves as the draft model for
+speculative decoding. ReplaySSM is on by default: verification leaves the
+committed Mamba2 state untouched and one kernel then rebuilds every layer's
+accepted state, instead of storing a state per draft token
+(`--disable-replay-ssm` stores them).
+
+```bash
+tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --max-model-len 16384 \
+  --world-size 1 \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 3 \
+  --speculative-num-draft-tokens 4
+```
+
 ## Tuning Order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.

@@ -2010,9 +2010,9 @@ class ServerArgs:
             dest="enable_replay_ssm",
             action="store_false",
             default=ServerArgs.enable_replay_ssm,
-            help="Stage every verify position's GDN recurrent state instead of "
+            help="Stage every verify position's recurrent state instead of "
             "replaying the accepted tokens (ReplaySSM, on by default for "
-            "supported Qwen GDN targets).",
+            "supported Qwen GDN and Nemotron-H Mamba2 targets).",
         )
         parser.add_argument(
             "--enable-replay-ssm",

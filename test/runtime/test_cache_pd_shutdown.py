@@ -21,6 +21,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine import event_loop as event_loop_module  # noqa: E402
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks  # noqa: E402
@@ -255,11 +256,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
         def send(self, message: object) -> None:
             self.messages.append(message)
 
-    mapping = SimpleNamespace(
-        rank=0,
-        nprocs_per_node=1,
-        attn=SimpleNamespace(tp_rank=0, dp_rank=0),
-    )
+    mapping = Mapping(rank=0)
     server_args = SimpleNamespace(
         mapping=mapping,
         device="cpu",

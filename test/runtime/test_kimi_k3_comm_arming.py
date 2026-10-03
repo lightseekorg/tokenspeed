@@ -309,7 +309,9 @@ def test_the_collective_is_what_serves_an_eligible_reduce():
     comm.mapping = SimpleNamespace(attn=SimpleNamespace(tp_rank=0, tp_group=(0, 1)))
 
     partial, prefix = torch.zeros(1, 8), torch.zeros(1, 8)
-    out, mixed = comm.attn_reduce(partial, prefix, None, mlp_wp=None)
+    out, mixed = comm.attn_reduce(
+        partial, prefix, None, producer_direct=False, mlp_wp=None
+    )
 
     # Both operands are [m, hidden] bf16, so assert identity, not arrival.
     args, kwargs = collective.call_args
@@ -322,7 +324,7 @@ def test_the_collective_is_what_serves_an_eligible_reduce():
     # Assert the vendor took over: an exception would also give call_count zero.
     collective.reset_mock()
     wide = torch.zeros(9, 8)
-    comm.attn_reduce(wide, wide, None, mlp_wp=None)
+    comm.attn_reduce(wide, wide, None, producer_direct=False, mlp_wp=None)
     assert collective.call_count == 0
     assert vendor.call_count == 1
 
@@ -406,21 +408,17 @@ def test_arming_declines_unsupported_collectives(monkeypatch, multicast, shape_o
 
 @needs_iris
 @pytest.mark.parametrize(
-    "rows,is_prefill,sharded_moe_supported,eligible",
+    "rows,eligible",
     [
-        (0, True, True, False),
-        (15, True, True, False),
-        (16, True, True, True),
-        (37, True, True, True),
-        (8192, True, True, True),
-        (8193, True, True, False),
-        (8192, False, True, False),
-        (8192, True, False, False),
+        (0, False),
+        (15, False),
+        (16, True),
+        (37, True),
+        (8192, True),
+        (8193, False),
     ],
 )
-def test_attention_prefill_producer_window(
-    monkeypatch, rows, is_prefill, sharded_moe_supported, eligible
-):
+def test_attention_producer_window(monkeypatch, rows, eligible):
     from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
     from tokenspeed.runtime.models import kimi_k3_comm as module
 
@@ -448,30 +446,15 @@ def test_attention_prefill_producer_window(
     )
     monkeypatch.setattr(module, "can_acquire_all_reduce_outputs", capability)
     monkeypatch.setattr(module, "acquire_all_reduce_outputs", acquire)
-    out = comm.acquire_prefill_projection_output(
-        like,
-        projection,
-        is_prefill=is_prefill,
-        sharded_moe_supported=sharded_moe_supported,
-    )
+    out = comm.acquire_projection_output(like, projection)
     assert (out is destination) == eligible
     assert acquire.call_count == int(eligible)
     if rows == 16 and eligible:
         projection.reduce_results = True
-        assert (
-            comm.acquire_prefill_projection_output(
-                like, projection, is_prefill=True, sharded_moe_supported=True
-            )
-            is None
-        )
+        assert comm.acquire_projection_output(like, projection) is None
         projection.reduce_results = False
         mapping.moe.ep_size = 8
-        assert (
-            comm.acquire_prefill_projection_output(
-                like, projection, is_prefill=True, sharded_moe_supported=True
-            )
-            is None
-        )
+        assert comm.acquire_projection_output(like, projection) is None
 
 
 @pytest.mark.parametrize(
@@ -485,7 +468,7 @@ def test_attention_prefill_producer_window(
         (512, False, False),
     ],
 )
-def test_attention_prefill_mix_window(monkeypatch, rows, is_cdna4, eligible):
+def test_attention_mix_window(monkeypatch, rows, is_cdna4, eligible):
     from tokenspeed.runtime.models import kimi_k3_comm as module
 
     group = tuple(range(8))
@@ -505,7 +488,7 @@ def test_attention_prefill_mix_window(monkeypatch, rows, is_cdna4, eligible):
         module, "current_platform", lambda: SimpleNamespace(is_cdna4=is_cdna4)
     )
     monkeypatch.setattr(module, "_get_process_group", lambda _: "owner")
-    result = comm.prefill_mix_for_moe(
+    result = comm.mix_for_moe(
         partial,
         None,
         history,

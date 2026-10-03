@@ -257,8 +257,8 @@ def use_decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
         weight: Projection weight shaped ``[N, K]``.
 
     Returns:
-        True for eligible small-M FI inputs or a registered CDNA5 kernel;
-        False when the caller should retain its ordinary GEMM path.
+        True for eligible small-M FI inputs or a registered CDNA4/CDNA5
+        kernel; False when the caller should retain its ordinary GEMM path.
     """
     if (
         flashinfer_joint_bf16_supported(x, weight, None)
@@ -276,7 +276,10 @@ def use_decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     ):
         return False
     m, k = x.shape
-    if not current_platform().is_cdna5 or k < 256:
+    platform = current_platform()
+    if platform.is_cdna4:
+        return m >= 2 and _select(m, weight.shape[0], k, True) is not torch_decode_gemv
+    if not platform.is_cdna5 or k < 256:
         return False
     return _select(m, weight.shape[0], k, True) is not torch_decode_gemv
 

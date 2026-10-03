@@ -1,4 +1,4 @@
-name: GB300 Slurm Nightly
+name: NVIDIA GB300 Nightly Tests
 
 on:
   schedule:

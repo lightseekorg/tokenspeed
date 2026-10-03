@@ -56,6 +56,7 @@ Module hierarchy matches the checkpoint::
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -114,6 +115,7 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.w8a8_fp8 import w8a8_fp8_per_channel_mm
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
     _get_process_group,
@@ -150,6 +152,10 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
     preprocess_fp8_pb_wo_weights,
+)
+from tokenspeed.runtime.layers.quantization.mxfp4 import (
+    Mxfp4Config,
+    preprocess_mxfp4_checkpoint_weights,
 )
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.shared_expert_tp import (
@@ -729,6 +735,23 @@ def _situ_betas(config: KimiLinearConfig) -> tuple[float, float | None]:
 # quantization layers' width: e4m3fn on NVIDIA, e4m3fnuz on older ROCm).
 _FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
+# Shared-expert and dense MLP modules in checkpoint naming.
+_K3_DENSE_MLP_MODULE = re.compile(r"(\.shared_experts\.|\.mlp\.)(gate|up|down)_proj$")
+
+
+def _dense_mlp_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Quantization config for K3's shared-expert and dense MLPs.
+
+    Their fused SiTU/down kernels consume BF16 weights. Under an MXFP4 config
+    these MLPs are built unquantized: MXFP4-serialized MLP weights are
+    dequantized at load (``preprocess_mxfp4_checkpoint_weights``) and BF16
+    ones load as-is. Other configs, such as the compressed-tensors config of
+    ``moonshotai/Kimi-K3``, are passed through unchanged.
+    """
+    return None if isinstance(quant_config, Mxfp4Config) else quant_config
+
 
 # FP8_PB_WO fused_qkv_a PRIVATE row layout (FP8 mode only). Segments are
 # REORDERED to [gate | q_a | kv_a | zero tail pad] so that every segment
@@ -910,6 +933,12 @@ class KimiKDAMergedProj(nn.Module):
     checkpoint's per-segment scale grids concatenate directly with no
     requantization; the zero pad rows share ``b``'s trailing block scale and
     dequantize to exact zeros (pad lemma).
+
+    Per-channel FP8 checkpoints (``fp8_channel_quant=True``, e.g. a per-layer
+    ``*self_attn*`` FP8 override): the buffer stays FP8-resident with one f32
+    dequant scale per output row, so each segment's scales load row-for-row
+    at the same offsets as its codes; rows keep the bf16 16-row alignment
+    and the zero pad rows carry scale 1.
     """
 
     _ROW_ALIGN = 16
@@ -923,13 +952,18 @@ class KimiKDAMergedProj(nn.Module):
         tp_rank: int,
         tp_size: int,
         fp8_block_quant: bool = False,
+        *,
+        fp8_channel_quant: bool,
     ) -> None:
         super().__init__()
+        if fp8_block_quant and fp8_channel_quant:
+            raise ValueError("FP8 block and per-channel quantization are exclusive")
         self.proj_local = proj // tp_size
         self.local_num_heads = num_heads // tp_size
         self.head_dim = head_dim
         self.tp_rank = tp_rank
         self.fp8_block_quant = fp8_block_quant
+        self.fp8_channel_quant = fp8_channel_quant
         p = self.proj_local
         self._offsets = {
             "q": 0,
@@ -974,6 +1008,18 @@ class KimiKDAMergedProj(nn.Module):
             # zeros; track loads explicitly and verify at post_load_weights.
             self._loaded_weight_shards: set[str] = set()
             self._loaded_scale_shards: set[str] = set()
+        elif fp8_channel_quant:
+            total = ceil_div(used, self._ROW_ALIGN) * self._ROW_ALIGN
+            self.weight = nn.Parameter(
+                torch.zeros(total, hidden_size, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.weight_scale = nn.Parameter(
+                torch.ones(total, 1, dtype=torch.float32), requires_grad=False
+            )
+            self.weight_scale.weight_loader = self._load_channel_scale
+            self._loaded_weight_shards = set()
+            self._loaded_scale_shards = set()
         else:
             total = ceil_div(used, self._ROW_ALIGN) * self._ROW_ALIGN
             # Explicit bf16: default-dtype fp32 would cost +6 GiB/rank and starve the KV budget.
@@ -984,25 +1030,37 @@ class KimiKDAMergedProj(nn.Module):
             self.weight.data[used:].zero_()
         self.weight.weight_loader = self._load_weight
 
+    def _shard_rows(self, loaded: torch.Tensor, shard_id: str) -> torch.Tensor:
+        """This rank's rows of a checkpoint segment (``f_a`` is replicated)."""
+        rows = self._rows[shard_id]
+        if shard_id == "f_a":
+            return loaded
+        return loaded.narrow(0, self.tp_rank * rows, rows)
+
+    def _load_channel_scale(
+        self, param: nn.Parameter, loaded_scale: torch.Tensor, shard_id: str
+    ) -> None:
+        """Place a segment's per-output-channel scales at its row offset."""
+        src = self._shard_rows(loaded_scale.reshape(-1, 1), shard_id)
+        start = self._offsets[shard_id]
+        param.data[start : start + self._rows[shard_id]].copy_(src)
+        self._loaded_scale_shards.add(shard_id)
+
     def _load_weight(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: str
     ) -> None:
-        if self.fp8_block_quant and loaded_weight.dtype not in _FP8_WEIGHT_DTYPES:
+        fp8_resident = self.fp8_block_quant or self.fp8_channel_quant
+        if fp8_resident and loaded_weight.dtype not in _FP8_WEIGHT_DTYPES:
             raise TypeError(
                 "FP8-resident merged KDA projection cannot load a "
                 f"{loaded_weight.dtype} shard (bf16 refit of FP8 KDA weights "
                 "is unsupported)."
             )
         rows = self._rows[shard_id]
-        # f_a is replicated (full copy per rank); the rest are row-sharded.
-        src = (
-            loaded_weight
-            if shard_id == "f_a"
-            else loaded_weight.narrow(0, self.tp_rank * rows, rows)
-        )
+        src = self._shard_rows(loaded_weight, shard_id)
         start = self._offsets[shard_id]
         param.data[start : start + rows].copy_(src)
-        if self.fp8_block_quant:
+        if fp8_resident:
             self._loaded_weight_shards.add(shard_id)
 
     def _load_scale(
@@ -1032,7 +1090,7 @@ class KimiKDAMergedProj(nn.Module):
         The FP8 buffers are zero-initialized, so a dropped shard would
         otherwise silently project to zeros.
         """
-        if not self.fp8_block_quant:
+        if not (self.fp8_block_quant or self.fp8_channel_quant):
             return
         expected = set(self._rows)
         missing_weights = expected - self._loaded_weight_shards
@@ -1047,7 +1105,7 @@ class KimiKDAMergedProj(nn.Module):
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.fp8_block_quant:
+        if self.fp8_block_quant or self.fp8_channel_quant:
             # Fail fast instead of feeding FP8 codes to the bf16 GEMV:
             # FP8-resident KDA projections must run through the quantized
             # w8a8 branch of kimi3_qkvfab_projection (KimiLinearKDA
@@ -1144,6 +1202,12 @@ class KimiLinearKDA(nn.Module):
             fp8_pb_wo_route is not None
             and fp8_pb_wo_route(add_prefix("q_proj", prefix)) == "w8a8"
         )
+        # A per-layer FP8 attention override keeps the merged buffer FP8 with
+        # per-channel scales (w8a8 per-token x per-channel GEMM).
+        merged_fp8_channel = (
+            isinstance(quant_config, Mxfp4Config)
+            and quant_config.fp8_override_route(add_prefix("q_proj", prefix)) == "w8a8"
+        )
         self.qkvgb_proj = KimiKDAMergedProj(
             hidden_size=hidden,
             proj=proj,
@@ -1152,6 +1216,7 @@ class KimiLinearKDA(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
             fp8_block_quant=merged_fp8,
+            fp8_channel_quant=merged_fp8_channel,
         )
         # Decay-gate up projection (f_a and beta ride in the merged GEMM).
         self.f_b_proj = _col(self.head_dim, proj, "f_b_proj")
@@ -1229,7 +1294,16 @@ class KimiLinearKDA(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project every KDA hidden-state consumer."""
         proj_local = self.local_num_heads * self.head_dim
-        if isinstance(
+        if self.qkvgb_proj.fp8_channel_quant:
+            if attnres_partial_args is not None:
+                attnres_partial_dual(*attnres_partial_args)
+            output = w8a8_fp8_per_channel_mm(
+                hidden_states,
+                self.qkvgb_proj.weight.t(),
+                self.qkvgb_proj.weight_scale,
+                hidden_states.dtype,
+            )
+        elif isinstance(
             getattr(self.qkvgb_proj, "quant_method", None),
             Fp8LinearMethod,
         ):
@@ -1845,7 +1919,7 @@ class KimiLinearMoE(nn.Module):
                 else (None if mapping.attn.dp_size > 1 else mapping.moe.tp_ep_group)
             ),
             shared_parallel=shared_parallel,
-            quant_config=quant_config,
+            quant_config=_dense_mlp_quant_config(quant_config),
             prefix=add_prefix("shared_experts", prefix),
             # TP combines shared partials in the tail; DP keeps complete local outputs.
             reduce_results=False,
@@ -2667,7 +2741,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 tp_size=mapping.dense.tp_size,
                 tp_group=mapping.dense.tp_group,
                 shared_parallel=None,
-                quant_config=quant_config,
+                quant_config=_dense_mlp_quant_config(quant_config),
                 prefix=add_prefix("mlp", prefix),
                 is_shared_expert=False,
                 reduce_results=True,
@@ -2735,6 +2809,8 @@ class KimiLinearDecoderLayer(nn.Module):
         attn_partial: torch.Tensor,
         prefix_sum: torch.Tensor | None,
         combine: tuple | None = None,
+        *,
+        producer_direct: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """All-reduce the attention partial and accumulate the residual.
 
@@ -2743,7 +2819,11 @@ class KimiLinearDecoderLayer(nn.Module):
         B1 combine / plain reduce).
         """
         return self.k3_comm.attn_reduce(
-            attn_partial, prefix_sum, combine, mlp_wp=self._mlp_wp
+            attn_partial,
+            prefix_sum,
+            combine,
+            producer_direct=producer_direct,
+            mlp_wp=self._mlp_wp,
         )
 
     def capture_attnres(
@@ -2881,16 +2961,10 @@ class KimiLinearDecoderLayer(nn.Module):
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
         )
 
-        projection_out = self.k3_comm.acquire_prefill_projection_output(
+        # The collective depends on row count and topology in every forward mode.
+        projection_out = self.k3_comm.acquire_projection_output(
             h,
             self.self_attn.o_proj,
-            is_prefill=ctx.forward_mode.is_extend(),
-            sharded_moe_supported=(
-                self.is_moe_layer
-                and isinstance(self.block_sparse_moe, KimiLinearMoE)
-                and self.block_sparse_moe.native_latent_moe is None
-                and self.mapping.attn.dp_size == 1
-            ),
         )
         attn_partial = self.self_attn(
             positions=positions,
@@ -2901,8 +2975,14 @@ class KimiLinearDecoderLayer(nn.Module):
             projection_out=projection_out,
         )
         mixed = None
-        if projection_out is not None:
-            mixed = self.k3_comm.prefill_mix_for_moe(
+        if (
+            projection_out is not None
+            and self.is_moe_layer
+            and isinstance(self.block_sparse_moe, KimiLinearMoE)
+            and self.block_sparse_moe.native_latent_moe is None
+            and self.mapping.attn.dp_size == 1
+        ):
+            mixed = self.k3_comm.mix_for_moe(
                 attn_partial,
                 None if self.is_block_write_layer else prefix_sum,
                 block_residual,
@@ -2918,7 +2998,7 @@ class KimiLinearDecoderLayer(nn.Module):
         if mixed is not None:
             prefix_sum, h = mixed
         else:
-            prefix_sum, delta = self.k3_comm.prefill_reduce_for_attnres(
+            prefix_sum, delta = self.k3_comm.reduce_for_attnres(
                 attn_partial,
                 None if self.is_block_write_layer else prefix_sum,
                 producer_direct=projection_out is not None,
@@ -3070,6 +3150,9 @@ class KimiLinearDecoderLayer(nn.Module):
                 )
             )
         )
+        projection_out = self.k3_comm.acquire_projection_output(
+            h, self.self_attn.o_proj
+        )
         with self.attn_fork.scope(
             enable=(
                 get_is_capture_mode()
@@ -3110,15 +3193,21 @@ class KimiLinearDecoderLayer(nn.Module):
                 ctx=ctx,
                 comm_manager=self.comm_manager,
                 attnres_partial_args=attnres_partial_args,
-                projection_out=None,
+                projection_out=projection_out,
             )
             if not reduce_consumes_scratch:
                 prefix_sum, h_fused = self._reduce_attn_accumulate(
-                    attn_out, prefix_sum, combine=ar_combine
+                    attn_out,
+                    prefix_sum,
+                    combine=ar_combine,
+                    producer_direct=projection_out is not None,
                 )
         if reduce_consumes_scratch:
             prefix_sum, h_fused = self._reduce_attn_accumulate(
-                attn_out, prefix_sum, combine=ar_combine
+                attn_out,
+                prefix_sum,
+                combine=ar_combine,
+                producer_direct=projection_out is not None,
             )
         # --- mlp: AttnRes mixing -> norm -> FFN -> accumulate ---
         if h_fused is not None:
@@ -3639,6 +3728,13 @@ class KimiLinearForCausalLM(BaseCausalLM):
         fused_qkv_a private layout below.
         """
         weights = preprocess_fp8_pb_wo_weights(weights, self.quant_config)
+        weights = preprocess_mxfp4_checkpoint_weights(
+            weights,
+            self.quant_config,
+            dequantize_mxfp4_module=lambda module: bool(
+                _K3_DENSE_MLP_MODULE.search(module)
+            ),
+        )
         config = self.config
         stacked_params_mapping = [
             # KDA q/k/v/g/f_a/b stack into qkvgb_proj; MLA's g_proj falls
@@ -3679,6 +3775,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
             fused_weight_name = f"{base}.fused_qkv_a_proj_with_mqa.weight"
             if fused_weight_name not in params_dict:
                 return False  # KDA layers (g_proj) or unfused configs
+            if f"{base}.fused_qkv_a_proj_with_mqa.weight_scale_inv" not in params_dict:
+                return False  # bf16 or per-channel FP8: canonical fused path
             if not is_scale and loaded_weight.dtype not in _FP8_WEIGHT_DTYPES:
                 return False  # bf16 checkpoints keep the existing fused path
             entry = fp8_fused_pending.setdefault(base, {})
@@ -3891,7 +3989,9 @@ class KimiLinearForCausalLM(BaseCausalLM):
             elif isinstance(self_attn, KimiLinearKDA):
                 self_attn.fuse_conv_weights()
                 merged = self_attn.qkvgb_proj
-                if getattr(merged, "fp8_block_quant", False):
+                if merged.fp8_channel_quant:
+                    merged.verify_fp8_load_complete()
+                elif getattr(merged, "fp8_block_quant", False):
                     merged.verify_fp8_load_complete()
                     if isinstance(
                         getattr(merged, "quant_method", None),

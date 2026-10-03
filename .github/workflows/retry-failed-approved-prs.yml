@@ -32,10 +32,10 @@ jobs:
         with:
           script: |
             const workflows = [
-              "pr-test-nvidia.yml",
-              "pr-test-amd.yml",
+              "nvidia-b200-tests.yml",
+              "amd-tests.yml",
               "pr-test-nvidia-arm.yml",
-              "gb200-slurm-per-commit.yml",
+              "nvidia-gb200-tests.yml",
             ];
             const maxAttempts = 3;
             const maxRunAgeMs = 30 * 24 * 60 * 60 * 1000;

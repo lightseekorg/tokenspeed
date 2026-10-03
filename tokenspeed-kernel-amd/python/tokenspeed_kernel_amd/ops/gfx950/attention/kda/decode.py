@@ -268,7 +268,8 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
     mixed_qkv,
     conv_weights,
     conv_states,
-    raw_g,
+    f_a_out,
+    f_b_weight,
     beta_logits,
     output_gate,
     norm_weight,
@@ -281,13 +282,14 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
     dt_bias,
     H: gl.constexpr,
     D: gl.constexpr,
+    F_A: gl.constexpr,
     MIXED_ROW_STRIDE: gl.constexpr,
     CONV_WEIGHT_ROW_STRIDE: gl.constexpr,
     CONV_WEIGHT_COL_STRIDE: gl.constexpr,
     CONV_PAGE_STRIDE: gl.constexpr,
     CONV_CHANNEL_STRIDE: gl.constexpr,
     CONV_HISTORY_STRIDE: gl.constexpr,
-    GATE_ROW_STRIDE: gl.constexpr,
+    F_A_ROW_STRIDE: gl.constexpr,
     BETA_ROW_STRIDE: gl.constexpr,
     OUTPUT_GATE_ROW_STRIDE: gl.constexpr,
     STATE_PAGE_STRIDE: gl.constexpr,
@@ -297,7 +299,7 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
     NORM_EPS: gl.constexpr,
     PIPELINE_DEPTH: gl.constexpr,
 ):
-    """Fuse the K3 decode convolution, recurrence, and gated RMSNorm."""
+    """Fuse the K3 decode convolution, decay projection, recurrence, and norm."""
     head_idx = gl.program_id(0)
     sequence_idx = gl.program_id(1)
 
@@ -314,19 +316,48 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
     compact_layout: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
     output_offsets = gl.arange(0, D, layout=compact_layout)
     shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
-    # Pack Q, K, V, and decay into one row; keep output in a D-wide allocation.
+    # Pack Q, K, and V into one row (the decay lanes go unused); decay and
+    # output each move between layouts through their own D-wide allocation.
     shared_vectors = gl.allocate_shared_memory(gl.float32, [1, 4 * D], shared_layout)
+    decay_alloc = gl.allocate_shared_memory(gl.float32, [1, D], shared_layout)
     output_alloc = gl.allocate_shared_memory(gl.float32, [1, D], shared_layout)
+
+    # Loads retire in order, so every small load is issued ahead of the state
+    # panels, and the per-head parameters ahead of the padding-row checks.
+    # The decay projection takes this head's [D, F_A] slice of f_b_weight.
+    # Four lanes share a weight row, so the reduction leaves each thread only
+    # two decay channels to finish instead of the state tile's eight.
+    projection_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 8],
+        [16, 4],
+        [4, 1],
+        [1, 0],
+    )
+    gate_rows = gl.arange(0, D, layout=gl.SliceLayout(1, projection_layout))
+    f_a_offsets = gl.arange(0, F_A, layout=gl.SliceLayout(0, projection_layout))
+    f_b_tile = gl.load(
+        f_b_weight + (head_idx * D + gate_rows)[:, None] * F_A + f_a_offsets[None, :]
+    )
+    gate_bias = gl.load(dt_bias + head_idx * D + gate_rows)
+    a_value = gl.load(a_log + head_idx)
+    # Process Q/K/V together so they share convolution loads. The fourth
+    # (decay) lanes use Q as an in-bounds dummy address and skip state writes.
+    qkv_channel, slot_id, _, _ = _kda_qkvd_indices(head_idx, H, D)
+    qkv_weight_base = conv_weights + qkv_channel * CONV_WEIGHT_ROW_STRIDE
+    qkv_weight0 = gl.load(qkv_weight_base)
+    qkv_weight1 = gl.load(qkv_weight_base + CONV_WEIGHT_COL_STRIDE)
+    qkv_weight2 = gl.load(qkv_weight_base + 2 * CONV_WEIGHT_COL_STRIDE)
+    qkv_weight3 = gl.load(qkv_weight_base + 3 * CONV_WEIGHT_COL_STRIDE)
 
     begin = gl.load(cu_seqlens + sequence_idx)
     end = gl.load(cu_seqlens + sequence_idx + 1)
+    read_idx = gl.load(read_indices + sequence_idx)
+    write_idx = gl.load(write_indices + sequence_idx)
     output_base = (sequence_idx * H + head_idx) * D
     if begin == end:
         gl.store(output + output_base + output_offsets, 0.0)
         return
 
-    read_idx = gl.load(read_indices + sequence_idx)
-    write_idx = gl.load(write_indices + sequence_idx)
     valid_read = (read_idx >= 0) & (read_idx < NUM_SLOTS)
     if not valid_read:
         gl.store(output + output_base + output_offsets, 0.0)
@@ -339,6 +370,19 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
     read_base = read_page_offset * STATE_PAGE_STRIDE + head_idx * D * D
     panel_value_offsets = gl.arange(0, 16, layout=value_layout)
 
+    token_idx = begin
+    f_a_value = gl.load(f_a_out + token_idx * F_A_ROW_STRIDE + f_a_offsets)
+    beta_value = gl.load(beta_logits + token_idx * BETA_ROW_STRIDE + head_idx)
+    qkv_input = gl.load(mixed_qkv + token_idx * MIXED_ROW_STRIDE + qkv_channel)
+    qkv_read_base = (
+        conv_states
+        + read_page_offset * CONV_PAGE_STRIDE
+        + qkv_channel * CONV_CHANNEL_STRIDE
+    )
+    qkv_history0 = gl.load(qkv_read_base)
+    qkv_history1 = gl.load(qkv_read_base + CONV_HISTORY_STRIDE)
+    qkv_history2 = gl.load(qkv_read_base + 2 * CONV_HISTORY_STRIDE)
+
     # Keep PIPELINE_DEPTH state panels in flight to balance latency and VGPR use.
     # static_range permits the unrolled tuple window to change length.
     off_pipe = ()
@@ -349,42 +393,16 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
         off_pipe = off_pipe + (_off_pd,)
         raw_pipe = raw_pipe + (_raw_pd,)
 
-    token_idx = begin
-
-    # Process Q/K/V/decay together so Q/K/V share convolution loads.
-    # Decay lanes use Q as an in-bounds dummy address and skip state writes.
-    qkv_channel, slot_id, local_offset, is_decay = _kda_qkvd_indices(head_idx, H, D)
-
-    qkv_input = gl.load(mixed_qkv + token_idx * MIXED_ROW_STRIDE + qkv_channel).to(
-        gl.float32
+    qkv_value = _kda_conv_step(
+        qkv_history0.to(gl.float32),
+        qkv_history1.to(gl.float32),
+        qkv_history2.to(gl.float32),
+        qkv_input.to(gl.float32),
+        qkv_weight0,
+        qkv_weight1,
+        qkv_weight2,
+        qkv_weight3,
     )
-    qkv_history0 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + qkv_channel * CONV_CHANNEL_STRIDE
-    ).to(gl.float32)
-    qkv_history1 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + qkv_channel * CONV_CHANNEL_STRIDE
-        + CONV_HISTORY_STRIDE
-    ).to(gl.float32)
-    qkv_history2 = gl.load(
-        conv_states
-        + read_page_offset * CONV_PAGE_STRIDE
-        + qkv_channel * CONV_CHANNEL_STRIDE
-        + 2 * CONV_HISTORY_STRIDE
-    ).to(gl.float32)
-
-    qkv_weight_base = conv_weights + qkv_channel * CONV_WEIGHT_ROW_STRIDE
-    qkv_value = (
-        qkv_history0 * gl.load(qkv_weight_base)
-        + qkv_history1 * gl.load(qkv_weight_base + CONV_WEIGHT_COL_STRIDE)
-        + qkv_history2 * gl.load(qkv_weight_base + 2 * CONV_WEIGHT_COL_STRIDE)
-        + qkv_input * gl.load(qkv_weight_base + 3 * CONV_WEIGHT_COL_STRIDE)
-    ).to(gl.float32)
-    qkv_value *= 1.0 / (1.0 + gl.exp(-qkv_value))
-
     qkv_write_base = (
         conv_states
         + write_page_offset * CONV_PAGE_STRIDE
@@ -395,29 +413,25 @@ def gluon_kda_fused_paged_decode_vmajor_gfx950(
     gl.store(qkv_write_base + CONV_HISTORY_STRIDE, qkv_history2, mask=write_mask)
     gl.store(qkv_write_base + 2 * CONV_HISTORY_STRIDE, qkv_input, mask=write_mask)
 
-    decay_channel = head_idx * D + local_offset
-    gate_value = gl.load(raw_g + token_idx * GATE_ROW_STRIDE + decay_channel).to(
-        gl.float32
-    ) + gl.load(dt_bias + decay_channel).to(gl.float32)
-    a_value = gl.exp(gl.load(a_log + head_idx).to(gl.float32))
-    if HAS_LOWER_BOUND:
-        log_decay = LOWER_BOUND / (1.0 + gl.exp(-(a_value * gate_value)))
-    else:
-        softplus = gl.maximum(gate_value, 0.0) + gl.log(
-            1.0 + gl.exp(-gl.abs(gate_value))
-        )
-        log_decay = -a_value * softplus
-    decay_value = gl.exp(log_decay)
-    beta_value = gl.load(beta_logits + token_idx * BETA_ROW_STRIDE + head_idx).to(
-        gl.float32
+    # Round like the BF16 GEMM that prefill and verify use for the same gate.
+    raw_gate = gl.sum(
+        f_b_tile.to(gl.float32) * f_a_value.to(gl.float32)[None, :], axis=1
     )
-    beta_value = 1.0 / (1.0 + gl.exp(-beta_value))
+    raw_gate = raw_gate.to(f_a_out.dtype.element_ty).to(gl.float32)
+    decay_value = _kda_decay(
+        raw_gate,
+        gate_bias.to(gl.float32),
+        gl.exp(a_value.to(gl.float32)),
+        HAS_LOWER_BOUND,
+        LOWER_BOUND,
+    )
+    beta_value = 1.0 / (1.0 + gl.exp(-beta_value.to(gl.float32)))
 
-    combined = gl.where(is_decay, decay_value, qkv_value)
-    shared_vectors.index(0).store(combined)
+    shared_vectors.index(0).store(qkv_value)
+    decay_alloc.index(0).store(decay_value)
     q_value = shared_vectors.index(0).slice(0, D, dim=0).load(key_layout)
     k_value = shared_vectors.index(0).slice(D, D, dim=0).load(key_layout)
-    decay = shared_vectors.index(0).slice(3 * D, D, dim=0).load(key_layout)
+    decay = decay_alloc.index(0).load(key_layout)
     q_square = gl.sum(q_value * q_value, axis=0)
     k_square = gl.sum(k_value * k_value, axis=0)
     raw_key_query = gl.sum(q_value * k_value, axis=0)
@@ -1117,7 +1131,8 @@ def gluon_kda_fused_decode_gfx950(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     conv_states: torch.Tensor,
-    raw_g: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
     beta_logits: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -1142,8 +1157,12 @@ def gluon_kda_fused_decode_gfx950(
             shape ``[3 * num_heads * head_dim, 4]``.
         conv_states: Mutable BF16 convolution state pool with shape
             ``[pages, 3 * num_heads * head_dim, 3]``.
-        raw_g: Projected decay-gate values with shape
-            ``[batch, num_heads * head_dim]``.
+        f_a_out: BF16 low-rank decay-gate activations with shape
+            ``[batch, head_dim]``.
+        f_b_weight: Contiguous BF16 decay-gate up projection with shape
+            ``[num_heads * head_dim, head_dim]``. The kernel computes the raw
+            decay gate ``f_a_out @ f_b_weight.T`` with FP32 accumulation and
+            rounds it to BF16.
         beta_logits: Per-token, per-head update logits with shape
             ``[batch, num_heads]``.
         A_log: Per-head FP32 decay parameters with shape ``[num_heads]``.
@@ -1175,7 +1194,8 @@ def gluon_kda_fused_decode_gfx950(
         mixed_qkv,
         conv_weights,
         conv_states,
-        raw_g,
+        f_a_out,
+        f_b_weight,
         beta_logits,
         A_log,
         dt_bias,
@@ -1208,8 +1228,17 @@ def gluon_kda_fused_decode_gfx950(
         raise ValueError(
             "conv_states inner channel/history dimensions must be contiguous"
         )
-    if raw_g.shape != (tokens, projection_width) or raw_g.stride(1) != 1:
-        raise ValueError("raw_g must have shape [batch, heads * head_dim]")
+    if f_a_out.shape != (tokens, head_dim) or f_a_out.stride(1) != 1:
+        raise ValueError("f_a_out must have shape [batch, head_dim]")
+    if (
+        f_b_weight.shape != (projection_width, head_dim)
+        or f_b_weight.dtype != f_a_out.dtype
+        or not f_b_weight.is_contiguous()
+    ):
+        raise ValueError(
+            "f_b_weight must be contiguous [heads * head_dim, head_dim] in "
+            "f_a_out dtype"
+        )
     if beta_logits.shape != (tokens, num_heads) or beta_logits.stride(1) != 1:
         raise ValueError("beta_logits must have shape [batch, heads]")
     if output_gate.shape != (tokens, projection_width) or output_gate.stride(1) != 1:
@@ -1248,13 +1277,22 @@ def gluon_kda_fused_decode_gfx950(
         dtype=mixed_qkv.dtype,
         device=mixed_qkv.device,
     )
-    # Beyond one CTA per CU, reduce VGPR pressure to favor higher occupancy.
-    pipeline_depth = 1 if num_heads * tokens > _CDNA4_NUM_CUS else 8
+    # Up to one CTA per CU, keep every state panel in flight. Up to two, trade
+    # the panel window for occupancy. Beyond that the grid has enough CTAs to
+    # keep memory busy, and a four-panel window measured fastest.
+    programs = num_heads * tokens
+    if programs <= _CDNA4_NUM_CUS:
+        pipeline_depth = 8
+    elif programs <= 2 * _CDNA4_NUM_CUS:
+        pipeline_depth = 1
+    else:
+        pipeline_depth = 4
     gluon_kda_fused_paged_decode_vmajor_gfx950[(num_heads, tokens)](
         mixed_qkv,
         conv_weights,
         conv_states,
-        raw_g,
+        f_a_out,
+        f_b_weight,
         beta_logits,
         output_gate,
         norm_weight,
@@ -1267,13 +1305,14 @@ def gluon_kda_fused_decode_gfx950(
         dt_bias,
         H=num_heads,
         D=head_dim,
+        F_A=f_a_out.shape[1],
         MIXED_ROW_STRIDE=mixed_qkv.stride(0),
         CONV_WEIGHT_ROW_STRIDE=conv_weights.stride(0),
         CONV_WEIGHT_COL_STRIDE=conv_weights.stride(1),
         CONV_PAGE_STRIDE=conv_states.stride(0),
         CONV_CHANNEL_STRIDE=conv_states.stride(1),
         CONV_HISTORY_STRIDE=conv_states.stride(2),
-        GATE_ROW_STRIDE=raw_g.stride(0),
+        F_A_ROW_STRIDE=f_a_out.stride(0),
         BETA_ROW_STRIDE=beta_logits.stride(0),
         OUTPUT_GATE_ROW_STRIDE=output_gate.stride(0),
         STATE_PAGE_STRIDE=state_pool.stride(0),

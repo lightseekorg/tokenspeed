@@ -424,6 +424,100 @@ def gdn_decode_mtp(
         )
 
 
+def validate_replay_commit_args(
+    payload: torch.Tensor,
+    parameters: torch.Tensor,
+    *,
+    state_addresses: torch.Tensor,
+    state_row_strides: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    draft_token_num: int,
+    geometry: tuple[int, int, int, int],
+    state_dtype: torch.dtype,
+) -> bool:
+    """Validate a recurrent replay call against the shared ``[K | V | a | b]`` layout.
+
+    Arguments are those of ``gdn_replay_commit``, with ``geometry`` read as
+    ``(key_heads, value_heads, key_dim, value_dim)``.
+
+    Returns:
+        ``False`` when there is no layer or request to replay.
+    """
+    if payload.dim() != 3 or not payload.is_contiguous():
+        raise ValueError("replay payload must be contiguous [L, rows, width]")
+    num_layers = payload.shape[0]
+    batch_size = accepted_length.numel()
+    if num_layers == 0 or batch_size == 0:
+        return False
+    num_k_heads, num_v_heads, head_k_dim, head_v_dim = geometry
+    if draft_token_num <= 0:
+        raise ValueError("draft_token_num must be positive")
+    if num_v_heads <= 0 or num_k_heads <= 0 or num_v_heads % num_k_heads:
+        raise ValueError("num_v_heads must be divisible by num_k_heads")
+    if head_k_dim <= 0 or head_v_dim <= 0:
+        raise ValueError("replay head dimensions must be positive")
+    payload_width = (
+        num_k_heads * head_k_dim + num_v_heads * head_v_dim + 2 * num_v_heads
+    )
+    if payload.shape[1] < batch_size * draft_token_num:
+        raise ValueError("replay payload has insufficient token capacity")
+    if payload.shape[2] != payload_width:
+        raise ValueError(
+            f"replay payload width must be {payload_width}, got {payload.shape[2]}"
+        )
+    if parameters.shape != (num_layers, 2, num_v_heads):
+        raise ValueError(
+            "replay parameters must have shape "
+            f"{(num_layers, 2, num_v_heads)}, got {tuple(parameters.shape)}"
+        )
+    if parameters.dtype != torch.float32 or not parameters.is_contiguous():
+        raise ValueError("replay parameters must be contiguous torch.float32")
+    if state_addresses.shape != (num_layers,) or state_addresses.dtype != torch.uint64:
+        raise ValueError(
+            "state_addresses must be torch.uint64 with one entry per layer"
+        )
+    if (
+        state_row_strides.shape != (num_layers,)
+        or state_row_strides.dtype != torch.int64
+    ):
+        raise ValueError(
+            "state_row_strides must be torch.int64 with one entry per layer"
+        )
+    if read_indices.shape != (num_layers, batch_size):
+        raise ValueError(
+            "read_indices must have shape "
+            f"{(num_layers, batch_size)}, got {tuple(read_indices.shape)}"
+        )
+    if write_indices.shape != (num_layers, batch_size):
+        raise ValueError(
+            "write_indices must have shape "
+            f"{(num_layers, batch_size)}, got {tuple(write_indices.shape)}"
+        )
+    if read_indices.dtype != torch.int32 or write_indices.dtype != torch.int32:
+        raise ValueError("replay page tables must have dtype torch.int32")
+    if accepted_length.shape != (batch_size,) or accepted_length.dtype != torch.int32:
+        raise ValueError("accepted_length must be a one-dimensional torch.int32 tensor")
+    if state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(f"unsupported replay state dtype: {state_dtype}")
+    tensors = (
+        parameters,
+        state_addresses,
+        state_row_strides,
+        read_indices,
+        write_indices,
+        accepted_length,
+    )
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError(
+            "replay address, stride, index, and parameter tables must be contiguous"
+        )
+    if any(tensor.device != payload.device for tensor in tensors):
+        raise ValueError("all replay tensors must reside on the payload device")
+    return True
+
+
 def gdn_replay_commit(
     payload: torch.Tensor,
     parameters: torch.Tensor,
@@ -464,76 +558,22 @@ def gdn_replay_commit(
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
     """
-    if payload.dim() != 3 or not payload.is_contiguous():
-        raise ValueError("GDN layer replay payload must be contiguous [L, rows, width]")
+    if not validate_replay_commit_args(
+        payload,
+        parameters,
+        state_addresses=state_addresses,
+        state_row_strides=state_row_strides,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        accepted_length=accepted_length,
+        draft_token_num=draft_token_num,
+        geometry=geometry,
+        state_dtype=state_dtype,
+    ):
+        return
     num_layers = payload.shape[0]
     batch_size = accepted_length.numel()
-    if num_layers == 0 or batch_size == 0:
-        return
     num_k_heads, num_v_heads, head_k_dim, head_v_dim = geometry
-    if draft_token_num <= 0:
-        raise ValueError("draft_token_num must be positive")
-    if num_v_heads <= 0 or num_k_heads <= 0 or num_v_heads % num_k_heads:
-        raise ValueError("num_v_heads must be divisible by num_k_heads")
-    if head_k_dim <= 0 or head_v_dim <= 0:
-        raise ValueError("GDN replay head dimensions must be positive")
-    payload_width = (
-        num_k_heads * head_k_dim + num_v_heads * head_v_dim + 2 * num_v_heads
-    )
-    if payload.shape[1] < batch_size * draft_token_num:
-        raise ValueError("GDN replay payload has insufficient token capacity")
-    if payload.shape[2] != payload_width:
-        raise ValueError(
-            f"GDN replay payload width must be {payload_width}, got {payload.shape[2]}"
-        )
-    if parameters.shape != (num_layers, 2, num_v_heads):
-        raise ValueError(
-            "GDN replay parameters must have shape "
-            f"{(num_layers, 2, num_v_heads)}, got {tuple(parameters.shape)}"
-        )
-    if parameters.dtype != torch.float32 or not parameters.is_contiguous():
-        raise ValueError("GDN replay parameters must be contiguous torch.float32")
-    if state_addresses.shape != (num_layers,) or state_addresses.dtype != torch.uint64:
-        raise ValueError(
-            "state_addresses must be torch.uint64 with one entry per layer"
-        )
-    if (
-        state_row_strides.shape != (num_layers,)
-        or state_row_strides.dtype != torch.int64
-    ):
-        raise ValueError(
-            "state_row_strides must be torch.int64 with one entry per layer"
-        )
-    if read_indices.shape != (num_layers, batch_size):
-        raise ValueError(
-            "read_indices must have shape "
-            f"{(num_layers, batch_size)}, got {tuple(read_indices.shape)}"
-        )
-    if write_indices.shape != (num_layers, batch_size):
-        raise ValueError(
-            "write_indices must have shape "
-            f"{(num_layers, batch_size)}, got {tuple(write_indices.shape)}"
-        )
-    if read_indices.dtype != torch.int32 or write_indices.dtype != torch.int32:
-        raise ValueError("GDN replay page tables must have dtype torch.int32")
-    if accepted_length.shape != (batch_size,) or accepted_length.dtype != torch.int32:
-        raise ValueError("accepted_length must be a one-dimensional torch.int32 tensor")
-    if state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise ValueError(f"unsupported GDN replay state dtype: {state_dtype}")
-    tensors = (
-        parameters,
-        state_addresses,
-        state_row_strides,
-        read_indices,
-        write_indices,
-        accepted_length,
-    )
-    if any(not tensor.is_contiguous() for tensor in tensors):
-        raise ValueError(
-            "GDN replay address, stride, index, and parameter tables must be contiguous"
-        )
-    if any(tensor.device != payload.device for tensor in tensors):
-        raise ValueError("all GDN replay tensors must reside on the payload device")
 
     signature = _attention_format_signature(q=payload, k=payload, v=payload)
     kernel = select_kernel(
@@ -618,4 +658,5 @@ __all__ = [
     "gdn_decode_mtp",
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
+    "validate_replay_commit_args",
 ]

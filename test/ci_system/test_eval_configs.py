@@ -9,7 +9,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EVAL_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "eval"
 PERF_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "perf"
-STAGE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "run-pr-test-stage.yml"
+STAGE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "run-ci-task-matrix.yml"
 HF_HOME_ASSIGNMENT = "HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache"
 FORK_PR_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "

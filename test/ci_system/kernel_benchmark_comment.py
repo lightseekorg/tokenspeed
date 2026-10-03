@@ -287,10 +287,16 @@ def extract_report(archive: bytes) -> dict[str, Any] | None:
     return validate_report_bytes(raw)
 
 
-def _artifact_name(run_id: int, run_attempt: int) -> str:
-    return (
-        "pr-test-kernel-benchmark-amd-gfx950-amd-mi355-1gpu-bench-"
-        f"{run_id}-{run_attempt}"
+def _artifact_names(run_id: int, run_attempt: int) -> tuple[str, ...]:
+    prefix = "pr-test-kernel-benchmark-amd-gfx950-"
+    suffix = f"-{run_id}-{run_attempt}"
+    return tuple(
+        f"{prefix}{label}{suffix}"
+        for label in (
+            "amd-mi350-1gpu-bench",
+            "amd-mi35x-1gpu-test",
+            "amd-mi355-1gpu-bench",
+        )
     )
 
 
@@ -298,7 +304,7 @@ def download_report(
     client: Any, repository: str, run_id: int, run_attempt: int
 ) -> tuple[dict[str, Any] | None, bool]:
     """Return the report and whether its task artifact exists for this attempt."""
-    expected_name = _artifact_name(run_id, run_attempt)
+    expected_names = set(_artifact_names(run_id, run_attempt))
     matches: list[dict[str, Any]] = []
     for page in range(1, MAX_ARTIFACT_PAGES + 1):
         response = client.get_json(
@@ -307,7 +313,7 @@ def download_report(
         )
         artifacts = response["artifacts"]
         for artifact in artifacts:
-            if artifact.get("name") == expected_name:
+            if artifact.get("name") in expected_names:
                 matches.append(artifact)
         if len(artifacts) < PER_PAGE:
             break
