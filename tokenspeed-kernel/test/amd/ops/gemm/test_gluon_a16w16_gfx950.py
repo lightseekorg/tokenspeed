@@ -330,6 +330,12 @@ def test_prefill_routes_k3_shapes_with_busy_cus() -> None:
     assert supports_gluon_mm_a16w16_prefill_gfx950(4000, 6288, 7168)
     assert not supports_gluon_mm_a16w16_prefill_gfx950(3072, 6288, 7168)
     assert not supports_gluon_mm_a16w16_prefill_gfx950(1024, 6288, 7168)
+    # Past two rounds the long qkvfab reduction needs nearly every CU busy:
+    # 8192 tokens busy 78% over four rounds, 12288 tokens 94% over five. The
+    # short attention output reduction keeps the base rule.
+    assert not supports_gluon_mm_a16w16_prefill_gfx950(8192, 6288, 7168)
+    assert supports_gluon_mm_a16w16_prefill_gfx950(12288, 6288, 7168)
+    assert supports_gluon_mm_a16w16_prefill_gfx950(8192, 7168, 1536)
     # Unmeasured or losing shapes keep hipBLASLt at any token count.
     assert not supports_gluon_mm_a16w16_prefill_gfx950(4096, 4096, 4096)
     assert not supports_gluon_mm_a16w16_prefill_gfx950(7168, 2304, 1536)

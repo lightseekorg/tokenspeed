@@ -73,6 +73,11 @@ _PREFILL_SHAPES = frozenset(
 # work over all rounds; hipBLASLt picks among many block shapes and wins when
 # this kernel leaves more CUs idle.
 _PREFILL_MIN_CU_UTILIZATION = 0.77
+# Long reductions past two rounds favor hipBLASLt's larger blocks unless
+# nearly every CU stays busy.
+_PREFILL_LONG_K = 3584
+_PREFILL_LONG_K_MAX_ROUNDS = 2
+_PREFILL_LONG_K_MIN_CU_UTILIZATION = 0.92
 
 
 def _dense16_mm_launch_metadata(grid, kernel, args):
@@ -560,13 +565,21 @@ def supports_gluon_mm_a16w16_prefill_gfx950(M: int, N: int, K: int) -> bool:
 
     Returns:
         True for a measured K3 ``(N, K)`` whose workgroups keep the CUs at
-        least ``_PREFILL_MIN_CU_UTILIZATION`` busy.
+        least ``_PREFILL_MIN_CU_UTILIZATION`` busy, and for ``K`` of at least
+        ``_PREFILL_LONG_K``, run in at most ``_PREFILL_LONG_K_MAX_ROUNDS``
+        rounds or keep the CUs ``_PREFILL_LONG_K_MIN_CU_UTILIZATION`` busy.
     """
     if M < 1 or (N, K) not in _PREFILL_SHAPES:
         return False
     workgroups = triton.cdiv(M, LARGEM_BLOCK_M) * triton.cdiv(N, LARGEM_BLOCK_N)
     rounds = triton.cdiv(workgroups, LARGEM_NUM_CUS)
-    return workgroups >= _PREFILL_MIN_CU_UTILIZATION * rounds * LARGEM_NUM_CUS
+    if workgroups < _PREFILL_MIN_CU_UTILIZATION * rounds * LARGEM_NUM_CUS:
+        return False
+    return (
+        K < _PREFILL_LONG_K
+        or rounds <= _PREFILL_LONG_K_MAX_ROUNDS
+        or workgroups >= _PREFILL_LONG_K_MIN_CU_UTILIZATION * rounds * LARGEM_NUM_CUS
+    )
 
 
 def _resolve_largem_output(
