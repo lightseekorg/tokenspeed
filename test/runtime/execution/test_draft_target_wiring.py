@@ -143,23 +143,56 @@ def test_wire_eagle3_shares_embed_head_and_installs_capture_ids():
 
 
 class _ModuleSharingDraft:
+    """A draft taking the target's complete lm_head module (Qwen3.5 NextN).
+
+    Like the in-tree pipeline-capable drafts it keeps its checkpoint embedding
+    when the target shares none and reports what it drafts with.
+    """
+
     def __init__(self):
         self.shared = None
         self.legacy = None
+        self.embedding = "CHECKPOINT_EMBED"
 
     def set_embed_and_head_module(self, embed, lm_head):
         self.shared = (embed, lm_head)
+        if embed is not None:
+            self.embedding = embed
 
     def set_embed_and_head(self, embed, head):
         self.legacy = (embed, head)
 
+    def get_embed_and_head(self):
+        return self.embedding, "DRAFT_HEAD"
+
 
 class _WeightSharingDraft:
+    """A draft aliasing the target's weights (the K3 / V4 NextN contract)."""
+
     def __init__(self):
         self.shared = None
+        self.embedding = "CHECKPOINT_EMBED"
 
     def set_embed_and_head(self, embed, head):
         self.shared = (embed, head)
+        if embed is not None:
+            self.embedding = embed
+
+    def get_embed_and_head(self):
+        return self.embedding, "DRAFT_HEAD"
+
+
+class _EmbedDroppingDraft:
+    """A generic draft that aliases whatever it is handed, None included."""
+
+    def __init__(self):
+        self.embedding = "CHECKPOINT_EMBED"
+
+    def set_embed_and_head(self, embed, head):
+        self.embedding = embed
+
+    def get_embed_and_head(self):
+        return self.embedding, "DRAFT_HEAD"
 
 
 def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
@@ -211,9 +244,9 @@ def test_wire_off_pipeline_requires_both_target_weights():
 
 @pytest.mark.parametrize("drafter_cls", [Eagle, Mtp])
 def test_wire_skips_embed_head_sharing_before_the_last_pipeline_stage(drafter_cls):
-    # Stages before the last run no drafter: their draft modules are empty
-    # shells, and the target holds neither side there (embedding on the
-    # first stage, head on the last). Nothing is read or bound.
+    # Stages before the last run no drafter (a draft built there only
+    # produces context), and the target holds neither side there (embedding
+    # on the first stage, head on the last). Nothing is read or bound.
     target_model = SimpleNamespace(
         get_embed_and_head=mock.Mock(side_effect=AssertionError("read a shell"))
     )
@@ -227,28 +260,158 @@ def test_wire_skips_embed_head_sharing_before_the_last_pipeline_stage(drafter_cl
     target_model.get_embed_and_head.assert_not_called()
 
 
-def test_wire_last_pipeline_stage_shares_only_the_head():
-    # The last stage owns the target head but not its embedding, so the draft
-    # keeps the embedding shard its checkpoint provides (embed=None).
-    lm_head = object()
-    target = _target_runner(
+def _last_stage_target(lm_head):
+    """The last stage reports the target head but no embedding."""
+    return _target_runner(
         SimpleNamespace(
             lm_head=lm_head, get_embed_and_head=lambda: (None, "HEAD_WEIGHT")
         ),
         _mapping(has_pp=True, is_last_pp_rank=True),
     )
+
+
+def test_wire_last_pipeline_stage_shares_the_head_and_keeps_the_draft_embedding():
+    # The last stage owns the target head but not its embedding: the draft is
+    # handed embed=None, binds the head, and must still draft with the
+    # embedding its checkpoint ships.
+    lm_head = object()
     weight_draft, module_draft = _WeightSharingDraft(), _ModuleSharingDraft()
     with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
         factory.configure_draft_target(
-            _server_args("MTP"), target, _draft_runner(weight_draft)
+            _server_args("MTP"),
+            _last_stage_target(lm_head),
+            _draft_runner(weight_draft),
         )
     with mock.patch.object(factory, "get_drafter_impl", return_value=Mtp):
         factory.configure_draft_target(
-            _server_args("MTP"), target, _draft_runner(module_draft)
+            _server_args("MTP"),
+            _last_stage_target(lm_head),
+            _draft_runner(module_draft),
         )
     assert weight_draft.shared == (None, "HEAD_WEIGHT")
+    assert weight_draft.get_embed_and_head()[0] == "CHECKPOINT_EMBED"
     assert module_draft.shared == (None, lm_head)
+    assert module_draft.get_embed_and_head()[0] == "CHECKPOINT_EMBED"
     assert module_draft.legacy is None
+
+
+def test_wire_last_pipeline_stage_rejects_a_draft_that_dropped_its_embedding():
+    # A draft that aliases None into its embedding would fail at its first
+    # forward; the factory names it at construction instead.
+    with (
+        mock.patch.object(factory, "get_drafter_impl", return_value=Eagle),
+        pytest.raises(ValueError, match="_EmbedDroppingDraft has no embedding"),
+    ):
+        factory.configure_draft_target(
+            _server_args("MTP"),
+            _last_stage_target(object()),
+            _draft_runner(_EmbedDroppingDraft()),
+        )
+
+
+def test_wire_last_pipeline_stage_rejects_a_draft_that_reports_no_embedding():
+    # Without get_embed_and_head nothing proves the draft kept one.
+    with (
+        mock.patch.object(factory, "get_drafter_impl", return_value=Eagle),
+        pytest.raises(ValueError, match="report it from get_embed_and_head"),
+    ):
+        factory.configure_draft_target(
+            _server_args("MTP"),
+            _last_stage_target(object()),
+            _draft_runner(SimpleNamespace(set_embed_and_head=lambda e, h: None)),
+        )
+
+
+STAGE_GROUP = (4, 5, 6, 7)
+
+
+class _RecordingRunner:
+    """Stands in for ModelRunner: records what the factory asked to build."""
+
+    built: list[tuple[str, tuple[int, ...] | None, bool]] = []
+
+    def __init__(
+        self,
+        *,
+        model_config,
+        gpu_id,
+        server_args,
+        global_rank,
+        checkpoint_load_group,
+        is_draft_worker=False,
+    ):
+        del gpu_id, server_args, global_rank
+        self.model = model_config
+        _RecordingRunner.built.append(
+            (model_config, checkpoint_load_group, is_draft_worker)
+        )
+
+
+@pytest.mark.parametrize(
+    "spec_algo,has_pp,is_last_pp_rank,builds_draft",
+    [
+        ("MTP", False, True, True),
+        ("MTP", True, True, True),
+        # An MTP draft reads only the last stage's hidden states: the stages
+        # before it build nothing -- no weights, no memory, no wiring.
+        ("MTP", True, False, False),
+        # A DSPARK draft produces its context on every stage.
+        ("DSPARK", True, False, True),
+        ("DSPARK", True, True, True),
+    ],
+)
+def test_create_model_runner_builds_the_draft_where_it_is_used(
+    spec_algo, has_pp, is_last_pp_rank, builds_draft
+):
+    _RecordingRunner.built = []
+    configured = []
+    mapping = SimpleNamespace(
+        has_pp=has_pp,
+        is_last_pp_rank=is_last_pp_rank,
+        attn=SimpleNamespace(world_group=STAGE_GROUP),
+    )
+    server_args = SimpleNamespace(speculative_algorithm=spec_algo, mapping=mapping)
+    with (
+        mock.patch.object(factory, "ModelRunner", _RecordingRunner),
+        mock.patch.object(
+            factory, "configure_draft_target", lambda *args: configured.append(args)
+        ),
+    ):
+        target, draft = factory.create_model_runner(
+            server_args, "target", "draft", gpu_id=0, global_rank=5
+        )
+
+    # The target reads the whole checkpoint on every stage: world-wide loads.
+    assert _RecordingRunner.built[0] == ("target", None, False)
+    assert target.model == "target"
+    if not builds_draft:
+        assert draft is None
+        assert _RecordingRunner.built == [("target", None, False)]
+        assert configured == []
+        return
+    # A pipeline draft loads within its stage: other stages may build none.
+    assert _RecordingRunner.built[1] == (
+        "draft",
+        STAGE_GROUP if has_pp else None,
+        True,
+    )
+    assert draft.model == "draft"
+    assert configured == [(server_args, target, draft)]
+
+
+def test_pipeline_stage_builds_draft_follows_the_drafter_kind():
+    before_last = SimpleNamespace(has_pp=True, is_last_pp_rank=False)
+    last = SimpleNamespace(has_pp=True, is_last_pp_rank=True)
+    single = SimpleNamespace(has_pp=False, is_last_pp_rank=True)
+    for spec_algo in ("MTP", "EAGLE3", "DSPARK", "DFLASH", None):
+        assert factory.pipeline_stage_builds_draft(spec_algo, last)
+        assert factory.pipeline_stage_builds_draft(spec_algo, single)
+    # Block drafters produce context from every stage's taps; nothing else
+    # has work before the last stage.
+    assert factory.pipeline_stage_builds_draft("DSPARK", before_last)
+    assert factory.pipeline_stage_builds_draft("DFLASH", before_last)
+    assert not factory.pipeline_stage_builds_draft("MTP", before_last)
+    assert not factory.pipeline_stage_builds_draft("EAGLE3", before_last)
 
 
 def test_wire_eagle3_explicit_capture_ids_override_checkpoint():

@@ -245,8 +245,8 @@ same P pipeline. Nothing is produced across stages: the NextN layer reads
 the final hidden states the last stage already computes, so only the last P
 stage holds the NextN layer, its embedding shard and the draft cache, samples
 the first token, runs the draft extend over the completed prompt and the
-multi-step draft, and writes the candidate block. The other stages build an
-empty draft shell that reads no checkpoint shard. The NextN checkpoint must
+multi-step draft, and writes the candidate block. The other stages build and
+load no draft model at all. The NextN checkpoint must
 ship its `embed_tokens` weight: the last stage loads that TP shard because
 the target embedding lives on the first stage, while the draft head is
 shared from the target as usual. Ownership, bootstrap placement, transfer

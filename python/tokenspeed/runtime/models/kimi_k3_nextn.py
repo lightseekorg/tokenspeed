@@ -291,11 +291,10 @@ class KimiK3ModelNextN(nn.Module):
 class KimiK3NextNForCausalLM(nn.Module):
     """Text-side NextN causal LM (draft worker).
 
-    On a prefill chunk pipeline only the last stage samples, so it alone runs
-    the drafter: the other stages build an empty shell that loads nothing and
-    never forwards. The last stage keeps the checkpoint's ``embed_tokens``
-    shard (the target embedding lives on the first stage) and shares only
-    the target's head; off the pipeline both are shared from the target.
+    On a prefill chunk pipeline only the last stage builds and runs this draft
+    (``create_model_runner``). It keeps the checkpoint's ``embed_tokens`` shard
+    there, since the target embedding lives on the first stage, and shares
+    only the target's head; off the pipeline both are shared from the target.
     """
 
     def __init__(
@@ -309,15 +308,6 @@ class KimiK3NextNForCausalLM(nn.Module):
         self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
-        self.is_draft_stage: bool = not mapping.has_pp or mapping.is_last_pp_rank
-        # Pipeline stages read different checkpoint subsets (the shell reads
-        # none), so a distributed loader synchronizes within the stage only.
-        self.checkpoint_load_group = mapping.attn.tp_group if mapping.has_pp else None
-        self.model: KimiK3ModelNextN | None = None
-        self.lm_head: nn.Module | None = None
-        self.logits_processor: nn.Module | None = None
-        if not self.is_draft_stage:
-            return
         self.model = KimiK3ModelNextN(
             config, mapping, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -345,21 +335,19 @@ class KimiK3NextNForCausalLM(nn.Module):
             tp_group=mapping.attn.tp_group,
         )
 
-    def _require_draft_stage(self) -> KimiK3ModelNextN:
-        if self.model is None:
-            raise RuntimeError(
-                "Kimi-K3 NextN runs on the last pipeline stage only; stage "
-                f"{self.mapping.pp_rank} holds an empty draft shell."
-            )
-        return self.model
-
     def get_input_embeddings(self) -> nn.Module:
-        return self._require_draft_stage().embed_tokens
+        return self.model.embed_tokens
 
     def get_hot_token_id(self):
         return None
 
-    def set_embed_and_head(self, embed, head):
+    def get_embed_and_head(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """The embedding and head weights this draft drafts with."""
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(
+        self, embed: torch.Tensor | None, head: torch.Tensor
+    ) -> None:
         """Alias the target's weights; ``embed=None`` keeps the checkpoint shard.
 
         DeepSeek MTP convention: the draft shares the target's embedding and
@@ -368,10 +356,9 @@ class KimiK3NextNForCausalLM(nn.Module):
         so it passes ``embed=None`` and the draft keeps the shard it loaded
         (``load_weights`` rejects a pipeline checkpoint without one).
         """
-        model = self._require_draft_stage()
         if embed is not None:
-            del model.embed_tokens.weight
-            model.embed_tokens.weight = embed
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
         del self.lm_head.weight
         self.lm_head.weight = head
         torch.cuda.empty_cache()
@@ -384,7 +371,7 @@ class KimiK3NextNForCausalLM(nn.Module):
         positions: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states, _ = self._require_draft_stage()(
+        hidden_states, _ = self.model(
             input_ids,
             positions,
             ctx,
@@ -399,18 +386,11 @@ class KimiK3NextNForCausalLM(nn.Module):
         """Shard preselection for ``load_weights`` (see DefaultModelLoader).
 
         Accepts a superset of the checkpoint names ``load_weights`` consumes:
-        everything under the NextN layer prefix. A pipeline stage without the
-        draft accepts nothing, so its shards are neither read nor prefetched.
+        everything under the NextN layer prefix.
         """
-        if not self.is_draft_stage:
-            return False
         return name.startswith(f"model.layers.{self.config.num_hidden_layers}.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        if not self.is_draft_stage:
-            # An empty shell: do not consume the lazy checkpoint iterator or
-            # join its collectives, and there is nothing to post-process.
-            return
         config = self.config
         nextn_prefix = f"model.layers.{config.num_hidden_layers}."
         stacked_params_mapping = [
@@ -515,7 +495,7 @@ class KimiK3NextNForCausalLM(nn.Module):
         self.post_load_weights()
 
     def post_load_weights(self) -> None:
-        attn = self._require_draft_stage().decoder.self_attn
+        attn = self.model.decoder.self_attn
         attn.w_kc, attn.w_vc = _prepare_mla_kv_b_proj_weights(
             attn.kv_b_proj.weight, attn
         )
@@ -537,9 +517,6 @@ class KimiK3ForConditionalGenerationNextN(nn.Module):
         self.language_model = KimiK3NextNForCausalLM(
             text_config, mapping, quant_config, prefix=prefix
         )
-        # The loader reads the stage's checkpoint subset contract off the
-        # entry module; a pipeline stage without the draft holds a shell.
-        self.checkpoint_load_group = self.language_model.checkpoint_load_group
         self.logits_processor = self.language_model.logits_processor
         self.lm_head = self.language_model.lm_head
 
@@ -549,7 +526,10 @@ class KimiK3ForConditionalGenerationNextN(nn.Module):
     def get_hot_token_id(self):
         return None
 
-    def set_embed_and_head(self, embed, head):
+    def get_embed_and_head(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed: torch.Tensor | None, head: torch.Tensor):
         self.language_model.set_embed_and_head(embed, head)
 
     def forward(self, *args, **kwargs):

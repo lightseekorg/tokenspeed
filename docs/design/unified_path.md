@@ -935,12 +935,17 @@ algorithm. Per-forward capture hooks consume the established configuration.
 Embed/head sharing (`shares_target_embed_head`) follows the same stage
 ownership. `get_embed_and_head` returns None for a side the stage does not
 hold -- the embedding lives on the first stage, the head on the last -- and
-never dereferences an absent module. Stages before the last bind nothing:
-their draft module is an empty shell. The last stage shares only the head
-(`embed=None`); a NextN draft then keeps the `embed_tokens` shard its
-checkpoint ships for that layer, and its loader rejects a pipeline checkpoint
-without one. Off the pipeline both sides are shared and the draft's copies
-are dropped before the KV-cache budget is profiled, as before.
+never dereferences an absent module. Stages before the last bind nothing: a
+draft built there only produces context. The last stage binds what the target
+reports, which is the head alone (`embed=None`); a pipeline-capable draft then
+keeps the `embed_tokens` shard its checkpoint ships for that layer, its loader
+rejects a pipeline checkpoint without one, and the factory checks afterwards
+that the draft's own `get_embed_and_head` still reports an embedding -- a
+draft that aliases None into its embedding is named at construction rather
+than failing at its first forward (`BaseCausalLM.set_embed_and_head` refuses
+`embed=None` outright, since a generic draft keeps none). Off the pipeline
+both sides are shared and the draft's copies are dropped before the KV-cache
+budget is profiled, as before.
 
 Checkpoint tap labels remain zero-based completed-layer IDs. Prefix tap L is
 produced after L. AttnRes tap L is produced at L+1's entry by that layer's
@@ -982,13 +987,26 @@ carry them. The MTP shape is
   `--pipeline-parallel-size > 1` on the prefill role only (the chunk pipeline
   has no decode token feedback to draft against anywhere else); the dense ==
   attention TP / CP = 1 rule stays DSPARK's, whose draft reduces attention-TP
-  embedding partials over the dense TP group. The drafter is built on the last
-  stage alone, as before; with no producer configured that stage's target
-  forward captures `CaptureHiddenMode.FULL` for it. The in-tree K3 NextN draft
-  is stage-aware: stages before the last build an empty shell whose
-  `checkpoint_weight_name_filter` accepts nothing and whose `load_weights`
-  never touches the checkpoint iterator (`checkpoint_load_group` is the
-  stage's attention TP group, so distributed loaders synchronize per stage).
+  embedding partials over the dense TP group. Which stages build the draft
+  model at all is the factory's decision, not each model's
+  (`factory.pipeline_stage_builds_draft`): a block drafter is built on every
+  stage because it produces context from every stage's taps, while an MTP
+  draft is built on the last stage alone -- the other stages construct no
+  draft runner, load no draft shard and wire nothing, so `ModelExecutor` and
+  `configure_draft_target` see `draft_model_runner=None` there and the in-tree
+  K3 and V4 NextN drafts need no stage-aware shell. The skip is safe because
+  nothing in draft construction is a world collective the skipping stages
+  would have to join: the KV-budget all-reduce runs on every stage with or
+  without a draft, the DeepEP/MoE communicators a draft layer reuses are the
+  target's and scoped to the stage, and the only world-scoped step -- the
+  InstantTensor weight iterator, which synchronizes over `group.WORLD` when a
+  model declares no `checkpoint_load_group` -- is bounded by the factory,
+  which loads a pipeline draft with the stage's rank set
+  (`ModelRunner(checkpoint_load_group=...)`, surfaced as
+  `LoadConfig.checkpoint_load_group`; a model's own declaration, such as K3
+  DSpark's stage-subset filter group, still wins). With no producer configured
+  the last stage's target forward captures `CaptureHiddenMode.FULL` for its
+  drafter.
 * **Cache.** Nothing changes: `CacheLayerOwnership` already places the draft
   cache layers as the last stage's trailing producer step, the draft backend
   and pool exist only there, and the merged plan, bootstrap placement and

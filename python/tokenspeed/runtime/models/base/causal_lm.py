@@ -283,12 +283,16 @@ class BaseCausalLM(nn.Module):
         head = self.lm_head.weight if self.lm_head is not None else None
         return embed, head
 
-    def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
+    def set_embed_and_head(
+        self, embed: torch.Tensor | None, head: torch.Tensor
+    ) -> None:
         """Alias the target's embedding and LM-head weights into this draft.
 
-        A generic draft keeps no embedding of its own, so it cannot run on a
-        pipeline's last stage (where the target shares only its head); drafts
-        that ship an embedding override this and accept ``embed=None``.
+        ``embed=None`` means the target shares no embedding (a pipeline's last
+        stage: it lives on the first stage). A generic draft keeps no embedding
+        of its own, so it refuses; a pipeline-capable draft overrides this to
+        keep the ``embed_tokens`` its checkpoint ships, and the factory checks
+        ``get_embed_and_head`` still reports one afterwards.
         """
         if embed is None:
             raise ValueError(

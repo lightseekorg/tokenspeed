@@ -255,9 +255,9 @@ only stage that samples; it writes the candidate block the remote decode
 carries to the decode server, which verifies it as usual. `DSPARK` also
 produces its draft context across stages and keeps requiring attention CP = 1
 and matching dense/attention TP groups. An `MTP` (NextN) draft reads only the
-last stage's final hidden states: the other stages build an empty draft
-shell, and the NextN checkpoint must ship its `embed_tokens` weight because
-the target embedding lives on the first stage. `DFLASH` and `EAGLE3` read
+last stage's final hidden states: the other stages build and load no draft
+model at all, and the NextN checkpoint must ship its `embed_tokens` weight
+because the target embedding lives on the first stage. `DFLASH` and `EAGLE3` read
 target taps from several stages and are rejected on a pipeline. Layerwise
 transfer (`--disaggregation-layerwise-interval`) works with both accepted
 algorithms on every stage.

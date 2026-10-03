@@ -84,9 +84,23 @@ class ModelRunner:
         server_args: ServerArgs,
         gpu_id: int,
         global_rank: int,
+        *,
+        checkpoint_load_group: tuple[int, ...] | None,
         is_draft_worker: bool = False,
     ):
-        """Initialize ModelRunner with injected dependencies."""
+        """Initialize ModelRunner with injected dependencies.
+
+        Args:
+            model_config: The model to build and load.
+            server_args: Parsed server arguments.
+            gpu_id: Local device index.
+            global_rank: This worker's global rank.
+            checkpoint_load_group: Global ranks that load this model together,
+                for a distributed loader's collectives; None means every rank.
+                A pipeline stage's draft names its stage, since the other
+                stages may not build it (``create_model_runner``).
+            is_draft_worker: Whether this is the speculative draft model.
+        """
         # Store configuration
         self.model_config = model_config
         self.server_args = server_args
@@ -97,6 +111,7 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_draft_worker = is_draft_worker
+        self.checkpoint_load_group = checkpoint_load_group
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
@@ -150,6 +165,7 @@ class ModelRunner:
             device=self.device,
             gpu_id=self.gpu_id,
             memory_saver_adapter=self.memory_saver_adapter,
+            checkpoint_load_group=self.checkpoint_load_group,
         )
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
             self.model, "spec_step_idx"
