@@ -65,6 +65,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroup
 from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
     local_pages,
     local_pages_by_group,
+    owned_local_pages,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -234,6 +235,17 @@ class LocalPagesTest(unittest.TestCase):
             ).tolist(),
             [2, 2, 1],
         )
+
+    def test_owner_mask_pairs_owned_pages_with_their_input_positions(self):
+        owned, local = owned_local_pages(
+            [0, 3, 3, 0, 1, 4], shard_count=2, rank=0, virtual_block_count=9
+        )
+        self.assertEqual(owned.tolist(), [False, True, True, False, True, False])
+        self.assertEqual(local.tolist(), [2, 2, 1])
+        owned, local = owned_local_pages(
+            [], shard_count=2, rank=0, virtual_block_count=9
+        )
+        self.assertEqual((owned.tolist(), local.tolist()), ([], []))
 
     def test_out_of_range_ids_and_ranks_are_rejected(self):
         with self.assertRaises(IndexError):
