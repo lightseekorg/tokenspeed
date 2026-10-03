@@ -722,6 +722,42 @@ def test_layerwise_final_preserves_speculative_candidates() -> None:
     assert metadata_calls == [(9, 42, [7, 8])]
 
 
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_every_pipeline_stage_publishes_the_broadcast_candidates(pp_rank) -> None:
+    """On a prefill pipeline only the last stage drafts, but the event loop
+    broadcasts its sampled token and candidate window to every stage before
+    commit, so each stage's remote-decode op carries the same bootstrap
+    payload. The executor publishes it unchanged, and the manager reports it
+    under the stage-major prefill rank Decode counts completions by."""
+    import tokenspeed.runtime.pd.prefill_executor as prefill_module
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    metadata_calls = []
+    executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor._layerwise_enabled = True
+    executor.senders = {"request-0": _FinalLayerwiseSender([])}
+    executor.kv_manager = SimpleNamespace(
+        set_prefill_metadata=lambda *args: metadata_calls.append(args)
+    )
+    executor._cache_decode(_op(spec_candidate_ids=[[7, 8]]))
+    assert metadata_calls == [(9, 42, [7, 8])]
+
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.topology = PDParallelTopology(
+        tp_size=2,
+        tp_rank=1,
+        cp_size=1,
+        cp_rank=0,
+        dp_size=1,
+        dp_rank=0,
+        world_size=4,
+        global_rank=pp_rank * 2 + 1,
+        pp_size=2,
+        pp_rank=pp_rank,
+    )
+    assert manager._status_prefill_rank == pp_rank * 2 + 1
+
+
 def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
     source_segment = make_segment(
         "layer.0.k",
