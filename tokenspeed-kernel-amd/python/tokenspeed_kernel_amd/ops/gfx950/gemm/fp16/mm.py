@@ -1962,17 +1962,50 @@ def launch_gluon_mm_a16w16_decode_gfx950(
     return C
 
 
-def gluon_mm_a16w16_add3_m16_gfx950(
+def supports_gluon_mm_a16w16_decode_add3_gfx950(M: int, N: int, K: int) -> bool:
+    """Whether the decode GEMM can fuse two addends into its epilogue here.
+
+    The addends are added once the full K reduction is in registers, so only
+    measured decode configs without split-K qualify.
+    """
+    config = _choose_decode_config(M, N, K)
+    return config is not None and config[6] == 1
+
+
+def launch_gluon_mm_a16w16_decode_add3_gfx950(
     A: torch.Tensor,
     B: torch.Tensor,
     addend_a: torch.Tensor,
     addend_b: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute ``A @ B.T + addend_a + addend_b`` for the tuned M=16 tile."""
-    if A.shape != (16, 3584) or B.shape != (7168, 3584):
+    """Compute decode-sized ``A @ B.T + addend_a + addend_b`` in one launch.
+
+    Uses the decode GEMM's measured tile for ``M`` and adds both addends to
+    the FP32 accumulator before the single BF16 rounding.
+
+    Args:
+        A: Contiguous fp16/bf16 activation ``[M, K]``.
+        B: Contiguous weight ``[N, K]`` with ``A``'s dtype.
+        addend_a: ``[M, N]`` addend with ``A``'s dtype and unit inner stride;
+            its row stride is free, so a column slice is accepted.
+        addend_b: Second addend with the same contract as ``addend_a``.
+
+    Returns:
+        ``[M, N]`` sum in ``A``'s dtype.
+    """
+    if A.ndim != 2 or B.ndim != 2:
         raise ValueError(
-            "M=16 dense16 add3 expects A [16, 3584] and B [7168, 3584], "
-            f"got A={tuple(A.shape)} B={tuple(B.shape)}"
+            f"decode dense16 add3 expects 2D inputs, got {A.ndim=} {B.ndim=}"
+        )
+    if A.dtype not in _SUPPORTED_DTYPES or not A.is_cuda:
+        raise ValueError("decode dense16 add3 requires CUDA/HIP fp16 or bf16 tensors")
+    if not A.is_contiguous() or not B.is_contiguous():
+        raise ValueError("decode dense16 add3 requires contiguous GEMM inputs")
+    M, K = A.shape
+    N, K_b = B.shape
+    if K_b != K:
+        raise ValueError(
+            f"decode dense16 add3 K mismatch: A={tuple(A.shape)} B={tuple(B.shape)}"
         )
     for name, tensor in (
         ("B", B),
@@ -1980,23 +2013,27 @@ def gluon_mm_a16w16_add3_m16_gfx950(
         ("addend_b", addend_b),
     ):
         if tensor.device != A.device or tensor.dtype != A.dtype:
-            raise ValueError(f"M=16 dense16 add3 {name} must match A dtype and device")
-    if A.dtype not in _SUPPORTED_DTYPES or not A.is_cuda:
-        raise ValueError("M=16 dense16 add3 requires CUDA/HIP fp16 or bf16 tensors")
-    if not A.is_contiguous() or not B.is_contiguous():
-        raise ValueError("M=16 dense16 add3 requires contiguous GEMM inputs")
-    for name, tensor in (("addend_a", addend_a), ("addend_b", addend_b)):
-        if tensor.shape != (16, 7168) or tensor.stride(1) != 1:
             raise ValueError(
-                f"M=16 dense16 add3 {name} must have shape [16, 7168] "
+                f"decode dense16 add3 {name} must match A dtype and device"
+            )
+    for name, tensor in (("addend_a", addend_a), ("addend_b", addend_b)):
+        if tensor.shape != (M, N) or tensor.stride(1) != 1:
+            raise ValueError(
+                f"decode dense16 add3 {name} must have shape [{M}, {N}] "
                 "and unit inner stride"
             )
+    if not supports_gluon_mm_a16w16_decode_add3_gfx950(M, N, K):
+        raise ValueError(
+            f"decode dense16 add3 has no measured single-pass config for "
+            f"M={M}, N={N}, K={K}"
+        )
 
-    C = A.new_empty((16, 7168))
-    block_m, block_n, block_k = 16, 32, 128
-    warps_m, warps_n, num_buffers = 2, 2, 3
-    grid = (triton.cdiv(7168, block_n),)
-    gluon_mm_a16w16_medium_gfx950[grid](
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers, _, num_xcds = (
+        _choose_decode_config(M, N, K)
+    )
+    C = A.new_empty((M, N))
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    gluon_mm_a16w16_medium_gfx950[(num_tiles,)](
         A,
         B,
         C,
@@ -2004,9 +2041,9 @@ def gluon_mm_a16w16_add3_m16_gfx950(
         addend_b,
         C,
         C,
-        16,
-        7168,
-        3584,
+        M,
+        N,
+        K,
         A.stride(0),
         A.stride(1),
         B.stride(1),
@@ -2023,10 +2060,10 @@ def gluon_mm_a16w16_add3_m16_gfx950(
         WARPS_M=warps_m,
         WARPS_N=warps_n,
         NUM_BUFFERS=num_buffers,
-        GROUP_SIZE_M=1,
+        GROUP_SIZE_M=GROUP_SIZE_M,
         ADD3=True,
         SPLIT_K=1,
-        NUM_XCDS=1,
+        NUM_XCDS=num_xcds,
         num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )

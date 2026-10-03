@@ -47,10 +47,12 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     gluon_mm_a16w16_gfx950,
     gluon_mm_a16w16_medium_gfx950,
     launch_gluon_bmm_a16w16_gfx950,
+    launch_gluon_mm_a16w16_decode_add3_gfx950,
     launch_gluon_mm_a16w16_decode_gfx950,
     launch_gluon_mm_a16w16_medium_gfx950,
     launch_gluon_mm_a16w16_splitk_gfx950,
     launch_gluon_mm_a16w16_warp_gfx950,
+    supports_gluon_mm_a16w16_decode_add3_gfx950,
     supports_gluon_mm_a16w16_decode_gfx950,
 )
 
@@ -456,4 +458,51 @@ def test_decode_gemm_row_count_does_not_recompile() -> None:
         run(rows)
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
+            run(rows)
+
+
+@pytest.mark.parametrize("m", [2, 4, 7, 8, 16, 24, 32])
+def test_decode_add3_matches_single_rounding_reference(m: int) -> None:
+    torch.manual_seed(0)
+    n, k = 7168, 3584
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    addend_a = torch.randn((m, n), device="cuda", dtype=torch.bfloat16)
+    # A column slice of a wider lane, as the K3 shared-expert output arrives.
+    lane = torch.randn((m, n + 3584), device="cuda", dtype=torch.bfloat16)
+    addend_b = lane[:, 3584:]
+
+    out = launch_gluon_mm_a16w16_decode_add3_gfx950(a, b, addend_a, addend_b)
+
+    expected = (a.float() @ b.float().T + addend_a.float() + addend_b.float()).to(
+        torch.bfloat16
+    )
+    torch.testing.assert_close(out, expected, atol=1e-4, rtol=_RTOL)
+
+
+def test_decode_add3_supports_only_single_pass_buckets() -> None:
+    assert supports_gluon_mm_a16w16_decode_add3_gfx950(2, 7168, 3584)
+    assert supports_gluon_mm_a16w16_decode_add3_gfx950(32, 7168, 3584)
+    # lat_up has no M=64 bucket; split-K shapes cannot fuse the addends.
+    assert not supports_gluon_mm_a16w16_decode_add3_gfx950(33, 7168, 3584)
+    assert not supports_gluon_mm_a16w16_decode_add3_gfx950(16, 3584, 7168)
+    assert not supports_gluon_mm_a16w16_decode_add3_gfx950(1, 7168, 3584)
+
+
+def test_decode_add3_row_count_does_not_recompile() -> None:
+    torch.manual_seed(0)
+    n, k = 7168, 3584
+    a = torch.randn((32, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    addend = torch.randn((32, n), device="cuda", dtype=torch.bfloat16)
+
+    def run(rows):
+        launch_gluon_mm_a16w16_decode_add3_gfx950(
+            a[:rows], b, addend[:rows], addend[:rows]
+        )
+
+    for rows in (3, 4, 5, 8, 9, 16, 17, 32):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (2, 6, 7, 12, 14, 20, 27, 31):
             run(rows)

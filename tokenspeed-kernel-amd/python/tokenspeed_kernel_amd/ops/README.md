@@ -71,6 +71,11 @@ decode batches.
   (`4, 8, 16, 32, 64`) with a measured config in `_DECODE_CONFIGS`; each
   entry beat `torch.mm` (hipBLASLt) by at least 4% in cold-cache sweeps at
   Kimi K3 TP8 shapes.
+- `launch_gluon_mm_a16w16_decode_add3_gfx950` computes `A @ B.T + X + Y` in
+  one launch, adding both BF16 addends to the FP32 accumulator before the
+  single rounding. It reuses the decode tile for `M` and accepts only buckets
+  without split-K (Kimi K3 latent up-projection, `2 <= M <= 32`), replacing a
+  separate add kernel.
 - Other shapes retain the default PyTorch path. The small- and medium-M
   kernels remain available for direct use but are not registered for
   automatic selection.
