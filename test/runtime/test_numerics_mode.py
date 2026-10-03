@@ -92,6 +92,16 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "trainer-aligned.*--moe-backend"):
             ServerArgs(model="x", numerics="trainer-aligned", moe_backend="triton")
 
+    def test_bitwise_envelopes_fold_the_per_request_sampling_stream(self):
+        self.assertEqual(ServerArgs(model="x").sampling_stream, "batch")
+        for numerics in ("rl-bitwise", "trainer-aligned"):
+            args = ServerArgs(model="x", numerics=numerics)
+            self.assertEqual(args.sampling_stream, "per-request", numerics)
+        args = ServerArgs(model="x", sampling_stream="per-request")
+        self.assertEqual(args.sampling_stream, "per-request")
+        with self.assertRaisesRegex(ValueError, "--sampling-stream"):
+            ServerArgs(model="x", sampling_stream="philox")
+
     def test_bitwise_envelopes_cover_every_pinning_envelope(self):
         from tokenspeed.runtime.configs.numerics import (
             BITWISE_ENVELOPES,

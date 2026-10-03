@@ -49,6 +49,12 @@ BITWISE_ENVELOPES = frozenset({"rl-bitwise", "trainer-aligned"})
 # FlashInfer backends overlay one on their pool route under rl-bitwise.
 RL_BITWISE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "greedy"})
 
+# ``--sampling-stream``: which random stream the FlashInfer backends' sampled
+# (non-greedy) rows draw from. ``batch`` is flashinfer's Philox stream keyed by
+# the batch row; ``per-request`` is the Gumbel-max pool route keyed by
+# (request seed, position), which the bitwise envelopes require.
+SAMPLING_STREAMS = ("batch", "per-request")
+
 
 def require_verified_numerics(
     numerics: str,
@@ -97,5 +103,6 @@ __all__ = [
     "BITWISE_ENVELOPES",
     "NUMERICS_ENVELOPES",
     "RL_BITWISE_SAMPLING_BACKENDS",
+    "SAMPLING_STREAMS",
     "require_verified_numerics",
 ]

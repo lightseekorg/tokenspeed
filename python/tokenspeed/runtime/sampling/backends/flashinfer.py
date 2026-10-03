@@ -40,10 +40,13 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
 )
-from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
+from tokenspeed_kernel.ops.sampling.triton import (
+    gather_and_expand_scalars,
+    gumbel_sample_from_pools_generic,
+)
 from tokenspeed_kernel.platform import pdl_enabled
 
-from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES, SAMPLING_STREAMS
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
@@ -156,6 +159,11 @@ class FlashInferSamplingBackend(SamplingBackend):
     keeping the hot path to 2 kernels. Requests asking for min_p, penalties,
     or logit_bias are silently ignored; use `flashinfer_full` if any of those
     matter for the workload.
+
+    ``config.sampling_stream == "per-request"`` swaps the single-step kernel
+    for the Gumbel-max pool route (``_sample_per_request``); verification
+    keeps the chain kernels, whose coins already come from per-slot
+    generators.
     """
 
     _HAS_POOL_STATE = True
@@ -164,6 +172,11 @@ class FlashInferSamplingBackend(SamplingBackend):
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         super().__init__(config)
+        if config.sampling_stream not in SAMPLING_STREAMS:
+            raise ValueError(
+                f"sampling_stream must be one of {list(SAMPLING_STREAMS)}, got "
+                f"{config.sampling_stream!r}"
+            )
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
@@ -350,6 +363,20 @@ class FlashInferSamplingBackend(SamplingBackend):
                 device=config.device,
             )
 
+        # The per-request stream route (``_sample_per_request``): its kernel
+        # takes int32 pool indices and writes into a caller-owned buffer, and
+        # a zero offsets pool stands in when the step carries no cache
+        # lengths (capture warm-up).
+        self._per_request_out = torch.empty(
+            (max_pad_bs,), dtype=torch.int32, device=config.device
+        )
+        self._per_request_pool_indices = torch.empty(
+            (max_pad_bs,), dtype=torch.int32, device=config.device
+        )
+        self._zero_offsets_pool = torch.zeros(
+            (config.max_req_pool_size + 1,), dtype=torch.int64, device=config.device
+        )
+
     def _gather_draft_probs(
         self,
         draft_probs: torch.Tensor,
@@ -384,6 +411,57 @@ class FlashInferSamplingBackend(SamplingBackend):
         out = buf[:bs]
         torch.index_select(draft_probs, 0, pool_indices, out=out)
         return out
+
+    def _sample_per_request(
+        self,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        *,
+        min_p_pool: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Sample every row from its request's own Gumbel-max stream.
+
+        flashinfer's ``*_sampling_from_probs`` kernels read one seed and
+        offset and seed curand with the batch row, so a request's draw moves
+        with its co-batch. The pool kernel keys the stream by
+        ``(seed_pool[pool_idx], offsets_pool[pool_idx])`` — the request's seed
+        and cache length — so the draw is the same alone and in any batch
+        (``--sampling-stream per-request``). Temperature, top-k, top-p and
+        min-p are read from the pool rows; finite top-k is capped at the
+        kernel's 128 candidates.
+
+        Args:
+            logits: ``[bs, vocab]`` logits (penalties already applied).
+            sampling_info: Batch info carrying the pool indices and the
+                pool-indexed cache lengths.
+            min_p_pool: Pool-indexed min-p values, or None for backends
+                without min-p.
+
+        Returns:
+            ``[bs]`` int32 token ids.
+        """
+        bs = logits.shape[0]
+        pool_indices = sampling_info.req_pool_indices[:bs]
+        if pool_indices.dtype != torch.int32:
+            pool_indices_i32 = self._per_request_pool_indices[:bs]
+            pool_indices_i32.copy_(pool_indices, non_blocking=True)
+            pool_indices = pool_indices_i32
+        offsets_pool = (
+            sampling_info.valid_cache_lengths
+            if sampling_info.valid_cache_lengths is not None
+            else self._zero_offsets_pool
+        )
+        return gumbel_sample_from_pools_generic(
+            logits,
+            pool_indices,
+            self._temperature_pool,
+            self._top_k_pool,
+            self._top_p_pool,
+            self._seed_pool,
+            offsets_pool,
+            self._per_request_out[:bs],
+            min_p_pool=min_p_pool,
+        )
 
     def _prepare_step_hook(
         self,
@@ -450,19 +528,24 @@ class FlashInferSamplingBackend(SamplingBackend):
             offsets=sampling_info.valid_cache_lengths,
         )
 
-        probs = softmax(
-            logits,
-            temperature=temperatures.view(-1, 1),
-        )
-        batch_next_token_ids = top_k_top_p_sampling_from_probs(
-            probs,
-            top_ks,
-            top_ps,
-            filter_apply_order="joint",
-            seed=seeds,
-            offset=offsets,
-            deterministic=True,
-        )
+        if self.config.sampling_stream == "per-request":
+            batch_next_token_ids = self._sample_per_request(
+                logits, sampling_info, min_p_pool=None
+            )
+        else:
+            probs = softmax(
+                logits,
+                temperature=temperatures.view(-1, 1),
+            )
+            batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                probs,
+                top_ks,
+                top_ps,
+                filter_apply_order="joint",
+                seed=seeds,
+                offset=offsets,
+                deterministic=True,
+            )
         if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
             batch_next_token_ids = canonical_greedy_tokens(
                 logits, top_ks, batch_next_token_ids

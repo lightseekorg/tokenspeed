@@ -65,25 +65,36 @@ numerics.mode                       --numerics {auto, rl-bitwise,
 │                                   none; the NVLS multimem in-switch
 │                                   reduction is the faster future citizen of
 │                                   this slot)
-├── sampling.deterministic          per-request Philox (seed=crc32(rid),
-│                                   offset=position) is run- and
-│                                   batch-invariant by construction; greedy
-│                                   rows additionally take the canonical
-│                                   lowest-index argmax, in sampling and in
-│                                   speculative verify (exact-match chain),
-│                                   because EXACT logit ties happen in
-│                                   practice and the pool route's stochastic
-│                                   kernels resolve them in batch-shape-
-│                                   dependent reduction order; backends
-│                                   without the overlay are refused. Under
-│                                   --enable-speculative-sampling the draft
-│                                   proposal is one more per-request stream:
-│                                   Gumbel-max noise keyed by the request's
-│                                   seed and a salted (position, step) offset
-│                                   (never the batch row), the verify coins
-│                                   stay per-slot, and greedy rows keep the
-│                                   canonical argmax with a one-hot q, so
-│                                   their verify is unchanged
+├── sampling.deterministic          sampling_stream=per-request: sampled rows
+│                                   draw from the Gumbel-max pool kernels,
+│                                   whose stream is keyed by the request's
+│                                   seed (crc32(rid)) and position (its cache
+│                                   length) and nothing else, so it is run-
+│                                   and batch-invariant by construction.
+│                                   flashinfer's *_sampling_from_probs
+│                                   kernels are NOT: they read one seed and
+│                                   offset for the whole batch and seed
+│                                   curand with the batch row, so a request's
+│                                   draw moves with its co-batch (T>0
+│                                   'packed' fails while 'rerun' passes).
+│                                   Verify keeps flashinfer's chain kernels,
+│                                   whose coins come from per-slot
+│                                   generators. Greedy rows additionally take
+│                                   the canonical lowest-index argmax, in
+│                                   sampling and in speculative verify
+│                                   (exact-match chain), because EXACT logit
+│                                   ties happen in practice and the pool
+│                                   route's stochastic kernels resolve them
+│                                   in batch-shape-dependent reduction order;
+│                                   backends without the overlay are refused.
+│                                   Under --enable-speculative-sampling the
+│                                   draft proposal is one more per-request
+│                                   stream: Gumbel-max noise keyed by the
+│                                   request's seed and a salted (position,
+│                                   step) offset (never the batch row), the
+│                                   verify coins stay per-slot, and greedy
+│                                   rows keep the canonical argmax with a
+│                                   one-hot q, so their verify is unchanged
 ├── invariance.batch                per-row-independent reductions
 │   ├── no split-KV attention       decode kernels whose split count scales
 │   │                               with batch/SM occupancy are excluded by

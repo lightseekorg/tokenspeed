@@ -57,6 +57,7 @@ def _config(logprobs: bool) -> SamplingBackendConfig:
         device="cuda",
         enable_output_logprobs=logprobs,
         enable_speculative_sampling=False,
+        sampling_stream="batch",
     )
 
 

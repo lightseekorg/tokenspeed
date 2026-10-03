@@ -34,6 +34,7 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.configs.numerics import (
     NUMERICS_ENVELOPES,
     RL_BITWISE_SAMPLING_BACKENDS,
+    SAMPLING_STREAMS,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.moe.dispatch_algorithm import (
@@ -331,6 +332,12 @@ class ServerArgs:
     # (default) is exact dense attention; see --skip-softmax-threshold help.
     skip_softmax_threshold: float = 0.0
     sampling_backend: str | None = None
+    # Random stream of the non-greedy rows of the FlashInfer sampling backends:
+    # "batch" keys flashinfer's Philox stream by the batch row, so a request's
+    # draw depends on its co-batch; "per-request" keys it by (request seed,
+    # position) through the Gumbel-max pool kernels. See
+    # docs/design/numerics.md, sampling.deterministic.
+    sampling_stream: str = "batch"
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
     attention_use_fp4_indexer_cache: bool | None = None
@@ -628,6 +635,11 @@ class ServerArgs:
     def resolve_kernel_backends(self):
         if self.dense_gemm_backend not in {"auto", "trtllm_cutedsl"}:
             raise ValueError("--dense-gemm-backend must be auto or trtllm_cutedsl")
+        if self.sampling_stream not in SAMPLING_STREAMS:
+            raise ValueError(
+                f"--sampling-stream must be one of {list(SAMPLING_STREAMS)}, got "
+                f"{self.sampling_stream!r}"
+            )
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
             # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
@@ -1071,7 +1083,8 @@ class ServerArgs:
                 f"solution 'aok'; --draft-moe-backend {self.draft_moe_backend} "
                 "makes no such claim"
             )
-        # Sampling: greedy rows must break exact logit ties canonically.
+        # Sampling: greedy rows must break exact logit ties canonically, and
+        # sampled rows must draw from a stream the co-batch cannot move.
         if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
             raise ValueError(
                 f"--numerics {self.numerics} needs a sampling backend with "
@@ -1079,6 +1092,7 @@ class ServerArgs:
                 f"({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); --sampling-backend "
                 f"{self.sampling_backend} resolves exact ties in reduction order"
             )
+        self.sampling_stream = "per-request"
 
     def _resolve_trainer_aligned(self):
         """The trainer-alignment block: the training framework's operation
@@ -2215,6 +2229,20 @@ class ServerArgs:
             "with Triton Gumbel-Max for single-step sampling. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "Finite top_k values must be < 128 or -1.",
+        )
+        parser.add_argument(
+            "--sampling-stream",
+            type=str,
+            choices=list(SAMPLING_STREAMS),
+            default=ServerArgs.sampling_stream,
+            help="Random stream of the non-greedy rows of the flashinfer and "
+            "flashinfer_full sampling backends. 'batch': flashinfer's "
+            "top_k_top_p / min_p sampling kernels, whose Philox stream is keyed "
+            "by the batch row, so a request's draw depends on its co-batch. "
+            "'per-request': the Gumbel-max pool kernels keyed by the request's "
+            "seed and position, so a request samples the same tokens alone and "
+            "inside any batch (finite top_k is capped at 128). Folded to "
+            "per-request by --numerics rl-bitwise and trainer-aligned.",
         )
         parser.add_argument(
             "--dp-sampling",

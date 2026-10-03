@@ -128,6 +128,7 @@ def _build_backend(
 
     cfg = SamplingBackendConfig(
         enable_speculative_sampling=False,
+        sampling_stream="batch",
         enable_output_logprobs=enable_output_logprobs,
         max_bs=max_bs,
         max_draft_tokens_per_req=max_n,

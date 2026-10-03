@@ -306,29 +306,34 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             )
         )
 
-        probs = softmax(logits, temperature=temperatures.view(-1, 1))
-
-        if _FUSED_TOPK_TOPP_AVAILABLE:
-            # Fused replacement for the back-to-back top_k_renorm_prob +
-            # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
-            # K = 1<<30 in top_ks routes per-row through the radix top-p
-            # only path.
-            probs = fused_topk_topp_renorm(
-                probs,
-                top_ks,
-                top_ps,
+        if self.config.sampling_stream == "per-request":
+            batch_next_token_ids = self._sample_per_request(
+                logits, sampling_info, min_p_pool=self._min_p_pool
             )
         else:
-            probs = top_k_renorm_prob(probs, top_ks)
-            probs = top_p_renorm_prob(probs, top_ps, is_deterministic=True)
+            probs = softmax(logits, temperature=temperatures.view(-1, 1))
 
-        batch_next_token_ids = min_p_sampling_from_probs(
-            probs,
-            min_ps,
-            seed=seeds,
-            offset=offsets,
-            deterministic=True,
-        )
+            if _FUSED_TOPK_TOPP_AVAILABLE:
+                # Fused replacement for the back-to-back top_k_renorm_prob +
+                # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
+                # K = 1<<30 in top_ks routes per-row through the radix top-p
+                # only path.
+                probs = fused_topk_topp_renorm(
+                    probs,
+                    top_ks,
+                    top_ps,
+                )
+            else:
+                probs = top_k_renorm_prob(probs, top_ks)
+                probs = top_p_renorm_prob(probs, top_ps, is_deterministic=True)
+
+            batch_next_token_ids = min_p_sampling_from_probs(
+                probs,
+                min_ps,
+                seed=seeds,
+                offset=offsets,
+                deterministic=True,
+            )
         if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
             # Greedy maximizes the penalized logits.
             batch_next_token_ids = canonical_greedy_tokens(
@@ -339,8 +344,13 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         # TP-rank sync BEFORE _accumulate_counts so per-rank counts stay aligned.
         # For fused top-k + top-p, the results are bit-identical across ranks.
-        # So we don't need to broadcast the results.
-        if not _FUSED_TOPK_TOPP_AVAILABLE:
+        # So we don't need to broadcast the results. The per-request route
+        # reads the gathered logits, which are not bit-identical across ranks,
+        # so it syncs like FlashInferSamplingBackend.sample.
+        if (
+            not _FUSED_TOPK_TOPP_AVAILABLE
+            or self.config.sampling_stream == "per-request"
+        ):
             self.maybe_broadcast(sampled)
 
         if raw_logprobs is not None:
