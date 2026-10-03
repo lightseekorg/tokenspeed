@@ -213,6 +213,10 @@ class Eagle(BaseDrafter):
         """Map token ids through hot_token_ids if available, otherwise return as-is."""
         return self.hot_token_ids[ids] if self.hot_token_ids is not None else ids
 
+    @override
+    def draft_vocab_map(self) -> torch.Tensor | None:
+        return self.hot_token_ids
+
     def _get_first_step_input(
         self,
         draft_input: EagleDraftInput,
@@ -477,9 +481,7 @@ class Eagle(BaseDrafter):
                 )
 
             with nvtx_range("draft_sample", color="yellow"):
-                draft_ids = self.sample_draft_step(
-                    logits_output, step=i, bs=bs, vocab_map=self.hot_token_ids
-                )
+                draft_ids = self.sample_draft_step(logits_output, step=i)
                 # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
                 next_tokens[:, i + 1] = self._map_hot(draft_ids)
                 if i + 1 < self.spec_num_steps:
@@ -538,9 +540,7 @@ class Eagle(BaseDrafter):
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
         logits_output, dsa_topk = self._run_first_step(bs, draft_input, narrowing)
 
-        draft_ids = self.sample_draft_step(
-            logits_output, step=0, bs=bs, vocab_map=self.hot_token_ids
-        )
+        draft_ids = self.sample_draft_step(logits_output, step=0)
         next_tokens[:, 1] = self._map_hot(draft_ids)
 
         if self.spec_num_steps <= 1:

@@ -369,20 +369,34 @@ POOL, VOCAB, N, MAX_BS = 4, 8, 3, 4
 RESERVED_SLOT = POOL  # state_write_padding_pool_index; row POOL of the pool+1 rows
 
 
-def _draft_sampler(monkeypatch, *, top_k_rows, temperatures):
-    from tokenspeed.runtime.execution.drafter import speculative_sampling as spec
-    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-    from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
+def _kernel_argmax(logits: torch.Tensor) -> torch.Tensor:
+    """The sampling argmax kernel's contract: NaNs are invalid candidates and
+    an all-NaN row returns -1 (torch.argmax would pick the first NaN)."""
+    masked = torch.where(
+        torch.isnan(logits), torch.full_like(logits, -float("inf")), logits
+    )
+    idx = masked.argmax(-1)
+    return torch.where(torch.isnan(logits).all(-1), torch.full_like(idx, -1), idx)
 
-    states = RuntimeStates(POOL, VOCAB, N, "cpu")
-    states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0)
-    buffers = SimpleNamespace(
+
+def _draft_buffers():
+    return SimpleNamespace(
         max_bs=MAX_BS,
         req_pool_indices_buf=torch.zeros(MAX_BS, dtype=torch.int64),
         state_write_req_pool_indices_buf=torch.full(
             (MAX_BS,), RESERVED_SLOT, dtype=torch.int64
         ),
     )
+
+
+def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
+    from tokenspeed.runtime.execution.drafter import speculative_sampling as spec
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
+
+    states = RuntimeStates(POOL, VOCAB, N, "cpu")
+    states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0)
+    buffers = _draft_buffers()
     pools = SpeculativeSamplingPools(
         temperature=torch.tensor(temperatures, dtype=torch.float32),
         top_k=torch.tensor(top_k_rows, dtype=torch.int32),
@@ -393,6 +407,7 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures):
         "softmax",
         lambda logits, temperature: torch.softmax(logits.float() / temperature, -1),
     )
+    monkeypatch.setattr(spec, "sampling_argmax", _kernel_argmax)
     calls = []
 
     def fake_gumbel(
@@ -419,7 +434,13 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures):
             )
         )
         # A stand-in draw: the second-highest logit, so it differs from argmax.
-        out[:rows].copy_(logits.topk(2, dim=-1).indices[:, 1].to(torch.int32))
+        # Like the kernel, an all-NaN row resolves to the first masked column
+        # (vocab_size), one past the last real token.
+        draw = logits.nan_to_num(-float("inf")).topk(2, dim=-1).indices[:, 1]
+        draw = torch.where(
+            torch.isnan(logits).all(-1), torch.full_like(draw, logits.shape[1]), draw
+        )
+        out[:rows].copy_(draw.to(torch.int32))
         return out[:rows]
 
     monkeypatch.setattr(spec, "gumbel_sample_from_pools", fake_gumbel)
@@ -428,6 +449,7 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures):
         runtime_states=states,
         input_buffers=buffers,
         spec_num_tokens=N,
+        vocab_map=vocab_map,
         device="cpu",
     )
     return sampler, states, buffers, pools, calls
@@ -454,7 +476,7 @@ def test_propose_samples_rows_by_request_and_records_q(monkeypatch):
     logits = torch.randn(bs, VOCAB)
     sentinel_before = states.draft_probs.clone()
 
-    tokens = sampler.propose(logits, step=1, bs=bs, vocab_map=None)
+    tokens = sampler.propose(logits, step=1)
 
     second = logits.topk(2, dim=-1).indices[:, 1]
     argmax = logits.argmax(-1)
@@ -481,23 +503,69 @@ def test_propose_samples_rows_by_request_and_records_q(monkeypatch):
     assert torch.equal(call["offsets"], expected_offsets)
 
 
-def test_propose_scatters_a_hot_token_vocab_into_the_full_one(monkeypatch):
+def test_propose_degrades_an_all_nan_row_to_a_junk_draft(monkeypatch):
+    # The argmax kernel marks an all-NaN row with -1 (a device assert as a
+    # scatter index) and the Gumbel kernel resolves it to vocab_size (out of
+    # range for the hot-token map and the verify gather). Both are clamped
+    # into the vocab; the row's q is NaN, which coin * q < p rejects.
+    top_k = [1 << 30] * (POOL + 1)
+    top_k[2] = 1  # a greedy NaN row too
     sampler, states, buffers, _, _ = _draft_sampler(
-        monkeypatch, top_k_rows=[1 << 30] * (POOL + 1), temperatures=[1.0] * (POOL + 1)
+        monkeypatch, top_k_rows=top_k, temperatures=[1.0] * (POOL + 1)
     )
+    slots = torch.tensor([1, 2, 3], dtype=torch.int64)
+    buffers.req_pool_indices_buf[:3] = slots
+    buffers.state_write_req_pool_indices_buf[:3] = slots
+    logits = torch.randn(3, VOCAB)
+    logits[0] = float("nan")
+    logits[1] = float("nan")
+
+    tokens = sampler.propose(logits, step=0)
+
+    assert tokens.shape == (3,) and tokens.dtype == torch.int32
+    assert tokens[0].item() == VOCAB - 1  # the sampled NaN row, clamped in range
+    assert tokens[1].item() == 0  # the greedy NaN row, clamped from -1
+    assert 0 <= tokens[2].item() < VOCAB
+    probs = states.draft_probs
+    assert torch.isnan(probs[1, 0]).all()
+    # The greedy NaN row's one-hot landed on column 0 instead of asserting.
+    assert torch.isnan(probs[2, 0]).all()
+    torch.testing.assert_close(probs[3, 0], torch.softmax(logits[2], -1))
+
+
+def test_propose_scatters_a_hot_token_vocab_through_persistent_buffers(monkeypatch):
+    vocab_map = torch.tensor([5, 2, 7], dtype=torch.int32)
+    sampler, states, buffers, _, _ = _draft_sampler(
+        monkeypatch,
+        top_k_rows=[1 << 30] * (POOL + 1),
+        temperatures=[1.0] * (POOL + 1),
+        vocab_map=vocab_map,
+    )
+    # The map is held as int64 once and the full-vocab row is preallocated.
+    assert sampler._vocab_map.dtype == torch.int64
+    assert sampler._full_q.shape == (MAX_BS, VOCAB)
+    # The Gumbel scratch follows the draft head's width, not the full vocab.
+    assert sampler._gumbel_local_ids.shape[0] == MAX_BS
     buffers.req_pool_indices_buf[:1] = 2
     buffers.state_write_req_pool_indices_buf[:1] = 2
-    vocab_map = torch.tensor([5, 2, 7], dtype=torch.int64)
+
     logits = torch.tensor([[0.0, 1.0, 2.0]])
-
-    tokens = sampler.propose(logits, step=0, bs=1, vocab_map=vocab_map)
-
+    tokens = sampler.propose(logits, step=0)
     # Ids stay in the draft vocab; the caller maps them through vocab_map.
     assert tokens.tolist() == [1]
-    q = torch.softmax(logits[0], -1)
     expected = torch.zeros(VOCAB)
-    expected[vocab_map] = q
+    expected[vocab_map.long()] = torch.softmax(logits[0], -1)
     torch.testing.assert_close(states.draft_probs[2, 0], expected)
+
+    # A second step with other logits overwrites the mapped columns only; the
+    # unmapped ones stay zero without a per-step re-allocation.
+    full_before = sampler._full_q
+    logits = torch.tensor([[3.0, 0.0, -1.0]])
+    sampler.propose(logits, step=1)
+    assert sampler._full_q is full_before
+    expected = torch.zeros(VOCAB)
+    expected[vocab_map.long()] = torch.softmax(logits[0], -1)
+    torch.testing.assert_close(states.draft_probs[2, 1], expected)
 
 
 def test_propose_sends_padding_rows_to_the_reserved_slot(monkeypatch):
@@ -512,7 +580,7 @@ def test_propose_sends_padding_rows_to_the_reserved_slot(monkeypatch):
     )
     logits = torch.randn(4, VOCAB)
 
-    sampler.propose(logits, step=0, bs=4, vocab_map=None)
+    sampler.propose(logits, step=0)
 
     probs = states.draft_probs
     torch.testing.assert_close(probs[1, 0], torch.softmax(logits[0], -1))
@@ -528,7 +596,65 @@ def test_propose_refuses_a_step_without_a_verify_column(monkeypatch):
     )
     buffers.req_pool_indices_buf[:1] = 1
     with pytest.raises(ValueError, match="no verify column"):
-        sampler.propose(torch.randn(1, VOCAB), step=N - 1, bs=1, vocab_map=None)
+        sampler.propose(torch.randn(1, VOCAB), step=N - 1)
+
+
+def _reference_draft_prob_accept(
+    candidates: torch.Tensor, draft_probs_rows: torch.Tensor, target_probs: torch.Tensor
+) -> torch.Tensor:
+    """The chain kernel's read convention for the draft-prob rule, in torch.
+
+    For candidate column ``i`` (1..N-1) the kernel reads
+    ``draft_probs[row, i - 1, candidates[row, i]]`` and
+    ``target_probs[row, i - 1, candidates[row, i]]``; with coin 0 every
+    column whose q is below the sentinel is accepted. Returns the q the
+    accept test saw per column, ``[bs, N - 1]``.
+    """
+    bs, n = candidates.shape
+    seen = torch.empty(bs, n - 1)
+    for i in range(1, n):
+        seen[:, i - 1] = draft_probs_rows[torch.arange(bs), i - 1, candidates[:, i]]
+    return seen
+
+
+def test_recorded_q_is_read_back_for_the_column_it_proposed(monkeypatch):
+    """Pins the write/read off-by-one between the drafter (step s writes
+    ``draft_probs[:, s]`` and candidate column ``s + 1``) and the verify
+    kernel (column ``i`` reads ``draft_probs[:, i - 1]``)."""
+    sampler, states, buffers, _, _ = _draft_sampler(
+        monkeypatch, top_k_rows=[1 << 30] * (POOL + 1), temperatures=[1.0] * (POOL + 1)
+    )
+    slots = torch.tensor([3, 1], dtype=torch.int64)
+    bs = slots.numel()
+    buffers.req_pool_indices_buf[:bs] = slots
+    buffers.state_write_req_pool_indices_buf[:bs] = slots
+
+    # One round of drafting, laid out like Eagle/Mtp lay out next_tokens:
+    # column 0 is the verified token, step s fills column s + 1.
+    torch.manual_seed(1)
+    next_tokens = torch.zeros(bs, N, dtype=torch.int64)
+    next_tokens[:, 0] = torch.tensor([4, 6])
+    step_logits = []
+    for step in range(N - 1):
+        logits = torch.randn(bs, VOCAB) * (step + 1)  # distinct q per step
+        step_logits.append(logits)
+        next_tokens[:, step + 1] = sampler.propose(logits, step=step).long()
+
+    # The verifier gathers the rows by pool index into batch order.
+    gathered = states.draft_probs.index_select(0, slots)
+    seen = _reference_draft_prob_accept(next_tokens, gathered, torch.rand(bs, N, VOCAB))
+    for step, logits in enumerate(step_logits):
+        q = torch.softmax(logits, -1)
+        proposed = next_tokens[:, step + 1]
+        # Column step + 1's accept test reads q of the step that proposed it.
+        torch.testing.assert_close(seen[:, step], q[torch.arange(bs), proposed])
+        # ...and that q really is the proposal's probability under the step's
+        # own distribution, not a neighbouring step's.
+        other = torch.softmax(step_logits[(step + 1) % (N - 1)], -1)
+        assert not torch.allclose(seen[:, step], other[torch.arange(bs), proposed])
+    # The bonus slot was never written and the sentinel covers no live column.
+    assert torch.equal(gathered[:, -1], torch.zeros(bs, VOCAB))
+    assert (gathered[:, :-1] <= 1.0).all()
 
 
 def test_sample_draft_step_keeps_argmax_when_the_flag_is_off():
@@ -541,17 +667,11 @@ def test_sample_draft_step_keeps_argmax_when_the_flag_is_off():
     logits = torch.tensor([[0.0, 3.0, 1.0], [2.0, 0.0, 1.0]])
     fused = torch.tensor([7, 8], dtype=torch.int32)
     out = drafter.sample_draft_step(
-        SimpleNamespace(next_token_logits=logits, next_token_ids=fused),
-        step=0,
-        bs=2,
-        vocab_map=None,
+        SimpleNamespace(next_token_logits=logits, next_token_ids=fused), step=0
     )
     assert out is fused
     out = drafter.sample_draft_step(
-        SimpleNamespace(next_token_logits=logits, next_token_ids=None),
-        step=0,
-        bs=2,
-        vocab_map=None,
+        SimpleNamespace(next_token_logits=logits, next_token_ids=None), step=0
     )
     assert out.tolist() == [1, 0]
     # The verifier's pools are not consulted without draft_probs.
@@ -570,13 +690,7 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
 
     states = RuntimeStates(POOL, VOCAB, N, "cpu")
     states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0)
-    buffers = SimpleNamespace(
-        max_bs=MAX_BS,
-        req_pool_indices_buf=torch.zeros(MAX_BS, dtype=torch.int64),
-        state_write_req_pool_indices_buf=torch.full(
-            (MAX_BS,), RESERVED_SLOT, dtype=torch.int64
-        ),
-    )
+    buffers = _draft_buffers()
     pools = SpeculativeSamplingPools(
         temperature=torch.ones(POOL + 1),
         top_k=torch.ones(POOL + 1, dtype=torch.int32),
@@ -594,46 +708,63 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
                 next_token_logits=torch.zeros(1, VOCAB), next_token_ids=None
             ),
             step=0,
-            bs=1,
-            vocab_map=None,
         )
+
+    full_vocab_requests = []
+
+    def _runner():
+        processor = SimpleNamespace(do_argmax=True)
+        processor.require_full_vocab_logits = lambda: full_vocab_requests.append(
+            processor
+        )
+        return SimpleNamespace(model=SimpleNamespace(logits_processor=processor))
 
     eagle = Eagle.__new__(Eagle)
     BaseDrafter.__init__(
-        eagle, spec_num_tokens=N, runtime_states=states, input_buffers=buffers
+        eagle,
+        spec_num_tokens=N,
+        draft_model_runner=_runner(),
+        runtime_states=states,
+        input_buffers=buffers,
     )
     eagle.hot_token_ids = torch.tensor([5, 2, 7])
     eagle.bind_sampling_backend(backend)
     assert isinstance(eagle.draft_sampler, spec.DraftProposalSampler)
+    # The hot-token map is bound into the sampler once...
+    assert eagle.draft_sampler._vocab_map.tolist() == [5, 2, 7]
+    # ...and the draft model was told to return full-vocab logits.
+    assert len(full_vocab_requests) == 1
 
     seen = {}
 
-    def fake_propose(logits, *, step, bs, vocab_map):
-        seen.update(step=step, bs=bs, vocab_map=vocab_map)
-        return torch.zeros(bs, dtype=torch.int32)
+    def fake_propose(logits, *, step):
+        seen.update(step=step, rows=logits.shape[0])
+        return torch.zeros(logits.shape[0], dtype=torch.int32)
 
     monkeypatch.setattr(eagle.draft_sampler, "propose", fake_propose)
     eagle.sample_draft_step(
         SimpleNamespace(next_token_logits=torch.zeros(2, 3), next_token_ids=None),
         step=1,
-        bs=2,
-        vocab_map=eagle.hot_token_ids,
     )
-    assert seen["step"] == 1 and seen["bs"] == 2
-    assert seen["vocab_map"] is eagle.hot_token_ids
+    assert seen == dict(step=1, rows=2)
 
     mtp = Mtp.__new__(Mtp)
     BaseDrafter.__init__(
-        mtp, spec_num_tokens=N, runtime_states=states, input_buffers=buffers
+        mtp,
+        spec_num_tokens=N,
+        draft_model_runner=_runner(),
+        runtime_states=states,
+        input_buffers=buffers,
     )
     mtp.bind_sampling_backend(backend)
+    assert mtp.draft_sampler._vocab_map is None  # MTP drafts over the full vocab
+    assert len(full_vocab_requests) == 2
     monkeypatch.setattr(mtp.draft_sampler, "propose", fake_propose)
-    mtp._sample_step_tokens(
+    mtp.sample_draft_step(
         SimpleNamespace(next_token_logits=torch.zeros(3, VOCAB), next_token_ids=None),
-        1,
-        3,
+        step=1,
     )
-    assert seen == dict(step=1, bs=3, vocab_map=None)
+    assert seen == dict(step=1, rows=3)
 
 
 if __name__ == "__main__":

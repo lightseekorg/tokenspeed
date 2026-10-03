@@ -313,15 +313,6 @@ class Mtp(BaseDrafter):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _sample_step_tokens(
-        self, logits_output: LogitsProcessorOutput, depth: int, bs: int
-    ) -> torch.Tensor:
-        """Depth ``depth``'s draft ids over the full vocab: the logits
-        processor's fused argmax when it ran, greedy argmax otherwise, or a
-        sample from the recorded draft distribution under
-        --enable-speculative-sampling (``BaseDrafter.sample_draft_step``)."""
-        return self.sample_draft_step(logits_output, step=depth, bs=bs, vocab_map=None)
-
     @nvtx_range("run_decode_depths", color="purple")
     def _run_decode_depths(
         self,
@@ -411,7 +402,7 @@ class Mtp(BaseDrafter):
                 prev_hidden = logits_output.hidden_states
 
             with nvtx_range("draft_sample", color="yellow"):
-                next_tokens[:, d + 1] = self._sample_step_tokens(logits_output, d, bs)
+                next_tokens[:, d + 1] = self.sample_draft_step(logits_output, step=d)
 
         self._stash_tokens_buf[slot] = window_ids[:, 1:]
         self._stash_hidden_buf[slot] = spliced_hidden.view(bs, k, -1)[:, 1:]
@@ -519,7 +510,7 @@ class Mtp(BaseDrafter):
             prev_hidden = logits_output.hidden_states
 
             with nvtx_range("draft_sample", color="yellow"):
-                next_tokens[:, d + 1] = self._sample_step_tokens(logits_output, d, bs)
+                next_tokens[:, d + 1] = self.sample_draft_step(logits_output, step=d)
 
     # ------------------------------------------------------------------
     # Public entry point (type-based dispatch from ModelExecutor)

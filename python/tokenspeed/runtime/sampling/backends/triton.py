@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_top_k_top_p_from_pools,
     gumbel_sample_top_k_top_p_qrita_from_pools,
     gumbel_sample_top_p_parallel_from_pools,
+    gumbel_scratch_shape,
     selected_token_logprobs,
     verify_chain_target_sampled,
 )
@@ -57,7 +58,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
-_GUMBEL_BLOCK_SIZE = 1024
 _COMPACT_GUMBEL_BLOCK_SIZE = 4096
 _COMPACT_GUMBEL_VOCAB_MAX = 32768
 _TOP_K_TOP_P_SMALL_BLOCK_SIZE = 1024
@@ -129,16 +129,12 @@ class TritonSamplingBackend(SamplingBackend):
         )
 
         vocab_size = max(int(config.vocab_size), 1)
-        gumbel_blocks = (vocab_size + _GUMBEL_BLOCK_SIZE - 1) // _GUMBEL_BLOCK_SIZE
+        gumbel_scratch = gumbel_scratch_shape(config.max_bs, vocab_size)
         self._gumbel_local_ids = torch.empty(
-            (config.max_bs, gumbel_blocks),
-            dtype=torch.int32,
-            device=config.device,
+            gumbel_scratch, dtype=torch.int32, device=config.device
         )
         self._gumbel_local_scores = torch.empty(
-            (config.max_bs, gumbel_blocks),
-            dtype=torch.float32,
-            device=config.device,
+            gumbel_scratch, dtype=torch.float32, device=config.device
         )
         self._gumbel_out = torch.empty(
             (config.max_bs,), dtype=torch.int32, device=config.device
@@ -151,15 +147,14 @@ class TritonSamplingBackend(SamplingBackend):
             dtype=torch.int32,
             device=config.device,
         )
+        verify_scratch = gumbel_scratch_shape(
+            config.max_bs * config.max_draft_tokens_per_req, vocab_size
+        )
         self._gumbel_verify_local_ids = torch.empty(
-            (config.max_bs * config.max_draft_tokens_per_req, gumbel_blocks),
-            dtype=torch.int32,
-            device=config.device,
+            verify_scratch, dtype=torch.int32, device=config.device
         )
         self._gumbel_verify_local_scores = torch.empty(
-            (config.max_bs * config.max_draft_tokens_per_req, gumbel_blocks),
-            dtype=torch.float32,
-            device=config.device,
+            verify_scratch, dtype=torch.float32, device=config.device
         )
 
         topk_blocks = (vocab_size + _TOP_K_TOP_P_SMALL_BLOCK_SIZE - 1) // (

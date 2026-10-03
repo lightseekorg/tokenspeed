@@ -106,7 +106,10 @@ class BaseDrafter:
         the executor allocated ``RuntimeStates.draft_probs``
         (--enable-speculative-sampling); then the drafter must be a chain
         drafter that proposes one token per step, and its proposals are
-        drawn from ``q`` and recorded there (``sample_draft_step``).
+        drawn from ``q`` and recorded there (``sample_draft_step``). Sampling
+        needs the whole distribution, so the draft model's logits processor
+        is switched off its fused (TP-sharded) argmax here, before the first
+        draft forward.
 
         Args:
             sampling_backend: The executor's verifier, owner of the
@@ -128,31 +131,36 @@ class BaseDrafter:
             runtime_states=self.runtime_states,
             input_buffers=self.input_buffers,
             spec_num_tokens=self.spec_num_tokens,
+            vocab_map=self.draft_vocab_map(),
             device=self.runtime_states.draft_probs.device,
         )
+        self.draft_model_runner.model.logits_processor.require_full_vocab_logits()
+
+    def draft_vocab_map(self) -> torch.Tensor | None:
+        """``[V_draft]`` int64 full-vocab id per draft logit column, or None
+        when the draft head spans the target vocabulary. Eagle3 hot-token
+        heads override this; ``sample_draft_step`` returns ids in the draft
+        vocab either way and the caller maps them."""
+        return None
 
     def sample_draft_step(
         self,
         logits_output: LogitsProcessorOutput,
         *,
         step: int,
-        bs: int,
-        vocab_map: torch.Tensor | None,
     ) -> torch.Tensor:
         """One draft step's proposed token ids, ``[bs]`` in the draft vocab.
 
         Without draft-prob sampling this is the logits processor's fused
         argmax when it ran, else the canonical argmax of the logits. With
         it, the token is sampled from ``q`` at the request's temperature
-        (greedy rows keep the argmax) and ``q`` is recorded for verify.
+        (greedy rows keep the argmax) and ``q`` is recorded for verify. The
+        row count is the logits' (the padded graph batch under replay).
 
         Args:
             logits_output: The step's draft forward output, one row per
                 request.
             step: Draft step index (verify candidate column ``step + 1``).
-            bs: Rows in the step, the padded graph batch under replay.
-            vocab_map: ``[V_draft]`` full-vocab id per draft logit column
-                (Eagle3 hot tokens), or None for a full-vocab draft.
         """
         sampler = self.draft_sampler
         if sampler is None:
@@ -167,9 +175,7 @@ class BaseDrafter:
             if logits_output.next_token_ids is not None:
                 return logits_output.next_token_ids
             return sampling_argmax(logits_output.next_token_logits)
-        return sampler.propose(
-            logits_output.next_token_logits, step=step, bs=bs, vocab_map=vocab_map
-        )
+        return sampler.propose(logits_output.next_token_logits, step=step)
 
     def wire_target(self, target_model: torch.nn.Module) -> None:
         """Wire this drafter to the loaded target model.

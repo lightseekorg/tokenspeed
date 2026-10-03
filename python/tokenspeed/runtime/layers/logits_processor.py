@@ -258,19 +258,9 @@ class LogitsProcessor(nn.Module):
         tp_group: tuple[int, ...] | None = None,
     ):
         super().__init__()
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
         self.config = config
         self.skip_all_gather = skip_all_gather
-        # The draft models' fused argmax (with the TP-sharded distributed
-        # reduction) returns local-shard logits a sampled draft cannot use:
-        # draft-prob sampling needs the full-vocab distribution, so the fast
-        # path stays off and the ordinary gather runs. Under attention DP the
-        # head is replicated (skip_all_gather) and the logits are already
-        # full-vocab either way.
-        self.do_argmax = (
-            do_argmax and not global_server_args_dict["enable_speculative_sampling"]
-        )
+        self.do_argmax = do_argmax
         self.dp_sampling_enabled = False
         self.dp_num_tokens_per_req = 1
         self.dp_sampling_min_bs = 0
@@ -303,6 +293,21 @@ class LogitsProcessor(nn.Module):
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+
+    def require_full_vocab_logits(self) -> None:
+        """Turn the fused draft argmax off so every forward returns full-vocab logits.
+
+        Draft models construct with ``do_argmax=True``: under tensor
+        parallelism the fused path reduces the argmax across the vocab shards
+        and hands back the local shard's logits, which only a greedy proposal
+        can live with. A consumer that samples from the draft distribution
+        (``--enable-speculative-sampling``) calls this once after construction
+        and before the first forward; the ordinary vocab all-gather then runs
+        on every draft step. Under attention DP the head is replicated
+        (``skip_all_gather``) and the logits are full-vocab either way.
+        Returns None.
+        """
+        self.do_argmax = False
 
     def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (

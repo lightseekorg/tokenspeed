@@ -47,16 +47,15 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.flashinfer import softmax
-from tokenspeed_kernel.ops.sampling.triton import gumbel_sample_from_pools
+from tokenspeed_kernel.ops.sampling.triton import (
+    gumbel_sample_from_pools,
+    gumbel_scratch_shape,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
-
-# The Gumbel kernel's two-stage path reduces the vocab in blocks of this many
-# tokens (tokenspeed_kernel.ops.sampling.triton.gumbel._GUMBEL_BLOCK_SIZE).
-_GUMBEL_BLOCK_SIZE = 1024
 
 # Philox offset salt for the draft proposal stream. sample() keys the
 # request's stream by (seed, valid_cache_length); the draft stream keys by
@@ -76,8 +75,21 @@ class DraftProposalSampler:
         runtime_states: RuntimeStates,
         input_buffers: InputBuffers,
         spec_num_tokens: int,
+        vocab_map: torch.Tensor | None,
         device: torch.device | str,
     ) -> None:
+        """
+        Args:
+            pools: The verifier's pool-indexed temperature / top-k / seed.
+            runtime_states: Owner of ``draft_probs`` (must be allocated) and
+                ``valid_cache_lengths``.
+            input_buffers: The executor's batch-ordered pool index buffers.
+            spec_num_tokens: Verify chain width N; steps ``0..N-2`` record.
+            vocab_map: ``[V_draft]`` full-vocab id of each draft logit column
+                (Eagle3 hot tokens), or None when the draft vocab is the
+                target's. Bound once: the recorded rows scatter through it.
+            device: Where the scratch lives.
+        """
         if runtime_states.draft_probs is None:
             raise RuntimeError(
                 "DraftProposalSampler needs RuntimeStates.draft_probs; the executor "
@@ -94,37 +106,47 @@ class DraftProposalSampler:
         max_bs = input_buffers.max_bs
         pool_rows = self._valid_cache_lengths.shape[0]
         vocab_size = self._draft_probs.shape[2]
-        gumbel_blocks = (vocab_size + _GUMBEL_BLOCK_SIZE - 1) // _GUMBEL_BLOCK_SIZE
         # Per-slot Philox offsets for this step, refreshed in place.
         self._offsets_pool = torch.zeros((pool_rows,), dtype=torch.int64, device=device)
-        self._pool_indices_i32 = torch.empty((max_bs,), dtype=torch.int32, device=device)
+        self._pool_indices_i32 = torch.empty(
+            (max_bs,), dtype=torch.int32, device=device
+        )
         self._gumbel_out = torch.empty((max_bs,), dtype=torch.int32, device=device)
+        # Sized by the draft head's width: the Gumbel draw runs over the draft
+        # logits, which a hot-token head keeps narrower than the full vocab.
+        draft_vocab_size = vocab_size if vocab_map is None else vocab_map.shape[0]
+        scratch_shape = gumbel_scratch_shape(max_bs, draft_vocab_size)
         self._gumbel_local_ids = torch.empty(
-            (max_bs, gumbel_blocks), dtype=torch.int32, device=device
+            scratch_shape, dtype=torch.int32, device=device
         )
         self._gumbel_local_scores = torch.empty(
-            (max_bs, gumbel_blocks), dtype=torch.float32, device=device
+            scratch_shape, dtype=torch.float32, device=device
         )
+        # Hot-token heads: q over the draft vocab is scattered into a
+        # full-vocab row before it is recorded. The scatter only ever writes
+        # the mapped columns, so the others stay zero from allocation.
+        self._vocab_map: torch.Tensor | None = None
+        self._full_q: torch.Tensor | None = None
+        if vocab_map is not None:
+            if vocab_map.ndim != 1 or vocab_map.shape[0] > vocab_size:
+                raise ValueError(
+                    f"vocab_map must be a [V_draft <= {vocab_size}] vector, got "
+                    f"{tuple(vocab_map.shape)}"
+                )
+            self._vocab_map = vocab_map.to(device=device, dtype=torch.int64)
+            self._full_q = torch.zeros(
+                (max_bs, vocab_size), dtype=torch.float32, device=device
+            )
 
-    def propose(
-        self,
-        logits: torch.Tensor,
-        *,
-        step: int,
-        bs: int,
-        vocab_map: torch.Tensor | None,
-    ) -> torch.Tensor:
+    def propose(self, logits: torch.Tensor, *, step: int) -> torch.Tensor:
         """Sample this step's draft tokens and record their distribution.
 
         Args:
             logits: ``[bs, V_draft]`` draft logits, one row per request in
-                batch order (padding rows included).
+                batch order (padding rows included; ``bs`` is the padded
+                graph batch under replay).
             step: Draft step index; the token lands in verify candidate
                 column ``step + 1`` and ``q`` in ``draft_probs[:, step]``.
-            bs: Rows in ``logits`` (the padded graph batch under replay).
-            vocab_map: ``[V_draft]`` full-vocab id of each draft logit column
-                (Eagle3 hot tokens), or None when the draft vocab is the
-                target's.
 
         Returns:
             ``[bs]`` int32 draft-vocab token ids.
@@ -134,8 +156,7 @@ class DraftProposalSampler:
                 f"draft step {step} has no verify column in a chain of "
                 f"{self._spec_num_tokens} tokens"
             )
-        if logits.shape[0] != bs:
-            raise ValueError(f"expected {bs} draft logit rows, got {logits.shape[0]}")
+        bs = logits.shape[0]
         pool_indices = self._req_pool_indices_buf[:bs]
         pool_indices_i32 = self._pool_indices_i32[:bs]
         pool_indices_i32.copy_(pool_indices)
@@ -144,7 +165,10 @@ class DraftProposalSampler:
 
         # q at the request's temperature, fp32 like the verifier's target probs.
         q = softmax(logits, temperature=temperature.view(-1, 1))
-        canonical = sampling_argmax(logits).to(torch.int64).view(-1, 1)
+        # The argmax kernel marks an all-NaN row with -1; clamp it to a real
+        # column so the one-hot scatter below stays in bounds and the row
+        # degrades to a junk draft the verify rejects, not a device assert.
+        canonical = sampling_argmax(logits).to(torch.int64).clamp_min_(0).view(-1, 1)
         # Greedy rows: one-hot at the canonical argmax, so verify stays exact.
         q.mul_((~greedy_rows).to(q.dtype))
         q.scatter_add_(1, canonical, greedy_rows.to(q.dtype))
@@ -166,15 +190,18 @@ class DraftProposalSampler:
             self._gumbel_local_scores[:bs],
             self._gumbel_out[:bs],
         )
+        # An all-NaN row has no maximum; the kernel resolves it to the first
+        # masked column (vocab_size). Keep the id a real column so the hot-token
+        # map and the verify gather stay in bounds; the NaN q rejects it anyway.
+        sampled.clamp_(0, logits.shape[1] - 1)
         tokens = torch.where(
             greedy_rows.view(-1), canonical.view(-1).to(sampled.dtype), sampled
         )
 
-        if vocab_map is not None:
-            full = torch.zeros(
-                (bs, self._draft_probs.shape[2]), dtype=q.dtype, device=q.device
-            )
-            full.index_copy_(1, vocab_map.to(torch.int64), q)
+        if self._vocab_map is not None:
+            assert self._full_q is not None
+            full = self._full_q[:bs]
+            full.index_copy_(1, self._vocab_map, q)
             q = full
         # Padding rows resolve to the reserved last slot, which verify never
         # gathers.
