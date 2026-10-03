@@ -2065,6 +2065,56 @@ TEST_F(FusedRetractionL2TestSuite, AReadmissionThatDoesNotFitWaitsWithoutRetract
     }
 }
 
+// RequestSpec::max_cached_prefix_tokens bounds the FIRST admission's probe
+// only. A retracted request's snapshot holds positions whose logits were
+// already produced, so its readmission matches the snapshot back in full.
+TEST_F(FusedRetractionL2TestSuite, ReadmissionIgnoresTheRequestsProbeBound) {
+    // r1 returns prompt logprobs from position 0: nothing may be matched at
+    // its first admission. r2 shares the pool and keeps decoding.
+    RequestSpec capped = MakeRequestSpec("r1", /*num_pages=*/2);
+    capped.max_cached_prefix_tokens = 0;
+    Submit(capped);
+    Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/101));
+    ExecutionPlan prefill = PlanOnce();
+    const ForwardBatch* first = FindForwardBatch(prefill);
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->request_ids.size(), 2u);
+    EXPECT_EQ(first->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(first->input_lengths.at(0), 4);
+    CompleteStores(prefill);
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    CompleteStores(PlanOnce());
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+    CompleteStores(PlanOnce());
+    SendForwardDone("r1", {44});
+    SendForwardDone("r2", {144});
+    // r1 = [1 2 3 4 42 43 44]: the blocked round retracts it and snapshots
+    // its completed pages [1 2] [3 4] [42 43] to the host tier.
+    const ExecutionPlan retraction = PlanOnce();
+    CompleteStores(retraction);
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+    ASSERT_EQ(scheduler_->DecodingSize(), 1u);
+
+    // r2 leaves; r1 readmits. The bound of 0 would recompute all 7 tokens;
+    // the readmission instead matches its three snapshot pages back.
+    const ExecutionPlan resumed = PlanOnce();
+    const ForwardBatch* r2_only = FindForwardBatch(resumed);
+    ASSERT_NE(r2_only, nullptr);
+    ASSERT_EQ(r2_only->request_ids, std::vector<std::string>{"r2"});
+    CompleteStores(resumed);
+    SendForwardDone("r2", {145});
+    SendFinish("r2");
+    const ExecutionPlan readmit = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(readmit);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(op->prefill_lengths.at(0), 7);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 6) << "the readmission must match the snapshot back";
+    EXPECT_EQ(op->input_lengths.at(0), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Cache retract: a blocked round picks the largest Decoding/PrefillDone
 // request, releases every page and requeues it as a fresh prefill. Accepted

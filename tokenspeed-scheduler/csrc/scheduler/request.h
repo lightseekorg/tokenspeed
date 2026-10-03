@@ -99,8 +99,9 @@ public:
         return std::max(0, max_new_tokens_ - (PrefillSize() - submitted_prompt_size_));
     }
 
-    // Longest prompt prefix the admission probe may claim from the prefix
-    // cache (RequestSpec::max_cached_prefix_tokens); INT32_MAX means unbounded.
+    // Longest prompt prefix the first admission's probe may claim from the
+    // prefix cache (RequestSpec::max_cached_prefix_tokens); INT32_MAX means
+    // unbounded. Not consulted for a readmission after retraction.
     std::int32_t MaxCachedPrefixTokens() const { return max_cached_prefix_tokens_; }
 
     template <typename Event>
