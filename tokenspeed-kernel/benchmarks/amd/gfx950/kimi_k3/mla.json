@@ -183,6 +183,54 @@
       }
     },
     {
+      "id": "kimi_k3.attention.mla_extend_with_kvcache/cached-8k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_extend_with_kvcache",
+        "parameters": {
+          "batch": [1, 4],
+          "query_tokens_per_sequence": [64, 256],
+          "prefix_tokens": 8192,
+          "max_context_len": 65536,
+          "q_dtype": "bfloat16",
+          "kv_cache_dtype": "float8_e4m3fn"
+        },
+        "cold_cache": true,
+        "seed": 4341
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.mla_extend_with_kvcache/cached-50k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_extend_with_kvcache",
+        "parameters": {
+          "batch": [1, 4],
+          "query_tokens_per_sequence": [64, 256],
+          "prefix_tokens": 50000,
+          "max_context_len": 65536,
+          "q_dtype": "bfloat16",
+          "kv_cache_dtype": "float8_e4m3fn"
+        },
+        "cold_cache": true,
+        "seed": 4342
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
       "id": "kimi_k3.attention.mla_prefill/causal-tail-float8",
       "comparison_epoch": 1,
       "measurement_blocks": 30,

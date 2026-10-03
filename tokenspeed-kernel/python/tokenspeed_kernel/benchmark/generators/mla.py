@@ -42,6 +42,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = [
     "prepare_mla_decode",
     "prepare_mla_decode_projected_value",
+    "prepare_mla_extend",
     "prepare_mla_normalize_project_query",
     "prepare_mla_prefill",
 ]
@@ -639,6 +640,115 @@ def prepare_mla_decode_projected_value(
             **_decode_parameters(shape, config, inputs["pages"]),
             "output_gate": output_gate,
             "gate_row_stride": None if gate is None else gate.stride(0),
+        },
+        validation=None,
+    )
+
+
+def prepare_mla_extend(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one absorbed causal MLA extend over a cached paged prefix.
+
+    Each request appends ``query_tokens_per_sequence`` tokens to
+    ``prefix_tokens`` cached tokens, as a prefix-cache hit or a short
+    chunked-prefill tail does. The new tokens are already in the cache, so
+    every request sees ``prefix_tokens + query_tokens_per_sequence`` tokens.
+    """
+
+    config = _resolve_config(request)
+    parameters = request.parameters
+    batch = _positive("batch", parameters["batch"])
+    query_tokens = _positive(
+        "query_tokens_per_sequence", parameters["query_tokens_per_sequence"]
+    )
+    prefix_tokens = _positive("prefix_tokens", parameters["prefix_tokens"])
+    max_context_len = _positive("max_context_len", parameters["max_context_len"])
+    kv_tokens = prefix_tokens + query_tokens
+    if kv_tokens > max_context_len:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "MLA extend prefix and query tokens must fit max_context_len",
+        )
+    q_dtype = _parse_dtype("q_dtype", parameters["q_dtype"])
+    kv_cache_dtype = _parse_dtype("kv_cache_dtype", parameters["kv_cache_dtype"])
+
+    load_builtin_kernels()
+    spec = _select_registration(
+        request,
+        platform,
+        signature_roles={"q": q_dtype, "kv_cache": kv_cache_dtype},
+        traits={
+            "max_seqlen_q": query_tokens,
+            "num_q_heads": config.local_heads,
+            "qk_nope_head_dim": config.qk_nope_head_dim,
+            "kv_lora_rank": config.kv_lora_rank,
+            "qk_rope_head_dim": config.qk_rope_head_dim,
+            "page_size": config.kv_page_size,
+            "is_causal": True,
+            "logit_cap": False,
+            "return_lse": False,
+        },
+    )
+
+    page_table, cache_seqlens, pages = _decode_page_table(
+        batch,
+        1,
+        kv_tokens,
+        max_context_len,
+        query_axis=True,
+        config=config,
+        device="cuda",
+    )
+    generator = _generator(request.seed)
+    q = _randn(
+        (batch * query_tokens, config.local_heads, config.latent_cache_dim),
+        generator=generator,
+        dtype=q_dtype,
+    )
+    kv_cache = _randn(
+        (pages, config.kv_page_size, 1, config.latent_cache_dim),
+        generator=generator,
+        dtype=kv_cache_dtype,
+    )
+    boundaries = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = boundaries * query_tokens
+    cu_seqlens_kv = boundaries * kv_tokens
+
+    from tokenspeed_kernel.ops.attention import mla as mla_ops
+
+    def invoke() -> object:
+        return mla_ops.mla_extend_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=query_tokens,
+            max_seqlen_k=max_context_len,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            softmax_scale=config.softmax_scale,
+            is_causal=True,
+            override=request.registration,
+            solution=request.solution,
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            **_common_parameters(config),
+            "batch": batch,
+            "query_tokens_per_sequence": query_tokens,
+            "prefix_tokens": prefix_tokens,
+            "max_context_len": max_context_len,
+            "q_dtype": _dtype_name(q_dtype),
+            "kv_cache_dtype": _dtype_name(kv_cache_dtype),
+            "kv_pages": pages,
         },
         validation=None,
     )
