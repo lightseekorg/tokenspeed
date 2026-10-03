@@ -51,7 +51,7 @@ on:
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
           - test/ci/eval/qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml
-          - test/ci/perf/gpt-oss-120b-mxfp4-evalscope-mi355.yaml
+          - test/ci/perf/gpt-oss-120b-mxfp4-evalscope-mi350.yaml
           - test/ci/perf/kernel-benchmark-amd-gfx950.yaml
           - test/ci/perf/kimi-k2.5-nvfp4-evalscope-agentic.yaml
           - test/ci/perf/kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-random-50k-500-mi35x.yaml
@@ -310,7 +310,7 @@ jobs:
   run:
     needs: scan
     if: needs.scan.outputs.has_tasks == 'true'
-    uses: ./.github/workflows/run-pr-test-stage.yml
+    uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
       matrix: ${{ needs.scan.outputs.matrix }}
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}

@@ -63,6 +63,7 @@ class TritonRSAGBackend:
         max_num_tokens = self._get_max_num_gathered_tokens()
         state = create_state(
             enable_lamport=False,
+            moe_tail_max_rows=0,
             group=pg_manager.get_process_group("nccl", group),
             rank_in_group=group.index(dist.get_rank()),
             attnres_max_numel=0,

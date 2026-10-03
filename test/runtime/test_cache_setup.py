@@ -988,5 +988,146 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
     assert (usable_pages + 1) * 64 * 16 <= 16_384
 
 
+@pytest.mark.parametrize(
+    "target_backend,draft_backend,error",
+    [
+        (None, None, None),
+        ("tokenspeed_mla", None, None),
+        (None, "tokenspeed_mla", None),
+        ("trtllm_mla", None, "does not support MLA DCP"),
+        (None, "trtllm_mla", "DCP currently requires"),
+        (None, "flashmla", "does not yet support speculation"),
+    ],
+)
+def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
+    monkeypatch, target_backend, draft_backend, error
+):
+    from test.runtime.conftest import kimi_recipe
+
+    from tokenspeed.runtime.layers.attention import registry
+    from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+
+    base = kimi_recipe(tp_size=8).attn_config
+    args = SimpleNamespace(
+        attention_backend=target_backend,
+        drafter_attention_backend=draft_backend,
+        decode_context_parallel_size=2,
+        disaggregation_mode="null",
+        mapping=SimpleNamespace(world_size=8, world_group=tuple(range(8))),
+        gpu_memory_utilization=0.9,
+    )
+    target = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
+        model_profile=None,
+        attention_arch=registry.AttentionArch.MLA,
+    )
+    draft = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=["KimiK3ForConditionalGenerationNextN"]
+        ),
+        model_profile=None,
+    )
+    built_draft = []
+
+    def create_config(server_args, model, is_draft=False):
+        name = (
+            server_args.drafter_attention_backend
+            if is_draft
+            else server_args.attention_backend
+        )
+        components = (replace(base.components[0], backend_name=name),)
+        config = replace(
+            base,
+            device="cuda",
+            dcp_size=2,
+            dcp_group=(0, 1),
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            is_draft=is_draft,
+            components=components if is_draft else components + base.components[1:],
+        )
+        if is_draft:
+            built_draft.append(config)
+        return config
+
+    class ReadyForAllocation(Exception):
+        pass
+
+    def profile(**kwargs):
+        config = kwargs["attn_config"]
+        assert config.component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
+        assert (
+            built_draft[0].component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
+        )
+        raise ReadyForAllocation
+
+    monkeypatch.setattr(
+        registry, "current_platform", lambda: SimpleNamespace(is_amd=False)
+    )
+
+    # This test resolves NVIDIA backend capabilities without constructing them.
+    # Their modules are not registered on AMD hosts.
+    class DCPBackend(AttentionBackend):
+        supports_mla_dcp = True
+
+    for name in ("tokenspeed_mla", "flashmla"):
+        monkeypatch.setitem(
+            registry._BACKEND_REGISTRY,
+            name,
+            ({registry.AttentionArch.MLA}, DCPBackend),
+        )
+    monkeypatch.setattr(registry, "_create_attn_config", create_config)
+    monkeypatch.setattr(registry, "profile_available_cache_memory_bytes", profile)
+    expected = (
+        pytest.raises(ValueError, match=error)
+        if error
+        else pytest.raises(ReadyForAllocation)
+    )
+    with expected:
+        registry.create_attn_components(
+            args,
+            target,
+            gpu_id=0,
+            rank=0,
+            gpu_memory=0,
+            draft_model_config=draft,
+            graph_reserve_bytes=0,
+            probe_batch_rows=None,
+            profiled_cache_bytes=None,
+            reuse_target_backend=None,
+            reuse_draft_backend=None,
+        )
+    if draft_backend is not None:
+        assert args.drafter_attention_backend == draft_backend
+
+
+@pytest.mark.parametrize("degree", [1, 2])
+def test_kimi_dspark_rejects_sharded_context_writes(degree):
+    from tokenspeed.runtime.layers.attention import registry
+
+    def side(architecture):
+        return registry._resolve_attn_side(
+            SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=[architecture]),
+                model_profile=None,
+            ),
+            "tokenspeed_mla",
+        )
+
+    args = SimpleNamespace(
+        attention_backend="tokenspeed_mla",
+        drafter_attention_backend="tokenspeed_mla",
+        decode_context_parallel_size=degree,
+    )
+    target = side("KimiK3ForConditionalGeneration")
+    draft = side("K3DSparkModel")
+    if degree > 1:
+        with pytest.raises(ValueError, match="K3 DSpark does not support DCP"):
+            registry._apply_backend_overrides(args, target, draft)
+    else:
+        registry._apply_backend_overrides(args, target, draft)
+        assert args.drafter_attention_backend == "tokenspeed_mla"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

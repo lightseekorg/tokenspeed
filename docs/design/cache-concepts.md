@@ -980,6 +980,16 @@ ratio limit through `max_padding_fraction`; the common packer still validates
 field geometry, strides and block-size limits, and the profiled byte budget
 still bounds capacity. Grouping, packing and allocation are unchanged.
 
+Hybrid recurrent recipes keep their groups balanced instead: every group's page
+spans the whole parent, so a parent is fully used only when every group fills
+the same planes. Qwen3.5 groups state layers by position within its fixed
+state-state-state-full period. Nemotron-H's Mamba2 runs are four or five layers
+long, so its recipe deals state layers round-robin instead and splits the
+attention layers into two KV groups whose K and V pages pack to the size of
+one SSM state; `recipes/mamba2.py` documents the layout. State pages carry no
+padding; KV pages pad only by their share of the conv planes, about 1.5% for
+Nemotron-3 Super.
+
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
 
@@ -1057,7 +1067,11 @@ The rows it re-feeds carry `extend_replay_lens_cpu` down the extend bundle
 
 The same backend narrows the CED decoder to each request's prompt tail
 (`decoder_view()`); the decoder's SWA rows are decode-only state and, being
-in the replayable group, are never expected from a hit either.
+in the replayable group, are never expected from a hit either. Decoder SWA
+visibility starts at that retained tail, even when the final chunk already
+contains exactly one window and no rows are dropped. Encoder metadata may be
+reused only when its visible history also starts there; equal row counts alone
+do not make the two windows interchangeable.
 
 Block drafters (DFLASH / DSPARK) write their KV at the target's cache
 locations, so their storage *is* a target-owned group whatever mask their
@@ -1152,9 +1166,18 @@ Decode gathers query heads, computes attention over owned history, and merges
 partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reconstructs bounded history chunks with an owner-masked sum reduction;
 GPU DSA sparse prefill instead combines local sparse-attention partials.
-The dense MLA implementation requires FlashMLA and its device/dtype support;
-DCP does not make unsupported kernels portable. These GPU paths currently
-exclude speculative decoding, PD transfer and KVStore.
+Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
+DCP does not make unsupported kernels portable. CuTe MLA supports speculative
+decoding. FlashMLA and GPU DSA still
+exclude speculative decoding; all these paths exclude PD transfer and KVStore.
+
+The runtime derives compact DCP page tables and local visible lengths from
+the scheduler's virtual block tables, without introducing new scheduler-owned
+request state. To support draft length changes, the read table retains
+allocated reserve pages while per-query visibility bounds limit actual reads.
+When drafting advances or reanchors to an accepted prefix, the runtime
+translates the global visibility bounds according to page ownership; a change
+in the global token count is not the same change in the local token count.
 
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte
@@ -1186,12 +1209,17 @@ used to shape an arena field. Virtual null ID 0 has no owner and is filtered
 during translation.
 
 Before zeroing scheduler blocks, the runtime checks IDs against the virtual
-bound and translates each group's batch to owned local IDs through the shared
-translation API. Translation precedes dispatch to pool views; pools and the
-arena receive physical IDs and hold no context rank. The arena's
-`zero_blocks()` validates every ID against its group's local page count before
-clearing any bytes. Physical page 0 is within that range and is handled like
-any other page when explicitly requested.
+bound and translates each group's batch to owned local IDs on the host
+(`local_pages`, plain integer arithmetic over the same cyclic placement the
+device translation kernels implement). Translation precedes dispatch to pool
+views; pools and the arena receive physical IDs and hold no context rank. The
+arena's `zero_blocks()` validates every ID against its group's local page
+count before clearing any bytes. Physical page 0 is within that range and is
+handled like any other page when explicitly requested. Host work on this path
+is O(pages): the arena ships the page ids through one pinned copy and the
+kernel expands page x field byte ranges from the group's fixed field table,
+because a long prompt's admission hands out thousands of pages and per-range
+Python here stalls the forward thread while the device sits idle.
 
 The allocator receives only an integer `shard_count`, fixed when the
 coordinator registers the group in its pools. It counts
@@ -1428,7 +1456,8 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   leaves see kernel vocabulary only. The bridge's per-group table views
   (`CacheBatchMetadata`) are the router's input — block vocabulary in,
   kernel pages out, one expand launch per group. Models and the runner never
-  compute locations — `write_locations(layer, mode)` is the single accessor
+  compute locations — `write_locations(layer, mode)` is the single accessor,
+  and `forward_write_locations` composes it for the attention prologue's writes
   (`unified_path.md`, "Write locations have one owner").
   QSA's indexer reuses `GroupTableStacks` with `kernel_page_size` equal to
   each group's `block_granularity`. This ratio-one fill copies stable raw

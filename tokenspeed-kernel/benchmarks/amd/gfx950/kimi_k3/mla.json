@@ -109,56 +109,6 @@
       }
     },
     {
-      "id": "kimi_k3.attention.mla_decode_projected_value/verify-50k-float8",
-      "comparison_epoch": 1,
-      "measurement_blocks": 50,
-      "definition": {
-        "family": "attention",
-        "mode": "mla_decode_projected_value",
-        "parameters": {
-          "requests": 1,
-          "rows_per_request": 4,
-          "cache_length": 50250,
-          "max_context_len": 65536,
-          "q_dtype": "float8_e4m3fn",
-          "kv_cache_dtype": "float8_e4m3fn",
-          "output_gate": true
-        },
-        "cold_cache": true,
-        "seed": 4313
-      },
-      "policy": {
-        "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 2.0,
-        "max_relative_mad": 0.05
-      }
-    },
-    {
-      "id": "kimi_k3.attention.mla_decode_projected_value/verify-8k-float8",
-      "comparison_epoch": 1,
-      "measurement_blocks": 50,
-      "definition": {
-        "family": "attention",
-        "mode": "mla_decode_projected_value",
-        "parameters": {
-          "requests": 1,
-          "rows_per_request": 4,
-          "cache_length": 8192,
-          "max_context_len": 65536,
-          "q_dtype": "float8_e4m3fn",
-          "kv_cache_dtype": "float8_e4m3fn",
-          "output_gate": true
-        },
-        "cold_cache": true,
-        "seed": 4315
-      },
-      "policy": {
-        "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 2.0,
-        "max_relative_mad": 0.05
-      }
-    },
-    {
       "id": "kimi_k3.attention.mla_decode_with_kvcache/decode-50k-float8",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
@@ -184,18 +134,19 @@
     },
     {
       "id": "kimi_k3.attention.mla_decode_with_kvcache/verify-50k-float8",
-      "comparison_epoch": 1,
+      "comparison_epoch": 2,
       "measurement_blocks": 30,
       "definition": {
         "family": "attention",
         "mode": "mla_decode_with_kvcache",
         "parameters": {
-          "requests": [2, 4, 8, 16],
+          "requests": [1, 2, 4, 8, 16],
           "rows_per_request": 4,
           "cache_length": 50250,
           "max_context_len": 65536,
           "q_dtype": "float8_e4m3fn",
-          "kv_cache_dtype": "float8_e4m3fn"
+          "kv_cache_dtype": "float8_e4m3fn",
+          "query_layout": "query_axis"
         },
         "cold_cache": true,
         "seed": 4322
@@ -203,6 +154,31 @@
       "policy": {
         "max_regression_relative": 0.05,
         "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.mla_decode_with_kvcache/verify-8k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "mla_decode_with_kvcache",
+        "parameters": {
+          "requests": [1, 2, 4, 8, 16],
+          "rows_per_request": 4,
+          "cache_length": 8192,
+          "max_context_len": 65536,
+          "q_dtype": "float8_e4m3fn",
+          "kv_cache_dtype": "float8_e4m3fn",
+          "query_layout": "query_axis"
+        },
+        "cold_cache": true,
+        "seed": 4323
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
         "max_relative_mad": 0.05
       }
     },

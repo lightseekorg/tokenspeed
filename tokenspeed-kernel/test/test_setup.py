@@ -58,6 +58,23 @@ def _requirements_by_name(requirements: list[str]) -> dict[str, Requirement]:
     return dict(zip(names, parsed, strict=True))
 
 
+def test_nightly_version_uses_post_date(monkeypatch) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "false")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "release/test")
+    base_version = _capture_setup_kwargs(monkeypatch, "cuda")["version"]
+
+    monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20260929")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
+    assert _capture_setup_kwargs(monkeypatch, "cuda")["version"] == (
+        f"{base_version}.post20260929"
+    )
+
+    monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20260230")
+    with pytest.raises(ValueError):
+        _capture_setup_kwargs(monkeypatch, "cuda")
+
+
 def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None:
     install_requires = _capture_install_requires(monkeypatch, "cuda")
 
@@ -76,7 +93,7 @@ def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None
     assert {"tokenspeed-kernel-amd", "tokenspeed-iris"}.isdisjoint(requirements)
     assert "tokenspeed-triton-kernels" not in requirements
     assert requirements["nvidia-cutlass-dsl"].extras == {"cu13"}
-    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.29.0"
+    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.30.0"
 
 
 def test_cuda_thirdparty_requirements_are_exactly_pinned() -> None:

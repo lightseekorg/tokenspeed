@@ -1,4 +1,22 @@
 # Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 """Dense BF16 projection kernels for Kimi K3.
 
@@ -11,13 +29,20 @@ a bandwidth-oriented fused Q/K/V/output-gate projection.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
+from types import MappingProxyType
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
-from tokenspeed_kernel.ops.gemm.routed_gemv import decode_gemv_routed
+from tokenspeed_kernel.ops.gemm.flashinfer import autotune_bf16_gemm
+from tokenspeed_kernel.ops.gemm.triton_gemv import use_decode_gemv
 from tokenspeed_kernel.platform import Platform, pdl_enabled
+from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
+    SkinnyGemmConfig,
+    shape_dynamic_skinny_gemm,
+)
 
 try:
     from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
@@ -30,6 +55,16 @@ except ImportError:
         return False
 
     def use_gluon_wmma_dense_gfx1250(m: int, k: int, n: int) -> bool:
+        return False
+
+
+try:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        supports_gluon_mm_a16w16_decode_gfx950,
+    )
+except ImportError:
+
+    def supports_gluon_mm_a16w16_decode_gfx950(m: int, n: int, k: int) -> bool:
         return False
 
 
@@ -67,10 +102,6 @@ def _use_gluon_mediumm(m: int, k: int, n: int) -> bool:
     if (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE):
         return 384 <= m <= 512 and m % 64 == 0
     return False
-
-
-def _use_gluon_smallm(m: int, k: int, n: int) -> bool:
-    return m in (2, 4) and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
 
 
 def _use_gluon_largem(m: int, k: int, n: int) -> bool:
@@ -345,8 +376,9 @@ def kimi3_latent_projection(
     ``solution='gluon_smallm'`` forces the split-K small-M gfx950 kernel,
     ``solution='gluon_mediumm'`` forces the middle-M gfx950 kernel, and
     ``solution='gluon_largem'`` forces the large-M gfx950 kernel. ``auto``
-    uses their measured gfx950 crossovers for canonical K3 shapes and retains
-    the vendor GEMM for other shapes and architectures.
+    uses their measured gfx950 crossovers for canonical K3 shapes, routes
+    decode batches through the ``decode_gemv`` registry, and retains the
+    vendor GEMM for other shapes and architectures.
     """
 
     m, n, k = _validate_fallback_projection(
@@ -375,10 +407,9 @@ def kimi3_latent_projection(
     )
     routed = solution == "auto"
     if solution == "auto":
+        autotune_bf16_gemm(hidden_states, weight)
         if Platform.get().is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
-        elif Platform.get().is_cdna4 and specialized and _use_gluon_smallm(m, k, n):
-            solution = "gluon_smallm"
         elif Platform.get().is_cdna4 and specialized and _use_gluon_mediumm(m, k, n):
             solution = "gluon_mediumm"
         elif Platform.get().is_cdna4 and specialized and _use_gluon_largem(m, k, n):
@@ -461,7 +492,7 @@ def kimi3_latent_projection(
             weight,
             out=out,
         )
-    if routed and decode_gemv_routed(hidden_states, weight):
+    if routed and use_decode_gemv(hidden_states, weight):
         from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
         return decode_gemv(hidden_states, weight, out)
@@ -503,6 +534,7 @@ def kimi3_mla_qkv_gate_projection(
     }:
         raise ValueError(f"unknown Kimi K3 MLA projection solution {solution!r}")
     if solution == "auto":
+        autotune_bf16_gemm(hidden_states, weight)
         gfx1250_tdm = (
             Platform.get().is_cdna5
             and hidden_states.is_cuda
@@ -537,7 +569,11 @@ def kimi3_mla_qkv_gate_projection(
             else (
                 "gluon_largem_gfx1250"
                 if gfx1250_largem
-                else ("split" if m > 32 else "fused")
+                else (
+                    "fused"
+                    if m <= 32 or use_decode_gemv(hidden_states, weight)
+                    else "split"
+                )
             )
         )
 
@@ -611,6 +647,94 @@ def kimi3_mla_qkv_gate_projection(
     qkv = torch.nn.functional.linear(hidden_states, weight[:qkv_width])
     gate = torch.nn.functional.linear(hidden_states, weight[qkv_width:])
     return Kimi3MLAQKVGateProjection(qkv=qkv, gate=gate, packed=None)
+
+
+# Retained fused add3 tile configurations, independent of ordinary GEMV tuning.
+# These configurations were measured on sm103 for the K3 latent-up projection.
+_SKINNY_ADD3_CONFIGS = MappingProxyType(
+    {(1, 7168, 3584): (64, 4, 2), (2, 7168, 3584): (64, 7, 2)}
+)
+_skinny_add3_warmed: set[tuple[int, int, int, int]] = set()
+_skinny_add3_warmed_lock = threading.Lock()
+
+
+@lru_cache(maxsize=8)
+def _skinny_add3_arch_supported(device_index: int) -> bool:
+    """Keep the fused tile configurations on their measured architecture."""
+    if Platform.get().vendor != "nvidia":
+        return False
+    return torch.cuda.get_device_capability(device_index) == (10, 3)
+
+
+def _skinny_add3_supported(m: int, n: int, k: int, device: torch.device) -> bool:
+    return (m, n, k) in _SKINNY_ADD3_CONFIGS and _skinny_add3_arch_supported(
+        device.index or 0
+    )
+
+
+def _skinny_add3_fallback(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    a: torch.Tensor,
+    c: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    result = torch.addmm(c, x, weight.t())
+    result += a
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def _skinny_gemv_add3(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    a: torch.Tensor,
+    c: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """``a + x @ weight.T + c`` via the skinny GEMM's dual-residual epilogue.
+
+    Args:
+        x: ``[M, K]`` contiguous bf16 activations.
+        weight: ``[N, K]`` contiguous bf16 weight.
+        a/c: ``[M, N]`` addends with unit inner stride (row stride free, so a
+            column slice of a wider tensor is accepted).
+        out: optional ``[M, N]`` destination.
+
+    Returns:
+        ``[M, N]`` result in ``x``'s dtype.
+    """
+
+    m, k = x.shape
+    n = weight.shape[0]
+    dev = x.device.index or 0
+    key = (dev, m, n, k)
+    tuned = _SKINNY_ADD3_CONFIGS.get((m, n, k))
+    if (
+        tuned is None
+        or x.dtype != torch.bfloat16
+        or not _skinny_add3_arch_supported(dev)
+        or (torch.cuda.is_current_stream_capturing() and key not in _skinny_add3_warmed)
+    ):
+        return _skinny_add3_fallback(x, weight, a, c, out)
+    config = SkinnyGemmConfig(m, *tuned)
+    if not shape_dynamic_skinny_gemm.supports(config, m, n, k):
+        return _skinny_add3_fallback(x, weight, a, c, out)
+    result = shape_dynamic_skinny_gemm(
+        x.detach(),
+        weight.detach(),
+        config,
+        residual=a.detach(),
+        residual2=c.detach(),
+        out=out,
+    )
+    # Only successful eager calls earn capture trust, separately for each GPU.
+    if not torch.cuda.is_current_stream_capturing():
+        with _skinny_add3_warmed_lock:
+            _skinny_add3_warmed.add(key)
+    return result
 
 
 def kimi3_latent_projection_add3(
@@ -738,11 +862,8 @@ def kimi3_latent_projection_add3(
         raise ValueError("Kimi K3 RMSNorm epsilon requires a norm weight")
 
     if solution == "auto":
-        from tokenspeed_kernel.ops.gemm.routed_gemv import (
-            skinny_add3_supported,
-        )
-
-        if specialized and skinny_add3_supported(m, n, k, hidden_states.device):
+        autotune_bf16_gemm(hidden_states, weight)
+        if specialized and _skinny_add3_supported(m, n, k, hidden_states.device):
             # Dual-residual skinny epilogue: 1.06x over rowcta_gemv_add3.
             solution = "skinny_add3"
         elif m == 1 and specialized:
@@ -764,13 +885,12 @@ def kimi3_latent_projection_add3(
                 "skinny_add3 projection-add3 requires contiguous CUDA BF16 "
                 "inputs at a K3 latent shape"
             )
-        from tokenspeed_kernel.ops.gemm.routed_gemv import skinny_gemv_add3
-
-        return skinny_gemv_add3(
+        return _skinny_gemv_add3(
             hidden_states,
             weight,
             prefix,
             shared_output,
+            None,
         )
     if solution == "rowcta_gemv":
         if m != 1:
@@ -918,6 +1038,7 @@ def kimi3_shared_situ_projection(
         and gate_up_width == KIMI3_SHARED_GATE_UP_LOCAL_SIZE
     )
     if solution == "auto":
+        autotune_bf16_gemm(hidden_states, gate_up_weight)
         solution = "triton_gemv" if Platform.get().is_cdna4 and specialized else "torch"
     if solution == "triton_gemv":
         if not specialized:
@@ -945,7 +1066,7 @@ def kimi3_shared_situ_projection(
         )
         return out
 
-    if routed and decode_gemv_routed(hidden_states, gate_up_weight):
+    if routed and use_decode_gemv(hidden_states, gate_up_weight):
         from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
         gate_up = decode_gemv(hidden_states, gate_up_weight)
@@ -1053,6 +1174,7 @@ def kimi3_shared_down_projection(
     )
     routed = solution == "auto"
     if solution == "auto":
+        autotune_bf16_gemm(hidden_states, weight)
         if Platform.get().is_cdna4 and specialized:
             solution = "triton_gemv"
         elif (
@@ -1072,7 +1194,7 @@ def kimi3_shared_down_projection(
             solution = "gluon_largem_gfx1250"
         else:
             solution = "torch"
-    if routed and decode_gemv_routed(hidden_states, weight):
+    if routed and use_decode_gemv(hidden_states, weight):
         from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
         return decode_gemv(hidden_states, weight, out)
@@ -1212,6 +1334,7 @@ def kimi3_qkvfab_projection(
         and output_width == KIMI3_QKVFAB_SIZE
     )
     if solution == "auto":
+        autotune_bf16_gemm(hidden_states, weight)
         if (
             Platform.get().is_cdna5
             and hidden_states.is_cuda
@@ -1240,7 +1363,7 @@ def kimi3_qkvfab_projection(
             solution = "gluon_largem_gfx1250"
         elif Platform.get().is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
-        elif specialized:
+        elif specialized or use_decode_gemv(hidden_states, weight):
             # Let the registry pick per (M, N, K); unlisted shapes hit torch.mm.
             solution = "decode_gemv"
         else:
@@ -1381,7 +1504,15 @@ def kimi3_router_projection(
         name="Kimi K3 router projection",
         out_dtype=torch.float32,
     )
-    if solution not in {"auto", "ll_bf16", "cuda", "cublas", "triton_gemv", "torch"}:
+    if solution not in {
+        "auto",
+        "ll_bf16",
+        "cuda",
+        "cublas",
+        "triton_gemv",
+        "gluon_decode",
+        "torch",
+    }:
         raise ValueError(f"unknown Kimi K3 router solution {solution!r}")
     specialized = (
         hidden_states.is_cuda
@@ -1396,6 +1527,12 @@ def kimi3_router_projection(
         platform = Platform.get()
         if platform.is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
+        elif (
+            platform.is_cdna4
+            and specialized
+            and supports_gluon_mm_a16w16_decode_gfx950(m, output_width, input_width)
+        ):
+            solution = "gluon_decode"
         elif platform.is_hopper_plus and specialized:
             if _ll_bf16_usable(hidden_states, weight, m):
                 solution = "ll_bf16"
@@ -1441,6 +1578,20 @@ def kimi3_router_projection(
             out=out,
             config=((4, 1024, 4, 1) if m == 1 else (8, 256, 8, 1)),
             validate=False,
+        )
+    if solution == "gluon_decode":
+        if not specialized:
+            raise ValueError(
+                "Kimi K3 router Gluon decode GEMM requires contiguous gfx950 "
+                "BF16 [M, 7168] input and [896, 7168] weight"
+            )
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+            launch_gluon_mm_a16w16_decode_gfx950,
+        )
+
+        # FP32 accumulate and FP32 store, matching the other router paths.
+        return launch_gluon_mm_a16w16_decode_gfx950(
+            hidden_states, weight, torch.float32, out=out
         )
     if solution == "cuda":
         if not specialized:

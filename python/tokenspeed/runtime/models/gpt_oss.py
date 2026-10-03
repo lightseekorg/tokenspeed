@@ -63,10 +63,7 @@ from tokenspeed.runtime.models.base import (
     BaseTransformerModel,
     CompiledMoEDecoderLayer,
 )
-from tokenspeed.runtime.models.utils import (
-    create_fused_set_kv_buffer_arg,
-    validate_attention_partition,
-)
+from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -213,6 +210,8 @@ class GptOssAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=(sliding_window_size if use_sliding_window else -1),
+            rotary_emb=self.rotary_emb,
+            qk_norm=None,
         )
         self.layer_id = layer_id
 
@@ -227,52 +226,15 @@ class GptOssAttention(nn.Module):
             return hidden_states, ctx, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        fused_kv_arg = None
-        if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            n = q.shape[0]
-            v_3d = v.view(n, self.num_kv_heads, self.head_dim)
-            fused_kv_arg = create_fused_set_kv_buffer_arg(
-                value=v_3d,
-                layer=self.attn,
-                # Prewrite at this layer's group locations, fetched from the
-                # backend (the one owner of KV write slots).
-                out_cache_loc=ctx.attn_backend.write_locations(
-                    self.attn, ctx.forward_mode
-                ),
-                token_to_kv_pool=ctx.token_to_kv_pool,
-            )
-
-        if fused_kv_arg is not None:
-            n = q.shape[0]
-            q_rope = torch.empty((n, self.q_size), dtype=q.dtype, device=q.device)
-            q, k = self.rotary_emb(
-                positions,
-                q,
-                k,
-                fused_set_kv_buffer_arg=fused_kv_arg,
-                output_q_rope=q_rope,
-            )
-            inner_state = q_rope, None, None
-        else:
-            q, k = self.rotary_emb(positions, q, k)
-            inner_state = q, k, v
-        return None, ctx, inner_state
+        return None, ctx, (q, k, v, positions)
 
     def forward_core(self, intermediate_state):
 
         hidden_states, ctx, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        # Cache was already written by the fused RoPE+KV kernel iff we took that path,
-        # which is exactly when k is None in inner_state.
-        save_kv_cache = inner_state[1] is not None
-        attn_output = self.attn(
-            *inner_state,
-            save_kv_cache=save_kv_cache,
-            ctx=ctx,
-            sinks=self.sinks,
-        )
+        q, k, v, positions = inner_state
+        attn_output = self.attn(q, k, v, positions, ctx, sinks=self.sinks)
         output, _ = self.o_proj(attn_output)
         return output
 

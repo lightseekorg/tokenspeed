@@ -147,7 +147,7 @@ env:
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_output_contract
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_inputs_use_torch
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches
-    tokenspeed-kernel/test/ops/gemm/test_routed_gemv.py::test_cdna5_route_admits_decode_shapes[7168-1536-17]
+    tokenspeed-kernel/test/ops/gemm/test_decode_gemv.py::test_cdna5_route_admits_decode_shapes[7168-1536-17]
     # Warmed AttnRes launch variants, dense split-K reduction, short TDM
     # tails, and seven-buffer QKVFAB.
     tokenspeed-kernel/test/amd/ops/test_dense_bf16_gfx1250.py

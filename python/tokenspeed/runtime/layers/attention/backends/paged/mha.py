@@ -31,9 +31,6 @@ from tokenspeed_kernel.ops.attention.mha import (
     mha_plan,
     mha_prefill,
 )
-from tokenspeed_kernel.ops.kvcache.triton import (
-    fused_fp8_set_kv_buffer,
-)
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -60,7 +57,7 @@ _KERNEL_SOLUTION_BY_BACKEND = {
 }
 
 
-def _slice_extend_inputs(metadata, q, k, v):
+def _slice_extend_inputs(metadata, *tensors):
     """Remove prefill-graph padding rows before calling an attention kernel.
 
     The live cu-seqlens describe only real tokens. Some kernels tolerate extra
@@ -68,22 +65,7 @@ def _slice_extend_inputs(metadata, q, k, v):
     pinned CPU mirror (sync-free) so every solution receives the same exact-row
     contract. No-op on normal unpadded forwards.
     """
-    return slice_to_real_tokens(metadata.cu_extend_seq_lens_cpu[-1], q, k, v)
-
-
-def trim_kv_to_locs(out_cache_loc, k, v):
-    """Slice a padded KV write down to the write-loc count.
-
-    Prefill-graph replay pads k/v rows to the bucket while the write
-    locations cover only the real (leading) rows. Trimming beats padding the
-    locs with the null page: kernels that don't scrub tail rows would write
-    garbage into page 0, breaking its stays-zero invariant. No-op off the
-    padded path.
-    """
-    n = out_cache_loc.shape[0]
-    if k is not None and k.shape[0] > n:
-        return k[:n], v[:n]
-    return k, v
+    return slice_to_real_tokens(metadata.cu_extend_seq_lens_cpu[-1], *tensors)
 
 
 @dataclass(kw_only=True)
@@ -162,10 +144,9 @@ class MHAAttnBackend(PagedAttentionBackend):
         self.forward_decode_metadata = None
         self.forward_extend_metadata = None
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
-        return forward_mode is not None and forward_mode.is_decode()
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        # Decode metadata exists only in decode rounds.
+        return forward_mode.is_decode()
 
     # ------------------------------------------------------------------
     # Metadata
@@ -280,19 +261,12 @@ class MHAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         assert layer.qk_head_dim == layer.v_head_dim
-        assert (k is None) == (v is None)
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        if k is not None:
-            k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-            v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         metadata = self.forward_decode_metadata
-        if save_kv_cache:
-            self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
 
         scale_kwargs = {}
         if self.is_mxfp8:
@@ -329,12 +303,10 @@ class MHAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         assert layer.qk_head_dim == layer.v_head_dim
-        assert (k is None) == (v is None)
-        assert k is not None
+        assert k is not None and v is not None
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
@@ -349,28 +321,8 @@ class MHAAttnBackend(PagedAttentionBackend):
         )
         extend_mode = plan.get("extend_mode", "prewrite")
         if metadata.max_extend_prefix_len == 0 and extend_mode == "postwrite":
-            return self._forward_prefill(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                metadata,
-                save_kv_cache,
-                sinks,
-            )
-        return self._forward_extend(
-            q,
-            k,
-            v,
-            layer,
-            out_cache_loc,
-            token_to_kv_pool,
-            metadata,
-            save_kv_cache,
-            sinks,
-        )
+            return self._forward_prefill(q, k, v, layer, metadata, sinks)
+        return self._forward_extend(q, layer, token_to_kv_pool, metadata, sinks)
 
     def _forward_prefill(
         self,
@@ -378,19 +330,10 @@ class MHAAttnBackend(PagedAttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
-        token_to_kv_pool,
         metadata: MHAExtendMetadata,
-        save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
         q, k, v = _slice_extend_inputs(metadata, q, k, v)
-        # TODO: use a custom kernel to do downcast
-        if self.is_fp8:
-            q = q.to(self.kv_cache_dtype)
-            k = k.to(self.kv_cache_dtype)
-            v = v.to(self.kv_cache_dtype)
-
         output = mha_prefill(
             q=q,
             k=k,
@@ -404,28 +347,17 @@ class MHAAttnBackend(PagedAttentionBackend):
             skip_softmax_threshold=self.skip_softmax_threshold,
             solution=self.kernel_solution,
         )
-        output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
-        if save_kv_cache:
-            self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
-        return output
+        return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _forward_extend(
         self,
         q: torch.Tensor,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
         layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         metadata: MHAExtendMetadata,
-        save_kv_cache: bool,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
-        q, k, v = _slice_extend_inputs(metadata, q, k, v)
-        if save_kv_cache:
-            # KV store (incl. the mxfp8 quantize-on-store path) lives solely
-            # in _save_kv_cache.
-            self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
+        (q,) = _slice_extend_inputs(metadata, q)
 
         scale_kwargs = {}
         if self.is_mxfp8:
@@ -456,27 +388,15 @@ class MHAAttnBackend(PagedAttentionBackend):
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     # ------------------------------------------------------------------
-    # KV store helpers
+    # MXFP8 helpers
     # ------------------------------------------------------------------
-
-    def _store_kv_mxfp8(self, layer, loc, token_to_kv_pool, k, v) -> None:
-        """MXFP8 quantize-on-store: one fused launch when the pool supports
-        it (bit-identical, PDL-chained), else the split 5-launch path.
-        The sole caller (_save_kv_cache) has already trimmed k/v to loc."""
-        fused = getattr(token_to_kv_pool, "quantize_and_set_kv_buffer", None)
-        if fused is not None and fused(layer, loc, k, v):
-            return
-        k_q, k_sf = self._quantize_mxfp8_tokens(k)
-        v_q, v_sf = self._quantize_mxfp8_tokens(v)
-        token_to_kv_pool.set_kv_buffer(layer, loc, k_q, v_q, k_scale=k_sf, v_scale=v_sf)
 
     def _quantize_mxfp8_tokens(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-token MXFP8: (fp8-e4m3 [T, H, D], UE8M0 scales [T, H, D // 32]).
 
-        Accepts [T, H, D] or [T, H * D]; H is inferred so the same helper
-        serves q (tp_q_head_num) and k/v (tp_kv_head_num).
+        Accepts query rows as [T, H, D] or [T, H * D].
         """
         t, d = x.shape[0], self.head_dim
         h = x.numel() // (t * d)
@@ -486,44 +406,6 @@ class MHAAttnBackend(PagedAttentionBackend):
             data.view(t, h, d),
             sf.view(torch.float8_e8m0fnu).view(t, h, d // 32),
         )
-
-    def _save_kv_cache(
-        self,
-        layer: PagedAttention,
-        out_cache_loc: torch.Tensor,
-        token_to_kv_pool,
-        k: torch.Tensor | None,
-        v: torch.Tensor | None,
-    ) -> None:
-        if k is None:
-            return
-        k, v = trim_kv_to_locs(out_cache_loc, k, v)
-
-        if self.is_mxfp8:
-            # Quantize-on-store: fp8 data + per-token e8m0 scales into the
-            # paged interleaved layout
-            self._store_kv_mxfp8(layer, out_cache_loc, token_to_kv_pool, k, v)
-        elif self.is_fp8:
-            k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            fused_fp8_set_kv_buffer(
-                k=k,
-                v=v,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_loc=out_cache_loc,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-                page_size=self.kernel_page_size,
-            )
-        else:
-            token_to_kv_pool.set_kv_buffer(
-                layer,
-                out_cache_loc,
-                k,
-                v,
-                layer.k_scale,
-                layer.v_scale,
-            )
 
     def _get_kv_cache(self, layer: PagedAttention, token_to_kv_pool):
         # Page ids are in this leaf's kernel-page units (the router expanded

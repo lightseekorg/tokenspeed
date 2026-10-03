@@ -1563,7 +1563,16 @@ def test_dspark_anchors_pick_last_accepted_verify_rows(device):
     positions = torch.arange(1000, 1000 + decodes * width, device=device)
     next_tokens = torch.zeros(bs, spec, device=device, dtype=torch.int32)
     start = torch.zeros(decodes, device=device, dtype=torch.int64)
-    dsv41.dspark_anchors(tokens, accept, positions, extends, width, next_tokens, start)
+    dsv41.dspark_anchors(
+        tokens,
+        accept,
+        positions,
+        extends,
+        width,
+        next_tokens,
+        start,
+        num_prefill_outputs=extends,
+    )
     # Extend rows keep their sampled token; decode rows take the token at the
     # last accepted verify row, with accept lengths clamped into 1..width.
     assert next_tokens.tolist() == [[100] * 6, [104] * 6, [107] * 6, [118] * 6]
@@ -1571,14 +1580,28 @@ def test_dspark_anchors_pick_last_accepted_verify_rows(device):
     cpu_next = torch.zeros(bs, spec, dtype=torch.int32)
     cpu_start = torch.zeros(decodes, dtype=torch.int64)
     dsv41.dspark_anchors(
-        tokens.cpu(), accept.cpu(), positions.cpu(), extends, width, cpu_next, cpu_start
+        tokens.cpu(),
+        accept.cpu(),
+        positions.cpu(),
+        extends,
+        width,
+        cpu_next,
+        cpu_start,
+        num_prefill_outputs=extends,
     )
     assert torch.equal(cpu_next, next_tokens.cpu()) and torch.equal(
         cpu_start, start.cpu()
     )
     with pytest.raises(ValueError):
         dsv41.dspark_anchors(
-            tokens[:-1], accept, positions, extends, width, next_tokens, start
+            tokens[:-1],
+            accept,
+            positions,
+            extends,
+            width,
+            next_tokens,
+            start,
+            num_prefill_outputs=extends,
         )
 
 
@@ -1626,3 +1649,36 @@ def test_dspark_block_expands_anchors_and_window_addressing(device):
         assert torch.equal(got.cpu(), reference.to(got.dtype))
     with pytest.raises(ValueError):
         dsv41.dspark_block(bonus[:2], start, history, noise, rows_per_page, hc, block)
+
+
+def test_dspark_sparse_outputs_preserve_inactive_rows_without_recompile(device):
+    extends, width = 2, 3
+    accept = torch.tensor([1, 0, 2], dtype=torch.int32, device=device)
+    positions = torch.tensor([50, 51, 52], dtype=torch.int64, device=device)
+    next_tokens = torch.full((3, width), -7, dtype=torch.int32, device=device)
+    starts = torch.empty(1, dtype=torch.int64, device=device)
+
+    def run(outputs):
+        tokens = torch.arange(
+            10, 10 + outputs + width, dtype=torch.int32, device=device
+        )
+        next_tokens.fill_(-7)
+        dsv41.dspark_anchors(
+            tokens,
+            accept,
+            positions,
+            extends,
+            width,
+            next_tokens,
+            starts,
+            num_prefill_outputs=outputs,
+        )
+        assert next_tokens[:outputs, 0].tolist() == list(range(10, 10 + outputs))
+        assert (next_tokens[outputs:extends] == -7).all()
+        assert next_tokens[extends].tolist() == [10 + outputs + 1] * width
+        assert starts.tolist() == [51]
+
+    run(1)
+    with assert_no_triton_compile(implementation._dspark_anchors_kernel):
+        run(0)
+        run(2)

@@ -25,6 +25,7 @@ from tokenspeed_kernel.ops.activation.flashinfer import (
 )
 from tokenspeed_kernel.ops.activation.triton import (
     add3,
+    relu2,
 )
 from tokenspeed_kernel.ops.activation.triton import silu_and_mul as triton_silu_and_mul
 from tokenspeed_kernel.ops.activation.triton import situ_and_mul as triton_situ_and_mul
@@ -110,6 +111,7 @@ def situ_and_mul(
 
 __all__ = [
     "add3",
+    "relu2",
     "prepare_fp8_linear_activation",
     "silu_and_mul",
     "situ_and_mul",

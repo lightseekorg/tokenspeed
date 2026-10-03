@@ -24,6 +24,7 @@ import dataclasses
 
 import torch
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
+from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     DistArgmaxState,
@@ -150,6 +151,7 @@ class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     gather_ids: torch.Tensor | None = None
+    logits_rows_selected: bool = False
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -183,6 +185,7 @@ class LogitsMetadata:
             forward_mode=ctx.forward_mode,
             capture_hidden_mode=ctx.capture_hidden_mode,
             gather_ids=ctx.gather_ids,
+            logits_rows_selected=ctx.logits_rows_selected,
         )
 
 
@@ -388,6 +391,7 @@ class LogitsProcessor(nn.Module):
         if key not in self._LOGITS_AG_STATES:
             self._LOGITS_AG_STATES[key] = create_state(
                 enable_lamport=False,
+                moe_tail_max_rows=0,
                 group=pg_manager.get_process_group("nccl", self.tp_group),
                 rank_in_group=self.tp_rank,
                 attnres_max_numel=0,
@@ -498,13 +502,34 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         aux_hidden_states: torch.Tensor | None = None,
     ) -> LogitsProcessorOutput:
+        # A model may finish a cache-only chunk without any logits rows.
+        # Return before LM-head/collective kernels, retaining the empty taps.
+        if logits_metadata.logits_rows_selected and hidden_states.shape[0] == 0:
+            if logits_metadata.extend_return_logprob:
+                raise ValueError("selected logits rows cannot provide input logprobs")
+            capture = None
+            if logits_metadata.capture_hidden_mode.need_capture():
+                capture = (
+                    torch.cat(aux_hidden_states, dim=-1)
+                    if aux_hidden_states
+                    else hidden_states
+                )
+            return LogitsProcessorOutput(
+                next_token_logits=hidden_states.new_empty(
+                    (0, self.config.vocab_size), dtype=torch.float32
+                ),
+                hidden_states=capture,
+            )
         # Get the last hidden states and last logits for the next token prediction
         if not logits_metadata.extend_return_logprob:
             gather_ids = logits_metadata.gather_ids
             if gather_ids is not None:
                 # Shapes align iff midlayer already pruned to one row per request
                 # (draft first-step reduce). Other paths emit [N, H] with N > bs.
-                if gather_ids.shape[0] == hidden_states.shape[0]:
+                if (
+                    logits_metadata.logits_rows_selected
+                    or gather_ids.shape[0] == hidden_states.shape[0]
+                ):
                     pruned_states = hidden_states
                     if aux_hidden_states is not None:
                         aux_pruned_states = list(aux_hidden_states)
@@ -727,12 +752,16 @@ class LogitsProcessor(nn.Module):
                     lm_head.weight,
                     override="aok",
                 )
-            elif self._use_fused_lm_head:
-                logits = _lm_head_matmul(hidden_states, lm_head.weight)
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                cast_hidden = hidden_states.to(lm_head.weight.dtype)
+                if current_platform().is_amd and use_decode_gemv(
+                    cast_hidden, lm_head.weight
+                ):
+                    logits = decode_gemv(cast_hidden, lm_head.weight)
+                elif self._use_fused_lm_head:
+                    logits = _lm_head_matmul(cast_hidden, lm_head.weight)
+                else:
+                    logits = torch.matmul(cast_hidden, lm_head.weight.T)
         else:
             # GGUF models
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)

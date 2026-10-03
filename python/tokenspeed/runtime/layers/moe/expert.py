@@ -27,6 +27,7 @@ import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
+    TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -45,6 +46,10 @@ from tokenspeed.runtime.layers.moe.utils import (
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
 from tokenspeed.runtime.layers.moe.weights.loaders import round_up
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
     should_ignore_quant_layer,
@@ -224,7 +229,11 @@ class MoELayer(torch.nn.Module):
             )
         if self._quant_kind == "nvfp4":
             self._apply_trtllm_ispp_padding(
-                TRTLLM_NVFP4_ISPP_ALIGNMENT,
+                (
+                    TRTLLM_NVFP4_ISPP_ALIGNMENT
+                    if self._spec.gated
+                    else TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT
+                ),
                 "the flashinfer_trtllm NVFP4 weight layout accepts it",
             )
         if self._quant_kind == "mxfp4":
@@ -288,9 +297,15 @@ class MoELayer(torch.nn.Module):
                     "Gluon Petit MegaMoE requires trivial expert placement "
                     "without EPLB or redundant experts"
                 )
-            if (
-                self._quant_kind != "mxfp4"
-                or not self.quant_config.is_checkpoint_mxfp4_serialized
+            if self._quant_kind != "mxfp4" or not (
+                (
+                    isinstance(self.quant_config, Mxfp4Config)
+                    and self.quant_config.is_checkpoint_mxfp4_serialized
+                )
+                or (
+                    isinstance(self.quant_config, CompressedTensorsConfig)
+                    and self.quant_config.quant_format == "mxfp4-pack-quantized"
+                )
             ):
                 raise ValueError(
                     "Gluon Petit MegaMoE requires serialized MXFP4 expert weights"
@@ -396,7 +411,10 @@ class MoELayer(torch.nn.Module):
                 ``ispp_alignment``).
             reason: Log fragment describing why the padding is required.
         """
-        if get_moe_backend().value != "flashinfer_trtllm":
+        backend = get_moe_backend().value
+        # Only the trtllm kernels run non-gated experts, so ``auto`` selects them.
+        trtllm_only = backend == "auto" and not self._spec.gated
+        if backend != "flashinfer_trtllm" and not trtllm_only:
             return
         ispp = self.intermediate_size // self.tp_size
         if ispp % alignment == 0:

@@ -57,6 +57,7 @@ LARGEM_DISPATCH_MIN_M = 2048
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _partial_cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
+_counter_cache: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
 def _dense16_bmm_launch_metadata(grid, kernel, args):
@@ -111,6 +112,26 @@ def _dense16_mediumm_launch_metadata(grid, kernel, args):
             args["addend_a_ptr"].element_size() + args["addend_b_ptr"].element_size()
         )
     return metadata
+
+
+@gluon.jit
+def _remap_xcd(pid, num_programs, NUM_XCDS: gl.constexpr):
+    # Hardware dispatches program i to XCD i % NUM_XCDS; give each XCD a
+    # contiguous range of program ids instead.
+    pids_per_xcd = (num_programs + NUM_XCDS - 1) // NUM_XCDS
+    tall_xcds = num_programs % NUM_XCDS
+    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    if xcd < tall_xcds:
+        pid = xcd * pids_per_xcd + local_pid
+    else:
+        pid = (
+            tall_xcds * pids_per_xcd
+            + (xcd - tall_xcds) * (pids_per_xcd - 1)
+            + local_pid
+        )
+    return pid
 
 
 @gluon.jit
@@ -774,6 +795,8 @@ def gluon_mm_a16w16_medium_gfx950(
     c_ptr,
     addend_a_ptr,
     addend_b_ptr,
+    partial_ptr,
+    counter_ptr,
     M,
     N,
     K: gl.constexpr,
@@ -795,13 +818,36 @@ def gluon_mm_a16w16_medium_gfx950(
     NUM_BUFFERS: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
     ADD3: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
     PID_OFFSET: gl.constexpr = 0,
 ):
-    """MFMA/LDS dense16 GEMM for selected 8 <= M <= 128 decode tiles."""
+    """MFMA/LDS dense16 GEMM for selected M <= 128 decode and middle-M tiles.
+
+    With ``SPLIT_K > 1`` each output tile is computed by ``SPLIT_K`` programs
+    over disjoint K slices. Each stores its FP32 partial to ``partial_ptr`` and
+    bumps the tile's ``counter_ptr`` entry; the last arriving program sums all
+    partials in split order, writes C, and resets the counter to zero for the
+    next launch.
+
+    ``NUM_XCDS > 1`` places consecutive tiles on the same XCD, so the M tiles
+    that share a weight tile also share that XCD's L2.
+    """
     pid = gl.program_id(axis=0) - PID_OFFSET
     num_pid_m = gl.cdiv(M, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
-    pid_m, pid_n = _tile_to_pid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
+    if NUM_XCDS > 1:
+        pid = _remap_xcd(pid, num_pid_m * num_pid_n * SPLIT_K, NUM_XCDS)
+    if SPLIT_K == 1:
+        tile = pid
+        k_base = 0
+    else:
+        gl.static_assert(not ADD3, "split-K tiled MFMA GEMM does not support ADD3")
+        num_tiles = num_pid_m * num_pid_n
+        tile = pid % num_tiles
+        split = pid // num_tiles
+        k_base = split * (K // SPLIT_K)
+    pid_m, pid_n = _tile_to_pid(tile, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     gl.static_assert(
         BLOCK_M % 16 == 0, "tiled MFMA GEMM requires BLOCK_M multiple of 16"
@@ -871,8 +917,10 @@ def gluon_mm_a16w16_medium_gfx950(
     offs_bn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, gLoadLayoutB))
     offs_bk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, gLoadLayoutB))
 
-    a_tile_base = pid_m * BLOCK_M * stride_am
-    b_tile_base = pid_n * BLOCK_N * stride_bn
+    a_tile_base = pid_m * BLOCK_M * stride_am + k_base * stride_ak
+    # Clamp weight rows past N to the last row instead of masking every B
+    # load; the store mask drops those output columns.
+    b_rows = gl.minimum(pid_n * BLOCK_N + offs_bn, N - 1)
 
     a_offs0 = (
         a_tile_base + offs_am[:, None] * stride_am + offs_ak[None, :] * stride_ak
@@ -880,7 +928,7 @@ def gluon_mm_a16w16_medium_gfx950(
     a_offs1 = (a_offs0 + BLOCK_K * stride_ak).to(gl.int32)
     a_offs2 = (a_offs0 + 2 * BLOCK_K * stride_ak).to(gl.int32)
     b_offs0 = (
-        b_tile_base + offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+        k_base * stride_bk + offs_bk[:, None] * stride_bk + b_rows[None, :] * stride_bn
     ).to(gl.int32)
     b_offs1 = (b_offs0 + BLOCK_K * stride_bk).to(gl.int32)
     b_offs2 = (b_offs0 + 2 * BLOCK_K * stride_bk).to(gl.int32)
@@ -890,7 +938,11 @@ def gluon_mm_a16w16_medium_gfx950(
     m = pid_m * BLOCK_M + offs_am
     a_mask = m[:, None] < M
 
-    k_tiles: gl.constexpr = K // BLOCK_K
+    gl.static_assert(
+        K % (SPLIT_K * BLOCK_K) == 0,
+        "tiled MFMA GEMM needs K divisible by SPLIT_K * BLOCK_K",
+    )
+    k_tiles: gl.constexpr = K // (SPLIT_K * BLOCK_K)
     if NUM_BUFFERS == 1:
         gl.static_assert(
             k_tiles == 1, "one-buffer tiled MFMA GEMM supports exactly one K tile"
@@ -1104,6 +1156,46 @@ def gluon_mm_a16w16_medium_gfx950(
     cn = pid_n * BLOCK_N + offs_cn
     c_offsets = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
     c_mask = (cm[:, None] < M) & (cn[None, :] < N)
+    if SPLIT_K > 1:
+        tile_elems: gl.constexpr = BLOCK_M * BLOCK_N
+        partial_offsets = offs_cm[:, None] * BLOCK_N + offs_cn[None, :]
+        num_tiles_sk = num_pid_m * num_pid_n
+        cdna4.buffer_store(
+            ptr=partial_ptr + (split * num_tiles_sk + tile) * tile_elems,
+            offsets=partial_offsets,
+            stored_value=acc_store,
+            cache=".wt",
+        )
+        # Publish the partial without an acq_rel atomic, whose L2 writeback and
+        # invalidate cost more than the GEMM: ".wt" writes through to memory,
+        # every wave waits for its stores to complete (vmcnt), and the barrier
+        # orders all waves' stores before the counter bump.
+        gl.inline_asm_elementwise(
+            asm="s_waitcnt vmcnt(0)",
+            constraints="=v,0",
+            args=[offs_cm],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+        gl.barrier()
+        old = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
+        if old != SPLIT_K - 1:
+            return
+        # Sum in split order, not arrival order, so results are deterministic.
+        # ".cv" bypasses caches so partials from other XCDs are not stale.
+        acc_store = cdna4.buffer_load(
+            ptr=partial_ptr + tile * tile_elems,
+            offsets=partial_offsets,
+            cache=".cv",
+        )
+        for s in gl.static_range(1, SPLIT_K):
+            acc_store += cdna4.buffer_load(
+                ptr=partial_ptr + (s * num_tiles_sk + tile) * tile_elems,
+                offsets=partial_offsets,
+                cache=".cv",
+            )
+        gl.store(counter_ptr + tile, 0)
     if ADD3:
         addend_a_offsets = (
             offs_cm[:, None] * stride_addend_am + offs_cn[None, :] * stride_addend_an
@@ -1604,6 +1696,8 @@ def launch_gluon_mm_a16w16_medium_gfx950(
         C,
         C,
         C,
+        C,
+        C,
         M,
         N,
         K,
@@ -1625,12 +1719,246 @@ def launch_gluon_mm_a16w16_medium_gfx950(
         NUM_BUFFERS=num_buffers,
         GROUP_SIZE_M=GROUP_SIZE_M,
         ADD3=False,
+        SPLIT_K=1,
+        NUM_XCDS=1,
         num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
 
     if alpha is not None:
         C.mul_(alpha.to(device=C.device, dtype=C.dtype))
+    return C
+
+
+# Cold-cache rocprofv3 sweeps on gfx950 at Kimi K3 TP8 decode shapes, keyed
+# by (N, K) and then by M bucket: a call uses the config of the smallest bucket
+# covering its M, so M stays a runtime argument within a bucket. A config is
+# (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M, WARPS_N, NUM_BUFFERS, SPLIT_K, NUM_XCDS).
+# Only buckets that beat torch.mm by at least 4% are listed; the rest keep the
+# torch path.
+DECODE_M_BUCKETS = (4, 8, 16, 32, 64)
+_DECODE_CONFIGS: dict[
+    tuple[int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
+] = {
+    # o_proj
+    (7168, 1536): {
+        4: (16, 16, 512, 1, 4, 2, 1, 8),
+        8: (16, 16, 512, 1, 4, 2, 1, 8),
+        16: (16, 32, 256, 1, 4, 3, 1, 1),
+        32: (32, 32, 256, 2, 2, 3, 1, 1),
+        64: (32, 32, 256, 2, 2, 2, 1, 8),
+    },
+    # q_b
+    (2304, 1536): {
+        4: (16, 16, 512, 2, 2, 3, 1, 8),
+        8: (16, 16, 512, 1, 4, 3, 1, 8),
+        16: (16, 16, 512, 1, 4, 3, 1, 8),
+        32: (32, 16, 256, 4, 1, 3, 1, 8),
+        64: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    # kv_b
+    (3072, 512): {
+        4: (16, 16, 256, 1, 4, 2, 1, 8),
+        8: (16, 16, 256, 1, 4, 2, 1, 8),
+        16: (16, 16, 256, 1, 4, 2, 1, 1),
+        32: (32, 16, 256, 2, 2, 2, 1, 8),
+        64: (32, 32, 256, 2, 2, 2, 1, 8),
+    },
+    # mla_qkv
+    (3648, 7168): {
+        4: (16, 16, 512, 1, 4, 2, 2, 1),
+        32: (32, 32, 256, 2, 2, 3, 2, 1),
+        64: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    # qkvfab
+    (6288, 7168): {
+        4: (16, 32, 256, 2, 2, 3, 1, 1),
+        8: (16, 32, 256, 2, 2, 3, 1, 1),
+        32: (32, 32, 256, 2, 2, 3, 1, 1),
+    },
+    # shared_gu
+    (1536, 7168): {
+        4: (16, 16, 256, 2, 2, 3, 7, 1),
+        8: (16, 16, 256, 1, 4, 3, 7, 8),
+        16: (16, 16, 256, 2, 2, 2, 7, 8),
+        32: (32, 32, 256, 2, 2, 3, 4, 1),
+        64: (32, 32, 128, 2, 2, 2, 8, 1),
+    },
+    # shared_dn
+    (7168, 768): {
+        4: (16, 32, 256, 2, 2, 3, 1, 1),
+        8: (16, 16, 256, 1, 4, 3, 1, 8),
+        16: (16, 32, 256, 1, 4, 3, 1, 1),
+        32: (32, 32, 256, 2, 2, 3, 1, 8),
+        64: (32, 32, 256, 2, 2, 2, 1, 8),
+    },
+    # router
+    (896, 7168): {
+        4: (16, 16, 512, 2, 2, 2, 7, 1),
+        8: (16, 16, 512, 2, 2, 2, 7, 1),
+        16: (16, 32, 512, 2, 2, 2, 7, 8),
+        32: (32, 32, 256, 2, 2, 3, 7, 8),
+        64: (32, 32, 256, 2, 2, 3, 4, 8),
+    },
+    # dense_gu
+    (8448, 7168): {
+        16: (16, 128, 64, 1, 4, 3, 7, 1),
+        32: (32, 32, 64, 2, 2, 2, 4, 8),
+    },
+    # dense_dn
+    (7168, 4224): {
+        4: (16, 32, 128, 1, 4, 3, 1, 1),
+        8: (16, 32, 64, 1, 4, 3, 2, 1),
+        16: (16, 32, 64, 1, 4, 3, 2, 1),
+        32: (32, 32, 64, 2, 2, 3, 2, 1),
+    },
+    # lm_head
+    (20480, 7168): {
+        4: (16, 32, 64, 2, 2, 3, 1, 1),
+        8: (16, 32, 64, 2, 2, 3, 1, 1),
+        16: (16, 32, 64, 1, 4, 3, 1, 8),
+    },
+    # lat_up
+    (7168, 3584): {
+        4: (16, 16, 512, 4, 1, 2, 1, 8),
+        8: (16, 16, 512, 2, 2, 2, 1, 1),
+        16: (16, 32, 256, 1, 4, 3, 1, 1),
+        32: (32, 32, 256, 2, 2, 3, 1, 1),
+    },
+    # lat_dn
+    (3584, 7168): {
+        16: (16, 32, 256, 1, 4, 3, 2, 1),
+        32: (32, 32, 256, 2, 2, 3, 2, 1),
+        64: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+}
+DECODE_MIN_M = 2
+
+
+def _choose_decode_config(
+    M: int, N: int, K: int
+) -> tuple[int, int, int, int, int, int, int, int] | None:
+    if M < DECODE_MIN_M or M > DECODE_M_BUCKETS[-1]:
+        return None
+    bucket = next(bound for bound in DECODE_M_BUCKETS if M <= bound)
+    return _DECODE_CONFIGS.get((N, K), {}).get(bucket)
+
+
+def supports_gluon_mm_a16w16_decode_gfx950(M: int, N: int, K: int) -> bool:
+    """Whether the decode GEMM has a measured config beating torch.mm here."""
+    return _choose_decode_config(M, N, K) is not None
+
+
+def _get_splitk_counters(device: torch.device, num_tiles: int) -> torch.Tensor:
+    """Return stream-local zeroed per-tile arrival counters.
+
+    The last program of each tile resets its counter, so the buffer is zero
+    again whenever a launch completes and same-stream launches can share it.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        # Keep captured launches on graph-private counters; never bake the
+        # shared eager buffer into a graph.
+        return torch.zeros((num_tiles,), dtype=torch.int32, device=device)
+
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    stream_id = torch.cuda.current_stream(device_index).cuda_stream
+    key = (device_index, stream_id, num_tiles)
+    counters = _counter_cache.get(key)
+    if counters is None:
+        counters = torch.zeros((num_tiles,), dtype=torch.int32, device=device)
+        _counter_cache[key] = counters
+    return counters
+
+
+def launch_gluon_mm_a16w16_decode_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out_dtype: torch.dtype,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute decode-sized dense ``A @ B.T`` with measured split-K tiling.
+
+    Args:
+        A: Contiguous fp16/bf16 activation ``[M, K]``.
+        B: Contiguous weight ``[N, K]`` with ``A``'s dtype.
+        out_dtype: Output dtype: ``A``'s dtype or fp32.
+        out: Optional ``[M, N]`` destination with unit inner stride.
+
+    Returns:
+        ``[M, N]`` product in ``out_dtype``.
+    """
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError(
+            f"decode dense16 GEMM expects 2D inputs, got {A.ndim=} {B.ndim=}"
+        )
+    if A.dtype not in _SUPPORTED_DTYPES or B.dtype != A.dtype:
+        raise TypeError(
+            f"decode dense16 GEMM expects matching fp16/bf16 inputs, got {A.dtype=} "
+            f"{B.dtype=}"
+        )
+    if out_dtype not in (A.dtype, torch.float32):
+        raise TypeError(
+            f"decode dense16 GEMM writes {A.dtype} or fp32, got {out_dtype=}"
+        )
+    if not A.is_cuda or not B.is_cuda:
+        raise ValueError("decode dense16 GEMM requires CUDA/HIP tensors")
+    if not A.is_contiguous() or not B.is_contiguous():
+        raise ValueError("decode dense16 GEMM requires contiguous inputs")
+    M, K = A.shape
+    N, K_b = B.shape
+    if K_b != K:
+        raise ValueError(
+            f"decode dense16 GEMM K mismatch: A={tuple(A.shape)} B={tuple(B.shape)}"
+        )
+    config = _choose_decode_config(M, N, K)
+    if config is None:
+        raise ValueError(
+            f"decode dense16 GEMM has no measured config for M={M}, N={N}, K={K}"
+        )
+
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = config
+    C = _resolve_output(A, (M, N), out_dtype, out, "decode dense16 GEMM")
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    if split_k > 1:
+        partial = _get_partial_scratch(A.device, num_tiles, split_k, block_n, block_m)
+        counters = _get_splitk_counters(A.device, num_tiles)
+    else:
+        partial = counters = C
+    gluon_mm_a16w16_medium_gfx950[(num_tiles * split_k,)](
+        A,
+        B,
+        C,
+        C,
+        C,
+        partial,
+        counters,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        C.stride(1),
+        C.stride(0),
+        C.stride(1),
+        C.stride(0),
+        C.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
+        SPLIT_K=split_k,
+        NUM_XCDS=num_xcds,
+        num_warps=warps_m * warps_n,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
     return C
 
 
@@ -1674,6 +2002,8 @@ def gluon_mm_a16w16_add3_m16_gfx950(
         C,
         addend_a,
         addend_b,
+        C,
+        C,
         16,
         7168,
         3584,
@@ -1695,6 +2025,8 @@ def gluon_mm_a16w16_add3_m16_gfx950(
         NUM_BUFFERS=num_buffers,
         GROUP_SIZE_M=1,
         ADD3=True,
+        SPLIT_K=1,
+        NUM_XCDS=1,
         num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )

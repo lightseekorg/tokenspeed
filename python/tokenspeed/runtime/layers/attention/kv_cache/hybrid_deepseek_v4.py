@@ -20,9 +20,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import ClassVar
 
+import numpy as np
 import torch
 from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compact_compressed_slot_mapping,
@@ -618,5 +620,5 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
     def get_kv_size_bytes(self) -> int:
         return int(self.arena.buffer.nbytes)
 
-    def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
+    def zero_new_blocks(self, new_page_ids: Mapping[str, np.ndarray]) -> None:
         self.arena.zero_blocks(new_page_ids)
