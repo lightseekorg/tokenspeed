@@ -755,9 +755,11 @@ class CacheGroupRouter(AttentionBackend):
     def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
         """Vanilla MTP re-anchor: seq_lens become the committed frontier,
         in-graph. Seq-lens-only like :meth:`advance_draft_forward_metadata`;
-        the drafter publishes its k-window explicitly."""
+        the drafter publishes its k-window explicitly. Each leaf's own hook
+        decides whether the k-row window needs more than the seq_lens edit
+        (the leaf default is that edit; DSA re-expands its per-token rows)."""
         for leaf in self.leaves.values():
-            leaf.advance_draft_forward_metadata(frontier)
+            leaf.update_draft_forward_metadata(frontier)
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         for leaf in self.leaves.values():

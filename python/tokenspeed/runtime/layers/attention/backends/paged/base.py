@@ -296,6 +296,19 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         bs = seq_lens.shape[0]
         buf[:bs].copy_(seq_lens[:bs])
 
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        """Publish a multi-depth MTP drafter's re-anchored window: every depth
+        re-runs ``spec_num_tokens`` rows per request ending at ``frontier``
+        (``[bs]`` committed lengths), in-graph.
+
+        The decode kernels derive each row's causal bound from the request's
+        single cache length, so for most leaves this is the same seq_lens
+        edit as :meth:`advance_draft_forward_metadata`. A leaf holding
+        per-row decode metadata (DSA's per-token indexer rows) re-expands it
+        to the k-row shape here instead.
+        """
+        self.advance_draft_forward_metadata(frontier)
+
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """DFLASH: broadcast each request's block-end length to its
         ``block_decode_expansion`` materialized entries (uniform, non-causal),

@@ -476,7 +476,19 @@ seq-lens-only: Eagle's step-0 accepted-prefix publish fires
 `advance_draft_forward_metadata` BEFORE the step-0 attention has consumed
 the verify-shaped write window, so the write-window publication is a
 separate, explicit drafter-loop call (`publish_draft_step_locations`, see
-"Write locations have one owner").
+"Write locations have one owner"). The router hands each hook to the
+leaf's hook of the same name, because the two edits describe different
+row shapes: the Eagle chain runs one row per request after step 0, the
+multi-depth MTP window `k` rows per request at every depth. A leaf whose
+decode kernels derive each row's causal bound from the request's single
+cache length needs the same seq_lens edit for both (the
+`PagedAttentionBackend` default routes `update_` to `advance_`); a leaf
+holding per-row decode metadata re-expands it in `update_` — DSA rewrites
+its per-token indexer rows (`_dsa_seq_lens_2d`, `[bs * k, 1]`) and their
+plan to the frontier, in place, while its `advance_` re-plans `[bs, 1]`
+rows and leaves the per-token rows as the round's refresh published them.
+Neither hook clears the layer-shared sparse selection: the depth loop is
+one forward's worth of top-k reuse.
 
 Backends with sharded KV must refresh derived local visibility in the same
 draft length-update hook as the global lengths. While page allocation and

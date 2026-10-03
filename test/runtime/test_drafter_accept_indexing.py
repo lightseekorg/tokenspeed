@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -108,6 +109,84 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             list(drafter._stash_hidden_buf.shape),
             [request_pool_rows, spec_num_tokens - 1, 8],
         )
+
+    def test_dsa_leaf_mtp_frontier_re_expands_the_k_row_indexer_metadata(self):
+        # The DSA leaf's k-row top-k reads one context length per query row
+        # (``_dsa_seq_lens_2d``, [bs * k, 1]) and a plan over them. The MTP
+        # re-anchor keeps that shape and rewrites it in place to the frontier,
+        # whereas the Eagle chain's advance re-plans one row per request.
+        from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_mod
+
+        k, bs = 4, 2
+        backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
+        backend.spec_num_tokens = k
+        backend.kernel_page_size = 64
+        seq_lens_k = torch.tensor([9, 5], dtype=torch.int32)
+        metadata = SimpleNamespace(
+            seq_lens_k=seq_lens_k,
+            _dsa_seq_lens_2d=seq_lens_k.unsqueeze(1)
+            .expand(-1, k)
+            .reshape(-1, 1)
+            .contiguous(),
+            _dsa_plan=object(),
+        )
+        backend._dense_backend = SimpleNamespace(forward_decode_metadata=metadata)
+        rows_before = metadata._dsa_seq_lens_2d
+        plans: list[dict] = []
+
+        with mock.patch.object(
+            dsa_mod, "dsa_plan", side_effect=lambda **kw: plans.append(kw)
+        ):
+            backend.update_draft_forward_metadata(
+                torch.tensor([7, 3, 99], dtype=torch.int32)
+            )
+            backend.advance_draft_forward_metadata(
+                torch.tensor([8, 4, 99], dtype=torch.int32)
+            )
+
+        # The re-anchor: seq_lens and every per-token row carry the frontier,
+        # same storage (in-graph), and the plan is refreshed in place over
+        # the k-row view at the leaf's kernel page size.
+        self.assertEqual(seq_lens_k.tolist(), [8, 4])  # last edit = advance
+        self.assertIs(metadata._dsa_seq_lens_2d, rows_before)
+        self.assertEqual(
+            metadata._dsa_seq_lens_2d.view(bs, k).tolist(), [[7] * k, [3] * k]
+        )
+        self.assertIs(plans[0]["seq_lens_2d"], metadata._dsa_seq_lens_2d)
+        self.assertIs(plans[0]["out"], metadata._dsa_plan)
+        self.assertEqual(plans[0]["page_size"], 64)
+        # The Eagle advance plans [bs, 1] rows and leaves the per-token rows
+        # as the round's refresh published them.
+        self.assertEqual(tuple(plans[1]["seq_lens_2d"].shape), (bs, 1))
+        self.assertEqual(plans[1]["seq_lens_2d"].view(-1).tolist(), [8, 4])
+        self.assertEqual(
+            metadata._dsa_seq_lens_2d.view(bs, k).tolist(), [[7] * k, [3] * k]
+        )
+
+    def test_dsa_leaf_mtp_frontier_rejects_a_stale_k_row_layout(self):
+        from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_mod
+
+        backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
+        backend.spec_num_tokens = 4
+        backend.kernel_page_size = 64
+        metadata = SimpleNamespace(
+            seq_lens_k=torch.tensor([9, 5], dtype=torch.int32),
+            _dsa_seq_lens_2d=torch.zeros((3, 1), dtype=torch.int32),
+            _dsa_plan=None,
+        )
+        backend._dense_backend = SimpleNamespace(forward_decode_metadata=metadata)
+
+        with self.assertRaisesRegex(RuntimeError, "per-token rows"):
+            backend.update_draft_forward_metadata(
+                torch.tensor([7, 3], dtype=torch.int32)
+            )
+
+        backend._dense_backend = SimpleNamespace(forward_decode_metadata=None)
+        with self.assertRaisesRegex(RuntimeError, "not initialized"):
+            backend.update_draft_forward_metadata(
+                torch.tensor([7, 3], dtype=torch.int32)
+            )
+
 
     def test_substitute_mm_pad_rewrites_media_ids_in_place(self):
         image = MultimodalDataItem(modality=Modality.IMAGE, hash=123)

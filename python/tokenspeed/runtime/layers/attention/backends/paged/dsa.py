@@ -310,6 +310,9 @@ class DSABackend(PagedAttentionBackend):
         )
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
+        """Eagle chain step: one query row per request, so the plan is
+        rebuilt from the ``[bs, 1]`` request lengths (the per-token
+        ``_dsa_seq_lens_2d`` is left as the round's refresh published it)."""
         metadata = self.forward_decode_metadata
         if metadata is None or metadata.seq_lens_k is None:
             raise RuntimeError("DSA draft decode metadata was not initialized")
@@ -317,6 +320,33 @@ class DSABackend(PagedAttentionBackend):
 
         dsa_plan(
             seq_lens_2d=metadata.seq_lens_k.unsqueeze(1),
+            page_size=self.kernel_page_size,
+            out=metadata._dsa_plan,
+        )
+
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        """Multi-depth MTP re-anchor: every depth re-runs ``spec_num_tokens``
+        query rows per request ending at ``frontier``, the same k-row shape
+        the round's :meth:`refresh_decode_metadata` published. The k-row
+        top-k reads one context length per query row (``_dsa_seq_lens_2d``,
+        ``[bs * k, 1]``) and its plan, so both are rewritten in place to
+        the frontier; the kernel derives row ``j``'s causal bound as
+        ``frontier - (k - 1) + j``. In-graph: fixed shapes, same storage."""
+        metadata = self.forward_decode_metadata
+        if metadata is None or metadata.seq_lens_k is None:
+            raise RuntimeError("DSA draft decode metadata was not initialized")
+        bs = metadata.seq_lens_k.numel()
+        k = self.spec_num_tokens
+        seq_lens_2d = metadata._dsa_seq_lens_2d
+        if seq_lens_2d.shape[0] != bs * k:
+            raise RuntimeError(
+                "DSA draft per-token rows do not match the decode batch: "
+                f"rows={seq_lens_2d.shape[0]}, requests={bs}, width={k}"
+            )
+        metadata.seq_lens_k.copy_(frontier[:bs])
+        seq_lens_2d.copy_(frontier[:bs].unsqueeze(1).expand(-1, k).reshape(-1, 1))
+        dsa_plan(
+            seq_lens_2d=seq_lens_2d,
             page_size=self.kernel_page_size,
             out=metadata._dsa_plan,
         )
