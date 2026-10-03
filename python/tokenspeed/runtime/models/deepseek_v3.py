@@ -824,6 +824,12 @@ class DeepseekV3AttentionMLA(nn.Module):
         """
         if hidden_states.shape[0] == 0 and not self.has_head_tp:
             return hidden_states
+        if self.has_head_tp and ctx.num_extends > 0:
+            raise RuntimeError(
+                "attention head TP serves decode rows only: the head-sharded "
+                "kv_b_proj cannot expand every head's K/V for a prefill; this "
+                f"forward carries {ctx.num_extends} extending requests"
+            )
         q, latent_cache = self._project_q_latent(
             hidden_states, ctx, comm_manager, block_scale
         )
