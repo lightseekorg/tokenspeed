@@ -38,6 +38,7 @@ CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
 configure_package_cache
 configure_nvcc_cache
 show_nvcc_cache_stats before
+TOKENSPEED_TESTPYPI_INDEX=${TOKENSPEED_TESTPYPI_INDEX:-https://test.pypi.org/simple}
 
 # Wrap pip install in a retry loop. PyPI's CDN occasionally returns a
 # bad Content-Type for /simple/<pkg>/ pages (most recently observed for
@@ -115,6 +116,18 @@ ensure_flashinfer_jit_cache() {
         --force-reinstall --index-url "${index_url}" "${wheel_url}"
 }
 
+preinstall_tokenspeed_testpypi_packages() {
+    local vendor_requirements=()
+    mapfile -t vendor_requirements < <(grep -E '^tokenspeed-(triton|proton)==' "${CUDA_REQ}")
+    if [ "${#vendor_requirements[@]}" -eq 0 ]; then
+        echo "No tokenspeed vendor requirements found in ${CUDA_REQ}" >&2
+        return 1
+    fi
+    pip_install_with_retry pip3 install --no-deps \
+        --index-url "${TOKENSPEED_TESTPYPI_INDEX}" \
+        "${vendor_requirements[@]}"
+}
+
 echo "=========================================="
 echo "SM=${SM}, CUDA_VERSION=${CUDA_VERSION}"
 echo "WORKSPACE=${WORKSPACE}"
@@ -187,6 +200,8 @@ if [[ "${FLASHINFER_PIN_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev([0-9]{8})$ ]
         "${NIGHTLY_WHEEL}" "${NIGHTLY_CUBIN_WHEEL}"
 fi
 cd ${WORKSPACE}
+echo "Preinstalling staged TokenSpeed vendor packages from ${TOKENSPEED_TESTPYPI_INDEX}"
+preinstall_tokenspeed_testpypi_packages
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
 TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
 pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
