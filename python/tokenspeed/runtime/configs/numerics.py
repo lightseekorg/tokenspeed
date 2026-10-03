@@ -55,9 +55,10 @@ RL_BITWISE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "gree
 # (request seed, position), which the bitwise envelopes require.
 SAMPLING_STREAMS = ("batch", "per-request")
 
-# ``--yarn-ramp-mask-device``: where the YaRN linear ramp mask of deepseek_yarn
-# RoPE is computed before moving to the model device. The trainer builds it on
-# the host.
+# ``--yarn-ramp-mask-device``: where the deepseek_yarn RoPE inverse frequencies
+# (position frequencies, both divisions and the YaRN linear ramp mask) are
+# computed before moving to the model device. The trainer builds them on the
+# host.
 YARN_RAMP_MASK_DEVICES = ("cuda", "cpu")
 
 # ``--mla-lora-scale``: where LongCat-style MLA applies its sqrt(hidden /

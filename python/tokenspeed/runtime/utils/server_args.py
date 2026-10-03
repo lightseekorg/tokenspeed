@@ -440,7 +440,8 @@ class ServerArgs:
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics trainer-aligned.
-    # Device that computes the YaRN linear ramp mask of deepseek_yarn RoPE.
+    # Device that computes the deepseek_yarn RoPE inverse frequencies (the
+    # position frequencies, both divisions and the YaRN linear ramp mask).
     yarn_ramp_mask_device: str = "cuda"
     # Where LongCat-style MLA applies its sqrt(hidden / lora_rank) norm scales:
     # folded into the q_a/kv_a layernorm weights at load, or multiplied at
@@ -1184,7 +1185,7 @@ class ServerArgs:
         order on top of rl-bitwise. Each switch it tightens is documented in
         ``docs/design/numerics.md`` under "alignment.trainer"."""
         # The trainer builds its RoPE inverse frequencies on the host; CPU and
-        # CUDA division round the ramp differently at ulp level.
+        # CUDA division round each of them differently at ulp level.
         self.yarn_ramp_mask_device = "cpu"
         # The trainer multiplies the LoRA norm scales as separate bf16 ops.
         self.mla_lora_scale = "runtime"
@@ -2866,11 +2867,12 @@ class ServerArgs:
             type=str,
             choices=list(YARN_RAMP_MASK_DEVICES),
             default=ServerArgs.yarn_ramp_mask_device,
-            help="Device that computes the YaRN linear ramp mask of "
-            "deepseek_yarn RoPE before it is moved to the model device. The "
-            "trainer builds it on the host, and CPU and CUDA division round "
-            "differently at ulp level. Folded to cpu by --numerics "
-            "trainer-aligned.",
+            help="Device that computes the deepseek_yarn RoPE inverse "
+            "frequencies (the position frequencies, both divisions and the "
+            "YaRN linear ramp mask) before the table is moved to the model "
+            "device once. The trainer builds it on the host, and CPU and CUDA "
+            "division round differently at ulp level. Folded to cpu by "
+            "--numerics trainer-aligned.",
         )
         parser.add_argument(
             "--mla-lora-scale",

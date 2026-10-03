@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``--yarn-ramp-mask-device``: where deepseek_yarn computes its ramp mask."""
+"""``--yarn-ramp-mask-device``: where deepseek_yarn computes its inv_freq table."""
 
 from __future__ import annotations
 
@@ -59,21 +59,17 @@ def _cpu_reference_inv_freq() -> torch.Tensor:
     return (1.0 / (SCALING_FACTOR * pos_freqs)) * (1 - mask) + (1.0 / pos_freqs) * mask
 
 
-def test_cpu_ramp_matches_the_pure_cpu_reference_and_lands_on_device():
+def test_cpu_ramp_matches_the_pure_cpu_reference():
     low, high = 3, 29
-    ramp = _yarn_linear_ramp_mask(
-        low, high, ROTARY_DIM // 2, torch.float, device="cpu", compute_device="cpu"
-    )
+    ramp = _yarn_linear_ramp_mask(low, high, ROTARY_DIM // 2, torch.float, device="cpu")
     assert torch.equal(ramp, _cpu_reference_ramp(low, high, ROTARY_DIM // 2))
     # The degenerate range is widened, not divided by zero.
-    flat = _yarn_linear_ramp_mask(
-        5, 5, 8, torch.float, device=None, compute_device="cpu"
-    )
+    flat = _yarn_linear_ramp_mask(5, 5, 8, torch.float, device=None)
     assert torch.isfinite(flat).all()
 
 
-def test_deepseek_yarn_cpu_ramp_reproduces_the_cpu_inv_freq():
-    rope = DeepseekScalingRotaryEmbedding(
+def _rope(device: str, ramp_device: str) -> DeepseekScalingRotaryEmbedding:
+    return DeepseekScalingRotaryEmbedding(
         ROTARY_DIM,
         ROTARY_DIM,
         ORIGINAL_MAX_POSITION,
@@ -81,9 +77,13 @@ def test_deepseek_yarn_cpu_ramp_reproduces_the_cpu_inv_freq():
         False,
         SCALING_FACTOR,
         torch.bfloat16,
-        device="cpu",
-        ramp_device="cpu",
+        device=device,
+        ramp_device=ramp_device,
     )
+
+
+def test_deepseek_yarn_cpu_ramp_reproduces_the_cpu_inv_freq():
+    rope = _rope(device="cpu", ramp_device="cpu")
     assert rope.ramp_device == "cpu"
     assert torch.equal(
         rope._compute_inv_freq(SCALING_FACTOR), _cpu_reference_inv_freq()
@@ -91,23 +91,20 @@ def test_deepseek_yarn_cpu_ramp_reproduces_the_cpu_inv_freq():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_ramp_lands_on_the_model_device_from_either_compute_device():
-    low, high = 3, 29
-    for compute_device in ("cpu", "cuda"):
-        ramp = _yarn_linear_ramp_mask(
-            low,
-            high,
-            ROTARY_DIM // 2,
-            torch.float,
-            device="cuda",
-            compute_device=compute_device,
-        )
-        assert ramp.device.type == "cuda"
-        assert ramp.shape == (ROTARY_DIM // 2,)
-    cpu_built = _yarn_linear_ramp_mask(
-        low, high, ROTARY_DIM // 2, torch.float, device="cuda", compute_device="cpu"
+def test_cuda_model_device_takes_the_whole_table_from_the_ramp_device():
+    # Under ramp_device=cpu the entire inv_freq (position frequencies, both
+    # divisions, ramp) is the pure-CPU table, moved to the model device once:
+    # bitwise equal to the CPU reference, not merely close.
+    cpu_built = _rope(device="cuda", ramp_device="cpu")._compute_inv_freq(
+        SCALING_FACTOR
     )
-    assert torch.equal(cpu_built.cpu(), _cpu_reference_ramp(low, high, ROTARY_DIM // 2))
+    assert cpu_built.device.type == "cuda"
+    assert torch.equal(cpu_built.cpu(), _cpu_reference_inv_freq())
+    cuda_built = _rope(device="cuda", ramp_device="cuda")._compute_inv_freq(
+        SCALING_FACTOR
+    )
+    assert cuda_built.device.type == "cuda"
+    assert cuda_built.shape == cpu_built.shape
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
