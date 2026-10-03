@@ -166,6 +166,24 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--logprob-order"):
             ServerArgs(model="x", logprob_order="apex")
 
+    def test_trainer_aligned_combines_moe_slots_in_the_leaf(self):
+        self.assertEqual(ServerArgs(model="x").moe_combine_order, "rank")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").moe_combine_order, "rank"
+        )
+        self.assertEqual(
+            ServerArgs(model="x", numerics="trainer-aligned").moe_combine_order,
+            "slot",
+        )
+        # The leaf returns complete rows, so a fused all-reduce+norm at the
+        # next layer boundary would sum them again: vetoed under auto too.
+        args = ServerArgs(
+            model="x", moe_combine_order="slot", enable_allreduce_fusion=True
+        )
+        self.assertFalse(args.enable_allreduce_fusion)
+        with self.assertRaisesRegex(ValueError, "--moe-combine-order"):
+            ServerArgs(model="x", moe_combine_order="tree")
+
     def test_bitwise_envelopes_cover_every_pinning_envelope(self):
         from tokenspeed.runtime.configs.numerics import (
             BITWISE_ENVELOPES,

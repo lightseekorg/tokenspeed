@@ -390,6 +390,20 @@ class CommManager:
         )
         return hidden_states, residual
 
+    def post_moe_combined(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
+    ):
+        """After a MoE leaf that already combined the expert outputs across the
+        MoE TP-EP group (``--moe-combine-order slot``): no reduction, since the
+        rows are complete on every rank; in the RSAG layout this rank still
+        takes back its own token rows, as the reduce-scatter would have."""
+        if not self.mapping.moe.has_tp_ep or self.use_all_reduce(is_moe=True):
+            return hidden_states, residual
+        token_list = self.moe_tp_ep_group_scattered_num_tokens(ctx)
+        offset = sum(token_list[: self.mapping.moe.tp_ep_rank])
+        own = token_list[self.mapping.moe.tp_ep_rank]
+        return hidden_states[offset : offset + own], residual
+
     def needs_final_all_gather(self) -> bool:
         """Whether the model output must gather the final layer's rows."""
         return self.mapping.has_attn_tp and not self.use_all_reduce(self.is_moe)

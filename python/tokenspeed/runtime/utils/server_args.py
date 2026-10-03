@@ -35,6 +35,7 @@ from tokenspeed.runtime.configs.numerics import (
     LAYER_BOUNDARY_NORMS,
     LOGPROB_ORDERS,
     MLA_LORA_SCALES,
+    MOE_COMBINE_ORDERS,
     NUMERICS_ENVELOPES,
     RL_BITWISE_SAMPLING_BACKENDS,
     ROUTER_TOPKS,
@@ -445,6 +446,10 @@ class ServerArgs:
     # Megatron's vocab-parallel cross-entropy over fixed 32768-wide vocab
     # blocks. Changes the reported logprobs only, never the sampled tokens.
     logprob_order: str = "torch"
+    # How a token's routed-expert contributions meet across the MoE TP-EP
+    # group: per-rank partials summed by the host (rank), or folded in fp32
+    # slot order inside the MoE leaf as the trainer does (slot).
+    moe_combine_order: str = "rank"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -690,6 +695,11 @@ class ServerArgs:
             raise ValueError(
                 f"--logprob-order must be one of {list(LOGPROB_ORDERS)}, got "
                 f"{self.logprob_order!r}"
+            )
+        if self.moe_combine_order not in MOE_COMBINE_ORDERS:
+            raise ValueError(
+                "--moe-combine-order must be one of "
+                f"{list(MOE_COMBINE_ORDERS)}, got {self.moe_combine_order!r}"
             )
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
@@ -1104,6 +1114,10 @@ class ServerArgs:
             # The fused all-reduce+norm kernels add the residual inside the
             # fusion; the unfused boundary norm needs the bf16 sum first.
             self.enable_allreduce_fusion = False
+        if self.moe_combine_order == "slot":
+            # The MoE leaf returns complete rows; a fused all-reduce+norm at
+            # the next layer boundary would sum them tp_size times.
+            self.enable_allreduce_fusion = False
 
     def _resolve_rl_bitwise(self):
         """The rl-bitwise block: every envelope beyond auto runs it."""
@@ -1166,6 +1180,9 @@ class ServerArgs:
         self.router_topk = "torch"
         # The trainer's logprobs come from its vocab-parallel cross-entropy.
         self.logprob_order = "megatron"
+        # The trainer's grouped MLP applies the router weight inside the
+        # activation and folds a token's slots in fp32 slot order.
+        self.moe_combine_order = "slot"
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -2890,6 +2907,23 @@ class ServerArgs:
             "temperature- or top-p-normalised logprobs are refused. Changes "
             "logprobs only, never the sampled tokens. Folded to megatron by "
             "--numerics trainer-aligned.",
+        )
+        parser.add_argument(
+            "--moe-combine-order",
+            type=str,
+            choices=list(MOE_COMBINE_ORDERS),
+            default=ServerArgs.moe_combine_order,
+            help="How a token's routed-expert contributions meet across the "
+            "MoE TP-EP group. 'rank': the MoE kernel returns this rank's "
+            "partial and the host sums the partials (all-reduce or "
+            "reduce-scatter), adding the identity zero-expert residual once "
+            "around it. 'slot': the MoE kernel folds the token's top-k slots "
+            "in fp32 slot order across the EP group itself, zero-expert "
+            "residual included, as the trainer's grouped MLP does, and the "
+            "host reduces nothing; needs MoE TP 1 and a kernel declaring the "
+            "combine_order trait with slot (the batch-invariant 'aok' leaf), "
+            "and vetoes all-reduce+norm fusion. Folded to slot by --numerics "
+            "trainer-aligned.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

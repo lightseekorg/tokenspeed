@@ -27,6 +27,8 @@ the MoE input width, the SwiGLU form and whether expert ids may repeat.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from tokenspeed.runtime.layers.moe import expert as expert_module
@@ -104,3 +106,45 @@ def test_activation_clamped_follows_the_swiglu_limit(monkeypatch, layer, clamped
     # The W4A8 kernel's fixed FC2 activation scale assumes a bounded SwiGLU
     # output; the plan states whether the checkpoint provides that bound.
     assert _plan_kwargs(monkeypatch, **layer)["activation_clamped"] is clamped
+
+
+def test_combine_order_follows_the_launch_switch(monkeypatch):
+    assert _plan_kwargs(monkeypatch, activation="swiglu")["combine_order"] == "rank"
+    monkeypatch.setitem(global_server_args_dict, "moe_combine_order", "slot")
+    plan = _plan_kwargs(monkeypatch, activation="swiglu")
+    assert plan["combine_order"] == "slot"
+    # One EP rank folds locally: no exchange group.
+    assert plan["process_group"] is None
+
+
+def test_slot_order_hands_the_leaf_the_ep_group(monkeypatch):
+    ep_group = (0, 1, 2, 3)
+    process_group = object()
+    monkeypatch.setitem(global_server_args_dict, "moe_combine_order", "slot")
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "mapping",
+        SimpleNamespace(moe=SimpleNamespace(ep_group=ep_group)),
+    )
+    monkeypatch.setattr(
+        expert_module.pg_manager,
+        "get_device_process_group",
+        lambda group: process_group if group == ep_group else None,
+    )
+    plan = _plan_kwargs(
+        monkeypatch, activation="swiglu", ep_rank=1, ep_size=4, tp_rank=0, tp_size=1
+    )
+    assert plan["combine_order"] == "slot"
+    assert plan["process_group"] is process_group
+
+
+def test_slot_order_refuses_moe_tensor_parallelism(monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "moe_combine_order", "slot")
+    with pytest.raises(ValueError, match="needs MoE TP 1"):
+        _plan_kwargs(monkeypatch, activation="swiglu", tp_rank=0, tp_size=2)
+
+
+def test_unknown_combine_order_is_refused(monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "moe_combine_order", "tree")
+    with pytest.raises(ValueError, match="moe_combine_order"):
+        _plan_kwargs(monkeypatch, activation="swiglu")

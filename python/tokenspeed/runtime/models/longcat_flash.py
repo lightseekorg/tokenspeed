@@ -344,6 +344,11 @@ class _RuntimeLongcatMoE(nn.Module):
                 "LongCat zero experts require a MoE backend that accepts "
                 "precomputed top-k ids. Launch with --moe-runner-backend triton."
             )
+        # --moe-combine-order (docs/design/numerics.md): under "slot" the MoE
+        # leaf folds a token's slots across the EP group itself, identity
+        # zero-expert residual included, so this module hands it the raw
+        # top-k and adds nothing, and the decoder layer skips post_moe_comm.
+        self.combine_order: str = self.experts.combine_order
         self.topk = _TopK(
             top_k=config.moe_topk,
             layer_id=layer_index,
@@ -383,8 +388,12 @@ class _RuntimeLongcatMoE(nn.Module):
         partial BEFORE post_moe_comm sums the partials over the MoE TP-EP
         group, so only one rank (``adds_zero_expert_residual``) materializes
         it; the others contribute exactly 0 and the reduction counts it once.
+
+        Under the slot-order combine the top-k stays as routed: zero-expert
+        slots keep their ``-1`` / past-the-experts id and their weight, and
+        the leaf folds the residual in fp32 slot order itself.
         """
-        if self.zero_expert_num <= 0:
+        if self.zero_expert_num <= 0 or self.combine_order == "slot":
             return None
 
         # The router's contract: a zero expert is -1, every other id is a
@@ -695,11 +704,19 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             num_global_tokens,
             max_num_tokens_per_gpu,
         )
-        hidden_states, residual = self.moe_comm.post_mlp_fused(
-            hidden_states,
-            residual,
-            ctx,
-        )
+        if self.mlp.combine_order == "slot":
+            # The leaf returned the EP-combined rows: nothing to reduce.
+            hidden_states, residual = self.moe_comm.post_moe_combined(
+                hidden_states,
+                residual,
+                ctx,
+            )
+        else:
+            hidden_states, residual = self.moe_comm.post_mlp_fused(
+                hidden_states,
+                residual,
+                ctx,
+            )
         hidden_states = self._to_dense_rows(hidden_states, ctx)
         return hidden_states, residual
 

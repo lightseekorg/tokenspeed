@@ -31,7 +31,10 @@ from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
 )
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.configs.numerics import (
+    BITWISE_ENVELOPES,
+    MOE_COMBINE_ORDERS,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -349,6 +352,28 @@ class MoELayer(torch.nn.Module):
         elif moe_backend == "mega_moe":
             mapping = global_server_args_dict["mapping"]
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+        # --moe-combine-order: how a token's routed contributions meet across
+        # the MoE TP-EP group (docs/design/numerics.md, alignment.trainer).
+        combine_order = global_server_args_dict["moe_combine_order"]
+        if combine_order not in MOE_COMBINE_ORDERS:
+            raise ValueError(
+                f"moe_combine_order must be one of {list(MOE_COMBINE_ORDERS)}, "
+                f"got {combine_order!r}"
+            )
+        self.combine_order: str = combine_order
+        if combine_order == "slot":
+            if self.tp_size > 1:
+                raise ValueError(
+                    "--moe-combine-order slot needs MoE TP 1: a K-split down "
+                    "projection would need a second, rank-ordered fold after "
+                    f"the slot-order one (got moe tp_size={self.tp_size})"
+                )
+            if self.ep_size > 1 and process_group is None:
+                # The leaf exchanges per-route outputs over the EP group.
+                mapping = global_server_args_dict["mapping"]
+                process_group = pg_manager.get_device_process_group(
+                    mapping.moe.ep_group
+                )
         self.plan = tokenspeed_kernel.moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,
@@ -377,6 +402,7 @@ class MoELayer(torch.nn.Module):
             # rl-bitwise promises one reduction order; fast-math epilogues
             # trade exactly that away.
             fast_math=global_server_args_dict["numerics"] not in BITWISE_ENVELOPES,
+            combine_order=combine_order,
         )
 
         create_layer_weights(

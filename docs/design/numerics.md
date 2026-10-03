@@ -142,14 +142,16 @@ and only the reported log-probabilities change.
 | `--layer-boundary-norm unfused` | The norm that opens each physical layer and the final norm read a bf16 `hidden + residual` materialized first (`residual = hidden`), then a standalone RMSNorm, instead of the fused add+norm kernel whose sum stays fp32; all-reduce+norm fusion is vetoed with it | forward values |
 | `--router-topk torch` | The correction-bias router runs fp32 `torch.softmax`, `torch.topk(probs + bias, sorted=True)` (PyTorch tie order), weights = unbiased probs x `routed_scaling_factor`, zero experts (`id >= num_real`) become `-1` and keep their weight for the identity residual | forward values (expert selection at near-ties, weights) |
 | `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (the in-block tree is the registered `sampling.block_sumexp` leaf's; the fold across blocks is a rank-ordered fp32 left fold), `logp = -(log(sum_exp) - target)`, for output and prompt (input) logprobs alike | logprobs only |
+| `--moe-combine-order slot` | The MoE leaf folds a token's top-k routed outputs in fp32 in slot order across the EP group itself and adds the identity zero-expert residual in the same fold, as the trainer's grouped MLP does (`moe_plan(combine_order="slot")`, `plan["process_group"]` = the EP group); the host hands it the raw top-k (zero-expert ids intact, weights kept), adds no residual and runs no MoE all-reduce / reduce-scatter (`CommManager.post_moe_combined` only takes back this rank's rows in the RSAG layout); all-reduce+norm fusion is vetoed. Needs MoE TP 1 and a kernel declaring `combine_order` with `slot`. Under `rank` the kernel returns a per-rank partial, the host reduces rank by rank and LongCat's residual enters exactly one partial (`adds_zero_expert_residual`, tp_ep_rank 0) | forward values |
 
 These are the switches the host can mirror with no new vendor dependency.
 The rest of the trainer's form lives in kernel leaves and model code the host
 does not own and is the out-of-tree model's part of the bargain: a
-`sampling.block_sumexp` leaf with the trainer's in-block order, MoE experts
-that apply the routing probabilities inside the activation and combine the
-zero-expert residual in fp32 slot order, BF16 index-K indexer scoring and
-top-k leaves, and the same LoRA-scale placement in the draft model.
+`sampling.block_sumexp` leaf with the trainer's in-block order, a MoE apply
+leaf declaring `combine_order={"rank", "slot"}` whose slot form applies the
+routing probabilities inside the activation and combines the zero-expert
+residual in fp32 slot order, BF16 index-K indexer scoring and top-k leaves,
+and the same LoRA-scale placement in the draft model.
 
 Trainer alignment is a stronger claim than invariance and cannot be checked
 by the engine alone: a model earns `trainer-aligned` in

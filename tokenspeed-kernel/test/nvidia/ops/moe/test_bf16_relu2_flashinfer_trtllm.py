@@ -177,6 +177,7 @@ def test_moe_plan_selects_the_bf16_relu2_kernels(routing_mode):
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     expected = {
         None: "flashinfer_trtllm_unquant_relu2_moe_apply",

@@ -113,6 +113,7 @@ class TestLongcatZeroExpert(unittest.TestCase):
         moe.n_routed_experts = 3
         moe.zero_expert_type = "identity"
         moe.adds_zero_expert_residual = True
+        moe.combine_order = "rank"
         moe.experts = SimpleNamespace(num_experts=num_physical_experts)
         return moe
 
@@ -203,6 +204,31 @@ class TestLongcatZeroExpert(unittest.TestCase):
         torch.testing.assert_close(
             topk_output.topk_ids,
             torch.tensor([[0, 0], [0, 1]]),
+        )
+
+    def test_slot_order_hands_the_leaf_the_raw_topk(self):
+        # --moe-combine-order slot: the leaf folds the identity residual in
+        # fp32 slot order itself, so the zero-expert slots (-1 from either
+        # router) and their weights reach it untouched, replicas past E
+        # included, and the host adds nothing.
+        moe = self._moe(5)
+        moe.combine_order = "slot"
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.tensor([[0.25, 0.75], [0.5, 0.5]]),
+            topk_ids=torch.tensor([[0, -1], [3, 1]]),
+            router_logits=torch.zeros(2, 4),
+        )
+
+        zero_output = _RuntimeLongcatMoE._apply_zero_experts(
+            moe, torch.ones(2, 2), topk_output
+        )
+
+        self.assertIsNone(zero_output)
+        torch.testing.assert_close(
+            topk_output.topk_weights, torch.tensor([[0.25, 0.75], [0.5, 0.5]])
+        )
+        torch.testing.assert_close(
+            topk_output.topk_ids, torch.tensor([[0, -1], [3, 1]])
         )
 
 
@@ -516,6 +542,8 @@ class TestLongcatRowLayout(unittest.TestCase):
             rows_seen["moe"] = hidden.shape[0]
             return hidden
 
+        # The rank-order combine: the layer reduces the MoE partial itself.
+        moe.combine_order = "rank"
         layer.mlp = moe
         layer._init_comm()
         return layer

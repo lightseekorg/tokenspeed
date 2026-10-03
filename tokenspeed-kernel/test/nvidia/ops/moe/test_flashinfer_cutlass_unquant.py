@@ -120,6 +120,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         expert_id_repeats=True,
         internal_activation_dtype="input",
         fast_math=True,
+        combine_order="rank",
         solution="flashinfer_cutlass",
     )
     reference_w13 = w13.clone()

@@ -81,6 +81,15 @@ ROUTER_TOPKS = ("fused", "torch")
 LOGPROB_ORDERS = ("torch", "megatron")
 MEGATRON_VOCAB_BLOCK = 32768
 
+# ``--moe-combine-order``: how a token's routed-expert contributions meet
+# across the MoE TP-EP group — ``rank``: per-rank partials summed by the
+# host's all-reduce / reduce-scatter, the identity zero-expert residual added
+# around it; ``slot``: the MoE leaf folds the top-k slots in fp32 slot order
+# across the EP group itself, residual included, as the trainer's grouped MLP
+# does, and the host reduces nothing. Mirrors ``tokenspeed_kernel``'s
+# ``moe.COMBINE_ORDERS``.
+MOE_COMBINE_ORDERS = ("rank", "slot")
+
 
 def require_verified_numerics(
     numerics: str,
@@ -131,6 +140,7 @@ __all__ = [
     "LOGPROB_ORDERS",
     "MEGATRON_VOCAB_BLOCK",
     "MLA_LORA_SCALES",
+    "MOE_COMBINE_ORDERS",
     "NUMERICS_ENVELOPES",
     "RL_BITWISE_SAMPLING_BACKENDS",
     "ROUTER_TOPKS",
