@@ -319,7 +319,7 @@ class TestRequestHandlerExpertLoadProfile(unittest.TestCase):
         self.device = mock.Mock()
         self.device.dump_expert_load.return_value = {
             "physical_count": torch.tensor([[3, 1], [2, 2]]),
-            "balancedness": torch.tensor([0.5, 1.0]),
+            "ep_rank": 0,
         }
         self.handler = _make_handler(_attn_mapping(tp_rank=2))
         self.handler._device = self.device

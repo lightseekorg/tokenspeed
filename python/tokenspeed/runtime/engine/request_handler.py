@@ -74,7 +74,10 @@ from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
-from tokenspeed.runtime.moe.expert_location import expert_load_recording_enabled
+from tokenspeed.runtime.moe.expert_location import (
+    EXPERT_LOAD_RECORD_SUFFIX,
+    expert_load_recording_enabled,
+)
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.utils import PipelinedPyobjBroadcaster
@@ -861,17 +864,18 @@ class RequestHandler:
             torch.cuda.cudart().cudaProfilerStop()
 
         if "EXPERT_LOAD" in self.profiler_activities:
-            record = self._device.dump_expert_load(
-                os.path.join(
-                    self.profiler_output_dir,
-                    f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.expert-load.pt",
-                )
+            # Per-rank, unreduced (a collective here would wait on DP peers);
+            # the ranks' records are summed when the directory is consumed.
+            record_path = os.path.join(
+                self.profiler_output_dir,
+                f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}"
+                f"{EXPERT_LOAD_RECORD_SUFFIX}",
             )
-            balancedness = record["balancedness"]
+            record = self._device.dump_expert_load(record_path)
             logger.info(
-                f"Expert load over {int(record['physical_count'].sum())} routes: "
-                f"balancedness mean {balancedness.mean():.3f}, min "
-                f"{balancedness.min():.3f} (per-layer mean rank load / busiest rank)"
+                f"Expert load: {int(record['physical_count'].sum())} routes counted "
+                f"on EP rank {record['ep_rank']} written to {record_path}; pass the "
+                "directory to --init-expert-location to merge every rank's record"
             )
 
         proton_error: Exception | None = None

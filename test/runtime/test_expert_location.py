@@ -22,14 +22,18 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest import mock
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe import ExpertDispatch, dispatch_topk_ids_reference
 
-from tokenspeed.runtime.moe import eplb_algorithms
+from tokenspeed.runtime.moe import eplb_algorithms, expert_location
 from tokenspeed.runtime.moe.expert_location import (
     ExpertLocationMetadata,
     compute_logical_to_rank_dispatch_physical_map,
+    merge_expert_load_records,
 )
 
 
@@ -130,32 +134,87 @@ def test_static_map_prefers_a_same_node_replica_before_a_remote_one():
         )
 
 
-def test_dispatch_reference_alternates_replicas_and_counts_load():
+def test_dispatch_reference_alternates_replicas():
     placement = _placement(ep_rank=0)
-    placement.enable_load_recording()
     dispatch = ExpertDispatch(
-        placement.dispatch_replicas[1],
-        placement.dispatch_num_replicas[1],
-        placement.physical_load[1],
+        placement.dispatch_replicas[1], placement.dispatch_num_replicas[1], load=None
     )
     topk_ids = torch.tensor([[1, 0], [1, 2], [1, 3]], dtype=torch.int32)
     physical = dispatch_topk_ids_reference(topk_ids, dispatch)
     # Expert 1's replicas are physical 2, 4, 5: row r, rank k picks (r + k) % 3.
     assert physical.tolist() == [[2, 3], [4, 1], [5, 0]]
     assert physical.dtype == torch.int32
-    assert placement.physical_load.tolist() == [
-        [0, 0, 0, 0, 0, 0],
-        [1, 1, 1, 1, 1, 1],
-    ]
-    record = placement.load_record(placement.physical_load)
-    assert record["logical_count"].tolist() == [[0, 0, 0, 0], [1, 3, 1, 1]]
-    assert record["rank_count"].tolist() == [[0, 0], [3, 3]]
-    assert record["balancedness"].tolist() == [0.0, 1.0]
-    assert torch.equal(
-        record["physical_to_logical_map"], placement.physical_to_logical_map_cpu
-    )
-    placement.reset_load()
-    assert not placement.physical_load.any()
+
+
+def test_load_record_is_per_rank_and_merges_across_ranks(tmp_path):
+    records = []
+    for ep_rank in (0, 1):
+        placement = _placement(ep_rank)
+        placement.enable_load_recording()
+        assert placement.physical_load.dtype == torch.int64
+        # Each rank counted its own tokens' routes (all-to-all EP).
+        placement.physical_load.copy_(
+            torch.tensor([[1, 0, 0, 0, 1, 0], [0, 0, 1, 0, 1, 1]]) * (ep_rank + 1)
+        )
+        record = placement.load_record(placement.physical_load)
+        assert record["ep_rank"] == ep_rank and record["ep_size"] == 2
+        assert record["physical_count"].dtype == torch.int64
+        # Logical 0 owns physical 0 and 4 in layer 0; expert 1 owns 2, 4, 5 in layer 1.
+        assert record["logical_count"].tolist() == [
+            [2 * (ep_rank + 1), 0, 0, 0],
+            [0, 3 * (ep_rank + 1), 0, 0],
+        ]
+        path = tmp_path / f"load-TP{ep_rank}.expert-load.pt"
+        torch.save(record, path)
+        records.append(path)
+        placement.reset_load()
+        assert not placement.physical_load.any()
+
+    merged = merge_expert_load_records(records)
+    assert merged["ep_ranks"] == [0, 1]
+    assert merged["physical_count"].tolist() == [[3, 0, 0, 0, 3, 0], [0, 0, 3, 0, 3, 3]]
+    assert merged["logical_count"].tolist() == [[6, 0, 0, 0], [0, 9, 0, 0]]
+    assert merged["rank_count"].tolist() == [[3, 3], [3, 6]]
+    assert merged["balancedness"].tolist() == pytest.approx([1.0, 0.75])
+    # Records of another placement cannot be merged in.
+    other = _placement(0)
+    other.physical_to_logical_map_cpu[0, 0] = 1
+    other.enable_load_recording()
+    torch.save(other.load_record(other.physical_load), tmp_path / "x.expert-load.pt")
+    with pytest.raises(ValueError, match="different expert placement"):
+        merge_expert_load_records(records + [tmp_path / "x.expert-load.pt"])
+
+
+def test_init_expert_location_merges_a_directory_of_records(tmp_path):
+    placement = _placement(0)
+    placement.enable_load_recording()
+    for ep_rank in (0, 1):
+        placement.physical_load.fill_(ep_rank + 1)
+        torch.save(
+            placement.load_record(placement.physical_load) | {"ep_rank": ep_rank},
+            tmp_path / f"p-TP{ep_rank}.expert-load.pt",
+        )
+    (tmp_path / "p-TP0.trace.json.gz").write_bytes(b"")  # other profile outputs
+    seen = {}
+
+    def fake_init_by_eplb(server_args, model_config, logical_count):
+        seen["logical_count"] = logical_count
+        return "placement"
+
+    with mock.patch.object(
+        ExpertLocationMetadata, "init_by_eplb", staticmethod(fake_init_by_eplb)
+    ):
+        result = expert_location.compute_initial_expert_location_metadata(
+            SimpleNamespace(init_expert_location=str(tmp_path)), None
+        )
+    assert result == "placement"
+    # 3 routes per slot summed over the ranks: expert 0 has 2 slots in layer 0.
+    assert seen["logical_count"].tolist() == [[6, 3, 6, 3], [3, 9, 3, 3]]
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(ValueError, match="holds no"):
+        expert_location.compute_initial_expert_location_metadata(
+            SimpleNamespace(init_expert_location=str(tmp_path / "empty")), None
+        )
 
 
 def test_eplb_placement_balances_a_skewed_load():

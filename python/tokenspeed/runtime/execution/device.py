@@ -83,9 +83,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as pg_manager,
-)
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     PendingExecution,
@@ -769,22 +766,17 @@ class DeviceHandle:
 
         self._thread.run(_reset)
 
-    def dump_expert_load(self, path: str) -> dict[str, torch.Tensor]:
-        """Write the expert load counted since the last reset to ``path``.
+    def dump_expert_load(self, path: str) -> dict[str, torch.Tensor | int]:
+        """Write this rank's expert load counted since the last reset to ``path``.
 
-        The counters are summed over the MoE EP group (each rank of an
-        all-to-all EP layer routes only its own tokens; the replicated-input
-        path counts every token on every rank, a uniform factor the placement
-        algorithm and the balancedness ratio are blind to), read back on the
-        data plane (the one deliberate host wait), then saved in the format
-        ``--init-expert-location`` reads (``logical_count``) together with the
-        physical counts, the placement that produced them and the per-layer
-        balancedness (mean rank load over the busiest rank's load).
-
-        The reduction is a collective: every rank of the group must stop the
-        profile with the same forwards issued, which holds when the stop is
-        broadcast with the request stream (attention TP, PP) or the server is
-        idle.
+        The counters are read back on the data plane (the one deliberate host
+        wait) and saved unreduced, as this rank's record: its physical and
+        logical counts, the placement that produced them and its EP rank.
+        No collective runs here -- a profile stop reaches attention-DP
+        workers independently, so a rank reducing inside the request would
+        wait on a peer still synchronizing its round. The ranks' records are
+        summed where they are consumed (``merge_expert_load_records``, which
+        ``--init-expert-location <dir>`` applies).
 
         Args:
             path: Destination ``.pt`` file; parent directories are created.
@@ -794,20 +786,11 @@ class DeviceHandle:
         """
         placement = _recording_expert_placement()
         executor = self._executor
-        moe_mapping = executor.model_runner.mapping.moe
-        group = (
-            pg_manager.get_device_process_group(moe_mapping.tp_ep_group)
-            if moe_mapping.tp_ep_size > 1
-            else None
-        )
 
         def _dump():
             with executor.device_module.stream(executor.execution_stream):
-                counts = placement.physical_load.clone()
-                if group is not None:
-                    torch.distributed.all_reduce(counts, group=group)
                 with allow_host_sync("expert load dump"):
-                    physical = counts.cpu()
+                    physical = placement.physical_load.cpu()
             record = placement.load_record(physical)
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             torch.save(record, path)
