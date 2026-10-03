@@ -104,19 +104,26 @@ class TestLongcatMixedFp8Config(unittest.TestCase):
 
 
 class TestLongcatZeroExpert(unittest.TestCase):
-    def test_identity_zero_expert_masks_and_adds_hidden_state(self):
+    """The router's contract: zero experts are -1, every other id is a slot < P."""
+
+    @staticmethod
+    def _moe(num_physical_experts: int):
         moe = object.__new__(_RuntimeLongcatMoE)
         moe.zero_expert_num = 1
         moe.n_routed_experts = 3
         moe.zero_expert_type = "identity"
-        moe.expert_dispatch_info = None
+        moe.experts = SimpleNamespace(num_experts=num_physical_experts)
+        return moe
+
+    def test_identity_zero_expert_masks_and_adds_hidden_state(self):
+        moe = self._moe(3)
         hidden_states = torch.tensor(
             [[2.0, 4.0], [6.0, 8.0]],
             dtype=torch.float32,
         )
         topk_output = StandardTopKOutput(
             topk_weights=torch.tensor([[0.25, 0.75], [0.5, 0.5]]),
-            topk_ids=torch.tensor([[0, -1], [3, 1]]),
+            topk_ids=torch.tensor([[0, -1], [-1, 1]]),
             router_logits=torch.zeros(2, 4),
         )
 
@@ -142,11 +149,7 @@ class TestLongcatZeroExpert(unittest.TestCase):
     def test_placed_replicas_beyond_the_routed_count_are_not_zero_experts(self):
         # With a placement the router emits physical ids: E=3 routed experts on
         # P=5 slots, so ids 3 and 4 are replicas, and only -1 is a zero expert.
-        moe = object.__new__(_RuntimeLongcatMoE)
-        moe.zero_expert_num = 1
-        moe.n_routed_experts = 3
-        moe.zero_expert_type = "identity"
-        moe.expert_dispatch_info = object()
+        moe = self._moe(5)
         hidden_states = torch.tensor([[2.0, 4.0], [6.0, 8.0]])
         topk_output = StandardTopKOutput(
             topk_weights=torch.tensor([[0.25, 0.75], [0.5, 0.5]]),
@@ -163,6 +166,18 @@ class TestLongcatZeroExpert(unittest.TestCase):
             topk_output.topk_weights, torch.tensor([[0.25, 0.0], [0.5, 0.5]])
         )
         torch.testing.assert_close(topk_output.topk_ids, torch.tensor([[4, 0], [3, 1]]))
+
+    def test_an_id_at_or_beyond_the_physical_experts_is_refused(self):
+        # A zero expert numbered from E (the reference engine's convention) is
+        # not this router's: it must have been normalized to -1 upstream.
+        moe = self._moe(3)
+        topk_output = StandardTopKOutput(
+            topk_weights=torch.tensor([[0.25, 0.75]]),
+            topk_ids=torch.tensor([[0, 3]]),
+            router_logits=torch.zeros(1, 4),
+        )
+        with self.assertRaisesRegex(RuntimeError, "zero experts must be -1"):
+            _RuntimeLongcatMoE._apply_zero_experts(moe, torch.ones(1, 2), topk_output)
 
 
 def _longcat_moe_config(n_routed_experts: int = 4) -> SimpleNamespace:
@@ -229,7 +244,7 @@ class TestLongcatExpertPlacementWiring(unittest.TestCase):
                 alt_stream=None,
             )
 
-    def _placement(self, algorithm: str):
+    def _placement(self):
         from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
 
         return ExpertLocationMetadata.from_physical_to_logical_map(
@@ -237,8 +252,7 @@ class TestLongcatExpertPlacementWiring(unittest.TestCase):
             4,
             ep_size=2,
             ep_rank=1,
-            num_nodes=1,
-            dispatch_algorithm=algorithm,
+            ep_rank_nodes=(0, 0),
         )
 
     def test_without_a_placement_the_layer_keeps_its_routed_experts(self):
@@ -249,7 +263,7 @@ class TestLongcatExpertPlacementWiring(unittest.TestCase):
         self.assertEqual(moe.topk.topk_config.layer_id, 1)
 
     def test_placement_sizes_slots_and_picks_the_dispatch_flavour(self):
-        placement = self._placement("static_with_zero_expert")
+        placement = self._placement()
         moe = self._build(
             placement, all_to_all_ep=False, algorithm="static_with_zero_expert"
         )
@@ -258,12 +272,14 @@ class TestLongcatExpertPlacementWiring(unittest.TestCase):
         self.assertEqual(moe.experts.num_local_experts, 3)
         info = moe.expert_dispatch_info
         self.assertEqual(info.layer_id, 1)
-        # Replicated-input EP: rank-agnostic replica tables, views of layer 1.
+        # Replicated-input EP: rank-agnostic replica tables, views of layer 1,
+        # and no static per-rank map is ever built.
         self.assertIsNotNone(info.replica_dispatch)
         self.assertTrue(
             info.replica_dispatch.replicas.data_ptr()
-            == placement.dispatch_replicas[1].data_ptr()
+            == placement.logical_to_all_physical_map[1].data_ptr()
         )
+        self.assertIsNone(placement._rank_dispatch_map)
         moe = self._build(
             placement, all_to_all_ep=True, algorithm="static_with_zero_expert"
         )
@@ -271,7 +287,7 @@ class TestLongcatExpertPlacementWiring(unittest.TestCase):
         self.assertIsNone(moe.expert_dispatch_info.replica_dispatch)
         self.assertEqual(
             moe.expert_dispatch_info.partial_logical_to_rank_dispatch_physical_map.tolist(),
-            placement.logical_to_rank_dispatch_physical_map[1].tolist(),
+            placement.rank_dispatch_map()[1].tolist(),
         )
 
     def test_placement_geometry_must_match_the_model(self):
@@ -282,17 +298,17 @@ class TestLongcatExpertPlacementWiring(unittest.TestCase):
             5,
             ep_size=2,
             ep_rank=1,
-            num_nodes=1,
-            dispatch_algorithm="static_with_zero_expert",
+            ep_rank_nodes=(0, 0),
         )
         with self.assertRaisesRegex(ValueError, "logical experts"):
             self._build(
                 wrong_experts, all_to_all_ep=False, algorithm="static_with_zero_expert"
             )
         with self.assertRaisesRegex(ValueError, "zero experts"):
-            self._build(
-                self._placement("static"), all_to_all_ep=False, algorithm="static"
-            )
+            self._build(self._placement(), all_to_all_ep=False, algorithm="static")
+
+    def test_longcat_opts_in_to_expert_placement(self):
+        self.assertTrue(LongcatFlashForCausalLM.supports_expert_placement)
 
 
 class TestLongcatMoePlan(unittest.TestCase):

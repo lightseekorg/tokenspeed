@@ -914,8 +914,7 @@ def test_expert_load_reset_and_dump_ride_the_data_plane_on_the_execution_stream(
         3,
         ep_size=2,
         ep_rank=1,
-        num_nodes=1,
-        dispatch_algorithm=None,
+        ep_rank_nodes=(0, 0),
     )
     placement.enable_load_recording()
     placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5], [0, 4, 0, 4]]))

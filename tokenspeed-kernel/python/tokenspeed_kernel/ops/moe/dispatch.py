@@ -24,9 +24,8 @@ With redundant experts a logical expert has several physical replicas, each
 on some rank. Routing then emits physical ids: every rank runs the same
 routing over the same tokens, so the replica must be a pure function of the
 token row and route rank -- ``replicas[logical, (row + rank) % count]`` --
-for exactly one rank to own each (token, expert) pair. The same kernel can
-count how many routes land on every physical expert, which is what the
-placement algorithm consumes.
+for exactly one rank to own each (token, expert) pair. Load counting is the
+runtime's (``record_expert_load``), applied to the mapped ids after routing.
 """
 
 from __future__ import annotations
@@ -44,13 +43,10 @@ class ExpertDispatch:
         replicas: ``[num_logical, X]`` int32 physical ids of every logical
             expert's replicas, ``-1`` padded; contiguous.
         num_replicas: ``[num_logical]`` int32 valid entries per row, all >= 1.
-        load: ``[num_physical]`` int32 counters the routing kernel increments
-            once per route, or None to skip counting.
     """
 
     replicas: torch.Tensor
     num_replicas: torch.Tensor
-    load: torch.Tensor | None
 
     def __post_init__(self) -> None:
         if self.replicas.ndim != 2 or self.replicas.dtype != torch.int32:
@@ -62,12 +58,6 @@ class ExpertDispatch:
             raise ValueError("num_replicas must be int32 [num_logical]")
         if not (self.replicas.is_contiguous() and self.num_replicas.is_contiguous()):
             raise ValueError("dispatch tables must be contiguous")
-        if self.load is not None and (
-            self.load.ndim != 1
-            or self.load.dtype != torch.int32
-            or not self.load.is_contiguous()
-        ):
-            raise ValueError("load must be a contiguous int32 [num_physical] counter")
 
     @property
     def max_replicas(self) -> int:
@@ -77,16 +67,19 @@ class ExpertDispatch:
 def dispatch_topk_ids_reference(
     topk_ids: torch.Tensor, dispatch: ExpertDispatch
 ) -> torch.Tensor:
-    """Tensor-op reference of the kernel's replica choice (and load counting)."""
+    """Tensor-op reference of the kernel's replica choice.
+
+    Args:
+        topk_ids: ``[tokens, top_k]`` logical ids, every entry in
+            ``[0, num_logical)``.
+        dispatch: The layer's replica tables.
+
+    Returns:
+        ``[tokens, top_k]`` physical ids in ``topk_ids``' dtype.
+    """
     rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)[:, None]
     ranks = torch.arange(topk_ids.shape[1], device=topk_ids.device)[None, :]
     logical = topk_ids.long()
     count = dispatch.num_replicas.long()[logical]
     physical = dispatch.replicas.long()[logical, (rows + ranks) % count]
-    if dispatch.load is not None:
-        dispatch.load.scatter_add_(
-            0,
-            physical.reshape(-1),
-            torch.ones_like(physical.reshape(-1), dtype=torch.int32),
-        )
     return physical.to(topk_ids.dtype)

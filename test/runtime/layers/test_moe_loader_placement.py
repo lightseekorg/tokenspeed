@@ -44,8 +44,7 @@ def _placement(physical_to_logical, num_logical, ep_size, ep_rank):
         num_logical,
         ep_size=ep_size,
         ep_rank=ep_rank,
-        num_nodes=1,
-        dispatch_algorithm=None,
+        ep_rank_nodes=(0,) * ep_size,
     )
 
 
@@ -144,13 +143,9 @@ def test_fused_checkpoint_tensors_gather_each_slots_expert():
 
 def test_placement_plan_for_896_slots_over_128_ranks_has_7_slots_per_rank():
     physical_to_logical = (torch.arange(896) % 768).view(1, 896)
+    nodes = tuple(r // 8 for r in range(128))
     placement = ExpertLocationMetadata.from_physical_to_logical_map(
-        physical_to_logical,
-        768,
-        ep_size=128,
-        ep_rank=5,
-        num_nodes=16,
-        dispatch_algorithm=None,
+        physical_to_logical, 768, ep_size=128, ep_rank=5, ep_rank_nodes=nodes
     )
     assert placement.num_local_physical_experts == 7
     plan = _build_placed_expert_plan(_SCHEMA, expert_placement=placement, ep_rank=5)
@@ -162,12 +157,7 @@ def test_placement_plan_for_896_slots_over_128_ranks_has_7_slots_per_rank():
     last = _build_placed_expert_plan(
         _SCHEMA,
         expert_placement=ExpertLocationMetadata.from_physical_to_logical_map(
-            physical_to_logical,
-            768,
-            ep_size=128,
-            ep_rank=127,
-            num_nodes=16,
-            dispatch_algorithm=None,
+            physical_to_logical, 768, ep_size=128, ep_rank=127, ep_rank_nodes=nodes
         ),
         ep_rank=127,
     )

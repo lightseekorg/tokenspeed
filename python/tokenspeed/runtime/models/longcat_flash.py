@@ -74,6 +74,9 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA as _DeepseekV3AttentionMLA,
 )
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MLP as _DeepseekV3MLP
+from tokenspeed.runtime.moe.dispatch_algorithm import (
+    has_zero_expert as _has_zero_expert,
+)
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder as _get_global_expert_distribution_recorder,
 )
@@ -193,7 +196,7 @@ def _check_longcat_expert_placement(
             f"has ep_size={mapping.moe.ep_size}"
         )
     algorithm = global_server_args_dict["ep_dispatch_algorithm"]
-    if config.zero_expert_num > 0 and not str(algorithm).endswith("_with_zero_expert"):
+    if config.zero_expert_num > 0 and not _has_zero_expert(algorithm):
         raise ValueError(
             f"LongCat routes {config.zero_expert_num} zero experts; use "
             "--ep-dispatch-algorithm static_with_zero_expert (or "
@@ -358,11 +361,17 @@ class _RuntimeLongcatMoE(nn.Module):
         if self.zero_expert_num <= 0:
             return None
 
-        zero_expert_mask = topk_output.topk_ids < 0
-        if self.expert_dispatch_info is None:
-            # Without a placement any id at or beyond the routed experts is a
-            # zero expert; with one, ids in [E, P) are real replicas.
-            zero_expert_mask |= topk_output.topk_ids >= self.n_routed_experts
+        # The router's contract: a zero expert is -1, every other id is a
+        # physical slot in [0, P) (the routed experts, plus the replicas an
+        # expert placement adds past E). Nothing here depends on whether a
+        # placement is active; the bound is checked device-side, graph-safe.
+        topk_ids = topk_output.topk_ids
+        torch._assert_async(
+            (topk_ids < self.experts.num_experts).all(),
+            f"LongCat top-k id at or beyond the {self.experts.num_experts} "
+            "physical experts; zero experts must be -1",
+        )
+        zero_expert_mask = topk_ids < 0
         zero_expert_weights = torch.where(
             zero_expert_mask,
             topk_output.topk_weights,
@@ -731,6 +740,9 @@ class _RuntimeLongcatModel(nn.Module):
 
 class LongcatFlashForCausalLM(_BaseCausalLM):
     model_cls = _RuntimeLongcatModel
+    # The MoE layers size their slots from the placement and route through
+    # its tables; load_weights fills every placed replica.
+    supports_expert_placement = True
 
     def __init__(
         self,

@@ -40,26 +40,27 @@ from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
 _PHYSICAL_TO_LOGICAL = torch.tensor([[0, 1, 2, 3, 0, 2]])
 
 
-def _placement(ep_rank: int, algorithm: str) -> ExpertLocationMetadata:
+def _placement(ep_rank: int) -> ExpertLocationMetadata:
     placement = ExpertLocationMetadata.from_physical_to_logical_map(
-        _PHYSICAL_TO_LOGICAL,
-        4,
-        ep_size=2,
-        ep_rank=ep_rank,
-        num_nodes=1,
-        dispatch_algorithm=algorithm,
+        _PHYSICAL_TO_LOGICAL, 4, ep_size=2, ep_rank=ep_rank, ep_rank_nodes=(0, 0)
     )
     placement.enable_load_recording()
     return placement
 
 
 def _info(ep_rank: int, algorithm: str, *, all_to_all_ep: bool):
-    return ExpertLocationDispatchInfo.init_new(
+    placement = _placement(ep_rank)
+    info = ExpertLocationDispatchInfo.init_new(
         layer_id=0,
         ep_dispatch_algorithm=algorithm,
-        expert_location_metadata=_placement(ep_rank, algorithm),
+        expert_location_metadata=placement,
         all_to_all_ep=all_to_all_ep,
     )
+    # Only all-to-all EP under a static algorithm pays for the static map.
+    assert (placement._rank_dispatch_map is not None) == (
+        all_to_all_ep and algorithm.startswith("static")
+    )
+    return info
 
 
 def test_all_to_all_ep_dispatches_to_the_ranks_own_replica():
@@ -117,6 +118,7 @@ def test_record_expert_load_counts_real_routes_only():
     ids = map_zero_expert_routes(torch.tensor([[0, 2, -1], [0, 2, 3]]), info, 4)
     record_expert_load(info.physical_load, ids)
     record_expert_load(info.physical_load, ids)
+    assert info.physical_load.dtype == torch.int64
     assert info.physical_load.tolist() == [2, 0, 2, 2, 2, 2]
     record_expert_load(None, ids)  # recording off: no-op
 

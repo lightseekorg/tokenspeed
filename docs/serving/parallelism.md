@@ -235,9 +235,12 @@ critical path. `--ep-num-redundant-experts R` gives every MoE layer
 placement* decides which logical expert each slot holds, so a hot expert is
 replicated across ranks. The placement is derived once, at startup, from
 recorded load with DeepSeek's EPLB algorithm; experts are not moved while
-serving (`--enable-eplb` is refused). Models opt in by building their MoE
-layers from the placement — LongCat-Flash does; a model without routed
-experts cannot take one.
+serving (`--enable-eplb` is refused). Models opt in explicitly
+(`supports_expert_placement` on the model class) by building their MoE layers
+from the placement and loading every placed slot — LongCat-Flash does. The
+placement flags are refused for any other model, so a placement is never
+installed only to be ignored. `--ep-num-redundant-experts` also needs
+expert parallelism (`ep_size > 1`): replicas live on other ranks.
 
 1. **Record** the load of a representative workload. Serve with
    `--expert-distribution-recorder-mode stat --ep-dispatch-algorithm
@@ -252,30 +255,42 @@ experts cannot take one.
    curl -X POST localhost:8401/stop_profile
    ```
 
-   `stop_profile` writes `<id>-TP<rank>.expert-load.pt` with `logical_count`
-   (`[layers, routed experts]`, summed over the EP group), the physical
-   counts, the placement that produced them, the per-rank counts and the
-   per-layer balancedness (mean rank load over the busiest rank's load), and
-   logs the balancedness summary. Every rank's file holds the same reduced
-   counts; the reduction is a collective, so stop the profile while the
-   server is idle when attention DP ranks receive the request independently.
+   `stop_profile` writes one record per rank,
+   `<id>-<rank tag>.expert-load.pt`, holding what *that rank's* router
+   counted: `physical_count` (`[layers, slots]`, int64), the same summed
+   over each logical expert's replicas as `logical_count`
+   (`[layers, routed experts]`), the `physical_to_logical_map` that produced
+   them and the rank's `ep_rank` / `ep_size`. The records are deliberately
+   **not reduced on the serving path**: a profile stop reaches attention-DP
+   workers independently, and a rank running a collective inside the request
+   would wait on a peer still synchronizing its scheduling round. The sum
+   over the EP group is taken when the records are consumed
+   (`merge_expert_load_records`): under all-to-all EP every rank counted its
+   own tokens, so every rank's record is needed; under replicated-input EP
+   every rank counted every token, so one record is complete and merging
+   more only scales the counts uniformly, which the placement algorithm is
+   blind to.
 
-2. **Place**: restart with the redundant slots and the recorded load.
+2. **Place**: restart with the redundant slots and the recorded load,
+   pointing `--init-expert-location` at the directory (or a glob) of the
+   records to merge them.
 
    ```bash
    --ep-num-redundant-experts 128 \
-   --init-expert-location /tmp/expert-load/<id>-TP0.expert-load.pt \
+   --init-expert-location /tmp/expert-load \
    --ep-dispatch-algorithm static_with_zero_expert
    ```
 
    `P` must divide over the EP size (LongCat 2.0: 768 + 128 = 896 slots at
    EP128, 7 per rank). The loader fills every local slot from the logical
    expert the placement assigns it — one checkpoint tensor lands in each of
-   its replicas, and RL weight sync through the same path does too. A file
-   holding only a `physical_to_logical_map` pins a placement exactly;
+   its replicas, and RL weight sync through the same path does too. A single
+   record file is also accepted (its `logical_count` alone); a file holding
+   only a `physical_to_logical_map` pins a placement exactly;
    `--eplb-algorithm` selects the balancing algorithm (`auto` picks the
    hierarchical variant when the model's expert groups divide over the
-   nodes).
+   nodes). The merged record's per-layer *balancedness* (mean rank load over
+   the busiest rank's load) is what to compare between placements.
 
 3. **Route**. The router emits physical ids; zero experts (LongCat) stay
    `-1` and never enter the tables. How a route picks among an expert's
@@ -283,9 +298,10 @@ experts cannot take one.
 
    - Under all-to-all EP (DeepEP) each rank routes only its own tokens, so
      every rank dispatches to its *nearest* replica — one on the same GPU,
-     else on the same node, else a seeded fair draw — through a static
-     per-rank map (`--ep-dispatch-algorithm static*`; the `dynamic*`
-     variants draw at random per route).
+     else on the same node (nodes taken from the EP group's actual ranks),
+     else a seeded fair draw — through a static per-rank map
+     (`--ep-dispatch-algorithm static*`; the `dynamic*` variants draw at
+     random per route). The map is computed only on this path.
    - Under replicated-input EP (every rank routes every token, e.g. the
      rl-bitwise aok path) exactly one rank must compute each route, so the
      replica is a pure function of the token:

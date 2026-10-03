@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 
+from tokenspeed.runtime.moe.dispatch_algorithm import STATIC_EP_DISPATCH_ALGORITHMS
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder,
 )
@@ -48,9 +49,6 @@ class TopKOutputFormat(Enum):
 
     def is_bypassed(self) -> bool:
         return self == TopKOutputFormat.BYPASSED
-
-
-_STATIC_DISPATCH_ALGORITHMS = frozenset({"static", "static_with_zero_expert"})
 
 
 @dataclass
@@ -74,9 +72,10 @@ class ExpertLocationDispatchInfo:
         "static_with_zero_expert",
         "dynamic_with_zero_expert",
     ]
-    # (num_logical_experts,)
+    # (num_logical_experts,) this rank's static map; None unless all-to-all
+    # EP under a static algorithm, the only consumer.
     partial_logical_to_rank_dispatch_physical_map: torch.Tensor | None
-    # (num_logical_experts, X)
+    # (num_logical_experts, X) replicas of every logical expert, -1 padded.
     partial_logical_to_all_physical_map: torch.Tensor
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
@@ -84,7 +83,7 @@ class ExpertLocationDispatchInfo:
     # Rank-agnostic replica tables for replicated-input EP; None under
     # all-to-all EP, where the per-rank static map applies.
     replica_dispatch: ExpertDispatch | None
-    # (num_physical_experts,) int32 route counters of this layer, or None
+    # (num_physical_experts,) int64 route counters of this layer, or None
     # when load recording is off.
     physical_load: torch.Tensor | None
 
@@ -108,7 +107,7 @@ class ExpertLocationDispatchInfo:
                 Otherwise every rank routes every token and a static
                 algorithm must pick the same replica on every rank.
         """
-        static = ep_dispatch_algorithm in _STATIC_DISPATCH_ALGORITHMS
+        static = ep_dispatch_algorithm in STATIC_EP_DISPATCH_ALGORITHMS
         if not all_to_all_ep and not static:
             raise ValueError(
                 f"--ep-dispatch-algorithm {ep_dispatch_algorithm} draws replicas "
@@ -116,31 +115,25 @@ class ExpertLocationDispatchInfo:
                 "every token and must agree on one replica per route; use "
                 "static or static_with_zero_expert."
             )
-        rank_map = expert_location_metadata.logical_to_rank_dispatch_physical_map
-        if static and all_to_all_ep and rank_map is None:
-            raise ValueError(
-                "the placement was built without a static dispatch map; pass "
-                f"dispatch_algorithm={ep_dispatch_algorithm!r} when building it"
-            )
+        replicas = expert_location_metadata.logical_to_all_physical_map[layer_id]
+        num_replicas = expert_location_metadata.logical_to_all_physical_map_num_valid[
+            layer_id
+        ]
         return cls(
             layer_id=layer_id,
             ep_dispatch_algorithm=ep_dispatch_algorithm,
+            # The per-rank static map is computed on first request, so a
+            # replicated-input EP server never builds it.
             partial_logical_to_rank_dispatch_physical_map=(
-                rank_map[layer_id, :] if rank_map is not None else None
+                expert_location_metadata.rank_dispatch_map()[layer_id]
+                if static and all_to_all_ep
+                else None
             ),
-            partial_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[
-                layer_id, :
-            ],
-            partial_logical_to_all_physical_map_num_valid=expert_location_metadata.logical_to_all_physical_map_num_valid[
-                layer_id, :
-            ],
+            partial_logical_to_all_physical_map=replicas,
+            partial_logical_to_all_physical_map_num_valid=num_replicas,
             num_physical_experts=expert_location_metadata.num_physical_experts,
             replica_dispatch=(
-                ExpertDispatch(
-                    expert_location_metadata.dispatch_replicas[layer_id],
-                    expert_location_metadata.dispatch_num_replicas[layer_id],
-                    load=None,
-                )
+                ExpertDispatch(replicas, num_replicas)
                 if static and not all_to_all_ep
                 else None
             ),

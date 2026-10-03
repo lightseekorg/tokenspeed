@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -43,6 +43,12 @@ from tokenspeed.runtime.utils import add_prefix
 class BaseCausalLM(nn.Module):
 
     model_cls: type[BaseTransformerModel]
+    # Whether the model's MoE layers route through the process-global expert
+    # placement (redundant replicas, load counters; ``moe/expert_location.py``)
+    # and its loader fills every placed slot. ``build_expert_placement``
+    # refuses the placement flags for a model that does not, so a placement
+    # is never installed only to be ignored.
+    supports_expert_placement: ClassVar[bool] = False
 
     def __init__(
         self,

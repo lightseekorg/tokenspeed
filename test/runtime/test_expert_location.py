@@ -30,71 +30,74 @@ import torch
 from tokenspeed_kernel.ops.moe import ExpertDispatch, dispatch_topk_ids_reference
 
 from tokenspeed.runtime.moe import eplb_algorithms, expert_location
+from tokenspeed.runtime.moe.dispatch_algorithm import (
+    EP_DISPATCH_ALGORITHMS,
+    STATIC_EP_DISPATCH_ALGORITHMS,
+    has_zero_expert,
+)
 from tokenspeed.runtime.moe.expert_location import (
     ExpertLocationMetadata,
+    build_expert_placement,
     compute_logical_to_rank_dispatch_physical_map,
+    expert_placement_requested,
     merge_expert_load_records,
 )
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-def _placement(ep_rank: int, dispatch_algorithm: str | None = None):
+def _placement(ep_rank: int):
     # Two layers, four logical experts on six slots over two ranks. Layer 1
     # gives expert 1 three replicas, two of them on rank 1.
     physical_to_logical = torch.tensor([[0, 1, 2, 3, 0, 2], [3, 2, 1, 0, 1, 1]])
     return ExpertLocationMetadata.from_physical_to_logical_map(
-        physical_to_logical,
-        4,
-        ep_size=2,
-        ep_rank=ep_rank,
-        num_nodes=1,
-        dispatch_algorithm=dispatch_algorithm,
+        physical_to_logical, 4, ep_size=2, ep_rank=ep_rank, ep_rank_nodes=(0, 0)
     )
 
 
 def test_placement_queries_follow_the_physical_map():
     placement = _placement(ep_rank=1)
     assert placement.num_local_physical_experts == 3
-    assert placement.has_redundancy
-    assert placement.local_logical_experts(0, 0) == [0, 1, 2]
-    assert placement.local_logical_experts(0, 1) == [3, 0, 2]
-    assert placement.local_logical_experts(1, 1) == [0, 1]
+    assert placement.local_slot_logical_experts(0, 0) == [0, 1, 2]
+    assert placement.local_slot_logical_experts(0, 1) == [3, 0, 2]
     assert placement.local_slot_logical_experts(1, 1) == [0, 1, 1]
-    assert placement.local_physical_slots(0, 0, ep_rank=0) == [0]
-    assert placement.local_physical_slots(0, 0, ep_rank=1) == [1]
-    assert placement.local_physical_slots(1, 1, ep_rank=1) == [1, 2]
-    assert placement.local_physical_slots(1, 3, ep_rank=1) == []
-    assert placement.dispatch_replicas.tolist() == [
+    assert placement.logical_to_all_physical(1, 1) == [2, 4, 5]
+    # The replica table is the one routing table: int32, trimmed to the
+    # widest replica count, never padded to the physical expert count.
+    assert placement.logical_to_all_physical_map.dtype == torch.int32
+    assert placement.logical_to_all_physical_map.tolist() == [
         [[0, 4, -1], [1, -1, -1], [2, 5, -1], [3, -1, -1]],
         [[3, -1, -1], [2, 4, 5], [1, -1, -1], [0, -1, -1]],
     ]
-    assert placement.dispatch_num_replicas.tolist() == [[2, 1, 2, 1], [1, 3, 1, 1]]
-    # No static map unless a static dispatch algorithm asks for one.
-    assert placement.logical_to_rank_dispatch_physical_map is None
+    assert placement.logical_to_all_physical_map_num_valid.dtype == torch.int32
+    assert placement.logical_to_all_physical_map_num_valid.tolist() == [
+        [2, 1, 2, 1],
+        [1, 3, 1, 1],
+    ]
     with pytest.raises(ValueError, match="do not divide"):
         ExpertLocationMetadata.from_physical_to_logical_map(
             torch.tensor([[0, 1, 2, 3, 0]]),
             4,
             ep_size=2,
             ep_rank=0,
-            num_nodes=1,
-            dispatch_algorithm=None,
+            ep_rank_nodes=(0, 0),
         )
     with pytest.raises(ValueError, match="no physical slot"):
         ExpertLocationMetadata.from_physical_to_logical_map(
-            torch.tensor([[0, 1, 2, 0]]),
-            4,
-            ep_size=2,
-            ep_rank=0,
-            num_nodes=1,
-            dispatch_algorithm=None,
+            torch.tensor([[0, 1, 2, 0]]), 4, ep_size=2, ep_rank=0, ep_rank_nodes=(0, 0)
+        )
+    with pytest.raises(ValueError, match="ep_rank_nodes"):
+        ExpertLocationMetadata.from_physical_to_logical_map(
+            torch.tensor([[0, 1, 2, 3]]), 4, ep_size=2, ep_rank=0, ep_rank_nodes=(0,)
         )
 
 
-def test_static_map_prefers_the_local_replica():
+def test_static_map_is_built_on_demand_and_prefers_the_local_replica():
     for ep_rank in (0, 1):
-        placement = _placement(ep_rank, dispatch_algorithm="static_with_zero_expert")
-        static = placement.logical_to_rank_dispatch_physical_map
-        assert static.shape == (2, 4)
+        placement = _placement(ep_rank)
+        assert placement._rank_dispatch_map is None  # nothing paid for yet
+        static = placement.rank_dispatch_map()
+        assert static is placement.rank_dispatch_map()  # computed once
+        assert static.shape == (2, 4) and static.dtype == torch.int32
         local = range(ep_rank * 3, (ep_rank + 1) * 3)
         for layer in range(2):
             for logical in range(4):
@@ -113,7 +116,10 @@ def test_static_map_prefers_a_same_node_replica_before_a_remote_one():
     logical_to_all = torch.tensor([[[0, 4], [6, 7], [2, -1], [1, 5], [3, -1]]])
     maps = [
         compute_logical_to_rank_dispatch_physical_map(
-            logical_to_all, num_gpus=4, num_nodes=2, num_physical_experts=8, ep_rank=r
+            logical_to_all,
+            num_physical_experts=8,
+            ep_rank_nodes=(0, 0, 1, 1),
+            ep_rank=r,
         )
         for r in range(4)
     ]
@@ -128,22 +134,72 @@ def test_static_map_prefers_a_same_node_replica_before_a_remote_one():
     # Expert 1 has no copy on node 0: ranks 0 and 1 draw one of its replicas.
     assert int(maps[2][0, 1]) == 6
     assert all(int(maps[r][0, 1]) in (6, 7) for r in (0, 1))
-    with pytest.raises(ValueError, match="do not spread evenly"):
+    assert all((m >= 0).all() for m in maps)
+
+
+def test_static_map_follows_the_ranks_actual_nodes():
+    # The EP ranks' nodes come from the mapping, not from ep_size / nnodes:
+    # here EP ranks 0 and 1 share node 0 while rank 2 is alone on node 1, a
+    # layout a divisibility rule would reject.
+    logical_to_all = torch.tensor([[[0, 5], [1, 2], [3, 4]]])
+    maps = [
         compute_logical_to_rank_dispatch_physical_map(
-            logical_to_all, num_gpus=4, num_nodes=3, num_physical_experts=8, ep_rank=0
+            logical_to_all, num_physical_experts=6, ep_rank_nodes=(0, 0, 1), ep_rank=r
         )
+        for r in range(3)
+    ]
+    # Rank 1 has no copy of expert 0; its node mate rank 0 does (slot 0).
+    assert int(maps[1][0, 0]) == 0
+    # Rank 0 has no copy of expert 2; node mate rank 1 holds slots 2-3.
+    assert int(maps[0][0, 2]) == 3
+    # MoE-TP-only: a single EP rank on a multi-node job is fine.
+    single = compute_logical_to_rank_dispatch_physical_map(
+        torch.tensor([[[0], [1]]]),
+        num_physical_experts=2,
+        ep_rank_nodes=(1,),
+        ep_rank=0,
+    )
+    assert single.tolist() == [[0, 1]]
+    with pytest.raises(ValueError, match="do not divide"):
+        compute_logical_to_rank_dispatch_physical_map(
+            logical_to_all,
+            num_physical_experts=6,
+            ep_rank_nodes=(0, 0, 1, 1),
+            ep_rank=0,
+        )
+
+
+def test_static_map_is_identical_on_every_rank_and_at_scale():
+    # 896 slots over 128 ranks on 16 nodes, 768 experts, a few replicated.
+    physical_to_logical = (torch.arange(896) % 768).view(1, 896)
+    nodes = tuple(r // 8 for r in range(128))
+    full = [
+        ExpertLocationMetadata.from_physical_to_logical_map(
+            physical_to_logical, 768, ep_size=128, ep_rank=r, ep_rank_nodes=nodes
+        ).rank_dispatch_map()
+        for r in (0, 77)
+    ]
+    assert full[0].shape == (1, 768)
+    # Ranks agree on where single-replica experts live, and each prefers its
+    # own slots for the replicated ones.
+    assert torch.equal(full[0][0, 128:], full[1][0, 128:])
+    assert full[0][0, :7].tolist() == list(range(7))  # rank 0 owns slots 0..6
+    assert all(768 <= p < 896 or p < 128 for p in full[1][0, :128].tolist())
 
 
 def test_dispatch_reference_alternates_replicas():
     placement = _placement(ep_rank=0)
     dispatch = ExpertDispatch(
-        placement.dispatch_replicas[1], placement.dispatch_num_replicas[1], load=None
+        placement.logical_to_all_physical_map[1],
+        placement.logical_to_all_physical_map_num_valid[1],
     )
     topk_ids = torch.tensor([[1, 0], [1, 2], [1, 3]], dtype=torch.int32)
     physical = dispatch_topk_ids_reference(topk_ids, dispatch)
     # Expert 1's replicas are physical 2, 4, 5: row r, rank k picks (r + k) % 3.
     assert physical.tolist() == [[2, 3], [4, 1], [5, 0]]
     assert physical.dtype == torch.int32
+    with pytest.raises(ValueError, match="int32"):
+        ExpertDispatch(dispatch.replicas.long(), dispatch.num_replicas)
 
 
 def test_load_record_is_per_rank_and_merges_across_ranks(tmp_path):
@@ -239,15 +295,59 @@ def test_eplb_placement_balances_a_skewed_load():
     assert busiest_over_mean(p2l) < 1.15
     assert logcnt[:, 0].min() >= 2  # the hot expert got replicas
     placement = ExpertLocationMetadata.from_maps(
-        p2l,
-        log2phy,
-        ep_size=ep,
-        ep_rank=0,
-        num_nodes=1,
-        dispatch_algorithm="static",
+        p2l, log2phy, ep_size=ep, ep_rank=0, ep_rank_nodes=(0, 0, 0, 0)
     )
     assert placement.num_physical_experts == experts + 8
     # Every logical expert is placed somewhere, and every slot is accounted for.
-    assert (placement.dispatch_num_replicas >= 1).all()
-    assert placement.dispatch_num_replicas.sum(-1).tolist() == [experts + 8] * layers
-    assert placement.logical_to_rank_dispatch_physical_map.shape == (layers, experts)
+    assert (placement.logical_to_all_physical_map_num_valid >= 1).all()
+    assert (
+        placement.logical_to_all_physical_map_num_valid.sum(-1).tolist()
+        == [experts + 8] * layers
+    )
+    assert placement.rank_dispatch_map().shape == (layers, experts)
+
+
+def test_build_expert_placement_refuses_models_that_do_not_opt_in():
+    from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+
+    class Plain(BaseCausalLM):
+        pass
+
+    class Placed(BaseCausalLM):
+        supports_expert_placement = True
+
+        @classmethod
+        def get_model_config_for_expert_location(cls, config):
+            return expert_location.ModelConfigForExpertLocation(
+                num_layers=1, num_logical_experts=4
+            )
+
+    args = SimpleNamespace(
+        ep_num_redundant_experts=2,
+        init_expert_location="trivial",
+        expert_distribution_recorder_mode="stat",
+        ep_dispatch_algorithm="static",
+    )
+    model_config = SimpleNamespace(hf_config=None)
+    assert not BaseCausalLM.supports_expert_placement
+    with mock.patch.object(
+        expert_location, "get_model_architecture", return_value=(Plain, "Plain")
+    ):
+        with pytest.raises(ValueError, match="does not route through"):
+            build_expert_placement(args, model_config)
+    with (
+        mock.patch.object(
+            expert_location, "get_model_architecture", return_value=(Placed, "Placed")
+        ),
+        mock.patch.object(
+            expert_location,
+            "compute_initial_expert_location_metadata",
+            return_value=_placement(0),
+        ),
+    ):
+        placement = build_expert_placement(args, model_config)
+    assert placement.physical_load is not None  # stat recording allocated
+    # Without a request there is no placement, whatever the model.
+    args.ep_num_redundant_experts = 0
+    args.expert_distribution_recorder_mode = None
+    assert build_expert_placement(args, model_config) is None
