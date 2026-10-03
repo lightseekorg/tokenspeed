@@ -468,24 +468,45 @@ def test_pipeline_dspark_draft_gets_a_context_producer_on_every_stage(is_last_pp
     assert producer.token_to_kv_pool is draft_pool
 
 
-@pytest.mark.parametrize("spec_algo", ["MTP", "EAGLE3"])
-@pytest.mark.parametrize("draft_pool", [None, object()])
-def test_pipeline_eagle_style_draft_produces_no_context(spec_algo, draft_pool):
-    # A NextN/MTP draft reads only the last stage's captured hidden states;
-    # neither a mid stage (no draft pool) nor the last stage builds a producer.
+@pytest.mark.parametrize(
+    "draft_model,draft_pool",
+    [
+        # A stage before the last builds no MTP draft at all.
+        (None, None),
+        # The last stage drafts from captured hidden states without a producer.
+        (torch.nn.Module(), object()),
+    ],
+)
+def test_pipeline_mtp_draft_produces_no_context(draft_model, draft_pool):
     from tokenspeed.runtime.execution.model_executor import (
         select_dspark_context_producer,
     )
 
     assert (
         select_dspark_context_producer(
-            spec_algo=spec_algo,
+            spec_algo="MTP",
             pp_size=2,
-            draft_model=torch.nn.Module(),
+            draft_model=draft_model,
             draft_token_to_kv_pool=draft_pool,
         )
         is None
     )
+
+
+def test_pipeline_eagle3_is_refused_by_the_executor():
+    # EAGLE3's aux taps live on several stages; the executor refuses it even
+    # when the ServerArgs gate is bypassed.
+    from tokenspeed.runtime.execution.model_executor import (
+        select_dspark_context_producer,
+    )
+
+    with pytest.raises(ValueError, match="EAGLE3 cannot run on a pipeline"):
+        select_dspark_context_producer(
+            spec_algo="EAGLE3",
+            pp_size=2,
+            draft_model=torch.nn.Module(),
+            draft_token_to_kv_pool=object(),
+        )
 
 
 def test_pipeline_block_drafter_without_context_production_is_rejected():
@@ -547,17 +568,47 @@ def test_pd_layerwise_finalization_is_decided_per_pipeline_stage(
         _supports_pd_layerwise_finalization,
     )
     from tokenspeed.runtime.execution.dspark_context import DSparkContextProducer
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
-    executor = SimpleNamespace(
-        dspark_context_producer=(
-            DSparkContextProducer.__new__(DSparkContextProducer)
-            if producer is not None
-            else None
-        ),
-        drafter=drafter.__new__(drafter) if drafter is not None else None,
+    # The real executor property: one predicate names the draft-field writer
+    # for the startup flag and for register_draft_final_step_counter alike.
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.dspark_context_producer = (
+        DSparkContextProducer.__new__(DSparkContextProducer)
+        if producer is not None
+        else None
     )
+    executor.drafter = drafter.__new__(drafter) if drafter is not None else None
     mapping = SimpleNamespace(has_pp=has_pp, is_last_pp_rank=is_last_pp_rank)
     assert _supports_pd_layerwise_finalization(executor, mapping) is expected
+    if has_pp and not is_last_pp_rank:
+        return
+    # The owning stage's register_draft_final_step_counter agrees with the flag.
+    executor.draft_attn_backend = object()
+    executor.attn_backend = object()
+    executor._draft_final_step_counter = None
+    if expected:
+        executor.register_draft_final_step_counter("counter")
+        assert executor._draft_final_step_counter == "counter"
+    else:
+        with pytest.raises(RuntimeError, match="cannot finalize layerwise"):
+            executor.register_draft_final_step_counter("counter")
+
+
+def test_draft_field_writer_prefers_the_context_producer():
+    from tokenspeed.runtime.execution.dspark_context import DSparkContextProducer
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.dspark_context_producer = None
+    executor.drafter = None
+    assert executor.draft_field_writer is None
+    executor.drafter = Eagle.__new__(Eagle)
+    assert executor.draft_field_writer is executor.drafter
+    executor.dspark_context_producer = DSparkContextProducer.__new__(
+        DSparkContextProducer
+    )
+    assert executor.draft_field_writer is executor.dspark_context_producer
 
 
 def test_wire_dflash_keeps_own_embed_head():

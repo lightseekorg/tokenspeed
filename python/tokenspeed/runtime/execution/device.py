@@ -1462,17 +1462,12 @@ def _supports_pd_layerwise_finalization(executor, mapping) -> bool:
     The draft cache fields are the last pipeline stage's trailing producer
     step (``CacheLayerOwnership``), so a stage before it owns none: its
     readiness is the target layers' alone and nothing remains to finalize.
-    The owning stage, like a non-PP engine, answers for whoever writes the
-    draft fields -- the context producer when configured, else the drafter.
-    Without speculation the answer is unused.
+    The owning stage, like a non-PP engine, answers for the executor's
+    ``draft_field_writer``. Without speculation the answer is unused.
     """
     if mapping.has_pp and not mapping.is_last_pp_rank:
         return True
-    writer = (
-        executor.dspark_context_producer
-        if executor.dspark_context_producer is not None
-        else executor.drafter
-    )
+    writer = executor.draft_field_writer
     return writer is not None and writer.supports_pd_layerwise_finalization
 
 

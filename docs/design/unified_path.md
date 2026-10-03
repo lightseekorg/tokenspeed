@@ -969,7 +969,8 @@ the producer from the pipeline configuration and the draft model's class
 (`select_dspark_context_producer`): on a pipeline a draft implementing
 `DSparkContextModel` gets a producer on every stage, a block drafter whose
 model does not implement it is rejected (it would draft from one stage's taps
-alone), and any other draft gets none. Off the pipeline every tap is local, so
+alone), EAGLE3 is refused (its aux taps span stages), and any other draft gets
+none. Off the pipeline every tap is local, so
 the drafter keeps its concatenated projection and its own context writes --
 including the quantization-aware path, since raw per-tap weight slicing is
 not a quantized linear operation. PP drafts require unquantized projection
@@ -981,7 +982,8 @@ An MTP (NextN) draft runs on a prefill pipeline without any cross-stage
 production: it consumes the post-final-norm hidden states the last stage
 already computes, so only that stage drafts. EAGLE3 stays off the pipeline:
 its aux taps come from several stages and the stage boundary bundle does not
-carry them. The MTP shape is
+carry them; `ServerArgs` rejects it and `select_dspark_context_producer`
+refuses it again at executor construction. The MTP shape is
 
 * **Construction.** `ServerArgs` accepts `DSPARK` and `MTP` with
   `--pipeline-parallel-size > 1` on the prefill role only (the chunk pipeline
@@ -1014,9 +1016,10 @@ carry them. The MTP shape is
 * **Layerwise CachePD.** `supports_pd_layerwise_finalization` is decided per
   stage (`device._supports_pd_layerwise_finalization`): a stage owning no
   draft fields has nothing to finalize and answers True; the owning stage
-  answers for the draft-field writer -- the producer when configured, else
-  the drafter -- exactly as a non-PP engine does. The last stage registers
-  the draft-final step counter; the others count target layers only.
+  answers for `ModelExecutor.draft_field_writer` -- the producer when
+  configured, else the drafter -- exactly as a non-PP engine does, and
+  `register_draft_final_step_counter` reads the same property. The last stage
+  registers the draft-final step counter; the others count target layers only.
 * **Handoff.** The last stage samples, runs the drafter over the completing
   chunk and writes the candidate block into the reserved decode slot; the
   event loop broadcasts `(output_tokens, output_lengths, next_input_ids)`
