@@ -1613,6 +1613,9 @@ def test_transfer_blocks_keep_only_owned_pages_translated_to_local() -> None:
     assert item.src_pages.tolist() == [1, 2, 3]
     assert item.dst_pages.tolist() == [11, 13, 15]
 
+    # The fragment route (what the planner emits for a sharded source) lands
+    # on the same page-gathered WRITE: a whole-field fragment is one row of
+    # the group's pages x fields grid, not a descriptor per page.
     fragment = CacheTransferFragment(
         group_id="history",
         field_id="layer.0.kv",
@@ -1623,16 +1626,16 @@ def test_transfer_blocks_keep_only_owned_pages_translated_to_local() -> None:
         bytes_per_row=16,
         rows_per_page=1,
     )
-    assert list(
-        manager._cache_transfer_blocks(
-            dst_ptr=0x2000,
-            src_block_manifest=source_manifest,
-            dst_block_manifest=destination_manifest,
-            transfer_fragments=(fragment,),
-            owner_filters=owner_filters,
-            dst_cache_layout=destination_layout,
-        )
-    ) == [
+    (item,) = manager._cache_transfer_blocks(
+        dst_ptr=0x2000,
+        src_block_manifest=source_manifest,
+        dst_block_manifest=destination_manifest,
+        transfer_fragments=(fragment,),
+        owner_filters=owner_filters,
+        dst_cache_layout=destination_layout,
+    )
+    assert isinstance(item, PageFieldCopies)
+    assert _expand_page_fields(item.src_pages, item.dst_pages, item.fields) == [
         (0x1000 + local * 32, 0x2000 + remote * 32, 16)
         for local, remote in ((1, 11), (2, 13), (3, 15))
     ]

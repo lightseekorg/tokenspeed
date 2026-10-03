@@ -523,6 +523,45 @@ def test_sharded_prefill_leaves_the_equal_tp_fast_path():
     }
 
 
+def test_equal_tp_sharded_route_sends_through_the_pages_api():
+    """P TP2 x DCP2 -> D TP2 leaves the empty-fragment route, yet every copy
+    still goes out as one pages x fields grid per group."""
+    from tokenspeed.runtime.pd.mooncake.pack import PageFieldCopies
+
+    prefill_layout = _latent_layout(shard_count=2, extra_replicated=True)
+    decode_layout = _latent_layout(shard_count=1, extra_replicated=True)
+    plan = _planner(2, 2, prefill_layout, decode_layout).plan_for_decode_rank(1)
+    src_ptr, dst_ptr = 0x10000, 0x20000
+    source_manifest = block_manifest(("history", (1, 2, 3, 4)), ("swa", (5, 6)))
+    destination_manifest = block_manifest(
+        ("history", (10, 11, 12, 13)), ("swa", (14, 15))
+    )
+
+    def grids(rank):
+        items = list(
+            _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+                dst_ptr=dst_ptr,
+                src_block_manifest=source_manifest,
+                dst_block_manifest=destination_manifest,
+                transfer_fragments=plan.fragments_by_prefill_rank[rank],
+                owner_filters=plan.owner_filters_by_prefill_rank[rank],
+                dst_cache_layout=decode_layout,
+            )
+        )
+        assert all(isinstance(item, PageFieldCopies) for item in items)
+        return [
+            (item.src_pages.tolist(), item.dst_pages.tolist(), item.fields.shape[0])
+            for item in items
+        ]
+
+    # Rank 0 owns virtual blocks 1, 3 (local pages 1, 2) of the two-field
+    # sharded group and nothing of the replicated one.
+    assert grids(0) == [([1, 2], [10, 12], 2)]
+    # Rank 1 owns 2, 4 and, as decode rank 1's same-index source, sends the
+    # replicated group whole.
+    assert grids(1) == [([1, 2], [11, 13], 2), ([5, 6], [14, 15], 1)]
+
+
 def test_unsharded_layouts_keep_the_equal_tp_fast_path():
     planner = _planner(
         2, 2, _latent_layout(shard_count=1), _latent_layout(shard_count=1)

@@ -1201,6 +1201,13 @@ head partition (Kimi K3's KDA state against its MLA subgroup), or a pipeline
 stage whose fields miss the group -- so that rank sends nothing for it. The
 prefill checks those decisions against its cache groups once, when the decode
 registers (`validate_rank_owner_filters`); the sender applies them as given.
+A sharded source leaves the equal-TP empty-fragment route (one predicate,
+`_uses_whole_copy_route`, decides it for routing and served-rank sets alike),
+but the sender folds every fragment with one contiguous span per page -- a
+whole field, or a head slice whose rows collapsed into one -- into its group's
+pages x fields grid, so DCP, pipeline stages and replicated fields across
+unequal TP all go through the page-gathered WRITE; only a fragment with
+several strided rows per page is emitted per page.
 
 The runtime derives compact DCP page tables and local visible lengths from
 the scheduler's virtual block tables, without introducing new scheduler-owned

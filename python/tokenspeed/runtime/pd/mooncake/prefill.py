@@ -31,6 +31,7 @@ from itertools import chain, islice
 import numpy as np
 import requests
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
     owned_local_pages,
 )
@@ -82,6 +83,50 @@ logger = get_colorful_logger(__name__)
 # Application-side descriptor batching keeps heterogeneous-TP row fragments
 # bounded in Python memory. This is not a Mooncake backend limit.
 _TRANSFER_DESCRIPTOR_BATCH_SIZE = 4096
+
+
+def _strided_page_copies(
+    fragment: CacheTransferFragment,
+    *,
+    src_base: int,
+    dst_base: int,
+    src_page_stride: int,
+    dst_page_stride: int,
+    src_pages: np.ndarray,
+    dst_pages: np.ndarray,
+) -> Iterator[PackedCopy | tuple[int, int, int]]:
+    """Per-page copies of a fragment with several strided rows per page.
+
+    A contiguous destination packs the rows into one ``PackedCopy`` (or one
+    plain span when the source is contiguous too); otherwise every row is its
+    own descriptor. ``src_base``/``dst_base`` already include the fragment's
+    byte offsets within the field.
+    """
+    width = fragment.bytes_per_row
+    rows = fragment.rows_per_page
+    src_pitch = fragment.src_row_stride_bytes
+    dst_pitch = fragment.dst_row_stride_bytes
+    for src_page, dst_page in zip(src_pages.tolist(), dst_pages.tolist(), strict=True):
+        src_page_addr = src_base + src_page * src_page_stride
+        dst_page_addr = dst_base + dst_page * dst_page_stride
+        if dst_pitch == width:
+            if src_pitch == width:
+                yield (src_page_addr, dst_page_addr, width * rows)
+                continue
+            yield PackedCopy(
+                src=src_page_addr,
+                dst=dst_page_addr,
+                width=width,
+                src_pitch=src_pitch,
+                rows=rows,
+            )
+            continue
+        for row in range(rows):
+            yield (
+                src_page_addr + row * src_pitch,
+                dst_page_addr + row * dst_pitch,
+                width,
+            )
 
 
 class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
@@ -433,6 +478,13 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
     ) -> Iterator[PageFieldCopies | PackedCopy | tuple[int, int, int]]:
         """Yield the copies that move this rank's part of one request's blocks.
 
+        Each cache group yields one pages x fields grid (``PageFieldCopies``)
+        holding every copy with one contiguous span per page -- a whole field
+        on the empty-fragment route, or a fragment whose rows collapsed into
+        one -- so a sharded or pipeline-staged source still goes through the
+        page-gathered WRITE. Only a fragment with several strided rows per
+        page is emitted per page.
+
         Args:
             owner_filters: The registration route's decision for every
                 DCP-sharded group of the layout (``validate_rank_owner_filters``
@@ -460,7 +512,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
         # Resolve block ids directly from the validated manifest/selection. This
         # leaves one authoritative representation of the request's block map.
-        group_transfers = []
+        group_transfers: list[tuple[CacheGroupSpec, np.ndarray, np.ndarray]] = []
         source_groups = (
             block_selection.groups
             if block_selection is not None
@@ -486,7 +538,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 raise ValueError(
                     "cache transfer source and destination pages differ in count"
                 )
-            if group_spec.shard_count != 1:
+            if group_spec.shard_count == 1:
+                src_pages = np.asarray(source_block_ids, dtype=np.int64)
+                dst_pages = np.asarray(destination_block_ids, dtype=np.int64)
+            else:
                 owner_filter = owner_filters[group_spec.group_id]
                 if owner_filter is None:
                     continue
@@ -494,93 +549,70 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 # == owner_rank, in its local pages; the destination holds
                 # every block, so keep the destination entries at the same
                 # manifest positions.
-                owned, source_block_ids = owned_local_pages(
+                owned, src_pages = owned_local_pages(
                     source_block_ids,
                     shard_count=owner_filter.owner_count,
                     rank=owner_filter.owner_rank,
                     virtual_block_count=layout.virtual_block_count(group_spec.group_id),
                 )
-                destination_block_ids = np.asarray(
-                    destination_block_ids, dtype=np.int64
-                )[owned]
-            group_transfers.append(
-                (
-                    group_spec,
-                    source_block_ids,
-                    destination_block_ids,
-                )
-            )
+                dst_pages = np.asarray(destination_block_ids, dtype=np.int64)[owned]
+            if len(src_pages):
+                group_transfers.append((group_spec, src_pages, dst_pages))
 
         # Per-field constants are hoisted out of the page loops: a long
         # prompt moves thousands of pages per field, and this generator runs
         # on the transfer thread while holding the GIL the forward thread
-        # needs.
+        # needs. Single-span copies never loop over pages at all: the pages x
+        # fields grid is expanded inside Mooncake.
         src_ptr = self.kv_args.kv_data_ptr
-        for group_spec, group_src_indices, group_dst_indices in group_transfers:
+        for group_spec, src_pages, dst_pages in group_transfers:
+            field_rows: list[tuple[int, int, int, int, int]] = []
             if cache_fragments:
                 for fragment in fragments_by_group.get(group_spec.group_id, ()):
+                    if field_ids is not None and fragment.field_id not in field_ids:
+                        continue
                     key = (fragment.group_id, fragment.field_id)
                     src_segment = local_segments[key]
                     dst_segment = peer_segments[key]
-                    if field_ids is not None and src_segment.field_id not in field_ids:
-                        continue
-                    src_field_base = (
+                    src_base = (
                         src_ptr
                         + layout.plan.field_page_byte_offset(src_segment.field_id, 0)
                         + fragment.src_byte_offset
                     )
-                    dst_field_base = (
+                    dst_base = (
                         dst_ptr
                         + dst_cache_layout.plan.field_page_byte_offset(
                             dst_segment.field_id, 0
                         )
                         + fragment.dst_byte_offset
                     )
-                    for src_page, dst_page in zip(
-                        group_src_indices, group_dst_indices, strict=True
-                    ):
-                        src_page_addr = (
-                            src_field_base
-                            + int(src_page) * src_segment.page_stride_bytes
-                        )
-                        dst_page_addr = (
-                            dst_field_base
-                            + int(dst_page) * dst_segment.page_stride_bytes
-                        )
-                        width = fragment.bytes_per_row
-                        rows = fragment.rows_per_page
-                        src_pitch = fragment.src_row_stride_bytes
-                        dst_pitch = fragment.dst_row_stride_bytes
-                        if rows > 1 and dst_pitch == width:
-                            if src_pitch == width:
-                                yield (src_page_addr, dst_page_addr, width * rows)
-                                continue
-                            yield PackedCopy(
-                                src=src_page_addr,
-                                dst=dst_page_addr,
-                                width=width,
-                                src_pitch=src_pitch,
-                                rows=rows,
+                    if fragment.rows_per_page == 1:
+                        field_rows.append(
+                            (
+                                src_base,
+                                src_segment.page_stride_bytes,
+                                dst_base,
+                                dst_segment.page_stride_bytes,
+                                fragment.bytes_per_row,
                             )
-                            continue
-                        for row in range(rows):
-                            yield (
-                                src_page_addr + row * src_pitch,
-                                dst_page_addr + row * dst_pitch,
-                                width,
-                            )
-                continue
-
-            group_fields = layout.fields_for_group(group_spec.group_id)
-            if group_fields and len(group_src_indices):
-                # One pages x fields item per group: the descriptors are
-                # expanded inside Mooncake, never here.
-                field_rows = []
-                for src_segment in group_fields:
+                        )
+                        continue
+                    yield from _strided_page_copies(
+                        fragment,
+                        src_base=src_base,
+                        dst_base=dst_base,
+                        src_page_stride=src_segment.page_stride_bytes,
+                        dst_page_stride=dst_segment.page_stride_bytes,
+                        src_pages=src_pages,
+                        dst_pages=dst_pages,
+                    )
+            else:
+                for src_segment in layout.fields_for_group(group_spec.group_id):
                     if field_ids is not None and src_segment.field_id not in field_ids:
                         continue
-                    key = (group_spec.group_id, src_segment.field_id)
-                    dst_segment = peer_segments[key]
+                    dst_segment = peer_segments[
+                        (group_spec.group_id, src_segment.field_id)
+                    ]
                     field_rows.append(
                         (
                             src_ptr
@@ -596,13 +628,12 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                             src_segment.payload_bytes,
                         )
                     )
-                if field_rows:
-                    yield PageFieldCopies(
-                        np.asarray(group_src_indices, dtype=np.int64),
-                        np.asarray(group_dst_indices, dtype=np.int64),
-                        np.asarray(field_rows, dtype=np.int64).reshape(-1, 5),
-                    )
-                continue
+            if field_rows:
+                yield PageFieldCopies(
+                    src_pages,
+                    dst_pages,
+                    np.asarray(field_rows, dtype=np.int64).reshape(-1, 5),
+                )
 
     def _wait_until_cache_step(
         self,
