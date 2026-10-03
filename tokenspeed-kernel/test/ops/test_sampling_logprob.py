@@ -74,6 +74,14 @@ def test_block_sumexp_is_a_fixed_pairwise_tree():
     torch.testing.assert_close(
         sums, torch.exp(shifted).view(3, -1, BLOCK).sum(-1), rtol=1e-5, atol=0
     )
+    # A non-contiguous input (a column slice of a wider matrix) folds to the
+    # same bits, and the input itself is never written.
+    wide = torch.cat((shifted, torch.full((3, 7), 5.0)), dim=1)
+    strided = wide[:, :VOCAB]
+    assert not strided.is_contiguous()
+    before = strided.clone()
+    assert torch.equal(torch_block_sumexp(strided, block_size=BLOCK), sums)
+    assert torch.equal(strided, before)
     with pytest.raises(ValueError, match="power of two"):
         torch_block_sumexp(shifted, block_size=3000)
     with pytest.raises(ValueError, match="multiple"):

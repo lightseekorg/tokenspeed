@@ -185,6 +185,59 @@ def test_unknown_plane_dtypes_and_shapes_are_refused(topk_leaves):
         _decode_topk(torch.zeros((2, 64, HEAD_DIM), dtype=torch.bfloat16))
 
 
+def test_candidate_lens_cpu_reaches_only_leaves_declaring_the_feature(
+    fresh_registry, h100_platform
+):
+    """An opaque ``*args, **kwargs`` wrapper (the AMD gluon registrations)
+    that does not declare ``CANDIDATE_LENS_CPU_FEATURE`` never receives the
+    keyword its launcher cannot take; a leaf declaring it does."""
+    _ = fresh_registry
+    real_platform = Platform.get()
+    Platform.override(h100_platform)
+    try:
+        seen: dict[str, list] = {"silent": [], "declaring": []}
+
+        def register(name: str, *, declares: bool):
+            def launcher(**kwargs):
+                seen[name].append(kwargs)
+                tokens = kwargs["q"].shape[0]
+                return (
+                    torch.full((tokens, int(kwargs["topk"])), -1, dtype=torch.int32),
+                    torch.zeros((tokens,), dtype=torch.int32),
+                )
+
+            def wrapper(*args, **kwargs):
+                return launcher(*args, **kwargs)
+
+            features = {"batch_invariant", "forced_initial_local"}
+            if declares:
+                features.add(dsa_pkg.CANDIDATE_LENS_CPU_FEATURE)
+            KernelRegistry.get().register(
+                KernelSpec(
+                    name=name,
+                    family="attention",
+                    mode="dsa_prefill_topk",
+                    solution=name,
+                    format_signatures=_topk_signature(),
+                    traits={"index_k_format": frozenset({"fp8_scaled"})},
+                    features=frozenset(features),
+                    priority=Priority.PORTABLE,
+                ),
+                wrapper,
+            )
+
+        register("silent", declares=False)
+        register("declaring", declares=True)
+        lens = torch.tensor([8, 16], dtype=torch.int64)
+        plane = torch.zeros((128, FP8_ROW_BYTES), dtype=torch.uint8)
+        _prefill_topk(plane, candidate_lens_cpu=lens, solution="silent")
+        _prefill_topk(plane, candidate_lens_cpu=lens, solution="declaring")
+        assert "candidate_lens_cpu" not in seen["silent"][0]
+        assert seen["declaring"][0]["candidate_lens_cpu"] is lens
+    finally:
+        Platform.override(real_platform)
+
+
 def test_workspace_rows_are_fp8_scaled(topk_leaves):
     fp8, bf16 = topk_leaves
     dsa_pkg.dsa_prefill_topk(

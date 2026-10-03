@@ -59,10 +59,13 @@ def torch_block_sumexp(shifted: torch.Tensor, *, block_size: int) -> torch.Tenso
         raise ValueError(f"block_size must be a power of two, got {block_size}")
     if vocab % block_size:
         raise ValueError(f"vocab {vocab} is not a multiple of block_size {block_size}")
-    values = torch.exp(shifted).view(rows, vocab // block_size, block_size)
+    # ``exp`` allocates the one buffer the fold runs in: ``reshape`` takes a
+    # non-contiguous ``shifted`` (``view`` would not), and each level adds the
+    # upper half onto the lower half in place, so no level allocates.
+    values = torch.exp(shifted).reshape(rows, vocab // block_size, block_size)
     width = block_size
     while width > 1:
         half = width // 2
-        values = values[..., :half] + values[..., half:width]
+        values[..., :half] += values[..., half:width]
         width = half
-    return values.squeeze(-1)
+    return values[..., 0]

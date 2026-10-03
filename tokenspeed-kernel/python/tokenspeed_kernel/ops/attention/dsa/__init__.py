@@ -20,18 +20,13 @@
 
 from __future__ import annotations
 
-import inspect
 import math
 
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import (
-    NoKernelFoundError,
-    SelectedKernel,
-    select_kernel,
-)
+from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     dense_tensor_format,
@@ -100,7 +95,16 @@ LSE_LN = math.log2(math.e)
 #     Ascending slot order, whatever the top-k leaf's tie order, so the
 #     reduction is batch-invariant whenever the selected set is. Only cores
 #     declaring ``slot_order={"sorted", ...}`` serve it and receive the kwarg.
-SLOT_ORDERS = ("sorted", "selection")
+#
+# The default form first, as the host's ``DSA_SLOT_ORDERS`` lists them.
+SLOT_ORDERS = ("selection", "sorted")
+
+# Feature a ``dsa_prefill_topk`` leaf declares when its signature takes the
+# ``candidate_lens_cpu`` keyword (the host mirror of each token's candidate
+# count, from which it sizes its launches without a stream sync). The facade
+# hands the mirror to exactly the leaves declaring it, by registry lookup;
+# a ``*args, **kwargs`` wrapper that does not declare it never sees it.
+CANDIDATE_LENS_CPU_FEATURE = "candidate_lens_cpu"
 
 # Storage of an index-key plane, read off its dtype (README, "Index-K plane
 # formats"): one layout per dtype, never guessed from a row width alone.
@@ -140,17 +144,19 @@ def _index_k_plane_traits(index_k_cache: torch.Tensor, head_dim: int) -> dict:
     )
 
 
-def _accepts_keyword(kernel, name: str) -> bool:
-    """Whether a selected leaf's call signature takes keyword ``name``."""
-    impl = kernel.impl if isinstance(kernel, SelectedKernel) else kernel
-    try:
-        parameters = inspect.signature(impl).parameters
-    except (TypeError, ValueError):
-        return False
-    return name in parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
-    )
+def _candidate_lens_cpu_kwargs(kernel, candidate_lens_cpu: torch.Tensor | None) -> dict:
+    """The ``candidate_lens_cpu`` kwarg for a selected top-k leaf, or nothing.
+
+    Only a leaf registered with ``CANDIDATE_LENS_CPU_FEATURE`` takes the
+    keyword; the decision is the registration's, read here, never a signature
+    probe on the forward path.
+    """
+    if candidate_lens_cpu is None:
+        return {}
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if spec is None or CANDIDATE_LENS_CPU_FEATURE not in spec.features:
+        return {}
+    return {"candidate_lens_cpu": candidate_lens_cpu}
 
 
 def _slot_order_kwargs(kernel, slot_order: str) -> dict:
@@ -583,9 +589,10 @@ def dsa_prefill_topk(
             q_scales[token, head]``.
         max_logits_bytes: Optional temporary logits memory cap.
         candidate_lens_cpu: Optional CPU mirror of ``row_ends - row_starts``,
-            handed to every implementation whose signature takes it (DeepGEMM
-            sizes its chunk launches from it without synchronizing the CUDA
-            stream); implementations without the keyword never see it.
+            handed to every implementation registered with the
+            ``candidate_lens_cpu`` feature (DeepGEMM sizes its chunk launches
+            from it without synchronizing the CUDA stream); implementations
+            without the feature never see it.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].
         lens_out: Optional contiguous int32 output buffer on q's device with
@@ -661,6 +668,7 @@ def dsa_prefill_topk(
         solution=solution,
         override=override,
     )
+    candidate_lens_cpu_kwargs = _candidate_lens_cpu_kwargs(kernel, candidate_lens_cpu)
     shape_params = {
         "tokens": q.shape[0],
         "workspace_rows": kv_workspace_slots.numel(),
@@ -693,13 +701,10 @@ def dsa_prefill_topk(
             "max_logits_bytes": max_logits_bytes,
             "out": out,
             "lens_out": lens_out,
+            **candidate_lens_cpu_kwargs,
         }
         if q_scales is not None:
             kernel_kwargs["q_scales"] = q_scales
-        if candidate_lens_cpu is not None and _accepts_keyword(
-            kernel, "candidate_lens_cpu"
-        ):
-            kernel_kwargs["candidate_lens_cpu"] = candidate_lens_cpu
         if initial_tokens or local_tokens:
             kernel_kwargs["initial_tokens"] = initial_tokens
             kernel_kwargs["local_tokens"] = local_tokens
@@ -980,6 +985,7 @@ import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
 # isort: on
 
 __all__ = [
+    "CANDIDATE_LENS_CPU_FEATURE",
     "SLOT_ORDERS",
     "dsa_decode",
     "dsa_prefill",

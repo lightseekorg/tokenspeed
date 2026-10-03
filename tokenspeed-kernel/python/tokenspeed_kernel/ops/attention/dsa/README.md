@@ -47,13 +47,16 @@ trainer-aligned indexer) registers `index_k_format={"bf16"}`,
 else. A plane of any other dtype is a `TypeError`.
 
 `candidate_lens_cpu` (the CPU mirror of each prefill token's candidate count)
-goes to every selected leaf whose signature takes the keyword and to no
-other, so a leaf that can size its launches from it declares the parameter.
+goes to every selected leaf registered with the `candidate_lens_cpu` feature
+(`dsa.CANDIDATE_LENS_CPU_FEATURE`) and to no other: a leaf that can size its
+launches from it declares the feature alongside the keyword, and the facade
+reads the registration rather than probing call signatures, so a
+`*args, **kwargs` wrapper never receives a keyword its launcher cannot take.
 
 ## Slot order of the sparse cores
 
 `dsa_decode` and `dsa_prefill` take a required `slot_order` in
-`SLOT_ORDERS = ("sorted", "selection")`, passed to selection as the
+`SLOT_ORDERS = ("selection", "sorted")`, passed to selection as the
 `slot_order` trait: `selection` reduces a token's selected slots in the order
 the top-k leaf emitted them and is what every core does by default (a core
 need not declare the trait); `sorted` reduces them in ascending slot order,
