@@ -73,7 +73,6 @@ class MoELayer(torch.nn.Module):
         tp_size: int | None = None,
         ep_rank: int | None = None,
         ep_size: int | None = None,
-        zero_expert_type: str = "",
         zero_expert_num: int = 0,
         activation: str = "silu",
         activation_situ_beta: float | None = None,
@@ -102,7 +101,6 @@ class MoELayer(torch.nn.Module):
         self.ep_num_redundant_experts = global_server_args_dict[
             "ep_num_redundant_experts"
         ]
-        self.zero_expert_type = zero_expert_type
         # LongCat routes some top-k slots to "zero experts" that no kernel
         # computes; the model rewrites those slots to a placeholder expert id
         # with weight zero, so a token can hand the kernel the same expert id

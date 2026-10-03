@@ -88,9 +88,7 @@ def test_swiglu_form_follows_alpha_and_beta(monkeypatch, layer, form):
 def test_zero_experts_declare_repeated_expert_ids(monkeypatch):
     plain = _plan_kwargs(monkeypatch, activation="swiglu")
     assert plain["expert_id_repeats"] is False
-    longcat = _plan_kwargs(
-        monkeypatch, activation="swiglu", zero_expert_type="copy", zero_expert_num=2
-    )
+    longcat = _plan_kwargs(monkeypatch, activation="swiglu", zero_expert_num=2)
     assert longcat["expert_id_repeats"] is True
 
 
