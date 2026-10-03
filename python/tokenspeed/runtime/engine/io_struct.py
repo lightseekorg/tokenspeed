@@ -968,6 +968,28 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class UpdateWeightsFromMooncakeReqInput(BaseReq, kw_only=True):
+    """Load one committed checkpoint version through the Model Updater SDK.
+
+    The trainer publishes weights to a Mooncake weight store and names the
+    version to serve; every scheduler reads its own shard. Requires the
+    server to be started with ``--model-update-config``.
+    """
+
+    # The committed weight-store version to load.
+    version: int
+    flush_cache: bool = True
+    # L3 namespace to publish after a successful load. ``None`` keeps the
+    # current namespace on an intermediate update; a flushed update defaults
+    # it to ``str(version)``.
+    weight_version: str | None = None
+
+
+class UpdateWeightsFromMooncakeReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     name: str
     truncate_size: int = 100
