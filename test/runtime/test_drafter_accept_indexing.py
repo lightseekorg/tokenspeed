@@ -369,11 +369,73 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
                 torch.tensor([7, 3], dtype=torch.int32)
             )
 
+        # Rows never published (no refresh ran at this bs): the re-anchor
+        # must not allocate them itself.
+        metadata._dsa_seq_lens_2d = None
+        with self.assertRaisesRegex(RuntimeError, "not published"):
+            backend.update_draft_forward_metadata(
+                torch.tensor([7, 3], dtype=torch.int32)
+            )
+
         backend._dense_backend = SimpleNamespace(forward_decode_metadata=None)
         with self.assertRaisesRegex(RuntimeError, "not initialized"):
             backend.update_draft_forward_metadata(
                 torch.tensor([7, 3], dtype=torch.int32)
             )
+
+    def test_dsa_leaf_refresh_allocates_the_k_rows_once_then_rewrites_in_place(
+        self,
+    ):
+        # The round's refresh and the MTP re-anchor share one publish: the
+        # first refresh at a bs fills the dense leaf's declared metadata
+        # fields (rows + plan), every later refresh or re-anchor rewrites
+        # the same storage and refreshes the plan with out=.
+        from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_mod
+        from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
+            TRTLLMMLADecodeMetadata,
+        )
+
+        k, bs = 4, 2
+        backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
+        backend.spec_num_tokens = k
+        backend.kernel_page_size = 64
+        metadata = TRTLLMMLADecodeMetadata(
+            seq_lens_k=torch.zeros(bs, dtype=torch.int32)
+        )
+        self.assertIsNone(metadata._dsa_seq_lens_2d)
+        self.assertIsNone(metadata._dsa_plan)
+        backend._dense_backend = SimpleNamespace(
+            forward_decode_metadata=metadata,
+            refresh_decode_metadata=lambda *args, **kwargs: None,
+        )
+        plan = object()
+        plans: list[dict] = []
+
+        def fake_plan(**kw):
+            plans.append(kw)
+            return plan
+
+        page_table = torch.zeros((bs, 1), dtype=torch.int32)
+        with mock.patch.object(dsa_mod, "dsa_plan", side_effect=fake_plan):
+            backend.refresh_decode_metadata(
+                bs, bs, torch.tensor([9, 5, 99], dtype=torch.int32), page_table
+            )
+            rows = metadata._dsa_seq_lens_2d
+            backend.refresh_decode_metadata(
+                bs, bs, torch.tensor([10, 6, 99], dtype=torch.int32), page_table
+            )
+            backend.update_draft_forward_metadata(
+                torch.tensor([7, 3, 99], dtype=torch.int32)
+            )
+
+        self.assertIs(metadata._dsa_seq_lens_2d, rows)
+        self.assertIs(metadata._dsa_plan, plan)
+        self.assertEqual(rows.view(bs, k).tolist(), [[7] * k, [3] * k])
+        self.assertEqual(metadata.seq_lens_k.tolist(), [7, 3])
+        self.assertEqual([p.get("out") for p in plans], [None, plan, plan])
+        for p in plans:
+            self.assertIs(p["seq_lens_2d"], rows)
+            self.assertEqual(p["page_size"], 64)
 
     def test_substitute_mm_pad_rewrites_media_ids_in_place(self):
         image = MultimodalDataItem(modality=Modality.IMAGE, hash=123)

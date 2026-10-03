@@ -92,6 +92,11 @@ class MLADecodeMetadata:
     # per layer.
     block_page_table: torch.Tensor | None = None
     block_seq_lens: torch.Tensor | None = None
+    # DSA wrapper's per-token indexer rows (``[bs * spec_num_tokens, 1]``
+    # context lengths) and their opaque ``dsa_plan`` (None when the selected
+    # kernel needs none); the dense leaf itself never reads them.
+    _dsa_seq_lens_2d: torch.Tensor | None = None
+    _dsa_plan: object | None = None
 
     @property
     def seq_lens_k(self) -> torch.Tensor:
