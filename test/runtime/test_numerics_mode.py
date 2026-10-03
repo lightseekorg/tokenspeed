@@ -102,6 +102,18 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--sampling-stream"):
             ServerArgs(model="x", sampling_stream="philox")
 
+    def test_trainer_aligned_computes_the_yarn_ramp_on_cpu(self):
+        self.assertEqual(ServerArgs(model="x").yarn_ramp_mask_device, "cuda")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").yarn_ramp_mask_device, "cuda"
+        )
+        self.assertEqual(
+            ServerArgs(model="x", numerics="trainer-aligned").yarn_ramp_mask_device,
+            "cpu",
+        )
+        with self.assertRaisesRegex(ValueError, "--yarn-ramp-mask-device"):
+            ServerArgs(model="x", yarn_ramp_mask_device="npu")
+
     def test_bitwise_envelopes_cover_every_pinning_envelope(self):
         from tokenspeed.runtime.configs.numerics import (
             BITWISE_ENVELOPES,

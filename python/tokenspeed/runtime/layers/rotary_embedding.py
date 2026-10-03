@@ -31,6 +31,8 @@ import torch.nn as nn
 from tokenspeed_kernel.ops.attention.prologue import MRope, RopeStyle, Rotary
 from tokenspeed_kernel.ops.embedding import apply_rope
 
+from tokenspeed.runtime.utils.env import global_server_args_dict
+
 logger = logging.getLogger(__name__)
 
 
@@ -316,13 +318,40 @@ def _yarn_find_correction_range(
 
 
 def _yarn_linear_ramp_mask(
-    low: float, high: float, dim: int, dtype: torch.dtype, device: torch.device = None
+    low: float,
+    high: float,
+    dim: int,
+    dtype: torch.dtype,
+    *,
+    device: torch.device | str | None,
+    compute_device: torch.device | str | None,
 ) -> torch.Tensor:
+    """The YaRN linear ramp ``clamp((i - low) / (high - low), 0, 1)``.
+
+    Args:
+        low: Ramp start (inclusive) in rotary-dimension index units.
+        high: Ramp end in the same units; a degenerate ``low == high`` is
+            widened by 0.001.
+        dim: Number of ramp entries (half the rotary dimension).
+        dtype: Output dtype.
+        device: Device the returned ramp lives on; None for the default.
+        compute_device: Device the arange and division run on; the result is
+            moved to ``device`` afterwards. CPU and CUDA round the division
+            differently at ulp level, and the trainer computes it on the host
+            (``--yarn-ramp-mask-device``).
+
+    Returns:
+        ``[dim]`` ramp on ``device``.
+    """
     if low == high:
         high += 0.001  # Prevent singularity
 
-    linear_func = (torch.arange(dim, dtype=dtype, device=device) - low) / (high - low)
+    linear_func = (torch.arange(dim, dtype=dtype, device=compute_device) - low) / (
+        high - low
+    )
     ramp_func = torch.clamp(linear_func, 0, 1)
+    if device is not None:
+        ramp_func = ramp_func.to(device)
     return ramp_func
 
 
@@ -381,7 +410,14 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
             1
-            - _yarn_linear_ramp_mask(low, high, self.rotary_dim // 2, dtype=torch.float)
+            - _yarn_linear_ramp_mask(
+                low,
+                high,
+                self.rotary_dim // 2,
+                dtype=torch.float,
+                device=None,
+                compute_device=None,
+            )
         ) * self.extrapolation_factor
         inv_freq = (
             inv_freq_interpolation * (1 - inv_freq_mask)
@@ -525,7 +561,16 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         mscale: float = 1,
         mscale_all_dim: float = 0,
         device: str | None = "cuda",
+        ramp_device: str,
     ) -> None:
+        """
+        Args:
+            device: Device the inverse frequencies and the cos/sin cache are
+                built on.
+            ramp_device: Device the YaRN linear ramp mask is computed on
+                before moving to ``device`` (``--yarn-ramp-mask-device``);
+                the trainer computes it on the host.
+        """
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
         self.attn_factor = attn_factor
@@ -538,6 +583,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             * attn_factor
         )
         self.device = device
+        self.ramp_device = ramp_device
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
@@ -561,7 +607,12 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq_mask = (
             1
             - _yarn_linear_ramp_mask(
-                low, high, self.rotary_dim // 2, dtype=torch.float, device=self.device
+                low,
+                high,
+                self.rotary_dim // 2,
+                dtype=torch.float,
+                device=self.device,
+                compute_device=self.ramp_device,
             )
         ) * self.extrapolation_factor
         inv_freq = (
@@ -1166,6 +1217,9 @@ def get_rope(
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
 
+    # deepseek_yarn builds its ramp on the launch's chosen device; the cache
+    # must not hand a cuda-built table to a cpu-ramp launch or vice versa.
+    yarn_ramp_mask_device = global_server_args_dict["yarn_ramp_mask_device"]
     key = (
         head_size,
         rotary_dim,
@@ -1174,6 +1228,7 @@ def get_rope(
         is_neox_style,
         rope_scaling_args,
         dtype,
+        yarn_ramp_mask_device,
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
@@ -1304,6 +1359,7 @@ def get_rope(
                 is_neox_style,
                 scaling_factor,
                 dtype,
+                ramp_device=yarn_ramp_mask_device,
                 **extra_kwargs,
             )
         elif scaling_type == "longrope":

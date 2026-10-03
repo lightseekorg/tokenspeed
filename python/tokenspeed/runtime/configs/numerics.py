@@ -55,6 +55,11 @@ RL_BITWISE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "gree
 # (request seed, position), which the bitwise envelopes require.
 SAMPLING_STREAMS = ("batch", "per-request")
 
+# ``--yarn-ramp-mask-device``: where the YaRN linear ramp mask of deepseek_yarn
+# RoPE is computed before moving to the model device. The trainer builds it on
+# the host.
+YARN_RAMP_MASK_DEVICES = ("cuda", "cpu")
+
 
 def require_verified_numerics(
     numerics: str,
@@ -104,5 +109,6 @@ __all__ = [
     "NUMERICS_ENVELOPES",
     "RL_BITWISE_SAMPLING_BACKENDS",
     "SAMPLING_STREAMS",
+    "YARN_RAMP_MASK_DEVICES",
     "require_verified_numerics",
 ]

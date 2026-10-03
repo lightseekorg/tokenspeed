@@ -35,6 +35,7 @@ from tokenspeed.runtime.configs.numerics import (
     NUMERICS_ENVELOPES,
     RL_BITWISE_SAMPLING_BACKENDS,
     SAMPLING_STREAMS,
+    YARN_RAMP_MASK_DEVICES,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.moe.dispatch_algorithm import (
@@ -420,6 +421,11 @@ class ServerArgs:
     # folds those and then the trainer-operation-order switches. Each folded
     # switch can still be set individually; the umbrella only ever tightens.
     numerics: str = "auto"
+    # Trainer-operation-order switches (docs/design/numerics.md,
+    # alignment.trainer). Each keeps the engine's own form by default and is
+    # folded to the trainer's form by --numerics trainer-aligned.
+    # Device that computes the YaRN linear ramp mask of deepseek_yarn RoPE.
+    yarn_ramp_mask_device: str = "cuda"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -639,6 +645,12 @@ class ServerArgs:
             raise ValueError(
                 f"--sampling-stream must be one of {list(SAMPLING_STREAMS)}, got "
                 f"{self.sampling_stream!r}"
+            )
+        if self.yarn_ramp_mask_device not in YARN_RAMP_MASK_DEVICES:
+            raise ValueError(
+                "--yarn-ramp-mask-device must be one of "
+                f"{list(YARN_RAMP_MASK_DEVICES)}, got "
+                f"{self.yarn_ramp_mask_device!r}"
             )
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
@@ -1098,6 +1110,9 @@ class ServerArgs:
         """The trainer-alignment block: the training framework's operation
         order on top of rl-bitwise. Each switch it tightens is documented in
         ``docs/design/numerics.md`` under "alignment.trainer"."""
+        # The trainer builds its RoPE inverse frequencies on the host; CPU and
+        # CUDA division round the ramp differently at ulp level.
+        self.yarn_ramp_mask_device = "cpu"
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -2760,6 +2775,17 @@ class ServerArgs:
             "trainer-aligned folds those and then the trainer-operation-order "
             "switches (docs/design/numerics.md, alignment.trainer); a model "
             "serves it only once its forward is verified against the trainer.",
+        )
+        parser.add_argument(
+            "--yarn-ramp-mask-device",
+            type=str,
+            choices=list(YARN_RAMP_MASK_DEVICES),
+            default=ServerArgs.yarn_ramp_mask_device,
+            help="Device that computes the YaRN linear ramp mask of "
+            "deepseek_yarn RoPE before it is moved to the model device. The "
+            "trainer builds it on the host, and CPU and CUDA division round "
+            "differently at ulp level. Folded to cpu by --numerics "
+            "trainer-aligned.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",
