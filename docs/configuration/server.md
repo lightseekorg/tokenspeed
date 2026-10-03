@@ -168,12 +168,18 @@ Trainer-side contract:
   model's `load_weights` in many partial calls. The runtime brackets the
   models in a weight-update session (`begin_weight_update` /
   `end_weight_update` on `BaseCausalLM`) so a model derives its post-load
-  state once, after the last chunk: the absorbed MLA `w_kc`/`w_vc` are
-  rewritten in their existing storage (captured CUDA graphs keep valid
-  addresses) and in-place one-shot transforms such as the LoRA norm scale
-  fold apply only to the parameters this update reloaded. Models outside
-  `BaseCausalLM` take no session hooks. The distributed update uses the
-  same session.
+  state once, after the last chunk: `BaseCausalLM` defers every
+  `post_load_weights` call made while the session is active and runs it once
+  at the end, so a model's loader needs no session awareness of its own. The
+  absorbed MLA `w_kc`/`w_vc` and the KDA conv banks are rewritten in their
+  existing storage (captured CUDA graphs keep valid addresses; a geometry
+  change is an error), in-place one-shot transforms such as the LoRA norm
+  scale fold apply only to the parameters this update reloaded, and fused
+  parameters assembled from several checkpoint tensors (the NextN drafts'
+  `q_a_proj`/`kv_a_proj_with_mqa`, GLM's FP8 indexer `wk` weight and scale)
+  may straddle chunks; an update that streams one half without the other is
+  rejected when the session ends. Models outside `BaseCausalLM` take no
+  session hooks. The distributed update uses the same session.
 
 ## Scheduler And Memory
 

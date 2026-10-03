@@ -166,6 +166,7 @@ from tokenspeed.runtime.layers.shared_expert_tp import (
 )
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
+    bind_or_copy,
     default_weight_loader,
     sharded_weight_loader,
 )
@@ -1282,10 +1283,18 @@ class KimiLinearKDA(nn.Module):
             )
 
     def fuse_conv_weights(self) -> None:
-        """Concatenate the loaded q/k/v conv kernels into ``self.conv_weights``."""
-        self.conv_weights = torch.cat(
-            (self.q_conv1d_weight, self.k_conv1d_weight, self.v_conv1d_weight), dim=0
-        ).squeeze(1)
+        """Concatenate the loaded q/k/v conv kernels into ``self.conv_weights``.
+
+        A live weight update re-runs this; the bank is written in place so
+        captured CUDA graphs keep its address.
+        """
+        self.conv_weights = bind_or_copy(
+            self.conv_weights,
+            torch.cat(
+                (self.q_conv1d_weight, self.k_conv1d_weight, self.v_conv1d_weight),
+                dim=0,
+            ).squeeze(1),
+        )
 
     def _project_qkvfab(
         self,

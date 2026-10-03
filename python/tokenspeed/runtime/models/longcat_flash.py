@@ -63,7 +63,6 @@ from tokenspeed.runtime.layers.utils import get_layer_id as _get_layer_id
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding as _VocabParallelEmbedding,
 )
-from tokenspeed.runtime.model_loader.weight_utils import bind_or_copy as _bind_or_copy
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader as _default_weight_loader,
 )
@@ -72,6 +71,9 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA as _DeepseekV3AttentionMLA,
 )
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MLP as _DeepseekV3MLP
+from tokenspeed.runtime.models.deepseek_v3 import (
+    _prepare_mla_kv_b_proj_weights,
+)
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder as _get_global_expert_distribution_recorder,
 )
@@ -735,9 +737,8 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
     def load_weights(self, weights: _Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load a (possibly partial) checkpoint stream.
 
-        Returns the ``named_parameters()`` names that received data. Inside a
-        weight-update session the per-call ``post_load_weights`` is skipped;
-        ``end_weight_update`` runs it once over the whole update.
+        Returns the ``named_parameters()`` names that received data (the
+        ``BaseCausalLM`` weight-update contract).
         """
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -840,9 +841,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 weight_loader(param, loaded_weight)
                 loaded.add(param_names[id(param)])
 
-        self.record_loaded_weights(loaded)
-        if not self._weight_update_active:
-            self.post_load_weights()
+        self.post_load_weights()
         return loaded
 
     def post_load_weights(self):
@@ -890,16 +889,8 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 else:
                     w = self_attn.kv_b_proj.weight
 
-                w_kc, w_vc = w.unflatten(
-                    0,
-                    (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim),
-                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-                self_attn.w_kc = _bind_or_copy(
-                    self_attn.w_kc,
-                    w_kc.transpose(1, 2).contiguous().transpose(1, 2),
-                )
-                self_attn.w_vc = _bind_or_copy(
-                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+                self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
+                    w, self_attn
                 )
                 if (
                     getattr(self.config, "mla_scale_q_lora", False)

@@ -869,17 +869,26 @@ def bind_or_copy(existing: torch.Tensor | None, derived: torch.Tensor) -> torch.
     from the loaded parameters after every load. Captured CUDA graphs hold the
     address of the tensor the model used at capture time, so a live update
     must write the new values into that tensor rather than rebind the
-    attribute. Returns ``derived`` on the first build (or when the geometry
-    changed, which cannot happen on an in-place update), otherwise copies it
-    into ``existing`` and returns ``existing``.
+    attribute. Returns ``derived`` on the first build (``existing`` is None),
+    otherwise copies it into ``existing`` and returns ``existing``.
+
+    Raises:
+        ValueError: ``existing`` and ``derived`` differ in shape, dtype or
+            device. A live update rewrites values, never geometry; silently
+            rebinding would leave captured graphs on the old tensor.
     """
+    if existing is None:
+        return derived
     if (
-        existing is None
-        or existing.shape != derived.shape
+        existing.shape != derived.shape
         or existing.dtype != derived.dtype
         or existing.device != derived.device
     ):
-        return derived
+        raise ValueError(
+            "derived weight changed geometry across a live update: existing "
+            f"{tuple(existing.shape)!s}/{existing.dtype!s}/{existing.device!s}, "
+            f"derived {tuple(derived.shape)!s}/{derived.dtype!s}/{derived.device!s}"
+        )
     existing.copy_(derived)
     return existing
 

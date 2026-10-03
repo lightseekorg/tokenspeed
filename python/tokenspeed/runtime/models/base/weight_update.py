@@ -50,8 +50,10 @@ def weight_update_session(models: Sequence[nn.Module]) -> Iterator[None]:
     ``end_weight_update`` runs only for the models whose session was opened,
     and only when the update body did not raise: a failed update leaves the
     model half-written, and deriving state from it would hide the failure
-    behind a later, unrelated error. The session flag is still cleared so the
-    next update can start.
+    behind a later, unrelated error. The session flag is still cleared on
+    every opened model so the next update can start -- also when one model's
+    ``end_weight_update`` raises, in which case the models after it are
+    aborted rather than derived.
 
     Args:
         models: The modules the update streams into, target first.
@@ -67,5 +69,13 @@ def weight_update_session(models: Sequence[nn.Module]) -> Iterator[None]:
         for model in opened:
             model.abort_weight_update()
         raise
-    for model in opened:
-        model.end_weight_update()
+    for index, model in enumerate(opened):
+        try:
+            model.end_weight_update()
+        except BaseException:
+            # ``end_weight_update`` closes its own model's session; the models
+            # not yet ended would otherwise stay open and reject the next
+            # update.
+            for remaining in opened[index + 1 :]:
+                remaining.abort_weight_update()
+            raise

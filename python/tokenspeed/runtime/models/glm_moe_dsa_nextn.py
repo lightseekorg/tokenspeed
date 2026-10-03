@@ -55,10 +55,8 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from tokenspeed.runtime.model_loader.weight_utils import (
-    bind_or_copy,
-    default_weight_loader,
-)
+from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.deepseek_v3 import _prepare_mla_kv_b_proj_weights
 from tokenspeed.runtime.models.glm5 import (
     GlmMoeDsaDecoderLayer,
     GlmMoeDsaForCausalLM,
@@ -194,6 +192,12 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         self.index_share_for_mtp_iteration = bool(
             getattr(config, "index_share_for_mtp_iteration", False)
         )
+        self._init_indexer_pairing_state()
+        # ``q_a_proj`` / ``kv_a_proj_with_mqa`` checkpoint tensors waiting for
+        # their partner before the fused projection is written. Kept on the
+        # instance because a live update streams the checkpoint in chunks and
+        # the pair may straddle a ``load_weights`` call.
+        self._pending_a_proj: dict[str, torch.Tensor] = {}
 
         if quant_config is not None and quant_config.get_name() == "nvfp4":
             quant_config = None
@@ -305,12 +309,14 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj: dict[str, torch.Tensor] | None = {} if fuse_qkv_a_proj else None
+        cached_a_proj: dict[str, torch.Tensor] | None = (
+            self._pending_a_proj if fuse_qkv_a_proj else None
+        )
 
         params_dict = dict(self.named_parameters())
         modules_dict = dict(self.named_modules())
-        pending_fp8_wk: dict[str, dict[str, torch.Tensor]] = {}
-        loaded_fused_indexer_shards: dict[str, set[int]] = {}
+        pending_fp8_wk = self._pending_fp8_wk
+        loaded_fused_indexer_shards = self._loaded_fused_indexer_shards
 
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params_dict,
@@ -419,6 +425,31 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
                     weight_loader(param, loaded_weight)
         self.post_load_weights()
 
+    def begin_weight_update(self) -> None:
+        super().begin_weight_update()
+        self._pending_a_proj.clear()
+
+    def abort_weight_update(self) -> None:
+        super().abort_weight_update()
+        self._pending_a_proj.clear()
+
+    def end_weight_update(self) -> None:
+        """Close the session; a half-arrived ``q_a``/``kv_a`` pair fails it.
+
+        Raises:
+            RuntimeError: One side of a ``q_a_proj`` / ``kv_a_proj_with_mqa``
+                pair was streamed without the other, so the fused projection
+                still holds the previous weights.
+        """
+        if self._pending_a_proj:
+            unpaired = sorted(self._pending_a_proj)
+            self.abort_weight_update()
+            raise RuntimeError(
+                f"{type(self).__name__}: the update streamed {unpaired} without "
+                "the partner tensor the fused q/kv a-projection needs"
+            )
+        super().end_weight_update()
+
     def post_load_weights(self) -> None:
         self_attn = self.model.decoder.self_attn
         pad_fused_qkv_a_proj_weight_for_fp8_blockscale(self_attn)
@@ -441,15 +472,7 @@ class GlmMoeDsaForCausalLMNextN(GlmMoeDsaForCausalLM):
         else:
             w = self_attn.kv_b_proj.weight
 
-        w_kc, w_vc = w.unflatten(
-            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-        ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-        # Write into the existing pair on a live update: captured CUDA graphs
-        # hold these addresses.
-        self_attn.w_kc = bind_or_copy(
-            self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-        )
-        self_attn.w_vc = bind_or_copy(self_attn.w_vc, w_vc.contiguous().transpose(1, 2))
+        self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(w, self_attn)
 
 
 EntryClass = [GlmMoeDsaForCausalLMNextN]

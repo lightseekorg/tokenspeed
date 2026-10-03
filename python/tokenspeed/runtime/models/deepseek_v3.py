@@ -1513,9 +1513,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load a (possibly partial) checkpoint stream.
 
-        Returns the ``named_parameters()`` names that received data. Inside a
-        weight-update session the per-call ``post_load_weights`` is skipped;
-        ``end_weight_update`` runs it once over the whole update.
+        Returns the ``named_parameters()`` names that received data (the
+        ``BaseCausalLM`` weight-update contract).
         """
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1660,9 +1659,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
                     weight_loader(param, loaded_weight)
                     loaded.add(param_names[id(param)])
 
-        self.record_loaded_weights(loaded)
-        if not self._weight_update_active:
-            self.post_load_weights()
+        self.post_load_weights()
         return loaded
 
     def post_load_weights(self):
