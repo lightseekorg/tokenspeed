@@ -28,7 +28,39 @@ catch-up, frontier-anchored decode windows, the cross-round drafter stash).
 Eagle-like MTP (MTP-Eagle: a single MTP layer chained on its own hidden,
 e.g. DeepSeek) stays in ``eagle.py``. Both register under
 ``--speculative-algorithm MTP``; ``ModelExecutor`` routes multi-depth
-draft model classes to this drafter (see ``get_drafter_impl``).
+draft model classes to this drafter (see ``get_drafter_impl``; an
+out-of-tree draft opts in with
+``register_drafter("MTP", Mtp, model_cls=...)``).
+
+Draft model contract
+--------------------
+
+A draft model served by this drafter implements:
+
+* ``forward(ctx, input_ids, positions, input_embeds=None,
+  captured_hidden_states=None, spec_step_idx=0, **kwargs)`` returning a
+  ``LogitsProcessorOutput`` whose ``hidden_states`` carries the FULL
+  per-row post-depth hidden (the next depth's chain input). ``spec_step_idx``
+  must be a named parameter: ``ModelRunner`` forwards it only to a
+  ``forward`` whose signature declares it (``**kwargs`` alone does not
+  count), and a model without it would silently run depth 0 for every step.
+  ``ForwardMode.IDLE`` with zero rows (``captured_hidden_states=None``) must
+  run the model's collectives without attention — that is what an idle
+  attention-DP rank calls.
+* Depth selection ``layers[spec_step_idx % num_depths]``; depth ``d``
+  writes its KV to the draft cache layer ``d`` (per-depth planes, cache
+  layer ids ``0..N-1``), so ``num_depths >= spec_num_steps``.
+* Every input row flows through the depth's MoE / dense collectives (there
+  is no per-request narrowing: the decode window is ``k`` rows per request
+  at every depth), so the model keeps the default collective sizing and
+  does NOT report ``global_bs`` through ``report_collective_sizing`` the
+  way the Eagle-chain heads do.
+* ``get_embed_and_head()`` / ``set_embed_and_head(embed, head)``: the
+  embedding and LM head are shared from the target
+  (``shares_target_embed_head``); a draft needing a request-token-history
+  view is refused at startup (``supports_request_token_history``).
+* ``checkpoint_weight_name_filter(name)`` plus ``load_weights`` mapping the
+  checkpoint's per-depth tensors onto ``layers[d]``.
 """
 
 from __future__ import annotations
@@ -47,12 +79,12 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
-    from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -235,10 +267,14 @@ class Mtp(BaseDrafter):
     that round (the ``k``-window per decode request, the prompt chunk's rows
     on extend), so each depth's collectives are sized by the target's
     ``global_num_tokens``; an idle rank mirrors that with ``spec_num_steps``
-    IDLE forwards (:meth:`idle_step_global_num_tokens`).
+    IDLE forwards (:meth:`idle_step_global_num_tokens`). PD layerwise
+    transfer: ``run`` returns only after every depth's forward — and so its
+    KV write to the depth's plane — is enqueued on the caller's stream, so
+    the executor's draft-final cache step publishes the complete chain.
     """
 
     shares_target_embed_head = True
+    supports_pd_layerwise_finalization = True
 
     def __init__(
         self,
@@ -264,6 +300,18 @@ class Mtp(BaseDrafter):
         )
 
         self.device = draft_model_runner.device
+
+        # Depth selection rides on spec_step_idx, which ModelRunner forwards
+        # only to a forward that declares it: a draft without the parameter
+        # would run depth 0 at every step and draft silently wrong tokens.
+        if not ModelRunner._forward_accepts_kwarg(
+            draft_model_runner.model, "spec_step_idx"
+        ):
+            raise TypeError(
+                f"{type(draft_model_runner.model).__name__}.forward must declare "
+                "spec_step_idx: the multi-depth MTP drafter selects depth d by "
+                "passing spec_step_idx=d (see the drafter module docstring)"
+            )
 
         # Drafter-owned seq_lens the CUDA-graph wrapper aliases into every
         # draft metadata init (it copies the round's live lengths in; on
@@ -531,7 +579,6 @@ class Mtp(BaseDrafter):
     # Public entry point (type-based dispatch from ModelExecutor)
     # ------------------------------------------------------------------
 
-    @override
     @override
     def draft(
         self,

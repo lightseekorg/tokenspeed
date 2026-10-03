@@ -220,6 +220,17 @@ the values accepted by the bundled `tokenspeed-smg` package.
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
 
+`MTP` serves two head shapes under one flag. An Eagle-like head (one MTP
+layer chained on its own hidden, e.g. DeepSeek NextN) runs the Eagle chain.
+A multi-depth head (one distinct depth layer per draft step over the same
+window, e.g. Inkling, or an out-of-tree draft registered for the multi-depth
+drafter) runs every depth `0..--speculative-num-steps-1` each round, so the
+draft checkpoint needs at least that many depths. Both shapes run under
+attention data parallelism (idle ranks mirror the depth loop with empty
+forwards) and with PD layerwise transfer
+(`--disaggregation-layerwise-interval`), where the draft's per-depth cache
+planes become ready together after the drafter's run.
+
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.
 `--speculative-num-draft-tokens` is the verify width -- one anchor row plus one

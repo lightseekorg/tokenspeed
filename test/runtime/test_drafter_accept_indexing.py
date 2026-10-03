@@ -135,6 +135,16 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             [request_pool_rows, spec_num_tokens - 1, 8],
         )
 
+    def test_mtp_refuses_a_draft_forward_without_spec_step_idx(self):
+        # ModelRunner forwards spec_step_idx only to a forward that declares
+        # it (**kwargs does not count); without it every depth would silently
+        # run depth 0, so construction fails instead.
+        def eagle_shaped_forward(ctx, input_ids, positions, **kwargs):
+            pass
+
+        with self.assertRaisesRegex(TypeError, "spec_step_idx"):
+            _make_mtp(model_forward=eagle_shaped_forward)
+
     def test_mtp_runs_under_attention_dp_and_sizes_every_depth_like_the_target(
         self,
     ):
