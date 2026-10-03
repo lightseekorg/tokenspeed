@@ -251,21 +251,17 @@ def test_k8s_dispatch_lists_every_supported_ci_yaml():
     assert all((REPO_ROOT / choice).is_file() for choice in choices)
 
 
-def test_amd_pr_workflow_orders_kernel_benchmarks_before_model_tests():
+def test_amd_pr_workflow_runs_kernel_benchmarks_alongside_model_tests():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-tests.yml")
     jobs = workflow["jobs"]
 
     assert jobs["kernel-benchmark"]["needs"] == ["scan", "unit-test"]
-    expected_model_needs = ["scan", "unit-test", "kernel-benchmark"]
     normal_model = jobs["model-test"]
-    assert normal_model["needs"] == expected_model_needs
+    assert normal_model["needs"] == ["scan", "unit-test"]
     assert "!cancelled()" in normal_model["if"]
     assert "needs.unit-test.result == 'success'" in normal_model["if"]
     assert "needs.scan.outputs.unit_has_tasks != 'true'" in normal_model["if"]
-    assert "needs.kernel-benchmark.result == 'success'" in normal_model["if"]
-    assert (
-        "needs.scan.outputs.kernel_benchmark_has_tasks != 'true'" in normal_model["if"]
-    )
+    assert "needs.kernel-benchmark" not in normal_model["if"]
 
     eager_model = jobs["model-test-eager"]
     assert eager_model["needs"] == "scan"
