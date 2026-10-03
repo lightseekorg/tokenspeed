@@ -369,12 +369,22 @@ def test_select_packed_gqa():
             }
         )
     )
+    assert prefill._select_packed_gqa(
+        **(kwargs | {"seqlens": [4096] * 4, "max_seqlen": 4096})
+    )
+    assert prefill._select_packed_gqa(
+        **(kwargs | {"seqlens": [8192] * 2, "max_seqlen": 8192})
+    )
 
     for override in (
         {"dtype": torch.float8_e4m3fn},
         {"head_dim": 64},
         {"n_heads": 32, "n_kv_heads": 8},
-        {"seqlens": [4096] * 4, "max_seqlen": 4096},
+        {
+            "dtype": torch.float16,
+            "seqlens": [4096] * 4,
+            "max_seqlen": 4096,
+        },
         {"has_sink": True},
         {"packed_q_block_bytes": 2**32 + 1},
     ):

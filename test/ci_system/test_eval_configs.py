@@ -219,7 +219,6 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert flag_value(server_tokens, "--max-total-tokens") == "1048576"
         assert flag_value(server_tokens, "--max-num-seqs") == "32"
         assert flag_value(server_tokens, "--chunked-prefill-size") == "8192"
-        assert flag_value(server_tokens, "--gpu-memory-utilization") == "0.9"
         assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "32"
         assert flag_value(server_tokens, "--reasoning-parser") == "deepseek_v31"
         assert "--disable-kvstore" in server_tokens
@@ -291,7 +290,7 @@ def test_kimi_k3_amd_gates_use_eagle3():
     assert flag_value(perf_server_tokens, "--max-num-seqs") == "16"
     assert flag_value(perf_server_tokens, "--chunked-prefill-size") == "8192"
     assert flag_value(perf_server_tokens, "--max-prefill-tokens") == "8192"
-    assert tasks[1]["perf_reference"] == {16: [23, 12.5]}
+    assert tasks[1]["perf_reference"] == {16: [60, 15]}
     assert tasks[1]["perf_threshold"] == 0.9
     assert "'evalscope[perf]==1.11.1'" in tasks[1]["perf"]["install"][0]
     perf_tokens = shlex.split(tasks[1]["perf"]["command"])

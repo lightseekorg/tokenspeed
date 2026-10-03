@@ -255,6 +255,36 @@ class TestCLIConfigCompat(unittest.TestCase):
         )
         self.assertEqual(args.gpu_memory_utilization, 0.9)
 
+    def test_gpu_memory_utilization_default_is_one_value_at_every_world_size(self):
+        for tp in ("1", "2", "8", "16"):
+            sa = self._from_cli_args_no_init(
+                self._parse_args(
+                    ["--model", "test/model", "--tensor-parallel-size", tp]
+                )
+            )
+            sa.resolve_basic_defaults()
+            sa.resolve_parallelism()
+            sa.resolve_memory_and_scheduling()
+            self.assertEqual(sa.gpu_memory_utilization, 0.95, tp)
+            self.assertTrue(sa._gpu_memory_utilization_defaulted, tp)
+        sa = self._from_cli_args_no_init(
+            self._parse_args(
+                [
+                    "--model",
+                    "test/model",
+                    "--tensor-parallel-size",
+                    "16",
+                    "--gpu-memory-utilization",
+                    "0.8",
+                ]
+            )
+        )
+        sa.resolve_basic_defaults()
+        sa.resolve_parallelism()
+        sa.resolve_memory_and_scheduling()
+        self.assertEqual(sa.gpu_memory_utilization, 0.8)
+        self.assertFalse(sa._gpu_memory_utilization_defaulted)
+
     def test_seed_arg(self):
         args = self._parse_args(["--model", "test/model", "--seed", "42"])
         self.assertEqual(args.seed, 42)

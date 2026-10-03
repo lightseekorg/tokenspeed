@@ -67,17 +67,7 @@ logger = get_colorful_logger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
-    "AWQMarlinLinearMethod",
-    "AWQLinearMethod",
-    "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
-    "BlockInt8LinearMethod",
-    "MarlinLinearMethod",
-    "QQQLinearMethod",
-    "GPTQMarlin24LinearMethod",
-    "TPUInt8LinearMethod",
-    "GPTQLinearMethod",
-    "IPEXAWQLinearMethod",
 ]
 
 

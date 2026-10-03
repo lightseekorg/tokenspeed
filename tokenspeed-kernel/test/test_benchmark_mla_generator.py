@@ -63,6 +63,14 @@ _PREFILL_SHAPE = {
     "return_lse": True,
     "dtype": _FP8,
 }
+_EXTEND_SHAPE = {
+    "batch": 2,
+    "query_tokens_per_sequence": 64,
+    "prefix_tokens": 8192,
+    "max_context_len": 65536,
+    "q_dtype": "bfloat16",
+    "kv_cache_dtype": _FP8,
+}
 _NORMALIZE_SHAPE = {
     "tokens": 1,
     "dtype": "bfloat16",
@@ -338,6 +346,35 @@ def test_mla_decode_projected_value_selection_matches_operation_api(
 
     assert actual == expected
     assert actual[1]["gate_kind"] == "sigmoid"
+
+
+def test_mla_extend_selection_matches_operation_api(monkeypatch) -> None:
+    batch, query_tokens = 2, 64
+    kv_tokens = 8192 + query_tokens
+    expected = _capture_operation_selection(
+        monkeypatch,
+        lambda ops: ops.mla_extend_with_kvcache(
+            q=torch.zeros((batch * query_tokens, 12, 576), dtype=torch.bfloat16),
+            kv_cache=torch.zeros((260, 64, 1, 576), dtype=torch.float8_e4m3fn),
+            page_table=torch.zeros((batch, 1024), dtype=torch.int32),
+            cache_seqlens=torch.full((batch,), kv_tokens, dtype=torch.int32),
+            cu_seqlens_q=torch.tensor([0, query_tokens, 2 * query_tokens]),
+            cu_seqlens_kv=torch.tensor([0, kv_tokens, 2 * kv_tokens]),
+            max_seqlen_q=query_tokens,
+            max_seqlen_k=65536,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            softmax_scale=192**-0.5,
+        ),
+    )
+    actual = _capture_generator_selection(
+        monkeypatch,
+        mla_generator.prepare_mla_extend,
+        _request("mla_extend_with_kvcache", _EXTEND_SHAPE),
+    )
+
+    assert actual == expected
 
 
 def test_mla_normalize_project_query_selection_matches_operation_api(

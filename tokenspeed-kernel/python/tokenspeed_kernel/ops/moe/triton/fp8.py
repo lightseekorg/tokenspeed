@@ -21,16 +21,21 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import TensorDescriptor, libdevice, tl, triton
+from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.moe.triton._common import (
     _combine,
     _num_programs,
     _prepare_routed_output,
+    _swiglu,
+    _swiglu_params,
     _validate_launch,
     _validate_topk,
 )
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+_FP8_BLOCK = 128
 
 
 def _validate(
@@ -49,78 +54,83 @@ def _validate(
         raise ValueError("Triton MoE does not support expert bias")
 
     activation = plan.get("activation") or getattr(w, "activation", "silu")
-    if activation not in {"silu", "situ", "swiglu"}:
-        raise ValueError(f"Triton MoE does not support activation {activation!r}")
-    swiglu_arg = getattr(w, "swiglu_arg", None)
-    if swiglu_arg is not None and (
-        getattr(swiglu_arg, "alpha", None) not in {None, 1.0}
-        or getattr(swiglu_arg, "limit", None) is not None
-    ):
-        raise ValueError("Triton MoE supports only standard SwiGLU")
-    if getattr(w, "swiglu_beta", None) not in {None, 0.0}:
-        raise ValueError("Triton MoE supports only standard SwiGLU")
+    if activation not in {"silu", "swiglu"}:
+        raise ValueError(f"Triton FP8 MoE does not support activation {activation!r}")
+    limit = getattr(getattr(w, "swiglu_arg", None), "limit", None)
+    if limit is not None and limit <= 0:
+        raise ValueError("SwiGLU limit must be positive")
     if getattr(w, "w13_input_layout", "concatenated") != "concatenated":
         raise ValueError("Triton MoE requires concatenated gate/up weights")
-    if activation == "situ":
-        situ_beta = getattr(w, "activation_situ_beta", None)
-        situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
-        if situ_beta is None or situ_beta <= 0:
-            raise ValueError("SiTU beta must be positive")
-        if situ_linear_beta is not None and situ_linear_beta <= 0:
-            raise ValueError("SiTU linear beta must be positive")
 
     w13 = w.w13_weight
     w2 = w.w2_weight
-    if x.ndim != 2 or w13.ndim != 3 or w2.ndim != 3:
-        raise ValueError("x and unquantized MoE weights must be rank-2/rank-3")
-    if x.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError("x must use torch.float16 or torch.bfloat16")
-    if w13.dtype != x.dtype or w2.dtype != x.dtype:
-        raise TypeError("x, w13_weight, and w2_weight must have the same dtype")
-    if not all(t.is_cuda and t.is_contiguous() for t in (x, w13, w2)):
-        raise ValueError("x and weights must be contiguous GPU tensors")
+    w13_scale = w.w13_weight_scale_inv
+    w2_scale = w.w2_weight_scale_inv
+    weights = (w13, w2, w13_scale, w2_scale)
+    if x.ndim != 2 or any(t.ndim != 3 for t in weights):
+        raise ValueError("x and block-FP8 MoE weights must be rank-2/rank-3")
+    if x.dtype != torch.bfloat16:
+        raise TypeError("x must use torch.bfloat16")
+    if w13.dtype != torch.float8_e4m3fn or w2.dtype != torch.float8_e4m3fn:
+        raise TypeError("w13_weight and w2_weight must use torch.float8_e4m3fn")
+    if w13_scale.dtype != torch.float32 or w2_scale.dtype != torch.float32:
+        raise TypeError("block-FP8 inverse scales must use torch.float32")
+    if not all(t.is_cuda and t.is_contiguous() for t in (x, *weights)):
+        raise ValueError("x, weights, and scales must be contiguous GPU tensors")
     _validate_topk(x, topk_weights, topk_ids)
-    if w13.device != x.device or w2.device != x.device:
+    if any(t.device != x.device for t in weights):
         raise ValueError("x and weights must be on the same device")
 
     hidden_size = x.shape[1]
     num_experts, twice_intermediate_size, weight_hidden_size = w13.shape
     intermediate_size = twice_intermediate_size // 2
     if num_experts == 0:
-        raise ValueError("unquantized MoE requires at least one expert")
+        raise ValueError("block-FP8 MoE requires at least one expert")
     if twice_intermediate_size % 2 or weight_hidden_size != hidden_size:
         raise ValueError("w13_weight has an incompatible shape")
     if w2.shape != (num_experts, hidden_size, intermediate_size):
         raise ValueError("w2_weight has an incompatible shape")
-    if hidden_size % 128 or intermediate_size % 32:
+    if hidden_size % _FP8_BLOCK or intermediate_size % _FP8_BLOCK:
         raise ValueError(
-            "hidden size must be a multiple of 128 and intermediate size of 32"
+            f"hidden and intermediate sizes must be multiples of {_FP8_BLOCK}"
         )
-    return topk_weights, topk_ids, activation
+    hidden_blocks = hidden_size // _FP8_BLOCK
+    intermediate_blocks = intermediate_size // _FP8_BLOCK
+    if w13_scale.shape != (num_experts, 2 * intermediate_blocks, hidden_blocks):
+        raise ValueError("w13_weight_scale_inv has an incompatible shape")
+    if w2_scale.shape != (num_experts, hidden_blocks, intermediate_blocks):
+        raise ValueError("w2_weight_scale_inv has an incompatible shape")
+    return topk_weights, topk_ids
 
 
 @triton.jit
 def _stage1_kernel(
-    x_desc,
-    w13_desc,
+    x_ptr,
+    w13_ptr,
+    w13_scale_ptr,
     inter_ptr,
     expert_route_ids_ptr,
     expert_counts_ptr,
     num_tokens,
+    num_programs,
     hidden_size: tl.constexpr,
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
     top_k: tl.constexpr,
-    situ_beta,
-    situ_linear_beta,
-    ACTIVATION: tl.constexpr,
-    HAS_LINEAR_BETA: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
+    swiglu_alpha: tl.constexpr,
+    swiglu_limit: tl.constexpr,
+    swiglu_beta: tl.constexpr,
+    HAS_LIMIT: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
+    tl.static_assert(SCALE_BLOCK % BLOCK_N == 0)
+    tl.static_assert(SCALE_BLOCK % BLOCK_K == 0)
     route_count = num_tokens * top_k
+    scale_k = hidden_size // SCALE_BLOCK
+    up_scale_offset = intermediate_size // SCALE_BLOCK * scale_k
     tile_idx = tl.program_id(0)
     problem_start = 0
 
@@ -129,6 +139,10 @@ def _stage1_kernel(
         num_m_tiles = tl.cdiv(group_m, BLOCK_M)
         num_n_tiles = tl.cdiv(intermediate_size, BLOCK_N)
         problem_tiles = num_m_tiles * num_n_tiles
+        expert_weight = w13_ptr + expert_id.to(tl.int64) * (
+            2 * intermediate_size * hidden_size
+        )
+        expert_scale = w13_scale_ptr + expert_id * 2 * up_scale_offset
 
         while tile_idx >= problem_start and tile_idx < problem_start + problem_tiles:
             tile_in_problem = tile_idx - problem_start
@@ -143,36 +157,41 @@ def _stage1_kernel(
             ).to(tl.int32)
             token_ids = tl.where(row_mask, route_ids // top_k, 0).to(tl.int32)
             n_offset = tile_n * BLOCK_N
+            gate_rows = n_offset + tl.arange(0, BLOCK_N)
+            up_rows = intermediate_size + gate_rows
+            gate_scale = expert_scale + n_offset // SCALE_BLOCK * scale_k
+            up_scale = gate_scale + up_scale_offset
             gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
             for k_offset in range(0, hidden_size, BLOCK_K):
-                x = x_desc.gather(token_ids, k_offset)
-                gate = w13_desc.load([expert_id, n_offset, k_offset]).reshape(
-                    (BLOCK_N, BLOCK_K)
+                k_cols = k_offset + tl.arange(0, BLOCK_K)
+                x = tl.load(
+                    x_ptr + token_ids[:, None] * hidden_size + k_cols[None, :],
+                    mask=row_mask[:, None],
+                    other=0.0,
                 )
-                up = w13_desc.load(
-                    [expert_id, intermediate_size + n_offset, k_offset]
-                ).reshape((BLOCK_N, BLOCK_K))
-                gate_acc += tl.dot(x, gate.T)
-                up_acc += tl.dot(x, up.T)
+                gate = tl.load(
+                    expert_weight + gate_rows[:, None] * hidden_size + k_cols[None, :]
+                ).to(tl.bfloat16)
+                up = tl.load(
+                    expert_weight + up_rows[:, None] * hidden_size + k_cols[None, :]
+                ).to(tl.bfloat16)
+                scale_col = k_offset // SCALE_BLOCK
+                gate_acc += tl.dot(x, gate.T) * tl.load(gate_scale + scale_col)
+                up_acc += tl.dot(x, up.T) * tl.load(up_scale + scale_col)
 
-            if ACTIVATION == "situ":
-                gate = gate_acc.to(x_desc.dtype).to(tl.float32)
-                up = up_acc.to(x_desc.dtype).to(tl.float32)
-                gate = situ_beta * libdevice.tanh(gate / situ_beta) * tl.sigmoid(gate)
-                if HAS_LINEAR_BETA:
-                    up = situ_linear_beta * libdevice.tanh(up / situ_linear_beta)
-                activated = (gate * up).to(x_desc.dtype)
-            else:
-                activated = (gate_acc * tl.sigmoid(gate_acc) * up_acc).to(x_desc.dtype)
-            inter_offsets = (
-                route_ids[:, None] * intermediate_size
-                + n_offset
-                + tl.arange(0, BLOCK_N)[None, :]
-            )
+            activated = _swiglu(
+                gate_acc,
+                up_acc,
+                swiglu_alpha,
+                swiglu_limit,
+                swiglu_beta,
+                HAS_LIMIT,
+            ).to(tl.bfloat16)
+            inter_offsets = route_ids[:, None] * intermediate_size + gate_rows[None, :]
             tl.store(inter_ptr + inter_offsets, activated, mask=row_mask[:, None])
-            tile_idx += NUM_PROGRAMS
+            tile_idx += num_programs
 
         problem_start += problem_tiles
 
@@ -180,21 +199,26 @@ def _stage1_kernel(
 @triton.jit
 def _stage2_kernel(
     inter_ptr,
-    w2_desc,
+    w2_ptr,
+    w2_scale_ptr,
     route_output_ptr,
     expert_route_ids_ptr,
     expert_counts_ptr,
     num_tokens,
+    num_programs,
     hidden_size: tl.constexpr,
     intermediate_size: tl.constexpr,
     num_experts: tl.constexpr,
     top_k: tl.constexpr,
-    NUM_PROGRAMS: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
+    tl.static_assert(SCALE_BLOCK % BLOCK_N == 0)
+    tl.static_assert(SCALE_BLOCK % BLOCK_K == 0)
     route_count = num_tokens * top_k
+    scale_k = intermediate_size // SCALE_BLOCK
     tile_idx = tl.program_id(0)
     problem_start = 0
 
@@ -203,6 +227,10 @@ def _stage2_kernel(
         num_m_tiles = tl.cdiv(group_m, BLOCK_M)
         num_n_tiles = tl.cdiv(hidden_size, BLOCK_N)
         problem_tiles = num_m_tiles * num_n_tiles
+        expert_weight = w2_ptr + expert_id.to(tl.int64) * (
+            hidden_size * intermediate_size
+        )
+        expert_scale = w2_scale_ptr + expert_id * (hidden_size // SCALE_BLOCK * scale_k)
 
         while tile_idx >= problem_start and tile_idx < problem_start + problem_tiles:
             tile_in_problem = tile_idx - problem_start
@@ -217,52 +245,49 @@ def _stage2_kernel(
             ).to(tl.int32)
             route_ids = tl.where(row_mask, route_ids, -1).to(tl.int32)
             n_offset = tile_n * BLOCK_N
+            weight_rows = n_offset + tl.arange(0, BLOCK_N)
+            weight_scale = expert_scale + n_offset // SCALE_BLOCK * scale_k
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
             for k_offset in range(0, intermediate_size, BLOCK_K):
-                intermediate_offsets = (
-                    route_ids[:, None] * intermediate_size
-                    + k_offset
-                    + tl.arange(0, BLOCK_K)[None, :]
-                )
+                k_cols = k_offset + tl.arange(0, BLOCK_K)
                 intermediate = tl.load(
-                    inter_ptr + intermediate_offsets,
+                    inter_ptr
+                    + route_ids[:, None] * intermediate_size
+                    + k_cols[None, :],
                     mask=row_mask[:, None],
                     other=0.0,
                 )
-                weight = w2_desc.load([expert_id, n_offset, k_offset]).reshape(
-                    (BLOCK_N, BLOCK_K)
+                weight = tl.load(
+                    expert_weight
+                    + weight_rows[:, None] * intermediate_size
+                    + k_cols[None, :]
+                ).to(tl.bfloat16)
+                acc += tl.dot(intermediate, weight.T) * tl.load(
+                    weight_scale + k_offset // SCALE_BLOCK
                 )
-                acc += tl.dot(intermediate, weight.T)
 
-            output_offsets = (
-                route_ids[:, None] * hidden_size
-                + n_offset
-                + tl.arange(0, BLOCK_N)[None, :]
-            )
+            output_offsets = route_ids[:, None] * hidden_size + weight_rows[None, :]
             tl.store(route_output_ptr + output_offsets, acc, mask=row_mask[:, None])
-            tile_idx += NUM_PROGRAMS
+            tile_idx += num_programs
 
         problem_start += problem_tiles
 
 
 def _moe(
     x: torch.Tensor,
-    w13: torch.Tensor,
-    w2: torch.Tensor,
+    w: torch.nn.Module,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    activation: str,
-    situ_beta: float,
-    situ_linear_beta: float | None,
 ) -> torch.Tensor:
     num_tokens, hidden_size = x.shape
-    num_experts, twice_intermediate_size, _ = w13.shape
+    num_experts, twice_intermediate_size, _ = w.w13_weight.shape
     intermediate_size = twice_intermediate_size // 2
     top_k = topk_ids.shape[1]
     if num_tokens == 0:
         return torch.empty_like(x)
 
+    swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_params(w)
     expert_route_ids, expert_counts, route_output, output = _prepare_routed_output(
         x, topk_ids, num_experts
     )
@@ -271,55 +296,53 @@ def _moe(
         (route_count, intermediate_size), device=x.device, dtype=x.dtype
     )
     block_m = 16 if num_tokens <= 16 else 64
-    stage1_block_n = 64 if intermediate_size % 64 == 0 else 32
-    stage2_block_n = 128
-    block_k = 64 if intermediate_size % 64 == 0 else 32
-    stage1_programs = _num_programs(
-        x.device, route_count, intermediate_size, stage1_block_n
-    )
-    stage2_programs = _num_programs(x.device, route_count, hidden_size, stage2_block_n)
-    x_desc = TensorDescriptor.from_tensor(x, [1, block_k])
-    w13_desc = TensorDescriptor.from_tensor(w13, [1, stage1_block_n, block_k])
-    w2_desc = TensorDescriptor.from_tensor(w2, [1, stage2_block_n, block_k])
+    block_n = 32
+    num_warps = 4 if block_m == 16 else 8
+    stage1_programs = _num_programs(x.device, route_count, intermediate_size, block_n)
+    stage2_programs = _num_programs(x.device, route_count, hidden_size, block_n)
 
     _stage1_kernel[(stage1_programs,)](
-        x_desc,
-        w13_desc,
+        x,
+        w.w13_weight,
+        w.w13_weight_scale_inv,
         intermediate,
         expert_route_ids,
         expert_counts,
         num_tokens,
+        stage1_programs,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         top_k=top_k,
-        situ_beta=situ_beta,
-        situ_linear_beta=(1.0 if situ_linear_beta is None else situ_linear_beta),
-        ACTIVATION=activation,
-        HAS_LINEAR_BETA=situ_linear_beta is not None,
-        NUM_PROGRAMS=stage1_programs,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=1.0 if swiglu_limit is None else swiglu_limit,
+        swiglu_beta=swiglu_beta,
+        HAS_LIMIT=swiglu_limit is not None,
+        SCALE_BLOCK=_FP8_BLOCK,
         BLOCK_M=block_m,
-        BLOCK_N=stage1_block_n,
-        BLOCK_K=block_k,
-        num_warps=4 if block_m == 16 else 8,
+        BLOCK_N=block_n,
+        BLOCK_K=_FP8_BLOCK,
+        num_warps=num_warps,
         num_stages=3,
     )
     _stage2_kernel[(stage2_programs,)](
         intermediate,
-        w2_desc,
+        w.w2_weight,
+        w.w2_weight_scale_inv,
         route_output,
         expert_route_ids,
         expert_counts,
         num_tokens,
+        stage2_programs,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         top_k=top_k,
-        NUM_PROGRAMS=stage2_programs,
+        SCALE_BLOCK=_FP8_BLOCK,
         BLOCK_M=block_m,
-        BLOCK_N=stage2_block_n,
-        BLOCK_K=block_k,
-        num_warps=4 if block_m == 16 else 8,
+        BLOCK_N=block_n,
+        BLOCK_K=_FP8_BLOCK,
+        num_warps=num_warps,
         num_stages=3,
     )
     _combine(route_output, topk_weights, output)
@@ -334,23 +357,32 @@ def _moe(
 @register_kernel(
     "moe",
     "apply",
-    name="triton_bf16_precomputed_moe_apply",
+    name="triton_fp8_block_precomputed_moe_apply",
     solution="triton",
-    signatures=format_signatures("x", "dense", {torch.float16, torch.bfloat16}),
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd", "nvidia"}),
+        vendor_min_arch_versions={
+            "amd": ArchVersion(9, 5),
+            "nvidia": ArchVersion(8, 9),
+        },
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
     traits={
-        "weight_dtype": frozenset({"unquant"}),
-        "activation": frozenset({"silu", "situ", "swiglu"}),
+        "weight_dtype": frozenset({"fp8"}),
+        "activation": frozenset({"silu", "swiglu"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "supports_ep": frozenset({False}),
         "supports_all_to_all_ep": frozenset({False}),
-        "ispp_alignment": frozenset({32}),
+        "ispp_alignment": frozenset({_FP8_BLOCK}),
+        "hidden_alignment": frozenset({_FP8_BLOCK}),
         "internal_activation_dtype": frozenset({"input"}),
+        "fp8_scale_block_shape": frozenset({(_FP8_BLOCK, _FP8_BLOCK)}),
         "supports_bias": frozenset({False}),
     },
     priority=Priority.PORTABLE,
 )
-def triton_bf16_precomputed_moe_apply(
+def triton_fp8_block_precomputed_moe_apply(
     plan: dict,
     x: torch.Tensor,
     w: torch.nn.Module,
@@ -362,13 +394,19 @@ def triton_bf16_precomputed_moe_apply(
     do_finalize: bool = True,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
-    """Apply an FP16/BF16 Triton MoE using precomputed top-k routing.
+    """Apply 128x128 block-scaled E4M3 experts to BF16 activations.
+
+    Weight tiles are upcast to BF16 exactly and each block's FP32 inverse scale
+    multiplies its FP32 partial product, so neither the weights nor the
+    activations are requantized.
 
     Args:
-        plan: MoE plan selecting standard SiLU/SwiGLU or SiTU activation.
-        x: Contiguous hidden states `[tokens, hidden]` in FP16 or BF16.
-        w: Module with contiguous `w13_weight` `[E, 2I, H]` and
-            `w2_weight` `[E, H, I]` tensors matching `x.dtype`.
+        plan: MoE plan selecting SiLU/SwiGLU activation. A `swiglu_arg` limit,
+            alpha, or `swiglu_beta` on `w` applies to either name.
+        x: Contiguous BF16 hidden states `[tokens, hidden]`.
+        w: Module with contiguous E4M3 `w13_weight` `[E, 2I, H]` and
+            `w2_weight` `[E, H, I]`, plus FP32 `w13_weight_scale_inv`
+            `[E, 2I/128, H/128]` and `w2_weight_scale_inv` `[E, H/128, I/128]`.
         router_logits: Unused because routing must be precomputed.
         topk_weights: Route weights `[tokens, top_k]`.
         topk_ids: Expert ids `[tokens, top_k]`. Out-of-range ids contribute zero.
@@ -378,18 +416,7 @@ def triton_bf16_precomputed_moe_apply(
         enable_pdl: Unused launch hint.
 
     Returns:
-        Finalized hidden states `[tokens, hidden]` with dtype matching `x`.
+        Finalized BF16 hidden states `[tokens, hidden]`.
     """
-    topk_weights, topk_ids, activation = _validate(
-        plan, x, w, topk_weights, topk_ids, do_finalize
-    )
-    return _moe(
-        x,
-        w.w13_weight,
-        w.w2_weight,
-        topk_weights,
-        topk_ids,
-        activation,
-        float(getattr(w, "activation_situ_beta", 1.0) or 1.0),
-        getattr(w, "activation_situ_linear_beta", None),
-    )
+    topk_weights, topk_ids = _validate(plan, x, w, topk_weights, topk_ids, do_finalize)
+    return _moe(x, w, topk_weights, topk_ids)

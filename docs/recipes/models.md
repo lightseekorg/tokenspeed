@@ -29,7 +29,6 @@ ts serve \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --trust-remote-code \
     --attention-backend fa4 \
@@ -51,7 +50,6 @@ ts serve \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --trust-remote-code \
     --enable-prefix-caching \
@@ -78,7 +76,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --attention-backend trtllm \
     --kv-cache-dtype fp8 \
@@ -108,7 +105,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --attention-backend trtllm \
     --kv-cache-dtype fp8 \
@@ -330,7 +326,6 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --mm-encoder-tp-mode data \
   --ep-size 8 \
   --moe-backend flashinfer_trtllm \
-  --gpu-memory-utilization 0.94 \
   --max-num-seqs 32 \
   --disable-kvstore \
   --host 0.0.0.0 \
@@ -359,7 +354,6 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --enable-expert-parallel \
   --attention-backend mla \
   --moe-backend auto \
-  --gpu-memory-utilization 0.92 \
   --max-num-seqs 32 \
   --disable-kvstore \
   --host 0.0.0.0 \
@@ -617,7 +611,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -633,7 +627,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -658,7 +652,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -676,7 +670,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -710,7 +704,6 @@ MTP (the draft model path points at the same checkpoint):
 tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
   --served-model-name Qwen/Qwen3.8-27B-FP8 \
   --world-size 1 \
-  --gpu-memory-utilization 0.9 \
   --attention-backend trtllm \
   --moe-backend flashinfer_trtllm \
   --chunked-prefill-size 8192 \
@@ -861,7 +854,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --max-total-tokens 163840 \
   --chunked-prefill-size 8192 \
   --enable-mixed-batch \
-  --gpu-memory-utilization 0.9 \
   --disable-kvstore \
   --host 0.0.0.0 \
   --port 8000
@@ -880,7 +872,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Pro \
   --max-model-len 80000 \
   --max-total-tokens 2560000 \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.9 \
   --disable-kvstore \
   --host 0.0.0.0 \
   --port 8000
@@ -909,7 +900,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --max-total-tokens 16384 \
   --chunked-prefill-size 8192 \
   --prefill-graph-max-tokens 8192 \
-  --gpu-memory-utilization 0.9 \
   --disable-kvstore \
   --speculative-algorithm MTP \
   --speculative-num-steps 3 \
@@ -982,7 +972,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --chunked-prefill-size 8192 \
   --enable-mixed-batch \
   --enable-prefix-caching \
-  --gpu-memory-utilization 0.90 \
   --disable-kvstore \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
   --speculative-eagle-topk 1 \

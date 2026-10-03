@@ -379,7 +379,7 @@ def register_kernel(
     priority: Priority | int = Priority.PERFORMANT + 2,
     weight_preprocessor: Callable | None = None,
 ) -> Callable:
-    """Decorator to register a kernel function.
+    """Decorator to register a kernel function or stateful kernel class.
 
     ``name`` is the registry key that ``override=`` strings, ``describe_kernel``
     and profiler scopes show.
@@ -414,7 +414,7 @@ def register_kernel(
     priority_int = _validate_priority(priority)
     normalized_weight_preprocessor = _validate_weight_preprocessor(weight_preprocessor)
 
-    def decorator(fn: Callable) -> Callable:
+    def decorator(impl: Callable) -> Callable:
         kernel_name = name or f"{solution}_{family}_{mode}"
 
         spec = KernelSpec(
@@ -430,8 +430,8 @@ def register_kernel(
             weight_preprocessor=normalized_weight_preprocessor,
         )
 
-        KernelRegistry.get().register(spec, fn)
-        return fn
+        KernelRegistry.get().register(spec, impl)
+        return impl
 
     return decorator
 

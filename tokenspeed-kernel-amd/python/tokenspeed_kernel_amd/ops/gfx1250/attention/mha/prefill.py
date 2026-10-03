@@ -1161,7 +1161,11 @@ def _select_packed_gqa(
     if window_left >= 0:
         return False
     if uniform:
-        return (batch_size, max_seqlen) in ((8, 1024), (4, 2048))
+        short = (batch_size, max_seqlen) in ((8, 1024), (4, 2048))
+        long_bf16 = dtype == torch.bfloat16 and (
+            (batch_size, max_seqlen) in ((4, 4096), (2, 8192))
+        )
+        return short or long_bf16
     return batch_size == 4 and max_seqlen == 4096
 
 
@@ -1314,7 +1318,7 @@ def launch_gluon_mha_prefill_gfx1250(
         for seq_start, seq_end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:])
     ]
     packed_group_size = config.n_heads // config.n_kv_heads
-    packed_query_span = 128 // packed_group_size
+    packed_query_span = 256 // packed_group_size
     selected_packed_gqa = _select_packed_gqa(
         dtype=q.dtype,
         head_dim=config.head_dim,
@@ -1334,13 +1338,18 @@ def launch_gluon_mha_prefill_gfx1250(
         * q.element_size(),
     )
     if selected_packed_gqa:
-        block_m = 128
+        wide_packed_gqa = (
+            q.dtype == torch.bfloat16
+            and config.window_left < 0
+            and (config.batch_size, config.max_seqlen) in ((4, 4096), (2, 8192))
+        )
+        block_m = 256 if wide_packed_gqa else 128
         block_n = 32 if config.window_left == 512 else 64
         config = config._replace(
             block_m=block_m,
             block_n=block_n,
-            num_warps=4,
-            waves_per_eu=2,
+            num_warps=8 if wide_packed_gqa else 4,
+            waves_per_eu=1 if wide_packed_gqa else 2,
             packed_gqa=True,
             grid=(
                 config.batch_size,
@@ -1387,7 +1396,7 @@ def launch_gluon_mha_prefill_gfx1250(
         block_m=config.block_m,
     )
     if selected_packed_gqa:
-        tdm_warp_hint = guarded_query_rows
+        tdm_warp_hint = guarded_query_rows or wide_packed_gqa
         reverse_q_blocks = True
         deep_pipeline = config.window_left < 0
     elif config.packed_gqa:
