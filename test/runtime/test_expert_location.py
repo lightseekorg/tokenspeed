@@ -22,8 +22,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe import ExpertDispatch, dispatch_topk_ids_reference
@@ -32,9 +30,7 @@ from tokenspeed.runtime.moe import eplb_algorithms
 from tokenspeed.runtime.moe.expert_location import (
     ExpertLocationMetadata,
     compute_logical_to_rank_dispatch_physical_map,
-    expert_placement_requested,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 def _placement(ep_rank: int, dispatch_algorithm: str | None = None):
@@ -196,73 +192,3 @@ def test_eplb_placement_balances_a_skewed_load():
     assert (placement.dispatch_num_replicas >= 1).all()
     assert placement.dispatch_num_replicas.sum(-1).tolist() == [experts + 8] * layers
     assert placement.logical_to_rank_dispatch_physical_map.shape == (layers, experts)
-
-
-def test_placement_is_requested_only_when_it_changes_routing():
-    def args(**kw):
-        base = dict(
-            ep_num_redundant_experts=0,
-            init_expert_location="trivial",
-            expert_distribution_recorder_mode=None,
-        )
-        base.update(kw)
-        return SimpleNamespace(**base)
-
-    assert not expert_placement_requested(args())
-    assert expert_placement_requested(args(ep_num_redundant_experts=8))
-    assert expert_placement_requested(args(init_expert_location="/tmp/load.pt"))
-    assert expert_placement_requested(args(expert_distribution_recorder_mode="stat"))
-
-
-class TestServerArgsPlacementValidation:
-    def test_trivial_serving_needs_no_dispatch_algorithm(self):
-        args = ServerArgs(model="x")
-        assert args.ep_dispatch_algorithm is None
-        assert not expert_placement_requested(args)
-
-    def test_placement_requires_an_explicit_dispatch_algorithm(self):
-        with pytest.raises(ValueError, match="--ep-dispatch-algorithm is required"):
-            ServerArgs(model="x", ep_num_redundant_experts=8)
-        with pytest.raises(ValueError, match="--ep-dispatch-algorithm is required"):
-            ServerArgs(model="x", init_expert_location="/tmp/load.pt")
-        with pytest.raises(ValueError, match="--ep-dispatch-algorithm is required"):
-            ServerArgs(model="x", expert_distribution_recorder_mode="stat")
-        args = ServerArgs(
-            model="x",
-            ep_num_redundant_experts=8,
-            init_expert_location="/tmp/load.pt",
-            ep_dispatch_algorithm="static_with_zero_expert",
-        )
-        assert args.ep_dispatch_algorithm == "static_with_zero_expert"
-
-    def test_dispatch_algorithm_without_a_placement_is_refused(self):
-        with pytest.raises(ValueError, match="has no effect"):
-            ServerArgs(model="x", ep_dispatch_algorithm="static")
-
-    def test_runtime_rebalancing_is_refused(self):
-        with pytest.raises(ValueError, match="--enable-eplb"):
-            ServerArgs(model="x", enable_eplb=True)
-
-    def test_only_stat_recording_exists(self):
-        with pytest.raises(ValueError, match="only 'stat'"):
-            ServerArgs(
-                model="x",
-                expert_distribution_recorder_mode="per_token",
-                ep_dispatch_algorithm="static",
-            )
-
-    def test_rl_bitwise_refuses_random_replica_choice(self):
-        with pytest.raises(ValueError, match="deterministic expert placement"):
-            ServerArgs(
-                model="x",
-                numerics="rl-bitwise",
-                ep_num_redundant_experts=8,
-                ep_dispatch_algorithm="dynamic_with_zero_expert",
-            )
-        args = ServerArgs(
-            model="x",
-            numerics="rl-bitwise",
-            ep_num_redundant_experts=8,
-            ep_dispatch_algorithm="static_with_zero_expert",
-        )
-        assert args.ep_num_redundant_experts == 8

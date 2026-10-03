@@ -36,6 +36,10 @@ from tokenspeed.runtime.configs.numerics import (
     RL_BITWISE_SAMPLING_BACKENDS,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
+from tokenspeed.runtime.moe.dispatch_algorithm import (
+    EP_DISPATCH_ALGORITHMS,
+    STATIC_EP_DISPATCH_ALGORITHMS,
+)
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
     get_colorful_logger,
@@ -68,10 +72,6 @@ ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
 # whose output is already truncated by max_new_tokens; the garbage KV is
 # evicted with the request one step later.
 _SPEC_OVERSHOOT_SPANS = 3
-
-# --ep-dispatch-algorithm values that map a logical expert to one fixed
-# replica per rank (the dynamic ones draw a replica at random per route).
-STATIC_EP_DISPATCH_ALGORITHMS = frozenset({"static", "static_with_zero_expert"})
 
 
 def expert_placement_requested(server_args) -> bool:
@@ -1094,6 +1094,13 @@ class ServerArgs:
             )
         if self.ep_num_redundant_experts < 0:
             raise ValueError("--ep-num-redundant-experts must be non-negative")
+        if self.ep_num_redundant_experts > 0 and self.mapping.moe.ep_size <= 1:
+            raise ValueError(
+                f"--ep-num-redundant-experts {self.ep_num_redundant_experts} "
+                "replicates experts across expert-parallel ranks, but the MoE "
+                f"layers run with ep_size={self.mapping.moe.ep_size}; enable "
+                "expert parallelism (--ep-size > 1) or drop the redundant experts."
+            )
         if expert_placement_requested(self):
             if self.ep_dispatch_algorithm is None:
                 raise ValueError(
@@ -1663,13 +1670,7 @@ class ServerArgs:
             "--ep-dispatch-algorithm",
             type=str,
             default=ServerArgs.ep_dispatch_algorithm,
-            choices=[
-                "static",
-                "dynamic",
-                "fake",
-                "static_with_zero_expert",
-                "dynamic_with_zero_expert",
-            ],
+            choices=list(EP_DISPATCH_ALGORITHMS),
             help="How routing picks among an expert's replicas; required with an "
             "expert placement. static_with_zero_expert for models with zero "
             "experts (LongCat), static otherwise; dynamic* draw at random.",
