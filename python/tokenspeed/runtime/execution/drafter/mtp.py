@@ -267,7 +267,7 @@ class Mtp(BaseDrafter):
     that round (the ``k``-window per decode request, the prompt chunk's rows
     on extend), so each depth's collectives are sized by the target's
     ``global_num_tokens``; an idle rank mirrors that with ``spec_num_steps``
-    IDLE forwards (:meth:`idle_step_global_num_tokens`). PD layerwise
+    IDLE forwards (:meth:`idle_forward_global_num_tokens`). PD layerwise
     transfer: ``run`` returns only after every depth's forward — and so its
     KV write to the depth's plane — is enqueued on the caller's stream, so
     the executor's draft-final cache step publishes the complete chain.
@@ -354,16 +354,13 @@ class Mtp(BaseDrafter):
         )
 
     @override
-    def idle_step_global_num_tokens(
-        self,
-        step_idx: int,
-        global_num_tokens: list[int],
-        global_bs: list[int] | None,
-    ) -> list[int]:
+    def idle_forward_global_num_tokens(
+        self, global_num_tokens: list[int], global_bs: list[int]
+    ) -> list[list[int]]:
         # Every depth re-runs the target's rows (the k-window per decode
         # request, the prompt chunk on extend) — never one row per request.
-        del step_idx, global_bs
-        return global_num_tokens
+        del global_bs
+        return [global_num_tokens] * self.spec_num_steps
 
     # ------------------------------------------------------------------
     # Internal helpers

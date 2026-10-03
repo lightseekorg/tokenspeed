@@ -68,11 +68,6 @@ class BaseDrafter:
     ):
         self.spec_num_tokens = spec_num_tokens
         self.spec_num_steps = spec_num_steps
-        # Draft forwards an idle attention-DP rank runs per round so it enters
-        # the same collectives as the ranks with work: one per draft step for
-        # the chained drafters (Eagle's first step plus its multi-step chain,
-        # multi-depth MTP's depths); block drafters narrow this to one.
-        self.idle_forward_steps: int = int(spec_num_steps or 0)
         self.draft_model_runner = draft_model_runner
         self.runtime_states = runtime_states
         self.input_buffers = input_buffers
@@ -125,34 +120,33 @@ class BaseDrafter:
         derived target weights and therefore need no action.
         """
 
-    def idle_step_global_num_tokens(
-        self,
-        step_idx: int,
-        global_num_tokens: list[int],
-        global_bs: list[int] | None,
-    ) -> list[int]:
-        """Per-rank token counts an idle attention-DP rank reports for its
-        ``step_idx`` IDLE draft forward (``spec_step_idx=step_idx``).
+    def idle_forward_global_num_tokens(
+        self, global_num_tokens: list[int], global_bs: list[int]
+    ) -> list[list[int]]:
+        """The IDLE draft forwards an idle attention-DP rank runs per round,
+        as the per-rank token counts each one reports: entry ``i`` sizes the
+        forward with ``spec_step_idx=i``, and the list length is the number
+        of draft forwards the active ranks run.
 
         The idle rank runs no rows of its own; it mirrors the collective
-        sizing of the ranks that do, which is the row count their draft
-        step ``step_idx`` runs. The default is the chained drafters' shape:
-        step 0 runs the target's rows (its verify window per decode
-        request), steps 1+ one row per request (``global_bs``). ``global_bs``
-        is None only while the decode graph is captured, where the step-0
-        shape stands in.
+        sizing of the ranks that do, so the list follows the drafter's step
+        loop. The default is the Eagle chain: step 0 runs the target's rows
+        (its verify window per decode request), steps 1+ one row per request
+        (``global_bs``). Drafters with another loop override this — block
+        drafters run one forward, multi-depth MTP the target's rows at every
+        depth.
 
         Args:
-            step_idx: The idle draft forward's index in ``0..idle_forward_steps``.
             global_num_tokens: The round's per-rank target token counts.
             global_bs: The round's per-rank decode request counts.
 
         Returns:
-            The ``global_num_tokens`` the step's ``ForwardContext`` carries.
+            One ``global_num_tokens`` per IDLE draft forward, in step order.
         """
-        if step_idx == 0 or global_bs is None:
-            return global_num_tokens
-        return global_bs
+        steps = int(self.spec_num_steps or 0)
+        if steps == 0:
+            return []
+        return [global_num_tokens] + [global_bs] * (steps - 1)
 
     @property
     def captures_prefill_graph(self) -> bool:

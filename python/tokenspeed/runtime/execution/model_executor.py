@@ -1422,9 +1422,9 @@ class ModelExecutor:
 
         # If a drafter is active, its model also has MoE layers that issue
         # NCCL collectives. Idle ranks must match those collectives: the
-        # drafter says how many draft forwards the active ranks run per round
-        # (idle_forward_steps) and how each one sizes its collectives
-        # (idle_step_global_num_tokens); every step runs the IDLE forward
+        # drafter lists the draft forwards the active ranks run per round,
+        # each as the per-rank token counts sizing its collectives
+        # (idle_forward_global_num_tokens); every step runs the IDLE forward
         # over an empty window with its own spec_step_idx.
         if self.drafter is not None:
             # A draft model that reads request-token history takes the view
@@ -1443,12 +1443,10 @@ class ModelExecutor:
                         committed_lengths=self.runtime_states.valid_cache_lengths,
                     )
                 )
-            for step_idx in range(self.drafter.idle_forward_steps):
-                draft_global_num_tokens = self.drafter.idle_step_global_num_tokens(
-                    step_idx,
-                    dp_metadata.global_num_tokens,
-                    dp_metadata.global_batch_size,
-                )
+            step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
+                dp_metadata.global_num_tokens, dp_metadata.global_batch_size
+            )
+            for step_idx, draft_global_num_tokens in enumerate(step_global_num_tokens):
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,

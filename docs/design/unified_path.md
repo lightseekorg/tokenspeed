@@ -173,13 +173,14 @@ touch a live request's cache. Eager passes `bs == actual_bs` (unpadded — no
 wasted FLOPs);
 `actual_bs == 0` is the idle replay. Eager idle bypasses the wrapper entirely
 (`execute_idle_forward` calls `model_runner.forward(IDLE)` directly). With a
-drafter, the eager idle then runs the drafter's `idle_forward_steps` IDLE
-draft forwards over an empty window, step `i` with `spec_step_idx=i` and the
-per-rank token counts the drafter's `idle_step_global_num_tokens` reports —
-the row shape the active ranks' step `i` runs (the Eagle chain: the target's
-rows at step 0, one row per request after; multi-depth MTP: the target's
-rows at every depth; block drafters: one step). The executor asks the
-drafter; it never derives a drafter's step shape itself.
+drafter, the eager idle then asks the drafter for its round
+(`idle_forward_global_num_tokens`): one list of per-rank token counts per
+draft forward the active ranks run, and runs one IDLE draft forward per
+entry over an empty window, entry `i` with `spec_step_idx=i` and that
+entry's counts — the row shape the active ranks' step `i` runs (the Eagle
+chain: the target's rows at step 0, one row per request after; multi-depth
+MTP: the target's rows at every depth; block drafters: one forward). The
+executor never derives a drafter's step count or shape itself.
 
 ### Pointer-stable per-bs views from one builder
 

@@ -4,6 +4,7 @@ from unittest import mock
 
 import torch
 
+from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle, EagleDraftInput
 from tokenspeed.runtime.execution.drafter.mtp import (
@@ -117,6 +118,64 @@ def _make_mtp(
     )
 
 
+def _recording_forward(calls: list[dict]):
+    """A draft ``forward`` recording each IDLE call's step and sizing."""
+
+    def draft_forward(ctx, input_ids, positions, spec_step_idx, **kwargs):
+        calls.append(
+            {
+                "mode": ctx.forward_mode,
+                "step": spec_step_idx,
+                "rows": input_ids.numel(),
+                "global_num_tokens": ctx.global_num_tokens,
+                "global_bs": ctx.global_bs,
+                "bs": ctx.bs,
+                "input_num_tokens": ctx.input_num_tokens,
+                "kwargs": kwargs,
+            }
+        )
+
+    return draft_forward
+
+
+def _run_idle_round(drafter) -> list[ForwardMode]:
+    """Run one idle-rank round (this rank idle, the peer decoding 2 requests
+    over 8 rows) through a stubbed executor; returns the target's forward
+    modes."""
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.execution.types import DpForwardMetadata
+
+    target_calls: list[ForwardMode] = []
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device = "cpu"
+    executor.input_buffers = SimpleNamespace(
+        req_pool_indices_buf=torch.zeros(4, dtype=torch.int64)
+    )
+    executor.runtime_states = SimpleNamespace(
+        valid_cache_lengths=torch.zeros(4, dtype=torch.int32), vocab_size=32
+    )
+    executor.attn_backend = SimpleNamespace()
+    executor.token_to_kv_pool = SimpleNamespace()
+    executor.model_runner = SimpleNamespace(
+        forward=lambda ctx, **kwargs: target_calls.append(ctx.forward_mode)
+    )
+    executor._model_input_kwargs = lambda bs, num_tokens: {}
+    executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
+    executor.drafter = drafter
+
+    executor.execute_idle_forward(
+        DpForwardMetadata(
+            global_num_tokens=[0, 8],
+            global_batch_size=[0, 2],
+            global_forward_mode=[ForwardMode.IDLE, ForwardMode.DECODE],
+            all_decode_or_idle=True,
+            all_extend=False,
+            need_idle_forward=True,
+        )
+    )
+    return target_calls
+
+
 class TestDrafterAcceptIndexing(unittest.TestCase):
     def test_mtp_stash_uses_request_pool_capacity(self):
         request_pool_rows = 18
@@ -156,67 +215,23 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         global_num_tokens = [8, 0, 12, 4]
         global_bs = [2, 0, 3, 1]
 
-        self.assertEqual(drafter.idle_forward_steps, 3)
-        for step_idx in range(3):
-            self.assertIs(
-                drafter.idle_step_global_num_tokens(
-                    step_idx, global_num_tokens, global_bs
-                ),
-                global_num_tokens,
-            )
+        steps = drafter.idle_forward_global_num_tokens(global_num_tokens, global_bs)
+
+        self.assertEqual(len(steps), 3)
+        for step in steps:
+            self.assertIs(step, global_num_tokens)
 
     def test_mtp_idle_rank_runs_one_empty_idle_forward_per_depth(self):
         # An idle DP rank's round: the executor runs the drafter's depth loop
         # as IDLE forwards over an empty window, one per depth with its own
         # spec_step_idx, each sized by the round's target token counts so the
         # rank enters the same collectives as the ranks with work.
-        from tokenspeed.runtime.execution.model_executor import ModelExecutor
-        from tokenspeed.runtime.execution.types import DpForwardMetadata
-
         calls: list[dict] = []
+        drafter = _make_mtp(
+            spec_num_steps=3, dp_size=2, draft_forward=_recording_forward(calls)
+        )
 
-        def draft_forward(ctx, input_ids, positions, spec_step_idx, **kwargs):
-            calls.append(
-                {
-                    "mode": ctx.forward_mode,
-                    "step": spec_step_idx,
-                    "rows": input_ids.numel(),
-                    "global_num_tokens": ctx.global_num_tokens,
-                    "global_bs": ctx.global_bs,
-                    "bs": ctx.bs,
-                    "input_num_tokens": ctx.input_num_tokens,
-                    "kwargs": kwargs,
-                }
-            )
-
-        drafter = _make_mtp(spec_num_steps=3, dp_size=2, draft_forward=draft_forward)
-        target_calls: list[ForwardMode] = []
-        executor = ModelExecutor.__new__(ModelExecutor)
-        executor.device = "cpu"
-        executor.input_buffers = SimpleNamespace(
-            req_pool_indices_buf=torch.zeros(4, dtype=torch.int64)
-        )
-        executor.runtime_states = SimpleNamespace(
-            valid_cache_lengths=torch.zeros(4, dtype=torch.int32), vocab_size=32
-        )
-        executor.attn_backend = SimpleNamespace()
-        executor.token_to_kv_pool = SimpleNamespace()
-        executor.model_runner = SimpleNamespace(
-            forward=lambda ctx, **kwargs: target_calls.append(ctx.forward_mode)
-        )
-        executor._model_input_kwargs = lambda bs, num_tokens: {}
-        executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
-        executor.drafter = drafter
-
-        dp_metadata = DpForwardMetadata(
-            global_num_tokens=[0, 8],
-            global_batch_size=[0, 2],
-            global_forward_mode=[ForwardMode.IDLE, ForwardMode.DECODE],
-            all_decode_or_idle=True,
-            all_extend=False,
-            need_idle_forward=True,
-        )
-        executor.execute_idle_forward(dp_metadata)
+        target_calls = _run_idle_round(drafter)
 
         self.assertEqual(target_calls, [ForwardMode.IDLE])
         self.assertEqual([c["step"] for c in calls], [0, 1, 2])
@@ -229,6 +244,39 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             self.assertEqual(call["global_bs"], [0, 2])
             # No request-token-history view: Mtp drafts do not read one.
             self.assertEqual(call["kwargs"], {})
+
+    def test_idle_round_follows_a_drafter_subclass_idle_hook(self):
+        # The executor iterates whatever the drafter's hook lists — one IDLE
+        # forward per entry, sized by that entry — so a subclass's override
+        # (here a block drafter's single step) shapes the round, not the
+        # base class's Eagle default.
+        class _BlockShaped(BaseDrafter):
+            def idle_forward_global_num_tokens(self, global_num_tokens, global_bs):
+                return [global_bs]
+
+            def run(self, *args, **kwargs):
+                raise AssertionError("idle rounds never draft")
+
+            def draft(self, *args, **kwargs):
+                raise AssertionError("idle rounds never draft")
+
+        calls: list[dict] = []
+        drafter = _BlockShaped(
+            spec_num_tokens=4,
+            spec_num_steps=3,
+            draft_model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(requires_request_token_history=False),
+                forward=_recording_forward(calls),
+            ),
+            attn_backend=SimpleNamespace(),
+        )
+
+        target_calls = _run_idle_round(drafter)
+
+        self.assertEqual(target_calls, [ForwardMode.IDLE])
+        self.assertEqual(
+            [(c["step"], c["global_num_tokens"]) for c in calls], [(0, [0, 2])]
+        )
 
     def test_dsa_leaf_mtp_frontier_re_expands_the_k_row_indexer_metadata(self):
         # The DSA leaf's k-row top-k reads one context length per query row
