@@ -29,8 +29,6 @@ large-M dense16 projection shapes.
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
@@ -44,6 +42,7 @@ LARGEM_NUM_WARPS = 8
 LARGEM_WARPS_M = 2
 LARGEM_WARPS_N = 4
 LARGEM_NUM_XCDS = 8
+LARGEM_NUM_CUS = 256
 LARGEM_GROUP_SIZE_M = 4
 LARGEM_K_TILE_PAIR = 2 * LARGEM_BLOCK_K
 LARGEM_MIN_K = 4 * LARGEM_BLOCK_K
@@ -551,11 +550,6 @@ def _supports_largem_shape(M: int, N: int, K: int) -> bool:
     return M >= 1 and N >= 1 and K >= LARGEM_MIN_K and K % LARGEM_K_TILE_PAIR == 0
 
 
-@lru_cache(maxsize=None)
-def _num_compute_units(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
 def supports_gluon_mm_a16w16_prefill_gfx950(M: int, N: int, K: int) -> bool:
     """Whether the prefill GEMM beats hipBLASLt for this K3 projection.
 
@@ -565,15 +559,14 @@ def supports_gluon_mm_a16w16_prefill_gfx950(M: int, N: int, K: int) -> bool:
         K: Reduction width.
 
     Returns:
-        True for a measured K3 ``(N, K)`` whose workgroups keep the current
-        device's CUs at least ``_PREFILL_MIN_CU_UTILIZATION`` busy.
+        True for a measured K3 ``(N, K)`` whose workgroups keep the CUs at
+        least ``_PREFILL_MIN_CU_UTILIZATION`` busy.
     """
     if M < 1 or (N, K) not in _PREFILL_SHAPES:
         return False
     workgroups = triton.cdiv(M, LARGEM_BLOCK_M) * triton.cdiv(N, LARGEM_BLOCK_N)
-    num_cus = _num_compute_units(torch.cuda.current_device())
-    rounds = triton.cdiv(workgroups, num_cus)
-    return workgroups >= _PREFILL_MIN_CU_UTILIZATION * rounds * num_cus
+    rounds = triton.cdiv(workgroups, LARGEM_NUM_CUS)
+    return workgroups >= _PREFILL_MIN_CU_UTILIZATION * rounds * LARGEM_NUM_CUS
 
 
 def _resolve_largem_output(

@@ -10,7 +10,6 @@ from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.ops.moe.sigmoid_topk import (
     _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
 )
-from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import largem
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -79,14 +78,12 @@ def test_kimi3_latent_projection_matches_torch(
     ],
 )
 def test_kimi3_latent_projection_dispatch_boundaries(
-    monkeypatch,
     m: int,
     k: int,
     n: int,
     uses_medium: bool,
     uses_large: bool,
 ) -> None:
-    monkeypatch.setattr(largem, "_num_compute_units", lambda _: 256)
     assert _use_gluon_mediumm(m, k, n) is uses_medium
     assert _use_gluon_largem(m, k, n) is uses_large
 

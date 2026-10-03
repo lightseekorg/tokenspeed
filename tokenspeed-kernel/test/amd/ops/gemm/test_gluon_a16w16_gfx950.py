@@ -31,7 +31,6 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import largem  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
     supports_gluon_mm_a16w16_prefill_gfx950,
@@ -323,8 +322,7 @@ def test_largem_masks_partial_tiles(shape: tuple[int, int, int]) -> None:
     assert torch.all(backing[:, n:] == 7.0)
 
 
-def test_prefill_routes_k3_shapes_with_busy_cus(monkeypatch) -> None:
-    monkeypatch.setattr(largem, "_num_compute_units", lambda _: 256)
+def test_prefill_routes_k3_shapes_with_busy_cus() -> None:
     # qkvfab spans 25 workgroups across N. 4096 tokens launch 400 workgroups,
     # busying 78% of 256 CUs over two rounds; 3072 tokens launch 300, which
     # leaves most CUs idle in the second round.
