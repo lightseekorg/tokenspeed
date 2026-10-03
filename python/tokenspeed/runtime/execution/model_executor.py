@@ -692,7 +692,8 @@ class ModelExecutor:
         # Decided here, once, so the ingress refuses such requests instead of
         # the data plane finding out.
         self.supports_prompt_logprobs: bool = (
-            config.pp_size == 1 and narrowing_prefill_model(model_runner.model) is None
+            self.config.pp_size == 1
+            and narrowing_prefill_model(self.model_runner.model) is None
         )
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
