@@ -215,8 +215,11 @@ class TestLongcatMoePlan(unittest.TestCase):
                     self.assertFalse(moe.experts.support_routing)
 
 
-def _fake_comm_ops(rank: int) -> dict:
-    """Single-process stand-ins for the comm ops, keyed by this rank's slot."""
+def _fake_comm_ops(rank: int, gathers: list | None = None) -> dict:
+    """Single-process stand-ins for the comm ops, keyed by this rank's slot.
+
+    ``gathers`` records the group of every all-gather when given.
+    """
 
     def all_reduce(tensor, group, **_):
         return tensor
@@ -224,6 +227,8 @@ def _fake_comm_ops(rank: int) -> dict:
     def token_all_gather(tensor, group, scattered_num_tokens):
         slot = group.index(rank)
         assert tensor.shape[0] == scattered_num_tokens[slot]
+        if gathers is not None:
+            gathers.append(group)
         out = tensor.new_zeros(sum(scattered_num_tokens), tensor.shape[1])
         offset = sum(scattered_num_tokens[:slot])
         out[offset : offset + tensor.shape[0]] = tensor
@@ -321,7 +326,12 @@ class TestLongcatRowLayout(unittest.TestCase):
 
         # attention TP 2 x DP 2, dense TP 2 (all-reduce), MoE EP 4 (RSAG).
         mapping = Mapping(
-            rank=1, world_size=4, attn_tp_size=2, dense_tp_size=2, moe_ep_size=4
+            rank=1,
+            world_size=4,
+            attn_tp_size=2,
+            attn_dp_size=2,
+            dense_tp_size=2,
+            moe_ep_size=4,
         )
         layer, rows_seen, out, residual = self._run(mapping=mapping, local_tokens=4)
 
@@ -338,7 +348,12 @@ class TestLongcatRowLayout(unittest.TestCase):
 
         # attention TP 2 x DP 2, dense TP 4 and MoE EP 4: both RSAG.
         mapping = Mapping(
-            rank=1, world_size=4, attn_tp_size=2, dense_tp_size=4, moe_ep_size=4
+            rank=1,
+            world_size=4,
+            attn_tp_size=2,
+            attn_dp_size=2,
+            dense_tp_size=4,
+            moe_ep_size=4,
         )
         layer, rows_seen, out, residual = self._run(mapping=mapping, local_tokens=4)
 
@@ -362,12 +377,55 @@ class TestLongcatRowLayout(unittest.TestCase):
         self.assertEqual(rows_seen["moe"], 4)
         self.assertEqual(out.shape[0], 4)
 
+    def test_idle_rank_joins_the_cross_dp_dense_collectives(self):
+        from tokenspeed.runtime.distributed import comm_manager as comm_module
+        from tokenspeed.runtime.distributed.mapping import Mapping
+
+        # Dense TP 4 spans both DP groups: an idle group must still take part
+        # in the MoE and both dense MLP all-gathers, in the active order.
+        mapping = Mapping(
+            rank=1,
+            world_size=4,
+            attn_tp_size=2,
+            attn_dp_size=2,
+            dense_tp_size=4,
+            moe_ep_size=4,
+        )
+        rows_seen: dict = {}
+        layer = self._layer(mapping, rows_seen)
+        ctx = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: True),
+            input_num_tokens=0,
+            global_num_tokens=[0, 0, 4, 4],
+            collective_num_tokens=None,
+            collective_global_num_tokens=None,
+        )
+        gathers: list = []
+        with mock.patch.multiple(comm_module, **_fake_comm_ops(mapping.rank, gathers)):
+            out, residual = layer.forward(
+                torch.empty(0, dtype=torch.int64),
+                torch.empty(0, self.HIDDEN),
+                ctx,
+                None,
+            )
+
+        self.assertEqual(gathers, [(0, 1, 2, 3)] * 3)
+        self.assertEqual(rows_seen["moe"], 4)
+        self.assertNotIn("attn0", rows_seen)
+        self.assertEqual(out.shape[0], 0)
+        self.assertIsNone(residual)
+
     def test_mixed_patterns_reject_allreduce_fusion(self):
         from tokenspeed.runtime.distributed.mapping import Mapping
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         mapping = Mapping(
-            rank=1, world_size=4, attn_tp_size=2, dense_tp_size=2, moe_ep_size=4
+            rank=1,
+            world_size=4,
+            attn_tp_size=2,
+            attn_dp_size=2,
+            dense_tp_size=2,
+            moe_ep_size=4,
         )
         with (
             mock.patch.dict(global_server_args_dict, {"enable_allreduce_fusion": True}),
