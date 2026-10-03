@@ -24,7 +24,9 @@ K3 uses two replicated dense projections around its routed expert block:
 7168 -> 3584 and 3584 -> 7168. This module keeps their shape contract explicit
 and provides gfx950-tuned Triton decode and Gluon middle/large-M implementations
 while retaining the vendor GEMM as a selectable fallback. KDA decode also uses
-a bandwidth-oriented fused Q/K/V/output-gate projection.
+a bandwidth-oriented fused Q/K/V/output-gate projection. On gfx950 the other
+K3 projections take the Gluon large-M kernel for the prefill token counts where
+it beats hipBLASLt.
 """
 
 from __future__ import annotations
@@ -68,6 +70,16 @@ except ImportError:
         return False
 
 
+try:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+        supports_gluon_mm_a16w16_prefill_gfx950,
+    )
+except ImportError:
+
+    def supports_gluon_mm_a16w16_prefill_gfx950(m: int, n: int, k: int) -> bool:
+        return False
+
+
 # FP8 storage dtypes served by the w8a8 projection branch (matches the
 # runtime quantization layers' width: e4m3fn on NVIDIA, e4m3fnuz on ROCm).
 _FP8_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
@@ -105,13 +117,49 @@ def _use_gluon_mediumm(m: int, k: int, n: int) -> bool:
 
 
 def _use_gluon_largem(m: int, k: int, n: int) -> bool:
-    if (k, n) == (KIMI3_HIDDEN_SIZE, KIMI3_LATENT_SIZE):
-        min_m = 4096
-    elif (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE):
-        min_m = 2048
-    else:
-        return False
-    return m >= min_m and m % 256 == 0
+    return (k, n) in _KIMI3_SHAPES and supports_gluon_mm_a16w16_prefill_gfx950(m, n, k)
+
+
+def _try_gluon_largem_gfx950(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Run the CDNA4 large-M kernel, or return None when the call is ineligible.
+
+    Named K3 APIs use this on their automatic path for the prefill shapes the
+    kernel was measured to win; BF16 ``UnquantizedLinearMethod`` layers reach
+    the same kernel through the ``mm`` registry.
+    """
+
+    if (
+        not Platform.get().is_cdna4
+        or activation.ndim != 2
+        or weight.ndim != 2
+        or activation.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or not activation.is_cuda
+        or weight.device != activation.device
+        or not activation.is_contiguous()
+        or not weight.is_contiguous()
+        or (
+            out is not None and (out.device != activation.device or out.stride(-1) != 1)
+        )
+        or not supports_gluon_mm_a16w16_prefill_gfx950(
+            int(activation.shape[0]),
+            int(weight.shape[0]),
+            int(activation.shape[1]),
+        )
+    ):
+        return None
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+        launch_gluon_mm_a16w16_prefill_gfx950,
+    )
+
+    return launch_gluon_mm_a16w16_prefill_gfx950(
+        activation, weight, activation.dtype, out=out
+    )
 
 
 def _try_gluon_largem_gfx1250(
@@ -469,9 +517,7 @@ def kimi3_latent_projection(
             out=out,
         )
         if output is None:
-            raise ValueError(
-                "Kimi K3 Gluon latent projection requires an aligned large-M shape"
-            )
+            raise ValueError("Kimi K3 Gluon latent projection rejected this shape")
         return output
     if solution == "gluon_largem_gfx1250":
         if not (
@@ -521,6 +567,7 @@ def kimi3_mla_qkv_gate_projection(
         None,
         name="Kimi K3 MLA QKV/gate projection",
     )
+    routed = solution == "auto"
     if not 0 < qkv_width < output_width:
         raise ValueError(
             f"Kimi K3 MLA qkv_width must be within (0, {output_width}), got {qkv_width}"
@@ -644,8 +691,14 @@ def kimi3_mla_qkv_gate_projection(
         )
         return Kimi3MLAQKVGateProjection(qkv=qkv, gate=gate, packed=None)
 
-    qkv = torch.nn.functional.linear(hidden_states, weight[:qkv_width])
-    gate = torch.nn.functional.linear(hidden_states, weight[qkv_width:])
+    qkv_weight = weight[:qkv_width]
+    gate_weight = weight[qkv_width:]
+    qkv = _try_gluon_largem_gfx950(hidden_states, qkv_weight) if routed else None
+    if qkv is None:
+        qkv = torch.nn.functional.linear(hidden_states, qkv_weight)
+    gate = _try_gluon_largem_gfx950(hidden_states, gate_weight) if routed else None
+    if gate is None:
+        gate = torch.nn.functional.linear(hidden_states, gate_weight)
     return Kimi3MLAQKVGateProjection(qkv=qkv, gate=gate, packed=None)
 
 
@@ -994,8 +1047,10 @@ def kimi3_shared_situ_projection(
         beta: Positive SiTU gate soft-clipping scale.
         linear_beta: Optional positive SiTU up-branch soft-clipping scale.
         out: Optional contiguous BF16 output shaped ``[M, 768]``.
-        solution: ``"auto"`` selects the fused gfx950 kernel and otherwise
-            uses the portable Torch projection plus TokenSpeed SiTU kernel.
+        solution: ``"auto"`` selects the fused gfx950 decode kernel, or the
+            Gluon large-M projection for measured prefill token counts, and
+            otherwise uses the portable Torch projection plus TokenSpeed SiTU
+            kernel.
 
     Returns:
         The local activated shared-expert rows shaped ``[M, 768]``.
@@ -1071,9 +1126,11 @@ def kimi3_shared_situ_projection(
 
         gate_up = decode_gemv(hidden_states, gate_up_weight)
     else:
-        gate_up = (
-            _try_gluon_largem_gfx1250(hidden_states, gate_up_weight) if routed else None
-        )
+        gate_up = None
+        if routed:
+            gate_up = _try_gluon_largem_gfx1250(hidden_states, gate_up_weight)
+            if gate_up is None:
+                gate_up = _try_gluon_largem_gfx950(hidden_states, gate_up_weight)
         if gate_up is None:
             gate_up = torch.nn.functional.linear(hidden_states, gate_up_weight)
     if gate_up.is_cuda:
@@ -1111,7 +1168,8 @@ def kimi3_shared_down_projection(
             the tensor contract; otherwise Torch writes into the same destination.
             Row-strided outputs require unit inner stride and non-overlapping
             rows, and are supported only by ``"auto"`` and ``"torch"``.
-        solution: ``"auto"`` selects the gfx950 decode GEMV and otherwise
+        solution: ``"auto"`` selects the gfx950 decode GEMV, or the Gluon
+            large-M kernel for measured prefill token counts, and otherwise
             uses the portable Torch linear operation.
 
     Returns:
@@ -1158,6 +1216,10 @@ def kimi3_shared_down_projection(
             return gluon_wmma_tdm_dense_gfx1250(
                 hidden_states, weight, out=out, split_k=None
             )
+        if solution == "auto":
+            output = _try_gluon_largem_gfx950(hidden_states, weight, out=out)
+            if output is not None:
+                return output
         return torch.mm(hidden_states, weight.T, out=out)
     expected_output = (m, output_width)
     if out is None:
@@ -1234,6 +1296,10 @@ def kimi3_shared_down_projection(
             weight,
             out=out,
         )
+    if routed:
+        output = _try_gluon_largem_gfx950(hidden_states, weight, out=out)
+        if output is not None:
+            return output
     return torch.mm(hidden_states, weight.T, out=out)
 
 
@@ -1271,8 +1337,8 @@ def kimi3_qkvfab_projection(
         out: Optional contiguous BF16 output buffer shaped ``[M, N]``.
         solution: ``"auto"`` selects the architecture-specific BF16 route;
             ``"triton_gemv"``, ``"gluon_wmma_gfx1250"``,
-            ``"gluon_largem_gfx1250"``, and ``"torch"`` force one.
-            (BF16 path only.)
+            ``"gluon_largem_gfx1250"``, ``"gluon_largem"`` (gfx950 prefill),
+            and ``"torch"`` force one. (BF16 path only.)
 
     Returns:
         The projected BF16 tensor shaped ``[M, N]``.
@@ -1320,6 +1386,7 @@ def kimi3_qkvfab_projection(
         "triton_gemv",
         "gluon_wmma_gfx1250",
         "gluon_largem_gfx1250",
+        "gluon_largem",
         "torch",
     }:
         raise ValueError(f"unknown Kimi K3 QKVFAB solution {solution!r}")
@@ -1363,6 +1430,17 @@ def kimi3_qkvfab_projection(
             solution = "gluon_largem_gfx1250"
         elif Platform.get().is_cdna4 and specialized and m == 1:
             solution = "triton_gemv"
+        elif (
+            Platform.get().is_cdna4
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and weight.is_contiguous()
+            and (out is None or out.is_contiguous())
+            and supports_gluon_mm_a16w16_prefill_gfx950(m, output_width, input_width)
+        ):
+            solution = "gluon_largem"
         elif specialized or use_decode_gemv(hidden_states, weight):
             # Let the registry pick per (M, N, K); unlisted shapes hit torch.mm.
             solution = "decode_gemv"
@@ -1415,6 +1493,29 @@ def kimi3_qkvfab_projection(
             config=(8, 512, 8, 1),
             validate=False,
         )
+    if solution == "gluon_largem":
+        if not (
+            Platform.get().is_cdna4
+            and hidden_states.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and weight.is_contiguous()
+            and (out is None or out.is_contiguous())
+        ):
+            raise ValueError(
+                "Kimi K3 gfx950 QKVFAB Gluon projection requires contiguous "
+                "BF16 inputs and output"
+            )
+        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+            launch_gluon_mm_a16w16_prefill_gfx950,
+        )
+
+        output = launch_gluon_mm_a16w16_prefill_gfx950(
+            hidden_states, weight, hidden_states.dtype, out=out
+        )
+        if output is None:
+            raise ValueError("Kimi K3 gfx950 QKVFAB Gluon projection rejected shape")
+        return output
     if solution == "gluon_largem_gfx1250":
         if not (
             Platform.get().is_cdna5

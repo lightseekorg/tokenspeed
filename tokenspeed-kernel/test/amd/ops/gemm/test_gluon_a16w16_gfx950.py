@@ -32,8 +32,8 @@ if not is_cdna4():
 
 
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
-    _supports_largem_shape,
     launch_gluon_mm_a16w16_prefill_gfx950,
+    supports_gluon_mm_a16w16_prefill_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _choose_mfma_lds_mediumm_config,
@@ -298,18 +298,47 @@ def test_use_mediumm_routes_configured_shapes() -> None:
     assert not _use_mfma_lds_mediumm(640, 3584, 7168)
 
 
-def test_supports_largem_shape_covers_aligned_prefill_tiles() -> None:
-    assert _supports_largem_shape(256, 256, 256)
-    assert _supports_largem_shape(2048, 8192, 8192)
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((300, 6288, 7168), id="qkvfab-ragged-mn"),
+        pytest.param((77, 100, 512), id="sub-tile"),
+        pytest.param((3001, 7168, 4224), id="odd-k-pairs"),
+    ],
+)
+def test_largem_masks_partial_tiles(shape: tuple[int, int, int]) -> None:
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    m, n, k = shape
+    a = torch.randn((m, k), device="cuda", dtype=dtype) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=dtype) * 0.25
+    # A sentinel-filled padded row stride catches stores past column N.
+    backing = torch.full((m, n + 16), 7.0, device="cuda", dtype=dtype)
+    out = backing[:, :n]
+
+    launch_gluon_mm_a16w16_prefill_gfx950(a, b, dtype, out=out)
+
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=_ATOL, rtol=_RTOL)
+    assert torch.all(backing[:, n:] == 7.0)
 
 
-def test_supports_largem_shape_rejects_unaligned_or_medium_shapes() -> None:
-    assert not _supports_largem_shape(128, 4096, 4096)
-    assert not _supports_largem_shape(256, 128, 256)
-    assert not _supports_largem_shape(256, 256, 128)
-    assert not _supports_largem_shape(256, 1280, 2880)
-    assert not _supports_largem_shape(384, 4096, 4096)
-    assert not _supports_largem_shape(512, 3968, 4096)
+def test_prefill_routes_k3_shapes_with_busy_cus() -> None:
+    # qkvfab spans 25 workgroups across N. 4096 tokens launch 400 workgroups,
+    # busying 78% of 256 CUs over two rounds; 3072 tokens launch 300, which
+    # leaves most CUs idle in the second round.
+    assert supports_gluon_mm_a16w16_prefill_gfx950(4096, 6288, 7168)
+    assert supports_gluon_mm_a16w16_prefill_gfx950(4000, 6288, 7168)
+    assert not supports_gluon_mm_a16w16_prefill_gfx950(3072, 6288, 7168)
+    assert not supports_gluon_mm_a16w16_prefill_gfx950(1024, 6288, 7168)
+    # Past two rounds the long qkvfab reduction needs nearly every CU busy:
+    # 8192 tokens busy 78% over four rounds, 12288 tokens 94% over five. The
+    # short attention output reduction keeps the base rule.
+    assert not supports_gluon_mm_a16w16_prefill_gfx950(8192, 6288, 7168)
+    assert supports_gluon_mm_a16w16_prefill_gfx950(12288, 6288, 7168)
+    assert supports_gluon_mm_a16w16_prefill_gfx950(8192, 7168, 1536)
+    # Unmeasured or losing shapes keep hipBLASLt at any token count.
+    assert not supports_gluon_mm_a16w16_prefill_gfx950(4096, 4096, 4096)
+    assert not supports_gluon_mm_a16w16_prefill_gfx950(7168, 2304, 1536)
 
 
 def test_use_largem_routes_only_dispatch_target_shapes() -> None:
