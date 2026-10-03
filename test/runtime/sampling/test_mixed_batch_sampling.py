@@ -94,6 +94,7 @@ def test_verify_reads_decode_rows_own_coins():
     )
 
     config = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         max_bs=MAX_BS,
         max_draft_tokens_per_req=MAX_N,
         max_req_pool_size=POOL,
@@ -173,6 +174,7 @@ def test_mixed_round_preserves_prefill_outputs():
     )
 
     config = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         max_bs=MAX_BS,
         max_draft_tokens_per_req=MAX_N,
         max_req_pool_size=POOL,
@@ -246,6 +248,7 @@ def test_mixed_round_preserves_prefill_logprobs():
     from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
 
     config = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         max_bs=MAX_BS,
         max_draft_tokens_per_req=MAX_N,
         max_req_pool_size=POOL,

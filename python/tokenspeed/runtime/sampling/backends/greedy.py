@@ -129,6 +129,8 @@ class GreedySamplingBackend(SamplingBackend):
     supported. Intended as the default backend and as a fallback when
     flashinfer is unavailable."""
 
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
+
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         super().__init__(config)
@@ -214,6 +216,16 @@ class GreedySamplingBackend(SamplingBackend):
             batch_size=bs,
             num_draft_tokens=num_tokens_per_req,
         )
+
+        # Retain normal verification cost before forcing benchmark acceptance.
+        if self.config.synthetic_acceptance_length is not None:
+            lengths = self.synthetic_lengths(candidates, sampling_info.batch_row_offset)
+            target_tokens = target_predict.gather(
+                1, (lengths - 1).long()[:, None]
+            ).squeeze(1)
+            self.write_synthetic_outputs(
+                candidates, target_tokens, lengths, predict, accept_index, accept_length
+            )
 
         accept_length += 1
 
