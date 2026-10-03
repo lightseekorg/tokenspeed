@@ -145,6 +145,7 @@ class ModelRunner:
             model_profile=model_config.model_profile,
             architecture=resolve_architecture(model_config.hf_config),
             quantization=model_config.quantization,
+            allow_unverified=server_args.allow_unverified_numerics,
         )
 
         draft_moe_override = (

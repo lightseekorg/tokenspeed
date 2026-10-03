@@ -307,7 +307,11 @@ class TestModelVerificationGate(unittest.TestCase):
         from tokenspeed.runtime.configs.numerics import require_verified_numerics
 
         require_verified_numerics(
-            "auto", model_profile=None, architecture="X", quantization="fp8"
+            "auto",
+            model_profile=None,
+            architecture="X",
+            quantization="fp8",
+            allow_unverified=False,
         )
 
     def test_rl_bitwise_requires_a_verified_unquantized_model(self):
@@ -315,7 +319,11 @@ class TestModelVerificationGate(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "has not been verified"):
             require_verified_numerics(
-                "rl-bitwise", model_profile=None, architecture="X", quantization=None
+                "rl-bitwise",
+                model_profile=None,
+                architecture="X",
+                quantization=None,
+                allow_unverified=False,
             )
         with self.assertRaisesRegex(ValueError, "has not been verified"):
             require_verified_numerics(
@@ -323,6 +331,7 @@ class TestModelVerificationGate(unittest.TestCase):
                 model_profile=self._profile({"auto"}),
                 architecture="X",
                 quantization=None,
+                allow_unverified=False,
             )
         verified = self._profile({"auto", "rl-bitwise"})
         with self.assertRaisesRegex(ValueError, "fp8-quantized"):
@@ -331,9 +340,14 @@ class TestModelVerificationGate(unittest.TestCase):
                 model_profile=verified,
                 architecture="X",
                 quantization="fp8",
+                allow_unverified=False,
             )
         require_verified_numerics(
-            "rl-bitwise", model_profile=verified, architecture="X", quantization=None
+            "rl-bitwise",
+            model_profile=verified,
+            architecture="X",
+            quantization=None,
+            allow_unverified=False,
         )
 
     def test_profile_envelopes_are_validated(self):
@@ -353,13 +367,48 @@ class TestModelVerificationGate(unittest.TestCase):
                 model_profile=self._profile({"auto", "rl-bitwise"}),
                 architecture="X",
                 quantization=None,
+                allow_unverified=False,
             )
         require_verified_numerics(
             "trainer-aligned",
             model_profile=self._profile({"auto", "rl-bitwise", "trainer-aligned"}),
             architecture="X",
             quantization=None,
+            allow_unverified=False,
         )
+
+    def test_the_harness_bootstrap_override_warns_instead_of_refusing(self):
+        # A model earns an envelope by passing its harness, which has to run
+        # before the profile declares it: --allow-unverified-numerics lets the
+        # engine start under the undeclared envelope, loudly.
+        from tokenspeed.runtime.configs import numerics as numerics_module
+        from tokenspeed.runtime.configs.numerics import require_verified_numerics
+
+        self.assertFalse(ServerArgs(model="x").allow_unverified_numerics)
+        self.assertTrue(
+            ServerArgs(
+                model="x", allow_unverified_numerics=True
+            ).allow_unverified_numerics
+        )
+        with self.assertLogs(numerics_module.logger, level="WARNING") as logs:
+            require_verified_numerics(
+                "trainer-aligned",
+                model_profile=self._profile({"auto", "rl-bitwise"}),
+                architecture="X",
+                quantization=None,
+                allow_unverified=True,
+            )
+        self.assertIn("NOT promised", "\n".join(logs.output))
+        # The quantization refusal is a hard incompatibility, not a
+        # verification gap: the override does not lift it.
+        with self.assertRaisesRegex(ValueError, "fp8-quantized"):
+            require_verified_numerics(
+                "rl-bitwise",
+                model_profile=None,
+                architecture="X",
+                quantization="fp8",
+                allow_unverified=True,
+            )
 
 
 class TestCanonicalGreedyTies(unittest.TestCase):

@@ -437,6 +437,10 @@ class ServerArgs:
     # folds those and then the trainer-operation-order switches. Each folded
     # switch can still be set individually; the umbrella only ever tightens.
     numerics: str = "auto"
+    # Development override: start an envelope the model's profile does not
+    # declare (with a warning) so the acceptance harness can run against it;
+    # the envelope's contract is not promised under it.
+    allow_unverified_numerics: bool = False
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics trainer-aligned.
@@ -2861,6 +2865,15 @@ class ServerArgs:
             "trainer-aligned folds those and then the trainer-operation-order "
             "switches (docs/design/numerics.md, alignment.trainer); a model "
             "serves it only once its forward is verified against the trainer.",
+        )
+        parser.add_argument(
+            "--allow-unverified-numerics",
+            action="store_true",
+            help="Development override: start a --numerics envelope the "
+            "model's profile does not declare, with a warning, so the "
+            "envelope's acceptance harness (docs/design/numerics.md) can run "
+            "against the model before it declares the envelope. The contract "
+            "is not promised under it; quantized checkpoints stay refused.",
         )
         parser.add_argument(
             "--yarn-ramp-mask-device",

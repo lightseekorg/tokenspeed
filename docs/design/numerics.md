@@ -336,3 +336,13 @@ model that does not list it — every in-tree model included, since none has
 a profile. Quantized checkpoints are refused too: no batch-invariant
 quantized GEMM leaf exists, so their linears would select shape-dependent
 ones.
+
+The harness that earns an envelope has to run before the profile declares
+it, and the gate would refuse exactly that launch. `--allow-unverified-numerics`
+is the development override for this bootstrap: the engine starts under the
+undeclared envelope with every switch folded, logs a warning that the
+contract is not promised, and the harness runs against it; only once it
+passes does the model add the envelope to its profile and drop the flag. The
+override lifts the declaration check alone — a quantized checkpoint stays
+refused, because that is an incompatibility, not a missing verification —
+and a deployment that serves with it advertises nothing.

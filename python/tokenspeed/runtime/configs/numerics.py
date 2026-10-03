@@ -28,10 +28,13 @@ harness passes for its checkpoint and kernel selection.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_profile import ModelProfile
+
+logger = logging.getLogger(__name__)
 
 # Every envelope name, the default first. A model always serves ``auto``.
 # ``trainer-aligned`` tightens ``rl-bitwise``: it folds every rl-bitwise switch
@@ -106,6 +109,7 @@ def require_verified_numerics(
     model_profile: ModelProfile | None,
     architecture: str,
     quantization: str | None,
+    allow_unverified: bool,
 ) -> None:
     """Refuse a model that the requested envelope has not been verified for.
 
@@ -115,11 +119,16 @@ def require_verified_numerics(
             model (none of which is verified under an envelope beyond auto).
         architecture: The model's architecture name, for the error.
         quantization: The checkpoint's resolved quantization method, or None.
+        allow_unverified: ``--allow-unverified-numerics``: let an undeclared
+            envelope start, with a warning, so the acceptance harness can run
+            against the model before its profile declares the envelope. The
+            quantization refusal is a hard incompatibility and stands.
 
     Raises:
-        ValueError: The envelope is not verified for this model, or the
-            checkpoint is quantized (no batch-invariant quantized GEMM leaf
-            exists, so quantized linears would select shape-dependent ones).
+        ValueError: The envelope is not verified for this model (unless
+            ``allow_unverified``), or the checkpoint is quantized (no
+            batch-invariant quantized GEMM leaf exists, so quantized linears
+            would select shape-dependent ones).
     """
     if numerics == "auto":
         return
@@ -129,11 +138,18 @@ def require_verified_numerics(
             if numerics == "trainer-aligned"
             else "the bitwise invariance harness passes"
         )
-        raise ValueError(
-            f"--numerics {numerics} is a contract verified per model, and "
-            f"{architecture} has not been verified under it: its model profile "
-            f"must list {numerics!r} in numerics_envelopes, which a model "
-            f"declares once {harness} for it"
+        if not allow_unverified:
+            raise ValueError(
+                f"--numerics {numerics} is a contract verified per model, and "
+                f"{architecture} has not been verified under it: its model "
+                f"profile must list {numerics!r} in numerics_envelopes, which a "
+                f"model declares once {harness} for it (or launch with "
+                "--allow-unverified-numerics to run that harness)"
+            )
+        logger.warning(
+            f"--allow-unverified-numerics: serving {architecture} under "
+            f"--numerics {numerics}, which its model profile does not declare; "
+            f"the envelope's contract is NOT promised until {harness} for it"
         )
     if quantization is not None:
         raise ValueError(
