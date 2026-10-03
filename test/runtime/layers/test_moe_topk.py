@@ -111,3 +111,20 @@ def test_correction_bias_route_forwards_renormalize(
     )
 
     assert calls == [renormalize]
+
+
+def test_simulated_routing_spreads_tokens_over_fixed_experts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TOKENSPEED_MOE_ROUTING_SIMULATION", "uniform")
+    monkeypatch.setattr(topk_module, "_simulated_logits", {})
+    topk = TopK(top_k=16, output_format=TopKOutputFormat.BYPASSED)
+    hidden_states = torch.empty((16, 4))
+    router_logits = torch.zeros((16, 896))
+
+    logits = topk(hidden_states, router_logits).router_logits
+    # 16 tokens choosing 16 of 896 experts at random touch ~223 experts.
+    assert torch.topk(logits, 16).indices.unique().numel() > 180
+
+    again = topk(hidden_states[:4], router_logits[:4]).router_logits
+    assert torch.equal(again, logits[:4])

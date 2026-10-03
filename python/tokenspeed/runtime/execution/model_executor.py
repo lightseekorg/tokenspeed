@@ -45,6 +45,11 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.engine.scheduler_utils import engram_context_len
+from tokenspeed.runtime.execution.accept_simulation import (
+    ACCEPT_LENGTH_SCALE,
+    parse_simulated_accept_length,
+    simulated_accept_lengths,
+)
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
@@ -488,6 +493,17 @@ class ModelExecutor:
             )
         else:
             self.drafter = None
+        self._simulated_accept_length = parse_simulated_accept_length(
+            envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get(),
+            spec_algorithm=config.spec_algo,
+            verify_width=config.output_length,
+        )
+        if self._simulated_accept_length is not None:
+            logger.info(
+                "Simulating speculative acceptance: every verify step keeps "
+                f"{self._simulated_accept_length / ACCEPT_LENGTH_SCALE:g} tokens "
+                f"per request on average, of up to {config.output_length:d}"
+            )
 
         self.grammar_runtime = create_grammar_runtime(
             grammar_backend=config.grammar_backend,
@@ -1048,6 +1064,25 @@ class ModelExecutor:
             )
         return kwargs
 
+    def _apply_simulated_accept_length(
+        self, accept_lengths: torch.Tensor, row_offset: int
+    ) -> torch.Tensor:
+        """Replace verified widths with the simulated average, in place.
+
+        Writing into the sampler's buffer keeps the packed output D2H path.
+        """
+        scaled_length = self._simulated_accept_length
+        if scaled_length is None or accept_lengths.numel() == 0:
+            return accept_lengths
+        pool_indices = self.input_buffers.req_pool_indices_buf[
+            row_offset : row_offset + accept_lengths.shape[0]
+        ]
+        cache_lengths = self.runtime_states.valid_cache_lengths.index_select(
+            0, pool_indices
+        )
+        accept_lengths.copy_(simulated_accept_lengths(cache_lengths, scaled_length))
+        return accept_lengths
+
     def _apply_force_single_token_verify(
         self,
         accept_lengths: torch.Tensor,
@@ -1108,6 +1143,7 @@ class ModelExecutor:
             output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output, sampling_info, candidates
             )
+            accept_lengths = self._apply_simulated_accept_length(accept_lengths, 0)
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
             )
@@ -1160,6 +1196,7 @@ class ModelExecutor:
                 ),
                 candidates,
             )
+            lengths = self._apply_simulated_accept_length(lengths, num_extends)
             lengths = self._apply_force_single_token_verify(
                 lengths, num_extends, num_decodes, ctx.decode_input_ids
             )
