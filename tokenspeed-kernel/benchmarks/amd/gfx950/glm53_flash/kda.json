@@ -75,7 +75,8 @@
           "lower_bound": -5,
           "recurrent_layout": "v_major",
           "batch": 1,
-          "tokens_per_sequence": 8192
+          "tokens_per_sequence": 8192,
+          "inputs_packed": false
         },
         "cold_cache": true,
         "seed": 801
@@ -102,7 +103,8 @@
           "lower_bound": -5,
           "recurrent_layout": "v_major",
           "batch": 1,
-          "tokens_per_sequence": 256
+          "tokens_per_sequence": 256,
+          "inputs_packed": false
         },
         "cold_cache": true,
         "seed": 901
@@ -129,7 +131,8 @@
           "lower_bound": -5,
           "recurrent_layout": "v_major",
           "batch": [2, 4, 8, 16],
-          "tokens_per_sequence": 256
+          "tokens_per_sequence": 256,
+          "inputs_packed": false
         },
         "cold_cache": true,
         "seed": 901
@@ -156,7 +159,8 @@
           "lower_bound": -5,
           "recurrent_layout": "v_major",
           "batch": [1, 2],
-          "tokens_per_sequence": 64
+          "tokens_per_sequence": 64,
+          "inputs_packed": false
         },
         "cold_cache": true,
         "seed": 1001
@@ -183,7 +187,8 @@
           "lower_bound": -5,
           "recurrent_layout": "v_major",
           "batch": [4, 8, 16],
-          "tokens_per_sequence": 64
+          "tokens_per_sequence": 64,
+          "inputs_packed": false
         },
         "cold_cache": true,
         "seed": 1001

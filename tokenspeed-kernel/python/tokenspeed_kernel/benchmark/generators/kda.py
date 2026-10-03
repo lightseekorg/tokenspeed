@@ -227,20 +227,32 @@ def _packed_prefill_inputs(
     tokens: int,
     profile: _KdaModelProfile,
     *,
+    inputs_packed: bool,
     dtype: torch.dtype,
     generator: torch.Generator,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build prefill inputs in the layout the model hands the scan.
+
+    Without checkpoint packing, beta logits stay a strided view of the input
+    projection. When a multi-request prefill splits at state checkpoints, the
+    checkpoint packer copies every input into contiguous buffers.
+    """
     shape = (1, tokens, profile.heads, profile.head_dim)
     q = _randn(shape, dtype=dtype, generator=generator)
     k = _randn(shape, dtype=dtype, generator=generator)
     v = _randn(shape, dtype=dtype, generator=generator)
     g_raw = _randn(shape, dtype=dtype, generator=generator)
-    beta_logits = _packed_beta_logits(
-        tokens,
-        profile,
-        dtype=dtype,
-        generator=generator,
-    )
+    if inputs_packed:
+        beta_logits = _randn(
+            (1, tokens, profile.heads), dtype=dtype, generator=generator
+        )
+    else:
+        beta_logits = _packed_beta_logits(
+            tokens,
+            profile,
+            dtype=dtype,
+            generator=generator,
+        )
     return q, k, v, g_raw, beta_logits
 
 
@@ -384,6 +396,12 @@ def prepare_kda_paged_prefill(
     batch = request.parameters["batch"]
     tokens_per_sequence = request.parameters["tokens_per_sequence"]
     total_tokens = batch * tokens_per_sequence
+    inputs_packed = request.parameters["inputs_packed"]
+    if not isinstance(inputs_packed, bool):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "KDA inputs_packed must be a boolean",
+        )
 
     load_builtin_kernels()
     spec = _select_registration(request, platform, traits=None)
@@ -392,6 +410,7 @@ def prepare_kda_paged_prefill(
     q, k, v, g_raw, beta_logits = _packed_prefill_inputs(
         total_tokens,
         _MODEL_PROFILES[model_profile],
+        inputs_packed=inputs_packed,
         dtype=dtype,
         generator=generator,
     )
@@ -429,7 +448,7 @@ def prepare_kda_paged_prefill(
             cu_seqlens=kernel_cu_seqlens,
             cu_seqlens_cpu=cu_seqlens_cpu,
             capacity=None,
-            inputs_packed=False,
+            inputs_packed=inputs_packed,
             lower_bound=lower_bound,
             override=request.registration,
             solution=request.solution,
@@ -449,6 +468,7 @@ def prepare_kda_paged_prefill(
         "batch": batch,
         "tokens_per_sequence": tokens_per_sequence,
         "total_tokens": total_tokens,
+        "inputs_packed": inputs_packed,
         "beta_token_stride": beta_logits.stride(1),
         "source_sequence_boundaries_dtype": "int64",
         "kernel_sequence_boundaries_dtype": "int32",

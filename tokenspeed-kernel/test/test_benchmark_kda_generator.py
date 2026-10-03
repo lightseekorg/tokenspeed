@@ -100,11 +100,16 @@ def test_kda_generator_builds_glm_decode_input_strides(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("model_profile", "head_stride", "projection_width"),
-    [("glm53_flash_tp4", 2048, 6416), ("kimi_k3_tp8", 1536, 6288)],
+    ("model_profile", "inputs_packed", "head_stride", "beta_row_stride"),
+    [
+        ("glm53_flash_tp4", False, 2048, 6416),
+        ("kimi_k3_tp8", False, 1536, 6288),
+        # The checkpoint packer leaves beta logits contiguous.
+        ("kimi_k3_tp8", True, 1536, 12),
+    ],
 )
 def test_kda_generator_builds_prefill_input_layouts(
-    monkeypatch, model_profile, head_stride, projection_width
+    monkeypatch, model_profile, inputs_packed, head_stride, beta_row_stride
 ) -> None:
     def cpu_randn(shape, *, dtype, generator):
         _ = generator
@@ -114,6 +119,7 @@ def test_kda_generator_builds_prefill_input_layouts(
     q, k, v, g_raw, beta = kda_generator._packed_prefill_inputs(
         4,
         kda_generator._MODEL_PROFILES[model_profile],
+        inputs_packed=inputs_packed,
         dtype=torch.bfloat16,
         generator=None,
     )
@@ -122,7 +128,7 @@ def test_kda_generator_builds_prefill_input_layouts(
     assert k.stride() == q.stride()
     assert v.stride() == q.stride()
     assert g_raw.stride() == q.stride()
-    assert beta.stride() == (4 * projection_width, projection_width, 1)
+    assert beta.stride() == (4 * beta_row_stride, beta_row_stride, 1)
 
 
 def test_kda_generator_builds_int64_prefill_boundaries() -> None:
@@ -208,6 +214,7 @@ def test_kda_prefill_binds_chunk_hint_to_converted_boundaries(
                 "recurrent_layout": "v_major",
                 "batch": 1,
                 "tokens_per_sequence": 64,
+                "inputs_packed": False,
             },
             solution=None,
             registration=None,
