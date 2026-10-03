@@ -28,6 +28,7 @@ optional sliding window, optional sinks, and optional natural-log LSE output.
 from __future__ import annotations
 
 import math
+import os
 from typing import NamedTuple
 
 import torch
@@ -66,6 +67,8 @@ class AttentionConfig:
     PACKED_GQA: gl.constexpr
     GUARDED_QUERY_ROWS: gl.constexpr
     WIDE_ADDRESSING: gl.constexpr
+    FIXED_REFERENCE: gl.constexpr
+    DISABLE_XDL_ARB_STALL: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -100,6 +103,8 @@ class AttentionConfig:
         PACKED_GQA,
         GUARDED_QUERY_ROWS,
         WIDE_ADDRESSING,
+        FIXED_REFERENCE,
+        DISABLE_XDL_ARB_STALL,
         q_strides,
         k_strides,
         v_strides,
@@ -151,6 +156,8 @@ class AttentionConfig:
         self.PACKED_GQA = gl.constexpr(PACKED_GQA)
         self.GUARDED_QUERY_ROWS = gl.constexpr(GUARDED_QUERY_ROWS)
         self.WIDE_ADDRESSING = gl.constexpr(WIDE_ADDRESSING)
+        self.FIXED_REFERENCE = gl.constexpr(FIXED_REFERENCE)
+        self.DISABLE_XDL_ARB_STALL = gl.constexpr(DISABLE_XDL_ARB_STALL)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -577,6 +584,15 @@ class AttentionProgram:
         return p, alpha, m_new
 
     @gluon.jit
+    def softmax_part0_fixed_reference(self, qk, m_i, reference_m):
+        """Keep probabilities in one scale so acc/l need no per-tile rescale."""
+        cfg = self.cfg
+        row_max_scaled = max(qk, 1) * cfg.SM_SCALE
+        m_new = maximum(m_i, row_max_scaled)
+        p = gl.exp2(qk * cfg.SM_SCALE - reference_m[:, None])
+        return p, m_new
+
+    @gluon.jit
     def softmax_part1(self, p, l_i, acc, alpha):
         cfg = self.cfg
         l_ij = gl.sum(p, axis=1)
@@ -585,6 +601,14 @@ class AttentionProgram:
         p = p.to(self.q_ptr.dtype.element_ty)
         p = gl.convert_layout(p, cfg.p_layout)
         return p, l_i, acc
+
+    @gluon.jit
+    def softmax_part1_deferred(self, p, l_i):
+        """Accumulate numerator and denominator in their shared fixed scale."""
+        cfg = self.cfg
+        l_i += gl.sum(p, axis=1)
+        p = gl.convert_layout(p.to(self.q_ptr.dtype.element_ty), cfg.p_layout)
+        return p, l_i
 
     @gluon.jit
     def apply_sinks(self, l_i, m_i, sink_log2):
@@ -833,6 +857,15 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
     cfg = program.cfg
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
+    defer_scale: gl.constexpr = (
+        cfg.FIXED_REFERENCE
+        and cfg.NUM_WARPS == 4
+        and cfg.HEAD_DIM == 128
+        and cfg.PACKED_GQA
+        and not cfg.GUARDED_QUERY_ROWS
+        and not cfg.HAS_SINK
+        and not cfg.HAS_LSE
+    )
 
     program.tdm_load_global_to_shared_k(kv_start, 0)
     program.tdm_load_global_to_shared_k(kv_start + cfg.BLOCK_N, 1)
@@ -846,6 +879,10 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
     else:
         qk = program.apply_mask(qk, kv_start)
     p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+    if defer_scale:
+        # Both numerator and denominator remain referenced to the first tile;
+        # their common scale cancels in the final normalization.
+        reference_m = m_i
 
     program.tdm_load_global_to_shared_k(kv_start + 2 * cfg.BLOCK_N, 0)
     program.tdm_load_global_to_shared_v(kv_start + cfg.BLOCK_N, 1)
@@ -861,7 +898,10 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
                 qk = program.apply_mask(qk, cur_kv_start)
         else:
             qk = program.apply_mask(qk, cur_kv_start)
-        p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+        if defer_scale:
+            p, l_i = program.softmax_part1_deferred(p, l_i)
+        else:
+            p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
         v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=2)
 
         program.tdm_load_global_to_shared_k(
@@ -870,7 +910,10 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
         )
 
         acc = program.compute_pv(p, v, acc)
-        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+        if defer_scale:
+            p, m_i = program.softmax_part0_fixed_reference(qk, m_i, reference_m)
+        else:
+            p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
         k = program.tdm_shared_load_k(iter_id % cfg.NUM_BUFFERS, wait_count=2)
 
         program.tdm_load_global_to_shared_v(
@@ -882,7 +925,10 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
     penultimate_kv_start = kv_start + (num_tiles - 2) * cfg.BLOCK_N
     last_kv_start = kv_start + (num_tiles - 1) * cfg.BLOCK_N
 
-    p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+    if defer_scale:
+        p, l_i = program.softmax_part1_deferred(p, l_i)
+    else:
+        p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
     v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=2)
     acc = program.compute_pv(p, v, acc)
 
@@ -892,19 +938,29 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
             qk = program.apply_mask(qk, penultimate_kv_start)
     else:
         qk = program.apply_mask(qk, penultimate_kv_start)
-    p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+    if defer_scale:
+        p, m_i = program.softmax_part0_fixed_reference(qk, m_i, reference_m)
+    else:
+        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
 
     k = program.tdm_shared_load_k(iter_id % cfg.NUM_BUFFERS, wait_count=1)
     program.tdm_load_global_to_shared_v(last_kv_start, iter_id % cfg.NUM_BUFFERS)
 
     qk = program.compute_qk(q, k)
     qk = program.apply_mask(qk, last_kv_start)
-    p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+    if defer_scale:
+        p, l_i = program.softmax_part1_deferred(p, l_i)
+    else:
+        p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
     v = program.tdm_shared_load_v((iter_id + 1) % cfg.NUM_BUFFERS, wait_count=1)
     acc = program.compute_pv(p, v, acc)
 
-    p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
-    p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+    if defer_scale:
+        p, m_i = program.softmax_part0_fixed_reference(qk, m_i, reference_m)
+        p, l_i = program.softmax_part1_deferred(p, l_i)
+    else:
+        p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+        p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
     v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=0)
     acc = program.compute_pv(p, v, acc)
 
@@ -951,9 +1007,13 @@ def gluon_mha_prefill_gfx1250(
     PACKED_GQA: gl.constexpr,
     GUARDED_QUERY_ROWS: gl.constexpr,
     WIDE_ADDRESSING: gl.constexpr,
+    FIXED_REFERENCE: gl.constexpr,
+    DISABLE_XDL_ARB_STALL: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
+    if DISABLE_XDL_ARB_STALL:
+        gl.amd.hint.disable_xdl_arb_stall()
     cfg = AttentionConfig(
         N_HEADS,
         N_KV_HEADS,
@@ -973,6 +1033,8 @@ def gluon_mha_prefill_gfx1250(
         PACKED_GQA,
         GUARDED_QUERY_ROWS,
         WIDE_ADDRESSING,
+        FIXED_REFERENCE,
+        DISABLE_XDL_ARB_STALL,
         InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
         InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
         InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
@@ -1169,6 +1231,26 @@ def _select_packed_gqa(
     return batch_size == 4 and max_seqlen == 4096
 
 
+def _select_fixed_reference(
+    *,
+    dtype: torch.dtype,
+    batch_size: int,
+    max_seqlen: int,
+    window_left: int,
+    uniform: bool,
+    n_heads: int,
+    n_kv_heads: int,
+) -> bool:
+    if dtype != torch.bfloat16 or window_left >= 0 or not uniform:
+        return False
+    h8_kv1 = n_heads == 8 and n_kv_heads == 1
+    return (h8_kv1 and (batch_size, max_seqlen) in ((4, 2048), (2, 8192))) or (
+        batch_size == 4
+        and max_seqlen == 4096
+        and (n_heads, n_kv_heads) in ((8, 1), (8, 8), (32, 8), (32, 1))
+    )
+
+
 def _select_m_tile(
     *, batch_size: int, n_heads: int, max_seqlen: int
 ) -> tuple[int, int]:
@@ -1337,19 +1419,41 @@ def launch_gluon_mha_prefill_gfx1250(
         )
         * q.element_size(),
     )
+    fixed_reference = False
+    fast_four_wave = False
     if selected_packed_gqa:
-        wide_packed_gqa = (
+        uniform = all(seqlen == config.max_seqlen for seqlen in seqlens)
+        fixed_reference_capable = _select_fixed_reference(
+            dtype=q.dtype,
+            batch_size=config.batch_size,
+            max_seqlen=config.max_seqlen,
+            window_left=config.window_left,
+            uniform=uniform,
+            n_heads=config.n_heads,
+            n_kv_heads=config.n_kv_heads,
+        )
+        # Fixed-reference softmax is faster for normalized model activations,
+        # but keep it opt-in because deliberately extreme logits can exceed
+        # the BF16 probability range before final normalization.
+        fixed_reference = (
+            fixed_reference_capable
+            and os.environ.get("TOKENSPEED_GFX1250_FIXED_REFERENCE") == "1"
+        )
+        fast_four_wave = (
             q.dtype == torch.bfloat16
             and config.window_left < 0
-            and (config.batch_size, config.max_seqlen) in ((4, 4096), (2, 8192))
+            and uniform
+            and (config.batch_size, config.max_seqlen)
+            in ((4, 2048), (4, 4096), (2, 8192))
         )
+        wide_packed_gqa = fast_four_wave and config.max_seqlen >= 4096
         block_m = 256 if wide_packed_gqa else 128
         block_n = 32 if config.window_left == 512 else 64
         config = config._replace(
             block_m=block_m,
             block_n=block_n,
-            num_warps=8 if wide_packed_gqa else 4,
-            waves_per_eu=1 if wide_packed_gqa else 2,
+            num_warps=4,
+            waves_per_eu=0 if wide_packed_gqa else 2,
             packed_gqa=True,
             grid=(
                 config.batch_size,
@@ -1396,7 +1500,7 @@ def launch_gluon_mha_prefill_gfx1250(
         block_m=config.block_m,
     )
     if selected_packed_gqa:
-        tdm_warp_hint = guarded_query_rows or wide_packed_gqa
+        tdm_warp_hint = guarded_query_rows or fast_four_wave
         reverse_q_blocks = True
         deep_pipeline = config.window_left < 0
     elif config.packed_gqa:
@@ -1460,11 +1564,14 @@ def launch_gluon_mha_prefill_gfx1250(
         config.packed_gqa,
         guarded_query_rows,
         wide_addressing,
+        fixed_reference,
+        fast_four_wave,
         config.num_warps,
         config.num_buffers,
         num_warps=config.num_warps,
         waves_per_eu=config.waves_per_eu,
         llvm_fn_attrs=llvm_fn_attrs,
+        enable_fp_fusion=True,
     )
     if return_lse:
         return output, lse

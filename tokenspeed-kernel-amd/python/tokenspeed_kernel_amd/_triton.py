@@ -18,19 +18,31 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# Single point of indirection for the Triton vendor release package used by
-# tokenspeed-kernel-amd. All implementation code imports Triton symbols from
-# here so the underlying distribution can be swapped in one place.
+# Single point of indirection for the Triton package used by
+# tokenspeed-kernel-amd. Prefer the vendor release in production, while allowing
+# compiler development directly against a public triton-lang source checkout.
 
-import tokenspeed_triton as triton
-import tokenspeed_triton.experimental.gluon.language as gl
-from tokenspeed_triton import language as tl
-from tokenspeed_triton.experimental import gluon
-from tokenspeed_triton.experimental.gluon.language._core import builtin as gluon_builtin
-from tokenspeed_triton.experimental.gluon.language.amd.cdna4 import (
-    async_copy as cdna4_async_copy,
+import importlib
+
+try:
+    triton = importlib.import_module("tokenspeed_triton")
+    _TRITON_PACKAGE = "tokenspeed_triton"
+except ModuleNotFoundError as exc:
+    if exc.name != "tokenspeed_triton":
+        raise
+    triton = importlib.import_module("triton")
+    _TRITON_PACKAGE = "triton"
+
+gl = importlib.import_module(f"{_TRITON_PACKAGE}.experimental.gluon.language")
+tl = importlib.import_module(f"{_TRITON_PACKAGE}.language")
+gluon = importlib.import_module(f"{_TRITON_PACKAGE}.experimental.gluon")
+gluon_builtin = importlib.import_module(
+    f"{_TRITON_PACKAGE}.experimental.gluon.language._core"
+).builtin
+cdna4_async_copy = importlib.import_module(
+    f"{_TRITON_PACKAGE}.experimental.gluon.language.amd.cdna4.async_copy"
 )
-from tokenspeed_triton.language.core import _aggregate as aggregate
+aggregate = importlib.import_module(f"{_TRITON_PACKAGE}.language.core")._aggregate
 
 __all__ = [
     "aggregate",
