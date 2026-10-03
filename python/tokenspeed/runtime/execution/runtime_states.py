@@ -57,6 +57,53 @@ class RuntimeStates:
         self.remote_spec_candidate_ready = torch.zeros(
             req_pool_size + 1, dtype=torch.bool, device=device
         )
+        # The drafter's recorded proposal distributions
+        # (--enable-speculative-sampling), see init_draft_probs.
+        self.draft_probs: torch.Tensor | None = None
+        self.draft_probs_sentinel: float = 0.0
+
+    def init_draft_probs(
+        self, *, spec_num_tokens: int, reject_threshold: float
+    ) -> None:
+        """Allocate the drafter's recorded proposal distributions.
+
+        ``draft_probs[slot, s]`` (fp32 ``[pool + 1, spec_num_tokens, vocab]``)
+        is the distribution the chain drafter sampled its step-``s`` token
+        from, which the next round verifies as candidate column ``s + 1``.
+        Rows start at the sentinel ``reject_threshold + 1``: a slot whose
+        drafter has not recorded this round (fresh admission, PD landing)
+        rejects every candidate and samples its first token from the full
+        target distribution. The last step slot pairs with the bonus token,
+        which has no proposal; it is never read and stays zero. Returns None.
+        """
+        if spec_num_tokens < 1:
+            raise ValueError(
+                f"draft_probs needs at least one verify column, got {spec_num_tokens}"
+            )
+        if reject_threshold < 1.0:
+            raise ValueError(
+                "the draft-prob sentinel threshold must be >= 1.0 so no real "
+                f"probability reads as a sentinel, got {reject_threshold}"
+            )
+        pool_size = self.valid_cache_lengths.shape[0]
+        self.draft_probs_sentinel = float(reject_threshold) + 1.0
+        self.draft_probs = torch.full(
+            (pool_size, spec_num_tokens, self.vocab_size),
+            self.draft_probs_sentinel,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.draft_probs[:, -1, :] = 0.0
+
+    def reset_draft_probs(self, pool_indices: torch.Tensor) -> None:
+        """Mark ``pool_indices`` as having no recorded proposal.
+
+        Tensor-only (index_fill_), so it is stream-ordered without a host
+        wait and legal inside a captured graph. Returns None.
+        """
+        if self.draft_probs is None:
+            return
+        self.draft_probs[:, :-1].index_fill_(0, pool_indices, self.draft_probs_sentinel)
 
     def init_ngram_state(self, context_len: int) -> None:
         """Allocate a bounded, newest-first accepted input tail per pool slot.
@@ -224,6 +271,10 @@ class RuntimeStates:
         self.remote_spec_candidate_ready.index_fill_(
             0, extend_request_pool_indices, False
         )
+        # Runs in the forward's prologue, before this round's drafter records
+        # the rows, so a (re)admitted request verifies its first chain against
+        # the sentinel and never a previous occupant's distributions.
+        self.reset_draft_probs(extend_request_pool_indices)
         if self.ngram_accepted_tokens is not None:
             assert self.ngram_needs_seed is not None
             self.ngram_accepted_tokens.index_fill_(0, extend_request_pool_indices, -1)
@@ -245,3 +296,8 @@ class RuntimeStates:
         ).to(self.device, non_blocking=True)
         self.future_input_map[req_pool_idx, :width] = ids
         self.remote_spec_candidate_ready[req_pool_idx] = True
+        # The prefill node's candidates come without their draft distribution:
+        # the first local verify rejects them at column 1 and samples token 0
+        # from the full target, the same outcome as a single-token verify.
+        if self.draft_probs is not None:
+            self.draft_probs[req_pool_idx, :-1].fill_(self.draft_probs_sentinel)

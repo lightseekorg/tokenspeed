@@ -258,9 +258,19 @@ class LogitsProcessor(nn.Module):
         tp_group: tuple[int, ...] | None = None,
     ):
         super().__init__()
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
         self.config = config
         self.skip_all_gather = skip_all_gather
-        self.do_argmax = do_argmax
+        # The draft models' fused argmax (with the TP-sharded distributed
+        # reduction) returns local-shard logits a sampled draft cannot use:
+        # draft-prob sampling needs the full-vocab distribution, so the fast
+        # path stays off and the ordinary gather runs. Under attention DP the
+        # head is replicated (skip_all_gather) and the logits are already
+        # full-vocab either way.
+        self.do_argmax = (
+            do_argmax and not global_server_args_dict["enable_speculative_sampling"]
+        )
         self.dp_sampling_enabled = False
         self.dp_num_tokens_per_req = 1
         self.dp_sampling_min_bs = 0

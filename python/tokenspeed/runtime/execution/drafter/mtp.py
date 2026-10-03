@@ -38,7 +38,6 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
-from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from typing_extensions import override
 
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -233,6 +232,7 @@ class Mtp(BaseDrafter):
     """
 
     shares_target_embed_head = True
+    supports_speculative_sampling = True
 
     def __init__(
         self,
@@ -313,12 +313,14 @@ class Mtp(BaseDrafter):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _sample_step_tokens(self, logits_output: LogitsProcessorOutput) -> torch.Tensor:
-        """One draft step's raw sampled ids: the logits processor's
-        pre-sampled ids when present, greedy argmax otherwise."""
-        if logits_output.next_token_ids is not None:
-            return logits_output.next_token_ids
-        return sampling_argmax(logits_output.next_token_logits)
+    def _sample_step_tokens(
+        self, logits_output: LogitsProcessorOutput, depth: int, bs: int
+    ) -> torch.Tensor:
+        """Depth ``depth``'s draft ids over the full vocab: the logits
+        processor's fused argmax when it ran, greedy argmax otherwise, or a
+        sample from the recorded draft distribution under
+        --enable-speculative-sampling (``BaseDrafter.sample_draft_step``)."""
+        return self.sample_draft_step(logits_output, step=depth, bs=bs, vocab_map=None)
 
     @nvtx_range("run_decode_depths", color="purple")
     def _run_decode_depths(
@@ -409,7 +411,7 @@ class Mtp(BaseDrafter):
                 prev_hidden = logits_output.hidden_states
 
             with nvtx_range("draft_sample", color="yellow"):
-                next_tokens[:, d + 1] = self._sample_step_tokens(logits_output)
+                next_tokens[:, d + 1] = self._sample_step_tokens(logits_output, d, bs)
 
         self._stash_tokens_buf[slot] = window_ids[:, 1:]
         self._stash_hidden_buf[slot] = spliced_hidden.view(bs, k, -1)[:, 1:]
@@ -517,7 +519,7 @@ class Mtp(BaseDrafter):
             prev_hidden = logits_output.hidden_states
 
             with nvtx_range("draft_sample", color="yellow"):
-                next_tokens[:, d + 1] = self._sample_step_tokens(logits_output)
+                next_tokens[:, d + 1] = self._sample_step_tokens(logits_output, d, bs)
 
     # ------------------------------------------------------------------
     # Public entry point (type-based dispatch from ModelExecutor)

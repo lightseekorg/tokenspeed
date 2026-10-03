@@ -555,6 +555,11 @@ class ForwardStepRunner:
                 if self.runtime_states is not None
                 else None
             ),
+            draft_probs=(
+                self.runtime_states.draft_probs
+                if self.runtime_states is not None
+                else None
+            ),
             vocab_size=self.vocab_size,
             device=self.device,
         )
@@ -717,6 +722,11 @@ class ForwardStepRunner:
                     req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
                     valid_cache_lengths=(
                         self.runtime_states.valid_cache_lengths
+                        if self.runtime_states is not None
+                        else None
+                    ),
+                    draft_probs=(
+                        self.runtime_states.draft_probs
                         if self.runtime_states is not None
                         else None
                     ),
