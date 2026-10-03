@@ -226,6 +226,83 @@ to the canonical contract once padding would cost more than the transpose it
 saves — the fused padding quantizer grows with `M` while the transpose does
 not. Decode row counts stay on the prepared path.
 
+### Static expert placement with redundant experts
+
+Real routing is skewed: a few experts of a layer draw many times their
+uniform share of routes, and the rank holding them carries the layer's
+critical path. `--ep-num-redundant-experts R` gives every MoE layer
+`P = E + R` physical expert slots, `P / ep_size` per rank, and an *expert
+placement* decides which logical expert each slot holds, so a hot expert is
+replicated across ranks. The placement is derived once, at startup, from
+recorded load with DeepSeek's EPLB algorithm; experts are not moved while
+serving (`--enable-eplb` is refused). Models opt in by building their MoE
+layers from the placement — LongCat-Flash does; a model without routed
+experts cannot take one.
+
+1. **Record** the load of a representative workload. Serve with
+   `--expert-distribution-recorder-mode stat --ep-dispatch-algorithm
+   static_with_zero_expert` (`static` for models without zero experts): the
+   router counts every route into a per-layer, per-physical-expert counter
+   on the device, and the `EXPERT_LOAD` profile activity frames the window:
+
+   ```bash
+   curl -X POST localhost:8401/start_profile -H 'Content-Type: application/json' \
+     -d '{"output_dir": "/tmp/expert-load", "activities": ["EXPERT_LOAD"]}'
+   # ... serve the workload ...
+   curl -X POST localhost:8401/stop_profile
+   ```
+
+   `stop_profile` writes `<id>-TP<rank>.expert-load.pt` with `logical_count`
+   (`[layers, routed experts]`, summed over the EP group), the physical
+   counts, the placement that produced them, the per-rank counts and the
+   per-layer balancedness (mean rank load over the busiest rank's load), and
+   logs the balancedness summary. Every rank's file holds the same reduced
+   counts; the reduction is a collective, so stop the profile while the
+   server is idle when attention DP ranks receive the request independently.
+
+2. **Place**: restart with the redundant slots and the recorded load.
+
+   ```bash
+   --ep-num-redundant-experts 128 \
+   --init-expert-location /tmp/expert-load/<id>-TP0.expert-load.pt \
+   --ep-dispatch-algorithm static_with_zero_expert
+   ```
+
+   `P` must divide over the EP size (LongCat 2.0: 768 + 128 = 896 slots at
+   EP128, 7 per rank). The loader fills every local slot from the logical
+   expert the placement assigns it — one checkpoint tensor lands in each of
+   its replicas, and RL weight sync through the same path does too. A file
+   holding only a `physical_to_logical_map` pins a placement exactly;
+   `--eplb-algorithm` selects the balancing algorithm (`auto` picks the
+   hierarchical variant when the model's expert groups divide over the
+   nodes).
+
+3. **Route**. The router emits physical ids; zero experts (LongCat) stay
+   `-1` and never enter the tables. How a route picks among an expert's
+   replicas follows the MoE kernel:
+
+   - Under all-to-all EP (DeepEP) each rank routes only its own tokens, so
+     every rank dispatches to its *nearest* replica — one on the same GPU,
+     else on the same node, else a seeded fair draw — through a static
+     per-rank map (`--ep-dispatch-algorithm static*`; the `dynamic*`
+     variants draw at random per route).
+   - Under replicated-input EP (every rank routes every token, e.g. the
+     rl-bitwise aok path) exactly one rank must compute each route, so the
+     replica is a pure function of the token:
+     `replicas[logical, (token row + route rank) mod replicas]`, identical
+     on every rank. Random replica choice is refused on this path.
+
+   Under `--numerics rl-bitwise` the placement must be deterministic (static
+   algorithms only) and drafts stay trivially placed; the MoE output remains
+   a pure function of the token and its routes, so a placed server stays
+   bitwise aligned with the trainer.
+
+A placement is only as good as the recorded distribution's match to the
+traffic it serves: record on production traffic and re-derive when it
+drifts. Decode benefit depends on the kernel being row-bound; where a grouped
+GEMM streams every touched expert regardless of row count (small decode
+batches), balancing the rows changes little.
+
 ## Multi-Node
 
 Set these explicitly:

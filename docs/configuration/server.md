@@ -163,6 +163,20 @@ Use `--tensor-parallel-size` for simple launches. Use the
 TokenSpeed-specific split knobs when attention, dense, and MoE layers need
 different process groups.
 
+### Expert Placement
+
+| Parameter | Purpose |
+| --- | --- |
+| `--ep-num-redundant-experts` | Extra physical expert slots per MoE layer for replicas of hot experts (`P = E + R`, must divide over the EP size). Default 0. |
+| `--init-expert-location` | `trivial` (default), or a `.pt`/`.json` file or inline JSON: a `logical_count` `[layers, experts]` load record derives the placement with the EPLB algorithm; a `physical_to_logical_map` `[layers, slots]` pins one exactly. |
+| `--ep-dispatch-algorithm` | How routing picks among an expert's replicas; required with any of the flags above or below. `static_with_zero_expert` for models with zero experts (LongCat), `static` otherwise; `dynamic`/`dynamic_with_zero_expert`/`fake` draw at random (refused under `--numerics rl-bitwise` and on replicated-input EP). |
+| `--eplb-algorithm` | `auto` (default), `deepseek` or `deepseek_hierarchical`. |
+| `--expert-distribution-recorder-mode` | `stat`: count the routes to every physical expert so the `EXPERT_LOAD` profile activity (`/start_profile` ... `/stop_profile`) can write a load record. |
+| `--enable-eplb` | Runtime rebalancing; not supported, refused at startup. |
+
+See [static expert placement](../serving/parallelism.md#static-expert-placement-with-redundant-experts)
+for the record → place → route flow and the two dispatch flavours.
+
 ## Backend Selection
 
 | Parameter | Purpose |
