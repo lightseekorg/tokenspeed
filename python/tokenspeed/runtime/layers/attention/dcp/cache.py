@@ -156,6 +156,32 @@ def plan_history_gather(
     )
 
 
+# Row dtypes the index-copy kernels implement; others scatter as bytes.
+_SCATTER_DTYPES = frozenset(
+    {torch.bfloat16, torch.float16, torch.float32, torch.uint8, torch.int32}
+)
+
+
+def _as_bf16_rows(rows: torch.Tensor) -> torch.Tensor:
+    """View 2-D rows of any dtype as bf16 pairs of their bytes.
+
+    The token all-gather moves bf16 rows only (its low-latency solution
+    asserts the dtype), and a history gather is byte-preserving data movement
+    whatever the rows hold -- bf16 or fp8 latent, uint8 index-K bytes, fp32
+    scales -- so every payload travels as bf16 pairs and is viewed back by
+    the caller. Needs an even row byte width.
+    """
+    if rows.dtype == torch.bfloat16:
+        return rows
+    row_bytes = rows.shape[1] * rows.element_size()
+    if row_bytes % 2:
+        raise ValueError(
+            f"history rows of {row_bytes} bytes cannot travel as bf16 pairs; "
+            "pad the row to an even byte width"
+        )
+    return rows.contiguous().view(torch.uint8).view(torch.bfloat16)
+
+
 def gather_history_rows(
     plan: HistoryGatherPlan,
     local_rows: torch.Tensor,
@@ -168,14 +194,17 @@ def gather_history_rows(
     own cache plane, as 2-D rows); one all-gather with per-rank counts puts
     them rank-major, and the plan's order scatters them into position order.
     Pure data movement: a row's bytes are the owner's bytes wherever the
-    gather lands them. Without page sharding the rows are already local and
-    only the scatter runs.
+    gather lands them, whatever their dtype (the collective moves the rows
+    as bf16 pairs of their bytes, see :func:`_as_bf16_rows`). Without page
+    sharding the rows are already local and only the scatter runs.
 
     Args:
         plan: The group's gather plan.
         local_rows: ``[owned_rows_per_rank[rank], width]`` rows this rank
-            contributes, position order.
-        out: ``[>= rows, width]`` destination; the leading ``rows`` are written.
+            contributes, position order; any dtype with an even row byte
+            width.
+        out: ``[>= rows, width]`` destination of ``local_rows``' dtype; the
+            leading ``rows`` are written.
 
     Returns:
         ``out[:rows]``.
@@ -189,19 +218,32 @@ def gather_history_rows(
             f"rank {plan.rank} contributes {plan.owned_rows_per_rank[plan.rank]} "
             f"rows, got {tuple(local_rows.shape)}"
         )
-    if out.dim() != 2 or out.shape[0] < rows or out.shape[1] != local_rows.shape[1]:
+    if (
+        out.dim() != 2
+        or out.shape[0] < rows
+        or out.shape[1] != local_rows.shape[1]
+        or out.dtype != local_rows.dtype
+    ):
         raise ValueError(
-            f"history destination {tuple(out.shape)} does not hold {rows} rows of "
-            f"{local_rows.shape[1]}"
+            f"history destination {tuple(out.shape)} {out.dtype} does not hold "
+            f"{rows} rows of {local_rows.shape[1]} {local_rows.dtype}"
         )
     if len(plan.group) == 1:
         gathered = local_rows
     else:
         gathered = token_all_gather(
-            local_rows.contiguous(), plan.group, list(plan.owned_rows_per_rank)
+            _as_bf16_rows(local_rows), plan.group, list(plan.owned_rows_per_rank)
         )
+        if local_rows.dtype != torch.bfloat16:
+            gathered = gathered.view(torch.uint8).view(local_rows.dtype)
     target = out[:rows]
-    target.index_copy_(0, plan.order, gathered)
+    if local_rows.dtype in _SCATTER_DTYPES:
+        target.index_copy_(0, plan.order, gathered)
+    else:
+        # fp8 rows: the index-copy kernels lack the dtype; scatter the bytes.
+        target.view(torch.uint8).index_copy_(
+            0, plan.order, gathered.contiguous().view(torch.uint8)
+        )
     return target
 
 

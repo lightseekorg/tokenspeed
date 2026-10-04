@@ -44,7 +44,10 @@ from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
 )
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    DSAConfig,
+    dsa_index_k_row_bytes,
+)
 from tokenspeed.runtime.layers.attention.dcp.cache import (
     HistoryGatherPlan,
     gather_history_rows,
@@ -64,6 +67,7 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
+from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
 )
@@ -184,8 +188,8 @@ class DSABackend(PagedAttentionBackend):
         self.query_shard_metadata: DSAQueryShardMetadata | None = None
         self._history_workspace_rows: int = 0
         self._history_kv_workspace: torch.Tensor | None = None
-        self._history_index_k_fp8_workspace: torch.Tensor | None = None
-        self._history_index_k_scale_workspace: torch.Tensor | None = None
+        # Packed index-K rows (FP8 bytes then fp32 scales), one gather per group.
+        self._history_index_k_workspace: torch.Tensor | None = None
         self.index_topk = spec.index_topk
         self.kv_lora_rank = spec.kv_lora_rank
         self.qk_nope_head_dim = spec.qk_nope_head_dim
@@ -243,21 +247,17 @@ class DSABackend(PagedAttentionBackend):
         them against the plan.
         """
         rows = history_gather_workspace_rows(max_model_len)
-        groups = self.index_head_dim // 128
         self._history_workspace_rows = rows
         self._history_kv_workspace = torch.empty(
             (rows, self.kv_cache_dim), dtype=self.data_type, device=self.device
         )
-        self._history_index_k_fp8_workspace = torch.empty(
-            (rows, self.index_head_dim), dtype=torch.uint8, device=self.device
-        )
-        self._history_index_k_scale_workspace = torch.empty(
-            (rows, groups), dtype=torch.float32, device=self.device
+        self._history_index_k_workspace = torch.empty(
+            (rows, dsa_index_k_row_bytes(self.index_head_dim)),
+            dtype=torch.uint8,
+            device=self.device,
         )
         return (
-            self._history_kv_workspace.nbytes
-            + self._history_index_k_fp8_workspace.nbytes
-            + self._history_index_k_scale_workspace.nbytes
+            self._history_kv_workspace.nbytes + self._history_index_k_workspace.nbytes
         )
 
     def cache_placement(self, layer) -> CachePlacement | None:
@@ -682,23 +682,17 @@ class DSABackend(PagedAttentionBackend):
         """Assemble one group's index-K rows: ``[rows, index_head_dim]`` FP8
         bytes and ``[rows, groups]`` fp32 scales in position order, the
         ``index_k_fp8`` / ``index_k_scale`` inputs of ``dsa_prefill_topk``
-        (views of the gather workspace). A collective over the page owners."""
-        if (
-            self._history_index_k_fp8_workspace is None
-            or self._history_index_k_scale_workspace is None
-        ):
+        (views of the gather workspace). One collective over the page owners
+        moves the rows packed (FP8 bytes then scale bytes per row)."""
+        if self._history_index_k_workspace is None:
             raise RuntimeError("DSA history gather workspace is not allocated")
-        fp8, scale = token_to_kv_pool.gather_index_k_rows(
+        packed = token_to_kv_pool.gather_index_k_rows(
             layer_id, group.gather.local_fetch_slots
         )
-        return (
-            gather_history_rows(
-                group.gather, fp8, out=self._history_index_k_fp8_workspace
-            ),
-            gather_history_rows(
-                group.gather, scale, out=self._history_index_k_scale_workspace
-            ),
+        gathered = gather_history_rows(
+            group.gather, packed, out=self._history_index_k_workspace
         )
+        return split_index_k_rows(gathered, index_head_dim=self.index_head_dim)
 
     # ------------------------------------------------------------------
     # Validation helpers

@@ -34,6 +34,33 @@ from tokenspeed.runtime.layers.attention.kv_cache.mla import (
 _INDEX_K_FP8_GROUP_SIZE = 128
 
 
+def split_index_k_rows(
+    packed: torch.Tensor, *, index_head_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """View packed index-K rows as their FP8 bytes and fp32 scales.
+
+    The inverse of :meth:`DSATokenToKVPool.gather_index_k_rows`'s packing:
+    no copy, the two views share ``packed``'s storage.
+
+    Args:
+        packed: ``[rows, index_head_dim + groups * 4]`` uint8 rows.
+        index_head_dim: Width of the FP8 part of a row.
+
+    Returns:
+        ``[rows, index_head_dim]`` uint8 FP8 rows and ``[rows, groups]`` fp32
+        scales.
+    """
+    groups = index_head_dim // _INDEX_K_FP8_GROUP_SIZE
+    if packed.dim() != 2 or packed.dtype != torch.uint8:
+        raise ValueError(f"packed index-K rows are 2-D uint8, got {packed.dtype}")
+    if packed.shape[1] != index_head_dim + groups * 4:
+        raise ValueError(
+            f"packed index-K rows are {packed.shape[1]} bytes wide, not "
+            f"{index_head_dim} + {groups * 4}"
+        )
+    return packed[:, :index_head_dim], packed[:, index_head_dim:].view(torch.float32)
+
+
 class DSATokenToKVPool(MLATokenToKVPool):
     def __init__(
         self,
@@ -57,25 +84,32 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self.layerwise_load_tracker.wait_for_layer(layer_id)
         return self.index_k_buffer[layer_id]
 
-    def gather_index_k_rows(
-        self, layer_id: int, slots: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Read index-K rows out of the block-split paged buffer.
+    def gather_index_k_rows(self, layer_id: int, slots: torch.Tensor) -> torch.Tensor:
+        """Read index-K rows out of the block-split paged buffer, packed per row.
 
         The buffer stores every page as its ``page_size`` FP8 rows followed by
         their fp32 scales (``index_k_block_split_scatter``); this is the read
         side of that layout, for the rows a query-context-parallel history
-        gather contributes.
+        gather contributes. Each row comes back as its FP8 bytes followed by
+        its scale bytes, so one gather moves both (:func:`split_index_k_rows`
+        views them apart again).
 
         Args:
             layer_id: The indexer layer whose plane to read.
             slots: ``[rows]`` int64 local cache slots.
 
         Returns:
-            ``[rows, index_head_dim]`` uint8 FP8 rows and ``[rows, groups]``
-            fp32 scales, in ``slots`` order.
+            ``[rows, index_head_dim + groups * 4]`` uint8 rows in ``slots``
+            order.
         """
         buf = self.get_index_k_buffer(layer_id)
+        if buf.dtype != torch.uint8:
+            # The plane's dtype is its format (configs/dsa.py INDEX_K_FORMATS);
+            # only the fp8_scaled block-split layout is read here.
+            raise ValueError(
+                "gather_index_k_rows reads the fp8_scaled index-K plane; got a "
+                f"{buf.dtype} plane"
+            )
         page_size = int(self.arena.kv_page_size)
         head_dim = self.index_head_dim
         groups = head_dim // _INDEX_K_FP8_GROUP_SIZE
@@ -84,14 +118,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         num_pages = buf.numel() // page_bytes
         pages = buf.reshape(-1)[: num_pages * page_bytes].view(num_pages, page_bytes)
         fp8 = pages[:, : page_size * head_dim].view(num_pages, page_size, head_dim)
-        scale = (
-            pages[:, page_size * head_dim :]
-            .view(torch.float32)
-            .view(num_pages, page_size, groups)
-        )
+        scale = pages[:, page_size * head_dim :].view(num_pages, page_size, groups * 4)
         page = torch.div(slots, page_size, rounding_mode="floor")
         offset = slots - page * page_size
-        return fp8[page, offset], scale[page, offset]
+        return torch.cat((fp8[page, offset], scale[page, offset]), dim=1)
 
     def set_index_k_buffer(
         self,

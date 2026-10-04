@@ -24,9 +24,10 @@ Four ranks own the pages of a sharded cache group cyclically. Each rank holds
 its owned rows of a deterministic reference plane; the gather must rebuild
 every request group's history in position order on every rank, with the
 per-rank split counted on the host from the page table. Also covered: a rank
-that owns no row of a group still joins the collective, the replicated
-(``placement=None``) path is a local gather, and the host owner rule agrees
-with the kernel's per-rank translation.
+that owns no row of a group still joins the collective, non-bf16 rows (packed
+index-K bytes, fp32 scales, fp8 latent) travel through a bf16-only gather
+backend byte-identically, the replicated (``placement=None``) path is a local
+gather, and the host owner rule agrees with the kernel's per-rank translation.
 """
 
 from __future__ import annotations
@@ -128,7 +129,27 @@ def _worker(rank: int, port: int, errors) -> None:
         errors[rank] = traceback.format_exc()
 
 
+class _Bf16OnlyBackend:
+    """The production low-latency token all-gather moves bf16 rows only
+    (``TritonRSAGBackend`` asserts the dtype); this stand-in enforces that
+    and delegates the data movement to the NCCL-style padded gather."""
+
+    def __init__(self, delegate) -> None:
+        self.delegate = delegate
+        self.gathered_dtypes: list[torch.dtype] = []
+
+    def token_all_gather(self, tensor, group, scattered_num_tokens):
+        assert tensor.dtype == torch.bfloat16, f"RSAG gather of {tensor.dtype}"
+        self.gathered_dtypes.append(tensor.dtype)
+        return self.delegate.token_all_gather(tensor, group, scattered_num_tokens)
+
+    def __getattr__(self, name):
+        return getattr(self.delegate, name)
+
+
 def _run(rank: int, port: int) -> None:
+    from tokenspeed.runtime.distributed.comm_backend import registry
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg_manager,
@@ -146,7 +167,11 @@ def _run(rank: int, port: int) -> None:
     pg_manager.register_process_group(
         "nccl", group, pg_manager.get_process_group("gloo", group)
     )
-    global_server_args_dict["force_deterministic_rsag"] = True
+    # Not the deterministic NCCL route: every history gather must be
+    # dtype-safe for the bf16-only low-latency solution.
+    global_server_args_dict["force_deterministic_rsag"] = False
+    backend = _Bf16OnlyBackend(NcclBackend())
+    registry._global_backend = backend
 
     placement = _placement(rank)
     table = _page_table()
@@ -183,8 +208,43 @@ def _run(rank: int, port: int) -> None:
         if requests == slice(2, 3):
             assert counts[2] == 0 and counts[3] == 0
 
+        # The non-bf16 payloads of the indexer (packed uint8 index-K rows,
+        # fp32 scales) and an fp8 latent travel as bf16 pairs of their bytes
+        # and land byte-identical.
+        reference = _reference(virtual_slots)
+        for dtype, width in (
+            (torch.uint8, 132),
+            (torch.float32, 3),
+            (torch.float8_e4m3fn, DIM),
+        ):
+            full = _typed_rows(reference, dtype, width)
+            local_typed = _typed_rows(local, dtype, width)
+            out = gather_history_rows(
+                plan,
+                local_typed,
+                out=torch.empty((rows + 3, width), dtype=dtype),
+            )
+            assert out.dtype == dtype and out.shape == (rows, width)
+            assert torch.equal(out.view(torch.uint8), full.view(torch.uint8))
+        with pytest.raises(ValueError, match="even byte width"):
+            gather_history_rows(
+                plan,
+                torch.zeros((counts[rank], 3), dtype=torch.uint8),
+                out=torch.empty((rows, 3), dtype=torch.uint8),
+            )
+    assert backend.gathered_dtypes and set(backend.gathered_dtypes) == {torch.bfloat16}
+
     dist.barrier()
     dist.destroy_process_group()
+
+
+def _typed_rows(rows: torch.Tensor, dtype: torch.dtype, width: int) -> torch.Tensor:
+    """Rows of ``dtype`` whose bytes derive from ``rows``' bf16 bytes: the
+    row's byte pattern repeated to ``width`` elements."""
+    raw = rows.contiguous().view(torch.uint8)
+    width_bytes = width * torch.tensor([], dtype=dtype).element_size()
+    repeats = -(-width_bytes // raw.shape[1])
+    return raw.repeat(1, repeats)[:, :width_bytes].contiguous().view(dtype)
 
 
 def test_history_gather_rebuilds_every_group_in_position_order():
