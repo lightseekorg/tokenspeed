@@ -66,8 +66,11 @@ def _k_row_context_lengths(seq_lens: torch.Tensor, k: int) -> torch.Tensor:
     """``[bs]`` request lengths as the indexer's per-token rows: ``k`` query
     rows per request, each carrying its request's context length
     (``[bs * k, 1]``; the top-k applies the per-row causal bound downstream,
-    see ``dsa_decode_topk``). A view over ``seq_lens``; callers that keep it
-    make it contiguous."""
+    see ``dsa_decode_topk``). Not a view for ``k > 1``: reshaping the
+    expanded (stride-0) rows materializes a contiguous copy, so later edits
+    of ``seq_lens`` do not reach it and keepers rewrite it in place
+    (``_publish_k_row_indexer_rows``). Only ``k == 1`` aliases ``seq_lens``;
+    callers that keep the rows call ``.contiguous()`` to cover that case."""
     return seq_lens.unsqueeze(1).expand(-1, k).reshape(-1, 1)
 
 
