@@ -29,6 +29,7 @@ and the slots must end up holding their new logical experts.
 from __future__ import annotations
 
 import random
+import time
 
 import pytest
 import torch
@@ -234,6 +235,26 @@ def test_randomized_group_ends_with_every_slot_holding_its_expert(seed):
             ep_rank_nodes=nodes,
             num_local=num_local,
         )
+
+
+def test_production_size_layer_plans_in_one_pass():
+    """EP128 x 7 slots, 768 experts: the planner indexes the rows once per
+    layer (per-expert source and destination rank lists), so a whole layer
+    plans in well under a second rather than rescanning the row per slot."""
+    rng = random.Random(7)
+    ep_size, num_local, num_logical = 128, 7, 768
+    nodes = tuple(r // 8 for r in range(ep_size))
+    old, new = _random_rows(rng, num_logical, ep_size * num_local)
+    started = time.perf_counter()
+    plans = [
+        plan_slot_moves(old, new, ep_rank=r, ep_rank_nodes=nodes, num_local=num_local)
+        for r in range(ep_size)
+    ]
+    elapsed = time.perf_counter() - started
+    assert elapsed < 5.0, f"planning 128 ranks took {elapsed:.1f}s"
+    sends = sum(len(p.send) for p in plans)
+    recvs = sum(len(p.recv) for p in plans)
+    assert sends == recvs > 0
 
 
 def test_plan_rejects_inconsistent_geometry():

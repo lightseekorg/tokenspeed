@@ -149,16 +149,6 @@ class SlotMoves:
         return len(self.recv) + len(self.local_copy) + len(self.free_rider)
 
 
-def _unique_in_order(values: Sequence[int]) -> list[int]:
-    seen: set[int] = set()
-    ordered: list[int] = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            ordered.append(value)
-    return ordered
-
-
 def _spread(elements: Sequence[int], over: Sequence[int]) -> dict[int, int]:
     """Assign ``elements`` to ``over`` in contiguous, evenly sized runs.
 
@@ -229,21 +219,33 @@ def plan_slot_moves(
     if not 0 <= ep_rank < ep_size:
         raise ValueError(f"ep_rank={ep_rank} is outside the {ep_size} EP ranks")
     nodes = [int(node) for node in ep_rank_nodes]
-    self_node = nodes[ep_rank]
     first = ep_rank * num_local
+
+    # One pass over the row: per logical expert, the ranks holding it before
+    # the move (in rank order) and the ranks that receive it from elsewhere.
+    src_ranks_of: dict[int, list[int]] = {}
+    for p, logical in enumerate(old):
+        ranks = src_ranks_of.setdefault(logical, [])
+        if not ranks or ranks[-1] != p // num_local:
+            ranks.append(p // num_local)
+    dst_ranks_of: dict[int, list[int]] = {}
+    for p, logical in enumerate(new):
+        rank = p // num_local
+        ranks = dst_ranks_of.setdefault(logical, [])
+        if rank not in src_ranks_of.get(logical, ()) and (
+            not ranks or ranks[-1] != rank
+        ):
+            ranks.append(rank)
+    # The slots of this rank: which hold each expert now, and the first slot
+    # receiving each expert in this update (free-ride source).
+    held_slot_of: dict[int, int] = {}
+    for slot in reversed(range(num_local)):
+        held_slot_of[old[first + slot]] = slot
 
     def source_for(logical: int, dst_rank: int) -> int:
         """The rank ``dst_rank`` receives ``logical`` from (identical on both ends)."""
-        src_ranks = _unique_in_order(
-            [p // num_local for p in range(num_physical) if old[p] == logical]
-        )
-        dst_ranks = _unique_in_order(
-            [
-                p // num_local
-                for p in range(num_physical)
-                if new[p] == logical and p // num_local not in src_ranks
-            ]
-        )
+        src_ranks = src_ranks_of[logical]
+        dst_ranks = dst_ranks_of[logical]
         dst_node = nodes[dst_rank]
         same_node_sources = [r for r in src_ranks if nodes[r] == dst_node]
         if same_node_sources:
@@ -256,35 +258,24 @@ def plan_slot_moves(
     recv: list[tuple[int, int, int]] = []  # (logical, dst_slot, src_rank)
     local_copy: list[tuple[int, int]] = []
     free_rider: list[tuple[int, int]] = []
+    first_receiving_slot: dict[int, int] = {}
     for dst_slot in range(num_local):
         logical = new[first + dst_slot]
         if old[first + dst_slot] == logical:
             continue
-        held = [s for s in range(num_local) if old[first + s] == logical]
-        if held:
-            local_copy.append((dst_slot, held[0]))
+        held = held_slot_of.get(logical)
+        if held is not None:
+            local_copy.append((dst_slot, held))
             continue
-        earlier = [s for s in range(dst_slot) if new[first + s] == logical]
-        if earlier:
-            free_rider.append((dst_slot, earlier[0]))
+        earlier = first_receiving_slot.setdefault(logical, dst_slot)
+        if earlier != dst_slot:
+            free_rider.append((dst_slot, earlier))
             continue
         recv.append((logical, dst_slot, source_for(logical, ep_rank)))
 
     send: list[tuple[int, int, int]] = []  # (logical, src_slot, dst_rank)
-    sent: set[int] = set()
-    for src_slot in range(num_local):
-        logical = old[first + src_slot]
-        if logical in sent:
-            continue
-        sent.add(logical)
-        src_ranks = {p // num_local for p in range(num_physical) if old[p] == logical}
-        for dst_rank in _unique_in_order(
-            [
-                p // num_local
-                for p in range(num_physical)
-                if new[p] == logical and p // num_local not in src_ranks
-            ]
-        ):
+    for logical, src_slot in sorted(held_slot_of.items(), key=lambda kv: kv[1]):
+        for dst_rank in dst_ranks_of.get(logical, ()):
             if source_for(logical, dst_rank) == ep_rank:
                 send.append((logical, src_slot, dst_rank))
 

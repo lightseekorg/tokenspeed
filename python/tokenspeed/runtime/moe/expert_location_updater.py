@@ -36,8 +36,9 @@ the execution stream, one chunk of layers per call. Per layer:
 3. Live writes: staging -> live for the received and same-GPU slots, then
    free-riders live -> live in slot order (the source landed first).
 4. The layer's routing tables switch in place
-   (``ExpertLocationMetadata.update_layers``), so a forward never sees a
-   layer whose tables and slots disagree.
+   (``ExpertLocationMetadata.switch_layer``; the host rows of the whole chunk
+   were prepared once up front), so a forward never sees a layer whose
+   tables and slots disagree.
 
 The staging buffer is one layer's worth of slot tensors, reserved at startup
 before the KV arena is sized (a transient allocation inside the op could not
@@ -207,22 +208,17 @@ class ExpertLocationUpdater:
                 committed placement.
             moves_by_layer: This rank's ``SlotMoves`` per layer.
         """
-        layer_ids = [int(layer_id) for layer_id in layer_ids]
-        if tuple(new_rows.shape) != (
-            len(layer_ids),
-            self._placement.num_physical_experts,
-        ):
-            raise ValueError(
-                f"new_rows has shape {tuple(new_rows.shape)}, expected "
-                f"({len(layer_ids)}, {self._placement.num_physical_experts})"
-            )
-        for index, layer_id in enumerate(layer_ids):
+        # The host side of the switch (inverse rows, valid counts, static map
+        # rows) is derived once for the chunk; each layer then switches with
+        # a few device copies right after its weights landed.
+        prepared = self._placement.prepare_layers(layer_ids, new_rows)
+        for index, layer_id in enumerate(prepared.layer_ids):
             moves = moves_by_layer[layer_id]
             tensors = self._weights_of_layer.get(layer_id)
             if tensors is not None and not moves.is_empty:
                 self._move_weights(layer_id, tensors, moves)
             # The table switch follows the layer's weights on the same stream.
-            self._placement.update_layers((layer_id,), new_rows[index : index + 1])
+            self._placement.switch_layer(prepared, index)
 
     def _move_weights(
         self, layer_id: int, tensors: Sequence[torch.Tensor], moves: SlotMoves

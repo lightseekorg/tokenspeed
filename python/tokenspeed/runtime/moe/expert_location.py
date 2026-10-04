@@ -79,6 +79,7 @@ __all__ = [
     "ExpertLocationMetadata",
     "InitExpertLocationForm",
     "ModelConfigForExpertLocation",
+    "PreparedPlacementRows",
     "build_expert_placement",
     "compute_initial_expert_location_metadata",
     "compute_logical_to_rank_dispatch_physical_map",
@@ -137,6 +138,26 @@ class ExpertLoadSnapshot:
             self.physical_to_logical_map,
             int(self.physical_to_logical_map.max().item()) + 1,
         )
+
+
+@dataclass(frozen=True)
+class PreparedPlacementRows:
+    """Host-side rows of one chunk's table switch (``prepare_layers``).
+
+    Attributes:
+        layer_ids: The chunk's layers, in switch order.
+        physical_to_logical: ``[n, P]`` int64 logical id per slot.
+        replicas: ``[n, E, X]`` int32 replica table rows, -1 padded.
+        num_valid: ``[n, E]`` int32 replicas per logical expert.
+        rank_dispatch: ``[n, E]`` int32 rows of this rank's static dispatch
+            map, or None when the placement never materialized it.
+    """
+
+    layer_ids: tuple[int, ...]
+    physical_to_logical: torch.Tensor
+    replicas: torch.Tensor
+    num_valid: torch.Tensor
+    rank_dispatch: torch.Tensor | None
 
 
 @dataclass
@@ -238,23 +259,24 @@ class ExpertLocationMetadata:
 
     # -------------------------------- in-place updates ------------------------------
 
-    def update_layers(self, layer_ids: Sequence[int], new_rows: torch.Tensor) -> None:
-        """Rewrite the placement of ``layer_ids`` in the existing tables.
+    def prepare_layers(
+        self, layer_ids: Sequence[int], new_rows: torch.Tensor
+    ) -> PreparedPlacementRows:
+        """Derive, on the host, everything a table switch of ``layer_ids`` writes.
 
-        The router and the captured CUDA graphs hold views of these tables, so
-        the switch is a ``copy_`` into their storage: the device
-        ``physical_to_logical_map`` and replica table rows, the valid counts,
-        this rank's static dispatch map when it has been materialized, then
-        the host map the loader and the move planner read. Called on the
-        forward thread only, after the layer's weights landed, so a forward
-        never sees a layer whose table and slots disagree.
+        One call per chunk: the inverse (replica) rows, their valid counts and
+        -- when this rank's static dispatch map has been materialized -- its
+        rows for exactly these layers. Validation (every logical expert keeps
+        a slot) happens here, before any table is touched, so the per-layer
+        ``switch_layer`` is a few ``copy_`` calls and the forward thread's
+        stall is bounded by the chunk, not by the model.
 
         Args:
             layer_ids: The layers to switch.
             new_rows: ``[len(layer_ids), num_physical_experts]`` logical ids
                 on the host, one row per layer.
         """
-        layer_ids = [int(layer_id) for layer_id in layer_ids]
+        layer_ids = tuple(int(layer_id) for layer_id in layer_ids)
         new_rows = new_rows.to(device="cpu", dtype=torch.int64)
         if tuple(new_rows.shape) != (len(layer_ids), self.num_physical_experts):
             raise ValueError(
@@ -266,8 +288,6 @@ class ExpertLocationMetadata:
                 raise ValueError(
                     f"layer {layer_id} is outside the placement's {self.num_layers}"
                 )
-        # The inverse rows are built on the host and validated there (every
-        # logical expert keeps at least one slot) before any table is touched.
         replicas = _pad_replica_table(
             _compute_logical_to_all_physical_map(
                 new_rows, num_logical_experts=self.num_logical_experts
@@ -275,32 +295,71 @@ class ExpertLocationMetadata:
             self.logical_to_all_physical_map.shape[-1],
         )
         num_valid = torch.count_nonzero(replicas != -1, dim=-1).to(torch.int32)
-        device = self.physical_to_logical_map.device
-        for i, layer_id in enumerate(layer_ids):
-            self.physical_to_logical_map[layer_id].copy_(
-                new_rows[i].to(self.physical_to_logical_map.dtype)
-            )
-            self.logical_to_all_physical_map[layer_id].copy_(replicas[i].to(device))
-            self.logical_to_all_physical_map_num_valid[layer_id].copy_(
-                num_valid[i].to(device)
-            )
-            self.physical_to_logical_map_cpu[layer_id].copy_(
-                new_rows[i].to(self.physical_to_logical_map_cpu.dtype)
-            )
+        rank_dispatch = None
         if self._rank_dispatch_map is not None:
-            # The static map is a function of the whole table; recompute it
-            # from the host map (no device read-back) and switch these rows.
-            full = compute_logical_to_rank_dispatch_physical_map(
-                logical_to_all_physical_map=_compute_logical_to_all_physical_map(
-                    self.physical_to_logical_map_cpu,
-                    num_logical_experts=self.num_logical_experts,
-                ),
+            # Each (layer, expert) choice depends only on that layer's
+            # replicas, so only the chunk's rows are derived; every rank runs
+            # the same computation on the same rows.
+            rank_dispatch = compute_logical_to_rank_dispatch_physical_map(
+                logical_to_all_physical_map=replicas,
                 num_physical_experts=self.num_physical_experts,
                 ep_rank_nodes=self.ep_rank_nodes,
                 ep_rank=self.ep_rank,
             )
-            for layer_id in layer_ids:
-                self._rank_dispatch_map[layer_id].copy_(full[layer_id].to(device))
+        return PreparedPlacementRows(
+            layer_ids=layer_ids,
+            physical_to_logical=new_rows,
+            replicas=replicas,
+            num_valid=num_valid,
+            rank_dispatch=rank_dispatch,
+        )
+
+    def switch_layer(self, prepared: PreparedPlacementRows, index: int) -> None:
+        """Rewrite one prepared layer's rows in the existing tables.
+
+        The router and the captured CUDA graphs hold views of these tables, so
+        the switch is a ``copy_`` into their storage: the device
+        ``physical_to_logical_map`` and replica table rows, the valid counts,
+        this rank's static dispatch map when it has been materialized, then
+        the host map the loader and the move planner read. Called on the
+        forward thread only, after the layer's weights landed, so a forward
+        never sees a layer whose table and slots disagree.
+
+        Args:
+            prepared: The chunk's rows from ``prepare_layers``.
+            index: Position of the layer within ``prepared.layer_ids``.
+        """
+        layer_id = prepared.layer_ids[index]
+        device = self.physical_to_logical_map.device
+        self.physical_to_logical_map[layer_id].copy_(
+            prepared.physical_to_logical[index].to(self.physical_to_logical_map.dtype)
+        )
+        self.logical_to_all_physical_map[layer_id].copy_(
+            prepared.replicas[index].to(device)
+        )
+        self.logical_to_all_physical_map_num_valid[layer_id].copy_(
+            prepared.num_valid[index].to(device)
+        )
+        if self._rank_dispatch_map is not None:
+            if prepared.rank_dispatch is None:
+                raise RuntimeError(
+                    "the static dispatch map was materialized after the rows "
+                    "were prepared; prepare the chunk again"
+                )
+            self._rank_dispatch_map[layer_id].copy_(
+                prepared.rank_dispatch[index].to(device)
+            )
+        self.physical_to_logical_map_cpu[layer_id].copy_(
+            prepared.physical_to_logical[index].to(
+                self.physical_to_logical_map_cpu.dtype
+            )
+        )
+
+    def update_layers(self, layer_ids: Sequence[int], new_rows: torch.Tensor) -> None:
+        """Prepare and switch ``layer_ids`` in one go (``prepare_layers`` + ``switch_layer``)."""
+        prepared = self.prepare_layers(layer_ids, new_rows)
+        for index in range(len(prepared.layer_ids)):
+            self.switch_layer(prepared, index)
 
     def snapshot_load(self) -> ExpertLoadSnapshot:
         """Read the route counters to the host and start a new window.

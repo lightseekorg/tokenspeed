@@ -37,6 +37,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.moe import expert_location
 from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
 from tokenspeed.runtime.moe.expert_location_updater import ExpertLocationUpdater
 from tokenspeed.runtime.moe.expert_rebalance import plan_slot_moves
@@ -122,11 +123,11 @@ def test_local_moves_keep_cycles_intact_and_switch_tables_after_weights():
     placement = _placement(old_map, 0, (0,))
     weights = _weights(placement)
     order: list = []
-    real_update = placement.update_layers
+    real_switch = placement.switch_layer
 
-    def spy_update(layer_ids, new_rows):
-        order.append(("tables", tuple(layer_ids), weights[0][2].tolist()))
-        real_update(layer_ids, new_rows)
+    def spy_switch(prepared, index):
+        order.append(("tables", (prepared.layer_ids[index],), weights[0][2].tolist()))
+        real_switch(prepared, index)
 
     updater = ExpertLocationUpdater(
         placement,
@@ -147,7 +148,7 @@ def test_local_moves_keep_cycles_intact_and_switch_tables_after_weights():
     with mock.patch.object(
         dist, "batch_isend_irecv", side_effect=AssertionError("no P2P on one rank")
     ):
-        with mock.patch.object(placement, "update_layers", spy_update):
+        with mock.patch.object(placement, "switch_layer", spy_switch):
             updater.apply((0, 1), new_map, moves)
     _assert_slots_hold(weights, placement, new_map)
     # The table switch of layer 0 ran after its slots held the new experts.
@@ -158,6 +159,61 @@ def test_local_moves_keep_cycles_intact_and_switch_tables_after_weights():
     assert placement.logical_to_all_physical(1, 0) == [0, 4]
     # Load counters are not part of the move.
     assert placement.physical_load.shape == (2, 6)
+
+
+def test_one_chunk_prepares_its_rows_once_and_switches_per_layer():
+    """The host-side derivation (inverse rows and, under all-to-all EP, this
+    rank's static dispatch rows) runs once per chunk over the chunk's layers
+    only; each layer then switches with device copies after its weights."""
+    old_map = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0], [0, 1, 2, 3]])
+    new_map = torch.tensor([[1, 0, 2, 3], [3, 2, 0, 1], [0, 1, 2, 3]])
+    placement = _placement(old_map, 0, (0, 0))
+    static_map = placement.rank_dispatch_map()  # all-to-all EP materializes it
+    weights = _weights(placement)
+    updater = ExpertLocationUpdater(
+        placement,
+        weights,
+        process_group=mock.Mock(name="pg"),
+        peer_ranks=(0, 1),
+        ep_rank=0,
+        all_to_all_ep=True,
+        num_groups=None,
+        num_nodes=1,
+    )
+    moves = _moves(old_map, new_map, placement)
+    calls: list = []
+    real_compute = expert_location.compute_logical_to_rank_dispatch_physical_map
+
+    def spy_compute(*, logical_to_all_physical_map, **kwargs):
+        calls.append(tuple(logical_to_all_physical_map.shape))
+        return real_compute(
+            logical_to_all_physical_map=logical_to_all_physical_map, **kwargs
+        )
+
+    with (
+        mock.patch.object(
+            dist, "batch_isend_irecv", side_effect=AssertionError("no P2P here")
+        ),
+        mock.patch.object(
+            expert_location,
+            "compute_logical_to_rank_dispatch_physical_map",
+            spy_compute,
+        ),
+        mock.patch.object(
+            placement, "switch_layer", wraps=placement.switch_layer
+        ) as switch,
+    ):
+        updater.apply((0, 1), new_map[:2], {k: moves[k] for k in (0, 1)})
+    # One derivation for the two-layer chunk, over those two layers' rows.
+    assert calls == [(2, 4, placement.logical_to_all_physical_map.shape[-1])]
+    assert [c.args[1] for c in switch.call_args_list] == [0, 1]
+    _assert_slots_hold(weights, placement, new_map)
+    # The static map switched in place for the chunk's layers only.
+    assert placement.rank_dispatch_map() is static_map
+    # Every expert has one replica, so the map is the inverse of each row.
+    assert static_map[0].tolist() == [1, 0, 2, 3]
+    assert static_map[1].tolist() == [2, 3, 1, 0]
+    assert static_map[2].tolist() == [0, 1, 2, 3]
 
 
 def test_updater_rejects_mismatched_slot_tensors():
