@@ -260,6 +260,8 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
             "chunked_prefill_size": server_args.chunked_prefill_size,
             "max_model_len": model_config.context_len,
             "multimodal_encoder_dtype": multimodal_encoder_dtype,
+            # No LM here: nothing scores prompt rows.
+            "supports_prompt_logprobs": False,
         }
     )
     mark_jit_compile_serving()

@@ -494,11 +494,12 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_params: SamplingParams
     # Whether to return the sampled token's logprob for this request.
     return_logprob: bool = False
-    # Internal carry-over fields kept for pipeline/PD compatibility. The
-    # output-logprob API only drives ``return_logprob``; InputProcessor sets
-    # these to neutral values (logprob_start_len=-1, top_logprobs_num=0,
-    # token_ids_logprob=None) since prompt logprobs, output top-k, and token-id
-    # logprobs are not supported.
+    # SGLang dialect: prompt (input) logprobs are returned for positions
+    # ``[logprob_start_len, len(input_ids))``; -1 selects the last prompt
+    # token only (no prompt logits needed). The ingress resolves -1 and
+    # rejects starts past the prompt. Output top-k and token-id logprobs are
+    # not supported: InputProcessor keeps top_logprobs_num=0 and
+    # token_ids_logprob=None.
     logprob_start_len: int = -1
     top_logprobs_num: int = 0
     token_ids_logprob: list[int] | None = None
@@ -680,10 +681,14 @@ class BatchTokenIDOut(BaseBatchReq, kw_only=True):
     spec_verify_ct: list[int]
 
     # Logprobs
-    input_token_logprobs_val: list[float]
-    input_token_logprobs_idx: list[int]
-    # Per-request lists, parallel to rids: the newly-decoded tokens' sampled
-    # logprobs/token ids this step, [] when logprobs are off (see stream_output).
+    # Per-request lists, parallel to rids. Prompt (input) logprobs are shipped
+    # once, on the first frame after the prompt's final chunk committed, as
+    # ``[None, lp(ids[start+1]), ...]`` over ``ids[start:]``; every other
+    # frame carries [] (see stream_output; the frontend keeps the lists).
+    input_token_logprobs_val: list[list[float | None]]
+    input_token_logprobs_idx: list[list[int]]
+    # The newly-decoded tokens' sampled logprobs/token ids this step, [] when
+    # logprobs are off (see stream_output).
     output_token_logprobs_val: list[list[float]]
     output_token_logprobs_idx: list[list[int]]
     input_top_logprobs_val: list[list]
@@ -737,7 +742,11 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # Sampled-token logprobs, parallel to rids: one inner list per request,
     # holding the value/token-id of each newly-decoded token this step. Empty []
     # for a request that did not ask for logprobs, so the columns stay
-    # non-ragged (always length == len(rids)).
+    # non-ragged (always length == len(rids)). Prompt (input) logprobs have no
+    # column here: the msgpack ingress refuses a ``logprob_start_len`` that
+    # would produce them (``MsgpackRecvSocket._validation_error``). Carrying
+    # them means appending ``input_token_logprobs_val/idx`` at the wire tail
+    # together with the frontend's decoder.
     output_token_logprobs_val: list[list[float]]
     output_token_logprobs_idx: list[list[int]]
     # Producing DP rank's engine index (the identity it dialed the frontend
@@ -814,11 +823,13 @@ class BatchStrOut(BaseBatchReq, kw_only=True):
     cached_tokens: list[int]
     spec_verify_ct: list[int]
 
-    # Logprobs
-    input_token_logprobs_val: list[float]
-    input_token_logprobs_idx: list[int]
-    output_token_logprobs_val: list[float]
-    output_token_logprobs_idx: list[int]
+    # Logprobs: the same per-request columns as BatchTokenIDOut, forwarded
+    # unchanged by a detokenizing producer (typed msgspec decode rejects a
+    # mismatch).
+    input_token_logprobs_val: list[list[float | None]]
+    input_token_logprobs_idx: list[list[int]]
+    output_token_logprobs_val: list[list[float]]
+    output_token_logprobs_idx: list[list[int]]
     input_top_logprobs_val: list[list]
     input_top_logprobs_idx: list[list]
     output_top_logprobs_val: list[list]

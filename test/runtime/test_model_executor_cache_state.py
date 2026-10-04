@@ -144,7 +144,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         merge_oov=lambda *_args: None,
     )
     executor._run_target_forward = lambda *_args: SimpleNamespace(
-        next_token_logprobs=None
+        next_token_logprobs=None, input_token_logprobs=None
     )
     executor._run_sampling = lambda *_args: (
         torch.tensor([3], dtype=torch.int32),

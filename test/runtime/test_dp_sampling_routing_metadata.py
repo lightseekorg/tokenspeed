@@ -340,6 +340,7 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
         lm_head,
         LogitsMetadata(forward_mode=ForwardMode.DECODE),
         plan=plan,
+        require_full_vocab=False,
     )
 
     assert logits.shape == (12, 7)
@@ -372,6 +373,7 @@ def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
         lm_head,
         LogitsMetadata(forward_mode=ForwardMode.DECODE),
         plan=plan,
+        require_full_vocab=False,
     )
 
     assert logits.shape == (12, 7)

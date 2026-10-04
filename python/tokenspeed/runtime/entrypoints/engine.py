@@ -717,6 +717,9 @@ def _launch_subprocesses(
         "max_single_request_tokens"
     ]
     tokenizer_manager.context_len = scheduler_info["max_model_len"]
+    tokenizer_manager.supports_prompt_logprobs = scheduler_info[
+        "supports_prompt_logprobs"
+    ]
     return tokenizer_manager, None, scheduler_info
 
 

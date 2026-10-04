@@ -203,6 +203,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # Set after scheduler is initialized
         self.max_req_input_len = None
         self.max_single_request_tokens = None
+        # Whether the engine can serve prompt (input) logprobs; None until the
+        # scheduler reported it, which the ingress treats as "cannot".
+        self.supports_prompt_logprobs: bool | None = None
 
         self.metrics = RequestMetrics(
             labels={

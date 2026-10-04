@@ -128,7 +128,7 @@ class DFlash2(DFlash):
             return self.candidate_topk(hidden_states)
         metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
         logits = self.candidate_logits_processor._get_logits(
-            hidden_states, self.lm_head, metadata
+            hidden_states, self.lm_head, metadata, require_full_vocab=False
         )
         unary_logits, candidate_ids = torch.topk(
             logits, self.selector_top_k, dim=-1, sorted=False

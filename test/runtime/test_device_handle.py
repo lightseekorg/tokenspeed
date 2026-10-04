@@ -124,6 +124,9 @@ class _DecodeExecutor(DisaggDecodeExecutor):
     def pop_remote_cached_tokens(self, request_id):
         return 0
 
+    def pop_remote_bootstrap_logprob(self, request_id):
+        return None
+
     def pop_remote_cache_slot(self, req_id):
         return self._slot
 
@@ -173,13 +176,14 @@ def _planned(*, num_extends, label=None):
         multimodal_context=None,
         ngram_inputs=None,
         request_history_seeds=None,
+        input_logprob_plan=None,
     )
 
 
 def _loop(trace, kv_transfer, state):
     output_processor = SimpleNamespace(
         rid_to_state={"r0": state} if state is not None else {},
-        on_remote_prefill_done=lambda rid, tok, cached_tokens: trace.append(
+        on_remote_prefill_done=lambda rid, tok, cached_tokens, logprob: trace.append(
             ("bootstrap", tok)
         ),
         finish_remote_prefill_only_request=lambda rid: [],
@@ -880,22 +884,28 @@ def test_prefill_usage_hook_records_committed_totals_and_skips_retired_requests(
     from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 
     recorded = []
+    logprobs = []
     transfer = object.__new__(DisaggPrefillExecutor)
     transfer.senders = {"hit": SimpleNamespace(bootstrap_room=9)}
     transfer.kv_manager = SimpleNamespace(
-        record_cached_tokens=lambda room, count: recorded.append((room, count))
+        record_cached_tokens=lambda room, count: recorded.append((room, count)),
+        record_bootstrap_logprob=lambda room, lp: logprobs.append((room, lp)),
     )
+    state = SimpleNamespace(cached_tokens=1280, output_token_logprobs_val=[])
     loop = SimpleNamespace(
         kv_transfer=transfer,
-        output_processor=SimpleNamespace(
-            rid_to_state={"hit": SimpleNamespace(cached_tokens=1280)}
-        ),
+        output_processor=SimpleNamespace(rid_to_state={"hit": state}),
     )
     hooks = PdTransferHooks(loop, None)
     hooks.record_prefill_usage(["hit", "retired"])
-    loop.output_processor.rid_to_state["hit"].cached_tokens = 1536
+    # An intermediate chunk has no bootstrap token yet; the final chunk's
+    # commit appends it with its logprob, which then rides the status message.
+    assert logprobs == []
+    state.cached_tokens = 1536
+    state.output_token_logprobs_val = [-0.75]
     hooks.record_prefill_usage(["hit"])
     assert recorded == [(9, 1280), (9, 1536)]
+    assert logprobs == [(9, -0.75)]
     loop.kv_transfer = None
     hooks.record_prefill_usage(["hit"])
     assert recorded == [(9, 1280), (9, 1536)]

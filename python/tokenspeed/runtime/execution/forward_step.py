@@ -1043,6 +1043,10 @@ class ForwardStepRunner:
         replay, which never read them. ``block_tables_cpu`` mirrors
         ``block_tables`` on the host for backends that plan an extend from
         the tables without waiting on the device.
+
+        Returns ``(output_tokens, output_lengths, output_logprobs,
+        input_token_logprobs)``; the last is the prompt-logprob gather of an
+        extend/mixed forward (``ctx.input_logprob_rows``) and None otherwise.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1161,10 +1165,13 @@ class ForwardStepRunner:
             if self._expert_load_rows is not None:
                 self._expert_load_rows.clear()
 
+            # A decode graph never gathers prompt logprobs (its captured
+            # fourth output is None).
             (
                 output_tokens,
                 output_lengths,
                 output_logprobs,
+                _input_token_logprobs,
             ) = self.output_buffers[graph_key]
 
             result = (
@@ -1175,6 +1182,7 @@ class ForwardStepRunner:
                     if output_logprobs is not None
                     else None
                 ),
+                None,
             )
         else:
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
