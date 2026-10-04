@@ -107,7 +107,13 @@ class OrdinaryRecipe(CacheRecipe):
         if self.family not in ("mla", "dsa") or self.attn_config.dcp_size == 1:
             return groups
         if self.draft_attn_config is not None:
-            raise ValueError("Sharded MLA/DSA cache does not support a draft model")
+            # The draft group would shard like the target's, but the draft's
+            # DCP decode steps are unvalidated and AttnConfig already rejects
+            # speculation under FlashMLA/GPU DSA DCP (docs/design/cache-concepts.md).
+            raise ValueError(
+                "Sharded MLA/DSA cache does not yet support a draft model; "
+                "run DCP without speculative decoding"
+            )
         return tuple(
             (replace(spec, shard_count=self.attn_config.dcp_size), fields)
             for spec, fields in groups

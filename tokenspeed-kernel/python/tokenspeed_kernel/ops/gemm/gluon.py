@@ -53,6 +53,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         launch_gluon_mm_a16w16_prefill_gfx950 as _mm_a16w16_prefill_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+        supports_gluon_mm_a16w16_prefill_gfx950 as _supports_mm_a16w16_prefill,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         launch_gluon_bmm_a16w16_gfx950 as _bmm_a16w16_impl,
     )
@@ -95,11 +98,6 @@ if current_platform().is_amd:
         }
     )
 
-    # Cold-cache rocprof measurements on MI350X identify one contiguous prefill
-    # range. Shapes outside it keep the PyTorch/rocBLAS path.
-    def _is_dense16_prefill_problem(m: int, n: int, k: int) -> bool:
-        return 2816 <= m <= 4096 and m % 256 == 0 and n == 3072 and k == 512
-
     def _validate_dense16_mm_arguments(
         A_scales: torch.Tensor | None,
         B_scales: torch.Tensor | None,
@@ -119,7 +117,7 @@ if current_platform().is_amd:
         signatures=_DENSE16_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
-            "mnk_problem_filter": frozenset({_is_dense16_prefill_problem}),
+            "mnk_problem_filter": frozenset({_supports_mm_a16w16_prefill}),
             "a_inner_stride_one": frozenset({True}),
             "b_inner_stride_one": frozenset({True}),
             "out_dtype": frozenset({torch.bfloat16}),
@@ -136,7 +134,7 @@ if current_platform().is_amd:
         block_size: list[int] | None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Dispatch measured Kimi shared-projection prefills to the large kernel."""
+        """Dispatch measured Kimi K3 projection prefills to the large-M kernel."""
         _validate_dense16_mm_arguments(A_scales, B_scales, block_size)
         output = _mm_a16w16_prefill_impl(A, B, out_dtype, alpha=alpha, out=out)
         if output is None:

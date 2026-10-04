@@ -1128,6 +1128,37 @@ class CacheGroupRouterTest(unittest.TestCase):
         self.assertEqual(leaves[SWA].seq_lens_buf[:2].tolist(), [7, 7])
         self.assertEqual(router.child_backends(), (leaves[FULL], leaves[SWA]))
 
+    def test_mtp_frontier_reaches_each_leaf_through_its_own_hook(self):
+        """The MTP re-anchor is dispatched to the leaf's
+        ``update_draft_forward_metadata``: a leaf with per-row metadata (DSA)
+        re-expands its k-row shape there, while the leaf default is the plain
+        seq_lens edit, so leaves without an override keep today's behavior."""
+
+        class _KRowLeaf(_StubLeaf):
+            def __init__(self, kernel_page_size):
+                super().__init__(kernel_page_size)
+                self.frontiers: list[list[int]] = []
+
+            def update_draft_forward_metadata(self, frontier):
+                self.frontiers.append(frontier.tolist())
+
+        leaves = {FULL: _KRowLeaf(4), SWA: _StubLeaf(2)}
+        router = CacheGroupRouter(
+            None,
+            is_draft=True,
+            spec_num_tokens=4,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.bind(_geometry(), leaves)
+        router.init_cuda_graph_state(4)
+
+        router.update_draft_forward_metadata(torch.tensor([7, 3], dtype=torch.int32))
+
+        self.assertEqual(leaves[FULL].frontiers, [[7, 3]])
+        self.assertEqual(leaves[FULL].seq_lens_buf[:2].tolist(), [0, 0])
+        self.assertEqual(leaves[SWA].seq_lens_buf[:2].tolist(), [7, 3])
+
     def test_every_metadata_build_clears_the_sparse_topk_share(self):
         """The sparse layers' shared selection is per forward: extend init,
         decode refresh and capture seeding each start it empty, so a "shared"
@@ -1506,6 +1537,7 @@ class PagedLeafRebindTest(unittest.TestCase):
                 "forward_prefill_metadata",
                 "forward_decode_metadata",
                 "spec_cache_seqlens_buf",
+                "tree_prefix_lens_buf",
             ],
         )
 

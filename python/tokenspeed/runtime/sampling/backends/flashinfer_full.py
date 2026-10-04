@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
 class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
@@ -365,7 +366,13 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        *,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if tree is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot verify draft trees"
+            )
 
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
@@ -440,6 +447,17 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         coins = self._coins_buf[row0 : row0 + bs, :num_tokens_per_req]
         coins_for_final_sampling = self._final_coins_buf[row0 : row0 + bs]
 
+        use_draft_prob = sampling_info.draft_probs is not None
+        draft_probs = (
+            self._gather_draft_probs(
+                sampling_info.draft_probs,
+                sampling_info.req_pool_indices,
+                bs,
+                num_tokens_per_req,
+            )
+            if use_draft_prob
+            else None
+        )
         chain_speculative_sampling_target_only(
             predicts=predict,
             accept_index=accept_index,
@@ -448,10 +466,12 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
-            draft_probs=None,
+            draft_probs=draft_probs,
             threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
             deterministic=True,
+            use_draft_prob=use_draft_prob,
+            reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
         )
         if global_server_args_dict["numerics"] == "rl-bitwise":
             canonical_greedy_verify(

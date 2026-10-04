@@ -172,7 +172,15 @@ are padding and must resolve to the null page 0 / dummy slot so they never
 touch a live request's cache. Eager passes `bs == actual_bs` (unpadded — no
 wasted FLOPs);
 `actual_bs == 0` is the idle replay. Eager idle bypasses the wrapper entirely
-(`execute_idle_forward` calls `model_runner.forward(IDLE)` directly).
+(`execute_idle_forward` calls `model_runner.forward(IDLE)` directly). With a
+drafter, the eager idle then asks the drafter for its round
+(`idle_forward_global_num_tokens`): one list of per-rank token counts per
+draft forward the active ranks run, and runs one IDLE draft forward per
+entry over an empty window, entry `i` with `spec_step_idx=i` and that
+entry's counts — the row shape the active ranks' step `i` runs (the Eagle
+chain: the target's rows at step 0, one row per request after; multi-depth
+MTP: the target's rows at every depth; block drafters: one forward). The
+executor never derives a drafter's step count or shape itself.
 
 ### Pointer-stable per-bs views from one builder
 
@@ -196,6 +204,14 @@ use uninitialized output and a placeholder for a disabled intermediate cache:
 live rows are fully written, while negative padding rows skip state access
 and leave output undefined. Consumers must ignore padded output; enabled
 intermediate caches always require real storage.
+
+State backends refresh every state group's decode pages in one prep-tape
+launch, up to eight groups; the tape loops over rows, so it covers every
+captured batch size. Target verify writes each group's committed-state pages
+straight into the captured `state_in` buffers. The commit enqueued after the
+replay reads those buffers before the next refresh rewrites them. Verify keeps
+`state_out` at `pad_slot_id` and refills it only after a decode refresh has
+written live pages into the same per-bs buffer.
 
 After verification, GDN, KDA and PLE resolve the accepted checkpoint with
 `commit_state_pages`, once per state group and only for live requests. It
@@ -476,13 +492,33 @@ seq-lens-only: Eagle's step-0 accepted-prefix publish fires
 `advance_draft_forward_metadata` BEFORE the step-0 attention has consumed
 the verify-shaped write window, so the write-window publication is a
 separate, explicit drafter-loop call (`publish_draft_step_locations`, see
-"Write locations have one owner").
+"Write locations have one owner"). The router hands each hook to the
+leaf's hook of the same name, because the two edits describe different
+row shapes: the Eagle chain runs one row per request after step 0, the
+multi-depth MTP window `k` rows per request at every depth. A leaf whose
+decode kernels derive each row's causal bound from the request's single
+cache length needs the same seq_lens edit for both (the
+`PagedAttentionBackend` default routes `update_` to `advance_`); a leaf
+holding per-row decode metadata re-expands it in `update_` — DSA rewrites
+its per-token indexer rows (`_dsa_seq_lens_2d`, `[bs * k, 1]`) and their
+plan to the frontier, in place, while its `advance_` re-plans `[bs, 1]`
+rows and leaves the per-token rows as the round's refresh published them.
+Neither hook clears the layer-shared sparse selection: the depth loop is
+one forward's worth of top-k reuse.
 
 Backends with sharded KV must refresh derived local visibility in the same
 draft length-update hook as the global lengths. While page allocation and
 request order stay unchanged, they reuse the compact tables and ownership
 prefixes from the full refresh and update local visibility in place. Eager
 execution and CUDA graph replay use the same hooks and persistent buffers.
+
+One named exception: draft-tree lanes (`docs/design/tree-speculation.md`)
+read `TreeDraftInputs`, which the drafter writes inside the round -- the
+frontier and lane window lengths once, then each step's lane masks, plus
+`active`, a Python flag set around each lane forward. The buffers are bound
+once, live at fixed addresses and are written by in-graph ops before each lane
+forward reads them; the draft leaf's decode metadata itself is still
+refreshed only as above.
 
 **Step 0 narrows rows; the drafter owns the lengths, the model names the
 moment.** Eagle's step 0 runs over the target's verify window (`N` rows per
@@ -546,6 +582,20 @@ anchor and real draft candidates with the target and draft caches. Decode
 installs that window before its first ordinary verify round. Stage ownership
 changes where context and proposals are produced; candidate handoff and
 verification follow the same path as other speculative prefills.
+
+Known limitation, multi-depth MTP (`Mtp`): the drafter's cross-round
+stash — per request-pool slot, the last `k-1` committed tokens and the
+target hiddens one position behind them, which seed the rows of the
+frontier-anchored decode window that lie before this round's verify window
+— is drafter-private state the prefill node fills during its extend
+catch-up and the bootstrap payload does not carry. After a PD landing the
+decode node's first rounds read the slot's stash as it stands (never
+filled for this request), so the depth loop rewrites up to `k-1` draft-KV
+positions in the prompt tail from wrong inputs until the stash has rolled
+those entries out (at most `k-1` rounds; the prompt-tail planes the
+prefill node transferred were correct). Draft quality only: verification
+is exact. Intended fix: ship the slot's stash rows with the bootstrap
+payload, the way K3 DSpark hands over its anchor and candidates.
 
 ### PD prefill nodes
 
@@ -932,6 +982,21 @@ A last pipeline stage borrows its local draft embedding when the target
 embedding lives elsewhere; this is resource binding, not a different proposal
 algorithm. Per-forward capture hooks consume the established configuration.
 
+Embed/head sharing (`shares_target_embed_head`) follows the same stage
+ownership. `get_embed_and_head` returns None for a side the stage does not
+hold -- the embedding lives on the first stage, the head on the last -- and
+never dereferences an absent module. Stages before the last bind nothing: a
+draft built there only produces context. The last stage binds what the target
+reports, which is the head alone (`embed=None`); a pipeline-capable draft then
+keeps the `embed_tokens` shard its checkpoint ships for that layer, its loader
+rejects a pipeline checkpoint without one, and the factory checks afterwards
+that the draft's own `get_embed_and_head` still reports an embedding -- a
+draft that aliases None into its embedding is named at construction rather
+than failing at its first forward (`BaseCausalLM.set_embed_and_head` refuses
+`embed=None` outright, since a generic draft keeps none). Off the pipeline
+both sides are shared and the draft's copies are dropped before the KV-cache
+budget is profiled, as before.
+
 Checkpoint tap labels remain zero-based completed-layer IDs. Prefix tap L is
 produced after L. AttnRes tap L is produced at L+1's entry by that layer's
 mixer, before input-layer normalization or snapshot mutation; the final tap
@@ -950,12 +1015,70 @@ Pipeline stages use `DSparkContextProducer`: each stage normalizes the taps it
 owns if configured, applies their projection columns and sums in FP32; the
 accumulator travels with the chunk's PP state and the final stage applies
 context normalization once and writes native context KV. The executor selects
-the producer from the pipeline configuration alone (`pp_size > 1` with a
-speculative algorithm) and requires the draft model to implement
-`DSparkContextModel`. Off the pipeline every tap is local, so the drafter keeps
-its concatenated projection and its own context writes -- including the
-quantization-aware path, since raw per-tap weight slicing is not a quantized
-linear operation. PP drafts require unquantized projection weights.
+the producer from the pipeline configuration and the draft model's class
+(`select_dspark_context_producer`): on a pipeline a draft implementing
+`DSparkContextModel` gets a producer on every stage, a block drafter whose
+model does not implement it is rejected (it would draft from one stage's taps
+alone), EAGLE3 is refused (its aux taps span stages), and any other draft gets
+none. Off the pipeline every tap is local, so
+the drafter keeps its concatenated projection and its own context writes --
+including the quantization-aware path, since raw per-tap weight slicing is
+not a quantized linear operation. PP drafts require unquantized projection
+weights.
+
+### Pipeline speculation is not DSPARK-only
+
+An MTP (NextN) draft runs on a prefill pipeline without any cross-stage
+production: it consumes the post-final-norm hidden states the last stage
+already computes, so only that stage drafts. EAGLE3 stays off the pipeline:
+its aux taps come from several stages and the stage boundary bundle does not
+carry them; `ServerArgs` rejects it and `select_dspark_context_producer`
+refuses it again at executor construction. The MTP shape is
+
+* **Construction.** `ServerArgs` accepts `DSPARK` and `MTP` with
+  `--pipeline-parallel-size > 1` on the prefill role only (the chunk pipeline
+  has no decode token feedback to draft against anywhere else); the dense ==
+  attention TP / CP = 1 rule stays DSPARK's, whose draft reduces attention-TP
+  embedding partials over the dense TP group. Which stages build the draft
+  model at all is the factory's decision, not each model's
+  (`factory.pipeline_stage_builds_draft`): a block drafter is built on every
+  stage because it produces context from every stage's taps, while an MTP
+  draft is built on the last stage alone -- the other stages construct no
+  draft runner, load no draft shard and wire nothing, so `ModelExecutor` and
+  `configure_draft_target` see `draft_model_runner=None` there and the in-tree
+  K3 and V4 NextN drafts need no stage-aware shell. The skip is safe because
+  nothing in draft construction is a world collective the skipping stages
+  would have to join: the KV-budget all-reduce runs on every stage with or
+  without a draft, the DeepEP/MoE communicators a draft layer reuses are the
+  target's and scoped to the stage, and the only world-scoped step -- the
+  InstantTensor weight iterator, which synchronizes over `group.WORLD` when a
+  model declares no `checkpoint_load_group` -- is bounded by the factory,
+  which loads a pipeline draft with the stage's rank set
+  (`ModelRunner(checkpoint_load_group=...)`, surfaced as
+  `LoadConfig.checkpoint_load_group`; a model's own declaration, such as K3
+  DSpark's stage-subset filter group, still wins). With no producer configured
+  the last stage's target forward captures `CaptureHiddenMode.FULL` for its
+  drafter.
+* **Cache.** Nothing changes: `CacheLayerOwnership` already places the draft
+  cache layers as the last stage's trailing producer step, the draft backend
+  and pool exist only there, and the merged plan, bootstrap placement and
+  transfer routes are the same as for DSPARK.
+* **Layerwise CachePD.** `supports_pd_layerwise_finalization` is decided per
+  stage (`device._supports_pd_layerwise_finalization`): a stage owning no
+  draft fields has nothing to finalize and answers True; the owning stage
+  answers for `ModelExecutor.draft_field_writer` -- the producer when
+  configured, else the drafter -- exactly as a non-PP engine does, and
+  `register_draft_final_step_counter` reads the same property. The last stage
+  registers the draft-final step counter; the others count target layers only.
+* **Handoff.** The last stage samples, runs the drafter over the completing
+  chunk and writes the candidate block into the reserved decode slot; the
+  event loop broadcasts `(output_tokens, output_lengths, next_input_ids)`
+  over the PP gloo group at commit so every rank's scheduler stamps the same
+  bootstrap token and candidate window onto the remote decode. The PD wire
+  and the decode side are untouched.
+
+Expect a larger last-stage bubble (NextN layer plus draft extend and
+multi-step drafting); rebalance with `--pp-layer-partition`.
 
 The producer is stateless across forwards. Each chunk owns its accumulator;
 queued chunks cannot alias it. A configured `ctx.dspark_context_producer`

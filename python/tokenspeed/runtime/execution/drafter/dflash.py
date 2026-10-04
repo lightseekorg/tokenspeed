@@ -168,7 +168,6 @@ class DFlash(BaseDrafter):
         # Legacy alias: callers that predate the verify/draft split.
         self.block_size = self.verify_width
         self.hidden_size = int(getattr(cfg, "hidden_size"))
-        self.idle_forward_steps = 1
         self._init_native_buffers()
         self._validate_draft_attention_window()
         self._greedy_gathered_max: torch.Tensor | None = None
@@ -176,6 +175,14 @@ class DFlash(BaseDrafter):
         self._greedy_gather_cap = 0
         self._init_fused_kv_helper()
         self._init_incremental_proj()
+
+    @override
+    def idle_forward_global_num_tokens(
+        self, global_num_tokens: list[int], global_bs: list[int]
+    ) -> list[list[int]]:
+        # Block drafter: one draft forward proposes the whole block.
+        del global_bs
+        return [global_num_tokens]
 
     def _validate_draft_attention_window(self) -> None:
         """Reject a drafter backend that would drop the draft's window.

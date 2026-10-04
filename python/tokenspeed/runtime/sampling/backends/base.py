@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -41,8 +42,27 @@ SPECULATIVE_ACCEPT_THRESHOLD_SINGLE = 1.0
 SPECULATIVE_ACCEPT_THRESHOLD_ACC = 1.0
 
 
+@dataclass(frozen=True)
+class SpeculativeSamplingPools:
+    """The verifier's pool-indexed per-request scalars a chain drafter reads
+    to sample its proposals from the request's own distribution
+    (``--enable-speculative-sampling``). Each is ``[max_req_pool_size + 1]``,
+    indexed by ``req_pool_idx``; the backend scatters them on admission."""
+
+    temperature: torch.Tensor  # fp32
+    top_k: torch.Tensor  # int32; greedy requests carry 1
+    seed: torch.Tensor  # int64 Philox seed
+
+
 @dataclass
 class SamplingBackendConfig:
+
+    # Draft-prob rejection sampling: verify gathers the drafter's recorded
+    # distributions by pool index into a persistent [max_pad_bs, N, vocab]
+    # fp32 buffer and runs the chain kernel's coin * q(x) < p(x) rule
+    # instead of the target-only rule. Selects the verify rule, so it is
+    # explicit.
+    enable_speculative_sampling: bool
 
     enable_nan_detection: bool = False
 
@@ -50,6 +70,10 @@ class SamplingBackendConfig:
     # start / graph capture time so the fast path has zero extra compute.
     # Enabling any of these enlarges the captured graph footprint.
     enable_output_logprobs: bool = False
+
+    # Recorded draft probabilities above this are the "no proposal yet"
+    # sentinel; only read under enable_speculative_sampling.
+    spec_reject_draft_prob_threshold: float = 2.0
 
     # Sizing for pre-allocated per-backend buffers (e.g. coin buffers for
     # rejection sampling). Required to keep RNG out of the CUDA graph.
@@ -86,6 +110,10 @@ class SamplingBackendConfig:
         return cls(
             enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
+            enable_speculative_sampling=server_args.enable_speculative_sampling,
+            spec_reject_draft_prob_threshold=(
+                server_args.spec_reject_draft_prob_threshold
+            ),
             max_bs=max_bs,
             max_draft_tokens_per_req=max(max_draft_tokens_per_req, 1),
             max_req_pool_size=max_req_pool_size,
@@ -192,12 +220,33 @@ class SamplingBackend(ABC):
             self._output_pack_buf, src=self._tp_src_global_rank, group=self._tp_pg
         )
 
+    def accepted_path(self, bs: int, num_nodes: int) -> torch.Tensor:
+        """``[bs, N]`` accepted path (root first, ``-1`` past it) of the last
+        tree verify, as agreed across TP ranks."""
+        return self._accept_index_buf[: bs * num_nodes].view(bs, num_nodes)
+
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
         """Configure optional DP sampling state.
 
         Stateless or unsupported backends ignore this; DP-capable backends
         override it to initialize backend-local communication buffers.
         """
+
+    def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
+        """The pool-indexed scalars a chain drafter samples its proposals with.
+
+        Only backends whose verify runs the draft-prob chain kernel keep
+        them; server-args resolution refuses the flag for the others, so
+        reaching this default is a wiring error, not a request error.
+
+        Raises:
+            NotImplementedError: This backend has no draft-prob verify.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no draft-prob verify; "
+            "--enable-speculative-sampling needs the flashinfer or "
+            "flashinfer_full sampling backend"
+        )
 
     def maybe_broadcast(self, *tensors: torch.Tensor) -> None:
         """Broadcast each tensor from tp_group[0] so all attention-TP ranks
@@ -315,6 +364,9 @@ class SamplingBackend(ABC):
         return None and let the caller fall back to two separate D2Hs."""
         return None
 
+    # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
+    supports_tree_verify: bool = False
+
     @abstractmethod
     def sample(
         self,
@@ -328,4 +380,9 @@ class SamplingBackend(ABC):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+        *,
+        tree: TreeVerifyBatch | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Verify each request's draft window; ``tree`` is the draft tree
+        (``None`` for a chain) and needs ``supports_tree_verify``; a tree
+        verify leaves its agreed path in ``accepted_path``."""

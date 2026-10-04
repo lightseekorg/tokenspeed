@@ -58,6 +58,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3DecoderLayer,
     DeepseekV3DraftAttentionMLA,
     DeepseekV3ForCausalLM,
+    _prepare_mla_kv_b_proj_weights,
 )
 
 logger = logging.getLogger(__name__)
@@ -240,6 +241,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.mapping = mapping
+        # ``q_a_proj`` / ``kv_a_proj_with_mqa`` checkpoint tensors waiting for
+        # their partner before the fused projection is written. Kept on the
+        # instance because a live update streams the checkpoint in chunks and
+        # the pair may straddle a ``load_weights`` call.
+        self._pending_a_proj: dict[str, torch.Tensor] = {}
 
         # FP4 quantization is not used for the NextN draft model.
         # The NVIDIA FP4 checkpoint stores NextN MoE weights in BF16,
@@ -338,7 +344,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
+        cached_a_proj = self._pending_a_proj
 
         nextn_spec_weight_names = [
             "shared_head.norm",
@@ -483,6 +489,31 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     weight_loader(param, loaded_weight)
         self.post_load_weights()
 
+    def begin_weight_update(self) -> None:
+        super().begin_weight_update()
+        self._pending_a_proj.clear()
+
+    def abort_weight_update(self) -> None:
+        super().abort_weight_update()
+        self._pending_a_proj.clear()
+
+    def end_weight_update(self) -> None:
+        """Close the session; a half-arrived ``q_a``/``kv_a`` pair fails it.
+
+        Raises:
+            RuntimeError: One side of a ``q_a_proj`` / ``kv_a_proj_with_mqa``
+                pair was streamed without the other, so the fused projection
+                still holds the previous weights.
+        """
+        if self._pending_a_proj:
+            unpaired = sorted(self._pending_a_proj)
+            self.abort_weight_update()
+            raise RuntimeError(
+                f"{type(self).__name__}: the update streamed {unpaired} without "
+                "the partner tensor the fused q/kv a-projection needs"
+            )
+        super().end_weight_update()
+
     def post_load_weights(self):
         self_attn = self.model.decoder.self_attn
         if (
@@ -504,11 +535,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         else:
             w = self_attn.kv_b_proj.weight
 
-        w_kc, w_vc = w.unflatten(
-            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-        ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-        self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-        self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+        self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(w, self_attn)
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

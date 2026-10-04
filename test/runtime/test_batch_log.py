@@ -214,6 +214,32 @@ def test_step_acceptance_log_separates_committed_and_draft_tokens():
     )
 
 
+def test_non_speculative_serving_with_default_widths_logs_no_accept_lengths():
+    """ServerArgs keeps steps=3 / draft tokens=4 with speculation off; the
+    device side must hand the logger 0 widths or a bs-token decode result
+    gets viewed as [bs, 4] verify rows."""
+    from tokenspeed.runtime.execution.device import speculative_widths
+
+    assert speculative_widths("EAGLE3", 3, 4) == (3, 4)
+    spec_num_steps, spec_num_tokens = speculative_widths(None, 3, 4)
+    assert (spec_num_steps, spec_num_tokens) == (0, 0)
+
+    logger = _logger(spec_num_steps=spec_num_steps, spec_num_tokens=spec_num_tokens)
+    result = SimpleNamespace(
+        output_lengths=torch.tensor([1, 1, 1]),
+        output_tokens=torch.tensor([11, 12, 13]),
+        spec_candidate_tokens=None,
+    )
+
+    with (
+        mock.patch.object(batch_log_module, "LOG_SPEC_ACCEPT_LENGTHS", True),
+        mock.patch.object(batch_log_module.logger, "info") as log,
+    ):
+        logger.record_decode(result, bs=3)
+
+    log.assert_not_called()
+
+
 def test_step_token_log_aligns_drafts_with_predecessor_target_logits():
     logger = _logger(spec_num_steps=3, spec_num_tokens=4)
     result = SimpleNamespace(

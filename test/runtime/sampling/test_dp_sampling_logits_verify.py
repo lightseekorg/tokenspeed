@@ -146,6 +146,7 @@ def _seed_coins(backend, *, bs: int, n: int, seed: int):
 
 def _build_backend(*, max_bs: int, max_n: int, vocab: int, device, group):
     cfg = SamplingBackendConfig(
+        enable_speculative_sampling=False,
         enable_output_logprobs=False,
         max_bs=max_bs,
         max_draft_tokens_per_req=max_n,
@@ -278,7 +279,7 @@ def _test_dp_chain_matches_legacy(
     legacy_out = LogitsProcessorOutput(next_token_logits=legacy_logits)
     _seed_coins(backend, bs=bs, n=n, seed=2024)
     legacy_predict, legacy_accept_length = backend.verify(
-        legacy_out, legacy_info, candidates
+        legacy_out, legacy_info, candidates, tree=None
     )
     legacy_predict = legacy_predict.clone()
     legacy_accept_length = legacy_accept_length.clone()
@@ -309,7 +310,9 @@ def _test_dp_chain_matches_legacy(
         logits_layout_plan=dp_plan,
     )
     _seed_coins(backend, bs=bs, n=n, seed=2024)
-    dp_predict, dp_accept_length = backend.verify(dp_out, dp_info, candidates)
+    dp_predict, dp_accept_length = backend.verify(
+        dp_out, dp_info, candidates, tree=None
+    )
 
     # Phantom rows consume neutral pool values and are not part of the result.
     torch.testing.assert_close(

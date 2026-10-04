@@ -65,8 +65,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroup
 from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
     local_pages,
     local_pages_by_group,
+    owned_local_pages,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.server_args import (
+    ServerArgs,
+    validate_dcp_disaggregation_role,
+)
 
 register_cuda_ci(
     est_time=10,
@@ -234,6 +238,17 @@ class LocalPagesTest(unittest.TestCase):
             ).tolist(),
             [2, 2, 1],
         )
+
+    def test_owner_mask_pairs_owned_pages_with_their_input_positions(self):
+        owned, local = owned_local_pages(
+            [0, 3, 3, 0, 1, 4], shard_count=2, rank=0, virtual_block_count=9
+        )
+        self.assertEqual(owned.tolist(), [False, True, True, False, True, False])
+        self.assertEqual(local.tolist(), [2, 2, 1])
+        owned, local = owned_local_pages(
+            [], shard_count=2, rank=0, virtual_block_count=9
+        )
+        self.assertEqual((owned.tolist(), local.tolist()), ([], []))
 
     def test_out_of_range_ids_and_ranks_are_rejected(self):
         with self.assertRaises(IndexError):
@@ -629,6 +644,15 @@ class ConfigurationTest(unittest.TestCase):
         args.enable_kvstore = False
         args._handle_kvstore()
         args.validate_cache_options()
+
+    def test_dcp_allows_aggregated_and_prefill_roles_only(self):
+        for mode in ("null", "prefill"):
+            validate_dcp_disaggregation_role(has_dcp=True, disaggregation_mode=mode)
+        for mode in ("null", "prefill", "decode", "encode"):
+            validate_dcp_disaggregation_role(has_dcp=False, disaggregation_mode=mode)
+        for mode in ("decode", "encode"):
+            with self.assertRaisesRegex(ValueError, "only the prefill side"):
+                validate_dcp_disaggregation_role(has_dcp=True, disaggregation_mode=mode)
 
 
 if __name__ == "__main__":

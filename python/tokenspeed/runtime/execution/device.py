@@ -150,8 +150,11 @@ class DeviceSpecs:
             (rather than by the capturable side-stream executor), which is
             what makes a grammar batch depend on the pending commit.
         supports_disaggregation: The KV arena can hand pages to a peer node.
-        supports_pd_layerwise_finalization: The drafter can finalize
-            layerwise KV writes, required for PD layerwise transfer.
+        supports_pd_layerwise_finalization: This rank can finalize layerwise
+            KV writes with speculation on, required for PD layerwise
+            transfer: the draft-field writer (producer or drafter) declares
+            it, and a pipeline stage owning no draft fields has nothing to
+            finalize.
         cache_state_group_ids: Group ids of the state-family cache groups,
             for the per-group page-usage debug line. Empty for pools with no
             recurrent/conv state.
@@ -171,6 +174,20 @@ class DeviceSpecs:
     supports_pd_layerwise_finalization: bool
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
+
+
+def speculative_widths(
+    spec_algo: str | None, spec_num_steps: int | None, spec_num_tokens: int | None
+) -> tuple[int, int]:
+    """The ``DeviceSpecs`` speculation widths: (draft steps, verify width).
+
+    ``ServerArgs`` keeps its default widths with speculation off, so the
+    algorithm, not the widths, says whether speculation is on. Both are 0
+    without it: the accept-length log views verify rows by them.
+    """
+    if spec_algo is None:
+        return 0, 0
+    return spec_num_steps or 0, spec_num_tokens or 0
 
 
 @dataclass(frozen=True)
@@ -802,10 +819,10 @@ class DeviceHandle:
         """Apply one in-place RL weight-sync request, ordered against forwards.
 
         Type-dispatched on the request — join the trainer's NCCL group,
-        receive and apply one broadcast, or tear the group down. One entry
-        point because it is one capability: rewriting model parameters in
-        place, which must be ordered against forwards rather than raced with
-        them.
+        receive and apply one broadcast, read one committed version from the
+        Mooncake weight store, or tear the group down. One entry point because
+        it is one capability: rewriting model parameters in place, which must
+        be ordered against forwards rather than raced with them.
 
         Args:
             req: An ``io_struct`` weight-update request.
@@ -820,6 +837,7 @@ class DeviceHandle:
             DestroyWeightsUpdateGroupReqInput,
             InitWeightsUpdateGroupReqInput,
             UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
         )
 
         runner = self._executor.model_runner
@@ -828,23 +846,44 @@ class DeviceHandle:
             UpdateWeightsFromDistributedReqInput: (
                 runner.update_weights_from_distributed
             ),
+            UpdateWeightsFromMooncakeReqInput: (
+                lambda req: runner.update_weights_from_mooncake(
+                    req.version, self._mooncake_update_models()
+                )
+            ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
         }
         handler = handlers.get(type(req))
         if handler is None:
             raise TypeError(f"unsupported weight-update request {type(req).__name__}")
+        loads_weights = type(req) in (
+            UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
+        )
 
         def _apply_update():
             result = handler(req)
-            if (
-                type(req) is UpdateWeightsFromDistributedReqInput
-                and result[0]
-                and self._executor.drafter is not None
-            ):
+            if loads_weights and result[0] and self._executor.drafter is not None:
                 self._executor.drafter.on_target_weights_updated()
             return result
 
         return self._thread.run(_apply_update)
+
+    def _mooncake_update_models(self) -> list:
+        """The modules a Mooncake update streams into, target first.
+
+        ``--model-update-draft-weights refresh`` adds the speculative draft
+        model when one is loaded; ``retain`` keeps the draft's weights.
+        """
+        runner = self._executor.model_runner
+        models = [runner.model]
+        draft_runner = self._executor.draft_model_runner
+        if (
+            runner.server_args.model_update_draft_weights == "refresh"
+            and draft_runner is not None
+        ):
+            models.append(draft_runner.model)
+        return models
 
 
 def _recording_expert_placement():
@@ -1352,21 +1391,22 @@ def build_device_side(
         global_rank=global_rank,
     )
 
+    spec_num_steps, spec_num_tokens = speculative_widths(
+        executor.config.spec_algo,
+        executor.config.spec_num_steps,
+        executor.config.spec_num_tokens,
+    )
     specs = DeviceSpecs(
         cache_geometry=views.cache_geometry,
         cache_groups=views.cache_groups,
         cache_storage=attention.cache_storage,
         multimodal_encoder_dtype=target.multimodal_encoder_dtype,
-        spec_num_steps=executor.config.spec_num_steps or 0,
-        spec_num_tokens=executor.config.spec_num_tokens or 0,
+        spec_num_steps=spec_num_steps,
+        spec_num_tokens=spec_num_tokens,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
-        supports_pd_layerwise_finalization=bool(
-            getattr(
-                executor.dspark_context_producer or executor.drafter,
-                "supports_pd_layerwise_finalization",
-                False,
-            )
+        supports_pd_layerwise_finalization=_supports_pd_layerwise_finalization(
+            executor, server_args.mapping
         ),
         cache_state_group_ids=tuple(
             str(spec.group_id)
@@ -1516,6 +1556,21 @@ def _resolve_role(kv_transfer) -> DeviceRole:
     if isinstance(kv_transfer, DisaggPrefillExecutor):
         return DeviceRole.PD_PREFILL
     raise TypeError("kv_transfer must be a Disagg{Prefill,Decode}Executor.")
+
+
+def _supports_pd_layerwise_finalization(executor, mapping) -> bool:
+    """Whether this rank can finalize layerwise CachePD writes with speculation on.
+
+    The draft cache fields are the last pipeline stage's trailing producer
+    step (``CacheLayerOwnership``), so a stage before it owns none: its
+    readiness is the target layers' alone and nothing remains to finalize.
+    The owning stage, like a non-PP engine, answers for the executor's
+    ``draft_field_writer``. Without speculation the answer is unused.
+    """
+    if mapping.has_pp and not mapping.is_last_pp_rank:
+        return True
+    writer = executor.draft_field_writer
+    return writer is not None and writer.supports_pd_layerwise_finalization
 
 
 def _build_kv_transfer(

@@ -77,6 +77,7 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
+    bind_or_copy,
     default_weight_loader,
     sharded_weight_loader,
 )
@@ -685,14 +686,19 @@ class Glm53FlashKDA(nn.Module):
         )
 
     def fuse_conv_weights(self) -> None:
-        self.conv_weights = torch.cat(
-            (
-                self.q_conv1d_weight,
-                self.k_conv1d_weight,
-                self.v_conv1d_weight,
-            ),
-            dim=0,
-        ).squeeze(1)
+        # Written in place on a re-run (live weight update): captured CUDA
+        # graphs hold the bank's address.
+        self.conv_weights = bind_or_copy(
+            self.conv_weights,
+            torch.cat(
+                (
+                    self.q_conv1d_weight,
+                    self.k_conv1d_weight,
+                    self.v_conv1d_weight,
+                ),
+                dim=0,
+            ).squeeze(1),
+        )
         self._conv_weight_versions = (
             self.q_conv1d_weight._version,
             self.k_conv1d_weight._version,

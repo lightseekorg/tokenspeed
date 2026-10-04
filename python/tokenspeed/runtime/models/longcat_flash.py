@@ -55,6 +55,9 @@ from tokenspeed.runtime.layers.moe.topk import (
 from tokenspeed.runtime.layers.moe.topk import TopK as _TopK
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat as _TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType as _RoutingMethodType
+from tokenspeed.runtime.layers.moe.utils import (
+    get_all2all_backend as _get_all2all_backend,
+)
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig as _QuantizationConfig,
 )
@@ -74,6 +77,9 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA as _DeepseekV3AttentionMLA,
 )
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MLP as _DeepseekV3MLP
+from tokenspeed.runtime.models.deepseek_v3 import (
+    _prepare_mla_kv_b_proj_weights,
+)
 from tokenspeed.runtime.moe.dispatch_algorithm import (
     has_zero_expert as _has_zero_expert,
 )
@@ -262,12 +268,29 @@ class _RuntimeLongcatMoE(nn.Module):
         self.zero_expert_num = config.zero_expert_num
         self.zero_expert_type = config.zero_expert_type
         self.routed_scaling_factor = config.routed_scaling_factor
+        # The routed output leaves this module as one partial per MoE TP-EP
+        # rank and post_moe_comm sums the group (all-reduce or reduce-scatter),
+        # so the identity zero-expert residual, which every rank could compute
+        # from its replicated input, must enter exactly one partial.
+        self.adds_zero_expert_residual: bool = self.mapping.moe.tp_ep_rank == 0
         self.stream_fork = _StreamFork(alt_stream)
 
         if self.mapping.moe.ep_size > config.n_routed_experts:
             raise ValueError(
                 f"EP size {self.mapping.moe.ep_size} is greater than the number "
                 f"of LongCat routed experts {config.n_routed_experts}."
+            )
+        if _get_all2all_backend().is_deepep():
+            # The decoder layer gathers the MoE input over the MoE TP-EP group
+            # and reduces the routed output through post_moe_comm, and the
+            # identity zero-expert residual enters one rank's partial on that
+            # assumption. DeepEP's combine already reduces inside the kernel
+            # and keeps each rank's own token rows, so the two cannot compose.
+            raise ValueError(
+                "LongCat-Flash does not support --all2all-backend deepep: its MoE "
+                "layer reduces the routed output through the host's MoE "
+                "all-reduce / reduce-scatter, which DeepEP's in-kernel combine "
+                "already performs; launch with --all2all-backend none"
             )
         if config.hidden_act != "silu":
             raise ValueError(
@@ -331,11 +354,8 @@ class _RuntimeLongcatMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             output_format=_TopKOutputFormat.STANDARD,
             zero_expert_num=config.zero_expert_num,
-            topk_indices_dtype=(
-                torch.int64
-                if global_server_args_dict.get("enable_deep_ep", False)
-                else torch.int32
-            ),
+            # DeepEP, the one consumer of int64 ids, is refused above.
+            topk_indices_dtype=torch.int32,
         )
         # This layer's view of the placement tables for the router; the
         # dispatch flavour follows the MoE kernel: all-to-all EP routes each
@@ -358,6 +378,14 @@ class _RuntimeLongcatMoE(nn.Module):
         ]
 
     def _apply_zero_experts(self, hidden_states: torch.Tensor, topk_output):
+        """Mask the zero-expert slots out of the routing and return this rank's
+        share of the identity residual (None when it adds none).
+
+        The residual ``hidden * sum(zero-slot weights)`` is added to the routed
+        partial BEFORE post_moe_comm sums the partials over the MoE TP-EP
+        group, so only one rank (``adds_zero_expert_residual``) materializes
+        it; the others contribute exactly 0 and the reduction counts it once.
+        """
         if self.zero_expert_num <= 0:
             return None
 
@@ -383,6 +411,8 @@ class _RuntimeLongcatMoE(nn.Module):
         topk_output.topk_weights[zero_expert_mask] = 0.0
 
         if self.zero_expert_type in ("identity", "copy"):
+            if not self.adds_zero_expert_residual:
+                return None
             zero_weight = zero_expert_weights.sum(dim=-1, keepdim=True).to(
                 hidden_states.dtype
             )
@@ -435,11 +465,25 @@ class _RuntimeLongcatMoE(nn.Module):
             )
 
         if zero_expert_output is not None:
+            # Pre-reduction add: the caller's post_moe_comm sums this partial
+            # with the other MoE TP-EP ranks', which hold None here.
             routed_expert_output = routed_expert_output + zero_expert_output
         return routed_expert_output
 
 
 class _RuntimeLongcatDecoderLayer(nn.Module):
+    """One LongCat layer: two attention/dense-MLP branches beside one MoE.
+
+    Row layout: the residual stream runs through the dense branches
+    (attention 0 -> MLP 0 -> attention 1 -> MLP 1), so the layer's rows follow
+    the dense comm pattern -- all-reduce (every attention-TP rank holds every
+    row of its attention DP group) or RSAG (each rank holds its scattered
+    share). The MoE is a side branch fed from attention 0's output; its own
+    pattern may differ (attention TP equal to the dense TP but not to the MoE
+    TP-EP width, e.g. attention DP with EP), so ``_forward_moe`` bridges its
+    rows into and out of the dense layout around the MoE collectives.
+    """
+
     def __init__(
         self,
         config: _PretrainedConfig,
@@ -526,13 +570,21 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
+        self._init_comm()
+
+    def _init_comm(self) -> None:
+        """Build the comm managers (see the class docstring for the row layout).
+
+        Subclasses that build their modules themselves call this after
+        ``input_layernorm`` and ``post_attention_layernorm`` exist.
+        """
+        # Attention 0 and MLP 0 share branch_comm[0]; the MoE manager only
+        # drives the MoE collectives.
         self.moe_comm = _CommManager(
             mapping=self.mapping,
             layer_id=self.layer_id,
             is_moe=True,
             prev_is_moe=False,
-            input_layernorm=self.input_layernorm[0],
-            post_attn_layernorm=self.post_attention_layernorm[0],
         )
         self.branch_comm = [
             _CommManager(
@@ -546,6 +598,43 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             for branch_id in range(2)
         ]
         self.final_norm_comm = self.branch_comm[1]
+        # Without attention TP the one rank of the attention-TP group holds
+        # every row of its DP group either way, so the two layouts coincide
+        # and no bridge is needed (pure attention DP with EP lands here).
+        self.moe_rows_differ: bool = self.mapping.has_attn_tp and (
+            self.moe_comm.use_all_reduce(is_moe=True)
+            != self.moe_comm.use_all_reduce(is_moe=False)
+        )
+        if self.moe_rows_differ and global_server_args_dict.get(
+            "enable_allreduce_fusion", False
+        ):
+            # A fused norm reduces the un-reduced sum of both MLP outputs;
+            # the bridged MoE output is already reduced in another layout.
+            raise ValueError(
+                "LongCat all-reduce fusion requires the MoE and dense MLPs to "
+                "share one comm pattern (attention TP equal to both the dense "
+                "TP and the MoE TP-EP width, or to neither)"
+            )
+
+    def _to_moe_rows(
+        self, hidden_states: torch.Tensor, ctx: _ForwardContext
+    ) -> torch.Tensor:
+        """Re-lay dense-layout rows for the MoE collectives."""
+        if not self.moe_rows_differ:
+            return hidden_states
+        if self.moe_comm.use_all_reduce(is_moe=False):
+            return self.moe_comm.slice_scattered_rows(hidden_states, ctx)
+        return self.moe_comm.gather_scattered_rows(hidden_states, ctx)
+
+    def _to_dense_rows(
+        self, hidden_states: torch.Tensor, ctx: _ForwardContext
+    ) -> torch.Tensor:
+        """Return the reduced MoE output to the dense layout."""
+        if not self.moe_rows_differ:
+            return hidden_states
+        if self.moe_comm.use_all_reduce(is_moe=False):
+            return self.moe_comm.gather_scattered_rows(hidden_states, ctx)
+        return self.moe_comm.slice_scattered_rows(hidden_states, ctx)
 
     def _forward_dense_mlp(
         self,
@@ -568,6 +657,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ):
+        hidden_states = self._to_moe_rows(hidden_states, ctx)
         hidden_states = self.moe_comm.pre_mlp_comm(hidden_states, ctx)
         hidden_states = self.mlp(
             hidden_states,
@@ -579,6 +669,34 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             residual,
             ctx,
         )
+        hidden_states = self._to_dense_rows(hidden_states, ctx)
+        return hidden_states, residual
+
+    def _forward_idle(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: _ForwardContext,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """An idle attention-DP rank joins every MLP collective over no rows.
+
+        The MoE TP-EP group always spans the DP groups; the dense TP group
+        does too when the dense TP is wider than the attention TP, so both
+        dense branches run as well, in the active ranks' order.
+        """
+        hidden_states, residual = self._forward_moe(
+            hidden_states,
+            residual,
+            ctx,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+        )
+        for branch_id in range(2):
+            hidden_states, residual = self._forward_dense_mlp(
+                branch_id, hidden_states, residual, ctx
+            )
         return hidden_states, residual
 
     def forward(
@@ -591,16 +709,15 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         num_global_tokens, max_num_tokens_per_gpu = self.moe_comm.get_num_tokens(ctx)
 
         if ctx.forward_mode.is_idle():
-            hidden_states, residual = self._forward_moe(
+            return self._forward_idle(
                 hidden_states,
                 residual,
                 ctx,
                 num_global_tokens,
                 max_num_tokens_per_gpu,
             )
-            return hidden_states, residual
 
-        hidden_states, residual = self.moe_comm.input_reduce_norm(
+        hidden_states, residual = self.branch_comm[0].input_reduce_norm(
             hidden_states,
             residual,
         )
@@ -608,9 +725,9 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            comm_manager=self.moe_comm,
+            comm_manager=self.branch_comm[0],
         )
-        hidden_states, residual = self.moe_comm.post_attn_reduce_norm(
+        hidden_states, residual = self.branch_comm[0].post_attn_reduce_norm(
             hidden_states,
             residual,
             ctx,
@@ -778,11 +895,14 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         )
 
     def post_init(self) -> None:
+        # Pipeline stages hold PPMissingLayer slots for the other stages'
+        # layers; only resident layers carry routed experts.
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_routed_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, _RuntimeLongcatMoE)
+                if isinstance(layer, _RuntimeLongcatDecoderLayer)
+                and isinstance(layer.mlp, _RuntimeLongcatMoE)
             }
         )
 
@@ -820,7 +940,12 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         _longcat_logger.warning(f"The {name!s} is not in the model.")
         return None
 
-    def load_weights(self, weights: _Iterable[tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: _Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load a (possibly partial) checkpoint stream.
+
+        Returns the ``named_parameters()`` names that received data (the
+        ``BaseCausalLM`` weight-update contract).
+        """
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
@@ -831,6 +956,9 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         # filled from the logical expert it holds (replicas included), and RL
         # weight sync through this same path lands in every replica.
         expert_placement = self.expert_placement
+        # ``get_param`` remaps checkpoint names; report the parameter's own.
+        param_names = {id(param): name for name, param in params_dict.items()}
+        loaded: set[str] = set()
         moe_loader = _build_moe_checkpoint_loader(
             params_dict=params_dict,
             expert_schema=_ExpertCheckpointSchema(
@@ -874,12 +1002,13 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 if param is None:
                     break
                 param.weight_loader(param, loaded_weight, shard_id)
+                loaded.add(param_names[id(param)])
                 break
             else:
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if moe_loader.matches(name):
-                    moe_loader.load(name, loaded_weight)
+                    loaded.add(moe_loader.load(name, loaded_weight))
                     continue
 
                 if fuse_qkv_a_proj and (
@@ -915,6 +1044,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                     if "scale_inv" in name:
                         begin_size //= quant_block_size
                     param.weight_loader(param, loaded_weight, begin_size=begin_size)
+                    loaded.add(param_names[id(param)])
                     continue
 
                 if "q_a_proj" in name and name not in params_dict:
@@ -924,11 +1054,34 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                     continue
                 weight_loader = getattr(param, "weight_loader", _default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded.add(param_names[id(param)])
 
         self.post_load_weights()
+        return loaded
 
     def post_load_weights(self):
+        """Derive the absorbed MLA weights and fold the LoRA norm scales.
+
+        Safe to re-run after a live update: ``w_kc``/``w_vc`` are written
+        into their existing storage (captured graphs hold those addresses),
+        and the ``sqrt(hidden/rank)`` fold into ``q_a_layernorm`` /
+        ``kv_a_layernorm`` -- which multiplies the parameter in place and so
+        must happen exactly once per loaded value -- is applied only to the
+        norms this update reloaded. The initial load reloads all of them.
+        """
+        reloaded = self._weight_update_loaded_names
+        param_names = (
+            {id(param): name for name, param in self.named_parameters()}
+            if reloaded is not None
+            else None
+        )
+
+        def _reloaded(param: torch.Tensor) -> bool:
+            return param_names is None or param_names[id(param)] in reloaded
+
         for layer in self.model.layers:
+            if not isinstance(layer, _RuntimeLongcatDecoderLayer):
+                continue  # PPMissingLayer: another pipeline stage owns it
             for self_attn in layer.self_attn:
                 if hasattr(
                     self.quant_config, "weight_block_size"
@@ -953,26 +1106,23 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 else:
                     w = self_attn.kv_b_proj.weight
 
-                w_kc, w_vc = w.unflatten(
-                    0,
-                    (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim),
-                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-                if getattr(self.config, "mla_scale_q_lora", False) and hasattr(
-                    self_attn,
-                    "q_a_layernorm",
+                self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
+                    w, self_attn
+                )
+                if (
+                    getattr(self.config, "mla_scale_q_lora", False)
+                    and hasattr(self_attn, "q_a_layernorm")
+                    and _reloaded(self_attn.q_a_layernorm.weight)
                 ):
                     self_attn.q_a_layernorm.weight.data *= (
                         self.config.hidden_size / self.config.q_lora_rank
                     ) ** 0.5
-                if getattr(self.config, "mla_scale_kv_lora", False):
+                if getattr(self.config, "mla_scale_kv_lora", False) and _reloaded(
+                    self_attn.kv_a_layernorm.weight
+                ):
                     self_attn.kv_a_layernorm.weight.data *= (
                         self.config.hidden_size / self.config.kv_lora_rank
                     ) ** 0.5
-
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight

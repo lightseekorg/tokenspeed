@@ -62,6 +62,7 @@ from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph, dummy_batch_size
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     ModelExecutionResult,
@@ -79,6 +80,10 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+    TreeVerifyInputs,
+)
+from tokenspeed.runtime.layers.attention.backends.support import resolve_tree_support
 from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
@@ -97,6 +102,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     setup_dp_sampling,
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
@@ -130,16 +136,6 @@ def _sampling_info_for_requests(
         ]
         info.vocab_mask = mask[::mask_width].contiguous() if prefill else mask
     return info
-
-
-def _draft_idle_global_num_tokens_for_step(
-    step_idx: int,
-    global_num_tokens: list[int],
-    global_bs: list[int] | None,
-) -> list[int]:
-    if step_idx == 0 or global_bs is None:
-        return global_num_tokens
-    return global_bs
 
 
 PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
@@ -203,6 +199,62 @@ def _autotune_cache_key(
     }
 
 
+def select_dspark_context_producer(
+    *,
+    spec_algo: str | None,
+    pp_size: int,
+    draft_model: torch.nn.Module | None,
+    draft_token_to_kv_pool,
+):
+    """Return the stage's DSpark context producer, or None when nothing is produced.
+
+    A DSpark draft reads target taps that live on several pipeline stages, so
+    each stage projects its own during the target forward and the final stage
+    writes the draft context; off the pipeline the drafter keeps projecting
+    and writing context itself. An MTP (NextN) draft consumes only the last
+    stage's captured hidden states, so no stage produces anything for it: the
+    executor then captures FULL hidden states for its drafter. EAGLE3 is
+    refused here as well as in ``ServerArgs``: its aux taps live on several
+    stages and nothing carries them through the stage boundary.
+
+    Args:
+        spec_algo: The speculative algorithm, or None without speculation.
+        pp_size: Pipeline stage count; a single stage never produces.
+        draft_model: The loaded draft model, or None when this stage builds
+            none (``pipeline_stage_builds_draft``).
+        draft_token_to_kv_pool: The draft cache pool this stage owns, or None.
+
+    Returns:
+        A ``DSparkContextProducer`` for a pipeline DSpark draft, else None.
+
+    Raises:
+        ValueError: EAGLE3 on the pipeline.
+        TypeError: A block drafter (DFLASH/DSPARK) on the pipeline whose model
+            cannot produce context across stages; it would draft from one
+            stage's taps alone.
+    """
+    if spec_algo is None or pp_size <= 1:
+        return None
+    if spec_algo == "EAGLE3":
+        raise ValueError(
+            "EAGLE3 cannot run on a pipeline: its aux taps live on several "
+            "stages and nothing carries them through the stage boundary."
+        )
+    from tokenspeed.runtime.execution.dspark_context import (
+        DSparkContextModel,
+        DSparkContextProducer,
+    )
+
+    if isinstance(draft_model, DSparkContextModel):
+        return DSparkContextProducer(draft_model, draft_token_to_kv_pool)
+    if is_block_drafter(spec_algo, is_draft=True):
+        raise TypeError(
+            f"{type(draft_model).__name__} cannot produce DSpark context across "
+            "pipeline stages."
+        )
+    return None
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -234,6 +286,8 @@ class ModelExecutorConfig:
     global_rank: int
     cudagraph_capture_sizes: list[int] | None
     disable_cuda_graph_padding: bool
+    # Children per draft node per step; above 1 the draft is a tree (tree_spec.py).
+    spec_topk: int
     max_cudagraph_capture_size: int
     model_is_mrope: bool
     autotune_cache_key: dict[str, object] | None
@@ -243,6 +297,11 @@ class ModelExecutorConfig:
     prefill_only: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
+    # Draft-prob rejection sampling: the drafter records its per-step
+    # proposal distributions in RuntimeStates.draft_probs and verify accepts
+    # with coin * q(x) < p(x) (see --enable-speculative-sampling). Selects
+    # the verify rule, so it is explicit.
+    enable_speculative_sampling: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -260,8 +319,11 @@ class ModelExecutorConfig:
     # ====== SPEC =========
     spec_algo: str | None = None
     spec_num_steps: int | None = None
-    # spec_num_tokens == spec_num_steps + 1 for now (without Tree Attention)
+    # Verify window width: spec_num_steps + 1 for a chain, the tree's node budget otherwise.
     spec_num_tokens: int | None = None
+    # Recorded draft probabilities above this value mark a slot with no
+    # proposal (always reject); only read under enable_speculative_sampling.
+    spec_reject_draft_prob_threshold: float = 2.0
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -362,6 +424,13 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            enable_speculative_sampling=server_args.enable_speculative_sampling,
+            spec_reject_draft_prob_threshold=server_args.spec_reject_draft_prob_threshold,
+            spec_topk=(
+                server_args.speculative_eagle_topk
+                if server_args.speculative_algorithm
+                else 1
+            ),
             overlap_schedule_depth=overlap_schedule_depth,
             dp_sampling=server_args.dp_sampling,
             dp_sampling_min_bs=server_args.dp_sampling_min_bs,
@@ -441,31 +510,30 @@ class ModelExecutor:
             if model_runner.model_config.requires_request_token_history
             else 0
         )
+        if config.enable_speculative_sampling:
+            if config.spec_algo is None:
+                raise ValueError(
+                    "enable_speculative_sampling needs a speculative drafter to "
+                    "record proposal distributions for"
+                )
+            self.runtime_states.init_draft_probs(
+                spec_num_tokens=spec_num_tokens,
+                reject_threshold=config.spec_reject_draft_prob_threshold,
+            )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
             max_bs,
             self.device,
         )
-        self.dspark_context_producer = None
-        if config.spec_algo is not None and config.pp_size > 1:
-            # Pipeline speculation: the target taps live on several stages, so
-            # each stage projects its own during the target forward and the
-            # final stage writes the draft context. Off the pipeline the
-            # drafter keeps projecting and writing context itself.
-            from tokenspeed.runtime.execution.dspark_context import (
-                DSparkContextModel,
-                DSparkContextProducer,
-            )
-
-            if not isinstance(draft_model_runner.model, DSparkContextModel):
-                raise TypeError(
-                    f"{type(draft_model_runner.model).__name__} cannot produce "
-                    "DSpark context across pipeline stages."
-                )
-            self.dspark_context_producer = DSparkContextProducer(
-                draft_model_runner.model, draft_token_to_kv_pool
-            )
+        self.dspark_context_producer = select_dspark_context_producer(
+            spec_algo=config.spec_algo,
+            pp_size=config.pp_size,
+            draft_model=(
+                draft_model_runner.model if draft_model_runner is not None else None
+            ),
+            draft_token_to_kv_pool=draft_token_to_kv_pool,
+        )
         if self.config.spec_algo is not None and self._pp_is_last_stage:
             # Model-to-model wiring (shared embed/head, eagle3 capture ids)
             # already happened in create_model_runner, right after both
@@ -483,11 +551,19 @@ class ModelExecutor:
                 vocab_size=config.vocab_size,
             )
             self.drafter.wire_target(self.model_runner.model)
+            # Draft-prob sampling reads the request's temperature / top-k /
+            # seed from the verifier's pool buffers: one owner of per-request
+            # sampling state.
+            self.drafter.bind_sampling_backend(self.sampling_backend)
             MultimodalRuntime.wire_drafter(
                 self.input_buffers, self.model_runner.model_config
             )
         else:
             self.drafter = None
+
+        self.tree_spec: TreeSpec | None = None
+        if config.spec_topk > 1:
+            self._init_tree_spec(max_bs)
 
         self.grammar_runtime = create_grammar_runtime(
             grammar_backend=config.grammar_backend,
@@ -568,6 +644,60 @@ class ModelExecutor:
         )
 
         logger.info("ModelExecutor initialized")
+
+    def _init_tree_spec(self, max_bs: int) -> None:
+        """Arm draft-tree speculation: shared tree state, verify leaves, drafter."""
+        if (
+            self.runtime_states.has_request_token_history
+            or self.runtime_states.ngram_accepted_tokens is not None
+        ):
+            raise NotImplementedError(
+                "draft trees write verify-window tokens in node order; a target that "
+                "reads request token or n-gram history needs them along the accepted path"
+            )
+        if not self.sampling_backend.supports_tree_verify:
+            raise NotImplementedError(
+                f"{type(self.sampling_backend).__name__} cannot verify draft trees; "
+                "use --sampling-backend greedy or triton"
+            )
+        if self.draft_attn_backend is self.attn_backend:
+            raise NotImplementedError(
+                "draft trees bind verify and lanes on distinct target and draft backends"
+            )
+        resolve_tree_support(self.attn_backend, self.draft_attn_backend)
+        config = self.config
+        self.tree_spec = TreeSpec(
+            TreeSpecConfig(
+                topk=config.spec_topk,
+                num_steps=config.spec_num_steps,
+                num_nodes=config.spec_num_tokens,
+            ),
+            max_bs=max_bs,
+            device=torch.device(self.device),
+        )
+        self.runtime_states.init_draft_trees(config.spec_num_tokens)
+        self.attn_backend.bind_tree_verify(
+            TreeVerifyInputs(
+                self.tree_spec.mask_buf,
+                config.spec_num_tokens,
+                parent=self.tree_spec.parent_buf,
+            )
+        )
+        self.drafter.bind_tree(self.tree_spec)
+
+    def _compact_accepted_tree(
+        self, bs: int, logits_output: LogitsProcessorOutput
+    ) -> None:
+        """Pack each request's accepted path to the front of its verify window:
+        target hidden rows, target KV, and the window positions back to ``vc + i``."""
+        tree = self.tree_spec
+        path = self.sampling_backend.accepted_path(bs, tree.num_nodes)
+        self.attn_backend.compact_verify_window(path)
+        tree.compact_rows(
+            path,
+            logits_output.hidden_states,
+            self.input_buffers.positions_buf[: bs * tree.num_nodes],
+        )
 
     def _configure_for_pools(self) -> None:
         """Publish the bound pools to the backends and the model's layers."""
@@ -966,6 +1096,16 @@ class ModelExecutor:
             pp_send(tensor, self.config.pp_rank + 1, self.config.pp_group)
 
     @property
+    def draft_model_runner(self) -> ModelRunner | None:
+        """The speculative draft's runner, or None without speculation.
+
+        Present on every pipeline stage that loaded draft weights, including
+        stages whose ``drafter`` is None (the draft only proposes on the last
+        stage). Live weight updates read it to refresh the draft in place.
+        """
+        return self._draft_model_runner
+
+    @property
     def _pp_is_last_stage(self) -> bool:
         return self.config.pp_rank == self.config.pp_size - 1
 
@@ -1106,7 +1246,17 @@ class ModelExecutor:
             return self.sampling_backend.sample(logits_output, sampling_info)
         if num_extends == 0:
             output_tokens, accept_lengths = self.sampling_backend.verify(
-                logits_output, sampling_info, candidates
+                logits_output,
+                sampling_info,
+                candidates,
+                tree=(
+                    None
+                    if self.tree_spec is None
+                    else TreeVerifyBatch(
+                        parents=self.tree_spec.parent_buf[:num_decodes],
+                        depths=self.tree_spec.depth_buf[:num_decodes],
+                    )
+                ),
             )
             accept_lengths = self._apply_force_single_token_verify(
                 accept_lengths, 0, num_decodes, ctx.decode_input_ids
@@ -1159,6 +1309,7 @@ class ModelExecutor:
                     sampling_info, decode_requests, mask_width=mask_width, prefill=False
                 ),
                 candidates,
+                tree=None,
             )
             lengths = self._apply_force_single_token_verify(
                 lengths, num_extends, num_decodes, ctx.decode_input_ids
@@ -1275,6 +1426,9 @@ class ModelExecutor:
         if self.capturable_grammar is not None:
             self.capturable_grammar.schedule_post_sampler(output_tokens, accept_lengths)
 
+        if self.tree_spec is not None and ctx.num_extends == 0:
+            self._compact_accepted_tree(ctx.bs, logits_output)
+
         if self.drafter is not None:
             next_round_input_ids = self.drafter.run(
                 base_ctx=ctx,
@@ -1294,6 +1448,10 @@ class ModelExecutor:
                 self.runtime_states.future_input_map[indices[requests]] = (
                     next_round_input_ids[requests].to(torch.int32)
                 )
+                if self.tree_spec is not None:
+                    self.runtime_states.future_parent_map[indices[requests]] = (
+                        self.tree_spec.draft_parent_buf[requests]
+                    )
             self._record_draft_final_cache_step(ctx.num_extends)
 
         output_logprobs = logits_output.next_token_logprobs
@@ -1351,6 +1509,7 @@ class ModelExecutor:
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
+            draft_probs=self.runtime_states.draft_probs,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
         )
@@ -1431,15 +1590,12 @@ class ModelExecutor:
         )
 
         # If a drafter is active, its model also has MoE layers that issue
-        # NCCL collectives. Idle ranks must match those collectives:
-        # 1 first-step forward + (spec_num_steps - 1) multi-step decode forwards.
+        # NCCL collectives. Idle ranks must match those collectives: the
+        # drafter lists the draft forwards the active ranks run per round,
+        # each as the per-rank token counts sizing its collectives
+        # (idle_forward_global_num_tokens); every step runs the IDLE forward
+        # over an empty window with its own spec_step_idx.
         if self.drafter is not None:
-            # DFLASH is a block drafter (idle_forward_steps=1); EAGLE3/MTP
-            # default to spec_num_steps. Mirror the active rank's per-step
-            # collective sizing either way.
-            idle_forward_steps = getattr(
-                self.drafter, "idle_forward_steps", self.drafter.spec_num_steps
-            )
             # A draft model that reads request-token history takes the view
             # on every forward; the idle rank hands it an empty one, as the
             # target's idle forward above does.
@@ -1456,14 +1612,10 @@ class ModelExecutor:
                         committed_lengths=self.runtime_states.valid_cache_lengths,
                     )
                 )
-            for step_idx in range(idle_forward_steps or 0):
-                # Mirror active rank's catch-up step: when all non-idle ranks
-                # are decoding, step 0 sizes collectives from bs/global_bs.
-                draft_global_num_tokens = _draft_idle_global_num_tokens_for_step(
-                    step_idx,
-                    dp_metadata.global_num_tokens,
-                    dp_metadata.global_batch_size,
-                )
+            step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
+                dp_metadata.global_num_tokens, dp_metadata.global_batch_size
+            )
+            for step_idx, draft_global_num_tokens in enumerate(step_global_num_tokens):
                 draft_ctx = ForwardContext(
                     attn_backend=self.drafter.attn_backend,
                     token_to_kv_pool=self.drafter.token_to_kv_pool,
@@ -1676,6 +1828,15 @@ class ModelExecutor:
                 total_tokens=total_tokens,
                 ngram_inputs=ngram_inputs,
             )
+            if self.tree_spec is not None and num_extends == 0 and bs > 0:
+                self.tree_spec.load_step(
+                    bs,
+                    self.input_buffers.req_pool_indices_buf[:bs],
+                    self.runtime_states.future_parent_map,
+                )
+                self.tree_spec.depth_positions(
+                    bs, self.input_buffers.positions_buf[:total_tokens]
+                )
             if request_history_seeds is not None:
                 self.runtime_states.seed_request_token_history(request_history_seeds)
             if self.drafter is not None and hasattr(
@@ -1890,10 +2051,12 @@ class ModelExecutor:
                         0, self.input_buffers.req_pool_indices_buf[:num_extends]
                     ).to("cpu", non_blocking=True)
 
+                # The candidate-vs-target compare reads the window as a chain.
                 if (
                     LOG_SPEC_ACCEPT_LENGTHS
-                    and self.config.spec_num_steps
+                    and self.config.spec_algo is not None
                     and num_extends == 0
+                    and self.tree_spec is None
                 ):
                     spec_candidate_tokens = self.input_buffers.input_ids_buf[
                         : bs * self.config.spec_num_tokens
@@ -1978,16 +2141,23 @@ class ModelExecutor:
                 req_pool_idx, candidate_ids
             )
 
+    @property
+    def draft_field_writer(self):
+        """Whoever writes this rank's draft cache fields, or None.
+
+        The context producer when configured (pipeline DSpark), else the
+        drafter. Its ``supports_pd_layerwise_finalization`` says whether the
+        rank can finalize layerwise CachePD writes with speculation on; this
+        is the one place that choice is made.
+        """
+        if self.dspark_context_producer is not None:
+            return self.dspark_context_producer
+        return self.drafter
+
     def register_draft_final_step_counter(self, step_counter) -> None:
         """Publish one CachePD step after a supported drafter's complete run."""
-        producer = (
-            self.dspark_context_producer
-            if self.dspark_context_producer is not None
-            else self.drafter
-        )
-        if producer is None or not getattr(
-            producer, "supports_pd_layerwise_finalization", False
-        ):
+        writer = self.draft_field_writer
+        if writer is None or not writer.supports_pd_layerwise_finalization:
             raise RuntimeError(
                 "the speculative drafter cannot finalize layerwise CachePD writes"
             )

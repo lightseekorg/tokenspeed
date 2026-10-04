@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -62,6 +63,8 @@ from tokenspeed.runtime.engine.io_struct import (
     SetInternalStateReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromMooncakeReqInput,
+    UpdateWeightsFromMooncakeReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -94,6 +97,29 @@ def combined_flush_cache_output(
     )
 
 
+def combined_weight_update_output(
+    results: Sequence[
+        InitWeightsUpdateGroupReqOutput
+        | DestroyWeightsUpdateGroupReqOutput
+        | UpdateWeightsFromDistributedReqOutput
+        | UpdateWeightsFromMooncakeReqOutput
+    ],
+) -> tuple[bool, str]:
+    """AND every DP replica's weight-op reply into one frontend result.
+
+    Weight ops fan out to ``attn.dp_size`` workers, each of which replies
+    once its own GPU load (or group init/teardown) finished. The scheduler
+    already MIN-reduces the outcome across the replica before replying, so
+    the replies normally agree; the AND is the frontend's matching report,
+    and the message keeps each distinct reply once, in first-seen order, so a
+    single failing worker's error is not drowned by the others' success.
+    """
+
+    success = bool(results) and all(result.success for result in results)
+    messages = list(dict.fromkeys(result.message for result in results))
+    return success, " | ".join(messages)
+
+
 class SchedulerControlClient:
     """Scheduler control-plane client methods for AsyncLLM."""
 
@@ -106,6 +132,9 @@ class SchedulerControlClient:
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
         self.update_weights_from_distributed_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
+        self.update_weights_from_mooncake_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
         self.update_weights_from_tensor_communicator = _Communicator(
@@ -164,6 +193,10 @@ class SchedulerControlClient:
                 (
                     UpdateWeightsFromDistributedReqOutput,
                     self.update_weights_from_distributed_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromMooncakeReqOutput,
+                    self.update_weights_from_mooncake_communicator.handle_recv,
                 ),
                 (
                     UpdateWeightsFromTensorReqOutput,
@@ -315,40 +348,48 @@ class SchedulerControlClient:
             ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
         )
 
+    # Weight ops fan out to every attention-DP worker (the DP controller
+    # broadcasts control requests) and the scheduler completes each one only
+    # once every DP rank holds it at the head of its queue, so the replies
+    # arrive together and are ANDed here. The writer lock keeps generation
+    # out while the model is rewritten; group init/teardown rewrite nothing
+    # and take no lock, so a trainer's rendezvous does not wait for every
+    # in-flight generation to finish.
+
     async def init_weights_update_group(
         self: AsyncLLM,
         obj: InitWeightsUpdateGroupReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        if self.server_args.mapping.attn.has_dp:
-            raise RuntimeError("dp_size must be 1 for init parameter update group")
-        result = (await self.init_weights_update_group_communicator(obj))[0]
-        return result.success, result.message
+        results = await self.init_weights_update_group_communicator(obj)
+        return combined_weight_update_output(results)
 
     async def destroy_weights_update_group(
         self: AsyncLLM,
         obj: DestroyWeightsUpdateGroupReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        assert (
-            not self.server_args.mapping.attn.has_dp
-        ), "dp_size must be 1 for destroy parameter update group"
-        result = (await self.destroy_weights_update_group_communicator(obj))[0]
-        return result.success, result.message
+        results = await self.destroy_weights_update_group_communicator(obj)
+        return combined_weight_update_output(results)
 
     async def update_weights_from_distributed(
         self: AsyncLLM,
         obj: UpdateWeightsFromDistributedReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        if self.server_args.mapping.attn.has_dp:
-            raise RuntimeError("dp_size must be 1 for update weights from distributed")
-
-        # This means that weight sync
-        # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
-            result = (await self.update_weights_from_distributed_communicator(obj))[0]
-            return result.success, result.message
+            results = await self.update_weights_from_distributed_communicator(obj)
+        return combined_weight_update_output(results)
+
+    async def update_weights_from_mooncake(
+        self: AsyncLLM,
+        obj: UpdateWeightsFromMooncakeReqInput,
+    ) -> tuple[bool, str]:
+        """Load one committed Mooncake weight-store version on every worker."""
+        self.auto_create_handle_loop()
+        async with self.model_update_lock.writer_lock:
+            results = await self.update_weights_from_mooncake_communicator(obj)
+        return combined_weight_update_output(results)
 
     async def update_weights_from_tensor(
         self: AsyncLLM,

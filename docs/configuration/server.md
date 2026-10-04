@@ -44,6 +44,10 @@ For a compact compatibility table, see
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
 | `--weight-version` | Initial model-weight version stamped into generation metadata. Defaults to `default`. |
+| `--model-update-config` | JSON object handed to the Model Updater SDK for `POST /update_weights_from_mooncake`. Requires the three flags below; see [Mooncake Weight Updates](#mooncake-weight-updates). |
+| `--model-update-sdk-module` | Import path of the Model Updater SDK module. Imported in the scheduler process on the first Mooncake update, not at startup. Required with `--model-update-config`. |
+| `--model-update-engine-type` | SDK `EngineType` member name for this engine, resolved as `EngineType[value.upper()]`. Required with `--model-update-config`. |
+| `--model-update-draft-weights` | `retain` or `refresh`: whether a Mooncake update also streams the speculative draft model's weights. Required with `--model-update-config`. |
 
 ### Weight Version Metadata
 
@@ -52,7 +56,8 @@ Every generation response includes the current version in
 policy version that produced a sample.
 
 The SGLang-compatible `update_weights_from_distributed`,
-`update_weights_from_tensor`, and `update_weights_from_disk` requests accept an
+`update_weights_from_mooncake`, `update_weights_from_tensor`, and
+`update_weights_from_disk` requests accept an
 optional `weight_version`. The version changes only after the update succeeds.
 `Engine.update_weights_from_distributed` requires `weight_version`; pass
 `None` to keep the current value on an intermediate update. Flushed L3
@@ -74,7 +79,10 @@ would leave the cache namespace on the old checkpoint. Use
 
 TokenSpeed exposes the SGLang HTTP surface used by slime. The supported path is
 an externally launched TokenSpeed rollout engine on separate GPUs, using full
-NCCL weight updates and TokenSpeed data-parallel size 1:
+NCCL weight updates. Attention data parallelism of any size is supported:
+each weight op fans out to every DP worker and the frontend ANDs the
+replies, and the scheduler completes an op only in a round where every DP
+rank holds it (see [Weight Updates Under Attention DP](#weight-updates-under-attention-dp)).
 
 - rollout: `POST /generate`, `POST /abort_request`, `GET /v1/loads`, and
   `GET /health_generate`;
@@ -99,9 +107,95 @@ The following slime paths are not yet supported end to end:
   `--rollout-top-p 1.0` until TokenSpeed returns that metadata;
 - rollout routing replay (`--use-rollout-routing-replay`).
 
-The HTTP route for `update_weights_from_tensor` remains for SGLang clients, but
-TokenSpeed's scheduler does not yet implement its CUDA-IPC receive path. Use the
-distributed update mode until that implementation is added.
+The HTTP routes for `update_weights_from_tensor` and `update_weights_from_disk`
+remain for SGLang clients, but TokenSpeed's scheduler does not implement their
+receive paths: the scheduler replies `success=false` with
+"not supported on this engine". Use the distributed or Mooncake update mode.
+
+### Weight Updates Under Attention DP
+
+With `--data-parallel-size > 1`, `init_weights_update_group`,
+`update_weights_from_distributed`, `update_weights_from_mooncake`, and
+`destroy_weights_update_group` are sent to every attention-DP worker and the
+frontend ANDs the replies (distinct messages are joined with ` | `). Each
+scheduler queues the op and completes it only in a round where every DP rank
+holds the same kind of op at the head of its queue, decided on the per-round
+DP all-reduce that already carries flush intent; one op completes per round.
+The device result is then MIN-reduced across the replica before the L3
+weight version is published, so a failure on one rank fails the update
+everywhere. A rank whose peer never receives the op waits indefinitely, as
+with `/flush_cache`. The design rationale is in `docs/design/event-loop.md`.
+
+Only the two loads take the frontend's model-update writer lock (generation
+is kept out while parameters are rewritten); `init_weights_update_group` and
+`destroy_weights_update_group` rewrite nothing and do not wait for in-flight
+generation, so the trainer's rendezvous is not held up by long requests.
+
+### Mooncake Weight Updates
+
+`POST /update_weights_from_mooncake` loads one committed checkpoint version
+that the RL trainer published to a Mooncake weight store through the Model
+Updater SDK. Body: `{"version": int, "flush_cache": bool = true,
+"weight_version": str | null}`; a missing or non-integer `version` is a 400.
+The `flush_cache` wire default mirrors the reference engine's (FluentLLM's)
+API so its trainer clients work unchanged. Every scheduler process reads its
+own shard with its global rank as the SDK reader rank, on the forward
+thread, ordered against forwards like the distributed update. The reply
+arrives only after every worker finished its read, so the control server
+proxies this route with a longer inactivity timeout (3600 s) than the other
+RL routes.
+
+The server must be started with the four `--model-update-*` flags (table
+above): the SDK module is imported lazily on the first update and a missing
+module fails that update with a clear message rather than failing startup.
+`--model-update-draft-weights retain` updates the target model only;
+`refresh` streams the target and the speculative draft model (every pipeline
+stage that holds draft weights). Both policies notify the drafter afterwards
+like the distributed update does.
+
+`flush_cache` and `weight_version` follow the distributed update's rules
+with one default: a flushed Mooncake update publishes `weight_version =
+str(version)` when none is given (an explicit value wins); an unflushed
+update keeps the current namespace unless one is given, and with L3 storage
+a new `weight_version` still requires `flush_cache=true`. A successful update
+stamps the version into generation metadata.
+
+Trainer-side contract:
+
+- Pause dispatch at the router before calling and resume after the reply.
+  The scheduler's control thread blocks for the duration of the SDK read,
+  so load reporting, PD transfer polling, and health responses stall on
+  every worker; the frontend's writer lock only drains requests already
+  admitted on this engine.
+- `flush_cache=true` is rejected (and the load skipped) while PD transfers
+  or Host write-backs are in flight on any replica rank; retry after they
+  drain, or send intermediate updates with `flush_cache=false` and flush on
+  the last one.
+- Model update session: the SDK streams `(name, tensor)` pairs into each
+  model's `load_weights` in many partial calls. The runtime brackets the
+  models in a weight-update session (`begin_weight_update` /
+  `end_weight_update` on `BaseCausalLM`) so a model derives its post-load
+  state once, after the last chunk: `BaseCausalLM` defers every
+  `post_load_weights` call made while the session is active and runs it once
+  at the end, so a model's loader needs no session awareness of its own. The
+  absorbed MLA `w_kc`/`w_vc` and the KDA conv banks are rewritten in their
+  existing storage (captured CUDA graphs keep valid addresses; a geometry
+  change is an error), in-place one-shot transforms such as the LoRA norm
+  scale fold apply only to the parameters this update reloaded, and fused
+  parameters assembled from several checkpoint tensors (the NextN drafts'
+  `q_a_proj`/`kv_a_proj_with_mqa`, GLM's FP8 indexer `wk` weight and scale)
+  may straddle chunks; an update that streams one half without the other is
+  rejected when the session ends. The session also screens every chunk for
+  KV-cache scales other than one (KV caches are written and read at unit
+  scale): such an update is loaded to completion and then rejected, like the
+  distributed update's. Models outside `BaseCausalLM` take no session hooks.
+  The distributed update uses the same session.
+- A failed update (`success: false`) is not rolled back: the SDK may already
+  have rewritten part of the parameters on some ranks, so the engine may be
+  serving a mix of old and new weights, and replicas may disagree. The weight
+  version is not advanced. Re-issue the update (a successful retry streams
+  the whole checkpoint and restores consistency) or restart the engine before
+  resuming dispatch; the same holds for the distributed update.
 
 ## Scheduler And Memory
 
@@ -147,12 +241,15 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | --- | --- |
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
+| `--decode-context-parallel-size` | Shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages. Allowed on aggregated engines and with `--disaggregation-mode prefill` (every rank of the subgroup sends its owned pages to an unsharded decode). Not supported yet: the decode role; speculative decoding on any ordinary MLA/DSA model (the recipe refuses to shard a cache holding a draft group, whichever dense kernel runs it -- only the DeepSeek V4 and Kimi K3 recipes shard with a draft, and FlashMLA/GPU DSA reject speculation under DCP outright); and the Host KVStore, so pass `--disable-kvstore`. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention replica width (attn TP x CP): the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |
 | `--mm-encoder-tp-mode` | Multimodal encoder parallelism: `weights` shards encoder weights with attention TP; `data` uses TP1 whole-item DP and currently requires aggregate serving and no attention context parallelism. |
 | `--enable-expert-parallel` | Set expert parallelism across the selected world size. |
 | `--expert-parallel-size`, `--ep-size` | Explicit expert parallel size. |
+| `--pipeline-parallel-size` | Pipeline stages for prefill chunk pipelining. Requires `--disaggregation-mode prefill`; forces eager execution; every per-layer parallelism resolves inside one stage's world. |
+| `--pp-layer-partition` | Explicit per-stage layer counts, front to back (`"24,24,24,21"`); one entry per stage, summing to the model's layer count. Default: even split with the remainder on the front stages. |
 | `--world-size` | Total worker process count across all nodes. |
 | `--nprocs-per-node` | Worker process count per node. |
 | `--nnodes` | Number of nodes. |
@@ -202,6 +299,12 @@ and request `swiglu` for their gated SiLU activation. These requirements apply t
 both unquantized and block-FP8 expert layers, including when selecting
 `--moe-backend flashinfer_trtllm` on Blackwell.
 
+A LongCat layer runs two dense MLPs and one MoE off the same attention output.
+Its rows follow the dense comm pattern; when the MoE pattern differs (attention
+TP equal to the dense TP but not to the MoE TP x EP width, as under attention
+DP with `--enable-expert-parallel`), the MoE output is re-gathered into the
+dense layout. `--enable-allreduce-fusion` is rejected for that layout.
+
 When `--dp-sampling` is enabled, the logits processor owns the per-forward
 logits layout decision and carries the resulting plan to the sampling backend
 with the logits output.
@@ -228,13 +331,95 @@ the values accepted by the bundled `tokenspeed-smg` package.
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
-| `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
-| `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |
+| `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
+| `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
+| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters (see below). Off by default. |
+| `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
 | `--eagle3-layers-to-capture` | EAGLE3 layers to capture. |
 | `--disable-replay-ssm` | Stage every verify position's recurrent state instead of replaying the accepted tokens. ReplaySSM is on by default for supported Qwen GDN and Nemotron-H Mamba2 targets; `--enable-replay-ssm` is accepted as a deprecated no-op. |
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+`EAGLE3` and `MTP` drafts are chains by default: `--speculative-num-draft-tokens`
+must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 1
+they draft a tree instead, and `--speculative-num-draft-tokens` is its node
+budget (root included) and must be given explicitly: topk 1..16, steps 1..10,
+`(steps - 1) * topk` lane slots within the node budget, and at most 64 nodes. Trees need the `trtllm`
+attention backends and the `greedy` or `triton` sampling backend; see
+[draft-tree speculation](../design/tree-speculation.md) for the full scope.
+
+`MTP` serves two head shapes under one flag. An Eagle-like head (one MTP
+layer chained on its own hidden, e.g. DeepSeek NextN) runs the Eagle chain.
+A multi-depth head (one distinct depth layer per draft step over the same
+window, e.g. Inkling, or an out-of-tree draft registered for the multi-depth
+drafter) runs every depth `0..--speculative-num-steps-1` each round, so the
+draft checkpoint needs at least that many depths. Both shapes run under
+attention data parallelism (idle ranks mirror the depth loop with empty
+forwards) and with PD layerwise transfer
+(`--disaggregation-layerwise-interval`), where the draft's per-depth cache
+planes become ready together after the drafter's run. Known PD limitation
+of the multi-depth head: the drafter's cross-round stash (the last `k-1`
+committed tokens and their target hiddens per request) is not transferred
+with the KV, so for up to `k-1` decode rounds after a request lands on the
+decode node the draft rewrites prompt-tail draft-KV positions from an
+unfilled stash. Draft acceptance may dip for those rounds; verification
+stays exact. Shipping the stash with the bootstrap payload is a planned
+follow-up.
+
+### Draft-prob rejection sampling
+
+By default the chain drafters (`EAGLE3`, `MTP`) propose the argmax of their
+logits and the verifier runs the target-only rule: draft `x` is accepted with
+probability `p(x)` and a rejection samples the target with `x` removed. The
+served distribution is the target's `p` whatever the drafter proposed, so no
+draft distribution is needed. `--enable-speculative-sampling` switches to the
+standard rule: each draft step samples its token from the drafter's own
+distribution `q = softmax(draft logits / T)` at the request's `temperature`
+(greedy requests keep the argmax and a one-hot `q`), records `q`, and the next
+round's verify accepts with `coin * q(x) < p(x)` and resamples from
+`norm(relu(p - q))`. Both rules serve `p`; the draft-prob rule accepts
+`1 - TV(p, q)` of the drafts, which is markedly higher than `p(argmax q)` when
+requests sample at temperature. Greedy requests behave identically under both
+rules. `top_k`, `top_p`, `min_p`, penalties and `logit_bias` stay on the
+verifier's side; `q` only follows the temperature.
+
+A request admitted (or re-admitted after retraction) has no recorded `q` for
+its first chain: its rows hold a sentinel above
+`--spec-reject-draft-prob-threshold`, which rejects at the first draft and
+samples the first token from the full target. The sentinel is written as
+`threshold + 1.0` in fp32, hence the range: below `1.0` a real probability
+would read as the sentinel, and the cap keeps the `+ 1.0` representable.
+Under PD disaggregation the prefill node's candidates land the same way, so
+the decode node's first verify of a landed request accepts nothing. The flag
+is refused on the prefill role (`--disaggregation-mode prefill`): that role
+never verifies a chain and its candidates ship without `q`, so it would only
+allocate the distribution buffer. Pass it to the decode role only.
+
+Requirements: `--speculative-algorithm EAGLE3` or `MTP` (block drafters
+`DFLASH`/`DSPARK` propose a whole block greedily), `--speculative-eagle-topk 1`,
+and `--sampling-backend flashinfer` or `flashinfer_full` (`greedy` verifies by
+exact match, the Triton backends by target-sampled exact match; neither reads
+`q`). The drafter switches its draft model's fused TP-sharded argmax off so
+the full-vocab logits reach it, which adds the logits all-gather to every
+draft step under tensor parallelism.
+
+Known limits, kept as in the reference engine for now: a landed PD request's
+first verify always rejects its shipped candidates (sentinel rows) rather than
+verifying them target-only, and the verifier gathers the full `[bs, N, vocab]`
+block of recorded rows per step instead of only the entries the accept test
+reads. A draft step whose logits give no finite distribution (all NaN, or an
+overflow) proposes a junk token and records the sentinel for that row, so
+verify rejects the token and samples from the full target; it never raises a
+device error.
+
+Memory: the recorded distributions take
+`(max_num_seqs + 2) x num_draft_tokens x vocab_size x 4` bytes
+(`--speculative-num-draft-tokens` fp32 rows per request-pool slot), plus a
+batch-ordered gather buffer of `max_num_seqs x num_draft_tokens x vocab_size x
+4` bytes on the verifier; 80 requests at 4 draft tokens over a 129K vocabulary
+cost about 330 MB in total. Both come out of the `--gpu-memory-utilization`
+headroom, not the KV-cache budget.
 
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.
@@ -262,6 +447,23 @@ walked by one Triton kernel per verify step. A request's `temperature`,
 `top_k` and `top_p` are applied by the target's verification step, never by
 the proposal, so the served distribution is the target's whatever the drafter
 proposed.
+
+On a prefill server with `--pipeline-parallel-size > 1`, speculation is
+accepted for `MTP` and `DSPARK` only. The drafter runs on the last stage, the
+only stage that samples; it writes the candidate block the remote decode
+carries to the decode server, which verifies it as usual. `DSPARK` also
+produces its draft context across stages and keeps requiring attention CP = 1
+and matching dense/attention TP groups. An `MTP` (NextN) draft reads only the
+last stage's final hidden states: the other stages build and load no draft
+model at all, and the NextN checkpoint must ship its `embed_tokens` weight
+because the target embedding lives on the first stage. `DFLASH` and `EAGLE3` read
+target taps from several stages and are rejected on a pipeline. Layerwise
+transfer (`--disaggregation-layerwise-interval`) is decided per stage: stages
+before the last own no draft cache and always allow it; the last stage allows
+it exactly when the same drafter would on a single-stage server, so an MTP
+drafter class that does not support layerwise finalization (the vanilla
+multi-layer `Mtp` drafter, e.g. Inkling NextN, as opposed to the EAGLE-style
+NextN drafts of Kimi K3 and DeepSeek V4) is still rejected at startup there.
 
 A block drafter writes its KV at the target's cache locations, so it shares the
 target's page table: `--block-size` is a target-side choice and the draft

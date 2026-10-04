@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -67,8 +68,15 @@ from tokenspeed.runtime.engine.io_struct import (
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromMooncakeReqInput,
+    UpdateWeightsFromMooncakeReqOutput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput,
+    mooncake_load_weight_version,
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
@@ -89,6 +97,48 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+# Weight ops the scheduler completes through the attention-DP same-round gate
+# (``_rendezvous_replica_flush``), with the reply type for each. The position
+# is the op's type code on the wire of that gate; append only.
+_WEIGHT_OPS: tuple[tuple[type, type], ...] = (
+    (InitWeightsUpdateGroupReqInput, InitWeightsUpdateGroupReqOutput),
+    (UpdateWeightsFromDistributedReqInput, UpdateWeightsFromDistributedReqOutput),
+    (DestroyWeightsUpdateGroupReqInput, DestroyWeightsUpdateGroupReqOutput),
+    (UpdateWeightsFromMooncakeReqInput, UpdateWeightsFromMooncakeReqOutput),
+)
+_WEIGHT_OP_CODES: dict[type, int] = {
+    req_type: code for code, (req_type, _) in enumerate(_WEIGHT_OPS, start=1)
+}
+_WEIGHT_OP_OUTPUTS: dict[type, type] = dict(_WEIGHT_OPS)
+# Ops that rewrite model parameters: they may ask for a cache flush and they
+# publish the L3 weight version; group init/teardown do neither.
+_WEIGHT_LOAD_OPS = (
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromMooncakeReqInput,
+)
+_WEIGHT_GATE_WIDTH = 4
+
+
+def _weight_op_wants_flush(recv_req) -> bool:
+    return isinstance(recv_req, _WEIGHT_LOAD_OPS) and bool(recv_req.flush_cache)
+
+
+def _requested_weight_version(recv_req) -> str | None:
+    """The L3 namespace a load op asks to publish, read off the request.
+
+    A flushed Mooncake load without an explicit ``weight_version`` publishes
+    the committed version's own identity (``mooncake_load_weight_version``);
+    the request object is left as it arrived.
+    """
+    if isinstance(recv_req, UpdateWeightsFromMooncakeReqInput):
+        return mooncake_load_weight_version(
+            version=recv_req.version,
+            flush_cache=recv_req.flush_cache,
+            weight_version=recv_req.weight_version,
+        )
+    return recv_req.weight_version
 
 
 def _profile_rank_tag(attn_mapping) -> str:
@@ -217,7 +267,18 @@ class RequestHandler:
         self._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
         # Same constraint as _profile_sync: gloo barrier would CUDA-allocate.
         self._replica_decision_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
-        self._replica_flush_want_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
+        # Per-round attention-DP MAX all-reduce: standalone flush intent plus
+        # the weight-op gate (see _rendezvous_replica_flush for the layout).
+        self._replica_flush_want_buf = torch.zeros(
+            _WEIGHT_GATE_WIDTH, dtype=torch.int32, device="cpu"
+        )
+        # Weight ops (NCCL group init/teardown, distributed and Mooncake
+        # loads) in arrival order. The head completes only in a round where
+        # every attention-DP rank holds the same op at its head: the device
+        # call blocks this control thread in a collective or an SDK read, and
+        # a peer that had not dequeued its copy would wait for this rank in
+        # the per-round DP all-reduce -- a deadlock. One op per round.
+        self._pending_weight_ops: deque = deque()
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
@@ -282,7 +343,6 @@ class RequestHandler:
         """Dispatch control requests and return new generate request specs and states."""
         new_req_specs, req_states, bootstrap_infos, abort_rids = [], [], [], []
         pending_flush_outputs = 0
-        pending_weight_updates = []
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 req_spec, req_state, bootstrap_info = self.handle_generate_request(
@@ -322,36 +382,47 @@ class RequestHandler:
                 self.send_func.send_pyobj(
                     SetInternalStateReqOutput(updated=False, server_args={})
                 )
-            elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
-                # RL weight sync: join the trainer's NCCL group on this worker.
-                ok, msg = self._device.update_weights(recv_req)
-                self.send_func.send_pyobj(
-                    InitWeightsUpdateGroupReqOutput(success=ok, message=msg)
-                )
-            elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
+            elif isinstance(
+                recv_req,
+                (InitWeightsUpdateGroupReqInput, DestroyWeightsUpdateGroupReqInput),
+            ):
+                # RL weight sync: join / leave the trainer's NCCL group. Gated
+                # like the loads: the rendezvous blocks this thread too.
+                self._pending_weight_ops.append(recv_req)
+            elif isinstance(recv_req, _WEIGHT_LOAD_OPS):
                 ok, msg = self._require_weight_version_for_l3_flush(recv_req)
                 if ok:
                     ok, msg = self._require_flush_for_l3_version_switch(recv_req)
                 if not ok:
                     self.send_func.send_pyobj(
-                        UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+                        _WEIGHT_OP_OUTPUTS[type(recv_req)](success=ok, message=msg)
                     )
                 else:
-                    pending_weight_updates.append(recv_req)
-            elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
-                # RL weight sync: tear down the trainer's NCCL group on this worker.
-                ok, msg = self._device.update_weights(recv_req)
+                    self._pending_weight_ops.append(recv_req)
+            elif isinstance(recv_req, UpdateWeightsFromTensorReqInput):
                 self.send_func.send_pyobj(
-                    DestroyWeightsUpdateGroupReqOutput(success=ok, message=msg)
+                    UpdateWeightsFromTensorReqOutput(
+                        success=False,
+                        message="update_weights_from_tensor is not supported on "
+                        "this engine",
+                    )
+                )
+            elif isinstance(recv_req, UpdateWeightFromDiskReqInput):
+                self.send_func.send_pyobj(
+                    UpdateWeightFromDiskReqOutput(
+                        success=False,
+                        message="update_weights_from_disk is not supported on "
+                        "this engine",
+                        num_paused_requests=0,
+                    )
                 )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
-        flush_success = self._rendezvous_replica_flush(
-            pending_flush_outputs=pending_flush_outputs,
-            weight_updates=pending_weight_updates,
+        flush_success, ready_op = self._rendezvous_replica_flush(
+            pending_flush_outputs=pending_flush_outputs
         )
-        for recv_req in pending_weight_updates:
-            self._complete_weight_update(recv_req, flush_success=flush_success)
+        if ready_op is not None:
+            self._complete_weight_update(ready_op, flush_success=flush_success)
         return new_req_specs, req_states, bootstrap_infos, abort_rids
 
     def _require_weight_version_for_l3_flush(self, recv_req) -> tuple[bool, str]:
@@ -368,7 +439,7 @@ class RequestHandler:
         if (
             storage_backend is None
             or not recv_req.flush_cache
-            or recv_req.weight_version is not None
+            or _requested_weight_version(recv_req) is not None
         ):
             return True, ""
         return False, L3_FLUSH_REQUIRES_WEIGHT_VERSION
@@ -388,7 +459,7 @@ class RequestHandler:
             return True, ""
         version = resolve_l3_weight_version(
             self.server_args.weight_version,
-            recv_req.weight_version,
+            _requested_weight_version(recv_req),
             flush_cache=False,
             storage_backend=storage_backend,
         )
@@ -401,51 +472,97 @@ class RequestHandler:
             "and in-flight writebacks cannot land in the new namespace",
         )
 
-    def _rendezvous_replica_flush(
-        self, *, pending_flush_outputs: int, weight_updates: list
-    ) -> bool:
-        """Enter flush collectives from every rank on every round.
+    def _rendezvous_replica_flush(self, *, pending_flush_outputs: int):
+        """Enter flush collectives from every rank on every round; gate weight ops.
 
-        ``FlushCacheReqInput`` is sent separately to each attention-DP
-        worker. If only the worker that dequeued it entered
-        ``_try_clear_replica_cache``, that rank would DP all-reduce while a
-        lagging peer continued to ``EventLoop._dp_sync_and_check`` and
-        world-gathered. MAX-reduce flush intent on the DP group first so
-        every DP rank takes the same MIN-reduce path, then reply.
+        ``FlushCacheReqInput`` and the weight ops are sent separately to each
+        attention-DP worker. If only the worker that dequeued one entered
+        ``_try_clear_replica_cache`` or blocked in ``update_weights``, that
+        rank would DP all-reduce (or sit in the trainer's NCCL broadcast)
+        while a lagging peer continued to ``EventLoop._dp_sync_and_check``
+        and world-gathered. One MAX all-reduce on the DP group settles both
+        on every rank identically::
+
+            [0] standalone flush intent (any rank)
+            [1] -1 if this rank has a queued weight op, else 0
+                -> MAX is -1 only when every rank has one
+            [2] +type code of the head op (0 without one)
+            [3] -type code of the head op
+                -> [2] == -[3] means every head is the same kind of op
+
+        The head is popped only when every rank has one; the flush intent of
+        a load op then counts because every rank reads it off its own copy
+        of the same op. Standalone flushes reply here.
+
+        Returns:
+            ``(flush_success, ready_op)`` -- ``ready_op`` is the weight op to
+            complete this round, or None.
+
+        Raises:
+            RuntimeError: Attention-DP ranks hold different kinds of weight
+                ops at their queue heads. The frontend sends every op to
+                every worker in one order, so this is a transport bug, and
+                completing mismatched ops would hang the collectives.
         """
 
-        want_flush = pending_flush_outputs > 0 or any(
-            bool(recv_req.flush_cache) for recv_req in weight_updates
-        )
+        head = self._pending_weight_ops[0] if self._pending_weight_ops else None
+        head_code = 0 if head is None else _WEIGHT_OP_CODES[type(head)]
+        want_standalone_flush = pending_flush_outputs > 0
+        all_have_head = head is not None
         if self.attn_dp_size > 1 and self.attn_dp_cpu_group is not None:
             buf = self._replica_flush_want_buf
-            buf[0] = 1 if want_flush else 0
+            buf[0] = 1 if want_standalone_flush else 0
+            buf[1] = -1 if head is not None else 0
+            buf[2] = head_code
+            buf[3] = -head_code
             torch.distributed.all_reduce(
                 buf, op=torch.distributed.ReduceOp.MAX, group=self.attn_dp_cpu_group
             )
-            want_flush = bool(buf.item())
+            reduced = buf.tolist()
+            want_standalone_flush = reduced[0] > 0
+            all_have_head = reduced[1] == -1
+            if all_have_head and reduced[2] != -reduced[3]:
+                raise RuntimeError(
+                    "attention-DP ranks hold different weight-update operations "
+                    f"at their queue heads (local {type(head).__name__}); the "
+                    "frontend must send every weight op to every DP worker in "
+                    "the same order"
+                )
+        ready_op = self._pending_weight_ops.popleft() if all_have_head else None
+        want_flush = want_standalone_flush or (
+            ready_op is not None and _weight_op_wants_flush(ready_op)
+        )
         flush_success = True
         if want_flush:
             flush_success = self._try_clear_replica_cache()
         for _ in range(pending_flush_outputs):
             self.send_func.send_pyobj(FlushCacheReqOutput(success=flush_success))
-        return flush_success
+        return flush_success, ready_op
 
     def _complete_weight_update(self, recv_req, *, flush_success: bool) -> None:
-        """Finish a validated weight update after the rank-identical flush."""
+        """Finish a gated weight op after the rank-identical flush.
 
-        if recv_req.flush_cache and not flush_success:
+        The device result is MIN-reduced across the replica (attention TP,
+        CP, PP, then DP) before the L3 weight version is published and the
+        reply is sent, so one rank's failed load fails the update everywhere
+        and no rank serves the new namespace against old weights.
+        """
+
+        if _weight_op_wants_flush(recv_req) and not flush_success:
             ok = False
             msg = (
                 "cache flush failed; retry the update after in-flight "
                 "Host writebacks drain"
             )
         else:
-            ok, msg = self._device.update_weights(recv_req)
-            if ok:
+            local_ok, msg = self._device.update_weights(recv_req)
+            ok = self._converge_replica_decision(local_ok)
+            if local_ok and not ok:
+                msg = f"weight update failed on another rank in the replica ({msg})"
+            if ok and isinstance(recv_req, _WEIGHT_LOAD_OPS):
                 ok, msg = self._commit_l3_weight_version(recv_req, msg)
         self.send_func.send_pyobj(
-            UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+            _WEIGHT_OP_OUTPUTS[type(recv_req)](success=ok, message=msg)
         )
 
     def _try_clear_replica_cache(self) -> bool:
@@ -528,7 +645,7 @@ class RequestHandler:
             return False, err
         version = resolve_l3_weight_version(
             self.server_args.weight_version,
-            recv_req.weight_version,
+            _requested_weight_version(recv_req),
             flush_cache=recv_req.flush_cache,
             storage_backend=getattr(self.server_args, "kvstore_storage_backend", None),
         )

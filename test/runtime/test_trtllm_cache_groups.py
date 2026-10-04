@@ -67,6 +67,7 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
         b.draft_block_decode = draft_block_decode
         b.forward_prefill_metadata = None
         b.forward_decode_metadata = None
+        b.tree_verify = None
         b.init_cuda_graph_state(max_bs)
         return b
 

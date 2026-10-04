@@ -353,7 +353,8 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
             inputs, begin=computed, end=computed + _WIDTH, prefill=False
         )
         actual.backend.commit_verified_state(
-            torch.tensor([accepted], dtype=torch.int32, device="cuda")
+            torch.tensor([accepted], dtype=torch.int32, device="cuda"),
+            accepted_path=None,
         )
         end = computed + accepted
         for layer in _LAYERS:

@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.attention.mamba2 import (
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.configs.linear_attn import Mamba2Config
 
 if TYPE_CHECKING:
@@ -229,6 +230,10 @@ class Mamba2AttnBackend(MambaAttnBackend):
             out=out,
         )
         return out.view(1, seq_len, heads, head_dim)
+
+    def tree_support(self) -> TreeSupport:
+        blocker = "the Mamba2 verify scan follows a chain; no draft trees yet"
+        return TreeSupport(verify_blocker=blocker, draft_blocker=blocker)
 
     def _replay_commit(
         self, payload: torch.Tensor, parameters: torch.Tensor, **tables: Any

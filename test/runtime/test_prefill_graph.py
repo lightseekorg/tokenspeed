@@ -151,10 +151,12 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             global_rank=0,
             cudagraph_capture_sizes=[1, 2, 4],
             disable_cuda_graph_padding=False,
+            spec_topk=1,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
             autotune_cache_key=None,
             prefill_only=False,
+            enable_speculative_sampling=False,
         )
         with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
             ModelExecutorConfig(**config_args)
@@ -1244,11 +1246,13 @@ class PrefillRoleGraphsTest(unittest.TestCase):
             global_rank=0,
             cudagraph_capture_sizes=[1, 2, 4],
             disable_cuda_graph_padding=False,
+            spec_topk=1,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
             autotune_cache_key=None,
             prefill_only=prefill_only,
             prefill_graph_capture_batch_sizes=None,
+            enable_speculative_sampling=False,
             prefill_graph_max_tokens=256,
         )
 

@@ -42,6 +42,32 @@ match the tables. Each retry recomputes the reserve from the cache group's
 declared `block_granularity`, using the same reservation interface as later
 prefill chunks.
 
+**What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
+probes the prefix cache for the prompt's leading pages. The probe is bounded
+in tokens, and the bound is the minimum of two rules: the configured replay
+tail (`prefix_replay_tokens`, at least the final prompt token, which is always
+recomputed to produce logits) and the request's own
+`RequestSpec::max_cached_prefix_tokens` (default `INT32_MAX`, no bound). The
+per-request bound exists for prompt (input) logprobs: a request that returns
+them from position `s` needs logits for every position at or after `s`, and a
+cached position has none, so the runtime admits it with the bound set to `s`
+and the positions `>= s` are recomputed as ordinary prefill input whatever the
+cache holds. The bound limits the probe itself, not a later trim, so excluded
+hit pages are never claimed and the recomputed suffix lands on private pages.
+A readmission after retraction relaxes the bound to
+`max(max_cached_prefix_tokens, landed_tokens)`, where `fsm::Retracted` records
+the positions whose forward results had landed before the retraction (the
+victim's computed chunks; for a decoding victim its whole rebased prompt).
+Those positions produced their logits and the runtime keeps those logprobs, so
+matching them back -- the victim's own snapshot or anyone's equal pages --
+loses nothing and recomputing them would only redo work. The probe does not
+reach further: it matches the global prefix cache, not the victim's snapshot,
+and a deeper hit on another request's pages (or on a chunk whose forward was
+skipped after a failed cache load) would stand in for logits that were never
+produced. The decode role of a disaggregated deployment never computes prompt
+rows (the prefill node returns the logprobs), so the runtime leaves its bound
+at the default.
+
 Two adjustments ride on top of the raw chunk size. Both are pure token
 arithmetic kept out of the planner: how a chunk is cut lives in
 `scheduler/operations/prefill_chunk.h` (`PrefillChunkTokens` is the one
