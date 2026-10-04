@@ -351,3 +351,186 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
     args.ep_num_redundant_experts = 0
     args.expert_distribution_recorder_mode = None
     assert build_expert_placement(args, model_config) is None
+
+
+# ----------------------------------------------------------------------
+# Mutable placement: fixed-width replica table, in-place row updates that
+# reach the router's views, and the counter snapshot.
+# ----------------------------------------------------------------------
+
+
+def test_replica_table_has_the_fixed_width_r_plus_one():
+    # Four logical experts on six slots: R = 2, so at most three replicas.
+    assert expert_location.replica_table_width(6, 4) == 3
+    assert expert_location.replica_table_width(4, 4) == 1
+    with pytest.raises(ValueError, match="cannot hold"):
+        expert_location.replica_table_width(3, 4)
+    # A placement whose widest expert has fewer replicas is padded, not trimmed.
+    placement = ExpertLocationMetadata.from_physical_to_logical_map(
+        torch.tensor([[0, 1, 2, 3, 0, 1]]),
+        4,
+        ep_size=2,
+        ep_rank=0,
+        ep_rank_nodes=(0, 0),
+    )
+    assert placement.logical_to_all_physical_map.shape == (1, 4, 3)
+    assert placement.logical_to_all_physical_map[0].tolist() == [
+        [0, 4, -1],
+        [1, 5, -1],
+        [2, -1, -1],
+        [3, -1, -1],
+    ]
+    # Trivial placement (R = 0): one column.
+    trivial = ExpertLocationMetadata.from_physical_to_logical_map(
+        torch.tensor([[0, 1, 2, 3]]), 4, ep_size=2, ep_rank=0, ep_rank_nodes=(0, 0)
+    )
+    assert trivial.logical_to_all_physical_map.shape == (1, 4, 1)
+    # The width never follows the placement: a table wider than R + 1 is
+    # accepted only when its extra columns are empty.
+    with pytest.raises(ValueError, match="more than"):
+        expert_location._pad_replica_table(torch.tensor([[[0, 1, 2, 3]]]), 3)
+    assert expert_location._pad_replica_table(
+        torch.tensor([[[0, 1, -1, -1]]]), 3
+    ).tolist() == [[[0, 1, -1]]]
+
+
+def test_update_layers_rewrites_rows_in_place_and_reaches_the_views():
+    placement = _placement(ep_rank=1)
+    placement.enable_load_recording()
+    static_before = placement.rank_dispatch_map()
+    # The router's views: the per-layer slices it indexes during a forward.
+    replicas_view = placement.logical_to_all_physical_map[1]
+    num_valid_view = placement.logical_to_all_physical_map_num_valid[1]
+    static_view = placement.rank_dispatch_map()[1]
+    device_map = placement.physical_to_logical_map
+    host_map = placement.physical_to_logical_map_cpu
+    storage = {
+        id(placement.logical_to_all_physical_map.untyped_storage()),
+        id(placement.logical_to_all_physical_map_num_valid.untyped_storage()),
+        id(placement.physical_to_logical_map.untyped_storage()),
+        id(placement.physical_to_logical_map_cpu.untyped_storage()),
+        id(placement.rank_dispatch_map().untyped_storage()),
+    }
+
+    # Layer 1 goes from [3, 2, 1, 0, 1, 1] to [1, 2, 3, 0, 0, 1]: expert 0
+    # gains a replica on rank 1, expert 1 loses one.
+    placement.update_layers([1], torch.tensor([[1, 2, 3, 0, 0, 1]]))
+
+    assert placement.physical_to_logical_map is device_map
+    assert placement.physical_to_logical_map_cpu is host_map
+    assert placement.rank_dispatch_map() is static_before
+    assert {
+        id(placement.logical_to_all_physical_map.untyped_storage()),
+        id(placement.logical_to_all_physical_map_num_valid.untyped_storage()),
+        id(placement.physical_to_logical_map.untyped_storage()),
+        id(placement.physical_to_logical_map_cpu.untyped_storage()),
+        id(placement.rank_dispatch_map().untyped_storage()),
+    } == storage
+    assert placement.local_slot_logical_experts(1, 1) == [0, 0, 1]
+    assert placement.local_slot_logical_experts(1, 0) == [1, 2, 3]
+    assert device_map[1].tolist() == [1, 2, 3, 0, 0, 1]
+    # Layer 0 is untouched; layer 1's views now read the new rows.
+    assert placement.local_slot_logical_experts(0, 1) == [3, 0, 2]
+    assert replicas_view.tolist() == [[3, 4, -1], [0, 5, -1], [1, -1, -1], [2, -1, -1]]
+    assert num_valid_view.tolist() == [2, 2, 1, 1]
+    assert placement.logical_to_all_physical(1, 0) == [3, 4]
+    # Rank 1 owns slots 3..5 and now prefers its own replica of experts 0 and 1.
+    assert static_view[0].item() in (3, 4) and static_view[1].item() == 5
+    assert static_view[2].item() == 1 and static_view[3].item() == 2
+    assert static_before[0].tolist() == placement.rank_dispatch_map()[0].tolist()
+    # The counters are untouched by a table switch.
+    assert placement.physical_load.shape == (2, 6)
+    with pytest.raises(ValueError, match="no physical slot"):
+        placement.update_layers([0], torch.tensor([[0, 1, 2, 0, 0, 2]]))
+    with pytest.raises(ValueError, match="expected"):
+        placement.update_layers([0, 1], torch.tensor([[0, 1, 2, 3, 0, 2]]))
+    with pytest.raises(ValueError, match="outside"):
+        placement.update_layers([2], torch.tensor([[0, 1, 2, 3, 0, 2]]))
+
+
+def test_snapshot_load_reads_then_zeroes_the_counters_with_their_map():
+    placement = _placement(ep_rank=0)
+    placement.enable_load_recording()
+    placement.physical_load.copy_(
+        torch.tensor([[1, 0, 0, 0, 1, 0], [0, 0, 1, 0, 1, 1]])
+    )
+    snapshot = placement.snapshot_load()
+    assert snapshot.physical_count.dtype == torch.int64
+    assert snapshot.physical_count.tolist() == [[1, 0, 0, 0, 1, 0], [0, 0, 1, 0, 1, 1]]
+    assert snapshot.logical_count.tolist() == [[2, 0, 0, 0], [0, 3, 0, 0]]
+    assert not placement.physical_load.any()
+    # The snapshot holds its own copies: a later table switch leaves it intact.
+    placement.update_layers([1], torch.tensor([[1, 2, 3, 0, 0, 1]]))
+    assert snapshot.physical_to_logical_map[1].tolist() == [3, 2, 1, 0, 1, 1]
+    assert expert_location.load_balancedness(
+        snapshot.physical_count, 2
+    ).tolist() == pytest.approx([1.0, 0.75])
+    with pytest.raises(RuntimeError, match="not enabled"):
+        _placement(ep_rank=0).snapshot_load()
+
+
+def test_compute_placement_maps_is_host_only_and_init_by_eplb_wraps_it():
+    torch.manual_seed(1)
+    load = torch.randint(1, 50, (2, 8))
+    phy2log, log2phy = expert_location.compute_placement_maps(
+        load,
+        num_physical_experts=12,
+        ep_size=4,
+        num_groups=None,
+        num_nodes=1,
+        algorithm=eplb_algorithms.EplbAlgorithm.deepseek,
+    )
+    assert phy2log.shape == (2, 12) and phy2log.dtype == torch.int32
+    assert log2phy.shape == (2, 8, 5) and log2phy.dtype == torch.int32
+    assert phy2log.device.type == "cpu" and log2phy.device.type == "cpu"
+    for layer in range(2):
+        assert sorted(set(phy2log[layer].tolist())) == list(range(8))
+    with pytest.raises(ValueError, match="logical_count must be"):
+        expert_location.compute_placement_maps(
+            load.unsqueeze(0),
+            num_physical_experts=12,
+            ep_size=4,
+            num_groups=None,
+            num_nodes=1,
+            algorithm=eplb_algorithms.EplbAlgorithm.deepseek,
+        )
+
+    seen = {}
+
+    def fake_compute(logical_count, **kwargs):
+        seen["logical_count"] = logical_count
+        seen.update(kwargs)
+        return phy2log, log2phy
+
+    args = SimpleNamespace(
+        ep_num_redundant_experts=4,
+        eplb_algorithm="deepseek",
+        device="cpu",
+        mapping=SimpleNamespace(
+            nnodes=1,
+            nprocs_per_node=4,
+            moe=SimpleNamespace(ep_size=4, ep_rank=2, ep_group=(0, 1, 2, 3)),
+        ),
+    )
+    geometry = expert_location.ModelConfigForExpertLocation(
+        num_layers=2, num_logical_experts=8
+    )
+    with (
+        mock.patch.object(
+            expert_location.ModelConfigForExpertLocation,
+            "from_model_config",
+            staticmethod(lambda model_config: geometry),
+        ),
+        mock.patch.object(
+            expert_location, "compute_placement_maps", side_effect=fake_compute
+        ),
+    ):
+        # Several recording windows are summed on the host before the call.
+        placement = ExpertLocationMetadata.init_by_eplb(
+            args, None, torch.stack([load, load])
+        )
+    assert seen["logical_count"].device.type == "cpu"
+    assert torch.equal(seen["logical_count"], 2 * load)
+    assert seen["ep_size"] == 4 and seen["num_physical_experts"] == 12
+    assert placement.ep_rank == 2 and placement.ep_rank_nodes == (0, 0, 0, 0)
+    assert torch.equal(placement.physical_to_logical_map, phy2log)
