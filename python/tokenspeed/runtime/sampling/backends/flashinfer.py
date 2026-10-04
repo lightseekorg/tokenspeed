@@ -77,9 +77,8 @@ if TYPE_CHECKING:
 
 # Greedy requests normalize to top_k=1 and ride the pool route, whose
 # stochastic kernels resolve EXACT logit ties in reduction order: run-stable,
-# not batch-invariant. Under the bitwise envelopes (rl-bitwise and
-# trainer-aligned) the helpers below give greedy rows the canonical
-# lowest-index argmax instead. Both are
+# not batch-invariant. Under the bitwise envelope (rl-bitwise) the helpers
+# below give greedy rows the canonical lowest-index argmax instead. Both are
 # elementwise over rows, so the graph-captured path stays one path.
 
 

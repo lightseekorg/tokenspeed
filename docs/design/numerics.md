@@ -8,36 +8,38 @@ training signal.
 
 ## The contract
 
-`--numerics rl-bitwise` promises, within one deployment (fixed world size,
-parallel layout, model, kernels):
+`--numerics rl-bitwise` is the one bitwise envelope. It promises, within one
+deployment (fixed world size, parallel layout, model, kernels):
 
 1. **Run invariance** — the same request produces bitwise-identical tokens
    and logprobs across runs.
 2. **Batch invariance** — a request's tokens and logprobs do not depend on
    which other requests share its batches, or on how the scheduler happened
    to chunk and batch it.
+3. **Trainer alignment** — the forward follows the training framework's
+   operation order wherever the two engines are known to differ, so that a
+   teacher-forced pass over a trainer-generated sequence reproduces the
+   trainer's per-token logprobs bitwise. The switches this tightens are
+   listed under `alignment.trainer` below; each exists individually for
+   `auto`.
 
 It deliberately does **not** promise (yet — the layer exists in the
 hierarchy, unimplemented):
 
-3. **Topology invariance** — the same logprobs under a different TP/DP
+4. **Topology invariance** — the same logprobs under a different TP/DP
    factorization (needs TP-invariant projection layouts on top of the
-   vocab-block log-softmax below).
+   vocab-block log-softmax of `alignment.trainer`).
 
-`--numerics trainer-aligned` is the next envelope up. It promises 1 and 2
-(it runs the whole rl-bitwise block first) and then:
-
-4. **Trainer alignment** — the forward follows the training framework's
-   operation order wherever the two engines are known to differ, so that a
-   teacher-forced pass over a trainer-generated sequence reproduces the
-   trainer's per-token logprobs bitwise. The switches it tightens are listed
-   under `alignment.trainer` below; each exists individually for `auto`.
+Two consequences of 3 are enforced at startup, so a model that cannot meet
+them is refused under rl-bitwise with the reason: MoE TP must be 1 (the
+slot-order MoE combine folds over the EP group inside the leaf), and the
+vocabulary must be a whole number of `MEGATRON_VOCAB_BLOCK`-wide blocks (the
+trainer's log-softmax folds fixed blocks).
 
 ## The hierarchy
 
 ```
-numerics.mode                       --numerics {auto, rl-bitwise,
-                                                trainer-aligned}
+numerics.mode                       --numerics {auto, rl-bitwise}
 ├── kernels.deterministic           fixed-reduction-order compute
 │   ├── no autotune                 disable_autotune (tactic choice is shape-
 │   │                               and machine-dependent state); no
@@ -115,8 +117,8 @@ numerics.mode                       --numerics {auto, rl-bitwise,
 ├── logprob.topology-invariant      (deferred) TP-invariant projection
 │                                   layouts on top of the vocab-block
 │                                   log-softmax of alignment.trainer
-└── alignment.trainer               --numerics trainer-aligned: the trainer's
-                                    operation order (section below)
+└── alignment.trainer               the trainer's operation order (section
+                                    below); rl-bitwise folds every switch
 ```
 
 Precedence: the envelope only ever tightens. It sets every switch it governs
@@ -127,10 +129,10 @@ the contract. `resolve_numerics` runs after `resolve_communication` so it can
 veto the auto-enabled all-reduce fusion. Every closed-set switch is validated
 once, in `ServerArgs`; the layers that read a resolved switch trust it, and
 a constraint that needs more than the launch (a model's vocabulary, its
-routing) is checked when that module is constructed, never per forward. `trainer-aligned` runs the
-rl-bitwise block and then its own; every selection point that pins a
-batch-invariant leaf tests `numerics in BITWISE_ENVELOPES`, never the one
-name, so a tighter envelope inherits every pin.
+routing) is checked when that module is constructed, never per forward.
+Every selection point that pins a batch-invariant leaf tests `numerics in
+BITWISE_ENVELOPES`, never the one name, so an envelope added above
+rl-bitwise would inherit every pin.
 
 ## alignment.trainer
 
@@ -145,7 +147,7 @@ and only the reported log-probabilities change.
 
 | Switch | Trainer form | Changes |
 | --- | --- | --- |
-| `--sampling-stream per-request` | Non-greedy rows draw from a Philox stream keyed by `(request seed, position)` only (`sampling.deterministic` above); the trainer plays back the sampled ids, so this is an invariance switch both bitwise envelopes fold — T>0 rollouts need it | tokens at T>0 (not logprobs) |
+| `--sampling-stream per-request` | Non-greedy rows draw from a Philox stream keyed by `(request seed, position)` only (`sampling.deterministic` above); the trainer plays back the sampled ids, so this is an invariance switch rather than an alignment one — T>0 rollouts need it | tokens at T>0 (not logprobs) |
 | `--yarn-ramp-mask-device cpu` | The whole `inv_freq` table of `deepseek_yarn` RoPE — position frequencies, both divisions and the YaRN linear ramp mask — is computed on the host and copied to the device once, as the trainer builds its `inv_freq` on the host; CPU and CUDA division round differently at ulp level, and every rotated q/k inherits the difference | forward values |
 | `--mla-lora-scale runtime` | The `sqrt(hidden / lora_rank)` norm scales of LongCat-style MLA stay out of the `q_a_layernorm` / `kv_a_layernorm` weights and multiply `q` after `q_b_proj` and the latent after `kv_a_layernorm` in bf16, as the trainer does; the DSA indexer reads the unscaled `q_lora` | forward values |
 | `--layer-boundary-norm unfused` | The norm that opens each physical layer and the final norm read a bf16 `hidden + residual` materialized first (`residual = hidden`), then a standalone RMSNorm, instead of the fused add+norm kernel whose sum stays fp32; all-reduce+norm fusion is vetoed with it | forward values |
@@ -168,7 +170,10 @@ configure-attention hook names its index-key storage on the model config
 `configure_dsa_attention` names `fp8_scaled` — FP8 keys plus per-128 fp32
 scales, the in-tree leaves' plane — and a plugin hook that scores the
 checkpoint's keys unquantized names `bf16`; a hook that names none is a
-construction error. The ordinary recipe plans that plane, the
+construction error. The hook receives the resolved launch
+(`ModelProfile.configure_attention(model_config, server_args)`), so a plugin
+can name the plane its leaves score under `server_args.numerics` and keep
+the FP8 plane under `auto`. The ordinary recipe plans that plane, the
 pool writes keys in the plane's own dtype and never converts between the
 two, and `dsa_decode_topk` / `dsa_prefill_topk` read `index_k_format` and
 `index_k_layout` off the plane's dtype and shape, so a bf16 plane selects
@@ -181,10 +186,11 @@ does must read `--mla-lora-scale` exactly as the target does, folding only
 under `folded`.
 
 Trainer alignment is a stronger claim than invariance and cannot be checked
-by the engine alone: a model earns `trainer-aligned` in
-`ModelProfile.numerics_envelopes` only through the teacher-forced comparison
-against a trainer dump described under Acceptance. In-tree models do not
-declare it; the out-of-tree LongCat 2.0 plugin is the first candidate.
+by the engine alone: a model earns `rl-bitwise` in
+`ModelProfile.numerics_envelopes` through the invariance harness *and* the
+teacher-forced comparison against a trainer dump described under Acceptance.
+In-tree models do not declare it; the out-of-tree LongCat 2.0 plugin is the
+first candidate.
 
 ## Kernel selection
 
@@ -275,16 +281,17 @@ already) and drafts stay trivially placed.
 
 ## Acceptance
 
-An envelope is verified end to end, not per switch. For `rl-bitwise` the
-invariance harness generates with returned logprobs for the same prompts
-(a) alone at bs=1, (b) packed with random co-batches, (c) across repeated
-runs, and asserts `torch.equal` on token ids and logprobs — base model and
-speculative decoding each, greedy and at `temperature=1.0` with fixed seeds
-(the T>0 case is what `sampling_stream=per-request` exists for). A
-deployment that passes the harness may advertise the rl-bitwise contract;
-one that fails it has a bug, not a tolerance.
+An envelope is verified end to end, not per switch, and `rl-bitwise` has two
+harnesses, both run against a deployment launched with `--numerics
+rl-bitwise`. The **invariance harness** generates with returned logprobs for
+the same prompts (a) alone at bs=1, (b) packed with random co-batches, (c)
+across repeated runs, and asserts `torch.equal` on token ids and logprobs —
+base model and speculative decoding each, greedy and at `temperature=1.0`
+with fixed seeds (the T>0 case is what `sampling_stream=per-request` exists
+for). A deployment that passes may advertise the contract; one that fails it
+has a bug, not a tolerance.
 
-`trainer-aligned` is earned against a second program, so its harness has a
+Trainer alignment is earned against a second program, so its harness has a
 reference the engine does not produce: a **trainer dump**. For a fixed prompt
 set (the invariance prompts plus longer, chat-formatted ones), the trainer
 runs its forward over each `prompt + response` sequence and records, per
@@ -300,7 +307,7 @@ commit       str            trainer commit that produced the dump
 
 (an optional `logits[:8, :]` of the first positions helps bisect a
 mismatch to a layer). The engine then teacher-forces the same `ids` under
-`--numerics trainer-aligned` with `return_logprob, logprob_start_len=0` and
+`--numerics rl-bitwise` with `return_logprob, logprob_start_len=0` and
 asserts `torch.equal` on the fp32 `input_token_logprobs` vector, reporting
 the first divergent position otherwise. Two self-consistency checks ride
 along: the response part of the teacher-forced `input_token_logprobs` must
@@ -328,21 +335,16 @@ the vendor leaf registers above it (any higher band), so plain selection
 takes it wherever it is installed and no host code names the vendor.
 
 The pins above cover only the paths a verified model takes, so the
-verification is recorded per model and enforced at startup: a model profile
-lists the envelopes its model passes in `ModelProfile.numerics_envelopes`
-(`trainer-aligned` only after the teacher-forced comparison passes for it),
-and launching an envelope other than `auto` refuses any target or draft
-model that does not list it — every in-tree model included, since none has
-a profile. Quantized checkpoints are refused too: no batch-invariant
+verification is recorded per model and enforced at startup
+(`require_verified_numerics`): a model profile lists the envelopes its model
+passes in `ModelProfile.numerics_envelopes`, and launching an envelope other
+than `auto` refuses any target or draft model that does not list it — every
+in-tree model included, since none has a profile. The declaration is the
+model's promise and the harnesses are what keep it honest: a model declares
+`rl-bitwise` when it is ready to run them, and a declared model that fails
+either has a bug to fix, not a flag to set. Two incompatibilities are refused
+regardless of the declaration: quantized checkpoints (no batch-invariant
 quantized GEMM leaf exists, so their linears would select shape-dependent
-ones.
-
-The harness that earns an envelope has to run before the profile declares
-it, and the gate would refuse exactly that launch. `--allow-unverified-numerics`
-is the development override for this bootstrap: the engine starts under the
-undeclared envelope with every switch folded, logs a warning that the
-contract is not promised, and the harness runs against it; only once it
-passes does the model add the envelope to its profile and drop the flag. The
-override lifts the declaration check alone — a quantized checkpoint stays
-refused, because that is an incompatibility, not a missing verification —
-and a deployment that serves with it advertises nothing.
+ones) and a vocabulary that is not a multiple of `MEGATRON_VOCAB_BLOCK`
+(the envelope's logprob order folds fixed blocks of it; MoE TP other than 1
+is refused by `resolve_numerics` for the same reason on the MoE side).

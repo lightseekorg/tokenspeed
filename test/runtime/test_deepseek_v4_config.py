@@ -1706,7 +1706,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(is_deepseek_v4(model_config.hf_config))
 
-        configure_deepseek_v4_attention(model_config)
+        configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
 
         self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
         self.assertEqual(model_config.head_dim, 512)
@@ -1746,7 +1746,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
-        configure_deepseek_v4_attention(model_config)
+        configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
 
         self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
         self.assertEqual(model_config.head_dim, 512)

@@ -432,18 +432,14 @@ class ServerArgs:
     batch_invariant_collectives: bool = False
     disable_sampling_tp_sync: bool = False
     # Numerics envelope: "auto" keeps every performance default; "rl-bitwise"
-    # asks for bitwise run-to-run and batch-composition invariance and folds
-    # the determinism switches below (resolve_numerics); "trainer-aligned"
-    # folds those and then the trainer-operation-order switches. Each folded
-    # switch can still be set individually; the umbrella only ever tightens.
+    # asks for bitwise run-to-run and batch-composition invariance and the
+    # trainer's operation order, and folds the determinism and trainer-order
+    # switches below (resolve_numerics). Each folded switch can still be set
+    # individually; the umbrella only ever tightens.
     numerics: str = "auto"
-    # Development override: start an envelope the model's profile does not
-    # declare (with a warning) so the acceptance harness can run against it;
-    # the envelope's contract is not promised under it.
-    allow_unverified_numerics: bool = False
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
-    # folded to the trainer's form by --numerics trainer-aligned.
+    # folded to the trainer's form by --numerics rl-bitwise.
     # Device that computes the deepseek_yarn RoPE inverse frequencies (the
     # position frequencies, both divisions and the YaRN linear ramp mask).
     yarn_ramp_mask_device: str = "cuda"
@@ -1089,10 +1085,10 @@ class ServerArgs:
 
         ``rl-bitwise`` is the RL rollout contract: within one deployment the
         same request produces bitwise-identical tokens and logprobs across
-        runs and regardless of batch composition. ``trainer-aligned`` tightens
-        it further toward the training framework's operation order
-        (``_resolve_trainer_aligned``). The umbrella only ever tightens: it
-        sets every switch it governs to its tight value and refuses explicit
+        runs and regardless of batch composition, and the forward follows the
+        training framework's operation order wherever the two engines differ
+        (``_resolve_rl_bitwise``). The umbrella only ever tightens: it sets
+        every switch it governs to its tight value and refuses explicit
         choices it cannot tighten (a named MoE or sampling backend without the
         guarantee). Each derived switch remains individually available for
         auto mode. Whether the served model is verified under the envelope is
@@ -1103,8 +1099,6 @@ class ServerArgs:
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
         if self.numerics != "auto":
             self._resolve_rl_bitwise()
-            if self.numerics == "trainer-aligned":
-                self._resolve_trainer_aligned()
         # Individual switches that veto a fusion resolve_communication may
         # have auto-enabled, whatever the envelope. CommManager.should_fuse
         # re-derives the veto from the switches, so the fused kernels stay off
@@ -1183,11 +1177,9 @@ class ServerArgs:
         # batch shape, so the cores reduce the selected slots sorted; the
         # batch-invariant cores the envelope pins declare the trait.
         self.dsa_slot_order = "sorted"
-
-    def _resolve_trainer_aligned(self):
-        """The trainer-alignment block: the training framework's operation
-        order on top of rl-bitwise. Each switch it tightens is documented in
-        ``docs/design/numerics.md`` under "alignment.trainer"."""
+        # Trainer alignment: the training framework's operation order wherever
+        # the two engines are known to differ. Each switch is documented in
+        # ``docs/design/numerics.md`` under "alignment.trainer".
         # The trainer builds its RoPE inverse frequencies on the host; CPU and
         # CUDA division round each of them differently at ulp level.
         self.yarn_ramp_mask_device = "cpu"
@@ -2347,7 +2339,7 @@ class ServerArgs:
             "'per-request': the Gumbel-max pool kernels keyed by the request's "
             "seed and position, so a request samples the same tokens alone and "
             "inside any batch (finite top_k is capped at 128). Folded to "
-            "per-request by --numerics rl-bitwise and trainer-aligned.",
+            "per-request by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--dp-sampling",
@@ -2860,20 +2852,13 @@ class ServerArgs:
             default=ServerArgs.numerics,
             help="Numerics envelope. rl-bitwise folds the determinism "
             "switches (deterministic collectives, no autotune/TF32/PDL, no "
-            "fused all-reduce) so outputs and logprobs are bitwise identical "
-            "across runs and batch compositions within one deployment. "
-            "trainer-aligned folds those and then the trainer-operation-order "
-            "switches (docs/design/numerics.md, alignment.trainer); a model "
-            "serves it only once its forward is verified against the trainer.",
-        )
-        parser.add_argument(
-            "--allow-unverified-numerics",
-            action="store_true",
-            help="Development override: start a --numerics envelope the "
-            "model's profile does not declare, with a warning, so the "
-            "envelope's acceptance harness (docs/design/numerics.md) can run "
-            "against the model before it declares the envelope. The contract "
-            "is not promised under it; quantized checkpoints stay refused.",
+            "fused all-reduce, the batch-invariant MoE leaves, per-request "
+            "sampling) so outputs and logprobs are bitwise identical across "
+            "runs and batch compositions within one deployment, and the "
+            "trainer-operation-order switches (docs/design/numerics.md, "
+            "alignment.trainer) so a teacher-forced pass reproduces the RL "
+            "trainer's logprobs; a model serves it only once its profile "
+            "declares it verified.",
         )
         parser.add_argument(
             "--yarn-ramp-mask-device",
@@ -2885,7 +2870,7 @@ class ServerArgs:
             "YaRN linear ramp mask) before the table is moved to the model "
             "device once. The trainer builds it on the host, and CPU and CUDA "
             "division round differently at ulp level. Folded to cpu by "
-            "--numerics trainer-aligned.",
+            "--numerics rl-bitwise.",
         )
         parser.add_argument(
             "--mla-lora-scale",
@@ -2897,7 +2882,7 @@ class ServerArgs:
             "weights after loading. 'runtime': as separate bf16 multiplies "
             "after q_b_proj and after kv_a_layernorm, as the trainer does; the "
             "norm weights are never rewritten and the DSA indexer reads the "
-            "unscaled q_lora. Folded to runtime by --numerics trainer-aligned.",
+            "unscaled q_lora. Folded to runtime by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--layer-boundary-norm",
@@ -2909,8 +2894,7 @@ class ServerArgs:
             "whose residual sum stays fp32 into the norm. 'unfused': "
             "hidden + residual is materialized in bf16 first, then a "
             "standalone RMSNorm, as the trainer does; all-reduce+norm fusion "
-            "is vetoed with it. Folded to unfused by --numerics "
-            "trainer-aligned.",
+            "is vetoed with it. Folded to unfused by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--router-topk",
@@ -2922,7 +2906,7 @@ class ServerArgs:
             "torch.topk(probs + bias, sorted=True) in PyTorch tie order, "
             "weights = unbiased probs x routed_scaling_factor, zero experts "
             "become id -1 and keep their weight, as the trainer does. Folded "
-            "to torch by --numerics trainer-aligned.",
+            "to torch by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--logprob-order",
@@ -2936,7 +2920,7 @@ class ServerArgs:
             "order, logp = -(log(sum_exp) - target)); requests asking for "
             "temperature- or top-p-normalised logprobs are refused. Changes "
             "logprobs only, never the sampled tokens. Folded to megatron by "
-            "--numerics trainer-aligned.",
+            "--numerics rl-bitwise.",
         )
         parser.add_argument(
             "--moe-combine-order",
@@ -2953,7 +2937,7 @@ class ServerArgs:
             "host reduces nothing; needs MoE TP 1 and a kernel declaring the "
             "combine_order trait with slot (the batch-invariant 'aok' leaf), "
             "and vetoes all-reduce+norm fusion. Folded to slot by --numerics "
-            "trainer-aligned.",
+            "rl-bitwise.",
         )
         parser.add_argument(
             "--dsa-slot-order",
@@ -2966,7 +2950,7 @@ class ServerArgs:
             "reduction is batch-invariant whenever the selected set is; "
             "served only by cores declaring the slot_order trait (the "
             "batch-invariant 'aok' leaves). Folded to sorted by --numerics "
-            "rl-bitwise and trainer-aligned.",
+            "rl-bitwise.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

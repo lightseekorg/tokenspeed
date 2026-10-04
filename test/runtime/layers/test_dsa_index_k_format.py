@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     _index_k_field,
 )
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 HEAD_DIM = 128
 PREFIX = 64
@@ -125,7 +126,7 @@ def test_the_configure_attention_hook_names_the_plane():
     model_config = SimpleNamespace(
         hf_text_config=text_config, hf_config=text_config, index_k_format=None
     )
-    configure_dsa_attention(model_config)
+    configure_dsa_attention(model_config, ServerArgs(model="x"))
     # The in-tree hook keeps the FP8-with-scale plane; a plugin hook that
     # scores the checkpoint's bf16 keys overrides it after.
     assert model_config.index_k_format == "fp8_scaled"

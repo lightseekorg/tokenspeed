@@ -40,8 +40,8 @@ convert a plane:
 
 `dsa_prefill_topk`'s workspace-row form (`index_k_fp8` + `index_k_scale`) is
 always `fp8_scaled`. The in-tree DeepGEMM, Triton and Gluon leaves score
-`fp8_scaled` planes; a leaf scoring the checkpoint's bf16 keys (the
-trainer-aligned indexer) registers `index_k_format={"bf16"}`,
+`fp8_scaled` planes; a leaf scoring the checkpoint's bf16 keys (an indexer
+in the RL trainer's order) registers `index_k_format={"bf16"}`,
 `index_k_layout={"packed"}` and the `batch_invariant` and
 `forced_initial_local` features, so a bf16 plane selects it and nothing
 else. A plane of any other dtype is a `TypeError`.

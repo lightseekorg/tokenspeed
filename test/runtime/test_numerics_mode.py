@@ -73,66 +73,35 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rl-bitwise"):
             ServerArgs(model="x", numerics="bitwise")
 
-    def test_trainer_aligned_runs_the_rl_bitwise_block(self):
-        tight = ServerArgs(model="x", numerics="rl-bitwise")
-        args = ServerArgs(model="x", numerics="trainer-aligned")
-        for name in (
-            "force_deterministic_rsag",
-            "batch_invariant_collectives",
-            "enable_allreduce_fusion",
-            "comm_fusion_max_num_tokens",
-            "disable_autotune",
-            "disable_tf32",
-            "disable_pdl",
-            "moe_backend",
-            "draft_moe_backend",
-        ):
-            self.assertEqual(getattr(args, name), getattr(tight, name), name)
-        # It inherits the refusals too, under its own name.
-        with self.assertRaisesRegex(ValueError, "trainer-aligned.*--moe-backend"):
-            ServerArgs(model="x", numerics="trainer-aligned", moe_backend="triton")
-
-    def test_bitwise_envelopes_fold_the_per_request_sampling_stream(self):
+    def test_rl_bitwise_folds_the_per_request_sampling_stream(self):
         self.assertEqual(ServerArgs(model="x").sampling_stream, "batch")
-        for numerics in ("rl-bitwise", "trainer-aligned"):
-            args = ServerArgs(model="x", numerics=numerics)
-            self.assertEqual(args.sampling_stream, "per-request", numerics)
+        args = ServerArgs(model="x", numerics="rl-bitwise")
+        self.assertEqual(args.sampling_stream, "per-request")
         args = ServerArgs(model="x", sampling_stream="per-request")
         self.assertEqual(args.sampling_stream, "per-request")
         with self.assertRaisesRegex(ValueError, "--sampling-stream"):
             ServerArgs(model="x", sampling_stream="philox")
 
-    def test_trainer_aligned_computes_the_yarn_ramp_on_cpu(self):
+    def test_rl_bitwise_computes_the_yarn_ramp_on_cpu(self):
         self.assertEqual(ServerArgs(model="x").yarn_ramp_mask_device, "cuda")
         self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").yarn_ramp_mask_device, "cuda"
-        )
-        self.assertEqual(
-            ServerArgs(model="x", numerics="trainer-aligned").yarn_ramp_mask_device,
-            "cpu",
+            ServerArgs(model="x", numerics="rl-bitwise").yarn_ramp_mask_device, "cpu"
         )
         with self.assertRaisesRegex(ValueError, "--yarn-ramp-mask-device"):
             ServerArgs(model="x", yarn_ramp_mask_device="npu")
 
-    def test_trainer_aligned_applies_the_mla_lora_scale_at_runtime(self):
+    def test_rl_bitwise_applies_the_mla_lora_scale_at_runtime(self):
         self.assertEqual(ServerArgs(model="x").mla_lora_scale, "folded")
         self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").mla_lora_scale, "folded"
-        )
-        self.assertEqual(
-            ServerArgs(model="x", numerics="trainer-aligned").mla_lora_scale,
-            "runtime",
+            ServerArgs(model="x", numerics="rl-bitwise").mla_lora_scale, "runtime"
         )
         with self.assertRaisesRegex(ValueError, "--mla-lora-scale"):
             ServerArgs(model="x", mla_lora_scale="both")
 
-    def test_trainer_aligned_unfuses_the_layer_boundary_norm(self):
+    def test_rl_bitwise_unfuses_the_layer_boundary_norm(self):
         self.assertEqual(ServerArgs(model="x").layer_boundary_norm, "fused")
         self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm, "fused"
-        )
-        self.assertEqual(
-            ServerArgs(model="x", numerics="trainer-aligned").layer_boundary_norm,
+            ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm,
             "unfused",
         )
         # On its own, under auto, it still vetoes the fused all-reduce+norm.
@@ -143,49 +112,34 @@ class TestNumericsMode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--layer-boundary-norm"):
             ServerArgs(model="x", layer_boundary_norm="half")
 
-    def test_trainer_aligned_routes_with_the_torch_router_topk(self):
+    def test_rl_bitwise_routes_with_the_torch_router_topk(self):
         self.assertEqual(ServerArgs(model="x").router_topk, "fused")
         self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").router_topk, "fused"
-        )
-        self.assertEqual(
-            ServerArgs(model="x", numerics="trainer-aligned").router_topk, "torch"
+            ServerArgs(model="x", numerics="rl-bitwise").router_topk, "torch"
         )
         with self.assertRaisesRegex(ValueError, "--router-topk"):
             ServerArgs(model="x", router_topk="cuda")
 
-    def test_trainer_aligned_reports_megatron_order_logprobs(self):
+    def test_rl_bitwise_reports_megatron_order_logprobs(self):
         self.assertEqual(ServerArgs(model="x").logprob_order, "torch")
         self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").logprob_order, "torch"
-        )
-        self.assertEqual(
-            ServerArgs(model="x", numerics="trainer-aligned").logprob_order,
-            "megatron",
+            ServerArgs(model="x", numerics="rl-bitwise").logprob_order, "megatron"
         )
         with self.assertRaisesRegex(ValueError, "--logprob-order"):
             ServerArgs(model="x", logprob_order="apex")
 
-    def test_bitwise_envelopes_reduce_dsa_slots_sorted(self):
+    def test_rl_bitwise_reduces_dsa_slots_sorted(self):
         self.assertEqual(ServerArgs(model="x").dsa_slot_order, "selection")
         self.assertEqual(
             ServerArgs(model="x", numerics="rl-bitwise").dsa_slot_order, "sorted"
         )
-        self.assertEqual(
-            ServerArgs(model="x", numerics="trainer-aligned").dsa_slot_order,
-            "sorted",
-        )
         with self.assertRaisesRegex(ValueError, "--dsa-slot-order"):
             ServerArgs(model="x", dsa_slot_order="shuffled")
 
-    def test_trainer_aligned_combines_moe_slots_in_the_leaf(self):
+    def test_rl_bitwise_combines_moe_slots_in_the_leaf(self):
         self.assertEqual(ServerArgs(model="x").moe_combine_order, "rank")
         self.assertEqual(
-            ServerArgs(model="x", numerics="rl-bitwise").moe_combine_order, "rank"
-        )
-        self.assertEqual(
-            ServerArgs(model="x", numerics="trainer-aligned").moe_combine_order,
-            "slot",
+            ServerArgs(model="x", numerics="rl-bitwise").moe_combine_order, "slot"
         )
         # The leaf returns complete rows, so a fused all-reduce+norm at the
         # next layer boundary would sum them again: vetoed under auto too.
@@ -212,9 +166,17 @@ class TestNumericsMode(unittest.TestCase):
                 ep_size=2,
                 all2all_backend="deepep",
             )
-        # The envelope inherits both refusals.
+        # The envelope inherits both refusals: rl-bitwise needs MoE TP 1.
         with self.assertRaisesRegex(ValueError, "needs MoE TP 1"):
-            ServerArgs(model="x", numerics="trainer-aligned", world_size=2)
+            ServerArgs(model="x", numerics="rl-bitwise", world_size=2)
+        ServerArgs(model="x", numerics="rl-bitwise", world_size=2, ep_size=2)
+
+    def test_rl_bitwise_is_the_one_bitwise_envelope(self):
+        from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES
+
+        self.assertEqual(NUMERICS_ENVELOPES, ("auto", "rl-bitwise"))
+        with self.assertRaisesRegex(ValueError, "rl-bitwise"):
+            ServerArgs(model="x", numerics="trainer-aligned")
 
     def test_bitwise_envelopes_cover_every_pinning_envelope(self):
         from tokenspeed.runtime.configs.numerics import (
@@ -311,11 +273,14 @@ class TestModelVerificationGate(unittest.TestCase):
             model_profile=None,
             architecture="X",
             quantization="fp8",
-            allow_unverified=False,
+            vocab_size=1000,
         )
 
     def test_rl_bitwise_requires_a_verified_unquantized_model(self):
-        from tokenspeed.runtime.configs.numerics import require_verified_numerics
+        from tokenspeed.runtime.configs.numerics import (
+            MEGATRON_VOCAB_BLOCK,
+            require_verified_numerics,
+        )
 
         with self.assertRaisesRegex(ValueError, "has not been verified"):
             require_verified_numerics(
@@ -323,7 +288,7 @@ class TestModelVerificationGate(unittest.TestCase):
                 model_profile=None,
                 architecture="X",
                 quantization=None,
-                allow_unverified=False,
+                vocab_size=MEGATRON_VOCAB_BLOCK,
             )
         with self.assertRaisesRegex(ValueError, "has not been verified"):
             require_verified_numerics(
@@ -331,7 +296,7 @@ class TestModelVerificationGate(unittest.TestCase):
                 model_profile=self._profile({"auto"}),
                 architecture="X",
                 quantization=None,
-                allow_unverified=False,
+                vocab_size=MEGATRON_VOCAB_BLOCK,
             )
         verified = self._profile({"auto", "rl-bitwise"})
         with self.assertRaisesRegex(ValueError, "fp8-quantized"):
@@ -340,75 +305,43 @@ class TestModelVerificationGate(unittest.TestCase):
                 model_profile=verified,
                 architecture="X",
                 quantization="fp8",
-                allow_unverified=False,
+                vocab_size=MEGATRON_VOCAB_BLOCK,
             )
         require_verified_numerics(
             "rl-bitwise",
             model_profile=verified,
             architecture="X",
             quantization=None,
-            allow_unverified=False,
+            vocab_size=4 * MEGATRON_VOCAB_BLOCK,
         )
+
+    def test_rl_bitwise_needs_a_whole_number_of_megatron_vocab_blocks(self):
+        # The envelope folds --logprob-order megatron, whose sum(exp) runs
+        # over fixed vocab blocks; a model whose vocabulary cannot be cut into
+        # them is refused at startup with that reason.
+        from tokenspeed.runtime.configs.numerics import (
+            MEGATRON_VOCAB_BLOCK,
+            require_verified_numerics,
+        )
+
+        with self.assertRaisesRegex(ValueError, "vocab_size 32000, not a multiple"):
+            require_verified_numerics(
+                "rl-bitwise",
+                model_profile=self._profile({"auto", "rl-bitwise"}),
+                architecture="X",
+                quantization=None,
+                vocab_size=32000,
+            )
+        self.assertEqual(MEGATRON_VOCAB_BLOCK, 32768)
 
     def test_profile_envelopes_are_validated(self):
         with self.assertRaisesRegex(ValueError, "must include 'auto'"):
             self._profile({"rl-bitwise"})
         with self.assertRaisesRegex(ValueError, "must include 'auto'"):
             self._profile({"auto", "bitwise"})
+        with self.assertRaisesRegex(ValueError, "must include 'auto'"):
+            self._profile({"auto", "trainer-aligned"})
         self.assertIsInstance(self._profile(["auto"]).numerics_envelopes, frozenset)
-
-    def test_trainer_aligned_is_its_own_verification(self):
-        from tokenspeed.runtime.configs.numerics import require_verified_numerics
-
-        # rl-bitwise passing does not earn trainer-aligned.
-        with self.assertRaisesRegex(ValueError, "teacher-forced"):
-            require_verified_numerics(
-                "trainer-aligned",
-                model_profile=self._profile({"auto", "rl-bitwise"}),
-                architecture="X",
-                quantization=None,
-                allow_unverified=False,
-            )
-        require_verified_numerics(
-            "trainer-aligned",
-            model_profile=self._profile({"auto", "rl-bitwise", "trainer-aligned"}),
-            architecture="X",
-            quantization=None,
-            allow_unverified=False,
-        )
-
-    def test_the_harness_bootstrap_override_warns_instead_of_refusing(self):
-        # A model earns an envelope by passing its harness, which has to run
-        # before the profile declares it: --allow-unverified-numerics lets the
-        # engine start under the undeclared envelope, loudly.
-        from tokenspeed.runtime.configs import numerics as numerics_module
-        from tokenspeed.runtime.configs.numerics import require_verified_numerics
-
-        self.assertFalse(ServerArgs(model="x").allow_unverified_numerics)
-        self.assertTrue(
-            ServerArgs(
-                model="x", allow_unverified_numerics=True
-            ).allow_unverified_numerics
-        )
-        with self.assertLogs(numerics_module.logger, level="WARNING") as logs:
-            require_verified_numerics(
-                "trainer-aligned",
-                model_profile=self._profile({"auto", "rl-bitwise"}),
-                architecture="X",
-                quantization=None,
-                allow_unverified=True,
-            )
-        self.assertIn("NOT promised", "\n".join(logs.output))
-        # The quantization refusal is a hard incompatibility, not a
-        # verification gap: the override does not lift it.
-        with self.assertRaisesRegex(ValueError, "fp8-quantized"):
-            require_verified_numerics(
-                "rl-bitwise",
-                model_profile=None,
-                architecture="X",
-                quantization="fp8",
-                allow_unverified=True,
-            )
 
 
 class TestCanonicalGreedyTies(unittest.TestCase):

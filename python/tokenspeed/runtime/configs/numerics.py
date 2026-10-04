@@ -28,24 +28,20 @@ harness passes for its checkpoint and kernel selection.
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_profile import ModelProfile
 
-logger = logging.getLogger(__name__)
-
 # Every envelope name, the default first. A model always serves ``auto``.
-# ``trainer-aligned`` tightens ``rl-bitwise``: it folds every rl-bitwise switch
-# and then the trainer-order switches (``docs/design/numerics.md``,
-# "alignment.trainer").
-NUMERICS_ENVELOPES = ("auto", "rl-bitwise", "trainer-aligned")
+# ``rl-bitwise`` is the one bitwise envelope: run and batch invariance plus
+# the trainer's operation order (``docs/design/numerics.md``).
+NUMERICS_ENVELOPES = ("auto", "rl-bitwise")
 
-# Envelopes that promise the rl-bitwise contract (run and batch invariance).
-# Selection points that pin batch-invariant leaves test membership here, so a
-# tighter envelope inherits every pin.
-BITWISE_ENVELOPES = frozenset({"rl-bitwise", "trainer-aligned"})
+# Envelopes that promise the bitwise contract. Selection points that pin
+# batch-invariant leaves test membership here rather than the one name, so an
+# envelope added above it inherits every pin.
+BITWISE_ENVELOPES = frozenset({"rl-bitwise"})
 
 # Sampling backends whose greedy rows break exact logit ties toward the lowest
 # token id in every batch shape: ``greedy`` is a canonical argmax, the
@@ -55,7 +51,7 @@ RL_BITWISE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "gree
 # ``--sampling-stream``: which random stream the FlashInfer backends' sampled
 # (non-greedy) rows draw from. ``batch`` is flashinfer's Philox stream keyed by
 # the batch row; ``per-request`` is the Gumbel-max pool route keyed by
-# (request seed, position), which the bitwise envelopes require.
+# (request seed, position), which the bitwise envelope requires.
 SAMPLING_STREAMS = ("batch", "per-request")
 
 # ``--yarn-ramp-mask-device``: where the deepseek_yarn RoPE inverse frequencies
@@ -109,7 +105,7 @@ def require_verified_numerics(
     model_profile: ModelProfile | None,
     architecture: str,
     quantization: str | None,
-    allow_unverified: bool,
+    vocab_size: int,
 ) -> None:
     """Refuse a model that the requested envelope has not been verified for.
 
@@ -119,43 +115,38 @@ def require_verified_numerics(
             model (none of which is verified under an envelope beyond auto).
         architecture: The model's architecture name, for the error.
         quantization: The checkpoint's resolved quantization method, or None.
-        allow_unverified: ``--allow-unverified-numerics``: let an undeclared
-            envelope start, with a warning, so the acceptance harness can run
-            against the model before its profile declares the envelope. The
-            quantization refusal is a hard incompatibility and stands.
+        vocab_size: The model's vocabulary size; the envelope's Megatron-order
+            logprobs fold fixed ``MEGATRON_VOCAB_BLOCK``-wide blocks of it.
 
     Raises:
-        ValueError: The envelope is not verified for this model (unless
-            ``allow_unverified``), or the checkpoint is quantized (no
-            batch-invariant quantized GEMM leaf exists, so quantized linears
-            would select shape-dependent ones).
+        ValueError: The envelope is not verified for this model, the
+            checkpoint is quantized (no batch-invariant quantized GEMM leaf
+            exists, so quantized linears would select shape-dependent ones),
+            or the vocabulary is not a whole number of Megatron blocks.
     """
     if numerics == "auto":
         return
     if model_profile is None or numerics not in model_profile.numerics_envelopes:
-        harness = (
-            "the teacher-forced logprob comparison against the trainer passes"
-            if numerics == "trainer-aligned"
-            else "the bitwise invariance harness passes"
-        )
-        if not allow_unverified:
-            raise ValueError(
-                f"--numerics {numerics} is a contract verified per model, and "
-                f"{architecture} has not been verified under it: its model "
-                f"profile must list {numerics!r} in numerics_envelopes, which a "
-                f"model declares once {harness} for it (or launch with "
-                "--allow-unverified-numerics to run that harness)"
-            )
-        logger.warning(
-            f"--allow-unverified-numerics: serving {architecture} under "
-            f"--numerics {numerics}, which its model profile does not declare; "
-            f"the envelope's contract is NOT promised until {harness} for it"
+        raise ValueError(
+            f"--numerics {numerics} is a contract verified per model, and "
+            f"{architecture} has not been verified under it: its model "
+            f"profile must list {numerics!r} in numerics_envelopes, which a "
+            "model declares once the invariance harness and the teacher-forced "
+            "logprob comparison against the trainer pass for it "
+            "(docs/design/numerics.md, Acceptance)"
         )
     if quantization is not None:
         raise ValueError(
             f"--numerics {numerics} serves unquantized checkpoints only: "
             f"{architecture} is {quantization}-quantized, and no "
             "batch-invariant quantized GEMM leaf exists"
+        )
+    if vocab_size % MEGATRON_VOCAB_BLOCK != 0:
+        raise ValueError(
+            f"--numerics {numerics} folds --logprob-order megatron, whose "
+            f"sum(exp) runs over fixed {MEGATRON_VOCAB_BLOCK}-wide vocabulary "
+            f"blocks; {architecture} has vocab_size {vocab_size}, not a "
+            "multiple of it"
         )
 
 

@@ -22,6 +22,7 @@ from tokenspeed.runtime.models.minimax_m3 import (
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 def _tiny_config() -> MiniMaxM3Config:
@@ -159,7 +160,7 @@ def test_minimax_m3_attention_family_selects_msa() -> None:
     assert spec.default_backend is None
 
     model_config = SimpleNamespace(attention_arch=None)
-    spec.configure(model_config)
+    spec.configure(model_config, ServerArgs(model="x"))
     assert model_config.attention_arch is AttentionArch.MSA
 
 
