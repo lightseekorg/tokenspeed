@@ -268,8 +268,10 @@ matching rule decides (`ci_path_filter.py` holds the full lists):
   always runs.
 
 PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
-with existing validation and runner/trigger rules. Mixed, empty, or potentially
-truncated diffs (300+ paths) keep the existing scope. Manual and nightly runs
+with existing validation and runner/trigger rules. Diffs that also, or only,
+touch kernel benchmark suites under `tokenspeed-kernel/benchmarks/` additionally
+run every `kernel-benchmark` task, skipping unit and model tests. Other mixed,
+empty, or potentially truncated diffs (300+ paths) keep the existing scope. Manual and nightly runs
 retain their existing task selection.
 
 `tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
