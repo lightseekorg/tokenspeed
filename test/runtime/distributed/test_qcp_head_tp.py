@@ -25,7 +25,8 @@ Four ranks, attention TP 4 with ``--prefill-context-parallel-size 4`` and
 is the same mapping without head TP -- head-replicated q_b / kv_b / o_proj,
 QCP's default -- so the exchanges, the shard row tables, the prologue's
 gathered write and both o_proj tails are what is tested, with core attention
-stubbed per row and head as in ``test_decode_tp_layouts``.
+stubbed per row and head as in ``test_decode_tp_layouts`` (the shared
+fakes live in ``_tp_layout_fakes``).
 
 Covered:
 * the sharded extend: ``head_tp_row_counts`` reads the shard plan (input
@@ -48,14 +49,14 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from test_decode_tp_layouts import (
+from _tp_layout_fakes import (
     HIDDEN,
     KV_LORA,
     NUM_HEADS,
     V_DIM,
-    _attention_weights,
-    _build_attention,
-    _init_gloo,
+    attention_weights,
+    build_attention,
+    init_gloo,
 )
 
 from tokenspeed.runtime.distributed.comm_manager import (
@@ -140,7 +141,7 @@ class _QcpStubCoreAttention:
 
 
 def _build(mapping: Mapping, weights: dict[str, torch.Tensor]):
-    attn = _build_attention(mapping, weights)
+    attn = build_attention(mapping, weights)
     # The decode-layout stub went in for attn_mqa; swap in the QCP-aware one
     # with the heads the core sees (every head after an exchange).
     attn.attn_mqa = _QcpStubCoreAttention(
@@ -202,9 +203,9 @@ def _worker(rank: int, rendezvous: str, tp_batch_invariant: str, lengths: list[i
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     mapping = _mapping(rank, head_tp=True)
-    _init_gloo(rank, rendezvous, mapping)
+    init_gloo(rank, rendezvous, mapping)
     try:
-        weights = _attention_weights(HIDDEN)
+        weights = attention_weights(HIDDEN)
         total = sum(lengths)
         plan = QueryShardPlan.from_forward(
             total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank

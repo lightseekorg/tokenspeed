@@ -52,6 +52,13 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from _tp_layout_fakes import (
+    HIDDEN,
+    NUM_HEADS,
+    attention_weights,
+    build_attention,
+    init_gloo,
+)
 
 from tokenspeed.runtime.distributed.comm_manager import (
     CommManager,
@@ -66,40 +73,6 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 WORLD = 4
 # Rows each DP rank owns; rank 1 is idle.
 ROW_COUNTS = [2, 0, 3, 1]
-HIDDEN = 32
-
-
-def _init_gloo(rank: int, rendezvous: str, mapping: Mapping) -> None:
-    """One gloo world; every group the layouts use is registered under the
-    device-backend key as well, so the NCCL-named backend path runs on CPU."""
-    from tokenspeed.runtime.distributed.process_group_manager import (
-        process_group_manager as pg_manager,
-    )
-    from tokenspeed.runtime.utils.env import global_server_args_dict
-
-    pg_manager.init_distributed(
-        mapping,
-        distributed_init_method=rendezvous,
-        backend="gloo",
-        timeout=60,
-    )
-    # Same creation order on every rank (init_process_group enumerates every
-    # group of a shape, so the order is by kind, not by this rank's members);
-    # a size-1 group needs no collective.
-    for group in (
-        mapping.attn.head_tp_group,
-        mapping.dense.tp_group,
-        mapping.lm_head.tp_group,
-    ):
-        if len(group) == 1 or pg_manager.has_process_group("nccl", group):
-            continue
-        pg_manager.init_process_group(group, backend="gloo")
-        pg_manager.register_process_group(
-            "nccl", group, pg_manager.get_process_group("gloo", group)
-        )
-    # NCCL (here gloo) collectives instead of symmetric-memory kernels.
-    global_server_args_dict["force_deterministic_rsag"] = True
-    global_server_args_dict["mapping"] = mapping
 
 
 def _mapping(
@@ -149,7 +122,7 @@ def _worker_comm(rank: int, rendezvous: str) -> None:
     )
 
     mapping = _mapping(rank, head_tp=True)
-    _init_gloo(rank, rendezvous, mapping)
+    init_gloo(rank, rendezvous, mapping)
     try:
         group = mapping.attn.head_tp_group
         heads_local, dim = 3, 5
@@ -224,7 +197,7 @@ def _worker_dense(rank: int, rendezvous: str) -> None:
     from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MLP
 
     mapping = _mapping(rank, head_tp=True)
-    _init_gloo(rank, rendezvous, mapping)
+    init_gloo(rank, rendezvous, mapping)
     try:
         intermediate = 48
         gen = torch.Generator().manual_seed(11)
@@ -313,7 +286,7 @@ def _worker_lm_head(rank: int, rendezvous: str) -> None:
     )
 
     mapping = _mapping(rank, head_tp=False)
-    _init_gloo(rank, rendezvous, mapping)
+    init_gloo(rank, rendezvous, mapping)
     try:
         vocab, padded_vocab = 30, 32
         gen = torch.Generator().manual_seed(5)
@@ -393,125 +366,6 @@ def test_lm_head_tp_under_dp_matches_replicated(tmp_path):
 # MLA attention under head TP + batch-invariant o_proj == TP1 replicated
 # ---------------------------------------------------------------------------
 
-NUM_HEADS = 8
-QK_NOPE, QK_ROPE, V_DIM = 8, 4, 6
-Q_LORA, KV_LORA = 16, 12
-
-
-class _StubCoreAttention:
-    """Stands in for ``PagedAttention`` on CPU.
-
-    The prologue asserts the one-row-count contract and marks the RoPE
-    channels with the row's position; core attention maps each (token, head)
-    query through that token's own latent ("KV"), so the output of a head
-    for a token depends on exactly the inputs the real kernel reads. A
-    narrowing draft step attends the live rows only (``ctx.gather_ids``).
-    """
-
-    def __init__(self, layer_id: int):
-        self.layer_id = layer_id
-        self.calls = 0
-
-    def latent_prologue(
-        self, query, q_pe, latent_cache, positions, ctx, *, slots, expanded, key_rows
-    ):
-        assert key_rows is None
-        assert expanded is None
-        assert query.shape[0] == q_pe.shape[0] == latent_cache.shape[0]
-        assert query.shape[0] == positions.shape[0] == slots.shape[0]
-        # q_pe is the query's own RoPE channels (head TP, after the exchange)
-        # or a view of the q_b output sharing no element with the query.
-        rotated = query.clone()
-        rotated[..., KV_LORA:] = q_pe * (positions.to(query.dtype) + 1.0)[:, None, None]
-        self.latent = latent_cache[:, :KV_LORA].clone()
-        return SimpleNamespace(query=rotated)
-
-    def __call__(self, Q, k=None, v=None, positions=None, ctx=None, **kwargs):
-        assert k is None and v is None
-        self.calls += 1
-        latent = self.latent
-        if ctx.gather_ids is not None and Q.shape[0] != latent.shape[0]:
-            latent = latent.index_select(0, ctx.gather_ids)
-        kv_gain = 1.0 + latent.sum(dim=-1)  # [T]
-        out = Q[..., :KV_LORA] * kv_gain[:, None, None]
-        out = out + 0.01 * Q[..., KV_LORA:].sum(dim=-1, keepdim=True)
-        return out.reshape(Q.shape[0], -1)
-
-
-def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    variance = x.pow(2).mean(dim=-1, keepdim=True)
-    return x * torch.rsqrt(variance + eps) * weight
-
-
-def _attention_weights(input_width: int) -> dict[str, torch.Tensor]:
-    gen = torch.Generator().manual_seed(3)
-
-    def linear(out_features: int, in_features: int) -> torch.Tensor:
-        # Fan-in scaled, so the activations stay O(1) through four GEMMs and
-        # fp32 reassociation noise stays far below the tolerance.
-        return torch.randn(out_features, in_features, generator=gen) / in_features**0.5
-
-    return {
-        "qkv_a": linear(Q_LORA + KV_LORA + QK_ROPE, input_width),
-        "q_b": linear(NUM_HEADS * (QK_NOPE + QK_ROPE), Q_LORA),
-        "kv_b": linear(NUM_HEADS * (QK_NOPE + V_DIM), KV_LORA),
-        "o": linear(HIDDEN, NUM_HEADS * V_DIM),
-        "q_norm": torch.rand(Q_LORA, generator=gen) + 0.5,
-        "kv_norm": torch.rand(KV_LORA, generator=gen) + 0.5,
-    }
-
-
-def _build_attention(mapping: Mapping, weights: dict[str, torch.Tensor], cls=None):
-    from tokenspeed.runtime.models.deepseek_v3 import (
-        DeepseekV3AttentionMLA,
-        DeepseekV3FusedQkvAProjWithMqa,
-        _prepare_mla_kv_b_proj_weights,
-    )
-
-    cls = cls or DeepseekV3AttentionMLA
-    attn = cls(
-        config=SimpleNamespace(rms_norm_eps=1e-6),
-        mapping=mapping,
-        hidden_size=HIDDEN,
-        num_heads=NUM_HEADS,
-        qk_nope_head_dim=QK_NOPE,
-        qk_rope_head_dim=QK_ROPE,
-        v_head_dim=V_DIM,
-        q_lora_rank=Q_LORA,
-        kv_lora_rank=KV_LORA,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        max_position_embeddings=128,
-        quant_config=None,
-        layer_id=0,
-        prefix="layers.0.self_attn",
-        reduce_attn_results=False,
-    )
-    input_width = weights["qkv_a"].shape[1]
-    if input_width != HIDDEN:
-        # The Eagle3 layer feeds [embeds || hidden_states].
-        attn.fused_qkv_a_proj_with_mqa = DeepseekV3FusedQkvAProjWithMqa(
-            input_width, Q_LORA + KV_LORA + QK_ROPE, bias=False
-        )
-    attn.fused_qkv_a_proj_with_mqa.weight.data.copy_(weights["qkv_a"])
-    attn.q_b_proj.weight_loader(attn.q_b_proj.weight, weights["q_b"])
-    attn.kv_b_proj.weight_loader(attn.kv_b_proj.weight, weights["kv_b"])
-    attn.o_proj.weight_loader(attn.o_proj.weight, weights["o"])
-    attn.q_a_layernorm.weight.data.copy_(weights["q_norm"])
-    attn.kv_a_layernorm.weight.data.copy_(weights["kv_norm"])
-    attn.w_kc, attn.w_vc = _prepare_mla_kv_b_proj_weights(attn.kv_b_proj.weight, attn)
-
-    def fused_norm(input_q_a, input_kv_a, output_q_a):
-        output_q_a.copy_(_rms_norm(input_q_a, weights["q_norm"]))
-        input_kv_a.copy_(_rms_norm(input_kv_a, weights["kv_norm"]))
-
-    # Replace the CUDA-only submodules with CPU stand-ins (plain attributes).
-    del attn.fused_qk_layernorm
-    attn.fused_qk_layernorm = fused_norm
-    del attn.attn_mqa
-    attn.attn_mqa = _StubCoreAttention(layer_id=0)
-    return attn
-
 
 def _replicated_mapping(rank: int) -> Mapping:
     return Mapping(
@@ -533,9 +387,9 @@ def _worker_attention(
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     mapping = _mapping(rank, head_tp=True, head_tp_size=head_tp_size)
-    _init_gloo(rank, rendezvous, mapping)
+    init_gloo(rank, rendezvous, mapping)
     try:
-        weights = _attention_weights(HIDDEN)
+        weights = attention_weights(HIDDEN)
         rows_full = sum(row_counts)
         gen = torch.Generator().manual_seed(4)
         hidden_full = torch.randn(rows_full, HIDDEN, generator=gen)
@@ -544,14 +398,14 @@ def _worker_attention(
 
         # TP1 replicated reference on this rank's rows.
         global_server_args_dict["tp_batch_invariant"] = "none"
-        reference = _build_attention(_replicated_mapping(rank), weights)
+        reference = build_attention(_replicated_mapping(rank), weights)
         assert not reference.has_head_tp and reference.num_local_heads == NUM_HEADS
 
         # Head TP over the DP ranks of the group: the batch-invariant o_proj
         # (column-parallel + transpose) or the row-parallel one whose head
         # partials are reduce-scattered.
         global_server_args_dict["tp_batch_invariant"] = tp_batch_invariant
-        sharded = _build_attention(mapping, weights)
+        sharded = build_attention(mapping, weights)
         assert sharded.has_head_tp
         assert sharded.num_local_heads == NUM_HEADS // head_tp_size
         assert type(sharded.o_proj).__name__ == (
@@ -734,7 +588,7 @@ def _worker_draft_layers(rank: int, rendezvous: str) -> None:
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     mapping = _mapping(rank, head_tp=True, dense_tp_size=1)
-    _init_gloo(rank, rendezvous, mapping)
+    init_gloo(rank, rendezvous, mapping)
     try:
         global_server_args_dict["tp_batch_invariant"] = "none"
         rows_full = sum(INPUT_COUNTS)
@@ -750,15 +604,15 @@ def _worker_draft_layers(rank: int, rendezvous: str) -> None:
         ctx = _narrowing_ctx(rank)
 
         # NextN-style layer: [N, H] in, [bs, H] out on the narrowing step.
-        weights = _attention_weights(HIDDEN)
+        weights = attention_weights(HIDDEN)
         reference = _draft_layer(
             _replicated_mapping(rank),
-            _build_attention(
+            build_attention(
                 _replicated_mapping(rank), weights, DeepseekV3DraftAttentionMLA
             ),
         )
         sharded = _draft_layer(
-            mapping, _build_attention(mapping, weights, DeepseekV3DraftAttentionMLA)
+            mapping, build_attention(mapping, weights, DeepseekV3DraftAttentionMLA)
         )
         expected, expected_residual = reference(positions, hidden, ctx, None)
         actual, residual = sharded(positions, hidden, ctx, None)
@@ -772,15 +626,15 @@ def _worker_draft_layers(rank: int, rendezvous: str) -> None:
         assert sharded.self_attn.attn_mqa.calls == (1 if live else 0)
 
         # Eagle3 layer: [embeds || hidden] in, [bs, H] out.
-        weights2 = _attention_weights(2 * HIDDEN)
+        weights2 = attention_weights(2 * HIDDEN)
         reference = _eagle3_layer(
             _replicated_mapping(rank),
-            _build_attention(
+            build_attention(
                 _replicated_mapping(rank), weights2, DeepseekV3DraftAttentionMLA
             ),
         )
         sharded = _eagle3_layer(
-            mapping, _build_attention(mapping, weights2, DeepseekV3DraftAttentionMLA)
+            mapping, build_attention(mapping, weights2, DeepseekV3DraftAttentionMLA)
         )
         expected, _ = reference(positions, embeds, hidden, ctx, None)
         actual, residual = sharded(positions, embeds, hidden, ctx, None)
