@@ -422,6 +422,62 @@ def _qcp_main(rank: int, port: int) -> None:
     out, _ = moe.post_moe_comm(rows.clone(), rows, plain)
     torch.testing.assert_close(out, rows * QCP_WORLD)
 
+    # The prefill preset: attention TP 4, dense TP 1, EP 4. The attention
+    # weights are head-replicated under the query-sharding mapping, so the
+    # attention legs are identity on EVERY forward -- the replicated decode
+    # step must not reduce-scatter complete rows (x4, scattered) nor gather
+    # rows nobody scattered; the final norm gathers nothing either.
+    preset = Mapping(
+        rank=rank,
+        world_size=QCP_WORLD,
+        attn_tp_size=QCP_WORLD,
+        attn_qcp_size=QCP_WORLD,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=QCP_WORLD,
+    )
+    assert not preset.dense.has_tp and preset.moe.tp_ep_size == QCP_WORLD
+    for layer_id, is_moe, prev_is_moe in ((0, True, False), (1, False, True)):
+        manager = CommManager(
+            mapping=preset,
+            layer_id=layer_id,
+            is_moe=is_moe,
+            prev_is_moe=prev_is_moe,
+            dense_batch_invariant=False,
+            query_sharded=True,
+        )
+        assert not manager.use_all_reduce(is_moe=False)  # the RSAG dense layout
+        assert not manager.needs_pre_attn_all_gather()
+        assert not manager.needs_final_all_gather()
+        for forward, hidden in ((ctx, mine), (plain, rows)):
+            assert manager.pre_attn_comm(hidden, forward) is hidden
+            assert manager.gather_residual(hidden, forward) is hidden
+            out, res = manager.post_attn_comm(hidden, hidden, forward)
+            assert out is hidden and res is hidden
+            out, res = manager.post_final_norm_comm(hidden, hidden, forward)
+            assert out is hidden and res is hidden
+            # Dense TP 1: the dense legs are identity on both layouts.
+            assert manager.pre_dense_comm(hidden, forward) is hidden
+            out, _ = manager.post_dense_comm(hidden, hidden, forward)
+            assert out is hidden
+    # A dense or MoE group narrower than attention TP has no rows to gather
+    # on the replicated forward, so the layout is refused.
+    with pytest.raises(ValueError, match="1 or the attention TP width"):
+        CommManager(
+            mapping=Mapping(
+                rank=rank,
+                world_size=QCP_WORLD,
+                attn_tp_size=QCP_WORLD,
+                attn_qcp_size=QCP_WORLD,
+                dense_tp_size=2,
+            ),
+            layer_id=0,
+            is_moe=False,
+            prev_is_moe=False,
+            dense_batch_invariant=False,
+            query_sharded=True,
+        )
+
     dist.barrier()
     dist.destroy_process_group()
 

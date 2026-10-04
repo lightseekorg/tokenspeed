@@ -551,10 +551,13 @@ rank computes it (`docs/design/numerics.md`).
 
 Requirements: `N == --attn-tp-size`, `--disaggregation-mode prefill`,
 `--disable-prefill-graph`, attention DP 1, no `--enable-mixed-batch`, a
-DSA-family attention backend (GPU DSA), and `--decode-context-parallel-size`
-1 or `N` (with `--disable-kvstore`, as DCP requires). The drafter's extend
-step is sharded like the target's; its decode steps run every row on every
-rank. A preset for an eight-GPU prefill engine:
+DSA-family attention backend (GPU DSA) with a bf16 KV cache, `--dense-tp-size`
+and the MoE TP×EP group each 1 or `N` (the attention weights are
+head-replicated, so the drafter's replicated decode rows are never scattered
+and a narrower group would have nothing to gather), and
+`--decode-context-parallel-size` 1 or `N` (with `--disable-kvstore`, as DCP
+requires). The drafter's extend step is sharded like the target's; its decode
+steps run every row on every rank. A preset for an eight-GPU prefill engine:
 
 ```bash
 tokenspeed serve <dsa-model> \

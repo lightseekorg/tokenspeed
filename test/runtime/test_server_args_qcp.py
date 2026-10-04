@@ -73,6 +73,9 @@ def test_off_by_default_everywhere():
         (["--disaggregation-mode", "decode"], "requires --disaggregation-mode prefill"),
         (["--enable-mixed-batch"], "--enable-mixed-batch"),
         (["--attention-backend", "flashmla"], "DSA-family attention backend"),
+        (["--kv-cache-dtype", "fp8_e4m3"], "bf16 KV cache"),
+        (["--kv-cache-dtype", "mxfp8"], "bf16 KV cache"),
+        (["--kv-cache-quant-method", "per_token_head"], "bf16 KV cache"),
     ],
 )
 def test_refusals(argv, match):
@@ -98,17 +101,35 @@ def test_refuses_attention_dp():
         prepare_server_args(BASE + ["--data-parallel-size", "2"])
 
 
+def test_dense_and_moe_groups_are_one_or_the_attention_width():
+    """The attention weights are head-replicated, so the drafter's replicated
+    decode rows are never scattered: a dense or MoE group narrower than the
+    attention TP would gather rows nobody scattered."""
+    wide = [flag if flag != "2" else "4" for flag in BASE]
+    for argv in (["--dense-tp-size", "1"], ["--dense-tp-size", "4"]):
+        args = prepare_server_args(wide + argv)
+        assert args.mapping.dense.tp_size == int(argv[1])
+    args = prepare_server_args(wide + ["--dense-tp-size", "1", "--ep-size", "4"])
+    assert args.mapping.moe.tp_ep_size == 4
+    with pytest.raises(ValueError, match="1 or the attention TP width"):
+        prepare_server_args(wide + ["--dense-tp-size", "2"])
+
+
 def test_validate_qcp_rejects_a_shard_below_the_tp_width():
     with pytest.raises(ValueError, match="must equal the attention TP size"):
         validate_qcp(
             qcp_size=2,
             attn_tp_size=4,
             attn_dp_size=1,
+            dense_tp_size=1,
+            moe_tp_ep_size=4,
             dcp_size=1,
             disaggregation_mode="prefill",
             disable_prefill_graph=True,
             enable_mixed_batch=False,
             attention_backend="dsa",
+            kv_cache_dtype="auto",
+            kv_cache_quant_method="none",
         )
     # An unset backend resolves to the architecture's default; the attention
     # config pins it to GPU DSA when the model is known.
@@ -116,9 +137,73 @@ def test_validate_qcp_rejects_a_shard_below_the_tp_width():
         qcp_size=4,
         attn_tp_size=4,
         attn_dp_size=1,
+        dense_tp_size=4,
+        moe_tp_ep_size=4,
         dcp_size=4,
         disaggregation_mode="prefill",
         disable_prefill_graph=True,
         enable_mixed_batch=False,
         attention_backend=None,
+        kv_cache_dtype="bfloat16",
+        kv_cache_quant_method="none",
+    )
+
+
+def _dsa_attn_config(**overrides):
+    import torch
+
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+
+    spec = DSAConfig(
+        num_attention_heads=4,
+        num_kv_heads=1,
+        head_dim=576,
+        attn_tp_size=2,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        scaling=1.0,
+        kv_cache_dim=576,
+        index_topk=2048,
+        index_head_dim=128,
+        index_n_heads=64,
+        index_k_format="fp8_scaled",
+    )
+    kwargs = dict(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        prefix_granularity=64,
+        kernel_page_size=64,
+        context_len=4096,
+        max_bs=4,
+        qcp_size=2,
+        qcp_rank=0,
+        qcp_group=(0, 1),
+        components=(spec,),
+    )
+    kwargs.update(overrides)
+    return AttnConfig(**kwargs)
+
+
+def test_the_attention_config_pins_query_sharding_to_a_bf16_native_cache():
+    """The sharded KV write stores gathered rows with ``latent_store``, which
+    writes native rows only: an FP8 / MXFP8 / per-token-head cache is refused
+    where the config is built, not at the first write."""
+    import torch
+
+    assert _dsa_attn_config().qcp_size == 2
+    for overrides in (
+        {"kv_cache_dtype": torch.float8_e4m3fn},
+        {"kv_cache_dtype": torch.float8_e4m3fn, "kv_cache_mxfp8": True},
+        {"kv_cache_quant_method": "per_token_head"},
+    ):
+        with pytest.raises(ValueError, match="bf16 KV cache"):
+            _dsa_attn_config(**overrides)
+    # Off, the same caches are allowed.
+    _dsa_attn_config(
+        kv_cache_dtype=torch.float8_e4m3fn, qcp_size=1, qcp_rank=0, qcp_group=(0,)
     )

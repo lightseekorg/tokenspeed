@@ -228,6 +228,18 @@ class AttnConfig:
                 )
             if torch.device(self.device).type != "cuda":
                 raise ValueError("GPU DSA query context parallelism requires CUDA")
+            # The sharded KV write gathers the rotated latent and stores it
+            # with latent_store, which writes native (bf16) rows only.
+            if (
+                self.kv_cache_dtype is not torch.bfloat16
+                or self.kv_cache_mxfp8
+                or self.kv_cache_quant_method != "none"
+            ):
+                raise ValueError(
+                    "query context parallelism requires a bf16 KV cache; got "
+                    f"{self.kv_cache_dtype} (mxfp8={self.kv_cache_mxfp8}, quant "
+                    f"method {self.kv_cache_quant_method!r})"
+                )
         if self.dcp_size > 1:
             softmax = softmax_components[0]
             if softmax.backend_name == "flashmla":

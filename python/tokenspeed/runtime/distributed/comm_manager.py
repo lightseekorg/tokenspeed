@@ -185,15 +185,20 @@ class CommManager:
     """Manages communication patterns (all_reduce vs RSAG) for each decoder layer.
 
     ``query_sharded`` declares the model slices its extend rows by
-    ``ctx.query_shard`` (query context parallelism): the rows a layer holds
-    are then a shard, never replicated, so attention needs no gather or
-    reduce, the dense and MoE legs run the existing all-gather /
-    reduce-scatter path over the shard's per-rank row table, and the model
-    exit gathers only the sampled rows. A forward without a shard (the
-    drafter's decode steps, idle) keeps the replicated-row behaviour. The
-    flag must agree with ``mapping.attn.has_qcp``: a model that does not
-    slice its rows cannot run under a query-sharding mapping, and one that
-    does cannot run without it.
+    ``ctx.query_shard`` (query context parallelism). Under that mapping the
+    attention weights are head-replicated on every rank, so an attention
+    output row is complete wherever it is computed and the attention legs
+    are identity on every forward -- a sharded extend and the drafter's
+    replicated decode steps alike; nothing is ever scattered by attention,
+    so nothing is gathered before it or at the final norm either. The dense
+    and MoE legs follow the forward: with a shard they run the existing
+    all-gather / reduce-scatter path over the shard's per-rank row table,
+    without one (decode steps, idle) the replicated all-reduce legs, which
+    is why dense TP and the MoE TP x EP group must each be 1 or the
+    attention TP width (``validate_qcp``). The model exit gathers only the
+    sampled rows. The flag must agree with ``mapping.attn.has_qcp``: a model
+    that does not slice its rows cannot run under a query-sharding mapping,
+    and one that does cannot run without it.
 
     ``dense_batch_invariant`` selects the TP-batch-invariant dense tail: the
     layer's ``down_proj`` is column-parallel on hidden and ``post_dense_comm``
@@ -219,6 +224,18 @@ class CommManager:
                 f"attention mapping (qcp_size={mapping.attn.qcp_size}): a model "
                 "declares query sharding only when it slices its extend rows by "
                 "ctx.query_shard, and must when the mapping shards queries"
+            )
+        if query_sharded and (
+            mapping.dense.tp_size not in (1, mapping.attn.tp_size)
+            or mapping.moe.tp_ep_size not in (1, mapping.attn.tp_size)
+        ):
+            # A replicated-row forward (the drafter's decode steps) keeps its
+            # rows whole through attention, so a dense / MoE group narrower
+            # than attention TP would gather rows nobody scattered.
+            raise ValueError(
+                "query sharding needs dense TP and the MoE TP x EP group to be 1 "
+                f"or the attention TP width {mapping.attn.tp_size}; got dense "
+                f"{mapping.dense.tp_size}, MoE {mapping.moe.tp_ep_size}"
             )
         self.mapping = mapping
         self.layer_id = layer_id
@@ -344,15 +361,17 @@ class CommManager:
 
     def needs_pre_attn_all_gather(self) -> bool:
         """Whether attention preparation must gather the previous layer's rows
-        (replicated-row layouts; a sharded forward never gathers)."""
+        (replicated-row layouts whose attention legs reduce-scatter; a
+        query-sharded model's attention never scatters, so never)."""
         return (
-            self.layer_id > 0
+            not self.query_sharded
+            and self.layer_id > 0
             and self.mapping.has_attn_tp
             and not self.use_all_reduce(self.prev_is_moe)
         )
 
     def pre_attn_comm(self, hidden_states: torch.Tensor, ctx: ForwardContext):
-        if self._shard(ctx) is not None or not self.needs_pre_attn_all_gather():
+        if not self.needs_pre_attn_all_gather():
             return hidden_states
 
         return token_all_gather(
@@ -367,7 +386,7 @@ class CommManager:
 
         Mirrors the pre_attn_comm gather conditions.
         """
-        if self._shard(ctx) is not None or not self.needs_pre_attn_all_gather():
+        if not self.needs_pre_attn_all_gather():
             return residual
         return self.gather_scattered_rows(residual, ctx)
 
@@ -414,9 +433,10 @@ class CommManager:
     def post_attn_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
-        # A shard's attention output is complete per row (the output
-        # projection is not row-parallel in this layout), so nothing to reduce.
-        if self._shard(ctx) is not None or not self.mapping.has_attn_tp:
+        # A query-sharded model's attention weights are head-replicated, so
+        # its output rows are complete on every forward (sharded extend or
+        # replicated decode step): nothing to reduce or scatter.
+        if self.query_sharded or not self.mapping.has_attn_tp:
             return hidden_states, residual
 
         if self.use_all_reduce(self.is_moe):
@@ -554,9 +574,14 @@ class CommManager:
 
     def needs_final_all_gather(self) -> bool:
         """Whether the model output must gather the final layer's rows
-        (replicated-row layouts; a sharded forward gathers sampled rows at the
+        (replicated-row layouts whose attention legs reduce-scatter; a
+        query-sharded model never scatters, and gathers sampled rows at the
         model exit instead, see :func:`gather_sampled_rows`)."""
-        return self.mapping.has_attn_tp and not self.use_all_reduce(self.is_moe)
+        return (
+            not self.query_sharded
+            and self.mapping.has_attn_tp
+            and not self.use_all_reduce(self.is_moe)
+        )
 
     def gather_sampled_rows(
         self, hidden_states: torch.Tensor, ctx: ForwardContext
@@ -573,7 +598,7 @@ class CommManager:
     def post_final_norm_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
-        if self._shard(ctx) is not None or not self.needs_final_all_gather():
+        if not self.needs_final_all_gather():
             return hidden_states, residual
         hidden_states = token_all_gather(
             hidden_states,

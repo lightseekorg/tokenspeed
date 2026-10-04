@@ -185,11 +185,15 @@ def validate_qcp(
     qcp_size: int,
     attn_tp_size: int,
     attn_dp_size: int,
+    dense_tp_size: int,
+    moe_tp_ep_size: int,
     dcp_size: int,
     disaggregation_mode: str,
     disable_prefill_graph: bool,
     enable_mixed_batch: bool,
     attention_backend: str | None,
+    kv_cache_dtype: str,
+    kv_cache_quant_method: str,
 ) -> None:
     """Reject query-context-parallel layouts the first landing does not serve.
 
@@ -200,6 +204,13 @@ def validate_qcp(
     """
     if qcp_size == 1:
         return
+    if kv_cache_dtype not in ("auto", "bfloat16") or kv_cache_quant_method != "none":
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires a bf16 KV cache (got "
+            f"--kv-cache-dtype {kv_cache_dtype!r}, --kv-cache-quant-method "
+            f"{kv_cache_quant_method!r}): the sharded KV write gathers the rotated "
+            "latent and stores it with latent_store, which writes native rows only"
+        )
     if qcp_size != attn_tp_size:
         raise ValueError(
             "--prefill-context-parallel-size must equal the attention TP size "
@@ -211,6 +222,18 @@ def validate_qcp(
             "--prefill-context-parallel-size > 1 requires attention DP 1 (got "
             f"attn_dp_size={attn_dp_size}): the sampled-row table of a shard is "
             "per DP group and the DP metadata gather does not carry it"
+        )
+    if dense_tp_size not in (1, attn_tp_size) or moe_tp_ep_size not in (
+        1,
+        attn_tp_size,
+    ):
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires --dense-tp-size and the "
+            f"MoE TP x EP group to be 1 or the attention TP width {attn_tp_size} "
+            f"(got dense {dense_tp_size}, MoE {moe_tp_ep_size}): the attention "
+            "weights are head-replicated, so the drafter's replicated decode rows "
+            "are never scattered and a narrower dense or MoE group has no rows to "
+            "gather"
         )
     if disaggregation_mode != "prefill":
         raise ValueError(
@@ -943,11 +966,15 @@ class ServerArgs:
             qcp_size=self.mapping.attn.qcp_size,
             attn_tp_size=self.mapping.attn.tp_size,
             attn_dp_size=self.mapping.attn.dp_size,
+            dense_tp_size=self.mapping.dense.tp_size,
+            moe_tp_ep_size=self.mapping.moe.tp_ep_size,
             dcp_size=self.mapping.attn.dcp_size,
             disaggregation_mode=self.disaggregation_mode,
             disable_prefill_graph=bool(self.disable_prefill_graph),
             enable_mixed_batch=self.enable_mixed_batch,
             attention_backend=self.attention_backend,
+            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_quant_method=self.kv_cache_quant_method,
         )
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")

@@ -1361,12 +1361,18 @@ The contract a model (in tree or a plugin) implements:
 * `CommManager(query_sharded=mapping.attn.has_qcp)` — declares that the
   model slices its rows by `ctx.query_shard`; a model that does not slice
   passes `False` and is refused at construction under a sharding mapping.
-  With a shard on the forward: identity around attention, the existing
-  all-gather / reduce-scatter dense and MoE legs over
+  The attention weights are head-replicated under this mapping, so the
+  attention legs (`pre_attn_comm`, `gather_residual`, `post_attn_comm`,
+  `post_final_norm_comm`) are identity on every forward — a sharded extend
+  and the drafter's replicated decode steps alike — and
+  `needs_pre_attn_all_gather` / `needs_final_all_gather` are False: nothing
+  is ever scattered by attention. The dense and MoE legs follow the
+  forward: with a shard, the existing all-gather / reduce-scatter legs over
   `plan.rows_for_collective(ctx.collective_num_tokens)` (the shard rows, or
-  the sampled rows after a draft's narrowing), no final all-gather, fusion
-  off. Without a shard (the drafter's decode steps, idle) the replicated-row
-  behaviour is unchanged on the same managers.
+  the sampled rows after a draft's narrowing); without one (decode steps,
+  idle), the replicated all-reduce legs — which is why dense TP and the MoE
+  TP×EP group must each be 1 or the attention TP width (`validate_qcp`, and
+  the manager refuses other mappings). Fusion off.
 * `PagedAttention.latent_prologue(..., key_rows=QueryShardGather(ctx.query_shard,
   mapping.attn.qcp_group))` (through `DeepseekV3AttentionMLA.forward_absorb_qkv_proj`
   automatically): the prologue rotates the local rows without a cache
@@ -1414,8 +1420,12 @@ Eager only: the history gather runs in the attention break, so
 `--prefill-context-parallel-size > 1` requires `--disable-prefill-graph`
 (the executor also refuses to replay a prefill graph for a sharded forward).
 A graph-capable form needs equal padding on every rank so the gathers are
-even collectives inside the captured segment. MIXED rounds, attention DP and
-non-prefill roles are refused at argument resolution.
+even collectives inside the captured segment. MIXED rounds, attention DP,
+non-prefill roles, a non-bf16 KV cache (the gathered write is
+`latent_store`, native rows only) and dense / MoE groups that are neither 1
+nor the attention TP width are refused at argument resolution
+(`validate_qcp`); `AttnConfig` repeats the attention-family and KV-cache
+checks where the config is built.
 
 ## Non-goals
 
