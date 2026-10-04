@@ -39,6 +39,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -325,8 +326,17 @@ class HybridLinearAttnBackend(AttentionBackend):
             ret = ret.flatten(0, 1)
         return ret
 
+    def tree_support(self) -> TreeSupport:
+        return TreeSupport(verify_blocker=None, draft_blocker=None)
+
     def commit_speculative_state_after_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
     ) -> None:
         if num_extends == 0:
-            self.linear_attn_backend.commit_verified_state(accepted_lengths)
+            self.linear_attn_backend.commit_verified_state(
+                accepted_lengths, accepted_path=accepted_path
+            )

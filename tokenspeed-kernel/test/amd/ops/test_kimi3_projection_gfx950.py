@@ -136,7 +136,7 @@ def test_kimi3_latent_projection_writes_out_and_captures(
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 16])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16, 24, 32, 64])
 def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     num_tokens: int,
 ) -> None:
@@ -164,7 +164,7 @@ def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4])
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 16, 17, 32, 64])
 def test_kimi3_rmsnorm_linear_add_matches_composed_and_captures(
     num_tokens: int,
 ) -> None:

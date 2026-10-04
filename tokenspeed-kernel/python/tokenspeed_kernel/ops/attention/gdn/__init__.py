@@ -316,6 +316,7 @@ def gdn_decode_mtp(
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
+    parent_indices: torch.Tensor | None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -348,7 +349,8 @@ def gdn_decode_mtp(
         intermediate_states_buffer: Optional batch-scoped ``[B, T,
             num_v_heads, head_v_dim, head_dim]`` (K-last, same dtype as
             ``initial_state``) buffer that receives every step's post-update
-            state at ``buffer[i_n, step]``.
+            state at ``buffer[i_n, step]`` (with ``parent_indices``, only the
+            branch points' states).
         output_state_indices: Optional per-token state-pool destinations shaped
             ``[B, T]`` with dtype ``torch.int32``. When provided, each
             post-update state ``h_{t+1}`` is written directly to
@@ -358,6 +360,14 @@ def gdn_decode_mtp(
             non-negative. This is mutually exclusive with
             ``intermediate_states_buffer`` and requires
             ``disable_state_update=False``.
+        parent_indices: Optional contiguous int32 ``[B, T]`` draft-tree parents: step
+            ``t`` continues from the state after step ``parent_indices[i, t]``
+            (the initial state when negative) instead of step ``t - 1``.
+            Needs exactly one of ``output_state_indices`` (node states in the
+            pool) or ``intermediate_states_buffer`` (ReplaySSM verify: the
+            pool left untouched, and the buffer receives only the branch
+            points' states, steps with a child other than the next step), and
+            runs the Triton solution; ``None`` is a chain.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -384,6 +394,28 @@ def gdn_decode_mtp(
             )
         if disable_state_update:
             raise ValueError("output_state_indices requires disable_state_update=False")
+
+    if parent_indices is not None:
+        if (output_state_indices is None) == (intermediate_states_buffer is None):
+            raise ValueError(
+                "parent_indices needs exactly one of output_state_indices (states in "
+                "the pool) or intermediate_states_buffer (ReplaySSM verify)"
+            )
+        if (
+            parent_indices.shape != q.shape[:2]
+            or parent_indices.dtype != torch.int32
+            or not parent_indices.is_contiguous()
+        ):
+            raise ValueError(
+                f"parent_indices must be contiguous int32 {tuple(q.shape[:2])}, got "
+                f"{parent_indices.dtype} {tuple(parent_indices.shape)} "
+                f"strides {parent_indices.stride()}"
+            )
+        if solution not in (None, "triton"):
+            raise ValueError(
+                f"draft-tree GDN verify runs the Triton solution, got {solution}"
+            )
+        solution = "triton"
 
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
@@ -421,6 +453,7 @@ def gdn_decode_mtp(
             use_qk_l2norm=use_qk_l2norm,
             intermediate_states_buffer=intermediate_states_buffer,
             output_state_indices=output_state_indices,
+            parent_indices=parent_indices,
         )
 
 

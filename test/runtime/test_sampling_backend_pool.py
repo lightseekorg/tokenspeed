@@ -442,6 +442,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         direct_sampler.assert_called_once()
@@ -503,6 +504,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         top_p_sampler.assert_called_once()
@@ -581,6 +583,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         qrita_sampler.assert_called_once()
@@ -662,6 +665,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 LogitsProcessorOutput(next_token_logits=logits),
                 sampling_info,
                 candidates,
+                tree=None,
             )
 
         qrita_sampler.assert_called_once()

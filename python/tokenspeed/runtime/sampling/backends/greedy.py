@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
 )
+from tokenspeed_kernel.ops.sampling.triton import verify_tree
 from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -34,13 +35,14 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
+from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
-
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
 def _verify_chain_greedy_torch(
@@ -129,6 +131,8 @@ class GreedySamplingBackend(SamplingBackend):
     supported. Intended as the default backend and as a fallback when
     flashinfer is unavailable."""
 
+    supports_tree_verify = True
+
     def __init__(self, config: SamplingBackendConfig) -> None:
 
         super().__init__(config)
@@ -181,6 +185,8 @@ class GreedySamplingBackend(SamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        *,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         bs = candidates.shape[0]
@@ -205,17 +211,27 @@ class GreedySamplingBackend(SamplingBackend):
             )
         target_predict = sampling_argmax(logits).reshape(bs, num_tokens_per_req)
 
-        _verify_chain_greedy(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=accept_length,
-            candidates=candidates.to(torch.int32),
-            target_predict=target_predict,
-            batch_size=bs,
-            num_draft_tokens=num_tokens_per_req,
-        )
-
-        accept_length += 1
+        if tree is not None:
+            # The accepted path rides in accept_index so the TP broadcast below carries it.
+            verify_tree(
+                predict,
+                accept_length,
+                accept_index,
+                candidates.to(torch.int32),
+                tree.parents,
+                target_predict.view(-1),
+            )
+        else:
+            _verify_chain_greedy(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=accept_length,
+                candidates=candidates.to(torch.int32),
+                target_predict=target_predict,
+                batch_size=bs,
+                num_draft_tokens=num_tokens_per_req,
+            )
+            accept_length += 1
 
         # TP-rank sync on the full verify-output triple, mirrors
         # FlashInferSamplingBackend.verify. Per-rank argmax / accept-length
@@ -223,7 +239,13 @@ class GreedySamplingBackend(SamplingBackend):
         # composition and deadlocks the model all-reduce.
         self.broadcast_verify_outputs()
 
-        if self.config.enable_output_logprobs:
+        if tree is not None:
+            if self.config.enable_output_logprobs:
+                # predict is packed along the path; score it against the path's own rows.
+                logits_output.next_token_logprobs = gather_token_logprobs_torch(
+                    logits.index_select(0, accepted_path_rows(accept_index)), predict
+                )
+        elif self.config.enable_output_logprobs:
             logits_output.next_token_logprobs = gather_token_logprobs_torch(
                 logits, predict
             )

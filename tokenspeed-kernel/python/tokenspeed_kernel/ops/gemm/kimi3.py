@@ -62,11 +62,15 @@ except ImportError:
 
 try:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        supports_gluon_mm_a16w16_decode_add3_gfx950,
         supports_gluon_mm_a16w16_decode_gfx950,
     )
 except ImportError:
 
     def supports_gluon_mm_a16w16_decode_gfx950(m: int, n: int, k: int) -> bool:
+        return False
+
+    def supports_gluon_mm_a16w16_decode_add3_gfx950(m: int, n: int, k: int) -> bool:
         return False
 
 
@@ -813,9 +817,9 @@ def kimi3_latent_projection_add3(
         eps: Positive RMSNorm epsilon required with ``norm_weight``.
         solution: ``"auto"`` selects the dual-residual skinny epilogue where
             it holds a measured win (sm103, M <= 2), the fused row-CTA GEMV
-            for other one-token execution, the fused MFMA epilogue for the
-            tuned CDNA4 M=16 tile, and otherwise composes the registered projection
-            and add kernels. ``"rowcta_gemv"``, ``"skinny_add3"``,
+            for other one-token execution, the fused MFMA epilogue for CDNA4
+            decode batches (2 <= M <= 32), and otherwise composes the
+            registered projection and add kernels. ``"rowcta_gemv"``, ``"skinny_add3"``,
             ``"gluon_mfma_add3"``, ``"gluon_wmma_add3"``,
             ``"triton_wmma_add3"``, and ``"composed"`` force an implementation.
 
@@ -876,19 +880,6 @@ def kimi3_latent_projection_add3(
         if (
             solution == "auto"
             and Platform.get().is_cdna4
-            and 3 <= m <= 16
-            and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
-            and specialized
-        ):
-            from tokenspeed_kernel.ops.activation.triton import add3
-            from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
-
-            normalized = rmsnorm(hidden_states, norm_weight, eps)
-            projected = torch.nn.functional.linear(normalized, weight)
-            return add3(prefix, projected, shared_output)
-        if (
-            solution == "auto"
-            and Platform.get().is_cdna4
             and m <= 2
             and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
             and specialized
@@ -905,12 +896,26 @@ def kimi3_latent_projection_add3(
                 shared_output,
                 eps=eps,
             )
-        source = hidden_states.float()
-        hidden_states = (
-            source
-            * torch.rsqrt(source.square().mean(dim=-1, keepdim=True) + eps)
-            * norm_weight.float()
-        ).to(hidden_states.dtype)
+        if (
+            solution == "auto"
+            and Platform.get().is_cdna4
+            and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
+            and specialized
+            and supports_gluon_mm_a16w16_decode_add3_gfx950(m, n, k)
+        ):
+            from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
+
+            # Rows the fused norm kernel above leaves (3 <= m <= 32) normalize
+            # in one Triton launch, then take the fused add3 below as without a
+            # norm. Keying on the add3 predicate keeps the two ranges aligned.
+            hidden_states = rmsnorm(hidden_states, norm_weight, eps)
+        else:
+            source = hidden_states.float()
+            hidden_states = (
+                source
+                * torch.rsqrt(source.square().mean(dim=-1, keepdim=True) + eps)
+                * norm_weight.float()
+            ).to(hidden_states.dtype)
     elif eps is not None:
         raise ValueError("Kimi K3 RMSNorm epsilon requires a norm weight")
 
@@ -921,7 +926,13 @@ def kimi3_latent_projection_add3(
             solution = "skinny_add3"
         elif m == 1 and specialized:
             solution = "rowcta_gemv"
-        elif Platform.get().is_cdna4 and m == 16 and specialized:
+        elif (
+            Platform.get().is_cdna4
+            and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
+            and specialized
+            and supports_gluon_mm_a16w16_decode_add3_gfx950(m, n, k)
+        ):
+            # Fusing the additions saves the add3 launch: 2.0-2.6 us per call.
             solution = "gluon_mfma_add3"
         elif (
             Platform.get().is_cdna5
@@ -962,16 +973,21 @@ def kimi3_latent_projection_add3(
             shared_output,
         )
     if solution == "gluon_mfma_add3":
-        if not Platform.get().is_cdna4 or m != 16 or not specialized:
+        if (
+            not Platform.get().is_cdna4
+            or (k, n) != (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
+            or not specialized
+            or not supports_gluon_mm_a16w16_decode_add3_gfx950(m, n, k)
+        ):
             raise ValueError(
-                "gluon_mfma_add3 projection-add3 requires 16 contiguous CUDA "
+                "gluon_mfma_add3 projection-add3 requires 2-32 contiguous CUDA "
                 "BF16 rows with the K3 3584->7168 shape on CDNA4"
             )
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
-            gluon_mm_a16w16_add3_m16_gfx950,
+            launch_gluon_mm_a16w16_decode_add3_gfx950,
         )
 
-        return gluon_mm_a16w16_add3_m16_gfx950(
+        return launch_gluon_mm_a16w16_decode_add3_gfx950(
             hidden_states,
             weight,
             prefix,

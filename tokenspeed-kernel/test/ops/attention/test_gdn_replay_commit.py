@@ -333,6 +333,7 @@ def test_gdn_replay_commit_matches_flashinfer_qwen_geometry(device: str, require
         disable_state_update=False,
         use_qk_l2norm=True,
         solution="flashinfer",
+        parent_indices=None,
     )
     _replay(
         k,
