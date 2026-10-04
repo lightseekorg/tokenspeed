@@ -732,6 +732,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_prompt_lens_cpu=prefix + new,
             extend_with_prefix=True,
             query_shard=None,
+            block_tables_cpu={},
         )
         kind, bs, num_extends, page_table, mode = leaves[FULL].calls[-2]
         self.assertEqual(
@@ -776,6 +777,7 @@ class CacheGroupRouterTest(unittest.TestCase):
                 extend_prompt_lens_cpu=no_extends + no_extends,
                 extend_with_prefix=False,
                 query_shard=None,
+                block_tables_cpu={},
             )
 
     def test_extend_init_rejects_bounded_replay_rows(self):
@@ -802,6 +804,7 @@ class CacheGroupRouterTest(unittest.TestCase):
                 extend_prompt_lens_cpu=prefix + new,
                 extend_with_prefix=True,
                 query_shard=None,
+                block_tables_cpu={},
             )
 
     def test_mixed_round_slices_decode_requests_after_the_extend_requests(self):
@@ -827,6 +830,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             + torch.tensor([5], dtype=torch.int32),
             extend_with_prefix=True,
             query_shard=None,
+            block_tables_cpu={},
         )
         self.assertEqual(
             router.write_locations(_layer(FULL), ForwardMode.EXTEND).tolist(),
@@ -877,6 +881,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_prompt_lens_cpu=four + five,
             extend_with_prefix=True,
             query_shard=None,
+            block_tables_cpu={},
         )
         padded = router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 8)
         self.assertEqual(padded.tolist(), [24, 25, 26, 27, 0, 39, 0, 0])
@@ -902,6 +907,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_prompt_lens_cpu=extend_prefix_lens + extend_seq_lens,
             extend_with_prefix=True,
             query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             1,
@@ -944,6 +950,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_prompt_lens_cpu=prefix + one,
             extend_with_prefix=True,
             query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             1,
@@ -980,6 +987,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_prompt_lens_cpu=extend_prefix_lens + extend_seq_lens,
             extend_with_prefix=True,
             query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             2,
@@ -1197,6 +1205,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_prompt_lens_cpu=prefix + new,
             extend_with_prefix=False,
             query_shard=None,
+            block_tables_cpu={},
         )
         self.assertEqual((share.prefill, share.decode), (None, None))
 

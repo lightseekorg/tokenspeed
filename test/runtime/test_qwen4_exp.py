@@ -584,6 +584,7 @@ def _qsa_extend_round(router: CacheGroupRouter, block_tables: dict, seq_lens) ->
         extend_prompt_lens_cpu=seq_lens - 1 + ones,
         extend_with_prefix=True,
         query_shard=None,
+        block_tables_cpu={},
     )
 
 

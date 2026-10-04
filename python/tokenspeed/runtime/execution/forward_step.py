@@ -1024,9 +1024,9 @@ class ForwardStepRunner:
         extend_seq_lens_cpu: torch.Tensor,
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
+        block_tables_cpu: dict,
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
-        block_tables_cpu: dict | None = None,
     ):
         """
         Unified forward entry point.
@@ -1041,8 +1041,9 @@ class ForwardStepRunner:
         The ``extend_*`` lengths are the ``[:num_extends]`` slices of the
         input buffers on every call — empty for a pure decode or the idle
         replay, which never read them. ``block_tables_cpu`` mirrors
-        ``block_tables`` on the host for backends that plan an extend from
-        the tables without waiting on the device.
+        ``block_tables`` on the host (the same group keys; empty at bs 0) for
+        backends that plan an extend from the tables without waiting on the
+        device.
 
         Returns ``(output_tokens, output_lengths, output_logprobs,
         input_token_logprobs)``; the last is the prompt-logprob gather of an

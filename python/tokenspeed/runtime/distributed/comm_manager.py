@@ -126,7 +126,7 @@ def moe_input_row_segments(
     def shard(rank: int) -> tuple[int, int]:
         """``rank``'s reduce-scatter shard: a contiguous run of its group's rows."""
         padded, live, tp_rank = dp_group_rows(rank)
-        lengths = CommManager._scatter_count(padded, attn.tp_size)
+        lengths = scatter_count(padded, attn.tp_size)
         offset = sum(lengths[:tp_rank])
         return lengths[tp_rank], min(max(live - offset, 0), lengths[tp_rank])
 
@@ -265,8 +265,6 @@ class CommManager:
 
     # ---- Scattered token counts ----
 
-    _scatter_count = staticmethod(scatter_count)
-
     def _shard(self, ctx: ForwardContext) -> QueryShardPlan | None:
         """The forward's query shard when the rows this layer holds are a
         shard; None for replicated rows."""
@@ -302,16 +300,14 @@ class CommManager:
                 # global_counts is indexed by global rank with dp stride
                 # tp_size.
                 num_tokens = global_counts[attn_dp_rank * self.mapping.attn.tp_size]
-                scattered.extend(
-                    self._scatter_count(num_tokens, self.mapping.attn.tp_size)
-                )
+                scattered.extend(scatter_count(num_tokens, self.mapping.attn.tp_size))
             return scattered
         num_tokens = (
             ctx.collective_num_tokens
             if ctx.collective_num_tokens is not None
             else ctx.input_num_tokens
         )
-        return self._scatter_count(num_tokens, self.mapping.attn.tp_size)
+        return scatter_count(num_tokens, self.mapping.attn.tp_size)
 
     def attn_tp_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
         start = self.mapping.attn.tp_size * self.mapping.attn.dp_rank

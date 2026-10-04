@@ -596,7 +596,7 @@ class CacheGroupRouter(AttentionBackend):
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         query_shard: QueryShardPlan | None,
-        block_tables_cpu: Mapping[str, torch.Tensor] | None = None,
+        block_tables_cpu: Mapping[str, torch.Tensor],
         **kwargs,
     ) -> None:
         """Extend / mixed / idle-warmup metadata for every leaf.
@@ -608,21 +608,16 @@ class CacheGroupRouter(AttentionBackend):
         or chunked prefix) travels with the extend lengths: leaves size their
         paged-prefix metadata by it, so it must reach them unchanged. A
         ``query_shard`` reaches every leaf too, with the host mirror of the
-        extend rows of its kernel page table (``block_tables_cpu`` expanded
-        the way the stack expands the device tables), so a leaf that gathers
-        history by page owner can split the gather without a device sync.
-        ``block_tables_cpu`` is the runner's optional host mirror; a sharded
-        extend requires it.
+        extend rows of its kernel page table (``block_tables_cpu``, the
+        runner's host mirror of ``block_tables``, expanded the way the stack
+        expands the device tables), so a leaf that gathers history by page
+        owner can split the gather without a device sync; an unsharded
+        forward reads nothing from the mirror.
         """
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
         del kwargs
         sharded = query_shard is not None and query_shard.size > 1
-        if sharded and block_tables_cpu is None:
-            raise RuntimeError(
-                "a sharded extend needs block_tables_cpu to split its history "
-                "gathers by page owner"
-            )
         # A new forward: the sparse layers' shared top-k is per forward.
         self.sparse_topk.clear()
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):

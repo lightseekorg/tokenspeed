@@ -29,12 +29,10 @@ import textwrap
 import pytest
 import torch
 
-from tokenspeed.runtime.distributed.comm_manager import (
-    CommManager,
-    moe_input_row_segments,
-)
+from tokenspeed.runtime.distributed.comm_manager import moe_input_row_segments
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution import forward_step, prefill_graph
+from tokenspeed.runtime.execution.query_shard import scatter_count
 from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask, LayerExpertLoad
 
 # ----------------------------------------------------------------------
@@ -63,7 +61,7 @@ def test_attention_tp_shards_split_the_live_prefix_contiguously():
     mapping = Mapping(
         rank=0, world_size=4, attn_tp_size=2, attn_dp_size=2, moe_ep_size=4
     )
-    assert CommManager._scatter_count(7, 2) == [4, 3]
+    assert scatter_count(7, 2) == [4, 3]
     segments = moe_input_row_segments(
         mapping,
         padded_global_num_tokens=[7, 7, 7, 7],

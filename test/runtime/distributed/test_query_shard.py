@@ -54,7 +54,6 @@ def test_scatter_count_matches_the_rsag_split():
     assert scatter_count(10, 4) == [3, 3, 2, 2]
     assert scatter_count(2, 4) == [1, 1, 0, 0]
     assert scatter_count(0, 3) == [0, 0, 0]
-    assert CommManager._scatter_count(10, 4) == scatter_count(10, 4)
 
 
 @pytest.mark.parametrize(
