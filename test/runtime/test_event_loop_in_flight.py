@@ -149,21 +149,26 @@ def _pp_loop(monkeypatch, *, is_last_pp_rank: bool, broadcast):
     return SimpleNamespace(server_args=SimpleNamespace(mapping=mapping))
 
 
-def test_pp_broadcast_adopts_the_last_stage_tokens_candidates_and_logprobs(
+def test_pp_broadcast_adopts_the_last_stage_tokens_candidates_logprobs_and_flags(
     monkeypatch,
 ) -> None:
     """A stage before the last commits the last stage's sampled tokens, the
     drafter's candidate rows (next_input_ids) -- every rank's scheduler folds
     them into the final chunk's result, which the remote decode carries --
-    and both logprob vectors, which every rank's output processor records on
-    its request state; the prompt-logprob plan the flat vector follows is
-    the stage's own (mirrored) one, so it stays in place."""
+    both logprob vectors, which every rank's output processor records on its
+    request state, and the NaN guard's per-request flags, so every stage
+    aborts (or finishes) the same requests: only the last stage audits
+    logits and prompt logprobs, and the stage's own flags (zero here, the
+    guard found nothing in its placeholder outputs) would commit as healthy a
+    request the last stage aborts. The prompt-logprob plan the flat vector
+    follows is the stage's own (mirrored) one, so it stays in place."""
     from_last_stage = (
         ["sampled"],
         ["lengths"],
         ["candidates"],
         ["output logprobs"],
         ["prompt logprobs"],
+        ["nan flags"],
     )
 
     def broadcast(payload, src, group):
@@ -178,6 +183,7 @@ def test_pp_broadcast_adopts_the_last_stage_tokens_candidates_and_logprobs(
         next_input_ids=None,
         output_logprobs=None,
         input_token_logprobs=None,
+        output_nan_flags="this stage's clean flags",
         input_logprob_plan="this stage's plan",
     )
 
@@ -188,6 +194,7 @@ def test_pp_broadcast_adopts_the_last_stage_tokens_candidates_and_logprobs(
     assert results.next_input_ids == ["candidates"]
     assert results.output_logprobs == ["output logprobs"]
     assert results.input_token_logprobs == ["prompt logprobs"]
+    assert results.output_nan_flags == ["nan flags"]
     assert results.input_logprob_plan == "this stage's plan"
 
 
@@ -204,15 +211,24 @@ def test_pp_broadcast_sends_the_last_stage_results_unchanged(monkeypatch) -> Non
         next_input_ids="candidates",
         output_logprobs="output logprobs",
         input_token_logprobs="prompt logprobs",
+        output_nan_flags="nan flags",
     )
 
     EventLoop._pp_broadcast_output_tokens(loop, forward_op=None, results=results)
 
     assert sent == [
-        ("sampled", "lengths", "candidates", "output logprobs", "prompt logprobs")
+        (
+            "sampled",
+            "lengths",
+            "candidates",
+            "output logprobs",
+            "prompt logprobs",
+            "nan flags",
+        )
     ]
     assert (results.output_tokens, results.next_input_ids) == ("sampled", "candidates")
     assert results.input_token_logprobs == "prompt logprobs"
+    assert results.output_nan_flags == "nan flags"
 
 
 def test_pp_broadcast_precedes_commit_post_processing() -> None:

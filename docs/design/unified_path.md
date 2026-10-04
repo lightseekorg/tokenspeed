@@ -1091,9 +1091,10 @@ refuses it again at executor construction. The MTP shape is
 * **Handoff.** The last stage samples, runs the drafter over the completing
   chunk and writes the candidate block into the reserved decode slot; the
   event loop broadcasts `(output_tokens, output_lengths, next_input_ids)`
-  over the PP gloo group at commit so every rank's scheduler stamps the same
-  bootstrap token and candidate window onto the remote decode. The PD wire
-  and the decode side are untouched.
+  over the PP gloo group at commit -- with the logprob vectors and the NaN
+  guard's per-request flags, see the QCP section -- so every rank's
+  scheduler stamps the same bootstrap token and candidate window onto the
+  remote decode. The PD wire and the decode side are untouched.
 
 Expect a larger last-stage bubble (NextN layer plus draft extend and
 multi-step drafting); rebalance with `--pp-layer-partition`.
@@ -1477,10 +1478,16 @@ The contract a model (in tree or a plugin) implements:
   deferred `logprob.topology-invariant` item of `numerics.md`.)
 * Pipeline parallelism: the last stage scores the prompt logprobs (on its
   shard, under QCP) and `_pp_broadcast_output_tokens` carries
-  `output_logprobs` and `input_token_logprobs` to the other stages with the
-  sampled tokens; every stage pairs the vector with its own mirrored plan,
-  which `ModelExecutionResult` carries whether or not the stage scored the
-  rows. Prompt logprobs are therefore no longer refused on a pipeline split
+  `output_logprobs`, `input_token_logprobs` and the NaN guard's
+  `output_nan_flags` to the other stages with the sampled tokens; every
+  stage pairs the vector with its own mirrored plan, which
+  `ModelExecutionResult` carries whether or not the stage scored the rows.
+  The flags travel with the values they audit: only the last stage holds
+  logits and prompt logprobs to flag (the other stages' guards see
+  placeholder outputs and the rank-consistent target audit at most), and
+  every stage's output processor must take the same abort-or-finish branch
+  for a request, or the stages' schedulers disagree on it. Prompt logprobs
+  are therefore no longer refused on a pipeline split
   (`supports_prompt_logprobs` depends on the narrowing-model check only).
 * Communication buffers (`prepare_communication_runtime(max_forward_tokens)`)
   stay sized by the whole chunk under QCP, not `ceil(chunk / qcp)`: the
