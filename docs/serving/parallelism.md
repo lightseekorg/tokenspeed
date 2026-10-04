@@ -63,7 +63,7 @@ instead. Three knobs shard those weights over contiguous groups of DP ranks
 
 | Parameter | Use |
 | --- | --- |
-| `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj` and `o_proj` by heads over `W` contiguous DP ranks. Requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). |
+| `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj` and `o_proj` by heads over `W` contiguous ranks that hold different rows. Over DP ranks: requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). Over the query shards of a prefill engine: `W` equal to `--prefill-context-parallel-size` (see [Query context parallelism](#query-context-parallelism-on-the-prefill-role)). |
 | `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); without attention DP it must equal the attention TP size (today's layout). |
 | `--dense-tp-size W` | Already shards the dense MLPs over `W` ranks (token all-gather in, token reduce-scatter out). |
 | `--tp-batch-invariant {none,attn,attn+dense}` | Make the sharded `o_proj` (`attn`) and dense `down_proj` (`attn+dense`) column-parallel on hidden so no cross-rank sum remains outside MoE; see below. |
@@ -110,7 +110,9 @@ cached prefix. Under head TP each rank holds `kv_b_proj` for its `H / W`
 heads and the latent cache for its own requests only, so no rank can expand
 the other heads of its prefix, and no other rank holds that prefix to expand
 it for it: the full-head K/V of a prefill is not available on the layout. The
-layout is therefore refused outside `--disaggregation-mode decode`, and the
+layout over DP ranks is therefore refused outside `--disaggregation-mode
+decode` (head TP over the query shards of a prefill engine serves its extend
+rows through the absorbed sparse prefill instead, see below), and the decode
 engine keeps every extend-shaped forward off its path:
 
 - startup tunes on a decode step instead of the usual extend-shaped dummy
@@ -540,37 +542,90 @@ transfer see page ownership only, and `--chunked-prefill-size` keeps counting
 the whole chunk, so size it as `N x rows-per-rank`.
 
 Per layer the rows a rank holds are its shard: attention needs no gather or
-reduce around it (the attention weights are head-replicated in this landing),
-the dense and MoE legs run the all-gather / reduce-scatter path over the
-shard's row table, the KV write all-gathers each rank's rotated latent to the
-whole span before the owner-masked store, the sparse DSA indexer and
-attention score the gathered history of each request group, and the model
-exit gathers only the sampled rows (one per request) before the LM head.
-Every QCP collective is data movement, so a row's bits do not depend on which
-rank computes it (`docs/design/numerics.md`).
+reduce around it (its weights are head-replicated by default, or its own
+head-TP tail returns the shard's rows, see below), the dense and MoE legs run
+the all-gather / reduce-scatter path over the shard's row table, the KV write
+all-gathers each rank's rotated latent to the whole span before the
+owner-masked store, the sparse DSA indexer and attention score the gathered
+history of each request group, and the model exit gathers only the sampled
+rows (one per request) before the LM head. Every QCP collective is data
+movement, so a row's bits do not depend on which rank computes it
+(`docs/design/numerics.md`).
 
 Requirements: `N == --attn-tp-size`, `--disaggregation-mode prefill`,
 `--disable-prefill-graph`, attention DP 1, no `--enable-mixed-batch`, a
 DSA-family attention backend (GPU DSA) with a bf16 KV cache, `--dense-tp-size`
-and the MoE TP×EP group each 1 or `N` (the attention weights are
-head-replicated, so the drafter's replicated decode rows are never scattered
-and a narrower group would have nothing to gather), and
-`--decode-context-parallel-size` 1 or `N` (with `--disable-kvstore`, as DCP
-requires). The drafter's extend step is sharded like the target's; its decode
-steps run every row on every rank. A preset for an eight-GPU prefill engine:
+and the MoE TP×EP group each 1 or `N` (attention returns complete rows, so
+the drafter's replicated decode rows are never scattered and a narrower group
+would have nothing to gather), and `--decode-context-parallel-size` 1 or `N`
+(with `--disable-kvstore`, as DCP requires). The drafter's extend step is
+sharded like the target's; its decode steps run every row on every rank.
+
+**Head TP over the query shards.** Without `--attn-head-tp-size` the shard
+group's ranks hold different rows and every rank holds every head of
+`q_b_proj`, `kv_b_proj` and `o_proj` (the mapping resolves
+`attn.head_tp_size` to 1). `--attn-head-tp-size N` shards those three
+projections by heads over the shard group instead — the same head group the
+decode-side layout above builds over DP ranks, here `== qcp_group`, with the
+same exchange around core attention: the normalized q latent is
+token-all-gathered to the span, `q_b_proj` runs this rank's `H / N` heads of
+every row, the heads-to-tokens all-to-all returns the shard's rows with every
+head, the prologue rotates them on the shard's own positions and writes the
+gathered KV as every QCP forward does, the sparse core attends the gathered
+history with every head, the tokens-to-heads all-to-all hands the head slice
+of every row to the local `w_vc`, and the `o_proj` tail returns the shard's
+rows (row-parallel `o_proj` plus a token reduce-scatter, or under
+`--tp-batch-invariant attn` the column-parallel `o_proj` with an all-gather
+of the heads in front and an all-to-all back). The exchange counts are the
+shard plan's, so there is no host sync; a rank whose shard is empty joins
+every leg. The drafter's decode steps hold every row on every rank, exchange
+nothing, attend this rank's head slice (the DCP arm over the KVP pages --
+the page-sharded KV of `--decode-context-parallel-size` -- as attention TP
+runs it) and all-reduce the `o_proj` partials (all-gather the
+hidden shards under `--tp-batch-invariant attn`). The expanded (dense MLA)
+prefill still refuses head TP; the layout serves the absorbed sparse prefill
+only. The decode-only rules of the DP layout (role, decode-shaped autotune,
+the generation budget) do not apply: the prefill role's rules above and
+`--attn-head-tp-size == --prefill-context-parallel-size` gate it.
+
+Memory: the head-shardable weights of one attention instance go from the
+whole matrices to `1 / N` of them per rank. For a model with hidden 8192, 64
+heads, `q_lora` 1536, `kv_lora` 512, `qk` 192 and `v` 128 that is `q_b_proj`
++ `kv_b_proj` + `o_proj` ≈ 94M parameters = 189 MB (bf16) per instance down
+to ≈ 24 MB per rank at `N = 8`; a five-layer pipeline stage of a model with
+two attention instances per layer saves ≈ 1.7 GB per rank, which the KV
+cache takes.
+
+Numerics: with row-parallel `o_proj` the shard group folds the same per-rank
+head partials the plain TP8 prefill engine does, so QCP with head TP is
+bitwise the TP8 engine; with `--tp-batch-invariant attn` it is bitwise the
+TP1 / head-replicated form the decode engine's batch-invariant layout
+computes (`docs/design/numerics.md`, "Layout invariance of query context
+parallelism").
+
+A preset for an eight-GPU prefill engine with head TP and the
+batch-invariant `o_proj`:
 
 ```bash
 tokenspeed serve <dsa-model> \
   --disaggregation-mode prefill \
   --attn-tp-size 8 --dense-tp-size 1 --enable-expert-parallel \
   --prefill-context-parallel-size 8 \
+  --attn-head-tp-size 8 --tp-batch-invariant attn \
   --disable-prefill-graph \
   --chunked-prefill-size 16384
 ```
 
-A model supports the layout by slicing its rows by `ctx.query_shard`
-(`docs/design/unified_path.md`, "Query context parallelism"); every other
-model refuses it at construction.
+Drop `--attn-head-tp-size 8 --tp-batch-invariant attn` for the
+head-replicated layout (the same bits, 189 MB more attention weight per
+instance per rank), or `--tp-batch-invariant attn` alone for the TP8 form.
+`--tp-batch-invariant attn` needs an unquantized `o_proj`, as on the decode
+side.
+
+A model supports the layout by slicing its rows by `ctx.query_shard` and,
+for head TP, threading the attention module's head-TP hooks around its
+sparse core (`docs/design/unified_path.md`, "Query context parallelism");
+every other model refuses it at construction.
 
 ## Multi-Node
 

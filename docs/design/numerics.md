@@ -302,14 +302,24 @@ attention over the gathered history with every head and no LSE merge, the
 indexer's top-k over pre-gathered rows, RoPE, the GEMMs — see for each row
 exactly the operands a single GPU would, so a row's bits do not depend on
 which rank computes it or on the batch it shares: the layout preserves run
-and batch invariance by construction. What differs from the TP8 prefill
-baseline is the output projection's form: this landing keeps it replicated
-over every head (the TP1 / trainer form), whereas TP8's row-parallel
-projection folds per-rank partials, the same gap as between the decode
-side's batch-invariant TP layout and an ordered fold. Only the drafter's
-decode steps on a sharded engine merge partials across page owners
-(`combine_attention_partials(keep_all_heads=True)`), with the ordered fold
-under rl-bitwise.
+and batch invariance by construction. Head TP over the query shards
+(`--attn-head-tp-size` equal to the shard group) adds only the head
+exchanges — all-to-all transposes, permutations of bytes — and the `o_proj`
+tail. What can differ from the TP8 prefill baseline is therefore the output
+projection's form alone, and the statement is: **QCP is bitwise the TP8
+engine iff `o_proj` takes the same form.** Head TP with the row-parallel
+`o_proj` folds the same per-rank head partials TP8 does (the ordered fold
+under rl-bitwise) and reproduces TP8. The head-replicated default (one GEMM
+over every head, the TP1 / trainer form) and head TP with
+`--tp-batch-invariant attn` (full-K column-parallel GEMM, a transpose back)
+reproduce the TP1 / decode-side batch-invariant form instead — the one the
+RL trainer alignment wants, and the same gap to TP8 as between the decode
+side's batch-invariant layout and an ordered fold. The drafter's decode steps
+on a sharded engine merge partials across the KVP page owners (the
+page-sharded KV of `--decode-context-parallel-size`;
+`combine_attention_partials`, every head under the head-replicated layout,
+the attention-TP slice under head TP), with the ordered fold under
+rl-bitwise.
 
 ## Kernel selection
 
