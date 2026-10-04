@@ -899,13 +899,15 @@ def kimi3_latent_projection_add3(
         if (
             solution == "auto"
             and Platform.get().is_cdna4
-            and 3 <= m <= 16
             and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
             and specialized
+            and supports_gluon_mm_a16w16_decode_add3_gfx950(m, n, k)
         ):
             from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
 
-            # The projection and both additions dispatch below as without a norm.
+            # Rows the fused norm kernel above leaves (3 <= m <= 32) normalize
+            # in one Triton launch, then take the fused add3 below as without a
+            # norm. Keying on the add3 predicate keeps the two ranges aligned.
             hidden_states = rmsnorm(hidden_states, norm_weight, eps)
         else:
             source = hidden_states.float()
