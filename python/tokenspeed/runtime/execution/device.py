@@ -1706,7 +1706,6 @@ def _build_kv_transfer(
 
     mapping = server_args.mapping
     topology = PDParallelTopology.from_mapping(mapping)
-    topology.require_cache_pd_supported()
 
     # PP: transfer-status consensus must span every stage — all ranks run the
     # same deterministic scheduler and must agree on Bootstrapped/Succeeded
