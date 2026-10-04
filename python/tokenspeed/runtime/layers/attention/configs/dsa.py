@@ -116,26 +116,25 @@ def dsa_history_gather_workspace_bytes(
 
     One whole history (``max_model_len`` rows, padded to kernel pages by
     :func:`dsa_history_gather_workspace_rows`) of latent rows in the KV cache
-    dtype plus ``fp8_scaled`` index-K rows (FP8 keys with their fp32 scales,
-    the one plane format the sharded extend arm gathers): the arm gathers
-    each request group's history into it, so a request's history
-    may never exceed the model length.
+    dtype plus index-K rows packed in the plane's own format
+    (:func:`index_k_row_bytes` of ``spec.index_k_format``: FP8 keys with
+    their scales, or bf16 keys): the sharded extend arm gathers each request
+    group's history into it, so a request's history may never exceed the
+    model length. ``DSABackend.preallocate_history_gather_workspace``
+    allocates exactly these bytes.
     """
     spec = config.component(DSAConfig)
     if spec is None:
         raise ValueError("the history gather workspace is a DSA quantity")
-    if spec.index_k_format != "fp8_scaled":
-        raise ValueError(
-            "DSA query context parallelism gathers fp8_scaled index-K rows; got "
-            f"index_k_format={spec.index_k_format!r}"
-        )
     rows = dsa_history_gather_workspace_rows(
         max_model_len, page_size=dsa_history_gather_page_size(config)
     )
     kv_bytes = (
         spec.kv_cache_dim * torch.tensor([], dtype=config.kv_cache_dtype).element_size()
     )
-    return rows * (kv_bytes + dsa_index_k_row_bytes(spec.index_head_dim))
+    return rows * (
+        kv_bytes + index_k_row_bytes(spec.index_head_dim, spec.index_k_format)
+    )
 
 
 @dataclass(kw_only=True)

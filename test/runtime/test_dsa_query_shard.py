@@ -23,9 +23,10 @@
 Covers the per-forward plan (request groups against the gather workspace,
 this rank's query slice of each group, the gather split), the gathered-buffer
 attention call shape (``return_lse=False``, group-relative top-k rows, every
-group's gather run even without local rows), the dense delegate's view of the
-forward, the decode arm's head-replicated combine, and the workspace
-reservation agreeing with the recipe's plan.
+group's gather run even without local rows), the index-K history gather in
+either plane format (FP8 bytes with scales, bf16 keys), the dense delegate's
+view of the forward, the decode arm's head-replicated combine, and the
+workspace reservation agreeing with the recipe's plan in either format.
 """
 
 from __future__ import annotations
@@ -39,8 +40,10 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged import dsa
 from tokenspeed.runtime.layers.attention.configs.dsa import (
+    INDEX_K_FORMATS,
     dsa_history_gather_workspace_bytes,
     dsa_index_k_row_bytes,
+    index_k_row_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.dsa import (
     DSATokenToKVPool,
@@ -61,7 +64,13 @@ PREFIX = [2, 4, 0]
 HISTORY = [p + e for p, e in zip(PREFIX, EXTEND)]  # [6, 5, 5]
 
 
-def _backend(rank: int, *, workspace_rows: int, qcp: bool = True) -> dsa.DSABackend:
+def _backend(
+    rank: int,
+    *,
+    workspace_rows: int,
+    qcp: bool = True,
+    index_k_format: str = "fp8_scaled",
+) -> dsa.DSABackend:
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = PAGE
     backend.kernel_solution = None
@@ -73,6 +82,7 @@ def _backend(rank: int, *, workspace_rows: int, qcp: bool = True) -> dsa.DSABack
     backend.qk_rope_head_dim = 2
     backend.kv_cache_dim = KV_DIM
     backend.index_head_dim = INDEX_HEAD_DIM
+    backend.index_k_format = index_k_format
     backend.index_topk = 4
     backend.max_context_len = 64
     backend.device = "cpu"
@@ -332,40 +342,100 @@ def _index_k_plane(head_dim: int, page_size: int, pages: int) -> torch.Tensor:
     return buf.view(pages * page_size, row_bytes)
 
 
-def test_the_index_k_gather_reads_the_block_split_plane_packed_per_row():
-    head_dim, page_size, pages = 128, 4, 3
-    pool = SimpleNamespace(
-        get_index_k_buffer=lambda layer_id: _index_k_plane(head_dim, page_size, pages),
-        arena=SimpleNamespace(kv_page_size=page_size),
-        index_head_dim=head_dim,
+def _bf16_index_k_plane(head_dim: int, page_size: int, pages: int) -> torch.Tensor:
+    """A bf16 index-K plane ``[slots, head_dim]``: slot ``v`` holds the key
+    ``v + 0.5`` in every element (the plane is flat, no per-page split)."""
+    slots = pages * page_size
+    return (
+        (torch.arange(slots, dtype=torch.float32) + 0.5)
+        .unsqueeze(1)
+        .expand(slots, head_dim)
+        .to(torch.bfloat16)
+        .contiguous()
     )
-    slots = torch.tensor([0, 5, 11, 6], dtype=torch.int64)
-    packed = DSATokenToKVPool.gather_index_k_rows(pool, 0, slots)
-    assert packed.shape == (4, dsa_index_k_row_bytes(head_dim))
-    assert packed.dtype == torch.uint8
-    fp8, scale = split_index_k_rows(packed, index_head_dim=head_dim)
-    assert fp8.shape == (4, head_dim) and scale.shape == (4, 1)
-    assert fp8[:, 0].tolist() == [0, 11, 23, 12]
-    assert scale[:, 0].tolist() == [0.0, 101.0, 203.0, 102.0]
-    with pytest.raises(ValueError, match="bytes wide"):
-        split_index_k_rows(packed[:, :-1], index_head_dim=head_dim)
 
 
-def test_the_index_k_history_is_one_gather_per_group(monkeypatch):
-    """``gather_history_index_k`` moves the packed rows in one collective and
-    hands the indexer views of the workspace: FP8 bytes and fp32 scales."""
-    backend = _backend(0, workspace_rows=11)
-    plan = _plan(0)
-    _init(backend, plan)
-    group = backend.require_query_shard_metadata().groups[0]
+def _index_k_pool(index_k_format: str, page_size: int, pages: int):
+    plane = (
+        _index_k_plane(INDEX_HEAD_DIM, page_size, pages)
+        if index_k_format == "fp8_scaled"
+        else _bf16_index_k_plane(INDEX_HEAD_DIM, page_size, pages)
+    )
     pool = SimpleNamespace(
-        get_index_k_buffer=lambda layer_id: _index_k_plane(INDEX_HEAD_DIM, PAGE, 8),
-        arena=SimpleNamespace(kv_page_size=PAGE),
+        get_index_k_buffer=lambda layer_id: plane,
+        arena=SimpleNamespace(kv_page_size=page_size),
         index_head_dim=INDEX_HEAD_DIM,
     )
     pool.gather_index_k_rows = lambda layer_id, slots: (
         DSATokenToKVPool.gather_index_k_rows(pool, layer_id, slots)
     )
+    return pool
+
+
+def test_the_index_k_gather_reads_the_block_split_plane_packed_per_row():
+    head_dim, page_size, pages = INDEX_HEAD_DIM, 4, 3
+    pool = _index_k_pool("fp8_scaled", page_size, pages)
+    slots = torch.tensor([0, 5, 11, 6], dtype=torch.int64)
+    packed = pool.gather_index_k_rows(0, slots)
+    assert packed.shape == (4, dsa_index_k_row_bytes(head_dim))
+    assert packed.dtype == torch.uint8
+    fp8, scale = split_index_k_rows(
+        packed, index_head_dim=head_dim, index_k_format="fp8_scaled"
+    )
+    assert fp8.shape == (4, head_dim) and scale.shape == (4, 1)
+    assert fp8[:, 0].tolist() == [0, 11, 23, 12]
+    assert scale[:, 0].tolist() == [0.0, 101.0, 203.0, 102.0]
+    with pytest.raises(ValueError, match="bytes wide"):
+        split_index_k_rows(
+            packed[:, :-1], index_head_dim=head_dim, index_k_format="fp8_scaled"
+        )
+    # The same bytes are not a bf16 row: the format is explicit, not guessed.
+    with pytest.raises(ValueError, match="bytes wide"):
+        split_index_k_rows(packed, index_head_dim=head_dim, index_k_format="bf16")
+
+
+def test_the_index_k_gather_reads_a_bf16_plane_as_key_bytes():
+    """A bf16 plane's packed row is its key's bytes (no scale); the split
+    views them back as bf16 keys and a ``None`` scale -- the ``index_k_bf16``
+    form of ``dsa_prefill_topk``."""
+    head_dim, page_size, pages = INDEX_HEAD_DIM, 4, 3
+    pool = _index_k_pool("bf16", page_size, pages)
+    slots = torch.tensor([0, 5, 11, 6], dtype=torch.int64)
+    packed = pool.gather_index_k_rows(0, slots)
+    assert packed.shape == (4, index_k_row_bytes(head_dim, "bf16")) == (4, 2 * head_dim)
+    assert packed.dtype == torch.uint8
+    keys, scale = split_index_k_rows(
+        packed, index_head_dim=head_dim, index_k_format="bf16"
+    )
+    assert scale is None
+    assert keys.dtype == torch.bfloat16 and keys.shape == (4, head_dim)
+    assert keys.data_ptr() == packed.data_ptr()
+    torch.testing.assert_close(
+        keys[:, 0].float(), torch.tensor([0.5, 5.5, 11.5, 6.5]), rtol=0, atol=0
+    )
+    with pytest.raises(ValueError, match="bytes wide"):
+        split_index_k_rows(packed, index_head_dim=head_dim, index_k_format="fp8_scaled")
+    # A plane of a dtype that is no format has no read path either.
+    plane = torch.zeros((8, head_dim), dtype=torch.float16)
+    pool = SimpleNamespace(
+        get_index_k_buffer=lambda layer_id: plane,
+        arena=SimpleNamespace(kv_page_size=page_size),
+        index_head_dim=head_dim,
+    )
+    with pytest.raises(TypeError, match="no read path"):
+        DSATokenToKVPool.gather_index_k_rows(pool, 0, slots)
+
+
+@pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
+def test_the_index_k_history_is_one_gather_per_group(monkeypatch, index_k_format):
+    """``gather_history_index_k`` moves the packed rows in one collective and
+    hands the indexer views of the workspace in the plane's format: FP8 bytes
+    and fp32 scales, or bf16 keys and no scale."""
+    backend = _backend(0, workspace_rows=11, index_k_format=index_k_format)
+    plan = _plan(0)
+    _init(backend, plan)
+    group = backend.require_query_shard_metadata().groups[0]
+    pool = _index_k_pool(index_k_format, PAGE, 8)
     gathers = []
     real = dsa.gather_history_rows
 
@@ -374,17 +444,26 @@ def test_the_index_k_history_is_one_gather_per_group(monkeypatch):
         return real(plan_, local, out=out)
 
     monkeypatch.setattr(dsa, "gather_history_rows", counting)
-    fp8, scale = backend.gather_history_index_k(0, pool, group)
+    keys, scale = backend.gather_history_index_k(0, pool, group)
     assert len(gathers) == 1
     dtype, shape, out = gathers[0]
-    assert dtype == torch.uint8 and shape == (group.rows, 132)
+    row_bytes = index_k_row_bytes(INDEX_HEAD_DIM, index_k_format)
+    assert dtype == torch.uint8 and shape == (group.rows, row_bytes)
     assert out is backend._history_workspace.index_k
-    # Views of the workspace in position order: slot v is page v // 2, row v % 2.
+    # Views of the workspace in position order.
     slots = group.gather.virtual_slots
-    assert fp8.shape == (group.rows, INDEX_HEAD_DIM) and scale.shape == (group.rows, 1)
-    assert fp8[:, 0].tolist() == ((slots % PAGE) + 10 * (slots // PAGE)).tolist()
-    assert scale[:, 0].tolist() == ((slots % PAGE) + 100 * (slots // PAGE)).tolist()
-    assert fp8.data_ptr() == backend._history_workspace.index_k.data_ptr()
+    assert keys.shape == (group.rows, INDEX_HEAD_DIM)
+    assert keys.data_ptr() == backend._history_workspace.index_k.data_ptr()
+    if index_k_format == "fp8_scaled":
+        # Slot v is page v // 2, row v % 2 of the block-split plane.
+        assert keys.dtype == torch.uint8 and scale.shape == (group.rows, 1)
+        assert keys[:, 0].tolist() == ((slots % PAGE) + 10 * (slots // PAGE)).tolist()
+        assert scale[:, 0].tolist() == ((slots % PAGE) + 100 * (slots // PAGE)).tolist()
+    else:
+        assert keys.dtype == torch.bfloat16 and scale is None
+        torch.testing.assert_close(
+            keys[:, 0].float(), slots.float() + 0.5, rtol=0, atol=0
+        )
 
 
 def _decode_arm_backend(*, num_attention_heads: int, attn_tp_size: int):
@@ -479,8 +558,12 @@ def test_a_layer_with_neither_head_layout_is_refused():
     assert not (len(backend.dcp_group) > 1)
 
 
-def test_the_workspace_reservation_matches_the_recipe_plan():
-    backend = _backend(0, workspace_rows=0)
+@pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
+def test_the_workspace_reservation_matches_the_recipe_plan(index_k_format):
+    """The recipe's plan (``dsa_history_gather_workspace_bytes``) and the
+    leaf's allocation are the same bytes in either index-K format: the
+    index-K rows are packed in the plane's own row width."""
+    backend = _backend(0, workspace_rows=0, index_k_format=index_k_format)
     max_model_len = 37
     allocated = backend.preallocate_history_gather_workspace(max_model_len)
     config = SimpleNamespace(
@@ -489,7 +572,7 @@ def test_the_workspace_reservation_matches_the_recipe_plan():
         component=lambda cls: SimpleNamespace(
             kv_cache_dim=KV_DIM,
             index_head_dim=INDEX_HEAD_DIM,
-            index_k_format="fp8_scaled",
+            index_k_format=index_k_format,
         ),
     )
     assert allocated == dsa_history_gather_workspace_bytes(
@@ -497,19 +580,20 @@ def test_the_workspace_reservation_matches_the_recipe_plan():
     )
     # One whole history, padded to kernel pages.
     rows = 38
-    assert allocated == rows * (KV_DIM * 2 + dsa_index_k_row_bytes(INDEX_HEAD_DIM))
+    row_bytes = index_k_row_bytes(INDEX_HEAD_DIM, index_k_format)
+    assert row_bytes == (132 if index_k_format == "fp8_scaled" else 256)
+    assert allocated == rows * (KV_DIM * 2 + row_bytes)
     workspace = backend.history_gather_workspace()
     assert workspace.rows == rows and workspace.nbytes == allocated
     assert workspace.kv.shape == (rows, KV_DIM)
-    assert workspace.index_k.shape == (
-        rows,
-        dsa_index_k_row_bytes(INDEX_HEAD_DIM),
-    )
+    assert workspace.index_k.shape == (rows, row_bytes)
+    assert workspace.index_k.dtype == torch.uint8
+    assert workspace.index_k_format == index_k_format
     # Without an override the plan follows the sparse kernels' fixed page.
     config.kernel_page_size = None
     assert dsa_history_gather_workspace_bytes(
         config, max_model_len=max_model_len
-    ) == 64 * (KV_DIM * 2 + dsa_index_k_row_bytes(INDEX_HEAD_DIM))
+    ) == 64 * (KV_DIM * 2 + row_bytes)
 
 
 def test_build_prefill_slots_match_the_group_history():
@@ -622,5 +706,16 @@ def test_the_draft_refuses_a_workspace_of_another_geometry():
     with pytest.raises(ValueError, match="geometry mismatch"):
         draft.adopt_history_gather_workspace(workspace)
     draft.kernel_page_size = PAGE
+    draft.index_k_format = "bf16"  # the target packed fp8_scaled rows
+    with pytest.raises(ValueError, match="geometry mismatch"):
+        draft.adopt_history_gather_workspace(workspace)
+    draft.index_k_format = "fp8_scaled"
     draft.adopt_history_gather_workspace(workspace)
     assert draft.history_gather_workspace() is workspace
+    with pytest.raises(ValueError, match="index_k_format"):
+        dsa.HistoryGatherWorkspace(
+            rows=workspace.rows,
+            kv=workspace.kv,
+            index_k=workspace.index_k,
+            index_k_format="fp16",
+        )

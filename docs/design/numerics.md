@@ -199,7 +199,13 @@ two, and `dsa_decode_topk` / `dsa_prefill_topk` read `index_k_format` and
 only a leaf declaring `index_k_format={"bf16"}` (the kernel package's DSA
 README has the table); the GLM-5.3-Flash recipe plans pooled `fp8_scaled`
 rows and refuses any other plane. `candidate_lens_cpu` reaches every top-k
-leaf registered with the `candidate_lens_cpu` feature and no other. In-tree
+leaf registered with the `candidate_lens_cpu` feature and no other. Index
+keys handed to `dsa_prefill_topk` as rows in workspace-row order (the
+query-context-parallel history gather over page-sharded caches,
+`docs/design/unified_path.md`) keep the plane's format -- `index_k_fp8` +
+`index_k_scale`, or `index_k_bf16` -- and select only leaves declaring the
+`index_k_workspace_rows` feature for it, so a bf16 leaf that scores gathered
+rows declares that feature and takes the `index_k_bf16` keyword. In-tree
 drafts fold no LoRA norm scale; a draft that
 does must read `--mla-lora-scale` exactly as the target does, folding only
 under `folded`.

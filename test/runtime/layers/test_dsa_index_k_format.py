@@ -144,6 +144,22 @@ def test_bf16_plane_costs_its_own_rows():
     )
 
 
+@pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
+def test_the_history_gather_workspace_plan_follows_the_plane_format(index_k_format):
+    """The query-context-parallel gather workspace the recipe reserves holds
+    one history of latent rows plus index-K rows in the plane's own width."""
+    from tokenspeed.runtime.layers.attention.configs.dsa import (
+        dsa_history_gather_workspace_bytes,
+    )
+
+    spec = _dsa_spec(index_k_format)
+    config = _attn_config(spec)
+    rows = 256  # context_len, already whole kernel pages of PREFIX
+    assert dsa_history_gather_workspace_bytes(
+        config, max_model_len=config.context_len
+    ) == rows * (spec.kv_cache_dim * 2 + index_k_row_bytes(HEAD_DIM, index_k_format))
+
+
 def _pool(plane: torch.Tensor) -> DSATokenToKVPool:
     pool = object.__new__(DSATokenToKVPool)
     pool.index_head_dim = HEAD_DIM

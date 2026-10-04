@@ -26,6 +26,10 @@ import torch
 from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    index_k_plane_dtype,
+    index_k_row_bytes,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.mla import (
     MLATokenToKVPool,
     _get_tensor_size_bytes,
@@ -35,30 +39,42 @@ _INDEX_K_FP8_GROUP_SIZE = 128
 
 
 def split_index_k_rows(
-    packed: torch.Tensor, *, index_head_dim: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """View packed index-K rows as their FP8 bytes and fp32 scales.
+    packed: torch.Tensor, *, index_head_dim: int, index_k_format: str
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """View packed index-K rows as the keys (and scales) of their format.
 
     The inverse of :meth:`DSATokenToKVPool.gather_index_k_rows`'s packing:
-    no copy, the two views share ``packed``'s storage.
+    no copy, the views share ``packed``'s storage. The pair is what
+    ``dsa_prefill_topk`` takes as rows in workspace-row order:
+    ``index_k_fp8`` / ``index_k_scale`` for ``fp8_scaled``, ``index_k_bf16``
+    (scale ``None``) for ``bf16``.
 
     Args:
-        packed: ``[rows, index_head_dim + groups * 4]`` uint8 rows.
-        index_head_dim: Width of the FP8 part of a row.
+        packed: ``[rows, index_k_row_bytes(index_head_dim, index_k_format)]``
+            uint8 rows.
+        index_head_dim: Elements of one key.
+        index_k_format: The plane's format (``configs/dsa.py``
+            ``INDEX_K_FORMATS``).
 
     Returns:
-        ``[rows, index_head_dim]`` uint8 FP8 rows and ``[rows, groups]`` fp32
-        scales.
+        ``fp8_scaled``: ``[rows, index_head_dim]`` uint8 FP8 keys and
+        ``[rows, groups]`` fp32 scales. ``bf16``: ``[rows, index_head_dim]``
+        bf16 keys and ``None``.
     """
-    groups = index_head_dim // _INDEX_K_FP8_GROUP_SIZE
+    row_bytes = index_k_row_bytes(index_head_dim, index_k_format)
     if packed.dim() != 2 or packed.dtype != torch.uint8:
         raise ValueError(f"packed index-K rows are 2-D uint8, got {packed.dtype}")
-    if packed.shape[1] != index_head_dim + groups * 4:
+    if packed.shape[1] != row_bytes:
         raise ValueError(
-            f"packed index-K rows are {packed.shape[1]} bytes wide, not "
-            f"{index_head_dim} + {groups * 4}"
+            f"packed {index_k_format} index-K rows are {packed.shape[1]} bytes "
+            f"wide, not {row_bytes}"
         )
-    return packed[:, :index_head_dim], packed[:, index_head_dim:].view(torch.float32)
+    if index_k_format == "fp8_scaled":
+        return (
+            packed[:, :index_head_dim],
+            packed[:, index_head_dim:].view(torch.float32),
+        )
+    return packed.view(index_k_plane_dtype(index_k_format)), None
 
 
 class DSATokenToKVPool(MLATokenToKVPool):
@@ -85,33 +101,35 @@ class DSATokenToKVPool(MLATokenToKVPool):
         return self.index_k_buffer[layer_id]
 
     def gather_index_k_rows(self, layer_id: int, slots: torch.Tensor) -> torch.Tensor:
-        """Read index-K rows out of the block-split paged buffer, packed per row.
+        """Read index-K rows out of the plane as packed bytes, one row per slot.
 
-        The buffer stores every page as its ``page_size`` FP8 rows followed by
-        their fp32 scales (``index_k_block_split_scatter``); this is the read
-        side of that layout, for the rows a query-context-parallel history
-        gather contributes. Each row comes back as its FP8 bytes followed by
-        its scale bytes, so one gather moves both (:func:`split_index_k_rows`
-        views them apart again).
+        The read side of :meth:`set_index_k_buffer`, for the rows a
+        query-context-parallel history gather contributes; the plane's dtype
+        is its format, as on the write side. A uint8 (``fp8_scaled``) plane
+        stores every page as its ``page_size`` FP8 rows followed by their
+        fp32 scales (``index_k_block_split_scatter``), and each row comes back
+        as its FP8 bytes followed by its scale bytes so one gather moves both;
+        a bf16 plane's row is its key's bytes. :func:`split_index_k_rows`
+        views the packed rows apart again.
 
         Args:
             layer_id: The indexer layer whose plane to read.
             slots: ``[rows]`` int64 local cache slots.
 
         Returns:
-            ``[rows, index_head_dim + groups * 4]`` uint8 rows in ``slots``
-            order.
+            ``[rows, index_k_row_bytes(index_head_dim, format)]`` uint8 rows
+            in ``slots`` order.
         """
         buf = self.get_index_k_buffer(layer_id)
+        head_dim = self.index_head_dim
+        if buf.dtype == torch.bfloat16:
+            return buf.reshape(-1, head_dim)[slots].view(torch.uint8)
         if buf.dtype != torch.uint8:
-            # The plane's dtype is its format (configs/dsa.py INDEX_K_FORMATS);
-            # only the fp8_scaled block-split layout is read here.
-            raise ValueError(
-                "gather_index_k_rows reads the fp8_scaled index-K plane; got a "
-                f"{buf.dtype} plane"
+            raise TypeError(
+                f"index-K plane dtype {buf.dtype} has no read path: uint8 "
+                "(fp8_scaled) or bfloat16 (bf16)"
             )
         page_size = int(self.arena.kv_page_size)
-        head_dim = self.index_head_dim
         groups = head_dim // _INDEX_K_FP8_GROUP_SIZE
         row_bytes = head_dim + groups * 4
         page_bytes = page_size * row_bytes
