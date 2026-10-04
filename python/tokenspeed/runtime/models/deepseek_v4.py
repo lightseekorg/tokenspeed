@@ -2349,6 +2349,7 @@ class DeepseekV4Indexer(nn.Module):
                 page_size=indexer_block_size,
                 max_logits_bytes=max_logits_mb * 1024 * 1024,
                 out=topk_out[token_slice],
+                slot_order=global_server_args_dict["dsa_slot_order"],
             )
             selected_i64 = selected.to(torch.int64)
             row_starts_i64 = row_starts.to(torch.int64)
@@ -2382,6 +2383,7 @@ class DeepseekV4Indexer(nn.Module):
             index_k_cache=indexer_cache,
             topk_layout="logical_offsets",
             out=topk_out[decode_slice],
+            slot_order=global_server_args_dict["dsa_slot_order"],
         )
         return topk_out
 

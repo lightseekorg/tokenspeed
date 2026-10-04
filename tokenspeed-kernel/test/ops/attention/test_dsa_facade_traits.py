@@ -22,8 +22,9 @@
 
 The index-key plane's dtype names its format (README, "Index-K plane
 formats"), so a bf16 plane selects a leaf declaring ``index_k_format="bf16"``
-and never an FP8 one; ``slot_order`` on the sparse cores is a trait plus a
-keyword that only declaring cores receive. Fake leaves on CPU; no kernel runs.
+and never an FP8 one; ``slot_order`` on the top-k leaves and the sparse cores
+is a trait plus a keyword that only declaring kernels receive. Fake leaves on
+CPU; no kernel runs.
 """
 
 from __future__ import annotations
@@ -51,7 +52,9 @@ def _topk_signature():
     )
 
 
-def _register_topk_leaf(mode: str, name: str, *, index_k_format: str, layouts):
+def _register_topk_leaf(
+    mode: str, name: str, *, index_k_format: str, layouts, slot_orders=None
+):
     calls: list[dict] = []
 
     def leaf(**kwargs):
@@ -73,6 +76,7 @@ def _register_topk_leaf(mode: str, name: str, *, index_k_format: str, layouts):
             "page_size": frozenset({64}),
             "index_k_format": frozenset({index_k_format}),
             "index_k_layout": frozenset(layouts),
+            **({"slot_order": frozenset(slot_orders)} if slot_orders else {}),
         },
         features=frozenset({"batch_invariant", "forced_initial_local"}),
         priority=Priority.PORTABLE,
@@ -105,7 +109,7 @@ def topk_leaves(fresh_registry, h100_platform):
     Platform.override(real_platform)
 
 
-def _decode_topk(index_k_cache: torch.Tensor):
+def _decode_topk(index_k_cache: torch.Tensor, slot_order: str = "selection", **extra):
     return dsa_pkg.dsa_decode_topk(
         torch.zeros((2, 16, HEAD_DIM), dtype=torch.bfloat16),
         torch.zeros((2, 16), dtype=torch.float32),
@@ -116,10 +120,12 @@ def _decode_topk(index_k_cache: torch.Tensor):
         softmax_scale=1.0,
         batch_invariant=True,
         index_k_cache=index_k_cache,
+        slot_order=slot_order,
+        **extra,
     )
 
 
-def _prefill_topk(index_k_cache: torch.Tensor, **extra):
+def _prefill_topk(index_k_cache: torch.Tensor, slot_order: str = "selection", **extra):
     return dsa_pkg.dsa_prefill_topk(
         torch.zeros((2, 16, HEAD_DIM), dtype=torch.bfloat16),
         torch.zeros((2, 16), dtype=torch.float32),
@@ -131,6 +137,7 @@ def _prefill_topk(index_k_cache: torch.Tensor, **extra):
         batch_invariant=True,
         index_k_cache=index_k_cache,
         page_size=64,
+        slot_order=slot_order,
         **extra,
     )
 
@@ -252,8 +259,76 @@ def test_workspace_rows_are_fp8_scaled(topk_leaves):
         index_k_fp8=torch.zeros((16, HEAD_DIM), dtype=torch.float8_e4m3fn),
         index_k_scale=torch.zeros((16, 1), dtype=torch.float32),
         page_size=64,
+        slot_order="selection",
     )
     assert len(fp8["dsa_prefill_topk"]) == 1 and not bf16["dsa_prefill_topk"]
+
+
+# --- top-k leaves: slot_order ------------------------------------------------
+
+
+@pytest.fixture
+def ordering_topk_leaves(fresh_registry, h100_platform):
+    """A silent bf16 leaf and one declaring ``slot_order`` per top-k mode."""
+    _ = fresh_registry
+    real_platform = Platform.get()
+    Platform.override(h100_platform)
+    silent = {
+        mode: _register_topk_leaf(
+            mode, f"silent_{mode}", index_k_format="bf16", layouts=("packed",)
+        )
+        for mode in ("dsa_decode_topk", "dsa_prefill_topk")
+    }
+    ordering = {
+        mode: _register_topk_leaf(
+            mode,
+            f"ordering_{mode}",
+            index_k_format="bf16",
+            layouts=("packed",),
+            slot_orders=("sorted", "selection"),
+        )
+        for mode in ("dsa_decode_topk", "dsa_prefill_topk")
+    }
+    yield silent, ordering
+    Platform.override(real_platform)
+
+
+_TOPK_CALLS = {"dsa_decode_topk": _decode_topk, "dsa_prefill_topk": _prefill_topk}
+
+
+@pytest.mark.parametrize("mode", ["dsa_decode_topk", "dsa_prefill_topk"])
+def test_topk_selection_order_is_served_by_a_silent_leaf_without_the_keyword(
+    ordering_topk_leaves, mode
+):
+    silent, _ = ordering_topk_leaves
+    plane = torch.zeros((128, HEAD_DIM), dtype=torch.bfloat16)
+    _TOPK_CALLS[mode](plane, slot_order="selection", solution=f"silent_{mode}")
+    assert len(silent[mode]) == 1 and "slot_order" not in silent[mode][0]
+
+
+@pytest.mark.parametrize("mode", ["dsa_decode_topk", "dsa_prefill_topk"])
+def test_topk_sorted_order_reaches_a_declaring_leaf_as_the_keyword(
+    ordering_topk_leaves, mode
+):
+    """Only the top-k leaf knows a slot's position, so the ascending-position
+    order of ``"sorted"`` is its to emit: it receives the keyword."""
+    _, ordering = ordering_topk_leaves
+    plane = torch.zeros((128, HEAD_DIM), dtype=torch.bfloat16)
+    _TOPK_CALLS[mode](plane, slot_order="sorted", solution=f"ordering_{mode}")
+    assert ordering[mode][0]["slot_order"] == "sorted"
+    _TOPK_CALLS[mode](plane, slot_order="selection", solution=f"ordering_{mode}")
+    assert ordering[mode][1]["slot_order"] == "selection"
+
+
+@pytest.mark.parametrize("mode", ["dsa_decode_topk", "dsa_prefill_topk"])
+def test_topk_sorted_order_refuses_a_silent_leaf(ordering_topk_leaves, mode):
+    """A leaf that cannot order by position is refused rather than letting the
+    core sort by slot, which follows the page placement, not the positions."""
+    plane = torch.zeros((128, HEAD_DIM), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="does not declare the slot_order"):
+        _TOPK_CALLS[mode](plane, slot_order="sorted", solution=f"silent_{mode}")
+    with pytest.raises(ValueError, match="slot_order must be one of"):
+        _TOPK_CALLS[mode](plane, slot_order="random", solution=f"ordering_{mode}")
 
 
 # --- sparse cores: slot_order -------------------------------------------------
