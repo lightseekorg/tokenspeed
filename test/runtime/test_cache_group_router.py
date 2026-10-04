@@ -1537,6 +1537,7 @@ class PagedLeafRebindTest(unittest.TestCase):
                 "forward_prefill_metadata",
                 "forward_decode_metadata",
                 "spec_cache_seqlens_buf",
+                "tree_prefix_lens_buf",
             ],
         )
 

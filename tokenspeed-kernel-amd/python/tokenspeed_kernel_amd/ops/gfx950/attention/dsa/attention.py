@@ -1192,6 +1192,14 @@ def _run_dense_kv(
         BLOCK_H=16,
         TILE_K=64 if qk_rope_head_dim == 0 else 32,
         num_warps=4,
+        # iterative-ilp overlaps the KV loads with the MFMAs better than the
+        # default scheduler for BF16 inputs. It slows BF16 q with FP8 KV, and
+        # native FP8 is unmeasured, so FP8 keeps the default.
+        llvm_fn_attrs=(
+            (("amdgpu-sched-strategy", "iterative-ilp"),)
+            if q.dtype == torch.bfloat16 and kv_cache.dtype == torch.bfloat16
+            else ()
+        ),
     )
     if num_kv_splits > 1:
         _dsa_dense_mfma_reduce_kernel[(q.shape[0], q.shape[1])](

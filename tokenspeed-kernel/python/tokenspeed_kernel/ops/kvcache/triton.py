@@ -50,6 +50,7 @@ def _use_pdl(enable_pdl: bool | None) -> bool:
 
 __all__ = [
     "HOST_CACHE_TRANSFER_CHUNK_BYTES",
+    "compact_window_rows",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
     "gather_page_table_with_padding",
@@ -2910,4 +2911,71 @@ def index_k_block_split_scatter(
         NG=ng,
         BLOCK_HD=_next_power_of_two(head_dim),
         BLOCK_NG=_next_power_of_two(ng),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Draft-tree window compaction
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _compact_window_rows_kernel(
+    addresses_ptr,  # [num_buffers] int64 base address of each token-row buffer
+    locations_ptr,  # [bs * N] int32 token slot of each window row
+    path_ptr,  # [bs, N] int32 accepted window row per depth, -1 past the path
+    N: tl.constexpr,
+    ROW_I32: tl.constexpr,
+    BLOCK_I32: tl.constexpr,
+):
+    """Program (buffer, request): move the accepted path's rows to the front
+    of the request's window, one depth after another."""
+    buf = tl.cast(tl.load(addresses_ptr + tl.program_id(0)), tl.pointer_type(tl.int32))
+    req = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK_I32)
+    # The path is increasing, so row d never overwrites a later row's source.
+    for d in range(N):
+        src = tl.load(path_ptr + req * N + d)
+        if (src >= 0) & (src != d):
+            src_row = (
+                buf + tl.load(locations_ptr + req * N + src).to(tl.int64) * ROW_I32
+            )
+            dst_row = buf + tl.load(locations_ptr + req * N + d).to(tl.int64) * ROW_I32
+            for start in range(0, ROW_I32, BLOCK_I32):
+                cols = start + offsets
+                row = tl.load(src_row + cols, mask=cols < ROW_I32)
+                tl.store(dst_row + cols, row, mask=cols < ROW_I32)
+
+
+def compact_window_rows(
+    addresses: torch.Tensor,
+    locations: torch.Tensor,
+    path: torch.Tensor,
+    *,
+    row_bytes: int,
+) -> None:
+    """Pack each request's accepted draft-tree path to the front of its
+    verify window in every token-row buffer, in one launch.
+
+    Args:
+        addresses: ``[num_buffers]`` int64 base addresses of contiguous
+            token-row buffers (e.g. every layer's K and V planes) of one row
+            width; aliased buffers must appear once.
+        locations: ``[bs * N]`` int32 token slot of each window row.
+        path: ``[bs, N]`` int32 accepted window row at each depth, root
+            first, ``-1`` past the path; increasing along each row.
+        row_bytes: bytes per token row, a multiple of 4.
+    """
+    bs, n = path.shape
+    if row_bytes % 4:
+        raise ValueError(f"token rows of {row_bytes} bytes are not 4-byte words")
+    if bs == 0 or addresses.numel() == 0:
+        return
+    _compact_window_rows_kernel[(addresses.numel(), bs)](
+        addresses,
+        locations,
+        path,
+        N=n,
+        ROW_I32=row_bytes // 4,
+        BLOCK_I32=1024,
     )

@@ -212,13 +212,21 @@ the values accepted by the bundled `tokenspeed-smg` package.
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
-| `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
-| `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |
+| `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
+| `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
 | `--eagle3-layers-to-capture` | EAGLE3 layers to capture. |
 | `--disable-replay-ssm` | Stage every verify position's recurrent state instead of replaying the accepted tokens. ReplaySSM is on by default for supported Qwen GDN and Nemotron-H Mamba2 targets; `--enable-replay-ssm` is accepted as a deprecated no-op. |
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+`EAGLE3` and `MTP` drafts are chains by default: `--speculative-num-draft-tokens`
+must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 1
+they draft a tree instead, and `--speculative-num-draft-tokens` is its node
+budget (root included) and must be given explicitly: topk 1..16, steps 1..10,
+`(steps - 1) * topk` lane slots within the node budget, and at most 64 nodes. Trees need the `trtllm`
+attention backends and the `greedy` or `triton` sampling backend; see
+[draft-tree speculation](../design/tree-speculation.md) for the full scope.
 
 `MTP` serves two head shapes under one flag. An Eagle-like head (one MTP
 layer chained on its own hidden, e.g. DeepSeek NextN) runs the Eagle chain.

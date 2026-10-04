@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -192,6 +193,11 @@ class SamplingBackend(ABC):
             self._output_pack_buf, src=self._tp_src_global_rank, group=self._tp_pg
         )
 
+    def accepted_path(self, bs: int, num_nodes: int) -> torch.Tensor:
+        """``[bs, N]`` accepted path (root first, ``-1`` past it) of the last
+        tree verify, as agreed across TP ranks."""
+        return self._accept_index_buf[: bs * num_nodes].view(bs, num_nodes)
+
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
         """Configure optional DP sampling state.
 
@@ -315,6 +321,9 @@ class SamplingBackend(ABC):
         return None and let the caller fall back to two separate D2Hs."""
         return None
 
+    # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
+    supports_tree_verify: bool = False
+
     @abstractmethod
     def sample(
         self,
@@ -328,4 +337,9 @@ class SamplingBackend(ABC):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+        *,
+        tree: TreeVerifyBatch | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Verify each request's draft window; ``tree`` is the draft tree
+        (``None`` for a chain) and needs ``supports_tree_verify``; a tree
+        verify leaves its agreed path in ``accepted_path``."""

@@ -114,6 +114,7 @@ def test_verify_lands_all_three_outputs_in_the_pack(monkeypatch) -> None:
         SimpleNamespace(next_token_logits=logits),
         SimpleNamespace(vocab_mask=None, req_pool_indices=None),
         candidates,
+        tree=None,
     )
     _, _, index = _pack_regions(backend)
     assert predict.data_ptr() == backend._output_pack_buf.data_ptr()

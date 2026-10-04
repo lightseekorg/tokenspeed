@@ -24,6 +24,7 @@ import functools
 import itertools
 from typing import Optional, Tuple
 
+from tokenspeed_kernel.ops.gemm.flashinfer import cublas_fp8_gemm
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import error_fn
 
@@ -402,3 +403,103 @@ if platform.is_nvidia:
 
 
 __all__ = ["nvfp4_gemm_swiglu_nvfp4_quant"]
+
+
+# ---- Per-tensor FP8 skinny GEMV (M == 1) ---------------------------------
+
+# Captures of an unwarmed shape fall back to the cuBLASLt FP8 GEMM.
+if cublas_fp8_gemm is not error_fn:
+    from tokenspeed_kernel.ops.gemm.flashinfer import flashinfer_mm_fp8_tensor_scaled
+    from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+    from tokenspeed_kernel.registry import Priority, register_kernel
+    from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+    from tokenspeed_kernel.thirdparty.cute_dsl.skinny_gemm import (
+        SkinnyGemmConfig,
+        shape_dynamic_skinny_gemm,
+    )
+
+    # 128 threads each load 16 FP8 weights (16 bytes) per K tile.
+    _FP8_SKINNY_BLOCK, _FP8_SKINNY_VECTOR = 128, 16
+    _fp8_skinny_warmed: set[tuple[int, int, int]] = set()
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="cute_dsl_mm_fp8_tensor_scaled_m1",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("a", "b"),
+            "scaled-fp8",
+            {torch.float8_e4m3fn},
+            scale=ScaleFormat(storage_dtype=torch.float32, granularity="tensor"),
+        ),
+        traits={
+            "m": frozenset({1}),
+            "n_align": frozenset({4}),
+            "k_align": frozenset({_FP8_SKINNY_BLOCK * _FP8_SKINNY_VECTOR}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({False}),
+            "out_dtype": frozenset({torch.bfloat16}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_mm_fp8_tensor_scaled_m1(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Per-tensor scaled FP8 GEMV for one decode row on CUDA cores.
+
+        At M == 1 the weight read is the whole cost, and this streams it at a
+        higher fraction of HBM bandwidth than cuBLASLt's FP8 tiles.
+
+        Args:
+            A: ``[1, K]`` row-major FP8 activations.
+            B: ``[K, N]`` column-major FP8 weights (a transposed ``[N, K]``).
+            A_scales: One-element FP32 activation dequant scale.
+            B_scales: One-element FP32 weight dequant scale.
+            out_dtype: BF16.
+            alpha: Must be None; the per-tensor scales carry the dequant.
+            block_size: Must be None; the scales are per tensor.
+            out: Optional ``[1, N]`` output buffer.
+
+        Returns:
+            ``[1, N]`` BF16 output, ``out`` when given.
+        """
+        if alpha is not None or block_size is not None:
+            raise ValueError("per-tensor FP8 GEMM takes no alpha or block_size")
+        n, k = B.shape[1], A.shape[1]
+        key = (A.device.index or 0, n, k)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if capturing and key not in _fp8_skinny_warmed:
+            # Compiling inside a capture is unsafe; eager warmup compiles first.
+            return flashinfer_mm_fp8_tensor_scaled(
+                A, B, A_scales, B_scales, out_dtype, out=out
+            )
+        config = SkinnyGemmConfig(
+            1, _FP8_SKINNY_BLOCK, 2 if k >= 8192 else 4, 1, _FP8_SKINNY_VECTOR
+        )
+        direct = out is not None and out.is_contiguous()
+        result = shape_dynamic_skinny_gemm(
+            A.contiguous(),
+            # A padded leading dimension needs the dense copy cuBLASLt also makes.
+            B.t().contiguous(),
+            config,
+            out=out if direct else None,
+            scales=(A_scales.reshape(1), B_scales.reshape(1)),
+        )
+        if not capturing:
+            _fp8_skinny_warmed.add(key)
+        if out is None or direct:
+            return result
+        return out.copy_(result)

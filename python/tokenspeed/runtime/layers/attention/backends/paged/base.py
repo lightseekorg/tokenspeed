@@ -41,11 +41,18 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
-from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
+from tokenspeed.runtime.layers.attention.backends.support import (
+    CudaGraphSupport,
+    TreeSupport,
+)
 from tokenspeed.runtime.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeDraftInputs,
+        TreeVerifyInputs,
+    )
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
@@ -131,6 +138,27 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self.page_table_buf: torch.Tensor | None = None
         self.seq_lens_buf: torch.Tensor | None = None
         self._decode_views_by_bs: dict[int, Any] = {}
+        # Draft-tree verify inputs; unset for chains and for draft leaves.
+        self.tree_verify: TreeVerifyInputs | None = None
+        # Draft-tree lane inputs; set on the drafter's leaves only.
+        self.tree_draft: TreeDraftInputs | None = None
+
+    def tree_support(self) -> TreeSupport:
+        name = type(self).__name__
+        return TreeSupport(
+            verify_blocker=f"{name} has no tree verify path; use --attention-backend trtllm",
+            draft_blocker=f"{name} has no tree lane path; use --drafter-attention-backend trtllm",
+        )
+
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        self.tree_verify = inputs
+
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        self.tree_draft = inputs
+
+    @property
+    def tree_lane_step_active(self) -> bool:
+        return self.tree_draft is not None and self.tree_draft.active
 
     # ------------------------------------------------------------------
     # Static shape / lifecycle

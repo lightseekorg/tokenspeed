@@ -60,6 +60,7 @@ from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     _reject_skip_term,
     logger,
 )
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 if TYPE_CHECKING:
@@ -698,6 +699,11 @@ class KdaAttnBackend(MambaAttnBackend):
         return core_attn_out.squeeze(0)
 
     @override
+    def tree_support(self) -> TreeSupport:
+        blocker = "the fused KDA verify kernel follows a chain; no draft trees yet"
+        return TreeSupport(verify_blocker=blocker, draft_blocker=blocker)
+
+    @override
     def _verify(
         self,
         mixed_qkv: torch.Tensor,
@@ -920,10 +926,15 @@ class KdaAttnBackend(MambaAttnBackend):
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     @override
-    def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
-        """Replay and eagerly commit this round's accepted KDA prefix."""
+    def commit_verified_state(
+        self, accepted_length: torch.Tensor, *, accepted_path: torch.Tensor | None
+    ) -> None:
+        """Replay and eagerly commit this round's accepted KDA prefix (a chain:
+        KDA refuses draft trees)."""
         if not self._replay_active:
-            return super().commit_verified_state(accepted_length)
+            return super().commit_verified_state(
+                accepted_length, accepted_path=accepted_path
+            )
         ctx = self._verify_commit_ctx
         if ctx is None:
             return

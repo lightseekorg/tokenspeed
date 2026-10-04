@@ -17,7 +17,9 @@ buffer is needed.
 `thirdparty/flashinfer/trtllm_moe.py` builds a source-keyed private JIT module.
 The adapter ships as a Python package in both source distributions and wheels;
 it does not require a source checkout on `PYTHONPATH`.
-It adds a checked `cudaMemsetAsync` after the named map allocation and retains
+It adds a checked fill-kernel launch after the named map allocation; the kernel
+waits on and releases programmatic dependents, so the routing chain keeps PDL
+where a memset graph node would cost about 4 us per MoE layer. It retains
 FlashInfer's routing and GEMM implementations and Python API signatures. The
 small-batch tactic policy below narrows the tuner's candidates for one model.
 The installed package and stock JIT modules are unchanged. The first warmup

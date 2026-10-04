@@ -201,10 +201,14 @@ class Qwen4ExpBackend(AttentionBackend):
             self.indexer_backend.fill_block_decode_seq_lens(bs, block_seq_lens)
 
     def commit_speculative_state_after_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
     ) -> None:
         self.attention_backend.commit_speculative_state_after_verify(
-            accepted_lengths, num_extends=num_extends
+            accepted_lengths, num_extends=num_extends, accepted_path=accepted_path
         )
         if num_extends == 0 and self.ple_backend is not None:
             self.ple_backend.commit_verified_state(accepted_lengths)
