@@ -37,8 +37,8 @@ struct RequestSpec {
     // from position `s` sets this to `s`, so every position at or after `s` is
     // recomputed and produces logits (a cached position has no logits). The
     // default places no bound beyond the ordinary replay tail. A readmission
-    // after retraction ignores the bound: the positions its snapshot holds have
-    // already produced their logits.
+    // after retraction relaxes it to the positions whose forward results had
+    // landed before the retraction: their logits already exist.
     std::int32_t max_cached_prefix_tokens{std::numeric_limits<std::int32_t>::max()};
 };
 

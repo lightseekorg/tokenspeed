@@ -54,14 +54,19 @@ cached position has none, so the runtime admits it with the bound set to `s`
 and the positions `>= s` are recomputed as ordinary prefill input whatever the
 cache holds. The bound limits the probe itself, not a later trim, so excluded
 hit pages are never claimed and the recomputed suffix lands on private pages.
-The bound applies to the first admission only. A readmission after retraction
-re-probes without it (`fsm::Retracted` ignores `max_cached_prefix_tokens`):
-every position the victim's snapshot holds had already produced its logits
-before the retraction, and the runtime keeps those logprobs, so matching the
-snapshot back loses nothing and recomputing it would only redo work. The
-decode role of a disaggregated deployment never computes prompt rows (the
-prefill node returns the logprobs), so the runtime leaves its bound at the
-default.
+A readmission after retraction relaxes the bound to
+`max(max_cached_prefix_tokens, landed_tokens)`, where `fsm::Retracted` records
+the positions whose forward results had landed before the retraction (the
+victim's computed chunks; for a decoding victim its whole rebased prompt).
+Those positions produced their logits and the runtime keeps those logprobs, so
+matching them back -- the victim's own snapshot or anyone's equal pages --
+loses nothing and recomputing them would only redo work. The probe does not
+reach further: it matches the global prefix cache, not the victim's snapshot,
+and a deeper hit on another request's pages (or on a chunk whose forward was
+skipped after a failed cache load) would stand in for logits that were never
+produced. The decode role of a disaggregated deployment never computes prompt
+rows (the prefill node returns the logprobs), so the runtime leaves its bound
+at the default.
 
 Two adjustments ride on top of the raw chunk size. Both are pure token
 arithmetic kept out of the planner: how a chunk is cut lives in

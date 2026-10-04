@@ -2065,10 +2065,10 @@ TEST_F(FusedRetractionL2TestSuite, AReadmissionThatDoesNotFitWaitsWithoutRetract
     }
 }
 
-// RequestSpec::max_cached_prefix_tokens bounds the FIRST admission's probe
-// only. A retracted request's snapshot holds positions whose logits were
-// already produced, so its readmission matches the snapshot back in full.
-TEST_F(FusedRetractionL2TestSuite, ReadmissionIgnoresTheRequestsProbeBound) {
+// RequestSpec::max_cached_prefix_tokens bounds the probe at the positions a
+// request still needs logits for. A decoding victim had produced them all, so
+// its readmission matches its whole snapshot back despite the bound.
+TEST_F(FusedRetractionL2TestSuite, ADecodingVictimReadmitsPastItsProbeBound) {
     // r1 returns prompt logprobs from position 0: nothing may be matched at
     // its first admission. r2 shares the pool and keeps decoding.
     RequestSpec capped = MakeRequestSpec("r1", /*num_pages=*/2);
@@ -4067,6 +4067,125 @@ TEST_F(PrefixHitSuite, MaxCachedPrefixTokensDefaultLeavesTheProbeUnbounded) {
     RequestSpec negative = MakeSpecWithTokens("r3", first.tokens);
     negative.max_cached_prefix_tokens = -1;
     EXPECT_THROW(Submit(negative), std::invalid_argument);
+}
+
+// The probe bound across a retraction. 8-token chunks, prefix cache live, no
+// host tier: a victim's own pages are gone when it readmits, and only another
+// request's equal pages can answer its probe -- which is exactly what the
+// bound must keep it from claiming past what it had computed.
+class ProbeBoundReadmissionSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 2;
+        // 31 physical pages -> 30 usable. "twin" decoding over 18 tokens holds
+        // 2*9 = 18 blocks and "capped"'s first 8-token chunk 2*4 = 8, leaving
+        // 4: too few for the second chunk's 2*4 pages plus its decode slot.
+        cfg.device_allocator.total_pages = 31;
+        cfg.host_allocator.total_pages = 32;
+        cfg.max_scheduled_tokens = 8;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+        cfg.cache_groups = {
+            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+        };
+        return cfg;
+    }
+
+    // "twin" prefills a 16-token prompt in two chunks and takes one decode
+    // step, which publishes all eight prompt pages; it holds them while it
+    // decodes.
+    void RunTwinToDecoding() {
+        const RequestSpec twin = MakeRequestSpec("twin", /*num_pages=*/8);
+        prompt_ = twin.tokens;
+        Submit(twin);
+        ExecutionPlan chunk1 = PlanOnce();
+        ASSERT_NE(FindForwardBatch(chunk1), nullptr);
+        ASSERT_EQ(FindForwardBatch(chunk1)->input_lengths.at(0), 8);
+        SendForwardDone("twin");
+        ExecutionPlan chunk2 = PlanOnce();
+        ASSERT_NE(FindForwardBatch(chunk2), nullptr);
+        ASSERT_EQ(FindForwardBatch(chunk2)->extend_prefix_lens.at(0), 8);
+        SendForwardDone("twin", {42});
+        PlanOnce();  // first decode step: publishes the second chunk's pages
+        SendForwardDone("twin", {43});
+    }
+
+    // "capped" is the same prompt returning logprobs from position 0: its
+    // first admission may match nothing. Schedules its first chunk.
+    void SubmitCappedFirstChunk() {
+        RequestSpec capped = RequestSpec{.request_id = "capped", .tokens = prompt_};
+        capped.max_cached_prefix_tokens = 0;
+        Submit(capped);
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* op = FindForwardBatch(plan);
+        ASSERT_NE(op, nullptr);
+        const auto row = std::ranges::find(op->request_ids, "capped");
+        ASSERT_NE(row, op->request_ids.end());
+        const auto i = static_cast<std::size_t>(std::distance(op->request_ids.begin(), row));
+        ASSERT_EQ(op->extend_prefix_lens.at(i), 0) << "the bound of 0 must not match the twin's pages";
+        ASSERT_EQ(op->input_lengths.at(i), 8);
+    }
+
+    // Drives rounds until "capped" is scheduled again and returns that row's
+    // (extend_prefix_len, input_length).
+    std::pair<std::int32_t, std::int32_t> ReadmitCapped() {
+        for (int round = 0; round < 6; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* op = FindForwardBatch(plan);
+            if (op == nullptr) {
+                continue;
+            }
+            const auto row = std::ranges::find(op->request_ids, "capped");
+            if (row == op->request_ids.end()) {
+                SendForwardDone("twin", {44 + round});
+                continue;
+            }
+            const auto i = static_cast<std::size_t>(std::distance(op->request_ids.begin(), row));
+            return {op->extend_prefix_lens.at(i), op->input_lengths.at(i)};
+        }
+        ADD_FAILURE() << "capped was never readmitted";
+        return {-1, -1};
+    }
+
+    std::vector<std::int32_t> prompt_;
+};
+
+// A victim retracted mid-prefill may match back exactly the chunks it had
+// computed -- their logits exist -- and no further, even though the twin's
+// equal pages reach the whole prompt: a hit there would stand in for logits
+// the request never produced.
+TEST_F(ProbeBoundReadmissionSuite, APrefillVictimReadmitsNoDeeperThanItsLandedChunks) {
+    RunTwinToDecoding();
+    SubmitCappedFirstChunk();
+    SendForwardDone("capped");  // the chunk landed: positions [0, 8) have logits
+
+    // The second chunk does not fit; the blocked round retracts the
+    // incomplete prefill (no host tier: it readmits like a new prompt).
+    PlanOnce();
+    SendForwardDone("twin", {44});
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u) << "the incomplete prefill gave way";
+
+    const auto [prefix_len, input_len] = ReadmitCapped();
+    EXPECT_EQ(prefix_len, 8) << "match back what had landed, not the twin's deeper pages";
+    EXPECT_EQ(input_len, 8);
+}
+
+// A chunk whose forward was skipped (the runtime retracts after a failed
+// cache load) landed nothing: the readmission keeps the request's own bound.
+TEST_F(ProbeBoundReadmissionSuite, ASkippedChunkDoesNotRelaxTheProbeBound) {
+    RunTwinToDecoding();
+    SubmitCappedFirstChunk();
+    SendRetractEvent("capped");  // before the chunk landed: nothing computed
+
+    const auto [prefix_len, input_len] = ReadmitCapped();
+    EXPECT_EQ(prefix_len, 0) << "nothing landed, so the bound of 0 stands";
+    EXPECT_EQ(input_len, 8);
 }
 
 TEST(PrefixReplayConfigTest, RejectsNegativeReplayTokens) {
