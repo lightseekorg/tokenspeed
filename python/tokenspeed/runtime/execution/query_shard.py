@@ -55,6 +55,47 @@ def scatter_count(num_tokens: int, size: int) -> list[int]:
     return [base + 1] * remainder + [base] * (size - remainder)
 
 
+def _split_sorted_rows(
+    row_counts: Sequence[int], rows: torch.Tensor
+) -> tuple[int, ...]:
+    """How many of the sorted batch-global ``rows`` fall in each rank's shard.
+
+    The one row split of a query shard: the sampled rows of a forward (the
+    last row of every request) and the prompt-logprob rows of a plan both
+    go through here. Host arithmetic over the shard boundaries, no per-row
+    Python work.
+
+    Args:
+        row_counts: Rows every rank owns, rank order (the shards).
+        rows: Batch-global rows, a 1-D host tensor sorted ascending; rank
+            order is then row order, so each rank's rows are one contiguous
+            run of ``rows``.
+
+    Returns:
+        Per-rank counts summing to ``rows.shape[0]``.
+
+    Raises:
+        ValueError: ``rows`` are not a 1-D host tensor, are not sorted, or
+            name a row past the shards' span.
+    """
+    if rows.dim() != 1 or rows.device.type != "cpu":
+        raise ValueError("query shard: rows must be a 1-D host tensor")
+    if rows.shape[0] > 1 and bool((rows[1:] < rows[:-1]).any()):
+        # The split counts rows below each boundary; unsorted rows would be
+        # miscounted silently, so refuse them here.
+        raise ValueError("query shard: rows must be sorted ascending")
+    bounds = torch.cumsum(torch.tensor(row_counts, dtype=rows.dtype), dim=0)
+    # Rows below each shard's end; successive differences are the shards'.
+    below = torch.searchsorted(rows, bounds)
+    counts = torch.diff(below, prepend=below.new_zeros(1))
+    if int(below[-1]) != rows.shape[0]:
+        raise ValueError(
+            f"query shard: rows up to {int(rows.max())} exceed the "
+            f"{int(bounds[-1])}-row span"
+        )
+    return tuple(int(count) for count in counts)
+
+
 @dataclass(frozen=True)
 class QueryShardPlan:
     """Which rows of one extend forward this rank computes.
@@ -109,29 +150,23 @@ class QueryShardPlan:
         Returns:
             The plan every rank of the group derives identically.
         """
-        if sum(int(length) for length in input_lengths) != total_tokens:
+        lengths = torch.tensor(
+            [int(length) for length in input_lengths], dtype=torch.int64
+        )
+        if int(lengths.sum()) != total_tokens:
             raise ValueError(
-                f"query shard: input lengths sum to "
-                f"{sum(int(length) for length in input_lengths)}, not "
+                f"query shard: input lengths sum to {int(lengths.sum())}, not "
                 f"{total_tokens} rows"
             )
         row_counts = scatter_count(total_tokens, size)
-        sampled = [0] * size
-        bound = 0
-        owner = 0
-        end = row_counts[0]
-        for length in input_lengths:
-            bound += int(length)
-            last_row = bound - 1
-            while last_row >= end and owner + 1 < size:
-                owner += 1
-                end += row_counts[owner]
-            sampled[owner] += 1
+        # The sampled rows (cumsum(input_lengths) - 1) are sorted by
+        # construction: the same split the prompt-logprob rows take.
+        sampled_rows = torch.cumsum(lengths, dim=0) - 1
         return cls(
             size=size,
             rank=rank,
             row_counts=tuple(row_counts),
-            sampled_rows_per_rank=tuple(sampled),
+            sampled_rows_per_rank=_split_sorted_rows(row_counts, sampled_rows),
         )
 
     @property
@@ -167,9 +202,10 @@ class QueryShardPlan:
 
         The sampled rows are sorted by row, so the ones this rank owns are
         the contiguous run ``[local_sampled_first, local_sampled_first +
-        sampled_rows_per_rank[rank])`` of ``gather_ids``.
+        sampled_rows_per_rank[rank])`` of ``gather_ids``
+        (``local_rows_run(sampled_rows_per_rank)``).
         """
-        return sum(self.sampled_rows_per_rank[: self.rank])
+        return self.local_rows_run(self.sampled_rows_per_rank).start
 
     @property
     def local_sampled_rows(self) -> int:
@@ -181,9 +217,9 @@ class QueryShardPlan:
         The one place the batch's ``gather_ids`` (full-layout rows, the last
         row of every request, sorted) are cut to a shard: ``ForwardContext``
         carries the full layout on every forward, the target's and the
-        drafter's step 0 alike, and whoever selects local rows -- the model
-        exit's ``gather_sampled_rows``, a draft that narrows to live rows --
-        goes through here.
+        drafter's step 0 alike, and whoever selects local rows -- the logits
+        processor's ``gather_sampled_rows``, a draft that narrows to live
+        rows -- goes through here.
 
         Args:
             gather_ids: ``[bs]`` batch-global sampled rows (``ctx.gather_ids``).
@@ -197,38 +233,32 @@ class QueryShardPlan:
                 f"{self.sampled_rows_total} sampled rows; pass the batch's full "
                 "layout, not a shard's slice"
             )
-        first = self.local_sampled_first
-        return gather_ids[first : first + self.local_sampled_rows] - self.local_start
+        run = self.local_rows_run(self.sampled_rows_per_rank)
+        return gather_ids[run] - self.local_start
 
     def rows_per_rank(self, rows: torch.Tensor) -> tuple[int, ...]:
         """How many of ``rows`` fall in each rank's shard.
 
         The split a collective over those rows needs (the prompt-logprob rows
         of a forward, whose activations every rank contributes from its shard
-        and gathers in row order): rows are batch-global and sorted, so rank
-        order is row order and this rank's rows are the contiguous run
+        and gathers in row order), the same one ``sampled_rows_per_rank`` is
+        built with: rows are batch-global and sorted, so rank order is row
+        order and this rank's rows are the contiguous run
         ``[sum(counts[:rank]), sum(counts[:rank + 1]))`` of ``rows``
         (``local_rows_run``). Host arithmetic over the shard boundaries, no
         per-row Python work.
 
         Args:
-            rows: Sorted batch-global rows, a 1-D host tensor.
+            rows: Batch-global rows, a 1-D host tensor sorted ascending.
 
         Returns:
             Per-rank counts summing to ``rows.shape[0]``.
+
+        Raises:
+            ValueError: ``rows`` are not a sorted 1-D host tensor, or name a
+                row past the shard span.
         """
-        if rows.dim() != 1 or rows.device.type != "cpu":
-            raise ValueError("rows_per_rank takes a 1-D host tensor of rows")
-        bounds = torch.cumsum(torch.tensor(self.row_counts, dtype=rows.dtype), dim=0)
-        # Rows below each shard's end; successive differences are the shards'.
-        below = torch.searchsorted(rows, bounds)
-        counts = torch.diff(below, prepend=below.new_zeros(1))
-        if int(below[-1]) != rows.shape[0]:
-            raise ValueError(
-                f"query shard: rows up to {int(rows.max())} exceed the "
-                f"{self.total_rows}-row span"
-            )
-        return tuple(int(count) for count in counts)
+        return _split_sorted_rows(self.row_counts, rows)
 
     def local_rows_run(self, rows_per_rank: Sequence[int]) -> slice:
         """This rank's run of a sorted row list split by ``rows_per_rank``."""

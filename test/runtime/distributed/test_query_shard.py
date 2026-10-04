@@ -131,12 +131,35 @@ def test_rows_per_rank_splits_sorted_rows_by_shard(lengths, size, rows):
     assert sum((rows[p.local_rows_run(counts)] for p in plans), []) == rows
 
 
-def test_rows_per_rank_refuses_rows_past_the_span_and_device_rows():
+def test_rows_per_rank_refuses_rows_past_the_span_unsorted_and_device_rows():
     plan = _plans(10, [4, 6], 4)[0]
     with pytest.raises(ValueError, match="exceed"):
         plan.rows_per_rank(torch.tensor([3, 10]))
     with pytest.raises(ValueError, match="1-D host"):
         plan.rows_per_rank(torch.tensor([[1, 2]]))
+    # The split counts rows below each shard boundary, so unsorted rows
+    # would be miscounted silently: refused loudly instead.
+    with pytest.raises(ValueError, match="sorted"):
+        plan.rows_per_rank(torch.tensor([5, 3]))
+    # Ties and a single row are sorted (shards [3, 3, 2, 2]).
+    assert plan.rows_per_rank(torch.tensor([3, 3, 9])) == (0, 2, 0, 1)
+    assert plan.rows_per_rank(torch.tensor([9])) == (0, 0, 0, 1)
+
+
+@pytest.mark.parametrize(
+    "lengths,size", [([5, 3, 7], 4), ([1, 1, 1], 4), ([2], 4), ([16], 8), ([], 2)]
+)
+def test_the_sampled_rows_take_the_same_split_as_any_sorted_rows(lengths, size):
+    """``sampled_rows_per_rank`` is ``rows_per_rank`` over the sampled rows:
+    one split, so the sampled-row gather and the prompt-row gather can never
+    disagree on which rank a row belongs to."""
+    plan = _plans(sum(lengths), lengths, size)[0]
+    sampled_rows = torch.tensor(_gather_rows(lengths), dtype=torch.int64)
+    assert plan.sampled_rows_per_rank == plan.rows_per_rank(sampled_rows)
+    assert (
+        plan.local_sampled_first
+        == plan.local_rows_run(plan.sampled_rows_per_rank).start
+    )
 
 
 def test_rows_for_collective_names_the_shard_or_the_sampled_rows():
