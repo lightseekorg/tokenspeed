@@ -30,6 +30,7 @@ metadata exchange.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, fields
 
 import torch
@@ -91,6 +92,56 @@ def pp_stage_windows(
     return windows
 
 
+def pp_stage_cache_windows(
+    execution_windows: Sequence[tuple[int, int]],
+    *,
+    cache_layers_per_execution_layer: int,
+    num_target_cache_layers: int,
+) -> list[tuple[int, int]]:
+    """Map stage execution windows to the target cache-layer namespace.
+
+    Stage windows partition execution blocks (decoder layers); cache ownership
+    is spoken in cache-layer IDs, one per attention instance. A paired layout
+    (LongCat's ScMoE layer: two attention branches around one MLP block) owns
+    ``cache_layers_per_execution_layer`` consecutive cache layers per block,
+    so both ends of every window scale by that count; the ordinary stack has
+    one cache layer per block and the windows pass through unchanged.
+
+    Args:
+        execution_windows: ``pp_stage_windows`` output, covering every block.
+        cache_layers_per_execution_layer: Attention instances per decoder
+            layer (``ModelProfile.attention_instances_per_layer``).
+        num_target_cache_layers: Cache layers the target recipe declared; the
+            scaled windows must end exactly there.
+
+    Returns:
+        One ``[start, end)`` cache-layer window per stage, in stage order.
+
+    Raises:
+        ValueError: the scaled windows do not cover the declared cache layers.
+    """
+    if cache_layers_per_execution_layer < 1:
+        raise ValueError(
+            "cache_layers_per_execution_layer must be >= 1, got "
+            f"{cache_layers_per_execution_layer}"
+        )
+    windows = [
+        (
+            start * cache_layers_per_execution_layer,
+            end * cache_layers_per_execution_layer,
+        )
+        for start, end in execution_windows
+    ]
+    if not windows or windows[-1][1] != num_target_cache_layers:
+        raise ValueError(
+            f"{len(execution_windows)} stage windows over "
+            f"{execution_windows[-1][1] if execution_windows else 0} execution "
+            f"layers x {cache_layers_per_execution_layer} cache layer(s) each do "
+            f"not cover the {num_target_cache_layers} target cache layers"
+        )
+    return windows
+
+
 def pp_layer_window(num_hidden_layers: int, mapping: Mapping) -> tuple[int, int]:
     """Return this stage's [start, end) target execution-block window.
 
@@ -111,10 +162,15 @@ class PPStageState:
     Fields are declared in wire order; ``tensors()`` and ``from_tensors``
     round-trip them so the executor can send/recv without knowing the model.
     ``None`` fields are skipped on the wire — the spec on the receive side
-    must produce the same skip pattern (both sides derive it from config).
+    must produce the same skip pattern and list its entries in this
+    declaration order (both sides derive it from config).
     """
 
     hidden_states: torch.Tensor
+    # Pre-norm residual stream carried beside ``hidden_states`` by models whose
+    # layers hand (hidden, residual) pairs to the next layer's fused add+norm
+    # (LongCat). Rows follow the layer boundary's dense comm layout.
+    residual: torch.Tensor | None = None
     hc_x: torch.Tensor | None = None
     hc_post: torch.Tensor | None = None
     hc_comb: torch.Tensor | None = None

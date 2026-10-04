@@ -237,6 +237,26 @@ produce the next candidate window through its local drafter. MLA, KDA
 recurrent/conv state and draft KV must all arrive before that round. The
 handoff uses the existing candidate transfer and verify path.
 
+## MTP (NextN) on the prefill pipeline
+
+`--speculative-algorithm MTP` with the K3 NextN checkpoint layer
+(`model.layers.<num_hidden_layers>.*`, the default draft path) runs on the
+same P pipeline. Nothing is produced across stages: the NextN layer reads
+the final hidden states the last stage already computes, so only the last P
+stage holds the NextN layer, its embedding shard and the draft cache, samples
+the first token, runs the draft extend over the completed prompt and the
+multi-step draft, and writes the candidate block. The other stages build and
+load no draft model at all. The NextN checkpoint must
+ship its `embed_tokens` weight: the last stage loads that TP shard because
+the target embedding lives on the first stage, while the draft head is
+shared from the target as usual. Ownership, bootstrap placement, transfer
+routes and the candidate handoff are identical to the DSpark case, and
+layerwise transfer (`--disaggregation-layerwise-interval`) works on every
+stage: only the last stage finalizes a draft-final step. The last stage
+carries the NextN MoE layer plus the draft extend and drafting time; size
+its memory and `--pp-layer-partition` for it. D keeps `--speculative-algorithm
+MTP` without PP and verifies the supplied candidates as before.
+
 ## Validation
 
 Run the existing cache-transfer, model-configuration and Marlin tests in the

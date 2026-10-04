@@ -147,8 +147,11 @@ class DeviceSpecs:
             (rather than by the capturable side-stream executor), which is
             what makes a grammar batch depend on the pending commit.
         supports_disaggregation: The KV arena can hand pages to a peer node.
-        supports_pd_layerwise_finalization: The drafter can finalize
-            layerwise KV writes, required for PD layerwise transfer.
+        supports_pd_layerwise_finalization: This rank can finalize layerwise
+            KV writes with speculation on, required for PD layerwise
+            transfer: the draft-field writer (producer or drafter) declares
+            it, and a pipeline stage owning no draft fields has nothing to
+            finalize.
         supports_prompt_logprobs: This engine can serve a request that asks
             for prompt (input) logprobs: either it never computes the prompt
             rows (the PD decode role, whose prefill node returns them) or its
@@ -174,6 +177,20 @@ class DeviceSpecs:
     supports_prompt_logprobs: bool
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
+
+
+def speculative_widths(
+    spec_algo: str | None, spec_num_steps: int | None, spec_num_tokens: int | None
+) -> tuple[int, int]:
+    """The ``DeviceSpecs`` speculation widths: (draft steps, verify width).
+
+    ``ServerArgs`` keeps its default widths with speculation off, so the
+    algorithm, not the widths, says whether speculation is on. Both are 0
+    without it: the accept-length log views verify rows by them.
+    """
+    if spec_algo is None:
+        return 0, 0
+    return spec_num_steps or 0, spec_num_tokens or 0
 
 
 @dataclass(frozen=True)
@@ -1298,21 +1315,22 @@ def build_device_side(
         global_rank=global_rank,
     )
 
+    spec_num_steps, spec_num_tokens = speculative_widths(
+        executor.config.spec_algo,
+        executor.config.spec_num_steps,
+        executor.config.spec_num_tokens,
+    )
     specs = DeviceSpecs(
         cache_geometry=views.cache_geometry,
         cache_groups=views.cache_groups,
         cache_storage=attention.cache_storage,
         multimodal_encoder_dtype=target.multimodal_encoder_dtype,
-        spec_num_steps=executor.config.spec_num_steps or 0,
-        spec_num_tokens=executor.config.spec_num_tokens or 0,
+        spec_num_steps=spec_num_steps,
+        spec_num_tokens=spec_num_tokens,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
-        supports_pd_layerwise_finalization=bool(
-            getattr(
-                executor.dspark_context_producer or executor.drafter,
-                "supports_pd_layerwise_finalization",
-                False,
-            )
+        supports_pd_layerwise_finalization=_supports_pd_layerwise_finalization(
+            executor, server_args.mapping
         ),
         supports_prompt_logprobs=(
             server_args.disaggregation_mode == "decode"
@@ -1466,6 +1484,21 @@ def _resolve_role(kv_transfer) -> DeviceRole:
     if isinstance(kv_transfer, DisaggPrefillExecutor):
         return DeviceRole.PD_PREFILL
     raise TypeError("kv_transfer must be a Disagg{Prefill,Decode}Executor.")
+
+
+def _supports_pd_layerwise_finalization(executor, mapping) -> bool:
+    """Whether this rank can finalize layerwise CachePD writes with speculation on.
+
+    The draft cache fields are the last pipeline stage's trailing producer
+    step (``CacheLayerOwnership``), so a stage before it owns none: its
+    readiness is the target layers' alone and nothing remains to finalize.
+    The owning stage, like a non-PP engine, answers for the executor's
+    ``draft_field_writer``. Without speculation the answer is unused.
+    """
+    if mapping.has_pp and not mapping.is_last_pp_rank:
+        return True
+    writer = executor.draft_field_writer
+    return writer is not None and writer.supports_pd_layerwise_finalization
 
 
 def _build_kv_transfer(

@@ -69,6 +69,15 @@ ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
 # evicted with the request one step later.
 _SPEC_OVERSHOOT_SPANS = 3
 
+# Speculative algorithms a prefill server runs on the chunk pipeline
+# (--pipeline-parallel-size > 1). The drafter executes on the last stage, the
+# only stage that samples: an MTP (NextN) draft needs only that stage's final
+# hidden states, and DSPARK produces its draft context across stages. EAGLE3
+# is excluded because its aux taps come from several stages and nothing
+# carries them through the stage boundary. See
+# ServerArgs.resolve_disaggregation.
+PIPELINE_SPEC_ALGORITHMS = ("DSPARK", "MTP")
+
 
 def str_to_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
@@ -484,6 +493,17 @@ class ServerArgs:
                 else:
                     self.speculative_num_steps = num_speculative_tokens
 
+        if self.speculative_eagle_topk != 1:
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    f"--speculative-eagle-topk {self.speculative_eagle_topk} needs "
+                    "--speculative-algorithm"
+                )
+            if self.speculative_num_draft_tokens is None:
+                raise ValueError(
+                    "--speculative-eagle-topk > 1 drafts a tree; set its node budget "
+                    "with --speculative-num-draft-tokens"
+                )
         if self.speculative_num_draft_tokens is None:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
@@ -759,12 +779,59 @@ class ServerArgs:
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
 
-        # Only chain speculative decoding is supported.
         if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
+            self._validate_tree_speculation()
+        elif (
+            self.speculative_algorithm in ("EAGLE3", "MTP")
+            and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
+        ):
             raise ValueError(
-                "speculative_eagle_topk > 1 (tree spec) is not currently "
-                f"supported: {self.speculative_eagle_topk=}. Only chain spec "
-                "(topk=1) is wired end-to-end."
+                f"a draft chain verifies speculative_num_steps + 1 = "
+                f"{self.speculative_num_steps + 1} tokens, got "
+                f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}"
+            )
+
+    def _validate_tree_speculation(self) -> None:
+        """Draft trees: EAGLE3/MTP with a node budget the draft can fill and a mask word can hold."""
+        topk = self.speculative_eagle_topk
+        steps = self.speculative_num_steps
+        nodes = self.speculative_num_draft_tokens
+        if self.speculative_algorithm not in ("EAGLE3", "MTP"):
+            raise ValueError(
+                f"speculative_eagle_topk={topk} (tree drafting) needs "
+                f"--speculative-algorithm EAGLE3 or MTP, got {self.speculative_algorithm}"
+            )
+        if not 1 <= topk <= 16 or not 1 <= steps <= 10:
+            raise ValueError(
+                f"tree drafting needs 1..16 children per node and 1..10 steps: {topk=}, {steps=}"
+            )
+        if (steps - 1) * topk > nodes:
+            raise ValueError(
+                f"tree drafting writes (steps - 1) * topk = {(steps - 1) * topk} lane slots per "
+                f"request into its {nodes}-slot draft window "
+                "(--speculative-num-draft-tokens); lower topk or steps"
+            )
+        candidates = topk + (steps - 1) * topk * topk
+        if not 2 <= nodes <= min(64, candidates + 1):
+            raise ValueError(
+                f"speculative_num_draft_tokens={nodes} must be in [2, {min(64, candidates + 1)}] "
+                f"for topk={topk} over {steps} steps (root + drafted nodes, at most 64)"
+            )
+        if self.grammar_backend != "none" or self.enable_mixed_batch:
+            raise ValueError(
+                "tree drafting does not support structured output or mixed batches yet: "
+                f"{self.grammar_backend=}, {self.enable_mixed_batch=}"
+            )
+        if self.disaggregation_mode != "null" or self.pipeline_parallel_size > 1:
+            raise ValueError(
+                "tree drafting does not carry the draft tree across prefill/decode "
+                f"disaggregation or pipeline stages yet: {self.disaggregation_mode=}, "
+                f"{self.pipeline_parallel_size=}"
+            )
+        if self.mapping.has_attn_dp:
+            raise ValueError(
+                "tree drafting does not support attention data parallelism yet: "
+                f"attention DP size {self.mapping.attn.dp_size}"
             )
 
     def resolve_communication(self):
@@ -883,20 +950,35 @@ class ServerArgs:
                     "supported yet"
                 )
             if self.speculative_algorithm is not None:
-                if (
-                    self.speculative_algorithm != "DSPARK"
-                    or self.disaggregation_mode != "prefill"
-                ):
+                # Pipeline speculation is a prefill-server feature: only the
+                # last stage samples, so it alone runs the drafter and owns
+                # the draft cache; the candidates ride the remote decode to
+                # the peer. A decode role (or the PP debug mode) has no
+                # token feedback on the chunk pipeline to draft against.
+                if self.disaggregation_mode != "prefill":
                     raise ValueError(
                         "--pipeline-parallel-size > 1 supports speculation only "
-                        "as DSPARK context production on a prefill server"
+                        "on a prefill server (--disaggregation-mode prefill)"
+                    )
+                # DSPARK produces its draft context across stages (each stage
+                # projects the target taps it owns); an MTP (NextN) draft
+                # needs only the last stage's captured hidden states.
+                if self.speculative_algorithm not in PIPELINE_SPEC_ALGORITHMS:
+                    raise ValueError(
+                        f"--speculative-algorithm {self.speculative_algorithm} "
+                        "is not supported with --pipeline-parallel-size > 1; "
+                        f"pipeline speculation supports {PIPELINE_SPEC_ALGORITHMS}"
                     )
                 # Current CachePD / draft layout limits rather than PP limits:
-                # CachePD has no CP partition contract, and the draft reduces
-                # its attention-TP embedding partials over the dense TP group.
-                if (
+                # CachePD has no CP partition contract, and the DSPARK draft
+                # reduces its attention-TP embedding partials over the dense
+                # TP group. MTP drafts embed with an ordinary reduced
+                # vocab-parallel lookup, so only DSPARK carries the rule.
+                # Both TP groups are stride-1 over the stage, so equal widths
+                # mean equal groups (the mapping has no rank yet here).
+                if self.speculative_algorithm == "DSPARK" and (
                     self.mapping.attn.cp_size != 1
-                    or self.mapping.dense.tp_group != self.mapping.attn.tp_group
+                    or self.mapping.dense.tp_size != self.mapping.attn.tp_size
                 ):
                     raise ValueError(
                         "Pipeline DSPARK requires attention CP=1 and matching "
@@ -2002,8 +2084,8 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-eagle-topk",
             type=int,
-            help="The number of tokens sampled from the draft model in each speculative step.",
-            choices=[1],
+            help="Children each draft node expands to per step; above 1 the draft is a tree "
+            "(EAGLE3, or EAGLE-style MTP), and --speculative-num-draft-tokens is its node budget.",
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(

@@ -51,6 +51,7 @@ class WeightLoader:
         device: str,
         gpu_id: int,
         memory_saver_adapter: TorchMemorySaverAdapter,
+        checkpoint_load_group: tuple[int, ...] | None,
     ):
         """Load model from disk.
 
@@ -60,6 +61,9 @@ class WeightLoader:
             device: Device type ("cuda", "cpu")
             gpu_id: GPU ID
             memory_saver_adapter: Memory saver adapter
+            checkpoint_load_group: Global ranks loading this model together,
+                for a distributed loader's collectives; None means every
+                rank. See ``LoadConfig.checkpoint_load_group``.
 
         Returns:
             LoadedModel with model and dtype
@@ -88,6 +92,7 @@ class WeightLoader:
             ext_yaml=server_args.ext_yaml,
             weight_loader_prefetch_checkpoints=server_args.weight_loader_prefetch_checkpoints,
             weight_loader_prefetch_num_threads=server_args.weight_loader_prefetch_num_threads,
+            checkpoint_load_group=checkpoint_load_group,
         )
 
         # Load model with memory saver context. Tag as "weights" with CPU backup

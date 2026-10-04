@@ -314,7 +314,7 @@ def test_residual_fusion_gather_boundaries_match_communication(
 ) -> None:
     mapping = SimpleNamespace(
         has_attn_tp=attn_tp > 1,
-        attn=SimpleNamespace(tp_size=attn_tp, tp_group=list(range(attn_tp))),
+        attn=SimpleNamespace(tp_size=attn_tp, tp_rank=0, tp_group=list(range(attn_tp))),
         dense=SimpleNamespace(tp_size=other_tp),
         moe=SimpleNamespace(tp_ep_size=other_tp),
     )

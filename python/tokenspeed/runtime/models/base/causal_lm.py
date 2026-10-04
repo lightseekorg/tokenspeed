@@ -271,12 +271,34 @@ class BaseCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-    def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_embed_and_head(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """The embedding and LM-head weights a draft may share with this target.
 
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        A pipeline stage holds only its own side: the embedding lives on the
+        first stage and the head on the last, so the missing side is None
+        rather than a dereference of an absent module.
+        """
+        embed_tokens = self.model.embed_tokens
+        embed = embed_tokens.weight if embed_tokens is not None else None
+        head = self.lm_head.weight if self.lm_head is not None else None
+        return embed, head
 
-    def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
+    def set_embed_and_head(
+        self, embed: torch.Tensor | None, head: torch.Tensor
+    ) -> None:
+        """Alias the target's embedding and LM-head weights into this draft.
 
+        ``embed=None`` means the target shares no embedding (a pipeline's last
+        stage: it lives on the first stage). A generic draft keeps no embedding
+        of its own, so it refuses; a pipeline-capable draft overrides this to
+        keep the ``embed_tokens`` its checkpoint ships, and the factory checks
+        ``get_embed_and_head`` still reports one afterwards.
+        """
+        if embed is None:
+            raise ValueError(
+                f"{type(self).__name__} shares the target embedding and cannot "
+                "keep its own; it is not a pipeline-capable draft."
+            )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
 

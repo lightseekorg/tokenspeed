@@ -221,6 +221,8 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--mm-encoder-tp-mode` | Multimodal encoder parallelism: `weights` shards encoder weights with attention TP; `data` uses TP1 whole-item DP and currently requires aggregate serving and no attention context parallelism. |
 | `--enable-expert-parallel` | Set expert parallelism across the selected world size. |
 | `--expert-parallel-size`, `--ep-size` | Explicit expert parallel size. |
+| `--pipeline-parallel-size` | Pipeline stages for prefill chunk pipelining. Requires `--disaggregation-mode prefill`; forces eager execution; every per-layer parallelism resolves inside one stage's world. |
+| `--pp-layer-partition` | Explicit per-stage layer counts, front to back (`"24,24,24,21"`); one entry per stage, summing to the model's layer count. Default: even split with the remainder on the front stages. |
 | `--world-size` | Total worker process count across all nodes. |
 | `--nprocs-per-node` | Worker process count per node. |
 | `--nnodes` | Number of nodes. |
@@ -254,6 +256,12 @@ and request `swiglu` for their gated SiLU activation. These requirements apply t
 both unquantized and block-FP8 expert layers, including when selecting
 `--moe-backend flashinfer_trtllm` on Blackwell.
 
+A LongCat layer runs two dense MLPs and one MoE off the same attention output.
+Its rows follow the dense comm pattern; when the MoE pattern differs (attention
+TP equal to the dense TP but not to the MoE TP x EP width, as under attention
+DP with `--enable-expert-parallel`), the MoE output is re-gathered into the
+dense layout. `--enable-allreduce-fusion` is rejected for that layout.
+
 When `--dp-sampling` is enabled, the logits processor owns the per-forward
 logits layout decision and carries the resulting plan to the sampling backend
 with the logits output.
@@ -280,13 +288,39 @@ the values accepted by the bundled `tokenspeed-smg` package.
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
-| `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
-| `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |
+| `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
+| `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
 | `--eagle3-layers-to-capture` | EAGLE3 layers to capture. |
 | `--disable-replay-ssm` | Stage every verify position's recurrent state instead of replaying the accepted tokens. ReplaySSM is on by default for supported Qwen GDN and Nemotron-H Mamba2 targets; `--enable-replay-ssm` is accepted as a deprecated no-op. |
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+`EAGLE3` and `MTP` drafts are chains by default: `--speculative-num-draft-tokens`
+must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 1
+they draft a tree instead, and `--speculative-num-draft-tokens` is its node
+budget (root included) and must be given explicitly: topk 1..16, steps 1..10,
+`(steps - 1) * topk` lane slots within the node budget, and at most 64 nodes. Trees need the `trtllm`
+attention backends and the `greedy` or `triton` sampling backend; see
+[draft-tree speculation](../design/tree-speculation.md) for the full scope.
+
+`MTP` serves two head shapes under one flag. An Eagle-like head (one MTP
+layer chained on its own hidden, e.g. DeepSeek NextN) runs the Eagle chain.
+A multi-depth head (one distinct depth layer per draft step over the same
+window, e.g. Inkling, or an out-of-tree draft registered for the multi-depth
+drafter) runs every depth `0..--speculative-num-steps-1` each round, so the
+draft checkpoint needs at least that many depths. Both shapes run under
+attention data parallelism (idle ranks mirror the depth loop with empty
+forwards) and with PD layerwise transfer
+(`--disaggregation-layerwise-interval`), where the draft's per-depth cache
+planes become ready together after the drafter's run. Known PD limitation
+of the multi-depth head: the drafter's cross-round stash (the last `k-1`
+committed tokens and their target hiddens per request) is not transferred
+with the KV, so for up to `k-1` decode rounds after a request lands on the
+decode node the draft rewrites prompt-tail draft-KV positions from an
+unfilled stash. Draft acceptance may dip for those rounds; verification
+stays exact. Shipping the stash with the bootstrap payload is a planned
+follow-up.
 
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.
@@ -314,6 +348,23 @@ walked by one Triton kernel per verify step. A request's `temperature`,
 `top_k` and `top_p` are applied by the target's verification step, never by
 the proposal, so the served distribution is the target's whatever the drafter
 proposed.
+
+On a prefill server with `--pipeline-parallel-size > 1`, speculation is
+accepted for `MTP` and `DSPARK` only. The drafter runs on the last stage, the
+only stage that samples; it writes the candidate block the remote decode
+carries to the decode server, which verifies it as usual. `DSPARK` also
+produces its draft context across stages and keeps requiring attention CP = 1
+and matching dense/attention TP groups. An `MTP` (NextN) draft reads only the
+last stage's final hidden states: the other stages build and load no draft
+model at all, and the NextN checkpoint must ship its `embed_tokens` weight
+because the target embedding lives on the first stage. `DFLASH` and `EAGLE3` read
+target taps from several stages and are rejected on a pipeline. Layerwise
+transfer (`--disaggregation-layerwise-interval`) is decided per stage: stages
+before the last own no draft cache and always allow it; the last stage allows
+it exactly when the same drafter would on a single-stage server, so an MTP
+drafter class that does not support layerwise finalization (the vanilla
+multi-layer `Mtp` drafter, e.g. Inkling NextN, as opposed to the EAGLE-style
+NextN drafts of Kimi K3 and DeepSeek V4) is still rejected at startup there.
 
 A block drafter writes its KV at the target's cache locations, so it shares the
 target's page table: `--block-size` is a target-side choice and the draft

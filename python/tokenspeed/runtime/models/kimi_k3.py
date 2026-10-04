@@ -3646,9 +3646,6 @@ class KimiLinearForCausalLM(BaseCausalLM):
             )
         self.model.eagle3_layers_to_capture = tuple(selected)
 
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
-
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         """Capture the K3 residual stream after each named target layer.
 

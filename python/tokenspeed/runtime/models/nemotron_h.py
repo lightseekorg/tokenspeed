@@ -44,6 +44,10 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_step import (
+    get_is_capture_mode,
+    get_is_cuda_graph_phase,
+)
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (
     RMSNorm as RMSNormGated,
 )
@@ -76,6 +80,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import set_weight_attrs
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 # Checkpoint name prefix -> runtime module path.
 _NAME_REPLACEMENTS = (
@@ -567,6 +572,7 @@ class NemotronHMoE(nn.Module):
         layer_index: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        alt_stream: torch.cuda.Stream | None,
     ) -> None:
         super().__init__()
         if config.mlp_hidden_act != "relu2":
@@ -634,6 +640,7 @@ class NemotronHMoE(nn.Module):
             self.fc2_latent_proj, config.mlp_bias, mapping
         )
         self.moe_rank = mapping.moe.tp_ep_rank
+        self.stream_fork = StreamFork(alt_stream)
 
     def input_fp8_scale(self) -> torch.Tensor | None:
         return _static_fp8_scale(self.shared_experts.up_proj)
@@ -644,7 +651,28 @@ class NemotronHMoE(nn.Module):
         hidden_fp8: torch.Tensor | None,
         ctx: ForwardContext,
     ) -> MixerOutput:
-        router_logits = self.gate(hidden_states)
+        with self.stream_fork.scope(
+            enable=hidden_states.shape[0] > 0 and get_is_cuda_graph_phase(),
+            overlap=get_is_capture_mode(),
+        ) as fork:
+            with fork.branch():
+                router_logits = self.gate(hidden_states)
+                fork.record_checkpoint()
+                shared = self.shared_experts(
+                    hidden_states if hidden_fp8 is None else hidden_fp8
+                )
+            latent, _ = self.fc1_latent_proj(hidden_states)
+            fork.join_checkpoint()
+            routed = self._routed(hidden_states, router_logits, latent, ctx)
+        return (shared, None) if routed is None else (routed, shared)
+
+    def _routed(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        latent: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor | None:
         if hidden_states.shape[0] > 0:
             topk_output = self.topk(hidden_states, router_logits)
         else:
@@ -653,7 +681,6 @@ class NemotronHMoE(nn.Module):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
             )
-        latent, _ = self.fc1_latent_proj(hidden_states)
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
@@ -663,11 +690,7 @@ class NemotronHMoE(nn.Module):
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
         )
-        routed = self._latent_to_hidden(routed)
-        shared = self.shared_experts(
-            hidden_states if hidden_fp8 is None else hidden_fp8
-        )
-        return (shared, None) if routed is None else (routed, shared)
+        return self._latent_to_hidden(routed)
 
     def _latent_to_hidden(self, routed: torch.Tensor) -> torch.Tensor | None:
         """fc2 of the routed latent, or None on a rank that leaves it to rank 0."""
@@ -696,6 +719,7 @@ class NemotronHBlock(nn.Module):
         layer_index: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        alt_stream: torch.cuda.Stream | None,
     ) -> None:
         super().__init__()
         mixer_prefix = f"{prefix}.mixer"
@@ -709,7 +733,7 @@ class NemotronHBlock(nn.Module):
             )
         elif block_type == "moe":
             self.mixer = NemotronHMoE(
-                config, mapping, layer_index, quant_config, mixer_prefix
+                config, mapping, layer_index, quant_config, mixer_prefix, alt_stream
             )
         else:
             raise NotImplementedError(f"Nemotron-H {block_type!r} blocks")
@@ -749,6 +773,7 @@ class NemotronHModel(nn.Module):
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
         )
+        alt_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
             NemotronHBlock(
                 config,
@@ -758,6 +783,7 @@ class NemotronHModel(nn.Module):
                 i,
                 quant_config,
                 f"backbone.layers.{i}",
+                alt_stream,
             )
             for i in range(config.num_hidden_layers)
         )

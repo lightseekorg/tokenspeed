@@ -230,6 +230,8 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         "valid_cache_lengths",
         "future_input_map",
         "remote_spec_candidate_ready",
+        "chain_parents",
+        "future_parent_map",
         "ngram_accepted_tokens",
         "ngram_needs_seed",
         "ngram_request_ids",
@@ -1096,6 +1098,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
         device="cpu",
         gpu_id=0,
         memory_saver_adapter=SimpleNamespace(region=region),
+        checkpoint_load_group=None,
     )
     assert result is model
     assert events == (
@@ -1103,3 +1106,21 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
         if has_engram
         else ["enter", "load", "exit"]
     )
+
+
+def test_forced_single_token_resets_draft_tree_parents(buffers):
+    """A row reset to its dummy tail (bootstrap override) drops its drafted tree:
+    its next-round parents return to the chain; other slots keep theirs."""
+    ib, _ = buffers
+    runtime = _spec_runtime(ib, 4)
+    runtime.init_draft_trees(4)
+    tree = torch.tensor([-1, 0, 0, 1], dtype=torch.int32, device=ib.device)
+    runtime.future_parent_map[:] = tree
+    states = {"decode": _state([40, 41, 42], [43])}
+    runtime.valid_cache_lengths[0] = 3
+    runtime.future_input_map[0] = torch.tensor([43, 44, 45, 46], device=ib.device)
+    op = _op(states, ["decode"], [0], [4], [], [], [43])
+    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    assert ib.force_single_token_verify_buf[0].item()
+    assert runtime.future_parent_map[0].tolist() == [-1, 0, 1, 2]
+    assert runtime.future_parent_map[1].tolist() == tree.tolist()

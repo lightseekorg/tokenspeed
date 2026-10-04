@@ -39,6 +39,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -97,9 +98,17 @@ class HybridLinearAttnBackend(AttentionBackend):
     def forward_extend_chunked(self, *args, **kwargs):
         return self.full_attn_backend.forward_extend_chunked(*args, **kwargs)
 
+    # Composite: the full-attention child owns the per-request decode lengths
+    # the draft reads, so every drafter length-edit hook reaches it (the
+    # linear child's state follows the committed position, not seq_lens).
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
-        # Composite: the full-attention child owns the seq_lens the draft reads.
         self.full_attn_backend.advance_draft_forward_metadata(seq_lens)
+
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        self.full_attn_backend.update_draft_forward_metadata(frontier)
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        self.full_attn_backend.fill_block_decode_seq_lens(bs, block_seq_lens)
 
     def draft_history_view(self):
         return self.full_attn_backend.draft_history_view()
@@ -325,8 +334,17 @@ class HybridLinearAttnBackend(AttentionBackend):
             ret = ret.flatten(0, 1)
         return ret
 
+    def tree_support(self) -> TreeSupport:
+        return TreeSupport(verify_blocker=None, draft_blocker=None)
+
     def commit_speculative_state_after_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
     ) -> None:
         if num_extends == 0:
-            self.linear_attn_backend.commit_verified_state(accepted_lengths)
+            self.linear_attn_backend.commit_verified_state(
+                accepted_lengths, accepted_path=accepted_path
+            )

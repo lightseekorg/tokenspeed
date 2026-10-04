@@ -290,7 +290,7 @@ def test_kimi_k3_amd_gates_use_eagle3():
     assert flag_value(perf_server_tokens, "--max-num-seqs") == "16"
     assert flag_value(perf_server_tokens, "--chunked-prefill-size") == "8192"
     assert flag_value(perf_server_tokens, "--max-prefill-tokens") == "8192"
-    assert tasks[1]["perf_reference"] == {16: [23, 12.5]}
+    assert tasks[1]["perf_reference"] == {16: [60, 15]}
     assert tasks[1]["perf_threshold"] == 0.9
     assert "'evalscope[perf]==1.11.1'" in tasks[1]["perf"]["install"][0]
     perf_tokens = shlex.split(tasks[1]["perf"]["command"])

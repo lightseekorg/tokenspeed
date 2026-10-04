@@ -84,9 +84,23 @@ class ModelRunner:
         server_args: ServerArgs,
         gpu_id: int,
         global_rank: int,
+        *,
+        checkpoint_load_group: tuple[int, ...] | None,
         is_draft_worker: bool = False,
     ):
-        """Initialize ModelRunner with injected dependencies."""
+        """Initialize ModelRunner with injected dependencies.
+
+        Args:
+            model_config: The model to build and load.
+            server_args: Parsed server arguments.
+            gpu_id: Local device index.
+            global_rank: This worker's global rank.
+            checkpoint_load_group: Global ranks that load this model together,
+                for a distributed loader's collectives; None means every rank.
+                A pipeline stage's draft names its stage, since the other
+                stages may not build it (``create_model_runner``).
+            is_draft_worker: Whether this is the speculative draft model.
+        """
         # Store configuration
         self.model_config = model_config
         self.server_args = server_args
@@ -97,8 +111,11 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_draft_worker = is_draft_worker
+        self.checkpoint_load_group = checkpoint_load_group
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
+        # Set by load_model from the model's forward signature.
+        self._model_forward_accepts_spec_step_idx: bool = False
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
         self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
         # Target and draft alike: the envelope covers every model that serves.
@@ -150,10 +167,22 @@ class ModelRunner:
             device=self.device,
             gpu_id=self.gpu_id,
             memory_saver_adapter=self.memory_saver_adapter,
+            checkpoint_load_group=self.checkpoint_load_group,
         )
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
             self.model, "spec_step_idx"
         )
+
+    @property
+    def forward_accepts_spec_step_idx(self) -> bool:
+        """Whether the model's ``forward`` declares ``spec_step_idx``.
+
+        :meth:`forward` passes ``spec_step_idx`` through only when this holds
+        (``**kwargs`` alone does not count); a drafter that selects depth by
+        step must check it at construction rather than discover at serve time
+        that every step ran depth 0.
+        """
+        return self._model_forward_accepts_spec_step_idx
 
     @property
     def multimodal_encoder_dtype(self) -> str | None:
@@ -224,9 +253,7 @@ class ModelRunner:
             kwargs["input_embeds"] = input_embeds
         if multimodal_context is not None:
             kwargs["multimodal_context"] = multimodal_context
-        if spec_step_idx is not None and getattr(
-            self, "_model_forward_accepts_spec_step_idx", False
-        ):
+        if spec_step_idx is not None and self.forward_accepts_spec_step_idx:
             kwargs["spec_step_idx"] = spec_step_idx
         if kv_sync_event is not None:
             kwargs["kv_sync_event"] = kv_sync_event

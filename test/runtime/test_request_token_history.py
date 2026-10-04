@@ -314,7 +314,7 @@ def test_idle_rank_hands_history_drafts_an_empty_view() -> None:
     executor.model_runner = SimpleNamespace(forward=lambda ctx, **kwargs: None)
     executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
     executor.drafter = SimpleNamespace(
-        spec_num_steps=2,
+        idle_forward_global_num_tokens=lambda tokens, bs: [tokens, bs],
         attn_backend=SimpleNamespace(),
         token_to_kv_pool=SimpleNamespace(),
         draft_model_runner=SimpleNamespace(

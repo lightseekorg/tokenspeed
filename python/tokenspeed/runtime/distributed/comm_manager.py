@@ -156,10 +156,46 @@ class CommManager:
         """
         if not self.needs_pre_attn_all_gather():
             return residual
+        return self.gather_scattered_rows(residual, ctx)
+
+    # ---- Row layouts ----
+    #
+    # An all-reduce layer holds every row of its attention DP group on each
+    # attention-TP rank; an RSAG layer holds this rank's scattered share. The
+    # two helpers below convert between the layouts for a model whose MLPs do
+    # not all follow one pattern (LongCat runs a MoE beside dense MLPs).
+
+    def slice_scattered_rows(
+        self, hidden_states: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        """Keep this rank's scattered share of the full rows (no collective)."""
+        token_list = self.attn_tp_group_scattered_num_tokens(ctx)
+        if hidden_states.shape[0] != sum(token_list):
+            raise RuntimeError(
+                "slice_scattered_rows expects the full rows of the attention "
+                f"DP group: got {hidden_states.shape[0]} rows for "
+                f"scattered counts {token_list}"
+            )
+        offset = sum(token_list[: self.mapping.attn.tp_rank])
+        return hidden_states[offset : offset + token_list[self.mapping.attn.tp_rank]]
+
+    def gather_scattered_rows(
+        self, hidden_states: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        """All-gather the scattered shares back into full rows."""
+        token_list = self.attn_tp_group_scattered_num_tokens(ctx)
+        if hidden_states.shape[0] != token_list[self.mapping.attn.tp_rank]:
+            raise RuntimeError(
+                "gather_scattered_rows expects this rank's scattered share: "
+                f"got {hidden_states.shape[0]} rows for scattered counts "
+                f"{token_list} at attention-TP rank {self.mapping.attn.tp_rank}"
+            )
+        if sum(token_list) == 0:
+            return hidden_states
         return token_all_gather(
-            residual,
+            hidden_states,
             group=self.mapping.attn.tp_group,
-            scattered_num_tokens=self.attn_tp_group_scattered_num_tokens(ctx),
+            scattered_num_tokens=token_list,
         )
 
     def post_attn_comm(

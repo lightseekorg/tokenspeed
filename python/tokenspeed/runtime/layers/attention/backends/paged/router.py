@@ -50,6 +50,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.kvcache.triton import compact_window_rows
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.attention.backends.base import (
@@ -67,9 +68,13 @@ from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
     GroupTableStacks,
 )
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeVerifyInputs,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
@@ -149,6 +154,10 @@ class CacheGroupRouter(AttentionBackend):
         self.is_draft = bool(is_draft)
         self.spec_num_tokens = max(int(spec_num_tokens or 1), 1)
         self.device = device
+        # Draft-tree verify: compaction's K/V address table, rebuilt on every pool bind.
+        self._tree_verify_armed = False
+        self._tree_window_addresses: torch.Tensor | None = None
+        self._tree_window_row_bytes: int | None = None
         self._init_pool_binding()
         self._forget_bound_pool_state()
 
@@ -250,6 +259,8 @@ class CacheGroupRouter(AttentionBackend):
             for leaf in self.leaves.values():
                 leaf.set_cache_pool(cache_pool)
         super()._publish_cache_pool(cache_pool)
+        if self._tree_verify_armed:
+            self._bind_tree_window_rows()
 
     def configure_runtime(self, **kwargs) -> None:
         specs = {
@@ -412,6 +423,49 @@ class CacheGroupRouter(AttentionBackend):
             raise RuntimeError("extend spans requested before init_forward_metadata")
         gid = self.group_ids[self._draft_history_index()]
         return self._extend_write_locations[gid]
+
+    def tree_support(self) -> TreeSupport:
+        if len(self.leaves) == 1:
+            return TreeSupport(verify_blocker=None, draft_blocker=None)
+        blocker = (
+            f"draft trees support one cache group; this router serves {self.group_ids}"
+        )
+        return TreeSupport(verify_blocker=blocker, draft_blocker=blocker)
+
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        super().bind_tree_verify(inputs)
+        self._tree_verify_armed = True
+        if self.cache_pool is not None:
+            self._bind_tree_window_rows()
+
+    def _bind_tree_window_rows(self) -> None:
+        """Address table of the history K/V token-row buffers compaction moves rows in."""
+        pool = self.cache_pool
+        buffers = [
+            buf
+            for layer in sorted(pool.history_group_by_layer())
+            for buf in pool.get_kv_buffer(layer)
+        ]
+        row_bytes = {buf[0].numel() * buf.element_size() for buf in buffers}
+        if len(row_bytes) != 1 or not all(buf.is_contiguous() for buf in buffers):
+            raise NotImplementedError(
+                "draft-tree compaction needs contiguous K/V token rows of one width"
+            )
+        self._tree_window_row_bytes = row_bytes.pop()
+        # Layers may alias one region through the memory plan; move each region once.
+        self._tree_window_addresses = torch.tensor(
+            sorted({buf.data_ptr() for buf in buffers}),
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+    def compact_verify_window(self, path: torch.Tensor) -> None:
+        compact_window_rows(
+            self._tree_window_addresses,
+            self.decode_window_locations(),
+            path,
+            row_bytes=self._tree_window_row_bytes,
+        )
 
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
@@ -755,9 +809,11 @@ class CacheGroupRouter(AttentionBackend):
     def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
         """Vanilla MTP re-anchor: seq_lens become the committed frontier,
         in-graph. Seq-lens-only like :meth:`advance_draft_forward_metadata`;
-        the drafter publishes its k-window explicitly."""
+        the drafter publishes its k-window explicitly. Each leaf's own hook
+        decides whether the k-row window needs more than the seq_lens edit
+        (the leaf default is that edit; DSA re-expands its per-token rows)."""
         for leaf in self.leaves.values():
-            leaf.advance_draft_forward_metadata(frontier)
+            leaf.update_draft_forward_metadata(frontier)
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         for leaf in self.leaves.values():

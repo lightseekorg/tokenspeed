@@ -620,6 +620,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertTrue(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -648,6 +649,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertFalse(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -680,6 +682,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertFalse(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(

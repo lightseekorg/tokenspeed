@@ -56,6 +56,7 @@ from tokenspeed.runtime.layers.quantization.base_config import (
 )
 from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
+    CompressedTensorsLinearMethod,
 )
 from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
@@ -65,20 +66,9 @@ from tokenspeed.runtime.utils import get_colorful_logger, set_weight_attrs
 
 logger = get_colorful_logger(__name__)
 
-WEIGHT_LOADER_V2_SUPPORTED = [
-    "CompressedTensorsLinearMethod",
-    "AWQMarlinLinearMethod",
-    "AWQLinearMethod",
-    "GPTQMarlinLinearMethod",
-    "Fp8LinearMethod",
-    "BlockInt8LinearMethod",
-    "MarlinLinearMethod",
-    "QQQLinearMethod",
-    "GPTQMarlin24LinearMethod",
-    "TPUInt8LinearMethod",
-    "GPTQLinearMethod",
-    "IPEXAWQLinearMethod",
-]
+# These methods create parameters implementing the V2 sharded-loading protocol.
+# Subclasses must preserve that contract; other methods retain the legacy loader.
+WEIGHT_LOADER_V2_METHODS = (Fp8LinearMethod, CompressedTensorsLinearMethod)
 
 
 def warmup_prepared_fp8_linears(model: torch.nn.Module, max_tokens: int) -> None:
@@ -222,7 +212,7 @@ class LinearBase(torch.nn.Module):
                 if should_exclude_quant_module(prefix, quant_config.ignored_layers):
                     self.quant_method = UnquantizedLinearMethod()
                 else:
-                    self.quant_method = Fp8LinearMethod(quant_config)
+                    self.quant_method = quant_config.get_quant_method(self, prefix)
             if isinstance(quant_config, W8A8Fp8Config):
                 self.quant_method = W8A8Fp8LinearMethod(quant_config)
 
@@ -435,7 +425,7 @@ class ColumnParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if isinstance(self.quant_method, WEIGHT_LOADER_V2_METHODS)
                 else self.weight_loader
             ),
         )
@@ -1205,7 +1195,7 @@ class RowParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if isinstance(self.quant_method, WEIGHT_LOADER_V2_METHODS)
                 else self.weight_loader
             ),
         )

@@ -729,6 +729,29 @@ def test_layerwise_final_preserves_speculative_candidates() -> None:
     assert metadata_calls == [(9, 42, [7, 8])]
 
 
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_every_pipeline_stage_reports_under_its_stage_major_rank(pp_rank) -> None:
+    """On a prefill pipeline every stage publishes the same broadcast bootstrap
+    payload (the executor path above is stage-agnostic); each manager reports
+    it under the stage-major prefill rank Decode counts completions by."""
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.topology = PDParallelTopology(
+        tp_size=2,
+        tp_rank=1,
+        cp_size=1,
+        cp_rank=0,
+        dp_size=1,
+        dp_rank=0,
+        world_size=4,
+        global_rank=pp_rank * 2 + 1,
+        pp_size=2,
+        pp_rank=pp_rank,
+    )
+    assert manager._status_prefill_rank == pp_rank * 2 + 1
+
+
 def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
     source_segment = make_segment(
         "layer.0.k",
