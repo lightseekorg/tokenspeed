@@ -130,7 +130,8 @@ class DFlash2(DFlash):
             raise RuntimeError("DFlash2 must be wired to the target before drafting.")
         if self.candidate_topk.enabled:
             return self.candidate_topk(hidden_states)
-        metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+        # Replicated draft rows: no query shard.
+        metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
         logits = self.candidate_logits_processor._get_logits(
             hidden_states, self.lm_head, metadata, require_full_vocab=False
         )

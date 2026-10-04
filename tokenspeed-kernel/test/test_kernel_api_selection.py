@@ -2450,6 +2450,68 @@ def test_deep_gemm_prefill_topk_declares_the_candidate_lens_cpu_feature() -> Non
             assert _attention_dsa_pkg.CANDIDATE_LENS_CPU_FEATURE not in other.features
 
 
+def test_a_leaf_declares_the_workspace_rows_feature_iff_its_launcher_takes_rows() -> (
+    None
+):
+    """``INDEX_K_WORKSPACE_ROWS_FEATURE`` is the registration's promise that the
+    launcher takes index keys in workspace-row order (``index_k_fp8`` +
+    ``index_k_scale`` or ``index_k_bf16``): every registered prefill top-k
+    leaf declares it exactly when its signature names such a keyword. A
+    plane-only launcher (the portable Triton leaf, the opaque ``**kwargs``
+    gluon wrappers) names none and declares none, so the facade never selects
+    it for rows."""
+    registry = KernelRegistry.get()
+    feature = _attention_dsa_pkg.INDEX_K_WORKSPACE_ROWS_FEATURE
+    row_keywords = {"index_k_fp8", "index_k_scale", "index_k_bf16"}
+    specs = registry.list_kernels("attention", "dsa_prefill_topk")
+    assert specs
+    for spec in specs:
+        named = {
+            name
+            for name, parameter in inspect.signature(
+                registry.get_impl(spec.name)
+            ).parameters.items()
+            if parameter.kind
+            not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        }
+        takes_rows = bool(named & row_keywords)
+        assert (feature in spec.features) == takes_rows, (
+            f"{spec.name}: declares={feature in spec.features}, "
+            f"row keywords={sorted(named & row_keywords)}"
+        )
+
+
+def test_workspace_rows_fail_at_selection_without_a_declaring_leaf(
+    h100_platform,
+) -> None:
+    """Forcing the portable Triton solution (the one an AMD or pre-Hopper
+    platform has) for rows raises ``NoKernelFoundError`` from the facade
+    instead of the leaf's own ``RuntimeError`` mid-forward."""
+    spec = KernelRegistry.get().get_by_name("triton_dsa_prefill_topk_fp8")
+    assert spec is not None
+    assert _attention_dsa_pkg.INDEX_K_WORKSPACE_ROWS_FEATURE not in spec.features
+    real_platform = Platform.get()
+    Platform.override(h100_platform)
+    try:
+        with pytest.raises(tokenspeed_kernel.NoKernelFoundError):
+            _attention_dsa_pkg.dsa_prefill_topk(
+                torch.empty((1, 32, 128), dtype=torch.bfloat16),
+                torch.empty((1, 32), dtype=torch.float32),
+                torch.arange(16, dtype=torch.int64),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([16], dtype=torch.int32),
+                topk=512,
+                softmax_scale=1.0,
+                batch_invariant=False,
+                index_k_fp8=torch.empty((16, 128), dtype=torch.float8_e4m3fn),
+                index_k_scale=torch.ones((16, 1), dtype=torch.float32),
+                solution="triton",
+                slot_order="selection",
+            )
+    finally:
+        Platform.override(real_platform)
+
+
 def test_deep_gemm_prefill_bound_resolution_preserves_both_host_inputs() -> None:
     from tokenspeed_kernel.ops.attention.dsa.deep_gemm import (
         _resolve_prefill_tile_max_seqlen_k,

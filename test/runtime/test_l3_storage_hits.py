@@ -668,6 +668,7 @@ def loop_methods():
         "maybe_control_plane_guard": nullcontext,
         "PlannedForward": SimpleNamespace,
         "ngram_inputs_for_forward": lambda *args: None,
+        "input_logprob_plan_for_forward": lambda *args: None,
         "advance_scheduler": lambda scheduler, events: scheduler.advance(events),
     }
     exec(
@@ -757,6 +758,7 @@ def test_l3_recovery_preserves_round_order(
         _epd_hooks=SimpleNamespace(
             drain_ready_embeddings=Mock(), assert_embeddings_received=Mock()
         ),
+        _eplb_hooks=SimpleNamespace(note_round=Mock()),
         _cache_hooks=SimpleNamespace(
             poll_ready_events=Mock(side_effect=[["cache0"], ["cache1"]]),
             count_plan_ops=Mock(),

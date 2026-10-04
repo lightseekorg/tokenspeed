@@ -97,21 +97,21 @@ def test_logits_processor_dp_layout_threshold_and_modes():
     assert (
         processor._resolve_logits_layout_plan(
             torch.empty(15 * 6, 3),
-            LogitsMetadata(forward_mode=ForwardMode.DECODE),
+            LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None),
         )
         is None
     )
 
     decode_plan = processor._resolve_logits_layout_plan(
         torch.empty(16 * 6, 3),
-        LogitsMetadata(forward_mode=ForwardMode.DECODE),
+        LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None),
     )
     assert decode_plan is not None
 
     assert (
         processor._resolve_logits_layout_plan(
             torch.empty(32 * 6, 3),
-            LogitsMetadata(forward_mode=ForwardMode.EXTEND),
+            LogitsMetadata(forward_mode=ForwardMode.EXTEND, query_shard=None),
         )
         is None
     )
@@ -284,7 +284,7 @@ def test_logits_processor_derives_dp_layout_from_effective_hidden_states(
 
     plan = processor._resolve_logits_layout_plan(
         torch.empty(5 * 6, 3),
-        LogitsMetadata(forward_mode=forward_mode),
+        LogitsMetadata(forward_mode=forward_mode, query_shard=None),
     )
 
     assert plan is not None
@@ -342,7 +342,7 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
     logits = processor._get_logits(
         hidden_states,
         lm_head,
-        LogitsMetadata(forward_mode=ForwardMode.DECODE),
+        LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None),
         plan=plan,
         require_full_vocab=False,
     )
@@ -376,7 +376,7 @@ def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
     logits = processor._get_logits(
         hidden_states,
         lm_head,
-        LogitsMetadata(forward_mode=ForwardMode.DECODE),
+        LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None),
         plan=plan,
         require_full_vocab=False,
     )

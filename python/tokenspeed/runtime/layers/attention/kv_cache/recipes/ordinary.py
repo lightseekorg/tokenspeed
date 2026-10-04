@@ -38,6 +38,7 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
 )
 from tokenspeed.runtime.layers.attention.configs.dsa import (
+    DSAConfig,
     dsa_history_gather_workspace_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
@@ -125,11 +126,27 @@ class OrdinaryRecipe(CacheRecipe):
     @override
     def workspace_bytes(self) -> int:
         """The query-context-parallel history gather workspace of GPU DSA:
-        one whole history of latent rows plus index-K rows and scales,
-        reserved before the arena is sized (``AttnConfig.__post_init__`` has
-        already pinned the family to GPU DSA for ``qcp_size > 1``)."""
+        one whole history of latent rows plus index-K rows packed in the
+        plane's format, reserved before the arena is sized
+        (``AttnConfig.__post_init__`` has already pinned the family to GPU DSA
+        for ``qcp_size > 1``). One workspace serves the target and the draft
+        (the draft gathers into the target's buffers), so the two must pack
+        index-K rows in the same format; a draft naming another is refused
+        here, where both configs are visible."""
         if self.attn_config.qcp_size == 1:
             return 0
+        target = self.attn_config.component(DSAConfig)
+        if self.draft_attn_config is not None and target is not None:
+            draft = self.draft_attn_config.component(DSAConfig)
+            draft_format = None if draft is None else draft.index_k_format
+            if draft_format != target.index_k_format:
+                raise ValueError(
+                    "query context parallelism shares one history gather "
+                    "workspace between the target and the draft, so both must "
+                    "store index keys in one format; the target's "
+                    f"index_k_format is {target.index_k_format!r}, the draft's "
+                    f"{draft_format!r}"
+                )
         return dsa_history_gather_workspace_bytes(
             self.attn_config, max_model_len=self.attn_config.context_len
         )

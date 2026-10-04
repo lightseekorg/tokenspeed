@@ -1092,6 +1092,33 @@ class CacheGroupRouterTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "single attention cache group"):
             _ = multi.chunked_prefill_metadata
 
+    def test_dsa_query_shard_surface_proxies_to_the_sole_leaf(self):
+        """A DSA model's own selection over KVP pages reaches the leaf's
+        sharded-extend plan and index-K history gather through the router."""
+        leaf = _StubLeaf(4)
+        meta = object()
+        gathered = (object(), None)
+        calls = []
+        leaf.require_query_shard_metadata = lambda: meta
+        leaf.gather_history_index_k = lambda layer_id, pool, group: (
+            calls.append((layer_id, pool, group)) or gathered
+        )
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.bind(_geometry(), {FULL: leaf})
+        self.assertIs(router.require_query_shard_metadata(), meta)
+        pool, group = object(), object()
+        self.assertIs(router.gather_history_index_k(3, pool, group), gathered)
+        self.assertEqual(calls, [(3, pool, group)])
+        multi, _ = self._router()
+        with self.assertRaisesRegex(RuntimeError, "single attention cache group"):
+            multi.require_query_shard_metadata()
+
     def test_draft_write_locations_ride_the_history_stack(self):
         """The drafters' in-graph slot math reads the router's address-stable
         full-history table in the stack: page-size invariant vs the raw table,

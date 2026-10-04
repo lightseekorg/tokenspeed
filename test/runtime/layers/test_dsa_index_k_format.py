@@ -26,6 +26,8 @@ and the pool writes keys in the plane's own dtype without converting.
 
 from __future__ import annotations
 
+from test.runtime.dsa_index_k_test_utils import index_k_pool
+
 import pytest
 import torch
 
@@ -144,13 +146,84 @@ def test_bf16_plane_costs_its_own_rows():
     )
 
 
+@pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
+def test_the_history_gather_workspace_plan_follows_the_plane_format(index_k_format):
+    """The query-context-parallel gather workspace the recipe reserves holds
+    one history of latent rows plus index-K rows in the plane's own width."""
+    from tokenspeed.runtime.layers.attention.configs.dsa import (
+        dsa_history_gather_workspace_bytes,
+    )
+
+    spec = _dsa_spec(index_k_format)
+    config = _attn_config(spec)
+    rows = 256  # context_len, already whole kernel pages of PREFIX
+    assert dsa_history_gather_workspace_bytes(
+        config, max_model_len=config.context_len
+    ) == rows * (spec.kv_cache_dim * 2 + index_k_row_bytes(HEAD_DIM, index_k_format))
+
+
+def _qcp_attn_config(spec: DSAConfig) -> AttnConfig:
+    """A query-context-parallel config (the device string and bf16 cache the
+    QCP checks require; nothing is allocated)."""
+    return AttnConfig(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        context_len=256,
+        max_bs=1,
+        prefix_granularity=PREFIX,
+        kernel_page_size=PREFIX,
+        kv_cache_quant_method="none",
+        pd_disaggregation_enabled=False,
+        qcp_size=2,
+        qcp_group=(0, 1),
+        components=(spec,),
+    )
+
+
+def _recipe(target: AttnConfig, draft: AttnConfig | None):
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+        OrdinaryRecipe,
+    )
+
+    return OrdinaryRecipe(
+        family="dsa",
+        server_args=SimpleNamespace(max_total_tokens=None),
+        model_config=SimpleNamespace(num_attention_layers=2),
+        attn_config=target,
+        draft_model_config=None if draft is None else SimpleNamespace(),
+        draft_attn_config=draft,
+        cache_budget_bytes=1 << 30,
+        probe_batch_rows=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+
+def test_the_recipe_refuses_a_draft_of_another_index_k_format():
+    """One history gather workspace serves the target and the draft under
+    query context parallelism, so the recipe that plans it refuses a draft
+    storing index keys in another format, naming both, before any leaf is
+    built; a draft of the same format shares the target's plan."""
+    from tokenspeed.runtime.layers.attention.configs.dsa import (
+        dsa_history_gather_workspace_bytes,
+    )
+
+    target = _qcp_attn_config(_dsa_spec("bf16"))
+    same = _recipe(target, _qcp_attn_config(_dsa_spec("bf16")))
+    assert same.workspace_bytes() == dsa_history_gather_workspace_bytes(
+        target, max_model_len=target.context_len
+    )
+    with pytest.raises(ValueError, match="'bf16', the draft's 'fp8_scaled'"):
+        _recipe(target, _qcp_attn_config(_dsa_spec("fp8_scaled"))).workspace_bytes()
+    # Without query context parallelism there is no workspace to share.
+    assert _recipe(_attn_config(_dsa_spec("bf16")), None).workspace_bytes() == 0
+
+
 def _pool(plane: torch.Tensor) -> DSATokenToKVPool:
-    pool = object.__new__(DSATokenToKVPool)
-    pool.index_head_dim = HEAD_DIM
-    pool.model_dtype = torch.bfloat16
-    pool.layerwise_load_tracker = None
-    pool.index_k_buffer = [plane]
-    return pool
+    return index_k_pool(plane, head_dim=HEAD_DIM, page_size=PREFIX)
 
 
 def test_bf16_plane_takes_the_keys_unquantized():
