@@ -1403,9 +1403,12 @@ The contract a model (in tree or a plugin) implements:
   the attention weights are head-replicated.
 * The model exit (`BaseCausalLM.exit_logits`, or `gather_sampled_rows` +
   `ctx.logits_rows_selected = True`) gathers only the sampled rows; a FULL
-  hidden capture stays the shard. The drafter's step 0 reads the shard's
-  slice of the shifted prefill ids and re-bases its `gather_ids` to the
-  shard.
+  hidden capture stays the shard. `ctx.gather_ids` keeps the batch's full
+  layout on every forward, the drafter's step 0 included (it reads the
+  shard's slice of the shifted prefill ids, nothing else is re-based):
+  `QueryShardPlan.local_sampled_ids(ctx.gather_ids)` is the one place that
+  cuts them to the shard, used by `gather_sampled_rows` and by any model
+  that narrows to its live rows itself.
 
 Eager only: the history gather runs in the attention break, so
 `--prefill-context-parallel-size > 1` requires `--disable-prefill-graph`

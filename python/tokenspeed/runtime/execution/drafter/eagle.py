@@ -282,9 +282,10 @@ class Eagle(BaseDrafter):
         ``[prefill_part || decode_part]`` under MIXED, full prefill chunks
         under EXTEND, ``base_model_output`` directly under DECODE. Under a
         query shard the ids are the shard's slice of the shifted prefill
-        ids and ``gather_ids`` are the sampled rows inside the shard,
-        re-based to it (the draft model gathers them across the group at
-        its exit, as the target does).
+        ids while ``gather_ids`` keep the batch's full layout, as on the
+        target's forward: the draft model's exit cuts them to its shard
+        through ``QueryShardPlan.local_sampled_ids`` when it gathers the
+        sampled rows across the group.
         """
         num_extends = draft_input.num_extends
         num_decodes = bs - num_extends
@@ -326,11 +327,6 @@ class Eagle(BaseDrafter):
                     raise RuntimeError(
                         "a query-sharded draft step runs pure extend rounds"
                     )
-                first = plan.local_sampled_first
-                gather_ids = (
-                    gather_ids[first : first + plan.local_sampled_rows]
-                    - plan.local_start
-                )
                 input_ids = input_ids[plan.local_slice]
         else:
             input_ids = draft_input.base_model_output

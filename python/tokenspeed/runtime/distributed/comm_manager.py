@@ -38,8 +38,9 @@ def gather_sampled_rows(
 ) -> torch.Tensor:
     """Gather the sampled rows of a sharded extend forward to every rank.
 
-    The last row of every request (``ctx.gather_ids``, sorted) lives on
-    exactly one rank; each rank selects the ones inside its shard and one
+    The last row of every request (``ctx.gather_ids``, the batch's full
+    layout, sorted) lives on exactly one rank; each rank selects the ones
+    inside its shard (``QueryShardPlan.local_sampled_ids``) and one
     all-gather with the plan's per-rank sampled-row counts concatenates them
     in rank order, which is request order. The model sets
     ``ctx.logits_rows_selected`` afterwards so the logits processor takes the
@@ -47,7 +48,8 @@ def gather_sampled_rows(
 
     Args:
         hidden_states: ``[local_rows, hidden]`` this rank's final rows.
-        ctx: The forward, with ``query_shard`` and ``gather_ids`` set.
+        ctx: The forward, with ``query_shard`` and the full-layout
+            ``gather_ids`` set.
         group: The query-context-parallel group.
 
     Returns:
@@ -63,11 +65,7 @@ def gather_sampled_rows(
             f"query shard rank {plan.rank} holds {plan.local_rows} rows, got "
             f"{hidden_states.shape[0]}"
         )
-    first = plan.local_sampled_first
-    local_ids = (
-        ctx.gather_ids[first : first + plan.local_sampled_rows] - plan.local_start
-    )
-    local = hidden_states.index_select(0, local_ids)
+    local = hidden_states.index_select(0, plan.local_sampled_ids(ctx.gather_ids))
     return token_all_gather(local, group, list(plan.sampled_rows_per_rank))
 
 

@@ -268,19 +268,26 @@ def test_the_executor_hands_the_model_its_shard_of_the_row_inputs():
     assert views["row_offset"] == 0
 
 
-def test_the_drafters_first_step_reads_its_shard_and_rebased_sampled_rows():
+def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
+    monkeypatch,
+):
     """Eagle's step-0 extend under a shard: the shifted prefill ids are the
-    shard's slice (after the last-token patch over the whole span) and the
-    draft's ``gather_ids`` are the sampled rows inside the shard, re-based,
-    so the draft model's exit gathers them like the target's."""
+    shard's slice (after the last-token patch over the whole span) while the
+    draft's ``gather_ids`` stay the batch's full layout, exactly as on the
+    target's context -- one convention, so the model exit's
+    ``gather_sampled_rows`` is the one place that cuts them to the shard."""
     from types import SimpleNamespace
 
+    from tokenspeed.runtime.distributed import comm_manager
+    from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.drafter.eagle import Eagle
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
-    lengths = [4, 1, 5]
+    lengths = [4, 1, 5]  # sampled rows 3, 4, 9 over shards [3, 3, 2, 2]
     total = sum(lengths)
+    rows = (torch.cumsum(torch.tensor(lengths), 0) - 1).tolist()
     shifted = torch.arange(100, 100 + total)
-    shifted[torch.tensor([3, 4, 9])] = -1  # the last token of every request
+    shifted[torch.tensor(rows)] = -1  # the last token of every request
     drafter = Eagle.__new__(Eagle)
     drafter.spec_num_tokens = 1
     drafter.input_buffers = SimpleNamespace(
@@ -288,6 +295,9 @@ def test_the_drafters_first_step_reads_its_shard_and_rebased_sampled_rows():
         input_lengths_buf=torch.tensor(lengths),
     )
     sampled = torch.tensor([7, 8, 9])
+    # The draft's final hidden rows on every rank: row r of the span is r.
+    hidden = torch.arange(total, dtype=torch.float32).unsqueeze(1)
+    gathered_by_rank = {}
     for rank in range(4):
         plan = QueryShardPlan.from_forward(
             total_tokens=total, input_lengths=lengths, size=4, rank=rank
@@ -301,11 +311,49 @@ def test_the_drafters_first_step_reads_its_shard_and_rebased_sampled_rows():
         ids, gather_ids = drafter._get_first_step_input(draft_input, 3, total)
         assert ids.shape[0] == plan.local_rows
         patched = shifted.clone()
-        patched[torch.tensor([3, 4, 9])] = sampled
+        patched[torch.tensor(rows)] = sampled
         assert torch.equal(ids, patched[plan.local_slice])
-        rows = (torch.cumsum(torch.tensor(lengths), 0) - 1).tolist()
-        local = [
+        assert gather_ids.tolist() == rows  # full layout, not re-based
+        # The exit selects this rank's sampled rows from its shard.
+        local = plan.local_sampled_ids(gather_ids)
+        expected = [
             r - plan.local_start for r in rows if plan.local_start <= r < plan.local_end
         ]
-        assert gather_ids.tolist() == local
-        assert len(local) == plan.local_sampled_rows
+        assert local.tolist() == expected
+        assert len(expected) == plan.local_sampled_rows == [0, 2, 0, 1][rank]
+        ctx = ForwardContext(
+            attn_backend=None,
+            token_to_kv_pool=None,
+            bs=3,
+            num_extends=3,
+            input_num_tokens=total,
+            forward_mode=ForwardMode.EXTEND,
+            output_layout=None,
+            gather_ids=gather_ids,
+            query_shard=plan,
+        )
+        monkeypatch.setattr(
+            comm_manager,
+            "token_all_gather",
+            lambda t, g, counts, r=rank: gathered_by_rank.setdefault(
+                r, (t.clone(), counts)
+            ),
+        )
+        comm_manager.gather_sampled_rows(
+            hidden[plan.local_slice], ctx, group=(0, 1, 2, 3)
+        )
+        contributed, counts = gathered_by_rank[rank]
+        assert counts == [0, 2, 0, 1]
+        # Rank 1 contributes rows 3 and 4, rank 3 row 9; the others none.
+        assert contributed.flatten().tolist() == [
+            r for r in rows if plan.local_start <= r < plan.local_end
+        ]
+    # The concatenation in rank order is the batch's sampled rows in request order.
+    assert (
+        torch.cat([gathered_by_rank[r][0] for r in range(4)]).flatten().tolist() == rows
+    )
+    # A shard's slice must not be handed in as the full layout.
+    with pytest.raises(ValueError, match="full layout"):
+        QueryShardPlan.from_forward(
+            total_tokens=total, input_lengths=lengths, size=4, rank=1
+        ).local_sampled_ids(torch.tensor([0, 1]))

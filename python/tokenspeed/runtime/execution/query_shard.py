@@ -37,6 +37,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import torch
+
 
 def scatter_count(num_tokens: int, size: int) -> list[int]:
     """Split ``num_tokens`` rows over ``size`` ranks, the first ranks one up.
@@ -172,6 +174,31 @@ class QueryShardPlan:
     @property
     def local_sampled_rows(self) -> int:
         return self.sampled_rows_per_rank[self.rank]
+
+    def local_sampled_ids(self, gather_ids: torch.Tensor) -> torch.Tensor:
+        """This rank's sampled rows as indices into its shard.
+
+        The one place the batch's ``gather_ids`` (full-layout rows, the last
+        row of every request, sorted) are cut to a shard: ``ForwardContext``
+        carries the full layout on every forward, the target's and the
+        drafter's step 0 alike, and whoever selects local rows -- the model
+        exit's ``gather_sampled_rows``, a draft that narrows to live rows --
+        goes through here.
+
+        Args:
+            gather_ids: ``[bs]`` batch-global sampled rows (``ctx.gather_ids``).
+
+        Returns:
+            ``[sampled_rows_per_rank[rank]]`` rows re-based to the shard.
+        """
+        if gather_ids.shape[0] != self.sampled_rows_total:
+            raise ValueError(
+                f"query shard: {gather_ids.shape[0]} gather ids for a plan of "
+                f"{self.sampled_rows_total} sampled rows; pass the batch's full "
+                "layout, not a shard's slice"
+            )
+        first = self.local_sampled_first
+        return gather_ids[first : first + self.local_sampled_rows] - self.local_start
 
     def rows_for_collective(self, num_tokens: int | None) -> tuple[int, ...]:
         """Per-rank row counts of the rows a collective moves.
