@@ -155,7 +155,9 @@ permutation of bytes, so the result is bitwise the full-K GEMM a TP1 or
 replicated layer computes -- the point when a prefill engine with such a
 layer must agree with the decode engine. It moves about the bytes of the
 reduce-scatter it replaces and needs unquantized `o_proj` / `down_proj`;
-`attn` requires head TP and `attn+dense` also requires dense TP.
+`attn` requires head TP and `attn+dense` also requires a dense TP group wider
+than attention TP (never under query context parallelism, whose dense group
+is 1 or the attention TP width).
 
 The decode preset for a 128-way DP MLA model is thus one node-local group
 of 8 reused three times:

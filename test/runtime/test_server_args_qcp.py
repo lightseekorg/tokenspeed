@@ -129,10 +129,8 @@ def test_head_tp_over_the_query_shards():
     """``--attn-head-tp-size`` equal to the shard group is the prefill-role
     head-TP layout: the head group is the shard group, ``--tp-batch-invariant
     attn`` selects the column-parallel o_proj, and none of the decode-only
-    gates (role, decode-shaped autotune, generation budget) apply."""
-    from tokenspeed.runtime.engine.request_handler import RequestHandler
-    from tokenspeed.runtime.engine.scheduler_utils import RETRACTION_SAFE_STEPS
-
+    gates (role, decode-shaped autotune, generation budget) apply -- they key
+    on ``head_tp_serves_decode_only``, False here."""
     args = prepare_server_args(BASE + ["--attn-head-tp-size", "2"])
     args.mapping.rank = 1
     attn = args.mapping.attn
@@ -148,13 +146,6 @@ def test_head_tp_over_the_query_shards():
     assert bi.tp_batch_invariant == "attn"
     assert bi.mapping.attn.has_head_tp
 
-    # The generation budget is the decode-only engine's rule.
-    handler = RequestHandler.__new__(RequestHandler)
-    handler.max_new_tokens_budget = (
-        RETRACTION_SAFE_STEPS if attn.head_tp_serves_decode_only else None
-    )
-    assert handler.max_new_tokens_budget is None
-
 
 @pytest.mark.parametrize(
     "argv,match",
@@ -169,6 +160,27 @@ def test_head_tp_over_the_query_shards():
 def test_head_tp_on_the_prefill_role_is_the_shard_group(argv, match):
     with pytest.raises(ValueError, match=match):
         prepare_server_args(BASE + argv)
+
+
+@pytest.mark.parametrize("dense_tp", ["1", "2"])
+def test_the_batch_invariant_dense_tail_has_no_layout_under_query_sharding(dense_tp):
+    """``--tp-batch-invariant attn+dense`` replaces the token reduce-scatter
+    of a dense group wider than attention TP; under query sharding the dense
+    group is 1 or the attention TP width, so the selection is refused at
+    argument resolution (CommManager would refuse it at construction)."""
+    argv = BASE + [
+        "--attn-head-tp-size",
+        "2",
+        "--dense-tp-size",
+        dense_tp,
+        "--tp-batch-invariant",
+        "attn+dense",
+    ]
+    with pytest.raises(ValueError, match="only --tp-batch-invariant attn applies"):
+        prepare_server_args(argv)
+    args = prepare_server_args(argv[:-1] + ["attn"])
+    assert args.tp_batch_invariant == "attn"
+    assert args.mapping.dense.tp_size == int(dense_tp)
 
 
 def test_head_tp_on_the_prefill_role_still_needs_the_shard():

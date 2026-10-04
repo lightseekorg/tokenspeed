@@ -1045,11 +1045,27 @@ class ServerArgs:
                 "column-parallel over the attention head TP group and needs "
                 "--attn-head-tp-size > 1"
             )
-        if self.tp_batch_invariant == "attn+dense" and not self.mapping.dense.has_tp:
+        if (
+            self.tp_batch_invariant == "attn+dense"
+            and self.mapping.dense.tp_size <= attn.tp_size
+        ):
+            # The batch-invariant dense tail replaces the token reduce-scatter
+            # of a dense group wider than attention TP (CommManager refuses
+            # it otherwise). Under query sharding the dense group is 1 or the
+            # attention TP width (validate_qcp), so the selection has no
+            # layout to apply to there.
             raise ValueError(
                 "--tp-batch-invariant attn+dense makes the dense down_proj "
-                "column-parallel over the dense TP group and needs "
-                "--dense-tp-size > 1"
+                "column-parallel over the dense TP group and needs a dense TP "
+                f"group wider than attention TP (got --dense-tp-size "
+                f"{self.mapping.dense.tp_size} with attention TP {attn.tp_size})"
+                + (
+                    "; under --prefill-context-parallel-size the dense group is 1 "
+                    "or the attention TP width, so only --tp-batch-invariant attn "
+                    "applies"
+                    if attn.has_qcp
+                    else ""
+                )
             )
         if attn.has_dp and self.mapping.lm_head.has_tp and self.dp_sampling:
             raise ValueError(
