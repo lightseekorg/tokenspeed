@@ -303,19 +303,48 @@ indexer's top-k over pre-gathered rows, RoPE, the GEMMs — see for each row
 exactly the operands a single GPU would, so a row's bits do not depend on
 which rank computes it or on the batch it shares: the layout preserves run
 and batch invariance by construction. Head TP over the query shards
-(`--attn-head-tp-size` equal to the shard group) adds only the head
-exchanges — all-to-all transposes, permutations of bytes — and the `o_proj`
-tail. What can differ from the TP8 prefill baseline is therefore the output
-projection's form alone, and the statement is: **QCP is bitwise the TP8
-engine iff `o_proj` takes the same form.** Head TP with the row-parallel
-`o_proj` folds the same per-rank head partials TP8 does (the ordered fold
-under rl-bitwise) and reproduces TP8. The head-replicated default (one GEMM
-over every head, the TP1 / trainer form) and head TP with
-`--tp-batch-invariant attn` (full-K column-parallel GEMM, a transpose back)
-reproduce the TP1 / decode-side batch-invariant form instead — the one the
-RL trainer alignment wants, and the same gap to TP8 as between the decode
-side's batch-invariant layout and an ordered fold. The drafter's decode steps
-on a sharded engine merge partials across the KVP page owners (the
+(`--attn-head-tp-size` equal to the shard group) adds the head exchanges —
+all-to-all transposes, permutations of bytes — and the `o_proj` tail. What
+can differ from the TP8 prefill baseline is therefore the output projection
+alone: its form, and for the row-parallel form the order in which the
+per-rank head partials are summed.
+
+Head TP with the row-parallel `o_proj` computes the same per-rank partials
+TP8 does, but reduce-scatters them to the shard rows where TP8 all-reduces,
+and under rl-bitwise (`--batch-invariant-collectives`) the two collectives
+do not take the same route (`comm_backend/auto.py: route`): a
+reduce-scatter always takes the ordered fold (ranks 0..W-1 left to right in
+fp32, one rounding), while a 2-D bf16 all-reduce on a multicast-reachable
+group takes the NVLS in-switch reduction through a fixed issuer, whose
+association order is a property of the GPU set and has been measured to
+differ between sets (`comm_backend/self_check.py`). So **QCP with head TP
+is bitwise the TP8 engine only when both engines sum `o_proj` in the same
+order** — both on the fold, i.e. the TP8 engine launched with
+`--force-deterministic-rsag` (or pinned there by its self-check); that is
+also what makes the comparison hold across machines, which the in-switch
+order does not promise. Within the QCP engine itself the two forward forms
+reduce differently too: the sharded extend reduce-scatters (the fold), the
+drafter's replicated decode steps all-reduce (the in-switch route where it
+applies); `--force-deterministic-rsag` on the engine pins both to the fold.
+Each form is run- and batch-invariant on its own either way. (Making the
+extend's tail all-reduce and slice, so one engine sums one way and matches
+TP8 on the same GPU set without the flag, was considered and left out: it
+moves W× the reduce-scatter's bytes on every layer of a prefill engine
+whose point is the extend, and buys nothing across GPU sets.) Known gap: the
+GPU validation of this layout against a plain TP4 prefill engine matched
+tokens and logprobs bitwise on prompts within `index_topk`, while one
+prompt whose context exceeded it — the indexer's top-k selecting a strict
+subset of the history — kept the tokens but diverged in logprobs from
+position 0 (max |Δ| 3.96e-2); unresolved, so the statement above is
+validated within `index_topk` only.
+
+The head-replicated default (one GEMM over every head, the TP1 / trainer
+form) and head TP with `--tp-batch-invariant attn` (full-K column-parallel
+GEMM, a transpose back) have no cross-rank sum in `o_proj` at all and
+reproduce the TP1 / decode-side batch-invariant form — the one the RL
+trainer alignment wants, and the same gap to TP8 as between the decode
+side's batch-invariant layout and a cross-rank sum. The drafter's decode
+steps on a sharded engine merge partials across the KVP page owners (the
 page-sharded KV of `--decode-context-parallel-size`;
 `combine_attention_partials`, every head under the head-replicated layout,
 the attention-TP slice under head TP), with the ordered fold under

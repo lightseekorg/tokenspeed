@@ -1424,18 +1424,28 @@ class ServerArgs:
         # activation and folds a token's slots in fp32 slot order.
         self.moe_combine_order = "slot"
         # Layouts stay explicit: the envelope does not fold them in. A
-        # head-sharded o_proj that still reduce-scatters (or all-reduces)
-        # folds the head partials in rank order -- batch-invariant, but not
-        # the bits of the full-K GEMM a replicated or column-parallel o_proj
-        # computes, so the other side of a PD pair with that layout disagrees
-        # with this one (the fold is the plain TP8 form, which a query-sharded
-        # prefill engine with row-parallel o_proj reproduces exactly).
+        # head-sharded o_proj that still sums its head partials across ranks
+        # is batch-invariant under the envelope, but its bits are not the
+        # full-K GEMM a replicated or column-parallel o_proj computes, and
+        # they equal a TP-W engine's all-reduced o_proj only when both sides
+        # sum in the same order: the exchanging forward's reduce-scatter
+        # always takes the ordered fold, while an all-reduce (the TP-W
+        # engine's, and the replicated-row decode steps of a query-sharding
+        # engine) takes the in-switch reduction where multicast reaches, whose
+        # order is a property of the GPU set (comm_backend/self_check.py).
+        # --force-deterministic-rsag on the all-reducing side pins it to the
+        # fold; docs/design/numerics.md, "Layout invariance of query context
+        # parallelism".
         if self.mapping.attn.has_head_tp and self.tp_batch_invariant == "none":
             logger.warning(
                 "--numerics rl-bitwise with --attn-head-tp-size > 1 but without "
-                "--tp-batch-invariant attn: the o_proj reduce-scatter is an "
-                "ordered fold, which is batch-invariant but differs from the "
-                "full-K o_proj of a TP1 or --tp-batch-invariant engine"
+                "--tp-batch-invariant attn: the o_proj head partials are summed "
+                "across ranks (the ordered fold for the reduce-scatter, the "
+                "in-switch all-reduce where it applies), which is batch-invariant "
+                "but differs from the full-K o_proj of a TP1 or --tp-batch-invariant "
+                "engine, and equals a TP-W engine's o_proj only when both sides "
+                "sum in the same order (--force-deterministic-rsag on the "
+                "all-reducing side)"
             )
 
     def resolve_disaggregation(self):

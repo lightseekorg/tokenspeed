@@ -598,12 +598,19 @@ to ≈ 24 MB per rank at `N = 8`; a five-layer pipeline stage of a model with
 two attention instances per layer saves ≈ 1.7 GB per rank, which the KV
 cache takes.
 
-Numerics: with row-parallel `o_proj` the shard group folds the same per-rank
-head partials the plain TP8 prefill engine does, so QCP with head TP is
-bitwise the TP8 engine; with `--tp-batch-invariant attn` it is bitwise the
-TP1 / head-replicated form the decode engine's batch-invariant layout
-computes (`docs/design/numerics.md`, "Layout invariance of query context
-parallelism").
+Numerics: with row-parallel `o_proj` the shard group computes the same
+per-rank head partials the plain TP8 prefill engine does and reduce-scatters
+them where TP8 all-reduces; the bits agree only when both engines sum in the
+same order. Under `--numerics rl-bitwise` the reduce-scatter always takes the
+ordered fold while an all-reduce takes the in-switch reduction where
+multicast reaches (an order that is per GPU set), so the TP8 engine must be
+pinned to the fold with `--force-deterministic-rsag` for the two to be
+bitwise. The QCP engine's own drafter decode steps all-reduce `o_proj`
+(replicated rows); `--force-deterministic-rsag` on it pins them to the fold
+as well. With `--tp-batch-invariant attn` there is no cross-rank sum in
+`o_proj`, and QCP is bitwise the TP1 / head-replicated form the decode
+engine's batch-invariant layout computes (`docs/design/numerics.md`, "Layout
+invariance of query context parallelism").
 
 A preset for an eight-GPU prefill engine with head TP and the
 batch-invariant `o_proj`:
@@ -620,7 +627,8 @@ tokenspeed serve <dsa-model> \
 
 Drop `--attn-head-tp-size 8 --tp-batch-invariant attn` for the
 head-replicated layout (the same bits, 189 MB more attention weight per
-instance per rank), or `--tp-batch-invariant attn` alone for the TP8 form.
+instance per rank), or `--tp-batch-invariant attn` alone for TP8's head
+partials, summed in the fold's order.
 `--tp-batch-invariant attn` needs an unquantized `o_proj`, as on the decode
 side.
 
