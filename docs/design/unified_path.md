@@ -1479,7 +1479,11 @@ layer exists for the slice), the DCP arm as attention TP runs it, and the
 tail all-reduces the row-parallel partials (or all-gathers the
 batch-invariant hidden shards), so the layer's rows stay replicated. The two
 forward forms of this engine are thus the sharded extend and the replicated
-decode step. The expanded (dense MLA) prefill keeps refusing head TP: only
+decode step, and nothing else runs on it: the startup autotune's dummy extend
+carries the shard plan a real extend of its rows would
+(`PrefillGraph.make_dummy_batch`, the model taking its slice as
+`_run_target_forward` does), rather than an unsharded replicated-row extend
+the contract does not list. The expanded (dense MLA) prefill keeps refusing head TP: only
 the absorbed sparse prefill can take the exchange. The alternative to this fork — sharding the drafter's decode
 rows by a plan too, so every forward exchanges — needs a sharded DSA decode
 arm (history gathers for decode rows) that does not exist; the fork is the

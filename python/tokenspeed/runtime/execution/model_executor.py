@@ -982,19 +982,24 @@ class ModelExecutor:
             else:
                 bs = dummy_batch_size(num_tokens, self.config.context_len)
                 ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
+                # The model's rows: the span, or this rank's query shard of
+                # it, as on a real extend (_run_target_forward).
+                rows = (
+                    slice(0, num_tokens)
+                    if ctx.query_shard is None
+                    else ctx.query_shard.local_slice
+                )
                 positions = (
-                    ib.mrope_positions_buf[:, :num_tokens]
+                    ib.mrope_positions_buf[:, rows]
                     if self.config.model_is_mrope
-                    else ib.positions_buf[:num_tokens]
+                    else ib.positions_buf[rows]
                 )
                 with active_forward(ctx):
                     self.model_runner.forward(
                         ctx=ctx,
-                        input_ids=ib.input_ids_buf[:num_tokens],
+                        input_ids=ib.input_ids_buf[rows],
                         positions=positions,
-                        **self._model_input_kwargs(
-                            num_tokens, ctx.bs, slice(0, num_tokens)
-                        ),
+                        **self._model_input_kwargs(num_tokens, ctx.bs, rows),
                     )
                 if self.drafter is not None:
                     self._autotune_draft_experts(num_tokens)
