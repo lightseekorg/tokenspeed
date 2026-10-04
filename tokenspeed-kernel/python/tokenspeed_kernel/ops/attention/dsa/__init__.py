@@ -85,16 +85,27 @@ def _blockscaled_signature_and_scales(
 
 LSE_LN = math.log2(math.e)
 
-# The order a sparse core reduces a token's selected slots in
-# (``dsa_decode`` / ``dsa_prefill`` ``slot_order``):
+# The order a token's selected KV rows are reduced in: established by the
+# top-k leaf (``dsa_decode_topk`` / ``dsa_prefill_topk`` ``slot_order``),
+# which emits its selection in that order, and kept by the sparse core
+# (``dsa_decode`` / ``dsa_prefill`` ``slot_order``), which reduces the slots
+# as they arrive:
 #
 # ``"selection"``
-#     The slots as the top-k leaf emitted them. Every registered core serves
-#     this form; declaring the trait is optional.
+#     The top-k leaf's own order (its segment layout, its tie order). Every
+#     registered leaf and core serves this form; declaring the trait is
+#     optional.
 # ``"sorted"``
-#     Ascending slot order, whatever the top-k leaf's tie order, so the
-#     reduction is batch-invariant whenever the selected set is. Only cores
-#     declaring ``slot_order={"sorted", ...}`` serve it and receive the kwarg.
+#     Ascending POSITION order of the selected rows, whatever the leaf's tie
+#     order, so the reduction is one function of the selected set: invariant
+#     across batch compositions, runs and engines. Only the top-k leaf knows a
+#     slot's position, so only leaves declaring ``slot_order={"sorted", ...}``
+#     serve it and receive the kwarg; a core declaring the trait promises to
+#     reduce in the emitted order. Ascending *slot* order is not a canonical
+#     order: a request's pages are allocated in arbitrary id order once pages
+#     recycle, so the same positions map to differently ordered slots on
+#     another engine (or the same engine later), and the reduction's bits
+#     would follow the page placement.
 #
 # The default form first, as the host's ``DSA_SLOT_ORDERS`` lists them.
 SLOT_ORDERS = ("selection", "sorted")
@@ -169,22 +180,31 @@ def _candidate_lens_cpu_kwargs(kernel, candidate_lens_cpu: torch.Tensor | None) 
     return {"candidate_lens_cpu": candidate_lens_cpu}
 
 
-def _slot_order_kwargs(kernel, slot_order: str) -> dict:
-    """The ``slot_order`` kwarg for a selected core, refusing what it cannot do.
+def _slot_order_kwargs(kernel, slot_order: str, *, role: str) -> dict:
+    """The ``slot_order`` kwarg for a selected leaf or core, refusing what it cannot do.
 
-    A core declaring the trait was already matched on it and takes the
-    kwarg. A silent core reduces the slots as selected: it serves
-    ``"selection"`` implicitly and cannot promise ``"sorted"``.
+    A kernel declaring the trait was already matched on it and takes the
+    kwarg. A silent one serves ``"selection"`` implicitly -- a top-k leaf
+    (``role="top-k"``) emits its own order, a core (``role="core"``) reduces
+    the slots as they arrive -- and cannot promise ``"sorted"``.
     """
+    if slot_order not in SLOT_ORDERS:
+        raise ValueError(
+            f"slot_order must be one of {list(SLOT_ORDERS)}, got {slot_order!r}"
+        )
     spec = KernelRegistry.get().get_by_name(kernel.name)
     declared = None if spec is None else spec.traits.get("slot_order")
     if declared is None:
         if slot_order == "sorted":
+            what = (
+                "emits its selection in its own order"
+                if role == "top-k"
+                else "reduces the selected slots in the top-k leaf's order"
+            )
             raise ValueError(
                 f"DSA kernel {kernel.name!r} does not declare the slot_order "
-                "trait: it reduces the selected slots in the top-k leaf's order "
-                "and cannot promise slot_order='sorted'; select a kernel "
-                "declaring the trait through solution="
+                f"trait: it {what} and cannot promise slot_order='sorted'; "
+                "select a kernel declaring the trait through solution="
             )
         return {}
     return {"slot_order": slot_order}
@@ -248,9 +268,11 @@ def dsa_decode(
         solution: Optional kernel solution to force through normal selection.
         slot_order: The order the selected slots are reduced in, one of
             ``SLOT_ORDERS``: ``"selection"`` (as the top-k leaf emitted them;
-            every kernel) or ``"sorted"`` (ascending; only kernels declaring
-            the ``slot_order`` trait, which receive it as a keyword). Required
-            keyword.
+            every kernel) or ``"sorted"`` (the ascending position order the
+            top-k leaf emitted under the same ``slot_order``; only cores
+            declaring the ``slot_order`` trait, which receive it as a keyword
+            and promise to reduce in the emitted order rather than by slot).
+            Required keyword.
 
     Returns:
         Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
@@ -292,7 +314,7 @@ def dsa_decode(
         solution=solution,
         override=override,
     )
-    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order)
+    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="core")
     shape_params = {
         "batch_size": batch_size,
         "q_len": q_len,
@@ -421,7 +443,7 @@ def dsa_prefill(
         solution=solution,
         override=override,
     )
-    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order)
+    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="core")
     shape_params = {
         "batch_size": batch_size,
         "q_len": q_len,
@@ -562,6 +584,7 @@ def dsa_prefill_topk(
     local_tokens: int = 0,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
+    slot_order: str,
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -620,6 +643,12 @@ def dsa_prefill_topk(
             [tokens, topk].
         lens_out: Optional contiguous int32 output buffer on q's device with
             shape [tokens].
+        slot_order: The order the leaf emits each row's selection in, one of
+            ``SLOT_ORDERS``: ``"selection"`` (the leaf's own layout and tie
+            order; every leaf) or ``"sorted"`` (ascending position order; only
+            leaves declaring the ``slot_order`` trait, which receive it as a
+            keyword -- the sparse core then reduces in that order). Required
+            keyword.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -720,6 +749,7 @@ def dsa_prefill_topk(
         override=override,
     )
     candidate_lens_cpu_kwargs = _candidate_lens_cpu_kwargs(kernel, candidate_lens_cpu)
+    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="top-k")
     shape_params = {
         "tokens": q.shape[0],
         "workspace_rows": kv_workspace_slots.numel(),
@@ -753,6 +783,7 @@ def dsa_prefill_topk(
             "out": out,
             "lens_out": lens_out,
             **candidate_lens_cpu_kwargs,
+            **slot_order_kwargs,
         }
         if index_k_bf16 is not None:
             # Only a leaf declaring INDEX_K_WORKSPACE_ROWS_FEATURE for the
@@ -789,6 +820,7 @@ def dsa_decode_topk(
     local_tokens: int = 0,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
+    slot_order: str,
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -839,6 +871,8 @@ def dsa_decode_topk(
             [tokens, topk].
         lens_out: Optional contiguous int32 output buffer on q's device with
             shape [tokens].
+        slot_order: The order the leaf emits each row's selection in, as for
+            :func:`dsa_prefill_topk`. Required keyword.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -929,6 +963,7 @@ def dsa_decode_topk(
         solution=solution,
         override=override,
     )
+    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="top-k")
     shape_params = {
         "tokens": q.shape[0],
         "max_pages": block_table.shape[1],
@@ -962,6 +997,7 @@ def dsa_decode_topk(
             "plan": plan,
             "out": out,
             "lens_out": lens_out,
+            **slot_order_kwargs,
         }
         if topk_layout == "logical_offsets":
             kernel_kwargs["topk_layout"] = topk_layout

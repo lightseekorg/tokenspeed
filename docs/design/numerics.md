@@ -126,12 +126,19 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               batch_invariant=True); the tuned top-k
 │   │                               kernels switch algorithm and CTA split
 │   │                               with the row count, which moves ties
-│   ├── sorted slot reduction       dsa_slot_order=sorted: the sparse cores
-│   │                               reduce a token's selected slots in
-│   │                               ascending order, not in the top-k leaf's
-│   │                               tie order (dsa_decode / dsa_prefill
-│   │                               slot_order trait; silent cores are
-│   │                               refused rather than assumed)
+│   ├── position-order reduction    dsa_slot_order=sorted: a token's selected
+│   │                               KV rows are reduced in ascending POSITION
+│   │                               order, not in the top-k leaf's tie order
+│   │                               and never in physical slot order (a
+│   │                               request's pages are allocated in arbitrary
+│   │                               id order once pages recycle, so slot order
+│   │                               follows the page placement and differs
+│   │                               between runs and engines). The top-k leaf
+│   │                               emits that order (dsa_decode_topk /
+│   │                               dsa_prefill_topk slot_order trait) and the
+│   │                               sparse core keeps it (dsa_decode /
+│   │                               dsa_prefill slot_order trait); silent
+│   │                               kernels are refused rather than assumed
 │   └── per-row GEMMs               fixed-order GEMM leaves (see aok below)
 ├── logprob.topology-invariant      (deferred) TP-invariant projection
 │                                   layouts on top of the vocab-block
