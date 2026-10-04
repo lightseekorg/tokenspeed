@@ -999,11 +999,14 @@ def test_a_sharded_forward_gathers_the_planned_rows_then_the_sampled_rows(
 
         return gather
 
-    # The planned-row gather (processor) and the sampled-row gather (comm_manager).
+    # The planned-row gather (processor) and the sampled-row gather
+    # (comm_manager.gather_sampled_rows): both byte-preserving row gathers.
     monkeypatch.setattr(
         logits_processor_module, "token_all_gather_rows", fake_gather("planned")
     )
-    monkeypatch.setattr(comm_manager_module, "token_all_gather", fake_gather("sampled"))
+    monkeypatch.setattr(
+        comm_manager_module, "token_all_gather_rows", fake_gather("sampled")
+    )
 
     for rank in range(4):
         plan = QueryShardPlan.from_forward(
@@ -1054,6 +1057,90 @@ def test_a_sharded_forward_gathers_the_planned_rows_then_the_sampled_rows(
             rtol=0,
             atol=0,
         )
+
+
+@pytest.mark.parametrize("taps", [0, 1, 3])
+def test_a_last_capture_under_a_shard_is_the_gathered_sampled_rows(monkeypatch, taps):
+    """A LAST hidden capture under a query shard stores the batch's gathered
+    ``[bs, hidden]`` rows, whole on every rank -- the aux taps' (Eagle3) when
+    the model has them, concatenated, else the final hidden's -- and each
+    tap costs one sampled-row gather only on a LAST capture: a FULL or NULL
+    capture never selects the taps, so the forward spends no collective on
+    them. ``taps=0`` is a model without taps."""
+    from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    lengths = [4, 1, 5]  # rows 0..9; sampled rows 3, 4, 9; shards [3, 3, 2, 2]
+    total = sum(lengths)
+    gather_ids = torch.cumsum(torch.tensor(lengths), 0) - 1
+    torch.manual_seed(1)
+    hidden = torch.randn(total, 2)
+    aux = [torch.randn(total, 2) + 10 * (i + 1) for i in range(taps)]
+    lm_head = SimpleNamespace(weight=torch.randn(8, 2))
+    gathered: list[torch.Tensor] = []
+    current: dict[str, QueryShardPlan] = {}
+
+    def fake_gather(tensor, group, counts):
+        assert group == (0, 1, 2, 3) and list(counts) == [0, 2, 0, 1]
+        # The final rows are gathered first, then each tap in order; this
+        # rank contributes its sampled rows of that source, and the collective
+        # hands back every rank's in rank order: the batch's sampled rows.
+        source = (hidden, *aux)[len(gathered)]
+        plan = current["plan"]
+        local = source[plan.local_slice][plan.local_sampled_ids(gather_ids)]
+        assert torch.equal(tensor, local)
+        gathered.append(tensor)
+        return source[gather_ids]
+
+    monkeypatch.setattr(comm_manager_module, "token_all_gather_rows", fake_gather)
+
+    modes = (CaptureHiddenMode.LAST, CaptureHiddenMode.FULL, CaptureHiddenMode.NULL)
+    for rank in range(4):
+        plan = QueryShardPlan.from_forward(
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+        )
+        current["plan"] = plan
+        shard = hidden[plan.local_slice]
+        aux_shard = [a[plan.local_slice] for a in aux] or None
+        for mode in modes:
+            gathered.clear()
+            proc = _sharded_processor(monkeypatch, 4, rank)
+            out = proc(
+                input_ids=None,
+                hidden_states=shard,
+                lm_head=lm_head,
+                logits_metadata=LogitsMetadata(
+                    forward_mode=ForwardMode.EXTEND,
+                    capture_hidden_mode=mode,
+                    gather_ids=gather_ids,
+                    query_shard=plan,
+                ),
+                aux_hidden_states=aux_shard,
+            )
+            torch.testing.assert_close(
+                out.next_token_logits,
+                (hidden[gather_ids] @ lm_head.weight.T).float(),
+                rtol=0,
+                atol=0,
+            )
+            if mode is CaptureHiddenMode.LAST:
+                assert len(gathered) == 1 + taps
+                expected = (
+                    torch.cat([a[gather_ids] for a in aux], dim=-1)
+                    if taps
+                    else hidden[gather_ids]
+                )
+                torch.testing.assert_close(out.hidden_states, expected, rtol=0, atol=0)
+                assert out.hidden_states.shape == (3, 2 * max(taps, 1))
+            else:
+                assert len(gathered) == 1  # the final hidden rows only
+                if mode is CaptureHiddenMode.FULL:
+                    expected = torch.cat(aux_shard, dim=-1) if taps else shard
+                    torch.testing.assert_close(
+                        out.hidden_states, expected, rtol=0, atol=0
+                    )
+                else:
+                    assert out.hidden_states is None
 
 
 def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):

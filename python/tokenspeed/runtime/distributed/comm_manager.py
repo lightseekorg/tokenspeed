@@ -26,6 +26,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     all_to_all_transpose,
     token_all_gather,
+    token_all_gather_rows,
     token_reduce_scatter,
 )
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
@@ -47,7 +48,11 @@ def gather_sampled_rows(
     shard (``QueryShardPlan.local_sampled_ids``) and one all-gather with the
     plan's per-rank sampled-row counts concatenates them in rank order, which
     is request order. The logits processor runs this in place of its
-    ``hidden_states[gather_ids]`` selection on a sharded forward.
+    ``hidden_states[gather_ids]`` selection on a sharded forward, for the
+    final hidden rows and for a LAST capture's aux hidden rows alike; the
+    gather is byte-preserving (:func:`token_all_gather_rows`), so any row
+    dtype and width travel, the per-rank sampled-row counts being whatever
+    the batch makes them.
 
     Args:
         hidden_states: ``[local_rows, hidden]`` this rank's final rows.
@@ -65,7 +70,7 @@ def gather_sampled_rows(
             f"{hidden_states.shape[0]}"
         )
     local = hidden_states.index_select(0, plan.local_sampled_ids(gather_ids))
-    return token_all_gather(local, group, list(plan.sampled_rows_per_rank))
+    return token_all_gather_rows(local, group, list(plan.sampled_rows_per_rank))
 
 
 def moe_input_row_segments(
@@ -194,8 +199,9 @@ class CommManager:
     all-gather / reduce-scatter path over the shard's per-rank row table,
     without one (decode steps, idle) the replicated all-reduce legs, which
     is why dense TP and the MoE TP x EP group must each be 1 or the
-    attention TP width (``validate_qcp``). The model exit gathers only the
-    sampled rows. The flag must agree with ``mapping.attn.has_qcp``: a model
+    attention TP width (``validate_qcp``). The logits processor gathers only
+    the sampled rows of the shard (:func:`gather_sampled_rows` over its TP
+    group). The flag must agree with ``mapping.attn.has_qcp``: a model
     that does not slice its rows cannot run under a query-sharding mapping,
     and one that does cannot run without it.
 
@@ -579,27 +585,12 @@ class CommManager:
     def needs_final_all_gather(self) -> bool:
         """Whether the model output must gather the final layer's rows
         (replicated-row layouts whose attention legs reduce-scatter; a
-        query-sharded model never scatters, and gathers sampled rows at the
-        model exit instead, see :func:`gather_sampled_rows`)."""
+        query-sharded model never scatters, and the logits processor gathers
+        only the sampled rows of its shard, see :func:`gather_sampled_rows`)."""
         return (
             not self.query_sharded
             and self.mapping.has_attn_tp
             and not self.use_all_reduce(self.is_moe)
-        )
-
-    def gather_sampled_rows(
-        self, hidden_states: torch.Tensor, ctx: ForwardContext
-    ) -> torch.Tensor:
-        """A sharded forward's model exit: every rank's sampled rows, request
-        order (:func:`gather_sampled_rows` over the query-context-parallel
-        group)."""
-        plan = self._shard(ctx)
-        if plan is None:
-            raise RuntimeError("gather_sampled_rows serves sharded forwards")
-        if ctx.gather_ids is None:
-            raise RuntimeError("gather_sampled_rows needs ctx.gather_ids")
-        return gather_sampled_rows(
-            hidden_states, plan, ctx.gather_ids, group=self.mapping.attn.qcp_group
         )
 
     def post_final_norm_comm(

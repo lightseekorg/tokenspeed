@@ -359,7 +359,7 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
         assert len(expected) == plan.local_sampled_rows == [0, 2, 0, 1][rank]
         monkeypatch.setattr(
             comm_manager,
-            "token_all_gather",
+            "token_all_gather_rows",
             lambda t, g, counts, r=rank: gathered_by_rank.setdefault(
                 r, (t.clone(), counts)
             ),

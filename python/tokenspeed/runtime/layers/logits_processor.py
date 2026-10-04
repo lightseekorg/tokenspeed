@@ -589,7 +589,9 @@ class LogitsProcessor(nn.Module):
         (every rank ends with the batch's ``[bs, hidden]`` rows in request
         order, so the LM head and the vocab all-gather run as without a
         shard). A FULL hidden capture is the rows as given -- the shard under
-        a shard, which is what a drafter's extend step consumes.
+        a shard, which is what a drafter's extend step consumes; a LAST
+        capture is the selected ``[bs, hidden]`` rows (the aux taps', when the
+        model has them), whole on every rank.
         """
         shard = self._query_shard(logits_metadata)
         # A model may finish a cache-only chunk without any logits rows.
@@ -623,11 +625,20 @@ class LogitsProcessor(nn.Module):
         input_token_logprobs = None
         if logits_metadata.input_logprob_rows is not None:
             input_token_logprobs = self.compute_input_token_logprobs(
-                hidden_states, lm_head, logits_metadata
+                hidden_states, lm_head, logits_metadata, shard
             )
 
         # Get the last hidden states and last logits for the next token prediction
         gather_ids = logits_metadata.gather_ids
+        # Only a LAST capture stores the sampled rows of the aux hidden states
+        # (Eagle3's layer taps), so only then are they selected -- on a shard,
+        # gathered: a collective per tap per forward otherwise spent for
+        # nothing. Uniform across the group: the mode rides the context.
+        aux_pruned_states: list[torch.Tensor] | None = None
+        select_aux = (
+            aux_hidden_states is not None
+            and logits_metadata.capture_hidden_mode.is_last()
+        )
         if gather_ids is not None:
             if logits_metadata.logits_rows_selected or (
                 # Shapes align iff midlayer already pruned to one row per
@@ -637,20 +648,20 @@ class LogitsProcessor(nn.Module):
                 and gather_ids.shape[0] == hidden_states.shape[0]
             ):
                 pruned_states = hidden_states
-                if aux_hidden_states is not None:
+                if select_aux:
                     aux_pruned_states = list(aux_hidden_states)
             elif shard is not None:
                 pruned_states = gather_sampled_rows(
                     hidden_states, shard, gather_ids, group=self.tp_group
                 )
-                if aux_hidden_states is not None:
+                if select_aux:
                     aux_pruned_states = [
                         gather_sampled_rows(h, shard, gather_ids, group=self.tp_group)
                         for h in aux_hidden_states
                     ]
             else:
                 pruned_states = hidden_states[gather_ids]
-                if aux_hidden_states is not None:
+                if select_aux:
                     aux_pruned_states = [h[gather_ids] for h in aux_hidden_states]
         else:
             if logits_metadata.forward_mode.is_extend_or_mixed():
@@ -658,7 +669,7 @@ class LogitsProcessor(nn.Module):
                     "EXTEND/MIXED forward must set gather_ids on ForwardContext"
                 )
             pruned_states = hidden_states
-            if aux_hidden_states is not None:
+            if select_aux:
                 aux_pruned_states = list(aux_hidden_states)
 
         # Compute logits for the sampled tokens.
@@ -687,8 +698,9 @@ class LogitsProcessor(nn.Module):
                     hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states; pruned states only contain
-                # the last tokens already.
-                if aux_hidden_states is not None:
+                # the last tokens already (on a shard: the batch's gathered
+                # [bs, hidden] rows, so the capture is whole on every rank).
+                if aux_pruned_states is not None:
                     hidden_states_to_store = (
                         aux_pruned_states[0]
                         if len(aux_pruned_states) == 1
@@ -743,6 +755,7 @@ class LogitsProcessor(nn.Module):
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
+        shard: QueryShardPlan | None,
     ) -> torch.Tensor:
         """Logprob of each named prompt row's next token, position-chunked.
 
@@ -777,6 +790,9 @@ class LogitsProcessor(nn.Module):
                 rank holds, one row per input token it computed.
             lm_head: The vocab-parallel head.
             logits_metadata: Carries ``input_logprob_rows``.
+            shard: The forward's query shard as ``forward`` resolved it
+                (``_query_shard``): the plan whose rows ``hidden_states`` are,
+                ``None`` when they are the whole forward's.
 
         Returns:
             fp32 ``[plan rows]`` logprobs in row order, the whole plan's.
@@ -809,7 +825,6 @@ class LogitsProcessor(nn.Module):
             )
         if plan.chunk_tokens <= 0:
             raise ValueError("input_logprob_chunk_tokens must be positive")
-        shard = self._query_shard(logits_metadata)
         if (plan.rows_per_rank is None) != (shard is None):
             raise ValueError(
                 "input logprob rows were staged for "
@@ -832,7 +847,7 @@ class LogitsProcessor(nn.Module):
             )
             index = None
             staged_rows = source.shape[0]
-        num_rows = plan.targets.shape[0]
+        num_rows = plan.num_result_rows
         if staged_rows != num_rows:
             raise ValueError(
                 f"{num_rows} prompt-logprob targets for {staged_rows} rows"

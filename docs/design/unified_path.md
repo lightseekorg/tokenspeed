@@ -1429,16 +1429,23 @@ The contract a model (in tree or a plugin) implements:
   of the processor's row selection: it scores the planned prompt rows
   first, then selects the sampled rows — `hidden_states[gather_ids]` on
   whole rows, `gather_sampled_rows` over the group on a shard (one
-  all-gather with `sampled_rows_per_rank`; rank order is request order) —
-  and runs the LM head on the batch's `[bs, hidden]` rows, so the vocab
-  all-gather is the TP one. The group of both gathers is the processor's
-  TP group: the LM head is vocab-sharded over it, every rank of it must end
-  with the same rows, and `validate_qcp` makes the query shard group exactly
-  that group (`qcp_size == attn_tp_size`); the processor refuses a plan of
-  another width. A FULL hidden capture stays the shard. A model that
-  selects its rows before the processor (`logits_rows_selected`) keeps
-  that contract, and such a model cannot serve prompt logprobs, sharded or
-  not. `ctx.gather_ids` keeps the batch's full layout on every forward, the
+  byte-preserving all-gather, `token_all_gather_rows`, with
+  `sampled_rows_per_rank`; rank order is request order) — and runs the LM
+  head on the batch's `[bs, hidden]` rows, so the vocab all-gather is the
+  TP one. The group of both gathers is the processor's TP group: the LM
+  head is vocab-sharded over it, every rank of it must end with the same
+  rows, and `validate_qcp` makes the query shard group exactly that group
+  (`qcp_size == attn_tp_size`); the processor refuses a plan of another
+  width. The processor is the only caller of `gather_sampled_rows`
+  (`CommManager` has no sampled-row leg: `needs_final_all_gather` is False
+  under a shard and nothing gathers the final norm's rows). A FULL hidden
+  capture stays the shard; a LAST capture is the gathered `[bs, hidden]`
+  rows, whole on every rank — the aux taps' (Eagle3) when the model has
+  them, each tap gathered the same way, and only on a LAST capture, since
+  no other mode reads them selected. A model that selects its rows before
+  the processor (`logits_rows_selected`) keeps that contract, and such a
+  model cannot serve prompt logprobs, sharded or not. `ctx.gather_ids`
+  keeps the batch's full layout on every forward, the
   drafters' extend steps included (Eagle's step 0 and every depth of the
   multi-depth `Mtp` drafter read the shard's slice of the shifted prefill
   ids and positions, chain the shard's hidden rows, and carry the plan on
@@ -1456,7 +1463,9 @@ The contract a model (in tree or a plugin) implements:
   its shard, re-based to it; the plan's rows are sorted, so each rank's are
   one contiguous run and the per-rank counts (`rows_per_rank`) are host
   arithmetic over the shard boundaries (`QueryShardPlan.rows_per_rank`,
-  `local_rows_run`). Scoring a row needs its full-vocabulary logits, and
+  `local_rows_run` — the one row split of the plan, the same that counts
+  the sampled rows per rank; it refuses unsorted rows rather than miscount
+  them). Scoring a row needs its full-vocabulary logits, and
   the head is vocab-sharded over the group: every rank must hold every
   planned row, so `compute_input_token_logprobs` all-gathers the planned
   rows' activations with those counts (`[plan rows, hidden]`, rank order is
