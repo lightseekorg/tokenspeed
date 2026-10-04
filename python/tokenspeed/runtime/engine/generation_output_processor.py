@@ -1115,12 +1115,21 @@ class OutputProcesser:
                 state.grammar = None
             return
         state.output_ids.append(bootstrap_token)
-        if (
-            state.output_token_logprobs_val is not None
-            and bootstrap_logprob is not None
-        ):
-            state.output_token_logprobs_val.append(bootstrap_logprob)
-            state.output_token_logprobs_idx.append(bootstrap_token)
+        if state.output_token_logprobs_val is not None:
+            if bootstrap_logprob is not None:
+                state.output_token_logprobs_val.append(bootstrap_logprob)
+                state.output_token_logprobs_idx.append(bootstrap_token)
+            else:
+                # Compat with a prefill peer that sends no logprob (older
+                # version, or launched without --enable-output-logprobs):
+                # the response's output logprobs are one entry short, which
+                # the client cannot tell from the data. Say so here.
+                logger.warning(
+                    f"[on_remote_prefill_done] rid={req_id!s} returns logprobs but "
+                    "the prefill peer sent no bootstrap logprob; its first output "
+                    "token has none (is the prefill node started with "
+                    "--enable-output-logprobs and at the same version?)",
+                )
         if state.grammar is not None:
             state.grammar.accept_token(bootstrap_token)
         state.check_finished()

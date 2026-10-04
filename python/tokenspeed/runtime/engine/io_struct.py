@@ -823,11 +823,13 @@ class BatchStrOut(BaseBatchReq, kw_only=True):
     cached_tokens: list[int]
     spec_verify_ct: list[int]
 
-    # Logprobs
-    input_token_logprobs_val: list[float]
-    input_token_logprobs_idx: list[int]
-    output_token_logprobs_val: list[float]
-    output_token_logprobs_idx: list[int]
+    # Logprobs: the same per-request columns as BatchTokenIDOut, forwarded
+    # unchanged by a detokenizing producer (typed msgspec decode rejects a
+    # mismatch).
+    input_token_logprobs_val: list[list[float | None]]
+    input_token_logprobs_idx: list[list[int]]
+    output_token_logprobs_val: list[list[float]]
+    output_token_logprobs_idx: list[list[int]]
     input_top_logprobs_val: list[list]
     input_top_logprobs_idx: list[list]
     output_top_logprobs_val: list[list]

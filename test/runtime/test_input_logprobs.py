@@ -543,22 +543,31 @@ def test_prefill_node_ships_prompt_logprobs_in_its_finished_frame():
     assert out.input_token_logprobs_idx == [[103, 104, 105]]
 
 
-def test_decode_node_prepends_the_bootstrap_logprob_to_output_logprobs():
+def test_decode_node_prepends_the_bootstrap_logprob_to_output_logprobs(caplog):
     processor = _processor()
     state = _state([1, 2, 3], start=0, computes_prompt_logprobs=False)
     state.computed_length = 3
     processor.rid_to_state["d"] = state
-    processor.on_remote_prefill_done("d", 101, 2, -0.25)
+    with caplog.at_level("WARNING"):
+        processor.on_remote_prefill_done("d", 101, 2, -0.25)
     assert state.output_ids == [101]
     assert state.output_token_logprobs_val == [-0.25]
     assert state.output_token_logprobs_idx == [101]
+    assert "no bootstrap logprob" not in caplog.text
 
-    # An older prefill node sends no logprob: the token still lands.
+    # A prefill peer that sends no logprob (older version, or logprobs off
+    # there): the token still lands, and the one-entry-short list is logged
+    # since the client cannot tell from the data.
     other = _state([1, 2, 3], start=0, computes_prompt_logprobs=False)
     processor.rid_to_state["e"] = other
-    processor.on_remote_prefill_done("e", 102, 2, None)
+    with caplog.at_level("WARNING"):
+        processor.on_remote_prefill_done("e", 102, 2, None)
     assert other.output_ids == [102]
     assert other.output_token_logprobs_val == []
+    assert (
+        "rid=e returns logprobs but the prefill peer sent no bootstrap logprob"
+        in caplog.text
+    )
 
 
 def test_result_rows_must_match_the_plan():
