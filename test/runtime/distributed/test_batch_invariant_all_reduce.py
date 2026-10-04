@@ -70,7 +70,6 @@ def worker_main(rank: int, world_size: int, port: int, attn_tp: int) -> None:
         rank=rank,
         world_size=world_size,
         attn_tp_size=attn_tp,
-        attn_cp_size=1,
         dense_tp_size=attn_tp,
     )
     pg_manager.init_distributed(

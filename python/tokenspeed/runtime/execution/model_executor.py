@@ -194,7 +194,7 @@ def _autotune_cache_key(
         "dtype": server_args.dtype,
         "moe_backend": str(server_args.moe_backend),
         "attention_backend": str(server_args.attention_backend),
-        "attention": (mapping.attn.tp_size, mapping.attn.cp_size, mapping.attn.dp_size),
+        "attention": (mapping.attn.tp_size, mapping.attn.dp_size),
         "dense": (mapping.dense.tp_size, mapping.dense.dp_size),
         "moe": (mapping.moe.tp_size, mapping.moe.ep_size, mapping.moe.dp_size),
         "linear_attention_tp": mapping.linear_attn.tp_size,

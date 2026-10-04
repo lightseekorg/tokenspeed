@@ -109,7 +109,6 @@ def _mapping(
         rank=rank,
         world_size=WORLD,
         attn_tp_size=1,
-        attn_cp_size=1,
         attn_dp_size=WORLD,
         attn_head_tp_size=head_tp_size if head_tp else None,
         lm_head_tp_size=WORLD,
@@ -253,7 +252,6 @@ def _worker_dense(rank: int, rendezvous: str) -> None:
             rank=rank,
             world_size=WORLD,
             attn_tp_size=1,
-            attn_cp_size=1,
             attn_dp_size=WORLD,
             dense_tp_size=1,
         )
@@ -517,7 +515,6 @@ def _replicated_mapping(rank: int) -> Mapping:
         rank=rank,
         world_size=WORLD,
         attn_tp_size=1,
-        attn_cp_size=1,
         attn_dp_size=WORLD,
         dense_tp_size=1,
     )
@@ -830,7 +827,6 @@ def test_dense_batch_invariant_needs_a_token_scatter_tail():
         rank=0,
         world_size=8,
         attn_tp_size=1,
-        attn_cp_size=1,
         attn_dp_size=8,
         dense_tp_size=8,
     )

@@ -2244,17 +2244,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         target_model.set_dspark_layers_to_capture.assert_not_called()
 
     def test_dspark_tp_only_contract_uses_resolved_mapping(self):
-        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
+        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1))
         DeepseekV4DSpark._validate_tp_only_mapping(mapping)
 
-        for field in ("dp_size", "cp_size"):
-            invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
-            setattr(invalid.attn, field, 2)
-            with (
-                self.subTest(field=field),
-                self.assertRaisesRegex(ValueError, "tensor parallelism only"),
-            ):
-                DeepseekV4DSpark._validate_tp_only_mapping(invalid)
+        invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=2))
+        with self.assertRaisesRegex(ValueError, "tensor parallelism only"):
+            DeepseekV4DSpark._validate_tp_only_mapping(invalid)
 
     def test_dspark_padding_slots_reset_before_every_graph_replay(self):
         drafter = object.__new__(DeepseekV4DSpark)

@@ -1383,6 +1383,10 @@ mapping remains a separate consumer of the shared mapping helpers
   path.
 * `grep -rn "init_forward_metadata_replay_cuda_graph\|is_all_greedy" python/`
   must stay empty.
+* `grep -rn "ENABLE_CP\|CP_METADATA" python/` must stay empty — the
+  module-global context-parallel switch and its process-wide metadata holder
+  were deleted; a parallel layout is a `Mapping` fact from an explicit server
+  argument and per-forward row metadata rides `ForwardContext`.
 * `grep -rn "ctx.accept_lengths\|ctx.draft_seq_lens_buf\|_apply_correction"
   python/` must stay empty — the step-0 accepted prefix is published through
   `ctx.draft_narrowing.publish_accepted_prefix()`, never computed in a model

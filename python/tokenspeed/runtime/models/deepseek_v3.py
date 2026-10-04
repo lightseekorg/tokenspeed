@@ -56,13 +56,7 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.utils import (
-    CP_METADATA,
-    ENABLE_CP,
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    get_layer_id,
-)
+from tokenspeed.runtime.layers.utils import get_layer_id
 
 _platform = current_platform()
 _is_blackwell = _platform.is_blackwell
@@ -1831,15 +1825,6 @@ class DeepseekV3Model(nn.Module):
             hidden_states = input_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
-        if CP_METADATA:
-            hidden_states = cp_split_and_rebuild_data(
-                hidden_states,
-                CP_METADATA.value.split_list,
-                CP_METADATA.value.zigzag_index,
-            )
-            positions = cp_split_and_rebuild_data(
-                positions, CP_METADATA.value.split_list, CP_METADATA.value.zigzag_index
-            )
         residual = None
         aux_hidden_states = [] if self.layers_to_capture else None
         for i in range(len(self.layers)):
@@ -1865,18 +1850,8 @@ class DeepseekV3Model(nn.Module):
                 residual,
             )
         if not ctx.forward_mode.is_idle():
-            if not ENABLE_CP:
-                hidden_states, _ = layer.comm_manager.final_norm(
-                    hidden_states, residual, ctx, self.norm
-                )
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
-        if CP_METADATA:
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                CP_METADATA.value,
-                self.mapping.attn.tp_rank,
-                self.mapping.attn.tp_group,
+            hidden_states, _ = layer.comm_manager.final_norm(
+                hidden_states, residual, ctx, self.norm
             )
         return hidden_states, aux_hidden_states
 

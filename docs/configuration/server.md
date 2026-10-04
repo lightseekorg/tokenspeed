@@ -333,10 +333,10 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous attention-DP ranks; each rank keeps its own KV and the attention exchanges heads for tokens. Needs attention TP 1, attention DP and `--disaggregation-mode decode`; the layout serves decode rows only, so it sets `--disable-prefill-graph`, tunes on a decode step, and admits only requests whose `max_new_tokens` is at most 4096 (the scheduler then never retracts them, so no local recovery prefill is scheduled). Defaults to the attention TP size (no exchange). See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
 | `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers the ranks' rows before the logits GEMM and transposes the shards back. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`; under attention DP, requests asking for prompt logprobs (`logprob_start_len`) are refused. |
 | `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs `--dense-tp-size` > 1; both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
-| `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention replica width (attn TP x CP): the full world without DP attention, one replica with it. |
+| `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention TP width: the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |
-| `--mm-encoder-tp-mode` | Multimodal encoder parallelism: `weights` shards encoder weights with attention TP; `data` uses TP1 whole-item DP and currently requires aggregate serving and no attention context parallelism. |
+| `--mm-encoder-tp-mode` | Multimodal encoder parallelism: `weights` shards encoder weights with attention TP; `data` uses TP1 whole-item DP and currently requires aggregate serving or the prefill role. |
 | `--enable-expert-parallel` | Set expert parallelism across the selected world size. |
 | `--expert-parallel-size`, `--ep-size` | Explicit expert parallel size. |
 | `--pipeline-parallel-size` | Pipeline stages for prefill chunk pipelining. Requires `--disaggregation-mode prefill`; forces eager execution; every per-layer parallelism resolves inside one stage's world. |
@@ -694,7 +694,9 @@ Mooncake Store (L3)
 ```
 
 Each packed Host CacheBlock is one Mooncake object, keyed as
-`{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
+`{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`
+(the trailing `c0` is the retired context-parallel shard id, kept literal so
+objects written before its removal stay addressable).
 The hashed prefix includes the loaded checkpoint (`--model`, the resolved
 immutable revision or a local fingerprint of selected weights, metadata,
 and local `*.py` including imported package subdirectories and
@@ -719,8 +721,7 @@ fields), the packed Host layout (field payloads, not GPU-capacity
 device arena offsets), the
 cache-quantization config (including `quantization_param_path` scale-file
 bytes and `--speculative-draft-model-quantization` when a draft pool is
-present), the pipeline stage, the context-parallel
-width (`cp_size`), any
+present), the pipeline stage, any
 speculative draft checkpoint, `--skip-softmax-threshold` (nonzero
 changes attention output and therefore downstream cached K/V), the
 resolved EAGLE3 capture-layer list (`--eagle3-layers-to-capture` or the
@@ -765,9 +766,9 @@ A backend exception or malformed result is a
 local miss so every replica rank still enters the MIN-reduce. Clients
 are not failed.
 L2 write-back ACKs use the same replica groups: `WriteBackDone` is
-emitted only after every cache-owning rank holds the completion, so an
-ENABLE_CP worker cannot publish Host while a CP peer's Mooncake put is
-still in flight. A truncated `batch_is_exist` reply is a failed put, not
+emitted only after every cache-owning rank holds the completion, so a
+worker cannot publish Host while a replica peer's Mooncake put is still in
+flight. A truncated `batch_is_exist` reply is a failed put, not
 an implicit success.
 Supplying a new
 `weight_version` with `flush_cache=False` is rejected when L3 is on so
@@ -776,11 +777,7 @@ new checkpoint. Flushed L3 updates require an explicit `weight_version`;
 minting `{current}-uN` would let independent checkpoints collide.
 A successful Engine update stamps that version into
 frontend `server_args`.
-Context-parallel workers (`ENABLE_CP`) share
-`attn_tp_rank == 0` and are distinguished by `c{cp_rank}` plus `cp_size`
-in the hashed namespace. Without PP, only `cp_rank==0` owns the request
-socket and load reporting, and `recv_reqs` broadcasts across CP so exists
-MIN is rank-identical. GQA with TP above the KV-head count assigns
+GQA with TP above the KV-head count assigns
 different heads to the same `r{tp_rank}`, so `attn_tp_size` (resolved
 `mapping.attn.tp_size`) is also in the namespace. Resolved target and draft
 attention backends, including the full-attention sub-backend of a hybrid model,
@@ -788,11 +785,9 @@ are isolated too: different implementations can produce different downstream
 KV even with identical cache layouts. This namespace extension intentionally
 starts a cold L3 cache instead of reusing objects written without backend identity.
 `global_segment_size` is split across
-attention-TP × context-parallel × pipeline-parallel ranks so the
-mounted total matches the configured size. Use the resolved mapping
-(`mapping.attn.tp_size` and `mapping.attn.cp_size`), not `--attn-tp-size`
-alone: `ENABLE_CP` with an omitted `--attn-tp-size` infers `cp_size = N`
-and `tp_size = 1`. L3 requires Host L2 (do not pass `--disable-kvstore`).
+attention-TP × pipeline-parallel ranks so the mounted total matches the
+configured size. Use the resolved `mapping.attn.tp_size`, not
+`--attn-tp-size` alone. L3 requires Host L2 (do not pass `--disable-kvstore`).
 Pass Mooncake client settings as JSON
 in `--kvstore-storage-backend-extra-config`, for example:
 

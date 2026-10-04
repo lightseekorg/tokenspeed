@@ -55,10 +55,8 @@ def _scattered_num_tokens_all(ctx: ForwardContext, mapping: Mapping) -> list[int
         scattered: list[int] = []
         for attn_dp_rank in range(mapping.attn.dp_size):
             # global_num_tokens is indexed by global rank with dp stride
-            # tp_size * cp_size; cp peers report the same count.
-            num_tokens = ctx.global_num_tokens[
-                attn_dp_rank * mapping.attn.tp_size * mapping.attn.cp_size
-            ]
+            # tp_size.
+            num_tokens = ctx.global_num_tokens[attn_dp_rank * mapping.attn.tp_size]
             scattered.extend(_scatter_count(num_tokens, mapping.attn.tp_size))
         return scattered
     return _scatter_count(ctx.input_num_tokens, mapping.attn.tp_size)

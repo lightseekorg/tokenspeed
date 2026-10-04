@@ -248,9 +248,7 @@ def _causal_lm(mapping: Mapping) -> _StubModel:
 class TestLmHeadResolution:
     def test_dp_default_is_replicated(self):
         model = _causal_lm(
-            Mapping(
-                rank=1, world_size=4, attn_tp_size=1, attn_cp_size=1, attn_dp_size=4
-            )
+            Mapping(rank=1, world_size=4, attn_tp_size=1, attn_dp_size=4)
         )
         assert isinstance(model.lm_head, ReplicatedLinear)
         assert model.logits_processor.skip_all_gather
@@ -263,7 +261,6 @@ class TestLmHeadResolution:
                 rank=1,
                 world_size=4,
                 attn_tp_size=1,
-                attn_cp_size=1,
                 attn_dp_size=4,
                 lm_head_tp_size=4,
             )
@@ -310,7 +307,6 @@ class TestModuleRefusals:
             rank=0,
             world_size=4,
             attn_tp_size=1,
-            attn_cp_size=1,
             attn_dp_size=4,
             dense_tp_size=4,
         )
@@ -324,7 +320,6 @@ class TestModuleRefusals:
             rank=0,
             world_size=4,
             attn_tp_size=1,
-            attn_cp_size=1,
             attn_dp_size=4,
             dense_tp_size=1,
         )
@@ -361,7 +356,6 @@ class TestModuleRefusals:
                 rank=1,
                 world_size=4,
                 attn_tp_size=1,
-                attn_cp_size=1,
                 attn_dp_size=4,
                 attn_head_tp_size=4,
             )
@@ -381,7 +375,6 @@ class TestModuleRefusals:
                     rank=0,
                     world_size=16,
                     attn_tp_size=1,
-                    attn_cp_size=1,
                     attn_dp_size=16,
                     attn_head_tp_size=16,
                 )
@@ -391,16 +384,13 @@ class TestModuleRefusals:
         monkeypatch.setitem(global_server_args_dict, "tp_batch_invariant", "attn")
         with pytest.raises(ValueError, match="attn-head-tp-size"):
             self._attention(
-                Mapping(
-                    rank=0, world_size=4, attn_tp_size=1, attn_cp_size=1, attn_dp_size=4
-                )
+                Mapping(rank=0, world_size=4, attn_tp_size=1, attn_dp_size=4)
             )
         attn = self._attention(
             Mapping(
                 rank=0,
                 world_size=4,
                 attn_tp_size=1,
-                attn_cp_size=1,
                 attn_dp_size=4,
                 attn_head_tp_size=4,
             )
@@ -422,7 +412,6 @@ class TestModuleRefusals:
             rank=0,
             world_size=4,
             attn_tp_size=1,
-            attn_cp_size=1,
             attn_dp_size=4,
             attn_head_tp_size=4,
         )
@@ -430,7 +419,5 @@ class TestModuleRefusals:
             self._attention(head_tp, Overriding)
         assert self._attention(head_tp, OptedIn).has_head_tp
         # Without head TP an overriding subclass is untouched.
-        plain = Mapping(
-            rank=0, world_size=4, attn_tp_size=1, attn_cp_size=1, attn_dp_size=4
-        )
+        plain = Mapping(rank=0, world_size=4, attn_tp_size=1, attn_dp_size=4)
         assert not self._attention(plain, Overriding).has_head_tp

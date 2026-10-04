@@ -115,7 +115,6 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             store,
             key_prefix="e2e",
             rank=0,
-            cp_rank=0,
             prefix_for_weight_version=lambda version: f"e2e-{version}",
         )
         self.addCleanup(executor.shutdown)

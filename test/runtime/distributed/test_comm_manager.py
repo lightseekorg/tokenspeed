@@ -91,7 +91,6 @@ def _worker_main(rank, world_size, port, attn_tp, dense_tp, dp_tokens, hidden_si
         rank=rank,
         world_size=world_size,
         attn_tp_size=attn_tp,
-        attn_cp_size=1,
         dense_tp_size=dense_tp,
     )
 

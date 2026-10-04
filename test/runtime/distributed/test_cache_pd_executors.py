@@ -53,8 +53,6 @@ def _topology(
     return PDParallelTopology(
         tp_size=tp_size,
         tp_rank=tp_rank,
-        cp_size=1,
-        cp_rank=0,
         dp_size=dp_size,
         dp_rank=dp_rank,
         world_size=world_size or tp_size * dp_size,
@@ -746,8 +744,6 @@ def test_every_pipeline_stage_reports_under_its_stage_major_rank(pp_rank) -> Non
     manager.topology = PDParallelTopology(
         tp_size=2,
         tp_rank=1,
-        cp_size=1,
-        cp_rank=0,
         dp_size=1,
         dp_rank=0,
         world_size=4,

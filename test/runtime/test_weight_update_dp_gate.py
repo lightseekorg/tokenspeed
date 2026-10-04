@@ -142,8 +142,6 @@ def _handler(*, dp_size: int = 1):
     handler.clear_cache_fn = mock.Mock(return_value=True)
     handler._replica_tp_size = 1
     handler._replica_tp_cpu_group = None
-    handler.attn_cp_size = 1
-    handler.attn_cp_cpu_group = None
     handler.pp_size = 1
     handler.pp_cpu_group = None
     handler.attn_dp_size = dp_size

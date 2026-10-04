@@ -112,7 +112,6 @@ def _mapping(rank, tp_size, world_size):
         rank=rank,
         world_size=world_size,
         attn_tp_size=tp_size,
-        attn_cp_size=1,
         attn_dp_size=world_size // tp_size,
         dense_tp_size=world_size,
         dense_dp_size=1,

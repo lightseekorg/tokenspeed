@@ -181,8 +181,6 @@ def _profile_rank_tag(attn_mapping) -> str:
     parts = []
     if attn_mapping.has_dp:
         parts.append(f"DP{attn_mapping.dp_rank}")
-    if attn_mapping.has_cp:
-        parts.append(f"CP{attn_mapping.cp_rank}")
     parts.append(f"TP{attn_mapping.tp_rank}")
     return "-".join(parts)
 
@@ -238,24 +236,12 @@ class RequestHandler:
                 "gloo", mapping.world_group
             )
             self.attn_tp_src_rank = mapping.world_group[0]
-        elif mapping.has_attn_cp:
-            # ENABLE_CP folds requested TP into CP and leaves every worker
-            # at attn_tp_rank 0, so the TP broadcaster never runs and each
-            # CP rank would otherwise PULL a different ZMQ message. Fan
-            # recv_reqs across CP the same way PP fans them across WORLD
-            # so L3 exists MIN (and later CP collectives) see one stream.
-            self.attn_tp_size = mapping.attn.cp_size
-            self.attn_tp_rank = mapping.attn.cp_rank
-            self.attn_tp_cpu_group = pg_manager.get_process_group(
-                "gloo", mapping.attn.cp_group
-            )
-            self.attn_tp_src_rank = mapping.attn.cp_group[0]
         else:
             self.attn_tp_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.attn.tp_group
             )
             self.attn_tp_src_rank = mapping.attn.tp_group[0]
-        # Cache-owning ranks in this DP replica (attention TP × CP × PP).
+        # Cache-owning ranks in this DP replica (attention TP × PP).
         # Distinct from attn_tp_* above: with PP those become WORLD so the
         # request stream is identical across stages, which would also pull
         # DP ranks into the TP MIN. Exists uses these replica groups;
@@ -264,21 +250,15 @@ class RequestHandler:
         self._replica_tp_cpu_group = pg_manager.get_process_group(
             "gloo", mapping.attn.tp_group
         )
-        self.attn_cp_size = mapping.attn.cp_size
-        self.attn_cp_cpu_group = (
-            pg_manager.get_process_group("gloo", mapping.attn.cp_group)
-            if mapping.has_attn_cp
-            else None
-        )
         self.pp_size = mapping.pp_size
         self.pp_cpu_group = (
             pg_manager.get_process_group("gloo", mapping.pp_group)
             if mapping.has_pp
             else None
         )
-        # Flush MIN includes attention DP after TP/CP/PP: object keys omit
+        # Flush MIN includes attention DP after TP/PP: object keys omit
         # DP rank, so DP replicas share the Mooncake namespace. Exists,
-        # prefetch, and WriteBackDone stay TP/CP/PP only (EventLoop /
+        # prefetch, and WriteBackDone stay TP/PP only (EventLoop /
         # L2CacheHooks); those ranks hold different sequences.
         self.attn_dp_size = mapping.attn.dp_size
         self.attn_dp_cpu_group = (
@@ -727,7 +707,7 @@ class RequestHandler:
     def _converge_replica_decision(self, local_ok: bool) -> bool:
         """MIN-reduce a yes/no across every rank that shares this flush.
 
-        Attention TP, then CP, then PP (same order as
+        Attention TP, then PP (same order as
         ``EventLoop._converge_l3_exists``), then attention DP. Exists and
         WriteBackDone omit DP because those ranks hold different sequences.
         Flush includes DP: ``storage_object_key`` has no DP rank, so a
@@ -739,8 +719,6 @@ class RequestHandler:
         groups = []
         if self._replica_tp_size > 1 and self._replica_tp_cpu_group is not None:
             groups.append(self._replica_tp_cpu_group)
-        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
-            groups.append(self.attn_cp_cpu_group)
         if self.pp_size > 1 and self.pp_cpu_group is not None:
             groups.append(self.pp_cpu_group)
         if self.attn_dp_size > 1 and self.attn_dp_cpu_group is not None:

@@ -1286,8 +1286,8 @@ class DeepseekV41Model(nn.Module):
         host_layout: str,
     ):
         super().__init__()
-        if mapping.pp_size != 1 or mapping.attn.cp_size != 1:
-            raise NotImplementedError("V4.1 full-prompt baseline requires PP=CP=1")
+        if mapping.pp_size != 1:
+            raise NotImplementedError("V4.1 full-prompt baseline requires PP=1")
         if mapping.attn.tp_size != mapping.moe.tp_ep_size:
             raise NotImplementedError(
                 "V4.1 HC residuals require attention TP == MoE TPxEP"

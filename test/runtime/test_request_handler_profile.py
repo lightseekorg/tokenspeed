@@ -12,15 +12,11 @@ from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
 
-def _attn_mapping(
-    tp_rank: int = 0, dp_rank: int | None = None, cp_rank: int | None = None
-) -> SimpleNamespace:
+def _attn_mapping(tp_rank: int = 0, dp_rank: int | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         tp_rank=tp_rank,
         has_dp=dp_rank is not None,
         dp_rank=dp_rank or 0,
-        has_cp=cp_rank is not None,
-        cp_rank=cp_rank or 0,
     )
 
 
@@ -189,7 +185,7 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             stop_profiling.assert_called_once()
             self.assertFalse(self.handler.profile_in_progress)
 
-    def test_rank_tag_includes_dp_cp_ranks_when_present(self):
+    def test_rank_tag_includes_dp_rank_when_present(self):
         self.assertEqual(
             request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=3)), "TP3"
         )
@@ -198,10 +194,8 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             "DP1-TP0",
         )
         self.assertEqual(
-            request_handler_mod._profile_rank_tag(
-                _attn_mapping(tp_rank=2, dp_rank=1, cp_rank=0)
-            ),
-            "DP1-CP0-TP2",
+            request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=2, dp_rank=1)),
+            "DP1-TP2",
         )
 
     def test_proton_outputs_do_not_collide_across_dp_ranks(self):

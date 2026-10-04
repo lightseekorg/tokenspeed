@@ -75,13 +75,12 @@ class KimiLinearMoEDeepEP(nn.Module):
         plan = Kimi3MoEExecutionPlan.build(mapping, get_moe_backend(), alt_stream)
         if (
             not plan.use_marlin
-            or mapping.attn.cp_size != 1
             or mapping.moe.tp_size != 1
             or mapping.moe.dp_size != 1
             or mapping.moe.ep_size != mapping.attn.tp_size * mapping.attn.dp_size
         ):
             raise ValueError(
-                "Kimi-K3 DeepEP requires Marlin, attention CP=1, MoE TP=1/DP=1, "
+                "Kimi-K3 DeepEP requires Marlin, MoE TP=1/DP=1, "
                 "and expert EP == attention TP*DP inside each pipeline stage."
             )
         self.mapping = mapping

@@ -75,8 +75,6 @@ class _EventLoopHarness:
             None,
             attn_tp_size=1,
             attn_tp_cpu_group=None,
-            attn_cp_size=1,
-            attn_cp_cpu_group=None,
             pp_size=1,
             pp_cpu_group=None,
         )

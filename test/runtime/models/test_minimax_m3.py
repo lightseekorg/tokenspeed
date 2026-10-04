@@ -96,7 +96,6 @@ def _tp4_mapping() -> Mapping:
         rank=0,
         world_size=4,
         attn_tp_size=4,
-        attn_cp_size=1,
         attn_dp_size=1,
         dense_tp_size=4,
         dense_dp_size=1,

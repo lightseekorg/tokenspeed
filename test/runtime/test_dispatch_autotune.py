@@ -1182,7 +1182,7 @@ def test_skinny_add3_preserves_capture_trust(capturing, warmed, failure):
 
 def test_pipeline_stages_share_shape_keyed_cache_identity():
     mapping = SimpleNamespace(
-        attn=SimpleNamespace(tp_size=2, cp_size=1, dp_size=1),
+        attn=SimpleNamespace(tp_size=2, dp_size=1),
         dense=SimpleNamespace(tp_size=2, dp_size=1),
         moe=SimpleNamespace(tp_size=2, ep_size=1, dp_size=1),
         linear_attn=SimpleNamespace(tp_size=2),

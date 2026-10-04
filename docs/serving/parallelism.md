@@ -6,9 +6,9 @@ plus additional split parallelism controls for attention, dense, and MoE layers.
 Scheduler process names in `ps` include their parallel ranks, for example
 `tokenspeed::scheduler_tp1_ep3_dp0`. `tp` always identifies the attention TP
 rank, including `tp0` for a single process. Other suffixes appear only when
-their parallel size exceeds one: `ep` for MoE expert parallelism, `dp`, `cp`
-and `dcp` for attention data, context and decode context parallelism, and `pp`
-for pipeline parallelism. These are zero-based ranks within their respective
+their parallel size exceeds one: `ep` for MoE expert parallelism, `dp` and
+`dcp` for attention data and decode context parallelism, and `pp` for pipeline
+parallelism. These are zero-based ranks within their respective
 groups, not parallel sizes.
 
 ## Quick Start
@@ -40,7 +40,7 @@ tokenspeed serve <model> \
 | `--world-size` | Total worker processes across all nodes. |
 | `--nprocs-per-node` | Worker processes launched on each node. |
 | `--attn-tp-size` | Attention tensor parallel size. |
-| `--dense-tp-size` | Dense layer tensor parallel size. Defaults to the attention replica width (attn TP x CP): the full world without DP attention, one replica with it. |
+| `--dense-tp-size` | Dense layer tensor parallel size. Defaults to the attention TP width: the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | MoE layer tensor parallel size. |
 | `--data-parallel-size` | Replicated data-parallel groups. |
 | `--mm-encoder-tp-mode` | `weights` (default), or TP1 whole-item DP within each attention TP group (`data`). |

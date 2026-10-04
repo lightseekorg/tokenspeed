@@ -1363,7 +1363,6 @@ def build_device_side(
                 server_args.kvstore_storage_backend_extra_config,
                 host_buffer=l2_cache_executor.host_storage.host_buffer,
                 tp_size=server_args.mapping.attn.tp_size,
-                cp_size=server_args.mapping.attn.cp_size,
                 pp_size=(
                     server_args.mapping.pp_size if server_args.mapping.has_pp else 1
                 ),
@@ -1428,7 +1427,6 @@ def build_device_side(
                 draft_quantization=draft_quantization,
             )
             attn_tp_size = int(server_args.mapping.attn.tp_size)
-            cp_size = int(server_args.mapping.attn.cp_size)
             eagle3_layers_to_capture: list[int] = []
             if server_args.speculative_algorithm == "EAGLE3":
                 configured_layers = server_args.eagle3_layers_to_capture
@@ -1455,7 +1453,6 @@ def build_device_side(
                     cache_signature=cache_signature,
                     pipeline_rank=pipeline_rank,
                     attn_tp_size=attn_tp_size,
-                    cp_size=cp_size,
                     draft_model=draft_model,
                     draft_revision=draft_revision,
                     draft_weight_version=weight_version if draft_model else "",
@@ -1471,7 +1468,6 @@ def build_device_side(
                 storage_backend,
                 key_prefix=prefix_for_weight_version(server_args.weight_version),
                 rank=attn_tp_rank,
-                cp_rank=server_args.mapping.attn.cp_rank,
                 prefix_for_weight_version=prefix_for_weight_version,
             )
 

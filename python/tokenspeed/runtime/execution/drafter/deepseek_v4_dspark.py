@@ -136,11 +136,10 @@ class DeepseekV4DSpark(BaseDrafter):
     @staticmethod
     def _validate_tp_only_mapping(mapping) -> None:
         dp_size = int(mapping.attn.dp_size)
-        cp_size = int(mapping.attn.cp_size)
-        if dp_size != 1 or cp_size != 1:
+        if dp_size != 1:
             raise ValueError(
                 "Week-0 DSPARK supports tensor parallelism only; "
-                f"got attention dp_size={dp_size}, cp_size={cp_size}."
+                f"got attention dp_size={dp_size}."
             )
 
     def _init_buffers(self) -> None:

@@ -62,7 +62,6 @@ class TestCLIConfigCompat(unittest.TestCase):
         return (
             mapping.world_size,
             mapping.attn.tp_size,
-            mapping.attn.cp_size,
             mapping.attn.dp_size,
             mapping.dense.tp_size,
             mapping.dense.dp_size,
@@ -179,7 +178,7 @@ class TestCLIConfigCompat(unittest.TestCase):
         )[:2]
         dense_tp = self._parallelism_snapshot(
             ["--model", "test/model", "--attn-tp-size", "8"]
-        )[4]
+        )[3]
         self.assertEqual((world, attn_tp), (8, 8))
         self.assertEqual(dense_tp, 8)
 
@@ -196,7 +195,7 @@ class TestCLIConfigCompat(unittest.TestCase):
                 "2",
             ]
         )
-        world, attn_tp, _attn_cp, attn_dp, dense_tp = snap[:5]
+        world, attn_tp, attn_dp, dense_tp = snap[:4]
         self.assertEqual((world, attn_tp, attn_dp), (8, 4, 2))
         self.assertEqual(dense_tp, 4)
 
@@ -213,29 +212,8 @@ class TestCLIConfigCompat(unittest.TestCase):
                 "--dense-tp-size",
                 "8",
             ]
-        )[4]
+        )[3]
         self.assertEqual(dense_tp, 8)
-
-    def test_dense_tp_default_tracks_replica_width_under_cp(self):
-        # Under ENABLE_CP the attention TP size is reinterpreted as CP, so the
-        # replica width is attn_tp x attn_cp; the dense default must use the
-        # product, not the post-swap attn_tp (which is 1 here).
-        import tokenspeed.runtime.utils.server_args as server_args_mod
-
-        with patch.object(server_args_mod, "ENABLE_CP", True):
-            snap = self._parallelism_snapshot(
-                [
-                    "--model",
-                    "test/model",
-                    "--attn-tp-size",
-                    "4",
-                    "--data-parallel-size",
-                    "2",
-                ]
-            )
-        world, attn_tp, attn_cp, attn_dp, dense_tp = snap[:5]
-        self.assertEqual((world, attn_tp, attn_cp, attn_dp), (8, 1, 4, 2))
-        self.assertEqual(dense_tp, 4)
 
     # ---- vLLM config names ----
 

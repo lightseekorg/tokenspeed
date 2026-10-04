@@ -264,12 +264,6 @@ class EventLoop:
         self.attn_tp_cpu_group = pg_manager.get_process_group(
             "gloo", server_args.mapping.attn.tp_group
         )
-        self.attn_cp_size = mapping.attn.cp_size
-        self.attn_cp_cpu_group = (
-            pg_manager.get_process_group("gloo", mapping.attn.cp_group)
-            if mapping.has_attn_cp
-            else None
-        )
         self.pp_size = mapping.pp_size
         self.pp_cpu_group = (
             pg_manager.get_process_group("gloo", mapping.pp_group)
@@ -295,8 +289,6 @@ class EventLoop:
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=self.attn_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
-            attn_cp_size=self.attn_cp_size,
-            attn_cp_cpu_group=self.attn_cp_cpu_group,
             pp_size=self.pp_size,
             pp_cpu_group=self.pp_cpu_group,
             global_rank=global_rank,
@@ -385,8 +377,6 @@ class EventLoop:
             self._device if scheduler_cfg.enable_l3_storage else None,
             attn_tp_size=self.attn_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
-            attn_cp_size=self.attn_cp_size,
-            attn_cp_cpu_group=self.attn_cp_cpu_group,
             pp_size=self.pp_size,
             pp_cpu_group=self.pp_cpu_group,
         )
@@ -663,24 +653,21 @@ class EventLoop:
     def _owns_request_io(self) -> bool:
         """True when this rank owns the tokenizer ZMQ pair and load reports.
 
-        PP: only global rank 0. Otherwise attention TP rank 0 and CP rank 0,
-        because ``ENABLE_CP`` leaves every worker at ``attn_tp_rank == 0``.
-        Load reporting must use this same predicate: nonowners get a
-        ``NullSender`` with no ``set_load_snapshot``.
+        PP: only global rank 0. Otherwise attention TP rank 0. Load reporting
+        must use this same predicate: nonowners get a ``NullSender`` with no
+        ``set_load_snapshot``.
         """
 
         mapping = self.server_args.mapping
         if mapping.has_pp:
             return mapping.rank == 0
-        return self.attn_tp_rank == 0 and mapping.attn.cp_rank == 0
+        return self.attn_tp_rank == 0
 
     def _init_interprocess_comm(self):
         context = zmq.Context(2)
         # Chunk-pipeline: request I/O is owned by GLOBAL rank 0 only —
         # every stage's tp_rank-0 would otherwise try to open the one
         # frontend socket pair. recv_reqs broadcasts over the world group.
-        # ENABLE_CP without PP: every worker is attn_tp_rank 0, so only
-        # cp_rank 0 owns the socket; RequestHandler fans recv_reqs across CP.
         if self._owns_request_io():
             if self.server_args.zmq_msgpack:
                 # SMG drives the scheduler directly: it binds the sockets and
@@ -1319,8 +1306,6 @@ def run_event_loop(
         process_title += f"_ep{mapping.moe.ep_rank}"
     if mapping.attn.has_dp:
         process_title += f"_dp{dp_rank}"
-    if mapping.attn.has_cp:
-        process_title += f"_cp{mapping.attn.cp_rank}"
     if mapping.attn.has_dcp:
         process_title += f"_dcp{mapping.attn.dcp_rank}"
     if mapping.has_pp:
