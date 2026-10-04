@@ -702,8 +702,11 @@ def test_input_logprobs_match_the_output_logprob_arithmetic(chunk_tokens):
     vocab = 6
     # Two requests of 3 and 2 tokens; prompt logprobs for rows 1, 2 of the
     # first and row 3 (position 0) of the second.
-    hidden = torch.randn(5, 4, device=device)
-    weight = torch.randn(vocab, 4, device=device)
+    # Keep the four-term dot products exact so cuBLAS's batch-dependent
+    # reduction order cannot change the prompt or sampled logits. This tests
+    # logprob arithmetic and row selection, not GEMM batch invariance in auto.
+    hidden = torch.randint(-8, 9, (5, 4), device=device).float() / 8
+    weight = torch.randint(-8, 9, (vocab, 4), device=device).float() / 8
     lm_head = SimpleNamespace(weight=weight)
     rows, targets = [1, 2, 3], [5, 2, 3]
     processor = LogitsProcessor(
