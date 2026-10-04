@@ -182,6 +182,8 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
             extend_prefix_lens=torch.tensor([64], dtype=torch.int32),
             extend_prefix_lens_cpu=torch.tensor([64], dtype=torch.int32),
             extend_with_prefix=True,
+            query_shard=None,
+            page_table_cpu=None,
         )
         meta = b.forward_prefill_metadata
         self.assertEqual(meta.page_table.tolist(), page_table.tolist())
@@ -206,6 +208,8 @@ class TRTLLMLeafMetadataTest(unittest.TestCase):
                 extend_prefix_lens=no_extends,
                 extend_prefix_lens_cpu=no_extends,
                 extend_with_prefix=False,
+                query_shard=None,
+                page_table_cpu=None,
             )
 
 

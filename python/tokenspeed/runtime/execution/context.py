@@ -31,6 +31,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.dspark_context import (
@@ -145,6 +146,12 @@ class ForwardContext:
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
     all_extend: bool = False
+    # --- query context parallelism ---
+    # The rows this rank computes of a sharded extend forward (plain host
+    # integers); None means every rank computes every row. ``input_num_tokens``
+    # and ``global_num_tokens`` keep the scheduler's full-chunk meaning, the
+    # model's row axis is the shard.
+    query_shard: QueryShardPlan | None = None
     # Models that need specific collective sizing (e.g. draft models whose
     # first-step forward narrows activations) report these via
     # ``report_collective_sizing``. Unset (None) means comm sizing falls

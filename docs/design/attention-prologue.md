@@ -18,7 +18,10 @@ first:
 * `gqa_prologue(q, k, v, *, norm, rotary, cache, return_kv,
   solution, override)` for multi-head and grouped-query attention;
 * `mla_prologue(query, q_pe, latent_cache, *, expanded, rotary,
-  cache, solution, override)` for multi-head latent attention;
+  cache, solution, override)` for multi-head latent attention; `cache=None`
+  rotates without storing and returns the latent for `latent_store(latent,
+  *, kv_lora_rank, cache)`, so a caller can gather rows between the two
+  (query context parallelism);
 * `qk_norm_rope(q, k, *, head_dim, norm, rotary)` for keys that are not
   attention K/V but take the norm step (MiniMax-M3's indexer): the GQA kernels
   with no cache write. Indexers that only rotate call `embedding.rope`.
@@ -163,6 +166,21 @@ to slot 0 with a False mask, and every latent store skips them. Head caches
 are never sharded, so their pools take no mask. Without a placement the slots
 pass through and the mask is None.
 
+Under query context parallelism a rank computes only its shard of the extend
+rows but may own pages of rows another rank computed, so the write gathers
+before it stores: `latent_prologue(..., key_rows=QueryShardGather(plan,
+group))` runs `mla_prologue(cache=None)` over the local rows — the composite's
+rotation with no store, returning the rotated latent — all-gathers that
+latent over the query group with the plan's per-rank row counts into the
+whole span (every rank holds the span's slots), and stores it through the
+same `resolve_cache_slots` target with `latent_store`, the composite's store
+step on its own. Rotation and store round once each way, so the bytes equal
+the fused write's (`tokenspeed-kernel/test/ops/attention/test_attention_prologue.py`).
+The gather sits inside the prologue wrapper, so it adds no writer to the
+list above; a sparse indexer's keys are gathered the same way by the model
+before their quantization and masked write. Page ownership stays a property
+of the cache placement, independent of which rank computed a row.
+
 ## Graphs and the KV write
 
 The write locations a prologue reads are refresh-in-place buffers, so the
@@ -253,7 +271,7 @@ returns per-head keys and values.
 | Solution | Kernel | Covers |
 | --- | --- | --- |
 | `triton` | one launch that also assembles the query | absorbed, dense cache, full write, up to 32768 token-heads |
-| `composite` | `embedding.rope` or `embedding.rope_mla`, then the latent store | everything on AMD and NVIDIA; its latent store needs `kv_lora_rank` a multiple of 256 below 512 written rows and a power of two above (every in-tree MLA model uses 512) |
+| `composite` | `embedding.rope` or `embedding.rope_mla`, then the latent store | everything on AMD and NVIDIA; its latent store needs `kv_lora_rank` a multiple of 256 below 512 written rows and a power of two above (every in-tree MLA model uses 512); the only solution of the store-less form (`cache=None`, trait `store=False`), whose returned latent `latent_store(latent, kv_lora_rank=, cache=)` writes into a native cache |
 
 ## Adding a fused kernel
 

@@ -37,6 +37,9 @@ from typing_extensions import override
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
 )
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    dsa_history_gather_workspace_bytes,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
 )
@@ -117,6 +120,18 @@ class OrdinaryRecipe(CacheRecipe):
         return tuple(
             (replace(spec, shard_count=self.attn_config.dcp_size), fields)
             for spec, fields in groups
+        )
+
+    @override
+    def workspace_bytes(self) -> int:
+        """The query-context-parallel history gather workspace of GPU DSA:
+        one whole history of latent rows plus index-K rows and scales,
+        reserved before the arena is sized (``AttnConfig.__post_init__`` has
+        already pinned the family to GPU DSA for ``qcp_size > 1``)."""
+        if self.attn_config.qcp_size == 1:
+            return 0
+        return dsa_history_gather_workspace_bytes(
+            self.attn_config, max_model_len=self.attn_config.context_len
         )
 
     @override

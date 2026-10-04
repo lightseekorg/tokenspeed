@@ -76,6 +76,33 @@ def index_k_row_bytes(index_head_dim: int, index_k_format: str) -> int:
     )
 
 
+def dsa_history_gather_workspace_bytes(
+    config: AttnConfig, *, max_model_len: int
+) -> int:
+    """Bytes of the query-context-parallel history gather workspace.
+
+    One whole history (``max_model_len`` rows) of latent rows in the KV
+    cache dtype plus ``fp8_scaled`` index-K rows (FP8 keys with their fp32
+    scales, the one plane format the sharded extend arm gathers): the arm
+    gathers each request group's history into it, so a request's history
+    may never exceed the model length.
+    """
+    spec = config.component(DSAConfig)
+    if spec is None:
+        raise ValueError("the history gather workspace is a DSA quantity")
+    if spec.index_k_format != "fp8_scaled":
+        raise ValueError(
+            "DSA query context parallelism gathers fp8_scaled index-K rows; got "
+            f"index_k_format={spec.index_k_format!r}"
+        )
+    if max_model_len <= 0:
+        raise ValueError("history workspace needs a positive max_model_len")
+    kv_bytes = (
+        spec.kv_cache_dim * torch.tensor([], dtype=config.kv_cache_dtype).element_size()
+    )
+    return int(max_model_len) * (kv_bytes + dsa_index_k_row_bytes(spec.index_head_dim))
+
+
 @dataclass(kw_only=True)
 class DSAConfig(MLAConfig):
     is_dsa: ClassVar[bool] = True

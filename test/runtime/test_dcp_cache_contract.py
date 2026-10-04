@@ -553,7 +553,7 @@ class MappingTest(unittest.TestCase):
     def test_dcp_subgroups_are_consecutive_within_attention_tp(self):
         for rank in range(8):
             mapping = AttentionLayerMapping(
-                rank=rank, world_size=8, tp_size=8, cp_size=1, dp_size=1, dcp_size=4
+                rank=rank, world_size=8, tp_size=8, dp_size=1, dcp_size=4
             )
             self.assertTrue(mapping.has_dcp)
             self.assertEqual(mapping.dcp_rank, rank % 4)
@@ -562,7 +562,7 @@ class MappingTest(unittest.TestCase):
                 mapping.dcp_group, tuple(range(rank - rank % 4, rank - rank % 4 + 4))
             )
         plain = AttentionLayerMapping(
-            rank=3, world_size=8, tp_size=8, cp_size=1, dp_size=1, dcp_size=1
+            rank=3, world_size=8, tp_size=8, dp_size=1, dcp_size=1
         )
         self.assertFalse(plain.has_dcp)
         self.assertEqual(plain.dcp_group, (3,))
@@ -570,11 +570,11 @@ class MappingTest(unittest.TestCase):
     def test_dcp_must_divide_attention_tp(self):
         with self.assertRaisesRegex(ValueError, "divisible"):
             AttentionLayerMapping(
-                rank=0, world_size=8, tp_size=8, cp_size=1, dp_size=1, dcp_size=3
+                rank=0, world_size=8, tp_size=8, dp_size=1, dcp_size=3
             )
         with self.assertRaisesRegex(ValueError, "positive"):
             AttentionLayerMapping(
-                rank=0, world_size=8, tp_size=8, cp_size=1, dp_size=1, dcp_size=0
+                rank=0, world_size=8, tp_size=8, dp_size=1, dcp_size=0
             )
 
 

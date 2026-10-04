@@ -1123,6 +1123,7 @@ class ForwardStepRunner:
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 extend_replay_lens_cpu=extend_replay_lens_cpu,
                 extend_prompt_lens_cpu=extend_prompt_lens_cpu,
+                query_shard=ctx.query_shard,
                 positions=positions,
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,

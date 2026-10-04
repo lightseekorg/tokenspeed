@@ -239,6 +239,7 @@ class _ScheduledKDA:
                     batch.prefill_lengths, dtype=torch.int32
                 ),
                 extend_with_prefix=begin > 0,
+                query_shard=None,
             )
         else:
             self.kernel.backend.refresh_decode_metadata(

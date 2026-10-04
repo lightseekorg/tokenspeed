@@ -169,7 +169,7 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
     executor.model_runner = SimpleNamespace(
         forward=lambda ctx, **kwargs: target_calls.append(ctx.forward_mode)
     )
-    executor._model_input_kwargs = lambda bs, num_tokens: {}
+    executor._model_input_kwargs = lambda num_tokens, bs, rows: {}
     executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
     executor.drafter = drafter
 

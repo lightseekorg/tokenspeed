@@ -1336,6 +1336,7 @@ def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
             extend_replay_lens_cpu=torch.tensor([replay], dtype=torch.int32),
             extend_prompt_lens_cpu=torch.tensor([prompt_len], dtype=torch.int32),
             extend_with_prefix=start > 0,
+            query_shard=None,
         )
         rows = slice(start, start + count)
         ctx = ForwardContext(

@@ -344,7 +344,14 @@ class TestAttentionBackendChoices(unittest.TestCase):
             attn_tp_size=None,
             mapping=SimpleNamespace(
                 attn=SimpleNamespace(
-                    tp_size=2, dp_size=1, dcp_size=1, dcp_rank=0, dcp_group=(0,)
+                    tp_size=2,
+                    dp_size=1,
+                    dcp_size=1,
+                    dcp_rank=0,
+                    dcp_group=(0,),
+                    qcp_size=1,
+                    qcp_rank=0,
+                    qcp_group=(0,),
                 )
             ),
             kv_cache_dtype="auto",

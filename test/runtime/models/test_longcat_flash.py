@@ -561,6 +561,7 @@ class TestLongcatRowLayout(unittest.TestCase):
                 global_num_tokens=[local_tokens] * mapping.world_size,
                 collective_num_tokens=None,
                 input_num_tokens=local_tokens,
+                query_shard=None,
             )
         )
         ctx = SimpleNamespace(
@@ -569,6 +570,7 @@ class TestLongcatRowLayout(unittest.TestCase):
             global_num_tokens=[local_tokens] * mapping.world_size,
             collective_num_tokens=None,
             collective_global_num_tokens=None,
+            query_shard=None,
         )
         # The layer input arrives in the dense layout of the previous layer.
         input_rows = (
@@ -668,6 +670,7 @@ class TestLongcatRowLayout(unittest.TestCase):
             global_num_tokens=[4] * 4,
             collective_num_tokens=None,
             collective_global_num_tokens=None,
+            query_shard=None,
         )
         gathers: list = []
         with mock.patch.multiple(comm_module, **_fake_comm_ops(mapping.rank, gathers)):
@@ -698,6 +701,7 @@ class TestLongcatRowLayout(unittest.TestCase):
             global_num_tokens=[4] * 4,
             collective_num_tokens=None,
             collective_global_num_tokens=None,
+            query_shard=None,
         )
         # Full rows (4) where this rank's scattered share (2) is expected.
         with self.assertRaisesRegex(RuntimeError, "scattered share"):
@@ -728,6 +732,7 @@ class TestLongcatRowLayout(unittest.TestCase):
             global_num_tokens=[0, 0, 4, 4],
             collective_num_tokens=None,
             collective_global_num_tokens=None,
+            query_shard=None,
         )
         gathers: list = []
         with mock.patch.multiple(comm_module, **_fake_comm_ops(mapping.rank, gathers)):

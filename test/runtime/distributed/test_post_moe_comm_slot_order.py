@@ -59,8 +59,9 @@ def _manager(
             tp_rank=0,
             tp_group=tuple(range(attn_tp_size)),
             tp_size=attn_tp_size,
-            cp_size=1,
             dp_size=tp_ep_size // attn_tp_size,
+            qcp_size=1,
+            has_qcp=False,
             has_dp=tp_ep_size > attn_tp_size,
             scatter_index=lambda rank: rank,
         ),
@@ -78,6 +79,7 @@ def _manager(
         is_moe=True,
         prev_is_moe=False,
         dense_batch_invariant=False,
+        query_sharded=False,
     )
 
 
@@ -95,6 +97,7 @@ def test_all_reduce_layout_returns_the_rows_untouched(monkeypatch):
     rows = torch.arange(12.0).view(6, 2)
     residual = torch.zeros(6, 2)
     ctx = SimpleNamespace(
+        query_shard=None,
         collective_global_num_tokens=None,
         global_num_tokens=None,
         collective_num_tokens=None,
@@ -117,6 +120,7 @@ def test_rsag_layout_takes_back_this_ranks_rows(monkeypatch, rank):
     rows = torch.arange(float(sum(counts) * 2)).view(sum(counts), 2)
     residual = torch.zeros(counts[rank], 2)
     ctx = SimpleNamespace(
+        query_shard=None,
         collective_global_num_tokens=None,
         global_num_tokens=counts,
         collective_num_tokens=None,
@@ -138,6 +142,7 @@ def test_rank_order_still_reduces_and_slot_order_vetoes_the_fusion(monkeypatch):
         lambda rows, group: reduced.append(group) or rows * 2,
     )
     ctx = SimpleNamespace(
+        query_shard=None,
         collective_global_num_tokens=None,
         global_num_tokens=None,
         collective_num_tokens=None,

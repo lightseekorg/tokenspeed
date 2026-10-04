@@ -175,6 +175,77 @@ def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
         raise ValueError(f"{flag} must be one of {list(choices)}, got {value!r}")
 
 
+# Attention backends whose sparse prefill can attend a query shard against the
+# gathered history of its requests (the query-context-parallel extend arm).
+QCP_ATTENTION_BACKENDS = frozenset({"dsa"})
+
+
+def validate_qcp(
+    *,
+    qcp_size: int,
+    attn_tp_size: int,
+    attn_dp_size: int,
+    dcp_size: int,
+    disaggregation_mode: str,
+    disable_prefill_graph: bool,
+    enable_mixed_batch: bool,
+    attention_backend: str | None,
+) -> None:
+    """Reject query-context-parallel layouts the first landing does not serve.
+
+    QCP shards an extend forward's rows over the attention TP group. It is a
+    prefill-role layout: the decode arm serves only the drafter's steps, the
+    eager extend break gathers the request history, and the sparse DSA
+    kernels attend the gathered buffer. ``qcp_size == 1`` is off and passes.
+    """
+    if qcp_size == 1:
+        return
+    if qcp_size != attn_tp_size:
+        raise ValueError(
+            "--prefill-context-parallel-size must equal the attention TP size "
+            f"(got {qcp_size} with attn_tp_size={attn_tp_size}): the query shard "
+            "spans the whole attention TP group"
+        )
+    if attn_dp_size != 1:
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires attention DP 1 (got "
+            f"attn_dp_size={attn_dp_size}): the sampled-row table of a shard is "
+            "per DP group and the DP metadata gather does not carry it"
+        )
+    if disaggregation_mode != "prefill":
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires --disaggregation-mode "
+            f"prefill (got {disaggregation_mode!r}): a sharded extend and "
+            "replicated decode rows cannot share one forward"
+        )
+    if not disable_prefill_graph:
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires --disable-prefill-graph: "
+            "the history gather runs in the eager attention break"
+        )
+    if enable_mixed_batch:
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 does not support "
+            "--enable-mixed-batch: a MIXED round would carry sharded extend rows "
+            "and replicated decode rows in one forward"
+        )
+    if (
+        attention_backend is not None
+        and attention_backend not in QCP_ATTENTION_BACKENDS
+    ):
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires a DSA-family attention "
+            f"backend ({sorted(QCP_ATTENTION_BACKENDS)}), got "
+            f"--attention-backend {attention_backend!r}"
+        )
+    if dcp_size not in (1, qcp_size):
+        raise ValueError(
+            "--decode-context-parallel-size must be 1 or equal to "
+            f"--prefill-context-parallel-size (got dcp={dcp_size}, qcp={qcp_size}): "
+            "the history gather splits by the page owners of the whole shard group"
+        )
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
@@ -361,6 +432,9 @@ class ServerArgs:
 
     # DeepSeek V4
     decode_context_parallel_size: int = 1
+    # Query context parallelism on the PD prefill role: shard every extend
+    # forward's rows over the attention TP group (1 = off).
+    prefill_context_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -844,6 +918,7 @@ class ServerArgs:
             attn_dcp_size=self.decode_context_parallel_size,
             attn_head_tp_size=self.attn_head_tp_size,
             lm_head_tp_size=self.lm_head_tp_size,
+            attn_qcp_size=self.prefill_context_parallel_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
@@ -863,6 +938,16 @@ class ServerArgs:
         validate_dcp_disaggregation_role(
             has_dcp=self.mapping.attn.has_dcp,
             disaggregation_mode=self.disaggregation_mode,
+        )
+        validate_qcp(
+            qcp_size=self.mapping.attn.qcp_size,
+            attn_tp_size=self.mapping.attn.tp_size,
+            attn_dp_size=self.mapping.attn.dp_size,
+            dcp_size=self.mapping.attn.dcp_size,
+            disaggregation_mode=self.disaggregation_mode,
+            disable_prefill_graph=bool(self.disable_prefill_graph),
+            enable_mixed_batch=self.enable_mixed_batch,
+            attention_backend=self.attention_backend,
         )
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
@@ -2935,6 +3020,17 @@ class ServerArgs:
             "bits match a TP1 full-K GEMM. attn needs --attn-head-tp-size > 1; "
             "attn+dense also needs --dense-tp-size > 1; both need unquantized "
             "o_proj / down_proj weights.",
+        )
+        parser.add_argument(
+            "--prefill-context-parallel-size",
+            type=int,
+            default=ServerArgs.prefill_context_parallel_size,
+            help="Shard every extend forward's query rows over the attention TP "
+            "group on the PD prefill role (query context parallelism): rank r "
+            "computes a contiguous slice of the chunk's rows against the gathered "
+            "KV history of its requests. Must equal --attn-tp-size and requires "
+            "--disaggregation-mode prefill, --disable-prefill-graph, a DSA-family "
+            "attention backend and --decode-context-parallel-size 1 or equal.",
         )
         parser.add_argument(
             "--dense-tp-size",

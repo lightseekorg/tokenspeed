@@ -178,6 +178,9 @@ class DistributedInitializer:
         # A DCP group of one is still the group the decode path collectives
         # address; init_process_group is idempotent and handles size 1.
         pg_manager.init_process_group(config.mapping.attn.dcp_group)
+        # The query-context-parallel group of a sharded extend; equal to the
+        # attention TP group while qcp == tp, so this is idempotent there.
+        pg_manager.init_process_group(config.mapping.attn.qcp_group)
         pg_manager.init_process_group(config.mapping.attn.dp_group)
         # No-op at the default linear_attn.tp == attn.tp (same group,
         # idempotent).

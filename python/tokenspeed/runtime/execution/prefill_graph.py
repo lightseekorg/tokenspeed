@@ -1183,6 +1183,9 @@ class PrefillGraph:
             extend_replay_lens_cpu=ib.extend_replay_lens_cpu[:bs],
             extend_prompt_lens_cpu=ib.extend_prompt_lens_cpu[:bs],
             extend_with_prefix=False,
+            # Query context parallelism refuses prefill graphs, so a capture
+            # forward is never sharded.
+            query_shard=None,
             **extra_metadata_kwargs,
         )
         return ctx

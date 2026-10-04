@@ -105,7 +105,10 @@ from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    QueryShardGather,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
@@ -1254,10 +1257,14 @@ class DeepseekV3AttentionMLA(nn.Module):
         positions: torch.Tensor,
         ctx: ForwardContext,
         slots: torch.Tensor,
+        *,
+        key_rows: QueryShardGather | None,
     ) -> torch.Tensor:
         """The absorbed MLA prologue: rotate the query and the latent key
         part, write the latent rows to ``slots`` and return the attention
-        query. One row count across the query, latent and positions."""
+        query. One row count across the query, latent and positions; under a
+        query shard ``key_rows`` gathers the rotated latent to the whole span
+        before the owner-masked store."""
         return self.attn_mqa.latent_prologue(
             Q,
             q_pe,
@@ -1266,6 +1273,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             ctx,
             slots=slots,
             expanded=None,
+            key_rows=key_rows,
         ).query
 
     def forward_absorb_qkv_proj(
@@ -1283,7 +1291,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         Under head TP ``q`` carries the head group's gathered rows and the
         exchange to this rank's own rows happens between the absorption and
         the prologue, so the prologue sees one row count; a rank with no rows
-        of its own skips the prologue and returns an empty query.
+        of its own skips the prologue and returns an empty query. Under a
+        query shard (head TP and query sharding exclude each other in the
+        mapping) the rows are this rank's shard and the prologue gathers the
+        rotated latent to the whole span; an empty shard still runs it.
         """
         Q, q_pe = self.absorb_query(q, absorbed_query)
         if self.has_head_tp:
@@ -1296,9 +1307,23 @@ class DeepseekV3AttentionMLA(nn.Module):
                 return Q
         # GLM's sparse prefill runs more rows than it commits: write the leading rows.
         query_tokens = Q.shape[0]
-        if cache_num_tokens is None:
+        key_rows = None
+        if ctx.query_shard is not None:
+            # A query shard rotates its own rows; the prologue gathers the
+            # rotated latent to the whole span (out_cache_loc) before the
+            # owner-masked store.
+            if cache_num_tokens is not None:
+                raise RuntimeError(
+                    "a query shard writes every row of the span; a partial write "
+                    "count cannot be combined with it"
+                )
+            key_rows = QueryShardGather(ctx.query_shard, self.mapping.attn.qcp_group)
+            cache_num_tokens = ctx.query_shard.total_rows
+        elif cache_num_tokens is None:
             cache_num_tokens = query_tokens
-        if cache_num_tokens < 0 or cache_num_tokens > query_tokens:
+        if cache_num_tokens < 0 or (
+            key_rows is None and cache_num_tokens > query_tokens
+        ):
             raise RuntimeError(
                 "MLA cache write count is outside the query capacity: "
                 f"writes={cache_num_tokens}, queries={query_tokens}"
@@ -1310,6 +1335,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             positions,
             ctx,
             slots=out_cache_loc[:cache_num_tokens],
+            key_rows=key_rows,
         )
 
     def forward_absorb_attn_v_proj(
@@ -1397,6 +1423,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             ctx,
             slots=slots,
             expanded=MLAExpandedKV(k_nope=k_nope, value=v),
+            key_rows=None,
         )
 
     def forward_normal_chunked_kv_core(
@@ -1671,6 +1698,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
             dense_batch_invariant=dense_batch_invariant and not self.is_moe_layer,
+            query_sharded=False,
         )
 
     @staticmethod
@@ -2266,6 +2294,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
             prev_is_moe=False,
             dense_batch_invariant=dense_batch_invariant,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(

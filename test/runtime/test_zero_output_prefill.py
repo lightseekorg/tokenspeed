@@ -707,6 +707,7 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
         "ForwardMode": SimpleNamespace(MIXED=object()),
         "V41_GROUP_GEOMETRY": {},
         "V41_SWA_GROUP_ID": "swa",
+        "reject_query_shard": lambda plan, name: None,
     }
     for name in (
         "V41PrefillSpan",
@@ -755,6 +756,7 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
         extend_replay_lens_cpu=torch.tensor(replays),
         extend_prompt_lens_cpu=torch.tensor(targets),
         extend_with_prefix=any(prefixes),
+        query_shard=None,
     )
     layout = ForwardOutputLayout.from_prefill(
         prefix_lengths=prefixes,

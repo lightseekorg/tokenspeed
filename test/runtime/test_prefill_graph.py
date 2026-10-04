@@ -159,6 +159,8 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             input_logprob_chunk_tokens=1024,
             enable_speculative_sampling=False,
             decode_only_attention=False,
+            query_shard_size=1,
+            query_shard_rank=0,
         )
         with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
             ModelExecutorConfig(**config_args)
@@ -1257,6 +1259,8 @@ class PrefillRoleGraphsTest(unittest.TestCase):
             decode_only_attention=False,
             prefill_graph_capture_batch_sizes=None,
             enable_speculative_sampling=False,
+            query_shard_size=1,
+            query_shard_rank=0,
             prefill_graph_max_tokens=256,
         )
 

@@ -620,6 +620,12 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         Subclasses that build their modules themselves call this after
         ``input_layernorm`` and ``post_attention_layernorm`` exist.
         """
+        # Under query context parallelism the layer's rows are this rank's
+        # shard of the chunk (the executor slices the inputs by
+        # ctx.query_shard), so the communication managers run the sharded
+        # layout: identity around attention, all-gather / reduce-scatter
+        # around the dense and MoE legs, sampled rows gathered at the exit.
+        query_sharded = self.mapping.attn.has_qcp
         # Attention 0 and MLP 0 share branch_comm[0]; the MoE manager only
         # drives the MoE collectives.
         self.moe_comm = _CommManager(
@@ -628,6 +634,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             is_moe=True,
             prev_is_moe=False,
             dense_batch_invariant=False,
+            query_sharded=query_sharded,
         )
         # --tp-batch-invariant attn+dense: the dense tail transposes rows
         # instead of reduce-scattering channel partials (see the MLPs).
@@ -643,6 +650,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
                 input_layernorm=self.input_layernorm[branch_id],
                 post_attn_layernorm=self.post_attention_layernorm[branch_id],
                 dense_batch_invariant=dense_batch_invariant,
+                query_sharded=query_sharded,
             )
             for branch_id in range(2)
         ]

@@ -1237,6 +1237,20 @@ unowned rows, and zeroing filters foreign blocks through the same path at
 every DCP size. Virtual block 0 is the null block; no path writes to it, at
 any DCP size.
 
+Query context parallelism (`--prefill-context-parallel-size`,
+`docs/design/unified_path.md`) is orthogonal to placement: DCP decides who
+stores a page, QCP decides who computes a row. Allocation, prefix matching,
+zeroing, publication and the P->D route never see the query shard. The
+sharded extend arm reads the placement through the same cyclic rule — the
+history gather of a request group splits by page owner
+(`dcp/placement.py: cyclic_slot_owner`, `owned_history_rows` on the host from
+the kernel page table's mirror) and the KV write gathers the rotated rows to
+the whole span before the owner-masked store — so a replicated group
+(`shard_count` 1) is a local gather and one owner, the same path with the
+degree as a parameter. A history gather workspace of one whole history is
+reserved from the cache budget by the recipe (`workspace_bytes`) like a
+verify workspace.
+
 Consumers bind a pool's compute view and read its arena's runtime contract.
 Views sharing an arena share that contract, rather than accepting separately
 injected copies of its geometry. Batch metadata retains the same contract for

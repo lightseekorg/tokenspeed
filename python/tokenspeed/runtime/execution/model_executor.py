@@ -65,6 +65,7 @@ from tokenspeed.runtime.execution.prefill_graph import (
     dummy_batch_size,
     narrowing_prefill_model,
 )
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.execution.types import (
@@ -316,6 +317,12 @@ class ModelExecutorConfig:
     # with coin * q(x) < p(x) (see --enable-speculative-sampling). Selects
     # the verify rule, so it is explicit.
     enable_speculative_sampling: bool
+    # Query context parallelism (mapping.attn.qcp_size / qcp_rank): an extend
+    # forward's rows are split over the attention TP group and this executor
+    # computes shard ``query_shard_rank``; size 1 means every rank computes
+    # every row.
+    query_shard_size: int
+    query_shard_rank: int
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -429,6 +436,8 @@ class ModelExecutorConfig:
             prefill_only=server_args.disaggregation_mode == "prefill",
             input_logprob_chunk_tokens=server_args.input_logprob_chunk_tokens,
             decode_only_attention=server_args.mapping.attn.has_head_tp,
+            query_shard_size=server_args.mapping.attn.qcp_size,
+            query_shard_rank=server_args.mapping.attn.qcp_rank,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
             world_group=server_args.mapping.world_group,
@@ -983,7 +992,9 @@ class ModelExecutor:
                         ctx=ctx,
                         input_ids=ib.input_ids_buf[:num_tokens],
                         positions=positions,
-                        **self._model_input_kwargs(num_tokens, ctx.bs),
+                        **self._model_input_kwargs(
+                            num_tokens, ctx.bs, slice(0, num_tokens)
+                        ),
                     )
                 if self.drafter is not None:
                     self._autotune_draft_experts(num_tokens)
@@ -1166,26 +1177,37 @@ class ModelExecutor:
 
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, ctx: ForwardContext):
+        # The model's rows: the whole packed span, or this rank's shard of it
+        # under query context parallelism. Every buffer below is the full span
+        # on every rank; the model sees the slice.
+        rows = (
+            slice(0, ctx.input_num_tokens)
+            if ctx.query_shard is None
+            else ctx.query_shard.local_slice
+        )
         positions = self._active_positions_override
         if positions is None:
             if self.config.model_is_mrope:
-                positions = self.input_buffers.mrope_positions_buf[
-                    :, : ctx.input_num_tokens
-                ]
+                positions = self.input_buffers.mrope_positions_buf[:, rows]
             else:
-                positions = self.input_buffers.positions_buf[: ctx.input_num_tokens]
+                positions = self.input_buffers.positions_buf[rows]
+        elif ctx.query_shard is not None:
+            positions = positions[..., rows]
+        input_ids = self.input_buffers.input_ids_buf[rows]
+        model_kwargs = self._model_input_kwargs(ctx.input_num_tokens, ctx.bs, rows)
         # PP mid-pipeline: receive the upstream boundary state and thread it
         # through the model's pp_inbound channel. Pipeline parallelism forces
         # eager (ServerArgs.resolve_disaggregation), so neither graph path
         # below can be active alongside PP.
         if self.config.pp_size > 1 and not self._pp_is_first_stage:
-            pp_inbound = self._pp_recv_stage_state(ctx.input_num_tokens)
+            # The boundary bundle carries the rows this stage computes.
+            pp_inbound = self._pp_recv_stage_state(rows.stop - rows.start)
             output = self.model_runner.forward(
                 ctx,
-                self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
+                input_ids,
                 positions,
                 pp_inbound=pp_inbound,
-                **self._model_input_kwargs(ctx.input_num_tokens, ctx.bs),
+                **model_kwargs,
             )
             return output
         # Prefill-graph replay when captured for this forward (the decode graph
@@ -1196,9 +1218,14 @@ class ModelExecutor:
             and (mode.is_extend() or mode.is_mixed())
             and self.prefill_graph.can_run(ctx, self._active_multimodal_context)
         ):
+            if ctx.query_shard is not None:
+                raise RuntimeError(
+                    "a sharded extend cannot replay a prefill graph; query context "
+                    "parallelism requires --disable-prefill-graph"
+                )
             return self.prefill_graph.replay(
                 ctx,
-                self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
+                input_ids,
                 self._active_multimodal_context,
             )
         if (
@@ -1213,21 +1240,28 @@ class ModelExecutor:
             )
         return self.model_runner.forward(
             ctx,
-            self.input_buffers.input_ids_buf[: ctx.input_num_tokens],
+            input_ids,
             positions,
             multimodal_context=self._active_multimodal_context,
-            **self._model_input_kwargs(ctx.input_num_tokens, ctx.bs),
+            **model_kwargs,
         )
 
-    def _model_input_kwargs(self, num_tokens: int, bs: int) -> dict[str, object]:
+    def _model_input_kwargs(
+        self, num_tokens: int, bs: int, rows: slice
+    ) -> dict[str, object]:
         """Model inputs beyond ids and positions, as views of persistent buffers.
 
         Every forward call site passes these, so eager, captured and replayed
-        forwards read the same storage.
+        forwards read the same storage. ``rows`` is the slice of the packed
+        span the model computes (the whole span, or a query shard): per-row
+        inputs are sliced by it, per-request inputs keep the whole batch with
+        the slice's start as their row offset.
         """
-        kwargs: dict[str, object] = dict(
-            self.input_buffers.ngram_model_kwargs(num_tokens)
-        )
+        # The n-gram history views are per row: hand the model its rows.
+        kwargs: dict[str, object] = {
+            name: view[rows]
+            for name, view in self.input_buffers.ngram_model_kwargs(num_tokens).items()
+        }
         if self.runtime_states.has_request_token_history:
             ib = self.input_buffers
             kwargs["request_token_history"] = (
@@ -1235,6 +1269,7 @@ class ModelExecutor:
                     req_pool_indices=ib.req_pool_indices_buf[:bs],
                     input_start_offsets=ib.input_start_offsets_buf[: bs + 1],
                     active_request_mask=ib.active_request_mask_buf[:bs],
+                    row_offset=rows.start,
                 )
             )
         return kwargs
@@ -1649,7 +1684,7 @@ class ModelExecutor:
             ctx,
             input_ids=empty,
             positions=empty,
-            **self._model_input_kwargs(0, 0),
+            **self._model_input_kwargs(0, 0, slice(0, 0)),
         )
 
         # If a drafter is active, its model also has MoE layers that issue
@@ -1673,6 +1708,7 @@ class ModelExecutor:
                         input_start_offsets=ib.input_start_offsets_buf[:1],
                         active_request_mask=ib.active_request_mask_buf[:0],
                         committed_lengths=self.runtime_states.valid_cache_lengths,
+                        row_offset=0,
                     )
                 )
             step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
@@ -1991,6 +2027,22 @@ class ModelExecutor:
                         num_decodes=bs - num_extends,
                         decode_width=self.config.output_length,
                     )
+                query_shard = None
+                if self.config.query_shard_size > 1:
+                    # The shard splits the packed extend span; host integers
+                    # from the same lengths gather_ids come from. The prefill
+                    # role never carries decode rows, so num_extends == bs.
+                    if num_extends != bs:
+                        raise RuntimeError(
+                            "query context parallelism shards pure extend "
+                            f"forwards; got {bs - num_extends} decode requests"
+                        )
+                    query_shard = QueryShardPlan.from_forward(
+                        total_tokens=total_tokens,
+                        input_lengths=forward_op.input_lengths[:bs],
+                        size=self.config.query_shard_size,
+                        rank=self.config.query_shard_rank,
+                    )
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -2010,6 +2062,7 @@ class ModelExecutor:
                     ),
                     decode_input_ids=decode_input_ids,
                     output_layout=output_layout,
+                    query_shard=query_shard,
                 )
                 if self.config.data_parallel_size > 1:
                     if dp_metadata is None:

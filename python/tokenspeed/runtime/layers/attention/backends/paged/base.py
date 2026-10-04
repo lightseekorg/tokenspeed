@@ -49,6 +49,7 @@ from tokenspeed.runtime.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
     from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
         TreeDraftInputs,
         TreeVerifyInputs,
@@ -257,6 +258,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
         **kwargs,
     ) -> None:
         """Build extend/mixed (or idle warmup) metadata.
@@ -275,6 +278,17 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
             extend_with_prefix: Whether any extend request continues a cached or
                 chunked prefix (some ``extend_prefix_lens`` entry is non-zero);
                 leaves that size ragged-vs-paged prefill metadata read it.
+            query_shard: The rows of the extend span this rank computes under
+                query context parallelism, or ``None`` when every rank computes
+                every row. Every length above describes the whole span; a leaf
+                without a gathered-history extend arm calls
+                :func:`reject_query_shard`.
+            page_table_cpu: Host mirror of ``page_table``'s extend rows
+                (``[num_extends, cols]`` int32 kernel pages, unpadded) when the
+                forward is sharded, else ``None``. The only host-side table a
+                leaf sees: the sharded extend arm counts how many history rows
+                each page owner holds from it, so the gather's per-rank split
+                never waits on the device.
         """
 
     @abstractmethod
@@ -316,6 +330,12 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         """Capture seeding: the idle refresh over the same buffers replay
         refreshes. Override only for a kernel-imposed capture asymmetry."""
         self.refresh_decode_metadata(bs, 0, seq_lens, page_table, for_graph_replay=True)
+
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        """A leaf without the sharded extend arm reserves nothing; the router
+        sums its leaves and the registry checks the total against the plan."""
+        del max_model_len
+        return 0
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """Publish a drafter's in-graph seq_lens edits into this leaf's own

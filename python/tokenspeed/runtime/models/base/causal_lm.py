@@ -31,6 +31,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.distributed.comm_manager import gather_sampled_rows
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -330,15 +331,46 @@ class BaseCausalLM(nn.Module):
             # Mid-pipeline stage: the executor sends this boundary state to
             # the next stage; there are no logits here.
             return hidden_states
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        return self.exit_logits(input_ids, hidden_states, aux_hidden_states, ctx)
 
-        return self.logits_processor(
+    def exit_logits(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        ctx: ForwardContext,
+    ):
+        """The model exit: sampled-row selection and the LM head.
+
+        Under query context parallelism ``hidden_states`` are this rank's
+        shard; only the sampled rows (one per request) are gathered across
+        the group before the LM head, in request order, and the context
+        marks its logits rows as selected. A full-hidden capture for the
+        drafter stays the shard, which is the drafter's extend input.
+        """
+        shard_hidden = None
+        if ctx.query_shard is not None and ctx.query_shard.size > 1:
+            shard_hidden = hidden_states
+            hidden_states = gather_sampled_rows(
+                hidden_states, ctx, group=self.mapping.attn.qcp_group
+            )
+            ctx.logits_rows_selected = True
+        logits_metadata = LogitsMetadata.from_forward_context(ctx)
+        output = self.logits_processor(
             input_ids,
             hidden_states,
             self.lm_head,
             logits_metadata,
             aux_hidden_states,
         )
+        if (
+            shard_hidden is not None
+            and aux_hidden_states is None
+            and ctx.capture_hidden_mode is not None
+            and ctx.capture_hidden_mode.is_full()
+        ):
+            output.hidden_states = shard_hidden
+        return output
 
     def prepare_model_kwargs(
         self, ctx: ForwardContext, input_ids: torch.Tensor, kwargs: dict

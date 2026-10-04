@@ -185,6 +185,7 @@ class NemotronHNorm(RMSNorm):
             prev_is_moe=False,
             dense_batch_invariant=False,
             post_attn_layernorm=self,
+            query_sharded=False,
         )
 
     def add_norm(
@@ -640,6 +641,7 @@ class NemotronHMoE(nn.Module):
             is_moe=True,
             prev_is_moe=False,
             dense_batch_invariant=False,
+            query_sharded=False,
         )
         self.fc2_reduce_group = _fc2_reduce_group(
             self.fc2_latent_proj, config.mlp_bias, mapping

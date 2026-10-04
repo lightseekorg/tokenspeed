@@ -299,7 +299,7 @@ def test_no_sink_combine_preserves_contiguous_mla_output(monkeypatch, batch, dty
         comm, "reduce_scatter", lambda x, group: (x * len(group))[:4].contiguous()
     )
     merged = comm.combine_attention_partials(
-        output, lse, group=(0, 1), rank=0, sink=None
+        output, lse, group=(0, 1), rank=0, sink=None, keep_all_heads=False
     )
     assert merged.is_contiguous()
     torch.testing.assert_close(merged, output[:, :4])
@@ -721,6 +721,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     backend.dcp_rank = rank
     backend.dcp_block_granularity = 64
     backend.dcp_virtual_block_count = 5
+    backend.qcp_group = (0,)
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
             num_extends=0, seq_lens_k=torch.tensor([128]), max_seq_len_k=128
@@ -753,8 +754,9 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
         assert kwargs["q"].shape == (1, 8, 128)
         return torch.full((1, 8, 128), 7.0), torch.zeros(1, 8)
 
-    def combine(out, lse, *, group, rank, sink):
+    def combine(out, lse, *, group, rank, sink, keep_all_heads):
         assert sink is None and group == backend.dcp_group
+        assert keep_all_heads is False
         assert lse.shape == out.shape[:-1]
         return out[:, rank * 2 : (rank + 1) * 2]
 

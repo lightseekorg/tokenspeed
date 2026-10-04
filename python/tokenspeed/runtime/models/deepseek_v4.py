@@ -3239,6 +3239,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             is_moe=True,
             prev_is_moe=True,
             dense_batch_invariant=False,
+            query_sharded=False,
         )
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

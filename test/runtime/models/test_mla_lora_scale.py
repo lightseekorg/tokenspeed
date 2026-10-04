@@ -266,7 +266,12 @@ def test_decoder_layer_hands_the_runtime_scales_to_attention(monkeypatch, mode):
         mock.patch.object(longcat_module, "_CommManager", lambda **kw: object()),
     ):
         _RuntimeLongcatDecoderLayer(
-            config, 0, mapping=SimpleNamespace(has_attn_tp=False), prefix="l"
+            config,
+            0,
+            mapping=SimpleNamespace(
+                has_attn_tp=False, attn=SimpleNamespace(has_qcp=False)
+            ),
+            prefix="l",
         )
     assert len(seen) == 2
     expected = (

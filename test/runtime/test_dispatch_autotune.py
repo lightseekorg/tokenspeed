@@ -174,9 +174,9 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             max_num_tokens=32,
             fill_dummy_decode_buffers=scrub,
         ),
-        _model_input_kwargs=lambda n, bs: {
-            "engram_previous_tokens": ngram_history[:n],
-            "engram_token_mask": ngram_mask[:n],
+        _model_input_kwargs=lambda n, bs, rows: {
+            "engram_previous_tokens": ngram_history[rows],
+            "engram_token_mask": ngram_mask[rows],
         },
         prefill_graph=SimpleNamespace(make_dummy_batch=prefill_batch),
         # Deliberately no capture_bs or graph-enabled flag: neither controls tuning.

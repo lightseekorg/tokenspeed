@@ -312,7 +312,13 @@ def test_residual_fusion_gather_boundaries_match_communication(
 ) -> None:
     mapping = SimpleNamespace(
         has_attn_tp=attn_tp > 1,
-        attn=SimpleNamespace(tp_size=attn_tp, tp_rank=0, tp_group=list(range(attn_tp))),
+        attn=SimpleNamespace(
+            tp_size=attn_tp,
+            tp_rank=0,
+            tp_group=list(range(attn_tp)),
+            has_qcp=False,
+            qcp_size=1,
+        ),
         dense=SimpleNamespace(tp_size=other_tp),
         moe=SimpleNamespace(tp_ep_size=other_tp),
     )
@@ -324,6 +330,7 @@ def test_residual_fusion_gather_boundaries_match_communication(
         input_layernorm=None,
         post_attn_layernorm=None,
         dense_batch_invariant=False,
+        query_sharded=False,
     )
     x = torch.arange(12).reshape(3, 4)
     gather = mock.Mock(side_effect=lambda value, **kwargs: value.repeat(2, 1))
@@ -335,16 +342,17 @@ def test_residual_fusion_gather_boundaries_match_communication(
     expected_pre = layer_id > 0 and expected_final
     assert manager.needs_pre_attn_all_gather() == expected_pre
     assert manager.needs_final_all_gather() == expected_final
+    ctx = SimpleNamespace(query_shard=None)
     for operation, expected in (
         (manager.pre_attn_comm, expected_pre),
         (manager.gather_residual, expected_pre),
     ):
         gather.reset_mock()
-        result = operation(x, None)
+        result = operation(x, ctx)
         assert gather.call_count == int(expected)
         assert (result is x) == (not expected)
     gather.reset_mock()
-    result, residual = manager.post_final_norm_comm(x, x, None)
+    result, residual = manager.post_final_norm_comm(x, x, ctx)
     assert gather.call_count == int(expected_final)
     assert residual is x and (result is x) == (not expected_final)
 

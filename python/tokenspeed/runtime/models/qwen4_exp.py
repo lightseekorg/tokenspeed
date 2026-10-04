@@ -309,6 +309,7 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
             is_moe=self.is_moe,
             prev_is_moe=self.is_moe,
             dense_batch_invariant=False,
+            query_sharded=False,
         )
         if _qwen4_exp_uses_sigmoid_output_gate(config):
             self.linear_attn.norm = _Qwen4ExpRMSNormGated(
@@ -443,6 +444,7 @@ class Qwen4ExpAttentionDecoderLayer(
             is_moe=self.is_moe,
             prev_is_moe=self.is_moe,
             dense_batch_invariant=False,
+            query_sharded=False,
         )
         self.indexer = None
         if getattr(config, "indexer_n_heads", None) is not None:

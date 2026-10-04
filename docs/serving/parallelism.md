@@ -527,6 +527,48 @@ output to stay bitwise identical across a rebalance; the envelope folds
 `--moe-combine-order slot` in, so the combination is accepted (see
 `docs/design/numerics.md`).
 
+## Query context parallelism on the prefill role
+
+`--prefill-context-parallel-size N` (QCP) splits every extend forward's rows
+over the attention TP group of a PD prefill engine: rank `r` computes the
+batch-global contiguous rows `[sum(c[:r]), sum(c[:r+1]))` of the chunk, with
+`c` the same uneven split the reduce-scatter / all-gather communication path
+uses, against the full KV history of its requests. It is a layout of the
+`Mapping` (`mapping.attn.qcp_size / qcp_rank / qcp_group`), not a mode: the
+scheduler plans the same chunk on every rank, cache allocation and the P->D
+transfer see page ownership only, and `--chunked-prefill-size` keeps counting
+the whole chunk, so size it as `N x rows-per-rank`.
+
+Per layer the rows a rank holds are its shard: attention needs no gather or
+reduce around it (the attention weights are head-replicated in this landing),
+the dense and MoE legs run the all-gather / reduce-scatter path over the
+shard's row table, the KV write all-gathers each rank's rotated latent to the
+whole span before the owner-masked store, the sparse DSA indexer and
+attention score the gathered history of each request group, and the model
+exit gathers only the sampled rows (one per request) before the LM head.
+Every QCP collective is data movement, so a row's bits do not depend on which
+rank computes it (`docs/design/numerics.md`).
+
+Requirements: `N == --attn-tp-size`, `--disaggregation-mode prefill`,
+`--disable-prefill-graph`, attention DP 1, no `--enable-mixed-batch`, a
+DSA-family attention backend (GPU DSA), and `--decode-context-parallel-size`
+1 or `N` (with `--disable-kvstore`, as DCP requires). The drafter's extend
+step is sharded like the target's; its decode steps run every row on every
+rank. A preset for an eight-GPU prefill engine:
+
+```bash
+tokenspeed serve <dsa-model> \
+  --disaggregation-mode prefill \
+  --attn-tp-size 8 --dense-tp-size 1 --enable-expert-parallel \
+  --prefill-context-parallel-size 8 \
+  --disable-prefill-graph \
+  --chunked-prefill-size 16384
+```
+
+A model supports the layout by slicing its rows by `ctx.query_shard`
+(`docs/design/unified_path.md`, "Query context parallelism"); every other
+model refuses it at construction.
+
 ## Multi-Node
 
 Set these explicitly:

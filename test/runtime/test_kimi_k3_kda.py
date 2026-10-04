@@ -566,6 +566,7 @@ class _KDAHarness:
             extend_replay_lens_cpu=torch.zeros_like(prefix_cpu),
             extend_prompt_lens_cpu=prefix_cpu + new_cpu,
             extend_with_prefix=bool(prefix_cpu.any()),
+            query_shard=None,
         )
 
     def decode_metadata(self, tables, seq_lens):

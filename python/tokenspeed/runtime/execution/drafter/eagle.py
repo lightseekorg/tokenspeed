@@ -35,6 +35,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeDraftInputs,
 )
@@ -87,6 +88,9 @@ class EagleDraftInput:
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
     dsa_topk: DsaTopKState = (None, None)
+    # The target forward's query shard: the draft's extend rows (step 0) are
+    # the same shard of the same span, its decode steps run every row.
+    query_shard: QueryShardPlan | None = None
 
 
 class Eagle(BaseDrafter):
@@ -276,7 +280,11 @@ class Eagle(BaseDrafter):
 
         The first-step input shape matches the base model's: ragged
         ``[prefill_part || decode_part]`` under MIXED, full prefill chunks
-        under EXTEND, ``base_model_output`` directly under DECODE.
+        under EXTEND, ``base_model_output`` directly under DECODE. Under a
+        query shard the ids are the shard's slice of the shifted prefill
+        ids and ``gather_ids`` are the sampled rows inside the shard,
+        re-based to it (the draft model gathers them across the group at
+        its exit, as the target does).
         """
         num_extends = draft_input.num_extends
         num_decodes = bs - num_extends
@@ -312,6 +320,18 @@ class Eagle(BaseDrafter):
                         + num_prefill_tokens,
                     ]
                 )
+            plan = draft_input.query_shard
+            if plan is not None and plan.size > 1:
+                if num_decodes > 0:
+                    raise RuntimeError(
+                        "a query-sharded draft step runs pure extend rounds"
+                    )
+                first = plan.local_sampled_first
+                gather_ids = (
+                    gather_ids[first : first + plan.local_sampled_rows]
+                    - plan.local_start
+                )
+                input_ids = input_ids[plan.local_slice]
         else:
             input_ids = draft_input.base_model_output
             gather_ids = (
@@ -378,6 +398,13 @@ class Eagle(BaseDrafter):
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
             draft_narrowing=narrowing,
+            query_shard=draft_input.query_shard,
+        )
+        # The step-0 rows: the whole span, or the target's shard of it.
+        rows = (
+            slice(0, input_num_tokens)
+            if draft_input.query_shard is None
+            else draft_input.query_shard.local_slice
         )
 
         dsa_topk = draft_input.dsa_topk
@@ -406,12 +433,13 @@ class Eagle(BaseDrafter):
                     input_start_offsets=buffers.input_start_offsets_buf[: bs + 1],
                     active_request_mask=buffers.active_request_mask_buf[:bs],
                     committed_lengths=self.runtime_states.valid_cache_lengths,
+                    row_offset=rows.start,
                 )
             )
         logits_output = self.draft_model_runner.forward(
             ctx=ctx,
             input_ids=input_ids,
-            positions=buffers.positions_buf[:input_num_tokens],
+            positions=buffers.positions_buf[rows],
             captured_hidden_states=draft_input.base_out_hidden_states,
             spec_step_idx=0,
             **history_kwargs,
@@ -519,6 +547,7 @@ class Eagle(BaseDrafter):
                             self.input_buffers.active_request_mask_buf[:bs]
                         ),
                         committed_lengths=self.draft_history_lengths_buf,
+                        row_offset=0,
                     )
                 )
             with nvtx_range("draft_forward", color="red"):
@@ -723,6 +752,7 @@ class Eagle(BaseDrafter):
             global_bs=base_ctx.global_bs,
             all_decode_or_idle=base_ctx.all_decode_or_idle,
             dsa_topk=self._target_dsa_topk(base_ctx),
+            query_shard=base_ctx.query_shard,
         )
 
         # next_tokens layout: column 0 = last verified id, columns 1.. = drafter tokens.

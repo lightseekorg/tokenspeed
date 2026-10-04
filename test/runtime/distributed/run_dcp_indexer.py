@@ -245,7 +245,9 @@ def main() -> None:
     partial, lse = dsa_decode(
         q=gathered, kv_cache=local_latent, topk_slots=local_slots, **kwargs
     )
-    output = combine_attention_partials(partial, lse, group=group, rank=rank, sink=None)
+    output = combine_attention_partials(
+        partial, lse, group=group, rank=rank, sink=None, keep_all_heads=False
+    )
     torch.testing.assert_close(
         output, ref_out[:, rank * 2 : (rank + 1) * 2], rtol=0.01, atol=0.005
     )

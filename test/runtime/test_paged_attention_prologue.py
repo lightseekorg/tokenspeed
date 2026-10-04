@@ -218,9 +218,89 @@ def test_the_write_lands_on_this_ranks_shard_under_dcp(monkeypatch):
         ctx,
         slots=torch.tensor([4, 9, 8, 0]),
         expanded=None,
+        key_rows=None,
     )
     assert handed["cache"].slots.tolist() == [0, 5, 4, 0]
     assert handed["cache"].write_mask.tolist() == [False, True, True, False]
+
+
+def test_a_query_shard_gathers_the_rotated_latent_before_the_masked_store(
+    monkeypatch,
+):
+    """Under query context parallelism the layer rotates its own rows without
+    a cache, all-gathers the rotated latent to the whole span with the plan's
+    row counts, and stores it through the owner-masked target: the same
+    masked write as DCP alone, fed by every rank's rows."""
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+
+    handed = {}
+    rotated = torch.arange(3 * 576, dtype=torch.bfloat16).reshape(3, 576)
+
+    def fake_mla_prologue(query, q_pe, latent, **kw):
+        handed["prologue"] = kw
+        return SimpleNamespace(query=query, key=None, value=None, latent=rotated)
+
+    def fake_gather(tensor, group, scattered_num_tokens):
+        handed["gather"] = (tensor, group, scattered_num_tokens)
+        return torch.cat([tensor, tensor[:2]])  # the other rank's two rows
+
+    monkeypatch.setattr(paged_attention, "mla_prologue", fake_mla_prologue)
+    monkeypatch.setattr(paged_attention, "token_all_gather", fake_gather)
+    monkeypatch.setattr(
+        paged_attention,
+        "latent_store",
+        lambda latent, *, kv_lora_rank, cache: handed.update(
+            store=(latent, kv_lora_rank, cache)
+        ),
+    )
+    layer = paged_attention.PagedAttention(
+        4, 576, 1.0, num_kv_heads=1, layer_id=0, rotary_emb=None, qk_norm=None
+    )
+    placement = CachePlacement(
+        block_granularity=4, virtual_block_count=8, group=(0, 1), rank=1
+    )
+    ctx = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        attn_backend=SimpleNamespace(cache_placement=lambda layer: placement),
+        token_to_kv_pool=SimpleNamespace(
+            kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
+        ),
+    )
+    plan = QueryShardPlan.from_forward(
+        total_tokens=5, input_lengths=[5], size=2, rank=0
+    )  # rows [3, 2]: this rank rotates three rows of a five-row span
+    q = torch.zeros(3, 4, 576, dtype=torch.bfloat16)
+    out = layer.latent_prologue(
+        q,
+        q[..., 512:],
+        torch.zeros(3, 576, dtype=torch.bfloat16),
+        torch.arange(3),
+        ctx,
+        slots=torch.tensor([4, 9, 8, 0, 5]),
+        expanded=None,
+        key_rows=paged_attention.QueryShardGather(plan, (0, 1)),
+    )
+    assert out.latent is rotated
+    assert handed["prologue"]["cache"] is None
+    tensor, group, counts = handed["gather"]
+    assert tensor is rotated or torch.equal(tensor, rotated)
+    assert group == (0, 1) and counts == [3, 2]
+    stored, kv_lora_rank, cache = handed["store"]
+    assert stored.shape == (5, 576) and kv_lora_rank == 512
+    assert cache.slots.tolist() == [0, 5, 4, 0, 0]
+    assert cache.write_mask.tolist() == [False, True, True, False, False]
+    with pytest.raises(ValueError, match="whole span"):
+        layer.latent_prologue(
+            q,
+            q[..., 512:],
+            torch.zeros(3, 576, dtype=torch.bfloat16),
+            torch.arange(3),
+            ctx,
+            slots=torch.tensor([4, 9, 8]),
+            expanded=None,
+            key_rows=paged_attention.QueryShardGather(plan, (0, 1)),
+        )
 
 
 def test_head_caches_take_no_write_mask():

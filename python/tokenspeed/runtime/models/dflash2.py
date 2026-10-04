@@ -341,6 +341,7 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
                 dense_batch_invariant=False,
                 input_layernorm=self.input_layernorm,
                 post_attn_layernorm=self.post_attention_layernorm,
+                query_sharded=False,
             )
         conv_args = dict(
             hidden_size=int(config.hidden_size),

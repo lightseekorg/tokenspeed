@@ -612,6 +612,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(
@@ -809,6 +810,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def _project_qkv(

@@ -252,6 +252,7 @@ def _extend_kwargs(
         extend_prompt_lens_cpu=extend_prefix_lens_cpu
         + extend_seq_lens_cpu[: extend_prefix_lens_cpu.numel()],
         extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
+        query_shard=None,
     )
 
 

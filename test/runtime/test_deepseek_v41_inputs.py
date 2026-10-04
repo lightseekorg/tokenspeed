@@ -723,7 +723,9 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     executor._active_positions_override = None
     executor._active_multimodal_context = None
     executor.prefill_graph = SimpleNamespace(can_run=lambda ctx, mm: False)
-    ctx = SimpleNamespace(input_num_tokens=num_tokens, forward_mode=mode, bs=1)
+    ctx = SimpleNamespace(
+        input_num_tokens=num_tokens, forward_mode=mode, bs=1, query_shard=None
+    )
     original = vars(ctx).copy()
     result = executor._run_target_forward(ctx)
     assert result["engram_previous_tokens"].shape == (num_tokens, 3)

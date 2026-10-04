@@ -34,6 +34,7 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -44,18 +45,28 @@ from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.dcp.cache import (
+    HistoryGatherPlan,
+    gather_history_rows,
+    history_gather_workspace_rows,
+    plan_history_gather,
+)
 from tokenspeed.runtime.layers.attention.dcp.comm import (
     combine_attention_partials,
     gather_query_heads,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
+    owned_history_rows,
     resolve_cache_slots,
 )
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
+from tokenspeed.runtime.layers.attention.page_table import (
+    build_prefill_kv_workspace_slots,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -73,6 +84,44 @@ def _k_row_context_lengths(seq_lens: torch.Tensor, k: int) -> torch.Tensor:
     (``_publish_k_row_indexer_rows``). Only ``k == 1`` aliases ``seq_lens``;
     callers that keep the rows call ``.contiguous()`` to cover that case."""
     return seq_lens.unsqueeze(1).expand(-1, k).reshape(-1, 1)
+
+
+@dataclasses.dataclass(frozen=True)
+class QueryShardHistoryGroup:
+    """One request group of a sharded extend: its history and this rank's queries.
+
+    Attributes:
+        requests: The extend requests in the group (a contiguous range).
+        row_base: Workspace row of the group's first history row: the
+            request-major concatenation of every extend request's history
+            (prefix plus chunk) numbers its rows, and ``dsa_prefill_topk``
+            returns rows in that numbering.
+        rows: History rows of the group.
+        local_query: This rank's query rows that belong to the group, as a
+            slice of the rank's shard rows.
+        gather: How the group's rows split over the page owners.
+    """
+
+    requests: slice
+    row_base: int
+    rows: int
+    local_query: slice
+    gather: HistoryGatherPlan
+
+
+@dataclasses.dataclass(frozen=True)
+class DSAQueryShardMetadata:
+    """The sharded extend arm's per-forward plan.
+
+    Attributes:
+        plan: The forward's query shard.
+        groups: Request groups whose history fits the gather workspace, in
+            request order; every rank runs every group's gather (a collective)
+            and attends only the groups it has query rows in.
+    """
+
+    plan: QueryShardPlan
+    groups: tuple[QueryShardHistoryGroup, ...]
 
 
 def _make_dense_leaf(
@@ -115,6 +164,28 @@ class DSABackend(PagedAttentionBackend):
         self.dcp_virtual_block_count: int | None = None
         if len(self.dcp_group) > 1 and spec.index_kpool is not None:
             raise ValueError("DSA DCP does not yet support KPool selection")
+        # Query context parallelism: the extend rows this rank computes are a
+        # shard of the chunk and attend the gathered history of their
+        # requests; the gather splits by page owner (the DCP group, or this
+        # rank alone) and lands in a workspace sized for one whole history.
+        self.qcp_group = tuple(config.qcp_group)
+        self.qcp_rank = config.qcp_rank
+        if len(self.qcp_group) > 1 and spec.index_kpool is not None:
+            raise ValueError("DSA query context parallelism does not support KPool")
+        if len(self.qcp_group) > 1 and spec.index_k_format != "fp8_scaled":
+            # The history gather reads the fp8_scaled block-split plane
+            # (DSATokenToKVPool.gather_index_k_rows); the workspace plan
+            # (dsa_history_gather_workspace_bytes) refuses the same.
+            raise ValueError(
+                "DSA query context parallelism gathers fp8_scaled index-K rows; "
+                f"got index_k_format={spec.index_k_format!r}"
+            )
+        self.index_head_dim = spec.index_head_dim
+        self.query_shard_metadata: DSAQueryShardMetadata | None = None
+        self._history_workspace_rows: int = 0
+        self._history_kv_workspace: torch.Tensor | None = None
+        self._history_index_k_fp8_workspace: torch.Tensor | None = None
+        self._history_index_k_scale_workspace: torch.Tensor | None = None
         self.index_topk = spec.index_topk
         self.kv_lora_rank = spec.kv_lora_rank
         self.qk_nope_head_dim = spec.qk_nope_head_dim
@@ -162,6 +233,32 @@ class DSABackend(PagedAttentionBackend):
             raise ValueError("DSA cache geometry does not match DCP topology")
         self.dcp_block_granularity = block_granularity
         self.dcp_virtual_block_count = virtual_block_count
+
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        """Allocate the gathered-history workspace of the sharded extend arm.
+
+        Reserved from the cache budget like a verify workspace: the recipe
+        plans the same bytes (``dsa_history_gather_workspace_bytes``) before
+        sizing the arena. Returns the bytes allocated so the caller can check
+        them against the plan.
+        """
+        rows = history_gather_workspace_rows(max_model_len)
+        groups = self.index_head_dim // 128
+        self._history_workspace_rows = rows
+        self._history_kv_workspace = torch.empty(
+            (rows, self.kv_cache_dim), dtype=self.data_type, device=self.device
+        )
+        self._history_index_k_fp8_workspace = torch.empty(
+            (rows, self.index_head_dim), dtype=torch.uint8, device=self.device
+        )
+        self._history_index_k_scale_workspace = torch.empty(
+            (rows, groups), dtype=torch.float32, device=self.device
+        )
+        return (
+            self._history_kv_workspace.nbytes
+            + self._history_index_k_fp8_workspace.nbytes
+            + self._history_index_k_scale_workspace.nbytes
+        )
 
     def cache_placement(self, layer) -> CachePlacement | None:
         if len(self.dcp_group) == 1:
@@ -259,6 +356,7 @@ class DSABackend(PagedAttentionBackend):
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self._prefill_page_table = None
+        self.query_shard_metadata = None
         self.dcp_block_granularity = None
         self.dcp_virtual_block_count = None
         if self.kpool_runtime is not None:
@@ -383,6 +481,8 @@ class DSABackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
         **kwargs,
     ):
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
@@ -390,6 +490,9 @@ class DSABackend(PagedAttentionBackend):
                 "DSA decode metadata goes through refresh_decode_metadata; "
                 f"init_forward_metadata only serves extend/mixed ({forward_mode})"
             )
+        # The dense delegate describes the whole extend span (its page table
+        # and lengths serve the indexer's workspace slots); the shard is this
+        # leaf's: it attends local rows against gathered history below.
         self._dense_backend.init_forward_metadata(
             bs,
             num_extends,
@@ -401,8 +504,31 @@ class DSABackend(PagedAttentionBackend):
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_with_prefix=extend_with_prefix,
+            query_shard=None,
+            page_table_cpu=None,
             **kwargs,
         )
+        self.query_shard_metadata = None
+        if query_shard is not None and query_shard.size > 1:
+            if forward_mode.is_mixed():
+                raise RuntimeError(
+                    "DSA query context parallelism serves pure extend forwards; a "
+                    "MIXED round carries replicated decode rows"
+                )
+            if page_table_cpu is None:
+                raise RuntimeError(
+                    "DSA query context parallelism needs the host page table to "
+                    "split the history gather by page owner"
+                )
+            self.query_shard_metadata = self._plan_query_shard(
+                query_shard,
+                num_extends=num_extends,
+                page_table=page_table,
+                page_table_cpu=page_table_cpu,
+                seq_lens=seq_lens,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            )
         # Target mixed batches carry decode rows needing the per-token plan.
         # A draft's plan is rebuilt by the wrapper's refresh_decode_metadata
         # after this init (the unified draft contract).
@@ -436,6 +562,143 @@ class DSABackend(PagedAttentionBackend):
                 # the leaf's kernel page size by construction).
                 self._prefill_page_table = page_table[:num_extends]
                 cmeta.page_table = self._prefill_page_table
+
+    # ------------------------------------------------------------------
+    # Query context parallelism: the gathered-history extend arm
+    # ------------------------------------------------------------------
+
+    def _plan_query_shard(
+        self,
+        plan: QueryShardPlan,
+        *,
+        num_extends: int,
+        page_table: torch.Tensor,
+        page_table_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+    ) -> DSAQueryShardMetadata:
+        """Group the extend requests by history and plan each group's gather.
+
+        Host arithmetic over the pinned length mirrors and the host page table
+        (owned-row counts per rank); the device work is one slot build per
+        group. Greedy grouping by summed history length against the gather
+        workspace, a request never splits.
+        """
+        if self._history_kv_workspace is None:
+            raise RuntimeError(
+                "DSA query context parallelism needs its history gather workspace; "
+                "preallocate_history_gather_workspace did not run"
+            )
+        extend_lens = [int(x) for x in extend_seq_lens_cpu[:num_extends].tolist()]
+        prefix_lens = [int(x) for x in extend_prefix_lens_cpu[:num_extends].tolist()]
+        if sum(extend_lens) != plan.total_rows:
+            raise RuntimeError(
+                f"query shard plans {plan.total_rows} rows but the extend requests "
+                f"carry {sum(extend_lens)}"
+            )
+        history_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        placement = self.cache_placement(None)
+        owned = owned_history_rows(
+            page_table_cpu[:num_extends],
+            torch.tensor(history_lens, dtype=torch.int64),
+            page_size=self.kernel_page_size,
+            placement=placement,
+        )
+        cap = self._history_workspace_rows
+        groups: list[QueryShardHistoryGroup] = []
+        query_start = 0
+        row_base = 0
+        first = 0
+        while first < num_extends:
+            if history_lens[first] > cap:
+                raise RuntimeError(
+                    f"request history of {history_lens[first]} rows exceeds the "
+                    f"{cap}-row query-context-parallel gather workspace"
+                )
+            last = first
+            rows = history_lens[first]
+            while last + 1 < num_extends and rows + history_lens[last + 1] <= cap:
+                last += 1
+                rows += history_lens[last]
+            requests = slice(first, last + 1)
+            query_rows = sum(extend_lens[requests])
+            local_lo = min(max(query_start, plan.local_start), plan.local_end)
+            local_hi = min(
+                max(query_start + query_rows, plan.local_start), plan.local_end
+            )
+            virtual_slots = build_prefill_kv_workspace_slots(
+                page_table=page_table[requests],
+                seq_lens=seq_lens[requests],
+                max_seq_len=max(history_lens[requests]),
+                page_size=self.kernel_page_size,
+                device=page_table.device,
+                num_tokens=rows,
+            )
+            gather = plan_history_gather(
+                virtual_slots,
+                placement=placement,
+                owned_rows_per_rank=owned[:, requests].sum(dim=1).tolist(),
+            )
+            groups.append(
+                QueryShardHistoryGroup(
+                    requests=requests,
+                    row_base=row_base,
+                    rows=rows,
+                    local_query=slice(
+                        local_lo - plan.local_start, local_hi - plan.local_start
+                    ),
+                    gather=gather,
+                )
+            )
+            query_start += query_rows
+            row_base += rows
+            first = last + 1
+        return DSAQueryShardMetadata(plan=plan, groups=tuple(groups))
+
+    def require_query_shard_metadata(self) -> DSAQueryShardMetadata:
+        """The sharded extend arm's plan for the current forward."""
+        if self.query_shard_metadata is None:
+            raise RuntimeError("this forward is not a sharded DSA extend")
+        return self.query_shard_metadata
+
+    def gather_history_kv(
+        self, layer, token_to_kv_pool, group: QueryShardHistoryGroup
+    ) -> torch.Tensor:
+        """Assemble one group's latent rows ``[rows, kv_cache_dim]`` in
+        position order (a view of the gather workspace, valid until the next
+        group's gather). A collective over the page owners: every rank calls
+        it for every group."""
+        if self._history_kv_workspace is None:
+            raise RuntimeError("DSA history gather workspace is not allocated")
+        kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_flat = kv_cache.reshape(-1, kv_cache.shape[-1])
+        local = kv_flat.index_select(0, group.gather.local_fetch_slots)
+        return gather_history_rows(group.gather, local, out=self._history_kv_workspace)
+
+    def gather_history_index_k(
+        self, layer_id: int, token_to_kv_pool, group: QueryShardHistoryGroup
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Assemble one group's index-K rows: ``[rows, index_head_dim]`` FP8
+        bytes and ``[rows, groups]`` fp32 scales in position order, the
+        ``index_k_fp8`` / ``index_k_scale`` inputs of ``dsa_prefill_topk``
+        (views of the gather workspace). A collective over the page owners."""
+        if (
+            self._history_index_k_fp8_workspace is None
+            or self._history_index_k_scale_workspace is None
+        ):
+            raise RuntimeError("DSA history gather workspace is not allocated")
+        fp8, scale = token_to_kv_pool.gather_index_k_rows(
+            layer_id, group.gather.local_fetch_slots
+        )
+        return (
+            gather_history_rows(
+                group.gather, fp8, out=self._history_index_k_fp8_workspace
+            ),
+            gather_history_rows(
+                group.gather, scale, out=self._history_index_k_scale_workspace
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Validation helpers
@@ -503,6 +766,11 @@ class DSABackend(PagedAttentionBackend):
         out: torch.Tensor | None = None,
     ):
         self._validate_logit_cap(logits_soft_cap)
+        if self.query_shard_metadata is not None:
+            raise RuntimeError(
+                "a sharded DSA extend attends through forward_sparse_prefill; the "
+                "dense delegate sees whole-span metadata for shard rows"
+            )
         self._validate_dense_context(seq_lens, batch_size)
         return self._dense_backend.forward_extend_chunked(
             q,
@@ -571,12 +839,20 @@ class DSABackend(PagedAttentionBackend):
         topk_lens: torch.Tensor,
         max_seq_len: int,
     ) -> torch.Tensor:
-        """Attend to preselected global KV slots and merge DCP partials.
+        """Attend to preselected KV slots and merge DCP partials.
 
         topk_slots contains one candidate row per query, with -1 for invalid
         entries; topk_lens gives valid counts. kv_seq_lens optionally supplies
         per-query causal lengths, bounded by max_seq_len. KV is already written.
         Returns token-major attention output, flattened over heads and features.
+
+        Under a query shard ``q`` holds this rank's rows and ``topk_slots``
+        are history workspace rows (the request-major rows of every extend
+        request's prefix and chunk, as ``dsa_prefill_topk`` numbers them, the
+        rows ``gather_history_index_k`` scored): per request group the KV
+        history is gathered from its page owners into one buffer and the
+        local rows attend it with every head -- pure data movement, so a
+        row's bytes are those of an unsharded forward, and no LSE merge.
         """
         if layer.logit_cap and layer.logit_cap > 0:
             self._validate_logit_cap(layer.logit_cap)
@@ -602,6 +878,29 @@ class DSABackend(PagedAttentionBackend):
                 "DSA sparse prefill physical length mismatch: "
                 f"lens={tuple(kv_seq_lens.shape)}, q_tokens={q.shape[0]}"
             )
+        if self.query_shard_metadata is not None:
+            # A rank without rows still joins every group's gather, so the
+            # sharded arm runs before the empty-query return.
+            if topk_slots.dim() != 2 or topk_slots.shape[1] <= 0:
+                raise RuntimeError(
+                    "DSA sparse prefill top-k shape mismatch: "
+                    f"indices={tuple(topk_slots.shape)}"
+                )
+            q_view = q.view(q.shape[0], layer.tp_q_head_num, layer.head_dim)
+            if self.data_type == torch.float8_e4m3fn and q_view.dtype != self.data_type:
+                q_view = q_view.to(self.data_type)
+            out = self._forward_sharded_sparse_prefill(
+                q_view=q_view,
+                layer=layer,
+                token_to_kv_pool=token_to_kv_pool,
+                kv_seq_lens=kv_seq_lens,
+                topk_slots=topk_slots,
+                topk_lens=topk_lens,
+                max_seq_len=max_seq_len,
+            )
+            if self.step_counter is not None:
+                self.step_counter.record_cache()
+            return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
         if q.shape[0] == 0:
             return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
         # KPool selection can append up to pool_size - 1 visible tail tokens,
@@ -652,6 +951,7 @@ class DSABackend(PagedAttentionBackend):
                 group=self.dcp_group,
                 rank=self.dcp_rank,
                 sink=None,
+                keep_all_heads=False,
             )
         # GLM's sparse-prefill path writes both the latent KV and index_k before
         # entering this method, but bypasses the backend's forward and its
@@ -661,6 +961,66 @@ class DSABackend(PagedAttentionBackend):
         if self.step_counter is not None:
             self.step_counter.record_cache()
         return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_sharded_sparse_prefill(
+        self,
+        *,
+        q_view: torch.Tensor,
+        layer,
+        token_to_kv_pool,
+        kv_seq_lens: torch.Tensor | None,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor,
+        max_seq_len: int,
+    ) -> torch.Tensor:
+        """The gathered-buffer arm: per request group, gather the history and
+        attend this rank's rows of the group against it."""
+        meta = self.require_query_shard_metadata()
+        if q_view.shape[0] != meta.plan.local_rows:
+            raise RuntimeError(
+                f"query shard rank {meta.plan.rank} attends {meta.plan.local_rows} "
+                f"rows, got {q_view.shape[0]}"
+            )
+        out = q_view.new_empty(
+            (q_view.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+            dtype=(
+                torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
+            ),
+        )
+        topk_lens = topk_lens.to(device=q_view.device, dtype=torch.int32).contiguous()
+        if kv_seq_lens is not None:
+            kv_seq_lens = kv_seq_lens.to(
+                device=q_view.device, dtype=torch.int32
+            ).contiguous()
+        for group in meta.groups:
+            # Every rank joins every group's gather; the collective does not
+            # know which ranks have query rows in the group.
+            kv_group = self.gather_history_kv(layer, token_to_kv_pool, group)
+            rows = group.local_query
+            if rows.stop <= rows.start:
+                continue
+            slots = topk_slots[rows]
+            slots = torch.where(slots >= 0, slots - group.row_base, -1)
+            out[rows] = dsa_prefill(
+                q=q_view[rows],
+                kv_cache=kv_group,
+                sparse_kv_cache=None,
+                topk_slots=slots,
+                topk_lens=topk_lens[rows],
+                kv_seq_lens=None if kv_seq_lens is None else kv_seq_lens[rows],
+                max_seqlen_k=max_seq_len,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                softmax_scale=layer.scaling,
+                page_size=self.kernel_page_size,
+                logit_cap=layer.logit_cap,
+                k_scale=1.0,
+                return_lse=False,
+                solution=self.kernel_solution,
+                slot_order=self.slot_order,
+            )
+        return out
 
     def forward_sparse_decode(
         self,
@@ -768,11 +1128,18 @@ class DSABackend(PagedAttentionBackend):
             getattr(metadata, "max_seq_len_k", 0) or self.max_context_len
         )
         use_dcp = len(self.dcp_group) > 1
+        # Under query context parallelism the attention weights are
+        # head-replicated (every rank holds every head), so the decode arm --
+        # a query shard's drafter steps -- keeps all heads: no query-head
+        # gather in, an all-reduce of the weighted partials out. Head TP under
+        # QCP retires this and makes it the head-sharded arm.
+        keep_all_heads = len(self.qcp_group) > 1
         topk_slots = topk_indices.view(num_tokens, -1)
         if use_dcp:
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
             topk_slots = torch.where(owned, slots, -1)
-            q_view = gather_query_heads(q_view, self.dcp_group)
+            if not keep_all_heads:
+                q_view = gather_query_heads(q_view, self.dcp_group)
         out = dsa_decode(
             q=q_view,
             kv_cache=kv_cache,
@@ -801,6 +1168,7 @@ class DSABackend(PagedAttentionBackend):
                 group=self.dcp_group,
                 rank=self.dcp_rank,
                 sink=None,
+                keep_all_heads=keep_all_heads,
             ).to(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
             )

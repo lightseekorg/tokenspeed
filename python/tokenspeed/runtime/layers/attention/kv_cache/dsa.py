@@ -57,6 +57,42 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self.layerwise_load_tracker.wait_for_layer(layer_id)
         return self.index_k_buffer[layer_id]
 
+    def gather_index_k_rows(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read index-K rows out of the block-split paged buffer.
+
+        The buffer stores every page as its ``page_size`` FP8 rows followed by
+        their fp32 scales (``index_k_block_split_scatter``); this is the read
+        side of that layout, for the rows a query-context-parallel history
+        gather contributes.
+
+        Args:
+            layer_id: The indexer layer whose plane to read.
+            slots: ``[rows]`` int64 local cache slots.
+
+        Returns:
+            ``[rows, index_head_dim]`` uint8 FP8 rows and ``[rows, groups]``
+            fp32 scales, in ``slots`` order.
+        """
+        buf = self.get_index_k_buffer(layer_id)
+        page_size = int(self.arena.kv_page_size)
+        head_dim = self.index_head_dim
+        groups = head_dim // _INDEX_K_FP8_GROUP_SIZE
+        row_bytes = head_dim + groups * 4
+        page_bytes = page_size * row_bytes
+        num_pages = buf.numel() // page_bytes
+        pages = buf.reshape(-1)[: num_pages * page_bytes].view(num_pages, page_bytes)
+        fp8 = pages[:, : page_size * head_dim].view(num_pages, page_size, head_dim)
+        scale = (
+            pages[:, page_size * head_dim :]
+            .view(torch.float32)
+            .view(num_pages, page_size, groups)
+        )
+        page = torch.div(slots, page_size, rounding_mode="floor")
+        offset = slots - page * page_size
+        return fp8[page, offset], scale[page, offset]
+
     def set_index_k_buffer(
         self,
         layer_id: int,

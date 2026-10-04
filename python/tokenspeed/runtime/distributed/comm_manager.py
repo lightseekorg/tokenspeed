@@ -30,6 +30,45 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan, scatter_count
+
+
+def gather_sampled_rows(
+    hidden_states: torch.Tensor, ctx: ForwardContext, *, group: tuple[int, ...]
+) -> torch.Tensor:
+    """Gather the sampled rows of a sharded extend forward to every rank.
+
+    The last row of every request (``ctx.gather_ids``, sorted) lives on
+    exactly one rank; each rank selects the ones inside its shard and one
+    all-gather with the plan's per-rank sampled-row counts concatenates them
+    in rank order, which is request order. The model sets
+    ``ctx.logits_rows_selected`` afterwards so the logits processor takes the
+    ``[bs, hidden]`` rows as given.
+
+    Args:
+        hidden_states: ``[local_rows, hidden]`` this rank's final rows.
+        ctx: The forward, with ``query_shard`` and ``gather_ids`` set.
+        group: The query-context-parallel group.
+
+    Returns:
+        ``[bs, hidden]`` sampled rows in request order, on every rank.
+    """
+    plan = ctx.query_shard
+    if plan is None:
+        raise ValueError("gather_sampled_rows needs a sharded forward")
+    if ctx.gather_ids is None:
+        raise ValueError("gather_sampled_rows needs ctx.gather_ids")
+    if hidden_states.shape[0] != plan.local_rows:
+        raise ValueError(
+            f"query shard rank {plan.rank} holds {plan.local_rows} rows, got "
+            f"{hidden_states.shape[0]}"
+        )
+    first = plan.local_sampled_first
+    local_ids = (
+        ctx.gather_ids[first : first + plan.local_sampled_rows] - plan.local_start
+    )
+    local = hidden_states.index_select(0, local_ids)
+    return token_all_gather(local, group, list(plan.sampled_rows_per_rank))
 
 
 def moe_input_row_segments(
@@ -147,6 +186,17 @@ def forward_collective_row_table(ctx: ForwardContext) -> list[int] | None:
 class CommManager:
     """Manages communication patterns (all_reduce vs RSAG) for each decoder layer.
 
+    ``query_sharded`` declares the model slices its extend rows by
+    ``ctx.query_shard`` (query context parallelism): the rows a layer holds
+    are then a shard, never replicated, so attention needs no gather or
+    reduce, the dense and MoE legs run the existing all-gather /
+    reduce-scatter path over the shard's per-rank row table, and the model
+    exit gathers only the sampled rows. A forward without a shard (the
+    drafter's decode steps, idle) keeps the replicated-row behaviour. The
+    flag must agree with ``mapping.attn.has_qcp``: a model that does not
+    slice its rows cannot run under a query-sharding mapping, and one that
+    does cannot run without it.
+
     ``dense_batch_invariant`` selects the TP-batch-invariant dense tail: the
     layer's ``down_proj`` is column-parallel on hidden and ``post_dense_comm``
     transposes its ``[T_full, H / W]`` output back to this rank's rows instead
@@ -162,13 +212,23 @@ class CommManager:
         dense_batch_invariant: bool,
         input_layernorm: torch.nn.Module | None = None,
         post_attn_layernorm: torch.nn.Module | None = None,
+        *,
+        query_sharded: bool,
     ) -> None:
+        if query_sharded != mapping.attn.has_qcp:
+            raise ValueError(
+                f"CommManager(query_sharded={query_sharded}) disagrees with the "
+                f"attention mapping (qcp_size={mapping.attn.qcp_size}): a model "
+                "declares query sharding only when it slices its extend rows by "
+                "ctx.query_shard, and must when the mapping shards queries"
+            )
         self.mapping = mapping
         self.layer_id = layer_id
         self.is_moe = is_moe
         self.prev_is_moe = prev_is_moe
         self.input_layernorm = input_layernorm
         self.post_attn_layernorm = post_attn_layernorm
+        self.query_sharded = query_sharded
         # utils.env imports server_args, which imports this package: resolve
         # the launch options lazily, as the fusion predicates below do.
         from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -190,16 +250,32 @@ class CommManager:
 
     # ---- Scattered token counts ----
 
-    @staticmethod
-    def _scatter_count(num_tokens: int, tp_size: int) -> list[int]:
-        base, remainder = divmod(num_tokens, tp_size)
-        return [base + 1] * remainder + [base] * (tp_size - remainder)
+    _scatter_count = staticmethod(scatter_count)
+
+    def _shard(self, ctx: ForwardContext) -> QueryShardPlan | None:
+        """The forward's query shard when the rows this layer holds are a
+        shard; None for replicated rows."""
+        plan = ctx.query_shard
+        if plan is None or plan.size == 1:
+            return None
+        if not self.query_sharded:
+            raise RuntimeError(
+                "a query-sharded forward reached a CommManager whose model did "
+                "not declare query_sharded"
+            )
+        return plan
 
     def get_num_tokens(self, ctx: ForwardContext):
         scattered = self.scattered_num_tokens(ctx)
         return sum(scattered), max(scattered)
 
     def scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
+        plan = self._shard(ctx)
+        if plan is not None:
+            # The shard is the scattered table (attention DP is refused under
+            # query sharding, so one group); a model that narrowed its rows to
+            # the sampled rows reports that through collective_num_tokens.
+            return list(plan.rows_for_collective(ctx.collective_num_tokens))
         global_counts = (
             ctx.collective_global_num_tokens
             if ctx.collective_global_num_tokens is not None
@@ -269,7 +345,8 @@ class CommManager:
         return self.mapping.attn.tp_size == self.mapping.dense.tp_size
 
     def needs_pre_attn_all_gather(self) -> bool:
-        """Whether attention preparation must gather the previous layer's rows."""
+        """Whether attention preparation must gather the previous layer's rows
+        (replicated-row layouts; a sharded forward never gathers)."""
         return (
             self.layer_id > 0
             and self.mapping.has_attn_tp
@@ -277,7 +354,7 @@ class CommManager:
         )
 
     def pre_attn_comm(self, hidden_states: torch.Tensor, ctx: ForwardContext):
-        if not self.needs_pre_attn_all_gather():
+        if self._shard(ctx) is not None or not self.needs_pre_attn_all_gather():
             return hidden_states
 
         return token_all_gather(
@@ -292,7 +369,7 @@ class CommManager:
 
         Mirrors the pre_attn_comm gather conditions.
         """
-        if not self.needs_pre_attn_all_gather():
+        if self._shard(ctx) is not None or not self.needs_pre_attn_all_gather():
             return residual
         return self.gather_scattered_rows(residual, ctx)
 
@@ -339,7 +416,9 @@ class CommManager:
     def post_attn_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
-        if not self.mapping.has_attn_tp:
+        # A shard's attention output is complete per row (the output
+        # projection is not row-parallel in this layout), so nothing to reduce.
+        if self._shard(ctx) is not None or not self.mapping.has_attn_tp:
             return hidden_states, residual
 
         if self.use_all_reduce(self.is_moe):
@@ -381,7 +460,7 @@ class CommManager:
         if not self.mapping.dense.has_tp:
             return hidden_states
 
-        if self.use_all_reduce(is_moe=False):
+        if self._shard(ctx) is None and self.use_all_reduce(is_moe=False):
             return hidden_states
 
         return token_all_gather(
@@ -394,7 +473,7 @@ class CommManager:
         if not self.mapping.moe.has_tp_ep:
             return hidden_states
 
-        if self.use_all_reduce(is_moe=True):
+        if self._shard(ctx) is None and self.use_all_reduce(is_moe=True):
             return hidden_states
 
         return token_all_gather(
@@ -417,7 +496,7 @@ class CommManager:
         if not self.mapping.dense.has_tp:
             return hidden_states, residual
 
-        if self.use_all_reduce(is_moe=False):
+        if self._shard(ctx) is None and self.use_all_reduce(is_moe=False):
             hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             return hidden_states, residual
         if self.dense_batch_invariant:
@@ -452,15 +531,20 @@ class CommManager:
         if not self.mapping.moe.has_tp_ep:
             return hidden_states, residual
 
+        # A query shard always took the all-gather leg in pre_moe_comm, so it
+        # takes the reduce-scatter back -- or, under the slot-ordered combine,
+        # the shard's rows out of the combined span: ``replicated`` is the one
+        # predicate both branches follow, never ``use_all_reduce`` alone.
+        replicated = self._shard(ctx) is None and self.use_all_reduce(is_moe=True)
         if self.moe_combine_order == "slot":
-            if self.use_all_reduce(is_moe=True):
+            if replicated:
                 return hidden_states, residual
             token_list = self.moe_tp_ep_group_scattered_num_tokens(ctx)
             offset = sum(token_list[: self.mapping.moe.tp_ep_rank])
             own = token_list[self.mapping.moe.tp_ep_rank]
             return hidden_states[offset : offset + own], residual
 
-        if self.use_all_reduce(is_moe=True):
+        if replicated:
             hidden_states = all_reduce(hidden_states, self.mapping.moe.tp_ep_group)
             return hidden_states, residual
         hidden_states = token_reduce_scatter(
@@ -471,13 +555,27 @@ class CommManager:
         return hidden_states, residual
 
     def needs_final_all_gather(self) -> bool:
-        """Whether the model output must gather the final layer's rows."""
+        """Whether the model output must gather the final layer's rows
+        (replicated-row layouts; a sharded forward gathers sampled rows at the
+        model exit instead, see :func:`gather_sampled_rows`)."""
         return self.mapping.has_attn_tp and not self.use_all_reduce(self.is_moe)
+
+    def gather_sampled_rows(
+        self, hidden_states: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        """A sharded forward's model exit: every rank's sampled rows, request
+        order (:func:`gather_sampled_rows` over the query-context-parallel
+        group)."""
+        if self._shard(ctx) is None:
+            raise RuntimeError("gather_sampled_rows serves sharded forwards")
+        return gather_sampled_rows(
+            hidden_states, ctx, group=self.mapping.attn.qcp_group
+        )
 
     def post_final_norm_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
-        if not self.needs_final_all_gather():
+        if self._shard(ctx) is not None or not self.needs_final_all_gather():
             return hidden_states, residual
         hidden_states = token_all_gather(
             hidden_states,
@@ -491,8 +589,11 @@ class CommManager:
     def use_all_reduce_norm_fusion(self) -> bool:
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
+        # A query-sharded model's rows are never replicated at the
+        # all-reduce boundary, so the fused all-reduce + norm has no place.
         return (
-            self.use_all_reduce(self.is_moe)
+            not self.query_sharded
+            and self.use_all_reduce(self.is_moe)
             and self.mapping.has_attn_tp
             and global_server_args_dict.get("enable_allreduce_fusion", False)
         )

@@ -59,7 +59,9 @@ def _manager(mode: str, monkeypatch, norm: StubNorm) -> CommManager:
     monkeypatch.setitem(global_server_args_dict, "enable_allreduce_fusion", False)
     mapping = SimpleNamespace(
         has_attn_tp=False,
-        attn=SimpleNamespace(tp_rank=0, tp_group=(0,), tp_size=1, dp_size=1),
+        attn=SimpleNamespace(
+            tp_rank=0, tp_group=(0,), tp_size=1, dp_size=1, qcp_size=1, has_qcp=False
+        ),
         dense=SimpleNamespace(tp_size=1),
         moe=SimpleNamespace(tp_ep_size=1),
     )
@@ -69,6 +71,7 @@ def _manager(mode: str, monkeypatch, norm: StubNorm) -> CommManager:
         is_moe=False,
         prev_is_moe=False,
         dense_batch_invariant=False,
+        query_sharded=False,
         input_layernorm=norm,
         post_attn_layernorm=norm,
     )
@@ -129,7 +132,9 @@ def test_intra_layer_norm_stays_fused_under_every_mode(monkeypatch, mode):
 
 def test_final_norm_follows_the_switch(monkeypatch):
     hidden, residual = _inputs()
-    ctx = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: False))
+    ctx = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_idle=lambda: False), query_shard=None
+    )
 
     norm = StubNorm()
     manager = _manager("unfused", monkeypatch, norm)
@@ -154,7 +159,9 @@ def test_unfused_vetoes_the_fused_all_reduce_norm_where_it_is_relied_upon(
     monkeypatch.setitem(global_server_args_dict, "comm_fusion_max_num_tokens", 1024)
     mapping = SimpleNamespace(
         has_attn_tp=True,
-        attn=SimpleNamespace(tp_rank=0, tp_group=(0, 1), tp_size=2, dp_size=1),
+        attn=SimpleNamespace(
+            tp_rank=0, tp_group=(0, 1), tp_size=2, dp_size=1, qcp_size=1, has_qcp=False
+        ),
         dense=SimpleNamespace(tp_size=2),
         moe=SimpleNamespace(tp_ep_size=2),
     )
@@ -167,5 +174,6 @@ def test_unfused_vetoes_the_fused_all_reduce_norm_where_it_is_relied_upon(
             is_moe=False,
             prev_is_moe=False,
             dense_batch_invariant=False,
+            query_sharded=False,
         )
         assert manager.should_fuse(4) is fuses, mode
