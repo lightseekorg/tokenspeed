@@ -43,6 +43,10 @@ from tokenspeed.runtime.moe.expert_location import (
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
+from tokenspeed.runtime.moe.expert_location_updater import (
+    ExpertLocationUpdater,
+    build_expert_location_updater,
+)
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict_update
@@ -175,6 +179,10 @@ class ModelRunner:
         # process-global so its model picks it up while it is built and loaded.
         # A draft routes its own experts trivially: the target's placement is
         # hidden while the draft is built, then restored for serving.
+        # Online rebalancing (--enable-eplb) moves the target's expert weights
+        # between slots: its staging buffer and P2P channels are reserved here,
+        # after the load and before the cache profile sizes the KV arena.
+        self.expert_location_updater: ExpertLocationUpdater | None = None
         if self.is_draft_worker:
             target_placement = get_global_expert_location_metadata()
             set_global_expert_location_metadata(None)
@@ -187,6 +195,10 @@ class ModelRunner:
                 build_expert_placement(server_args, model_config)
             )
             self.load_model()
+            if server_args.enable_eplb:
+                self.expert_location_updater = build_expert_location_updater(
+                    self.model, model_config, server_args
+                )
         if draft_moe_override:
             server_args.moe_backend = saved_moe_backend
             global_server_args_dict_update(server_args)

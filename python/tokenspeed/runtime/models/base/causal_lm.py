@@ -128,6 +128,21 @@ class BaseCausalLM(nn.Module):
     # is never installed only to be ignored.
     supports_expert_placement: ClassVar[bool] = False
 
+    @property
+    def routed_experts_weights_of_layer(self) -> dict[int, list[torch.Tensor]]:
+        """Each MoE layer's slot tensors, ``[num_local_slots, ...]`` in slot order.
+
+        The online expert rebalance (``--enable-eplb``) moves these between
+        slots and reserves a staging buffer of one layer's worth at startup.
+        Keyed by the placement's layer id. Every model that opts in to expert
+        placement provides it; the processed parameters (quantized weights and
+        scales included) are what moves, so nothing is re-derived.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not expose its routed expert weights per "
+            "layer; --enable-eplb needs routed_experts_weights_of_layer"
+        )
+
     # Live weight-update session (see the class docstring). Declared here
     # with defaults and assigned again in ``__init__``.
     _weight_update_active: bool = False

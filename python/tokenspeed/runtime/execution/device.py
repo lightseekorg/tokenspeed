@@ -75,7 +75,7 @@ import contextlib
 import enum
 import os
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -88,7 +88,11 @@ from tokenspeed.runtime.execution.types import (
     PendingExecution,
     PlannedForward,
 )
-from tokenspeed.runtime.moe.expert_location import get_global_expert_location_metadata
+from tokenspeed.runtime.moe.expert_location import (
+    ExpertLoadSnapshot,
+    get_global_expert_location_metadata,
+)
+from tokenspeed.runtime.moe.expert_rebalance import ExpertRebalanceSpecs, SlotMoves
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.host_sync import allow_host_sync
@@ -161,6 +165,9 @@ class DeviceSpecs:
         num_host_pages: The L2 host tier's page count (incl. the null page),
             sized here because it depends on the pools' transfer layout; 0
             without ``--enable-kvstore``. The scheduler is configured from it.
+        expert_rebalance: The expert placement's geometry and this rank's
+            position in its EP group, for the online rebalance controller;
+            None unless the server started with ``--enable-eplb``.
     """
 
     cache_geometry: Any
@@ -174,6 +181,7 @@ class DeviceSpecs:
     supports_pd_layerwise_finalization: bool
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
+    expert_rebalance: ExpertRebalanceSpecs | None
 
 
 def speculative_widths(
@@ -815,6 +823,68 @@ class DeviceHandle:
 
         return self._thread.run(_dump)
 
+    def snapshot_expert_load(self) -> ExpertLoadSnapshot:
+        """Read this rank's expert load since the previous snapshot and start a new window.
+
+        The online rebalance's recording window: the counters are copied to
+        the host (the one deliberate host wait) and zeroed on the execution
+        stream, behind the in-flight forward and ahead of the next one, so the
+        boundary is exact at forward granularity. Rank-local like
+        ``dump_expert_load``; the caller reduces the result over the EP group
+        where that is needed (inside the same-round gate, never here).
+
+        Returns:
+            The host counters with the placement they were counted under.
+        """
+        placement = _recording_expert_placement()
+        executor = self._executor
+
+        def _snapshot():
+            with executor.device_module.stream(executor.execution_stream):
+                with allow_host_sync("expert load snapshot"):
+                    return placement.snapshot_load()
+
+        return self._thread.run(_snapshot)
+
+    def apply_expert_placement(
+        self,
+        layer_ids: Sequence[int],
+        new_rows: torch.Tensor,
+        moves_by_layer: Mapping[int, SlotMoves],
+    ) -> None:
+        """Move one chunk of layers' expert weights and switch their routing tables.
+
+        Runs on the forward thread inside the execution stream: the P2P over
+        the EP group and the slot copies land behind the in-flight forward,
+        each layer's tables switch right after its slots, and the next forward
+        is enqueued after the whole chunk. The stream is synchronized at the
+        end -- a deliberate, low-rate host wait like ``update_weights`` -- so a
+        P2P failure surfaces in this call rather than in a later forward.
+
+        Args:
+            layer_ids: The chunk's layers.
+            new_rows: ``[len(layer_ids), num_physical]`` host rows of the
+                committed placement.
+            moves_by_layer: This rank's ``SlotMoves`` per layer.
+
+        Raises:
+            RuntimeError: The server did not start with ``--enable-eplb``.
+        """
+        updater = self._executor.model_runner.expert_location_updater
+        if updater is None:
+            raise RuntimeError(
+                "expert placement updates need the server to start with --enable-eplb"
+            )
+        executor = self._executor
+
+        def _apply():
+            with executor.device_module.stream(executor.execution_stream):
+                updater.apply(layer_ids, new_rows, moves_by_layer)
+                with allow_host_sync("expert placement chunk"):
+                    executor.execution_stream.synchronize()
+
+        self._thread.run(_apply)
+
     def update_weights(self, req) -> tuple[bool, str]:
         """Apply one in-place RL weight-sync request, ordered against forwards.
 
@@ -1415,6 +1485,11 @@ def build_device_side(
         ),
         num_host_pages=(
             l2_cache_executor.num_host_pages if l2_cache_executor is not None else 0
+        ),
+        expert_rebalance=(
+            target.expert_location_updater.specs
+            if target.expert_location_updater is not None
+            else None
         ),
     )
 

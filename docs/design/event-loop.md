@@ -106,6 +106,16 @@ Consequences:
   per DP worker), so a rank reducing inside the request would block in the
   collective while its peer is still in `_dp_sync_and_check`; the ranks'
   records are summed where they are consumed (`--init-expert-location`).
+  Online expert rebalancing (`--enable-eplb`) adds two more named
+  operations on the same counters: `snapshot_expert_load` (read the window
+  to the host and zero it, one stream-ordered step) and
+  `apply_expert_placement` (one chunk of layers: P2P over the EP device
+  group into a startup-reserved staging buffer, slot copies, then each
+  layer's routing tables switched in place after its slots landed; the
+  execution stream is synchronized at the end so a P2P failure surfaces in
+  the op). Both are rank-local on the handle; the rebalance may reduce the
+  snapshot over the EP group because its ops ride the same-round gate
+  (below), unlike the profile's dump.
   Changing this surface requires updating both this contract and the explicit
   operation allowlist in `test/runtime/test_device_handle.py`.
 * The role is a **value** (`DeviceRole`), not a class hierarchy. Subclassing
