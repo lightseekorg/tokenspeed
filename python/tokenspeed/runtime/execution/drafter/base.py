@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -226,6 +227,13 @@ class BaseDrafter:
         """Capture draft prefill work after target capture, when prefill graphs
         are enabled. Drafters without a separate prefill graph need no action.
         """
+
+    def bind_tree(self, tree_spec: TreeSpec) -> None:
+        """Draft trees (--speculative-eagle-topk > 1); only EAGLE-style drafters expand lanes."""
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot draft trees (--speculative-eagle-topk > 1); "
+            "tree drafting needs an EAGLE-style drafter (EAGLE3, or MTP served by Eagle)"
+        )
 
     @abstractmethod
     def run(

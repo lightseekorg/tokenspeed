@@ -36,6 +36,7 @@ from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
 )
 
 _ALLOCATION = """
+namespace flashinfer {
   void prepare_routing_common() {
     expanded_idx_to_permuted_idx = alloc_tensor({num_tokens * top_k}, dl_int32, device);
     permuted_idx_to_token_idx =
@@ -51,14 +52,28 @@ _CLONE_VALUE = object()
 def test_initializer_uses_native_capacity_and_stream(guard):
     source = _ALLOCATION.replace(" + 1", guard)
     actual = _initialize_routing_map(source)
-    assert actual.count("cudaMemsetAsync(") == 1
+    launch = "tokenspeed_launch_fill_route_map(\n"
+    assert actual.count(launch) == 1
+    assert "cudaMemsetAsync" not in actual
     assert "permuted_idx_to_token_idx.numel()" in actual
     assert "get_stream(hidden_states.device())" in actual
-    assert "data_ptr(), 0xff," in actual
-    assert actual.index("cudaMemsetAsync(") > actual.index("alloc_tensor({max_num")
-    assert actual.index("cudaMemsetAsync(") < actual.index("prepare_other_workspace()")
+    assert "map[i] = -1;" in actual
+    assert "programmaticStreamSerializationAllowed = 1" in actual
+    assert actual.index("__global__ void tokenspeed_fill_route_map") < actual.index(
+        "namespace flashinfer {"
+    )
+    assert actual.index(launch) > actual.index("alloc_tensor({max_num")
+    assert actual.index(launch) < actual.index("prepare_other_workspace()")
     # The original allocation, including upstream's optional guard, is retained.
-    assert source[: source.index("    prepare_other_workspace")] in actual
+    body = source[
+        source.index("namespace") : source.index("    prepare_other_workspace")
+    ]
+    assert body in actual
+
+
+def test_initializer_requires_the_launcher_namespace():
+    with pytest.raises(RuntimeError, match="no flashinfer namespace"):
+        _initialize_routing_map(_ALLOCATION.replace("namespace flashinfer {", ""))
 
 
 @pytest.mark.parametrize(

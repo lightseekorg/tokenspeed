@@ -212,8 +212,8 @@ the values accepted by the bundled `tokenspeed-smg` package.
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
-| `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`. |
-| `--speculative-eagle-topk` | EAGLE top-k. Defaults to `1`. |
+| `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
+| `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
 | `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters (see below). Off by default. |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
 | `--eagle3-layers-to-capture` | EAGLE3 layers to capture. |
@@ -221,6 +221,14 @@ the values accepted by the bundled `tokenspeed-smg` package.
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+`EAGLE3` and `MTP` drafts are chains by default: `--speculative-num-draft-tokens`
+must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 1
+they draft a tree instead, and `--speculative-num-draft-tokens` is its node
+budget (root included) and must be given explicitly: topk 1..16, steps 1..10,
+`(steps - 1) * topk` lane slots within the node budget, and at most 64 nodes. Trees need the `trtllm`
+attention backends and the `greedy` or `triton` sampling backend; see
+[draft-tree speculation](../design/tree-speculation.md) for the full scope.
 
 ### Draft-prob rejection sampling
 

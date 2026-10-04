@@ -43,6 +43,8 @@ WORKFLOW_STAGE_TYPES = {
     "model-test": {"eval", "perf"},
 }
 SUPPORTED_WORKFLOW_STAGES = tuple(WORKFLOW_STAGE_TYPES)
+# Kernel benchmark suite definitions are read only by `kernel-benchmark` tasks.
+KERNEL_BENCHMARK_SUITE_DIRECTORY = "tokenspeed-kernel/benchmarks/"
 SUPPORTED_SETUP_MODES = ("ci", "slurm")
 # Lower sort key = dispatched earlier. GitHub Actions starts matrix jobs in
 # include-list order, so `high` entries reach runner pools first when several
@@ -2214,13 +2216,25 @@ def main(argv: Iterable[str] | None = None) -> int:
         )
         if args.changed_files is not None:
             changed = args.changed_files.read_text(encoding="utf-8").splitlines()
+            suite_changed = any(
+                path.startswith(KERNEL_BENCHMARK_SUITE_DIRECTORY) for path in changed
+            )
             # GitHub comparisons may truncate the file list at 300 entries.
             if 0 < len(changed) < 300 and all(
-                path.startswith("test/ci/") and path.endswith(".yaml")
+                (path.startswith("test/ci/") and path.endswith(".yaml"))
+                or path.startswith(KERNEL_BENCHMARK_SUITE_DIRECTORY)
                 for path in changed
             ):
+                # Run the changed tasks, plus every kernel benchmark task when
+                # a suite definition changed; nothing else reads those files.
                 matrix["include"] = [
-                    entry for entry in matrix["include"] if entry["config"] in changed
+                    entry
+                    for entry in matrix["include"]
+                    if entry["config"] in changed
+                    or (
+                        suite_changed
+                        and entry.get("workflow_stage") == "kernel-benchmark"
+                    )
                 ]
         print(json.dumps(matrix, separators=(",", ":")))
         return 0

@@ -51,11 +51,16 @@ import torch
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.attention.backends.support import (  # noqa: F401
     CudaGraphSupport,
+    TreeSupport,
     resolve_cuda_graph_support,
 )
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeDraftInputs,
+        TreeVerifyInputs,
+    )
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
@@ -422,6 +427,39 @@ class AttentionBackend(CachePoolBinding, ABC):
             f"{type(self).__name__} owns no draft write locations"
         )
 
+    def tree_support(self) -> TreeSupport:
+        """This node's own draft-tree capability; ``resolve_tree_support`` asks
+        every node before any bind. Nodes without a tree path keep this."""
+        name = type(self).__name__
+        return TreeSupport(
+            verify_blocker=f"{name} has no draft-tree verify path",
+            draft_blocker=f"{name} has no draft-tree lane path",
+        )
+
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        """Arm draft-tree verify (--speculative-eagle-topk > 1) on every node,
+        after ``resolve_tree_support``; leaves that verify trees keep ``inputs``."""
+        for backend in self.child_backends():
+            backend.bind_tree_verify(inputs)
+
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        """Arm draft-tree lanes on every node of the drafter's backend, after
+        ``resolve_tree_support``; leaves that draft trees keep ``inputs``."""
+        for backend in self.child_backends():
+            backend.bind_tree_draft(inputs)
+
+    def compact_verify_window(self, path: torch.Tensor) -> None:
+        """After a draft-tree verify, move each request's accepted path to the
+        front of its verify window in the cache this node owns; nodes that own
+        none forward to their children.
+
+        Args:
+            path: ``[bs, N]`` int32 accepted window row at each depth, root
+                first, ``-1`` past the path.
+        """
+        for backend in self.child_backends():
+            backend.compact_verify_window(path)
+
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
     ) -> torch.Tensor:
@@ -468,12 +506,18 @@ class AttentionBackend(CachePoolBinding, ABC):
         self.step_counter = step_counter
 
     def commit_speculative_state_after_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
     ) -> None:
         """Commit live acceptance after drafted decode/mixed execution or replay.
 
         ``num_extends == 0`` identifies pure decode; otherwise extend requests
-        lead the mixed batch. Stateless backends inherit this no-op.
+        lead the mixed batch. ``accepted_path`` is the ``[bs, N]`` accepted
+        draft-tree path (root first, ``-1`` past it), ``None`` for a chain.
+        Stateless backends inherit this no-op.
         """
 
     @contextmanager

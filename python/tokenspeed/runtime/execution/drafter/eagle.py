@@ -24,15 +24,20 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tokenspeed_kernel.ops.sampling.triton import logprob_topk
 from typing_extensions import override
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+from tokenspeed.runtime.execution.drafter.tree import DraftTree
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+    TreeDraftInputs,
+)
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DsaTopKState = tuple[Any | None, Any | None]
@@ -41,6 +46,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -158,6 +164,17 @@ class Eagle(BaseDrafter):
                 self.input_buffers.max_bs + 1, dtype=torch.int32, device=self.device
             )
 
+        # Draft-tree state (bind_tree); None for chains.
+        self.tree_spec: TreeSpec | None = None
+        self.draft_tree: DraftTree | None = None
+        self.tree_lanes: TreeDraftInputs | None = None
+        # Rows each request drafts per step: 1 for a chain, K for a draft tree.
+        self.lanes_per_request = 1
+        # Step 0's lane ancestor masks, lane r seeing only its own slot.
+        self._tree_seed_lane_mask: torch.Tensor | None = None
+        # Width of the full draft vocabulary the tree ranks (bind_tree).
+        self.tree_vocab_size: int | None = None
+
         # Precomputed `arange(max_bs) * spec_num_tokens - 1`
         # gather_ids = gather_ids_offsets + accept_lengths
         self.padded_gather_ids_offsets_buf = (
@@ -167,6 +184,38 @@ class Eagle(BaseDrafter):
             * spec_num_tokens
             - 1
         )
+
+    def bind_tree(self, tree_spec: TreeSpec) -> None:
+        """Draft trees: top-K lanes per step (tree.py) in the draft paged cache's lane window."""
+        if self.draft_reads_token_history:
+            raise NotImplementedError(
+                "tree drafting does not support draft token history yet"
+            )
+        config = tree_spec.config
+        max_bs = self.input_buffers.max_bs
+        logits_processor = self.draft_model_runner.model.logits_processor
+        # The fused distributed argmax leaves each TP rank only its vocab shard of the logits.
+        logits_processor.do_argmax = False
+        self.tree_vocab_size = (
+            self.hot_token_ids.numel()
+            if self.hot_token_ids is not None
+            else logits_processor.config.vocab_size
+        )
+        self.tree_spec = tree_spec
+        self.draft_tree = DraftTree(
+            max_bs, config.topk, config.num_steps, config.num_nodes, self.device
+        )
+        self.tree_lanes = TreeDraftInputs(
+            topk=config.topk,
+            num_steps=config.num_steps,
+            max_bs=max_bs,
+            device=self.device,
+        )
+        self.attn_backend.bind_tree_draft(self.tree_lanes)
+        self.lanes_per_request = config.topk
+        self._tree_seed_lane_mask = torch.ones(
+            config.topk, dtype=torch.int64, device=self.device
+        ) << torch.arange(config.topk, device=self.device)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -381,12 +430,15 @@ class Eagle(BaseDrafter):
         self,
         bs: int,
         draft_ids: torch.Tensor,
+        hidden: torch.Tensor,
         next_tokens: torch.Tensor,
-        logits_output: LogitsProcessorOutput,
         draft_input: EagleDraftInput,
         dsa_topk: DsaTopKState,
         frontier: torch.Tensor,
     ) -> None:
+        """Draft steps ``1 .. S - 1``: ``lanes`` rows per request (1 for a
+        chain, K for a draft tree) forward from the accepted frontier."""
+        lanes = self.lanes_per_request
         # Step 1 writes at the accepted frontier (vc + accept_length after the
         # target's verify) so rotary/cache metadata stay on the accepted
         # prefix, not the rejected tail.
@@ -396,7 +448,9 @@ class Eagle(BaseDrafter):
         draft_seq_lens = self.draft_seq_lens_buf[:bs]
         torch.add(cache_start, 1, out=draft_seq_lens)
 
-        positions = cache_start.clone()
+        positions = cache_start.repeat_interleave(lanes)
+        # Step i's write window: a chain's one advancing slot, or K lane slots per request.
+        slot_starts = positions if self.tree_lanes is None else cache_start.clone()
 
         history_pool_indices = None
         if self.draft_reads_token_history:
@@ -425,10 +479,10 @@ class Eagle(BaseDrafter):
             ctx = ForwardContext(
                 bs=bs,
                 num_extends=0,
-                output_layout=ForwardOutputLayout(0, 0, bs, 1),
+                output_layout=ForwardOutputLayout(0, 0, bs, lanes),
                 attn_backend=self.attn_backend,
                 token_to_kv_pool=self.token_to_kv_pool,
-                input_num_tokens=bs,
+                input_num_tokens=bs * lanes,
                 forward_mode=ForwardMode.DECODE,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
                 global_num_tokens=global_num_tokens,
@@ -437,18 +491,22 @@ class Eagle(BaseDrafter):
             )
             self._attach_dsa_topk(dsa_topk)
 
-            # Keep attention metadata on the accepted prefix; rejected verify
-            # tail slots may still contain stale draft KV.
-            _advance_draft_forward_metadata_if_supported(
-                ctx.attn_backend,
-                draft_seq_lens,
-            )
+            if self.tree_lanes is None:
+                # Keep attention metadata on the accepted prefix; rejected verify
+                # tail slots may still contain stale draft KV.
+                _advance_draft_forward_metadata_if_supported(
+                    ctx.attn_backend,
+                    draft_seq_lens,
+                )
+            else:
+                # Tree lanes attend over the accepted prefix and their window (TreeDraftInputs).
+                self.tree_lanes.active = True
             # Publish this step's one write slot per request (the chain's
             # advancing position, seq_len - 1): step i writes position
             # cache_start + (i - 1).
             self.attn_backend.publish_draft_step_locations(
-                cache_start=positions,
-                num_tokens=1,
+                cache_start=slot_starts,
+                num_tokens=lanes,
             )
 
             history_kwargs = {}
@@ -466,13 +524,15 @@ class Eagle(BaseDrafter):
             with nvtx_range("draft_forward", color="red"):
                 logits_output = self.draft_model_runner.forward(
                     ctx=ctx,
-                    input_ids=self._map_hot(draft_ids),
+                    input_ids=self._map_hot(draft_ids.reshape(-1)),
                     positions=positions,
-                    captured_hidden_states=logits_output.hidden_states,
+                    captured_hidden_states=hidden,
                     spec_step_idx=i,
                     **history_kwargs,
                 )
                 dsa_topk = self._extract_dsa_topk(dsa_topk)
+            if self.tree_lanes is not None:
+                self.tree_lanes.active = False
             if self.draft_reads_token_history and i + 1 < self.spec_num_steps:
                 self.draft_history_lengths_buf.index_copy_(
                     0,
@@ -481,12 +541,75 @@ class Eagle(BaseDrafter):
                 )
 
             with nvtx_range("draft_sample", color="yellow"):
-                draft_ids = self.sample_draft_step(logits_output, step=i)
-                # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
-                next_tokens[:, i + 1] = self._map_hot(draft_ids)
+                if self.tree_lanes is None:
+                    draft_ids = self.sample_draft_step(logits_output, step=i)
+                    # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
+                    next_tokens[:, i + 1] = self._map_hot(draft_ids)
+                    hidden = logits_output.hidden_states
+                else:
+                    draft_ids, hidden = self._expand_tree_lanes(bs, i, logits_output)
                 if i + 1 < self.spec_num_steps:
                     positions.add_(1)
                     draft_seq_lens.add_(1)
+                    if self.tree_lanes is not None:
+                        slot_starts.add_(lanes)
+
+    def _seed_tree_lanes(
+        self,
+        bs: int,
+        logits_output: LogitsProcessorOutput,
+        frontier: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Step 0 of a draft tree: the best K candidates become the lanes.
+        Returns their ``[bs, K]`` tokens and ``[bs * K, hidden]`` rows."""
+        topk = self.lanes_per_request
+        lane_tokens = self.draft_tree.seed(bs, *self._score_candidates(logits_output))
+        self.tree_lanes.lane_mask[: bs * topk].view(bs, topk).copy_(
+            self._tree_seed_lane_mask
+        )
+        self.tree_lanes.set_frontier(bs, frontier)
+        return lane_tokens, logits_output.hidden_states.repeat_interleave(topk, dim=0)
+
+    def _expand_tree_lanes(
+        self, bs: int, step: int, logits_output: LogitsProcessorOutput
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Keep each request's best K children as the next lanes; returns
+        their tokens and hidden rows (``None`` after the last step)."""
+        topk = self.lanes_per_request
+        last = step == self.spec_num_steps - 1
+        next_hidden = None if last else torch.empty_like(logits_output.hidden_states)
+        lane_mask = self.tree_lanes.lane_mask[: bs * topk].view(bs, topk)
+        lane_tokens = self.draft_tree.expand(
+            bs,
+            step,
+            *self._score_candidates(logits_output),
+            None if last else (lane_mask, logits_output.hidden_states, next_hidden),
+        )
+        return lane_tokens, next_hidden
+
+    def _draft_window(self, bs: int, next_tokens: torch.Tensor) -> torch.Tensor:
+        """The next verify window: the chain's tokens, or the best tree's
+        (whose parents become the next round's tree)."""
+        if self.tree_spec is None:
+            return next_tokens
+        tokens, parent = self.draft_tree.finalize(bs, next_tokens[:, 0])
+        tokens[:, 1:] = self._map_hot(tokens[:, 1:].long()).to(torch.int32)
+        self.tree_spec.draft_parent_buf[:bs].copy_(parent)
+        return tokens
+
+    def _score_candidates(
+        self, logits_output: LogitsProcessorOutput
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each draft row's best K candidates: ``[rows, K]`` log-probabilities
+        (best first) and tokens. The one place a drafter decides how the tree
+        scores candidates; DraftTree only records and selects."""
+        logits = logits_output.next_token_logits
+        if logits.shape[-1] != self.tree_vocab_size:
+            raise RuntimeError(
+                f"tree drafting ranks all {self.tree_vocab_size} draft tokens, "
+                f"got logits of width {logits.shape[-1]}"
+            )
+        return logprob_topk(logits, self.draft_tree.topk)
 
     # ------------------------------------------------------------------
     # Public entry point (type-based dispatch from ModelExecutor)
@@ -503,7 +626,7 @@ class Eagle(BaseDrafter):
         # Layout: column 0 holds the last verified id (the base model's accepted token);
         # columns 1..spec_num_steps hold the drafter's speculative tokens.
         next_tokens = torch.empty(
-            (bs, self.spec_num_steps + 1),
+            (bs, self.spec_num_tokens),
             dtype=torch.int32,
             device=self.device,
         )
@@ -526,7 +649,7 @@ class Eagle(BaseDrafter):
                 indices,
                 out=next_tokens[num_extends:, 0],
             )
-        if self.spec_num_steps > 0:
+        if self.spec_num_tokens > 1:
             next_tokens[:, 1:] = next_tokens[:, :1]
 
         # The runner refreshed the draft decode metadata over the target's
@@ -540,11 +663,15 @@ class Eagle(BaseDrafter):
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
         logits_output, dsa_topk = self._run_first_step(bs, draft_input, narrowing)
 
-        draft_ids = self.sample_draft_step(logits_output, step=0)
-        next_tokens[:, 1] = self._map_hot(draft_ids)
+        if self.tree_lanes is None:
+            draft_ids = self.sample_draft_step(logits_output, step=0)
+            next_tokens[:, 1] = self._map_hot(draft_ids)
+            hidden = logits_output.hidden_states
+        else:
+            draft_ids, hidden = self._seed_tree_lanes(bs, logits_output, frontier)
 
         if self.spec_num_steps <= 1:
-            return next_tokens
+            return self._draft_window(bs, next_tokens)
 
         if self.input_buffers.all_extends_mid_chunk and self.dp_size == 1:
             # Skip multi-step when the whole batch is mid-chunk EXTEND:
@@ -554,6 +681,8 @@ class Eagle(BaseDrafter):
             # In DP we still run, because peer ranks may have completing
             # extends or decodes; diverging here would desync the drafter's
             # dense-TP / MoE-EP collectives (NCCL hang or RSAG mismatch).
+            if self.tree_spec is not None:
+                self.tree_spec.draft_parent_buf[:bs].copy_(self.tree_spec.chain_parent)
             return next_tokens
 
         # Draft step 2+ (multi-step decode).
@@ -565,13 +694,13 @@ class Eagle(BaseDrafter):
             self._run_multi_step_decode(
                 bs,
                 draft_ids,
+                hidden,
                 next_tokens,
-                logits_output,
                 draft_input,
                 dsa_topk,
                 frontier,
             )
-        return next_tokens
+        return self._draft_window(bs, next_tokens)
 
     @override
     @nvtx_range("drafter", color="purple")

@@ -64,6 +64,8 @@ class LinearAttnConfig(AttnComponentSpec):
     # Resolved by the GDN cache recipe after checking the engine option,
     # verify width, device, and registered kernel support.
     replay_ssm: bool = False
+    # Draft-tree verify windows (topk > 1); a ReplaySSM tree keeps node states in one shared workspace.
+    draft_tree: bool = False
 
     def __post_init__(self):
         if not self.layer_ids:

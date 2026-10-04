@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
 # Greedy requests normalize to top_k=1 and ride the pool route, whose
@@ -490,7 +491,13 @@ class FlashInferSamplingBackend(SamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        *,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if tree is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot verify draft trees"
+            )
 
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]

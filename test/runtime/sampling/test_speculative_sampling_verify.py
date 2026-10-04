@@ -123,7 +123,10 @@ def test_verify_gathers_recorded_rows_and_selects_the_draft_prob_rule(
     logits = torch.randn(2 * N, VOCAB)
     candidates = torch.randint(0, VOCAB, (2, N), dtype=torch.int64)
     backend.verify(
-        LogitsProcessorOutput(next_token_logits=logits), _info(recorded), candidates
+        LogitsProcessorOutput(next_token_logits=logits),
+        _info(recorded),
+        candidates,
+        tree=None,
     )
 
     assert seen["use_draft_prob"] is True
@@ -138,7 +141,10 @@ def test_verify_gathers_recorded_rows_and_selects_the_draft_prob_rule(
     # Without recorded distributions the target-only call is unchanged.
     seen.clear()
     backend.verify(
-        LogitsProcessorOutput(next_token_logits=logits), _info(None), candidates
+        LogitsProcessorOutput(next_token_logits=logits),
+        _info(None),
+        candidates,
+        tree=None,
     )
     assert seen["use_draft_prob"] is False and seen["draft_probs"] is None
 
@@ -155,6 +161,7 @@ def test_verify_refuses_draft_probs_on_a_backend_built_without_the_flag(monkeypa
             LogitsProcessorOutput(next_token_logits=logits),
             _info(_recorded_draft_probs()),
             candidates,
+            tree=None,
         )
     assert "use_draft_prob" not in seen
 

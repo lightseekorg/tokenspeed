@@ -108,6 +108,22 @@ class RuntimeStates:
         if self.draft_probs is None:
             return
         self.draft_probs[:, :-1].index_fill_(0, pool_indices, self.draft_probs_sentinel)
+        # Draft trees (init_draft_trees): next round's parents next to its tokens.
+        self.chain_parents: torch.Tensor | None = None
+        self.future_parent_map: torch.Tensor | None = None
+
+    def init_draft_trees(self, num_nodes: int) -> None:
+        """Allocate each pool slot's next-round tree parents, starting as the chain.
+
+        The drafter's tree for a slot rides next to its candidate tokens in
+        ``future_input_map``; rows reset to dummy tokens reset to the chain.
+        """
+        self.chain_parents = torch.arange(
+            -1, num_nodes - 1, dtype=torch.int32, device=self.device
+        )
+        self.future_parent_map = self.chain_parents.repeat(
+            self.future_input_map.shape[0], 1
+        )
 
     def init_ngram_state(self, context_len: int) -> None:
         """Allocate a bounded, newest-first accepted input tail per pool slot.

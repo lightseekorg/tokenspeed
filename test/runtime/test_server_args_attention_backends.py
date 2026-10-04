@@ -118,7 +118,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
         )
         components = {
             SoftmaxAttnConfig: spec,
-            LinearAttnConfig: SimpleNamespace(layer_ids=(0,), replay_ssm=False),
+            LinearAttnConfig: SimpleNamespace(
+                layer_ids=(0,), replay_ssm=False, draft_tree=False
+            ),
         }
         config = SimpleNamespace(
             device="cpu",

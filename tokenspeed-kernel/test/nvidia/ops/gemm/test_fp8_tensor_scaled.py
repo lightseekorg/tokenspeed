@@ -28,8 +28,8 @@ from tokenspeed_kernel.ops.gemm import flashinfer as flashinfer_ops
 from tokenspeed_kernel.selection import select_kernel
 
 pytestmark = pytest.mark.skipif(
-    flashinfer_ops.bmm_fp8 is flashinfer_ops.error_fn,
-    reason="FlashInfer bmm_fp8 needs a Blackwell NVIDIA GPU",
+    flashinfer_ops.cublas_fp8_gemm is flashinfer_ops.error_fn,
+    reason="FlashInfer cuBLASLt FP8 GEMM needs a Blackwell NVIDIA GPU",
 )
 
 

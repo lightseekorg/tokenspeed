@@ -442,15 +442,15 @@ if mm_mxfp8 is not error_fn:
 # ---- FlashInfer per-tensor FP8 (cuBLASLt) -------------------------------
 
 _FP8_TENSOR_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
-bmm_fp8 = error_fn
+cublas_fp8_gemm = error_fn
 
 if platform.is_nvidia and platform.is_blackwell:
     try:
-        from flashinfer import bmm_fp8
+        from tokenspeed_kernel.thirdparty.flashinfer.fp8_gemm import cublas_fp8_gemm
     except ImportError:
         pass
 
-if bmm_fp8 is not error_fn:
+if cublas_fp8_gemm is not error_fn:
 
     @register_kernel(
         "gemm",
@@ -499,19 +499,26 @@ if bmm_fp8 is not error_fn:
         """
         if alpha is not None or block_size is not None:
             raise ValueError("per-tensor FP8 GEMM takes no alpha or block_size")
+        if out_dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(
+                f"per-tensor FP8 GEMM writes BF16 or FP16, not {out_dtype}"
+            )
         # cuBLASLt reads dense operands: row-major A and column-major B.
         A = A.contiguous()
         B = B.t().contiguous().t()
         direct = out is not None and out.is_contiguous()
-        result = bmm_fp8(
+        result = (
+            out
+            if direct
+            else torch.empty(A.shape[0], B.shape[1], dtype=out_dtype, device=A.device)
+        )
+        cublas_fp8_gemm(
             A.unsqueeze(0),
             B.unsqueeze(0),
             A_scales,
             B_scales,
-            out_dtype,
-            out=out.unsqueeze(0) if direct else None,
-            backend="cublas",
-        ).squeeze(0)
+            result.unsqueeze(0),
+        )
         if out is None or direct:
             return result
         # cuBLASLt writes dense rows; a strided view gets a copy.

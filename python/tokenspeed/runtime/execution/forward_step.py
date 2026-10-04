@@ -1164,6 +1164,11 @@ class ForwardStepRunner:
             self.attn_backend.commit_speculative_state_after_verify(
                 result[1],
                 num_extends=ctx.num_extends,
+                accepted_path=(
+                    self.sampling_backend.accepted_path(bs, self.config.spec_num_tokens)
+                    if self.config.spec_topk > 1 and ctx.num_extends == 0
+                    else None
+                ),
             )
 
         return result
