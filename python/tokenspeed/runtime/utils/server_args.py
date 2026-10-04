@@ -283,10 +283,9 @@ class ServerArgs:
         | None
     ) = None
     eplb_algorithm: str = "auto"
-    expert_distribution_recorder_mode: (
-        Literal["stat", "stat_approx", "per_pass", "per_token"] | None
-    ) = None
-    enable_expert_distribution_metrics: bool = False
+    # 'stat': int64 route counters per physical expert, read by the
+    # EXPERT_LOAD profile activity and by --enable-eplb.
+    expert_distribution_recorder_mode: Literal["stat"] | None = None
     # Online expert rebalancing; the two knobs below are required with it.
     enable_eplb: bool = False
     eplb_rebalance_num_iterations: int | None = None
@@ -1990,13 +1989,10 @@ class ServerArgs:
             "--expert-distribution-recorder-mode",
             type=str,
             default=ServerArgs.expert_distribution_recorder_mode,
+            choices=["stat"],
             help="'stat' counts the routes to every physical expert so the "
-            "EXPERT_LOAD profile activity can dump a load record.",
-        )
-        parser.add_argument(
-            "--enable-expert-distribution-metrics",
-            action="store_true",
-            help="Enable logging metrics for expert balancedness",
+            "EXPERT_LOAD profile activity can dump a load record and "
+            "--enable-eplb can rebalance from it.",
         )
         parser.add_argument(
             "--enable-eplb",

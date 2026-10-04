@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -164,6 +166,23 @@ class TestServerArgsPlacementValidation:
                 expert_distribution_recorder_mode="per_token",
                 ep_dispatch_algorithm="static",
             )
+        # The CLI admits only that value, and the metrics switch of the
+        # deleted recorder is gone with it.
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        action = next(
+            a
+            for a in parser._actions
+            if "--expert-distribution-recorder-mode" in a.option_strings
+        )
+        assert list(action.choices) == ["stat"]
+        assert not any(
+            "--enable-expert-distribution-metrics" in a.option_strings
+            for a in parser._actions
+        )
+        assert "enable_expert_distribution_metrics" not in {
+            f.name for f in dataclasses.fields(ServerArgs)
+        }
 
     def test_rl_bitwise_refuses_random_replica_choice(self):
         ep = dict(attn_tp_size=2, ep_size=2)

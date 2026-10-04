@@ -307,9 +307,6 @@ class Envs:
     # Quantization
     TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT = EnvBool(True)
 
-    # EPLB
-    TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
-
     # Communication
     # InfiniBand traffic class for NVSHMEM (DeepEP all-to-all). Read in every
     # inference process entry so the value reaches NVSHMEM regardless of how

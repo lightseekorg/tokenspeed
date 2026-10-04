@@ -35,9 +35,6 @@ from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 
 from tokenspeed.runtime.moe.dispatch_algorithm import STATIC_EP_DISPATCH_ALGORITHMS
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 
 
 class TopKOutputFormat(Enum):
@@ -761,6 +758,5 @@ def select_experts(
             topk_weights *= routed_scaling_factor
 
     record_expert_load(physical_load, topk_ids)
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

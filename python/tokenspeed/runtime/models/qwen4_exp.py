@@ -76,9 +76,6 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeSparseMoeBlock,
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
 
@@ -559,14 +556,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 next_ple = self.layers[layer_id + 1].ple
                 if next_ple is not None:
                     self._start_ple_prefetch(next_ple, input_ids, ctx)
-            with get_global_expert_distribution_recorder().with_current_layer(layer_id):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    ctx=ctx,
-                    input_ids=input_ids,
-                )
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                ctx=ctx,
+                input_ids=input_ids,
+            )
             if (
                 input_deepstack_embeds is not None
                 and input_deepstack_embeds.numel()

@@ -115,9 +115,6 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import (
     LazyValue,
@@ -1393,14 +1390,13 @@ class DeepseekV3Model(nn.Module):
                 aux_hidden_states.append(
                     gathered if gathered is aux else gathered.clone()
                 )
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    ctx,
-                    residual,
-                )
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                ctx,
+                residual,
+            )
         if not ctx.forward_mode.is_idle():
             if not ENABLE_CP:
                 hidden_states, _ = layer.comm_manager.final_norm(

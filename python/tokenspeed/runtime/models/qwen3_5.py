@@ -83,9 +83,6 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
 )
 from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
 from tokenspeed.runtime.models.utils import validate_attention_partition
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -1034,15 +1031,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 aux_hidden_states.append(
                     gathered if gathered is aux else gathered.clone()
                 )
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    ctx=ctx,
-                )
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                ctx=ctx,
+            )
 
             # Process deepstack embeddings if provided
             if (

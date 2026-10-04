@@ -31,9 +31,6 @@ from typing import (
 from tokenspeed.runtime.engine.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
-    ExpertDistributionReq,
-    ExpertDistributionReqOutput,
-    ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
@@ -180,9 +177,6 @@ class SchedulerControlClient:
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
 
-        self.expert_distribution_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
         self._result_dispatcher += self._get_communicator_dispatcher()
 
     def _get_communicator_dispatcher(self: AsyncLLM):
@@ -255,10 +249,6 @@ class SchedulerControlClient:
                 (
                     SetInternalStateReqOutput,
                     self.set_internal_state_communicator.handle_recv,
-                ),
-                (
-                    ExpertDistributionReqOutput,
-                    self.expert_distribution_communicator.handle_recv,
                 ),
             ]
         )
@@ -339,24 +329,6 @@ class SchedulerControlClient:
         if not result.success:
             raise RuntimeError(result.message)
         return result
-
-    async def start_expert_distribution_record(self: AsyncLLM):
-        self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(
-            ExpertDistributionReq(action=ExpertDistributionReqType.START_RECORD)
-        )
-
-    async def stop_expert_distribution_record(self: AsyncLLM):
-        self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(
-            ExpertDistributionReq(action=ExpertDistributionReqType.STOP_RECORD)
-        )
-
-    async def dump_expert_distribution_record(self: AsyncLLM):
-        self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(
-            ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
-        )
 
     # Weight ops fan out to every attention-DP worker (the DP controller
     # broadcasts control requests) and the scheduler completes each one only

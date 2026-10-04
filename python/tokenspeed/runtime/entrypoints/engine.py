@@ -319,15 +319,6 @@ class Engine(EngineBase):
     def stop_profile(self):
         self.llm.run(self.tokenizer_manager.stop_profile())
 
-    def start_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.start_expert_distribution_record())
-
-    def stop_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.stop_expert_distribution_record())
-
-    def dump_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.dump_expert_distribution_record())
-
     def get_server_info(self):
         internal_states = self.llm.run(self.tokenizer_manager.get_internal_state())
         return {

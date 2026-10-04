@@ -83,9 +83,6 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 from tokenspeed.runtime.moe.dispatch_algorithm import (
     has_zero_expert as _has_zero_expert,
 )
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder as _get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.moe.expert_location import (
     ExpertLocationMetadata as _ExpertLocationMetadata,
 )
@@ -835,15 +832,12 @@ class _RuntimeLongcatModel(nn.Module):
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
-            with _get_global_expert_distribution_recorder().with_current_layer(
-                layer_id
-            ):
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    ctx,
-                    residual,
-                )
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                ctx,
+                residual,
+            )
 
         if not ctx.forward_mode.is_idle() and layer is not None:
             hidden_states, _ = layer.final_norm_comm.final_norm(

@@ -1081,20 +1081,6 @@ class SetInternalStateReqOutput(BaseReq, kw_only=True):
     server_args: dict[str, Any]
 
 
-class ExpertDistributionReqType(Enum):
-    START_RECORD = 1
-    STOP_RECORD = 2
-    DUMP_RECORD = 3
-
-
-class ExpertDistributionReq(BaseReq, kw_only=True):
-    action: ExpertDistributionReqType
-
-
-class ExpertDistributionReqOutput(BaseReq, kw_only=True):
-    pass
-
-
 class ProfileReqType(Enum):
     START_PROFILE = 1
     STOP_PROFILE = 2

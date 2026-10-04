@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import inspect
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -36,7 +35,6 @@ from tokenspeed_kernel import (
 
 import tokenspeed.runtime.distributed.comm_manager as comm_manager_module
 import tokenspeed.runtime.layers.hyperconnection as hyperconnection_module
-import tokenspeed.runtime.models.qwen4_exp as qwen4_exp_module
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.hyperconnection import (
@@ -459,13 +457,8 @@ def _tail_fusion_model(
     ],
 )
 def test_mlp_tail_fusion_preserves_intervening_operations(
-    monkeypatch, dtype: torch.dtype, boundary: str
+    dtype: torch.dtype, boundary: str
 ) -> None:
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "get_global_expert_distribution_recorder",
-        lambda: SimpleNamespace(with_current_layer=lambda index: nullcontext()),
-    )
     torch.manual_seed(103)
     model = _tail_fusion_model(dtype, boundary, 3)
     ids = torch.arange(4, device="cuda")
@@ -518,13 +511,8 @@ def test_mlp_tail_fusion_preserves_intervening_operations(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize(("rows", "layer_count"), [(0, 1), (1, 3), (4, 1)])
 def test_mlp_tail_fusion_graph_replay_keeps_current_residual(
-    monkeypatch, rows: int, layer_count: int
+    rows: int, layer_count: int
 ) -> None:
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "get_global_expert_distribution_recorder",
-        lambda: SimpleNamespace(with_current_layer=lambda index: nullcontext()),
-    )
     torch.manual_seed(109)
     model = _tail_fusion_model(torch.bfloat16, "none", layer_count)
     ids = torch.arange(rows, device="cuda")
