@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.moe import (
     ExpertDispatch,
-    dispatch_topk_ids_reference,
+    dispatch_topk_ids,
     moe_topk,
 )
 from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
@@ -206,7 +206,7 @@ def _topk_ids_logical_to_physical_static(
     info: ExpertLocationDispatchInfo,
 ) -> torch.Tensor:
     if info.replica_dispatch is not None:
-        return dispatch_topk_ids_reference(topk_ids, info.replica_dispatch)
+        return dispatch_topk_ids(topk_ids, info.replica_dispatch)
     return info.partial_logical_to_rank_dispatch_physical_map[topk_ids].to(
         topk_ids.dtype
     )

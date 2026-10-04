@@ -18,14 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Expert placement inputs for routing kernels.
+"""Expert placement dispatch: logical top-k ids onto physical replicas.
 
 With redundant experts a logical expert has several physical replicas, each
 on some rank. Routing then emits physical ids: every rank runs the same
 routing over the same tokens, so the replica must be a pure function of the
 token row and route rank -- ``replicas[logical, (row + rank) % count]`` --
-for exactly one rank to own each (token, expert) pair. Load counting is the
-runtime's (``record_expert_load``), applied to the mapped ids after routing.
+for exactly one rank to own each (token, expert) pair. ``dispatch_topk_ids``
+is the production implementation of that choice, in tensor ops (two gathers
+and a modulo over ``[tokens, top_k]``); a fused Triton kernel is a
+follow-up, see ``README.md``. Load counting is the runtime's
+(``record_expert_load``), applied to the mapped ids after routing.
 """
 
 from __future__ import annotations
@@ -64,10 +67,14 @@ class ExpertDispatch:
         return self.replicas.shape[1]
 
 
-def dispatch_topk_ids_reference(
-    topk_ids: torch.Tensor, dispatch: ExpertDispatch
-) -> torch.Tensor:
-    """Tensor-op reference of the kernel's replica choice.
+def dispatch_topk_ids(topk_ids: torch.Tensor, dispatch: ExpertDispatch) -> torch.Tensor:
+    """Map logical top-k ids onto physical replicas (the serving path).
+
+    Replica ``(row + route rank) % count`` of each logical expert, so every
+    rank running the same routing over the same rows picks the same replica
+    and the replicas of a hot expert share its routes evenly. Tensor ops,
+    graph-capturable; the ids must all be real experts in ``[0, num_logical)``
+    (the runtime masks zero experts and padding around this call).
 
     Args:
         topk_ids: ``[tokens, top_k]`` logical ids, every entry in

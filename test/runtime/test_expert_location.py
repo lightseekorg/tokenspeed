@@ -27,7 +27,7 @@ from unittest import mock
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe import ExpertDispatch, dispatch_topk_ids_reference
+from tokenspeed_kernel.ops.moe import ExpertDispatch, dispatch_topk_ids
 
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.moe import eplb_algorithms, expert_location
@@ -185,14 +185,14 @@ def test_static_map_is_identical_on_every_rank_and_at_scale():
     assert all(768 <= p < 896 or p < 128 for p in full[1][0, :128].tolist())
 
 
-def test_dispatch_reference_alternates_replicas():
+def test_dispatch_alternates_replicas_per_row_and_route():
     placement = _placement(ep_rank=0)
     dispatch = ExpertDispatch(
         placement.logical_to_all_physical_map[1],
         placement.logical_to_all_physical_map_num_valid[1],
     )
     topk_ids = torch.tensor([[1, 0], [1, 2], [1, 3]], dtype=torch.int32)
-    physical = dispatch_topk_ids_reference(topk_ids, dispatch)
+    physical = dispatch_topk_ids(topk_ids, dispatch)
     # Expert 1's replicas are physical 2, 4, 5: row r, rank k picks (r + k) % 3.
     assert physical.tolist() == [[2, 3], [4, 1], [5, 0]]
     assert physical.dtype == torch.int32

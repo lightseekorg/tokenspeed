@@ -37,7 +37,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "ExpertDispatch",
-    "dispatch_topk_ids_reference",
+    "dispatch_topk_ids",
     "native_latent_moe_available",
     "latent_moe_decode_pipeline_available",
     "latent_moe_expert_shared",
@@ -50,7 +50,7 @@ __all__ = [
 
 from tokenspeed_kernel.ops.moe.dispatch import (  # noqa: E402
     ExpertDispatch,
-    dispatch_topk_ids_reference,
+    dispatch_topk_ids,
 )
 from tokenspeed_kernel.ops.moe.latent_decode import (  # noqa: E402
     latent_moe_decode_pipeline_available,

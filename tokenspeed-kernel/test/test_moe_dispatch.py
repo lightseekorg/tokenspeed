@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe import ExpertDispatch, dispatch_topk_ids_reference
+from tokenspeed_kernel.ops.moe import ExpertDispatch, dispatch_topk_ids
 
 
 def _dispatch() -> ExpertDispatch:
@@ -39,12 +39,12 @@ def test_replica_is_a_pure_function_of_row_and_route_rank():
     dispatch = _dispatch()
     assert dispatch.max_replicas == 3
     ids = torch.tensor([[2, 0], [2, 0], [2, 1]], dtype=torch.int64)
-    physical = dispatch_topk_ids_reference(ids, dispatch)
+    physical = dispatch_topk_ids(ids, dispatch)
     # Row r, route rank k picks replicas[logical, (r + k) % count].
     assert physical.tolist() == [[2, 3], [4, 0], [5, 1]]
     assert physical.dtype == torch.int64
     # Every rank running the same routing over the same rows agrees.
-    assert torch.equal(physical, dispatch_topk_ids_reference(ids, dispatch))
+    assert torch.equal(physical, dispatch_topk_ids(ids, dispatch))
 
 
 def test_dispatch_tables_are_validated():
