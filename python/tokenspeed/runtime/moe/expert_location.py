@@ -59,6 +59,7 @@ import random
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import torch
 
@@ -74,6 +75,7 @@ __all__ = [
     "EXPERT_LOAD_RECORD_SUFFIX",
     "ExpertLoadSnapshot",
     "ExpertLocationMetadata",
+    "InitExpertLocationForm",
     "ModelConfigForExpertLocation",
     "build_expert_placement",
     "compute_initial_expert_location_metadata",
@@ -82,6 +84,7 @@ __all__ = [
     "expert_load_recording_enabled",
     "expert_placement_requested",
     "get_global_expert_location_metadata",
+    "init_expert_location_form",
     "load_balancedness",
     "logical_count_of",
     "merge_expert_load_records",
@@ -997,31 +1000,60 @@ def merge_expert_load_records(paths: Sequence[str | Path]) -> dict:
     }
 
 
-def _expert_load_record_paths(data: str) -> list[str] | None:
-    """The record files ``--init-expert-location`` names, or None for other inputs."""
+InitExpertLocationForm = Literal["trivial", "json", "directory", "file", "glob"]
+
+
+def init_expert_location_form(data: str) -> InitExpertLocationForm:
+    """Decide what ``--init-expert-location`` names, in one fixed order.
+
+    ``trivial`` is the identity placement; a string starting with ``{`` is
+    inline JSON (a bare map or a load record); an existing directory holds
+    the per-rank ``*.expert-load.pt`` records of one profile; an existing
+    file is one ``.pt`` or ``.json`` record or map; anything else is a glob
+    over record files. Deciding by form (not by the characters a glob would
+    use) keeps inline JSON with ``[`` or ``?`` inside from being read as a
+    pattern.
+    """
+    if data == "trivial":
+        return "trivial"
+    if data.lstrip().startswith("{"):
+        return "json"
     path = Path(data)
     if path.is_dir():
-        paths = sorted(str(p) for p in path.glob(f"*{EXPERT_LOAD_RECORD_SUFFIX}"))
+        return "directory"
+    if path.is_file():
+        return "file"
+    return "glob"
+
+
+def _expert_load_record_paths(data: str, form: InitExpertLocationForm) -> list[str]:
+    """The record files a ``directory`` or ``glob`` form names (at least one)."""
+    if form == "directory":
+        paths = sorted(str(p) for p in Path(data).glob(f"*{EXPERT_LOAD_RECORD_SUFFIX}"))
         if not paths:
             raise ValueError(f"{data} holds no *{EXPERT_LOAD_RECORD_SUFFIX} records")
         return paths
-    if glob.has_magic(data):
+    if form == "glob":
         paths = sorted(glob.glob(data))
         if not paths:
-            raise ValueError(f"{data} matches no expert load record")
+            raise ValueError(
+                f"--init-expert-location {data!r} is not 'trivial', inline JSON, "
+                "a directory or a file, and matches no expert load record as a glob"
+            )
         return paths
-    return None
+    raise ValueError(f"{form} names no record files")
 
 
 def compute_initial_expert_location_metadata(
     server_args: ServerArgs, model_config: ModelConfig
 ) -> ExpertLocationMetadata:
     data = server_args.init_expert_location
-    if data == "trivial":
+    form = init_expert_location_form(data)
+    if form == "trivial":
         return ExpertLocationMetadata.init_trivial(server_args, model_config)
 
-    record_paths = _expert_load_record_paths(data)
-    if record_paths is not None:
+    if form in ("directory", "glob"):
+        record_paths = _expert_load_record_paths(data, form)
         logger.info(
             f"init_expert_location: EPLB placement from {len(record_paths)} merged "
             f"expert load records in {data}"
@@ -1032,12 +1064,17 @@ def compute_initial_expert_location_metadata(
             logical_count=merge_expert_load_records(record_paths)["logical_count"],
         )
 
-    if data.endswith(".pt"):
+    if form == "json":
+        data_dict = json.loads(data)
+    elif data.endswith(".pt"):
         data_dict = torch.load(data, weights_only=True)
     elif data.endswith(".json"):
         data_dict = json.loads(Path(data).read_text())
     else:
-        data_dict = json.loads(data)
+        raise ValueError(
+            f"--init-expert-location file {data!r} must be a .pt or .json "
+            "record or placement map"
+        )
 
     # A load record (EXPERT_LOAD profile) carries both its counts and the
     # placement that produced them; the counts win, since the point of the

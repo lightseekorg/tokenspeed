@@ -273,6 +273,75 @@ def test_init_expert_location_merges_a_directory_of_records(tmp_path):
         )
 
 
+def test_init_expert_location_form_is_decided_by_shape_not_by_glob_characters(
+    tmp_path,
+):
+    """Inline JSON, a directory, a file and a glob each take their own path;
+    JSON containing ``[``/``?`` is never mistaken for a pattern."""
+    placement = _placement(0)
+    placement.enable_load_recording()
+    placement.physical_load.fill_(2)
+    record = placement.load_record(placement.physical_load)
+    torch.save(record, tmp_path / "p-TP0.expert-load.pt")
+    torch.save(record | {"ep_rank": 1}, tmp_path / "p-TP1.expert-load.pt")
+    inline = '{"physical_to_logical_map": [[0, 1, 2, 3, 0, 2], [3, 2, 1, 0, 1, 1]]}'
+    assert expert_location.init_expert_location_form("trivial") == "trivial"
+    assert expert_location.init_expert_location_form(inline) == "json"
+    assert expert_location.init_expert_location_form(str(tmp_path)) == "directory"
+    assert (
+        expert_location.init_expert_location_form(
+            str(tmp_path / "p-TP0.expert-load.pt")
+        )
+        == "file"
+    )
+    assert (
+        expert_location.init_expert_location_form(str(tmp_path / "p-TP?.expert-*"))
+        == "glob"
+    )
+
+    seen: dict[str, object] = {}
+
+    def fake_init_by_eplb(server_args, model_config, logical_count):
+        seen["logical_count"] = logical_count
+        return "eplb"
+
+    def fake_init_by_mapping(server_args, model_config, physical_to_logical_map):
+        seen["map"] = physical_to_logical_map
+        return "mapping"
+
+    def compute(data):
+        return expert_location.compute_initial_expert_location_metadata(
+            SimpleNamespace(init_expert_location=data), None
+        )
+
+    with (
+        mock.patch.object(
+            ExpertLocationMetadata, "init_by_eplb", staticmethod(fake_init_by_eplb)
+        ),
+        mock.patch.object(
+            ExpertLocationMetadata,
+            "init_by_mapping",
+            staticmethod(fake_init_by_mapping),
+        ),
+    ):
+        assert compute(inline) == "mapping"
+        assert seen["map"] == [[0, 1, 2, 3, 0, 2], [3, 2, 1, 0, 1, 1]]
+        # Two records merged: 2 routes per slot per rank, 4 after the merge.
+        assert compute(str(tmp_path / "p-TP?.expert-*")) == "eplb"
+        assert seen["logical_count"].tolist() == [[8, 4, 8, 4], [4, 12, 4, 4]]
+        # One record file alone: its own logical_count, nothing merged.
+        assert compute(str(tmp_path / "p-TP1.expert-load.pt")) == "eplb"
+        assert seen["logical_count"].tolist() == [[4, 2, 4, 2], [2, 6, 2, 2]]
+        # Neither JSON, directory nor file: a glob, which must match.
+        with pytest.raises(ValueError, match="matches no expert load record"):
+            compute(str(tmp_path / "nothing-here-*"))
+        with pytest.raises(ValueError, match="matches no expert load record"):
+            compute(str(tmp_path / "not-a-record.txt"))
+        (tmp_path / "not-a-record.txt").write_text("x")
+        with pytest.raises(ValueError, match="must be a .pt or .json"):
+            compute(str(tmp_path / "not-a-record.txt"))
+
+
 def test_eplb_placement_balances_a_skewed_load():
     torch.manual_seed(0)
     layers, experts, ep = 3, 32, 4

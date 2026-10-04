@@ -1956,11 +1956,12 @@ class ServerArgs:
             "--init-expert-location",
             type=str,
             default=ServerArgs.init_expert_location,
-            help="Expert placement: 'trivial', or a .pt/.json file (or inline "
-            "JSON) holding a 'logical_count' [layers, experts] load record to "
-            "derive the placement from with the EPLB algorithm, or a "
-            "'physical_to_logical_map' [layers, slots] to pin it exactly. "
-            "The EXPERT_LOAD profile activity writes such a load record.",
+            help="Expert placement: 'trivial'; inline JSON (starts with '{'); "
+            "a directory of per-rank *.expert-load.pt records; a .pt/.json "
+            "file; otherwise a glob over record files. A 'logical_count' "
+            "[layers, experts] load record derives the placement with the EPLB "
+            "algorithm, a 'physical_to_logical_map' [layers, slots] pins it "
+            "exactly. The EXPERT_LOAD profile activity writes load records.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",
