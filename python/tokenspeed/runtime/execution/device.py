@@ -81,6 +81,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
@@ -1326,7 +1327,11 @@ def build_device_side(
             draft_token_to_kv_pool=views.draft_token_to_kv_pool,
         )
     # Once per process, before the probe: a graph keeps its capture-time tactic.
-    with startup_phase("kernels.autotune"), startup_memory.measure("startup"):
+    with (
+        startup_phase("kernels.autotune"),
+        startup_memory.measure("startup"),
+        current_platform().restore_stack_limit(),
+    ):
         executor.autotune()
     if probing:
         # Consumers above keep the probe's: they read only block-count-invariant fields.

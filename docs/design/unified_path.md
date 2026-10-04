@@ -163,14 +163,17 @@ from one first bound to that pool:
   captures there, one-time bytes the first captures take included; the
   probe releases them and the serving capture pays them again. What executor
   init and kernel tuning keep resident between the probe build and the probe
-  -- buffers, and on a cold tuning cache the kernels of every tactic tried --
-  is measured the same way, including the free space a kept block pins in an
-  allocator segment, and this startup residue joins each rank's projection
-  before the MAX; its net is floored at zero. The
+  -- buffers, and on a cold tuning cache the kernels of every tactic tried,
+  though not, on CUDA, the stack limit they raised, which is restored after
+  tuning -- is measured the same way, including the free space a kept block
+  pins in an allocator segment, and this startup residue joins each rank's
+  projection before the MAX; its net is floored at zero. The
   utilization headroom covers everything else: activations, fragmentation,
-  the warmups and workspaces a capture allocates around its windows, and any
-  shortfall of the projection, as it covers every graph and all of startup
-  on a boot without a
+  the warmups and workspaces a capture allocates around its windows, the
+  local memory a kept kernel reserves when it raises the stack limit again
+  after tuning (a driver allocation that first drains the device, and the
+  launch fails if it does not fit), and any shortfall of the projection, as
+  it covers every graph and all of startup on a boot without a
   reserve. Profiling again after the probe would charge the cache a second
   time for what startup and the probe left allocated. The deltas read the
   whole device, so the probe assumes no other process allocates on it during

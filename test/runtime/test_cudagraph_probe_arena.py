@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import pathlib
 import sys
 from types import SimpleNamespace
@@ -246,10 +247,10 @@ class _ServingCapture(Exception):
 
 
 def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager):
-    """Boot with fakes; returns (startup bytes each rebind got, devices read)."""
+    """Boot with fakes; returns (startup bytes each rebind got, devices read, stack kept)."""
     from tokenspeed.runtime.execution import factory
 
-    free, reads, charged = [1 << 40], [], []
+    free, reads, charged, stack = [1 << 40], [], [], [0]
 
     class Executor:
         attn_backend = draft_attn_backend = None
@@ -258,7 +259,9 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager):
             free[0] -= init_keeps
 
         def autotune(self):
-            free[0] -= tune_keeps
+            # Tried tactics also raise the stack limit, which reserves local memory.
+            free[0] -= tune_keeps + (1 << 30)
+            stack[0] += 1 << 30
 
         def capture_graphs(self, *, entries, observer):
             raise _ServingCapture
@@ -292,12 +295,25 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager):
         token_to_kv_pool=None,
         draft_token_to_kv_pool=None,
     )
+
+    @contextlib.contextmanager
+    def restore_stack_limit():
+        found = stack[0]
+        yield
+        free[0] += stack[0] - found
+        stack[0] = found
+
     driver = SimpleNamespace(
         synchronize=lambda gpu: reads.append(gpu),
         empty_cache=lambda: None,
         mem_get_info=lambda gpu: reads.append(gpu) or (free[0], 1 << 40),
     )
     monkeypatch.setattr(torch, "get_device_module", lambda _device: driver)
+    monkeypatch.setattr(
+        device,
+        "current_platform",
+        lambda: SimpleNamespace(restore_stack_limit=restore_stack_limit),
+    )
     monkeypatch.setattr(factory, "create_model_runner", lambda *a: (target, None))
     monkeypatch.setattr(factory, "create_model_executor", lambda **_: Executor())
     monkeypatch.setattr(
@@ -331,7 +347,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager):
             decode_input_tokens=1,
             max_batch_size=8,
         )
-    return charged, set(reads)
+    return charged, set(reads), stack[0]
 
 
 @pytest.mark.parametrize(
@@ -340,19 +356,19 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager):
 def test_the_rebind_is_charged_what_executor_init_and_tuning_kept(
     monkeypatch, init_keeps, tune_keeps
 ) -> None:
-    charged, devices = _startup_charge(
+    charged, devices, stack = _startup_charge(
         monkeypatch, init_keeps=init_keeps, tune_keeps=tune_keeps, enforce_eager=False
     )
     # The signed net of both; the probe floors it.
     assert charged == [init_keeps + tune_keeps]
-    assert devices == {3}
+    assert devices == {3} and stack == 0
 
 
 def test_a_boot_without_a_probe_reads_no_startup_memory(monkeypatch) -> None:
-    charged, devices = _startup_charge(
+    charged, devices, stack = _startup_charge(
         monkeypatch, init_keeps=1 << 30, tune_keeps=1 << 30, enforce_eager=True
     )
-    assert charged == [] and devices == set()
+    assert charged == [] and devices == set() and stack == 0
 
 
 def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
