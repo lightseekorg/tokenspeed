@@ -511,6 +511,7 @@ def test_dsa_with_kvcache(
         softmax_scale=softmax_scale,
         page_size=64,
         solution=solution,
+        slot_order="selection",
     )
 
     ref = _dsa_reference(
