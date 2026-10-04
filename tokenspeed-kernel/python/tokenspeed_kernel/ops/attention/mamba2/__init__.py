@@ -394,6 +394,26 @@ def mamba2_state_update(
         )
 
 
+def _check_tree_parents(x: torch.Tensor, parent_indices: torch.Tensor | None) -> None:
+    """Validate a draft tree's ``[batch, T]`` parent table."""
+    if parent_indices is None:
+        return
+    batch, steps = x.shape[:2]
+    if steps > 64:
+        raise ValueError(
+            f"a draft tree holds at most 64 tokens (a 64-bit ancestor mask), got {steps}"
+        )
+    if (
+        parent_indices.shape != (batch, steps)
+        or parent_indices.dtype != torch.int32
+        or not parent_indices.is_contiguous()
+    ):
+        raise ValueError(
+            f"parent_indices must be contiguous int32 {(batch, steps)}, got "
+            f"{parent_indices.dtype} {tuple(parent_indices.shape)}"
+        )
+
+
 def mamba2_verify_scan(
     state: torch.Tensor,
     x: torch.Tensor,
@@ -406,6 +426,7 @@ def mamba2_verify_scan(
     *,
     state_indices: torch.Tensor,
     dst_state_indices: torch.Tensor | None,
+    parent_indices: torch.Tensor | None,
     null_slot: int,
     out: torch.Tensor,
     override: str | None = None,
@@ -415,6 +436,8 @@ def mamba2_verify_scan(
 
     Every request starts from its own slot and steps through its tokens in
     order, exactly as ``T`` consecutive ``mamba2_state_update`` calls would.
+    With ``parent_indices`` the tokens form a draft tree: token ``t``
+    continues from the state after its parent token instead of token ``t - 1``.
 
     Args:
         state: ``[slots, heads, head_dim, d_state]`` state pool, ``d_state``
@@ -431,6 +454,12 @@ def mamba2_verify_scan(
         dst_state_indices: ``[batch, T]`` int32 slot receiving the state after
             each token, or None to leave the pool untouched (the caller
             replays the accepted tokens later).
+        parent_indices: Contiguous int32 ``[batch, T]`` draft-tree parents:
+            token ``t`` continues from the state after token
+            ``parent_indices[i, t]``, or from the read slot when negative;
+            parents precede their children, ``T`` is at most 64, and
+            destinations must not alias the read slot or each other. None
+            for a chain.
         null_slot: Index marking padding: a request whose read slot is
             ``null_slot`` starts from zeros, and a ``null_slot`` destination
             is skipped.
@@ -448,10 +477,12 @@ def mamba2_verify_scan(
         or dst_state_indices.stride(-1) != 1
     ):
         raise ValueError("dst_state_indices must be a dense int32 [batch, T] table")
+    _check_tree_parents(x, parent_indices)
     destinations = () if dst_state_indices is None else (dst_state_indices,)
+    parents = () if parent_indices is None else (parent_indices,)
     _check_memory(
         (out, state),
-        (x, dt, A_log, B, C, D, dt_bias, state_indices, *destinations),
+        (x, dt, A_log, B, C, D, dt_bias, state_indices, *destinations, *parents),
     )
     if batch == 0 or steps == 0:
         return
@@ -491,6 +522,7 @@ def mamba2_verify_scan(
             dt_bias,
             state_indices=state_indices,
             dst_state_indices=dst_state_indices,
+            parent_indices=parent_indices,
             null_slot=null_slot,
             out=out,
         )

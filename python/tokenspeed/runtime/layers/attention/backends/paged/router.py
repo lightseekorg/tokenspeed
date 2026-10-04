@@ -160,8 +160,7 @@ class CacheGroupRouter(AttentionBackend):
         self.device = device
         # Draft-tree verify: compaction's K/V address table, rebuilt on every pool bind.
         self._tree_verify_armed = False
-        self._tree_window_addresses: torch.Tensor | None = None
-        self._tree_window_row_bytes: int | None = None
+        self._tree_window_rows: dict[str, tuple[torch.Tensor, int]] = {}
         self._init_pool_binding()
         self._forget_bound_pool_state()
 
@@ -433,10 +432,13 @@ class CacheGroupRouter(AttentionBackend):
         extend requests are skipped). DFLASH reads the TARGET router's verify
         window through this to copy target-aligned KV into the draft cache
         (the pools share one page-id space)."""
+        return self._decode_window_of(self.group_ids[self._draft_history_index()])
+
+    def _decode_window_of(self, gid: str) -> torch.Tensor:
+        """Group ``gid``'s current decode write window view (see ``decode_window_locations``)."""
         published = self.decode_write_locations
         if published is None:
             raise RuntimeError("decode window requested before any decode refresh")
-        gid = self.group_ids[self._draft_history_index()]
         locs = published.by_group[gid]
         if self._decode_request_offset:
             locs = locs[self._decode_request_offset * published.tokens_per_req :]
@@ -451,10 +453,17 @@ class CacheGroupRouter(AttentionBackend):
         return self._extend_write_locations[gid]
 
     def tree_support(self) -> TreeSupport:
-        if len(self.leaves) == 1:
+        unsupported = []
+        for gid in self.group_ids:
+            retention, _ = self.geometry.retentions[gid]
+            _, entry_stride_tokens = self.geometry.row_geometry[gid]
+            if retention != "full_history" or entry_stride_tokens not in (None, 1):
+                unsupported.append(gid)
+        if not unsupported:
             return TreeSupport(verify_blocker=None, draft_blocker=None)
         blocker = (
-            f"draft trees support one cache group; this router serves {self.group_ids}"
+            "draft trees need full-history cache groups of one row per token; "
+            f"{', '.join(unsupported)} slide or pack several tokens per row"
         )
         return TreeSupport(verify_blocker=blocker, draft_blocker=blocker)
 
@@ -465,33 +474,39 @@ class CacheGroupRouter(AttentionBackend):
             self._bind_tree_window_rows()
 
     def _bind_tree_window_rows(self) -> None:
-        """Address table of the history K/V token-row buffers compaction moves rows in."""
+        """Per group, the address table of the K/V token-row buffers compaction moves rows in."""
         pool = self.cache_pool
-        buffers = [
-            buf
-            for layer in sorted(pool.history_group_by_layer())
-            for buf in pool.get_kv_buffer(layer)
-        ]
-        row_bytes = {buf[0].numel() * buf.element_size() for buf in buffers}
-        if len(row_bytes) != 1 or not all(buf.is_contiguous() for buf in buffers):
-            raise NotImplementedError(
-                "draft-tree compaction needs contiguous K/V token rows of one width"
+        buffers_by_group: dict[str, list[torch.Tensor]] = {}
+        for layer, gid in sorted(pool.history_group_by_layer().items()):
+            if gid in self.leaves:
+                buffers_by_group.setdefault(gid, []).extend(pool.get_kv_buffer(layer))
+        self._tree_window_rows = {}
+        for gid, buffers in buffers_by_group.items():
+            row_bytes = {buf[0].numel() * buf.element_size() for buf in buffers}
+            contiguous = all(buf.is_contiguous() for buf in buffers)
+            if len(row_bytes) != 1 or not contiguous:
+                raise NotImplementedError(
+                    "draft-tree compaction needs contiguous K/V token rows of one "
+                    f"width per cache group; {gid} has widths {sorted(row_bytes)}, "
+                    f"contiguous={contiguous}"
+                )
+            # Layers may alias one region through the memory plan; move each region once.
+            addresses = torch.tensor(
+                sorted({buf.data_ptr() for buf in buffers}),
+                dtype=torch.int64,
+                device=self.device,
             )
-        self._tree_window_row_bytes = row_bytes.pop()
-        # Layers may alias one region through the memory plan; move each region once.
-        self._tree_window_addresses = torch.tensor(
-            sorted({buf.data_ptr() for buf in buffers}),
-            dtype=torch.int64,
-            device=self.device,
-        )
+            self._tree_window_rows[gid] = (addresses, row_bytes.pop())
+        if not self._tree_window_rows:
+            raise NotImplementedError(
+                f"draft-tree compaction found no K/V rows in cache groups {self.group_ids}"
+            )
 
     def compact_verify_window(self, path: torch.Tensor) -> None:
-        compact_window_rows(
-            self._tree_window_addresses,
-            self.decode_window_locations(),
-            path,
-            row_bytes=self._tree_window_row_bytes,
-        )
+        for gid, (addresses, row_bytes) in self._tree_window_rows.items():
+            compact_window_rows(
+                addresses, self._decode_window_of(gid), path, row_bytes=row_bytes
+            )
 
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
