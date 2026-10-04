@@ -197,6 +197,14 @@ live rows are fully written, while negative padding rows skip state access
 and leave output undefined. Consumers must ignore padded output; enabled
 intermediate caches always require real storage.
 
+State backends refresh every state group's decode pages in one prep-tape
+launch, up to eight groups; the tape loops over rows, so it covers every
+captured batch size. Target verify writes each group's committed-state pages
+straight into the captured `state_in` buffers. The commit enqueued after the
+replay reads those buffers before the next refresh rewrites them. Verify keeps
+`state_out` at `pad_slot_id` and refills it only after a decode refresh has
+written live pages into the same per-bs buffer.
+
 After verification, GDN, KDA and PLE resolve the accepted checkpoint with
 `commit_state_pages`, once per state group and only for live requests. It
 clamps acceptance, computes checkpoint slots and gathers destination pages in

@@ -709,6 +709,40 @@ def test_quantized_fc2_sees_the_reduced_latent_and_counts_once(
         assert out is None
 
 
+@pytest.mark.parametrize("graph_phase,capture", [(False, False), (True, True)])
+def test_router_and_shared_expert_run_beside_fc1_only_in_decode_graphs(
+    monkeypatch: pytest.MonkeyPatch, graph_phase: bool, capture: bool
+):
+    """Graph capture runs the router and shared expert on the aux stream beside fc1."""
+    from tokenspeed.runtime.models import nemotron_h
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    monkeypatch.setattr(nemotron_h, "get_is_cuda_graph_phase", lambda: graph_phase)
+    monkeypatch.setattr(nemotron_h, "get_is_capture_mode", lambda: capture)
+    aux = torch.cuda.Stream()
+    streams = {}
+
+    def record(name, value):
+        streams[name] = torch.cuda.current_stream()
+        return value
+
+    moe = SimpleNamespace(
+        stream_fork=StreamFork(aux),
+        gate=lambda x: record("gate", x * 3),
+        shared_experts=lambda x: record("shared", x * 2),
+        fc1_latent_proj=lambda x: (record("fc1", x - 1), None),
+        _routed=lambda x, logits, latent, ctx: record("routed", logits + latent),
+    )
+    hidden = torch.arange(8.0, device="cuda").view(2, 4)
+    out_routed, out_shared = nemotron_h.NemotronHMoE.forward(moe, hidden, None, None)
+    torch.cuda.synchronize()
+    assert torch.equal(out_routed, hidden * 4 - 1)
+    assert torch.equal(out_shared, hidden * 2)
+    main = torch.cuda.current_stream()
+    side = aux if graph_phase else main
+    assert streams == {"gate": side, "shared": side, "fc1": main, "routed": main}
+
+
 @pytest.mark.parametrize(
     "blocks",
     [

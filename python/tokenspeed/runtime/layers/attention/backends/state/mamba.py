@@ -90,6 +90,9 @@ from tokenspeed.runtime.utils.tensor import upload_packed
 
 logger = logging.getLogger(__name__)
 
+# The replay tape holds one row pointer (PTR0..PTR7) and width (USER0..USER7) per group.
+_TAPE_MAX_STATE_GROUPS = 8
+
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.metadata import PrepTape
 
@@ -453,7 +456,6 @@ class MambaAttnBackend(AttentionBackend):
         self._verify_scratch = None
         self._verify_commit_ctx = None
         self._verify_copy_tables: dict[str, torch.Tensor | int | None] | None = None
-        self._replay_state_tapes: dict[int, PrepTape] = {}
 
     @property
     def kv_pool(self) -> CachePool | None:
@@ -475,6 +477,10 @@ class MambaAttnBackend(AttentionBackend):
         self._verify_base_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._qsl_dirty: list[bool] = []
         self._qsl_last_mode: list[tuple[ForwardMode, bool] | None] = []
+        # Whether a decode refresh left live pages in the captured state_out buffer.
+        self._state_out_live: list[bool] = []
+        # Tapes bake in the index buffers' addresses, so they die with them.
+        self._replay_state_tapes: dict[int, PrepTape] = {}
 
     def set_kv_pool(self, kv_pool: CachePool) -> None:
         """Bind a unified pool that publishes state groups and component views."""
@@ -642,17 +648,18 @@ class MambaAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         draft_token_num: int,
         block_tables: Mapping[str, torch.Tensor],
-    ) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict[str, torch.Tensor]]:
+        *,
+        pages_out: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Target-verify state paging: per-group committed-state pages.
 
         Verify reads the state at the last COMMITTED position
         (``seq_lens - draft_token_num``); speculative outputs stay out of the
         state slab, and the accepted state is committed back by
-        ``commit_speculative_state_after_verify``. Returns the per-group in
-        pages, the committed lengths, and the per-group group tables (kept
-        for the commit's dynamic page resolve).
+        ``commit_speculative_state_after_verify``. Writes each group's in
+        pages into ``pages_out[group][:bs]`` and returns the committed lengths
+        and the per-group tables (kept for the commit's dynamic page resolve).
         """
-        state_in_blocks: dict[str, torch.Tensor] = {}
         tables: dict[str, torch.Tensor] = {}
         rows_by_group = {
             group_id: self._state_rows(block_tables, group_id)
@@ -660,25 +667,22 @@ class MambaAttnBackend(AttentionBackend):
         }
         if not rows_by_group:
             return (
-                {},
                 (seq_lens[:bs].to(torch.int64) - draft_token_num).clamp_min(0),
                 {},
             )
         committed = torch.empty(bs, dtype=torch.int64, device=seq_lens.device)
         for group_id, rows in rows_by_group.items():
-            pages = torch.empty(bs, dtype=torch.int32, device=seq_lens.device)
             verify_state_blocks(
                 seq_lens,
                 rows,
                 batch_size=bs,
                 draft_tokens=draft_token_num,
                 granularity=self._checkpoint_granularity,
-                pages_out=pages,
+                pages_out=pages_out[group_id],
                 committed_out=committed,
             )
-            state_in_blocks[group_id] = pages
             tables[group_id] = rows
-        return state_in_blocks, committed, tables
+        return committed, tables
 
     def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
         """Lazily allocate graph-stable verify scratch and replay inputs."""
@@ -1242,6 +1246,7 @@ class MambaAttnBackend(AttentionBackend):
             )
         self._qsl_dirty = [False] * max_bs
         self._qsl_last_mode = [None] * max_bs
+        self._state_out_live = [False] * max_bs
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1298,6 +1303,7 @@ class MambaAttnBackend(AttentionBackend):
                 state_out.fill_(self.pad_slot_id)
                 state_in_blocks_by_group[gid] = state_in
                 state_out_blocks_by_group[gid] = state_out
+            self._state_out_live[bs - 1] = False
         self._qsl_dirty[bs - 1] = False
         self._qsl_last_mode[bs - 1] = (forward_mode, self.spec_num_tokens > 1)
         self.forward_metadata = MambaForwardMetadata(
@@ -1380,45 +1386,38 @@ class MambaAttnBackend(AttentionBackend):
             draft_token_num = int(self.speculative_num_draft_tokens)
             self._ensure_verify_scratch(bs, draft_token_num)
             mamba_output_indices = self._verify_scratch_grid(bs, draft_token_num)
-            pages_by_group = None
+            state_in_blocks_by_group = {
+                group_id: self.state_in_by_group[group_id][bs - 1]
+                for group_id in self._state_groups()
+            }
+            state_out_blocks_by_group = {
+                group_id: self.state_out_by_group[group_id][bs - 1]
+                for group_id in self._state_groups()
+            }
             if real_bs > 0:
-                (
-                    pages_by_group,
-                    verify_committed,
-                    verify_tables,
-                ) = self._verify_state_blocks(
-                    real_bs, seq_lens, draft_token_num, block_tables
+                # The commit runs before the next refresh, so it may read the captured pages.
+                verify_committed, verify_tables = self._verify_state_blocks(
+                    real_bs,
+                    seq_lens,
+                    draft_token_num,
+                    block_tables,
+                    pages_out=state_in_blocks_by_group,
                 )
                 self._verify_commit_ctx = (
                     verify_committed,
                     verify_tables,
                     draft_token_num,
-                    pages_by_group,
+                    state_in_blocks_by_group,
                 )
             else:
                 self._verify_commit_ctx = None
-            captured_in = {
-                group_id: self.state_in_by_group[group_id][bs - 1]
-                for group_id in self._state_groups()
-            }
-            captured_out = {
-                group_id: self.state_out_by_group[group_id][bs - 1]
-                for group_id in self._state_groups()
-            }
-            state_in_blocks_by_group = {}
-            state_out_blocks_by_group = {}
             for group_id in self._state_groups():
-                state_in = captured_in[group_id]
-                state_out = captured_out[group_id]
-                if pages_by_group is not None:
-                    state_in[:real_bs].copy_(pages_by_group[group_id][:real_bs])
                 if real_bs < bs:
-                    state_in[real_bs:].fill_(self.pad_slot_id)
-                # Slab out pages are unused under verify; keep the captured
-                # buffer inert.
-                state_out.fill_(self.pad_slot_id)
-                state_in_blocks_by_group[group_id] = state_in
-                state_out_blocks_by_group[group_id] = state_out
+                    state_in_blocks_by_group[group_id][real_bs:].fill_(self.pad_slot_id)
+                # Slab out pages are unused under verify; keep the captured buffer inert.
+                if self._state_out_live[bs - 1]:
+                    state_out_blocks_by_group[group_id].fill_(self.pad_slot_id)
+            self._state_out_live[bs - 1] = False
         elif self.state_paging_active:
             # For multi-group state paging, dual indexing runs once per
             # state group over the real rows. Padded rows get pad_slot_id (-1),
@@ -1431,6 +1430,7 @@ class MambaAttnBackend(AttentionBackend):
             state_in_blocks_by_group, state_out_blocks_by_group = (
                 self._replay_contract_state_blocks(bs, real_bs, seq_lens, block_tables)
             )
+            self._state_out_live[bs - 1] = True
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
@@ -1460,7 +1460,7 @@ class MambaAttnBackend(AttentionBackend):
             not cache_debug_enabled()
             and seq_lens.is_cuda
             and seq_lens.dtype == torch.int32
-            and len(gids) <= 4
+            and len(gids) <= _TAPE_MAX_STATE_GROUPS
             and all(gid in block_tables for gid in gids)
         )
         if use_tape:
@@ -1477,7 +1477,7 @@ class MambaAttnBackend(AttentionBackend):
                         sin,
                         sout,
                         rows_ptr=Reg(Reg.PTR0 + i),
-                        seq_lens_ptr=Reg.PTR4,
+                        seq_lens_ptr=Reg.PTR8,
                         bs=Reg.REAL_BS,
                         max_slots=Reg(Reg.USER0 + i),
                         page_size=self._checkpoint_granularity,
@@ -1490,7 +1490,7 @@ class MambaAttnBackend(AttentionBackend):
                     )
                 tape.finalize()
                 tapes[bs] = tape
-            regs = {Reg.REAL_BS: real_bs, Reg.PTR4: seq_lens}
+            regs = {Reg.REAL_BS: real_bs, Reg.PTR8: seq_lens}
             for i, gid in enumerate(gids):
                 rows = block_tables[gid]
                 regs[Reg(Reg.PTR0 + i)] = rows
