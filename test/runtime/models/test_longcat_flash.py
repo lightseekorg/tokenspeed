@@ -215,6 +215,293 @@ class TestLongcatMoePlan(unittest.TestCase):
                     self.assertFalse(moe.experts.support_routing)
 
 
+def _fake_comm_ops(rank: int, gathers: list | None = None) -> dict:
+    """Single-process stand-ins for the comm ops, keyed by this rank's slot.
+
+    ``gathers`` records the group of every all-gather when given.
+    """
+
+    def all_reduce(tensor, group, **_):
+        return tensor
+
+    def token_all_gather(tensor, group, scattered_num_tokens):
+        slot = group.index(rank)
+        assert tensor.shape[0] == scattered_num_tokens[slot]
+        if gathers is not None:
+            gathers.append(group)
+        out = tensor.new_zeros(sum(scattered_num_tokens), tensor.shape[1])
+        offset = sum(scattered_num_tokens[:slot])
+        out[offset : offset + tensor.shape[0]] = tensor
+        return out
+
+    def token_reduce_scatter(tensor, group, scattered_num_tokens):
+        slot = group.index(rank)
+        assert tensor.shape[0] == sum(scattered_num_tokens)
+        offset = sum(scattered_num_tokens[:slot])
+        return tensor[offset : offset + scattered_num_tokens[slot]]
+
+    return {
+        "all_reduce": all_reduce,
+        "token_all_gather": token_all_gather,
+        "token_reduce_scatter": token_reduce_scatter,
+    }
+
+
+class TestLongcatRowLayout(unittest.TestCase):
+    """Both attention branches see one row layout; the MoE is bridged into it."""
+
+    HIDDEN = 4
+
+    def _layer(self, mapping, rows_seen: dict):
+        from tokenspeed.runtime.models.longcat_flash import (
+            _RuntimeLongcatDecoderLayer,
+        )
+
+        layer = _RuntimeLongcatDecoderLayer.__new__(_RuntimeLongcatDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.mapping = mapping
+        # Not the first layer: its input arrives in the previous layer's layout.
+        layer.layer_id = 1
+        layer.hidden_size = self.HIDDEN
+
+        def norm(hidden, residual=None):
+            return hidden if residual is None else (hidden, residual)
+
+        layer.input_layernorm = [norm, norm]
+        layer.post_attention_layernorm = [norm, norm]
+
+        def attention(branch):
+            def run(*, positions, hidden_states, ctx, comm_manager):
+                hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
+                rows_seen[f"attn{branch}"] = hidden_states.shape[0]
+                return hidden_states
+
+            return run
+
+        layer.self_attn = [attention(0), attention(1)]
+        layer.mlps = [lambda hidden: hidden, lambda hidden: hidden]
+
+        def moe(hidden, num_global_tokens, max_num_tokens_per_gpu):
+            rows_seen["moe"] = hidden.shape[0]
+            return hidden
+
+        layer.mlp = moe
+        layer._init_comm()
+        return layer
+
+    def _run(self, *, mapping, local_tokens: int):
+        from tokenspeed.runtime.distributed import comm_manager as comm_module
+
+        rows_seen: dict = {}
+        layer = self._layer(mapping, rows_seen)
+        scattered = layer.moe_comm.attn_tp_group_scattered_num_tokens(
+            SimpleNamespace(
+                collective_global_num_tokens=None,
+                global_num_tokens=[local_tokens] * mapping.world_size,
+                collective_num_tokens=None,
+                input_num_tokens=local_tokens,
+            )
+        )
+        ctx = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            input_num_tokens=local_tokens,
+            global_num_tokens=[local_tokens] * mapping.world_size,
+            collective_num_tokens=None,
+            collective_global_num_tokens=None,
+        )
+        # The layer input arrives in the dense layout of the previous layer.
+        input_rows = (
+            local_tokens
+            if layer.branch_comm[0].use_all_reduce(is_moe=False)
+            else scattered[mapping.attn.tp_rank]
+        )
+        hidden = torch.randn(input_rows, self.HIDDEN)
+        positions = torch.arange(local_tokens)
+        with mock.patch.multiple(comm_module, **_fake_comm_ops(mapping.rank)):
+            out, residual = layer.forward(positions, hidden, ctx, None)
+        return layer, rows_seen, out, residual
+
+    def test_attention_dp_with_ep_bridges_the_moe_into_full_rows(self):
+        from tokenspeed.runtime.distributed.mapping import Mapping
+
+        # attention TP 2 x DP 2, dense TP 2 (all-reduce), MoE EP 4 (RSAG).
+        mapping = Mapping(
+            rank=1,
+            world_size=4,
+            attn_tp_size=2,
+            attn_dp_size=2,
+            dense_tp_size=2,
+            moe_ep_size=4,
+        )
+        layer, rows_seen, out, residual = self._run(mapping=mapping, local_tokens=4)
+
+        self.assertTrue(layer.moe_rows_differ)
+        self.assertEqual(rows_seen["attn0"], 4)
+        self.assertEqual(rows_seen["attn1"], 4)
+        # The MoE gathers its TP-EP group's scattered shares: 2 per rank.
+        self.assertEqual(rows_seen["moe"], 8)
+        self.assertEqual(out.shape[0], 4)
+        self.assertEqual(residual.shape[0], 4)
+
+    def test_rsag_everywhere_keeps_scattered_rows(self):
+        from tokenspeed.runtime.distributed.mapping import Mapping
+
+        # attention TP 2 x DP 2, dense TP 4 and MoE EP 4: both RSAG.
+        mapping = Mapping(
+            rank=1,
+            world_size=4,
+            attn_tp_size=2,
+            attn_dp_size=2,
+            dense_tp_size=4,
+            moe_ep_size=4,
+        )
+        layer, rows_seen, out, residual = self._run(mapping=mapping, local_tokens=4)
+
+        self.assertFalse(layer.moe_rows_differ)
+        self.assertEqual(rows_seen["attn0"], 4)
+        self.assertEqual(rows_seen["attn1"], 4)
+        self.assertEqual(rows_seen["moe"], 8)
+        self.assertEqual(out.shape[0], 2)
+        self.assertEqual(residual.shape[0], 2)
+
+    def test_tensor_parallel_only_keeps_full_rows(self):
+        from tokenspeed.runtime.distributed.mapping import Mapping
+
+        mapping = Mapping(
+            rank=1, world_size=4, attn_tp_size=4, dense_tp_size=4, moe_ep_size=4
+        )
+        layer, rows_seen, out, _ = self._run(mapping=mapping, local_tokens=4)
+
+        self.assertFalse(layer.moe_rows_differ)
+        self.assertEqual((rows_seen["attn0"], rows_seen["attn1"]), (4, 4))
+        self.assertEqual(rows_seen["moe"], 4)
+        self.assertEqual(out.shape[0], 4)
+
+    def test_pure_attention_dp_with_ep_needs_no_bridge(self):
+        from tokenspeed.runtime.distributed import comm_manager as comm_module
+        from tokenspeed.runtime.distributed.mapping import Mapping
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        # Attention TP 1 x DP 4 with EP 4: the MoE pattern (RSAG) differs from
+        # the dense one (all-reduce), but a one-rank attention-TP group holds
+        # all of its rows either way, so the only gather is the MoE's own
+        # TP-EP one and all-reduce fusion stays inert as before.
+        mapping = Mapping(
+            rank=1,
+            world_size=4,
+            attn_tp_size=1,
+            attn_dp_size=4,
+            dense_tp_size=1,
+            moe_ep_size=4,
+        )
+        rows_seen: dict = {}
+        with mock.patch.dict(
+            global_server_args_dict, {"enable_allreduce_fusion": True}
+        ):
+            layer = self._layer(mapping, rows_seen)
+        self.assertFalse(layer.moe_rows_differ)
+
+        ctx = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            input_num_tokens=4,
+            global_num_tokens=[4] * 4,
+            collective_num_tokens=None,
+            collective_global_num_tokens=None,
+        )
+        gathers: list = []
+        with mock.patch.multiple(comm_module, **_fake_comm_ops(mapping.rank, gathers)):
+            out, residual = layer.forward(
+                torch.arange(4), torch.randn(4, self.HIDDEN), ctx, None
+            )
+
+        self.assertEqual(gathers, [mapping.moe.tp_ep_group])
+        self.assertNotIn(mapping.attn.tp_group, gathers)
+        self.assertEqual((rows_seen["attn0"], rows_seen["attn1"]), (4, 4))
+        self.assertEqual(rows_seen["moe"], 16)
+        self.assertEqual((out.shape[0], residual.shape[0]), (4, 4))
+
+    def test_row_bridges_reject_the_wrong_input_layout(self):
+        from tokenspeed.runtime.distributed.mapping import Mapping
+
+        mapping = Mapping(
+            rank=1,
+            world_size=4,
+            attn_tp_size=2,
+            attn_dp_size=2,
+            dense_tp_size=2,
+            moe_ep_size=4,
+        )
+        layer = self._layer(mapping, {})
+        ctx = SimpleNamespace(
+            input_num_tokens=4,
+            global_num_tokens=[4] * 4,
+            collective_num_tokens=None,
+            collective_global_num_tokens=None,
+        )
+        # Full rows (4) where this rank's scattered share (2) is expected.
+        with self.assertRaisesRegex(RuntimeError, "scattered share"):
+            layer.moe_comm.gather_scattered_rows(torch.randn(4, self.HIDDEN), ctx)
+        # A scattered share where the full rows are expected.
+        with self.assertRaisesRegex(RuntimeError, "full rows"):
+            layer.moe_comm.slice_scattered_rows(torch.randn(2, self.HIDDEN), ctx)
+
+    def test_idle_rank_joins_the_cross_dp_dense_collectives(self):
+        from tokenspeed.runtime.distributed import comm_manager as comm_module
+        from tokenspeed.runtime.distributed.mapping import Mapping
+
+        # Dense TP 4 spans both DP groups: an idle group must still take part
+        # in the MoE and both dense MLP all-gathers, in the active order.
+        mapping = Mapping(
+            rank=1,
+            world_size=4,
+            attn_tp_size=2,
+            attn_dp_size=2,
+            dense_tp_size=4,
+            moe_ep_size=4,
+        )
+        rows_seen: dict = {}
+        layer = self._layer(mapping, rows_seen)
+        ctx = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: True),
+            input_num_tokens=0,
+            global_num_tokens=[0, 0, 4, 4],
+            collective_num_tokens=None,
+            collective_global_num_tokens=None,
+        )
+        gathers: list = []
+        with mock.patch.multiple(comm_module, **_fake_comm_ops(mapping.rank, gathers)):
+            out, residual = layer.forward(
+                torch.empty(0, dtype=torch.int64),
+                torch.empty(0, self.HIDDEN),
+                ctx,
+                None,
+            )
+
+        self.assertEqual(gathers, [(0, 1, 2, 3)] * 3)
+        self.assertEqual(rows_seen["moe"], 4)
+        self.assertNotIn("attn0", rows_seen)
+        self.assertEqual(out.shape[0], 0)
+        self.assertIsNone(residual)
+
+    def test_mixed_patterns_reject_allreduce_fusion(self):
+        from tokenspeed.runtime.distributed.mapping import Mapping
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        mapping = Mapping(
+            rank=1,
+            world_size=4,
+            attn_tp_size=2,
+            attn_dp_size=2,
+            dense_tp_size=2,
+            moe_ep_size=4,
+        )
+        with (
+            mock.patch.dict(global_server_args_dict, {"enable_allreduce_fusion": True}),
+            self.assertRaisesRegex(ValueError, "one comm pattern"),
+        ):
+            self._layer(mapping, {})
+
+
 class TestLongcatCheckpointLoading(unittest.TestCase):
     def test_missing_kv_scale_params_are_silent(self):
         model = object.__new__(LongcatFlashForCausalLM)

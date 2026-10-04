@@ -1,9 +1,12 @@
+import inspect
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 
+from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.eagle import Eagle, EagleDraftInput
 from tokenspeed.runtime.execution.drafter.mtp import (
@@ -72,33 +75,124 @@ def test_mtp_index_sharing_rides_the_draft_backend_share() -> None:
     assert drafter._target_dsa_topk(base_ctx) == (None, None)
 
 
+def _multi_depth_forward(
+    ctx, input_ids, positions, captured_hidden_states=None, spec_step_idx=0, **kwargs
+):
+    """The draft-model forward shape the multi-depth drafter requires."""
+
+
+def _make_mtp(
+    *,
+    spec_num_tokens: int = 4,
+    spec_num_steps: int = 3,
+    num_mtp_layers: int | None = None,
+    max_bs: int = 16,
+    request_pool_rows: int = 18,
+    dp_size: int = 1,
+    draft_forward=None,
+    model_forward=_multi_depth_forward,
+) -> Mtp:
+    """An ``Mtp`` over stubbed runner/buffers (no weights, no kernels); the
+    draft model builds ``num_mtp_layers`` depths (default: one per step)."""
+    if num_mtp_layers is None:
+        num_mtp_layers = spec_num_steps
+    input_buffers = SimpleNamespace(
+        max_bs=max_bs,
+        seq_lens_buf=torch.zeros(max_bs, dtype=torch.int32),
+    )
+    model_runner = SimpleNamespace(
+        device="cpu",
+        mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=dp_size)),
+        model=SimpleNamespace(forward=model_forward, num_mtp_layers=num_mtp_layers),
+        # What ModelRunner.load_model derives from the forward signature.
+        forward_accepts_spec_step_idx=(
+            "spec_step_idx" in inspect.signature(model_forward).parameters
+        ),
+        model_config=SimpleNamespace(
+            hidden_size=8,
+            dtype=torch.float32,
+            requires_request_token_history=False,
+        ),
+        forward=draft_forward,
+    )
+    runtime_states = SimpleNamespace(
+        valid_cache_lengths=torch.zeros(request_pool_rows, dtype=torch.int32)
+    )
+    return Mtp(
+        spec_num_tokens=spec_num_tokens,
+        spec_num_steps=spec_num_steps,
+        draft_model_runner=model_runner,
+        attn_backend=SimpleNamespace(),
+        runtime_states=runtime_states,
+        input_buffers=input_buffers,
+    )
+
+
+def _recording_forward(calls: list[dict]):
+    """A draft ``forward`` recording each IDLE call's step and sizing."""
+
+    def draft_forward(ctx, input_ids, positions, spec_step_idx, **kwargs):
+        calls.append(
+            {
+                "mode": ctx.forward_mode,
+                "step": spec_step_idx,
+                "rows": input_ids.numel(),
+                "global_num_tokens": ctx.global_num_tokens,
+                "global_bs": ctx.global_bs,
+                "bs": ctx.bs,
+                "input_num_tokens": ctx.input_num_tokens,
+                "kwargs": kwargs,
+            }
+        )
+
+    return draft_forward
+
+
+def _run_idle_round(drafter) -> list[ForwardMode]:
+    """Run one idle-rank round (this rank idle, the peer decoding 2 requests
+    over 8 rows) through a stubbed executor; returns the target's forward
+    modes."""
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.execution.types import DpForwardMetadata
+
+    target_calls: list[ForwardMode] = []
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device = "cpu"
+    executor.input_buffers = SimpleNamespace(
+        req_pool_indices_buf=torch.zeros(4, dtype=torch.int64)
+    )
+    executor.runtime_states = SimpleNamespace(
+        valid_cache_lengths=torch.zeros(4, dtype=torch.int32), vocab_size=32
+    )
+    executor.attn_backend = SimpleNamespace()
+    executor.token_to_kv_pool = SimpleNamespace()
+    executor.model_runner = SimpleNamespace(
+        forward=lambda ctx, **kwargs: target_calls.append(ctx.forward_mode)
+    )
+    executor._model_input_kwargs = lambda bs, num_tokens: {}
+    executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
+    executor.drafter = drafter
+
+    executor.execute_idle_forward(
+        DpForwardMetadata(
+            global_num_tokens=[0, 8],
+            global_batch_size=[0, 2],
+            global_forward_mode=[ForwardMode.IDLE, ForwardMode.DECODE],
+            all_decode_or_idle=True,
+            all_extend=False,
+            need_idle_forward=True,
+        )
+    )
+    return target_calls
+
+
 class TestDrafterAcceptIndexing(unittest.TestCase):
     def test_mtp_stash_uses_request_pool_capacity(self):
-        max_bs = 16
         request_pool_rows = 18
         spec_num_tokens = 4
-        input_buffers = SimpleNamespace(
-            max_bs=max_bs,
-            seq_lens_buf=torch.zeros(max_bs, dtype=torch.int32),
-        )
-        model_runner = SimpleNamespace(
-            device="cpu",
-            mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
-            model=SimpleNamespace(),
-            model_config=SimpleNamespace(hidden_size=8, dtype=torch.float32),
-        )
-        runtime_states = SimpleNamespace(
-            valid_cache_lengths=torch.zeros(request_pool_rows, dtype=torch.int32)
-        )
-        backend = SimpleNamespace()
 
-        drafter = Mtp(
-            spec_num_tokens=spec_num_tokens,
-            spec_num_steps=3,
-            draft_model_runner=model_runner,
-            attn_backend=backend,
-            runtime_states=runtime_states,
-            input_buffers=input_buffers,
+        drafter = _make_mtp(
+            spec_num_tokens=spec_num_tokens, request_pool_rows=request_pool_rows
         )
 
         self.assertEqual(
@@ -109,6 +203,240 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             list(drafter._stash_hidden_buf.shape),
             [request_pool_rows, spec_num_tokens - 1, 8],
         )
+
+    def test_mtp_refuses_a_draft_forward_without_spec_step_idx(self):
+        # ModelRunner forwards spec_step_idx only to a forward that declares
+        # it (**kwargs does not count); without it every depth would silently
+        # run depth 0, so construction fails instead.
+        def eagle_shaped_forward(ctx, input_ids, positions, **kwargs):
+            pass
+
+        with self.assertRaisesRegex(TypeError, "spec_step_idx"):
+            _make_mtp(model_forward=eagle_shaped_forward)
+
+    def test_mtp_refuses_more_steps_than_the_draft_has_depths(self):
+        # Step d runs layers[d % num_mtp_layers] onto cache plane d % N: a
+        # step count past the depth count would wrap onto plane 0 and
+        # overwrite it, so construction refuses it; equal or more depths
+        # are fine.
+        with self.assertRaisesRegex(ValueError, "2 MTP depth layer"):
+            _make_mtp(spec_num_steps=3, num_mtp_layers=2)
+
+        _make_mtp(spec_num_steps=3, num_mtp_layers=3)
+        _make_mtp(spec_num_steps=3, num_mtp_layers=8)
+
+    def test_mtp_runs_under_attention_dp_and_sizes_every_depth_like_the_target(
+        self,
+    ):
+        # Attention DP is a parameter of the one drafting path: construction
+        # no longer refuses dp_size > 1, and every depth (not just depth 0)
+        # mirrors the target's per-rank row counts — the k-window per decode
+        # request — never the Eagle chain's one row per request.
+        drafter = _make_mtp(spec_num_steps=3, dp_size=4)
+        global_num_tokens = [8, 0, 12, 4]
+        global_bs = [2, 0, 3, 1]
+
+        steps = drafter.idle_forward_global_num_tokens(global_num_tokens, global_bs)
+
+        self.assertEqual(len(steps), 3)
+        for step in steps:
+            self.assertIs(step, global_num_tokens)
+
+    def test_mtp_idle_rank_runs_one_empty_idle_forward_per_depth(self):
+        # An idle DP rank's round: the executor runs the drafter's depth loop
+        # as IDLE forwards over an empty window, one per depth with its own
+        # spec_step_idx, each sized by the round's target token counts so the
+        # rank enters the same collectives as the ranks with work.
+        calls: list[dict] = []
+        drafter = _make_mtp(
+            spec_num_steps=3, dp_size=2, draft_forward=_recording_forward(calls)
+        )
+
+        target_calls = _run_idle_round(drafter)
+
+        self.assertEqual(target_calls, [ForwardMode.IDLE])
+        self.assertEqual([c["step"] for c in calls], [0, 1, 2])
+        for call in calls:
+            self.assertEqual(call["mode"], ForwardMode.IDLE)
+            self.assertEqual(
+                (call["bs"], call["input_num_tokens"], call["rows"]), (0, 0, 0)
+            )
+            self.assertEqual(call["global_num_tokens"], [0, 8])
+            self.assertEqual(call["global_bs"], [0, 2])
+            # No request-token-history view: Mtp drafts do not read one.
+            self.assertEqual(call["kwargs"], {})
+
+    def test_idle_round_follows_a_drafter_subclass_idle_hook(self):
+        # The executor iterates whatever the drafter's hook lists — one IDLE
+        # forward per entry, sized by that entry — so a subclass's override
+        # (here a block drafter's single step) shapes the round, not the
+        # base class's Eagle default.
+        class _BlockShaped(BaseDrafter):
+            def idle_forward_global_num_tokens(self, global_num_tokens, global_bs):
+                return [global_bs]
+
+            def run(self, *args, **kwargs):
+                raise AssertionError("idle rounds never draft")
+
+            def draft(self, *args, **kwargs):
+                raise AssertionError("idle rounds never draft")
+
+        calls: list[dict] = []
+        drafter = _BlockShaped(
+            spec_num_tokens=4,
+            spec_num_steps=3,
+            draft_model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(requires_request_token_history=False),
+                forward=_recording_forward(calls),
+            ),
+            attn_backend=SimpleNamespace(),
+        )
+
+        target_calls = _run_idle_round(drafter)
+
+        self.assertEqual(target_calls, [ForwardMode.IDLE])
+        self.assertEqual(
+            [(c["step"], c["global_num_tokens"]) for c in calls], [(0, [0, 2])]
+        )
+
+    def test_dsa_leaf_mtp_frontier_re_expands_the_k_row_indexer_metadata(self):
+        # The DSA leaf's k-row top-k reads one context length per query row
+        # (``_dsa_seq_lens_2d``, [bs * k, 1]) and a plan over them. The MTP
+        # re-anchor keeps that shape and rewrites it in place to the frontier,
+        # whereas the Eagle chain's advance re-plans one row per request.
+        from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_mod
+
+        k, bs = 4, 2
+        backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
+        backend.spec_num_tokens = k
+        backend.kernel_page_size = 64
+        seq_lens_k = torch.tensor([9, 5], dtype=torch.int32)
+        metadata = SimpleNamespace(
+            seq_lens_k=seq_lens_k,
+            _dsa_seq_lens_2d=seq_lens_k.unsqueeze(1)
+            .expand(-1, k)
+            .reshape(-1, 1)
+            .contiguous(),
+            _dsa_plan=object(),
+        )
+        backend._dense_backend = SimpleNamespace(forward_decode_metadata=metadata)
+        rows_before = metadata._dsa_seq_lens_2d
+        plans: list[dict] = []
+
+        with mock.patch.object(
+            dsa_mod, "dsa_plan", side_effect=lambda **kw: plans.append(kw)
+        ):
+            backend.update_draft_forward_metadata(
+                torch.tensor([7, 3, 99], dtype=torch.int32)
+            )
+            backend.advance_draft_forward_metadata(
+                torch.tensor([8, 4, 99], dtype=torch.int32)
+            )
+
+        # The re-anchor: seq_lens and every per-token row carry the frontier,
+        # same storage (in-graph), and the plan is refreshed in place over
+        # the k-row view at the leaf's kernel page size.
+        self.assertEqual(seq_lens_k.tolist(), [8, 4])  # last edit = advance
+        self.assertIs(metadata._dsa_seq_lens_2d, rows_before)
+        self.assertEqual(
+            metadata._dsa_seq_lens_2d.view(bs, k).tolist(), [[7] * k, [3] * k]
+        )
+        self.assertIs(plans[0]["seq_lens_2d"], metadata._dsa_seq_lens_2d)
+        self.assertIs(plans[0]["out"], metadata._dsa_plan)
+        self.assertEqual(plans[0]["page_size"], 64)
+        # The Eagle advance plans [bs, 1] rows and leaves the per-token rows
+        # as the round's refresh published them.
+        self.assertEqual(tuple(plans[1]["seq_lens_2d"].shape), (bs, 1))
+        self.assertEqual(plans[1]["seq_lens_2d"].view(-1).tolist(), [8, 4])
+        self.assertEqual(
+            metadata._dsa_seq_lens_2d.view(bs, k).tolist(), [[7] * k, [3] * k]
+        )
+
+    def test_dsa_leaf_mtp_frontier_rejects_a_stale_k_row_layout(self):
+        from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_mod
+
+        backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
+        backend.spec_num_tokens = 4
+        backend.kernel_page_size = 64
+        metadata = SimpleNamespace(
+            seq_lens_k=torch.tensor([9, 5], dtype=torch.int32),
+            _dsa_seq_lens_2d=torch.zeros((3, 1), dtype=torch.int32),
+            _dsa_plan=None,
+        )
+        backend._dense_backend = SimpleNamespace(forward_decode_metadata=metadata)
+
+        with self.assertRaisesRegex(RuntimeError, "per-token rows"):
+            backend.update_draft_forward_metadata(
+                torch.tensor([7, 3], dtype=torch.int32)
+            )
+
+        # Rows never published (no refresh ran at this bs): the re-anchor
+        # must not allocate them itself.
+        metadata._dsa_seq_lens_2d = None
+        with self.assertRaisesRegex(RuntimeError, "not published"):
+            backend.update_draft_forward_metadata(
+                torch.tensor([7, 3], dtype=torch.int32)
+            )
+
+        backend._dense_backend = SimpleNamespace(forward_decode_metadata=None)
+        with self.assertRaisesRegex(RuntimeError, "not initialized"):
+            backend.update_draft_forward_metadata(
+                torch.tensor([7, 3], dtype=torch.int32)
+            )
+
+    def test_dsa_leaf_refresh_allocates_the_k_rows_once_then_rewrites_in_place(
+        self,
+    ):
+        # The round's refresh and the MTP re-anchor share one publish: the
+        # first refresh at a bs fills the dense leaf's declared metadata
+        # fields (rows + plan), every later refresh or re-anchor rewrites
+        # the same storage and refreshes the plan with out=.
+        from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_mod
+        from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
+            TRTLLMMLADecodeMetadata,
+        )
+
+        k, bs = 4, 2
+        backend = dsa_mod.DSABackend.__new__(dsa_mod.DSABackend)
+        backend.spec_num_tokens = k
+        backend.kernel_page_size = 64
+        metadata = TRTLLMMLADecodeMetadata(
+            seq_lens_k=torch.zeros(bs, dtype=torch.int32)
+        )
+        self.assertIsNone(metadata._dsa_seq_lens_2d)
+        self.assertIsNone(metadata._dsa_plan)
+        backend._dense_backend = SimpleNamespace(
+            forward_decode_metadata=metadata,
+            refresh_decode_metadata=lambda *args, **kwargs: None,
+        )
+        plan = object()
+        plans: list[dict] = []
+
+        def fake_plan(**kw):
+            plans.append(kw)
+            return plan
+
+        page_table = torch.zeros((bs, 1), dtype=torch.int32)
+        with mock.patch.object(dsa_mod, "dsa_plan", side_effect=fake_plan):
+            backend.refresh_decode_metadata(
+                bs, bs, torch.tensor([9, 5, 99], dtype=torch.int32), page_table
+            )
+            rows = metadata._dsa_seq_lens_2d
+            backend.refresh_decode_metadata(
+                bs, bs, torch.tensor([10, 6, 99], dtype=torch.int32), page_table
+            )
+            backend.update_draft_forward_metadata(
+                torch.tensor([7, 3, 99], dtype=torch.int32)
+            )
+
+        self.assertIs(metadata._dsa_seq_lens_2d, rows)
+        self.assertIs(metadata._dsa_plan, plan)
+        self.assertEqual(rows.view(bs, k).tolist(), [[7] * k, [3] * k])
+        self.assertEqual(metadata.seq_lens_k.tolist(), [7, 3])
+        self.assertEqual([p.get("out") for p in plans], [None, plan, plan])
+        for p in plans:
+            self.assertIs(p["seq_lens_2d"], rows)
+            self.assertEqual(p["page_size"], 64)
 
     def test_substitute_mm_pad_rewrites_media_ids_in_place(self):
         image = MultimodalDataItem(modality=Modality.IMAGE, hash=123)

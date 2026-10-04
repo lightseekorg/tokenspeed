@@ -134,6 +134,11 @@ class TRTLLMMLADecodeMetadata:
     seq_lens_k: torch.Tensor | None = None
     # Verify window width baked into the graph views (1 outside target verify).
     q_len_per_req: int = 1
+    # DSA wrapper's per-token indexer rows (``[bs * spec_num_tokens, 1]``
+    # context lengths) and their opaque ``dsa_plan`` (None when the selected
+    # kernel needs none); the dense leaf itself never reads them.
+    _dsa_seq_lens_2d: torch.Tensor | None = None
+    _dsa_plan: object | None = None
 
 
 class TRTLLMMLABackend(PagedAttentionBackend):

@@ -110,7 +110,9 @@ def test_pd_layerwise_finalization_capability_matches_supported_drafters():
     assert Eagle.supports_pd_layerwise_finalization
     assert DFlash.supports_pd_layerwise_finalization
     assert DSpark.supports_pd_layerwise_finalization
-    assert not Mtp.supports_pd_layerwise_finalization
+    # Mtp.run enqueues every depth's forward (and its plane's KV write) on
+    # the caller's stream before returning, so the draft-final step is exact.
+    assert Mtp.supports_pd_layerwise_finalization
     assert not DeepseekV4DSpark.supports_pd_layerwise_finalization
     assert not BaseDrafter.supports_pd_layerwise_finalization
 
