@@ -60,13 +60,21 @@ def _resolve_dcp_size(tp_size: int, dcp_size: int) -> int:
 def _resolve_qcp_size(tp_size: int, qcp_size: int) -> int:
     """Validate query context parallelism within resolved attention TP.
 
-    QCP shards an extend forward's query rows over a consecutive subgroup of
-    attention TP; it adds no world-size dimension.
+    QCP shards an extend forward's query rows over the attention TP group;
+    it adds no world-size dimension. The shard spans the whole group (1 is
+    off): a partial shard would leave the ranks holding the same rows strided
+    by the shard width, which no group here (the head group, the DCP group)
+    is built with, and ``validate_qcp`` pins the server to the same rule.
     """
     if isinstance(qcp_size, bool) or not isinstance(qcp_size, int) or qcp_size < 1:
         raise ValueError("qcp_size must be a positive integer")
     if tp_size % qcp_size:
         raise ValueError("attention TP size must be divisible by QCP size")
+    if qcp_size not in (1, tp_size):
+        raise ValueError(
+            f"a query shard spans the whole attention TP group: qcp_size={qcp_size} "
+            f"must be 1 or the attention TP size {tp_size}"
+        )
     return qcp_size
 
 
@@ -157,8 +165,9 @@ def _attention_row_group_size(tp_size: int, qcp_size: int) -> int:
 
     Attention TP replicates a forward's rows over its group; query context
     parallelism (QCP) shards an extend's rows over that group instead, so
-    only ``tp_size // qcp_size`` ranks hold the same rows (one, since a
-    query shard spans the whole group, ``validate_qcp``).
+    only ``tp_size // qcp_size`` ranks hold the same rows -- one, since a
+    query shard spans the whole group (``_resolve_qcp_size``), which is what
+    lets the groups below stay contiguous.
     """
     return tp_size // qcp_size
 
@@ -194,7 +203,7 @@ def _resolve_head_tp_size(
         raise ValueError(
             "attention head TP shards heads over ranks that hold different rows "
             "(attention-DP ranks, or the query shards of a QCP group) and needs "
-            "attention TP 1 or a query shard spanning the attention TP group, "
+            "attention TP 1 or a query shard over the attention TP group, "
             f"got attn_tp_size={tp_size} with qcp_size={qcp_size}"
         )
     if qcp_size != 1 and head_tp_size != qcp_size:

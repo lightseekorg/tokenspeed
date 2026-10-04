@@ -444,6 +444,31 @@ class TestAttentionHeadTp:
         with pytest.raises(ValueError, match="attention TP 1 or a query shard"):
             _resolve_head_tp_size(8, 4, 8, 8)
 
+    def test_a_partial_query_shard_is_refused_before_any_group_is_built(self):
+        """With ``1 < qcp < tp`` the ranks holding the same rows are strided by
+        the shard width ({0, 2} / {1, 3} for tp 4, qcp 2), while every group
+        here is contiguous: the default head group would shard the heads over
+        ranks holding different rows with no exchange. The mapping refuses the
+        shard, explicit head TP or not, as ``validate_qcp`` does for the
+        server."""
+        for head_tp_size in (None, 2, 4):
+            with pytest.raises(ValueError, match="whole attention TP group"):
+                AttentionLayerMapping(
+                    rank=0,
+                    world_size=4,
+                    tp_size=4,
+                    qcp_size=2,
+                    head_tp_size=head_tp_size,
+                )
+        with pytest.raises(ValueError, match="whole attention TP group"):
+            Mapping(rank=0, world_size=8, attn_tp_size=8, attn_qcp_size=4)
+        # The two shard widths that exist: off, and the whole group.
+        for qcp_size in (1, 4):
+            m = AttentionLayerMapping(
+                rank=2, world_size=4, tp_size=4, qcp_size=qcp_size
+            )
+            assert m.head_tp_group == ((2,) if qcp_size == 4 else (0, 1, 2, 3))
+
     def test_head_tp_must_tile_the_stage(self):
         with pytest.raises(ValueError, match="divide"):
             AttentionLayerMapping(rank=0, world_size=8, tp_size=1, head_tp_size=3)

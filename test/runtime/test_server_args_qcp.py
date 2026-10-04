@@ -66,8 +66,10 @@ def test_off_by_default_everywhere():
     "argv,match",
     [
         (
+            # The mapping refuses the partial shard first (a query shard spans
+            # the whole group); validate_qcp repeats the rule for its callers.
             ["--attn-tp-size", "4", "--prefill-context-parallel-size", "2"],
-            "must equal the attention TP size",
+            "must be 1 or the attention TP size",
         ),
         (["--disaggregation-mode", "null"], "requires --disaggregation-mode prefill"),
         (["--disaggregation-mode", "decode"], "requires --disaggregation-mode prefill"),
