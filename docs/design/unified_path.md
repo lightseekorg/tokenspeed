@@ -1091,9 +1091,10 @@ refuses it again at executor construction. The MTP shape is
 * **Handoff.** The last stage samples, runs the drafter over the completing
   chunk and writes the candidate block into the reserved decode slot; the
   event loop broadcasts `(output_tokens, output_lengths, next_input_ids)`
-  over the PP gloo group at commit so every rank's scheduler stamps the same
-  bootstrap token and candidate window onto the remote decode. The PD wire
-  and the decode side are untouched.
+  over the PP gloo group at commit -- with the logprob vectors and the NaN
+  guard's per-request flags, see the QCP section -- so every rank's
+  scheduler stamps the same bootstrap token and candidate window onto the
+  remote decode. The PD wire and the decode side are untouched.
 
 Expect a larger last-stage bubble (NextN layer plus draft extend and
 multi-step drafting); rebalance with `--pp-layer-partition`.
@@ -1361,10 +1362,12 @@ The contract a model (in tree or a plugin) implements:
 * `CommManager(query_sharded=mapping.attn.has_qcp)` — declares that the
   model slices its rows by `ctx.query_shard`; a model that does not slice
   passes `False` and is refused at construction under a sharding mapping.
-  The attention weights are head-replicated under this mapping, so the
-  attention legs (`pre_attn_comm`, `gather_residual`, `post_attn_comm`,
-  `post_final_norm_comm`) are identity on every forward — a sharded extend
-  and the drafter's replicated decode steps alike — and
+  Attention returns complete rows under this mapping — its weights are
+  head-replicated (the default, `mapping.attn.head_tp_size == 1`), or under
+  head TP over the shard group its own tail returns this rank's rows (below)
+  — so the attention legs (`pre_attn_comm`, `gather_residual`,
+  `post_attn_comm`, `post_final_norm_comm`) are identity on every forward —
+  a sharded extend and the drafter's replicated decode steps alike — and
   `needs_pre_attn_all_gather` / `needs_final_all_gather` are False: nothing
   is ever scattered by attention. The dense and MoE legs follow the
   forward: with a shard, the existing all-gather / reduce-scatter legs over
@@ -1442,24 +1445,152 @@ The contract a model (in tree or a plugin) implements:
   allocated by the leaf from the same formula; the recipe refuses a draft
   whose `index_k_format` differs from the target's, naming both, since the
   two share one workspace, and the adopting leaf checks the recorded format
-  with the rest of the geometry. The decode arm (the
-  drafter's steps) keeps the DCP combine; its form follows the layer's head
-  count against the attention config (`keep_all_heads` when
-  `layer.tp_q_head_num` is every head — head-replicated weights — the
-  gather-and-reduce-scatter form when it is the attention-TP slice; any other
-  count is refused), never a mapping assumption.
-* The model exit (`BaseCausalLM.exit_logits`, or `gather_sampled_rows` +
-  `ctx.logits_rows_selected = True`) gathers only the sampled rows; a FULL
-  hidden capture stays the shard. `ctx.gather_ids` keeps the batch's full
-  layout on every forward, the drafters' extend steps included (Eagle's
-  step 0 and every depth of the multi-depth `Mtp` drafter read the shard's
-  slice of the shifted prefill ids and positions, chain the shard's hidden
-  rows, and carry the plan on their context; `Mtp` sums its cross-chunk
-  stash of target hiddens over the group, one owner per row):
-  `QueryShardPlan.local_sampled_ids(ctx.gather_ids)` is the one place that
-  cuts them to the shard, used by `gather_sampled_rows` and by any model
-  that narrows to its live rows itself. A draft model's FULL capture under
-  a shard is the shard's rows, which is what the next depth consumes.
+  with the rest of the geometry. The sparse cores take
+  their head count from the query, never from `layer.tp_q_head_num` or a
+  mapping assumption (`DSABackend._query_heads`: the model's heads or the
+  attention-TP slice, any other count refused), so one model layer serves a
+  forward whose rows carry every head and one whose rows carry the slice.
+  The sharded arm attends with every head and refuses a query carrying the
+  slice. The decode arm (the drafter's steps) keeps the DCP combine over the
+  KVP pages; its form follows the query's heads (`keep_all_heads` for every
+  head — head-replicated weights — the gather-and-reduce-scatter form for
+  the slice, as the drafter's steps under head TP over the shard group
+  carry). The model threads the sequence after `forward_absorb_qkv_proj`
+  through `DeepseekV3AttentionMLA.sparse_prefill_attn_v_proj` (the backend's
+  `forward_sparse_prefill` with the model's selection, then
+  `project_attended_heads`: under head TP the tokens-to-heads exchange, the
+  local `w_vc`); GLM-5's sparse prefill runs it in tree. A rank whose shard
+  is empty calls it like every other rank — the core's history gathers are
+  collectives — and projects nothing.
+* The model exit hands the logits processor the shard's rows with the plan
+  on `LogitsMetadata.query_shard` (`BaseCausalLM.exit_logits` is that one
+  call; a model with its own exit does the same). The shard is a parameter
+  of the processor's row selection: it scores the planned prompt rows
+  first, then selects the sampled rows — `hidden_states[gather_ids]` on
+  whole rows, `gather_sampled_rows` over the group on a shard (one
+  byte-preserving all-gather, `token_all_gather_rows`, with
+  `sampled_rows_per_rank`; rank order is request order) — and runs the LM
+  head on the batch's `[bs, hidden]` rows, so the vocab all-gather is the
+  TP one. The group of both gathers is the processor's TP group: the LM
+  head is vocab-sharded over it, every rank of it must end with the same
+  rows, and `validate_qcp` makes the query shard group exactly that group
+  (`qcp_size == attn_tp_size`); the processor refuses a plan of another
+  width. The processor is the only caller of `gather_sampled_rows`
+  (`CommManager` has no sampled-row leg: `needs_final_all_gather` is False
+  under a shard and nothing gathers the final norm's rows). A FULL hidden
+  capture stays the shard; a LAST capture is the gathered `[bs, hidden]`
+  rows, whole on every rank — the aux taps' (Eagle3) when the model has
+  them, each tap gathered the same way, and only on a LAST capture, since
+  no other mode reads them selected. A model that selects its rows before
+  the processor (`logits_rows_selected`) keeps that contract, and such a
+  model cannot serve prompt logprobs, sharded or not. `ctx.gather_ids`
+  keeps the batch's full layout on every forward, the
+  drafters' extend steps included (Eagle's step 0 and every depth of the
+  multi-depth `Mtp` drafter read the shard's slice of the shifted prefill
+  ids and positions, chain the shard's hidden rows, and carry the plan on
+  their context; `Mtp` sums its cross-chunk stash of target hiddens over
+  the group, one owner per row): `QueryShardPlan.local_sampled_ids(
+  ctx.gather_ids)` is the one place that cuts them to the shard, used by
+  `gather_sampled_rows` and by any model that narrows to its live rows
+  itself. A draft model's FULL capture under a shard is the shard's rows,
+  which is what the next depth consumes.
+* Prompt logprobs (`InputLogprobPlan`, `--input-logprob-chunk-tokens`): the
+  plan's rows are full-layout rows. The forward thread stages the whole
+  plan's targets and slots on every rank (the shifted ids are the whole span
+  everywhere, so the target audit flags the same requests on every rank)
+  and keeps as this rank's `InputLogprobRows.rows` the plan's rows inside
+  its shard, re-based to it; the plan's rows are sorted, so each rank's are
+  one contiguous run and the per-rank counts (`rows_per_rank`) are host
+  arithmetic over the shard boundaries (`QueryShardPlan.rows_per_rank`,
+  `local_rows_run` — the one row split of the plan, the same that counts
+  the sampled rows per rank; it refuses unsorted rows rather than miscount
+  them). Scoring a row needs its full-vocabulary logits, and
+  the head is vocab-sharded over the group: every rank must hold every
+  planned row, so `compute_input_token_logprobs` all-gathers the planned
+  rows' activations with those counts (`[plan rows, hidden]`, rank order is
+  row order — a rank without a planned row contributes none and still
+  joins) and then runs the unsharded chunk loop over the whole plan on
+  every rank; the chunk schedule is thereby the same on every rank, which
+  the vocab all-gather inside each chunk, a collective, requires. Every rank
+  ends with the whole plan's fp32 vector — the tensor-parallel path's bit
+  for bit, since each row meets the same operands — so no result gather
+  follows, the per-request NaN audit agrees across the group and
+  `ModelExecutionResult.input_token_logprobs` is the full vector in plan
+  order on every rank; the commit path and the P→D bootstrap-logprob frame
+  are unchanged. (Scoring only the local rows against a vocab-sharded head
+  is not possible: a row's log-sum-exp needs every rank's vocab slice of
+  that row, and the vocab all-gather assumes replicated rows. The LM-head
+  work for prompt logprobs is therefore that of the TP path plus the
+  activation gather of the planned rows; a vocab-parallel cross-entropy
+  that trades the `[rows, vocab]` all-gather for per-row partials is the
+  deferred `logprob.topology-invariant` item of `numerics.md`.)
+* Pipeline parallelism: the last stage scores the prompt logprobs (on its
+  shard, under QCP) and `_pp_broadcast_output_tokens` carries
+  `output_logprobs`, `input_token_logprobs` and the NaN guard's
+  `output_nan_flags` to the other stages with the sampled tokens; every
+  stage pairs the vector with its own mirrored plan, which
+  `ModelExecutionResult` carries whether or not the stage scored the rows.
+  The flags travel with the values they audit: only the last stage holds
+  logits and prompt logprobs to flag (the other stages' guards see
+  placeholder outputs and the rank-consistent target audit at most), and
+  every stage's output processor must take the same abort-or-finish branch
+  for a request, or the stages' schedulers disagree on it. Prompt logprobs
+  are therefore no longer refused on a pipeline split
+  (`supports_prompt_logprobs` depends on the narrowing-model check only).
+* Communication buffers (`prepare_communication_runtime(max_forward_tokens)`)
+  stay sized by the whole chunk under QCP, not `ceil(chunk / qcp)`: the
+  all-gather / reduce-scatter legs' gathered side is the whole chunk on
+  every rank (the dense and MoE legs gather the shard rows to the group), so
+  only buffers of local rows could shrink, and the one model that prepares
+  such buffers today does not shard queries. Revisit with a per-buffer
+  audit when a sharding model allocates them.
+
+**Head TP over the query shards** (`--attn-head-tp-size N` with
+`--prefill-context-parallel-size N`). The query shards hold different rows,
+so the head group of the decode-side layout (`docs/serving/parallelism.md`,
+"Decode-side TP layouts under attention DP") applies to them unchanged:
+`mapping.attn.head_tp_group == qcp_group` (the attention TP group),
+`q_b_proj` / `kv_b_proj` / `o_proj` are head-sharded over it, and the
+sharded extend forward runs the same exchange — the normalized q latent
+token-all-gathered to the span, `q_b_proj` and the absorption on this rank's
+head slice of every row, the heads-to-tokens all-to-all back to the shard
+rows with every head, the prologue (RoPE on the shard's own positions, the
+gathered KV write as on every QCP forward; there is no positions
+collective), the sparse core over the gathered history with every head and
+no LSE merge, the tokens-to-heads all-to-all, the local `w_vc`, and the
+`o_proj` tail: row-parallel plus a token reduce-scatter to the shard rows, or
+under `--tp-batch-invariant attn` the all-gather of the heads, the
+column-parallel GEMM and an all-to-all back. One resolver
+(`comm_manager.head_tp_row_counts`, the module's
+`head_tp_leg_row_counts(ctx, num_rows, collective=)`) hands every leg its
+per-rank counts: the DP tables under attention DP, the shard plan under QCP
+(`row_counts` for the legs up to the core, `rows_for_collective(ctx.collective_num_tokens)`
+after it — identical on an extend that does not narrow), so no model code
+branches on the layout. The drafter's decode steps on this engine hold every
+row on every rank: they exchange nothing — `head_tp_exchanges(ctx)` is False
+without a shard, the one fork of the head-TP path, asked by every leg and
+switching off the exchanges and nothing else — so they attend this rank's
+head slice of every row through the same `attn_mqa` layer (which declares
+every head; the DSA core reads the head count from the query, so no second
+layer exists for the slice), the DCP arm as attention TP runs it, and the
+tail all-reduces the row-parallel partials (or all-gathers the
+batch-invariant hidden shards), so the layer's rows stay replicated. The two
+forward forms of this engine are thus the sharded extend and the replicated
+decode step, and nothing else runs on it: the startup autotune's dummy extend
+carries the shard plan a real extend of its rows would
+(`PrefillGraph.make_dummy_batch`, the model taking its slice as
+`_run_target_forward` does), rather than an unsharded replicated-row extend
+the contract does not list. The expanded (dense MLA) prefill keeps refusing
+head TP: only the absorbed sparse prefill can take the exchange. The
+alternative to this fork — sharding the drafter's decode rows by a plan too,
+so every forward exchanges — needs a sharded DSA decode arm (history gathers
+for decode rows) that does not exist; the fork is the contained form until
+it does. The decode-only gates of the attention-DP
+layout (`disaggregation_mode == "decode"`, the decode-shaped autotune, the
+retraction-window generation budget) key on
+`mapping.attn.head_tp_serves_decode_only`, which is False over the query
+shards; the prefill role's own rules (`validate_qcp`) and the mapping (`head
+TP == qcp`) gate this layout.
 
 Eager only: the history gather runs in the attention break, so
 `--prefill-context-parallel-size > 1` requires `--disable-prefill-graph`

@@ -12,9 +12,9 @@ recovers its original hidden states after the full cycle.
 The query-sharded layout (``CommManager(query_sharded=True)``) is covered on
 CPU over gloo at the end of this file: identity around attention on both the
 sharded and the replicated forward, the MoE all-gather / reduce-scatter round
-trip over the shard's row table, the final gather off, ``gather_sampled_rows``
-with an idle rank, and the vocab-parallel embedding's gather / reduce-scatter
-of a shard's ids.
+trip over the shard's row table, the final gather off, the logits processor's
+``gather_sampled_rows`` with an idle rank, and the vocab-parallel embedding's
+gather / reduce-scatter of a shard's ids.
 """
 
 import socket
@@ -400,10 +400,20 @@ def _qcp_main(rank: int, port: int) -> None:
     assert moe.scattered_num_tokens(ctx) == list(plan.sampled_rows_per_rank)
     ctx.collective_num_tokens = None
 
-    # The model exit gathers the sampled rows in request order, idle ranks
-    # contributing none.
-    sampled = dense.gather_sampled_rows(mine, ctx)
+    # The logits processor gathers the sampled rows in request order over its
+    # TP group (the query shard group), idle ranks contributing none; the
+    # gather is byte-preserving, so fp32 rows of an odd width travel too.
+    from tokenspeed.runtime.distributed.comm_manager import gather_sampled_rows
+
+    sampled = gather_sampled_rows(
+        mine, plan, ctx.gather_ids, group=mapping.attn.tp_group
+    )
     torch.testing.assert_close(sampled, full[ctx.gather_ids], rtol=0, atol=0)
+    narrow = full[:, :3].contiguous()  # 12-byte fp32 rows
+    sampled = gather_sampled_rows(
+        narrow[plan.local_slice], plan, ctx.gather_ids, group=mapping.attn.tp_group
+    )
+    torch.testing.assert_close(sampled, narrow[ctx.gather_ids], rtol=0, atol=0)
     if rank in (0, 2):
         assert plan.local_sampled_rows == 0
 

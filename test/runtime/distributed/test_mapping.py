@@ -9,6 +9,7 @@ from tokenspeed.runtime.distributed.mapping import (
     MoeLayerMapping,
     _make_parallelism_group,
     _make_parallelism_rank,
+    _resolve_head_tp_size,
     _resolve_parallelism_sizes,
 )
 
@@ -400,6 +401,73 @@ class TestAttentionHeadTp:
     def test_head_tp_needs_attention_tp_1(self):
         with pytest.raises(ValueError, match="attention TP 1"):
             AttentionLayerMapping(rank=0, world_size=8, tp_size=2, head_tp_size=4)
+
+    def test_query_sharding_defaults_to_head_replicated_weights(self):
+        """A query shard holds different rows from its peers, so the ranks
+        holding the same rows are one: the default head group is this rank
+        alone (head-replicated q_b/kv_b/o_proj), with no exchange."""
+        for rank in range(8):
+            m = AttentionLayerMapping(rank=rank, world_size=8, tp_size=8, qcp_size=8)
+            assert m.head_tp_size == 1
+            assert not m.has_head_tp and not m.head_tp_serves_decode_only
+            assert m.head_tp_rank == 0 and m.head_tp_group == (rank,)
+        # Saying so explicitly is the same layout.
+        m = AttentionLayerMapping(
+            rank=3, world_size=8, tp_size=8, qcp_size=8, head_tp_size=1
+        )
+        assert m.head_tp_size == 1 and not m.has_head_tp
+
+    def test_head_tp_over_the_query_shards(self):
+        """``--attn-head-tp-size`` equal to the shard group shards the heads
+        over it: the head group is the QCP group (the attention TP group) and
+        the forward exchanges; it serves the prefill role, so it is not the
+        decode-only layout."""
+        m = AttentionLayerMapping(
+            rank=5, world_size=8, tp_size=8, qcp_size=8, head_tp_size=8
+        )
+        assert m.has_head_tp and m.has_qcp
+        assert not m.head_tp_serves_decode_only
+        assert m.head_tp_group == m.qcp_group == m.tp_group == tuple(range(8))
+        assert m.head_tp_rank == m.qcp_rank == 5
+        # Over attention-DP ranks the layout stays decode-only.
+        dp = AttentionLayerMapping(rank=5, world_size=8, tp_size=1, head_tp_size=8)
+        assert dp.has_head_tp and dp.head_tp_serves_decode_only
+
+    def test_head_tp_under_query_sharding_is_the_shard_group(self):
+        with pytest.raises(ValueError, match="must equal qcp_size"):
+            AttentionLayerMapping(
+                rank=0, world_size=16, tp_size=8, qcp_size=8, head_tp_size=16
+            )
+        with pytest.raises(ValueError, match="must equal qcp_size"):
+            _resolve_head_tp_size(8, 8, 16, 2)
+        # A partial shard leaves ranks holding the same rows: no head TP.
+        with pytest.raises(ValueError, match="attention TP 1 or a query shard"):
+            _resolve_head_tp_size(8, 4, 8, 8)
+
+    def test_a_partial_query_shard_is_refused_before_any_group_is_built(self):
+        """With ``1 < qcp < tp`` the ranks holding the same rows are strided by
+        the shard width ({0, 2} / {1, 3} for tp 4, qcp 2), while every group
+        here is contiguous: the default head group would shard the heads over
+        ranks holding different rows with no exchange. The mapping refuses the
+        shard, explicit head TP or not, as ``validate_qcp`` does for the
+        server."""
+        for head_tp_size in (None, 2, 4):
+            with pytest.raises(ValueError, match="whole attention TP group"):
+                AttentionLayerMapping(
+                    rank=0,
+                    world_size=4,
+                    tp_size=4,
+                    qcp_size=2,
+                    head_tp_size=head_tp_size,
+                )
+        with pytest.raises(ValueError, match="whole attention TP group"):
+            Mapping(rank=0, world_size=8, attn_tp_size=8, attn_qcp_size=4)
+        # The two shard widths that exist: off, and the whole group.
+        for qcp_size in (1, 4):
+            m = AttentionLayerMapping(
+                rank=2, world_size=4, tp_size=4, qcp_size=qcp_size
+            )
+            assert m.head_tp_group == ((2,) if qcp_size == 4 else (0, 1, 2, 3))
 
     def test_head_tp_must_tile_the_stage(self):
         with pytest.raises(ValueError, match="divide"):

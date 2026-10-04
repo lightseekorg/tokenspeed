@@ -26,6 +26,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     all_to_all_transpose,
     token_all_gather,
+    token_all_gather_rows,
     token_reduce_scatter,
 )
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
@@ -34,39 +35,42 @@ from tokenspeed.runtime.execution.query_shard import QueryShardPlan, scatter_cou
 
 
 def gather_sampled_rows(
-    hidden_states: torch.Tensor, ctx: ForwardContext, *, group: tuple[int, ...]
+    hidden_states: torch.Tensor,
+    plan: QueryShardPlan,
+    gather_ids: torch.Tensor,
+    *,
+    group: tuple[int, ...],
 ) -> torch.Tensor:
     """Gather the sampled rows of a sharded extend forward to every rank.
 
-    The last row of every request (``ctx.gather_ids``, the batch's full
-    layout, sorted) lives on exactly one rank; each rank selects the ones
-    inside its shard (``QueryShardPlan.local_sampled_ids``) and one
-    all-gather with the plan's per-rank sampled-row counts concatenates them
-    in rank order, which is request order. The model sets
-    ``ctx.logits_rows_selected`` afterwards so the logits processor takes the
-    ``[bs, hidden]`` rows as given.
+    The last row of every request (``gather_ids``, the batch's full layout,
+    sorted) lives on exactly one rank; each rank selects the ones inside its
+    shard (``QueryShardPlan.local_sampled_ids``) and one all-gather with the
+    plan's per-rank sampled-row counts concatenates them in rank order, which
+    is request order. The logits processor runs this in place of its
+    ``hidden_states[gather_ids]`` selection on a sharded forward, for the
+    final hidden rows and for a LAST capture's aux hidden rows alike; the
+    gather is byte-preserving (:func:`token_all_gather_rows`), so any row
+    dtype and width travel, the per-rank sampled-row counts being whatever
+    the batch makes them.
 
     Args:
         hidden_states: ``[local_rows, hidden]`` this rank's final rows.
-        ctx: The forward, with ``query_shard`` and the full-layout
-            ``gather_ids`` set.
+        plan: The forward's query shard.
+        gather_ids: ``[bs]`` the batch's full-layout sampled rows
+            (``ctx.gather_ids``).
         group: The query-context-parallel group.
 
     Returns:
         ``[bs, hidden]`` sampled rows in request order, on every rank.
     """
-    plan = ctx.query_shard
-    if plan is None:
-        raise ValueError("gather_sampled_rows needs a sharded forward")
-    if ctx.gather_ids is None:
-        raise ValueError("gather_sampled_rows needs ctx.gather_ids")
     if hidden_states.shape[0] != plan.local_rows:
         raise ValueError(
             f"query shard rank {plan.rank} holds {plan.local_rows} rows, got "
             f"{hidden_states.shape[0]}"
         )
-    local = hidden_states.index_select(0, plan.local_sampled_ids(ctx.gather_ids))
-    return token_all_gather(local, group, list(plan.sampled_rows_per_rank))
+    local = hidden_states.index_select(0, plan.local_sampled_ids(gather_ids))
+    return token_all_gather_rows(local, group, list(plan.sampled_rows_per_rank))
 
 
 def moe_input_row_segments(
@@ -181,24 +185,95 @@ def forward_collective_row_table(ctx: ForwardContext) -> list[int] | None:
     return ctx.global_num_tokens
 
 
+def head_tp_row_counts(
+    ctx: ForwardContext, mapping: Mapping, num_rows: int, *, collective: bool
+) -> list[int]:
+    """Per-rank rows of the head group for one leg of the head-TP exchange.
+
+    Head TP shards the head projections over ranks that hold different rows,
+    and its exchanges split by how many rows each of them holds. Under
+    attention DP those counts are the forward's world-indexed DP tables;
+    under query context parallelism the head group is the query-shard group
+    and the counts are the shard plan's. One resolver, so no model code
+    branches on the layout.
+
+    Args:
+        ctx: The forward.
+        mapping: The parallel layout (``mapping.attn.head_tp_group`` is the
+            group).
+        num_rows: Rows this rank holds in this leg; the table's entry for it
+            must agree, so a layout mistake fails here instead of hanging in
+            the collective.
+        collective: Which rows the leg moves. ``False`` is the forward's input
+            rows (the legs up to core attention); ``True`` the rows the
+            forward's collectives size by -- the live rows a narrowing drafter
+            reported, else the input rows (the legs after core attention).
+            Every rank of the group picks the same leg, never by matching
+            ``num_rows``: a rank with no rows could not tell the tables apart.
+
+    Returns:
+        One count per rank of the head group, in group order.
+
+    Raises:
+        ValueError: The forward carries no table for the layout -- no DP
+            table under attention DP, or a replicated-row forward under query
+            sharding (every rank holds every row; the attention exchanges
+            nothing there) -- or ``num_rows`` disagrees with it.
+    """
+    attn = mapping.attn
+    if not attn.has_qcp:
+        table = (
+            forward_collective_row_table(ctx)
+            if collective
+            else forward_input_row_table(ctx)
+        )
+        return dp_group_row_counts(table, attn.head_tp_group, mapping.rank, num_rows)
+    plan = ctx.query_shard
+    if plan is None or plan.size == 1:
+        raise ValueError(
+            "head-TP row counts are unavailable: the forward carries no query "
+            "shard, so every rank holds every row and the attention exchanges "
+            "nothing"
+        )
+    if plan.size != len(attn.head_tp_group):
+        raise ValueError(
+            f"query shard over {plan.size} ranks does not match the head TP group "
+            f"of {len(attn.head_tp_group)}"
+        )
+    counts = (
+        plan.rows_for_collective(ctx.collective_num_tokens)
+        if collective
+        else plan.row_counts
+    )
+    if counts[plan.rank] != num_rows:
+        raise ValueError(
+            f"query shard rank {plan.rank} holds {num_rows} rows but the shard "
+            f"table gives it {counts[plan.rank]}"
+        )
+    return list(counts)
+
+
 class CommManager:
     """Manages communication patterns (all_reduce vs RSAG) for each decoder layer.
 
     ``query_sharded`` declares the model slices its extend rows by
-    ``ctx.query_shard`` (query context parallelism). Under that mapping the
-    attention weights are head-replicated on every rank, so an attention
-    output row is complete wherever it is computed and the attention legs
-    are identity on every forward -- a sharded extend and the drafter's
-    replicated decode steps alike; nothing is ever scattered by attention,
-    so nothing is gathered before it or at the final norm either. The dense
-    and MoE legs follow the forward: with a shard they run the existing
-    all-gather / reduce-scatter path over the shard's per-rank row table,
-    without one (decode steps, idle) the replicated all-reduce legs, which
-    is why dense TP and the MoE TP x EP group must each be 1 or the
-    attention TP width (``validate_qcp``). The model exit gathers only the
-    sampled rows. The flag must agree with ``mapping.attn.has_qcp``: a model
-    that does not slice its rows cannot run under a query-sharding mapping,
-    and one that does cannot run without it.
+    ``ctx.query_shard`` (query context parallelism). Under that mapping an
+    attention output row is complete wherever it is computed -- the
+    attention weights are head-replicated on every rank, or, under head TP
+    over the query shards (``--attn-head-tp-size``), the attention's own
+    tail (``DeepseekV3AttentionMLA.project_output``) returns complete rows --
+    so the attention legs are identity on every forward, a sharded extend
+    and the drafter's replicated decode steps alike; nothing is ever
+    scattered by attention, so nothing is gathered before it or at the final
+    norm either. The dense and MoE legs follow the forward: with a shard they
+    run the existing all-gather / reduce-scatter path over the shard's
+    per-rank row table, without one (decode steps, idle) the replicated
+    all-reduce legs, which is why dense TP and the MoE TP x EP group must
+    each be 1 or the attention TP width (``validate_qcp``). The logits
+    processor gathers only the sampled rows of the shard
+    (:func:`gather_sampled_rows` over its TP group). The flag must agree with
+    ``mapping.attn.has_qcp``: a model that does not slice its rows cannot run
+    under a query-sharding mapping, and one that does cannot run without it.
 
     ``dense_batch_invariant`` selects the TP-batch-invariant dense tail: the
     layer's ``down_proj`` is column-parallel on hidden and ``post_dense_comm``
@@ -438,9 +513,10 @@ class CommManager:
     def post_attn_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
-        # A query-sharded model's attention weights are head-replicated, so
-        # its output rows are complete on every forward (sharded extend or
-        # replicated decode step): nothing to reduce or scatter.
+        # A query-sharded model's attention output rows are complete on every
+        # forward (sharded extend or replicated decode step): head-replicated
+        # weights, or the head-TP tail that already returned this rank's rows.
+        # Nothing to reduce or scatter.
         if self.query_sharded or not self.mapping.has_attn_tp:
             return hidden_states, residual
 
@@ -580,24 +656,12 @@ class CommManager:
     def needs_final_all_gather(self) -> bool:
         """Whether the model output must gather the final layer's rows
         (replicated-row layouts whose attention legs reduce-scatter; a
-        query-sharded model never scatters, and gathers sampled rows at the
-        model exit instead, see :func:`gather_sampled_rows`)."""
+        query-sharded model never scatters, and the logits processor gathers
+        only the sampled rows of its shard, see :func:`gather_sampled_rows`)."""
         return (
             not self.query_sharded
             and self.mapping.has_attn_tp
             and not self.use_all_reduce(self.is_moe)
-        )
-
-    def gather_sampled_rows(
-        self, hidden_states: torch.Tensor, ctx: ForwardContext
-    ) -> torch.Tensor:
-        """A sharded forward's model exit: every rank's sampled rows, request
-        order (:func:`gather_sampled_rows` over the query-context-parallel
-        group)."""
-        if self._shard(ctx) is None:
-            raise RuntimeError("gather_sampled_rows serves sharded forwards")
-        return gather_sampled_rows(
-            hidden_states, ctx, group=self.mapping.attn.qcp_group
         )
 
     def post_final_norm_comm(

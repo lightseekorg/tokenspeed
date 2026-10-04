@@ -134,7 +134,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     def prefill_batch(num_tokens, batch_size):
         assert batch_size == -(-num_tokens // 4)
         assert 0 < batch_size <= 8
-        return SimpleNamespace(bs=batch_size)
+        return SimpleNamespace(bs=batch_size, query_shard=None)
 
     policy = Mock(return_value=nullcontext())
     namespace = dict(
@@ -225,6 +225,78 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         )
     for tensor in metadata:
         tensor.fill_(1)  # Capture must be able to mutate warmup metadata later.
+
+
+def test_a_query_sharding_engine_tunes_on_the_shards_rows():
+    """The dummy extend carries the engine's shard plan (make_dummy_batch),
+    and the target forward sees this rank's slice of the span -- ids,
+    positions and the per-row model inputs -- as a real sharded extend does."""
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    plan = QueryShardPlan.from_forward(
+        total_tokens=16, input_lengths=[4, 4, 4, 4], size=4, rank=2
+    )
+    assert plan.local_slice == slice(8, 12)
+    seen = {}
+
+    def forward(**kwargs):
+        seen.update(kwargs)
+
+    executor = SimpleNamespace(
+        config=SimpleNamespace(
+            max_num_seqs=8,
+            data_parallel_size=1,
+            chunked_prefill_size=16,
+            context_len=4,
+            world_size=4,
+            world_group=(0, 1, 2, 3),
+            global_rank=2,
+            autotune_cache_key=None,
+            pp_size=1,
+            disable_autotune=False,
+            model_is_mrope=False,
+            prefill_only=True,
+            decode_only_attention=False,
+        ),
+        model_runner=SimpleNamespace(forward=forward),
+        input_buffers=SimpleNamespace(
+            input_ids_buf=torch.arange(32),
+            positions_buf=torch.arange(32) * 10,
+            max_bs=8,
+            max_num_tokens=32,
+            fill_dummy_decode_buffers=lambda **kwargs: None,
+        ),
+        _model_input_kwargs=lambda n, bs, rows: {"rows": rows, "span": n},
+        prefill_graph=SimpleNamespace(
+            make_dummy_batch=lambda n, bs: SimpleNamespace(bs=bs, query_shard=plan)
+        ),
+        forward_step=SimpleNamespace(),
+        drafter=None,
+        device="cpu",
+    )
+    namespace = dict(
+        torch=torch,
+        dummy_batch_size=lambda n, context: -(-n // context),
+        time=time,
+        logger=logging.getLogger(__name__),
+        autotune=Mock(return_value=nullcontext()),
+        active_forward=lambda ctx: nullcontext(),
+        set_autotune_max_num_tokens=Mock(),
+        set_autotune_process_group=Mock(),
+        load_autotune_cache=Mock(),
+        save_autotune_cache=Mock(),
+        pg_manager=SimpleNamespace(get_process_group=lambda *args: None),
+    )
+    method = _functions(
+        RUNTIME / "execution/model_executor.py",
+        "ModelExecutor",
+        ("autotune",),
+        namespace,
+    )
+    method.autotune(executor)
+    assert seen["input_ids"].tolist() == [8, 9, 10, 11]
+    assert seen["positions"].tolist() == [80, 90, 100, 110]
+    assert seen["rows"] == slice(8, 12) and seen["span"] == 16
 
 
 @pytest.mark.parametrize("speculative", [False, True])

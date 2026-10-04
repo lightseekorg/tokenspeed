@@ -230,10 +230,10 @@ def validate_qcp(
         raise ValueError(
             "--prefill-context-parallel-size > 1 requires --dense-tp-size and the "
             f"MoE TP x EP group to be 1 or the attention TP width {attn_tp_size} "
-            f"(got dense {dense_tp_size}, MoE {moe_tp_ep_size}): the attention "
-            "weights are head-replicated, so the drafter's replicated decode rows "
-            "are never scattered and a narrower dense or MoE group has no rows to "
-            "gather"
+            f"(got dense {dense_tp_size}, MoE {moe_tp_ep_size}): attention returns "
+            "complete rows (head-replicated weights, or the head-TP tail), so the "
+            "drafter's replicated decode rows are never scattered and a narrower "
+            "dense or MoE group has no rows to gather"
         )
     if disaggregation_mode != "prefill":
         raise ValueError(
@@ -992,24 +992,31 @@ class ServerArgs:
         logger.info(f"Parallelism configuration:\n{self.mapping!s}")
 
     def _validate_decode_tp_layouts(self):
-        """Constraints of the decode-side TP layouts under attention DP.
+        """Constraints of the TP layouts over ranks holding different rows:
+        the decode-side layouts under attention DP, and head TP over the
+        query shards of a prefill engine.
 
-        The structural rules (head TP needs attention TP 1 and tiles the
-        stage world; LM head TP under DP needs attention TP 1) live in
-        ``Mapping``. This checks what only the server knows: the engine role
-        and the batch-invariance selection. The weights' quantization is
-        checked once the checkpoint's is resolved
+        The structural rules (head TP needs attention TP 1 or a full-TP query
+        shard, is the query-shard group under QCP, tiles the stage world; LM
+        head TP under DP needs attention TP 1) live in ``Mapping``; the
+        prefill role's rules in ``validate_qcp``. This checks what only the
+        server knows: the engine role and the batch-invariance selection. The
+        weights' quantization is checked once the checkpoint's is resolved
         (:meth:`validate_tp_batch_invariant_weights`).
         """
         attn = self.mapping.attn
-        if attn.has_head_tp:
-            # The head exchange serves absorbed decode rows only: an
-            # expanded prefill would need every head's K/V for the cached
-            # prefix, which the head-sharded kv_b_proj cannot produce.
+        if attn.head_tp_serves_decode_only:
+            # Head TP over attention-DP ranks serves absorbed decode rows
+            # only: an expanded prefill would need every head's K/V for the
+            # cached prefix, which the head-sharded kv_b_proj cannot produce.
+            # Over the query shards (attn.has_qcp) the extend rows run the
+            # absorbed sparse prefill through the exchange, and validate_qcp
+            # pinned the prefill role and the eager prefill already.
             if self.disaggregation_mode != "decode":
                 raise ValueError(
                     "--attn-head-tp-size > 1 serves decode rows only and "
-                    "requires --disaggregation-mode decode"
+                    "requires --disaggregation-mode decode (or, on the prefill "
+                    "role, --prefill-context-parallel-size equal to it)"
                 )
             # The prefill CUDA graph records extend forwards, and startup
             # would capture (and tune on) extend-shaped dummies this layout
@@ -1021,12 +1028,12 @@ class ServerArgs:
                     "the prefill CUDA graph (--disable-prefill-graph)"
                 )
                 self.disable_prefill_graph = True
-            if self.mapping.nprocs_per_node % attn.head_tp_size:
-                logger.warning(
-                    f"attention head TP group of {attn.head_tp_size} ranks spans "
-                    f"nodes ({self.mapping.nprocs_per_node} ranks per node); the "
-                    "per-layer head exchanges will cross the network"
-                )
+        if attn.has_head_tp and self.mapping.nprocs_per_node % attn.head_tp_size:
+            logger.warning(
+                f"attention head TP group of {attn.head_tp_size} ranks spans "
+                f"nodes ({self.mapping.nprocs_per_node} ranks per node); the "
+                "per-layer head exchanges will cross the network"
+            )
         if self.tp_batch_invariant not in ("none", "attn", "attn+dense"):
             raise ValueError(
                 "--tp-batch-invariant must be one of none, attn, attn+dense; got "
@@ -1038,11 +1045,27 @@ class ServerArgs:
                 "column-parallel over the attention head TP group and needs "
                 "--attn-head-tp-size > 1"
             )
-        if self.tp_batch_invariant == "attn+dense" and not self.mapping.dense.has_tp:
+        if (
+            self.tp_batch_invariant == "attn+dense"
+            and self.mapping.dense.tp_size <= attn.tp_size
+        ):
+            # The batch-invariant dense tail replaces the token reduce-scatter
+            # of a dense group wider than attention TP (CommManager refuses
+            # it otherwise). Under query sharding the dense group is 1 or the
+            # attention TP width (validate_qcp), so the selection has no
+            # layout to apply to there.
             raise ValueError(
                 "--tp-batch-invariant attn+dense makes the dense down_proj "
-                "column-parallel over the dense TP group and needs "
-                "--dense-tp-size > 1"
+                "column-parallel over the dense TP group and needs a dense TP "
+                f"group wider than attention TP (got --dense-tp-size "
+                f"{self.mapping.dense.tp_size} with attention TP {attn.tp_size})"
+                + (
+                    "; under --prefill-context-parallel-size the dense group is 1 "
+                    "or the attention TP width, so only --tp-batch-invariant attn "
+                    "applies"
+                    if attn.has_qcp
+                    else ""
+                )
             )
         if attn.has_dp and self.mapping.lm_head.has_tp and self.dp_sampling:
             raise ValueError(
@@ -1401,16 +1424,28 @@ class ServerArgs:
         # activation and folds a token's slots in fp32 slot order.
         self.moe_combine_order = "slot"
         # Layouts stay explicit: the envelope does not fold them in. A
-        # head-sharded o_proj that still reduce-scatters folds the head
-        # partials in rank order -- batch-invariant, but not the bits of the
-        # full-K GEMM a replicated or column-parallel o_proj computes, so a
-        # prefill side with the other layout disagrees with this decode side.
+        # head-sharded o_proj that still sums its head partials across ranks
+        # is batch-invariant under the envelope, but its bits are not the
+        # full-K GEMM a replicated or column-parallel o_proj computes, and
+        # they equal a TP-W engine's all-reduced o_proj only when both sides
+        # sum in the same order: the exchanging forward's reduce-scatter
+        # always takes the ordered fold, while an all-reduce (the TP-W
+        # engine's, and the replicated-row decode steps of a query-sharding
+        # engine) takes the in-switch reduction where multicast reaches, whose
+        # order is a property of the GPU set (comm_backend/self_check.py).
+        # --force-deterministic-rsag on the all-reducing side pins it to the
+        # fold; docs/design/numerics.md, "Layout invariance of query context
+        # parallelism".
         if self.mapping.attn.has_head_tp and self.tp_batch_invariant == "none":
             logger.warning(
                 "--numerics rl-bitwise with --attn-head-tp-size > 1 but without "
-                "--tp-batch-invariant attn: the o_proj reduce-scatter is an "
-                "ordered fold, which is batch-invariant but differs from the "
-                "full-K o_proj of a TP1 prefill engine"
+                "--tp-batch-invariant attn: the o_proj head partials are summed "
+                "across ranks (the ordered fold for the reduce-scatter, the "
+                "in-switch all-reduce where it applies), which is batch-invariant "
+                "but differs from the full-K o_proj of a TP1 or --tp-batch-invariant "
+                "engine, and equals a TP-W engine's o_proj only when both sides "
+                "sum in the same order (--force-deterministic-rsag on the "
+                "all-reducing side)"
             )
 
     def resolve_disaggregation(self):
@@ -3018,11 +3053,15 @@ class ServerArgs:
             type=int,
             default=ServerArgs.attn_head_tp_size,
             help="Shard the MLA head projections (q_b_proj, kv_b_proj, o_proj) "
-            "by heads over this many contiguous attention-DP ranks while every "
-            "rank keeps its own KV cache; the attention exchanges heads for "
-            "tokens around core attention. Requires attention TP 1, attention "
-            "DP, and a decode engine (--disaggregation-mode decode). Defaults "
-            "to the attention TP size (no head exchange).",
+            "by heads over this many contiguous ranks that hold different rows; "
+            "the attention exchanges heads for tokens around core attention. "
+            "Either attention-DP ranks of a decode engine (requires attention "
+            "TP 1, attention DP and --disaggregation-mode decode; every rank "
+            "keeps its own KV cache), or the query shards of a prefill engine "
+            "(must equal --prefill-context-parallel-size; the extend rows run "
+            "the absorbed sparse prefill through the exchange). Defaults to the "
+            "ranks holding the same rows: the attention TP size, or 1 "
+            "(head-replicated) under --prefill-context-parallel-size.",
         )
         parser.add_argument(
             "--lm-head-tp-size",
@@ -3057,7 +3096,9 @@ class ServerArgs:
             "computes a contiguous slice of the chunk's rows against the gathered "
             "KV history of its requests. Must equal --attn-tp-size and requires "
             "--disaggregation-mode prefill, --disable-prefill-graph, a DSA-family "
-            "attention backend and --decode-context-parallel-size 1 or equal.",
+            "attention backend and --decode-context-parallel-size 1 or equal. "
+            "The attention weights are head-replicated unless --attn-head-tp-size "
+            "equals it, which shards them over the shard group.",
         )
         parser.add_argument(
             "--dense-tp-size",
