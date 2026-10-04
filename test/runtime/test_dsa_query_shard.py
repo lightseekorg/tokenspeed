@@ -88,9 +88,7 @@ def _backend(rank: int, *, workspace_rows: int, qcp: bool = True) -> dsa.DSABack
     backend.qcp_rank = rank if qcp else 0
     backend.query_shard_metadata = None
     backend._prefill_page_table = None
-    backend._history_workspace_rows = 0
-    backend._history_kv_workspace = None
-    backend._history_index_k_workspace = None
+    backend._history_workspace = None
     backend._dense_backend = SimpleNamespace(
         init_forward_metadata=lambda *args, **kwargs: None,
         chunked_prefill_metadata=None,
@@ -380,13 +378,13 @@ def test_the_index_k_history_is_one_gather_per_group(monkeypatch):
     assert len(gathers) == 1
     dtype, shape, out = gathers[0]
     assert dtype == torch.uint8 and shape == (group.rows, 132)
-    assert out is backend._history_index_k_workspace
+    assert out is backend._history_workspace.index_k
     # Views of the workspace in position order: slot v is page v // 2, row v % 2.
     slots = group.gather.virtual_slots
     assert fp8.shape == (group.rows, INDEX_HEAD_DIM) and scale.shape == (group.rows, 1)
     assert fp8[:, 0].tolist() == ((slots % PAGE) + 10 * (slots // PAGE)).tolist()
     assert scale[:, 0].tolist() == ((slots % PAGE) + 100 * (slots // PAGE)).tolist()
-    assert fp8.data_ptr() == backend._history_index_k_workspace.data_ptr()
+    assert fp8.data_ptr() == backend._history_workspace.index_k.data_ptr()
 
 
 def test_the_decode_arm_keeps_every_head_under_a_query_shard(monkeypatch):
@@ -467,8 +465,10 @@ def test_the_workspace_reservation_matches_the_recipe_plan():
     # One whole history, padded to kernel pages.
     rows = 38
     assert allocated == rows * (KV_DIM * 2 + dsa_index_k_row_bytes(INDEX_HEAD_DIM))
-    assert backend._history_kv_workspace.shape == (rows, KV_DIM)
-    assert backend._history_index_k_workspace.shape == (
+    workspace = backend.history_gather_workspace()
+    assert workspace.rows == rows and workspace.nbytes == allocated
+    assert workspace.kv.shape == (rows, KV_DIM)
+    assert workspace.index_k.shape == (
         rows,
         dsa_index_k_row_bytes(INDEX_HEAD_DIM),
     )
@@ -490,3 +490,104 @@ def test_build_prefill_slots_match_the_group_history():
         num_tokens=11,
     )
     assert slots.tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+
+def _router(leaf: dsa.DSABackend, *, is_draft: bool):
+    """A CacheGroupRouter over one DSA leaf, the shape the registry builds."""
+    from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
+        CacheGroupGeometry,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.router import (
+        CacheGroupRouter,
+    )
+
+    router = CacheGroupRouter(
+        None,
+        is_draft=is_draft,
+        spec_num_tokens=1,
+        device="cpu",
+        consumed_group_ids=None,
+    )
+    router.bind(
+        CacheGroupGeometry(
+            granularities={"full": PAGE},
+            families={"full": "history"},
+            full_history_group_id="full",
+            row_geometry={"full": (PAGE, 1)},
+            retentions={"full": ("full_history", None)},
+        ),
+        {"full": leaf},
+    )
+    return router
+
+
+def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
+    """The serve path: ``_prepare_fixed_workspaces`` allocates the history
+    gather workspace on the target tree against the recipe's plan and the
+    draft tree gathers into the same buffers, so a sharded draft extend finds
+    its workspace without a second reservation."""
+    from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
+
+    target = _backend(0, workspace_rows=0)
+    draft = _backend(0, workspace_rows=0)
+    draft.is_draft = True
+    target_router = _router(target, is_draft=False)
+    draft_router = _router(draft, is_draft=True)
+    max_model_len = 37
+    config = SimpleNamespace(
+        qcp_size=WORLD,
+        context_len=max_model_len,
+        max_bs=4,
+        kv_cache_dtype=torch.bfloat16,
+        kernel_page_size=PAGE,
+        component=lambda cls: SimpleNamespace(
+            kv_cache_dim=KV_DIM,
+            index_head_dim=INDEX_HEAD_DIM,
+            index_k_format="fp8_scaled",
+        ),
+    )
+    planned = dsa_history_gather_workspace_bytes(config, max_model_len=max_model_len)
+    kwargs = dict(
+        server_args=SimpleNamespace(speculative_num_draft_tokens=2),
+        config=config,
+        backend=target_router,
+        draft_backend=draft_router,
+        uses_paged_state_verify=False,
+        is_inkling=False,
+    )
+    _prepare_fixed_workspaces(**kwargs, expected_bytes=planned)
+    workspace = target_router.history_gather_workspace()
+    assert workspace is not None and workspace.nbytes == planned
+    assert workspace.rows == 38 and workspace.rows % PAGE == 0
+    assert draft.history_gather_workspace() is workspace
+    assert draft_router.history_gather_workspace() is workspace
+    # Both leaves plan a sharded extend against it.
+    for leaf in (target, draft):
+        _init(leaf, _plan(0))
+        assert leaf.require_query_shard_metadata().groups
+    with pytest.raises(RuntimeError, match="does not match allocated"):
+        _prepare_fixed_workspaces(**kwargs, expected_bytes=planned + 1)
+    # Off: nothing is allocated and nothing is checked.
+    fresh = _backend(0, workspace_rows=0, qcp=False)
+    config.qcp_size = 1
+    _prepare_fixed_workspaces(
+        **{**kwargs, "backend": _router(fresh, is_draft=False), "draft_backend": None},
+        expected_bytes=0,
+    )
+    assert fresh.history_gather_workspace() is None
+
+
+def test_the_draft_refuses_a_workspace_of_another_geometry():
+    target = _backend(0, workspace_rows=11)
+    workspace = target.history_gather_workspace()
+    draft = _backend(0, workspace_rows=0)
+    draft.kv_cache_dim = KV_DIM + 2
+    with pytest.raises(ValueError, match="geometry mismatch"):
+        draft.adopt_history_gather_workspace(workspace)
+    draft.kv_cache_dim = KV_DIM
+    draft.kernel_page_size = 5  # 12 rows are not whole pages of five
+    with pytest.raises(ValueError, match="geometry mismatch"):
+        draft.adopt_history_gather_workspace(workspace)
+    draft.kernel_page_size = PAGE
+    draft.adopt_history_gather_workspace(workspace)
+    assert draft.history_gather_workspace() is workspace

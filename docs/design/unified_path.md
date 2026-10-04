@@ -1378,7 +1378,9 @@ The contract a model (in tree or a plugin) implements:
 * GPU DSA (`backends/paged/dsa.py`): `init_forward_metadata` builds a
   `DSAQueryShardMetadata` — request groups whose summed history fits the
   gather workspace (one whole history, reserved from the cache budget by the
-  recipe's `workspace_bytes`), each with its `row_base` in the request-major
+  recipe's `workspace_bytes`, allocated once on the target tree by
+  `registry._prepare_fixed_workspaces` and shared with the draft tree, whose
+  extend step never gathers concurrently), each with its `row_base` in the request-major
   history-row numbering, this rank's `local_query` slice and a
   `HistoryGatherPlan` (per-owner row counts from `page_table_cpu`,
   `dcp/placement.py: owned_history_rows`). For the indexer the model calls

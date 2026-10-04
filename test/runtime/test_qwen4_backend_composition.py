@@ -49,7 +49,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.registry import (
     _compose_qwen4_exp_backend,
-    _prepare_verify_workspace,
+    _prepare_fixed_workspaces,
 )
 
 
@@ -65,6 +65,7 @@ def _config(*, is_draft: bool, width: int):
         speculative_num_draft_tokens=width,
         context_len=512,
         max_bs=4,
+        qcp_size=1,
     )
 
 
@@ -172,7 +173,7 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
     )
     target_verify = width > 1 and not is_draft
     expected_bytes = (3 * has_gdn + 5 * has_ple + 7 * has_qsa) if target_verify else 0
-    _prepare_verify_workspace(**kwargs, expected_bytes=expected_bytes)
+    _prepare_fixed_workspaces(**kwargs, expected_bytes=expected_bytes)
     assert calls == (
         ([("gdn", 2, width)] if has_gdn else [])
         + ([("ple", 2, width)] if has_ple else [])
@@ -181,7 +182,7 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
         else []
     )
     with pytest.raises(RuntimeError, match="does not match allocated tensors"):
-        _prepare_verify_workspace(**kwargs, expected_bytes=expected_bytes + 1)
+        _prepare_fixed_workspaces(**kwargs, expected_bytes=expected_bytes + 1)
 
 
 @pytest.mark.parametrize("is_qwen4", [False, True])

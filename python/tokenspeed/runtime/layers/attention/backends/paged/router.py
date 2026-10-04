@@ -76,6 +76,9 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
         TreeVerifyInputs,
     )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        HistoryGatherWorkspace,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
@@ -286,6 +289,22 @@ class CacheGroupRouter(AttentionBackend):
             leaf.preallocate_history_gather_workspace(max_model_len)
             for leaf in self.leaves.values()
         )
+
+    def history_gather_workspace(self) -> HistoryGatherWorkspace | None:
+        workspaces = [
+            workspace
+            for leaf in self.leaves.values()
+            if (workspace := leaf.history_gather_workspace()) is not None
+        ]
+        if len(workspaces) > 1:
+            raise RuntimeError(
+                "CacheGroupRouter holds more than one history gather workspace"
+            )
+        return workspaces[0] if workspaces else None
+
+    def adopt_history_gather_workspace(self, workspace: HistoryGatherWorkspace) -> None:
+        for leaf in self.leaves.values():
+            leaf.adopt_history_gather_workspace(workspace)
 
     def register_step_counter(self, step_counter) -> None:
         # The MLA leaves record the PD layerwise step inside their chunked

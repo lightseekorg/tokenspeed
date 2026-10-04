@@ -65,6 +65,45 @@ def gather_mla_history(
 
 
 @dataclass(frozen=True)
+class HistoryGatherWorkspace:
+    """The buffers a request group's gathered history lands in.
+
+    Allocated once per engine (the recipe reserves the bytes from the cache
+    budget, ``OrdinaryRecipe.workspace_bytes``) by the target's DSA leaf and
+    shared with the draft's: the two never gather at the same time, since the
+    draft's extend step follows the target's forward on the same stream.
+
+    Attributes:
+        rows: Row capacity, a whole number of kernel pages.
+        kv: ``[rows, kv_cache_dim]`` latent rows in the KV cache dtype.
+        index_k: ``[rows, row_bytes]`` packed uint8 index-K rows (FP8 bytes
+            then fp32 scales, ``kv_cache.dsa.split_index_k_rows``).
+    """
+
+    rows: int
+    kv: torch.Tensor
+    index_k: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if (
+            self.kv.dim() != 2
+            or self.index_k.dim() != 2
+            or self.kv.shape[0] != self.rows
+            or self.index_k.shape[0] != self.rows
+            or self.index_k.dtype != torch.uint8
+        ):
+            raise ValueError(
+                f"history workspace of {self.rows} rows does not match kv "
+                f"{tuple(self.kv.shape)} / index_k {tuple(self.index_k.shape)} "
+                f"{self.index_k.dtype}"
+            )
+
+    @property
+    def nbytes(self) -> int:
+        return self.kv.nbytes + self.index_k.nbytes
+
+
+@dataclass(frozen=True)
 class HistoryGatherPlan:
     """How one request group's history rows split over the page owners.
 

@@ -66,6 +66,9 @@ if TYPE_CHECKING:
         AttnConfig,
         SoftmaxAttnConfig,
     )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        HistoryGatherWorkspace,
+    )
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -195,11 +198,27 @@ class AttentionBackend(CachePoolBinding, ABC):
 
     def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
         """Allocate the query-context-parallel history gather workspace and
-        return its bytes (the recipe reserved them from the cache budget).
-        Only a tree with the GPU DSA sharded extend arm has one."""
+        return its bytes (the recipe reserved them from the cache budget;
+        the registry checks the two agree). Only a tree with the GPU DSA
+        sharded extend arm has one."""
         raise NotImplementedError(
             f"{type(self).__name__} has no sharded extend arm; query context "
             "parallelism needs GPU DSA attention"
+        )
+
+    def history_gather_workspace(self) -> HistoryGatherWorkspace | None:
+        """The allocated history gather workspace of this tree, or ``None``
+        before :meth:`preallocate_history_gather_workspace` ran (or on a tree
+        without the sharded extend arm)."""
+        return None
+
+    def adopt_history_gather_workspace(self, workspace: HistoryGatherWorkspace) -> None:
+        """Share another tree's history gather workspace: the draft tree
+        gathers into the target's buffers, which are idle while the draft
+        runs. A leaf without the sharded extend arm ignores it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no sharded extend arm to share a history "
+            "gather workspace with"
         )
 
     @property

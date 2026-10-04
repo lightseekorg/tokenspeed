@@ -1205,7 +1205,7 @@ def _create_draft_components(
     return backend, draft_pool
 
 
-def _prepare_verify_workspace(
+def _prepare_fixed_workspaces(
     *,
     server_args,
     config,
@@ -1215,26 +1215,51 @@ def _prepare_verify_workspace(
     is_inkling: bool,
     expected_bytes: int,
 ) -> None:
+    """Allocate the fixed workspaces the recipe reserved from the cache budget
+    (``CacheRecipe.workspace_bytes``) and check the bytes agree.
+
+    The verify workspaces of the paged-state families and the
+    query-context-parallel history gather workspace of GPU DSA: the target
+    tree allocates the latter once and the draft tree gathers into the same
+    buffers (the draft's extend step follows the target's forward on the
+    same stream), so the plan budgets one workspace.
+    """
     from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
         Qwen4ExpBackend,
     )
 
     width = int(server_args.speculative_num_draft_tokens or 1)
+    allocated = False
+    actual_bytes = 0
     if isinstance(backend, Qwen4ExpBackend):
-        actual_bytes = backend.preallocate_verify_workspace(config.max_bs, width)
+        actual_bytes += backend.preallocate_verify_workspace(config.max_bs, width)
+        allocated = True
     elif uses_paged_state_verify and expected_bytes:
-        actual_bytes = backend.linear_attn_backend.preallocate_verify_workspace(
+        actual_bytes += backend.linear_attn_backend.preallocate_verify_workspace(
             config.max_bs, width
         )
+        allocated = True
     elif is_inkling:
-        actual_bytes = backend.fixed_workspace_bytes()
+        actual_bytes += backend.fixed_workspace_bytes()
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()
-    else:
+        allocated = True
+    if config.qcp_size > 1:
+        actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
+        allocated = True
+        if draft_backend is not None:
+            workspace = backend.history_gather_workspace()
+            if workspace is None:
+                raise RuntimeError(
+                    "query context parallelism needs the target's history gather "
+                    "workspace for the draft to share"
+                )
+            draft_backend.adopt_history_gather_workspace(workspace)
+    if not allocated:
         return
     if actual_bytes != expected_bytes:
         raise RuntimeError(
-            "planned verify workspace does not match allocated tensors: "
+            "planned fixed workspace does not match allocated tensors: "
             f"{expected_bytes} planned, {actual_bytes} allocated"
         )
 
@@ -1551,7 +1576,7 @@ def create_attn_components(
             continue
         side_backend.set_cache_pool(side_pool)
 
-    _prepare_verify_workspace(
+    _prepare_fixed_workspaces(
         server_args=server_args,
         config=config,
         backend=backend,

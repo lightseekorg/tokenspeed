@@ -58,6 +58,9 @@ if TYPE_CHECKING:
         AttnConfig,
         SoftmaxAttnConfig,
     )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        HistoryGatherWorkspace,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
@@ -336,6 +339,10 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         sums its leaves and the registry checks the total against the plan."""
         del max_model_len
         return 0
+
+    def adopt_history_gather_workspace(self, workspace: HistoryGatherWorkspace) -> None:
+        """A leaf without the sharded extend arm has nothing to gather into."""
+        del workspace
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """Publish a drafter's in-graph seq_lens edits into this leaf's own
