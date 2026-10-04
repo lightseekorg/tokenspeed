@@ -154,6 +154,7 @@ def _forward(
         lm_head=SimpleNamespace(weight=local),
         logits_metadata=LogitsMetadata(
             forward_mode=ForwardMode.EXTEND,
+            query_shard=None,
             gather_ids=gather_ids,
             input_logprob_rows=replicated,
         ),

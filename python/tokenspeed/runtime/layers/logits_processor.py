@@ -175,15 +175,17 @@ class LogitsProcessorOutput:
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode
+    # The rows ``hidden_states`` holds are this rank's shard of the forward
+    # (query context parallelism); None when they are the whole forward. It
+    # selects the row-selection path (gathers over the TP group or local
+    # indexing), so every constructor names it.
+    query_shard: QueryShardPlan | None = dataclasses.field(kw_only=True)
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     gather_ids: torch.Tensor | None = None
     logits_rows_selected: bool = False
     # Prompt rows whose next-token logprob the forward returns (SGLang
     # ``logprob_start_len``); None when none is wanted.
     input_logprob_rows: InputLogprobRows | None = None
-    # The rows ``hidden_states`` holds are this rank's shard of the forward
-    # (query context parallelism); None when they are the whole forward.
-    query_shard: QueryShardPlan | None = None
     # The forward's per-rank row tables (attention DP), for the LM-head TP
     # group's row counts; see LogitsProcessor._lm_head_tp_row_counts.
     all_decode_or_idle: bool = False

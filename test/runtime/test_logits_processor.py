@@ -30,7 +30,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
 def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
     hidden_states = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
     lm_head = SimpleNamespace(weight=torch.eye(2, dtype=torch.float32))
-    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
     calls = {"fused": 0}
 
     def fake_lm_head_matmul(hidden, weight):
@@ -72,7 +72,7 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
     )
     hidden_states = torch.empty((0, 2), dtype=torch.float32)
     lm_head = SimpleNamespace(weight=torch.ones((3, 2), dtype=torch.float32))
-    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
     calls = {"all_gather": 0}
 
     def fake_all_gather_single(output, input_, group):
@@ -527,7 +527,7 @@ def test_get_logits_skips_gather_when_dist_argmax_active(monkeypatch):
 
     hidden = torch.randn(4, 2, dtype=torch.float32)
     lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))  # 4*2 == 8
-    md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    md = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
     out = proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
     assert out.shape == (4, 4)  # local shard width retained, not gathered to 8
 
@@ -561,7 +561,7 @@ def test_require_full_vocab_logits_turns_the_fused_draft_argmax_off(monkeypatch)
     )
     hidden = torch.randn(4, 2, dtype=torch.float32)
     lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))
-    md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    md = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
     out = proc._get_logits(hidden, lm_head, md, require_full_vocab=True)
     assert out.shape == (4, 8)  # gathered to the full vocab
 
@@ -602,7 +602,7 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(monkeypatc
 
     hidden = torch.randn(4, 2, dtype=torch.float32)
     lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))
-    md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    md = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
     out = proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
 
     assert out.shape == (4, 8)
@@ -640,7 +640,7 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch):
     lm_head = SimpleNamespace(
         weight=torch.randn(4, 2, dtype=torch.bfloat16)
     )  # 4*2 == 8
-    md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    md = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
     out = proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
     assert called.get("ag")  # gathered (softcap on full vocab), not early-returned
     assert out.shape == (4, 8)
@@ -712,6 +712,7 @@ def test_input_logprobs_match_the_output_logprob_arithmetic(chunk_tokens):
     )
     metadata = LogitsMetadata(
         forward_mode=ForwardMode.EXTEND,
+        query_shard=None,
         gather_ids=torch.tensor([2, 4], device=device),
         input_logprob_rows=_input_logprob_rows(
             rows, targets, num_input_rows=5, chunk_tokens=chunk_tokens, device=device
@@ -755,6 +756,7 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
     processor._get_logits = spy
     metadata = LogitsMetadata(
         forward_mode=ForwardMode.MIXED,
+        query_shard=None,
         gather_ids=torch.tensor([3, 4, 5], device=device),
         input_logprob_rows=_input_logprob_rows(
             [0, 1, 2], [1, 2, 3], num_input_rows=6, chunk_tokens=2, device=device
@@ -796,6 +798,7 @@ def test_input_logprobs_refuse_a_model_that_narrowed_its_logits_rows():
             lm_head=lm_head,
             logits_metadata=LogitsMetadata(
                 forward_mode=ForwardMode.EXTEND,
+                query_shard=None,
                 gather_ids=torch.tensor([0], device=device),
                 logits_rows_selected=True,
                 input_logprob_rows=rows,
@@ -809,6 +812,7 @@ def test_input_logprobs_refuse_a_model_that_narrowed_its_logits_rows():
             lm_head=lm_head,
             logits_metadata=LogitsMetadata(
                 forward_mode=ForwardMode.EXTEND,
+                query_shard=None,
                 gather_ids=torch.tensor([1], device=device),
                 input_logprob_rows=rows,
             ),
@@ -821,6 +825,7 @@ def test_input_logprobs_refuse_a_model_that_narrowed_its_logits_rows():
             lm_head=lm_head,
             logits_metadata=LogitsMetadata(
                 forward_mode=ForwardMode.EXTEND,
+                query_shard=None,
                 logits_rows_selected=True,
                 input_logprob_rows=rows,
             ),
@@ -859,6 +864,7 @@ def test_input_logprobs_bypass_the_sharded_argmax_shortcut(monkeypatch):
     lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))
     md = LogitsMetadata(
         forward_mode=ForwardMode.EXTEND,
+        query_shard=None,
         gather_ids=torch.tensor([2]),
         input_logprob_rows=_input_logprob_rows(
             [0, 1], [1, 6], num_input_rows=3, chunk_tokens=8, device="cpu"
@@ -913,6 +919,7 @@ def test_input_logprob_chunks_never_take_the_multicast_gather(monkeypatch):
     lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.bfloat16))
     md = LogitsMetadata(
         forward_mode=ForwardMode.EXTEND,
+        query_shard=None,
         gather_ids=torch.tensor([4]),
         input_logprob_rows=_input_logprob_rows(
             [0, 1, 2, 3], [1, 6, 2, 5], num_input_rows=5, chunk_tokens=3, device="cpu"
@@ -1183,6 +1190,7 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
             lm_head=lm_head,
             logits_metadata=LogitsMetadata(
                 forward_mode=ForwardMode.EXTEND,
+                query_shard=None,
                 gather_ids=torch.tensor([1]),
                 input_logprob_rows=rows,
             ),
