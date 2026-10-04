@@ -106,6 +106,16 @@ SLOT_ORDERS = ("selection", "sorted")
 # a ``*args, **kwargs`` wrapper that does not declare it never sees it.
 CANDIDATE_LENS_CPU_FEATURE = "candidate_lens_cpu"
 
+# Feature a ``dsa_prefill_topk`` leaf declares when it scores index-K rows
+# handed to it already in workspace-row order instead of resolving them from
+# a plane through ``kv_workspace_slots``: ``index_k_fp8`` + ``index_k_scale``
+# for an ``fp8_scaled`` plane, ``index_k_bf16`` for a ``bf16`` one (the
+# query-context-parallel history gather over page-sharded caches produces
+# them). The facade REQUIRES it whenever such rows are passed, so a leaf that
+# only reads planes is never selected for them: the failure is a selection
+# error up front, not the leaf raising mid-forward.
+INDEX_K_WORKSPACE_ROWS_FEATURE = "index_k_workspace_rows"
+
 # Storage of an index-key plane, read off its dtype (README, "Index-K plane
 # formats"): one layout per dtype, never guessed from a row width alone.
 _INDEX_K_FP8_GROUP_SIZE = 128
@@ -544,6 +554,7 @@ def dsa_prefill_topk(
     page_size: int | None = None,
     index_k_fp8: torch.Tensor | None = None,
     index_k_scale: torch.Tensor | None = None,
+    index_k_bf16: torch.Tensor | None = None,
     q_scales: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     candidate_lens_cpu: torch.Tensor | None = None,
@@ -579,11 +590,23 @@ def dsa_prefill_topk(
             (``"fp8_scaled"``, packed or page-planar; page-planar caches may
             have a padded outer page stride), bfloat16 is the unquantized
             ``[slots, head_dim]`` plane (``"bf16"``, packed).
-        page_size: KV cache page size for index_k_cache.
-        index_k_fp8: FP8 index-K rows already in workspace-row order. Must be
-            provided together with index_k_scale.
-        index_k_scale: FP8 index-K scales already in workspace-row order. Must
-            be provided together with index_k_fp8.
+        page_size: KV cache page size for index_k_cache. Passed to selection
+            as the ``page_size`` trait whenever given, rows or plane: a leaf
+            pinned to a page size is not selected without it.
+        index_k_fp8: FP8 index-K rows already in workspace-row order
+            (``[workspace_rows, head_dim]``, the gathered form of an
+            ``fp8_scaled`` plane). Must be provided together with
+            index_k_scale and instead of index_k_cache.
+        index_k_scale: FP8 index-K scales already in workspace-row order
+            (``[workspace_rows, head_dim / 128]`` fp32). Must be provided
+            together with index_k_fp8.
+        index_k_bf16: bf16 index-K rows already in workspace-row order
+            (``[workspace_rows, head_dim]``, the gathered form of a ``bf16``
+            plane), instead of index_k_cache and of the FP8 pair. Rows in
+            workspace-row order, of either format, select only leaves
+            declaring ``INDEX_K_WORKSPACE_ROWS_FEATURE`` for the matching
+            ``index_k_format``; the bf16 rows reach the leaf as the
+            ``index_k_bf16`` keyword.
         q_scales: Optional positive FP32 scale per token/head for FP8 queries,
             defining ``dequant(q[token, head]) = q[token, head].float() *
             q_scales[token, head]``.
@@ -633,17 +656,43 @@ def dsa_prefill_topk(
         "page_size": None if page_size is None else int(page_size),
         "topk": int(topk),
     }
-    has_workspace_rows = index_k_fp8 is not None and index_k_scale is not None
     if (index_k_fp8 is None) != (index_k_scale is None):
         raise ValueError(
             "index_k_fp8 and index_k_scale must be provided together for "
             "workspace-row input"
         )
+    has_fp8_rows = index_k_fp8 is not None
+    has_bf16_rows = index_k_bf16 is not None
+    if has_fp8_rows and has_bf16_rows:
+        raise ValueError(
+            "index_k_fp8/index_k_scale and index_k_bf16 are the workspace rows "
+            "of two index-K formats; pass the plane's one"
+        )
+    has_workspace_rows = has_fp8_rows or has_bf16_rows
+    if has_workspace_rows and index_k_cache is not None:
+        raise ValueError(
+            "index_k_cache and workspace rows (index_k_fp8/index_k_scale or "
+            "index_k_bf16) are two sources of index keys; pass one"
+        )
     if index_k_cache is not None:
         traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1]))
-    elif has_workspace_rows:
-        # Workspace rows are FP8 values plus scales by construction.
+    elif has_bf16_rows:
+        if (
+            index_k_bf16.dtype != torch.bfloat16
+            or index_k_bf16.ndim != 2
+            or index_k_bf16.shape[1] != q.shape[-1]
+        ):
+            raise ValueError(
+                "index_k_bf16 holds bf16 rows [workspace_rows, head_dim] = "
+                f"[*, {q.shape[-1]}], got {index_k_bf16.dtype} "
+                f"{tuple(index_k_bf16.shape)}"
+            )
+        traits["index_k_format"] = "bf16"
+        traits["index_k_layout"] = "packed"
+    elif has_fp8_rows:
+        # FP8 values plus scales by construction, one row per workspace row.
         traits["index_k_format"] = "fp8_scaled"
+        traits["index_k_layout"] = "packed"
     initial_tokens = int(initial_tokens)
     local_tokens = int(local_tokens)
     if initial_tokens < 0 or local_tokens < 0:
@@ -658,6 +707,8 @@ def dsa_prefill_topk(
         required_features.add("forced_initial_local")
     if batch_invariant:
         required_features.add("batch_invariant")
+    if has_workspace_rows:
+        required_features.add(INDEX_K_WORKSPACE_ROWS_FEATURE)
     signature = _attention_format_signature(q=q, weights=weights)
     kernel = select_kernel(
         "attention",
@@ -703,6 +754,10 @@ def dsa_prefill_topk(
             "lens_out": lens_out,
             **candidate_lens_cpu_kwargs,
         }
+        if index_k_bf16 is not None:
+            # Only a leaf declaring INDEX_K_WORKSPACE_ROWS_FEATURE for the
+            # bf16 format was selected; the FP8 leaves never see the keyword.
+            kernel_kwargs["index_k_bf16"] = index_k_bf16
         if q_scales is not None:
             kernel_kwargs["q_scales"] = q_scales
         if initial_tokens or local_tokens:
@@ -993,6 +1048,7 @@ import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
 
 __all__ = [
     "CANDIDATE_LENS_CPU_FEATURE",
+    "INDEX_K_WORKSPACE_ROWS_FEATURE",
     "SLOT_ORDERS",
     "dsa_decode",
     "dsa_prefill",

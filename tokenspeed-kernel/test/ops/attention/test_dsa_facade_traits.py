@@ -22,8 +22,11 @@
 
 The index-key plane's dtype names its format (README, "Index-K plane
 formats"), so a bf16 plane selects a leaf declaring ``index_k_format="bf16"``
-and never an FP8 one; ``slot_order`` on the sparse cores is a trait plus a
-keyword that only declaring cores receive. Fake leaves on CPU; no kernel runs.
+and never an FP8 one; index keys handed as rows in workspace-row order
+(``index_k_fp8`` + ``index_k_scale``, ``index_k_bf16``) select only leaves
+declaring ``INDEX_K_WORKSPACE_ROWS_FEATURE`` for their format; ``slot_order``
+on the sparse cores is a trait plus a keyword that only declaring cores
+receive. Fake leaves on CPU; no kernel runs.
 """
 
 from __future__ import annotations
@@ -51,7 +54,14 @@ def _topk_signature():
     )
 
 
-def _register_topk_leaf(mode: str, name: str, *, index_k_format: str, layouts):
+def _register_topk_leaf(
+    mode: str,
+    name: str,
+    *,
+    index_k_format: str,
+    layouts,
+    workspace_rows: bool = False,
+):
     calls: list[dict] = []
 
     def leaf(**kwargs):
@@ -62,6 +72,9 @@ def _register_topk_leaf(mode: str, name: str, *, index_k_format: str, layouts):
             torch.zeros((tokens,), dtype=torch.int32),
         )
 
+    features = {"batch_invariant", "forced_initial_local"}
+    if workspace_rows:
+        features.add(dsa_pkg.INDEX_K_WORKSPACE_ROWS_FEATURE)
     spec = KernelSpec(
         name=name,
         family="attention",
@@ -74,7 +87,7 @@ def _register_topk_leaf(mode: str, name: str, *, index_k_format: str, layouts):
             "index_k_format": frozenset({index_k_format}),
             "index_k_layout": frozenset(layouts),
         },
-        features=frozenset({"batch_invariant", "forced_initial_local"}),
+        features=frozenset(features),
         priority=Priority.PORTABLE,
     )
     KernelRegistry.get().register(spec, leaf)
@@ -238,9 +251,19 @@ def test_candidate_lens_cpu_reaches_only_leaves_declaring_the_feature(
         Platform.override(real_platform)
 
 
-def test_workspace_rows_are_fp8_scaled(topk_leaves):
-    fp8, bf16 = topk_leaves
-    dsa_pkg.dsa_prefill_topk(
+# --- workspace rows: index keys handed in workspace-row order -----------------
+
+FP8_ROWS = {
+    "index_k_fp8": torch.zeros((16, HEAD_DIM), dtype=torch.float8_e4m3fn),
+    "index_k_scale": torch.zeros((16, 1), dtype=torch.float32),
+}
+BF16_ROWS = {"index_k_bf16": torch.zeros((16, HEAD_DIM), dtype=torch.bfloat16)}
+
+
+def _prefill_topk_rows(**rows):
+    # page_size names the page geometry a leaf pins (the stubs declare 64)
+    # even though rows carry no plane; a leaf without the trait ignores it.
+    return dsa_pkg.dsa_prefill_topk(
         torch.zeros((2, 16, HEAD_DIM), dtype=torch.bfloat16),
         torch.zeros((2, 16), dtype=torch.float32),
         torch.arange(16, dtype=torch.int64),
@@ -249,11 +272,99 @@ def test_workspace_rows_are_fp8_scaled(topk_leaves):
         topk=4,
         softmax_scale=1.0,
         batch_invariant=True,
-        index_k_fp8=torch.zeros((16, HEAD_DIM), dtype=torch.float8_e4m3fn),
-        index_k_scale=torch.zeros((16, 1), dtype=torch.float32),
         page_size=64,
+        **rows,
     )
-    assert len(fp8["dsa_prefill_topk"]) == 1 and not bf16["dsa_prefill_topk"]
+
+
+@pytest.fixture
+def row_leaves(fresh_registry, h100_platform):
+    """Per format, one leaf that only reads planes and one that also takes
+    rows in workspace-row order (``INDEX_K_WORKSPACE_ROWS_FEATURE``)."""
+    _ = fresh_registry
+    real_platform = Platform.get()
+    Platform.override(h100_platform)
+    leaves = {}
+    for index_k_format, layouts in (
+        ("fp8_scaled", ("packed", "page_planar")),
+        ("bf16", ("packed",)),
+    ):
+        for takes_rows in (False, True):
+            name = f"{index_k_format}_{'rows' if takes_rows else 'plane'}"
+            leaves[name] = _register_topk_leaf(
+                "dsa_prefill_topk",
+                name,
+                index_k_format=index_k_format,
+                layouts=layouts,
+                workspace_rows=takes_rows,
+            )
+    yield leaves
+    Platform.override(real_platform)
+
+
+def test_workspace_rows_select_the_declaring_leaf_of_their_format(row_leaves):
+    _prefill_topk_rows(**FP8_ROWS)
+    _prefill_topk_rows(**BF16_ROWS)
+    assert len(row_leaves["fp8_scaled_rows"]) == 1
+    assert len(row_leaves["bf16_rows"]) == 1
+    assert not row_leaves["fp8_scaled_plane"] and not row_leaves["bf16_plane"]
+    fp8_call = row_leaves["fp8_scaled_rows"][0]
+    assert fp8_call["index_k_fp8"] is FP8_ROWS["index_k_fp8"]
+    assert fp8_call["index_k_scale"] is FP8_ROWS["index_k_scale"]
+    assert "index_k_bf16" not in fp8_call
+    bf16_call = row_leaves["bf16_rows"][0]
+    assert bf16_call["index_k_bf16"] is BF16_ROWS["index_k_bf16"]
+    assert bf16_call["index_k_fp8"] is None and bf16_call["index_k_scale"] is None
+    assert bf16_call["index_k_cache"] is None
+
+
+def test_a_plane_only_leaf_is_never_selected_for_workspace_rows(
+    fresh_registry, h100_platform
+):
+    """The failure for rows without a declaring leaf is at selection -- the
+    plane-only leaf (what ``triton_dsa_prefill_topk_fp8`` is) never runs."""
+    _ = fresh_registry
+    real_platform = Platform.get()
+    Platform.override(h100_platform)
+    try:
+        plane_only = _register_topk_leaf(
+            "dsa_prefill_topk",
+            "fp8_plane",
+            index_k_format="fp8_scaled",
+            layouts=("packed", "page_planar"),
+        )
+        with pytest.raises(NoKernelFoundError):
+            _prefill_topk_rows(**FP8_ROWS)
+        with pytest.raises(NoKernelFoundError):
+            _prefill_topk_rows(**BF16_ROWS)
+        assert not plane_only
+        # The plane itself still reaches it.
+        _prefill_topk(torch.zeros((128, FP8_ROW_BYTES), dtype=torch.uint8))
+        assert len(plane_only) == 1
+    finally:
+        Platform.override(real_platform)
+
+
+def test_workspace_rows_come_in_one_format_and_without_a_plane(row_leaves):
+    with pytest.raises(ValueError, match="two index-K formats"):
+        _prefill_topk_rows(**FP8_ROWS, **BF16_ROWS)
+    with pytest.raises(ValueError, match="two sources of index keys"):
+        _prefill_topk_rows(
+            **BF16_ROWS,
+            index_k_cache=torch.zeros((128, HEAD_DIM), dtype=torch.bfloat16),
+        )
+    with pytest.raises(ValueError, match="two sources of index keys"):
+        _prefill_topk_rows(
+            **FP8_ROWS,
+            index_k_cache=torch.zeros((128, FP8_ROW_BYTES), dtype=torch.uint8),
+        )
+    with pytest.raises(ValueError, match="bf16 rows \\[workspace_rows, head_dim\\]"):
+        _prefill_topk_rows(index_k_bf16=torch.zeros((16, HEAD_DIM), dtype=torch.uint8))
+    with pytest.raises(ValueError, match="bf16 rows \\[workspace_rows, head_dim\\]"):
+        _prefill_topk_rows(
+            index_k_bf16=torch.zeros((16, HEAD_DIM // 2), dtype=torch.bfloat16)
+        )
+    assert not any(row_leaves.values())
 
 
 # --- sparse cores: slot_order -------------------------------------------------

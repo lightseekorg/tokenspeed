@@ -2442,6 +2442,48 @@ def test_deep_gemm_prefill_topk_declares_the_candidate_lens_cpu_feature() -> Non
             assert _attention_dsa_pkg.CANDIDATE_LENS_CPU_FEATURE not in other.features
 
 
+def test_only_leaves_taking_workspace_rows_declare_the_feature() -> None:
+    """Index keys in workspace-row order (``index_k_fp8`` + ``index_k_scale``)
+    are a DeepGEMM-only form in tree: the portable Triton leaf and the opaque
+    gluon wrappers read planes and must not be selectable for rows, which the
+    facade enforces by requiring ``INDEX_K_WORKSPACE_ROWS_FEATURE``."""
+    registry = KernelRegistry.get()
+    feature = _attention_dsa_pkg.INDEX_K_WORKSPACE_ROWS_FEATURE
+    for spec in registry.list_kernels("attention", "dsa_prefill_topk"):
+        declares = feature in spec.features
+        assert declares == (spec.name == "deep_gemm_dsa_prefill_topk"), spec.name
+
+
+def test_workspace_rows_fail_at_selection_without_a_declaring_leaf(
+    h100_platform,
+) -> None:
+    """Forcing the portable Triton solution (the one an AMD or pre-Hopper
+    platform has) for rows raises ``NoKernelFoundError`` from the facade
+    instead of the leaf's own ``RuntimeError`` mid-forward."""
+    spec = KernelRegistry.get().get_by_name("triton_dsa_prefill_topk_fp8")
+    assert spec is not None
+    assert _attention_dsa_pkg.INDEX_K_WORKSPACE_ROWS_FEATURE not in spec.features
+    real_platform = Platform.get()
+    Platform.override(h100_platform)
+    try:
+        with pytest.raises(tokenspeed_kernel.NoKernelFoundError):
+            _attention_dsa_pkg.dsa_prefill_topk(
+                torch.empty((1, 32, 128), dtype=torch.bfloat16),
+                torch.empty((1, 32), dtype=torch.float32),
+                torch.arange(16, dtype=torch.int64),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([16], dtype=torch.int32),
+                topk=512,
+                softmax_scale=1.0,
+                batch_invariant=False,
+                index_k_fp8=torch.empty((16, 128), dtype=torch.float8_e4m3fn),
+                index_k_scale=torch.ones((16, 1), dtype=torch.float32),
+                solution="triton",
+            )
+    finally:
+        Platform.override(real_platform)
+
+
 def test_deep_gemm_prefill_bound_resolution_preserves_both_host_inputs() -> None:
     from tokenspeed_kernel.ops.attention.dsa.deep_gemm import (
         _resolve_prefill_tile_max_seqlen_k,
