@@ -1673,6 +1673,8 @@ class ModelExecutor:
                     extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:0],
                     extend_replay_lens_cpu=ib.extend_replay_lens_cpu[:0],
                     extend_prompt_lens_cpu=ib.extend_prompt_lens_cpu[:0],
+                    # No request, so no group tables on either side.
+                    block_tables_cpu={},
                 )
             return
 
