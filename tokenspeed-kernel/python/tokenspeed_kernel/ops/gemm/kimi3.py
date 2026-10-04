@@ -928,6 +928,7 @@ def kimi3_latent_projection_add3(
             solution = "rowcta_gemv"
         elif (
             Platform.get().is_cdna4
+            and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
             and specialized
             and supports_gluon_mm_a16w16_decode_add3_gfx950(m, n, k)
         ):
@@ -974,6 +975,7 @@ def kimi3_latent_projection_add3(
     if solution == "gluon_mfma_add3":
         if (
             not Platform.get().is_cdna4
+            or (k, n) != (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
             or not specialized
             or not supports_gluon_mm_a16w16_decode_add3_gfx950(m, n, k)
         ):
