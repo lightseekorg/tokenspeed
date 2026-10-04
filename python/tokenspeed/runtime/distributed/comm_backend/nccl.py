@@ -168,7 +168,7 @@ class NcclBackend(CommBackend):
         if pynccl is not None and not pynccl.disabled:
             pynccl.all_gather(output, input)
         else:
-            torch.distributed.all_gather_single(
+            torch.distributed.all_gather_into_tensor(
                 output, input, group=res["device_group"]
             )
 
@@ -209,7 +209,7 @@ class NcclBackend(CommBackend):
         if pynccl is not None and not pynccl.disabled:
             pynccl.reduce_scatter(output_tensor, tensor)
         else:
-            torch.distributed.reduce_scatter_single(
+            torch.distributed.reduce_scatter_tensor(
                 output_tensor, tensor, group=res["device_group"]
             )
         return output_tensor
@@ -303,7 +303,7 @@ class NcclBackend(CommBackend):
             max_tokens, hidden, dtype=tensor.dtype, device=tensor.device
         )
         res = self._get_or_create_resources(group)
-        torch.distributed.reduce_scatter_single(
+        torch.distributed.reduce_scatter_tensor(
             output, padded_input.contiguous(), group=res["device_group"]
         )
         rank = group.index(torch.distributed.get_rank())
