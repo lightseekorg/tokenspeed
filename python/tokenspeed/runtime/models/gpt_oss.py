@@ -65,7 +65,6 @@ from tokenspeed.runtime.models.base import (
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
@@ -276,9 +275,7 @@ class GptOssSparseMoeBlock(nn.Module):
         self.activation = config.hidden_act
         self.activation_alpha = getattr(config, "hidden_act_alpha", 1.702)
         self.swiglu_limit = config.swiglu_limit
-        self.num_experts = (
-            num_experts + global_server_args_dict["ep_num_redundant_experts"]
-        )
+        self.num_experts = num_experts
         self.quant_config = quant_config
         if self.tp_size > config.num_local_experts:
             raise ValueError(

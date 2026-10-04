@@ -54,7 +54,9 @@ class ExpertWeightPlanEntry(CheckpointPlanEntry):
     local_expert_id: int
     # The decoder layer this entry serves, or None when every layer shares it
     # (contiguous ownership). An expert placement assigns slots per layer.
-    layer_id: int | None = None
+    # Explicit at every construction: which of the two it is selects how the
+    # entry matches checkpoint names.
+    layer_id: int | None
 
     def matches(self, checkpoint_name: str) -> bool:
         return super().matches(checkpoint_name) and (
@@ -118,6 +120,8 @@ def _build_default_expert_plan(
                 ),
                 shard_id=shard_id,
                 local_expert_id=local_expert_id,
+                # Contiguous ownership: the same slot serves every layer.
+                layer_id=None,
             )
             for param_name, semantic, shard_id in _expert_shards(schema)
         )

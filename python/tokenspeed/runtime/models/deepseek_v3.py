@@ -319,8 +319,7 @@ class DeepseekV3MoE(nn.Module):
 
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=config.n_routed_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,

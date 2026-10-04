@@ -65,7 +65,7 @@ from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.env import envs
 
 _is_blackwell = current_platform().is_blackwell
 
@@ -299,8 +299,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=config.num_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            num_experts=config.num_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
