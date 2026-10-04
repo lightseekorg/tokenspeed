@@ -772,6 +772,13 @@ def dsa_decode_topk(
         q_scales: Optional positive FP32 scale per token/head for FP8 queries,
             defining ``dequant(q[token, head]) = q[token, head].float() *
             q_scales[token, head]``.
+        seq_lens_2d: Optional per-token rows of the request's full KV length
+            (``[tokens, 1]``, every row of a request carrying ``seq_lens[req]``),
+            the scoring extent the ``plan`` was built from (:func:`dsa_plan`).
+            It carries no per-row causal bound: a leaf derives that from
+            ``seq_lens`` and ``q_len_per_req`` as under ``seq_lens`` above,
+            never from these rows, so a verify or draft row never selects its
+            window's later rows.
         plan: Optional opaque backend-specific plan.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].

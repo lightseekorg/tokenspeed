@@ -46,6 +46,16 @@ in the RL trainer's order) registers `index_k_format={"bf16"}`,
 `forced_initial_local` features, so a bf16 plane selects it and nothing
 else. A plane of any other dtype is a `TypeError`.
 
+A `dsa_decode_topk` leaf bounds every query row itself: row `j` of a request
+scored with `q_len_per_req` rows (spec verify, a multi-depth draft's k-row
+window) selects over the first `seq_lens[req] - (q_len_per_req - 1) + j`
+positions, derived from `seq_lens`. The `seq_lens_2d` rows the facade hands
+every leaf (`[tokens, 1]`, each carrying the request's full length) are the
+scoring extent the `plan` was built from, not per-row bounds; a leaf that read
+them as bounds would let a verify or draft row select its window's later
+rows, and a sparse core that trusts the selection for causality (`kv_seq_lens`
+is optional on `dsa_decode`) would attend them.
+
 `candidate_lens_cpu` (the CPU mirror of each prefill token's candidate count)
 goes to every selected leaf registered with the `candidate_lens_cpu` feature
 (`dsa.CANDIDATE_LENS_CPU_FEATURE`) and to no other: a leaf that can size its
