@@ -64,8 +64,10 @@ from typing import Literal
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.model_loader import get_model_architecture
 from tokenspeed.runtime.moe import eplb_algorithms
+from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
 from tokenspeed.runtime.utils.server_args import (
     ServerArgs,
     expert_placement_requested,
@@ -163,6 +165,9 @@ class ExpertLocationMetadata:
     # (layers, num_physical_experts) int64 routes to each physical expert
     # since the last reset; None until load recording is enabled.
     physical_load: torch.Tensor | None = field(init=False, default=None)
+    # Which rows of the MoE input are real tokens (padded forwards carry
+    # filler rows the counters must not see); enabled with the counters.
+    load_rows: ExpertLoadRowMask | None = field(init=False, default=None)
     # This rank's static dispatch map (layers, num_logical_experts), computed
     # on first use: only all-to-all EP under a static algorithm needs it.
     _rank_dispatch_map: torch.Tensor | None = field(
@@ -354,17 +359,31 @@ class ExpertLocationMetadata:
 
     # -------------------------------- load recording ---------------------------------
 
-    def enable_load_recording(self) -> None:
+    def enable_load_recording(self, mapping: Mapping) -> None:
         """Allocate the per-physical-expert route counters the router bumps.
 
         int64: on replicated-input EP every rank counts every token's routes,
-        and a long window on a hot expert overruns int32.
+        and a long window on a hot expert overruns int32. The live-row mask
+        that keeps padded forwards' filler rows out of the counters comes
+        with them; its buffer is reserved before the first forward
+        (``reserve_load_rows``).
+
+        Args:
+            mapping: The parallel layout, which lays out the ranks' rows in
+                the MoE input.
         """
         self.physical_load = torch.zeros(
             (self.num_layers, self.num_physical_experts),
             dtype=torch.int64,
             device=self.physical_to_logical_map.device,
         )
+        self.load_rows = ExpertLoadRowMask(mapping)
+
+    def reserve_load_rows(self, max_rows: int) -> None:
+        """Reserve the live-row mask for the largest MoE input any forward carries."""
+        if self.load_rows is None:
+            raise RuntimeError("expert load recording is not enabled")
+        self.load_rows.reserve(max_rows, self.physical_to_logical_map.device)
 
     def reset_load(self) -> None:
         if self.physical_load is None:
@@ -927,7 +946,7 @@ def build_expert_placement(
         )
     placement = compute_initial_expert_location_metadata(server_args, model_config)
     if server_args.expert_distribution_recorder_mode is not None:
-        placement.enable_load_recording()
+        placement.enable_load_recording(server_args.mapping)
     logger.info(
         f"Expert placement: {placement.num_logical_experts} logical experts on "
         f"{placement.num_physical_experts} physical slots over "

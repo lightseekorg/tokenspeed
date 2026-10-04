@@ -259,7 +259,23 @@ class ModelRunner:
         )
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
-        """Allocate model communication buffers before cache planning."""
+        """Allocate model communication buffers before cache planning.
+
+        The expert load counters' live-row mask is reserved here too: it is
+        sized by the largest MoE input a forward can carry (the MoE TP-EP
+        group's all-gather of ``max_num_tokens`` rows per rank), must exist
+        before the first forward (captured graphs hold its address) and is
+        accounted for by the cache profile like the communication buffers.
+        """
+        placement = get_global_expert_location_metadata()
+        if (
+            not self.is_draft_worker
+            and placement is not None
+            and placement.load_rows is not None
+        ):
+            placement.reserve_load_rows(
+                self.server_args.mapping.moe.tp_ep_size * max_num_tokens
+            )
         prepare = getattr(self.model, "prepare_communication_runtime", None)
         if prepare is None:
             return False

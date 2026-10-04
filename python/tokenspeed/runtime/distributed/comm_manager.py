@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from collections.abc import Sequence
+
 import torch
 
 from tokenspeed.runtime.distributed.comm_ops import (
@@ -27,6 +29,76 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+
+
+def moe_input_row_segments(
+    mapping: Mapping,
+    *,
+    padded_global_num_tokens: Sequence[int],
+    live_global_num_tokens: Sequence[int],
+) -> list[tuple[int, int]]:
+    """``(rows, live_rows)`` of each segment of the MoE layers' input, in row order.
+
+    Mirrors the row layout ``CommManager.post_attn_comm`` and ``pre_moe_comm``
+    produce for a padded forward (a decode graph replayed at a ladder batch
+    size, a prefill graph replayed at a bucket): every rank's rows are padded
+    to the same count and only a prefix of each rank's rows carries real
+    tokens. The MoE input is either this rank's own rows -- the whole
+    attention-DP group's rows after an all-reduce, or this rank's contiguous
+    reduce-scatter shard of them -- or the all-gather of such shards over the
+    MoE TP-EP group, one segment per group rank in group order.
+
+    Args:
+        mapping: The parallel layout.
+        padded_global_num_tokens: Rows every rank feeds the model, indexed by
+            global rank (the ranks of one attention-DP group share a value).
+        live_global_num_tokens: Real token rows per global rank, same index;
+            a rank's live rows are the first ones of its padded rows.
+
+    Returns:
+        One ``(rows, live_rows)`` per segment, ``live_rows <= rows``, summing
+        to the MoE input's row count.
+    """
+    attn = mapping.attn
+    world_size = mapping.world_size
+    if len(padded_global_num_tokens) != world_size:
+        raise ValueError(
+            f"padded_global_num_tokens has {len(padded_global_num_tokens)} "
+            f"entries, world_size={world_size}"
+        )
+    if len(live_global_num_tokens) != world_size:
+        raise ValueError(
+            f"live_global_num_tokens has {len(live_global_num_tokens)} "
+            f"entries, world_size={world_size}"
+        )
+
+    def dp_group_rows(rank: int) -> tuple[int, int, int]:
+        """``(padded, live, tp_rank)`` of ``rank``'s attention-DP group."""
+        dp_rank, tp_rank = divmod(attn.scatter_index(rank), attn.tp_size)
+        # The count table is indexed by global rank with the DP stride.
+        first = dp_rank * attn.tp_size * attn.cp_size
+        padded = int(padded_global_num_tokens[first])
+        live = int(live_global_num_tokens[first])
+        if not 0 <= live <= padded:
+            raise ValueError(
+                f"rank {rank}: {live} live rows do not fit {padded} padded rows"
+            )
+        return padded, live, tp_rank
+
+    def shard(rank: int) -> tuple[int, int]:
+        """``rank``'s reduce-scatter shard: a contiguous run of its group's rows."""
+        padded, live, tp_rank = dp_group_rows(rank)
+        lengths = CommManager._scatter_count(padded, attn.tp_size)
+        offset = sum(lengths[:tp_rank])
+        return lengths[tp_rank], min(max(live - offset, 0), lengths[tp_rank])
+
+    moe_all_reduce = attn.tp_size == mapping.moe.tp_ep_size
+    if mapping.moe.has_tp_ep and not moe_all_reduce:
+        return [shard(rank) for rank in mapping.moe.tp_ep_group]
+    if mapping.has_attn_tp and not moe_all_reduce:
+        return [shard(mapping.rank)]
+    padded, live, _ = dp_group_rows(mapping.rank)
+    return [(padded, live)]
 
 
 class CommManager:

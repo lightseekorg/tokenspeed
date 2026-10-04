@@ -86,6 +86,10 @@ from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
+from tokenspeed.runtime.moe.expert_location import (
+    get_global_expert_location_metadata,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import (
     get_available_gpu_memory,
@@ -421,6 +425,13 @@ class PrefillGraph:
         self.drafter = drafter
         self.num_warmup = num_warmup
         self.dp_size = config.data_parallel_size
+        # The expert load counters' live-row mask (None without load
+        # recording): a bucket replay marks the filler rows past each rank's
+        # real tokens before the graph runs and clears the mark after.
+        placement = get_global_expert_location_metadata()
+        self._expert_load_rows: ExpertLoadRowMask | None = (
+            placement.load_rows if placement is not None else None
+        )
 
         # A narrowing model is captured as encoder + decoder graph families
         # around its eager narrowing stage (module docstring); None means the
@@ -1228,6 +1239,13 @@ class PrefillGraph:
                 ib.mrope_positions_buf[:, num_tokens:bucket].zero_()
             else:
                 ib.positions_buf[num_tokens:bucket].zero_()
+        # The live rows of every rank, read before _padded_to pins the
+        # bucket onto ctx.
+        live_global_num_tokens = (
+            ctx.global_num_tokens
+            if ctx.global_num_tokens is not None
+            else [num_tokens] * self.config.world_size
+        )
         if self._narrowing is not None:
             hidden_states, aux_hidden_states = self._replay_narrowed(
                 bucket, ctx, num_tokens
@@ -1245,7 +1263,14 @@ class PrefillGraph:
                 if ready and capture_bs is not None:
                     cap, output = self._captures[bucket, capture_bs]
             with self._padded_to(ctx, bucket):
+                if self._expert_load_rows is not None:
+                    self._expert_load_rows.mark_padded(
+                        padded_global_num_tokens=[bucket] * self.config.world_size,
+                        live_global_num_tokens=live_global_num_tokens,
+                    )
                 cap.replay(valid_rows=num_tokens)
+                if self._expert_load_rows is not None:
+                    self._expert_load_rows.clear()
             hidden_states, aux_hidden_states = output.sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
@@ -1268,6 +1293,10 @@ class PrefillGraph:
         decoder graph replays with the narrowed row count as its valid rows,
         so its breaks scrub the static state's padded tail; a row count above
         the largest decoder bucket runs the decoder stage eager.
+
+        The expert load counters are not told about this path's filler rows:
+        the encoder bucket and the narrowed decoder bucket pad differently,
+        and no model that opts into expert placement narrows.
         """
         model = self._narrowing
         encoder = self._encoders[bucket]

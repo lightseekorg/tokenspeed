@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.moe.topk import (
     ExpertLocationDispatchInfo,
     TopK,
@@ -44,7 +45,15 @@ def _placement(ep_rank: int) -> ExpertLocationMetadata:
     placement = ExpertLocationMetadata.from_physical_to_logical_map(
         _PHYSICAL_TO_LOGICAL, 4, ep_size=2, ep_rank=ep_rank, ep_rank_nodes=(0, 0)
     )
-    placement.enable_load_recording()
+    # Two attention-DP ranks, EP2: the MoE input is the all-gather of both
+    # ranks' rows. The row mask is reserved for 8 rows, as serving does
+    # before the first forward.
+    placement.enable_load_recording(
+        Mapping(
+            rank=ep_rank, world_size=2, attn_tp_size=1, attn_dp_size=2, moe_ep_size=2
+        )
+    )
+    placement.reserve_load_rows(8)
     return placement
 
 
@@ -116,11 +125,35 @@ def test_zero_expert_algorithms_keep_legacy_ids_beyond_the_routed_count():
 def test_record_expert_load_counts_real_routes_only():
     info = _info(0, "static_with_zero_expert", all_to_all_ep=False)
     ids = map_zero_expert_routes(torch.tensor([[0, 2, -1], [0, 2, 3]]), info, 4)
-    record_expert_load(info.physical_load, ids)
-    record_expert_load(info.physical_load, ids)
-    assert info.physical_load.dtype == torch.int64
-    assert info.physical_load.tolist() == [2, 0, 2, 2, 2, 2]
+    record_expert_load(info.load, ids)
+    record_expert_load(info.load, ids)
+    assert info.load.physical_load.dtype == torch.int64
+    assert info.load.physical_load.tolist() == [2, 0, 2, 2, 2, 2]
     record_expert_load(None, ids)  # recording off: no-op
+
+
+def test_record_expert_load_skips_the_filler_rows_of_a_padded_batch():
+    """A decode graph replayed at bs=2 on both DP ranks while rank 0 has one
+    live request and rank 1 none: the gathered MoE input is [r0 live, r0
+    filler, r1 filler, r1 filler], and only the first row's routes count."""
+    info = _info(0, "static_with_zero_expert", all_to_all_ep=False)
+    rows = info.load.rows
+    ids = map_zero_expert_routes(
+        torch.tensor([[0, 2, -1], [0, 2, 3], [1, 1, 1], [3, 3, 3]]), info, 4
+    )
+    rows.mark_padded(padded_global_num_tokens=[2, 2], live_global_num_tokens=[1, 0])
+    assert rows.rows(4).tolist() == [True, False, False, False]
+    record_expert_load(info.load, ids)
+    assert info.load.physical_load.tolist() == [1, 0, 0, 0, 0, 1]
+    # After the replay the mask is cleared: an eager forward counts every row.
+    rows.clear()
+    record_expert_load(info.load, ids)
+    assert info.load.physical_load.tolist() == [2, 3, 1, 4, 1, 2]
+    # All live: the fast path leaves the mask all-True.
+    rows.mark_padded(padded_global_num_tokens=[2, 2], live_global_num_tokens=[2, 2])
+    assert rows.rows(8).all()
+    with pytest.raises(ValueError, match="exceeds the reserved"):
+        rows.rows(9)
 
 
 def test_topk_config_carries_the_layer_id():

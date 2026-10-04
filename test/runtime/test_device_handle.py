@@ -48,6 +48,7 @@ import pytest
 import torch
 from tokenspeed_scheduler import PD
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
@@ -918,7 +919,7 @@ def test_expert_load_reset_and_dump_ride_the_data_plane_on_the_execution_stream(
         ep_rank=1,
         ep_rank_nodes=(0, 0),
     )
-    placement.enable_load_recording()
+    placement.enable_load_recording(Mapping(rank=1, world_size=2, moe_ep_size=2))
     placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5], [0, 4, 0, 4]]))
     trace: list = []
     streams: list = []
@@ -973,7 +974,7 @@ def test_expert_load_snapshot_reads_then_zeroes_on_the_execution_stream():
         ep_rank=1,
         ep_rank_nodes=(0, 0),
     )
-    placement.enable_load_recording()
+    placement.enable_load_recording(Mapping(rank=1, world_size=2, moe_ep_size=2))
     placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5], [0, 4, 0, 4]]))
     trace: list = []
     streams: list = []

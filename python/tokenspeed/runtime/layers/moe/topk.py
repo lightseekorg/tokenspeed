@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 
 from tokenspeed.runtime.moe.dispatch_algorithm import STATIC_EP_DISPATCH_ALGORITHMS
+from tokenspeed.runtime.moe.expert_load_rows import LayerExpertLoad
 
 
 class TopKOutputFormat(Enum):
@@ -80,9 +81,9 @@ class ExpertLocationDispatchInfo:
     # Rank-agnostic replica tables for replicated-input EP; None under
     # all-to-all EP, where the per-rank static map applies.
     replica_dispatch: ExpertDispatch | None
-    # (num_physical_experts,) int64 route counters of this layer, or None
+    # This layer's route counters with the model-wide live-row mask, or None
     # when load recording is off.
-    physical_load: torch.Tensor | None
+    load: LayerExpertLoad | None
 
     @classmethod
     def init_new(
@@ -134,8 +135,11 @@ class ExpertLocationDispatchInfo:
                 if static and not all_to_all_ep
                 else None
             ),
-            physical_load=(
-                expert_location_metadata.physical_load[layer_id]
+            load=(
+                LayerExpertLoad(
+                    expert_location_metadata.physical_load[layer_id],
+                    expert_location_metadata.load_rows,
+                )
                 if expert_location_metadata.physical_load is not None
                 else None
             ),
@@ -250,21 +254,15 @@ def _mask_topk_ids_padded_region(
     topk_ids[indices >= num_token_non_padded, :] = -1
 
 
-def record_expert_load(
-    physical_load: torch.Tensor | None, topk_ids: torch.Tensor
-) -> None:
-    """Count every real route of ``topk_ids`` into the layer's physical counters.
+def record_expert_load(load: LayerExpertLoad | None, topk_ids: torch.Tensor) -> None:
+    """Count the real routes of ``topk_ids`` into the layer's counters (None: off).
 
-    ``-1`` marks zero-expert and padded slots; they are not routes. One
-    ``scatter_add_`` with a zero weight for those keeps this graph-capturable.
+    Routes of filler rows (a padded replay) and ``-1`` entries (zero experts,
+    masked slots) are not traffic; see ``LayerExpertLoad.record``.
     """
-    if physical_load is None:
+    if load is None:
         return
-    ids = topk_ids.reshape(-1)
-    valid = ids >= 0
-    physical_load.scatter_add_(
-        0, ids.masked_fill(~valid, 0).long(), valid.to(physical_load.dtype)
-    )
+    load.record(topk_ids)
 
 
 def torch_native_fused_topk(
@@ -580,8 +578,8 @@ def select_experts(
         )
     # Taken before the branches: the grouped path drops the dispatch info once
     # its kernel has mapped the ids, and the counters still apply to those.
-    physical_load = (
-        expert_location_dispatch_info.physical_load
+    expert_load = (
+        expert_location_dispatch_info.load
         if expert_location_dispatch_info is not None
         else None
     )
@@ -757,6 +755,6 @@ def select_experts(
         if routed_scaling_factor is not None:
             topk_weights *= routed_scaling_factor
 
-    record_expert_load(physical_load, topk_ids)
+    record_expert_load(expert_load, topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

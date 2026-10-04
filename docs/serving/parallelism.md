@@ -247,7 +247,12 @@ expert parallelism (`ep_size > 1`): replicas live on other ranks.
    `--expert-distribution-recorder-mode stat --ep-dispatch-algorithm
    static_with_zero_expert` (`static` for models without zero experts): the
    router counts every route into a per-layer, per-physical-expert counter
-   on the device, and the `EXPERT_LOAD` profile activity frames the window:
+   on the device, and the `EXPERT_LOAD` profile activity frames the window.
+   Only real tokens count: a padded replay (a decode graph at a ladder batch
+   size, a prefill graph at a bucket, an idle attention-DP rank) feeds
+   filler rows through the MoE layers, and the graph owners mark those rows
+   in a device-side live-row mask before the replay and clear it after, so
+   the counters see traffic, not padding.
 
    ```bash
    curl -X POST localhost:8401/start_profile -H 'Content-Type: application/json' \

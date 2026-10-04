@@ -36,6 +36,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
 from tokenspeed.runtime.moe.expert_location_updater import ExpertLocationUpdater
 from tokenspeed.runtime.moe.expert_rebalance import plan_slot_moves
@@ -86,7 +87,11 @@ def _placement(old_map, ep_rank, ep_rank_nodes):
         ep_rank=ep_rank,
         ep_rank_nodes=ep_rank_nodes,
     )
-    placement.enable_load_recording()
+    placement.enable_load_recording(
+        Mapping(
+            rank=ep_rank, world_size=len(ep_rank_nodes), moe_ep_size=len(ep_rank_nodes)
+        )
+    )
     return placement
 
 

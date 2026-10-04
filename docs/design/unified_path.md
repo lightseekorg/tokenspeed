@@ -182,6 +182,16 @@ chain: the target's rows at step 0, one row per request after; multi-depth
 MTP: the target's rows at every depth; block drafters: one forward). The
 executor never derives a drafter's step count or shape itself.
 
+Padding rows still route through the MoE layers, and under attention DP every
+rank's filler is interleaved with the real rows in the all-gathered MoE
+input. The expert load counters (`--expert-distribution-recorder-mode stat`)
+therefore read a device-side live-row mask (`ExpertLoadRowMask`, one
+`[max_rows]` bool buffer reserved before the first forward) that the graph
+owners mark from the host's padded/live counts before a padded replay — the
+decode graph in `ForwardStepRunner`, the bucket in `PrefillGraph.replay` —
+and clear right after it, on the same stream. Eager forwards are unpadded
+and read the all-True mask; the router counts a route iff its row is marked.
+
 ### Pointer-stable per-bs views from one builder
 
 Per-bs metadata objects (each leaf's `_decode_views_by_bs[bs]`, the router's
