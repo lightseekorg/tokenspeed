@@ -75,6 +75,7 @@ import torch
 from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
 from typing_extensions import override
 
+from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.forward_batch_info import (
@@ -82,6 +83,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -210,6 +212,38 @@ def _frontier_hidden_splice(
     return h.gather(1, idx).reshape(bs * k, -1)
 
 
+def _tail_row_offsets(
+    lengths: torch.Tensor, width: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(offs, rows)`` of each request's last ``width`` rows in a ragged span:
+    ``offs`` is the row's offset into its chunk (negative when the chunk is
+    shorter than the tail), ``rows`` the batch-global row (clamped at the
+    chunk's start where ``offs`` is negative)."""
+    n = lengths.shape[0]
+    lens = lengths.to(torch.int64)
+    starts = lens.cumsum(0) - lens
+    offs = (
+        lens.view(n, 1)
+        - width
+        + torch.arange(width, dtype=torch.int64, device=lengths.device).view(1, width)
+    )
+    return offs, starts.view(n, 1) + offs.clamp_min(0)
+
+
+def _blend_tail(
+    offs: torch.Tensor, new_rows: torch.Tensor, old_tail: torch.Tensor, width: int
+) -> torch.Tensor:
+    """Take ``new_rows`` where the chunk has the row, the previous tail's
+    entry where the chunk is shorter than the tail."""
+    n = offs.shape[0]
+    idx_shape = (n, width) + (1,) * (old_tail.dim() - 2)
+    expand = (n, width) + old_tail.shape[2:]
+    old_rows = old_tail.gather(
+        1, (offs + width).clamp_max(width - 1).view(idx_shape).expand(expand)
+    )
+    return torch.where((offs >= 0).view(idx_shape), new_rows, old_rows)
+
+
 def _ragged_tail_rows(
     flat: torch.Tensor,
     lengths: torch.Tensor,
@@ -231,21 +265,42 @@ def _ragged_tail_rows(
         The updated [n, width, ...] tail.
     """
     n = lengths.shape[0]
-    lens = lengths.to(torch.int64)
-    starts = lens.cumsum(0) - lens
-    offs = (
-        lens.view(n, 1)
-        - width
-        + torch.arange(width, dtype=torch.int64, device=flat.device).view(1, width)
-    )
-    rows = starts.view(n, 1) + offs.clamp_min(0)
+    offs, rows = _tail_row_offsets(lengths, width)
     new_rows = flat[rows.reshape(-1)].reshape((n, width) + flat.shape[1:])
-    idx_shape = (n, width) + (1,) * (old_tail.dim() - 2)
-    expand = (n, width) + old_tail.shape[2:]
-    old_rows = old_tail.gather(
-        1, (offs + width).clamp_max(width - 1).view(idx_shape).expand(expand)
-    )
-    return torch.where((offs >= 0).view(idx_shape), new_rows, old_rows)
+    return _blend_tail(offs, new_rows, old_tail, width)
+
+
+def _sharded_tail_contribution(
+    shard: torch.Tensor,
+    lengths: torch.Tensor,
+    width: int,
+    plan: QueryShardPlan,
+) -> torch.Tensor:
+    """This rank's part of the per-request tail rows when ``shard`` holds
+    only the rows ``plan`` assigns it: the tail rows inside the shard, read
+    at their shard-local index, and zero rows elsewhere. Summing every
+    rank's contribution (one owner per row) rebuilds the full tail, so the
+    stash is identical on every rank.
+
+    Args:
+        shard: [plan.local_rows, ...] this rank's rows of the span.
+        lengths: [n] per-request row counts over the whole span.
+        width: Tail width.
+        plan: The forward's query shard.
+
+    Returns:
+        [n, width, ...] rows, zero where another rank holds the row.
+    """
+    n = lengths.shape[0]
+    offs, rows = _tail_row_offsets(lengths, width)
+    owned = (offs >= 0) & (rows >= plan.local_start) & (rows < plan.local_end)
+    out = shard.new_zeros((n, width) + shard.shape[1:])
+    if plan.local_rows > 0:
+        local = (rows - plan.local_start).clamp(0, plan.local_rows - 1)
+        picked = shard[local.reshape(-1)].reshape(out.shape)
+        mask = owned.view((n, width) + (1,) * (shard.dim() - 1))
+        out = torch.where(mask, picked, out)
+    return out
 
 
 @dataclass
@@ -255,10 +310,15 @@ class MtpDraftInput:
     forward_mode: ForwardMode
     base_model_output: torch.Tensor  # [bs] (extend) / [bs * k] (decode verify outputs)
     accept_lengths: torch.Tensor  # [bs]
+    # The target's FULL hidden rows: the whole span, or this rank's shard of
+    # it under a query shard.
     base_out_hidden_states: torch.Tensor
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
+    # The target forward's query shard: the extend depths run the same shard
+    # of the same span; a sharded engine runs no decode rounds.
+    query_shard: QueryShardPlan | None = None
 
 
 class Mtp(BaseDrafter):
@@ -399,6 +459,11 @@ class Mtp(BaseDrafter):
         position 0: wrong-shift rewrites bounded to prompts shorter than
         k-1 tokens, draft-quality-only.
         """
+        if draft_input.query_shard is not None and draft_input.query_shard.size > 1:
+            raise RuntimeError(
+                "a query-sharded engine runs pure extend rounds; the decode window "
+                "has no shard"
+            )
         k = self.spec_num_tokens
         buffers = self.input_buffers
         slot = buffers.req_pool_indices_buf[:bs]
@@ -477,6 +542,12 @@ class Mtp(BaseDrafter):
         stash-width shift-1 ids and target hidden rows of each request's
         chunk (blending across chunk boundaries when a chunk is shorter
         than the stash).
+
+        The shift-1 ids are the whole span on every rank. Under a query
+        shard the target hiddens are this rank's rows only, so each rank
+        contributes the tail rows it holds (zeros elsewhere) and the group
+        sums them: one owner per row, so the stash is the full tail on every
+        rank, as the replicated layout has it.
         """
         width = self._stash_width
         buffers = self.input_buffers
@@ -488,9 +559,20 @@ class Mtp(BaseDrafter):
         hidden = self._stash_hidden_buf
         shift1 = buffers.shifted_prefill_ids_buf[:num_tokens]
         tokens[slot] = _ragged_tail_rows(shift1, lengths, tokens[slot], width)
-        hidden[slot] = _ragged_tail_rows(
-            draft_input.base_out_hidden_states, lengths, hidden[slot], width
+        plan = draft_input.query_shard
+        if plan is None or plan.size == 1:
+            hidden[slot] = _ragged_tail_rows(
+                draft_input.base_out_hidden_states, lengths, hidden[slot], width
+            )
+            return
+        offs, _rows = _tail_row_offsets(lengths, width)
+        contribution = _sharded_tail_contribution(
+            draft_input.base_out_hidden_states, lengths, width, plan
         )
+        full_tail = all_reduce(
+            contribution.contiguous(), self.draft_model_runner.mapping.attn.qcp_group
+        )
+        hidden[slot] = _blend_tail(offs, full_tail, hidden[slot], width)
 
     @nvtx_range("run_extend_depths", color="purple")
     def _run_extend_depths(
@@ -509,9 +591,22 @@ class Mtp(BaseDrafter):
         over the prompt region. Mid-chunk rounds run it too (their drafts
         are discarded): the point is per-depth state coverage of THIS
         chunk's rows.
+
+        Under a query shard every depth runs the target's shard of the span,
+        exactly as Eagle's step 0: the ids and positions are the shard's
+        slice of the whole-span buffers (the per-depth shifts are computed
+        over the whole span, every rank holds it), ``gather_ids`` keep the
+        full layout and the chain hiddens are the shard's rows -- the
+        target's capture in, the draft's FULL capture out.
         """
         buffers = self.input_buffers
         input_num_tokens = draft_input.input_num_tokens
+        plan = draft_input.query_shard
+        rows = (
+            slice(0, input_num_tokens)
+            if plan is None or plan.size == 1
+            else plan.local_slice
+        )
 
         # Final chunks carry a -1 placeholder in their last shift-1 row;
         # patch in the round's sampled token IN PLACE so the per-depth
@@ -533,7 +628,7 @@ class Mtp(BaseDrafter):
         extend_pre = _extend_depth_precompute(
             input_ids, input_lengths, last_row=gather_ids
         )
-        positions = buffers.positions_buf[:input_num_tokens]
+        positions = buffers.positions_buf[rows]
         # FULL per-row hiddens chain between depths; logits stay gathered.
         capture_mode = (
             CaptureHiddenMode.FULL
@@ -541,13 +636,18 @@ class Mtp(BaseDrafter):
             else CaptureHiddenMode.LAST
         )
 
-        prev_hidden = draft_input.base_out_hidden_states  # [input_num_tokens, H]
+        prev_hidden = draft_input.base_out_hidden_states  # [rows, H]
+        if prev_hidden.shape[0] != rows.stop - rows.start:
+            raise RuntimeError(
+                f"the target captured {prev_hidden.shape[0]} hidden rows for the "
+                f"drafter's {rows.stop - rows.start} extend rows"
+            )
         for d in range(self.spec_num_steps):
             step_ids = (
                 input_ids
                 if d == 0
                 else _extend_depth_shifted_ids_from(extend_pre, next_tokens, d)
-            )
+            )[rows]
 
             ctx = ForwardContext(
                 bs=bs,
@@ -562,6 +662,7 @@ class Mtp(BaseDrafter):
                 global_num_tokens=draft_input.global_num_tokens,
                 global_bs=draft_input.global_bs,
                 all_decode_or_idle=draft_input.all_decode_or_idle,
+                query_shard=plan,
             )
 
             with nvtx_range("draft_extend_forward", color="red"):
@@ -635,6 +736,7 @@ class Mtp(BaseDrafter):
             global_num_tokens=base_ctx.global_num_tokens,
             global_bs=base_ctx.global_bs,
             all_decode_or_idle=base_ctx.all_decode_or_idle,
+            query_shard=base_ctx.query_shard,
         )
 
         return self.draft(draft_input)

@@ -356,3 +356,139 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
         QueryShardPlan.from_forward(
             total_tokens=total, input_lengths=lengths, size=4, rank=1
         ).local_sampled_ids(torch.tensor([0, 1]))
+
+
+def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
+    """The multi-depth MTP drafter under a shard, every rank of a four-rank
+    group in turn: each depth's ids and positions are the shard's slice of
+    the whole-span depth ids, the draft context carries the plan and the
+    full-layout ``gather_ids``, the chain hiddens are the shard's rows, and
+    the cross-chunk stash of target hiddens -- summed from every rank's
+    owned tail rows -- equals the replicated layout's."""
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.execution.drafter import mtp
+    from tokenspeed.runtime.execution.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+
+    lengths = [4, 1, 5]
+    total, bs, steps, k, hidden = sum(lengths), 3, 3, 4, 2
+    rows = (torch.cumsum(torch.tensor(lengths), 0) - 1).tolist()
+    shifted = torch.arange(100, 100 + total, dtype=torch.int32)
+    shifted[torch.tensor(rows)] = -1
+    sampled = torch.tensor([7, 8, 9], dtype=torch.int32)
+    patched = shifted.clone()
+    patched[torch.tensor(rows)] = sampled
+    target_hidden = torch.arange(total * hidden, dtype=torch.float32).reshape(
+        total, hidden
+    )
+    old_tail = torch.full((bs, k - 1, hidden), -1.0)
+
+    def make_drafter(plan):
+        drafter = mtp.Mtp.__new__(mtp.Mtp)
+        drafter.device = "cpu"
+        drafter.spec_num_tokens = k
+        drafter.spec_num_steps = steps
+        drafter._stash_width = k - 1
+        drafter.attn_backend = None
+        drafter.token_to_kv_pool = None
+        # No draft-prob sampling: each depth takes the fused argmax.
+        drafter.draft_sampler = None
+        drafter.runtime_states = None
+        drafter.input_buffers = SimpleNamespace(
+            shifted_prefill_ids_buf=shifted.clone(),
+            input_lengths_buf=torch.tensor(lengths, dtype=torch.int32),
+            positions_buf=torch.arange(1000, 1000 + total),
+            req_pool_indices_buf=torch.tensor([2, 0, 1]),
+        )
+        drafter._stash_tokens_buf = torch.zeros(bs, k - 1, dtype=torch.int32)
+        drafter._stash_hidden_buf = old_tail.clone()[torch.tensor([1, 2, 0])]
+        drafter.draft_model_runner = SimpleNamespace(
+            mapping=SimpleNamespace(attn=SimpleNamespace(qcp_group=(0, 1, 2, 3))),
+            forward=lambda **kw: forwards.append(kw)
+            or SimpleNamespace(
+                hidden_states=kw["captured_hidden_states"] + 1,
+                next_token_ids=torch.full((bs,), 50 + kw["spec_step_idx"]),
+            ),
+        )
+        return drafter
+
+    def draft_input(plan):
+        shard = target_hidden[plan.local_slice] if plan is not None else target_hidden
+        return mtp.MtpDraftInput(
+            input_num_tokens=total,
+            num_extends=bs,
+            forward_mode=ForwardMode.EXTEND,
+            base_model_output=sampled,
+            accept_lengths=torch.ones(bs, dtype=torch.int64),
+            base_out_hidden_states=shard,
+            query_shard=plan,
+        )
+
+    # The replicated reference: whole-span ids per depth and the full stash.
+    forwards = []
+    reference = make_drafter(None)
+    monkeypatch.setattr(mtp, "all_reduce", lambda t, g: pytest.fail("no shard"))
+    reference_next = reference.draft(draft_input(None))
+    reference_ids = [f["input_ids"].clone() for f in forwards]
+    reference_stash = reference._stash_hidden_buf.clone()
+    assert len(reference_ids) == steps
+    assert torch.equal(reference_ids[0], patched)
+
+    contributions = {}
+    for rank in range(4):
+        plan = QueryShardPlan.from_forward(
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+        )
+        forwards = []
+        drafter = make_drafter(plan)
+        # The group's sum of every rank's contribution: collected here and
+        # applied once all four have run.
+        monkeypatch.setattr(
+            mtp,
+            "all_reduce",
+            lambda t, g, r=rank: contributions.setdefault(r, t.clone()),
+        )
+        next_tokens = drafter.draft(draft_input(plan))
+        assert torch.equal(next_tokens, reference_next)
+        assert len(forwards) == steps
+        for d, call in enumerate(forwards):
+            assert torch.equal(call["input_ids"], reference_ids[d][plan.local_slice])
+            assert torch.equal(
+                call["positions"], torch.arange(1000, 1000 + total)[plan.local_slice]
+            )
+            ctx = call["ctx"]
+            assert ctx.query_shard is plan and ctx.gather_ids.tolist() == rows
+            assert ctx.capture_hidden_mode is CaptureHiddenMode.FULL
+            assert call["captured_hidden_states"].shape[0] == plan.local_rows
+            torch.testing.assert_close(
+                call["captured_hidden_states"],
+                target_hidden[plan.local_slice] + d,
+                rtol=0,
+                atol=0,
+            )
+    # Every tail row has exactly one owner: the summed contributions blended
+    # with the old tail are the replicated stash.
+    summed = sum(contributions.values())
+    offs, _ = mtp._tail_row_offsets(torch.tensor(lengths), k - 1)
+    blended = mtp._blend_tail(offs, summed, old_tail, k - 1)
+    assert torch.equal(blended, reference_stash[torch.tensor([2, 0, 1])])
+    # Request 1 is one row long: two stash rows stay the old tail's.
+    assert blended[1, :2].eq(-1).all() and blended[1, 2].tolist() == [8.0, 9.0]
+    # A sharded engine runs no decode rounds.
+    with pytest.raises(RuntimeError, match="pure extend rounds"):
+        make_drafter(plan)._run_decode_depths(
+            bs,
+            torch.zeros(bs, steps + 1, dtype=torch.int32),
+            mtp.MtpDraftInput(
+                input_num_tokens=bs * k,
+                num_extends=0,
+                forward_mode=ForwardMode.DECODE,
+                base_model_output=torch.zeros(bs * k, dtype=torch.int32),
+                accept_lengths=torch.ones(bs, dtype=torch.int64),
+                base_out_hidden_states=torch.zeros(bs * k, hidden),
+                query_shard=plan,
+            ),
+        )
