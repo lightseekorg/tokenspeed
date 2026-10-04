@@ -1030,6 +1030,23 @@ class CacheGroupRouter(AttentionBackend):
         )
 
     # ------------------------------------------------------------------
+    # DSA query-shard surface: a sparse-attention model's own top-k over KVP
+    # pages reads the sharded extend's request groups and gathers each
+    # group's index-K history through the leaf (``docs/design/unified_path.md``,
+    # "Query context parallelism").
+    # ------------------------------------------------------------------
+
+    def require_query_shard_metadata(self):
+        return self._sole_leaf(
+            "require_query_shard_metadata"
+        ).require_query_shard_metadata()
+
+    def gather_history_index_k(self, layer_id: int, token_to_kv_pool, group):
+        return self._sole_leaf("gather_history_index_k").gather_history_index_k(
+            layer_id, token_to_kv_pool, group
+        )
+
+    # ------------------------------------------------------------------
     # DSA KPool surface (GLM-5.3-Flash): the model drives the leaf's pooled
     # indexing runtime through the router.
     # ------------------------------------------------------------------
