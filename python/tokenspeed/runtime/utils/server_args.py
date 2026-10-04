@@ -63,9 +63,9 @@ SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full"})
 
 # Usable range of --spec-reject-draft-prob-threshold. The sentinel rows are
 # written as threshold + 1.0 in fp32 and detected by ``draft_prob > threshold``:
-# below 1.0 a real probability would read as the sentinel, and from 2**23 on
-# fp32 (24 significand bits) can no longer resolve the + 1.0; 2**20 leaves a
-# wide margin, and nothing is gained from a larger sentinel.
+# below 1.0 a real probability would read as the sentinel, and from 2**24 on
+# fp32 (24 significand bits, ulp 2.0 there) can no longer resolve the + 1.0;
+# 2**20 leaves a wide margin, and nothing is gained from a larger sentinel.
 SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN = 1.0
 SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX = float(1 << 20)
 

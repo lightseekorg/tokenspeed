@@ -503,34 +503,62 @@ def test_propose_samples_rows_by_request_and_records_q(monkeypatch):
     assert torch.equal(call["offsets"], expected_offsets)
 
 
-def test_propose_degrades_an_all_nan_row_to_a_junk_draft(monkeypatch):
+def test_propose_records_a_non_finite_row_as_no_proposal(monkeypatch):
     # The argmax kernel marks an all-NaN row with -1 (a device assert as a
     # scatter index) and the Gumbel kernel resolves it to vocab_size (out of
     # range for the hot-token map and the verify gather). Both are clamped
-    # into the vocab; the row's q is NaN, which coin * q < p rejects.
+    # into the vocab, and the row records the sentinel: verify then rejects
+    # the token and samples from the full target, as for an unrecorded slot.
+    # A NaN q would also be rejected but would poison the residual
+    # relu(p - q), and NaN * 0 would survive the greedy one-hot.
     top_k = [1 << 30] * (POOL + 1)
     top_k[2] = 1  # a greedy NaN row too
     sampler, states, buffers, _, _ = _draft_sampler(
         monkeypatch, top_k_rows=top_k, temperatures=[1.0] * (POOL + 1)
     )
-    slots = torch.tensor([1, 2, 3], dtype=torch.int64)
-    buffers.req_pool_indices_buf[:3] = slots
-    buffers.state_write_req_pool_indices_buf[:3] = slots
-    logits = torch.randn(3, VOCAB)
+    slots = torch.tensor([1, 2, 3, 0], dtype=torch.int64)
+    buffers.req_pool_indices_buf[:4] = slots
+    buffers.state_write_req_pool_indices_buf[:4] = slots
+    logits = torch.randn(4, VOCAB)
     logits[0] = float("nan")
     logits[1] = float("nan")
+    logits[3, 2] = float("inf")  # softmax overflows to NaN
 
     tokens = sampler.propose(logits, step=0)
 
-    assert tokens.shape == (3,) and tokens.dtype == torch.int32
+    assert tokens.shape == (4,) and tokens.dtype == torch.int32
     assert tokens[0].item() == VOCAB - 1  # the sampled NaN row, clamped in range
     assert tokens[1].item() == 0  # the greedy NaN row, clamped from -1
     assert 0 <= tokens[2].item() < VOCAB
     probs = states.draft_probs
-    assert torch.isnan(probs[1, 0]).all()
-    # The greedy NaN row's one-hot landed on column 0 instead of asserting.
-    assert torch.isnan(probs[2, 0]).all()
+    sentinel = torch.full((VOCAB,), states.draft_probs_sentinel)
+    assert torch.equal(probs[1, 0], sentinel)
+    assert torch.equal(probs[2, 0], sentinel)
+    assert torch.equal(probs[0, 0], sentinel)
+    assert torch.isfinite(probs).all()
     torch.testing.assert_close(probs[3, 0], torch.softmax(logits[2], -1))
+
+
+def test_propose_sentinel_covers_only_the_mapped_hot_token_columns(monkeypatch):
+    vocab_map = torch.tensor([5, 2, 7], dtype=torch.int32)
+    sampler, states, buffers, _, _ = _draft_sampler(
+        monkeypatch,
+        top_k_rows=[1 << 30] * (POOL + 1),
+        temperatures=[1.0] * (POOL + 1),
+        vocab_map=vocab_map,
+    )
+    buffers.req_pool_indices_buf[:1] = 2
+    buffers.state_write_req_pool_indices_buf[:1] = 2
+    logits = torch.full((1, 3), float("nan"))
+
+    tokens = sampler.propose(logits, step=1)
+
+    # The draw is clamped into the draft vocab, so the hot-token map is in range.
+    assert tokens.item() == 2
+    row = states.draft_probs[2, 1]
+    expected = torch.zeros(VOCAB)
+    expected[vocab_map.long()] = states.draft_probs_sentinel
+    assert torch.equal(row, expected)
 
 
 def test_propose_scatters_a_hot_token_vocab_through_persistent_buffers(monkeypatch):

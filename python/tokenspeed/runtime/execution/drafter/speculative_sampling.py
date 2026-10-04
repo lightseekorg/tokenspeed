@@ -97,6 +97,7 @@ class DraftProposalSampler:
             )
         self._pools = pools
         self._draft_probs = runtime_states.draft_probs
+        self._sentinel = runtime_states.draft_probs_sentinel
         self._valid_cache_lengths = runtime_states.valid_cache_lengths
         self._req_pool_indices_buf = input_buffers.req_pool_indices_buf
         self._state_write_req_pool_indices_buf = (
@@ -165,13 +166,21 @@ class DraftProposalSampler:
 
         # q at the request's temperature, fp32 like the verifier's target probs.
         q = softmax(logits, temperature=temperature.view(-1, 1))
+        # A row whose logits give no finite distribution (all NaN, or an
+        # overflow) proposes nothing: it is recorded as the sentinel below.
+        no_proposal = ~torch.isfinite(q).all(dim=1, keepdim=True)
         # The argmax kernel marks an all-NaN row with -1; clamp it to a real
-        # column so the one-hot scatter below stays in bounds and the row
-        # degrades to a junk draft the verify rejects, not a device assert.
+        # column so the one-hot scatter below stays in bounds.
         canonical = sampling_argmax(logits).to(torch.int64).clamp_min_(0).view(-1, 1)
         # Greedy rows: one-hot at the canonical argmax, so verify stays exact.
-        q.mul_((~greedy_rows).to(q.dtype))
+        # masked_fill_, not a multiply by 0: NaN * 0 is NaN.
+        q.masked_fill_(greedy_rows, 0.0)
         q.scatter_add_(1, canonical, greedy_rows.to(q.dtype))
+        # Verify reads the sentinel as "no proposal": it rejects the token
+        # and samples from the full target, as for an unrecorded slot. A NaN
+        # q would also fail coin * q < p, but then poison the residual
+        # relu(p - q) the replacement token is drawn from.
+        q.masked_fill_(no_proposal, self._sentinel)
 
         # Gumbel-max over logits / T draws exactly Categorical(q); the noise is
         # keyed by the request's seed and this (round, step) offset.
@@ -192,7 +201,7 @@ class DraftProposalSampler:
         )
         # An all-NaN row has no maximum; the kernel resolves it to the first
         # masked column (vocab_size). Keep the id a real column so the hot-token
-        # map and the verify gather stay in bounds; the NaN q rejects it anyway.
+        # map and the verify gather stay in bounds; its sentinel q rejects it.
         sampled.clamp_(0, logits.shape[1] - 1)
         tokens = torch.where(
             greedy_rows.view(-1), canonical.view(-1).to(sampled.dtype), sampled

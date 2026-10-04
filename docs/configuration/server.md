@@ -263,8 +263,10 @@ Known limits, kept as in the reference engine for now: a landed PD request's
 first verify always rejects its shipped candidates (sentinel rows) rather than
 verifying them target-only, and the verifier gathers the full `[bs, N, vocab]`
 block of recorded rows per step instead of only the entries the accept test
-reads. A draft step whose logits are all NaN proposes a junk token and records
-a NaN `q`, which the accept test rejects; it never raises a device error.
+reads. A draft step whose logits give no finite distribution (all NaN, or an
+overflow) proposes a junk token and records the sentinel for that row, so
+verify rejects the token and samples from the full target; it never raises a
+device error.
 
 Memory: the recorded distributions take
 `(max_num_seqs + 2) x num_draft_tokens x vocab_size x 4` bytes
