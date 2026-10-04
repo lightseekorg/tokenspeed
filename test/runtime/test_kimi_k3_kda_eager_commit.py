@@ -162,7 +162,7 @@ class _Harness:
         self.prepare_metadata(rpis, pages, seq_lens)
         self.forward(self.inputs(bs, seed), bs)
         self.backend.commit_verified_state(
-            torch.tensor(accepted, dtype=torch.int32, device=DEV)
+            torch.tensor(accepted, dtype=torch.int32, device=DEV), accepted_path=None
         )
 
 
@@ -297,8 +297,8 @@ def test_direct_committed_read_matches_seeded_verify_and_commit_bitwise():
             )
 
     accepted = torch.tensor([1, T, 2], dtype=torch.int32, device=DEV)
-    direct.backend.commit_verified_state(accepted)
-    seeded.backend.commit_verified_state(accepted)
+    direct.backend.commit_verified_state(accepted, accepted_path=None)
+    seeded.backend.commit_verified_state(accepted, accepted_path=None)
     torch.cuda.synchronize()
     for layer_id in direct.layer_ids:
         for component in ("conv_state", "recurrent_state"):
@@ -389,8 +389,8 @@ def test_packed_qkv_views_match_materialized_split_across_commits():
             assert torch.equal(viewed_state[write_rows], materialized_state[write_rows])
 
         accepted_tensor = torch.tensor(accepted, dtype=torch.int32, device=DEV)
-        viewed.backend.commit_verified_state(accepted_tensor)
-        materialized.backend.commit_verified_state(accepted_tensor)
+        viewed.backend.commit_verified_state(accepted_tensor, accepted_path=None)
+        materialized.backend.commit_verified_state(accepted_tensor, accepted_path=None)
         torch.cuda.synchronize()
         for viewed_layer in viewed.layer_ids:
             for component in ("conv_state", "recurrent_state"):
@@ -494,11 +494,11 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
             stable_inputs[name].copy_(value)
         accepted_source.copy_(torch.tensor(accepted, dtype=torch.int32, device=DEV))
         graph.replay()
-        captured.backend.commit_verified_state(stable_accepted)
+        captured.backend.commit_verified_state(stable_accepted, accepted_path=None)
 
         eager.prepare_metadata(rpis, pages, seq_lens)
         eager.forward(replay_inputs, bs)
-        eager.backend.commit_verified_state(stable_accepted)
+        eager.backend.commit_verified_state(stable_accepted, accepted_path=None)
         torch.cuda.synchronize()
         _assert_committed_pages_equal(captured, eager, pages)
         seq_lens = [length + count for length, count in zip(seq_lens, accepted)]
@@ -530,7 +530,7 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
     graph.replay()  # Deliberately omit commit_verified_state.
     eager.prepare_metadata(rpis, pages, seq_lens)
     eager.forward(replay_inputs, bs)
-    eager.backend.commit_verified_state(stable_accepted)
+    eager.backend.commit_verified_state(stable_accepted, accepted_path=None)
     torch.cuda.synchronize()
     with pytest.raises(AssertionError):
         _assert_committed_pages_equal(captured, eager, pages)

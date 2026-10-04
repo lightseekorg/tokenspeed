@@ -157,6 +157,7 @@ def _fused_gdn_decode_update_kernel(
     output_state_indices,
     intermediate_states_buffer,
     per_token_output_state_indices,
+    parent_indices,
     scale,
     T,
     H: tl.constexpr,
@@ -170,6 +171,8 @@ def _fused_gdn_decode_update_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
     HAS_PER_TOKEN_OUTPUT_STATE_INDICES: tl.constexpr,
+    HAS_PARENT_INDICES: tl.constexpr,
+    T_BLOCK: tl.constexpr,
     Q_STRIDES: tl.constexpr,
     K_STRIDES: tl.constexpr,
     V_STRIDES: tl.constexpr,
@@ -192,7 +195,8 @@ def _fused_gdn_decode_update_kernel(
     - HAS_OUTPUT_STATE_INDICES: after the LAST processed step, write to the
       single row ``output_state_indices[i_n]`` (``[B]``-shaped; T=1 decode's
       dual-index paging remap).
-    - CACHE_INTERMEDIATE_STATES: after EVERY step, write to the batch-scoped
+    - CACHE_INTERMEDIATE_STATES: after EVERY step (every branch point under
+      HAS_PARENT_INDICES), write to the batch-scoped
       ``intermediate_states_buffer[i_n, step]`` (``[B, T, HV, V, K]``,
       K-last -- matches flashinfer's MTP intermediate-state-buffer convention).
     - HAS_PER_TOKEN_OUTPUT_STATE_INDICES: after EVERY step, write directly to
@@ -200,6 +204,14 @@ def _fused_gdn_decode_update_kernel(
       matching FlashInfer 0.6.15's ``ssm_state_indices`` contract.
     DISABLE_STATE_UPDATE additionally gates a final write-back to
     ``h0_indices[i_n]`` (the read row) when neither of the above applies.
+
+    HAS_PARENT_INDICES (draft trees, with per-token output rows or the
+    intermediate buffer): step t continues from the state after step
+    ``parent_indices[i_n, t]`` (the initial state when negative) instead of
+    step t - 1, reloading it from that step's output row or intermediate-buffer
+    entry when the parent is not t - 1. The intermediate buffer then receives
+    only the branch points' states (steps with a child other than the next
+    step), the only entries a later step reloads.
     """
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -242,16 +254,82 @@ def _fused_gdn_decode_update_kernel(
         )
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
+    if HAS_PARENT_INDICES and CACHE_INTERMEDIATE_STATES:
+        nodes = tl.arange(0, T_BLOCK)
+        parents = tl.load(parent_indices + i_n * T + nodes, mask=nodes < T, other=-1)
+
+    # Prefetch the next step's operands to overlap the current state update.
+    b_A_log = tl.load(p_A_log).to(tl.float32)
+    b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+    n_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
+    n_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
+    n_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
+    n_b = tl.load(p_b).to(tl.float32)
+    n_a = tl.load(p_a).to(tl.float32)
     for step_idx in range(0, T):
-        b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
-        b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-        b_b = tl.load(p_b).to(tl.float32)
-
-        b_A_log = tl.load(p_A_log).to(tl.float32)
-        b_a = tl.load(p_a).to(tl.float32)
-        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
-
+        b_q = n_q
+        b_k = n_k
+        b_v = n_v
+        b_b = n_b
+        b_a = n_a
+        has_next = step_idx + 1 < T
+        n_q = tl.load(p_q + Q_STRIDES[1], mask=mask_k & has_next, other=0).to(
+            tl.float32
+        )
+        n_k = tl.load(p_k + K_STRIDES[1], mask=mask_k & has_next, other=0).to(
+            tl.float32
+        )
+        n_v = tl.load(p_v + V_STRIDES[1], mask=mask_v & has_next, other=0).to(
+            tl.float32
+        )
+        n_b = tl.load(p_b + B_STRIDES[1], mask=has_next, other=0).to(tl.float32)
+        n_a = tl.load(p_a + A_STRIDES[1], mask=has_next, other=0).to(tl.float32)
+        if HAS_PARENT_INDICES:
+            parent = tl.load(parent_indices + i_n * T + step_idx)
+            if parent != step_idx - 1:
+                # The parent's row was written by this program over the same tile.
+                tl.debug_barrier()
+                if CACHE_INTERMEDIATE_STATES:
+                    # Replay verify: node states live in the intermediate buffer only.
+                    if parent < 0:
+                        p_parent = (
+                            h0_source
+                            + idx * HV * V * K
+                            + i_hv * V * K
+                            + o_v[None, :] * K
+                            + o_k[:, None]
+                        )
+                        b_h = tl.load(p_parent, mask=mask_h & (idx >= 0), other=0).to(
+                            tl.float32
+                        )
+                    else:
+                        p_parent = (
+                            intermediate_states_buffer
+                            + ((i_n * T + parent).to(tl.int64) * HV + i_hv) * V * K
+                            + o_v[None, :] * K
+                            + o_k[:, None]
+                        )
+                        b_h = tl.load(p_parent, mask=mask_h, other=0).to(tl.float32)
+                else:
+                    row = tl.where(
+                        parent < 0,
+                        idx,
+                        tl.load(
+                            per_token_output_state_indices
+                            + i_n * T
+                            + tl.maximum(parent, 0)
+                        ).to(tl.int64),
+                    )
+                    p_parent = (
+                        h0_source
+                        + row * HV * V * K
+                        + i_hv * V * K
+                        + o_v[None, :] * K
+                        + o_k[:, None]
+                    )
+                    b_h = tl.load(p_parent, mask=mask_h & (row >= 0), other=0).to(
+                        tl.float32
+                    )
         x = b_a + b_dt_bias
         beta_x = softplus_beta * x
         softplus_x = tl.where(
@@ -278,11 +356,16 @@ def _fused_gdn_decode_update_kernel(
         if CACHE_INTERMEDIATE_STATES:
             cache_ptr = (
                 intermediate_states_buffer
-                + ((i_n * T + step_idx) * HV + i_hv) * V * K
+                + ((i_n * T + step_idx).to(tl.int64) * HV + i_hv) * V * K
                 + o_v[None, :] * K
                 + o_k[:, None]
             )
-            tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
+            if HAS_PARENT_INDICES:
+                child = (parents == step_idx) & (nodes > step_idx + 1)
+                if tl.max(child.to(tl.int32), axis=0) != 0:
+                    tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
+            else:
+                tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
         if HAS_PER_TOKEN_OUTPUT_STATE_INDICES:
             out_idx = tl.load(per_token_output_state_indices + i_n * T + step_idx).to(
@@ -349,6 +432,7 @@ def _launch_fused_gdn_decode_update(
     output_state_indices: torch.Tensor | None,
     intermediate_states_buffer: torch.Tensor | None,
     per_token_output_state_indices: torch.Tensor | None,
+    parent_indices: torch.Tensor | None,
 ) -> torch.Tensor:
     """Shared launcher for the ``gdn_decode_step`` (T=1) / ``gdn_decode_mtp``
     (T>1) Triton fallback kernels. q/k: [B, T, H, K]; v: [B, T, HV, V]; a/b:
@@ -364,7 +448,10 @@ def _launch_fused_gdn_decode_update(
 
     o = q.new_empty(B, T, HV, V)
 
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    # Serial tree verify needs narrow V tiles for parallelism; chains keep BV=32.
+    BK, BV = triton.next_power_of_2(K), min(
+        triton.next_power_of_2(V), 8 if parent_indices is not None else 32
+    )
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
 
@@ -385,6 +472,7 @@ def _launch_fused_gdn_decode_update(
         output_state_indices=output_state_indices,
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=per_token_output_state_indices,
+        parent_indices=parent_indices,
         scale=scale,
         T=T,
         H=H,
@@ -398,6 +486,8 @@ def _launch_fused_gdn_decode_update(
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
         HAS_PER_TOKEN_OUTPUT_STATE_INDICES=(per_token_output_state_indices is not None),
+        HAS_PARENT_INDICES=parent_indices is not None,
+        T_BLOCK=1 if parent_indices is None else triton.next_power_of_2(T),
         Q_STRIDES=q.stride(),
         K_STRIDES=k.stride(),
         V_STRIDES=v.stride(),
@@ -458,6 +548,7 @@ def triton_gdn_decode_step(
         output_state_indices=output_state_indices,
         intermediate_states_buffer=None,
         per_token_output_state_indices=None,
+        parent_indices=None,
     )
 
 
@@ -488,6 +579,7 @@ def triton_gdn_decode_mtp(
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
+    parent_indices: torch.Tensor | None,
 ) -> torch.Tensor:
     """Portable Triton fallback for ``gdn_decode_mtp`` (see
     ``flashinfer/gated_delta_rule.py`` for the shared contract). Supports both
@@ -510,6 +602,7 @@ def triton_gdn_decode_mtp(
         output_state_indices=None,
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=output_state_indices,
+        parent_indices=parent_indices,
     )
 
 

@@ -165,7 +165,7 @@ jobs:
     secrets: inherit
 
   model-test:
-    needs: [scan, unit-test, kernel-benchmark]
+    needs: [scan, unit-test]
     if: |
       !cancelled() &&
       needs.scan.result == 'success' &&
@@ -175,10 +175,6 @@ jobs:
       (
         needs.unit-test.result == 'success' ||
         needs.scan.outputs.unit_has_tasks != 'true'
-      ) &&
-      (
-        needs.kernel-benchmark.result == 'success' ||
-        needs.scan.outputs.kernel_benchmark_has_tasks != 'true'
       ) &&
       needs.scan.outputs.model_has_tasks == 'true'
     uses: ./.github/workflows/run-ci-task-matrix.yml

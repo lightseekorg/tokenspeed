@@ -315,6 +315,34 @@ def test_hybrid_composite_forwards_advance_to_full_attn_child():
     assert torch.equal(full.decode_seq_lens_buffer[:4], seq_lens)
 
 
+def test_hybrid_composite_forwards_every_draft_length_hook_to_full_attn_child():
+    """The MTP frontier re-anchor and the block drafter's in-graph seq_lens
+    reach the full-attention router through the composite, like the Eagle
+    advance does; the composite's base class would otherwise swallow them."""
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
+
+    router = SimpleNamespace(
+        update_draft_forward_metadata=Mock(),
+        fill_block_decode_seq_lens=Mock(),
+    )
+    hybrid = object.__new__(HybridLinearAttnBackend)
+    hybrid.full_attn_backend = router
+    hybrid.linear_attn_backend = None
+
+    frontier = torch.tensor([7, 3], dtype=torch.int32)
+    block_seq_lens = torch.tensor([9, 5, -1], dtype=torch.int32)
+    hybrid.update_draft_forward_metadata(frontier)
+    hybrid.fill_block_decode_seq_lens(2, block_seq_lens)
+
+    router.update_draft_forward_metadata.assert_called_once_with(frontier)
+    router.fill_block_decode_seq_lens.assert_called_once_with(2, block_seq_lens)
+
+
 # Step 0: the drafter publishes the accepted frontier (vc + N -> vc + a); the
 # model only names the moment.
 

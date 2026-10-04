@@ -28,7 +28,42 @@ catch-up, frontier-anchored decode windows, the cross-round drafter stash).
 Eagle-like MTP (MTP-Eagle: a single MTP layer chained on its own hidden,
 e.g. DeepSeek) stays in ``eagle.py``. Both register under
 ``--speculative-algorithm MTP``; ``ModelExecutor`` routes multi-depth
-draft model classes to this drafter (see ``get_drafter_impl``).
+draft model classes to this drafter (see ``get_drafter_impl``; an
+out-of-tree draft opts in with
+``register_drafter("MTP", Mtp, model_cls=...)``).
+
+Draft model contract
+--------------------
+
+A draft model served by this drafter implements:
+
+* ``forward(ctx, input_ids, positions, input_embeds=None,
+  captured_hidden_states=None, spec_step_idx=0, **kwargs)`` returning a
+  ``LogitsProcessorOutput`` whose ``hidden_states`` carries the FULL
+  per-row post-depth hidden (the next depth's chain input). ``spec_step_idx``
+  must be a named parameter: ``ModelRunner`` forwards it only to a
+  ``forward`` whose signature declares it (``**kwargs`` alone does not
+  count), and a model without it would silently run depth 0 for every step.
+  ``ForwardMode.IDLE`` with zero rows (``captured_hidden_states=None``) must
+  run the model's collectives without attention — that is what an idle
+  attention-DP rank calls.
+* ``num_mtp_layers``: the number of depth layers built. Depth selection is
+  ``layers[spec_step_idx % num_mtp_layers]`` and depth ``d`` writes its KV
+  to the draft cache layer ``d`` (per-depth planes, cache layer ids
+  ``0..N-1``), so a step count above it would wrap onto plane 0 and
+  overwrite it; ``Mtp`` refuses ``num_mtp_layers < spec_num_steps`` at
+  construction.
+* Every input row flows through the depth's MoE / dense collectives (there
+  is no per-request narrowing: the decode window is ``k`` rows per request
+  at every depth), so the model keeps the default collective sizing and
+  does NOT report ``global_bs`` through ``report_collective_sizing`` the
+  way the Eagle-chain heads do.
+* ``get_embed_and_head()`` / ``set_embed_and_head(embed, head)``: the
+  embedding and LM head are shared from the target
+  (``shares_target_embed_head``); a draft needing a request-token-history
+  view is refused at startup (``supports_request_token_history``).
+* ``checkpoint_weight_name_filter(name)`` plus ``load_weights`` mapping the
+  checkpoint's per-depth tensors onto ``layers[d]``.
 """
 
 from __future__ import annotations
@@ -230,9 +265,19 @@ class MtpDraftInput:
 class Mtp(BaseDrafter):
     """
     Draft model runner for original multi-depth MTP heads.
+
+    Attention DP: every depth on an active rank runs the target's rows of
+    that round (the ``k``-window per decode request, the prompt chunk's rows
+    on extend), so each depth's collectives are sized by the target's
+    ``global_num_tokens``; an idle rank mirrors that with ``spec_num_steps``
+    IDLE forwards (:meth:`idle_forward_global_num_tokens`). PD layerwise
+    transfer: ``run`` returns only after every depth's forward — and so its
+    KV write to the depth's plane — is enqueued on the caller's stream, so
+    the executor's draft-final cache step publishes the complete chain.
     """
 
     shares_target_embed_head = True
+    supports_pd_layerwise_finalization = True
 
     def __init__(
         self,
@@ -259,14 +304,25 @@ class Mtp(BaseDrafter):
 
         self.device = draft_model_runner.device
 
-        # Multi-depth drafting has no DP support: idle rounds (a DP rank
-        # keeping collectives in sync with no work of its own) have no
-        # window to run.
-        dp_size = draft_model_runner.mapping.attn.dp_size
-        if dp_size > 1:
-            raise NotImplementedError(
-                "multi-depth MTP drafting does not support data parallelism "
-                f"(dp_size={dp_size})"
+        # Depth selection rides on spec_step_idx, which ModelRunner forwards
+        # only to a forward that declares it: a draft without the parameter
+        # would run depth 0 at every step and draft silently wrong tokens.
+        model_name = type(draft_model_runner.model).__name__
+        if not draft_model_runner.forward_accepts_spec_step_idx:
+            raise TypeError(
+                f"{model_name}.forward must declare spec_step_idx: the "
+                "multi-depth MTP drafter selects depth d by passing "
+                "spec_step_idx=d (see the drafter module docstring)"
+            )
+        # Depth d writes cache plane d; a step past the last depth would wrap
+        # (layers[d % num_mtp_layers]) and overwrite plane 0 with a later
+        # step's KV.
+        num_mtp_layers = int(draft_model_runner.model.num_mtp_layers)
+        if num_mtp_layers < spec_num_steps:
+            raise ValueError(
+                f"{model_name} builds {num_mtp_layers} MTP depth layer(s) but "
+                f"--speculative-num-steps {spec_num_steps} runs one depth per "
+                "step: the step count must not exceed the draft's depth count"
             )
 
         # Drafter-owned seq_lens the CUDA-graph wrapper aliases into every
@@ -308,6 +364,15 @@ class Mtp(BaseDrafter):
             dtype=model_config.dtype,
             device=self.device,
         )
+
+    @override
+    def idle_forward_global_num_tokens(
+        self, global_num_tokens: list[int], global_bs: list[int]
+    ) -> list[list[int]]:
+        # Every depth re-runs the target's rows (the k-window per decode
+        # request, the prompt chunk on extend) — never one row per request.
+        del global_bs
+        return [global_num_tokens] * self.spec_num_steps
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -523,7 +588,6 @@ class Mtp(BaseDrafter):
     # Public entry point (type-based dispatch from ModelExecutor)
     # ------------------------------------------------------------------
 
-    @override
     @override
     def draft(
         self,

@@ -123,6 +123,7 @@ class NemotronHForCausalLMNextN(nn.Module):
         self.eh_proj = ReplicatedLinear(
             2 * hidden, hidden, bias=False, prefix="mtp.layers.0.eh_proj"
         )
+        alt_stream = torch.cuda.Stream()
         self.layers = nn.ModuleList(
             NemotronHBlock(
                 config,
@@ -132,6 +133,7 @@ class NemotronHForCausalLMNextN(nn.Module):
                 config.num_hidden_layers + i,
                 None,
                 f"mtp.layers.{i}",
+                alt_stream,
             )
             for i, block_type in enumerate(block_types)
         )

@@ -442,7 +442,9 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
             # Both rounds must commit even without another host-side staging call.
             graph.replay()
         backend.commit_speculative_state_after_verify(
-            torch.tensor(accepted, dtype=torch.int32, device="cuda"), num_extends=0
+            torch.tensor(accepted, dtype=torch.int32, device="cuda"),
+            num_extends=0,
+            accepted_path=None,
         )
         assert state._verify_workspace is workspace
         source_cpu = source.cpu()
@@ -481,7 +483,7 @@ def test_qsa_only_target_verification_creates_state(
     with pytest.raises(RuntimeError, match="speculative target"):
         backend.verify_staging_buffers(1, 2)
     root.commit_speculative_state_after_verify(
-        torch.tensor([3, 1], dtype=torch.int32), num_extends=0
+        torch.tensor([3, 1], dtype=torch.int32), num_extends=0, accepted_path=None
     )
     assert commit_calls == []
 

@@ -115,8 +115,10 @@ perf:
 report:
   github_step_summary: true
 perf_threshold: 0.9
-# Values are [Latency (tps/user), Throughput (tps/gpu)]. Rounded down from the
-# median of three consecutive 8x MI350X TP8/EP1 runs. They measured
-# 22.38-24.39 tps/user and 12.33-13.13 tps/GPU at 50K/500, concurrency 16.
+# Values are [Latency (tps/user), Throughput (tps/gpu)]. 8x MI350X runs at
+# #1932, #1923, #1914, #1885, #1944 and #1948 measured (53.79/16.16,
+# 63.86/16.23, 75.53/14.93, 67.11/14.74, 68.21/16.03, 57.01/15.27), with
+# medians 65.49 / 15.65. Both references sit below the medians to absorb the
+# run-to-run variance, which is especially wide for latency.
 perf_reference:
-  16: [23, 12.5]
+  16: [60, 15]

@@ -208,6 +208,7 @@ def _load_builtin_generators() -> None:
         prepare_moe_apply,
         prepare_sigmoid_bias_topk,
     )
+    from tokenspeed_kernel.benchmark.generators.residual import prepare_attn_res_fwd
 
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kda_paged_decode"), prepare_kda_paged_decode
@@ -253,6 +254,7 @@ def _load_builtin_generators() -> None:
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "mla_extend_with_kvcache"), prepare_mla_extend
     )
+    _BENCHMARK_GENERATORS.setdefault(("residual", "attn_res_fwd"), prepare_attn_res_fwd)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "decode_gemv"), prepare_decode_gemv)

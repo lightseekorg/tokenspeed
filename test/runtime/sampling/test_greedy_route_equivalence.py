@@ -228,6 +228,7 @@ def test_verify_top_k1_equals_greedy_chain(backend_name):
         _logits_output(logits.clone()),
         _sampling_info(req_pool_indices),
         candidates,
+        tree=None,
     )
 
     ref_predict, ref_accept = _chain_greedy_reference(

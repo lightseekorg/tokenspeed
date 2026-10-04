@@ -155,6 +155,7 @@ def test_verify_reads_decode_rows_own_coins():
             LogitsProcessorOutput(next_token_logits=logits),
             decode_info,
             candidates,
+            tree=None,
         )
     finally:
         fi.chain_speculative_sampling_target_only = original
