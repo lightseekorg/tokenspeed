@@ -75,10 +75,11 @@ class MooncakeKVManagerBase(DisaggManagerBase):
 
     def register_buffer_to_engine(self):
         layout = self.kv_args.cache_layout
-        self.engine.register(
-            self.kv_args.kv_data_ptr,
-            layout.plan.arena_bytes,
+        regions = self.kv_args.registration_regions or (
+            (self.kv_args.kv_data_ptr, layout.plan.arena_bytes),
         )
+        for pointer, size in regions:
+            self.engine.register(pointer, size)
 
 
 class MooncakeKVBootstrapServer(DisaggBootstrapServerBase):

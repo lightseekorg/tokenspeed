@@ -110,6 +110,7 @@ def dsa_decode(
     override: str | None = None,
     solution: str | None = None,
     kv_seq_lens: torch.Tensor | None = None,
+    topk_order_keys: torch.Tensor | None = None,
 ) -> AttentionResult:
     """Sparse DSA decode over selected global KV slots.
 
@@ -123,6 +124,9 @@ def dsa_decode(
             entries are -1.
         topk_lens: Valid selected-slot count per token, or None when the
             implementation relies on -1 padding.
+        topk_order_keys: Optional original slot IDs for an implementation that
+            canonicalizes the selection. Paired elementwise with relocated
+            topk_slots; the implementation must support this input explicitly.
         max_seqlen_k: Maximum dense visible context length for this batch.
         qk_nope_head_dim: Original non-RoPE q/k dimension.
         kv_lora_rank: MLA latent rank and output head dimension.
@@ -188,6 +192,7 @@ def dsa_decode(
     ShapeCapture.get().record(
         "attention", "dsa_decode", kernel.name, q.dtype, shape_params
     )
+    ordering = {} if topk_order_keys is None else {"topk_order_keys": topk_order_keys}
     with kernel_scope(
         "attention", "dsa_decode", q.dtype, kernel_name=kernel.name, **shape_params
     ):
@@ -210,6 +215,7 @@ def dsa_decode(
             return_lse=return_lse,
             out=out,
             enable_pdl=pdl_enabled(),
+            **ordering,
         )
 
 

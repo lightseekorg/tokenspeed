@@ -118,6 +118,7 @@ def _recipe(*, dcp_size: int, fp4: bool, draft: bool) -> DeepseekV4Recipe:
     )
     return DeepseekV4Recipe(
         server_args=SimpleNamespace(
+            kv_offload_config=None,
             max_total_tokens=None,
             chunked_prefill_size=8192,
             disaggregation_mode="null",

@@ -777,9 +777,12 @@ def _kv_pool_bytes(*pools) -> int:
     in the target's arena), so counting both naively would double the KV.
     Dedupe by arena identity -- the allocation each view reports on.
 
-    Return types differ (int, or a tuple like MSA's (kv, index); a hybrid pool
-    may nest several) -- sum any numeric leaves.
+    Arena-backed pools report actual device allocations, including residency
+    workspace and excluding authoritative host history. Legacy pools may
+    report nested numeric totals.
     """
+    from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+
     seen: set[int] = set()
     total = 0
     for pool in pools:
@@ -789,6 +792,9 @@ def _kv_pool_bytes(*pools) -> int:
         if id(arena) in seen:
             continue
         seen.add(id(arena))
+        if isinstance(arena, CacheArena):
+            total += arena.allocated_device_bytes
+            continue
         getter = getattr(pool, "get_kv_size_bytes", None)
         if getter is None:
             continue

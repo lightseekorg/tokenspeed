@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import torch
@@ -486,6 +487,7 @@ class DSABackend(PagedAttentionBackend):
         bs: int,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
+        topk_order_keys: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
@@ -497,6 +499,7 @@ class DSABackend(PagedAttentionBackend):
                 bs=bs,
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
+                topk_order_keys=topk_order_keys,
             )
         if len(self.dcp_group) > 1:
             raise ValueError("Sharded DSA decode requires global top-k selection")
@@ -525,6 +528,7 @@ class DSABackend(PagedAttentionBackend):
         topk_slots: torch.Tensor,
         topk_lens: torch.Tensor,
         max_seq_len: int,
+        kv_tiles: Iterator[tuple[slice, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         """Attend to preselected global KV slots and merge DCP partials.
 
@@ -532,6 +536,11 @@ class DSABackend(PagedAttentionBackend):
         entries; topk_lens gives valid counts. kv_seq_lens optionally supplies
         per-query causal lengths, bounded by max_seq_len. KV is already written.
         Returns token-major attention output, flattened over heads and features.
+        KV offloading recovery supplies kv_tiles as bounded GPU staging views.
+        Advancing that iterator first flushes the projected chunk to Host,
+        then gathers selected history. Consume each (slice, slots) on the
+        execution stream before advancing again and reusing the KV storage.
+        Without kv_tiles, topk_slots directly addresses ordinary device KV.
         """
         if layer.logit_cap and layer.logit_cap > 0:
             self._validate_logit_cap(layer.logit_cap)
@@ -576,28 +585,43 @@ class DSABackend(PagedAttentionBackend):
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
             topk_slots = torch.where(owned, slots, -1)
             q_view = gather_query_heads(q_view, self.dcp_group)
-        out = dsa_prefill(
-            q=q_view,
-            kv_cache=kv_cache,
-            sparse_kv_cache=None,
-            topk_slots=topk_slots,
-            topk_lens=topk_lens.to(device=q.device, dtype=torch.int32).contiguous(),
-            kv_seq_lens=(
-                kv_seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
-                if kv_seq_lens is not None
-                else None
-            ),
-            max_seqlen_k=max_seq_len,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            softmax_scale=layer.scaling,
-            page_size=self.kernel_page_size,
-            logit_cap=layer.logit_cap,
-            k_scale=1.0,
-            return_lse=use_dcp,
-            solution=self.kernel_solution,
-        )
+        if kv_tiles is not None and use_dcp:
+            raise ValueError("tiled sparse residency does not support DCP")
+        tiles = ((slice(0, q.shape[0]), topk_slots),) if kv_tiles is None else kv_tiles
+        out = None
+        for query_slice, tile_slots in tiles:
+            tile_output = dsa_prefill(
+                q=q_view[query_slice],
+                kv_cache=kv_cache,
+                sparse_kv_cache=None,
+                topk_slots=tile_slots,
+                topk_lens=topk_lens[query_slice]
+                .to(device=q.device, dtype=torch.int32)
+                .contiguous(),
+                kv_seq_lens=(
+                    kv_seq_lens[query_slice]
+                    .to(device=q.device, dtype=torch.int32)
+                    .contiguous()
+                    if kv_seq_lens is not None
+                    else None
+                ),
+                max_seqlen_k=max_seq_len,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                softmax_scale=layer.scaling,
+                page_size=self.kernel_page_size,
+                logit_cap=layer.logit_cap,
+                k_scale=1.0,
+                return_lse=use_dcp,
+                solution=self.kernel_solution,
+            )
+            if kv_tiles is None:
+                out = tile_output
+            else:
+                if out is None:
+                    out = tile_output.new_empty((q.shape[0], *tile_output.shape[1:]))
+                out[query_slice].copy_(tile_output)
         if use_dcp:
             local_output, local_lse = out
             out = combine_attention_partials(
@@ -625,6 +649,7 @@ class DSABackend(PagedAttentionBackend):
         bs: int,
         topk_indices: torch.Tensor,
         topk_lens: torch.Tensor | None,
+        topk_order_keys: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.kernel_page_size != DSA_SPARSE_PAGE_SIZE:
             raise RuntimeError(
@@ -733,6 +758,7 @@ class DSABackend(PagedAttentionBackend):
             sparse_kv_cache=None,
             topk_slots=topk_slots,
             topk_lens=topk_lens,
+            topk_order_keys=topk_order_keys,
             max_seqlen_k=max_seqlen_k,
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,

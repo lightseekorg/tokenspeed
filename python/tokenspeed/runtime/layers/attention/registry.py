@@ -173,12 +173,12 @@ def _resolve_heterogeneous_draft_family(
 
 
 def _arena_allocated_bytes(arena) -> int:
-    """Bytes this model's cache actually occupies: the one arena allocation.
+    """Device bytes this model's cache owner actually occupies.
 
     Summing a pool's per-layer view sizes would answer a different question
     (and double-count aliased views), so read the owner directly.
     """
-    return int(arena.buffer.nbytes)
+    return int(arena.allocated_device_bytes)
 
 
 def _cache_storage_report(
@@ -212,20 +212,26 @@ def _cache_storage_report(
     # both models' layers.
     arena_bytes = _arena_allocated_bytes(arena)
     allocated_cache_bytes = arena_bytes + fixed_workspace_bytes
-    if allocated_cache_bytes > configured_cache_bytes:
+    storage = arena.storage_plan
+    planned_peak_bytes = allocated_cache_bytes + storage.temporary_workspace_bytes
+    if planned_peak_bytes > configured_cache_bytes:
         raise RuntimeError(
-            "allocated cache storage exceeds its profiled budget: "
-            f"{allocated_cache_bytes} > {configured_cache_bytes}"
+            "planned cache storage exceeds its profiled budget: "
+            f"{planned_peak_bytes} > {configured_cache_bytes}"
         )
     return {
         "configured_cache_bytes": int(configured_cache_bytes),
         "allocated_cache_bytes": allocated_cache_bytes,
+        "planned_peak_cache_bytes": planned_peak_bytes,
         "physical_token_capacity": physical_token_capacity,
         "capacity_source": "lcm_geometry",
         "geometry": geometry
         | {
             "arena_bytes": arena_bytes,
+            "host_history_bytes": arena.allocated_host_bytes,
             "fixed_workspace_bytes": fixed_workspace_bytes,
+            "offload_persistent_workspace_bytes": storage.persistent_workspace_bytes,
+            "offload_temporary_workspace_bytes": storage.temporary_workspace_bytes,
         },
     }
 
@@ -1249,9 +1255,18 @@ def _narrow_spec_for_pp(
     retains the complete plan separately for the PD wire contract.
     """
     stage_start, stage_end = ownership.resident_cache_window
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
+        plan_cache_storage,
+    )
+
+    memory_plan = spec.memory_plan.narrow_to_layers(stage_start, stage_end)
+    offload = None if spec.storage_plan is None else spec.storage_plan.offload
     return dataclasses.replace(
         spec,
-        memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
+        memory_plan=memory_plan,
+        storage_plan=plan_cache_storage(
+            memory_plan, spec.cache_group_specs, offload=offload
+        ),
     )
 
 

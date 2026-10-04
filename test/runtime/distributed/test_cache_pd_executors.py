@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -487,6 +488,10 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
             plan=layout.plan,
             cache_group_specs=layout.group_specs,
             contract_binding=lambda: buffer,
+            field_address=lambda name: (
+                buffer.data_ptr() + layout.plan.field_page_byte_offset(name, 0)
+            ),
+            registration_regions=lambda: ((buffer.data_ptr(), buffer.nbytes),),
         ),
     )
 
@@ -513,7 +518,13 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
     assert kv_args.kv_data_ptr == buffer.data_ptr()
     assert kv_args.ib_device == "mlx5_0"
     assert kv_args.gpu_id == 0
-    assert kv_args.cache_layout == layout
+    assert kv_args.cache_layout.plan == layout.plan
+    assert kv_args.cache_layout.group_specs == layout.group_specs
+    assert kv_args.cache_layout.transfer_schema == layout.transfer_schema
+    for field in layout.plan.fields:
+        assert kv_args.cache_layout.field_address(
+            buffer.data_ptr(), field.field_id
+        ) == buffer.data_ptr() + layout.plan.field_page_byte_offset(field.field_id, 0)
     assert kv_args.cache_producer_schedule.fields_by_step == (
         ("layer.0.kv",),
         ("layer.1.state",),
@@ -781,7 +792,10 @@ def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
     ]
 
 
-def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
+@pytest.mark.parametrize("physical_addresses", [False, True])
+def test_transfer_blocks_for_many_pages_match_the_per_page_geometry(
+    physical_addresses,
+) -> None:
     # Two fields and hundreds of pages: the generator resolves each field's
     # geometry once and expands pages in bulk, so check it against the plain
     # per-page formula in both the whole-field and the fragment path.
@@ -798,6 +812,23 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
 
     source_layout = two_field_layout(700)
     destination_layout = two_field_layout(900)
+    if physical_addresses:
+        # Mixed arenas advertise each field's landing address independently
+        # of the logical plane offsets and the endpoint's registration base.
+        source_layout = replace(
+            source_layout,
+            field_addresses={
+                field.field_id: 0x100000 * (i + 1)
+                for i, field in enumerate(source_layout.plan.fields)
+            },
+        )
+        destination_layout = replace(
+            destination_layout,
+            field_addresses={
+                field.field_id: 0x1000000 * (i + 1)
+                for i, field in enumerate(destination_layout.plan.fields)
+            },
+        )
     pages = 300
     src_pages = tuple(range(1, 2 * pages, 2))
     dst_pages = tuple(range(899, 899 - 2 * pages, -2))
@@ -807,7 +838,7 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
     def field_pages(layout, ptr, field_id, page_ids):
         segment = next(f for f in layout.plan.fields if f.field_id == field_id)
         return [
-            ptr + layout.plan.field_page_byte_offset(field_id, page)
+            layout.field_address(ptr, field_id) + page * segment.page_stride_bytes
             for page in page_ids
         ], segment.payload_bytes
 
@@ -1561,3 +1592,45 @@ def test_usage_alone_does_not_release_layerwise_bootstrap_waiter():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_bootstrap_layout_excludes_rank_local_field_addresses():
+    from dataclasses import replace
+
+    from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVBootstrapServer
+    from tokenspeed.runtime.pd.mooncake.entities import KVArgs
+
+    layout = _layout()
+    names = tuple(f.field_id for f in layout.plan.fields)
+    bootstrap = object.__new__(MooncakeKVBootstrapServer)
+    bootstrap.prefill_cache_layout_wire = None
+    bootstrap.prefill_cache_fields_by_stage = None
+    wires = []
+    for rank in range(2):
+        bound = replace(
+            layout,
+            field_addresses={
+                name: 0x1000 * (rank + 1) + i * 128 for i, name in enumerate(names)
+            },
+        )
+        args = KVArgs(
+            engine_rank=rank,
+            kv_data_ptr=0x1000,
+            ib_device="",
+            gpu_id=rank,
+            cache_layout=bound,
+            cache_fields_by_stage=(names,),
+        )
+        wire = args.wire_layout.to_wire_bytes().decode("ascii")
+        wires.append(wire)
+        bootstrap._ingest_put_extra(
+            {
+                "cache_layout": wire,
+                "cache_fields_by_stage": [list(names)],
+                "pp_size": 1,
+            }
+        )
+        # Endpoint registration still retains this rank's actual landing addresses.
+        assert args.cache_layout.field_addresses == bound.field_addresses
+        assert args.wire_layout.field_addresses is None
+    assert wires[0] == wires[1]

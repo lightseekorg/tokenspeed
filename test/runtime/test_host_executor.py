@@ -301,6 +301,7 @@ class GroupAwareWireTest(unittest.TestCase):
             ),
         )
 
+        pool.arena.storage_plan = SimpleNamespace(host_bytes=0)
         layout = pool.cache_transfer_layout()
 
         self.assertEqual(

@@ -475,6 +475,7 @@ def _super_cache_recipe(tp: int, kv_dtype: torch.dtype, *, draft_tokens: int):
             speculative_num_draft_tokens=draft_tokens,
             speculative_eagle_topk=1,
             enable_replay_ssm=with_draft,
+            kv_offload_config=None,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=SimpleNamespace()),

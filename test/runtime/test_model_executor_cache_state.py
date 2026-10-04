@@ -45,6 +45,9 @@ class _ExecutionStream:
 
 def test_mixed_batch_resets_only_prefill_lengths(monkeypatch):
     executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
     executor.device = "cpu"
     executor.device_module = torch.cuda
     executor.default_stream = object()
@@ -78,6 +81,9 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     can establish these lengths: they come from the prefill node's complete
     prompt, not from the local extend prefix."""
     executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
     executor.device = "cpu"
     executor.device_module = torch.cuda
     executor.default_stream = object()
@@ -126,6 +132,10 @@ def test_draft_final_step_follows_the_complete_drafter_run():
             events.append("future-input")
 
     executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
+    executor.device_module = SimpleNamespace(current_stream=lambda: None)
     executor.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.tensor([0]),
         state_write_req_pool_indices_buf=torch.tensor([0]),
@@ -227,6 +237,10 @@ def test_non_spec_decode_routes_through_verify():
     calls = []
 
     executor = ModelExecutor.__new__(ModelExecutor)
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor.attn_backend = CachePoolBinding()
+    executor.device_module = SimpleNamespace(current_stream=lambda: None)
     executor.drafter = None
     executor.tree_spec = None
     executor.config = SimpleNamespace(output_length=1)

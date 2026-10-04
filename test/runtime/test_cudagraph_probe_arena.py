@@ -155,6 +155,97 @@ def test_the_probe_arena_does_not_grow_with_max_num_seqs() -> None:
     assert arena_bytes(1) < arena_bytes(512)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires an NVIDIA GPU",
+)
+def test_offload_probe_budget_includes_hot_storage(monkeypatch) -> None:
+    from test.runtime.test_cache_setup import _mla_config
+
+    from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+    from tokenspeed.runtime.layers.attention.kv_cache.offload_config import (
+        KVOffloadPolicy,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+        OrdinaryRecipe,
+    )
+
+    recipe = OrdinaryRecipe(
+        family="mla",
+        server_args=SimpleNamespace(
+            kv_offload_config=None,
+            max_total_tokens=None,
+            disaggregation_mode="null",
+            chunked_prefill_size=1024,
+            enable_prefix_caching=False,
+        ),
+        model_config=SimpleNamespace(
+            num_attention_layers=2, hf_config=SimpleNamespace()
+        ),
+        attn_config=_mla_config(),
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=0,
+        probe_batch_rows=2,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+    policy = KVOffloadPolicy(
+        field_ids=("layer.0.latent_kv",),
+        hot_tokens=4096,
+        reserved_tokens=1,
+        topk=2048,
+        queries=1,
+        host_budget_bytes=1 << 30,
+        overlap=True,
+        cyclic_tokens=0,
+        selection_consumers=(),
+    )
+    monkeypatch.setattr(recipe, "offload_policy", lambda: policy)
+    setup = recipe.setup()
+    arena = CacheArena(
+        setup.spec.memory_plan,
+        "cuda",
+        cache_group_specs=setup.spec.cache_group_specs,
+        storage_plan=setup.spec.storage_plan,
+    )
+    report = registry._cache_storage_report(
+        configured_cache_bytes=setup.cache_budget_bytes,
+        pool=SimpleNamespace(arena=arena),
+        fixed_workspace_bytes=setup.fixed_workspace_bytes,
+    )
+    assert report["allocated_cache_bytes"] > arena.plan.arena_bytes
+    assert report["allocated_cache_bytes"] <= setup.cache_budget_bytes
+    assert report["planned_peak_cache_bytes"] == setup.cache_budget_bytes
+
+    # Serving uses the same configured token cap as the ordinary recipe.
+    # CapacityModel's per-request rounding is for admission working sets,
+    # not an extra parent to add to a flat history capacity limit.
+    recipe.probe_batch_rows = None
+    recipe.cache_budget_bytes = 1 << 30
+    recipe.server_args.max_total_tokens = 512
+    del recipe.token_limit  # Rebuild with a changed startup configuration.
+    serving = recipe.setup()
+    assert serving.spec.token_capacity == 512
+    rows = serving.spec.storage_plan.offload.device_rows
+    # With the history cap reached, serving must keep the demand-sized pool
+    # instead of spending the remaining budget on unusable hot rows.
+    assert rows == setup.spec.storage_plan.offload.device_rows
+    assert serving.spec.storage_plan.device_budget_bytes < recipe.cache_budget_bytes
+    serving_arena = CacheArena(
+        serving.spec.memory_plan,
+        "cuda",
+        cache_group_specs=serving.spec.cache_group_specs,
+        storage_plan=serving.spec.storage_plan,
+    )
+    assert serving_arena.compute_field("layer.0.latent_kv").shape[0] == rows
+    from dataclasses import replace
+
+    recipe.attn_config = replace(recipe.attn_config, context_len=131072)
+    longer = recipe.setup()
+    assert longer.spec.storage_plan.offload.device_rows == rows
+
+
 def test_the_override_reaches_the_plan_through_the_factory_seam() -> None:
     template = _kimi_k3_recipe()
     built = setup.prepare_cache_setup(

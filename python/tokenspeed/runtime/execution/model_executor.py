@@ -546,6 +546,7 @@ class ModelExecutor:
         self._active_positions_override = None
 
         self._graph_support = graph_support
+        self.device_module = torch.get_device_module(self.device)
         self._build_graph_owners()
 
         # Encoder graphs are installed before KV-cache sizing and retained by
@@ -554,7 +555,6 @@ class ModelExecutor:
             self.model_runner, "encoder_graph_wrappers", {}
         )
 
-        self.device_module = torch.get_device_module(self.device)
         # Two streams, named once. `default_stream` is the forward thread's
         # own: page zeroing runs here, and the cache ops take it by name for
         # their fences and start events. `execution_stream` carries the model
@@ -643,6 +643,7 @@ class ModelExecutor:
     def _configure_for_pools(self) -> None:
         """Publish the bound pools to the backends and the model's layers."""
         self.attn_backend.configure_runtime(
+            request_slot_capacity=self.config.max_req_pool_size + 1,
             cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
             cache_group_page_counts=_cache_arena_attr(
                 self.token_to_kv_pool, "cache_group_page_counts", None
@@ -1320,6 +1321,13 @@ class ModelExecutor:
                 input_ids_buf_slice=slice_, candidate_start=ctx.num_extends
             )
 
+        # KV offloading uses scheduler request slots to bind hot partitions;
+        # ordinary backends keep their existing path through a no-op hook.
+        self.attn_backend.prepare_cache_batch(
+            self.input_buffers.req_pool_indices_buf[:bs],
+            num_extends=ctx.num_extends,
+            stream=self.device_module.current_stream(),
+        )
         ctx.dspark_context_producer = self.dspark_context_producer
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
@@ -1346,6 +1354,10 @@ class ModelExecutor:
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates
         )
+
+        # Offloading must persist accepted target-input KV before completion
+        # can publish prefixes or allow a scheduler request slot to be reused.
+        self.attn_backend.writeback_accepted_kv(accept_lengths)
 
         # Backstop: flag any request whose sampled id falls outside [0, vocab)
         # so the output processor can terminate it. Covers sampler/verify kernel
@@ -1705,6 +1717,11 @@ class ModelExecutor:
                 pin_memory=True,
             ).to(self.device, non_blocking=True)
             self.runtime_states.reset_states(rows, values)
+            # KV offloading tags may still describe a previous owner or a
+            # pre-recovery history view; invalidate them without erasing history.
+            self.attn_backend.invalidate_cache_residency(
+                rows, stream=self.execution_stream
+            )
 
     def execute_forward_op(
         self,

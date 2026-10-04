@@ -134,6 +134,61 @@ class CachePoolBinding:
         """Return logical-slot ownership, or None for local/replicated storage."""
         return None
 
+    def prepare_cache_batch(
+        self, request_slots: torch.Tensor, *, num_extends: int, stream: torch.Stream
+    ) -> None:
+        """Begin KV offloading access for this target batch's request slots.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Clear last-step read/write mappings, mask null/padded requests, and
+        order residency work on stream. This does not allocate history.
+        num_extends identifies recovery rows; the current offload engine
+        requires recovery to occupy a separate, all-extend batch.
+        """
+        for child in self.child_backends():
+            child.prepare_cache_batch(
+                request_slots, num_extends=num_extends, stream=stream
+            )
+
+    def writeback_accepted_kv(self, accept_lengths: torch.Tensor) -> None:
+        """Persist accepted KV from offloading compute buffers to Host history.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Join writeback to the execution stream before publishing completion.
+        accept_lengths counts accepted target-input rows, not output tokens.
+        Recovery retains all extend rows; its tile iterator may already have
+        flushed the chunk before reusing staging storage.
+        """
+        for child in self.child_backends():
+            child.writeback_accepted_kv(accept_lengths)
+
+    def invalidate_cache_residency(
+        self, request_slots: torch.Tensor, *, stream: torch.Stream
+    ) -> None:
+        """Fence KV offloading work and invalidate reused request-slot tags.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Reset hot-cache tags, seed state, and LRU on stream. This does not
+        erase authoritative history or release scheduler-owned cache blocks.
+        """
+        for child in self.child_backends():
+            child.invalidate_cache_residency(request_slots, stream=stream)
+
+    def prefetch_sparse_kv(
+        self,
+        layer: PagedAttention,
+        selection: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Overlap sparse KV offloading loads for this producer's consumers.
+
+        layer identifies the selection producer. Its recipe declares which
+        offloaded consumer fields share selection. Load those fields on the
+        prefetch stream when overlap is enabled; otherwise do nothing.
+        Each consumer must still call prepare_sparse_kv_access to join its
+        ready event and publish compute slots before projection/attention.
+        """
+
 
 class AttentionBackend(CachePoolBinding, ABC):
     """The runner-facing contract; see the module docstring.
@@ -463,8 +518,12 @@ class AttentionBackend(CachePoolBinding, ABC):
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        """This layer's KV write slots for one mode's requests: the EXTEND span
-        or the DECODE window."""
+        """Return this layer's authoritative history write slots.
+
+        Index-K uses these before selection, independently of KV offloading.
+        Offloaded latent KV writers use the compute slots returned by
+        prepare_sparse_kv_access instead. This query does not copy KV.
+        """
         raise NotImplementedError(
             f"{type(self).__name__} owns no paged write locations"
         )
@@ -489,6 +548,26 @@ class AttentionBackend(CachePoolBinding, ABC):
         if locations.numel() != rows:
             raise ValueError(f"{locations.numel()} write slots for {rows} rows")
         return locations
+
+    def prepare_sparse_kv_access(
+        self,
+        layer: PagedAttention,
+        selection: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
+        """Prepare sparse KV offloading and return this layer's compute writes.
+
+        selection contains history row IDs, including masks and duplicates;
+        positions contains token positions. Decode loads history or joins
+        prefetch, then publishes hot reads/writes. Extend reserves projection
+        staging; sparse-prefill iteration later flushes and gathers history.
+        Use the returned slots for KV projection before attention. Layers
+        without offloading return ordinary history writes without copying KV.
+        Wrappers route by layer and preserve the returned tensor.
+        """
+        return self.write_locations(layer, forward_mode)
 
     # ------------------------------------------------------------------
     # PD / speculative side state

@@ -101,12 +101,13 @@ from one first bound to that pool:
 * For nodes accepting pool replacement, binding drops every pool-derived latch:
   pointer tables, scratch and views,
   per-forward metadata, the paged leaves' graph buffers, Inkling's ShortConv
-  ring and pending remote restores, and side-state verify caches. The state
-  backends keep their pool-independent index buffers, so a same-geometry
-  replacement stays usable without re-initialisation of those buffers (a
+  ring and pending remote restores, and side-state verify caches. The target
+  router recreates `KVOffloadAdapter` against the new arena's offload engine.
+  The state backends keep their pool-independent index buffers, so a
+  same-geometry replacement stays usable without re-initialisation of those buffers (a
   router in the same tree still needs `init_cuda_graph_state` before any
   metadata call); the caller still runs `configure_runtime` (with the new
-  pool's specs and page counts), `init_cuda_graph_state`,
+  pool's specs, page counts and request-slot capacity), `init_cuda_graph_state`,
   `init_prefill_graph_state` and `preallocate_verify_workspace` again after
   a rebind, as after a first bind. A probe pool must still hold `max_bs`
   state rows: the KDA raw-gate verify scratch is the bound pool's own conv
@@ -873,16 +874,20 @@ leaves ignore it; it carries no table or page vocabulary.
 
 ## Write locations have one owner
 
-`write_locations(layer, forward_mode)` on the top-level backend is the ONLY
-accessor for KV write slots — models, drafters and the runner neither
-compute nor thread location vectors. `forward_write_locations(layer,
-forward_mode)` derives from it the slots the attention prologue writes: the
-mode's `write_locations`, with the decode window appended for a draft's first
-step over a MIXED round (`docs/design/attention-prologue.md`).
+`write_locations(layer, forward_mode)` on the top-level backend addresses
+authoritative history — models, drafters and the runner neither compute nor
+thread location vectors. `forward_write_locations(layer, forward_mode)`
+supplies the attention prologue's writes, appending the decode window for a
+draft's first step over a MIXED round (`docs/design/attention-prologue.md`).
 `PagedAttention.forward`, `AttentionBackend.forward`, `model_runner.forward`
 and the model forward chains above the attention layers carry no
 `out_cache_loc` parameter; `InputBuffers` has no location buffer;
-`fill_input_buffers` takes no table.
+`fill_input_buffers` takes no table. For sparse KV offloading, the model
+prepares canonical Top-K IDs and positions with `prepare_sparse_kv_access`
+before writing latent KV to the returned hot or recovery-staging slots.
+`KVOffloadAdapter` retains these mappings for prologue and router leaf access,
+requiring preparation for the same step and forward family. Index-K uses
+history destinations through `write_locations`.
 
 * **Extend**: `init_forward_metadata` computes each group's span over the
   stacks (`[sum(extend_seq_lens)]`, request-major); `write_locations(layer,
@@ -910,7 +915,8 @@ and the model forward chains above the attention layers carry no
   target-aligned KV into the draft cache (the pools share one page-id
   space).
 * **Writes outside the backend** (the attention prologue, V4 group writes)
-  fetch their slots immediately before the write. When a draft step-0
+  fetch their slots immediately before the write. An offloaded latent
+  projection uses the compute slots returned by its sparse prepare. When a draft step-0
   forward over a MIXED round writes the round's full K/V rows, dispatched as
   MIXED or as DECODE (the MLA draft's whole-batch write, a GQA draft's
   narrowed first step), `forward_write_locations` concatenates the EXTEND
@@ -1284,8 +1290,9 @@ mapping remains a separate consumer of the shared mapping helpers
   batch does not carry; the contract is about the call, not the record.
 * `grep -rn "select_out_cache_loc\|DraftPageStaging\|tables_self_padding\|
   cache_active_pages_must_be_real\|engine_owned_group_ids" python/` must
-  stay empty — write locations have one accessor (`write_locations`), and
-  table delivery has no capability flags.
+  stay empty — history write locations have one accessor (`write_locations`),
+  sparse prepare returns its compute writes, and table delivery has no
+  capability flags.
 * `grep -rn "out_cache_loc" python/tokenspeed/runtime/models/` matches only
   `write_locations(...)` fetches and the helper parameters they feed —
   never a forward-chain parameter threaded from the runner.
@@ -1300,3 +1307,43 @@ mapping remains a separate consumer of the shared mapping helpers
 * New backends implement `refresh_decode_metadata` + `init_cuda_graph_state`;
   capture is inherited from the base default (idle refresh). Only a
   kernel-imposed capture asymmetry justifies an override.
+
+### Sparse KV offloading
+
+Eager and captured decode execute the same `_forward_step`: the executor calls
+`prepare_cache_batch`, runs the target forward and verification, then calls
+`writeback_accepted_kv` before publishing completion. Request slots, positions,
+canonical Top-K IDs and accepted target-input lengths are GPU inputs. The
+arena-owned `SparseKVOffload` engine keeps hot buffers, tags, LRU and metadata
+at fixed addresses. `KVOffloadAdapter` binds router layers to fields and
+retains each step's compute mappings. See `cache-concepts.md`, "Sparse KV
+offloading and physical storage", for allocation and admission.
+
+At each sparse layer, `prepare_sparse_kv_access` returns the projection's
+compute write slots and publishes mapped attention reads. A declared
+selection producer can call `prefetch_sparse_kv` for an offloaded consumer:
+current-slot preparation runs on the execution stream, the prefetch stream
+waits for it, and lookup plus swap-in record the field's `ready` event. The
+consumer's prepare joins that event. Inline resolve and prefetched resolve
+produce the same ordered selection mapping.
+
+Verification supplies accepted input lengths directly to GPU writeback
+masking. The write stream waits for execution, copies accepted rows to Host
+history and records `write_done`; execution waits for that event before
+completion. Capture records these dependencies and replay uses the captured
+buffers and GPU inputs. Offloading requires no CPU read of accepted lengths
+or sequence lengths. Null and padding requests install no tags and commit
+no KV rows.
+
+When PD admission or local recovery resets valid history lengths,
+`invalidate_cache_residency` runs outside graph execution. It fences prefetch
+and writeback streams and resets request-slot tags, seed flags and LRU while
+preserving authoritative history. PD transfer completion precedes seeding.
+Here residency means the hot-cache contents managed by the arena's offload
+engine; the router adapter holds the compute mappings for accessing them.
+
+Local recovery uses a separate all-extend batch. It projects the current chunk
+into a bounded prefix of the same hot allocation, flushes that chunk to Host,
+then gathers attention tiles whose storage is reused only after consumption
+on the execution stream. Already flushed rows are excluded from the final
+writeback. Mixed recovery/decode batches are unsupported.

@@ -71,6 +71,9 @@ def _row_invariant_topk(
             logits, (0, int(topk) - logits.shape[1]), value=float("-inf")
         )
     deterministic_decode_topk(logits, out, int(topk))
+    # Canonicalize before logical offsets become physical slots. Allocation
+    # and relocation must not change the attention reduction order.
+    out.copy_(out.sort(dim=-1).values)
 
 
 def _prepare_logits_for_topk(logits: torch.Tensor) -> torch.Tensor:
@@ -516,15 +519,18 @@ if platform.is_hopper_plus:
                 ),
                 (int(page_size) * row_bytes, hd, 1),
             )
+            scale_storage = flat.view(torch.float32)
             scale_view = torch.as_strided(
-                flat.view(torch.float32),
+                scale_storage,
                 (
                     index_k_cache.shape[0] // int(page_size),
                     int(page_size),
                     num_groups,
                 ),
                 ((int(page_size) * row_bytes) // 4, num_groups, 1),
-                (int(page_size) * hd) // 4,
+                # as_strided's explicit offset is relative to the allocation,
+                # not this field view inside a shared cache arena.
+                scale_storage.storage_offset() + (int(page_size) * hd) // 4,
             )
             slots = kv_workspace_slots.to(device=q.device, dtype=torch.long)
             index_k_fp8 = fp8_view[slots // int(page_size), slots % int(page_size)]

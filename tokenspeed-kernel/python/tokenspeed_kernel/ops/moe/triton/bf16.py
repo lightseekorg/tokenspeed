@@ -102,6 +102,7 @@ def _validate(
 @triton.jit
 def _stage1_kernel(
     x_desc,
+    x_ptr,
     w13_desc,
     inter_ptr,
     expert_route_ids_ptr,
@@ -119,6 +120,7 @@ def _stage1_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_TMA_GATHER: tl.constexpr,
 ):
     route_count = num_tokens * top_k
     tile_idx = tl.program_id(0)
@@ -147,7 +149,17 @@ def _stage1_kernel(
             up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
             for k_offset in range(0, hidden_size, BLOCK_K):
-                x = x_desc.gather(token_ids, k_offset)
+                if USE_TMA_GATHER:
+                    x = x_desc.gather(token_ids, k_offset)
+                else:
+                    # Descriptor gather requires SM100. Hopper supports the
+                    # weight descriptor loads but needs ordinary input loads.
+                    offsets = (
+                        token_ids[:, None] * hidden_size
+                        + k_offset
+                        + tl.arange(0, BLOCK_K)[None, :]
+                    )
+                    x = tl.load(x_ptr + offsets, row_mask[:, None], 0.0)
                 gate = w13_desc.load([expert_id, n_offset, k_offset]).reshape(
                     (BLOCK_N, BLOCK_K)
                 )
@@ -284,6 +296,7 @@ def _moe(
 
     _stage1_kernel[(stage1_programs,)](
         x_desc,
+        x,
         w13_desc,
         intermediate,
         expert_route_ids,
@@ -301,6 +314,7 @@ def _moe(
         BLOCK_M=block_m,
         BLOCK_N=stage1_block_n,
         BLOCK_K=block_k,
+        USE_TMA_GATHER=torch.cuda.get_device_capability(x.device)[0] >= 10,
         num_warps=4 if block_m == 16 else 8,
         num_stages=3,
     )

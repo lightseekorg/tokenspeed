@@ -23,6 +23,7 @@
 import argparse
 import dataclasses
 import json
+import math
 import os
 import random
 import socket
@@ -142,6 +143,8 @@ class ServerArgs:
     enable_mixed_batch: bool = False
     # Scheduler cache-reuse identity granularity in tokens.
     prefix_granularity: int = 64
+    # JSON on the CLI, normalized once to generic runtime options.
+    kv_offload_config: str | dict | None = None
     # special kv cache
     mamba_ssm_dtype: str = "float32"
 
@@ -719,9 +722,48 @@ class ServerArgs:
         logger.info(f"Parallelism configuration:\n{self.mapping!s}")
 
     def resolve_cache(self):
+        self.resolve_kv_offload()
         # Handle KVStore settings.
         self._handle_kvstore()
         self.validate_cache_options()
+
+    def resolve_kv_offload(self):
+        """Validate deployment options without model-specific cache geometry."""
+        options = self.kv_offload_config
+        if options is None:
+            return
+        if isinstance(options, str):
+            try:
+                options = json.loads(options)
+            except json.JSONDecodeError as exc:
+                raise ValueError("--kv-offload-config must be valid JSON") from exc
+        required = {"layers", "hot_tokens", "host_gb", "overlap"}
+        if not isinstance(options, dict) or set(options) != required:
+            raise ValueError(
+                f"--kv-offload-config requires a JSON object with exactly {sorted(required)}"
+            )
+        layers = options["layers"]
+        if (
+            not isinstance(layers, list)
+            or not layers
+            or any(type(layer) is not int or layer < 0 for layer in layers)
+            or len(set(layers)) != len(layers)
+        ):
+            raise ValueError("offload layers must be unique nonnegative integer IDs")
+        hot = options["hot_tokens"]
+        if type(hot) is not int or hot <= 0 or hot & (hot - 1):
+            raise ValueError("offload hot_tokens must be a positive power of two")
+        host = options["host_gb"]
+        if (
+            type(host) not in (int, float)
+            or not math.isfinite(host)
+            or host <= 0
+            or int(host * (1 << 30)) <= 0
+        ):
+            raise ValueError("offload host_gb must be a finite positive GiB budget")
+        if type(options["overlap"]) is not bool:
+            raise ValueError("offload overlap must be an explicit bool")
+        self.kv_offload_config = dict(options, layers=list(layers))
 
     def resolve_speculative_decoding(self):
         # Keep drafter backend consistent with the main model unless explicitly set.
@@ -1416,6 +1458,14 @@ class ServerArgs:
         )
 
         # KVStore
+        parser.add_argument(
+            "--kv-offload-config",
+            type=str,
+            default=ServerArgs.kv_offload_config,
+            help='Sparse KV offload JSON object with explicit "layers", "hot_tokens", '
+            '"host_gb" (GiB), and "overlap". Model-specific options remain in '
+            "--hf-overrides; unsupported cache recipes reject this configuration.",
+        )
         parser.add_argument(
             "--disable-kvstore",
             action="store_true",

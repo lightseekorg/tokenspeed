@@ -64,7 +64,9 @@ class _Holder:
         self.token_to_kv_pool = pool
         self.log.append((self.name, "set_cache_pool", pool))
 
-    def configure_runtime(self, *, cache_group_specs, cache_group_page_counts):
+    def configure_runtime(
+        self, *, cache_group_specs, cache_group_page_counts, request_slot_capacity=None
+    ):
         self.log.append(
             (self.name, "configure", cache_group_specs, cache_group_page_counts)
         )
@@ -73,7 +75,9 @@ class _Holder:
 def _executor(monkeypatch, log, *, with_draft: bool):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
-    executor.config = SimpleNamespace(spec_algo=None, enforce_eager=False)
+    executor.config = SimpleNamespace(
+        spec_algo=None, enforce_eager=False, max_req_pool_size=3
+    )
     executor.model_runner = SimpleNamespace(model="target model")
     executor.attn_backend = _Holder("target", log)
     executor.token_to_kv_pool = _pool("probe")
@@ -172,7 +176,9 @@ def test_a_block_drafter_is_rechecked_against_the_targets_new_pool(
 ):
     log = []
     executor = _executor(monkeypatch, log, with_draft=True)
-    executor.config = SimpleNamespace(spec_algo=spec_algo, enforce_eager=False)
+    executor.config = SimpleNamespace(
+        spec_algo=spec_algo, enforce_eager=False, max_req_pool_size=3
+    )
     monkeypatch.setattr(
         module, "check_block_drafter_storage", lambda m, p: log.append(("check", m, p))
     )
