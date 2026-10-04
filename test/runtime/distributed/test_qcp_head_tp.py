@@ -24,20 +24,27 @@ Four ranks, attention TP 4 with ``--prefill-context-parallel-size 4`` and
 ``--attn-head-tp-size 4``: the head group is the shard group. The reference
 is the same mapping without head TP -- head-replicated q_b / kv_b / o_proj,
 QCP's default -- so the exchanges, the shard row tables, the prologue's
-gathered write and both o_proj tails are what is tested, with core attention
-stubbed per row and head as in ``test_decode_tp_layouts`` (the shared
-fakes live in ``_tp_layout_fakes``).
+gathered write and both o_proj tails are what is tested, with the core
+stubbed per row and head as in ``test_decode_tp_layouts`` (the shared fakes
+live in ``_tp_layout_fakes``). The stub stands in for the DSA backend: its
+sparse prefill reads the head count from the query, attends every head of
+the local rows against a history it gathers over the shard group on every
+rank -- so a rank that skipped the core on its empty shard would hang the
+others -- and its decode core attends whatever heads the query carries.
 
 Covered:
-* the sharded extend: ``head_tp_row_counts`` reads the shard plan (input
-  and collective legs), the legs run with an uneven split and with a rank
-  whose shard is empty (it joins every collective, attends nothing);
+* the sharded extend through the sequence a DSA model threads
+  (``forward_absorb_qkv_proj`` -> ``sparse_prefill_attn_v_proj`` ->
+  ``project_output``): ``head_tp_leg_row_counts`` reads the shard plan
+  (input and collective legs), the legs run with an uneven split and with a
+  rank whose shard is empty (it joins every collective, the core's history
+  gather included, and attends nothing);
 * the o_proj forms: row-parallel + reduce-scatter to the shard rows, and
   ``--tp-batch-invariant attn`` (all-gather heads, column-parallel GEMM,
   all-to-all back);
 * the drafter's decode step (replicated rows, no shard): no exchange, this
-  rank's head slice on ``attn_mqa_local``, the all-reduce / all-gather tail,
-  through the hooks and through the dense ``forward``;
+  rank's head slice through the one core layer, the all-reduce / all-gather
+  tail, through the hooks and through the dense ``forward``;
 * the resolver refuses a replicated-row forward's table under query sharding.
 """
 
@@ -86,22 +93,32 @@ def _mapping(rank: int, *, head_tp: bool) -> Mapping:
     )
 
 
-class _QcpStubCoreAttention:
-    """``PagedAttention`` stand-in for the sharded engine.
+class _QcpStubCore:
+    """``PagedAttention`` plus the DSA backend's sparse prefill, on CPU.
 
     The prologue asserts the one-row-count contract and, under a query shard,
     the QCP write: the span's slots on every rank and the rotated latent
     gathered over the shard group (the collective an empty shard still
-    joins). Core attention maps each (token, head) query through that
-    token's own latent, so a head's output for a token depends on exactly the
-    inputs the real kernel reads.
+    joins). The cores take the head count from the query, as the DSA backend
+    does: every head (``every_heads``, what the layer declares under head TP)
+    or the attention-TP slice (``slice_heads``). Each maps a (token, head)
+    query through that token's own latent, so a head's output for a token
+    depends on exactly the inputs the real kernel reads. The sparse prefill
+    mirrors the sharded arm: every rank gathers the group's history before
+    attending its own rows, with or without rows.
     """
 
-    def __init__(self, layer_id: int, heads: int):
+    def __init__(
+        self, layer_id: int, *, slice_heads: int, every_heads: int, group: tuple
+    ):
         self.layer_id = layer_id
-        self.tp_q_head_num = heads
-        self.calls = 0
+        self.tp_q_head_num = every_heads
+        self.slice_heads = slice_heads
+        self.every_heads = every_heads
+        self.group = group
+        self.calls_by_heads: dict[int, int] = {slice_heads: 0, every_heads: 0}
         self.gathers = 0
+        self.history_gathers = 0
         self.latent: torch.Tensor | None = None
 
     def latent_prologue(
@@ -110,7 +127,7 @@ class _QcpStubCoreAttention:
         assert expanded is None
         assert query.shape[0] == q_pe.shape[0] == latent_cache.shape[0]
         assert query.shape[0] == positions.shape[0]
-        assert query.shape[1] == self.tp_q_head_num
+        assert query.shape[1] in (self.slice_heads, self.every_heads)
         if key_rows is None:
             assert slots.shape[0] == query.shape[0]
             latent = latent_cache
@@ -128,35 +145,55 @@ class _QcpStubCoreAttention:
         self.latent = latent[:, :KV_LORA].clone()
         return SimpleNamespace(query=rotated)
 
-    def __call__(self, Q, k=None, v=None, positions=None, ctx=None, **kwargs):
-        assert k is None and v is None
-        assert Q.shape[1] == self.tp_q_head_num
-        self.calls += 1
+    def _attend(self, Q: torch.Tensor) -> torch.Tensor:
+        heads = Q.shape[1]
+        assert heads in (self.slice_heads, self.every_heads)
+        self.calls_by_heads[heads] += 1
         kv_gain = 1.0 + self.latent.sum(dim=-1)  # [T]
         out = Q[..., :KV_LORA] * kv_gain[:, None, None]
         out = out + 0.01 * Q[..., KV_LORA:].sum(dim=-1, keepdim=True)
-        # An empty shard attends nothing (the real sharded arm still joins
-        # the history gathers); keep the reshape well-defined for 0 rows.
-        return out.reshape(Q.shape[0], Q.shape[1] * KV_LORA)
+        # An empty shard attends nothing; keep the reshape well-defined.
+        return out.reshape(Q.shape[0], heads * KV_LORA)
+
+    def __call__(self, Q, k=None, v=None, positions=None, ctx=None, **kwargs):
+        """The decode core (``PagedAttention.forward``)."""
+        assert k is None and v is None
+        return self._attend(Q)
+
+    def sparse_prefill(self, plan: QueryShardPlan, *, q, layer, **kwargs):
+        """The backend's ``forward_sparse_prefill`` for ``layer`` (this)."""
+        assert layer is self
+        assert q.shape[0] == plan.local_rows
+        # The sharded arm attends with every head and gathers the group's
+        # history on every rank before the empty-query return.
+        assert q.shape[1] == self.every_heads
+        token_all_gather(self.latent.contiguous(), self.group, list(plan.row_counts))
+        self.history_gathers += 1
+        return self._attend(q)
 
 
 def _build(mapping: Mapping, weights: dict[str, torch.Tensor]):
     attn = build_attention(mapping, weights)
     # The decode-layout stub went in for attn_mqa; swap in the QCP-aware one
-    # with the heads the core sees (every head after an exchange).
-    attn.attn_mqa = _QcpStubCoreAttention(
-        0, attn.num_heads if attn.has_head_tp else attn.num_local_heads
+    # with the heads the core may see: every head after an exchange (what
+    # the layer declares), the slice on a replicated-row forward.
+    attn.attn_mqa = _QcpStubCore(
+        0,
+        slice_heads=attn.num_local_heads,
+        every_heads=attn.num_heads if attn.has_head_tp else attn.num_local_heads,
+        group=mapping.attn.qcp_group,
     )
-    if attn.attn_mqa_local is not None:
-        heads = attn.attn_mqa_local.tp_q_head_num
-        del attn.attn_mqa_local
-        attn.attn_mqa_local = _QcpStubCoreAttention(0, heads)
     return attn
 
 
 def _extend_ctx(plan: QueryShardPlan, lengths: list[int]) -> ForwardContext:
     return ForwardContext(
-        attn_backend=SimpleNamespace(spec_num_tokens=1),
+        attn_backend=SimpleNamespace(
+            spec_num_tokens=1,
+            # Dispatches to the layer's stub, as the router dispatches to the
+            # leaf serving the layer.
+            forward_sparse_prefill=lambda **kw: kw["layer"].sparse_prefill(plan, **kw),
+        ),
         token_to_kv_pool=None,
         bs=len(lengths),
         num_extends=len(lengths),
@@ -172,6 +209,7 @@ def _decode_ctx(bs: int) -> ForwardContext:
     return ForwardContext(
         attn_backend=SimpleNamespace(
             spec_num_tokens=1,
+            supports_mla_projected_value_decode=False,
             write_locations=lambda layer, mode: torch.arange(bs, dtype=torch.int64),
         ),
         token_to_kv_pool=None,
@@ -186,16 +224,30 @@ def _decode_ctx(bs: int) -> ForwardContext:
 def _absorbed_forward(attn, positions, hidden, ctx, comm, span_slots):
     """The hooks a sparse-attention model threads: the q latent projection
     (token gather under head TP), the absorption and prologue (exchange, the
-    QCP write), the core and value projection (exchange back), the o_proj
-    tail. The same calls on every layout; the hooks decide."""
+    QCP write), the core and value projection (the sparse prefill on extend
+    rows, the decode core otherwise; exchange back), the o_proj tail. The
+    same calls on every layout; the hooks decide."""
     q, latent = attn._project_q_latent(hidden, ctx, comm, None)
     Q = attn.forward_absorb_qkv_proj(q, latent, positions, ctx, span_slots)
     own = hidden.shape[0]
     rows = (
-        sum(attn.head_tp_row_counts(ctx, own)) if attn.head_tp_exchanges(ctx) else own
+        sum(attn.head_tp_leg_row_counts(ctx, own, collective=True))
+        if attn.head_tp_exchanges(ctx)
+        else own
     )
     output = q.new_empty(rows, attn.num_local_heads * V_DIM)
-    attn.forward_absorb_attn_v_proj(Q, ctx, output)
+    if ctx.num_extends > 0:
+        attn.sparse_prefill_attn_v_proj(
+            Q,
+            ctx,
+            output,
+            kv_seq_lens=None,
+            topk_slots=torch.empty(Q.shape[0], 0, dtype=torch.int32),
+            topk_lens=torch.zeros(Q.shape[0], dtype=torch.int32),
+            max_seq_len=0,
+        )
+    else:
+        attn.forward_absorb_attn_v_proj(Q, ctx, output)
     return attn.project_output(output, ctx, own)
 
 
@@ -214,17 +266,18 @@ def _worker(rank: int, rendezvous: str, tp_batch_invariant: str, lengths: list[i
         hidden_full = torch.randn(total, HIDDEN, generator=gen)
         positions_full = torch.arange(total, dtype=torch.int64) * 3
         span_slots = torch.arange(total, dtype=torch.int64)
+        slice_heads = NUM_HEADS // WORLD
 
         # The head-replicated reference: QCP's default layout.
         global_server_args_dict["tp_batch_invariant"] = "none"
         reference = _build(_mapping(rank, head_tp=False), weights)
         assert not reference.has_head_tp and reference.num_local_heads == NUM_HEADS
-        assert reference.attn_mqa_local is None
 
         global_server_args_dict["tp_batch_invariant"] = tp_batch_invariant
         sharded = _build(mapping, weights)
-        assert sharded.has_head_tp and sharded.num_local_heads == NUM_HEADS // WORLD
+        assert sharded.has_head_tp and sharded.num_local_heads == slice_heads
         assert sharded.head_tp_group == mapping.attn.qcp_group
+        assert sharded.attn_mqa.tp_q_head_num == NUM_HEADS
         assert type(sharded.o_proj).__name__ == (
             "ColumnParallelLinear"
             if tp_batch_invariant == "attn"
@@ -245,12 +298,17 @@ def _worker(rank: int, rendezvous: str, tp_batch_invariant: str, lengths: list[i
         hidden = hidden_full[own].contiguous()
         positions = positions_full[own].contiguous()
         assert sharded.head_tp_exchanges(ctx)
-        assert sharded.head_tp_input_row_counts(ctx, plan.local_rows) == list(
-            plan.row_counts
+        counts = list(plan.row_counts)
+        assert (
+            sharded.head_tp_leg_row_counts(ctx, plan.local_rows, collective=False)
+            == counts
         )
-        assert sharded.head_tp_row_counts(ctx, plan.local_rows) == list(plan.row_counts)
+        assert (
+            sharded.head_tp_leg_row_counts(ctx, plan.local_rows, collective=True)
+            == counts
+        )
         with pytest.raises(ValueError, match="holds"):
-            sharded.head_tp_row_counts(ctx, plan.local_rows + 1)
+            sharded.head_tp_leg_row_counts(ctx, plan.local_rows + 1, collective=True)
 
         expected = _absorbed_forward(
             reference, positions, hidden, ctx, comm, span_slots
@@ -258,10 +316,11 @@ def _worker(rank: int, rendezvous: str, tp_batch_invariant: str, lengths: list[i
         actual = _absorbed_forward(sharded, positions, hidden, ctx, comm, span_slots)
         assert tuple(actual.shape) == (plan.local_rows, HIDDEN)
         torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
-        # Every rank ran the prologue's gather; only ranks with rows attended.
-        assert sharded.attn_mqa.gathers == 1 and reference.attn_mqa.gathers == 1
-        assert sharded.attn_mqa.calls == (1 if plan.local_rows else 0)
-        assert sharded.attn_mqa_local.calls == 0
+        # Every rank ran the prologue's gather and the core's history gather,
+        # the empty shard included; the core attended every head.
+        for core in (sharded.attn_mqa, reference.attn_mqa):
+            assert core.gathers == 1 and core.history_gathers == 1
+        assert sharded.attn_mqa.calls_by_heads == {slice_heads: 0, NUM_HEADS: 1}
 
         # --- The drafter's decode step: replicated rows, no shard ---------
         bs = 2
@@ -270,9 +329,8 @@ def _worker(rank: int, rendezvous: str, tp_batch_invariant: str, lengths: list[i
         decode_positions = torch.tensor([7, 11], dtype=torch.int64)
         decode_ctx = _decode_ctx(bs)
         assert not sharded.head_tp_exchanges(decode_ctx)
-        assert sharded.absorbed_attention(decode_ctx) is sharded.attn_mqa_local
         with pytest.raises(ValueError, match="no query shard"):
-            sharded.head_tp_row_counts(decode_ctx, bs)
+            sharded.head_tp_leg_row_counts(decode_ctx, bs, collective=True)
         expected = _absorbed_forward(
             reference, decode_positions, rows, decode_ctx, comm, span_slots[:bs]
         )
@@ -281,14 +339,13 @@ def _worker(rank: int, rendezvous: str, tp_batch_invariant: str, lengths: list[i
         )
         assert tuple(actual.shape) == (bs, HIDDEN)
         torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
-        assert sharded.attn_mqa_local.calls == 1 and sharded.attn_mqa.calls == (
-            1 if plan.local_rows else 0
-        )
+        # The one layer attended this rank's head slice of every row.
+        assert sharded.attn_mqa.calls_by_heads == {slice_heads: 1, NUM_HEADS: 1}
         # The dense forward takes the same path for a decode step.
         expected = reference(decode_positions, rows, decode_ctx, comm)
         actual = sharded(decode_positions, rows, decode_ctx, comm)
         torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
-        assert sharded.attn_mqa_local.calls == 2
+        assert sharded.attn_mqa.calls_by_heads == {slice_heads: 2, NUM_HEADS: 1}
         dist.barrier()
     finally:
         dist.destroy_process_group()

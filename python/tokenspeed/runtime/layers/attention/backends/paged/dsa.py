@@ -736,22 +736,44 @@ class DSABackend(PagedAttentionBackend):
     # Validation helpers
     # ------------------------------------------------------------------
 
-    def _layer_holds_every_head(self, layer) -> bool:
-        """Whether ``layer``'s query heads are the model's (head-replicated
-        attention weights, as under query context parallelism) or the
-        attention-TP slice. The DCP combine's form follows the layer, never a
-        mapping assumption: replicated heads attend every head over the owned
-        pages and all-reduce the weighted partials; sharded heads gather the
-        group's query heads in and reduce-scatter their own back out."""
-        heads = layer.tp_q_head_num
-        if heads == self.num_local_heads:
-            return False
-        if heads == self.num_attention_heads:
-            return True
-        raise ValueError(
-            f"DSA layer holds {heads} query heads, neither the attention-TP slice "
-            f"({self.num_local_heads}) nor every head ({self.num_attention_heads})"
-        )
+    def _query_heads(self, q: torch.Tensor, layer) -> int:
+        """The heads ``q`` carries: ``[rows, heads, head_dim]``, or
+        ``[rows, heads * head_dim]``.
+
+        The sparse cores take their head count from the query, not from
+        ``layer.tp_q_head_num``: one model layer serves a forward whose rows
+        carry every head (head-replicated weights; head TP, whose exchange
+        delivered every head of this rank's own rows) and one whose rows
+        carry the attention-TP slice (plain attention TP; the replicated-row
+        forwards of a head-TP engine, which exchange nothing). Any other
+        count is a layout bug, refused here.
+        """
+        if q.dim() == 3:
+            heads, head_dim = q.shape[1], q.shape[2]
+        elif q.dim() == 2:
+            heads, head_dim = divmod(q.shape[1], layer.head_dim)
+            head_dim = layer.head_dim if head_dim == 0 else -1
+        else:
+            raise ValueError(f"DSA query must be 2-D or 3-D, got {tuple(q.shape)}")
+        if head_dim != layer.head_dim:
+            raise ValueError(
+                f"DSA query {tuple(q.shape)} does not split into heads of "
+                f"{layer.head_dim}"
+            )
+        if heads not in (self.num_local_heads, self.num_attention_heads):
+            raise ValueError(
+                f"DSA query carries {heads} heads, neither the attention-TP slice "
+                f"({self.num_local_heads}) nor every head ({self.num_attention_heads})"
+            )
+        return heads
+
+    def _query_holds_every_head(self, heads: int) -> bool:
+        """Whether a query of ``heads`` heads carries the model's heads rather
+        than the attention-TP slice (``_query_heads``). The DCP combine's form
+        follows it, never a mapping assumption: every head attends the owned
+        pages and all-reduces the weighted partials; the slice gathers the
+        group's query heads in and reduce-scatters its own back out."""
+        return heads != self.num_local_heads
 
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
         if logits_soft_cap and logits_soft_cap > 0:
@@ -902,10 +924,11 @@ class DSABackend(PagedAttentionBackend):
         history is gathered from its page owners into one buffer and the
         local rows attend it with every head -- pure data movement, so a
         row's bytes are those of an unsharded forward, and no LSE merge. The
-        layer must hold every head (head-replicated weights, or head TP over
+        query must carry every head (head-replicated weights, or head TP over
         the shard group, whose exchange delivers every head of the local
         rows before the core); the attention-TP slice is refused.
         """
+        heads = self._query_heads(q, layer)
         if layer.logit_cap and layer.logit_cap > 0:
             self._validate_logit_cap(layer.logit_cap)
         if getattr(token_to_kv_pool, "quant_method", None) == "per_token_head":
@@ -938,14 +961,14 @@ class DSABackend(PagedAttentionBackend):
                     "DSA sparse prefill top-k shape mismatch: "
                     f"indices={tuple(topk_slots.shape)}"
                 )
-            if not self._layer_holds_every_head(layer):
+            if not self._query_holds_every_head(heads):
                 raise RuntimeError(
                     "the sharded DSA extend attends the gathered history with every "
-                    f"head; the layer holds the attention-TP slice of "
-                    f"{layer.tp_q_head_num} heads (under head TP the exchange "
-                    "delivers every head of the local rows before the core)"
+                    f"head; the query carries the attention-TP slice of {heads} "
+                    "heads (under head TP the exchange delivers every head of the "
+                    "local rows before the core)"
                 )
-            q_view = q.view(q.shape[0], layer.tp_q_head_num, layer.head_dim)
+            q_view = q.view(q.shape[0], heads, layer.head_dim)
             if self.data_type == torch.float8_e4m3fn and q_view.dtype != self.data_type:
                 q_view = q_view.to(self.data_type)
             out = self._forward_sharded_sparse_prefill(
@@ -959,9 +982,9 @@ class DSABackend(PagedAttentionBackend):
             )
             if self.step_counter is not None:
                 self.step_counter.record_cache()
-            return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return out.reshape(-1, heads * layer.v_head_dim)
         if q.shape[0] == 0:
-            return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
+            return q.new_empty((0, heads * layer.v_head_dim))
         # KPool selection can append up to pool_size - 1 visible tail tokens,
         # so its workspace may be wider than the configured pooled top-k.
         if topk_slots.dim() != 2 or topk_slots.shape[1] <= 0:
@@ -969,13 +992,13 @@ class DSABackend(PagedAttentionBackend):
                 "DSA sparse prefill top-k shape mismatch: "
                 f"indices={tuple(topk_slots.shape)}"
             )
-        q_view = q.view(q.shape[0], layer.tp_q_head_num, layer.head_dim)
+        q_view = q.view(q.shape[0], heads, layer.head_dim)
         if self.data_type == torch.float8_e4m3fn and q_view.dtype != self.data_type:
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         use_dcp = len(self.dcp_group) > 1
-        keep_all_heads = use_dcp and self._layer_holds_every_head(layer)
+        keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         if use_dcp:
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
             topk_slots = torch.where(owned, slots, -1)
@@ -1021,7 +1044,7 @@ class DSABackend(PagedAttentionBackend):
         # observe either cache field before it is ready.
         if self.step_counter is not None:
             self.step_counter.record_cache()
-        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return out.reshape(-1, heads * layer.v_head_dim)
 
     def _forward_sharded_sparse_prefill(
         self,
@@ -1043,7 +1066,7 @@ class DSABackend(PagedAttentionBackend):
                 f"rows, got {q_view.shape[0]}"
             )
         out = q_view.new_empty(
-            (q_view.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+            (q_view.shape[0], q_view.shape[1], layer.v_head_dim),
             dtype=(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
             ),
@@ -1183,7 +1206,8 @@ class DSABackend(PagedAttentionBackend):
                 seq_lens.unsqueeze(1).add(offsets).clamp_min(0).reshape(-1).contiguous()
             )
 
-        q_view = q.view(num_tokens, layer.tp_q_head_num, layer.head_dim)
+        heads = self._query_heads(q, layer)
+        q_view = q.view(num_tokens, heads, layer.head_dim)
         if self.data_type == torch.float8_e4m3fn:
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1192,12 +1216,14 @@ class DSABackend(PagedAttentionBackend):
             getattr(metadata, "max_seq_len_k", 0) or self.max_context_len
         )
         use_dcp = len(self.dcp_group) > 1
-        # The combine's form follows the layer's head layout: a layer holding
-        # every head (head-replicated attention weights, as a query shard's
-        # drafter steps have) keeps all heads -- no query-head gather in, an
-        # all-reduce of the weighted partials out; a layer holding the TP
-        # slice gathers heads in and reduce-scatters them back.
-        keep_all_heads = use_dcp and self._layer_holds_every_head(layer)
+        # The combine's form follows the query's heads: every head
+        # (head-replicated attention weights, as the drafter's steps on a
+        # query-sharding engine without head TP carry) keeps all heads -- no
+        # query-head gather in, an all-reduce of the weighted partials out;
+        # the attention-TP slice (plain attention TP, or the drafter's steps
+        # under head TP over the query shards, which exchange nothing)
+        # gathers heads in and reduce-scatters them back.
+        keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         topk_slots = topk_indices.view(num_tokens, -1)
         if use_dcp:
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
@@ -1236,7 +1262,7 @@ class DSABackend(PagedAttentionBackend):
             ).to(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
             )
-        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return out.reshape(-1, heads * layer.v_head_dim)
 
 
 register_backend("dsa", {AttentionArch.DSA}, DSABackend)

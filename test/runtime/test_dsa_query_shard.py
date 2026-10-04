@@ -75,8 +75,8 @@ def _backend(rank: int, *, workspace_rows: int, qcp: bool = True) -> dsa.DSABack
     backend.index_head_dim = INDEX_HEAD_DIM
     backend.index_topk = 4
     backend.max_context_len = 64
-    # Two heads in the model, one per attention-TP slice: a layer passing
-    # tp_q_head_num=2 holds every head, tp_q_head_num=1 the slice.
+    # Two heads in the model, one per attention-TP slice: a query of two
+    # heads carries every head, of one head the slice.
     backend.num_attention_heads = 2
     backend.num_local_heads = 1
     backend.device = "cpu"
@@ -297,16 +297,17 @@ def test_the_sharded_arm_attends_gathered_groups_with_full_heads(monkeypatch, ra
         assert not calls
 
 
-def test_the_sharded_arm_refuses_a_layer_holding_the_tp_slice():
-    """The gathered history is attended with every head: a layer holding the
+def test_the_sharded_arm_refuses_a_query_carrying_the_tp_slice():
+    """The gathered history is attended with every head: a query carrying the
     attention-TP slice (the head-sharded form without the exchange in front
-    of it) is a layout bug, refused before any gather."""
+    of it) is a layout bug, refused before any gather -- whatever head count
+    the layer declares."""
     backend = _backend(1, workspace_rows=11)
     plan = _plan(1)
     _init(backend, plan)
     layer = SimpleNamespace(
         layer_id=0,
-        tp_q_head_num=1,
+        tp_q_head_num=2,
         head_dim=KV_DIM,
         v_head_dim=KV_DIM - 2,
         scaling=0.5,
@@ -453,17 +454,18 @@ def _decode_layer(heads: int):
 
 
 @pytest.mark.parametrize("layer_heads,keep_all_heads", [(8, True), (2, False)])
-def test_the_dcp_combine_form_follows_the_layers_head_layout(
+def test_the_dcp_combine_form_follows_the_querys_heads(
     monkeypatch, layer_heads, keep_all_heads
 ):
-    """The decode arm's combine is decided by the layer's heads, not by the
-    mapping: a layer holding every head (head-replicated weights, the
-    drafter's steps on a query-sharding engine without head TP) keeps all
-    heads -- no query-head gather, an all-reduce combine; a layer holding the
-    attention-TP slice (plain attention TP, or the drafter's steps under head
-    TP over the query shards, which skip the exchange and attend the slice
-    on ``attn_mqa_local``) gathers the group's heads in and reduce-scatters
-    its own back -- the DCP arm as it stands, ``keep_all_heads`` retired."""
+    """The decode arm's combine is decided by the heads the query carries,
+    not by the layer's declared count or the mapping: every head
+    (head-replicated weights, the drafter's steps on a query-sharding engine
+    without head TP) keeps all heads -- no query-head gather, an all-reduce
+    combine; the attention-TP slice (plain attention TP, or the drafter's
+    steps under head TP over the query shards, which exchange nothing and
+    hand the one core layer the slice) gathers the group's heads in and
+    reduce-scatters its own back -- the DCP arm as it stands. The layer here
+    declares every head either way, as a head-TP layer does."""
     backend = _decode_arm_backend(num_attention_heads=8, attn_tp_size=4)
     query = torch.zeros(1, layer_heads, 128, dtype=torch.bfloat16)
     slots = torch.full((1, 512), -1, dtype=torch.int32)
@@ -494,7 +496,7 @@ def test_the_dcp_combine_form_follows_the_layers_head_layout(
     monkeypatch.setattr(dsa, "combine_attention_partials", combine)
     out = backend.forward_sparse_decode(
         q=query,
-        layer=_decode_layer(layer_heads),
+        layer=_decode_layer(8),
         token_to_kv_pool=pool,
         bs=1,
         topk_indices=slots,
@@ -504,10 +506,19 @@ def test_the_dcp_combine_form_follows_the_layers_head_layout(
     assert gathered == ([] if keep_all_heads else [(1, layer_heads, 128)])
 
 
-def test_a_layer_with_neither_head_layout_is_refused():
+def test_a_query_with_neither_head_layout_is_refused():
     backend = _decode_arm_backend(num_attention_heads=8, attn_tp_size=4)
+    layer = _decode_layer(8)
     with pytest.raises(ValueError, match="neither the attention-TP slice"):
-        backend._layer_holds_every_head(_decode_layer(3))
+        backend._query_heads(torch.zeros(1, 3, 128), layer)
+    # A flat query splits by the layer's head_dim; a ragged one is refused.
+    assert backend._query_heads(torch.zeros(1, 2 * 128), layer) == 2
+    assert backend._query_heads(torch.zeros(0, 8, 128), layer) == 8
+    with pytest.raises(ValueError, match="does not split"):
+        backend._query_heads(torch.zeros(1, 2 * 128 + 1), layer)
+    with pytest.raises(ValueError, match="does not split"):
+        backend._query_heads(torch.zeros(1, 2, 64), layer)
+    assert backend._query_holds_every_head(8) and not backend._query_holds_every_head(2)
     # Without DCP the form is moot and the arm never asks.
     backend.dcp_group = (1,)
     backend.dcp_rank = 0

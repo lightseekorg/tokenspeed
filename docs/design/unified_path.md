@@ -1418,14 +1418,23 @@ The contract a model (in tree or a plugin) implements:
   holds too and no solution is wrong at runtime; the padding rows are never
   selected. The history gathers move any row dtype (packed uint8 index-K
   rows, fp32 scales) as bf16 pairs of their bytes, since the token
-  all-gather's low-latency solution is bf16-only. The sharded arm attends
-  with every head and refuses a layer holding the attention-TP slice. The
-  decode arm (the drafter's steps) keeps the DCP combine over the KVP pages;
-  its form follows the layer's head count against the attention config
-  (`keep_all_heads` when `layer.tp_q_head_num` is every head —
-  head-replicated weights — the gather-and-reduce-scatter form when it is
-  the attention-TP slice, as under head TP over the shard group; any other
-  count is refused), never a mapping assumption.
+  all-gather's low-latency solution is bf16-only. The sparse cores take
+  their head count from the query, never from `layer.tp_q_head_num` or a
+  mapping assumption (`DSABackend._query_heads`: the model's heads or the
+  attention-TP slice, any other count refused), so one model layer serves a
+  forward whose rows carry every head and one whose rows carry the slice.
+  The sharded arm attends with every head and refuses a query carrying the
+  slice. The decode arm (the drafter's steps) keeps the DCP combine over the
+  KVP pages; its form follows the query's heads (`keep_all_heads` for every
+  head — head-replicated weights — the gather-and-reduce-scatter form for
+  the slice, as the drafter's steps under head TP over the shard group
+  carry). The model threads the sequence after `forward_absorb_qkv_proj`
+  through `DeepseekV3AttentionMLA.sparse_prefill_attn_v_proj` (the backend's
+  `forward_sparse_prefill` with the model's selection, then
+  `project_attended_heads`: under head TP the tokens-to-heads exchange, the
+  local `w_vc`); GLM-5's sparse prefill runs it in tree. A rank whose shard
+  is empty calls it like every other rank — the core's history gathers are
+  collectives — and projects nothing.
 * The model exit (`BaseCausalLM.exit_logits`, or `gather_sampled_rows` +
   `ctx.logits_rows_selected = True`) gathers only the sampled rows; a FULL
   hidden capture stays the shard. `ctx.gather_ids` keeps the batch's full
@@ -1455,18 +1464,26 @@ no LSE merge, the tokens-to-heads all-to-all, the local `w_vc`, and the
 `o_proj` tail: row-parallel plus a token reduce-scatter to the shard rows, or
 under `--tp-batch-invariant attn` the all-gather of the heads, the
 column-parallel GEMM and an all-to-all back. One resolver
-(`comm_manager.head_tp_row_counts`) hands every leg its per-rank counts: the
-DP tables under attention DP, the shard plan under QCP (`row_counts` for the
-legs up to the core, `rows_for_collective(ctx.collective_num_tokens)` after
-it — identical on an extend that does not narrow), so no model code
+(`comm_manager.head_tp_row_counts`, the module's
+`head_tp_leg_row_counts(ctx, num_rows, collective=)`) hands every leg its
+per-rank counts: the DP tables under attention DP, the shard plan under QCP
+(`row_counts` for the legs up to the core, `rows_for_collective(ctx.collective_num_tokens)`
+after it — identical on an extend that does not narrow), so no model code
 branches on the layout. The drafter's decode steps on this engine hold every
-row on every rank: they exchange nothing (`head_tp_exchanges(ctx)` is False
-without a shard), attend this rank's head slice on `attn_mqa_local` — the
-DCP arm as attention TP runs it, `keep_all_heads` retired on this layout —
-and the tail all-reduces the row-parallel partials (or all-gathers the
-batch-invariant hidden shards), so the layer's rows stay replicated. The
-expanded (dense MLA) prefill keeps refusing head TP: only the absorbed sparse
-prefill can take the exchange. The decode-only gates of the attention-DP
+row on every rank: they exchange nothing — `head_tp_exchanges(ctx)` is False
+without a shard, the one fork of the head-TP path, asked by every leg and
+switching off the exchanges and nothing else — so they attend this rank's
+head slice of every row through the same `attn_mqa` layer (which declares
+every head; the DSA core reads the head count from the query, so no second
+layer exists for the slice), the DCP arm as attention TP runs it, and the
+tail all-reduces the row-parallel partials (or all-gathers the
+batch-invariant hidden shards), so the layer's rows stay replicated. The two
+forward forms of this engine are thus the sharded extend and the replicated
+decode step. The expanded (dense MLA) prefill keeps refusing head TP: only
+the absorbed sparse prefill can take the exchange. The alternative to this fork — sharding the drafter's decode
+rows by a plan too, so every forward exchanges — needs a sharded DSA decode
+arm (history gathers for decode rows) that does not exist; the fork is the
+contained form until it does. The decode-only gates of the attention-DP
 layout (`disaggregation_mode == "decode"`, the decode-shaped autotune, the
 retraction-window generation budget) key on
 `mapping.attn.head_tp_serves_decode_only`, which is False over the query
