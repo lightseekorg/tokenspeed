@@ -44,6 +44,9 @@ register_cuda_ci(est_time=60, suite="runtime-1gpu")
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
+from tokenspeed.runtime.engine import (  # noqa: E402
+    generation_output_processor as output_module,
+)
 from tokenspeed.runtime.engine.generation_output_processor import (  # noqa: E402
     OutputProcesser,
     RequestState,
@@ -543,7 +546,11 @@ def test_prefill_node_ships_prompt_logprobs_in_its_finished_frame():
     assert out.input_token_logprobs_idx == [[103, 104, 105]]
 
 
-def test_decode_node_prepends_the_bootstrap_logprob_to_output_logprobs(caplog):
+def test_decode_node_prepends_the_bootstrap_logprob_to_output_logprobs(
+    caplog, monkeypatch
+):
+    # The colorful logger does not propagate; let caplog see its records.
+    monkeypatch.setattr(output_module.logger, "propagate", True)
     processor = _processor()
     state = _state([1, 2, 3], start=0, computes_prompt_logprobs=False)
     state.computed_length = 3
