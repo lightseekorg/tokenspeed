@@ -200,6 +200,41 @@ class QueryShardPlan:
         first = self.local_sampled_first
         return gather_ids[first : first + self.local_sampled_rows] - self.local_start
 
+    def rows_per_rank(self, rows: torch.Tensor) -> tuple[int, ...]:
+        """How many of ``rows`` fall in each rank's shard.
+
+        The split a collective over those rows needs (the prompt-logprob rows
+        of a forward, whose activations every rank contributes from its shard
+        and gathers in row order): rows are batch-global and sorted, so rank
+        order is row order and this rank's rows are the contiguous run
+        ``[sum(counts[:rank]), sum(counts[:rank + 1]))`` of ``rows``
+        (``local_rows_run``). Host arithmetic over the shard boundaries, no
+        per-row Python work.
+
+        Args:
+            rows: Sorted batch-global rows, a 1-D host tensor.
+
+        Returns:
+            Per-rank counts summing to ``rows.shape[0]``.
+        """
+        if rows.dim() != 1 or rows.device.type != "cpu":
+            raise ValueError("rows_per_rank takes a 1-D host tensor of rows")
+        bounds = torch.cumsum(torch.tensor(self.row_counts, dtype=rows.dtype), dim=0)
+        # Rows below each shard's end; successive differences are the shards'.
+        below = torch.searchsorted(rows, bounds)
+        counts = torch.diff(below, prepend=below.new_zeros(1))
+        if int(below[-1]) != rows.shape[0]:
+            raise ValueError(
+                f"query shard: rows up to {int(rows.max())} exceed the "
+                f"{self.total_rows}-row span"
+            )
+        return tuple(int(count) for count in counts)
+
+    def local_rows_run(self, rows_per_rank: Sequence[int]) -> slice:
+        """This rank's run of a sorted row list split by ``rows_per_rank``."""
+        first = sum(rows_per_rank[: self.rank])
+        return slice(first, first + rows_per_rank[self.rank])
+
     def rows_for_collective(self, num_tokens: int | None) -> tuple[int, ...]:
         """Per-rank row counts of the rows a collective moves.
 

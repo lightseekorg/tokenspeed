@@ -44,12 +44,16 @@ from tokenspeed.runtime.configs.numerics import (
     BITWISE_ENVELOPES,
     MEGATRON_VOCAB_BLOCK,
 )
-from tokenspeed.runtime.distributed.comm_manager import dp_group_row_counts
+from tokenspeed.runtime.distributed.comm_manager import (
+    dp_group_row_counts,
+    gather_sampled_rows,
+)
 from tokenspeed.runtime.distributed.comm_ops import (
     all_gather,
     all_gather_single,
     all_to_all_transpose,
     token_all_gather,
+    token_all_gather_rows,
 )
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -59,6 +63,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -162,8 +167,8 @@ class LogitsProcessorOutput:
     next_token_token_ids_logprobs_idx: list | None = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
-    # The logprobs of the prompt rows ``LogitsMetadata.input_logprob_rows``
-    # named, fp32 in that order.           shape: [#rows]
+    # The logprobs of the prompt rows the forward's ``InputLogprobPlan``
+    # named, fp32 in plan order, whole on every rank.  shape: [#rows]
     input_token_logprobs: torch.Tensor | None = None
 
 
@@ -176,6 +181,9 @@ class LogitsMetadata:
     # Prompt rows whose next-token logprob the forward returns (SGLang
     # ``logprob_start_len``); None when none is wanted.
     input_logprob_rows: InputLogprobRows | None = None
+    # The rows ``hidden_states`` holds are this rank's shard of the forward
+    # (query context parallelism); None when they are the whole forward.
+    query_shard: QueryShardPlan | None = None
     # The forward's per-rank row tables (attention DP), for the LM-head TP
     # group's row counts; see LogitsProcessor._lm_head_tp_row_counts.
     all_decode_or_idle: bool = False
@@ -200,6 +208,7 @@ class LogitsMetadata:
             gather_ids=ctx.gather_ids,
             logits_rows_selected=ctx.logits_rows_selected,
             input_logprob_rows=ctx.input_logprob_rows,
+            query_shard=ctx.query_shard,
             all_decode_or_idle=ctx.all_decode_or_idle,
             global_num_tokens=ctx.global_num_tokens,
             collective_global_num_tokens=ctx.collective_global_num_tokens,
@@ -568,6 +577,21 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         aux_hidden_states: torch.Tensor | None = None,
     ) -> LogitsProcessorOutput:
+        """The model exit: prompt logprobs, the sampled rows, their logits.
+
+        ``hidden_states`` are every input row of the forward, or this rank's
+        shard of them under query context parallelism
+        (``logits_metadata.query_shard``), or -- when the model selected its
+        logits rows itself (``logits_rows_selected``) -- the sampled rows
+        already. Prompt logprobs are scored first, where the activations
+        live, then the sampled rows are selected: ``hidden_states[gather_ids]``
+        on whole rows, :func:`gather_sampled_rows` over the group on a shard
+        (every rank ends with the batch's ``[bs, hidden]`` rows in request
+        order, so the LM head and the vocab all-gather run as without a
+        shard). A FULL hidden capture is the rows as given -- the shard under
+        a shard, which is what a drafter's extend step consumes.
+        """
+        shard = self._query_shard(logits_metadata)
         # A model may finish a cache-only chunk without any logits rows.
         # Return before LM-head/collective kernels, retaining the empty taps.
         if logits_metadata.logits_rows_selected and hidden_states.shape[0] == 0:
@@ -593,8 +617,9 @@ class LogitsProcessor(nn.Module):
                 next_token_logits=logits, hidden_states=capture
             )
 
-        # Prompt logprobs read the full [num_tokens, hidden] activations, so
-        # they are gathered before the sampled-row pruning below.
+        # Prompt logprobs read the [num_input_rows, hidden] activations this
+        # rank holds, so they are scored before the sampled-row selection
+        # below (on a shard: before the sampled rows leave it).
         input_token_logprobs = None
         if logits_metadata.input_logprob_rows is not None:
             input_token_logprobs = self.compute_input_token_logprobs(
@@ -604,15 +629,25 @@ class LogitsProcessor(nn.Module):
         # Get the last hidden states and last logits for the next token prediction
         gather_ids = logits_metadata.gather_ids
         if gather_ids is not None:
-            # Shapes align iff midlayer already pruned to one row per request
-            # (draft first-step reduce). Other paths emit [N, H] with N > bs.
-            if (
-                logits_metadata.logits_rows_selected
-                or gather_ids.shape[0] == hidden_states.shape[0]
+            if logits_metadata.logits_rows_selected or (
+                # Shapes align iff midlayer already pruned to one row per
+                # request (draft first-step reduce). Other paths emit [N, H]
+                # with N > bs. A shard's rows are never pre-selected.
+                shard is None
+                and gather_ids.shape[0] == hidden_states.shape[0]
             ):
                 pruned_states = hidden_states
                 if aux_hidden_states is not None:
                     aux_pruned_states = list(aux_hidden_states)
+            elif shard is not None:
+                pruned_states = gather_sampled_rows(
+                    hidden_states, shard, gather_ids, group=self.tp_group
+                )
+                if aux_hidden_states is not None:
+                    aux_pruned_states = [
+                        gather_sampled_rows(h, shard, gather_ids, group=self.tp_group)
+                        for h in aux_hidden_states
+                    ]
             else:
                 pruned_states = hidden_states[gather_ids]
                 if aux_hidden_states is not None:
@@ -675,6 +710,34 @@ class LogitsProcessor(nn.Module):
             input_token_logprobs=input_token_logprobs,
         )
 
+    def _query_shard(self, logits_metadata: LogitsMetadata) -> QueryShardPlan | None:
+        """The forward's query shard when ``hidden_states`` are a shard.
+
+        The shard's collectives (the sampled-row gather, the gather of the
+        planned prompt rows) run over this processor's TP group: it is the LM
+        head's vocab-shard group, every rank of which must hold the same rows
+        for the vocab all-gather to be consistent, and query context
+        parallelism shards queries over exactly that group
+        (``validate_qcp``: ``qcp_size == attn_tp_size``). A plan of another
+        width, or a replicated head (attention DP), names a layout this
+        processor cannot serve.
+        """
+        plan = logits_metadata.query_shard
+        if plan is None or plan.size == 1:
+            return None
+        if plan.size != self.tp_size or self.skip_all_gather:
+            head = (
+                "a replicated LM head"
+                if self.skip_all_gather
+                else f"an LM head sharded over {self.tp_size} ranks"
+            )
+            raise ValueError(
+                f"query shard of {plan.size} ranks over {head}: the sampled rows "
+                "and prompt logprobs are gathered over the head's vocab-shard "
+                "group, so the query shard group must be it"
+            )
+        return plan
+
     def compute_input_token_logprobs(
         self,
         hidden_states: torch.Tensor,
@@ -696,19 +759,32 @@ class LogitsProcessor(nn.Module):
         the next chunk's gather on a faster rank would overwrite while this
         rank still reads it, so the chunk loop never takes that path.
 
+        Under a query shard (``InputLogprobRows.rows_per_rank`` is set) the
+        rows this rank holds are the plan's rows inside its shard. The head
+        is vocab-sharded over the same group, so a row's full-vocabulary
+        logits need every rank's slice *of that row*: the planned rows'
+        activations are all-gathered first (one collective with the
+        per-rank counts, rank order being row order) and the chunk loop then
+        runs over the whole plan on every rank, exactly as without a shard.
+        Every rank ends with the same fp32 vector -- the unsharded forward's
+        bit for bit, since each row meets the same operands -- so no result
+        gather follows and the per-request NaN audit agrees across the
+        group. A rank without any planned row contributes no activation and
+        still joins the gather and every chunk's vocab all-gather.
+
         Args:
-            hidden_states: The forward's full ``[num_input_rows, hidden]``
-                activations, one row per input token.
+            hidden_states: The ``[num_input_rows, hidden]`` activations this
+                rank holds, one row per input token it computed.
             lm_head: The vocab-parallel head.
             logits_metadata: Carries ``input_logprob_rows``.
 
         Returns:
-            fp32 ``[len(rows)]`` logprobs in row order.
+            fp32 ``[plan rows]`` logprobs in row order, the whole plan's.
 
         Raises:
             ValueError: The model narrowed its logits rows (``hidden_states``
-                does not cover every input row), so prompt rows have no
-                activations to read.
+                does not cover every input row it computed), so prompt rows
+                have no activations to read.
             RuntimeError: The head is vocab-sharded over attention-DP ranks
                 (``dp_lm_head_tp``); admission refuses such requests
                 (``RequestHandler.supports_input_logprobs``), so reaching here
@@ -733,12 +809,40 @@ class LogitsProcessor(nn.Module):
             )
         if plan.chunk_tokens <= 0:
             raise ValueError("input_logprob_chunk_tokens must be positive")
-        num_rows = plan.rows.shape[0]
+        shard = self._query_shard(logits_metadata)
+        if (plan.rows_per_rank is None) != (shard is None):
+            raise ValueError(
+                "input logprob rows were staged for "
+                f"{'a sharded' if plan.rows_per_rank is not None else 'an unsharded'} "
+                f"forward but the forward is {'sharded' if shard else 'not'}"
+            )
+        if shard is None:
+            # Chunks index the activations in place: no [rows, hidden] copy.
+            source, index = hidden_states, plan.rows
+            staged_rows = index.shape[0]
+        else:
+            if plan.rows.shape[0] != plan.rows_per_rank[shard.rank]:
+                raise ValueError(
+                    f"query shard rank {shard.rank} staged {plan.rows.shape[0]} "
+                    f"prompt rows but its share of the plan is "
+                    f"{plan.rows_per_rank[shard.rank]}"
+                )
+            source = token_all_gather_rows(
+                hidden_states[plan.rows], self.tp_group, list(plan.rows_per_rank)
+            )
+            index = None
+            staged_rows = source.shape[0]
+        num_rows = plan.targets.shape[0]
+        if staged_rows != num_rows:
+            raise ValueError(
+                f"{num_rows} prompt-logprob targets for {staged_rows} rows"
+            )
         out = torch.empty(num_rows, dtype=torch.float32, device=hidden_states.device)
         for begin in range(0, num_rows, plan.chunk_tokens):
             end = min(begin + plan.chunk_tokens, num_rows)
+            rows = source[begin:end] if index is None else source[index[begin:end]]
             logits = self._get_logits(
-                hidden_states[plan.rows[begin:end]],
+                rows,
                 lm_head,
                 logits_metadata,
                 plan=None,

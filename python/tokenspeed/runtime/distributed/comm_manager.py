@@ -34,38 +34,37 @@ from tokenspeed.runtime.execution.query_shard import QueryShardPlan, scatter_cou
 
 
 def gather_sampled_rows(
-    hidden_states: torch.Tensor, ctx: ForwardContext, *, group: tuple[int, ...]
+    hidden_states: torch.Tensor,
+    plan: QueryShardPlan,
+    gather_ids: torch.Tensor,
+    *,
+    group: tuple[int, ...],
 ) -> torch.Tensor:
     """Gather the sampled rows of a sharded extend forward to every rank.
 
-    The last row of every request (``ctx.gather_ids``, the batch's full
-    layout, sorted) lives on exactly one rank; each rank selects the ones
-    inside its shard (``QueryShardPlan.local_sampled_ids``) and one
-    all-gather with the plan's per-rank sampled-row counts concatenates them
-    in rank order, which is request order. The model sets
-    ``ctx.logits_rows_selected`` afterwards so the logits processor takes the
-    ``[bs, hidden]`` rows as given.
+    The last row of every request (``gather_ids``, the batch's full layout,
+    sorted) lives on exactly one rank; each rank selects the ones inside its
+    shard (``QueryShardPlan.local_sampled_ids``) and one all-gather with the
+    plan's per-rank sampled-row counts concatenates them in rank order, which
+    is request order. The logits processor runs this in place of its
+    ``hidden_states[gather_ids]`` selection on a sharded forward.
 
     Args:
         hidden_states: ``[local_rows, hidden]`` this rank's final rows.
-        ctx: The forward, with ``query_shard`` and the full-layout
-            ``gather_ids`` set.
+        plan: The forward's query shard.
+        gather_ids: ``[bs]`` the batch's full-layout sampled rows
+            (``ctx.gather_ids``).
         group: The query-context-parallel group.
 
     Returns:
         ``[bs, hidden]`` sampled rows in request order, on every rank.
     """
-    plan = ctx.query_shard
-    if plan is None:
-        raise ValueError("gather_sampled_rows needs a sharded forward")
-    if ctx.gather_ids is None:
-        raise ValueError("gather_sampled_rows needs ctx.gather_ids")
     if hidden_states.shape[0] != plan.local_rows:
         raise ValueError(
             f"query shard rank {plan.rank} holds {plan.local_rows} rows, got "
             f"{hidden_states.shape[0]}"
         )
-    local = hidden_states.index_select(0, plan.local_sampled_ids(ctx.gather_ids))
+    local = hidden_states.index_select(0, plan.local_sampled_ids(gather_ids))
     return token_all_gather(local, group, list(plan.sampled_rows_per_rank))
 
 
@@ -594,10 +593,13 @@ class CommManager:
         """A sharded forward's model exit: every rank's sampled rows, request
         order (:func:`gather_sampled_rows` over the query-context-parallel
         group)."""
-        if self._shard(ctx) is None:
+        plan = self._shard(ctx)
+        if plan is None:
             raise RuntimeError("gather_sampled_rows serves sharded forwards")
+        if ctx.gather_ids is None:
+            raise RuntimeError("gather_sampled_rows needs ctx.gather_ids")
         return gather_sampled_rows(
-            hidden_states, ctx, group=self.mapping.attn.qcp_group
+            hidden_states, plan, ctx.gather_ids, group=self.mapping.attn.qcp_group
         )
 
     def post_final_norm_comm(

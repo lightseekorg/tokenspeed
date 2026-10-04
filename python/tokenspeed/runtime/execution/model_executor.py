@@ -2058,7 +2058,7 @@ class ModelExecutor:
                     ),
                     gather_ids=gather_ids,
                     input_logprob_rows=self._input_logprob_rows(
-                        input_logprob_plan, num_extends, total_tokens
+                        input_logprob_plan, num_extends, total_tokens, query_shard
                     ),
                     decode_input_ids=decode_input_ids,
                     output_layout=output_layout,
@@ -2269,7 +2269,11 @@ class ModelExecutor:
         )
 
     def _input_logprob_rows(
-        self, plan: InputLogprobPlan | None, num_extends: int, total_tokens: int
+        self,
+        plan: InputLogprobPlan | None,
+        num_extends: int,
+        total_tokens: int,
+        query_shard: QueryShardPlan | None,
     ) -> InputLogprobRows | None:
         """Expand the plan into device rows, targets and slots for the logits processor.
 
@@ -2282,6 +2286,15 @@ class ModelExecutor:
         boundary). A target outside the vocabulary flags its request through
         the NaN guard, which terminates it; the clamp only keeps the gather
         from faulting on a flagged row.
+
+        Under a query shard every rank stages the whole plan's targets and
+        slots (the shifted ids are the whole span on every rank; every rank
+        scores every row once the planned activations are gathered, and the
+        target audit flags the same requests everywhere) and keeps as its
+        ``rows`` the ones inside its shard, re-based to it: the plan's rows
+        are sorted batch-global rows, so each rank's are one contiguous run
+        and the per-rank counts are host arithmetic over the shard boundaries
+        (``QueryShardPlan.rows_per_rank``).
         """
         if plan is None:
             return None
@@ -2302,12 +2315,20 @@ class ModelExecutor:
             targets, slots, num_extends, self.runtime_states.vocab_size
         )
         targets.clamp_(0, self.runtime_states.vocab_size - 1)
+        rows_per_rank = None
+        num_input_rows = total_tokens
+        if query_shard is not None and query_shard.size > 1:
+            rows_per_rank = query_shard.rows_per_rank(rows_cpu)
+            local = query_shard.local_rows_run(rows_per_rank)
+            rows = rows[local] - query_shard.local_start
+            num_input_rows = query_shard.local_rows
         return InputLogprobRows(
             rows=rows,
             targets=targets,
             slots=slots,
-            num_input_rows=total_tokens,
+            num_input_rows=num_input_rows,
             chunk_tokens=self.config.input_logprob_chunk_tokens,
+            rows_per_rank=rows_per_rank,
         )
 
     def write_remote_spec_candidate_ids(

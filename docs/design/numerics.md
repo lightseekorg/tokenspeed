@@ -297,12 +297,17 @@ Within one deployment they keep the contract as follows.
 
 Every collective query context parallelism adds (`docs/design/unified_path.md`)
 is data movement: row slicing, the all-gather of rotated latent rows, index-K
-rows, gathered history rows and sampled rows. The per-row kernels — sparse
-attention over the gathered history with every head and no LSE merge, the
-indexer's top-k over pre-gathered rows, RoPE, the GEMMs — see for each row
-exactly the operands a single GPU would, so a row's bits do not depend on
-which rank computes it or on the batch it shares: the layout preserves run
-and batch invariance by construction. What differs from the TP8 prefill
+rows, gathered history rows, sampled rows and the planned prompt-logprob rows'
+activations. The per-row kernels — sparse attention over the gathered history
+with every head and no LSE merge, the indexer's top-k over pre-gathered rows,
+RoPE, the GEMMs — see for each row exactly the operands a single GPU would,
+so a row's bits do not depend on which rank computes it or on the batch it
+shares: the layout preserves run and batch invariance by construction. The
+prompt logprobs in particular are the tensor-parallel path's bit for bit:
+once the planned rows are gathered, every rank runs the same chunk loop over
+the same rows against the same vocab-sharded head
+(`test/runtime/distributed/test_qcp_prompt_logprobs.py` asserts
+`torch.equal` against that path). What differs from the TP8 prefill
 baseline is the output projection's form: this landing keeps it replicated
 over every head (the TP1 / trainer form), whereas TP8's row-parallel
 projection folds per-rank partials, the same gap as between the decode

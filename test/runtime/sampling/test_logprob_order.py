@@ -143,6 +143,7 @@ def _prompt_rows(rows: list[int], targets: list[int], *, num_input_rows: int):
         slots=torch.zeros(len(rows), dtype=torch.int64),
         num_input_rows=num_input_rows,
         chunk_tokens=2,
+        rows_per_rank=None,
     )
 
 
