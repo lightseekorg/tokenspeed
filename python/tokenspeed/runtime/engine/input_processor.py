@@ -184,8 +184,7 @@ class InputProcessor:
 
         Everything the data plane would otherwise trip over is a 400 here:
         the engine's capability (a model that narrows its prefill rows has no
-        activations for the prompt positions; a pipeline split leaves the
-        logits on another stage -- ``AsyncLLM.supports_prompt_logprobs``,
+        activations for the prompt positions -- ``AsyncLLM.supports_prompt_logprobs``,
         reported by the scheduler at startup), a multimodal prompt (its media
         positions carry content-hash ids, not tokens, so they have no logprob)
         and a client-supplied token id outside the vocabulary (its logprob
@@ -194,9 +193,8 @@ class InputProcessor:
         if not self.engine.supports_prompt_logprobs:
             raise ValueError(
                 "logprob_start_len >= 0 (prompt logprobs) is not supported by this "
-                "engine: the model narrows its prefill rows or runs pipeline "
-                "parallel, so it cannot score every prompt position. Use "
-                "logprob_start_len=-1."
+                "engine: the model narrows its prefill rows, so it cannot score "
+                "every prompt position. Use logprob_start_len=-1."
             )
         if multimodal_inputs is not None:
             raise ValueError(

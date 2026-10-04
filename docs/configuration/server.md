@@ -132,16 +132,16 @@ non-finite value.
 A request with `logprob_start_len >= 0` that asks for at least one prompt
 logprob is refused at the ingress with a 400 when the engine cannot score
 every prompt position: models that narrow their prefill rows (DeepSeek V4.1's
-CED decoder keeps only each prompt's last window for the LM head) and
-pipeline-parallel deployments (`--pp-size > 1`, where the logits live on the
-last stage only). The scheduler reports this capability at startup and the
-frontend checks it before admitting the request, so the data plane never has
-to. Multimodal prompts are refused too (their media positions carry
-content-hash ids, not tokens), as is a prompt whose client-supplied
-`input_ids` fall outside the vocabulary. `logprob_start_len=-1` is always
-accepted.
+CED decoder keeps only each prompt's last window for the LM head). The
+scheduler reports this capability at startup and the frontend checks it
+before admitting the request, so the data plane never has to. Multimodal
+prompts are refused too (their media positions carry content-hash ids, not
+tokens), as is a prompt whose client-supplied `input_ids` fall outside the
+vocabulary. `logprob_start_len=-1` is always accepted.
 
-Under query context parallelism
+Under pipeline parallelism (`--pp-size > 1`) the last stage scores the prompt
+rows and the commit path carries both logprob vectors to the other stages
+with the sampled tokens. Under query context parallelism
 (`--prefill-context-parallel-size N`) the prompt rows of a chunk live on the
 rank whose shard holds them; since the LM head is vocab-sharded over the same
 ranks, the planned rows' activations are gathered to the group and every rank
@@ -164,8 +164,7 @@ scheduler drive (SMG) carries sampled-token logprobs only: it refuses a
 `logprob_start_len` that would produce prompt logprobs rather than compute
 and drop them.
 
-`top_logprobs_num > 0` and `token_ids_logprob` are not supported yet. Output
-logprobs are not propagated across pipeline-parallel stages (`--pp-size > 1`).
+`top_logprobs_num > 0` and `token_ids_logprob` are not supported yet.
 
 This runtime requires a `tokenspeed-scheduler` build that has
 `RequestSpec.max_cached_prefix_tokens` (the admission-probe bound; see

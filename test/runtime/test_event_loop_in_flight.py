@@ -149,11 +149,22 @@ def _pp_loop(monkeypatch, *, is_last_pp_rank: bool, broadcast):
     return SimpleNamespace(server_args=SimpleNamespace(mapping=mapping))
 
 
-def test_pp_broadcast_adopts_the_last_stage_tokens_and_candidates(monkeypatch) -> None:
-    """A stage before the last commits the last stage's sampled tokens AND the
-    drafter's candidate rows (next_input_ids): every rank's scheduler folds
-    them into the final chunk's result, which the remote decode carries."""
-    from_last_stage = (["sampled"], ["lengths"], ["candidates"])
+def test_pp_broadcast_adopts_the_last_stage_tokens_candidates_and_logprobs(
+    monkeypatch,
+) -> None:
+    """A stage before the last commits the last stage's sampled tokens, the
+    drafter's candidate rows (next_input_ids) -- every rank's scheduler folds
+    them into the final chunk's result, which the remote decode carries --
+    and both logprob vectors, which every rank's output processor records on
+    its request state; the prompt-logprob plan the flat vector follows is
+    the stage's own (mirrored) one, so it stays in place."""
+    from_last_stage = (
+        ["sampled"],
+        ["lengths"],
+        ["candidates"],
+        ["output logprobs"],
+        ["prompt logprobs"],
+    )
 
     def broadcast(payload, src, group):
         assert src == 7 and group == ("gloo", (3, 7))
@@ -162,7 +173,12 @@ def test_pp_broadcast_adopts_the_last_stage_tokens_and_candidates(monkeypatch) -
 
     loop = _pp_loop(monkeypatch, is_last_pp_rank=False, broadcast=broadcast)
     results = SimpleNamespace(
-        output_tokens="placeholder", output_lengths="placeholder", next_input_ids=None
+        output_tokens="placeholder",
+        output_lengths="placeholder",
+        next_input_ids=None,
+        output_logprobs=None,
+        input_token_logprobs=None,
+        input_logprob_plan="this stage's plan",
     )
 
     EventLoop._pp_broadcast_output_tokens(loop, forward_op=None, results=results)
@@ -170,6 +186,9 @@ def test_pp_broadcast_adopts_the_last_stage_tokens_and_candidates(monkeypatch) -
     assert results.output_tokens == ["sampled"]
     assert results.output_lengths == ["lengths"]
     assert results.next_input_ids == ["candidates"]
+    assert results.output_logprobs == ["output logprobs"]
+    assert results.input_token_logprobs == ["prompt logprobs"]
+    assert results.input_logprob_plan == "this stage's plan"
 
 
 def test_pp_broadcast_sends_the_last_stage_results_unchanged(monkeypatch) -> None:
@@ -180,13 +199,20 @@ def test_pp_broadcast_sends_the_last_stage_results_unchanged(monkeypatch) -> Non
         broadcast=lambda payload, src, group: sent.append(payload[0]),
     )
     results = SimpleNamespace(
-        output_tokens="sampled", output_lengths="lengths", next_input_ids="candidates"
+        output_tokens="sampled",
+        output_lengths="lengths",
+        next_input_ids="candidates",
+        output_logprobs="output logprobs",
+        input_token_logprobs="prompt logprobs",
     )
 
     EventLoop._pp_broadcast_output_tokens(loop, forward_op=None, results=results)
 
-    assert sent == [("sampled", "lengths", "candidates")]
+    assert sent == [
+        ("sampled", "lengths", "candidates", "output logprobs", "prompt logprobs")
+    ]
     assert (results.output_tokens, results.next_input_ids) == ("sampled", "candidates")
+    assert results.input_token_logprobs == "prompt logprobs"
 
 
 def test_pp_broadcast_precedes_commit_post_processing() -> None:

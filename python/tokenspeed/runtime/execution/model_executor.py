@@ -829,15 +829,14 @@ class ModelExecutor:
             self.forward_step.warmup_decode_path(batch_sizes=(1,), graph_phase=True)
             logger.info("Finished prewarming Triton RSAG communication states")
 
-        # Prompt (input) logprobs need the LM head to score every prompt row on
-        # this rank: one activation row per input token, which a model that
-        # narrows its prefill rows (NarrowingPrefillModel) does not keep, and
-        # the logits themselves, which only the last pipeline stage has.
-        # Decided here, once, so the ingress refuses such requests instead of
-        # the data plane finding out.
+        # Prompt (input) logprobs need the LM head to score every prompt row:
+        # one activation row per input token, which a model that narrows its
+        # prefill rows (NarrowingPrefillModel) does not keep. The last pipeline
+        # stage scores them and the commit path broadcasts the result to the
+        # other stages with the sampled tokens. Decided here, once, so the
+        # ingress refuses such requests instead of the data plane finding out.
         self.supports_prompt_logprobs: bool = (
-            self.config.pp_size == 1
-            and narrowing_prefill_model(self.model_runner.model) is None
+            narrowing_prefill_model(self.model_runner.model) is None
         )
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
@@ -2263,9 +2262,10 @@ class ModelExecutor:
             output_nan_flags=output_nan_flags,
             spec_candidate_tokens=spec_candidate_tokens,
             input_token_logprobs=input_token_logprobs,
-            input_logprob_plan=(
-                input_logprob_plan if input_token_logprobs is not None else None
-            ),
+            # The plan rides along whether or not this rank scored the rows: a
+            # pipeline stage without logits adopts the last stage's logprobs on
+            # the commit path and pairs them with its own (mirrored) plan.
+            input_logprob_plan=input_logprob_plan,
         )
 
     def _input_logprob_rows(

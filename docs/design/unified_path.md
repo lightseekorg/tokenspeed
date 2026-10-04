@@ -1475,6 +1475,13 @@ The contract a model (in tree or a plugin) implements:
   activation gather of the planned rows; a vocab-parallel cross-entropy
   that trades the `[rows, vocab]` all-gather for per-row partials is the
   deferred `logprob.topology-invariant` item of `numerics.md`.)
+* Pipeline parallelism: the last stage scores the prompt logprobs (on its
+  shard, under QCP) and `_pp_broadcast_output_tokens` carries
+  `output_logprobs` and `input_token_logprobs` to the other stages with the
+  sampled tokens; every stage pairs the vector with its own mirrored plan,
+  which `ModelExecutionResult` carries whether or not the stage scored the
+  rows. Prompt logprobs are therefore no longer refused on a pipeline split
+  (`supports_prompt_logprobs` depends on the narrowing-model check only).
 * Communication buffers (`prepare_communication_runtime(max_forward_tokens)`)
   stay sized by the whole chunk under QCP, not `ceil(chunk / qcp)`: the
   all-gather / reduce-scatter legs' gathered side is the whole chunk on
