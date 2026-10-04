@@ -901,7 +901,10 @@ class DSABackend(PagedAttentionBackend):
         rows ``gather_history_index_k`` scored): per request group the KV
         history is gathered from its page owners into one buffer and the
         local rows attend it with every head -- pure data movement, so a
-        row's bytes are those of an unsharded forward, and no LSE merge.
+        row's bytes are those of an unsharded forward, and no LSE merge. The
+        layer must hold every head (head-replicated weights, or head TP over
+        the shard group, whose exchange delivers every head of the local
+        rows before the core); the attention-TP slice is refused.
         """
         if layer.logit_cap and layer.logit_cap > 0:
             self._validate_logit_cap(layer.logit_cap)
@@ -934,6 +937,13 @@ class DSABackend(PagedAttentionBackend):
                 raise RuntimeError(
                     "DSA sparse prefill top-k shape mismatch: "
                     f"indices={tuple(topk_slots.shape)}"
+                )
+            if not self._layer_holds_every_head(layer):
+                raise RuntimeError(
+                    "the sharded DSA extend attends the gathered history with every "
+                    f"head; the layer holds the attention-TP slice of "
+                    f"{layer.tp_q_head_num} heads (under head TP the exchange "
+                    "delivers every head of the local rows before the core)"
                 )
             q_view = q.view(q.shape[0], layer.tp_q_head_num, layer.head_dim)
             if self.data_type == torch.float8_e4m3fn and q_view.dtype != self.data_type:

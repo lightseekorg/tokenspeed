@@ -368,6 +368,123 @@ class TestModuleRefusals:
         assert attn.attn_mqa.tp_q_head_num == 8
         assert attn.attn_mha.tp_q_head_num == 2
 
+    def test_query_sharding_replicates_the_heads_unless_head_tp_is_asked(self):
+        """Under QCP the default head group is this rank alone (every head on
+        every rank, no exchange); ``--attn-head-tp-size`` equal to the shard
+        group shards them, and the module keeps a second core layer holding
+        the attention-TP slice for the replicated-row forwards (the drafter's
+        decode steps) that skip the exchange."""
+        replicated = self._attention(
+            Mapping(rank=1, world_size=4, attn_tp_size=4, attn_qcp_size=4)
+        )
+        assert not replicated.has_head_tp and replicated.num_local_heads == 8
+        assert replicated.q_b_proj.tp_size == 1 and replicated.o_proj.tp_size == 1
+        assert replicated.attn_mqa.tp_q_head_num == 8
+        assert replicated.attn_mqa_local is None
+
+        sharded = self._attention(
+            Mapping(
+                rank=1,
+                world_size=4,
+                attn_tp_size=4,
+                attn_qcp_size=4,
+                attn_head_tp_size=4,
+            )
+        )
+        assert sharded.has_head_tp and sharded.num_local_heads == 2
+        assert (
+            sharded.q_b_proj.tp_group == (0, 1, 2, 3) and sharded.q_b_proj.tp_rank == 1
+        )
+        assert sharded.kv_b_proj.weight.shape[0] == 2 * (8 + 4)
+        assert sharded.o_proj.weight.shape == (16, 2 * 4)
+        assert not sharded.o_proj.reduce_results
+        assert sharded.attn_mqa.tp_q_head_num == 8
+        assert sharded.attn_mqa_local is not None
+        assert sharded.attn_mqa_local.tp_q_head_num == 2
+        assert sharded.attn_mqa_local.layer_id == sharded.attn_mqa.layer_id
+        # The exchange follows the forward: a sharded extend exchanges, a
+        # replicated decode step (no shard) attends the slice.
+        from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+        plan = QueryShardPlan.from_forward(
+            total_tokens=6, input_lengths=[4, 2], size=4, rank=1
+        )
+        extend = SimpleNamespace(query_shard=plan)
+        decode = SimpleNamespace(query_shard=None)
+        assert sharded.head_tp_exchanges(extend)
+        assert sharded.absorbed_attention(extend) is sharded.attn_mqa
+        assert not sharded.head_tp_exchanges(decode)
+        assert sharded.absorbed_attention(decode) is sharded.attn_mqa_local
+        assert not replicated.head_tp_exchanges(extend)
+        assert replicated.absorbed_attention(decode) is replicated.attn_mqa
+        # Attention DP exchanges every forward and has no replicated rows.
+        dp = self._attention(
+            Mapping(
+                rank=1,
+                world_size=4,
+                attn_tp_size=1,
+                attn_dp_size=4,
+                attn_head_tp_size=4,
+            )
+        )
+        assert dp.head_tp_exchanges(decode) and dp.attn_mqa_local is None
+        assert dp.absorbed_attention(decode) is dp.attn_mqa
+
+    def test_the_expanded_prefill_keeps_refusing_under_head_tp(self):
+        """``forward`` (the dense MLA path with the expanded prologue) refuses
+        extend rows on every head-sharded layout: a query shard outright, and
+        a whole-span extend because the head-sharded kv_b_proj cannot expand
+        every head's K/V."""
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+        def ctx(**overrides):
+            fields = dict(
+                num_extends=1,
+                bs=1,
+                input_num_tokens=3,
+                forward_mode=ForwardMode.EXTEND,
+                query_shard=None,
+            )
+            fields.update(overrides)
+            return SimpleNamespace(**fields)
+
+        hidden = torch.zeros(3, 16)
+        positions = torch.arange(3)
+        for mapping in (
+            Mapping(
+                rank=0,
+                world_size=4,
+                attn_tp_size=4,
+                attn_qcp_size=4,
+                attn_head_tp_size=4,
+            ),
+            Mapping(
+                rank=0,
+                world_size=4,
+                attn_tp_size=1,
+                attn_dp_size=4,
+                attn_head_tp_size=4,
+            ),
+        ):
+            attn = self._attention(mapping)
+            with pytest.raises(RuntimeError, match="expanded prefill"):
+                attn(positions, hidden, ctx(), comm_manager=None)
+        sharded = self._attention(
+            Mapping(
+                rank=0,
+                world_size=4,
+                attn_tp_size=4,
+                attn_qcp_size=4,
+                attn_head_tp_size=4,
+            )
+        )
+        plan = QueryShardPlan.from_forward(
+            total_tokens=3, input_lengths=[3], size=4, rank=0
+        )
+        with pytest.raises(RuntimeError, match="cannot take a query shard"):
+            sharded(positions, hidden, ctx(query_shard=plan), comm_manager=None)
+
     def test_heads_must_split_over_the_head_group(self):
         with pytest.raises(ValueError, match="divisible by the head TP size"):
             self._attention(

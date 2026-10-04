@@ -115,6 +115,95 @@ def test_dense_and_moe_groups_are_one_or_the_attention_width():
         prepare_server_args(wide + ["--dense-tp-size", "2"])
 
 
+def test_the_default_attention_weights_are_head_replicated():
+    args = prepare_server_args(BASE)
+    args.mapping.rank = 1
+    assert args.mapping.attn.head_tp_size == 1
+    assert not args.mapping.attn.has_head_tp
+    assert args.mapping.attn.head_tp_group == (1,)
+
+
+def test_head_tp_over_the_query_shards():
+    """``--attn-head-tp-size`` equal to the shard group is the prefill-role
+    head-TP layout: the head group is the shard group, ``--tp-batch-invariant
+    attn`` selects the column-parallel o_proj, and none of the decode-only
+    gates (role, decode-shaped autotune, generation budget) apply."""
+    from tokenspeed.runtime.engine.request_handler import RequestHandler
+    from tokenspeed.runtime.engine.scheduler_utils import RETRACTION_SAFE_STEPS
+
+    args = prepare_server_args(BASE + ["--attn-head-tp-size", "2"])
+    args.mapping.rank = 1
+    attn = args.mapping.attn
+    assert attn.has_head_tp and attn.has_qcp
+    assert not attn.head_tp_serves_decode_only
+    assert attn.head_tp_group == attn.qcp_group == (0, 1)
+    assert args.disaggregation_mode == "prefill"
+    assert args.tp_batch_invariant == "none"
+
+    bi = prepare_server_args(
+        BASE + ["--attn-head-tp-size", "2", "--tp-batch-invariant", "attn"]
+    )
+    assert bi.tp_batch_invariant == "attn"
+    assert bi.mapping.attn.has_head_tp
+
+    # The generation budget is the decode-only engine's rule.
+    handler = RequestHandler.__new__(RequestHandler)
+    handler.max_new_tokens_budget = (
+        RETRACTION_SAFE_STEPS if attn.head_tp_serves_decode_only else None
+    )
+    assert handler.max_new_tokens_budget is None
+
+
+@pytest.mark.parametrize(
+    "argv,match",
+    [
+        (["--attn-head-tp-size", "4"], "must equal qcp_size"),
+        (
+            ["--attn-head-tp-size", "1", "--tp-batch-invariant", "attn"],
+            "attn-head-tp-size",
+        ),
+    ],
+)
+def test_head_tp_on_the_prefill_role_is_the_shard_group(argv, match):
+    with pytest.raises(ValueError, match=match):
+        prepare_server_args(BASE + argv)
+
+
+def test_head_tp_on_the_prefill_role_still_needs_the_shard():
+    """Without a query shard the attention TP ranks hold the same rows, so
+    head TP on the prefill role is the decode-only layout, refused as before."""
+    with pytest.raises(ValueError, match="attention TP 1"):
+        prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--attn-tp-size",
+                "2",
+                "--disaggregation-mode",
+                "prefill",
+                "--attention-backend",
+                "dsa",
+                "--attn-head-tp-size",
+                "4",
+            ]
+        )
+    with pytest.raises(ValueError, match="disaggregation-mode decode"):
+        prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--attn-tp-size",
+                "1",
+                "--data-parallel-size",
+                "2",
+                "--disaggregation-mode",
+                "prefill",
+                "--attn-head-tp-size",
+                "2",
+            ]
+        )
+
+
 def test_validate_qcp_rejects_a_shard_below_the_tp_width():
     with pytest.raises(ValueError, match="must equal the attention TP size"):
         validate_qcp(

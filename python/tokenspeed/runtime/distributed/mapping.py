@@ -152,30 +152,56 @@ class DenseLayerMapping(MappingBase):
         return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
 
 
+def _attention_row_group_size(tp_size: int, qcp_size: int) -> int:
+    """Ranks of the attention TP group that hold the same attention rows.
+
+    Attention TP replicates a forward's rows over its group; query context
+    parallelism (QCP) shards an extend's rows over that group instead, so
+    only ``tp_size // qcp_size`` ranks hold the same rows (one, since a
+    query shard spans the whole group, ``validate_qcp``).
+    """
+    return tp_size // qcp_size
+
+
 def _resolve_head_tp_size(
-    tp_size: int, world_size: int, head_tp_size: int | None
+    tp_size: int, qcp_size: int, world_size: int, head_tp_size: int | None
 ) -> int:
     """Resolve the attention head-TP width.
 
-    ``None`` keeps the head projections on the attention TP group (today's
-    layout). A wider head group shards ``q_b_proj`` / ``kv_b_proj`` /
-    ``o_proj`` by heads over ranks that are data-parallel for attention, so
-    it requires attention TP 1 and must tile the stage world.
+    ``None`` keeps the head projections on the ranks that hold the same
+    attention rows (today's layout: the attention TP group; head-replicated
+    under query context parallelism, whose shards hold different rows). A
+    wider head group shards ``q_b_proj`` / ``kv_b_proj`` / ``o_proj`` by
+    heads over ranks that hold different rows -- attention-DP ranks, or the
+    query shards of a QCP group -- and the attention forward exchanges heads
+    for tokens around core attention. It therefore requires that no two
+    ranks of the group hold the same rows (attention TP 1, or a query shard
+    spanning the attention TP group), is the QCP group itself under query
+    sharding, and must tile the stage world.
     """
+    row_group_size = _attention_row_group_size(tp_size, qcp_size)
     if head_tp_size is None:
-        return tp_size
+        return row_group_size
     if (
         isinstance(head_tp_size, bool)
         or not isinstance(head_tp_size, int)
         or head_tp_size < 1
     ):
         raise ValueError("attention head TP size must be a positive integer")
-    if head_tp_size == tp_size:
+    if head_tp_size == row_group_size:
         return head_tp_size
-    if tp_size != 1:
+    if row_group_size != 1:
         raise ValueError(
-            "attention head TP shards heads over data-parallel ranks and needs "
-            f"attention TP 1, got attn_tp_size={tp_size}"
+            "attention head TP shards heads over ranks that hold different rows "
+            "(attention-DP ranks, or the query shards of a QCP group) and needs "
+            "attention TP 1 or a query shard spanning the attention TP group, "
+            f"got attn_tp_size={tp_size} with qcp_size={qcp_size}"
+        )
+    if qcp_size != 1 and head_tp_size != qcp_size:
+        raise ValueError(
+            "under query context parallelism the attention head TP group is the "
+            f"query-shard group: head_tp_size={head_tp_size} must equal "
+            f"qcp_size={qcp_size}"
         )
     if world_size % head_tp_size:
         raise ValueError(
@@ -204,16 +230,31 @@ class AttentionLayerMapping(MappingBase):
         self.dcp_size = _resolve_dcp_size(self.tp_size, dcp_size)
         self.qcp_size = _resolve_qcp_size(self.tp_size, qcp_size)
         # Width of the group the head projections (q_b/kv_b/o_proj) shard
-        # over. Equal to tp_size unless head TP widens it over DP ranks.
+        # over. Equal to the ranks holding the same rows (tp_size, or 1 under
+        # query sharding) unless head TP widens it over DP ranks or over the
+        # query shards.
         self.head_tp_size = _resolve_head_tp_size(
-            self.tp_size, self.world_size, head_tp_size
+            self.tp_size, self.qcp_size, self.world_size, head_tp_size
         )
 
     @property
     def has_head_tp(self) -> bool:
-        """Heads are sharded over a group wider than attention TP, so the
-        attention forward exchanges heads for tokens around core attention."""
-        return self.head_tp_size != self.tp_size
+        """Heads are sharded over a group wider than the ranks that hold the
+        same attention rows (the attention TP group, or one query shard of it
+        under QCP), so the attention forward exchanges heads for tokens around
+        core attention."""
+        return self.head_tp_size != _attention_row_group_size(
+            self.tp_size, self.qcp_size
+        )
+
+    @property
+    def head_tp_serves_decode_only(self) -> bool:
+        """Head TP over attention-DP ranks serves decode rows only: an expanded
+        prefill needs every head's K/V for the cached prefix, which the
+        head-sharded ``kv_b_proj`` cannot produce. Over the query shards of a
+        QCP group the sparse prefill is absorbed and the extend rows take the
+        exchange, so that layout serves the prefill role."""
+        return self.has_head_tp and not self.has_qcp
 
     @cached_property
     def head_tp_rank(self) -> int:
@@ -222,7 +263,9 @@ class AttentionLayerMapping(MappingBase):
     @cached_property
     def head_tp_group(self) -> Group:
         """Contiguous ranks sharing one set of head projections; equals
-        ``tp_group`` without head TP."""
+        ``tp_group`` without head TP (``(rank,)`` under query sharding, whose
+        default is head-replicated) and ``qcp_group`` under head TP over the
+        query shards."""
         return _make_parallelism_group(self.rank, self.head_tp_size, stride=1)
 
     @property

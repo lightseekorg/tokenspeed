@@ -68,12 +68,11 @@ _FUSED_A_MAX_M = 16  # measured cliff: wins to M=16, flat ~1.35x loss from 18 to
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import (
     CommManager,
-    dp_group_row_counts,
-    forward_collective_row_table,
-    forward_input_row_table,
+    head_tp_row_counts,
 )
 from tokenspeed.runtime.distributed.comm_ops import (
     all_gather,
+    all_reduce,
     all_to_all_head_scatter,
     all_to_all_transpose,
     token_all_gather,
@@ -609,9 +608,11 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.kv_lora_scale = kv_lora_scale
         self.num_heads = num_heads
         # The head projections (q_b/kv_b/o_proj) shard over the head-TP
-        # group: the attention TP group today, or a wider group of
-        # attention-DP ranks under head TP, where every rank keeps its own KV
-        # and the forward exchanges heads for tokens around core attention.
+        # group: the attention TP group today (replicated under query context
+        # parallelism, whose shards hold different rows), or, under head TP,
+        # a group of ranks holding different rows -- attention-DP ranks, or
+        # the query shards -- where the forward exchanges heads for tokens
+        # around core attention.
         self.has_head_tp = self.mapping.attn.has_head_tp
         self.head_tp_size = self.mapping.attn.head_tp_size
         self.head_tp_rank = self.mapping.attn.head_tp_rank
@@ -730,8 +731,9 @@ class DeepseekV3AttentionMLA(nn.Module):
                 self.num_heads * self.v_head_dim,
                 self.hidden_size,
                 bias=False,
-                # Under head TP the partials are reduce-scattered to each
-                # rank's own rows in project_output, never all-reduced.
+                # Under head TP the attention's own tail (project_output)
+                # reduces the partials: a reduce-scatter to each rank's rows,
+                # or an all-reduce on a replicated-row forward.
                 reduce_results=reduce_attn_results and not self.has_head_tp,
                 quant_config=quant_config,
                 prefix=add_prefix("o_proj", prefix),
@@ -766,8 +768,8 @@ class DeepseekV3AttentionMLA(nn.Module):
         else:
             self.rotary_emb = None
 
-        # Under head TP the absorbed decode attends every head of this
-        # rank's own tokens (the heads arrive through the exchange).
+        # Under head TP the absorbed core attends every head of this rank's
+        # own rows (the heads arrive through the exchange).
         self.attn_mqa = PagedAttention(
             self.num_heads if self.has_head_tp else self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -777,6 +779,24 @@ class DeepseekV3AttentionMLA(nn.Module):
             v_head_dim=self.kv_lora_rank,
             rotary_emb=self.rotary_emb,
             qk_norm=None,
+        )
+        # Head TP over the query shards also runs replicated-row forwards
+        # (the drafter's decode steps: every rank holds every row), which skip
+        # the exchange and attend this rank's head slice as attention TP does;
+        # their core layer has that head count. Same layer id and cache group.
+        self.attn_mqa_local: PagedAttention | None = (
+            PagedAttention(
+                self.num_local_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                rotary_emb=self.rotary_emb,
+                qk_norm=None,
+            )
+            if self.has_head_tp and self.mapping.attn.has_qcp
+            else None
         )
 
         self.attn_mha = PagedAttention(
@@ -845,12 +865,18 @@ class DeepseekV3AttentionMLA(nn.Module):
             # The o_proj output shape (the Eagle3 input is twice as wide).
             return hidden_states.new_empty(0, self.hidden_size)
         if self.has_head_tp and ctx.num_extends > 0:
-            # Unreachable by configuration (see _validate_decode_tp_layouts):
-            # a guard against a prefill row reaching a decode-only layout.
+            # Unreachable by configuration (see _validate_decode_tp_layouts
+            # and validate_qcp): a guard against a prefill row reaching the
+            # expanded prologue on a head-sharded layout. Head TP serves
+            # decode rows, or extend rows under query context parallelism
+            # through the absorbed sparse prefill (the shard was refused
+            # above); the expanded path never.
             raise RuntimeError(
-                "attention head TP serves decode rows only: the head-sharded "
-                "kv_b_proj cannot expand every head's K/V for a prefill; this "
-                f"forward carries {ctx.num_extends} extending requests"
+                "attention head TP serves decode rows, or extend rows under query "
+                "context parallelism with an absorbed sparse prefill: the "
+                "head-sharded kv_b_proj cannot expand every head's K/V for the "
+                f"expanded prefill; this forward carries {ctx.num_extends} "
+                "extending requests"
             )
         q, latent_cache = self._project_q_latent(
             hidden_states, ctx, comm_manager, block_scale
@@ -874,31 +900,64 @@ class DeepseekV3AttentionMLA(nn.Module):
     #   o_proj tail               -->  [T_own, hidden]
     # The exchange precedes the prologue so the prologue sees one row count
     # for the query, the latent and the write slots, and RoPE (a per-row
-    # rotation of each head) commutes with the head permutation.
+    # rotation of each head) commutes with the head permutation; the local
+    # rows' positions are the rows' own, so no positions collective exists.
     #
-    # Row counts come from the forward's DP tables, by phase: the legs up to
-    # core attention move the forward's input rows; the legs after it move
-    # its collective rows, which a narrowing drafter has reduced to the live
-    # rows (``forward_collective_row_table``). Every rank of the group,
-    # including one with no rows of its own, picks the table the same way.
+    # The head group's ranks hold different rows: attention-DP ranks (the
+    # decode role), or the query shards of a query-context-parallel prefill
+    # engine, where the exchange serves the sharded extend forwards and the
+    # KV write inside the prologue gathers the rotated latent to the span
+    # as every QCP forward does. Row counts come from one resolver
+    # (``head_tp_row_counts``: the forward's DP tables, or the shard plan),
+    # by phase: the legs up to core attention move the forward's input rows;
+    # the legs after it move its collective rows, which a narrowing drafter
+    # has reduced to the live rows. Every rank of the group, including one
+    # with no rows of its own, picks the table the same way.
+    #
+    # The drafter's decode steps on a query-sharding engine hold every row
+    # on every rank: there is nothing to exchange, so they attend this rank's
+    # head slice as attention TP does (``head_tp_exchanges`` is False, the
+    # core runs on ``attn_mqa_local``) and the o_proj tail reduces over the
+    # head group instead of returning rows.
+
+    def head_tp_exchanges(self, ctx: ForwardContext) -> bool:
+        """Whether this forward exchanges heads for tokens over the head group.
+
+        Every forward on the attention-DP layout does; on the query-sharding
+        layout the sharded extend forwards do, while a forward without a
+        shard (the drafter's decode steps) holds every row on every rank and
+        runs the attention-TP form on this rank's head slice.
+        """
+        if not self.has_head_tp:
+            return False
+        if not self.mapping.attn.has_qcp:
+            return True
+        return ctx.query_shard is not None and ctx.query_shard.size > 1
+
+    def absorbed_attention(self, ctx: ForwardContext) -> PagedAttention:
+        """The absorbed core-attention layer for this forward's rows.
+
+        ``attn_mqa`` carries the heads the core sees on this rank's own rows:
+        every head under head TP (they arrive through the exchange), the
+        attention-TP slice otherwise. A replicated-row forward under head TP
+        skips the exchange and attends the slice, on ``attn_mqa_local``.
+        """
+        if self.has_head_tp and not self.head_tp_exchanges(ctx):
+            if self.attn_mqa_local is None:
+                raise RuntimeError(
+                    "a replicated-row forward under attention head TP needs the "
+                    "query-sharding layout; attention DP exchanges every forward"
+                )
+            return self.attn_mqa_local
+        return self.attn_mqa
 
     def head_tp_input_row_counts(self, ctx: ForwardContext, num_rows: int) -> list[int]:
         """Input rows every head-group rank holds; ``num_rows`` is this rank's."""
-        return dp_group_row_counts(
-            forward_input_row_table(ctx),
-            self.head_tp_group,
-            self.mapping.rank,
-            num_rows,
-        )
+        return head_tp_row_counts(ctx, self.mapping, num_rows, collective=False)
 
     def head_tp_row_counts(self, ctx: ForwardContext, num_rows: int) -> list[int]:
         """Collective rows every head-group rank holds; ``num_rows`` is this rank's."""
-        return dp_group_row_counts(
-            forward_collective_row_table(ctx),
-            self.head_tp_group,
-            self.mapping.rank,
-            num_rows,
-        )
+        return head_tp_row_counts(ctx, self.mapping, num_rows, collective=True)
 
     def head_tp_gather_tokens(
         self, x: torch.Tensor, ctx: ForwardContext
@@ -930,10 +989,30 @@ class DeepseekV3AttentionMLA(nn.Module):
         plain ``o_proj`` result). Under head TP the batch-invariant tail
         all-gathers the heads, runs the column-parallel ``o_proj`` and
         transposes the hidden shards back; the plain tail runs the
-        row-parallel ``o_proj`` and reduce-scatters its partial sums.
+        row-parallel ``o_proj`` and reduce-scatters its partial sums. A
+        replicated-row forward under head TP (``T == num_rows`` on every
+        rank, nothing exchanged) reduces over the head group instead of
+        returning rows: the row-parallel partials are all-reduced -- the
+        attention-TP form -- and the batch-invariant hidden shards are
+        all-gathered, so every rank holds every row either way.
         """
         if not self.has_head_tp:
             return self.o_proj(attn_output)[0]
+        if not self.head_tp_exchanges(ctx):
+            if attn_output.shape[0] != num_rows:
+                raise ValueError(
+                    f"a replicated-row forward projects its own {num_rows} rows, "
+                    f"got {attn_output.shape[0]}"
+                )
+            if num_rows == 0:
+                # Every rank holds the same (no) rows: no collective.
+                return attn_output.new_empty(0, self.hidden_size)
+            if self.o_proj_batch_invariant:
+                attn_output = all_gather(attn_output, self.head_tp_group, dim=-1)
+                partial_hidden, _ = self.o_proj(attn_output)
+                return all_gather(partial_hidden, self.head_tp_group, dim=-1)
+            partial, _ = self.o_proj(attn_output)
+            return all_reduce(partial, self.head_tp_group)
         counts = self.head_tp_row_counts(ctx, num_rows)
         if sum(counts) == 0:
             # The whole head group is idle: no rows anywhere, no collective.
@@ -1011,7 +1090,7 @@ class DeepseekV3AttentionMLA(nn.Module):
                 )
                 if self.kv_lora_scale is not None:
                     kv_a.mul_(self.kv_lora_scale)
-            if self.has_head_tp:
+            if self.head_tp_exchanges(ctx):
                 q_norm = self.head_tp_gather_tokens(q_norm, ctx)
             q = self.q_b_proj(q_norm)[0]
             if self.q_lora_scale is not None:
@@ -1065,8 +1144,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             num_prefill_tokens = 0
         real_total = num_prefill_tokens + num_decode_tokens
 
-        if self.has_head_tp:
-            # ``forward`` refused extending rows before the projections.
+        if self.head_tp_exchanges(ctx):
+            # ``forward`` refused extending rows before the projections. A
+            # replicated-row forward under head TP (the drafter's decode
+            # steps on a query-sharding engine) takes the plain path below:
+            # this rank's head slice over every row, the all-reduce tail.
             if output_gate is not None or absorbed_query is not None:
                 raise NotImplementedError(
                     "attention head TP does not support an output gate or a "
@@ -1285,17 +1367,22 @@ class DeepseekV3AttentionMLA(nn.Module):
         part, write the latent rows to ``slots`` and return the attention
         query. One row count across the query, latent and positions; under a
         query shard ``key_rows`` gathers the rotated latent to the whole span
-        before the owner-masked store."""
-        return self.attn_mqa.latent_prologue(
-            Q,
-            q_pe,
-            latent_cache,
-            positions,
-            ctx,
-            slots=slots,
-            expanded=None,
-            key_rows=key_rows,
-        ).query
+        before the owner-masked store. Runs on the forward's core layer
+        (:meth:`absorbed_attention`), whose head count the query carries."""
+        return (
+            self.absorbed_attention(ctx)
+            .latent_prologue(
+                Q,
+                q_pe,
+                latent_cache,
+                positions,
+                ctx,
+                slots=slots,
+                expanded=None,
+                key_rows=key_rows,
+            )
+            .query
+        )
 
     def forward_absorb_qkv_proj(
         self,
@@ -1312,19 +1399,23 @@ class DeepseekV3AttentionMLA(nn.Module):
         Under head TP ``q`` carries the head group's gathered rows and the
         exchange to this rank's own rows happens between the absorption and
         the prologue, so the prologue sees one row count; a rank with no rows
-        of its own skips the prologue and returns an empty query. Under a
-        query shard (head TP and query sharding exclude each other in the
-        mapping) the rows are this rank's shard and the prologue gathers the
-        rotated latent to the whole span; an empty shard still runs it.
+        of its own skips the prologue and returns an empty query -- unless
+        the forward is a query shard, whose prologue gathers the rotated
+        latent to the whole span (``out_cache_loc``) and stores it
+        owner-masked, so an empty shard still runs it. Without an exchange
+        (no head TP, or the replicated decode rows of a query-sharding
+        engine) the rows are this rank's own from the start.
         """
         Q, q_pe = self.absorb_query(q, absorbed_query)
-        if self.has_head_tp:
+        if self.head_tp_exchanges(ctx):
             # The RoPE part travels inside the query through the exchange;
             # the prologue then rotates the query's own RoPE channels.
             Q[..., self.kv_lora_rank :] = q_pe
             Q = self.head_tp_scatter_query(Q, ctx, latent_cache.shape[0])
             q_pe = Q[..., self.kv_lora_rank :]
-            if Q.shape[0] == 0:
+            if Q.shape[0] == 0 and ctx.query_shard is None:
+                # An idle attention-DP rank: nothing to rotate or write. An
+                # empty query shard goes on: its prologue joins the gather.
                 return Q
         # GLM's sparse prefill runs more rows than it commits: write the leading rows.
         query_tokens = Q.shape[0]
@@ -1370,8 +1461,11 @@ class DeepseekV3AttentionMLA(nn.Module):
         """Core absorbed attention over this rank's KV, then the value
         projection into ``output``. Under head TP the attention runs every
         head of this rank's tokens, the heads are exchanged back and the
-        local ``w_vc`` projects this rank's head shard of the group's rows."""
-        if self.has_head_tp:
+        local ``w_vc`` projects this rank's head shard of the group's rows;
+        a replicated-row forward under head TP attends the head slice of
+        every row (``attn_mqa_local``) and projects it in place, as
+        attention TP does."""
+        if self.head_tp_exchanges(ctx):
             if output_gate is not None:
                 raise NotImplementedError(
                     "attention head TP does not support an output gate"
@@ -1394,12 +1488,13 @@ class DeepseekV3AttentionMLA(nn.Module):
                 # The whole head group is idle this forward.
                 return output
             return mla_project_value(attn_output, self.w_vc, out=output)
+        layer = self.absorbed_attention(ctx)
         use_projected_value_decode = (
             output_gate is not None
             and ctx.num_extends == 0
             and ctx.attn_backend.supports_mla_projected_value_decode
         )
-        attn_output = self.attn_mqa(
+        attn_output = layer(
             Q,
             k=None,
             v=None,
@@ -1412,6 +1507,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         )
         if use_projected_value_decode:
             return attn_output
+        if attn_output.shape[0] == 0:
+            # An empty query shard: the core joined its group's history
+            # gathers and attended nothing; there is no value to project.
+            return output
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
         return mla_project_value(
             attn_output,
@@ -1602,7 +1701,7 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
             absorbed_query=absorbed_query,
         )
         Q = Q.index_select(0, ctx.gather_ids)
-        if self.has_head_tp:
+        if self.head_tp_exchanges(ctx):
             # The exchanged rows after narrowing are the group's live rows.
             output_rows = sum(self.head_tp_row_counts(ctx, ctx.bs))
         else:

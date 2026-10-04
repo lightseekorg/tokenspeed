@@ -435,7 +435,7 @@ class ModelExecutorConfig:
             model_is_mrope=model_is_mrope,
             prefill_only=server_args.disaggregation_mode == "prefill",
             input_logprob_chunk_tokens=server_args.input_logprob_chunk_tokens,
-            decode_only_attention=server_args.mapping.attn.has_head_tp,
+            decode_only_attention=server_args.mapping.attn.head_tp_serves_decode_only,
             query_shard_size=server_args.mapping.attn.qcp_size,
             query_shard_rank=server_args.mapping.attn.qcp_rank,
             data_parallel_size=server_args.mapping.attn.dp_size,
