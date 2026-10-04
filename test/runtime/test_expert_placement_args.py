@@ -150,9 +150,9 @@ class TestServerArgsPlacementValidation:
         with pytest.raises(ValueError, match="no effect without --enable-eplb"):
             ServerArgs(model="x", eplb_rebalance_layers_per_chunk=1, **ep)
         # Under a bitwise envelope the placement-independent MoE combine is
-        # required, which this build does not provide.
-        with pytest.raises(ValueError, match="moe-combine-order slot"):
-            ServerArgs(model="x", numerics="rl-bitwise", **full)
+        # required; the envelope folds it, so the launch is accepted with it.
+        args = ServerArgs(model="x", numerics="rl-bitwise", **full)
+        assert args.enable_eplb and args.moe_combine_order == "slot"
 
     def test_recorder_buffer_size_knob_is_gone(self):
         assert "expert_distribution_recorder_buffer_size" not in {

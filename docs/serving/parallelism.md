@@ -400,8 +400,8 @@ The routing path is unchanged: slot ownership stays contiguous per rank, the
 replica choice is a pure function of the token, and a placement change alters
 only table entries and slot contents. Under `--numerics rl-bitwise` the
 MoE combine must be placement-independent (slot-order combine) for the
-output to stay bitwise identical across a rebalance; a build without that
-combine refuses `--enable-eplb` under the envelope (see
+output to stay bitwise identical across a rebalance; the envelope folds
+`--moe-combine-order slot` in, so the combination is accepted (see
 `docs/design/numerics.md`).
 
 ## Multi-Node

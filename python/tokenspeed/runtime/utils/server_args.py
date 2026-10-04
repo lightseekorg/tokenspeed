@@ -1499,16 +1499,16 @@ class ServerArgs:
                     f"ranks, but the MoE layers run with ep_size="
                     f"{self.mapping.moe.ep_size}; enable expert parallelism."
                 )
-            if self.numerics != "auto":
+            if self.numerics != "auto" and self.moe_combine_order != "slot":
                 # Under a bitwise envelope the rank-order MoE combine makes the
-                # output depend on the placement, which a rebalance changes.
-                # The slot-order combine (--moe-combine-order slot) is
-                # placement-independent; this build has no such flag yet, so
-                # the combination is refused until it lands.
+                # output depend on the placement, which a rebalance changes;
+                # the slot-order combine is placement-independent. The
+                # envelope folds it in resolve_numerics, so this only guards
+                # that fold.
                 raise ValueError(
                     f"--enable-eplb under --numerics {self.numerics} requires "
                     "--moe-combine-order slot (a placement-independent MoE "
-                    "combine), which this build does not provide."
+                    f"combine); got {self.moe_combine_order!r}."
                 )
         elif (
             self.eplb_rebalance_num_iterations is not None

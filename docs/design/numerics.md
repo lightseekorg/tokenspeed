@@ -339,10 +339,11 @@ exactly one rank by a row-invariant leaf and the routes of a token folded in
 slot order (`--moe-combine-order slot`), which makes each route's value a
 pure function of the token and its logical expert's weights — replicas are
 byte-identical copies — and the output bitwise identical across rebalances.
-A build without that combine refuses `--enable-eplb` under the envelope. The
-load counters, the CPU-side algorithm and the P2P copies never enter the
-arithmetic; the dispatch algorithm stays static (required under rl-bitwise
-already) and drafts stay trivially placed.
+The envelope folds that combine in (alignment.trainer above), so the
+combination is accepted; `--enable-eplb` with the rank-order combine stays an
+`auto` launch. The load counters, the CPU-side algorithm and the P2P copies
+never enter the arithmetic; the dispatch algorithm stays static (required
+under rl-bitwise already) and drafts stay trivially placed.
 
 ## Acceptance
 
