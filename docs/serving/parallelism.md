@@ -252,7 +252,10 @@ expert parallelism (`ep_size > 1`): replicas live on other ranks.
    size, a prefill graph at a bucket, an idle attention-DP rank) feeds
    filler rows through the MoE layers, and the graph owners mark those rows
    in a device-side live-row mask before the replay and clear it after, so
-   the counters see traffic, not padding.
+   the counters see traffic, not padding. Startup forwards (autotune,
+   warm-up, graph capture) are not traffic either: the counters are zeroed
+   once capture is done, so the first window -- a profile's or a rebalance's
+   -- starts at the first served forward.
 
    ```bash
    curl -X POST localhost:8401/start_profile -H 'Content-Type: application/json' \

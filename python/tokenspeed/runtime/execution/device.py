@@ -966,6 +966,24 @@ def _recording_expert_placement():
     return placement
 
 
+def start_expert_load_window(executor) -> None:
+    """Zero the expert load counters once the startup forwards are done.
+
+    Autotune, warm-up and graph capture route tokens through the MoE layers,
+    and none of that is traffic: the first window a rebalance
+    (``--enable-eplb``) or an ``EXPERT_LOAD`` profile sees must start at the
+    first served forward. The device is drained first so no startup kernel
+    is still bumping the counters, then the reset rides the execution stream
+    like the serving-time resets. A no-op without load recording.
+    """
+    placement = get_global_expert_location_metadata()
+    if placement is None or placement.physical_load is None:
+        return
+    executor.device_module.synchronize()
+    with executor.device_module.stream(executor.execution_stream):
+        placement.reset_load()
+
+
 def arm_data_plane_sync_debug(device: str) -> None:
     """Arm torch's sync-debug mode for the serving phase when asked to.
 
@@ -1293,6 +1311,7 @@ def build_device_side(
         executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
     # Tuning and capture draw from the generator; this is the state startup leaves.
     set_random_seed(48)
+    start_expert_load_window(executor)
 
     # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
     if attn_tp_rank == 0:
