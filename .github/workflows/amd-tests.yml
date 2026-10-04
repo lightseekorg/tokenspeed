@@ -1,4 +1,4 @@
-name: PR Test NVIDIA
+name: AMD Tests
 
 # Split vendor CI into separate workflows so either side can be rerun without
 # waiting for the other side's jobs to finish.
@@ -13,10 +13,10 @@ on:
       - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
-      - ".github/workflows/pr-test-amd.yml"
-      - ".github/workflows/pr-test-nvidia.yml"
+      - ".github/workflows/amd-tests.yml"
+      - ".github/workflows/nvidia-b200-tests.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
-      - ".github/workflows/run-pr-test-stage.yml"
+      - ".github/workflows/run-ci-task-matrix.yml"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]
@@ -28,10 +28,10 @@ on:
       - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
-      - ".github/workflows/pr-test-amd.yml"
-      - ".github/workflows/pr-test-nvidia.yml"
+      - ".github/workflows/amd-tests.yml"
+      - ".github/workflows/nvidia-b200-tests.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
-      - ".github/workflows/run-pr-test-stage.yml"
+      - ".github/workflows/run-ci-task-matrix.yml"
   workflow_dispatch:
     inputs:
       trigger:
@@ -46,10 +46,10 @@ on:
 env:
   PIP_BREAK_SYSTEM_PACKAGES: 1
   CUDA_VERSION: 13.0.1
-  TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+  TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
 
 concurrency:
-  group: pr-test-nvidia-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
+  group: pr-test-amd-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -68,6 +68,8 @@ jobs:
       should_run: ${{ steps.changes.outputs.should_run }}
       unit_matrix: ${{ steps.scan.outputs.unit_matrix }}
       unit_has_tasks: ${{ steps.scan.outputs.unit_has_tasks }}
+      kernel_benchmark_matrix: ${{ steps.scan.outputs.kernel_benchmark_matrix }}
+      kernel_benchmark_has_tasks: ${{ steps.scan.outputs.kernel_benchmark_has_tasks }}
       model_matrix: ${{ steps.scan.outputs.model_matrix }}
       model_has_tasks: ${{ steps.scan.outputs.model_has_tasks }}
       eager_model: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'high priority') }}
@@ -113,7 +115,7 @@ jobs:
               ;;
           esac
           python3 test/ci_system/ci_path_filter.py \
-            --runner-group nvidia-x86 \
+            --runner-group amd \
             --event-name "${{ github.event_name }}" \
             --repo-root "$GITHUB_WORKSPACE" \
             "$changed_files" >> "$GITHUB_OUTPUT"
@@ -122,10 +124,11 @@ jobs:
         id: scan
         if: steps.changes.outputs.should_run == 'true'
         env:
-          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: h100,b300,${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
+          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
         run: |
           for stage in \
             unit:unit-test \
+            kernel_benchmark:kernel-benchmark \
             model:model-test; do
             output=${stage%%:*}
             workflow_stage=${stage#*:}
@@ -133,7 +136,7 @@ jobs:
               --root test/ci \
               --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
               --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
-              --runner-group "nvidia-x86" \
+              --runner-group "amd" \
               --workflow-stage "$workflow_stage")
             echo "${output}_matrix=${matrix}" >> "$GITHUB_OUTPUT"
             printf '%s' "$matrix" | python3 -c "import json, sys; print('${output}_has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"
@@ -154,11 +157,11 @@ jobs:
         github.event_name != 'pull_request' ||
         github.event.pull_request.draft == false
       )
-    uses: ./.github/workflows/run-pr-test-stage.yml
+    uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
       matrix: ${{ needs.scan.outputs.unit_matrix }}
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
-      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
     secrets: inherit
 
   model-test:
@@ -174,12 +177,32 @@ jobs:
         needs.scan.outputs.unit_has_tasks != 'true'
       ) &&
       needs.scan.outputs.model_has_tasks == 'true'
-    uses: ./.github/workflows/run-pr-test-stage.yml
+    uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
       matrix: ${{ needs.scan.outputs.model_matrix }}
-      timeout_minutes: 120
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
-      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
+    secrets: inherit
+
+  kernel-benchmark:
+    needs: [scan, unit-test]
+    if: |
+      !cancelled() &&
+      needs.scan.result == 'success' &&
+      needs.scan.outputs.should_run == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
+      (
+        needs.unit-test.result == 'success' ||
+        needs.scan.outputs.unit_has_tasks != 'true'
+      ) &&
+      needs.scan.outputs.kernel_benchmark_has_tasks == 'true'
+    uses: ./.github/workflows/run-ci-task-matrix.yml
+    with:
+      matrix: ${{ needs.scan.outputs.kernel_benchmark_matrix }}
+      install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
+      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
+      comparison_base_ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || github.sha }}
+      comparison_candidate_ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'push' && github.event.after || github.sha }}
     secrets: inherit
 
   model-test-eager:
@@ -189,12 +212,11 @@ jobs:
       needs.scan.outputs.eager_model == 'true' &&
       github.event.pull_request.draft == false &&
       needs.scan.outputs.model_has_tasks == 'true'
-    uses: ./.github/workflows/run-pr-test-stage.yml
+    uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
       matrix: ${{ needs.scan.outputs.model_matrix }}
-      timeout_minutes: 120
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
-      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+      b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
     secrets: inherit
 
   finish:
@@ -207,16 +229,17 @@ jobs:
         github.repository == vars.TOKENSPEED_CI_REPOSITORY
       ) &&
       (github.event.action != 'labeled' || github.event.label.name == 'high priority')
-    needs: [unit-test, model-test, model-test-eager]
+    needs: [unit-test, kernel-benchmark, model-test, model-test-eager]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
         env:
           UNIT_TEST_RESULT: ${{ needs.unit-test.result }}
+          KERNEL_BENCHMARK_RESULT: ${{ needs.kernel-benchmark.result }}
           MODEL_TEST_RESULT: ${{ needs.model-test.result }}
           MODEL_TEST_EAGER_RESULT: ${{ needs.model-test-eager.result }}
         run: |
-          for result in "$UNIT_TEST_RESULT" "$MODEL_TEST_RESULT" "$MODEL_TEST_EAGER_RESULT"; do
+          for result in "$UNIT_TEST_RESULT" "$KERNEL_BENCHMARK_RESULT" "$MODEL_TEST_RESULT" "$MODEL_TEST_EAGER_RESULT"; do
             if [[ "$result" != "success" && "$result" != "skipped" ]]; then
               echo "PR Test did not finish successfully: dependency result=$result"
               exit 1

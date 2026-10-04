@@ -23,7 +23,6 @@ server:
     --max-total-tokens 1048576
     --max-num-seqs 32
     --chunked-prefill-size 8192
-    --gpu-memory-utilization 0.9
     --disable-kvstore
     --disable-prefill-graph
     --trust-remote-code

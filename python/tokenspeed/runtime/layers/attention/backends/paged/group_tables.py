@@ -211,6 +211,23 @@ class GroupTableStacks:
         i = self._index[group_id]
         return self.tables[i, :bs, : self._max_num_pages[i]]
 
+    def host_table(
+        self, group_id: str, block_table_cpu: torch.Tensor, num_requests: int
+    ) -> torch.Tensor:
+        """Expand one group's host block table into kernel pages: the
+        ``[num_requests, blocks * ratio]`` host mirror of :meth:`table`'s
+        leading rows (unpadded), the same block-to-page math as the device
+        fill, for leaves that count page ownership on the host."""
+        i = self._index[group_id]
+        ratio = self._ratios[i]
+        src = block_table_cpu[:num_requests].to(torch.int64).clamp_min(0)
+        if ratio != 1:
+            offsets = torch.arange(ratio, dtype=torch.int64)
+            src = (src.unsqueeze(-1) * ratio + offsets).reshape(num_requests, -1)
+            # Page 0 stays 0 across its ratio slots.
+            src = torch.where(src >= ratio, src, torch.zeros_like(src))
+        return src.to(torch.int32)
+
     def decode_locations(
         self, group_id: str, bs: int, tokens_per_req: int
     ) -> torch.Tensor:

@@ -328,6 +328,7 @@ class GrammarManagerTimeoutTests(unittest.TestCase):
             sampling_params=sp,
             stream=False,
             tokenizer=None,
+            computes_prompt_logprobs=True,
             eos_token_ids=[1],
         )
         s.rid = "test-rid"

@@ -164,6 +164,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             disable_autotune=disabled,
             model_is_mrope=False,
             prefill_only=prefill_only,
+            decode_only_attention=False,
         ),
         model_runner=SimpleNamespace(forward=forward),
         input_buffers=SimpleNamespace(
@@ -173,9 +174,9 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             max_num_tokens=32,
             fill_dummy_decode_buffers=scrub,
         ),
-        _model_input_kwargs=lambda n, bs: {
-            "engram_previous_tokens": ngram_history[:n],
-            "engram_token_mask": ngram_mask[:n],
+        _model_input_kwargs=lambda n, bs, rows: {
+            "engram_previous_tokens": ngram_history[rows],
+            "engram_token_mask": ngram_mask[rows],
         },
         prefill_graph=SimpleNamespace(make_dummy_batch=prefill_batch),
         # Deliberately no capture_bs or graph-enabled flag: neither controls tuning.
@@ -226,6 +227,89 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         tensor.fill_(1)  # Capture must be able to mutate warmup metadata later.
 
 
+@pytest.mark.parametrize("speculative", [False, True])
+def test_decode_only_attention_tunes_on_a_decode_step(speculative):
+    """Head TP serves decode rows only: no extend-shaped dummy is built; the
+    traversal is one decode step at the largest batch, draft experts included."""
+    events = []
+
+    def forward(**kwargs):
+        raise AssertionError("no extend forward on a decode-only layout")
+
+    def warmup(*, batch_sizes, graph_phase):
+        assert batch_sizes == (8,)
+        assert graph_phase is False
+        events.append("decode")
+
+    def prefill_batch(num_tokens, batch_size):
+        raise AssertionError("no extend dummy batch on a decode-only layout")
+
+    max_tokens = Mock()
+    namespace = dict(
+        torch=torch,
+        dummy_batch_size=lambda n, context: -(-n // context),
+        time=time,
+        logger=logging.getLogger(__name__),
+        autotune=Mock(return_value=nullcontext()),
+        active_forward=lambda ctx: nullcontext(),
+        set_autotune_max_num_tokens=max_tokens,
+        set_autotune_process_group=lambda group: events.append(("group", group)),
+        autotune_cache_path=lambda key: "cache.json",
+        load_autotune_cache=lambda *args: events.append("load"),
+        save_autotune_cache=lambda *args: events.append("save"),
+    )
+    executor = SimpleNamespace(
+        config=SimpleNamespace(
+            max_num_seqs=8,
+            data_parallel_size=1,
+            chunked_prefill_size=16,
+            context_len=4,
+            world_size=1,
+            world_group=(0,),
+            global_rank=0,
+            autotune_cache_key={},
+            pp_size=1,
+            disable_autotune=False,
+            model_is_mrope=False,
+            prefill_only=False,
+            decode_only_attention=True,
+        ),
+        model_runner=SimpleNamespace(forward=forward),
+        input_buffers=SimpleNamespace(
+            input_ids_buf=torch.ones(32),
+            positions_buf=torch.arange(32),
+            max_bs=8,
+            max_num_tokens=32,
+            fill_dummy_decode_buffers=lambda **kwargs: events.append("scrub"),
+        ),
+        _model_input_kwargs=lambda n, bs: {},
+        prefill_graph=SimpleNamespace(make_dummy_batch=prefill_batch),
+        forward_step=SimpleNamespace(
+            warmup_decode_path=warmup, max_decode_bs=8, max_tokens_per_req=3
+        ),
+        drafter=object() if speculative else None,
+        _autotune_draft_experts=lambda n: events.append(("draft_experts", n)),
+        device="cpu",
+    )
+    method = _functions(
+        RUNTIME / "execution/model_executor.py",
+        "ModelExecutor",
+        ("autotune",),
+        namespace,
+    )
+    method.autotune(executor)
+    max_tokens.assert_called_once_with(8 * 3)
+    assert events == [
+        "load",
+        ("group", None),
+        "scrub",
+        *([("draft_experts", 24)] if speculative else []),
+        "decode",
+        ("group", None),
+        "save",
+    ]
+
+
 def _moe_api(impl, routing_modes, deferred):
     spec = SimpleNamespace(
         name="test_moe",
@@ -245,6 +329,8 @@ def _moe_api(impl, routing_modes, deferred):
         _validate_routing_mode=Mock(),
         _validate_deepep_mode=Mock(),
         _validate_selected_deepep_mode=Mock(),
+        _validate_combine_order=Mock(),
+        COMBINE_ORDERS=("rank", "slot"),
         _build_traits=Mock(return_value={}),
         select_kernel=lambda *args, **kwargs: impl,
         format_signature=lambda **kwargs: kwargs,
@@ -277,6 +363,7 @@ def _make_moe_plan(api, routing_mode):
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
         with_bias=False,
         process_group=None,
         deepep_mode=None,
@@ -1095,7 +1182,7 @@ def test_skinny_add3_preserves_capture_trust(capturing, warmed, failure):
 
 def test_pipeline_stages_share_shape_keyed_cache_identity():
     mapping = SimpleNamespace(
-        attn=SimpleNamespace(tp_size=2, cp_size=1, dp_size=1),
+        attn=SimpleNamespace(tp_size=2, dp_size=1),
         dense=SimpleNamespace(tp_size=2, dp_size=1),
         moe=SimpleNamespace(tp_size=2, ep_size=1, dp_size=1),
         linear_attn=SimpleNamespace(tp_size=2),

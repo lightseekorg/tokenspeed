@@ -49,6 +49,10 @@ def _use_cute_dsl_decode_topk() -> bool:
 _TOPK_FEATURES = frozenset({"forced_initial_local"}) | (
     frozenset({"batch_invariant"}) if has_deterministic_decode_topk() else frozenset()
 )
+# The prefill leaf sizes its chunk launches from the host mirror of each
+# token's candidate count (``candidate_lens_cpu``), so it declares the feature
+# the facade hands the keyword on (``dsa.CANDIDATE_LENS_CPU_FEATURE``).
+_PREFILL_TOPK_FEATURES = _TOPK_FEATURES | frozenset({"candidate_lens_cpu"})
 
 
 def _row_invariant_topk(
@@ -429,7 +433,7 @@ if platform.is_hopper_plus:
         "dsa_prefill_topk",
         name="deep_gemm_dsa_prefill_topk",
         solution="deep_gemm",
-        features=_TOPK_FEATURES,
+        features=_PREFILL_TOPK_FEATURES,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),

@@ -1,5 +1,6 @@
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,12 +13,15 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from runtime.cache_pd_test_utils import block_manifest  # noqa: E402
 from runtime.cache_pd_test_utils import group  # noqa: E402
 from runtime.cache_pd_test_utils import segment  # noqa: E402
 from runtime.cache_pd_test_utils import layout as make_layout  # noqa: E402
 
 from tokenspeed.runtime.pd.transfer_plan import (
+    CachePageOwnerFilter,
     CacheTransferPlanner,
+    UnsupportedPDLayoutError,
 )
 
 
@@ -404,3 +408,459 @@ def test_stage_placement_supports_noncontiguous_fields_without_model_counts():
         rank: {fragment.field_id for fragment in fragments}
         for rank, fragments in plan.fragments_by_prefill_rank.items()
     } == {rank: set(stage) for rank, stage in enumerate(fields)}
+
+
+# ---- DCP page-sharded prefill (sharded source, whole destination) ----
+
+
+def _latent_layout(*, shard_count: int, extra_replicated: bool = False):
+    """MLA-style layout: replicated latent fields, optionally a second group."""
+    groups = [
+        group(
+            "history",
+            segment("layer.0.latent", dtype="bfloat16", shape=(2, 1), stride=16),
+            segment(
+                "layer.1.latent", dtype="bfloat16", shape=(2, 1), offset=512, stride=16
+            ),
+            shard_count=shard_count,
+        )
+    ]
+    if extra_replicated:
+        groups.append(
+            group(
+                "swa",
+                segment(
+                    "layer.2.swa",
+                    dtype="bfloat16",
+                    shape=(2, 1),
+                    offset=1024,
+                    stride=16,
+                ),
+            )
+        )
+    return make_layout(*groups, page_bytes=128)
+
+
+def test_sharded_prefill_fans_every_subgroup_rank_to_one_decode_rank():
+    """P TP4 x DCP4 -> D TP1: all four P ranks send, each tagged as an owner."""
+    planner = _planner(
+        4, 1, _latent_layout(shard_count=4), _latent_layout(shard_count=1)
+    )
+    assert planner.has_sharded_groups
+
+    plan = planner.plan_for_decode_rank(0)
+
+    assert plan.target_prefill_ranks == (0, 1, 2, 3)
+    assert plan.owner_filters_by_prefill_rank == {
+        rank: {"history": CachePageOwnerFilter(rank, 4)} for rank in range(4)
+    }
+    for rank in range(4):
+        fragments = plan.fragments_by_prefill_rank[rank]
+        assert [f.field_id for f in fragments] == ["layer.0.latent", "layer.1.latent"]
+        assert all(f.rows_per_page == 1 and f.bytes_per_row == 4 for f in fragments)
+    # Every P rank serves the only D rank; nobody is a dummy rendezvous rank.
+    assert planner.decode_ranks_by_prefill_rank == {
+        rank: frozenset({0}) for rank in range(4)
+    }
+
+
+def test_sharded_prefill_picks_the_replica_subgroup_per_decode_rank():
+    """P TP4 x DCP2 -> D TP2: each D rank reads one whole DCP subgroup."""
+    planner = _planner(
+        4, 2, _latent_layout(shard_count=2), _latent_layout(shard_count=1)
+    )
+
+    first = planner.plan_for_decode_rank(0)
+    second = planner.plan_for_decode_rank(1)
+
+    assert first.target_prefill_ranks == (0, 1)
+    assert second.target_prefill_ranks == (2, 3)
+    assert first.owner_filters_by_prefill_rank == {
+        0: {"history": CachePageOwnerFilter(0, 2)},
+        1: {"history": CachePageOwnerFilter(1, 2)},
+    }
+    assert second.owner_filters_by_prefill_rank == {
+        2: {"history": CachePageOwnerFilter(0, 2)},
+        3: {"history": CachePageOwnerFilter(1, 2)},
+    }
+    assert planner.decode_ranks_by_prefill_rank == {
+        0: frozenset({0}),
+        1: frozenset({0}),
+        2: frozenset({1}),
+        3: frozenset({1}),
+    }
+
+
+def test_sharded_prefill_leaves_the_equal_tp_fast_path():
+    """Equal TP still fans a sharded group out; a replicated group does not."""
+    planner = _planner(
+        2,
+        2,
+        _latent_layout(shard_count=2, extra_replicated=True),
+        _latent_layout(shard_count=1, extra_replicated=True),
+    )
+
+    plan = planner.plan_for_decode_rank(1)
+
+    assert plan.target_prefill_ranks == (0, 1)
+    assert plan.owner_filters_by_prefill_rank == {
+        0: {"history": CachePageOwnerFilter(0, 2)},
+        1: {"history": CachePageOwnerFilter(1, 2)},
+    }
+    # The replicated group keeps its one same-index source and no owner filter.
+    assert {f.field_id for f in plan.fragments_by_prefill_rank[0]} == {
+        "layer.0.latent",
+        "layer.1.latent",
+    }
+    assert {f.field_id for f in plan.fragments_by_prefill_rank[1]} == {
+        "layer.0.latent",
+        "layer.1.latent",
+        "layer.2.swa",
+    }
+    assert planner.decode_ranks_by_prefill_rank == {
+        0: frozenset({0, 1}),
+        1: frozenset({0, 1}),
+    }
+
+
+def test_equal_tp_sharded_route_sends_through_the_pages_api():
+    """P TP2 x DCP2 -> D TP2 leaves the empty-fragment route, yet every copy
+    still goes out as one pages x fields grid per group."""
+    from tokenspeed.runtime.pd.mooncake.pack import PageFieldCopies
+
+    prefill_layout = _latent_layout(shard_count=2, extra_replicated=True)
+    decode_layout = _latent_layout(shard_count=1, extra_replicated=True)
+    plan = _planner(2, 2, prefill_layout, decode_layout).plan_for_decode_rank(1)
+    src_ptr, dst_ptr = 0x10000, 0x20000
+    source_manifest = block_manifest(("history", (1, 2, 3, 4)), ("swa", (5, 6)))
+    destination_manifest = block_manifest(
+        ("history", (10, 11, 12, 13)), ("swa", (14, 15))
+    )
+
+    def grids(rank):
+        items = list(
+            _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+                dst_ptr=dst_ptr,
+                src_block_manifest=source_manifest,
+                dst_block_manifest=destination_manifest,
+                transfer_fragments=plan.fragments_by_prefill_rank[rank],
+                owner_filters=plan.owner_filters_by_prefill_rank[rank],
+                dst_cache_layout=decode_layout,
+            )
+        )
+        assert all(isinstance(item, PageFieldCopies) for item in items)
+        return [
+            (item.src_pages.tolist(), item.dst_pages.tolist(), item.fields.shape[0])
+            for item in items
+        ]
+
+    # Rank 0 owns virtual blocks 1, 3 (local pages 1, 2) of the two-field
+    # sharded group and nothing of the replicated one.
+    assert grids(0) == [([1, 2], [10, 12], 2)]
+    # Rank 1 owns 2, 4 and, as decode rank 1's same-index source, sends the
+    # replicated group whole.
+    assert grids(1) == [([1, 2], [11, 13], 2), ([5, 6], [14, 15], 1)]
+
+
+def test_unsharded_layouts_keep_the_equal_tp_fast_path():
+    planner = _planner(
+        2, 2, _latent_layout(shard_count=1), _latent_layout(shard_count=1)
+    )
+    plan = planner.plan_for_decode_rank(1)
+    assert plan.fragments_by_prefill_rank == {1: ()}
+    # The one source rank still carries its (empty) set of decisions.
+    assert plan.owner_filters_by_prefill_rank == {1: {}}
+    assert planner.decode_ranks_by_prefill_rank == {
+        0: frozenset({0}),
+        1: frozenset({1}),
+    }
+
+
+def test_equal_tp_stage_subset_routes_gqa_replicas_like_the_full_plan():
+    """One predicate picks the route: a PP stage at equal TP leaves the
+    whole-copy path, so its served-rank sets follow the fragment route."""
+    layout = _paged_layout(
+        local_heads=1, global_heads=2, page_stride=4096, page_zero_offset=128
+    )
+    full = CacheTransferPlanner(
+        prefill_tp_size=4,
+        decode_tp_size=4,
+        prefill_layout=layout,
+        decode_layout=layout,
+        prefill_field_ids=None,
+    )
+    stage = CacheTransferPlanner(
+        prefill_tp_size=4,
+        decode_tp_size=4,
+        prefill_layout=layout,
+        decode_layout=layout,
+        prefill_field_ids=frozenset({"layer.0.k"}),
+    )
+    # Whole copy: every rank serves itself.
+    assert full.decode_ranks_by_prefill_rank == {
+        rank: frozenset({rank}) for rank in range(4)
+    }
+    # Fragment route: the representative rank of each GQA replica pair serves
+    # both of its decode ranks, exactly as plan_for_decode_rank routes them.
+    assert stage.decode_ranks_by_prefill_rank == {
+        0: frozenset({0, 1}),
+        1: frozenset(),
+        2: frozenset({2, 3}),
+        3: frozenset(),
+    }
+    for decode_rank in range(4):
+        plan = stage.plan_for_decode_rank(decode_rank)
+        for prefill_rank in plan.target_prefill_ranks:
+            assert decode_rank in stage.decode_ranks_by_prefill_rank[prefill_rank]
+
+
+def test_sharded_decode_destination_is_rejected():
+    with pytest.raises(UnsupportedPDLayoutError, match="sharded on Decode"):
+        _planner(2, 2, _latent_layout(shard_count=1), _latent_layout(shard_count=2))
+
+
+def test_shard_count_must_divide_prefill_tp():
+    with pytest.raises(UnsupportedPDLayoutError, match="does not divide"):
+        _planner(3, 1, _latent_layout(shard_count=2), _latent_layout(shard_count=1))
+
+
+def test_head_partitioned_field_in_a_sharded_group_is_rejected():
+    def layout(shard_count):
+        return make_layout(
+            group(
+                "history",
+                segment(
+                    "layer.0.k",
+                    dtype="bfloat16",
+                    shape=(2, 2, 2),
+                    stride=32,
+                    axis=1,
+                    extent=4,
+                ),
+                shard_count=shard_count,
+            ),
+            page_bytes=128,
+        )
+
+    with pytest.raises(UnsupportedPDLayoutError, match="head-partitioned"):
+        _planner(2, 2, layout(2), layout(1))
+
+
+def test_pipeline_plan_offsets_owner_filters_by_stage():
+    from tokenspeed.runtime.pd.transfer_plan import build_pipeline_transfer_plan
+
+    plan, dummy_ranks = build_pipeline_transfer_plan(
+        prefill_tp_size=2,
+        decode_tp_size=1,
+        decode_tp_rank=0,
+        prefill_layout=_latent_layout(shard_count=2),
+        decode_layout=_latent_layout(shard_count=1),
+        cache_fields_by_stage=(("layer.0.latent",), ("layer.1.latent",)),
+    )
+
+    assert dummy_ranks == ()
+    assert {
+        rank: [f.field_id for f in fragments]
+        for rank, fragments in plan.fragments_by_prefill_rank.items()
+    } == {
+        0: ["layer.0.latent"],
+        1: ["layer.0.latent"],
+        2: ["layer.1.latent"],
+        3: ["layer.1.latent"],
+    }
+    assert plan.owner_filters_by_prefill_rank == {
+        0: {"history": CachePageOwnerFilter(0, 2)},
+        1: {"history": CachePageOwnerFilter(1, 2)},
+        2: {"history": CachePageOwnerFilter(0, 2)},
+        3: {"history": CachePageOwnerFilter(1, 2)},
+    }
+
+
+def _copies(items) -> list[tuple[int, int, int]]:
+    """Expand sender items to ``(src, dst, length)`` triples."""
+    from tokenspeed.runtime.pd.mooncake.pack import (
+        PackedCopy,
+        PageFieldCopies,
+        expand_packed_copy,
+    )
+
+    copies = []
+    for item in items:
+        if isinstance(item, PageFieldCopies):
+            copies.extend(
+                (
+                    int(src_base + page * src_stride),
+                    int(dst_base + peer * dst_stride),
+                    int(length),
+                )
+                for src_base, src_stride, dst_base, dst_stride, length in item.fields.tolist()
+                for page, peer in zip(
+                    item.src_pages.tolist(), item.dst_pages.tolist(), strict=True
+                )
+            )
+        elif isinstance(item, PackedCopy):
+            copies.extend(expand_packed_copy(item))
+        else:
+            copies.append(item)
+    return copies
+
+
+def _sender(layout, src_ptr: int):
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.kv_args = SimpleNamespace(cache_layout=layout, kv_data_ptr=src_ptr)
+    return manager
+
+
+def _hybrid_layout(*, local_kda_heads: int, shard_count: int):
+    """Kimi K3 shape: a page-sharded MLA group plus head-partitioned KDA state."""
+    return make_layout(
+        group(
+            "history",
+            segment("layer.0.latent", dtype="bfloat16", shape=(2, 1), stride=16),
+            shard_count=shard_count,
+        ),
+        group(
+            "kda",
+            segment(
+                "layer.1.state",
+                dtype="bfloat16",
+                shape=(local_kda_heads, 4),
+                offset=512,
+                stride=64,
+                axis=0,
+                extent=8,
+            ),
+            family="state",
+        ),
+        page_bytes=128,
+    )
+
+
+def test_every_target_rank_of_a_hybrid_route_can_send_with_its_own_decisions():
+    """P TP8 x DCP2 -> D TP2: the KDA head partition routes ranks outside the
+    MLA subgroup; they hold no 'history' fragments and must say so."""
+    prefill_layout = _hybrid_layout(local_kda_heads=1, shard_count=2)
+    decode_layout = _hybrid_layout(local_kda_heads=4, shard_count=1)
+    planner = _planner(8, 2, prefill_layout, decode_layout)
+    src_ptr, dst_ptr = 0x10000, 0x20000
+    kda_dst_base = dst_ptr + 512
+    source_manifest = block_manifest(("history", (1, 2, 3, 4)), ("kda", (5,)))
+    destination_manifest = block_manifest(("history", (10, 11, 12, 13)), ("kda", (7,)))
+
+    for decode_rank, subgroup in ((0, (0, 1)), (1, (4, 5))):
+        plan = planner.plan_for_decode_rank(decode_rank)
+        assert plan.target_prefill_ranks == tuple(range(subgroup[0], subgroup[0] + 4))
+        for rank in plan.target_prefill_ranks:
+            decisions = plan.owner_filters_by_prefill_rank[rank]
+            assert set(decisions) == {"history"}
+            if rank in subgroup:
+                assert decisions["history"] == CachePageOwnerFilter(rank % 2, 2)
+            else:
+                assert decisions["history"] is None
+            copies = _copies(
+                _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+                    dst_ptr=dst_ptr,
+                    src_block_manifest=source_manifest,
+                    dst_block_manifest=destination_manifest,
+                    transfer_fragments=plan.fragments_by_prefill_rank[rank],
+                    owner_filters=decisions,
+                    dst_cache_layout=decode_layout,
+                )
+            )
+            history_copies = [copy for copy in copies if copy[1] < kda_dst_base]
+            kda_copies = [copy for copy in copies if copy[1] >= kda_dst_base]
+            # Every rank of the four sends its KDA head slice of the one page.
+            assert len(kda_copies) == 1
+            if rank in subgroup:
+                # Owned virtual blocks 1,3 (owner 0) or 2,4 (owner 1) come from
+                # local pages 1,2 and land at the matching manifest positions.
+                owner = rank % 2
+                assert history_copies == [
+                    (src_ptr + local * 16, dst_ptr + remote * 16, 4)
+                    for local, remote in ((1, 10 + owner), (2, 12 + owner))
+                ]
+            else:
+                assert history_copies == []
+
+
+def test_pipeline_stage_without_a_sharded_group_decides_none_and_sends_rest():
+    """Two sharded groups, stage 0 holding only one: its ranks send that
+    group's owned pages and nothing of the other."""
+    from tokenspeed.runtime.pd.transfer_plan import build_pipeline_transfer_plan
+
+    def layout(shard_count):
+        return make_layout(
+            group(
+                "history",
+                segment("layer.0.latent", dtype="bfloat16", shape=(2, 1), stride=16),
+                shard_count=shard_count,
+            ),
+            group(
+                "index",
+                segment(
+                    "layer.1.index",
+                    dtype="bfloat16",
+                    shape=(2, 1),
+                    offset=512,
+                    stride=16,
+                ),
+                shard_count=shard_count,
+            ),
+            page_bytes=128,
+        )
+
+    prefill_layout, decode_layout = layout(2), layout(1)
+    plan, dummy_ranks = build_pipeline_transfer_plan(
+        prefill_tp_size=2,
+        decode_tp_size=1,
+        decode_tp_rank=0,
+        prefill_layout=prefill_layout,
+        decode_layout=decode_layout,
+        cache_fields_by_stage=(("layer.0.latent",), ("layer.1.index",)),
+    )
+    assert dummy_ranks == ()
+    assert plan.owner_filters_by_prefill_rank == {
+        0: {"history": CachePageOwnerFilter(0, 2), "index": None},
+        1: {"history": CachePageOwnerFilter(1, 2), "index": None},
+        2: {"history": None, "index": CachePageOwnerFilter(0, 2)},
+        3: {"history": None, "index": CachePageOwnerFilter(1, 2)},
+    }
+
+    src_ptr, dst_ptr = 0x10000, 0x20000
+    copies = _copies(
+        _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+            dst_ptr=dst_ptr,
+            src_block_manifest=block_manifest(("history", (1, 2)), ("index", (3, 4))),
+            dst_block_manifest=block_manifest(("history", (5, 6)), ("index", (7, 8))),
+            transfer_fragments=plan.fragments_by_prefill_rank[1],
+            owner_filters=plan.owner_filters_by_prefill_rank[1],
+            dst_cache_layout=decode_layout,
+        )
+    )
+    # Stage-0 rank 1 owns virtual block 2 (local page 1) of 'history' only.
+    assert copies == [(src_ptr + 1 * 16, dst_ptr + 6 * 16, 4)]
+
+
+def test_receiver_calc_targets_every_rank_of_a_sharded_prefill():
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.pd.mooncake.decode import PrefillParallelInfo
+    from tokenspeed.runtime.pd.mooncake.receiver import _calc
+
+    kv_mgr = SimpleNamespace(
+        topology=SimpleNamespace(tp_size=1, tp_rank=0),
+        kv_args=SimpleNamespace(cache_layout=_latent_layout(shard_count=1)),
+    )
+    info = PrefillParallelInfo(
+        tp_size=4,
+        dp_size=1,
+        cache_fields_by_stage=(("layer.0.latent", "layer.1.latent"),),
+        cache_layout=_latent_layout(shard_count=4),
+    )
+
+    route = _calc(kv_mgr, info)
+
+    assert route.target_tp_ranks == (0, 1, 2, 3)
+    assert route.dummy_tp_ranks == ()

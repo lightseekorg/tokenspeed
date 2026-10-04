@@ -31,6 +31,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.dspark_context import (
@@ -93,6 +94,25 @@ class CapturedRows:
     prefill_spans: tuple[tuple[int, int], ...]
 
 
+@dataclass(frozen=True)
+class InputLogprobRows:
+    """Device-side form of an ``InputLogprobPlan`` for the logits processor.
+
+    ``rows`` indexes the forward's full ``[num_input_rows, hidden]``
+    activations, ``targets`` names the token each row predicts and ``slots``
+    the extend slot each row belongs to (for per-request NaN flags); all three
+    are int64 device tensors of equal length. ``chunk_tokens`` bounds how many
+    rows the processor pushes through the LM head at once (a memory knob, not
+    a numerics one: log-softmax is row-local).
+    """
+
+    rows: torch.Tensor
+    targets: torch.Tensor
+    slots: torch.Tensor
+    num_input_rows: int
+    chunk_tokens: int
+
+
 @dataclass
 class ForwardContext:
     """Do not contain Tensor.
@@ -102,7 +122,8 @@ class ForwardContext:
     arguments or through those subsystems (attention metadata, the backend's
     per-forward scratch, the KV pool). The collaborators a drafter attaches
     per forward (``draft_narrowing``, ``target_capture_sink``) lend behavior,
-    not buffers. ``gather_ids`` is the one tensor left, pending its move to a
+    not buffers. The logits-processor inputs -- ``gather_ids`` and the
+    prompt-logprob rows -- are the tensors left, pending their move to a
     forward argument beside ``positions``.
     """
 
@@ -125,6 +146,12 @@ class ForwardContext:
     global_bs: list[int] | None = None
     all_decode_or_idle: bool = False
     all_extend: bool = False
+    # --- query context parallelism ---
+    # The rows this rank computes of a sharded extend forward (plain host
+    # integers); None means every rank computes every row. ``input_num_tokens``
+    # and ``global_num_tokens`` keep the scheduler's full-chunk meaning, the
+    # model's row axis is the shard.
+    query_shard: QueryShardPlan | None = None
     # Models that need specific collective sizing (e.g. draft models whose
     # first-step forward narrows activations) report these via
     # ``report_collective_sizing``. Unset (None) means comm sizing falls
@@ -137,6 +164,9 @@ class ForwardContext:
 
     # --- logits processor ---
     gather_ids: torch.Tensor | None = None
+    # Prompt rows whose next-token logprob this forward returns (SGLang
+    # ``logprob_start_len``); None when no extend row asks for any.
+    input_logprob_rows: InputLogprobRows | None = None
     # Set by a target model that captures its taps on a narrowed row subset
     # (see CapturedRows); None means one captured row per input row.
     captured_rows: CapturedRows | None = None

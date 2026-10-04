@@ -53,6 +53,19 @@ def require_positive_int(name: str, value: object) -> int:
     return value
 
 
+def virtual_block_count(page_count: int, shard_count: int) -> int:
+    """Scheduler block count of a group holding ``page_count`` local pages.
+
+    Local page 0 and virtual block 0 are both the null block. Every other
+    virtual block is dealt cyclically to ``shard_count`` owners, so one
+    owner's local pages back one ``shard_count``-th of the virtual blocks; a
+    replicated group (``shard_count`` 1) has as many virtual blocks as pages.
+    Both the arena contract and the PD wire contract size scheduler IDs with
+    this one formula.
+    """
+    return 1 + (page_count - 1) * shard_count
+
+
 @dataclass(frozen=True)
 class CacheRuntimeContract:
     prefix_granularity: int
@@ -141,8 +154,9 @@ class CacheRuntimeContract:
     def virtual_block_counts(self) -> Mapping[str, int]:
         """Scheduler block counts, including the null block."""
         return {
-            spec.group_id: 1
-            + (self.group_page_counts[spec.group_id] - 1) * spec.shard_count
+            spec.group_id: virtual_block_count(
+                self.group_page_counts[spec.group_id], spec.shard_count
+            )
             for spec in self.group_specs
         }
 

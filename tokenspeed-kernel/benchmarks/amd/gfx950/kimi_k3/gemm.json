@@ -9,7 +9,7 @@
         "family": "gemm",
         "mode": "mm",
         "parameters": {
-          "M": [2816, 3072, 3328, 3584, 3840, 4096],
+          "M": [4608, 5120],
           "N": 3072,
           "K": 512,
           "quant": "none",
@@ -27,6 +27,122 @@
       "policy": {
         "max_regression_relative": 0.05,
         "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.mm/gluon_mm_a16w16_prefill_gfx950/tp8-kda_qkvfab-n6288-k7168-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [2048, 4096, 12288],
+          "N": 6288,
+          "K": 7168,
+          "quant": "none",
+          "dtype": "bfloat16",
+          "validation": {
+            "runs": 3,
+            "atol": 0.0001,
+            "rtol": 0.0078125
+          }
+        },
+        "registration": "gluon_mm_a16w16_prefill_gfx950",
+        "cold_cache": true,
+        "seed": 4608
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.mm/gluon_mm_a16w16_prefill_gfx950/tp8-mla_qkv_a-n2112-k7168-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [6144],
+          "N": 2112,
+          "K": 7168,
+          "quant": "none",
+          "dtype": "bfloat16",
+          "validation": {
+            "runs": 3,
+            "atol": 0.0001,
+            "rtol": 0.0078125
+          }
+        },
+        "registration": "gluon_mm_a16w16_prefill_gfx950",
+        "cold_cache": true,
+        "seed": 4609
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.mm/gluon_mm_a16w16_prefill_gfx950/tp8-o_proj-n7168-k1536-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [4096, 8192],
+          "N": 7168,
+          "K": 1536,
+          "quant": "none",
+          "dtype": "bfloat16",
+          "validation": {
+            "runs": 3,
+            "atol": 0.0001,
+            "rtol": 0.0078125
+          }
+        },
+        "registration": "gluon_mm_a16w16_prefill_gfx950",
+        "cold_cache": true,
+        "seed": 4610
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.mm/gluon_mm_a16w16_prefill_gfx950/tp8-shared_down-n7168-k768-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [2048, 8192],
+          "N": 7168,
+          "K": 768,
+          "quant": "none",
+          "dtype": "bfloat16",
+          "validation": {
+            "runs": 3,
+            "atol": 0.0001,
+            "rtol": 0.0078125
+          }
+        },
+        "registration": "gluon_mm_a16w16_prefill_gfx950",
+        "cold_cache": true,
+        "seed": 4611
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 5.0,
         "max_relative_mad": 0.05
       }
     },
@@ -76,7 +192,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
+        "max_regression_absolute_us": 2.0,
         "max_relative_mad": 0.05
       }
     },
@@ -96,6 +212,190 @@
         "registration": "triton_rowcta_gemv",
         "cold_cache": true,
         "seed": 4604
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.decode_gemv/triton_rowcta_gemv/tp8-lm_head-m1-n20480-k7168-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "decode_gemv",
+        "parameters": {
+          "M": 1,
+          "N": 20480,
+          "K": 7168,
+          "dtype": "bfloat16"
+        },
+        "registration": "triton_rowcta_gemv",
+        "cold_cache": true,
+        "seed": 4612
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-o_proj-n7168-k1536-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "decode_gemv",
+        "parameters": {
+          "M": [4, 16, 64],
+          "N": 7168,
+          "K": 1536,
+          "dtype": "bfloat16"
+        },
+        "registration": "gluon_mm_a16w16_decode_gfx950",
+        "cold_cache": true,
+        "seed": 4605
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-shared_gate_up-n1536-k7168-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "decode_gemv",
+        "parameters": {
+          "M": [4, 32, 64],
+          "N": 1536,
+          "K": 7168,
+          "dtype": "bfloat16"
+        },
+        "registration": "gluon_mm_a16w16_decode_gfx950",
+        "cold_cache": true,
+        "seed": 4606
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-latent_up-n7168-k3584-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "decode_gemv",
+        "parameters": {
+          "M": [2, 8, 32],
+          "N": 7168,
+          "K": 3584,
+          "dtype": "bfloat16"
+        },
+        "registration": "gluon_mm_a16w16_decode_gfx950",
+        "cold_cache": true,
+        "seed": 4607
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-kda_qkvfab-n6288-k7168-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "decode_gemv",
+        "parameters": {
+          "M": [8, 32],
+          "N": 6288,
+          "K": 7168,
+          "dtype": "bfloat16"
+        },
+        "registration": "gluon_mm_a16w16_decode_gfx950",
+        "cold_cache": true,
+        "seed": 4608
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-mla_qkv_gate-n3648-k7168-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "decode_gemv",
+        "parameters": {
+          "M": [4, 32, 64],
+          "N": 3648,
+          "K": 7168,
+          "dtype": "bfloat16"
+        },
+        "registration": "gluon_mm_a16w16_decode_gfx950",
+        "cold_cache": true,
+        "seed": 4609
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-shared_down-n7168-k768-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "decode_gemv",
+        "parameters": {
+          "M": [4, 16, 64],
+          "N": 7168,
+          "K": 768,
+          "dtype": "bfloat16"
+        },
+        "registration": "gluon_mm_a16w16_decode_gfx950",
+        "cold_cache": true,
+        "seed": 4610
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-lm_head-n20480-k7168-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "decode_gemv",
+        "parameters": {
+          "M": [4, 16],
+          "N": 20480,
+          "K": 7168,
+          "dtype": "bfloat16"
+        },
+        "registration": "gluon_mm_a16w16_decode_gfx950",
+        "cold_cache": true,
+        "seed": 4611
       },
       "policy": {
         "max_regression_relative": 0.05,

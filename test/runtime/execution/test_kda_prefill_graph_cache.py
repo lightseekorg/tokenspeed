@@ -764,7 +764,7 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
 
     events = []
     mode = ForwardMode[mode]
-    ctx = SimpleNamespace(forward_mode=mode, bs=2, input_num_tokens=7)
+    ctx = SimpleNamespace(forward_mode=mode, bs=2, input_num_tokens=7, query_shard=None)
     executor = object.__new__(ModelExecutor)
     executor.config = SimpleNamespace(pp_size=1, data_parallel_size=dp_size)
     executor._active_positions_override = torch.arange(7)

@@ -380,6 +380,7 @@ class _Harness:
             extend_replay_lens_cpu=torch.zeros(1, dtype=torch.int32),
             extend_prompt_lens_cpu=torch.tensor([T], dtype=torch.int32),
             extend_with_prefix=False,
+            query_shard=None,
             block_tables=self.block_tables,
         )
         self.seq_len = T

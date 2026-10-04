@@ -21,6 +21,18 @@ install:
   - python3 -m pip install --break-system-packages pytest==9.1.1 pytest-xdist -r tokenspeed-kernel/python/requirements/cuda.txt -r tokenspeed-kernel/python/requirements/cuda-thirdparty.txt compressed-tensors pybase64 pyzmq pillow fastapi
   - |
     bash -ec '
+      flashinfer_version=$(python3 -c "from importlib.metadata import version; print(version(\"flashinfer-python\"))")
+      python3 -m pip install --break-system-packages --no-deps \
+        --index-url https://flashinfer.ai/whl/ "flashinfer-cubin==${flashinfer_version}"
+      jit_cache_url=$(python3 test/ci_system/flashinfer_jit_cache_installer.py \
+        --requirements tokenspeed-kernel/python/requirements/cuda.txt --cuda-index 134)
+      if [ -n "$jit_cache_url" ]; then
+        python3 -m pip install --break-system-packages \
+          --index-url https://flashinfer.ai/whl/cu134 "$jit_cache_url"
+      fi
+    '
+  - |
+    bash -ec '
       export WORKSPACE="$PWD"
       source test/ci_system/package_cache.sh
       configure_package_cache

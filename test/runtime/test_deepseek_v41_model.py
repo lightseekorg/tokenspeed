@@ -77,7 +77,6 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
     DeepseekV41RotaryEmbedding,
-    configure_v41_fp8_linear,
     v41_hc_post,
     v41_hc_pre,
     v41_mxfp8_config,
@@ -432,23 +431,31 @@ def test_scale_expansion_then_tp_and_merged_sharding():
             elif isinstance(linear, v41.RowParallelLinear):
                 expected = expected.chunk(4, dim=1)[rank]
             assert torch.equal(linear.weight_scale_inv, expected)
-        merged = MergedColumnParallelLinear(
-            input_size=128,
-            output_sizes=[128, 128],
-            bias=False,
-            gather_output=False,
-            skip_bias_add=False,
-            params_dtype=torch.bfloat16,
-            quant_config=quant,
-            prefix="shared.gate_up_proj",
-            tp_rank=rank,
-            tp_size=4,
-            tp_group=mapping.attn.tp_group,
-            use_presharded_weights=False,
-            override_kernel_name=None,
-            interleave_linear_and_gate=False,
+        # Shared experts consume the config through the unchanged V4 MLP.
+        shared = v41.DeepseekV4MLP(
+            128,
+            128,
+            "silu",
+            mapping,
+            quant,
+            "shared",
+            swiglu_limit=None,
+            reduce_results=False,
+            is_shared_expert=False,
         )
-        configure_v41_fp8_linear(merged, True)
+        merged = shared.gate_up_proj
+        assert isinstance(merged.quant_method, v41._ReferenceFp8LinearMethod)
+        assert isinstance(shared.down_proj.quant_method, v41._ReferenceFp8LinearMethod)
+        scales = torch.arange(16, dtype=torch.uint8).reshape(4, 4)
+        shared.down_proj.weight_scale_inv.weight_loader(
+            shared.down_proj.weight_scale_inv, scales
+        )
+        torch.testing.assert_close(
+            shared.down_proj.weight_scale_inv,
+            scales.repeat_interleave(32, dim=0).chunk(4, dim=1)[rank],
+            rtol=0,
+            atol=0,
+        )
         for shard in (0, 1):
             scales = (torch.arange(16).reshape(4, 4) + 100 + shard).to(torch.uint8)
             merged.weight_scale_inv.weight_loader(
@@ -459,6 +466,88 @@ def test_scale_expansion_then_tp_and_merged_sharding():
                 merged.weight_scale_inv[shard * 32 : (shard + 1) * 32], expected
             )
     assert quant.weight_block_size == [1, 32]
+
+
+@pytest.mark.parametrize("hopper", [False, True])
+@pytest.mark.parametrize(
+    ("kind", "rank"),
+    [
+        ("replicated", 0),
+        ("column", 0),
+        ("column", 3),
+        ("merged", 0),
+        ("merged", 3),
+        ("row", 0),
+        ("row", 3),
+    ],
+)
+def test_reference_linear_construction_preserves_checkpoint_loading(
+    monkeypatch, hopper, kind, rank
+):
+    # Exercise both storage contracts without requiring a Hopper allocation.
+    monkeypatch.setattr(
+        v41, "current_platform", lambda: SimpleNamespace(is_hopper=hopper)
+    )
+    quant = v41_mxfp8_config(_quant())
+    kwargs = dict(
+        input_size=128,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        prefix="model.proj",
+    )
+    if kind != "replicated":
+        kwargs.update(tp_rank=rank, tp_size=4, tp_group=(0, 1, 2, 3))
+    if kind == "merged":
+        cls = v41.MergedColumnParallelLinear
+        kwargs["output_sizes"] = [128, 128]
+    else:
+        kwargs["output_size"] = 128
+        cls = {
+            "replicated": v41.ReplicatedLinear,
+            "column": v41.ColumnParallelLinear,
+            "row": v41.RowParallelLinear,
+        }[kind]
+    layer = cls(quant_config=quant, **kwargs)
+    assert isinstance(layer.quant_method, v41._ReferenceFp8LinearMethod)
+    assert layer.weight.dtype == (torch.bfloat16 if hopper else torch.float8_e4m3fn)
+    expected_weights, expected_scales = [], []
+    for shard in range(2 if kind == "merged" else 1):
+        codes = ((torch.arange(128 * 128).reshape(128, 128) % 17) - 8 + shard).to(
+            torch.float8_e4m3fn
+        )
+        scales = (torch.arange(16).reshape(4, 4) % 7 + 120 + shard).to(torch.uint8)
+        shard_args = (shard,) if kind == "merged" else ()
+        layer.weight.weight_loader(layer.weight, codes, *shard_args)
+        layer.weight_scale_inv.weight_loader(
+            layer.weight_scale_inv, scales.view(torch.float8_e8m0fnu), *shard_args
+        )
+        values = codes.float()
+        expanded = scales.repeat_interleave(32, dim=0)
+        if kind in ("column", "merged"):
+            values = values.chunk(4, dim=0)[rank]
+            expanded = expanded.chunk(4, dim=0)[rank]
+        elif kind == "row":
+            values = values.chunk(4, dim=1)[rank]
+            expanded = expanded.chunk(4, dim=1)[rank]
+        expected_weights.append(values)
+        expected_scales.append(expanded)
+    expected_weight = torch.cat(expected_weights)
+    expected_scale = torch.cat(expected_scales)
+    torch.testing.assert_close(layer.weight.float(), expected_weight, rtol=0, atol=0)
+    torch.testing.assert_close(layer.weight_scale_inv, expected_scale, rtol=0, atol=0)
+    if hopper:
+        layer.quant_method.process_weights_after_loading(layer)
+        expected = (
+            (
+                expected_weight.unflatten(-1, (-1, 32))
+                * expected_scale.view(torch.float8_e8m0fnu).float().unsqueeze(-1)
+            )
+            .flatten(-2)
+            .to(torch.bfloat16)
+        )
+        assert isinstance(layer.quant_method, v41.UnquantizedLinearMethod)
+        assert layer.weight_scale_inv is None
+        torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
 
 
 def _mix_reference(x, weight, scale, base, eps, hc_eps, iters):
@@ -1247,6 +1336,7 @@ def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
             extend_replay_lens_cpu=torch.tensor([replay], dtype=torch.int32),
             extend_prompt_lens_cpu=torch.tensor([prompt_len], dtype=torch.int32),
             extend_with_prefix=start > 0,
+            query_shard=None,
         )
         rows = slice(start, start + count)
         ctx = ForwardContext(

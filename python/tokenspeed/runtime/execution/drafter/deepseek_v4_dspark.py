@@ -123,18 +123,23 @@ class DeepseekV4DSpark(BaseDrafter):
         )
         self.target_layer_ids = list(self.model.target_layer_ids)
         self.hidden_width = len(self.target_layer_ids) * int(self.model.hidden_size)
-        self.idle_forward_steps = 1
         self._prefill_graph: torch.cuda.CUDAGraph | None = None
         self._init_buffers()
+
+    def idle_forward_global_num_tokens(
+        self, global_num_tokens: list[int], global_bs: list[int]
+    ) -> list[list[int]]:
+        # Block drafter: one draft forward proposes the whole block.
+        del global_bs
+        return [global_num_tokens]
 
     @staticmethod
     def _validate_tp_only_mapping(mapping) -> None:
         dp_size = int(mapping.attn.dp_size)
-        cp_size = int(mapping.attn.cp_size)
-        if dp_size != 1 or cp_size != 1:
+        if dp_size != 1:
             raise ValueError(
                 "Week-0 DSPARK supports tensor parallelism only; "
-                f"got attention dp_size={dp_size}, cp_size={cp_size}."
+                f"got attention dp_size={dp_size}."
             )
 
     def _init_buffers(self) -> None:

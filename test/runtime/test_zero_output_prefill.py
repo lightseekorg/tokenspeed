@@ -99,7 +99,8 @@ class SharedBufferSampler:
         output.next_token_logprobs = self.logprobs[:n]
         return self.tokens[:n], self.lengths[:n]
 
-    def verify(self, output, info, candidates):
+    def verify(self, output, info, candidates, *, tree):
+        assert tree is None
         self.calls.append(("verify", info))
         n, width = candidates.shape
         self.tokens[: n * width] = output.next_token_logits.argmax(-1)
@@ -141,6 +142,7 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
     )
     backend = SharedBufferSampler()
     executor = SimpleNamespace(
+        tree_spec=None,
         sampling_backend=backend,
         _apply_force_single_token_verify=lambda lengths, *args: lengths,
     )
@@ -327,7 +329,7 @@ def test_cache_progress_is_independent_of_generated_tokens(width):
         ngram_token_mask_buf=None,
     )
     executor = SimpleNamespace(
-        drafter=None, runtime_states=states, input_buffers=buffers
+        tree_spec=None, drafter=None, runtime_states=states, input_buffers=buffers
     )
     update(
         executor,
@@ -362,8 +364,10 @@ def test_zero_rows_return_before_lm_head_and_retain_empty_taps():
         capture_hidden_mode=SimpleNamespace(need_capture=lambda: True),
     )
     # No LM-head method exists on this object; reaching it fails the test.
+    # (A replicated head: LM-head TP peers under attention DP would still
+    # join the row exchange with no rows.)
     output = forward(
-        SimpleNamespace(config=SimpleNamespace(vocab_size=32)),
+        SimpleNamespace(config=SimpleNamespace(vocab_size=32), dp_lm_head_tp=False),
         torch.arange(4),
         torch.empty(0, 8),
         None,
@@ -459,6 +463,7 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
     )
     backend = SharedBufferSampler()
     executor = SimpleNamespace(
+        tree_spec=None,
         sampling_backend=backend,
         _apply_force_single_token_verify=lambda lengths, *args: lengths,
     )
@@ -532,6 +537,7 @@ def test_idle_graph_grammar_enqueues_an_identity_completion():
     ):
         setattr(buffers, name, torch.zeros(1))
     executor = SimpleNamespace(
+        tree_spec=None,
         attn_backend=None,
         token_to_kv_pool=None,
         input_buffers=buffers,
@@ -587,7 +593,10 @@ def test_grammar_mask_producers_walk_only_original_decode_candidates(
             owner="CapturableGrammarExecutor",
         )
         executor = SimpleNamespace(
-            max_tokens_per_req=3, bitmask_host=masks, candidates_host=candidates
+            tree_spec=None,
+            max_tokens_per_req=3,
+            bitmask_host=masks,
+            candidates_host=candidates,
         )
         fill(
             executor,
@@ -648,6 +657,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
     tokens = torch.tensor([11, 21, 22, 23, 31, 32, 33])
     lengths = torch.tensor([1, 0, 2, 1])
     executor = SimpleNamespace(
+        tree_spec=None,
         capturable_grammar=None,
         dspark_context_producer=None,
         drafter=SimpleNamespace(
@@ -697,6 +707,7 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
         "ForwardMode": SimpleNamespace(MIXED=object()),
         "V41_GROUP_GEOMETRY": {},
         "V41_SWA_GROUP_ID": "swa",
+        "reject_query_shard": lambda plan, name: None,
     }
     for name in (
         "V41PrefillSpan",
@@ -745,6 +756,7 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
         extend_replay_lens_cpu=torch.tensor(replays),
         extend_prompt_lens_cpu=torch.tensor(targets),
         extend_with_prefix=any(prefixes),
+        query_shard=None,
     )
     layout = ForwardOutputLayout.from_prefill(
         prefix_lengths=prefixes,

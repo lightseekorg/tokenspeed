@@ -29,6 +29,7 @@ from math import prod
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: F401
+import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
@@ -959,6 +960,13 @@ _KERNELS_WITH_PDL: frozenset[str] = frozenset(
 )
 
 
+def _as_2d_tensor_scale(scale: torch.Tensor | None) -> torch.Tensor | None:
+    """A single-element scale of rank < 2 as its ``[1, 1]`` view."""
+    if scale is not None and scale.dim() < 2 and scale.numel() == 1:
+        return scale.view(1, 1)
+    return scale
+
+
 def _infer_scale_type(
     A_scales: torch.Tensor | None,
     B_scales: torch.Tensor | None,
@@ -1293,8 +1301,12 @@ def mm(
     override = resolve_kernel_override("gemm", "mm", override)
     enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
+    # Per-tensor scales may arrive as 0-dim or [1]; kernels take them as [1, 1].
+    A_scales = _as_2d_tensor_scale(A_scales)
+    B_scales = _as_2d_tensor_scale(B_scales)
 
     M = A.shape[0]
+    b_layout = "NK"
     if quant == "mxfp4":
         K = A.shape[-1] * 2
         N = B.shape[0]
@@ -1303,7 +1315,8 @@ def mm(
         N = B.shape[0]
     else:
         K = A.shape[-1]
-        N = B.shape[-1] if B.shape[0] == K else B.shape[0]
+        b_layout = "KN" if B.shape[0] == K else "NK"
+        N = B.shape[-1] if b_layout == "KN" else B.shape[0]
 
     if out is not None:
         _validate_gemm_out(
@@ -1359,6 +1372,7 @@ def mm(
         "m": M,
         "n": N,
         "k": K,
+        "b_layout": b_layout,
         "a_inner_stride_one": A.stride(-1) == 1,
         "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
         "b_inner_stride_one": B.stride(-1) == 1,

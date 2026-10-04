@@ -153,8 +153,6 @@ class PLELookup(nn.Module):
             VocabParallelEmbedding,
         )
 
-        if mapping.attn.has_dp and mapping.attn.has_cp:
-            raise ValueError("Global PLE lookup with DP requires attention CP=1")
         if min(vocab_size, ngram_heads, head_dim) <= 0:
             raise ValueError("PLE lookup dimensions must be positive")
         if storage_dtype not in (None, torch.float8_e4m3fn):

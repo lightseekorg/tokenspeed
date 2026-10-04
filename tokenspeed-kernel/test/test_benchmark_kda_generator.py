@@ -270,3 +270,21 @@ def test_kda_generator_builds_in_place_and_boundary_state_indices() -> None:
     assert read_indices.tolist() == [1, 2, 3, 4]
     assert in_place.tolist() == [1, 2, 3, 4]
     assert distinct.tolist() == [17, 18, 19, 20]
+
+
+def test_kda_generator_builds_kimi_k3_cache_arena_state_pages() -> None:
+    # One 884736-byte page of the TP8 cache arena: the FP32 recurrent state
+    # followed by the BF16 convolution history.
+    conv_pool, state_pool = kda_generator._state_arena(
+        3,
+        884736,
+        kda_generator._MODEL_PROFILES["kimi_k3_tp8"],
+        4,
+        device="cpu",
+    )
+
+    assert conv_pool.shape == (3, 4608, 3)
+    assert conv_pool.stride() == (442368, 3, 1)
+    assert state_pool.shape == (3, 12, 128, 128)
+    assert state_pool.stride() == (221184, 16384, 128, 1)
+    assert conv_pool.data_ptr() - state_pool.data_ptr() == 12 * 128 * 128 * 4

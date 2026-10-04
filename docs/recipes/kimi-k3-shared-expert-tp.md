@@ -35,7 +35,7 @@ python -m tokenspeed.cli serve \
   --all2all-backend flashinfer --moe-backend flashinfer_trtllm \
   --attention-backend tokenspeed_mla --kda-backend cutedsl_kda \
   --dist-init-addr HEAD_NODE:29500 \
-  --gpu-memory-utilization 0.83 --max-num-seqs 512 \
+  --max-num-seqs 512 \
   --chunked-prefill-size 8192 --max-prefill-tokens 8192 \
   --prefix-granularity 128 --enable-prefix-caching \
   --max-cudagraph-capture-size 32 --cudagraph-capture-sizes 32

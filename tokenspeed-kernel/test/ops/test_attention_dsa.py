@@ -573,6 +573,7 @@ def test_dsa_decode_dense_kvcache(device: str, q_dtype: torch.dtype, require) ->
         softmax_scale=softmax_scale,
         page_size=64,
         solution="triton",
+        slot_order="selection",
     )
 
     ref = _dsa_reference(
@@ -618,6 +619,7 @@ def test_dsa_lse_partials_reconstruct_full_attention(packed, degree):
         page_size=64,
         return_lse=True,
         solution="triton",
+        slot_order="selection",
     )
     reference, ref_lse = dsa_decode(topk_slots=slots, **kwargs)
     assert reference.dtype == query.dtype

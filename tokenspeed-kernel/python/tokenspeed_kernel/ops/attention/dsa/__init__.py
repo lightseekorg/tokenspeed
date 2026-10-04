@@ -25,6 +25,7 @@ import math
 import torch
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
@@ -84,6 +85,100 @@ def _blockscaled_signature_and_scales(
 
 LSE_LN = math.log2(math.e)
 
+# The order a sparse core reduces a token's selected slots in
+# (``dsa_decode`` / ``dsa_prefill`` ``slot_order``):
+#
+# ``"selection"``
+#     The slots as the top-k leaf emitted them. Every registered core serves
+#     this form; declaring the trait is optional.
+# ``"sorted"``
+#     Ascending slot order, whatever the top-k leaf's tie order, so the
+#     reduction is batch-invariant whenever the selected set is. Only cores
+#     declaring ``slot_order={"sorted", ...}`` serve it and receive the kwarg.
+#
+# The default form first, as the host's ``DSA_SLOT_ORDERS`` lists them.
+SLOT_ORDERS = ("selection", "sorted")
+
+# Feature a ``dsa_prefill_topk`` leaf declares when its signature takes the
+# ``candidate_lens_cpu`` keyword (the host mirror of each token's candidate
+# count, from which it sizes its launches without a stream sync). The facade
+# hands the mirror to exactly the leaves declaring it, by registry lookup;
+# a ``*args, **kwargs`` wrapper that does not declare it never sees it.
+CANDIDATE_LENS_CPU_FEATURE = "candidate_lens_cpu"
+
+# Storage of an index-key plane, read off its dtype (README, "Index-K plane
+# formats"): one layout per dtype, never guessed from a row width alone.
+_INDEX_K_FP8_GROUP_SIZE = 128
+_INDEX_K_SCALE_BYTES = 4
+
+
+def _index_k_plane_traits(index_k_cache: torch.Tensor, head_dim: int) -> dict:
+    """``index_k_format`` / ``index_k_layout`` selection traits of a plane.
+
+    ``uint8`` planes hold FP8 keys with one fp32 scale per 128 elements
+    (``"fp8_scaled"``): ``"packed"`` as ``[slots, head_dim + 4 *
+    head_dim / 128]`` rows, otherwise ``"page_planar"``. ``bfloat16`` planes
+    hold the keys unquantized (``"bf16"``) and are only ever ``"packed"``
+    ``[slots, head_dim]``.
+    """
+    if index_k_cache.dtype == torch.uint8:
+        row_bytes = (
+            head_dim + head_dim // _INDEX_K_FP8_GROUP_SIZE * _INDEX_K_SCALE_BYTES
+        )
+        packed = index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
+        return {
+            "index_k_format": "fp8_scaled",
+            "index_k_layout": "packed" if packed else "page_planar",
+        }
+    if index_k_cache.dtype == torch.bfloat16:
+        if index_k_cache.ndim != 2 or index_k_cache.shape[1] != head_dim:
+            raise ValueError(
+                "a bf16 index-K plane must be packed [slots, head_dim] = "
+                f"[slots, {head_dim}], got {tuple(index_k_cache.shape)}"
+            )
+        return {"index_k_format": "bf16", "index_k_layout": "packed"}
+    raise TypeError(
+        f"index-K plane dtype {index_k_cache.dtype} has no registered format: "
+        "uint8 holds FP8 keys with scales (fp8_scaled), bfloat16 holds the keys "
+        "unquantized (bf16)"
+    )
+
+
+def _candidate_lens_cpu_kwargs(kernel, candidate_lens_cpu: torch.Tensor | None) -> dict:
+    """The ``candidate_lens_cpu`` kwarg for a selected top-k leaf, or nothing.
+
+    Only a leaf registered with ``CANDIDATE_LENS_CPU_FEATURE`` takes the
+    keyword; the decision is the registration's, read here, never a signature
+    probe on the forward path.
+    """
+    if candidate_lens_cpu is None:
+        return {}
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if spec is None or CANDIDATE_LENS_CPU_FEATURE not in spec.features:
+        return {}
+    return {"candidate_lens_cpu": candidate_lens_cpu}
+
+
+def _slot_order_kwargs(kernel, slot_order: str) -> dict:
+    """The ``slot_order`` kwarg for a selected core, refusing what it cannot do.
+
+    A core declaring the trait was already matched on it and takes the
+    kwarg. A silent core reduces the slots as selected: it serves
+    ``"selection"`` implicitly and cannot promise ``"sorted"``.
+    """
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    declared = None if spec is None else spec.traits.get("slot_order")
+    if declared is None:
+        if slot_order == "sorted":
+            raise ValueError(
+                f"DSA kernel {kernel.name!r} does not declare the slot_order "
+                "trait: it reduces the selected slots in the top-k leaf's order "
+                "and cannot promise slot_order='sorted'; select a kernel "
+                "declaring the trait through solution="
+            )
+        return {}
+    return {"slot_order": slot_order}
+
 
 # ===-----------------------------------------------------------------------===#
 # DSA Kernels
@@ -110,6 +205,8 @@ def dsa_decode(
     override: str | None = None,
     solution: str | None = None,
     kv_seq_lens: torch.Tensor | None = None,
+    *,
+    slot_order: str,
 ) -> AttentionResult:
     """Sparse DSA decode over selected global KV slots.
 
@@ -139,12 +236,21 @@ def dsa_decode(
         out: Optional output buffer.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        slot_order: The order the selected slots are reduced in, one of
+            ``SLOT_ORDERS``: ``"selection"`` (as the top-k leaf emitted them;
+            every kernel) or ``"sorted"`` (ascending; only kernels declaring
+            the ``slot_order`` trait, which receive it as a keyword). Required
+            keyword.
 
     Returns:
         Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
         Partials come back in the query dtype (each context shard is rounded
         before aggregation); only the LSE stays FP32 for the cross-shard merge.
     """
+    if slot_order not in SLOT_ORDERS:
+        raise ValueError(
+            f"slot_order must be one of {list(SLOT_ORDERS)}, got {slot_order!r}"
+        )
     if q.dim() == 4:
         batch_size, q_len, num_heads, head_dim = q.shape
         tokens = batch_size * q_len
@@ -165,6 +271,7 @@ def dsa_decode(
         "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
         "topk_layout": "global_slots",
+        "slot_order": slot_order,
     }
     signature = _attention_format_signature(q=q)
     kernel = select_kernel(
@@ -175,6 +282,7 @@ def dsa_decode(
         solution=solution,
         override=override,
     )
+    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order)
     shape_params = {
         "batch_size": batch_size,
         "q_len": q_len,
@@ -210,6 +318,7 @@ def dsa_decode(
             return_lse=return_lse,
             out=out,
             enable_pdl=pdl_enabled(),
+            **slot_order_kwargs,
         )
 
 
@@ -232,6 +341,8 @@ def dsa_prefill(
     override: str | None = None,
     solution: str | None = None,
     kv_seq_lens: torch.Tensor | None = None,
+    *,
+    slot_order: str,
 ) -> AttentionResult:
     """Sparse DSA prefill over selected global KV slots.
 
@@ -259,10 +370,16 @@ def dsa_prefill(
         out: Optional output buffer.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        slot_order: The order the selected slots are reduced in, as for
+            :func:`dsa_decode`. Required keyword.
 
     Returns:
         Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
     """
+    if slot_order not in SLOT_ORDERS:
+        raise ValueError(
+            f"slot_order must be one of {list(SLOT_ORDERS)}, got {slot_order!r}"
+        )
     if q.dim() == 4:
         batch_size, q_len, num_heads, head_dim = q.shape
         tokens = batch_size * q_len
@@ -283,6 +400,7 @@ def dsa_prefill(
         "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
         "topk_layout": "global_slots",
+        "slot_order": slot_order,
     }
     signature = _attention_format_signature(q=q)
     kernel = select_kernel(
@@ -293,6 +411,7 @@ def dsa_prefill(
         solution=solution,
         override=override,
     )
+    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order)
     shape_params = {
         "batch_size": batch_size,
         "q_len": q_len,
@@ -328,6 +447,7 @@ def dsa_prefill(
             return_lse=return_lse,
             out=out,
             enable_pdl=pdl_enabled(),
+            **slot_order_kwargs,
         )
 
 
@@ -453,10 +573,12 @@ def dsa_prefill_topk(
             token's own row only: equal scores resolve toward the lowest
             candidate, whatever else the batch holds. Only implementations
             declaring the ``batch_invariant`` feature are eligible.
-        index_k_cache: Packed or page-planar FP8 index-K cache with scales
-            (uint8). Page-planar caches may have a padded outer page stride.
-            Used with kv_workspace_slots to resolve workspace rows inside the
-            selected implementation.
+        index_k_cache: Index-K plane, used with kv_workspace_slots to resolve
+            workspace rows inside the selected implementation. Its dtype
+            selects the ``index_k_format`` trait: uint8 is FP8 with scales
+            (``"fp8_scaled"``, packed or page-planar; page-planar caches may
+            have a padded outer page stride), bfloat16 is the unquantized
+            ``[slots, head_dim]`` plane (``"bf16"``, packed).
         page_size: KV cache page size for index_k_cache.
         index_k_fp8: FP8 index-K rows already in workspace-row order. Must be
             provided together with index_k_scale.
@@ -466,9 +588,11 @@ def dsa_prefill_topk(
             defining ``dequant(q[token, head]) = q[token, head].float() *
             q_scales[token, head]``.
         max_logits_bytes: Optional temporary logits memory cap.
-        candidate_lens_cpu: Optional CPU mirror of ``row_ends - row_starts``.
-            DeepGEMM uses it to select chunk launch bounds without synchronizing
-            the CUDA stream; other implementations ignore it.
+        candidate_lens_cpu: Optional CPU mirror of ``row_ends - row_starts``,
+            handed to every implementation registered with the
+            ``candidate_lens_cpu`` feature (DeepGEMM sizes its chunk launches
+            from it without synchronizing the CUDA stream); implementations
+            without the feature never see it.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].
         lens_out: Optional contiguous int32 output buffer on q's device with
@@ -515,16 +639,11 @@ def dsa_prefill_topk(
             "index_k_fp8 and index_k_scale must be provided together for "
             "workspace-row input"
         )
-    has_fp8 = index_k_cache is not None or has_workspace_rows
-    if has_fp8:
-        traits["index_k_format"] = "fp8_scaled"
     if index_k_cache is not None:
-        row_bytes = q.shape[-1] + q.shape[-1] // 128 * 4
-        traits["index_k_layout"] = (
-            "packed"
-            if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
-            else "page_planar"
-        )
+        traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1]))
+    elif has_workspace_rows:
+        # Workspace rows are FP8 values plus scales by construction.
+        traits["index_k_format"] = "fp8_scaled"
     initial_tokens = int(initial_tokens)
     local_tokens = int(local_tokens)
     if initial_tokens < 0 or local_tokens < 0:
@@ -549,6 +668,7 @@ def dsa_prefill_topk(
         solution=solution,
         override=override,
     )
+    candidate_lens_cpu_kwargs = _candidate_lens_cpu_kwargs(kernel, candidate_lens_cpu)
     shape_params = {
         "tokens": q.shape[0],
         "workspace_rows": kv_workspace_slots.numel(),
@@ -581,11 +701,10 @@ def dsa_prefill_topk(
             "max_logits_bytes": max_logits_bytes,
             "out": out,
             "lens_out": lens_out,
+            **candidate_lens_cpu_kwargs,
         }
         if q_scales is not None:
             kernel_kwargs["q_scales"] = q_scales
-        if candidate_lens_cpu is not None and kernel.name.startswith("deep_gemm_"):
-            kernel_kwargs["candidate_lens_cpu"] = candidate_lens_cpu
         if initial_tokens or local_tokens:
             kernel_kwargs["initial_tokens"] = initial_tokens
             kernel_kwargs["local_tokens"] = local_tokens
@@ -645,11 +764,21 @@ def dsa_decode_topk(
             absolute logical row offsets when ``logical_offsets``.
         block_table_base_offsets: Optional compact-table base page per request.
             Used only with ``topk_layout="logical_offsets"``.
-        index_k_cache: Packed or page-planar FP8 index-K cache with scales
-            (uint8). Page-planar caches may have a padded outer page stride.
+        index_k_cache: Index-K plane. Its dtype selects the ``index_k_format``
+            trait: uint8 is FP8 with scales (``"fp8_scaled"``, packed or
+            page-planar; page-planar caches may have a padded outer page
+            stride), bfloat16 is the unquantized ``[slots, head_dim]`` plane
+            (``"bf16"``, packed).
         q_scales: Optional positive FP32 scale per token/head for FP8 queries,
             defining ``dequant(q[token, head]) = q[token, head].float() *
             q_scales[token, head]``.
+        seq_lens_2d: Optional per-token rows of the request's full KV length
+            (``[tokens, 1]``, every row of a request carrying ``seq_lens[req]``),
+            the scoring extent the ``plan`` was built from (:func:`dsa_plan`).
+            It carries no per-row causal bound: a leaf derives that from
+            ``seq_lens`` and ``q_len_per_req`` as under ``seq_lens`` above,
+            never from these rows, so a verify or draft row never selects its
+            window's later rows.
         plan: Optional opaque backend-specific plan.
         out: Optional contiguous int32 output buffer on q's device with shape
             [tokens, topk].
@@ -718,13 +847,7 @@ def dsa_decode_topk(
         "topk": int(topk),
     }
     if index_k_cache is not None:
-        traits["index_k_format"] = "fp8_scaled"
-        row_bytes = q.shape[-1] + q.shape[-1] // 128 * 4
-        traits["index_k_layout"] = (
-            "packed"
-            if index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
-            else "page_planar"
-        )
+        traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1]))
     initial_tokens = int(initial_tokens)
     local_tokens = int(local_tokens)
     if initial_tokens < 0 or local_tokens < 0:
@@ -869,6 +992,8 @@ import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
 # isort: on
 
 __all__ = [
+    "CANDIDATE_LENS_CPU_FEATURE",
+    "SLOT_ORDERS",
     "dsa_decode",
     "dsa_prefill",
     "dsa_prefill_topk",

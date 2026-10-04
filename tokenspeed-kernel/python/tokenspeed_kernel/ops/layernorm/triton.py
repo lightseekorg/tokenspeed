@@ -4,6 +4,8 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
+_FP8_E4M3_MAX = tl.constexpr(448.0)
+
 
 @triton.jit
 def _rmsnorm_kernel(
@@ -725,7 +727,124 @@ def rmsnorm_fused_parallel(
     )
 
 
+@triton.jit
+def _add_rmsnorm_kernel(
+    x_ptr,
+    x2_ptr,
+    residual_ptr,
+    weight_ptr,
+    out_ptr,
+    out_fp8_ptr,
+    fp8_scale_ptr,
+    stride_x,
+    stride_x2,
+    stride_residual,
+    stride_out,
+    stride_out_fp8,
+    n_cols,
+    eps,
+    BLOCK: tl.constexpr,
+    HAS_X2: tl.constexpr,
+    HAS_FP8: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    # Weights and the quant scale are model constants, loaded before the wait.
+    weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    if HAS_FP8:
+        inv_scale = 1.0 / tl.load(fp8_scale_ptr).to(tl.float32)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    addend = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0)
+    if HAS_X2:
+        # Sum the two addends in their own dtype, as an all-reduce input would be.
+        addend += tl.load(x2_ptr + row * stride_x2 + cols, mask=mask, other=0.0)
+    total = addend.to(tl.float32) + tl.load(
+        residual_ptr + row * stride_residual + cols, mask=mask, other=0.0
+    ).to(tl.float32)
+    tl.store(
+        residual_ptr + row * stride_residual + cols,
+        total.to(residual_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    variance = tl.sum(total * total, axis=0) / n_cols
+    normed = (total * tl.rsqrt(variance + eps) * weight).to(out_ptr.dtype.element_ty)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    tl.store(out_ptr + row * stride_out + cols, normed, mask=mask)
+    if HAS_FP8:
+        quant = tl.clamp(
+            normed.to(tl.float32) * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+        )
+        tl.store(
+            out_fp8_ptr + row * stride_out_fp8 + cols,
+            quant.to(out_fp8_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
+def add_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    x2: torch.Tensor | None,
+    out: torch.Tensor,
+    out_fp8: torch.Tensor | None,
+    fp8_scale: torch.Tensor | None,
+) -> None:
+    """``residual += x (+ x2)``, then RMSNorm, optionally also into static FP8.
+
+    Args:
+        x: ``[M, N]`` addend, rows may be strided but columns dense.
+        residual: ``[M, N]`` residual stream, updated in place.
+        weight: ``[N]`` norm weight.
+        eps: Norm epsilon.
+        x2: Optional second ``[M, N]`` addend, summed with ``x`` in their own dtype.
+        out: ``[M, N]`` normalized output; may alias ``x``.
+        out_fp8: Optional ``[M, N]`` FP8 output quantized with ``fp8_scale``.
+        fp8_scale: One-element FP32 dequant scale, given exactly with
+            ``out_fp8``.
+    """
+    if (out_fp8 is None) != (fp8_scale is None):
+        raise ValueError("out_fp8 and fp8_scale are given together")
+    tensors = [t for t in (x, x2, residual, out, out_fp8) if t is not None]
+    if any(t.dim() != 2 or t.shape != x.shape or t.stride(1) != 1 for t in tensors):
+        raise ValueError("add_rmsnorm operands must be [M, N] with dense columns")
+    rows, cols = x.shape
+    if rows == 0:
+        return
+    block = triton.next_power_of_2(cols)
+    enable_pdl = pdl_enabled()
+    _add_rmsnorm_kernel[(rows,)](
+        x,
+        x if x2 is None else x2,
+        residual,
+        weight,
+        out,
+        x if out_fp8 is None else out_fp8,
+        weight if fp8_scale is None else fp8_scale,
+        x.stride(0),
+        0 if x2 is None else x2.stride(0),
+        residual.stride(0),
+        out.stride(0),
+        0 if out_fp8 is None else out_fp8.stride(0),
+        cols,
+        eps,
+        BLOCK=block,
+        HAS_X2=x2 is not None,
+        HAS_FP8=out_fp8 is not None,
+        ENABLE_PDL=enable_pdl,
+        num_warps=min(max(block // 256, 1), 8),
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+
+
 __all__ = [
+    "add_rmsnorm",
     "grouped_gemma_rmsnorm",
     "rmsnorm",
     "qk_rmsnorm",

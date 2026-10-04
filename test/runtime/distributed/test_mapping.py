@@ -3,6 +3,7 @@ import pytest
 from tokenspeed.runtime.distributed.mapping import (
     AttentionLayerMapping,
     DenseLayerMapping,
+    LmHeadMapping,
     Mapping,
     MappingBase,
     MoeLayerMapping,
@@ -273,64 +274,42 @@ class TestDenseLayerMapping:
 class TestAttentionLayerMapping:
 
     def test_tp_only(self):
-        m = AttentionLayerMapping(rank=2, world_size=8, tp_size=8, cp_size=1, dp_size=1)
+        m = AttentionLayerMapping(rank=2, world_size=8, tp_size=8, dp_size=1)
         assert m.tp_rank == 2
-        assert m.cp_rank == 0
         assert m.dp_rank == 0
         assert m.tp_group == tuple(range(8))
-        assert m.cp_group == (2,)
         assert m.dp_group == (2,)
 
-    def test_tp_cp(self):
-        # ws=8, tp=2, cp=4, dp=1
-        # rank layout: rank = dp_rank*(tp*cp) + cp_rank*tp + tp_rank
-        m = AttentionLayerMapping(rank=5, world_size=8, tp_size=2, cp_size=4, dp_size=1)
-        assert m.tp_rank == 1  # 5 % 2
-        assert m.cp_rank == 2  # (5 // 2) % 4
-        assert m.dp_rank == 0  # 5 // 8
-        assert m.tp_group == (4, 5)
-        assert m.cp_group == (1, 3, 5, 7)
-
-    def test_tp_cp_dp(self):
-        # ws=16, tp=2, cp=2, dp=4
-        m = AttentionLayerMapping(
-            rank=7, world_size=16, tp_size=2, cp_size=2, dp_size=4
-        )
+    def test_tp_dp(self):
+        # ws=16, tp=2, dp=8
+        # rank layout: rank = dp_rank*tp + tp_rank
+        m = AttentionLayerMapping(rank=7, world_size=16, tp_size=2, dp_size=8)
         assert m.tp_rank == 1  # 7 % 2
-        assert m.cp_rank == 1  # (7 // 2) % 2
-        assert m.dp_rank == 1  # 7 // 4
+        assert m.dp_rank == 3  # 7 // 2
         assert m.tp_group == (6, 7)
-        assert m.cp_group == (5, 7)
-        assert m.dp_group == (3, 7, 11, 15)
-
-    def test_infer_cp(self):
-        m = AttentionLayerMapping(rank=0, world_size=16, tp_size=2, dp_size=4)
-        assert m.cp_size == 2
+        assert m.dp_group == (1, 3, 5, 7, 9, 11, 13, 15)
 
     def test_infer_dp(self):
-        m = AttentionLayerMapping(rank=0, world_size=16, tp_size=2, cp_size=4)
-        assert m.dp_size == 2
+        m = AttentionLayerMapping(rank=0, world_size=16, tp_size=2)
+        assert m.dp_size == 8
 
     def test_deferred_rank(self):
-        m = AttentionLayerMapping(world_size=16, tp_size=2, cp_size=2, dp_size=4)
+        m = AttentionLayerMapping(world_size=16, tp_size=2, dp_size=8)
         assert m.tp_size == 2
-        assert m.cp_size == 2
-        assert m.dp_size == 4
+        assert m.dp_size == 8
         m.rank = 7
         assert m.tp_rank == 1
-        assert m.cp_rank == 1
-        assert m.dp_rank == 1
+        assert m.dp_rank == 3
         assert m.tp_group == (6, 7)
-        assert m.cp_group == (5, 7)
-        assert m.dp_group == (3, 7, 11, 15)
+        assert m.dp_group == (1, 3, 5, 7, 9, 11, 13, 15)
 
-    def test_cp_size_1_matches_dense(self):
-        """With cp_size=1, AttentionLayerMapping should produce the same
-        tp/dp ranks and groups as DenseLayerMapping."""
+    def test_matches_dense(self):
+        """AttentionLayerMapping produces the same tp/dp ranks and groups as
+        DenseLayerMapping: both are two-dimensional inner-to-outer layouts."""
         ws = 8
         tp = 4
         for r in range(ws):
-            attn = AttentionLayerMapping(rank=r, world_size=ws, tp_size=tp, cp_size=1)
+            attn = AttentionLayerMapping(rank=r, world_size=ws, tp_size=tp)
             dense = DenseLayerMapping(rank=r, world_size=ws, tp_size=tp)
             assert attn.tp_rank == dense.tp_rank
             assert attn.dp_rank == dense.dp_rank
@@ -338,19 +317,16 @@ class TestAttentionLayerMapping:
             assert attn.dp_group == dense.dp_group
 
     def test_groups_partition_world(self):
-        """All three group types should partition the world correctly."""
+        """Both group types should partition the world correctly."""
         ws = 24
-        tp, cp, dp = 2, 3, 4
+        tp, dp = 3, 8
         mappings = [
-            AttentionLayerMapping(
-                rank=r, world_size=ws, tp_size=tp, cp_size=cp, dp_size=dp
-            )
+            AttentionLayerMapping(rank=r, world_size=ws, tp_size=tp, dp_size=dp)
             for r in range(ws)
         ]
 
         for attr, expected_count in [
             ("tp_group", ws // tp),
-            ("cp_group", ws // cp),
             ("dp_group", ws // dp),
         ]:
             groups = set()
@@ -363,21 +339,161 @@ class TestAttentionLayerMapping:
             assert all_ranks == list(range(ws)), f"{attr}: groups don't cover all ranks"
 
     def test_all_ranks_consistent(self):
-        """For every rank, rank == dp_rank * (tp*cp) + cp_rank * tp + tp_rank."""
+        """For every rank, rank == dp_rank * tp + tp_rank."""
         ws = 24
-        tp, cp, dp = 2, 3, 4
+        tp, dp = 3, 8
         for r in range(ws):
-            m = AttentionLayerMapping(
-                rank=r, world_size=ws, tp_size=tp, cp_size=cp, dp_size=dp
-            )
-            reconstructed = m.dp_rank * (tp * cp) + m.cp_rank * tp + m.tp_rank
+            m = AttentionLayerMapping(rank=r, world_size=ws, tp_size=tp, dp_size=dp)
+            reconstructed = m.dp_rank * tp + m.tp_rank
             assert reconstructed == r, f"rank={r}: reconstructed={reconstructed}"
+
+    def test_scatter_index(self):
+        """dp-major / tp-minor index into the scattered token-count table."""
+        ws = 8
+        tp, dp = 2, 4
+        for r in range(ws):
+            m = AttentionLayerMapping(rank=r, world_size=ws, tp_size=tp, dp_size=dp)
+            assert m.scatter_index(r) == m.dp_rank * tp + m.tp_rank == r
 
     def test_invalid_product_raises(self):
         with pytest.raises(AssertionError):
+            AttentionLayerMapping(rank=0, world_size=16, tp_size=3, dp_size=4)
+
+
+# =============================================================================
+# Attention head TP
+# =============================================================================
+
+
+class TestAttentionHeadTp:
+
+    @pytest.mark.parametrize("tp", [1, 2, 8])
+    def test_default_is_the_attention_tp_group(self, tp):
+        """Omitting head TP keeps the head projections on attention TP."""
+        for rank in range(8):
+            m = AttentionLayerMapping(rank=rank, world_size=8, tp_size=tp)
+            assert m.head_tp_size == tp
+            assert not m.has_head_tp
+            assert m.head_tp_rank == m.tp_rank
+            assert m.head_tp_group == m.tp_group
+
+    def test_head_tp_over_dp_ranks(self):
+        # DP8 with heads sharded over contiguous groups of 4.
+        m = AttentionLayerMapping(rank=6, world_size=8, tp_size=1, head_tp_size=4)
+        assert m.has_head_tp
+        assert m.dp_size == 8
+        assert m.head_tp_rank == 2
+        assert m.head_tp_group == (4, 5, 6, 7)
+        assert m.tp_group == (6,)
+        groups = {
             AttentionLayerMapping(
-                rank=0, world_size=16, tp_size=2, cp_size=3, dp_size=4
+                rank=r, world_size=8, tp_size=1, head_tp_size=4
+            ).head_tp_group
+            for r in range(8)
+        }
+        assert groups == {(0, 1, 2, 3), (4, 5, 6, 7)}
+
+    def test_head_tp_equal_to_tp_is_a_no_op(self):
+        m = AttentionLayerMapping(rank=3, world_size=8, tp_size=4, head_tp_size=4)
+        assert not m.has_head_tp
+
+    def test_head_tp_needs_attention_tp_1(self):
+        with pytest.raises(ValueError, match="attention TP 1"):
+            AttentionLayerMapping(rank=0, world_size=8, tp_size=2, head_tp_size=4)
+
+    def test_head_tp_must_tile_the_stage(self):
+        with pytest.raises(ValueError, match="divide"):
+            AttentionLayerMapping(rank=0, world_size=8, tp_size=1, head_tp_size=3)
+
+    @pytest.mark.parametrize("bad", [0, -1, True])
+    def test_head_tp_rejects_non_positive(self, bad):
+        with pytest.raises(ValueError):
+            AttentionLayerMapping(rank=0, world_size=8, tp_size=1, head_tp_size=bad)
+
+
+# =============================================================================
+# LmHeadMapping
+# =============================================================================
+
+
+class TestLmHeadMapping:
+
+    def test_follows_attention_tp_without_dp(self):
+        # Attention TP fills the stage world: no DP is inferred.
+        for tp in (1, 4, 8):
+            m = Mapping(rank=tp - 1, world_size=tp, attn_tp_size=tp)
+            assert m.lm_head.tp_size == tp
+            assert m.lm_head.has_tp == (tp > 1)
+            assert m.lm_head.tp_group == m.attn.tp_group
+            assert m.lm_head.tp_rank == m.attn.tp_rank
+
+    def test_replicated_under_dp_by_default(self):
+        m = Mapping(rank=5, world_size=8, attn_tp_size=1, attn_dp_size=8)
+        assert m.lm_head.tp_size == 1
+        assert not m.lm_head.has_tp
+        assert m.lm_head.tp_group == (5,)
+
+    def test_explicit_width_under_dp(self):
+        m = Mapping(
+            rank=5, world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=4
+        )
+        assert m.lm_head.has_tp
+        assert m.lm_head.tp_rank == 1
+        assert m.lm_head.tp_group == (4, 5, 6, 7)
+        assert m.lm_head.dp_size == 2
+        assert m.lm_head.dp_group == (1, 5)
+
+    def test_shares_the_head_group_tuple(self):
+        """The decode preset reuses one node-local group for heads, dense and
+        the LM head; identical tuples dedupe in the process-group manager."""
+        m = Mapping(
+            rank=10,
+            world_size=16,
+            attn_tp_size=1,
+            attn_dp_size=16,
+            attn_head_tp_size=8,
+            lm_head_tp_size=8,
+            dense_tp_size=8,
+        )
+        assert m.attn.head_tp_group == m.lm_head.tp_group == m.dense.tp_group
+        assert m.attn.head_tp_group == tuple(range(8, 16))
+
+    def test_rank_propagates_when_deferred(self):
+        m = Mapping(world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=8)
+        m.rank = 3
+        assert m.lm_head.tp_rank == 3
+        assert m.attn.head_tp_rank == 0
+
+    def test_explicit_width_without_dp_must_match_attention_tp(self):
+        with pytest.raises(ValueError, match="attention TP group"):
+            Mapping(rank=0, world_size=8, attn_tp_size=8, lm_head_tp_size=1)
+        with pytest.raises(ValueError, match="attention TP group"):
+            Mapping(rank=0, world_size=4, attn_tp_size=4, lm_head_tp_size=8)
+
+    def test_under_dp_needs_attention_tp_1(self):
+        with pytest.raises(ValueError, match="attention TP 1"):
+            Mapping(
+                rank=0,
+                world_size=8,
+                attn_tp_size=2,
+                attn_dp_size=4,
+                lm_head_tp_size=8,
             )
+
+    def test_must_tile_the_stage(self):
+        with pytest.raises(ValueError, match="divide"):
+            Mapping(
+                rank=0,
+                world_size=8,
+                attn_tp_size=1,
+                attn_dp_size=8,
+                lm_head_tp_size=3,
+            )
+
+    def test_standalone_mapping(self):
+        m = LmHeadMapping(rank=6, world_size=8, tp_size=4)
+        assert m.tp_group == (4, 5, 6, 7)
+        assert m.dp_rank == 1
 
 
 # =============================================================================
@@ -459,23 +575,19 @@ class TestMoeLayerMapping:
             assert moe.dp_group == dense.dp_group
 
     def test_structure_mirrors_attention(self):
-        """MoeLayerMapping(tp, ep, dp) should have the same rank/group structure
-        as AttentionLayerMapping(tp, cp, dp) when sizes match, since both are
-        3-dim inner-to-outer layouts."""
+        """MoeLayerMapping(tp, ep=1, dp) should have the same rank/group
+        structure as AttentionLayerMapping(tp, dp) when sizes match, since
+        both are inner-to-outer layouts."""
         ws = 24
-        tp, middle, dp = 2, 3, 4
+        tp, dp = 2, 12
         for r in range(ws):
-            attn = AttentionLayerMapping(
-                rank=r, world_size=ws, tp_size=tp, cp_size=middle, dp_size=dp
-            )
+            attn = AttentionLayerMapping(rank=r, world_size=ws, tp_size=tp, dp_size=dp)
             moe = MoeLayerMapping(
-                rank=r, world_size=ws, tp_size=tp, ep_size=middle, dp_size=dp
+                rank=r, world_size=ws, tp_size=tp, ep_size=1, dp_size=dp
             )
             assert attn.tp_rank == moe.tp_rank
-            assert attn.cp_rank == moe.ep_rank
             assert attn.dp_rank == moe.dp_rank
             assert attn.tp_group == moe.tp_group
-            assert attn.cp_group == moe.ep_group
             assert attn.dp_group == moe.dp_group
 
     def test_groups_partition_world(self):

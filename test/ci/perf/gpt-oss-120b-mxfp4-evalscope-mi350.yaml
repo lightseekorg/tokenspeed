@@ -1,5 +1,5 @@
 api_version: ci.tokenspeed.io/v1
-name: perf-gpt-oss-120b-mxfp4-mi355
+name: perf-gpt-oss-120b-mxfp4-mi350
 type: perf
 workflow_stage: model-test
 triggers:
@@ -7,7 +7,7 @@ triggers:
   - manual
 runner:
   labels:
-    - amd-mi355-1gpu-bench
+    - amd-mi350-1gpu-bench
 env:
   CI: "true"
 install:

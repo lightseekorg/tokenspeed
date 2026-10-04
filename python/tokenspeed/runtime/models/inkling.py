@@ -919,7 +919,12 @@ class InklingSparseMoeBlock(nn.Module):
             )
             assert not self.experts.support_routing
         self.comm_manager = CommManager(
-            mapping=mapping, layer_id=layer_id, is_moe=True, prev_is_moe=True
+            mapping=mapping,
+            layer_id=layer_id,
+            is_moe=True,
+            prev_is_moe=True,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         # sconv shifts along the token dim, so this block must return full token rows (no reduce-scatter).
         assert self.comm_manager.use_all_reduce(is_moe=True), (
@@ -1596,6 +1601,7 @@ class InklingForConditionalGeneration(nn.Module):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
 
     def get_input_embeddings(self):

@@ -1,10 +1,10 @@
-name: NVIDIA GPU Library Tests
+name: NVIDIA Kernel Library Tests
 
 on:
   push:
     branches: [main]
     paths:
-      - ".github/workflows/nvidia-arm-kernel-tests.yml"
+      - ".github/workflows/nvidia-kernel-library-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
       - "test/ci_system/kernel_gpu_worker.py"
       - "test/ci_system/run_kernel_gpu_ut.sh"
@@ -16,7 +16,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths:
-      - ".github/workflows/nvidia-arm-kernel-tests.yml"
+      - ".github/workflows/nvidia-kernel-library-tests.yml"
       - "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml"
       - "test/ci_system/kernel_gpu_worker.py"
       - "test/ci_system/run_kernel_gpu_ut.sh"
@@ -55,7 +55,7 @@ jobs:
           unset SBATCH_GPUS_PER_NODE SLURM_GPUS_PER_NODE
           export TS_CI_ARTIFACT_ROOT="$HOME/tokenspeed-native-library-slurm"
           export TS_CI_CACHE_DIR="$HOME/tokenspeed-native-library-cache"
-          export TS_CI_CONTAINER_IMAGE=ghcr.io/lightseekorg/tokenspeed-runner:cu134-torch-2.14.0-flashinfer-0.7.0@sha256:d93dee2b33d1779dbfea331f953ca98f96264a377c02e9134d9cc9d4788bce82
+          export TS_CI_CONTAINER_IMAGE=ghcr.io/lightseekorg/tokenspeed-runner:cu134-torch-2.14.0-flashinfer-0.7.1rc2@sha256:458daaad85b63279a1a635bcb852e481c028b69d8e204ee558a878a3021b80bb
           bash test/ci/run_slurm.sh \
             --config test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml \
             --runner slurm-nvidia-arm-4gpu --type ut --trigger slurm \
@@ -72,6 +72,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: nvidia-gpu-library-tests
+          name: nvidia-kernel-library-tests
           path: ${{ runner.temp }}/native-library-report
           if-no-files-found: ignore

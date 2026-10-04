@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from functools import cached_property
 
 import torch
@@ -16,6 +17,7 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
+    cache_dtype_bytes,
     cache_dtype_name,
     mxfp8_kv_scale_fields,
     scatter_stored_dtype_name,
@@ -56,6 +58,7 @@ class QwenGDNRecipe(CacheRecipe):
         # The GDN backend reads the same decision, so publish it once here
         # rather than as a side effect of sizing the workspace.
         linear_attn.replay_ssm = self.replay_ssm
+        linear_attn.draft_tree = self.draft_tree
 
     # ---- layer vocabulary ----
 
@@ -203,6 +206,13 @@ class QwenGDNRecipe(CacheRecipe):
     # ---- speculative verify workspace ----
 
     @cached_property
+    def draft_tree(self) -> bool:
+        """Whether verify windows are draft trees (--speculative-eagle-topk > 1)."""
+        return bool(self.num_draft_layers) and (
+            int(self.server_args.speculative_eagle_topk) > 1
+        )
+
+    @cached_property
     def replay_ssm(self) -> bool:
         """Whether the GDN backend replays the SSM state instead of staging it."""
         if (
@@ -216,9 +226,13 @@ class QwenGDNRecipe(CacheRecipe):
             and torch.device(self.attn_config.device).type == "cuda"
         ):
             return False
+        return self._replay_commit_supported(self.attn_config.dtype)
+
+    def _replay_commit_supported(self, dtype: torch.dtype) -> bool:
+        """Whether this family's replay kernel runs here for ``dtype`` payloads."""
         from tokenspeed_kernel.ops.attention.gdn import gdn_replay_commit_supported
 
-        return bool(gdn_replay_commit_supported(self.attn_config.dtype))
+        return bool(gdn_replay_commit_supported(dtype))
 
     @override
     def workspace_bytes(self) -> int:
@@ -237,12 +251,23 @@ class QwenGDNRecipe(CacheRecipe):
             if field.field_id.endswith(self._verify_workspace_field_suffixes())
         )
         if self.replay_ssm:
-            return staged + self._replay_payload_bytes()
+            return staged + self._replay_payload_bytes() + self._tree_state_bytes()
         return staged
 
     def _verify_workspace_field_suffixes(self) -> tuple[str, ...]:
         """Return cache-field suffixes staged during target verification."""
         return (".conv",) if self.replay_ssm else (".conv", ".ssm")
+
+    def _tree_state_bytes(self) -> int:
+        """A ReplaySSM tree verify's node states: one layer's worth per draft
+        position, shared by every layer (``MambaAttnBackend._tree_node_states``)."""
+        if not self.draft_tree:
+            return 0
+        _, _, ssm_shape, ssm_dtype = self._state_shapes
+        rows = self.attn_config.max_bs * int(
+            self.server_args.speculative_num_draft_tokens
+        )
+        return rows * math.prod(ssm_shape) * cache_dtype_bytes(ssm_dtype)
 
     def _replay_payload_bytes(self) -> int:
         """Captured verify projections, stacked per GDN layer.

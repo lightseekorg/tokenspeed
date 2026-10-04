@@ -41,9 +41,6 @@ from tokenspeed.runtime.models.base.decoder_layer import (
     CompiledDecoderLayer,
 )
 from tokenspeed.runtime.models.base.placement import ParallelGroup, PlacementType
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.utils import add_prefix, make_layers
 
 
@@ -213,15 +210,13 @@ class BaseTransformerModel(nn.Module):
 
             capture = i in self.layers_to_capture
 
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    ctx,
-                    residual,
-                    aux_hidden_states=aux_hidden_states if capture else None,
-                )
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                ctx,
+                residual,
+                aux_hidden_states=aux_hidden_states if capture else None,
+            )
 
             if capture and ctx.target_capture_sink is not None:
                 self._notify_dflash_capture(
