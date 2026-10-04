@@ -3,6 +3,13 @@ from __future__ import annotations
 import os
 
 import torch
+
+# The package defines its feature names before importing its leaves, so the
+# partially initialized package already carries them here.
+from tokenspeed_kernel.ops.attention.dsa import (
+    CANDIDATE_LENS_CPU_FEATURE,
+    INDEX_K_WORKSPACE_ROWS_FEATURE,
+)
 from tokenspeed_kernel.ops.attention.dsa.cuda import (
     has_ragged_decode_topk,
     ragged_decode_topk,
@@ -52,10 +59,9 @@ _TOPK_FEATURES = frozenset({"forced_initial_local"}) | (
 # The prefill leaf sizes its chunk launches from the host mirror of each
 # token's candidate count (``candidate_lens_cpu``) and scores FP8 rows handed
 # to it in workspace-row order (``index_k_fp8`` + ``index_k_scale``), so it
-# declares the features the facade routes those keywords by
-# (``dsa.CANDIDATE_LENS_CPU_FEATURE``, ``dsa.INDEX_K_WORKSPACE_ROWS_FEATURE``).
+# declares the features the facade routes those keywords by.
 _PREFILL_TOPK_FEATURES = _TOPK_FEATURES | frozenset(
-    {"candidate_lens_cpu", "index_k_workspace_rows"}
+    {CANDIDATE_LENS_CPU_FEATURE, INDEX_K_WORKSPACE_ROWS_FEATURE}
 )
 
 

@@ -2450,16 +2450,35 @@ def test_deep_gemm_prefill_topk_declares_the_candidate_lens_cpu_feature() -> Non
             assert _attention_dsa_pkg.CANDIDATE_LENS_CPU_FEATURE not in other.features
 
 
-def test_only_leaves_taking_workspace_rows_declare_the_feature() -> None:
-    """Index keys in workspace-row order (``index_k_fp8`` + ``index_k_scale``)
-    are a DeepGEMM-only form in tree: the portable Triton leaf and the opaque
-    gluon wrappers read planes and must not be selectable for rows, which the
-    facade enforces by requiring ``INDEX_K_WORKSPACE_ROWS_FEATURE``."""
+def test_a_leaf_declares_the_workspace_rows_feature_iff_its_launcher_takes_rows() -> (
+    None
+):
+    """``INDEX_K_WORKSPACE_ROWS_FEATURE`` is the registration's promise that the
+    launcher takes index keys in workspace-row order (``index_k_fp8`` +
+    ``index_k_scale`` or ``index_k_bf16``): every registered prefill top-k
+    leaf declares it exactly when its signature names such a keyword. A
+    plane-only launcher (the portable Triton leaf, the opaque ``**kwargs``
+    gluon wrappers) names none and declares none, so the facade never selects
+    it for rows."""
     registry = KernelRegistry.get()
     feature = _attention_dsa_pkg.INDEX_K_WORKSPACE_ROWS_FEATURE
-    for spec in registry.list_kernels("attention", "dsa_prefill_topk"):
-        declares = feature in spec.features
-        assert declares == (spec.name == "deep_gemm_dsa_prefill_topk"), spec.name
+    row_keywords = {"index_k_fp8", "index_k_scale", "index_k_bf16"}
+    specs = registry.list_kernels("attention", "dsa_prefill_topk")
+    assert specs
+    for spec in specs:
+        named = {
+            name
+            for name, parameter in inspect.signature(
+                registry.get_impl(spec.name)
+            ).parameters.items()
+            if parameter.kind
+            not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        }
+        takes_rows = bool(named & row_keywords)
+        assert (feature in spec.features) == takes_rows, (
+            f"{spec.name}: declares={feature in spec.features}, "
+            f"row keywords={sorted(named & row_keywords)}"
+        )
 
 
 def test_workspace_rows_fail_at_selection_without_a_declaring_leaf(

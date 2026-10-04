@@ -117,14 +117,17 @@ SLOT_ORDERS = ("selection", "sorted")
 # a ``*args, **kwargs`` wrapper that does not declare it never sees it.
 CANDIDATE_LENS_CPU_FEATURE = "candidate_lens_cpu"
 
-# Feature a ``dsa_prefill_topk`` leaf declares when it scores index-K rows
-# handed to it already in workspace-row order instead of resolving them from
-# a plane through ``kv_workspace_slots``: ``index_k_fp8`` + ``index_k_scale``
-# for an ``fp8_scaled`` plane, ``index_k_bf16`` for a ``bf16`` one (the
-# query-context-parallel history gather over page-sharded caches produces
-# them). The facade REQUIRES it whenever such rows are passed, so a leaf that
-# only reads planes is never selected for them: the failure is a selection
-# error up front, not the leaf raising mid-forward.
+# Feature a ``dsa_prefill_topk`` leaf declares when its launcher takes index-K
+# rows handed to it already in workspace-row order instead of resolving them
+# from a plane through ``kv_workspace_slots``: the ``index_k_fp8`` +
+# ``index_k_scale`` keywords for an ``fp8_scaled`` plane, ``index_k_bf16`` for
+# a ``bf16`` one (the query-context-parallel history gather over page-sharded
+# caches produces them). The facade REQUIRES it whenever such rows are passed
+# and hands the keywords to declaring leaves only (``_index_k_rows_kwargs``),
+# so a leaf that only reads planes is never selected for them -- not by
+# ranking, not by an override -- and the failure is a ``NoKernelFoundError``
+# at selection, not the leaf raising mid-forward. A host probes the selection
+# at construction through :func:`select_dsa_prefill_topk_for_rows`.
 INDEX_K_WORKSPACE_ROWS_FEATURE = "index_k_workspace_rows"
 
 # Storage of an index-key plane, read off its dtype (README, "Index-K plane
@@ -178,6 +181,168 @@ def _candidate_lens_cpu_kwargs(kernel, candidate_lens_cpu: torch.Tensor | None) 
     if spec is None or CANDIDATE_LENS_CPU_FEATURE not in spec.features:
         return {}
     return {"candidate_lens_cpu": candidate_lens_cpu}
+
+
+# The index-K formats whose rows ``dsa_prefill_topk`` takes in workspace-row
+# order, and the keywords carrying them (README, "Index-K plane formats").
+_INDEX_K_ROW_KEYWORDS = {
+    "fp8_scaled": ("index_k_fp8", "index_k_scale"),
+    "bf16": ("index_k_bf16",),
+}
+
+
+def _index_k_rows_traits(index_k_format: str) -> dict:
+    """``index_k_format`` / ``index_k_layout`` selection traits of index keys
+    handed as rows in workspace-row order: the rows of a plane of that format,
+    one per workspace row, so always ``"packed"``."""
+    if index_k_format not in _INDEX_K_ROW_KEYWORDS:
+        raise ValueError(
+            "index keys in workspace-row order come in one of "
+            f"{sorted(_INDEX_K_ROW_KEYWORDS)}, got {index_k_format!r}"
+        )
+    return {"index_k_format": index_k_format, "index_k_layout": "packed"}
+
+
+def _check_index_k_rows(
+    index_k_fp8: torch.Tensor | None,
+    index_k_scale: torch.Tensor | None,
+    index_k_bf16: torch.Tensor | None,
+    *,
+    head_dim: int,
+    workspace_rows: int,
+) -> None:
+    """Refuse rows that are not one key per workspace row in their format.
+
+    ``index_k_bf16`` is ``[workspace_rows, head_dim]`` bf16; ``index_k_fp8`` is
+    ``[workspace_rows, head_dim]`` FP8 bytes (uint8 or float8_e4m3fn) with
+    ``index_k_scale`` ``[workspace_rows, head_dim / 128]`` fp32.
+    """
+    if index_k_bf16 is not None:
+        if index_k_bf16.dtype != torch.bfloat16 or index_k_bf16.shape != (
+            workspace_rows,
+            head_dim,
+        ):
+            raise ValueError(
+                "index_k_bf16 holds bf16 rows [workspace_rows, head_dim] = "
+                f"[{workspace_rows}, {head_dim}], got {index_k_bf16.dtype} "
+                f"{tuple(index_k_bf16.shape)}"
+            )
+        return
+    groups = head_dim // _INDEX_K_FP8_GROUP_SIZE
+    if index_k_fp8.dtype not in (
+        torch.uint8,
+        torch.float8_e4m3fn,
+    ) or index_k_fp8.shape != (workspace_rows, head_dim):
+        raise ValueError(
+            "index_k_fp8 holds FP8 rows [workspace_rows, head_dim] = "
+            f"[{workspace_rows}, {head_dim}] as uint8 or float8_e4m3fn, got "
+            f"{index_k_fp8.dtype} {tuple(index_k_fp8.shape)}"
+        )
+    if index_k_scale.dtype != torch.float32 or index_k_scale.shape != (
+        workspace_rows,
+        groups,
+    ):
+        raise ValueError(
+            "index_k_scale holds fp32 scales [workspace_rows, head_dim / "
+            f"{_INDEX_K_FP8_GROUP_SIZE}] = [{workspace_rows}, {groups}], got "
+            f"{index_k_scale.dtype} {tuple(index_k_scale.shape)}"
+        )
+
+
+def _index_k_rows_kwargs(
+    kernel,
+    *,
+    index_k_fp8: torch.Tensor | None,
+    index_k_scale: torch.Tensor | None,
+    index_k_bf16: torch.Tensor | None,
+) -> dict:
+    """The workspace-row keywords for a selected top-k leaf, or nothing.
+
+    Only a leaf registered with ``INDEX_K_WORKSPACE_ROWS_FEATURE`` takes them;
+    the decision is the registration's, read here, never a signature probe.
+    Selection already required the feature for rows (ranking and overrides
+    alike), so a leaf without it here is refused rather than handed a keyword
+    its launcher does not take.
+    """
+    if index_k_fp8 is None and index_k_bf16 is None:
+        return {}
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if spec is None or INDEX_K_WORKSPACE_ROWS_FEATURE not in spec.features:
+        raise ValueError(
+            f"DSA kernel {kernel.name!r} does not declare the "
+            f"{INDEX_K_WORKSPACE_ROWS_FEATURE!r} feature: it resolves index keys "
+            "from a plane and cannot score rows in workspace-row order"
+        )
+    if index_k_bf16 is not None:
+        return {"index_k_bf16": index_k_bf16}
+    return {"index_k_fp8": index_k_fp8, "index_k_scale": index_k_scale}
+
+
+def select_dsa_prefill_topk_for_rows(
+    *,
+    index_k_format: str,
+    q_dtype: torch.dtype,
+    weights_dtype: torch.dtype,
+    index_heads: int,
+    head_dim: int,
+    topk: int,
+    page_size: int | None,
+    batch_invariant: bool,
+    solution: str | None,
+) -> str:
+    """Select, without running it, the ``dsa_prefill_topk`` leaf for index keys
+    handed as rows in workspace-row order of ``index_k_format``.
+
+    The selection :func:`dsa_prefill_topk` makes for ``index_k_fp8`` +
+    ``index_k_scale`` (``"fp8_scaled"``) or ``index_k_bf16`` (``"bf16"``):
+    the rows' format and layout traits plus ``INDEX_K_WORKSPACE_ROWS_FEATURE``
+    required. A host whose sharded prefill will hand such rows (the
+    query-context-parallel history gather over page-sharded caches) calls this
+    at construction so a platform without a declaring leaf fails at startup
+    rather than in the first sharded prefill.
+
+    Args:
+        index_k_format: The plane format the rows are packed in, one of
+            ``"fp8_scaled"`` or ``"bf16"``.
+        q_dtype: dtype of the indexer query the leaf will score.
+        weights_dtype: dtype of the per-token/head weights.
+        index_heads: Indexer heads, the ``index_heads`` trait.
+        head_dim: Key width, the ``head_dim`` trait.
+        topk: Candidates selected per row, the ``topk`` trait.
+        page_size: KV cache page size, the ``page_size`` trait (a leaf pinned
+            to one is not selected without it), or ``None``.
+        batch_invariant: Whether the ``batch_invariant`` feature is required
+            too, as the forward will require it.
+        solution: Restrict selection to a registered solution, as the forward
+            will.
+
+    Returns:
+        The selected kernel's name.
+
+    Raises:
+        NoKernelFoundError: No registered leaf declares the feature for the
+            format with these traits on this platform.
+    """
+    traits = {
+        "index_heads": int(index_heads),
+        "head_dim": int(head_dim),
+        "page_size": None if page_size is None else int(page_size),
+        "topk": int(topk),
+        **_index_k_rows_traits(index_k_format),
+    }
+    required_features = {INDEX_K_WORKSPACE_ROWS_FEATURE}
+    if batch_invariant:
+        required_features.add("batch_invariant")
+    return select_kernel(
+        "attention",
+        "dsa_prefill_topk",
+        format_signature(
+            q=dense_tensor_format(q_dtype), weights=dense_tensor_format(weights_dtype)
+        ),
+        traits=traits,
+        features=frozenset(required_features),
+        solution=solution,
+    ).name
 
 
 def _slot_order_kwargs(kernel, slot_order: str, *, role: str) -> dict:
@@ -612,14 +777,16 @@ def dsa_prefill_topk(
             selects the ``index_k_format`` trait: uint8 is FP8 with scales
             (``"fp8_scaled"``, packed or page-planar; page-planar caches may
             have a padded outer page stride), bfloat16 is the unquantized
-            ``[slots, head_dim]`` plane (``"bf16"``, packed).
+            ``[slots, head_dim]`` plane (``"bf16"``, packed). The index keys
+            come either as this plane or as rows in workspace-row order
+            (below), exactly one of the two.
         page_size: KV cache page size for index_k_cache. Passed to selection
             as the ``page_size`` trait whenever given, rows or plane: a leaf
             pinned to a page size is not selected without it.
         index_k_fp8: FP8 index-K rows already in workspace-row order
-            (``[workspace_rows, head_dim]``, the gathered form of an
-            ``fp8_scaled`` plane). Must be provided together with
-            index_k_scale and instead of index_k_cache.
+            (``[workspace_rows, head_dim]`` uint8 or float8_e4m3fn, the
+            gathered form of an ``fp8_scaled`` plane). Must be provided
+            together with index_k_scale and instead of index_k_cache.
         index_k_scale: FP8 index-K scales already in workspace-row order
             (``[workspace_rows, head_dim / 128]`` fp32). Must be provided
             together with index_k_fp8.
@@ -628,8 +795,9 @@ def dsa_prefill_topk(
             plane), instead of index_k_cache and of the FP8 pair. Rows in
             workspace-row order, of either format, select only leaves
             declaring ``INDEX_K_WORKSPACE_ROWS_FEATURE`` for the matching
-            ``index_k_format``; the bf16 rows reach the leaf as the
-            ``index_k_bf16`` keyword.
+            ``index_k_format`` and reach only such a leaf, as the
+            ``index_k_fp8`` + ``index_k_scale`` or ``index_k_bf16`` keyword
+            (:func:`select_dsa_prefill_topk_for_rows` probes the selection).
         q_scales: Optional positive FP32 scale per token/head for FP8 queries,
             defining ``dequant(q[token, head]) = q[token, head].float() *
             q_scales[token, head]``.
@@ -705,23 +873,21 @@ def dsa_prefill_topk(
         )
     if index_k_cache is not None:
         traits.update(_index_k_plane_traits(index_k_cache, q.shape[-1]))
-    elif has_bf16_rows:
-        if (
-            index_k_bf16.dtype != torch.bfloat16
-            or index_k_bf16.ndim != 2
-            or index_k_bf16.shape[1] != q.shape[-1]
-        ):
-            raise ValueError(
-                "index_k_bf16 holds bf16 rows [workspace_rows, head_dim] = "
-                f"[*, {q.shape[-1]}], got {index_k_bf16.dtype} "
-                f"{tuple(index_k_bf16.shape)}"
-            )
-        traits["index_k_format"] = "bf16"
-        traits["index_k_layout"] = "packed"
-    elif has_fp8_rows:
-        # FP8 values plus scales by construction, one row per workspace row.
-        traits["index_k_format"] = "fp8_scaled"
-        traits["index_k_layout"] = "packed"
+    elif has_workspace_rows:
+        _check_index_k_rows(
+            index_k_fp8,
+            index_k_scale,
+            index_k_bf16,
+            head_dim=q.shape[-1],
+            workspace_rows=kv_workspace_slots.numel(),
+        )
+        traits.update(_index_k_rows_traits("bf16" if has_bf16_rows else "fp8_scaled"))
+    else:
+        raise ValueError(
+            "dsa_prefill_topk needs its index keys: a plane (index_k_cache) or "
+            "rows in workspace-row order (index_k_fp8 + index_k_scale, or "
+            "index_k_bf16)"
+        )
     initial_tokens = int(initial_tokens)
     local_tokens = int(local_tokens)
     if initial_tokens < 0 or local_tokens < 0:
@@ -749,6 +915,12 @@ def dsa_prefill_topk(
         override=override,
     )
     candidate_lens_cpu_kwargs = _candidate_lens_cpu_kwargs(kernel, candidate_lens_cpu)
+    index_k_rows_kwargs = _index_k_rows_kwargs(
+        kernel,
+        index_k_fp8=index_k_fp8,
+        index_k_scale=index_k_scale,
+        index_k_bf16=index_k_bf16,
+    )
     slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="top-k")
     shape_params = {
         "tokens": q.shape[0],
@@ -777,18 +949,13 @@ def dsa_prefill_topk(
             "softmax_scale": softmax_scale,
             "index_k_cache": index_k_cache,
             "page_size": page_size,
-            "index_k_fp8": index_k_fp8,
-            "index_k_scale": index_k_scale,
             "max_logits_bytes": max_logits_bytes,
             "out": out,
             "lens_out": lens_out,
             **candidate_lens_cpu_kwargs,
+            **index_k_rows_kwargs,
             **slot_order_kwargs,
         }
-        if index_k_bf16 is not None:
-            # Only a leaf declaring INDEX_K_WORKSPACE_ROWS_FEATURE for the
-            # bf16 format was selected; the FP8 leaves never see the keyword.
-            kernel_kwargs["index_k_bf16"] = index_k_bf16
         if q_scales is not None:
             kernel_kwargs["q_scales"] = q_scales
         if initial_tokens or local_tokens:
@@ -1091,4 +1258,5 @@ __all__ = [
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
+    "select_dsa_prefill_topk_for_rows",
 ]

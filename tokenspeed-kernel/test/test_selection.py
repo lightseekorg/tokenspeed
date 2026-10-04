@@ -917,6 +917,76 @@ class TestSelectKernel:
             )
             assert impl() == "reference_decode"
 
+    def test_override_refuses_a_kernel_lacking_a_required_feature(
+        self, sample_specs, h100_platform
+    ):
+        """An override skips platform, signature and trait matching, but a
+        required feature names a keyword or behaviour the facade relies on:
+        a kernel without it is refused at selection, by name or by solution,
+        and the error names the feature."""
+        reg = KernelRegistry.get()
+        register_all_samples(reg, sample_specs)
+        reg.register(
+            KernelSpec(
+                name="triton_decode_plain",
+                family="attention",
+                mode="decode",
+                solution="triton",
+                format_signatures=frozenset({ATTN_DECODE_BF16}),
+                priority=12,
+            ),
+            lambda: "triton_decode_plain",
+        )
+
+        # Every sample decode kernel declares "paged"; the plain one does not.
+        impl = select_kernel(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            features=frozenset({"paged"}),
+            override="reference_decode",
+        )
+        assert impl() == "reference_decode"
+        with pytest.raises(NoKernelFoundError, match="'paged'"):
+            select_kernel(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+                features=frozenset({"paged"}),
+                override="triton_decode_plain",
+            )
+        # By solution: the solution's highest-priority kernel declaring the
+        # feature, not its highest-priority kernel.
+        impl = select_kernel(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            features=frozenset({"paged"}),
+            override="triton",
+        )
+        assert impl() == "triton_decode"
+        with pytest.raises(NoKernelFoundError, match="'unpaged'"):
+            select_kernel(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+                features=frozenset({"unpaged"}),
+                override="triton",
+            )
+        # Without required features an override is honoured as before.
+        impl = select_kernel(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            override="triton_decode_plain",
+        )
+        assert impl() == "triton_decode_plain"
+
     def test_amd_platform_selects_aiter(self, sample_specs, mi350_platform):
         reg = KernelRegistry.get()
         register_all_samples(reg, sample_specs)

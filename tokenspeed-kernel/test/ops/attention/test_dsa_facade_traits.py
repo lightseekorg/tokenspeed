@@ -60,7 +60,7 @@ def _register_topk_leaf(
     *,
     index_k_format: str,
     layouts,
-    workspace_rows: bool = False,
+    workspace_rows: bool,
     slot_orders=None,
 ):
     calls: list[dict] = []
@@ -107,12 +107,17 @@ def topk_leaves(fresh_registry, h100_platform):
             f"fp8_{mode}",
             index_k_format="fp8_scaled",
             layouts=("packed", "page_planar"),
+            workspace_rows=False,
         )
         for mode in ("dsa_decode_topk", "dsa_prefill_topk")
     }
     bf16 = {
         mode: _register_topk_leaf(
-            mode, f"bf16_{mode}", index_k_format="bf16", layouts=("packed",)
+            mode,
+            f"bf16_{mode}",
+            index_k_format="bf16",
+            layouts=("packed",),
+            workspace_rows=False,
         )
         for mode in ("dsa_decode_topk", "dsa_prefill_topk")
     }
@@ -188,6 +193,7 @@ def test_bf16_plane_only_with_the_bf16_leaf_registered_is_the_only_match(
             "fp8_only",
             index_k_format="fp8_scaled",
             layouts=("packed", "page_planar"),
+            workspace_rows=False,
         )
         # Honest labelling: a bf16 plane is never scored as FP8 bytes.
         with pytest.raises(NoKernelFoundError):
@@ -267,7 +273,11 @@ def ordering_topk_leaves(fresh_registry, h100_platform):
     Platform.override(h100_platform)
     silent = {
         mode: _register_topk_leaf(
-            mode, f"silent_{mode}", index_k_format="bf16", layouts=("packed",)
+            mode,
+            f"silent_{mode}",
+            index_k_format="bf16",
+            layouts=("packed",),
+            workspace_rows=False,
         )
         for mode in ("dsa_decode_topk", "dsa_prefill_topk")
     }
@@ -277,6 +287,7 @@ def ordering_topk_leaves(fresh_registry, h100_platform):
             f"ordering_{mode}",
             index_k_format="bf16",
             layouts=("packed",),
+            workspace_rows=False,
             slot_orders=("sorted", "selection"),
         )
         for mode in ("dsa_decode_topk", "dsa_prefill_topk")
@@ -325,11 +336,12 @@ def test_topk_sorted_order_refuses_a_silent_leaf(ordering_topk_leaves, mode):
 
 # --- workspace rows: index keys handed in workspace-row order -----------------
 
+ROWS = 16
 FP8_ROWS = {
-    "index_k_fp8": torch.zeros((16, HEAD_DIM), dtype=torch.float8_e4m3fn),
-    "index_k_scale": torch.zeros((16, 1), dtype=torch.float32),
+    "index_k_fp8": torch.zeros((ROWS, HEAD_DIM), dtype=torch.float8_e4m3fn),
+    "index_k_scale": torch.zeros((ROWS, HEAD_DIM // 128), dtype=torch.float32),
 }
-BF16_ROWS = {"index_k_bf16": torch.zeros((16, HEAD_DIM), dtype=torch.bfloat16)}
+BF16_ROWS = {"index_k_bf16": torch.zeros((ROWS, HEAD_DIM), dtype=torch.bfloat16)}
 
 
 def _prefill_topk_rows(**rows):
@@ -338,7 +350,7 @@ def _prefill_topk_rows(**rows):
     return dsa_pkg.dsa_prefill_topk(
         torch.zeros((2, 16, HEAD_DIM), dtype=torch.bfloat16),
         torch.zeros((2, 16), dtype=torch.float32),
-        torch.arange(16, dtype=torch.int64),
+        torch.arange(ROWS, dtype=torch.int64),
         torch.tensor([0, 0], dtype=torch.int32),
         torch.tensor([8, 16], dtype=torch.int32),
         topk=4,
@@ -387,8 +399,19 @@ def test_workspace_rows_select_the_declaring_leaf_of_their_format(row_leaves):
     assert "index_k_bf16" not in fp8_call
     bf16_call = row_leaves["bf16_rows"][0]
     assert bf16_call["index_k_bf16"] is BF16_ROWS["index_k_bf16"]
-    assert bf16_call["index_k_fp8"] is None and bf16_call["index_k_scale"] is None
+    assert "index_k_fp8" not in bf16_call and "index_k_scale" not in bf16_call
     assert bf16_call["index_k_cache"] is None
+
+
+def test_a_plane_only_leaf_never_receives_the_row_keywords(row_leaves):
+    """The row keywords are routed by the registered feature, like
+    ``candidate_lens_cpu``: a leaf without it is not handed them even when it
+    is the one selected (here through the plane)."""
+    _prefill_topk(torch.zeros((128, FP8_ROW_BYTES), dtype=torch.uint8))
+    _prefill_topk(torch.zeros((128, HEAD_DIM), dtype=torch.bfloat16))
+    for name in ("fp8_scaled_plane", "fp8_scaled_rows", "bf16_plane", "bf16_rows"):
+        for call in row_leaves[name]:
+            assert not {"index_k_fp8", "index_k_scale", "index_k_bf16"} & set(call)
 
 
 def test_a_plane_only_leaf_is_never_selected_for_workspace_rows(
@@ -405,6 +428,7 @@ def test_a_plane_only_leaf_is_never_selected_for_workspace_rows(
             "fp8_plane",
             index_k_format="fp8_scaled",
             layouts=("packed", "page_planar"),
+            workspace_rows=False,
         )
         with pytest.raises(NoKernelFoundError):
             _prefill_topk_rows(**FP8_ROWS)
@@ -416,6 +440,37 @@ def test_a_plane_only_leaf_is_never_selected_for_workspace_rows(
         assert len(plane_only) == 1
     finally:
         Platform.override(real_platform)
+
+
+@pytest.mark.parametrize("how", ["override", "solution", "env"])
+def test_an_override_cannot_force_a_plane_only_leaf_onto_workspace_rows(
+    row_leaves, monkeypatch, how
+):
+    """An override skips traits, not required features: forcing the plane-only
+    leaf (``override=`` by name or the environment override, which name the
+    missing feature; ``solution=``, which filters on it) for rows is a
+    ``NoKernelFoundError``, never a keyword the leaf's launcher does not take."""
+    if how == "env":
+        monkeypatch.setenv(
+            "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL_TOPK",
+            "fp8_scaled_plane",
+        )
+        forced = {}
+    else:
+        forced = {how: "fp8_scaled_plane"}
+    message = "with solution" if how == "solution" else "index_k_workspace_rows"
+    with pytest.raises(NoKernelFoundError, match=message):
+        _prefill_topk_rows(**FP8_ROWS, **forced)
+    assert not row_leaves["fp8_scaled_plane"]
+    # The same override still serves the plane.
+    _prefill_topk(torch.zeros((128, FP8_ROW_BYTES), dtype=torch.uint8), **forced)
+    assert len(row_leaves["fp8_scaled_plane"]) == 1
+    # Forcing the declaring leaf by override hands it the rows.
+    monkeypatch.delenv(
+        "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL_TOPK", raising=False
+    )
+    _prefill_topk_rows(**FP8_ROWS, override="fp8_scaled_rows")
+    assert row_leaves["fp8_scaled_rows"][0]["index_k_fp8"] is FP8_ROWS["index_k_fp8"]
 
 
 def test_workspace_rows_come_in_one_format_and_without_a_plane(row_leaves):
@@ -431,12 +486,95 @@ def test_workspace_rows_come_in_one_format_and_without_a_plane(row_leaves):
             **FP8_ROWS,
             index_k_cache=torch.zeros((128, FP8_ROW_BYTES), dtype=torch.uint8),
         )
-    with pytest.raises(ValueError, match="bf16 rows \\[workspace_rows, head_dim\\]"):
-        _prefill_topk_rows(index_k_bf16=torch.zeros((16, HEAD_DIM), dtype=torch.uint8))
-    with pytest.raises(ValueError, match="bf16 rows \\[workspace_rows, head_dim\\]"):
-        _prefill_topk_rows(
-            index_k_bf16=torch.zeros((16, HEAD_DIM // 2), dtype=torch.bfloat16)
-        )
+    # Neither a plane nor rows: refused at the facade, not inside a leaf.
+    with pytest.raises(ValueError, match="needs its index keys"):
+        _prefill_topk_rows()
+    with pytest.raises(ValueError, match="provided together"):
+        _prefill_topk_rows(index_k_fp8=FP8_ROWS["index_k_fp8"])
+    assert not any(row_leaves.values())
+
+
+@pytest.mark.parametrize(
+    "rows, message",
+    [
+        (
+            {"index_k_bf16": torch.zeros((ROWS, HEAD_DIM), dtype=torch.uint8)},
+            "index_k_bf16 holds bf16 rows",
+        ),
+        (
+            {"index_k_bf16": torch.zeros((ROWS, HEAD_DIM // 2), dtype=torch.bfloat16)},
+            "index_k_bf16 holds bf16 rows",
+        ),
+        (
+            {"index_k_bf16": torch.zeros((ROWS + 1, HEAD_DIM), dtype=torch.bfloat16)},
+            "index_k_bf16 holds bf16 rows",
+        ),
+        (
+            {
+                **FP8_ROWS,
+                "index_k_fp8": torch.zeros((ROWS, HEAD_DIM), dtype=torch.int8),
+            },
+            "index_k_fp8 holds FP8 rows",
+        ),
+        (
+            {
+                **FP8_ROWS,
+                "index_k_fp8": torch.zeros((ROWS + 1, HEAD_DIM), dtype=torch.uint8),
+            },
+            "index_k_fp8 holds FP8 rows",
+        ),
+        (
+            {**FP8_ROWS, "index_k_scale": torch.zeros((ROWS, 1), dtype=torch.bfloat16)},
+            "index_k_scale holds fp32 scales",
+        ),
+        (
+            {**FP8_ROWS, "index_k_scale": torch.zeros((ROWS, 2), dtype=torch.float32)},
+            "index_k_scale holds fp32 scales",
+        ),
+    ],
+)
+def test_workspace_rows_are_one_key_per_workspace_row_in_their_format(
+    row_leaves, rows, message
+):
+    """Both forms are checked alike before selection: dtype, key width, and
+    one row per entry of ``kv_workspace_slots``."""
+    with pytest.raises(ValueError, match=message):
+        _prefill_topk_rows(**rows)
+    assert not any(row_leaves.values())
+    # The FP8 bytes may come as uint8 (the gathered plane's bytes) as well.
+    _prefill_topk_rows(
+        **{**FP8_ROWS, "index_k_fp8": torch.zeros((ROWS, HEAD_DIM), dtype=torch.uint8)}
+    )
+    assert len(row_leaves["fp8_scaled_rows"]) == 1
+
+
+def _probe(index_k_format: str, solution: str | None = None) -> str:
+    return dsa_pkg.select_dsa_prefill_topk_for_rows(
+        index_k_format=index_k_format,
+        q_dtype=torch.bfloat16,
+        weights_dtype=torch.float32,
+        index_heads=16,
+        head_dim=HEAD_DIM,
+        topk=4,
+        page_size=64,
+        batch_invariant=True,
+        solution=solution,
+    )
+
+
+def test_the_rows_selection_can_be_probed_without_running(row_leaves):
+    """``select_dsa_prefill_topk_for_rows`` is the selection the rows form
+    makes, for a host to run at construction: the declaring leaf of the
+    format, a ``NoKernelFoundError`` without one, and no leaf runs."""
+    assert _probe("fp8_scaled") == "fp8_scaled_rows"
+    assert _probe("bf16") == "bf16_rows"
+    assert _probe("bf16", solution="bf16_rows") == "bf16_rows"
+    with pytest.raises(NoKernelFoundError):
+        _probe("bf16", solution="bf16_plane")
+    with pytest.raises(NoKernelFoundError):
+        _probe("fp8_scaled", solution="fp8_scaled_plane")
+    with pytest.raises(ValueError, match="workspace-row order"):
+        _probe("fp16")
     assert not any(row_leaves.values())
 
 
