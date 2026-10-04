@@ -343,7 +343,9 @@ FIFO and complete them, once the same-round gate (below) agrees, through two
 named handle operations (`snapshot_expert_load`, `apply_expert_placement`)
 and two EP-group gloo agreements (the summed load under all-to-all EP, the
 committed map broadcast from EP rank 0). The placement itself is derived on
-EP rank 0 in a CPU-only thread, off both planes. The loop's one line is
+EP rank 0 in a spawned CPU worker process, off both planes and off this
+process's GIL (a Python-bound thread would contend with the forward thread
+for the seconds the greedy packing takes). The loop's one line is
 `note_round(forwarded=...)` after its forward submission; nothing in the
 loop body knows a rebalance exists.
 

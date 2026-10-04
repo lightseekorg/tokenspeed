@@ -458,8 +458,8 @@ def test_replica_table_has_the_fixed_width_r_plus_one():
     # The width never follows the placement: a table wider than R + 1 is
     # accepted only when its extra columns are empty.
     with pytest.raises(ValueError, match="more than"):
-        expert_location._pad_replica_table(torch.tensor([[[0, 1, 2, 3]]]), 3)
-    assert expert_location._pad_replica_table(
+        expert_location.pad_replica_table(torch.tensor([[[0, 1, 2, 3]]]), 3)
+    assert expert_location.pad_replica_table(
         torch.tensor([[[0, 1, -1, -1]]]), 3
     ).tolist() == [[[0, 1, -1]]]
 

@@ -51,6 +51,7 @@ from tokenspeed.runtime.moe.expert_rebalance import (
     EplbSnapshot,
     ExpertRebalanceController,
     ExpertRebalanceSpecs,
+    PlacementComputeWorker,
 )
 
 __all__ = [
@@ -69,6 +70,8 @@ def make_expert_rebalance_controller(
 
     None unless the server started with ``--enable-eplb`` (the device side
     then reports the placement geometry in ``DeviceSpecs.expert_rebalance``).
+    EP rank 0 gets the spawned CPU worker that derives placements; it starts
+    here, during startup, so the first rebalance pays no child import.
     """
     if specs is None:
         if server_args.enable_eplb:
@@ -91,6 +94,7 @@ def make_expert_rebalance_controller(
             num_nodes=specs.num_nodes,
         ),
         commit_delay_forwards=COMMIT_DELAY_FORWARDS,
+        compute_worker=PlacementComputeWorker() if specs.ep_rank == 0 else None,
     )
 
 
@@ -157,7 +161,7 @@ class EplbHooks:
             self._request_handler.enqueue_internal_op(op)
 
     def close(self) -> None:
-        """Stop the controller's compute thread at engine shutdown."""
+        """Stop the controller's compute worker at engine shutdown."""
         if self._controller is not None:
             self._controller.shutdown()
 

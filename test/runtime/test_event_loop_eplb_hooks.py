@@ -29,6 +29,7 @@ from EP rank 0, and every chunk reaches ``apply_expert_placement``.
 
 from __future__ import annotations
 
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest import mock
 
@@ -53,6 +54,20 @@ from tokenspeed.runtime.moe.expert_rebalance import (
     ExpertRebalanceSpecs,
     RebalancePhase,
 )
+from tokenspeed.runtime.moe.placement_maps import compute_placement_maps
+
+
+class _InlineWorker:
+    """In-process stand-in for the spawned placement worker."""
+
+    def submit(self, logical_count, **kwargs) -> Future:
+        future: Future = Future()
+        future.set_result(compute_placement_maps(logical_count, **kwargs))
+        return future
+
+    def shutdown(self) -> None:
+        pass
+
 
 SUM = torch.distributed.ReduceOp.SUM
 MAX = torch.distributed.ReduceOp.MAX
@@ -81,6 +96,7 @@ def _controller(ep_rank: int = 0, *, all_to_all_ep: bool = False):
         layers_per_chunk=2,
         algorithm=EplbAlgorithm.deepseek,
         commit_delay_forwards=2,
+        compute_worker=_InlineWorker() if ep_rank == 0 else None,
     )
 
 
@@ -289,7 +305,18 @@ def test_controller_factory_follows_the_flag_and_the_specs():
         eplb_rebalance_layers_per_chunk=3,
         eplb_algorithm="auto",
     )
-    controller = make_expert_rebalance_controller(args, _specs(0, all_to_all_ep=False))
+    # The factory spawns the real worker for EP rank 0; stand it in here.
+    with mock.patch.object(hooks_mod, "PlacementComputeWorker", _InlineWorker):
+        controller = make_expert_rebalance_controller(
+            args, _specs(0, all_to_all_ep=False)
+        )
+        assert isinstance(controller.compute_worker, _InlineWorker)
+        assert (
+            make_expert_rebalance_controller(
+                args, _specs(1, all_to_all_ep=False)
+            ).compute_worker
+            is None
+        )
     assert isinstance(controller, ExpertRebalanceController)
     assert controller._chunks == [(0, 1, 2)]
     assert controller._commit_delay == hooks_mod.COMMIT_DELAY_FORWARDS == 200

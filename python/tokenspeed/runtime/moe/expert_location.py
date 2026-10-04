@@ -68,6 +68,11 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.model_loader import get_model_architecture
 from tokenspeed.runtime.moe import eplb_algorithms
 from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
+from tokenspeed.runtime.moe.placement_maps import (
+    compute_placement_maps,
+    pad_replica_table,
+    replica_table_width,
+)
 from tokenspeed.runtime.utils.server_args import (
     ServerArgs,
     expert_placement_requested,
@@ -91,6 +96,7 @@ __all__ = [
     "load_balancedness",
     "logical_count_of",
     "merge_expert_load_records",
+    "pad_replica_table",
     "replica_table_width",
     "set_global_expert_location_metadata",
 ]
@@ -100,21 +106,6 @@ logger = logging.getLogger(__name__)
 # File suffix of the per-rank load record the EXPERT_LOAD profile activity
 # writes; a directory given to --init-expert-location is scanned for it.
 EXPERT_LOAD_RECORD_SUFFIX = ".expert-load.pt"
-
-
-def replica_table_width(num_physical_experts: int, num_logical_experts: int) -> int:
-    """Columns of the replica table: the most replicas one logical expert can have.
-
-    Every other expert needs at least one slot, so ``P - (E - 1)`` -- ``R + 1``
-    with ``R`` redundant slots. Fixed for the server's lifetime so an online
-    rebalance rewrites the table in place.
-    """
-    if num_physical_experts < num_logical_experts:
-        raise ValueError(
-            f"{num_physical_experts} physical experts cannot hold "
-            f"{num_logical_experts} logical experts"
-        )
-    return num_physical_experts - num_logical_experts + 1
 
 
 @dataclass(frozen=True)
@@ -249,7 +240,7 @@ class ExpertLocationMetadata:
         # One routing table at the fixed width R + 1 (never P columns): the
         # router indexes a small [logical, X] slice, and an online rebalance
         # rewrites rows in place, so the width cannot follow the placement.
-        self.logical_to_all_physical_map = _pad_replica_table(
+        self.logical_to_all_physical_map = pad_replica_table(
             self.logical_to_all_physical_map,
             replica_table_width(num_physical_experts, num_logical_experts_0),
         )
@@ -288,7 +279,7 @@ class ExpertLocationMetadata:
                 raise ValueError(
                     f"layer {layer_id} is outside the placement's {self.num_layers}"
                 )
-        replicas = _pad_replica_table(
+        replicas = pad_replica_table(
             _compute_logical_to_all_physical_map(
                 new_rows, num_logical_experts=self.num_logical_experts
             ),
@@ -700,86 +691,6 @@ def load_balancedness(physical_count: torch.Tensor, ep_size: int) -> torch.Tenso
     num_layers = physical_count.shape[0]
     per_rank = physical_count.view(num_layers, ep_size, -1).sum(-1).double()
     return per_rank.mean(-1) / per_rank.max(-1).values.clamp_min(1)
-
-
-def compute_placement_maps(
-    logical_count: torch.Tensor,
-    *,
-    num_physical_experts: int,
-    ep_size: int,
-    num_groups: int | None,
-    num_nodes: int,
-    algorithm: eplb_algorithms.EplbAlgorithm,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Derive a placement from a logical load with the EPLB algorithm, on the host.
-
-    Pure CPU work, deterministic for equal inputs (double-precision counts,
-    stable sorts), so it may run off the control plane -- in a background
-    thread during serving -- and gives the same maps on every rank.
-
-    Args:
-        logical_count: ``[layers, logical]`` routes per logical expert, on the
-            host.
-        num_physical_experts: Slots per layer, ``P = E + R``.
-        ep_size: Ranks the slots are spread over.
-        num_groups: The model's expert groups, or None.
-        num_nodes: Nodes the EP ranks span (the hierarchical algorithm's tier).
-        algorithm: The EPLB algorithm variant.
-
-    Returns:
-        ``(physical_to_logical_map [layers, P], logical_to_all_physical_map
-        [layers, E, X])`` int32 host tensors; the replica table is -1 padded
-        to the fixed width ``replica_table_width``.
-    """
-    if logical_count.device.type != "cpu":
-        raise ValueError("compute_placement_maps runs on host tensors only")
-    if logical_count.ndim != 2:
-        raise ValueError(
-            f"logical_count must be [layers, logical], got {tuple(logical_count.shape)}"
-        )
-    if ep_size <= 0 or num_physical_experts % ep_size:
-        raise ValueError(
-            f"{num_physical_experts} physical experts do not divide over ep_size={ep_size}"
-        )
-    num_logical_experts = logical_count.shape[1]
-    physical_to_logical_map, logical_to_all_physical_map, _ = (
-        eplb_algorithms.rebalance_experts(
-            # The algorithm sums recording windows over its leading dim.
-            tokens_per_expert=logical_count.unsqueeze(0),
-            num_physical_experts=num_physical_experts,
-            num_local_physical_experts=num_physical_experts // ep_size,
-            num_groups=num_groups,
-            num_nodes=num_nodes,
-            algorithm=algorithm,
-        )
-    )
-    return (
-        physical_to_logical_map.to(torch.int32).contiguous(),
-        _pad_replica_table(
-            logical_to_all_physical_map,
-            replica_table_width(num_physical_experts, num_logical_experts),
-        ),
-    )
-
-
-def _pad_replica_table(table: torch.Tensor, width: int) -> torch.Tensor:
-    """Bring a ``[..., X]`` replica table to ``width`` columns (-1 padded), int32 contiguous."""
-    current = table.shape[-1]
-    if current > width:
-        if bool((table[..., width:] != -1).any()):
-            raise ValueError(
-                f"replica table holds more than {width} replicas of one expert"
-            )
-        table = table[..., :width]
-    elif current < width:
-        pad = torch.full(
-            (*table.shape[:-1], width - current),
-            -1,
-            dtype=table.dtype,
-            device=table.device,
-        )
-        table = torch.cat([table, pad], dim=-1)
-    return table.to(torch.int32).contiguous()
 
 
 def _compute_logical_to_all_physical_map(

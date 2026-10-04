@@ -31,8 +31,9 @@ in the same round and the device call may block the control thread:
 1. ``EplbSnapshot``: read the route counters since the previous snapshot
    (``DeviceHandle.snapshot_expert_load``), reduce them over the EP group when
    each rank counted only its own tokens, and hand the logical load to the
-   controller. EP rank 0 derives the new placement in a CPU-only background
-   thread (``compute_placement_maps``).
+   controller. EP rank 0 derives the new placement in a spawned CPU worker
+   process (``compute_placement_maps``), so the Python greedy loop never
+   contends for this process's GIL with the forward thread.
 2. ``EplbCommit``, ``COMMIT_DELAY_FORWARDS`` forwards later: rank 0 waits for
    its result, the map is broadcast over the EP group, and every rank plans
    the same slot moves (``plan_slot_moves``) from the old and new rows.
@@ -54,19 +55,17 @@ construction and the P2P batch pairs without any further agreement.
 from __future__ import annotations
 
 import logging
+import multiprocessing
 from collections.abc import Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 
 import torch
 
 from tokenspeed.runtime.moe.eplb_algorithms import EplbAlgorithm
-from tokenspeed.runtime.moe.expert_location import (
-    compute_placement_maps,
-    load_balancedness,
-    logical_count_of,
-)
+from tokenspeed.runtime.moe.expert_location import load_balancedness, logical_count_of
+from tokenspeed.runtime.moe.placement_maps import compute_placement_maps
 
 __all__ = [
     "COMMIT_DELAY_FORWARDS",
@@ -75,6 +74,7 @@ __all__ = [
     "EplbSnapshot",
     "ExpertRebalanceController",
     "ExpertRebalanceSpecs",
+    "PlacementComputeWorker",
     "RebalancePhase",
     "SlotMoves",
     "chunk_layer_ids",
@@ -89,6 +89,42 @@ logger = logging.getLogger(__name__)
 # instead of stalling the commit round. A slow computation is still waited
 # for at the commit (the reference engine's 200-step overlap).
 COMMIT_DELAY_FORWARDS = 200
+
+
+def _worker_ready() -> bool:
+    """Warm-up task: forces the compute worker to spawn and import at startup."""
+    return True
+
+
+class PlacementComputeWorker:
+    """One spawned CPU process that derives placements off the serving process.
+
+    A Python-bound thread would contend for the GIL with the forward thread
+    (eager launches, metadata refresh) for the seconds the greedy packing
+    takes; a spawned process does not, and it never inherits the CUDA
+    context. The worker is started here, at construction, so the first
+    rebalance does not pay the child's torch import inside the snapshot
+    round; inputs and results cross as small CPU tensors.
+    """
+
+    def __init__(self) -> None:
+        self._pool = ProcessPoolExecutor(
+            max_workers=1, mp_context=multiprocessing.get_context("spawn")
+        )
+        self._ready: Future = self._pool.submit(_worker_ready)
+
+    def submit(self, logical_count: torch.Tensor, **kwargs) -> Future:
+        """Schedule ``compute_placement_maps(logical_count, **kwargs)`` in the worker."""
+        if logical_count.device.type != "cpu":
+            raise ValueError("the placement worker takes host tensors only")
+        return self._pool.submit(compute_placement_maps, logical_count, **kwargs)
+
+    def wait_ready(self, timeout: float | None = None) -> None:
+        """Block until the worker process is up (tests and startup checks)."""
+        self._ready.result(timeout=timeout)
+
+    def shutdown(self) -> None:
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
 
 # -------------------------------- internal op kinds ---------------------------------
@@ -371,9 +407,9 @@ class ExpertRebalanceController:
     ops to enqueue. It never touches the device or a collective; the hooks
     complete the ops with the handle and feed the results back here.
 
-    EP rank 0 of each EP group computes the placement in a CPU-only thread
-    and the hooks broadcast it at the commit, so no rank-agreement argument
-    about the algorithm's tie-breaking is needed.
+    EP rank 0 of each EP group computes the placement in a spawned CPU
+    worker process and the hooks broadcast it at the commit, so no
+    rank-agreement argument about the algorithm's tie-breaking is needed.
     """
 
     def __init__(
@@ -384,6 +420,7 @@ class ExpertRebalanceController:
         layers_per_chunk: int,
         algorithm: EplbAlgorithm,
         commit_delay_forwards: int,
+        compute_worker: PlacementComputeWorker | None,
     ) -> None:
         """
         Args:
@@ -393,22 +430,25 @@ class ExpertRebalanceController:
             algorithm: The EPLB algorithm variant.
             commit_delay_forwards: Forwards between a snapshot and its commit
                 (``COMMIT_DELAY_FORWARDS`` in serving).
+            compute_worker: Where EP rank 0 derives the placement (a spawned
+                ``PlacementComputeWorker`` in serving); None on every other
+                rank, which takes the broadcast map instead.
         """
         if rebalance_num_iterations <= 0:
             raise ValueError("rebalance_num_iterations must be positive")
         if commit_delay_forwards < 0:
             raise ValueError("commit_delay_forwards must be non-negative")
+        if (compute_worker is None) == (specs.ep_rank == 0):
+            raise ValueError(
+                "EP rank 0 derives the placement and needs a compute worker; "
+                "every other rank takes the broadcast map and must not have one"
+            )
         self.specs = specs
         self._interval = rebalance_num_iterations
         self._commit_delay = commit_delay_forwards
         self._chunks = chunk_layer_ids(specs.num_layers, layers_per_chunk)
         self._algorithm = algorithm
-        self._computes_placement = specs.ep_rank == 0
-        self._compute_thread: ThreadPoolExecutor | None = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="eplb-compute")
-            if self._computes_placement
-            else None
-        )
+        self._compute_worker = compute_worker
         self.phase = RebalancePhase.IDLE
         # Forwards this rank submitted (real or DP-idle), rank-identical.
         self.forwards = 0
@@ -502,9 +542,8 @@ class ExpertRebalanceController:
             f"{specs.num_layers} layers; balancedness min {before.min():.3f} "
             f"mean {before.mean():.3f}; commit in {self._commit_delay} forwards"
         )
-        if self._compute_thread is not None:
-            self._future = self._compute_thread.submit(
-                compute_placement_maps,
+        if self._compute_worker is not None:
+            self._future = self._compute_worker.submit(
                 self._logical_count,
                 num_physical_experts=specs.num_physical_experts,
                 ep_size=specs.ep_size,
@@ -603,6 +642,11 @@ class ExpertRebalanceController:
         self.rebalances_completed += 1
         logger.info(f"Expert rebalance {self.rebalances_completed} applied")
 
+    @property
+    def compute_worker(self) -> PlacementComputeWorker | None:
+        """The spawned worker (EP rank 0 only), for startup checks and tests."""
+        return self._compute_worker
+
     def shutdown(self) -> None:
-        if self._compute_thread is not None:
-            self._compute_thread.shutdown(wait=False, cancel_futures=True)
+        if self._compute_worker is not None:
+            self._compute_worker.shutdown()

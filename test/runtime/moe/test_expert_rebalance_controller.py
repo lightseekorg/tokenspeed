@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
+
 import pytest
 import torch
 
@@ -32,8 +34,27 @@ from tokenspeed.runtime.moe.expert_rebalance import (
     EplbSnapshot,
     ExpertRebalanceController,
     ExpertRebalanceSpecs,
+    PlacementComputeWorker,
     RebalancePhase,
 )
+from tokenspeed.runtime.moe.placement_maps import compute_placement_maps
+
+
+class _InlineWorker:
+    """A compute worker that runs in this process: the controller's contract only."""
+
+    def __init__(self):
+        self.submitted = 0
+        self.shut_down = False
+
+    def submit(self, logical_count, **kwargs) -> Future:
+        self.submitted += 1
+        future: Future = Future()
+        future.set_result(compute_placement_maps(logical_count, **kwargs))
+        return future
+
+    def shutdown(self) -> None:
+        self.shut_down = True
 
 
 def _specs(ep_rank: int = 0) -> ExpertRebalanceSpecs:
@@ -58,6 +79,7 @@ def _controller(ep_rank: int = 0, *, interval: int = 5, chunk: int = 2, delay: i
         layers_per_chunk=chunk,
         algorithm=EplbAlgorithm.deepseek,
         commit_delay_forwards=delay,
+        compute_worker=_InlineWorker() if ep_rank == 0 else None,
     )
 
 
@@ -176,3 +198,56 @@ def test_constructor_validates_its_knobs():
         _controller(chunk=4)
     with pytest.raises(ValueError, match="non-negative"):
         _controller(delay=-1)
+    # The compute worker belongs to EP rank 0 and to no other rank.
+    for ep_rank, worker in ((0, None), (1, _InlineWorker())):
+        with pytest.raises(ValueError, match="compute worker"):
+            ExpertRebalanceController(
+                _specs(ep_rank),
+                rebalance_num_iterations=5,
+                layers_per_chunk=2,
+                algorithm=EplbAlgorithm.deepseek,
+                commit_delay_forwards=3,
+                compute_worker=worker,
+            )
+
+
+def test_rank_zero_submits_to_its_worker_once_per_snapshot_and_shuts_it_down():
+    controller = _controller()
+    worker = controller.compute_worker
+    _rounds(controller, 5)
+    _snapshot(controller)
+    assert worker.submitted == 1
+    _rounds(controller, 3)
+    controller.on_commit(controller.placement_for_commit())
+    for ids in ((0, 1), (2,)):
+        controller.chunk_payload(ids)
+        controller.on_chunk_applied(ids)
+    controller.shutdown()
+    assert worker.shut_down
+    assert _controller(ep_rank=1).compute_worker is None
+
+
+def test_spawned_worker_computes_the_same_maps_off_process():
+    """The serving worker: a spawned CPU process (no CUDA context, no GIL
+    contention with the forward thread) that returns the maps as host tensors
+    identical to the in-process computation."""
+    worker = PlacementComputeWorker()
+    try:
+        worker.wait_ready(timeout=300)
+        load = torch.ones(3, 4, dtype=torch.int64)
+        load[:, 3] = 40
+        kwargs = dict(
+            num_physical_experts=6,
+            ep_size=2,
+            num_groups=None,
+            num_nodes=1,
+            algorithm=EplbAlgorithm.deepseek,
+        )
+        phy2log, log2phy = worker.submit(load, **kwargs).result(timeout=300)
+        expected = compute_placement_maps(load, **kwargs)
+        assert phy2log.device.type == "cpu" and torch.equal(phy2log, expected[0])
+        assert torch.equal(log2phy, expected[1])
+        with pytest.raises(ValueError, match="host tensors"):
+            worker.submit(load.to(torch.device("meta")), **kwargs)
+    finally:
+        worker.shutdown()

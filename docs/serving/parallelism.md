@@ -365,9 +365,11 @@ How a rebalance runs, and why it needs no new communication:
    forward, a correctness bug that fails the server rather than being
    averaged away. Under all-to-all EP (DeepEP) each rank counted its own
    tokens, and the load is summed over the EP group.
-2. **Compute and commit.** EP rank 0 derives the placement in a CPU-only
-   background thread (the DeepSeek algorithm with stable tie-breaking and
-   double-precision counts); 200 forwards later the result is broadcast over
+2. **Compute and commit.** EP rank 0 derives the placement in a spawned
+   CPU worker process, started at launch (the DeepSeek algorithm with stable
+   tie-breaking and double-precision counts; off the serving process's GIL,
+   so the forward thread is not slowed); 200 forwards later the result is
+   broadcast over
    the EP group, and every rank plans the same slot moves from the old and
    new rows. Only the `[layers, slots]` map crosses the wire; the inverse
    tables are rebuilt locally.
