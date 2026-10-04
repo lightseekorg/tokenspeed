@@ -412,12 +412,15 @@ class Engine(EngineBase):
     def update_weights_from_mooncake(
         self,
         version: int,
-        flush_cache: bool = True,
         *,
+        flush_cache: bool,
         weight_version: str | None,
     ):
         """Load one committed Model Updater SDK version on every worker.
 
+        ``flush_cache`` selects whether the KV caches are dropped and a new
+        weight namespace published, so it is explicit here; only the HTTP
+        route defaults it, for the reference engine's trainer clients.
         ``weight_version`` is required. Pass ``None`` to publish
         ``str(version)`` on a flushed load, or to keep the current namespace
         on an intermediate (unflushed) one (``mooncake_load_weight_version``).

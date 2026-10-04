@@ -37,16 +37,32 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
-from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.model_loader.weight_utils import (
+    default_weight_loader,
+    non_unit_kv_scale_message,
+    record_non_unit_kv_scales,
+)
 from tokenspeed.runtime.models.base.transformer_model import BaseTransformerModel
 from tokenspeed.runtime.utils import add_prefix
 
 
 def _record_loaded_names(load_weights: Callable) -> Callable:
-    """Record the parameter names a ``load_weights`` override returns."""
+    """Record the parameter names a ``load_weights`` override returns and,
+    inside a session, screen the stream for KV-cache scales other than one."""
 
     @functools.wraps(load_weights)
     def wrapper(self: BaseCausalLM, *args: Any, **kwargs: Any) -> Any:
+        rejected = self._weight_update_non_unit_kv_scales
+        if rejected is not None:
+            # The session owns the stream contract whoever drives the calls
+            # (the trainer's NCCL receive loop, the Model Updater SDK), so the
+            # check lives here rather than at each caller.
+            if args:
+                args = (record_non_unit_kv_scales(args[0], rejected), *args[1:])
+            else:
+                kwargs["weights"] = record_non_unit_kv_scales(
+                    kwargs["weights"], rejected
+                )
         loaded = load_weights(self, *args, **kwargs)
         if isinstance(loaded, set):
             self.record_loaded_weights(loaded)
@@ -94,7 +110,10 @@ class BaseCausalLM(nn.Module):
     session awareness of their own; subclasses that keep pairing state across
     chunks (a fused parameter assembled from several checkpoint tensors)
     extend ``begin_weight_update`` / ``end_weight_update`` /
-    ``abort_weight_update`` to reset and verify it.
+    ``abort_weight_update`` to reset and verify it. The session also screens
+    every chunk for KV-cache scales other than one and rejects the update at
+    its end (``end_weight_update``), the check the initial load applies to
+    the checkpoint, whoever drives the ``load_weights`` calls.
 
     The session fields are class-level defaults so a subclass that builds
     itself without ``BaseCausalLM.__init__`` (the speculative drafts) still
@@ -111,6 +130,10 @@ class BaseCausalLM(nn.Module):
     _weight_update_loaded_names: set[str] | None = None
     # A ``post_load_weights`` call was deferred by the session.
     _weight_update_derive_pending: bool = False
+    # KV-cache scales other than one seen by this session's ``load_weights``
+    # calls (KV caches are written and read at unit scale); None outside a
+    # session, where the loader screens the checkpoint itself.
+    _weight_update_non_unit_kv_scales: list[str] | None = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -138,6 +161,7 @@ class BaseCausalLM(nn.Module):
         self._weight_update_active = False
         self._weight_update_loaded_names = None
         self._weight_update_derive_pending = False
+        self._weight_update_non_unit_kv_scales = None
 
         self.encoder_only = encoder_only
         if encoder_only:
@@ -378,6 +402,7 @@ class BaseCausalLM(nn.Module):
         self._weight_update_active = True
         self._weight_update_loaded_names = set()
         self._weight_update_derive_pending = False
+        self._weight_update_non_unit_kv_scales = []
 
     def end_weight_update(self) -> None:
         """Leave the session and run the deferred derivation once.
@@ -386,10 +411,13 @@ class BaseCausalLM(nn.Module):
         ``_weight_update_loaded_names`` still populated so a model can
         restrict derivations that are not idempotent to the parameters this
         update actually replaced. The session is closed whether or not the
-        derivation raises.
+        derivation raises. An update that streamed a KV-cache scale other
+        than one is still loaded to completion and derived, so the model
+        stays consistent, and then rejected.
 
         Raises:
             RuntimeError: No session is active.
+            ValueError: The update carried a KV-cache scale other than one.
         """
         if not self._weight_update_active:
             raise RuntimeError(
@@ -398,17 +426,26 @@ class BaseCausalLM(nn.Module):
         # Leave the session first: the ``post_load_weights`` wrapper defers
         # only while one is active.
         self._weight_update_active = False
+        rejected = self._weight_update_non_unit_kv_scales
         try:
             if self._weight_update_derive_pending:
                 self.post_load_weights()
         finally:
             self.abort_weight_update()
+        if rejected:
+            # A subclass loader that hands the stream to ``super()`` screens
+            # the same tensors twice; report each once.
+            raise ValueError(
+                f"{type(self).__name__}: "
+                f"{non_unit_kv_scale_message(list(dict.fromkeys(rejected)))}"
+            )
 
     def abort_weight_update(self) -> None:
         """Leave the session without deriving state (the update failed)."""
         self._weight_update_active = False
         self._weight_update_loaded_names = None
         self._weight_update_derive_pending = False
+        self._weight_update_non_unit_kv_scales = None
 
     def record_loaded_weights(self, names: Iterable[str]) -> None:
         """Remember which parameters this session's ``load_weights`` touched.

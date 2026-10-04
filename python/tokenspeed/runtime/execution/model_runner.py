@@ -352,7 +352,10 @@ class ModelRunner:
                     dist.broadcast(buf, src=0, group=pg)
                     yield name, buf
 
-            # The update loads to completion so the model stays consistent, then fails on a scale.
+            # The update loads to completion so the model stays consistent,
+            # then fails on a scale. A BaseCausalLM session screens the stream
+            # itself and raises at its end; this wrap covers the models that
+            # take no session (multimodal wrappers).
             rejected: list[str] = []
             with weight_update_session([self.model]):
                 self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))

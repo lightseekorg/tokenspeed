@@ -187,6 +187,39 @@ def test_a_failed_update_leaves_no_session_behind_and_skips_derivation(model):
     assert model.post_load_calls == 2
 
 
+def test_a_non_unit_kv_scale_is_loaded_derived_and_then_rejected(model):
+    """The session screens every chunk like the initial load screens the
+    checkpoint, whoever drives the calls (the Model Updater SDK streams
+    straight into ``load_weights``). The update still completes and derives,
+    so the model stays consistent, and is rejected at the end."""
+    stream = _checkpoint(5)
+    scales = [
+        ("layers.0.attn.k_scale", torch.tensor([2.0])),
+        ("layers.1.attn.v_scale", torch.ones(1)),  # unit: fine
+    ]
+
+    with pytest.raises(ValueError, match="layers.0.attn.k_scale") as info:
+        with weight_update_session([model]):
+            model.load_weights(stream[:2] + scales)
+            model.load_weights(stream[2:])
+    assert "v_scale" not in str(info.value)
+    assert model.post_load_calls == 2
+    assert not model._weight_update_active
+    for attn in model.layers:
+        w_kc, w_vc = _expected_pair(attn.kv_b_proj.weight.detach())
+        assert torch.equal(attn.w_kc, w_kc)
+    # The next session starts clean and a unit scale passes.
+    with weight_update_session([model]):
+        model.load_weights(_checkpoint(6) + scales[1:])
+    assert model.post_load_calls == 3
+
+
+def test_kv_scales_are_not_screened_outside_a_session(model):
+    # The initial load screens the checkpoint itself (require_unit_kv_scales).
+    model.load_weights([("layers.0.attn.k_scale", torch.tensor([2.0]))])
+    assert model.post_load_calls == 2
+
+
 def test_nested_sessions_are_rejected(model):
     with weight_update_session([model]):
         with pytest.raises(RuntimeError, match="already active"):
@@ -290,6 +323,26 @@ def test_naive_overrides_derive_once_per_session_and_record_names():
     assert lm._weight_update_loaded_names is None
     w_kc, w_vc = _expected_pair(lm.layer.kv_b_proj.weight.detach())
     assert torch.equal(lm.layer.w_kc, w_kc) and torch.equal(lm.layer.w_vc, w_vc)
+
+
+def test_a_delegating_override_reports_each_non_unit_scale_once():
+    """A subclass loader that hands the stream to ``super()`` runs the screen
+    twice (both ``load_weights`` are wrapped); the rejection names each
+    scale once."""
+
+    class _Delegating(_TinyLM):
+        def load_weights(self, weights):
+            return super().load_weights((name, weight) for name, weight in weights)
+
+    lm = _Delegating()
+    lm.load_weights(_checkpoint(0))
+    with pytest.raises(ValueError) as info:
+        with weight_update_session([lm]):
+            lm.load_weights(
+                _checkpoint(7) + [("layers.0.attn.k_scale", torch.tensor([0.5]))]
+            )
+    assert str(info.value).count("k_scale") == 1
+    assert lm.post_load_calls == 2
 
 
 def test_a_session_without_any_load_derives_nothing():
@@ -445,3 +498,40 @@ def test_nextn_rejects_an_update_whose_partner_never_arrived(nextn):
     assert torch.equal(
         attn.fused_qkv_a_proj_with_mqa.weight, torch.cat([q_a[1], kv_a[1]])
     )
+
+
+# ---------------------------------------------------------------------------
+# GLM's FP8 fused QKV-A pad replaces the parameter; the loader must survive.
+# ---------------------------------------------------------------------------
+
+
+def test_fp8_qkv_a_pad_keeps_the_loader_attributes_for_live_updates():
+    from tokenspeed.runtime.layers.linear import ReplicatedLinear
+    from tokenspeed.runtime.models.glm5 import (
+        pad_fused_qkv_a_proj_weight_for_fp8_blockscale,
+    )
+
+    n, k = 2624, 16  # GLM-5.1's unaligned N (q_lora + kv_lora + rope)
+    proj = nn.Module()
+    proj.weight = nn.Parameter(
+        torch.ones(n, k).to(torch.float8_e4m3fn), requires_grad=False
+    )
+    loader = ReplicatedLinear.weight_loader.__get__(proj)
+    proj.weight.weight_loader = loader
+    proj.weight.output_dim = 0
+    attn = SimpleNamespace(fused_qkv_a_proj_with_mqa=proj)
+
+    pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn)
+
+    padded = proj.weight
+    assert padded.shape == (2688, k)
+    assert padded.weight_loader is loader and padded.output_dim == 0
+    assert torch.all(padded[n:].float() == 0)
+    # The next live update's fused branch streams a shard by row offset.
+    shard = torch.full((4, k), 2.0).to(torch.float8_e4m3fn)
+    padded.weight_loader(padded, shard, begin_size=8)
+    assert torch.all(padded[8:12].float() == 2.0)
+    assert torch.all(padded[n:].float() == 0)
+    # Aligned now: a re-run (every load_weights ends in the pad) is a no-op.
+    pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn)
+    assert proj.weight is padded

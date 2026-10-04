@@ -122,10 +122,19 @@ def test_failure_leaves_the_version_alone():
 
 
 def test_request_fields_are_explicit_and_the_default_lives_in_one_helper():
-    # The wire default is the HTTP route's; the request object takes every
-    # field explicitly.
+    # The wire default is the HTTP route's; the request object and the
+    # Engine API take every field explicitly.
+    import inspect
+
+    from tokenspeed.runtime.entrypoints.engine import Engine
+
     with pytest.raises(TypeError):
         UpdateWeightsFromMooncakeReqInput(version=3)
+    flush_cache = inspect.signature(Engine.update_weights_from_mooncake).parameters[
+        "flush_cache"
+    ]
+    assert flush_cache.kind is inspect.Parameter.KEYWORD_ONLY
+    assert flush_cache.default is inspect.Parameter.empty
     assert (
         mooncake_load_weight_version(version=3, flush_cache=True, weight_version=None)
         == "3"

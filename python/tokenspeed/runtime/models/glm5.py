@@ -65,7 +65,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3MoE,
     get_layer_id,
 )
-from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _INDEXER_PREFILL_MAX_LOGITS_MB_ARG = "deepseek_v4_indexer_prefill_max_logits_mb"
@@ -1311,9 +1311,15 @@ def pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn) -> None:
         return
     n_pad = ((n + 127) // 128) * 128
     pad = weight.new_zeros(n_pad - n, weight.shape[1])
-    proj.weight = torch.nn.Parameter(
+    padded = torch.nn.Parameter(
         torch.cat([weight.data, pad], dim=0), requires_grad=False
     )
+    # Keep the attributes the quant method attached (``weight_loader``,
+    # ``input_dim`` / ``output_dim``, ...): a live weight update streams the
+    # q_a / kv_a shards into this parameter by row offset through
+    # ``weight_loader``, and the padding rows stay zero.
+    set_weight_attrs(padded, dict(vars(weight)))
+    proj.weight = padded
 
 
 class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):

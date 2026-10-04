@@ -185,8 +185,17 @@ Trainer-side contract:
   parameters assembled from several checkpoint tensors (the NextN drafts'
   `q_a_proj`/`kv_a_proj_with_mqa`, GLM's FP8 indexer `wk` weight and scale)
   may straddle chunks; an update that streams one half without the other is
-  rejected when the session ends. Models outside `BaseCausalLM` take no
-  session hooks. The distributed update uses the same session.
+  rejected when the session ends. The session also screens every chunk for
+  KV-cache scales other than one (KV caches are written and read at unit
+  scale): such an update is loaded to completion and then rejected, like the
+  distributed update's. Models outside `BaseCausalLM` take no session hooks.
+  The distributed update uses the same session.
+- A failed update (`success: false`) is not rolled back: the SDK may already
+  have rewritten part of the parameters on some ranks, so the engine may be
+  serving a mix of old and new weights, and replicas may disagree. The weight
+  version is not advanced. Re-issue the update (a successful retry streams
+  the whole checkpoint and restores consistency) or restart the engine before
+  resuming dispatch; the same holds for the distributed update.
 
 ## Scheduler And Memory
 
