@@ -259,8 +259,12 @@ last stage's final hidden states: the other stages build and load no draft
 model at all, and the NextN checkpoint must ship its `embed_tokens` weight
 because the target embedding lives on the first stage. `DFLASH` and `EAGLE3` read
 target taps from several stages and are rejected on a pipeline. Layerwise
-transfer (`--disaggregation-layerwise-interval`) works with both accepted
-algorithms on every stage.
+transfer (`--disaggregation-layerwise-interval`) is decided per stage: stages
+before the last own no draft cache and always allow it; the last stage allows
+it exactly when the same drafter would on a single-stage server, so an MTP
+drafter class that does not support layerwise finalization (the vanilla
+multi-layer `Mtp` drafter, e.g. Inkling NextN, as opposed to the EAGLE-style
+NextN drafts of Kimi K3 and DeepSeek V4) is still rejected at startup there.
 
 A block drafter writes its KV at the target's cache locations, so it shares the
 target's page table: `--block-size` is a target-side choice and the draft
