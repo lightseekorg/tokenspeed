@@ -137,6 +137,10 @@ class BaseCausalLM(nn.Module):
         Keyed by the placement's layer id. Every model that opts in to expert
         placement provides it; the processed parameters (quantized weights and
         scales included) are what moves, so nothing is re-derived.
+
+        One shape for every MoE model: a read-only property collecting each
+        MoE block's ``get_moe_routed_weights()``. It is never assigned (an
+        assignment to a setter-less property raises at load time).
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not expose its routed expert weights per "
