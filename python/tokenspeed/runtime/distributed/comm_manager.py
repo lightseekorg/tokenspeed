@@ -391,12 +391,18 @@ class CommManager:
     # An all-reduce layer holds every row of its attention DP group on each
     # attention-TP rank; an RSAG layer holds this rank's scattered share. The
     # two helpers below convert between the layouts for a model whose MLPs do
-    # not all follow one pattern (LongCat runs a MoE beside dense MLPs).
+    # not all follow one pattern (LongCat runs a MoE beside dense MLPs). On a
+    # sharded forward the rows a layer holds ARE the scattered share and no
+    # layer ever holds full rows, so both conversions are identity there; a
+    # model never branches on the shard for its row layout.
 
     def slice_scattered_rows(
         self, hidden_states: torch.Tensor, ctx: ForwardContext
     ) -> torch.Tensor:
-        """Keep this rank's scattered share of the full rows (no collective)."""
+        """Keep this rank's scattered share of the full rows (no collective);
+        identity on a sharded forward, whose rows are already the share."""
+        if self._shard(ctx) is not None:
+            return hidden_states
         token_list = self.attn_tp_group_scattered_num_tokens(ctx)
         if hidden_states.shape[0] != sum(token_list):
             raise RuntimeError(
@@ -410,7 +416,10 @@ class CommManager:
     def gather_scattered_rows(
         self, hidden_states: torch.Tensor, ctx: ForwardContext
     ) -> torch.Tensor:
-        """All-gather the scattered shares back into full rows."""
+        """All-gather the scattered shares back into full rows; identity on a
+        sharded forward, which never holds full rows."""
+        if self._shard(ctx) is not None:
+            return hidden_states
         token_list = self.attn_tp_group_scattered_num_tokens(ctx)
         if hidden_states.shape[0] != token_list[self.mapping.attn.tp_rank]:
             raise RuntimeError(

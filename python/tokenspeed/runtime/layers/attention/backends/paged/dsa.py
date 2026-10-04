@@ -1052,6 +1052,9 @@ class DSABackend(PagedAttentionBackend):
                 continue
             slots = topk_slots[rows]
             slots = torch.where(slots >= 0, slots - group.row_base, -1)
+            # This call mirrors the unsharded arm's: every kernel facade
+            # option the unsharded call passes (the slot-order selection
+            # included) must be passed here too.
             out[rows] = dsa_prefill(
                 q=q_view[rows],
                 kv_cache=kv_group,

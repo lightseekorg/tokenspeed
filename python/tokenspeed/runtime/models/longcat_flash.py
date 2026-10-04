@@ -903,7 +903,10 @@ class _RuntimeLongcatModel(nn.Module):
         if input_embeds is not None:
             hidden_states = input_embeds
         else:
-            hidden_states = self.embed_tokens(input_ids)
+            # Under query context parallelism the ids are this rank's shard;
+            # the embedding gathers them to the span for its vocab shards and
+            # reduce-scatters the rows back.
+            hidden_states = self.embed_tokens(input_ids, query_shard=ctx.query_shard)
 
         residual = None
         aux_hidden_states = [] if self.layers_to_capture else None

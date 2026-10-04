@@ -558,6 +558,44 @@ def token_all_gather(
     return backend.token_all_gather(tensor, group, scattered_num_tokens)
 
 
+def token_all_gather_rows(
+    rows: torch.Tensor,
+    group: Group,
+    scattered_num_tokens: list[int],
+    backend=None,
+) -> torch.Tensor:
+    """Token-aware all-gather of 2-D rows of any dtype, byte-preserving.
+
+    :func:`token_all_gather` moves bf16 rows (its low-latency solution
+    asserts the dtype); pure data movement -- gathered cache rows, packed
+    index-K bytes, fp32 scales, token ids -- has no dtype of its own, so
+    non-bf16 rows travel as bf16 pairs of their bytes and come back viewed
+    as the input dtype. The row byte width must be even.
+
+    Args:
+        rows: ``[local_rows, width]`` this rank's rows.
+        group: The gather group.
+        scattered_num_tokens: Rows every rank of the group contributes.
+
+    Returns:
+        ``[sum(scattered_num_tokens), width]`` rows in rank order, ``rows``'
+        dtype.
+    """
+    if rows.dim() != 2:
+        raise ValueError(f"token_all_gather_rows takes 2-D rows, got {rows.dim()}-D")
+    if rows.dtype == torch.bfloat16:
+        return token_all_gather(rows.contiguous(), group, scattered_num_tokens, backend)
+    row_bytes = rows.shape[1] * rows.element_size()
+    if row_bytes % 2:
+        raise ValueError(
+            f"rows of {row_bytes} bytes cannot travel as bf16 pairs; pad the row "
+            "to an even byte width"
+        )
+    payload = rows.contiguous().view(torch.uint8).view(torch.bfloat16)
+    gathered = token_all_gather(payload, group, scattered_num_tokens, backend)
+    return gathered.view(torch.uint8).view(rows.dtype)
+
+
 def token_reduce_scatter(
     tensor: torch.Tensor,
     group: Group,

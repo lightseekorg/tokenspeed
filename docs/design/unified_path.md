@@ -1372,7 +1372,14 @@ The contract a model (in tree or a plugin) implements:
   the sampled rows after a draft's narrowing); without one (decode steps,
   idle), the replicated all-reduce legs — which is why dense TP and the MoE
   TP×EP group must each be 1 or the attention TP width (`validate_qcp`, and
-  the manager refuses other mappings). Fusion off.
+  the manager refuses other mappings). The row-layout conversions
+  (`slice_scattered_rows`, `gather_scattered_rows`) are identity on a sharded
+  forward, whose rows are the scattered share already. Fusion off.
+* `VocabParallelEmbedding.forward(input_ids, query_shard=ctx.query_shard)`:
+  the ids a rank embeds are its shard, so the layer all-gathers the ids to
+  the span for its vocab shard, sums the shards and reduce-scatters the rows
+  back (the same bytes as the replicated all-reduce). A model passes the
+  shard explicitly; the default (`None`) is the replicated lookup.
 * `PagedAttention.latent_prologue(..., key_rows=QueryShardGather(ctx.query_shard,
   mapping.attn.qcp_group))` (through `DeepseekV3AttentionMLA.forward_absorb_qkv_proj`
   automatically): the prologue rotates the local rows without a cache

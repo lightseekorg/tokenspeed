@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from tokenspeed.runtime.distributed.comm_ops import token_all_gather
+from tokenspeed.runtime.distributed.comm_ops import token_all_gather_rows
 from tokenspeed.runtime.layers.attention.dcp.comm import gather_owned_rows
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
@@ -201,26 +201,6 @@ _SCATTER_DTYPES = frozenset(
 )
 
 
-def _as_bf16_rows(rows: torch.Tensor) -> torch.Tensor:
-    """View 2-D rows of any dtype as bf16 pairs of their bytes.
-
-    The token all-gather moves bf16 rows only (its low-latency solution
-    asserts the dtype), and a history gather is byte-preserving data movement
-    whatever the rows hold -- bf16 or fp8 latent, uint8 index-K bytes, fp32
-    scales -- so every payload travels as bf16 pairs and is viewed back by
-    the caller. Needs an even row byte width.
-    """
-    if rows.dtype == torch.bfloat16:
-        return rows
-    row_bytes = rows.shape[1] * rows.element_size()
-    if row_bytes % 2:
-        raise ValueError(
-            f"history rows of {row_bytes} bytes cannot travel as bf16 pairs; "
-            "pad the row to an even byte width"
-        )
-    return rows.contiguous().view(torch.uint8).view(torch.bfloat16)
-
-
 def gather_history_rows(
     plan: HistoryGatherPlan,
     local_rows: torch.Tensor,
@@ -233,9 +213,9 @@ def gather_history_rows(
     own cache plane, as 2-D rows); one all-gather with per-rank counts puts
     them rank-major, and the plan's order scatters them into position order.
     Pure data movement: a row's bytes are the owner's bytes wherever the
-    gather lands them, whatever their dtype (the collective moves the rows
-    as bf16 pairs of their bytes, see :func:`_as_bf16_rows`). Without page
-    sharding the rows are already local and only the scatter runs.
+    gather lands them, whatever their dtype (:func:`token_all_gather_rows`
+    moves them as bf16 pairs of their bytes). Without page sharding the rows
+    are already local and only the scatter runs.
 
     Args:
         plan: The group's gather plan.
@@ -270,11 +250,9 @@ def gather_history_rows(
     if len(plan.group) == 1:
         gathered = local_rows
     else:
-        gathered = token_all_gather(
-            _as_bf16_rows(local_rows), plan.group, list(plan.owned_rows_per_rank)
+        gathered = token_all_gather_rows(
+            local_rows, plan.group, list(plan.owned_rows_per_rank)
         )
-        if local_rows.dtype != torch.bfloat16:
-            gathered = gathered.view(torch.uint8).view(local_rows.dtype)
     target = out[:rows]
     if local_rows.dtype in _SCATTER_DTYPES:
         target.index_copy_(0, plan.order, gathered)

@@ -10,9 +10,11 @@ Verifies that with attn_tp ≠ dense_tp and uneven token counts, each rank
 recovers its original hidden states after the full cycle.
 
 The query-sharded layout (``CommManager(query_sharded=True)``) is covered on
-CPU over gloo at the end of this file: identity around attention, the MoE
-all-gather / reduce-scatter round trip over the shard's row table, the final
-gather off, and ``gather_sampled_rows`` with an idle rank.
+CPU over gloo at the end of this file: identity around attention on both the
+sharded and the replicated forward, the MoE all-gather / reduce-scatter round
+trip over the shard's row table, the final gather off, ``gather_sampled_rows``
+with an idle rank, and the vocab-parallel embedding's gather / reduce-scatter
+of a shard's ids.
 """
 
 import socket
@@ -460,6 +462,52 @@ def _qcp_main(rank: int, port: int) -> None:
             assert manager.pre_dense_comm(hidden, forward) is hidden
             out, _ = manager.post_dense_comm(hidden, hidden, forward)
             assert out is hidden
+    # Row-layout conversions (a model with MoE and dense MLPs on different
+    # patterns re-lays rows between them): identity on a sharded forward,
+    # whose rows are the scattered share already; the replicated forward's
+    # slice / gather round-trip stands.
+    assert dense.slice_scattered_rows(mine, ctx) is mine
+    assert dense.gather_scattered_rows(mine, ctx) is mine
+    share = dense.slice_scattered_rows(rows, plain)
+    assert share.shape[0] == [1, 1, 0, 0][rank]
+    torch.testing.assert_close(dense.gather_scattered_rows(share, plain), rows)
+
+    # The vocab-parallel embedding under a shard: every rank's ids are its
+    # own rows, so the lookup gathers the ids to the span for its vocab
+    # shard, sums the shards and reduce-scatters the rows back -- the same
+    # rows the replicated all-reduce lookup gives for the whole span.
+    from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    embedding = VocabParallelEmbedding(
+        num_embeddings=256,
+        embedding_dim=QCP_HIDDEN,
+        params_dtype=torch.bfloat16,
+        tp_rank=rank,
+        tp_size=QCP_WORLD,
+        tp_group=mapping.attn.tp_group,
+        padding_size=64,
+    )
+    shard_rows = embedding.weight.shape[0]
+    embedding.weight.data.copy_(
+        (
+            torch.arange(shard_rows, dtype=torch.float32).unsqueeze(1)
+            + 1000 * rank
+            + torch.arange(QCP_HIDDEN, dtype=torch.float32) / 16
+        ).to(torch.bfloat16)
+    )
+    torch.manual_seed(11)
+    ids = torch.randint(0, 256, (plan.total_rows,))  # the span, every rank
+    replicated = embedding(ids)  # the whole span through the all-reduce path
+    sharded = embedding(ids[plan.local_slice], query_shard=plan)
+    assert sharded.shape == (plan.local_rows, QCP_HIDDEN)
+    torch.testing.assert_close(sharded, replicated[plan.local_slice], rtol=0, atol=0)
+    with pytest.raises(ValueError, match="reduces its rows"):
+        embedding(ids[plan.local_slice], reduce_results=False, query_shard=plan)
+    with pytest.raises(ValueError, match="embeds"):
+        embedding(ids, query_shard=plan)
+
     # A dense or MoE group narrower than attention TP has no rows to gather
     # on the replicated forward, so the layout is refused.
     with pytest.raises(ValueError, match="1 or the attention TP width"):
