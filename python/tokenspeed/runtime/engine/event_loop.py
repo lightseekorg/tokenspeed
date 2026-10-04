@@ -98,7 +98,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
     get_zmq_socket,
 )
-from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict_update
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.jit_compile_check import (
     install_jit_compile_check,
@@ -640,6 +640,11 @@ class EventLoop:
 
     @startup_phase("distributed.init")
     def _init_distributed(self) -> float:
+        # The communication backend reads the resolved launch (node spans,
+        # RS/AG buffer capacity, the collective switches) from this dict, and
+        # the distributed init already probes it; publish before probing. The
+        # model runner republishes after its own resolution.
+        global_server_args_dict_update(self.server_args)
         max_num_input_tokens = (
             self.server_args.chunked_prefill_size
             if self.server_args.chunked_prefill_size > 0

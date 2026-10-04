@@ -52,21 +52,36 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │                                   missing implementation fails at startup
 │                                   instead of silently falling back
 ├── collectives.deterministic       one association order per reduction
-│   ├── force_deterministic_rsag    NCCL instead of symmetric-memory paths
 │   ├── no fused AR+norm            enable_allreduce_fusion=False (the fused
 │   │                               kernels make no bitwise claim)
 │   ├── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
 │   │   NCCL_PROTO=Simple           size changes association order
-│   └── batch_invariant_collectives all-reduce = all-gather + fixed-rank-order
-│                                   fp32 fold, reduce-scatter (plain and
-│                                   token) = all-to-all + the same fold; a
-│                                   ring reduction chunks by message size, so
-│                                   its per-element order is run-stable but
-│                                   not batch-size-invariant (all-reduce pays
-│                                   world_size x traffic, reduce-scatter
-│                                   none; the NVLS multimem in-switch
-│                                   reduction is the faster future citizen of
-│                                   this slot)
+│   ├── batch_invariant_collectives AutoBackend.route, one decision for every
+│   │                               collective: a 2-D bf16 all-reduce on a
+│   │                               multicast-reachable group the startup
+│   │                               self-check verified is the NVLS in-switch
+│   │                               reduction issued by one fixed rank
+│   │                               (section below); every other
+│   │                               reduction is NCCL data movement plus a
+│   │                               fixed-rank-order fp32 fold (all-reduce =
+│   │                               all-gather + fold at world_size x traffic,
+│   │                               reduce-scatter = all-to-all + fold at no
+│   │                               extra traffic). A ring reduction chunks
+│   │                               by message size, so its per-element order
+│   │                               is run-stable but not batch-size-
+│   │                               invariant. Gathers move data and keep the
+│   │                               multicast kernels. The route reads only
+│   │                               static properties of the call site (group,
+│   │                               dtype, rank, width), never the row count,
+│   │                               so a site cannot change route with the
+│   │                               batch; a payload past the switch buffer
+│   │                               raises rather than reroutes
+│   └── force_deterministic_rsag    the user's "NCCL and the fold only" knob:
+│                                   no symmetric-memory path at all (multicast
+│                                   gathers, in-switch reduction, the trtllm
+│                                   and Triton all-reduce tiers, distributed
+│                                   argmax). Not folded by the envelope,
+│                                   honoured first by every route
 ├── sampling.deterministic          sampling_stream=per-request: sampled rows
 │                                   draw from the Gumbel-max pool kernels,
 │                                   whose stream is keyed by the request's
@@ -191,6 +206,56 @@ by the engine alone: a model earns `rl-bitwise` in
 teacher-forced comparison against a trainer dump described under Acceptance.
 In-tree models do not declare it; the out-of-tree LongCat 2.0 plugin is the
 first candidate.
+
+## The in-switch reduction
+
+The NVLS `multimem.ld_reduce` sums the group's copies of a row in the
+switch (fp32 accumulate, one rounding to bf16) and is the batch-invariant
+all-reduce under `--batch-invariant-collectives`. What was measured on
+8xH20 (`tokenspeed-kernel/test/ops/test_communcation.py` keeps the
+assertions): for a fixed issuing rank the result is bitwise stable across
+repetitions with launch jitter and independent of how many rows ride along;
+but the association order **depends on which rank issues the load** — two
+issuers disagree on a few elements per 10^7 where the fp32 sum is
+ill-conditioned, each also disagreeing with the sequential rank-ordered fold
+on a few. That rules out the natural reduce-scatter in which each rank
+reduces its own slice: a row's issuer would move with the slicing — with the
+co-batched tokens under attention TP, with the request's DP placement under
+attention DP — and so would its bits.
+
+Hence the shape of the route. The all-reduce pins the issuer
+(`TritonRSAGBackend.multimem_all_reduce`: group rank 0 reduces every row
+and multicasts the sum back; the others only join the kernels' barriers), so
+the sum is one function of its inputs for the deployment's lifetime; the
+issuer's port carries the payload twice, still far under the fold's
+`world_size` x all-gather, at every size. A pinned-issuer reduce-scatter is
+the same two kernels plus a slice and gains nothing over the fold, whose
+all-to-all moves each byte once, so the reduce-scatters keep the fold.
+
+Nothing in software pins the switch's order, so a deployment verifies it
+before serving (`comm_backend/self_check.py`, run by the distributed
+initializer on the attention TP, dense TP and MoE TP-EP groups the route
+sends to the switch) with a payload built to be ill-conditioned on most
+elements (`multimem_probe_payload`: per element one rank holds `+B`, another
+`-B`, the rest values whose low bits fall below fp32's resolution at `B`),
+so that two orders disagree on about half of it rather than on a few per ten
+million. Three legs: the payload reduced eight times must come back bitwise
+identical and its first half must reproduce the first half's rows — a
+difference is a fault and refuses startup, naming the kind, the group and
+what differed, and `--force-deterministic-rsag` as the way to keep every
+reduction on the fold. The third leg asks whether the kind is *one
+function*: every group of a kind reduces the identical payload, and every
+rank must take the same route for the kind and every group must return the
+same bits, or a request's bits would depend on the replica serving it. The
+switch's order is a property of the GPU set — on 8xH20 the groups `{0..3}`
+and `{4..7}` reduce the probe to different bits on half of its elements,
+while groups of two cannot differ (two addends have one sum) — so this is a
+topology, not a fault: the self-check pins the kind's groups to the ordered
+fold (`AutoBackend.pin_ordered_fold`, the same decision on every rank) and
+logs it, and the route honours the pin. A deployment whose attention TP
+groups are several sets of three or more GPUs therefore keeps its attention
+all-reduce on the fold and its single MoE group on the switch; one TP group
+of everything, or TP-2 replicas, run the switch throughout.
 
 ## Kernel selection
 

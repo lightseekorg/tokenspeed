@@ -284,9 +284,13 @@ class K3AttnComm:
             allreduce_residual_attnres_combine_supported,
         )
 
-        return not global_server_args_dict.get(
+        # A symmetric-memory reduction in the kernel's own order: off under
+        # the NCCL-only knob and under the batch-invariant contract alike.
+        if global_server_args_dict.get(
             "force_deterministic_rsag", False
-        ) and allreduce_residual_attnres_combine_supported(
+        ) or global_server_args_dict.get("batch_invariant_collectives", False):
+            return False
+        return allreduce_residual_attnres_combine_supported(
             partial,
             residual,
             score_weight,

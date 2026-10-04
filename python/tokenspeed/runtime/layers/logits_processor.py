@@ -113,9 +113,24 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
 
 
 def _force_deterministic_rsag() -> bool:
+    """``--force-deterministic-rsag``: NCCL only, even for the pure-data-movement
+    multicast gather of the logits."""
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     return bool(global_server_args_dict.get("force_deterministic_rsag", False))
+
+
+def _dist_argmax_vetoed() -> bool:
+    """Whether the distributed argmax (a cross-rank reduction over symmetric
+    memory) stays off: under ``--force-deterministic-rsag`` like every
+    symmetric-memory path, and under the bitwise envelope, which was verified
+    with the gather plus the canonical local argmax and pins that form."""
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    return (
+        _force_deterministic_rsag()
+        or global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+    )
 
 
 @dataclasses.dataclass
@@ -491,7 +506,7 @@ class LogitsProcessor(nn.Module):
         return state
 
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
-        if _force_deterministic_rsag():
+        if _dist_argmax_vetoed():
             return None
         if not 2 <= self.tp_size <= 32:
             return None  # the kernel's cross-rank reduce is a single warp shuffle

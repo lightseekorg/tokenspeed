@@ -35,7 +35,14 @@ class TestNumericsMode(unittest.TestCase):
 
     def test_rl_bitwise_tightens_every_switch(self):
         args = ServerArgs(model="x", numerics="rl-bitwise")
-        self.assertTrue(args.force_deterministic_rsag)
+        # The envelope routes reductions itself (batch_invariant_collectives);
+        # the NCCL-only knob stays the user's.
+        self.assertFalse(args.force_deterministic_rsag)
+        self.assertTrue(
+            ServerArgs(
+                model="x", numerics="rl-bitwise", force_deterministic_rsag=True
+            ).force_deterministic_rsag
+        )
         self.assertTrue(args.disable_autotune)
         self.assertTrue(args.disable_tf32)
         self.assertTrue(args.disable_pdl)

@@ -1131,11 +1131,14 @@ class ServerArgs:
 
     def _resolve_rl_bitwise(self):
         """The rl-bitwise block: every envelope beyond auto runs it."""
-        # Collectives: rank-ordered NCCL instead of the symmetric-memory and
-        # trtllm fused paths, and the all-reduce becomes an all-gather with a
-        # fixed-rank-order fp32 fold: NCCL's ring chunks by message size, so
-        # a plain NCCL sum is run-stable but not batch-size-invariant.
-        self.force_deterministic_rsag = True
+        # Collectives: one association order per reduction. NCCL's ring
+        # chunks by message size, so a plain NCCL sum is run-stable but not
+        # batch-size-invariant; batch_invariant_collectives routes the
+        # all-reduce to the NVLS in-switch reduction with a fixed issuer where
+        # multicast reaches (verified bitwise at startup) and every other
+        # reduction to the rank-ordered fp32 fold (comm_backend/auto.py).
+        # force_deterministic_rsag stays the user's "NCCL and the fold only"
+        # knob; the envelope does not set it.
         self.batch_invariant_collectives = True
         self.enable_allreduce_fusion = False
         self.comm_fusion_max_num_tokens = -1
@@ -2834,16 +2837,26 @@ class ServerArgs:
         parser.add_argument(
             "--force-deterministic-rsag",
             action="store_true",
-            help="Use NCCL collectives instead of Triton symmetric-memory "
-            "all-reduce/gather/scatter.",
+            help="NCCL and the rank-ordered fold only: no symmetric-memory "
+            "path -- neither the Triton multicast all-gather/reduce-scatter "
+            "and in-switch all-reduce, nor the trtllm and Triton all-reduce "
+            "tiers, nor the distributed argmax. With --batch-invariant-collectives every "
+            "reduction takes the fold; without it, NCCL. Not folded in by "
+            "--numerics rl-bitwise, which keeps the multicast paths and "
+            "verifies the in-switch reduction at startup.",
         )
         parser.add_argument(
             "--batch-invariant-collectives",
             action="store_true",
-            help="Run every all-reduce as an all-gather plus a fixed-rank-order "
-            "fp32 fold. NCCL sums are run-stable but chunk by message size, so "
-            "they are not batch-size-invariant; the fold is. Costs world_size "
-            "times the all-reduce traffic. Folded in by --numerics rl-bitwise.",
+            help="One association order per reduction, independent of the "
+            "batch. A 2-D bf16 all-reduce on a multicast-reachable group runs "
+            "as the NVLS in-switch reduction issued by one fixed rank, "
+            "verified bitwise at startup; every other reduction (other "
+            "payloads, unreachable groups, the reduce-scatters) runs as NCCL "
+            "data movement plus a fixed-rank-order fp32 fold, which for an "
+            "all-reduce costs world_size times the traffic. NCCL sums are "
+            "run-stable but chunk by message size, so they are not "
+            "batch-size-invariant. Folded in by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--numerics",
@@ -2851,7 +2864,7 @@ class ServerArgs:
             choices=list(NUMERICS_ENVELOPES),
             default=ServerArgs.numerics,
             help="Numerics envelope. rl-bitwise folds the determinism "
-            "switches (deterministic collectives, no autotune/TF32/PDL, no "
+            "switches (batch-invariant collectives, no autotune/TF32/PDL, no "
             "fused all-reduce, the batch-invariant MoE leaves, per-request "
             "sampling) so outputs and logprobs are bitwise identical across "
             "runs and batch compositions within one deployment, and the "

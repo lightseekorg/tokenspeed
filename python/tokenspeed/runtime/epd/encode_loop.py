@@ -54,7 +54,7 @@ from tokenspeed.runtime.cache.embedding_cache import (
 from tokenspeed.runtime.epd.encode_scheduler import EncodeScheduler
 from tokenspeed.runtime.epd.encode_worker import EncodeWorker
 from tokenspeed.runtime.utils import get_colorful_logger, get_zmq_socket
-from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict_update
 from tokenspeed.runtime.utils.jit_compile_check import mark_jit_compile_serving
 
 logger = get_colorful_logger(__name__)
@@ -151,6 +151,9 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
         quantization=server_args.quantization,
         server_args=server_args,
     )
+    # The communication backend's probes read the resolved launch from this
+    # dict; publish before the distributed init runs them.
+    global_server_args_dict_update(server_args)
     DistributedInitializer.initialize(
         DistributedConfig.from_server_args(
             server_args=server_args,
