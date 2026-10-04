@@ -387,7 +387,7 @@ def test_the_index_k_history_is_one_gather_per_group(monkeypatch):
     assert fp8.data_ptr() == backend._history_workspace.index_k.data_ptr()
 
 
-def test_the_decode_arm_keeps_every_head_under_a_query_shard(monkeypatch):
+def _decode_arm_backend(*, num_attention_heads: int, attn_tp_size: int):
     backend = _backend(1, workspace_rows=0)
     backend.kernel_page_size = 64
     backend.dcp_group = (0, 1, 2, 3)
@@ -399,51 +399,84 @@ def test_the_decode_arm_keeps_every_head_under_a_query_shard(monkeypatch):
     backend.qk_rope_head_dim = 0
     backend.index_topk = 512
     backend.max_context_len = 512
+    backend.num_attention_heads = num_attention_heads
+    backend.num_local_heads = num_attention_heads // attn_tp_size
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
             num_extends=0, seq_lens_k=torch.tensor([128]), max_seq_len_k=128
         )
     )
-    query = torch.zeros(1, 2, 128, dtype=torch.bfloat16)
-    slots = torch.full((1, 512), -1, dtype=torch.int32)
-    slots[0, :4] = torch.tensor([64, 128, 192, 256])
-    pool = SimpleNamespace(
-        quant_method=None, get_key_buffer=lambda layer_id: torch.empty(320, 128)
-    )
-    layer = SimpleNamespace(
+    return backend
+
+
+def _decode_layer(heads: int):
+    return SimpleNamespace(
         layer_id=0,
-        tp_q_head_num=2,
+        tp_q_head_num=heads,
         head_dim=128,
         v_head_dim=128,
         scaling=0.1,
         logit_cap=0.0,
     )
 
+
+@pytest.mark.parametrize("layer_heads,keep_all_heads", [(8, True), (2, False)])
+def test_the_dcp_combine_form_follows_the_layers_head_layout(
+    monkeypatch, layer_heads, keep_all_heads
+):
+    """The decode arm's combine is decided by the layer's heads, not by the
+    mapping: a layer holding every head (head-replicated weights, a query
+    shard's drafter steps) keeps all heads -- no query-head gather, an
+    all-reduce combine; a layer holding the attention-TP slice gathers the
+    group's heads in and reduce-scatters its own back."""
+    backend = _decode_arm_backend(num_attention_heads=8, attn_tp_size=4)
+    query = torch.zeros(1, layer_heads, 128, dtype=torch.bfloat16)
+    slots = torch.full((1, 512), -1, dtype=torch.int32)
+    slots[0, :4] = torch.tensor([64, 128, 192, 256])
+    pool = SimpleNamespace(
+        quant_method=None, get_key_buffer=lambda layer_id: torch.empty(320, 128)
+    )
+    gathered = []
+
     def gather(q, group):
-        raise AssertionError("head-replicated attention gathers no query heads")
+        gathered.append(q.shape)
+        return q.repeat(1, len(group), 1)
 
     def decode(**kwargs):
         assert kwargs["return_lse"] is True
-        assert kwargs["q"].shape == (1, 2, 128)
-        return torch.full((1, 2, 128), 7.0), torch.zeros(1, 2)
+        heads = kwargs["q"].shape[1]
+        assert heads == (layer_heads if keep_all_heads else layer_heads * 4)
+        return torch.full((1, heads, 128), 7.0), torch.zeros(1, heads)
 
-    def combine(out, lse, *, group, rank, sink, keep_all_heads):
-        assert keep_all_heads is True and sink is None
+    def combine(out, lse, *, group, rank, sink, keep_all_heads=None):
+        assert keep_all_heads is keep_all_heads_expected and sink is None
         assert group == backend.dcp_group and rank == 1
-        return out
+        return out if keep_all_heads else out[:, :layer_heads]
 
+    keep_all_heads_expected = keep_all_heads
     monkeypatch.setattr(dsa, "gather_query_heads", gather)
     monkeypatch.setattr(dsa, "dsa_decode", decode)
     monkeypatch.setattr(dsa, "combine_attention_partials", combine)
     out = backend.forward_sparse_decode(
         q=query,
-        layer=layer,
+        layer=_decode_layer(layer_heads),
         token_to_kv_pool=pool,
         bs=1,
         topk_indices=slots,
         topk_lens=None,
     )
-    assert out.shape == (1, 256) and (out == 7).all()
+    assert out.shape == (1, layer_heads * 128) and (out == 7).all()
+    assert gathered == ([] if keep_all_heads else [(1, layer_heads, 128)])
+
+
+def test_a_layer_with_neither_head_layout_is_refused():
+    backend = _decode_arm_backend(num_attention_heads=8, attn_tp_size=4)
+    with pytest.raises(ValueError, match="neither the attention-TP slice"):
+        backend._layer_holds_every_head(_decode_layer(3))
+    # Without DCP the form is moot and the arm never asks.
+    backend.dcp_group = (1,)
+    backend.dcp_rank = 0
+    assert not (len(backend.dcp_group) > 1)
 
 
 def test_the_workspace_reservation_matches_the_recipe_plan():

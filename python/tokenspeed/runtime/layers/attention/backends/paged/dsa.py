@@ -199,6 +199,7 @@ class DSABackend(PagedAttentionBackend):
         self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
+        self.num_attention_heads = spec.num_attention_heads
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
         # rl-bitwise pins the sparse decode onto the batch-invariant no-split
         # leaves; without one registered, selection fails at the first decode
@@ -735,6 +736,23 @@ class DSABackend(PagedAttentionBackend):
     # Validation helpers
     # ------------------------------------------------------------------
 
+    def _layer_holds_every_head(self, layer) -> bool:
+        """Whether ``layer``'s query heads are the model's (head-replicated
+        attention weights, as under query context parallelism) or the
+        attention-TP slice. The DCP combine's form follows the layer, never a
+        mapping assumption: replicated heads attend every head over the owned
+        pages and all-reduce the weighted partials; sharded heads gather the
+        group's query heads in and reduce-scatter their own back out."""
+        heads = layer.tp_q_head_num
+        if heads == self.num_local_heads:
+            return False
+        if heads == self.num_attention_heads:
+            return True
+        raise ValueError(
+            f"DSA layer holds {heads} query heads, neither the attention-TP slice "
+            f"({self.num_local_heads}) nor every head ({self.num_attention_heads})"
+        )
+
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
         if logits_soft_cap and logits_soft_cap > 0:
             raise NotImplementedError(
@@ -947,10 +965,12 @@ class DSABackend(PagedAttentionBackend):
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         use_dcp = len(self.dcp_group) > 1
+        keep_all_heads = use_dcp and self._layer_holds_every_head(layer)
         if use_dcp:
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
             topk_slots = torch.where(owned, slots, -1)
-            q_view = gather_query_heads(q_view, self.dcp_group)
+            if not keep_all_heads:
+                q_view = gather_query_heads(q_view, self.dcp_group)
         out = dsa_prefill(
             q=q_view,
             kv_cache=kv_cache,
@@ -982,7 +1002,7 @@ class DSABackend(PagedAttentionBackend):
                 group=self.dcp_group,
                 rank=self.dcp_rank,
                 sink=None,
-                keep_all_heads=False,
+                keep_all_heads=keep_all_heads,
             )
         # GLM's sparse-prefill path writes both the latent KV and index_k before
         # entering this method, but bypasses the backend's forward and its
@@ -1159,12 +1179,12 @@ class DSABackend(PagedAttentionBackend):
             getattr(metadata, "max_seq_len_k", 0) or self.max_context_len
         )
         use_dcp = len(self.dcp_group) > 1
-        # Under query context parallelism the attention weights are
-        # head-replicated (every rank holds every head), so the decode arm --
-        # a query shard's drafter steps -- keeps all heads: no query-head
-        # gather in, an all-reduce of the weighted partials out. Head TP under
-        # QCP retires this and makes it the head-sharded arm.
-        keep_all_heads = len(self.qcp_group) > 1
+        # The combine's form follows the layer's head layout: a layer holding
+        # every head (head-replicated attention weights, as a query shard's
+        # drafter steps have) keeps all heads -- no query-head gather in, an
+        # all-reduce of the weighted partials out; a layer holding the TP
+        # slice gathers heads in and reduce-scatters them back.
+        keep_all_heads = use_dcp and self._layer_holds_every_head(layer)
         topk_slots = topk_indices.view(num_tokens, -1)
         if use_dcp:
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))

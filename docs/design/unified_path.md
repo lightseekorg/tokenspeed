@@ -1410,8 +1410,11 @@ The contract a model (in tree or a plugin) implements:
   selected. The history gathers move any row dtype (packed uint8 index-K
   rows, fp32 scales) as bf16 pairs of their bytes, since the token
   all-gather's low-latency solution is bf16-only. The decode arm (the
-  drafter's steps) keeps the DCP combine with `keep_all_heads=True` while
-  the attention weights are head-replicated.
+  drafter's steps) keeps the DCP combine; its form follows the layer's head
+  count against the attention config (`keep_all_heads` when
+  `layer.tp_q_head_num` is every head — head-replicated weights — the
+  gather-and-reduce-scatter form when it is the attention-TP slice; any other
+  count is refused), never a mapping assumption.
 * The model exit (`BaseCausalLM.exit_logits`, or `gather_sampled_rows` +
   `ctx.logits_rows_selected = True`) gathers only the sampled rows; a FULL
   hidden capture stays the shard. `ctx.gather_ids` keeps the batch's full

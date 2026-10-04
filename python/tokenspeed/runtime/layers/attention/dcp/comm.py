@@ -75,11 +75,13 @@ def combine_attention_partials(
         keep_all_heads: Required keyword. ``False`` is the head-sharded form:
             the query heads were gathered from every rank of the group and the
             weighted partials are reduce-scattered back so each rank keeps its
-            TP-local heads. ``True`` is the head-replicated form (a query
-            shard's drafter decode steps, whose attention weights are not
-            head-sharded): every rank attended all heads over its own pages
-            and the weighted partials are all-reduced, so every rank returns
-            every head; no sink yet.
+            TP-local heads. ``True`` is the head-replicated form (a layer
+            holding every head, as under query context parallelism): every
+            rank attended all heads over its own pages and the weighted
+            partials are all-reduced, so every rank returns every head; no
+            sink yet. Both forms share the weighting kernel, which splits the
+            heads by the group's degree, so ``heads % len(group) == 0`` holds
+            for either.
 
     Returns:
         Original-dtype output [tokens, heads, head_dim] -- the TP-local heads,

@@ -724,6 +724,10 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     backend.dcp_block_granularity = 64
     backend.dcp_virtual_block_count = 5
     backend.qcp_group = (0,)
+    # The layer holds the attention-TP slice (2 of 8 heads): the sharded-head
+    # combine form.
+    backend.num_attention_heads = 8
+    backend.num_local_heads = 2
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
             num_extends=0, seq_lens_k=torch.tensor([128]), max_seq_len_k=128
