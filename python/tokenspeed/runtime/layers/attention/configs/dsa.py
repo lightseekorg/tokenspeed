@@ -29,6 +29,9 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    DSA_SPARSE_PAGE_SIZE,
+)
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 _INDEX_K_FP8_GROUP_SIZE = 128
@@ -76,15 +79,46 @@ def index_k_row_bytes(index_head_dim: int, index_k_format: str) -> int:
     )
 
 
+def dsa_history_gather_workspace_rows(max_model_len: int, *, page_size: int) -> int:
+    """Rows of the query-context-parallel history gather workspace.
+
+    One request's whole history (``max_model_len`` rows), rounded up to whole
+    kernel pages: the sharded extend arm hands ``dsa_prefill`` each group's
+    gathered rows as a flat ``[slots, dim]`` cache, and the paged solutions
+    view such a buffer as ``[slots / page_size, page_size, dim]``, so the view
+    every solution takes must be a whole number of pages. The rows past a
+    group's history are never selected.
+
+    Args:
+        max_model_len: Longest history a request can have.
+        page_size: The DSA leaf's kernel page size.
+    """
+    if max_model_len <= 0:
+        raise ValueError("history workspace needs a positive max_model_len")
+    if page_size <= 0:
+        raise ValueError("history workspace needs a positive kernel page size")
+    return -(-int(max_model_len) // int(page_size)) * int(page_size)
+
+
+def dsa_history_gather_page_size(config: AttnConfig) -> int:
+    """The kernel page size the GPU DSA leaf runs at under ``config``: the
+    explicit override, else the sparse kernels' fixed page
+    (``DSABackend.resolve_kernel_page_size`` makes the same choice)."""
+    if config.kernel_page_size is not None:
+        return int(config.kernel_page_size)
+    return DSA_SPARSE_PAGE_SIZE
+
+
 def dsa_history_gather_workspace_bytes(
     config: AttnConfig, *, max_model_len: int
 ) -> int:
     """Bytes of the query-context-parallel history gather workspace.
 
-    One whole history (``max_model_len`` rows) of latent rows in the KV
-    cache dtype plus ``fp8_scaled`` index-K rows (FP8 keys with their fp32
-    scales, the one plane format the sharded extend arm gathers): the arm
-    gathers each request group's history into it, so a request's history
+    One whole history (``max_model_len`` rows, padded to kernel pages by
+    :func:`dsa_history_gather_workspace_rows`) of latent rows in the KV cache
+    dtype plus ``fp8_scaled`` index-K rows (FP8 keys with their fp32 scales,
+    the one plane format the sharded extend arm gathers): the arm gathers
+    each request group's history into it, so a request's history
     may never exceed the model length.
     """
     spec = config.component(DSAConfig)
@@ -95,12 +129,13 @@ def dsa_history_gather_workspace_bytes(
             "DSA query context parallelism gathers fp8_scaled index-K rows; got "
             f"index_k_format={spec.index_k_format!r}"
         )
-    if max_model_len <= 0:
-        raise ValueError("history workspace needs a positive max_model_len")
+    rows = dsa_history_gather_workspace_rows(
+        max_model_len, page_size=dsa_history_gather_page_size(config)
+    )
     kv_bytes = (
         spec.kv_cache_dim * torch.tensor([], dtype=config.kv_cache_dtype).element_size()
     )
-    return int(max_model_len) * (kv_bytes + dsa_index_k_row_bytes(spec.index_head_dim))
+    return rows * (kv_bytes + dsa_index_k_row_bytes(spec.index_head_dim))
 
 
 @dataclass(kw_only=True)

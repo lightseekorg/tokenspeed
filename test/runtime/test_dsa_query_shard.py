@@ -163,7 +163,7 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
 
 
 def test_a_history_over_the_workspace_is_refused_and_an_unsharded_init_clears():
-    backend = _backend(0, workspace_rows=5)
+    backend = _backend(0, workspace_rows=3)  # four rows once padded to pages
     with pytest.raises(RuntimeError, match="exceeds"):
         _init(backend, _plan(0))
     backend = _backend(0, workspace_rows=11)
@@ -274,10 +274,16 @@ def test_the_sharded_arm_attends_gathered_groups_with_full_heads(monkeypatch, ra
     for call, group in zip(calls, attended):
         rows = group.local_query
         assert call["return_lse"] is False
-        assert call["kv_cache"].shape == (group.rows, KV_DIM)
-        # The gathered buffer holds the group's history in position order.
+        # The buffer is a whole number of kernel pages (every dsa_prefill
+        # solution's flat view holds) holding the group's history in
+        # position order in its leading rows.
+        padded = -(-group.rows // PAGE) * PAGE
+        assert call["kv_cache"].shape == (padded, KV_DIM)
+        assert padded % PAGE == 0 and group.rows <= padded < group.rows + PAGE
         expected = plane[group.gather.virtual_slots, 0]
-        torch.testing.assert_close(call["kv_cache"], expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            call["kv_cache"][: group.rows], expected, rtol=0, atol=0
+        )
         # Top-k rows are re-based to the group's buffer, -1 stays -1.
         expected_slots = topk[rows].clone()
         expected_slots[:, 0] -= group.row_base
@@ -444,23 +450,33 @@ def test_the_decode_arm_keeps_every_head_under_a_query_shard(monkeypatch):
 
 def test_the_workspace_reservation_matches_the_recipe_plan():
     backend = _backend(0, workspace_rows=0)
-    rows = 37
-    allocated = backend.preallocate_history_gather_workspace(rows)
+    max_model_len = 37
+    allocated = backend.preallocate_history_gather_workspace(max_model_len)
     config = SimpleNamespace(
         kv_cache_dtype=torch.bfloat16,
+        kernel_page_size=PAGE,
         component=lambda cls: SimpleNamespace(
             kv_cache_dim=KV_DIM,
             index_head_dim=INDEX_HEAD_DIM,
             index_k_format="fp8_scaled",
         ),
     )
-    assert allocated == dsa_history_gather_workspace_bytes(config, max_model_len=rows)
+    assert allocated == dsa_history_gather_workspace_bytes(
+        config, max_model_len=max_model_len
+    )
+    # One whole history, padded to kernel pages.
+    rows = 38
     assert allocated == rows * (KV_DIM * 2 + dsa_index_k_row_bytes(INDEX_HEAD_DIM))
     assert backend._history_kv_workspace.shape == (rows, KV_DIM)
     assert backend._history_index_k_workspace.shape == (
         rows,
         dsa_index_k_row_bytes(INDEX_HEAD_DIM),
     )
+    # Without an override the plan follows the sparse kernels' fixed page.
+    config.kernel_page_size = None
+    assert dsa_history_gather_workspace_bytes(
+        config, max_model_len=max_model_len
+    ) == 64 * (KV_DIM * 2 + dsa_index_k_row_bytes(INDEX_HEAD_DIM))
 
 
 def test_build_prefill_slots_match_the_group_history():

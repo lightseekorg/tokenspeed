@@ -46,12 +46,12 @@ from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSuppor
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     DSAConfig,
+    dsa_history_gather_workspace_rows,
     dsa_index_k_row_bytes,
 )
 from tokenspeed.runtime.layers.attention.dcp.cache import (
     HistoryGatherPlan,
     gather_history_rows,
-    history_gather_workspace_rows,
     plan_history_gather,
 )
 from tokenspeed.runtime.layers.attention.dcp.comm import (
@@ -246,7 +246,9 @@ class DSABackend(PagedAttentionBackend):
         sizing the arena. Returns the bytes allocated so the caller can check
         them against the plan.
         """
-        rows = history_gather_workspace_rows(max_model_len)
+        rows = dsa_history_gather_workspace_rows(
+            max_model_len, page_size=self.kernel_page_size
+        )
         self._history_workspace_rows = rows
         self._history_kv_workspace = torch.empty(
             (rows, self.kv_cache_dim), dtype=self.data_type, device=self.device
@@ -665,16 +667,23 @@ class DSABackend(PagedAttentionBackend):
     def gather_history_kv(
         self, layer, token_to_kv_pool, group: QueryShardHistoryGroup
     ) -> torch.Tensor:
-        """Assemble one group's latent rows ``[rows, kv_cache_dim]`` in
-        position order (a view of the gather workspace, valid until the next
-        group's gather). A collective over the page owners: every rank calls
-        it for every group."""
+        """Assemble one group's latent rows in position order.
+
+        Returns a ``[pages * kernel_page_size, kv_cache_dim]`` view of the
+        gather workspace (valid until the next group's gather) whose leading
+        ``group.rows`` rows are the history: a whole number of kernel pages, so
+        every ``dsa_prefill`` solution's view of a flat ``[slots, dim]`` cache
+        holds, paged or not; the padding rows are never selected. A collective
+        over the page owners: every rank calls it for every group.
+        """
         if self._history_kv_workspace is None:
             raise RuntimeError("DSA history gather workspace is not allocated")
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_flat = kv_cache.reshape(-1, kv_cache.shape[-1])
         local = kv_flat.index_select(0, group.gather.local_fetch_slots)
-        return gather_history_rows(group.gather, local, out=self._history_kv_workspace)
+        gather_history_rows(group.gather, local, out=self._history_kv_workspace)
+        page = self.kernel_page_size
+        return self._history_kv_workspace[: -(-group.rows // page) * page]
 
     def gather_history_index_k(
         self, layer_id: int, token_to_kv_pool, group: QueryShardHistoryGroup

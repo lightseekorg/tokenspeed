@@ -1389,9 +1389,16 @@ The contract a model (in tree or a plugin) implements:
   `forward_sparse_prefill(topk_slots=<workspace rows>)` the local rows;
   the arm gathers every group's KV (`gather_history_kv`, a collective every
   rank joins even without rows in the group) and attends the local rows with
-  every head, `return_lse=False`, no combine. The decode arm (the drafter's
-  steps) keeps the DCP combine with `keep_all_heads=True` while the
-  attention weights are head-replicated.
+  every head, `return_lse=False`, no combine. The gathered buffer handed to
+  `dsa_prefill` as a flat `[slots, dim]` cache is a whole number of kernel
+  pages (the workspace rows are padded by
+  `dsa_history_gather_workspace_rows`), so the paged solutions' view of it
+  holds too and no solution is wrong at runtime; the padding rows are never
+  selected. The history gathers move any row dtype (packed uint8 index-K
+  rows, fp32 scales) as bf16 pairs of their bytes, since the token
+  all-gather's low-latency solution is bf16-only. The decode arm (the
+  drafter's steps) keeps the DCP combine with `keep_all_heads=True` while
+  the attention weights are head-replicated.
 * The model exit (`BaseCausalLM.exit_logits`, or `gather_sampled_rows` +
   `ctx.logits_rows_selected = True`) gathers only the sampled rows; a FULL
   hidden capture stays the shard. The drafter's step 0 reads the shard's

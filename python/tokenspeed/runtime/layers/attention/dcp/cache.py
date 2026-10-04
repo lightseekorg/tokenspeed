@@ -245,10 +245,3 @@ def gather_history_rows(
             0, plan.order, gathered.contiguous().view(torch.uint8)
         )
     return target
-
-
-def history_gather_workspace_rows(max_model_len: int) -> int:
-    """Rows the gathered-history workspace holds: one request's whole history."""
-    if max_model_len <= 0:
-        raise ValueError("history workspace needs a positive max_model_len")
-    return int(max_model_len)
