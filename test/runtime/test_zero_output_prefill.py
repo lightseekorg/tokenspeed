@@ -364,8 +364,10 @@ def test_zero_rows_return_before_lm_head_and_retain_empty_taps():
         capture_hidden_mode=SimpleNamespace(need_capture=lambda: True),
     )
     # No LM-head method exists on this object; reaching it fails the test.
+    # (A replicated head: LM-head TP peers under attention DP would still
+    # join the row exchange with no rows.)
     output = forward(
-        SimpleNamespace(config=SimpleNamespace(vocab_size=32)),
+        SimpleNamespace(config=SimpleNamespace(vocab_size=32), dp_lm_head_tp=False),
         torch.arange(4),
         torch.empty(0, 8),
         None,

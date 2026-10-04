@@ -816,6 +816,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         global_rank=0,
         autotune_cache_key=None,
         prefill_only=False,
+        decode_only_attention=False,
         disable_autotune=False,
         model_is_mrope=False,
         device=ib.device,

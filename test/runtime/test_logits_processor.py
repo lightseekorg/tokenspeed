@@ -543,6 +543,7 @@ def test_require_full_vocab_logits_turns_the_fused_draft_argmax_off(monkeypatch)
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
+        dp_lm_head_tp=False,
     )
     assert proc.do_argmax
     proc.require_full_vocab_logits()
@@ -734,7 +735,7 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
     hidden = torch.randn(6, 4, device=device)  # 4 prefill rows + 2 decode rows
     weight = torch.randn(vocab, 4, device=device)
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=vocab)
+        config=SimpleNamespace(model_type="test", vocab_size=vocab), dp_lm_head_tp=False
     )
     seen = []
     original = processor._get_logits
@@ -771,7 +772,9 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
 
 def test_input_logprobs_refuse_a_model_that_narrowed_its_logits_rows():
     device = _logprob_device()
-    processor = LogitsProcessor(config=SimpleNamespace(model_type="test", vocab_size=4))
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=4), dp_lm_head_tp=False
+    )
     lm_head = SimpleNamespace(weight=torch.randn(4, 2, device=device))
     rows = _input_logprob_rows(
         [0, 1], [1, 2], num_input_rows=3, chunk_tokens=8, device=device
@@ -827,6 +830,7 @@ def test_input_logprobs_bypass_the_sharded_argmax_shortcut(monkeypatch):
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
+        dp_lm_head_tp=False,
     )
     monkeypatch.setattr(proc, "_init_dist_argmax_state", lambda lm_head: object())
     monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: None)
@@ -877,6 +881,7 @@ def test_input_logprob_chunks_never_take_the_multicast_gather(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        dp_lm_head_tp=False,
     )
     multicast_state = object()
     monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: multicast_state)

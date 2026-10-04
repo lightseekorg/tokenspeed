@@ -353,8 +353,9 @@ class LogitsProcessor(nn.Module):
         can live with. A consumer that samples from the draft distribution
         (``--enable-speculative-sampling``) calls this once after construction
         and before the first forward; the ordinary vocab all-gather then runs
-        on every draft step. Under attention DP the head is replicated
-        (``skip_all_gather``) and the logits are full-vocab either way.
+        on every draft step. Under attention DP the logits are full-vocab
+        either way: the head is replicated (``skip_all_gather``), or
+        ``dp_lm_head_tp`` transposes the vocab shards back to each rank's rows.
         Returns None.
         """
         self.do_argmax = False
@@ -708,8 +709,20 @@ class LogitsProcessor(nn.Module):
             ValueError: The model narrowed its logits rows (``hidden_states``
                 does not cover every input row), so prompt rows have no
                 activations to read.
+            RuntimeError: The head is vocab-sharded over attention-DP ranks
+                (``dp_lm_head_tp``); admission refuses such requests
+                (``RequestHandler.supports_input_logprobs``), so reaching here
+                is a routing error.
         """
         plan = logits_metadata.input_logprob_rows
+        if self.dp_lm_head_tp:
+            # Each chunk's LM-head TP exchange needs every peer, and the peers
+            # hold different numbers of prompt rows (attention DP), so their
+            # chunk loops would not line up; refuse rather than hang.
+            raise RuntimeError(
+                "prompt logprobs are not supported with --lm-head-tp-size > 1 "
+                "under attention DP"
+            )
         if logits_metadata.logits_rows_selected or (
             hidden_states.shape[0] != plan.num_input_rows
         ):

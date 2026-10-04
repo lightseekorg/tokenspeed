@@ -172,6 +172,34 @@ class TestServerArgs:
         _, state = admit(plain, None)
         assert state.finished_reason is None
 
+    def test_lm_head_tp_under_dp_refuses_prompt_logprobs(self):
+        """The LM-head TP group exchanges its logits rows once per forward;
+        the prompt-logprob chunk loop would run that exchange a per-rank
+        number of times, so the engine aborts such requests at admission."""
+        from tokenspeed.runtime.engine.request_handler import RequestHandler
+
+        def admit(server_args, wants_input_logprobs):
+            handler = RequestHandler.__new__(RequestHandler)
+            mapping = server_args.mapping
+            handler.supports_input_logprobs = not (
+                mapping.attn.has_dp and mapping.lm_head.has_tp
+            )
+            state = SimpleNamespace(
+                wants_input_logprobs=wants_input_logprobs, finished_reason=None
+            )
+            RequestHandler._refuse_unsupported_input_logprobs(handler, state)
+            return state
+
+        sharded = ServerArgs(**DP8, lm_head_tp_size=8)
+        sharded.mapping.rank = 0
+        assert admit(sharded, False).finished_reason is None
+        state = admit(sharded, True)
+        assert state.finished_reason is not None
+        assert "lm-head-tp-size" in state.finished_reason.message
+        replicated = ServerArgs(**DP8)
+        replicated.mapping.rank = 0
+        assert admit(replicated, True).finished_reason is None
+
     def test_batch_invariant_rejects_unknown_selection(self):
         with pytest.raises(ValueError, match="tp-batch-invariant"):
             ServerArgs(
@@ -192,6 +220,9 @@ class TestServerArgs:
         """The envelope neither selects nor refuses a layout."""
         args = ServerArgs(
             **DP8,
+            # rl-bitwise folds the MoE routes in slot order, which needs MoE
+            # TP 1: the DP8 world runs its experts under EP.
+            ep_size=8,
             numerics="rl-bitwise",
             attn_head_tp_size=8,
             disaggregation_mode="decode",

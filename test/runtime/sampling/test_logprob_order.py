@@ -131,7 +131,8 @@ def _processor(order: str, monkeypatch, vocab_size: int = VOCAB) -> LogitsProces
     return LogitsProcessor(
         SimpleNamespace(
             model_type="test", vocab_size=vocab_size, final_logit_softcapping=None
-        )
+        ),
+        dp_lm_head_tp=False,
     )
 
 

@@ -329,6 +329,13 @@ class RequestHandler:
         self.max_new_tokens_budget: int | None = (
             RETRACTION_SAFE_STEPS if mapping.attn.has_head_tp else None
         )
+        # LM-head TP under attention DP exchanges the logits rows with the
+        # group once per forward (LogitsProcessor._lm_head_tp_row_counts); the
+        # prompt-logprob chunk loop would run that exchange a per-rank number
+        # of times, so this engine refuses requests asking for prompt logprobs.
+        self.supports_input_logprobs: bool = not (
+            mapping.attn.has_dp and mapping.lm_head.has_tp
+        )
         self.vocab_size = vocab_size
         self.clear_cache_fn = clear_cache_fn
         self.can_clear_cache_fn = can_clear_cache_fn
@@ -847,6 +854,7 @@ class RequestHandler:
                 ),
             )
 
+        self._refuse_unsupported_input_logprobs(req_state)
         self._apply_generation_budget(req_spec, req_state)
         return (
             req_spec,
@@ -857,6 +865,15 @@ class RequestHandler:
                 recv_req.bootstrap_room,
             ),
         )
+
+    def _refuse_unsupported_input_logprobs(self, req_state) -> None:
+        """Finish a request asking for prompt logprobs with an abort when this
+        engine's LM-head layout cannot compute them (``supports_input_logprobs``)."""
+        if req_state.wants_input_logprobs and not self.supports_input_logprobs:
+            req_state.finished_reason = FINISH_ABORT(
+                "Invalid request: prompt logprobs (logprob_start_len) are not "
+                "available with --lm-head-tp-size > 1 under attention DP"
+            )
 
     def _apply_generation_budget(self, req_spec, req_state) -> None:
         """Clamp ``max_new_tokens`` to the context; refuse what exceeds this

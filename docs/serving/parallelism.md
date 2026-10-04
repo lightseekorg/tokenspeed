@@ -139,7 +139,10 @@ or its logprob rows, a MIXED round, a model selecting its own logits rows --
 exchange the counts. A drafter sharing the target's head must build its own
 head on the same layout (the NextN, Eagle3-MLA and Llama-Eagle3 drafters do;
 the others are refused with a clear error). It cannot combine with
-`--dp-sampling`.
+`--dp-sampling`, and a request asking for prompt logprobs
+(`logprob_start_len`) is refused at admission: that path pushes the prompt
+rows through the LM head in per-request chunks, a per-rank number of row
+exchanges the group cannot agree on.
 
 `--tp-batch-invariant` replaces the two reduce-scatters of these layouts
 (after `o_proj`, after the dense `down_proj`) with column-parallel GEMMs on

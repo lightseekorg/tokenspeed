@@ -341,7 +341,9 @@ def _worker_lm_head(rank: int, rendezvous: str) -> None:
         with mock.patch.object(
             lp_module, "all_gather", wraps=lp_module.all_gather
         ) as ag:
-            logits = processor._get_logits(own, lm_head, decode)
+            logits = processor._get_logits(
+                own, lm_head, decode, require_full_vocab=False
+            )
             assert ag.call_count == 0
         assert tuple(logits.shape) == (ROW_COUNTS[rank], vocab)
         torch.testing.assert_close(logits, expected, atol=1e-5, rtol=1e-5)
@@ -351,7 +353,9 @@ def _worker_lm_head(rank: int, rendezvous: str) -> None:
         narrowed = LogitsMetadata.from_forward_context(
             replace(_ctx(SimpleNamespace(), rank), collective_global_num_tokens=live)
         )
-        logits = processor._get_logits(own[: live[rank]], lm_head, narrowed)
+        logits = processor._get_logits(
+            own[: live[rank]], lm_head, narrowed, require_full_vocab=False
+        )
         torch.testing.assert_close(logits, expected[: live[rank]], atol=1e-5, rtol=1e-5)
 
         # A shape with no table (not every rank decodes) exchanges the counts.
@@ -359,7 +363,9 @@ def _worker_lm_head(rank: int, rendezvous: str) -> None:
         with mock.patch.object(
             lp_module, "all_gather", wraps=lp_module.all_gather
         ) as ag:
-            logits = processor._get_logits(own, lm_head, mixed)
+            logits = processor._get_logits(
+                own, lm_head, mixed, require_full_vocab=False
+            )
             assert ag.call_count == 1
         torch.testing.assert_close(logits, expected, atol=1e-5, rtol=1e-5)
 

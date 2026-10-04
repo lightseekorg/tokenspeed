@@ -72,7 +72,13 @@ def _manager(
             tp_ep_group=tuple(range(tp_ep_size)),
         ),
     )
-    return CommManager(mapping=mapping, layer_id=0, is_moe=True, prev_is_moe=False)
+    return CommManager(
+        mapping=mapping,
+        layer_id=0,
+        is_moe=True,
+        prev_is_moe=False,
+        dense_batch_invariant=False,
+    )
 
 
 def _forbid_collectives(monkeypatch):

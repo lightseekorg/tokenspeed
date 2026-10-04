@@ -68,6 +68,7 @@ def _manager(mode: str, monkeypatch, norm: StubNorm) -> CommManager:
         layer_id=0,
         is_moe=False,
         prev_is_moe=False,
+        dense_batch_invariant=False,
         input_layernorm=norm,
         post_attn_layernorm=norm,
     )
@@ -161,6 +162,10 @@ def test_unfused_vetoes_the_fused_all_reduce_norm_where_it_is_relied_upon(
         monkeypatch.setitem(global_server_args_dict, "layer_boundary_norm", mode)
         monkeypatch.setitem(global_server_args_dict, "enable_allreduce_fusion", True)
         manager = CommManager(
-            mapping=mapping, layer_id=1, is_moe=False, prev_is_moe=False
+            mapping=mapping,
+            layer_id=1,
+            is_moe=False,
+            prev_is_moe=False,
+            dense_batch_invariant=False,
         )
         assert manager.should_fuse(4) is fuses, mode

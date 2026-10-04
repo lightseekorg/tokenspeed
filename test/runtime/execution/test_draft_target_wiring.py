@@ -75,6 +75,15 @@ def _target_runner(model, mapping=None) -> SimpleNamespace:
     )
 
 
+def _head_layout(**overrides) -> SimpleNamespace:
+    """The LM-head layout the factory compares between a target and the draft
+    sharing its head (``_check_shared_head_layout``): the logits processor's
+    group, width and attention-DP flag. Default: one replicated head."""
+    layout = dict(tp_group=None, tp_size=1, dp_lm_head_tp=False)
+    layout.update(overrides)
+    return SimpleNamespace(**layout)
+
+
 def test_get_drafter_impl_routing():
     from tokenspeed.runtime.models.deepseek_v4_dspark import (
         DeepseekV4ForCausalLMDSpark,
@@ -132,6 +141,7 @@ def test_wire_eagle3_shares_embed_head_and_installs_capture_ids():
     target, draft = mock.MagicMock(), mock.MagicMock()
     target.mapping = _mapping()
     target.model.get_embed_and_head.return_value = ("EMBED", "HEAD")
+    target.model.logits_processor = draft.model.logits_processor = _head_layout()
     draft.model_config.hf_config = {
         "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}
     }
@@ -155,6 +165,7 @@ class _ModuleSharingDraft:
         self.shared = None
         self.legacy = None
         self.embedding = "CHECKPOINT_EMBED"
+        self.logits_processor = _head_layout()
 
     def set_embed_and_head_module(self, embed, lm_head):
         self.shared = (embed, lm_head)
@@ -174,6 +185,7 @@ class _WeightSharingDraft:
     def __init__(self):
         self.shared = None
         self.embedding = "CHECKPOINT_EMBED"
+        self.logits_processor = _head_layout()
 
     def set_embed_and_head(self, embed, head):
         self.shared = (embed, head)
@@ -189,6 +201,7 @@ class _EmbedDroppingDraft:
 
     def __init__(self):
         self.embedding = "CHECKPOINT_EMBED"
+        self.logits_processor = _head_layout()
 
     def set_embed_and_head(self, embed, head):
         self.embedding = embed
@@ -203,6 +216,7 @@ def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
         SimpleNamespace(
             lm_head=lm_head,
             get_embed_and_head=lambda: ("EMBED", "HEAD_WEIGHT"),
+            logits_processor=_head_layout(),
         )
     )
     draft_model = _ModuleSharingDraft()
@@ -217,7 +231,10 @@ def test_wire_mtp_shares_complete_lm_head_for_opted_in_draft():
 
 def test_wire_mtp_module_sharing_requires_target_lm_head():
     target = _target_runner(
-        SimpleNamespace(get_embed_and_head=lambda: ("EMBED", "HEAD_WEIGHT"))
+        SimpleNamespace(
+            get_embed_and_head=lambda: ("EMBED", "HEAD_WEIGHT"),
+            logits_processor=_head_layout(),
+        )
     )
     draft = _draft_runner(_ModuleSharingDraft())
 
@@ -235,13 +252,38 @@ def test_wire_off_pipeline_requires_both_target_weights():
         ("EMBED", None, "lm_head weight"),
     ):
         target = _target_runner(
-            SimpleNamespace(get_embed_and_head=lambda e=embed, h=head: (e, h))
+            SimpleNamespace(
+                get_embed_and_head=lambda e=embed, h=head: (e, h),
+                logits_processor=_head_layout(),
+            )
         )
         with (
             mock.patch.object(factory, "get_drafter_impl", return_value=Eagle),
             pytest.raises(ValueError, match=message),
         ):
             factory.configure_draft_target(_server_args("MTP"), target, draft)
+
+
+def test_wire_rejects_a_draft_head_in_another_layout():
+    # The target vocab-shards its head over the LM-head TP group under
+    # attention DP (--lm-head-tp-size); a draft that built a replicated head
+    # would take the shard as the whole vocab, so the factory refuses the
+    # share before anything is bound.
+    target = _target_runner(
+        SimpleNamespace(
+            get_embed_and_head=mock.Mock(side_effect=AssertionError("bound")),
+            logits_processor=_head_layout(
+                tp_group=(0, 1), tp_size=2, dp_lm_head_tp=True
+            ),
+        )
+    )
+    with (
+        mock.patch.object(factory, "get_drafter_impl", return_value=Eagle),
+        pytest.raises(ValueError, match="--lm-head-tp-size"),
+    ):
+        factory.configure_draft_target(
+            _server_args("MTP"), target, _draft_runner(_WeightSharingDraft())
+        )
 
 
 @pytest.mark.parametrize("drafter_cls", [Eagle, Mtp])
@@ -266,7 +308,9 @@ def _last_stage_target(lm_head):
     """The last stage reports the target head but no embedding."""
     return _target_runner(
         SimpleNamespace(
-            lm_head=lm_head, get_embed_and_head=lambda: (None, "HEAD_WEIGHT")
+            lm_head=lm_head,
+            get_embed_and_head=lambda: (None, "HEAD_WEIGHT"),
+            logits_processor=_head_layout(),
         ),
         _mapping(has_pp=True, is_last_pp_rank=True),
     )
@@ -320,7 +364,12 @@ def test_wire_last_pipeline_stage_rejects_a_draft_that_reports_no_embedding():
         factory.configure_draft_target(
             _server_args("MTP"),
             _last_stage_target(object()),
-            _draft_runner(SimpleNamespace(set_embed_and_head=lambda e, h: None)),
+            _draft_runner(
+                SimpleNamespace(
+                    set_embed_and_head=lambda e, h: None,
+                    logits_processor=_head_layout(),
+                )
+            ),
         )
 
 
@@ -420,6 +469,7 @@ def test_wire_eagle3_explicit_capture_ids_override_checkpoint():
     target, draft = mock.MagicMock(), mock.MagicMock()
     target.mapping = _mapping()
     target.model.get_embed_and_head.return_value = ("E", "H")
+    target.model.logits_processor = draft.model.logits_processor = _head_layout()
     draft.model_config.hf_config = {
         "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}
     }

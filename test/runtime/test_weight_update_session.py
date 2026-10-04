@@ -440,7 +440,11 @@ def nextn() -> DeepseekV3ForCausalLMNextN:
         vocab_size=16,
     )
     attn = SimpleNamespace(has_dp=True, tp_rank=0, tp_size=1, tp_group=None)
-    mapping = SimpleNamespace(attn=attn, moe=SimpleNamespace(ep_rank=0, ep_size=1))
+    # Attention DP with the default replicated LM head (no --lm-head-tp-size).
+    lm_head = SimpleNamespace(has_tp=False, tp_rank=0, tp_size=1, tp_group=None)
+    mapping = SimpleNamespace(
+        attn=attn, lm_head=lm_head, moe=SimpleNamespace(ep_rank=0, ep_size=1)
+    )
     with mock.patch.object(deepseek_nextn, "DeepseekModelNextN", _DraftModel):
         return DeepseekV3ForCausalLMNextN(config, mapping, None)
 
