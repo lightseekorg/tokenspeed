@@ -311,5 +311,79 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             self.assertFalse(self.handler.profile_in_progress)
 
 
+class TestRequestHandlerExpertLoadProfile(unittest.TestCase):
+    """EXPERT_LOAD zeroes the routing load counters at start and dumps at stop."""
+
+    def setUp(self):
+        self.output_dir = tempfile.mkdtemp()
+        self.device = mock.Mock()
+        self.device.dump_expert_load.return_value = {
+            "physical_count": torch.tensor([[3, 1], [2, 2]]),
+            "ep_rank": 0,
+        }
+        self.handler = _make_handler(_attn_mapping(tp_rank=2))
+        self.handler._device = self.device
+        self.handler.attn_tp_size = 1
+        recording = mock.patch.object(
+            request_handler_mod, "expert_load_recording_enabled", return_value=True
+        )
+        recording.start()
+        self.addCleanup(recording.stop)
+
+    def _start(self, **kwargs) -> ProfileReq:
+        return ProfileReq(
+            type=ProfileReqType.START_PROFILE,
+            output_dir=self.output_dir,
+            activities=["EXPERT_LOAD"],
+            profile_id="load",
+            **kwargs,
+        )
+
+    def test_start_resets_and_stop_dumps_per_rank_record(self):
+        result = self.handler.profile(self._start())
+        self.assertTrue(result.success)
+        self.device.reset_expert_load.assert_called_once_with()
+        self.device.dump_expert_load.assert_not_called()
+
+        result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+        self.assertTrue(result.success)
+        self.device.dump_expert_load.assert_called_once_with(
+            f"{self.output_dir}/load-TP2.expert-load.pt"
+        )
+        self.assertFalse(self.handler.profile_in_progress)
+
+    def test_stage_profiles_dump_one_record_per_stage(self):
+        result = self.handler.profile(self._start(profile_by_stage=True, num_steps=1))
+        self.assertTrue(result.success)
+        self.handler._profile_batch_predicate(ForwardMode.EXTEND)
+        self.handler._profile_batch_predicate(ForwardMode.EXTEND)
+        self.handler._profile_batch_predicate(ForwardMode.DECODE)
+        self.handler._profile_batch_predicate(ForwardMode.DECODE)
+        dumped = [call.args[0] for call in self.device.dump_expert_load.call_args_list]
+        self.assertEqual(
+            dumped,
+            [
+                f"{self.output_dir}/load-TP2-EXTEND.expert-load.pt",
+                f"{self.output_dir}/load-TP2-DECODE.expert-load.pt",
+            ],
+        )
+        self.assertEqual(self.device.reset_expert_load.call_count, 2)
+
+    def test_init_refuses_without_recording_or_device(self):
+        with mock.patch.object(
+            request_handler_mod, "expert_load_recording_enabled", return_value=False
+        ):
+            result = self.handler.profile(self._start())
+        self.assertFalse(result.success)
+        self.assertIn("--expert-distribution-recorder-mode stat", result.message)
+        self.assertFalse(self.handler.profile_in_progress)
+        self.device.reset_expert_load.assert_not_called()
+
+        self.handler._device = None
+        result = self.handler.profile(self._start())
+        self.assertFalse(result.success)
+        self.assertIn("device handle", result.message)
+
+
 if __name__ == "__main__":
     unittest.main()

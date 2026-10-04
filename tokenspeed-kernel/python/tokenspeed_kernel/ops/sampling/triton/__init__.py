@@ -38,6 +38,7 @@ from .generic import gumbel_sample_from_pools_generic
 from .gumbel import (
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
+    gumbel_scratch_shape,
 )
 from .logprobs import selected_token_logprobs
 from .min_p import (
@@ -60,6 +61,7 @@ __all__ = [
     "gather_and_expand_scalars",
     "gumbel_sample_from_pools",
     "gumbel_sample_from_pools_compact",
+    "gumbel_scratch_shape",
     "gumbel_sample_min_p_from_pools",
     "gumbel_sample_min_p_from_pools_parallel",
     "gumbel_sample_from_pools_generic",

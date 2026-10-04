@@ -87,6 +87,7 @@ POOL = 8  # max_req_pool_size → pool_rows == POOL + 1
 
 def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        enable_speculative_sampling=False,
         max_bs=4,
         max_draft_tokens_per_req=4,
         max_req_pool_size=POOL,
@@ -517,6 +518,7 @@ class TestTritonRouteSelection(unittest.TestCase):
         bs, n, vocab = 32, 4, 32768
         backend = TritonSamplingBackend(
             SamplingBackendConfig(
+                enable_speculative_sampling=False,
                 max_bs=bs,
                 max_draft_tokens_per_req=n,
                 max_req_pool_size=POOL + bs,
@@ -599,6 +601,7 @@ class TestTritonRouteSelection(unittest.TestCase):
         bs, n, vocab = 32, 4, 200064
         backend = TritonSamplingBackend(
             SamplingBackendConfig(
+                enable_speculative_sampling=False,
                 max_bs=bs,
                 max_draft_tokens_per_req=n,
                 max_req_pool_size=POOL + bs,

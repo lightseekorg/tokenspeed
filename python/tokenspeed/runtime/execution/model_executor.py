@@ -307,6 +307,11 @@ class ModelExecutorConfig:
     # ``[rows, vocab]`` logits; log-softmax is row-local so the value never
     # changes a result.
     input_logprob_chunk_tokens: int
+    # Draft-prob rejection sampling: the drafter records its per-step
+    # proposal distributions in RuntimeStates.draft_probs and verify accepts
+    # with coin * q(x) < p(x) (see --enable-speculative-sampling). Selects
+    # the verify rule, so it is explicit.
+    enable_speculative_sampling: bool
     enable_nan_detection: bool = False
     disable_autotune: bool = False
     enable_cudagraph_gc: bool = False
@@ -326,6 +331,9 @@ class ModelExecutorConfig:
     spec_num_steps: int | None = None
     # Verify window width: spec_num_steps + 1 for a chain, the tree's node budget otherwise.
     spec_num_tokens: int | None = None
+    # Recorded draft probabilities above this value mark a slot with no
+    # proposal (always reject); only read under enable_speculative_sampling.
+    spec_reject_draft_prob_threshold: float = 2.0
     overlap_schedule_depth: int = 0
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
@@ -427,6 +435,8 @@ class ModelExecutorConfig:
             spec_algo=server_args.speculative_algorithm,
             spec_num_steps=server_args.speculative_num_steps,
             spec_num_tokens=server_args.speculative_num_draft_tokens,
+            enable_speculative_sampling=server_args.enable_speculative_sampling,
+            spec_reject_draft_prob_threshold=server_args.spec_reject_draft_prob_threshold,
             spec_topk=(
                 server_args.speculative_eagle_topk
                 if server_args.speculative_algorithm
@@ -511,6 +521,16 @@ class ModelExecutor:
             if model_runner.model_config.requires_request_token_history
             else 0
         )
+        if config.enable_speculative_sampling:
+            if config.spec_algo is None:
+                raise ValueError(
+                    "enable_speculative_sampling needs a speculative drafter to "
+                    "record proposal distributions for"
+                )
+            self.runtime_states.init_draft_probs(
+                spec_num_tokens=spec_num_tokens,
+                reject_threshold=config.spec_reject_draft_prob_threshold,
+            )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -542,6 +562,10 @@ class ModelExecutor:
                 vocab_size=config.vocab_size,
             )
             self.drafter.wire_target(self.model_runner.model)
+            # Draft-prob sampling reads the request's temperature / top-k /
+            # seed from the verifier's pool buffers: one owner of per-request
+            # sampling state.
+            self.drafter.bind_sampling_backend(self.sampling_backend)
             MultimodalRuntime.wire_drafter(
                 self.input_buffers, self.model_runner.model_config
             )
@@ -1094,6 +1118,16 @@ class ModelExecutor:
             pp_send(tensor, self.config.pp_rank + 1, self.config.pp_group)
 
     @property
+    def draft_model_runner(self) -> ModelRunner | None:
+        """The speculative draft's runner, or None without speculation.
+
+        Present on every pipeline stage that loaded draft weights, including
+        stages whose ``drafter`` is None (the draft only proposes on the last
+        stage). Live weight updates read it to refresh the draft in place.
+        """
+        return self._draft_model_runner
+
+    @property
     def _pp_is_last_stage(self) -> bool:
         return self.config.pp_rank == self.config.pp_size - 1
 
@@ -1509,6 +1543,7 @@ class ModelExecutor:
         return SamplingBatchInfo(
             req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
             valid_cache_lengths=self.runtime_states.valid_cache_lengths,
+            draft_probs=self.runtime_states.draft_probs,
             vocab_size=self.runtime_states.vocab_size,
             device=self.device,
         )

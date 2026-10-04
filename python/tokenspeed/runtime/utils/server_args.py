@@ -36,6 +36,10 @@ from tokenspeed.runtime.configs.numerics import (
     RL_BITWISE_SAMPLING_BACKENDS,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
+from tokenspeed.runtime.moe.dispatch_algorithm import (
+    EP_DISPATCH_ALGORITHMS,
+    STATIC_EP_DISPATCH_ALGORITHMS,
+)
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
     get_colorful_logger,
@@ -54,6 +58,20 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 logger = get_colorful_logger(__name__)
 
 ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
+
+# Sampling backends whose verify runs the draft-prob chain kernel
+# (--enable-speculative-sampling). greedy verifies by exact match and the
+# Triton backends by target-sampled exact match; the drafter's recorded
+# distribution never enters either.
+SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full"})
+
+# Usable range of --spec-reject-draft-prob-threshold. The sentinel rows are
+# written as threshold + 1.0 in fp32 and detected by ``draft_prob > threshold``:
+# below 1.0 a real probability would read as the sentinel, and from 2**24 on
+# fp32 (24 significand bits, ulp 2.0 there) can no longer resolve the + 1.0;
+# 2**20 leaves a wide margin, and nothing is gained from a larger sentinel.
+SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN = 1.0
+SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX = float(1 << 20)
 
 # Spec-decode overshoot spans the physical KV extent must absorb past the
 # logical context_len. The overlap scheduler steps a finished request at most
@@ -77,6 +95,20 @@ _SPEC_OVERSHOOT_SPANS = 3
 # carries them through the stage boundary. See
 # ServerArgs.resolve_disaggregation.
 PIPELINE_SPEC_ALGORITHMS = ("DSPARK", "MTP")
+
+
+def expert_placement_requested(server_args) -> bool:
+    """Whether serving needs an expert placement beyond the trivial identity.
+
+    Redundant experts, a non-trivial initial location and load recording all
+    need the placement tables (``moe/expert_location.py``); plain EP serving
+    does not and keeps its routing untouched.
+    """
+    return (
+        server_args.ep_num_redundant_experts > 0
+        or server_args.init_expert_location != "trivial"
+        or server_args.expert_distribution_recorder_mode is not None
+    )
 
 
 def str_to_bool(value: str | bool) -> bool:
@@ -103,6 +135,25 @@ def _nonempty_str(value: str) -> str:
     if not value.strip():
         raise argparse.ArgumentTypeError("value must be a non-empty string")
     return value
+
+
+def validate_dcp_disaggregation_role(
+    *, has_dcp: bool, disaggregation_mode: str
+) -> None:
+    """Reject DCP on PD roles whose transfer path cannot shard pages yet.
+
+    An aggregated engine and the prefill role may shard: the prefill sender
+    copies only the pages each rank owns and every rank of the DCP subgroup
+    serves every decode rank. The decode role receives into an unsharded
+    cache only -- no receive path lands a block on its owner alone -- and the
+    encode role has no KV cache to shard.
+    """
+    if has_dcp and disaggregation_mode not in ("null", "prefill"):
+        raise ValueError(
+            "--decode-context-parallel-size > 1 requires --disaggregation-mode "
+            f"null or prefill (got {disaggregation_mode!r}): only the prefill "
+            "side of a PD transfer can be DCP-sharded"
+        )
 
 
 @dataclasses.dataclass
@@ -190,6 +241,18 @@ class ServerArgs:
     # sample. Updated atomically after a successful weight push when the trainer
     # supplies a new version string.
     weight_version: str = "default"
+    # Model Updater SDK (``/update_weights_from_mooncake``). The config is an
+    # opaque JSON object handed to the SDK; the other three are required with
+    # it and must stay unset without it (validated in ``validate``).
+    model_update_config: str | None = None
+    # Import path of the SDK module exposing ``make_model_updater``,
+    # ``ModelUpdaterConfig``, ``EngineType``, ``MooncakeWeightStore``,
+    # ``FluentLlmEngineConfig`` and ``FluentLlmModelUpdateInitConfig``.
+    model_update_sdk_module: str | None = None
+    # ``EngineType`` member name the SDK resolves this engine as.
+    model_update_engine_type: str | None = None
+    # Whether an update also streams the speculative draft model's weights.
+    model_update_draft_weights: Literal["retain", "refresh"] | None = None
 
     # Data parallelism
     data_parallel_size: int | None = None
@@ -302,6 +365,18 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    # Standard (draft-prob) rejection sampling for the chain drafters: the
+    # drafter samples each step from its own distribution q and records it,
+    # verify accepts with coin * q(x) < p(x). Off: the target-only rule
+    # (accept with probability p(x) whatever the proposal). Both serve the
+    # target distribution; this one trades a sampled proposal for a higher
+    # acceptance rate under sampling temperatures.
+    enable_speculative_sampling: bool = False
+    # Recorded draft probabilities above this value mark a slot with no
+    # proposal (fresh admission, PD landing): always reject. Sentinel rows
+    # are written as threshold + 1, so it must lie within
+    # [SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN, SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX].
+    spec_reject_draft_prob_threshold: float = 2.0
     enable_replay_ssm: bool = True
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
@@ -711,8 +786,10 @@ class ServerArgs:
         )
 
         # Impl constraints:
-        if self.mapping.attn.has_dcp and self.disaggregation_mode != "null":
-            raise ValueError("DCP cache transfer does not yet support PD")
+        validate_dcp_disaggregation_role(
+            has_dcp=self.mapping.attn.has_dcp,
+            disaggregation_mode=self.disaggregation_mode,
+        )
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
 
@@ -791,6 +868,9 @@ class ServerArgs:
                 f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}"
             )
 
+        if self.enable_speculative_sampling:
+            self._validate_speculative_sampling()
+
     def _validate_tree_speculation(self) -> None:
         """Draft trees: EAGLE3/MTP with a node budget the draft can fill and a mask word can hold."""
         topk = self.speculative_eagle_topk
@@ -832,6 +912,76 @@ class ServerArgs:
             raise ValueError(
                 "tree drafting does not support attention data parallelism yet: "
                 f"attention DP size {self.mapping.attn.dp_size}"
+            )
+
+    def _validate_speculative_sampling(self):
+        """Refuse ``--enable-speculative-sampling`` launches it cannot serve.
+
+        The accept test needs a proposal drawn from the recorded draft
+        distribution q, so the drafter must propose one token per step from
+        its own logits (the Eagle family and the multi-depth MTP drafter;
+        block drafters propose a whole block greedily), and the verifier must
+        be a backend that runs the draft-prob chain kernel: ``greedy`` verifies
+        by exact match and ``triton`` by a target-sampled exact match, so q
+        never enters either. The prefill role of a disaggregated deployment
+        never verifies a chain of its own and its drafted candidates ship to
+        the decode node without q, so there the flag would only allocate the
+        per-slot distribution buffer; it is refused. The sentinel threshold
+        is validated here once for every layer below: at least 1.0 so no
+        real probability reads as the sentinel, and at most 2**20 so the
+        fp32 sentinel ``threshold + 1.0`` stays distinguishable from it.
+        """
+        if self.disaggregation_mode == "prefill":
+            raise ValueError(
+                "--enable-speculative-sampling has no effect on the prefill role "
+                "of a disaggregated deployment: it never verifies a chain and its "
+                "candidates reach the decode node without their draft "
+                "distribution, so the flag would only cost the draft_probs "
+                "buffer. Pass it to the decode role only."
+            )
+        if self.speculative_algorithm is None:
+            raise ValueError(
+                "--enable-speculative-sampling needs speculative decoding: pass "
+                "--speculative-algorithm EAGLE3 or MTP"
+            )
+        if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS:
+            raise ValueError(
+                "--enable-speculative-sampling needs a chain drafter that samples "
+                "one token per step from its own distribution; "
+                f"{self.speculative_algorithm} proposes a whole block greedily"
+            )
+        if self.speculative_eagle_topk != 1:
+            raise ValueError(
+                "--enable-speculative-sampling supports only the topk=1 chain: "
+                f"{self.speculative_eagle_topk=}"
+            )
+        if self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS:
+            if self.sampling_backend == "greedy":
+                why = "verifies by exact match, so the draft distribution never enters"
+            elif self.sampling_backend in ("triton", "triton_full"):
+                why = (
+                    "verifies by target-sampled exact match and has no draft-prob "
+                    "rejection kernel"
+                )
+            else:
+                why = "has no draft-prob rejection kernel"
+            raise ValueError(
+                "--enable-speculative-sampling needs a verifier with the draft-prob "
+                f"chain kernel ({sorted(SPECULATIVE_SAMPLING_BACKENDS)}); "
+                f"--sampling-backend {self.sampling_backend} {why}"
+            )
+        threshold = self.spec_reject_draft_prob_threshold
+        if not (
+            SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN
+            <= threshold
+            <= SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX
+        ):
+            raise ValueError(
+                "--spec-reject-draft-prob-threshold must be within "
+                f"[{SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN}, "
+                f"{SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX}]: at least 1.0 so no real "
+                "probability reads as the no-proposal sentinel, and small enough "
+                f"that the fp32 sentinel threshold + 1.0 stays above it; got {threshold}"
             )
 
     def resolve_communication(self):
@@ -1048,10 +1198,14 @@ class ServerArgs:
     def validate_cache_options(self):
         # Runs after _handle_kvstore() has applied the KVStore default, so the
         # check sees the effective setting rather than the pre-resolution flag.
+        # The Host L2 copies address device pages by scheduler block ID with
+        # no ownership translation (cache/l2/executor.py), so a sharded group
+        # would read and write the wrong local pages.
         if self.decode_context_parallel_size > 1 and self.enable_kvstore:
             raise ValueError(
-                "DCP cache transfer does not yet support KVStore; "
-                "use --disable-kvstore."
+                "--decode-context-parallel-size > 1 does not yet support the Host "
+                "KVStore (L2 addresses device pages without DCP ownership "
+                "translation); pass --disable-kvstore."
             )
         # Same-checkpoint DSpark's KVStore support depends on where the draft
         # keeps its context; the engine decides once the draft config resolves
@@ -1064,6 +1218,37 @@ class ServerArgs:
             raise ValueError(
                 "KVStore and disabled prefix caching are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
+            )
+
+    def validate_model_update_options(self):
+        """Require the Model Updater SDK flags together, or none of them.
+
+        The config alone cannot select the SDK module, the engine type, or
+        the draft policy, so those three are mandatory with it and
+        meaningless without it.
+        """
+        companions = {
+            "--model-update-sdk-module": self.model_update_sdk_module,
+            "--model-update-engine-type": self.model_update_engine_type,
+            "--model-update-draft-weights": self.model_update_draft_weights,
+        }
+        if self.model_update_config is None:
+            given = [flag for flag, value in companions.items() if value is not None]
+            if given:
+                raise ValueError(f"{', '.join(given)} require --model-update-config")
+            return
+        missing = [flag for flag, value in companions.items() if value is None]
+        if missing:
+            raise ValueError(f"--model-update-config requires {', '.join(missing)}")
+        try:
+            parsed = json.loads(self.model_update_config)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--model-update-config must be valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("--model-update-config must be a JSON object")
+        if self.model_update_draft_weights not in ("retain", "refresh"):
+            raise ValueError(
+                "--model-update-draft-weights must be 'retain' or 'refresh'"
             )
 
     def validate_petit_moe_options(self):
@@ -1138,6 +1323,63 @@ class ServerArgs:
                     "than 1024"
                 )
 
+    def validate_expert_placement_options(self):
+        """Check the expert placement flags (redundant experts, recorded load).
+
+        Experts are placed once at startup; runtime rebalancing
+        (``--enable-eplb``) is not implemented. A placement needs an explicit
+        dispatch algorithm, and under rl-bitwise a deterministic one: the
+        replicated-input EP path relies on every rank choosing the same
+        replica for a route.
+        """
+        if self.enable_eplb:
+            raise ValueError(
+                "--enable-eplb (runtime expert rebalancing) is not supported. "
+                "Record expert load with --expert-distribution-recorder-mode stat "
+                "and the EXPERT_LOAD profile activity, then serve a static "
+                "placement with --ep-num-redundant-experts and "
+                "--init-expert-location <load.pt>."
+            )
+        if self.expert_distribution_recorder_mode not in (None, "stat"):
+            raise ValueError(
+                "--expert-distribution-recorder-mode supports only 'stat' (per "
+                "physical expert route counters dumped by the EXPERT_LOAD profile "
+                f"activity), got {self.expert_distribution_recorder_mode!r}."
+            )
+        if self.ep_num_redundant_experts < 0:
+            raise ValueError("--ep-num-redundant-experts must be non-negative")
+        if self.ep_num_redundant_experts > 0 and self.mapping.moe.ep_size <= 1:
+            raise ValueError(
+                f"--ep-num-redundant-experts {self.ep_num_redundant_experts} "
+                "replicates experts across expert-parallel ranks, but the MoE "
+                f"layers run with ep_size={self.mapping.moe.ep_size}; enable "
+                "expert parallelism (--ep-size > 1) or drop the redundant experts."
+            )
+        if expert_placement_requested(self):
+            if self.ep_dispatch_algorithm is None:
+                raise ValueError(
+                    "--ep-dispatch-algorithm is required with "
+                    "--ep-num-redundant-experts, a non-trivial "
+                    "--init-expert-location or --expert-distribution-recorder-mode: "
+                    "static_with_zero_expert for models with zero experts, "
+                    "static otherwise."
+                )
+            if (
+                self.numerics == "rl-bitwise"
+                and self.ep_dispatch_algorithm not in STATIC_EP_DISPATCH_ALGORITHMS
+            ):
+                raise ValueError(
+                    "--numerics rl-bitwise needs a deterministic expert placement; "
+                    f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} picks "
+                    "replicas at random. Use static or static_with_zero_expert."
+                )
+        elif self.ep_dispatch_algorithm is not None:
+            raise ValueError(
+                f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} has no effect "
+                "without an expert placement (--ep-num-redundant-experts, "
+                "--init-expert-location or --expert-distribution-recorder-mode)."
+            )
+
     def validate(self):
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
@@ -1162,6 +1404,8 @@ class ServerArgs:
         if self.mapping.has_attn_cp and self.max_num_seqs > 1:
             raise ValueError("CP attention is enabled but max_num_seqs > 1")
 
+        self.validate_model_update_options()
+
         if self.mapping.has_attn_dp:
             if self.chunked_prefill_size > self.max_prefill_tokens:
                 raise ValueError(
@@ -1171,19 +1415,7 @@ class ServerArgs:
         if self.deepseek_v4_prefill_chunk_size <= 0:
             raise ValueError("deepseek_v4_prefill_chunk_size must be positive")
 
-        if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
-            self.expert_distribution_recorder_mode = "stat"
-            logger.info(
-                "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
-            )
-
-        if (self.enable_eplb or (self.init_expert_location is not None)) and (
-            self.ep_dispatch_algorithm is None
-        ):
-            self.ep_dispatch_algorithm = "static"
-            logger.info(
-                "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
-            )
+        self.validate_expert_placement_options()
 
         from tokenspeed.runtime.utils.env import envs
 
@@ -1679,31 +1911,41 @@ class ServerArgs:
             "--init-expert-location",
             type=str,
             default=ServerArgs.init_expert_location,
-            help="Initial location of EP experts.",
+            help="Expert placement: 'trivial', or a .pt/.json file (or inline "
+            "JSON) holding a 'logical_count' [layers, experts] load record to "
+            "derive the placement from with the EPLB algorithm, or a "
+            "'physical_to_logical_map' [layers, slots] to pin it exactly. "
+            "The EXPERT_LOAD profile activity writes such a load record.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",
             type=int,
             default=ServerArgs.ep_num_redundant_experts,
-            help="Allocate this number of redundant experts in expert parallel.",
+            help="Add this many physical expert slots per MoE layer for replicas "
+            "of hot experts; the total must divide over the EP size.",
         )
         parser.add_argument(
             "--ep-dispatch-algorithm",
             type=str,
             default=ServerArgs.ep_dispatch_algorithm,
-            help="The algorithm to choose ranks for redundant experts in expert parallel.",
+            choices=list(EP_DISPATCH_ALGORITHMS),
+            help="How routing picks among an expert's replicas; required with an "
+            "expert placement. static_with_zero_expert for models with zero "
+            "experts (LongCat), static otherwise; dynamic* draw at random.",
         )
         parser.add_argument(
             "--eplb-algorithm",
             type=str,
             default=ServerArgs.eplb_algorithm,
-            help="Chosen EPLB algorithm",
+            help="EPLB algorithm deriving the placement from a load record: "
+            "auto, deepseek or deepseek_hierarchical.",
         )
         parser.add_argument(
             "--expert-distribution-recorder-mode",
             type=str,
             default=ServerArgs.expert_distribution_recorder_mode,
-            help="Mode of expert distribution recorder.",
+            help="'stat' counts the routes to every physical expert so the "
+            "EXPERT_LOAD profile activity can dump a load record.",
         )
         parser.add_argument(
             "--expert-distribution-recorder-buffer-size",
@@ -1719,7 +1961,8 @@ class ServerArgs:
         parser.add_argument(
             "--enable-eplb",
             action="store_true",
-            help="Enable EPLB algorithm",
+            help="Runtime expert rebalancing; not supported (rejected at startup). "
+            "Use a static placement from a recorded load instead.",
         )
         parser.add_argument(
             "--dense-gemm-backend",
@@ -2095,6 +2338,28 @@ class ServerArgs:
             default=ServerArgs.speculative_num_draft_tokens,
         )
         parser.add_argument(
+            "--enable-speculative-sampling",
+            action="store_true",
+            default=ServerArgs.enable_speculative_sampling,
+            help="Standard rejection sampling for chain speculative decoding: the "
+            "drafter samples each step from its own distribution q (per-request "
+            "temperature; greedy rows stay argmax) and verify accepts with "
+            "coin * q(x) < p(x) instead of the target-only rule. Needs EAGLE3 "
+            "or MTP with --speculative-eagle-topk 1 and the flashinfer or "
+            "flashinfer_full sampling backend; refused on the prefill role of "
+            "a disaggregated deployment. Costs a per-request fp32 draft "
+            "distribution buffer; see docs/configuration/server.md.",
+        )
+        parser.add_argument(
+            "--spec-reject-draft-prob-threshold",
+            type=float,
+            default=ServerArgs.spec_reject_draft_prob_threshold,
+            help="With --enable-speculative-sampling, recorded draft probabilities "
+            "above this value mark a request with no proposal yet (fresh "
+            "admission, PD landing) and always reject. Must lie within "
+            "[1.0, 2**20].",
+        )
+        parser.add_argument(
             "--disable-replay-ssm",
             dest="enable_replay_ssm",
             action="store_false",
@@ -2333,7 +2598,10 @@ class ServerArgs:
             "--decode-context-parallel-size",
             type=int,
             default=ServerArgs.decode_context_parallel_size,
-            help="Shard DeepSeek V4 compressed KV over a subgroup of attention TP.",
+            help="Shard full-history KV pages (MLA/DSA latent, DeepSeek V4 "
+            "compressed KV) cyclically over a consecutive subgroup of attention "
+            "TP. Allowed on aggregated engines and the PD prefill role; the "
+            "decode role and the Host KVStore are not supported yet.",
         )
         parser.add_argument(
             "--dense-tp-size",
@@ -2502,6 +2770,37 @@ class ServerArgs:
             type=str,
             default=ServerArgs.weight_version,
             help="Initial model-weight version stamped into generation metadata.",
+        )
+        parser.add_argument(
+            "--model-update-config",
+            type=str,
+            default=ServerArgs.model_update_config,
+            help="JSON object handed to the Model Updater SDK for "
+            "/update_weights_from_mooncake. Requires --model-update-sdk-module, "
+            "--model-update-engine-type and --model-update-draft-weights.",
+        )
+        parser.add_argument(
+            "--model-update-sdk-module",
+            type=str,
+            default=ServerArgs.model_update_sdk_module,
+            help="Import path of the Model Updater SDK module (imported lazily "
+            "on the first /update_weights_from_mooncake).",
+        )
+        parser.add_argument(
+            "--model-update-engine-type",
+            type=str,
+            default=ServerArgs.model_update_engine_type,
+            help="Model Updater SDK EngineType member name for this engine "
+            "(resolved as EngineType[value.upper()]).",
+        )
+        parser.add_argument(
+            "--model-update-draft-weights",
+            type=str,
+            choices=["retain", "refresh"],
+            default=ServerArgs.model_update_draft_weights,
+            help="Whether /update_weights_from_mooncake also streams the "
+            "speculative draft model's weights: 'retain' updates the target "
+            "only, 'refresh' updates target and draft.",
         )
 
     @classmethod

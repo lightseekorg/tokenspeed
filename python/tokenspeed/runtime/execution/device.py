@@ -77,6 +77,7 @@ import os
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -87,8 +88,10 @@ from tokenspeed.runtime.execution.types import (
     PendingExecution,
     PlannedForward,
 )
+from tokenspeed.runtime.moe.expert_location import get_global_expert_location_metadata
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.host_sync import allow_host_sync
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
@@ -771,14 +774,62 @@ class DeviceHandle:
         # decode, and PD completions are rare enough to afford the wait.
         self._thread.run(_land)
 
+    def reset_expert_load(self) -> None:
+        """Zero the router's expert load counters, ordered against forwards.
+
+        The counters are bumped on the execution stream by every forward's
+        routing, so the reset rides that stream too: it lands after the
+        forwards already issued and before the next one.
+        """
+        placement = _recording_expert_placement()
+        executor = self._executor
+
+        def _reset():
+            with executor.device_module.stream(executor.execution_stream):
+                placement.reset_load()
+
+        self._thread.run(_reset)
+
+    def dump_expert_load(self, path: str) -> dict[str, torch.Tensor | int]:
+        """Write this rank's expert load counted since the last reset to ``path``.
+
+        The counters are read back on the data plane (the one deliberate host
+        wait) and saved unreduced, as this rank's record: its physical and
+        logical counts, the placement that produced them and its EP rank.
+        No collective runs here -- a profile stop reaches attention-DP
+        workers independently, so a rank reducing inside the request would
+        wait on a peer still synchronizing its round. The ranks' records are
+        summed where they are consumed (``merge_expert_load_records``, which
+        ``--init-expert-location <dir>`` applies).
+
+        Args:
+            path: Destination ``.pt`` file; parent directories are created.
+
+        Returns:
+            The saved record.
+        """
+        placement = _recording_expert_placement()
+        executor = self._executor
+
+        def _dump():
+            with executor.device_module.stream(executor.execution_stream):
+                with allow_host_sync("expert load dump"):
+                    physical = placement.physical_load.cpu()
+            record = placement.load_record(physical)
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(record, path)
+            return record
+
+        return self._thread.run(_dump)
+
     def update_weights(self, req) -> tuple[bool, str]:
         """Apply one in-place RL weight-sync request, ordered against forwards.
 
         Type-dispatched on the request — join the trainer's NCCL group,
-        receive and apply one broadcast, or tear the group down. One entry
-        point because it is one capability: rewriting model parameters in
-        place, which must be ordered against forwards rather than raced with
-        them.
+        receive and apply one broadcast, read one committed version from the
+        Mooncake weight store, or tear the group down. One entry point because
+        it is one capability: rewriting model parameters in place, which must
+        be ordered against forwards rather than raced with them.
 
         Args:
             req: An ``io_struct`` weight-update request.
@@ -793,6 +844,7 @@ class DeviceHandle:
             DestroyWeightsUpdateGroupReqInput,
             InitWeightsUpdateGroupReqInput,
             UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
         )
 
         runner = self._executor.model_runner
@@ -801,23 +853,54 @@ class DeviceHandle:
             UpdateWeightsFromDistributedReqInput: (
                 runner.update_weights_from_distributed
             ),
+            UpdateWeightsFromMooncakeReqInput: (
+                lambda req: runner.update_weights_from_mooncake(
+                    req.version, self._mooncake_update_models()
+                )
+            ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
         }
         handler = handlers.get(type(req))
         if handler is None:
             raise TypeError(f"unsupported weight-update request {type(req).__name__}")
+        loads_weights = type(req) in (
+            UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
+        )
 
         def _apply_update():
             result = handler(req)
-            if (
-                type(req) is UpdateWeightsFromDistributedReqInput
-                and result[0]
-                and self._executor.drafter is not None
-            ):
+            if loads_weights and result[0] and self._executor.drafter is not None:
                 self._executor.drafter.on_target_weights_updated()
             return result
 
         return self._thread.run(_apply_update)
+
+    def _mooncake_update_models(self) -> list:
+        """The modules a Mooncake update streams into, target first.
+
+        ``--model-update-draft-weights refresh`` adds the speculative draft
+        model when one is loaded; ``retain`` keeps the draft's weights.
+        """
+        runner = self._executor.model_runner
+        models = [runner.model]
+        draft_runner = self._executor.draft_model_runner
+        if (
+            runner.server_args.model_update_draft_weights == "refresh"
+            and draft_runner is not None
+        ):
+            models.append(draft_runner.model)
+        return models
+
+
+def _recording_expert_placement():
+    placement = get_global_expert_location_metadata()
+    if placement is None or placement.physical_load is None:
+        raise RuntimeError(
+            "expert load is not being recorded; start the server with "
+            "--expert-distribution-recorder-mode stat"
+        )
+    return placement
 
 
 def arm_data_plane_sync_debug(device: str) -> None:

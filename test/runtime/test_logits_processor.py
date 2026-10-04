@@ -515,6 +515,39 @@ def test_get_logits_skips_gather_when_dist_argmax_active(monkeypatch):
     assert out.shape == (4, 4)  # local shard width retained, not gathered to 8
 
 
+def test_require_full_vocab_logits_turns_the_fused_draft_argmax_off(monkeypatch):
+    """A consumer that samples from the draft distribution asks for the
+    full-vocab gather explicitly; the draft model keeps constructing with
+    do_argmax=True and no global flag is consulted."""
+    proc = LogitsProcessor(
+        config=SimpleNamespace(
+            model_type="test", vocab_size=8, final_logit_softcapping=None
+        ),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        do_argmax=True,
+    )
+    assert proc.do_argmax
+    proc.require_full_vocab_logits()
+    assert not proc.do_argmax
+
+    monkeypatch.setattr(
+        proc,
+        "_init_dist_argmax_state",
+        lambda lm_head: pytest.fail("the fused argmax gate must stay off"),
+    )
+    monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: None)
+    monkeypatch.setattr(
+        logits_processor_module, "all_gather_single", lambda out, inp, group: None
+    )
+    hidden = torch.randn(4, 2, dtype=torch.float32)
+    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))
+    md = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    out = proc._get_logits(hidden, lm_head, md, require_full_vocab=True)
+    assert out.shape == (4, 8)  # gathered to the full vocab
+
+
 def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(monkeypatch):
     """The uninitialised sentinel must not be mistaken for a built state.
 

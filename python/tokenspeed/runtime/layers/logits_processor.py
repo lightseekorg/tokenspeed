@@ -278,6 +278,21 @@ class LogitsProcessor(nn.Module):
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
 
+    def require_full_vocab_logits(self) -> None:
+        """Turn the fused draft argmax off so every forward returns full-vocab logits.
+
+        Draft models construct with ``do_argmax=True``: under tensor
+        parallelism the fused path reduces the argmax across the vocab shards
+        and hands back the local shard's logits, which only a greedy proposal
+        can live with. A consumer that samples from the draft distribution
+        (``--enable-speculative-sampling``) calls this once after construction
+        and before the first forward; the ordinary vocab all-gather then runs
+        on every draft step. Under attention DP the head is replicated
+        (``skip_all_gather``) and the logits are full-vocab either way.
+        Returns None.
+        """
+        self.do_argmax = False
+
     def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (
             not runtime.enabled

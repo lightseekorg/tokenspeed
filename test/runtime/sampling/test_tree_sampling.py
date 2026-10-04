@@ -56,6 +56,7 @@ def _config(logprobs: bool) -> SamplingBackendConfig:
         vocab_size=VOCAB,
         device="cuda",
         enable_output_logprobs=logprobs,
+        enable_speculative_sampling=False,
     )
 
 

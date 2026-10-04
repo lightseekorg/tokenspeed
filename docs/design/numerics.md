@@ -68,7 +68,15 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │                                   practice and the pool route's stochastic
 │                                   kernels resolve them in batch-shape-
 │                                   dependent reduction order; backends
-│                                   without the overlay are refused
+│                                   without the overlay are refused. Under
+│                                   --enable-speculative-sampling the draft
+│                                   proposal is one more per-request stream:
+│                                   Gumbel-max noise keyed by the request's
+│                                   seed and a salted (position, step) offset
+│                                   (never the batch row), the verify coins
+│                                   stay per-slot, and greedy rows keep the
+│                                   canonical argmax with a one-hot q, so
+│                                   their verify is unchanged
 ├── invariance.batch                per-row-independent reductions
 │   ├── no split-KV attention       decode kernels whose split count scales
 │   │                               with batch/SM occupancy are excluded by

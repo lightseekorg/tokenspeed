@@ -447,6 +447,17 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         coins = self._coins_buf[row0 : row0 + bs, :num_tokens_per_req]
         coins_for_final_sampling = self._final_coins_buf[row0 : row0 + bs]
 
+        use_draft_prob = sampling_info.draft_probs is not None
+        draft_probs = (
+            self._gather_draft_probs(
+                sampling_info.draft_probs,
+                sampling_info.req_pool_indices,
+                bs,
+                num_tokens_per_req,
+            )
+            if use_draft_prob
+            else None
+        )
         chain_speculative_sampling_target_only(
             predicts=predict,
             accept_index=accept_index,
@@ -455,10 +466,12 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
-            draft_probs=None,
+            draft_probs=draft_probs,
             threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
             deterministic=True,
+            use_draft_prob=use_draft_prob,
+            reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
         )
         if global_server_args_dict["numerics"] == "rl-bitwise":
             canonical_greedy_verify(

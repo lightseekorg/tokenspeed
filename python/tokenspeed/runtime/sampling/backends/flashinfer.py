@@ -49,6 +49,7 @@ from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
     SamplingBackend,
     SamplingBackendConfig,
+    SpeculativeSamplingPools,
 )
 from tokenspeed.runtime.sampling.backends.greedy import _verify_chain_greedy
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -282,6 +283,13 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._cpu_generator_per_slot: list[torch.Generator | None] = [None] * pool_rows
         self._cpu_generator_per_slot[0] = self._capture_gen
 
+    def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
+        return SpeculativeSamplingPools(
+            temperature=self._temperature_pool,
+            top_k=self._top_k_pool,
+            seed=self._seed_pool,
+        )
+
     def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
         self._temperature_pool[pool_idx].fill_(float(sp.temperature))
         self._top_k_pool[pool_idx].fill_(int(sp.top_k))
@@ -322,6 +330,58 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._predict_local_buf: torch.Tensor | None = None
         self._accept_index_local_buf: torch.Tensor | None = None
         self._accept_length_local_buf: torch.Tensor | None = None
+
+        # Draft-prob verify gathers each row's recorded distributions out of
+        # the pool-indexed RuntimeStates.draft_probs into this batch-ordered
+        # buffer (the chain kernel reads [bs, N, V] contiguous rows). Sized
+        # for the padded graph batch; the gather is captured with the graph.
+        self._draft_probs_gather_buf: torch.Tensor | None = None
+        if config.enable_speculative_sampling:
+            if config.vocab_size <= 0:
+                raise ValueError(
+                    "enable_speculative_sampling needs vocab_size > 0 to size the "
+                    f"draft-prob gather buffer, got {config.vocab_size}"
+                )
+            self._draft_probs_gather_buf = torch.empty(
+                (max_pad_bs, max_n, config.vocab_size),
+                dtype=torch.float32,
+                device=config.device,
+            )
+
+    def _gather_draft_probs(
+        self,
+        draft_probs: torch.Tensor,
+        pool_indices: torch.Tensor,
+        bs: int,
+        num_tokens_per_req: int,
+    ) -> torch.Tensor:
+        """Batch-order the recorded draft distributions for this verify.
+
+        Args:
+            draft_probs: ``[pool_rows, N, V]`` fp32 ``RuntimeStates.draft_probs``.
+            pool_indices: ``[bs]`` pool slot per verify row (padding rows
+                carry slot 0; their outputs are discarded).
+            bs: Verify rows, padded under graph replay or DP sharding.
+            num_tokens_per_req: The chain width N.
+
+        Returns:
+            The ``[bs, N, V]`` leading slice of the persistent gather buffer.
+        """
+        buf = self._draft_probs_gather_buf
+        if buf is None:
+            raise RuntimeError(
+                "verify received draft_probs but the sampling backend was built "
+                "without enable_speculative_sampling"
+            )
+        if num_tokens_per_req != buf.shape[1] or draft_probs.shape[1:] != buf.shape[1:]:
+            raise RuntimeError(
+                f"draft_probs geometry {tuple(draft_probs.shape[1:])} / N="
+                f"{num_tokens_per_req} does not match the verify buffer "
+                f"{tuple(buf.shape[1:])}"
+            )
+        out = buf[:bs]
+        torch.index_select(draft_probs, 0, pool_indices, out=out)
+        return out
 
     def _prepare_step_hook(
         self,
@@ -573,6 +633,14 @@ class FlashInferSamplingBackend(SamplingBackend):
             )
         target_probs = target_probs.reshape(bs, n, -1)
 
+        # Draft-prob rule when the drafter recorded its distributions (the
+        # DP shard gathers its own rows); target-only otherwise.
+        use_draft_prob = sampling_info.draft_probs is not None
+        draft_probs = (
+            self._gather_draft_probs(sampling_info.draft_probs, pool_indices, bs, n)
+            if use_draft_prob
+            else None
+        )
         chain_speculative_sampling_target_only(
             predicts=predict,
             accept_index=accept_index,
@@ -581,10 +649,12 @@ class FlashInferSamplingBackend(SamplingBackend):
             uniform_samples=coins[:bs, :n],
             uniform_samples_for_final_sampling=final_coins[:bs],
             target_probs=target_probs,
-            draft_probs=None,
+            draft_probs=draft_probs,
             threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
             deterministic=not dp_sampling,
+            use_draft_prob=use_draft_prob,
+            reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
         )
         if global_server_args_dict["numerics"] == "rl-bitwise":
             canonical_greedy_verify(

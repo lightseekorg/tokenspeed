@@ -78,6 +78,7 @@ from tokenspeed.runtime.engine.io_struct import (
     SetInternalStateReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromMooncakeReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -178,6 +179,11 @@ class EngineClient(Protocol):
     async def update_weights_from_distributed(
         self,
         obj: UpdateWeightsFromDistributedReqInput,
+    ) -> tuple[bool, str]: ...
+
+    async def update_weights_from_mooncake(
+        self,
+        obj: UpdateWeightsFromMooncakeReqInput,
     ) -> tuple[bool, str]: ...
 
     async def update_weights_from_tensor(

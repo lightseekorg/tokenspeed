@@ -1172,9 +1172,52 @@ partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reconstructs bounded history chunks with an owner-masked sum reduction;
 GPU DSA sparse prefill instead combines local sparse-attention partials.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
-DCP does not make unsupported kernels portable. CuTe MLA supports speculative
-decoding. FlashMLA and GPU DSA still
-exclude speculative decoding; all these paths exclude PD transfer and KVStore.
+DCP does not make unsupported kernels portable. DCP excludes speculative
+decoding for every model on the ordinary MLA/DSA recipe, whichever dense
+kernel runs it: `OrdinaryRecipe.groups()` refuses to shard a cache that holds
+a draft group, so a CuTe MLA engine that would accept the draft kernels still
+cannot combine DCP with a draft; FlashMLA and GPU DSA `AttnConfig` additionally
+reject any speculative width, draft or target, under DCP. Only the recipes
+that declare their own groups shard with a draft present: DeepSeek V4 (its
+draft layers join the compressed-KV chains) and Kimi K3 (its draft layers join
+the sharded MLA history group), each subject to its backend's `AttnConfig`
+gate. The draft's decode steps would run the same sparse/dense DCP branches as
+the target's, but that path has not been validated for the ordinary recipe, so
+its exclusion is a gate rather than a geometry limit. All DCP paths exclude the Host KVStore: the L2
+copies address device pages by scheduler block ID with no ownership
+translation (`cache/l2/executor.py`), so a sharded engine must pass
+`--disable-kvstore`.
+
+PD transfer supports a sharded **prefill** role against an unsharded decode
+role. Manifests carry scheduler (virtual) IDs on both sides and are bounded
+by each side's virtual count, `1 + (page_count - 1) * shard_count`, never by
+the physical page count. The route planner (`pd/transfer_plan.py`) reads
+`shard_count` from the wire `group_specs`: for a sharded group it fans a
+decode rank's replica out to the whole DCP subgroup (consecutive attention-TP
+ranks), tagging every member with an owner filter `(owner_rank, owner_count)`;
+the sender keeps the manifest blocks with `(v - 1) % owner_count ==
+owner_rank`, translates them to local pages through the same
+`owned_local_pages` placement zeroing uses, and copies them to the destination
+blocks at the same manifest positions. Every rank of the subgroup therefore
+serves every decode rank and none is a control-only dummy; the decode receiver
+already counts completions from a rank set. Replicated groups keep the
+single-source route. A sharded decode cache, and a field that is both
+head-partitioned and page-sharded, are rejected by the planner.
+
+The plan records one decision per (source rank, sharded group), never by
+omission: the owner filter when the rank's fragments name the group, an
+explicit `None` when they do not -- a rank routed only for another group's
+head partition (Kimi K3's KDA state against its MLA subgroup), or a pipeline
+stage whose fields miss the group -- so that rank sends nothing for it. The
+prefill checks those decisions against its cache groups once, when the decode
+registers (`validate_rank_owner_filters`); the sender applies them as given.
+A sharded source leaves the equal-TP empty-fragment route (one predicate,
+`_uses_whole_copy_route`, decides it for routing and served-rank sets alike),
+but the sender folds every fragment with one contiguous span per page -- a
+whole field, or a head slice whose rows collapsed into one -- into its group's
+pages x fields grid, so DCP, pipeline stages and replicated fields across
+unequal TP all go through the page-gathered WRITE; only a fragment with
+several strided rows per page is emitted per page.
 
 The runtime derives compact DCP page tables and local visible lengths from
 the scheduler's virtual block tables, without introducing new scheduler-owned

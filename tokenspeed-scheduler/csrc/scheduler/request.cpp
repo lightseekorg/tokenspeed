@@ -31,6 +31,7 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
       token_container_{spec.tokens},
       submitted_prompt_size_{static_cast<std::int32_t>(spec.tokens.size())},
       max_new_tokens_{spec.max_new_tokens},
+      max_cached_prefix_tokens_{spec.max_cached_prefix_tokens},
       prefix_granularity_{prefix_granularity},
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
                                   : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}

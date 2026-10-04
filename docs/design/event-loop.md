@@ -96,6 +96,16 @@ Consequences:
   probes, prefetch planning/results, failed-read invalidation, namespace and
   weight-version changes, and cache shutdown. These keep the executor and
   Host buffer hidden; they do not introduce another generic work slot.
+  The `EXPERT_LOAD` profile activity adds two more named operations,
+  `reset_expert_load` and `dump_expert_load`: the routing kernels bump the
+  expert placement's load counters on the execution stream, so zeroing and
+  reading them back ride the forward thread on that stream (the read-back is
+  a deliberate, low-rate host wait, like the other `run_*` methods). The
+  dump is rank-local by contract -- it runs no collective. A profile stop
+  reaches attention-DP workers independently (`stop_profile` is delivered
+  per DP worker), so a rank reducing inside the request would block in the
+  collective while its peer is still in `_dp_sync_and_check`; the ranks'
+  records are summed where they are consumed (`--init-expert-location`).
   Changing this surface requires updating both this contract and the explicit
   operation allowlist in `test/runtime/test_device_handle.py`.
 * The role is a **value** (`DeviceRole`), not a class hierarchy. Subclassing
@@ -418,7 +428,17 @@ For orientation, one iteration of `event_loop`:
   MAX-reduce flush intent across attention DP so every DP worker enters
   the same collectives — the frontend sends `FlushCacheReqInput`
   separately, and a rank that reduced inside request handling would wait
-  on a peer still in `_dp_sync_and_check`. They then MIN-reduce a
+  on a peer still in `_dp_sync_and_check`. The same MAX all-reduce gates
+  the weight ops themselves (NCCL group init/teardown, distributed and
+  Mooncake loads): `RequestHandler` queues each op and completes the
+  head only in a round where every DP rank reports one of the same kind
+  at its head (a mismatch raises — the frontend sends every op to every
+  worker in one order). The device call blocks the control thread in a
+  collective the trainer drives or an SDK read; a DP peer that had not
+  yet dequeued its copy would keep looping and wait for this rank in the
+  per-round all-reduce, a deadlock. One op completes per round, and its
+  result is MIN-reduced across the replica before the L3 weight version
+  is published or the reply sent. They then MIN-reduce a
   non-mutating `can_clear_cache` probe across the replica (attention TP,
   then CP, then PP) and then across attention DP — DP replicas share
   Mooncake objects — then MIN-reduce an error-returning L3

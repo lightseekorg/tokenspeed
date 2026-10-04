@@ -36,6 +36,8 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "ExpertDispatch",
+    "dispatch_topk_ids_reference",
     "native_latent_moe_available",
     "latent_moe_decode_pipeline_available",
     "latent_moe_expert_shared",
@@ -46,6 +48,10 @@ __all__ = [
     "moe_topk",
 ]
 
+from tokenspeed_kernel.ops.moe.dispatch import (  # noqa: E402
+    ExpertDispatch,
+    dispatch_topk_ids_reference,
+)
 from tokenspeed_kernel.ops.moe.latent_decode import (  # noqa: E402
     latent_moe_decode_pipeline_available,
     latent_moe_expert_shared,
@@ -594,6 +600,10 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
+        # routes, so routing may pick per-rank replicas. Otherwise every
+        # rank routes every token and must agree on one replica per route.
+        "supports_all_to_all_ep": traits["supports_all_to_all_ep"],
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
     }

@@ -26,12 +26,22 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.configs.numerics import require_verified_numerics
+from tokenspeed.runtime.execution.model_update import (
+    ModelUpdateAdapter,
+    model_update_adapter_for,
+)
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.model_loader.weight_utils import (
     non_unit_kv_scale_message,
     record_non_unit_kv_scales,
+)
+from tokenspeed.runtime.models.base.weight_update import weight_update_session
+from tokenspeed.runtime.moe.expert_location import (
+    build_expert_placement,
+    get_global_expert_location_metadata,
+    set_global_expert_location_metadata,
 )
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -114,6 +124,13 @@ class ModelRunner:
         self.checkpoint_load_group = checkpoint_load_group
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
+        # Model Updater SDK client for /update_weights_from_mooncake; None
+        # without --model-update-config and on the draft runner. Holds only
+        # the arguments until the first update imports the SDK (on the
+        # forward thread).
+        self.model_update: ModelUpdateAdapter | None = model_update_adapter_for(
+            server_args, global_rank=global_rank, is_draft_worker=is_draft_worker
+        )
         # Set by load_model from the model's forward signature.
         self._model_forward_accepts_spec_step_idx: bool = False
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
@@ -154,7 +171,22 @@ class ModelRunner:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
-        self.load_model()
+        # The target's expert placement (redundant replicas, load counters) is
+        # process-global so its model picks it up while it is built and loaded.
+        # A draft routes its own experts trivially: the target's placement is
+        # hidden while the draft is built, then restored for serving.
+        if self.is_draft_worker:
+            target_placement = get_global_expert_location_metadata()
+            set_global_expert_location_metadata(None)
+            try:
+                self.load_model()
+            finally:
+                set_global_expert_location_metadata(target_placement)
+        else:
+            set_global_expert_location_metadata(
+                build_expert_placement(server_args, model_config)
+            )
+            self.load_model()
         if draft_moe_override:
             server_args.moe_backend = saved_moe_backend
             global_server_args_dict_update(server_args)
@@ -367,9 +399,13 @@ class ModelRunner:
                     dist.broadcast(buf, src=0, group=pg)
                     yield name, buf
 
-            # The update loads to completion so the model stays consistent, then fails on a scale.
+            # The update loads to completion so the model stays consistent,
+            # then fails on a scale. A BaseCausalLM session screens the stream
+            # itself and raises at its end; this wrap covers the models that
+            # take no session (multimodal wrappers).
             rejected: list[str] = []
-            self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
+            with weight_update_session([self.model]):
+                self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
             torch.cuda.synchronize(device)
             if rejected:
                 return False, (
@@ -381,6 +417,41 @@ class ModelRunner:
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_distributed failed")
             return False, str(e)
+
+    def update_weights_from_mooncake(
+        self, version: int, models: list[torch.nn.Module]
+    ) -> tuple[bool, str]:
+        """Read one committed weight-store version into ``models`` in place.
+
+        Runs on the forward thread. The SDK streams partial ``load_weights``
+        calls, so the models are bracketed in a weight-update session; the
+        SDK's device staging buffers are released afterwards -- also when the
+        read failed partway -- because PyTorch would otherwise keep the blocks
+        cached against the KV arena.
+
+        Args:
+            version: The committed version to load.
+            models: Target first, then the draft when the server's
+                ``--model-update-draft-weights`` is ``refresh``.
+
+        Returns:
+            ``(ok, message)`` for the control plane.
+        """
+        if self.model_update is None:
+            return False, (
+                "update_weights_from_mooncake requires the server to start with "
+                "--model-update-config (target runner only)"
+            )
+        try:
+            with weight_update_session(models):
+                result = self.model_update.update(models, version)
+            torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
+            return True, f"applied model version {version}: {result}"
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("update_weights_from_mooncake failed")
+            return False, str(e)
+        finally:
+            torch.cuda.empty_cache()
 
     def destroy_weights_update_group(self, obj) -> tuple[bool, str]:
         """Tear down the trainer weight-update NCCL group joined in ``init``.
