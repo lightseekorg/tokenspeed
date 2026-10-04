@@ -378,16 +378,23 @@ class PagedAttention(nn.Module):
                 f"a sharded latent store takes the whole span of {plan.total_rows} "
                 f"slots, got {slots.numel()}"
             )
-        out = mla_prologue(
-            query,
-            q_pe,
-            latent_cache,
-            expanded=None,
-            rotary=rotary,
-            cache=None,
-            solution=None,
-            override=None,
-        )
+        if plan.local_rows > 0:
+            out = mla_prologue(
+                query,
+                q_pe,
+                latent_cache,
+                expanded=None,
+                rotary=rotary,
+                cache=None,
+                solution=None,
+                override=None,
+            )
+        else:
+            # An empty shard rotates nothing but still joins the gather and
+            # stores the rows it owns of what the other ranks computed.
+            out = MLAPrologueOutput(
+                query=query, key=None, value=None, latent=latent_cache
+            )
         gathered = token_all_gather(
             out.latent.contiguous(), key_rows.group, list(plan.row_counts)
         )

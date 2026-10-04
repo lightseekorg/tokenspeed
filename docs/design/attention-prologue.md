@@ -178,8 +178,12 @@ step on its own. Rotation and store round once each way, so the bytes equal
 the fused write's (`tokenspeed-kernel/test/ops/attention/test_attention_prologue.py`).
 The gather sits inside the prologue wrapper, so it adds no writer to the
 list above; a sparse indexer's keys are gathered the same way by the model
-before their quantization and masked write. Page ownership stays a property
-of the cache placement, independent of which rank computed a row.
+before their quantization and masked write. A rank whose shard is empty
+skips the rotation but still joins the gather and stores its owned rows.
+Page ownership stays a property of the cache placement, independent of
+which rank computed a row. The expanded (non-absorbed) prologue cannot take
+a shard -- its per-head keys are not gatherable and its slots would be the
+shard's rows at the span's head -- and refuses one.
 
 ## Graphs and the KV write
 

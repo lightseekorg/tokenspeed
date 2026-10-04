@@ -1378,9 +1378,14 @@ The contract a model (in tree or a plugin) implements:
   automatically): the prologue rotates the local rows without a cache
   (`mla_prologue(cache=None)`), all-gathers the rotated latent to the whole
   span with the plan's row counts and stores it owner-masked
-  (`latent_store`); `slots` is the whole span. Index-K the model gathers the
-  same way (`token_all_gather` of the local keys before quantization) and
-  writes with the owner mask.
+  (`latent_store`); `slots` is the whole span. A rank whose shard is empty
+  rotates nothing but joins the gather and the store, so a model must reach
+  the prologue (and every other QCP collective: the index-K gather, each
+  group's history gathers) with zero rows rather than return early; the
+  dense MLA path (`DeepseekV3AttentionMLA.forward`, the expanded prologue)
+  refuses a shard up front. Index-K the model gathers the same way
+  (`token_all_gather` of the local keys before quantization) and writes
+  with the owner mask.
 * GPU DSA (`backends/paged/dsa.py`): `init_forward_metadata` builds a
   `DSAQueryShardMetadata` — request groups whose summed history fits the
   gather workspace (one whole history, reserved from the cache budget by the

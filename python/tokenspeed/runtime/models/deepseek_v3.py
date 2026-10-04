@@ -170,6 +170,18 @@ def _prepare_mla_kv_b_proj_weights(
     )
 
 
+def _reject_query_shard(ctx: ForwardContext, where: str) -> None:
+    """Fail loud when a sharded forward reaches an MLA path that attends every
+    row of the span (the dense, expanded prologue with head-sharded weights);
+    only the absorbed sparse path can take a query shard."""
+    if ctx.query_shard is not None and ctx.query_shard.size > 1:
+        raise RuntimeError(
+            f"{where} cannot take a query shard: query context parallelism "
+            "runs the absorbed sparse DSA prefill, whose prologue gathers the "
+            "rotated latent across the group"
+        )
+
+
 class DeepseekV3MLP(nn.Module):
     """Dense SwiGLU MLP sharded over the dense (or shared-expert) TP group.
 
@@ -817,12 +829,18 @@ class DeepseekV3AttentionMLA(nn.Module):
         whole-attention break leaves. Outside capture the ``@break_point`` is
         a direct call, so the eager path is unchanged.
 
+        This dense MLA path (expanded prefill prologue, head-sharded weights)
+        attends every row of the span, so it refuses a query shard outright
+        -- before the empty-row return, since a rank whose shard is empty
+        would otherwise skip collectives the other ranks join.
+
         Every decoder layer calls this on an idle forward too, with its empty
         input rows. Without head TP that is a no-op; under head TP the rank
         still owns a head shard of its group's tokens, so it computes that
         shard here and joins every exchange (they are collectives) -- the one
         place idle participation lives, so no layer branches on the layout.
         """
+        _reject_query_shard(ctx, "DeepseekV3AttentionMLA.forward")
         if hidden_states.shape[0] == 0 and not self.has_head_tp:
             # The o_proj output shape (the Eagle3 input is twice as wide).
             return hidden_states.new_empty(0, self.hidden_size)
@@ -1212,17 +1230,20 @@ class DeepseekV3AttentionMLA(nn.Module):
             Q = absorbed_query
             q_pe = Q[..., self.kv_lora_rank :]
         # The absorption projection must be per-row batch-invariant under
-        # rl-bitwise: the cuBLAS batched GEMM retiles by the token count.
-        bmm(
-            q_nope.transpose(0, 1),
-            self.w_kc.transpose(1, 2),
-            out=Q[..., : self.kv_lora_rank].transpose(0, 1),
-            override=(
-                "aok"
-                if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
-                else None
-            ),
-        )
+        # rl-bitwise: the cuBLAS batched GEMM retiles by the token count. A
+        # rank whose query shard is empty has nothing to absorb but still
+        # runs the prologue for its collectives.
+        if q_nope.shape[0] > 0:
+            bmm(
+                q_nope.transpose(0, 1),
+                self.w_kc.transpose(1, 2),
+                out=Q[..., : self.kv_lora_rank].transpose(0, 1),
+                override=(
+                    "aok"
+                    if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+                    else None
+                ),
+            )
         return Q, q_pe
 
     def head_tp_scatter_query(
@@ -1409,7 +1430,11 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> MLAPrologueOutput:
         """The expanded prefill prologue over every row of ``q``: per-head keys
         and values up-projected from the latent, the rotated query, and the
-        latent rows stored at ``slots``; the inputs are left as given."""
+        latent rows stored at ``slots``; the inputs are left as given. The
+        expanded form cannot gather per-head keys across a query shard and
+        ``slots`` would be the shard's rows at the span's head, so a sharded
+        forward is refused here rather than writing the wrong rows."""
+        _reject_query_shard(ctx, "the expanded MLA prefill prologue")
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         # kv_b_proj's fp8 online-quant GEMM needs a contiguous latent, not this strided slice.
         kv = self.kv_b_proj(latent_cache[..., : self.kv_lora_rank].contiguous())[0]

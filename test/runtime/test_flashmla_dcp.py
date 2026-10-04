@@ -417,7 +417,9 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
             torch.arange(3, device="cuda"),
             values.new_zeros((3, 192)),
             values.squeeze(1),
-            SimpleNamespace(attn_backend=backend, token_to_kv_pool=pool),
+            SimpleNamespace(
+                attn_backend=backend, token_to_kv_pool=pool, query_shard=None
+            ),
             loc,
         )
     else:
