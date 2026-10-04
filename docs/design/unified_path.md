@@ -1403,8 +1403,9 @@ The contract a model (in tree or a plugin) implements:
   `HistoryGatherPlan` (per-owner row counts from `page_table_cpu`,
   `dcp/placement.py: owned_history_rows`). For the indexer the model calls
   `backend.gather_history_index_k(layer_id, pool, group)` per group, which
-  returns the group's index keys in position order in the plane's own
-  format (`DSAConfig.index_k_format`, the pool reads it off the plane's
+  returns the group's index keys in position order in the leaf's
+  `index_k_format` (`DSAConfig.index_k_format`; the pool read
+  `gather_index_k_rows(..., index_k_format=)` refuses a plane of another
   dtype): `fp8_scaled` gives `(fp8 [rows, head_dim] uint8, scales [rows,
   head_dim / 128] fp32)`, `bf16` gives `(keys [rows, head_dim] bf16, None)`.
   The model hands them to `dsa_prefill_topk(q_local, w_local,
@@ -1413,10 +1414,16 @@ The contract a model (in tree or a plugin) implements:
   or `index_k_bf16=` -- never with `index_k_cache`; the facade routes the
   rows by the `index_k_format` trait and requires the
   `index_k_workspace_rows` feature (`dsa.INDEX_K_WORKSPACE_ROWS_FEATURE`),
-  so only a leaf whose launcher takes rows of that format is selected (the
-  in-tree DeepGEMM leaf for the FP8 pair; a plugin's bf16 leaf declares the
-  feature beside `index_k_format={"bf16"}` and takes the `index_k_bf16`
-  keyword) and a plane-only leaf fails at selection, not mid-forward. The
+  so only a leaf whose launcher takes rows of that format is selected and
+  handed the row keywords (the in-tree DeepGEMM leaf for the FP8 pair; a
+  plugin's bf16 leaf declares the feature beside `index_k_format={"bf16"}`
+  and takes the `index_k_bf16` keyword), and an override cannot force a
+  plane-only leaf onto rows. The leaf probes that selection at construction
+  (`DSABackend.__init__` under `qcp_size > 1`,
+  `dsa.select_dsa_prefill_topk_for_rows` with the configured format, page
+  size, indexer geometry and the envelope's batch-invariance and solution
+  pin), so a platform without a declaring leaf is a `NoKernelFoundError` at
+  startup rather than in the first sharded prefill. The
   model adds `group.row_base` to the returned rows and hands
   `forward_sparse_prefill(topk_slots=<workspace rows>)` the local rows;
   the arm gathers every group's KV (`gather_history_kv`, a collective every
@@ -1432,8 +1439,10 @@ The contract a model (in tree or a plugin) implements:
   token all-gather's low-latency solution is bf16-only; the workspace
   (`HistoryGatherWorkspace`, `index_k_format` recorded, rows of
   `index_k_row_bytes(head_dim, format)`) is sized by the recipe and
-  allocated by the leaf from the same formula, and the draft adopts the
-  target's only when the formats agree. The decode arm (the
+  allocated by the leaf from the same formula; the recipe refuses a draft
+  whose `index_k_format` differs from the target's, naming both, since the
+  two share one workspace, and the adopting leaf checks the recorded format
+  with the rest of the geometry. The decode arm (the
   drafter's steps) keeps the DCP combine; its form follows the layer's head
   count against the attention config (`keep_all_heads` when
   `layer.tp_q_head_num` is every head — head-replicated weights — the

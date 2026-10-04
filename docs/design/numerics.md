@@ -210,9 +210,12 @@ leaf registered with the `candidate_lens_cpu` feature and no other. Index
 keys handed to `dsa_prefill_topk` as rows in workspace-row order (the
 query-context-parallel history gather over page-sharded caches,
 `docs/design/unified_path.md`) keep the plane's format -- `index_k_fp8` +
-`index_k_scale`, or `index_k_bf16` -- and select only leaves declaring the
-`index_k_workspace_rows` feature for it, so a bf16 leaf that scores gathered
-rows declares that feature and takes the `index_k_bf16` keyword. In-tree
+`index_k_scale`, or `index_k_bf16` -- and reach only leaves declaring the
+`index_k_workspace_rows` feature for it (selection requires the feature,
+overrides included, and the keywords are routed by it), so a bf16 leaf that
+scores gathered rows declares that feature and takes the `index_k_bf16`
+keyword; the GPU DSA leaf selects that leaf once at construction under
+query context parallelism, so a missing one fails at startup. In-tree
 drafts fold no LoRA norm scale; a draft that
 does must read `--mla-lora-scale` exactly as the target does, folding only
 under `folded`.

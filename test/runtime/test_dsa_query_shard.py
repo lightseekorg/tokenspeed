@@ -31,6 +31,11 @@ workspace reservation agreeing with the recipe's plan in either format.
 
 from __future__ import annotations
 
+from test.runtime.dsa_index_k_test_utils import (
+    expected_index_k_rows,
+    index_k_pool,
+    write_index_k_plane,
+)
 from types import SimpleNamespace
 
 import pytest
@@ -45,10 +50,7 @@ from tokenspeed.runtime.layers.attention.configs.dsa import (
     dsa_index_k_row_bytes,
     index_k_row_bytes,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.dsa import (
-    DSATokenToKVPool,
-    split_index_k_rows,
-)
+from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
 )
@@ -68,8 +70,8 @@ def _backend(
     rank: int,
     *,
     workspace_rows: int,
+    index_k_format: str,
     qcp: bool = True,
-    index_k_format: str = "fp8_scaled",
 ) -> dsa.DSABackend:
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = PAGE
@@ -140,7 +142,9 @@ def _init(backend: dsa.DSABackend, plan: QueryShardPlan) -> None:
 
 @pytest.mark.parametrize("rank", range(WORLD))
 def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
-    backend = _backend(rank, workspace_rows=11)  # 6 + 5 fit, 6 + 5 + 5 do not
+    backend = _backend(
+        rank, workspace_rows=11, index_k_format="fp8_scaled"
+    )  # 6 + 5 fit, 6 + 5 + 5 do not
     plan = _plan(rank)
     delegate_calls = []
     backend._dense_backend.init_forward_metadata = (
@@ -171,10 +175,12 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
 
 
 def test_a_history_over_the_workspace_is_refused_and_an_unsharded_init_clears():
-    backend = _backend(0, workspace_rows=3)  # four rows once padded to pages
+    backend = _backend(
+        0, workspace_rows=3, index_k_format="fp8_scaled"
+    )  # four rows once padded to pages
     with pytest.raises(RuntimeError, match="exceeds"):
         _init(backend, _plan(0))
-    backend = _backend(0, workspace_rows=11)
+    backend = _backend(0, workspace_rows=11, index_k_format="fp8_scaled")
     _init(backend, _plan(0))
     assert backend.query_shard_metadata is not None
     backend.init_forward_metadata(
@@ -197,7 +203,7 @@ def test_a_history_over_the_workspace_is_refused_and_an_unsharded_init_clears():
 
 
 def test_a_sharded_init_needs_the_host_table_and_the_workspace():
-    backend = _backend(0, workspace_rows=11)
+    backend = _backend(0, workspace_rows=11, index_k_format="fp8_scaled")
     with pytest.raises(RuntimeError, match="host page table"):
         backend.init_forward_metadata(
             3,
@@ -213,14 +219,14 @@ def test_a_sharded_init_needs_the_host_table_and_the_workspace():
             query_shard=_plan(0),
             page_table_cpu=None,
         )
-    backend = _backend(0, workspace_rows=0)
+    backend = _backend(0, workspace_rows=0, index_k_format="fp8_scaled")
     with pytest.raises(RuntimeError, match="workspace"):
         _init(backend, _plan(0))
 
 
 @pytest.mark.parametrize("rank", range(WORLD))
 def test_the_sharded_arm_attends_gathered_groups_with_full_heads(monkeypatch, rank):
-    backend = _backend(rank, workspace_rows=11)
+    backend = _backend(rank, workspace_rows=11, index_k_format="fp8_scaled")
     plan = _plan(rank)
     _init(backend, plan)
     meta = backend.require_query_shard_metadata()
@@ -304,7 +310,7 @@ def test_the_sharded_arm_attends_gathered_groups_with_full_heads(monkeypatch, ra
 
 
 def test_the_dense_delegate_is_refused_under_a_shard():
-    backend = _backend(0, workspace_rows=11)
+    backend = _backend(0, workspace_rows=11, index_k_format="fp8_scaled")
     _init(backend, _plan(0))
     with pytest.raises(RuntimeError, match="forward_sparse_prefill"):
         backend.forward_extend_chunked(
@@ -323,107 +329,66 @@ def test_the_dense_delegate_is_refused_under_a_shard():
         )
 
 
-def _index_k_plane(head_dim: int, page_size: int, pages: int) -> torch.Tensor:
-    """A block-split index-K plane: fp8 rows then fp32 scales per page; row
-    ``r`` of page ``p`` holds byte ``r + 10 p`` and scale ``r + 100 p``."""
-    groups = head_dim // 128
-    row_bytes = head_dim + groups * 4
-    buf = torch.zeros(pages * page_size * row_bytes, dtype=torch.uint8)
-    for page in range(pages):
-        base = page * page_size * row_bytes
-        fp8 = buf[base : base + page_size * head_dim].view(page_size, head_dim)
-        fp8[:] = (torch.arange(page_size) + 10 * page).unsqueeze(1).to(torch.uint8)
-        scales = (
-            buf[base + page_size * head_dim : base + page_size * row_bytes]
-            .view(torch.float32)
-            .view(page_size, groups)
-        )
-        scales[:] = (torch.arange(page_size) + 100 * page).unsqueeze(1).float()
-    return buf.view(pages * page_size, row_bytes)
-
-
-def _bf16_index_k_plane(head_dim: int, page_size: int, pages: int) -> torch.Tensor:
-    """A bf16 index-K plane ``[slots, head_dim]``: slot ``v`` holds the key
-    ``v + 0.5`` in every element (the plane is flat, no per-page split)."""
+def _written_index_k_pool(index_k_format: str, page_size: int, pages: int):
+    """A pool over a plane of ``pages`` pages written through the production
+    write path, slot ``v`` holding the key ``v + i / 4`` (``i`` the element),
+    with the rows the read side must hand back for every slot."""
     slots = pages * page_size
-    return (
-        (torch.arange(slots, dtype=torch.float32) + 0.5)
-        .unsqueeze(1)
-        .expand(slots, head_dim)
-        .to(torch.bfloat16)
-        .contiguous()
+    keys = (
+        torch.arange(slots, dtype=torch.float32).unsqueeze(1)
+        + torch.arange(INDEX_HEAD_DIM, dtype=torch.float32) / 4
+    ).to(torch.bfloat16)
+    plane = write_index_k_plane(
+        index_k_format,
+        head_dim=INDEX_HEAD_DIM,
+        page_size=page_size,
+        slots=slots,
+        loc=torch.arange(slots, dtype=torch.int64),
+        keys=keys,
     )
+    pool = index_k_pool(plane, head_dim=INDEX_HEAD_DIM, page_size=page_size)
+    return pool, expected_index_k_rows(index_k_format, keys)
 
 
-def _index_k_pool(index_k_format: str, page_size: int, pages: int):
-    plane = (
-        _index_k_plane(INDEX_HEAD_DIM, page_size, pages)
-        if index_k_format == "fp8_scaled"
-        else _bf16_index_k_plane(INDEX_HEAD_DIM, page_size, pages)
-    )
-    pool = SimpleNamespace(
-        get_index_k_buffer=lambda layer_id: plane,
-        arena=SimpleNamespace(kv_page_size=page_size),
-        index_head_dim=INDEX_HEAD_DIM,
-    )
-    pool.gather_index_k_rows = lambda layer_id, slots: (
-        DSATokenToKVPool.gather_index_k_rows(pool, layer_id, slots)
-    )
-    return pool
-
-
-def test_the_index_k_gather_reads_the_block_split_plane_packed_per_row():
+@pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
+def test_the_index_k_gather_reads_back_what_the_pool_wrote(index_k_format):
+    """``gather_index_k_rows`` is the read side of ``set_index_k_buffer``: the
+    packed row of a slot is the bytes the write stored for it (FP8 bytes then
+    the scale, or the bf16 key), and ``split_index_k_rows`` views them back
+    as the rows ``dsa_prefill_topk`` takes."""
     head_dim, page_size, pages = INDEX_HEAD_DIM, 4, 3
-    pool = _index_k_pool("fp8_scaled", page_size, pages)
-    slots = torch.tensor([0, 5, 11, 6], dtype=torch.int64)
-    packed = pool.gather_index_k_rows(0, slots)
-    assert packed.shape == (4, dsa_index_k_row_bytes(head_dim))
-    assert packed.dtype == torch.uint8
-    fp8, scale = split_index_k_rows(
-        packed, index_head_dim=head_dim, index_k_format="fp8_scaled"
+    pool, (expected_keys, expected_scale) = _written_index_k_pool(
+        index_k_format, page_size, pages
     )
-    assert fp8.shape == (4, head_dim) and scale.shape == (4, 1)
-    assert fp8[:, 0].tolist() == [0, 11, 23, 12]
-    assert scale[:, 0].tolist() == [0.0, 101.0, 203.0, 102.0]
+    slots = torch.tensor([0, 5, 11, 6], dtype=torch.int64)
+    packed = pool.gather_index_k_rows(0, slots, index_k_format=index_k_format)
+    row_bytes = index_k_row_bytes(head_dim, index_k_format)
+    assert packed.shape == (4, row_bytes) and packed.dtype == torch.uint8
+    keys, scale = split_index_k_rows(
+        packed, index_head_dim=head_dim, index_k_format=index_k_format
+    )
+    assert keys.shape == (4, head_dim)
+    assert torch.equal(keys, expected_keys[slots])
+    if index_k_format == "fp8_scaled":
+        assert row_bytes == dsa_index_k_row_bytes(head_dim)
+        assert keys.dtype == torch.uint8 and scale.shape == (4, 1)
+        assert torch.equal(scale, expected_scale[slots])
+    else:
+        assert row_bytes == 2 * head_dim
+        assert keys.dtype == torch.bfloat16 and scale is None
+        assert keys.data_ptr() == packed.data_ptr()
+    # The format is explicit, never guessed from the bytes: the other
+    # format's width is refused on the split, and the other format's plane
+    # on the read.
+    other = "bf16" if index_k_format == "fp8_scaled" else "fp8_scaled"
+    with pytest.raises(ValueError, match="bytes wide"):
+        split_index_k_rows(packed, index_head_dim=head_dim, index_k_format=other)
     with pytest.raises(ValueError, match="bytes wide"):
         split_index_k_rows(
-            packed[:, :-1], index_head_dim=head_dim, index_k_format="fp8_scaled"
+            packed[:, :-1], index_head_dim=head_dim, index_k_format=index_k_format
         )
-    # The same bytes are not a bf16 row: the format is explicit, not guessed.
-    with pytest.raises(ValueError, match="bytes wide"):
-        split_index_k_rows(packed, index_head_dim=head_dim, index_k_format="bf16")
-
-
-def test_the_index_k_gather_reads_a_bf16_plane_as_key_bytes():
-    """A bf16 plane's packed row is its key's bytes (no scale); the split
-    views them back as bf16 keys and a ``None`` scale -- the ``index_k_bf16``
-    form of ``dsa_prefill_topk``."""
-    head_dim, page_size, pages = INDEX_HEAD_DIM, 4, 3
-    pool = _index_k_pool("bf16", page_size, pages)
-    slots = torch.tensor([0, 5, 11, 6], dtype=torch.int64)
-    packed = pool.gather_index_k_rows(0, slots)
-    assert packed.shape == (4, index_k_row_bytes(head_dim, "bf16")) == (4, 2 * head_dim)
-    assert packed.dtype == torch.uint8
-    keys, scale = split_index_k_rows(
-        packed, index_head_dim=head_dim, index_k_format="bf16"
-    )
-    assert scale is None
-    assert keys.dtype == torch.bfloat16 and keys.shape == (4, head_dim)
-    assert keys.data_ptr() == packed.data_ptr()
-    torch.testing.assert_close(
-        keys[:, 0].float(), torch.tensor([0.5, 5.5, 11.5, 6.5]), rtol=0, atol=0
-    )
-    with pytest.raises(ValueError, match="bytes wide"):
-        split_index_k_rows(packed, index_head_dim=head_dim, index_k_format="fp8_scaled")
-    # A plane of a dtype that is no format has no read path either.
-    plane = torch.zeros((8, head_dim), dtype=torch.float16)
-    pool = SimpleNamespace(
-        get_index_k_buffer=lambda layer_id: plane,
-        arena=SimpleNamespace(kv_page_size=page_size),
-        index_head_dim=head_dim,
-    )
-    with pytest.raises(TypeError, match="no read path"):
-        DSATokenToKVPool.gather_index_k_rows(pool, 0, slots)
+    with pytest.raises(ValueError, match=f"not the .* of index_k_format={other!r}"):
+        pool.gather_index_k_rows(0, slots, index_k_format=other)
 
 
 @pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
@@ -435,7 +400,9 @@ def test_the_index_k_history_is_one_gather_per_group(monkeypatch, index_k_format
     plan = _plan(0)
     _init(backend, plan)
     group = backend.require_query_shard_metadata().groups[0]
-    pool = _index_k_pool(index_k_format, PAGE, 8)
+    pool, (expected_keys, expected_scale) = _written_index_k_pool(
+        index_k_format, PAGE, 8
+    )
     gathers = []
     real = dsa.gather_history_rows
 
@@ -454,20 +421,16 @@ def test_the_index_k_history_is_one_gather_per_group(monkeypatch, index_k_format
     slots = group.gather.virtual_slots
     assert keys.shape == (group.rows, INDEX_HEAD_DIM)
     assert keys.data_ptr() == backend._history_workspace.index_k.data_ptr()
+    assert torch.equal(keys, expected_keys[slots])
     if index_k_format == "fp8_scaled":
-        # Slot v is page v // 2, row v % 2 of the block-split plane.
         assert keys.dtype == torch.uint8 and scale.shape == (group.rows, 1)
-        assert keys[:, 0].tolist() == ((slots % PAGE) + 10 * (slots // PAGE)).tolist()
-        assert scale[:, 0].tolist() == ((slots % PAGE) + 100 * (slots // PAGE)).tolist()
+        assert torch.equal(scale, expected_scale[slots])
     else:
         assert keys.dtype == torch.bfloat16 and scale is None
-        torch.testing.assert_close(
-            keys[:, 0].float(), slots.float() + 0.5, rtol=0, atol=0
-        )
 
 
 def _decode_arm_backend(*, num_attention_heads: int, attn_tp_size: int):
-    backend = _backend(1, workspace_rows=0)
+    backend = _backend(1, workspace_rows=0, index_k_format="fp8_scaled")
     backend.kernel_page_size = 64
     backend.dcp_group = (0, 1, 2, 3)
     backend.dcp_rank = 1
@@ -645,8 +608,8 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
     its workspace without a second reservation."""
     from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
 
-    target = _backend(0, workspace_rows=0)
-    draft = _backend(0, workspace_rows=0)
+    target = _backend(0, workspace_rows=0, index_k_format="fp8_scaled")
+    draft = _backend(0, workspace_rows=0, index_k_format="fp8_scaled")
     draft.is_draft = True
     target_router = _router(target, is_draft=False)
     draft_router = _router(draft, is_draft=True)
@@ -685,7 +648,7 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
     with pytest.raises(RuntimeError, match="does not match allocated"):
         _prepare_fixed_workspaces(**kwargs, expected_bytes=planned + 1)
     # Off: nothing is allocated and nothing is checked.
-    fresh = _backend(0, workspace_rows=0, qcp=False)
+    fresh = _backend(0, workspace_rows=0, qcp=False, index_k_format="fp8_scaled")
     config.qcp_size = 1
     _prepare_fixed_workspaces(
         **{**kwargs, "backend": _router(fresh, is_draft=False), "draft_backend": None},
@@ -695,9 +658,9 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
 
 
 def test_the_draft_refuses_a_workspace_of_another_geometry():
-    target = _backend(0, workspace_rows=11)
+    target = _backend(0, workspace_rows=11, index_k_format="fp8_scaled")
     workspace = target.history_gather_workspace()
-    draft = _backend(0, workspace_rows=0)
+    draft = _backend(0, workspace_rows=0, index_k_format="fp8_scaled")
     draft.kv_cache_dim = KV_DIM + 2
     with pytest.raises(ValueError, match="geometry mismatch"):
         draft.adopt_history_gather_workspace(workspace)
@@ -706,16 +669,85 @@ def test_the_draft_refuses_a_workspace_of_another_geometry():
     with pytest.raises(ValueError, match="geometry mismatch"):
         draft.adopt_history_gather_workspace(workspace)
     draft.kernel_page_size = PAGE
-    draft.index_k_format = "bf16"  # the target packed fp8_scaled rows
+    # The index-K format is part of the geometry too (the recipe refuses a
+    # draft of another format before any leaf exists; this is the leaf's own
+    # invariant over the buffer it gathers into).
+    draft.index_k_format = "bf16"
     with pytest.raises(ValueError, match="geometry mismatch"):
         draft.adopt_history_gather_workspace(workspace)
     draft.index_k_format = "fp8_scaled"
     draft.adopt_history_gather_workspace(workspace)
     assert draft.history_gather_workspace() is workspace
-    with pytest.raises(ValueError, match="index_k_format"):
-        dsa.HistoryGatherWorkspace(
-            rows=workspace.rows,
-            kv=workspace.kv,
-            index_k=workspace.index_k,
-            index_k_format="fp16",
-        )
+
+
+def _register_rows_leaf(name: str, *, index_k_format: str, takes_rows: bool):
+    """A ``dsa_prefill_topk`` leaf of solution ``name`` for the format, with
+    or without the workspace-rows feature; registered on any platform."""
+    from tokenspeed_kernel.ops.attention.dsa import INDEX_K_WORKSPACE_ROWS_FEATURE
+    from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, Priority
+    from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+    features = {"batch_invariant"}
+    if takes_rows:
+        features.add(INDEX_K_WORKSPACE_ROWS_FEATURE)
+    spec = KernelSpec(
+        name=name,
+        family="attention",
+        mode="dsa_prefill_topk",
+        solution=name,
+        format_signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    weights=dense_tensor_format(torch.float32),
+                )
+            }
+        ),
+        traits={
+            "index_k_format": frozenset({index_k_format}),
+            "index_k_layout": frozenset({"packed"}),
+            "page_size": frozenset({PAGE}),
+        },
+        features=frozenset(features),
+        priority=Priority.PORTABLE,
+    )
+    KernelRegistry.get().register(spec, lambda **kwargs: None)
+    return spec.name
+
+
+@pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
+def test_construction_probes_the_rows_leaf_the_sharded_prefill_will_need(
+    index_k_format,
+):
+    """Under query context parallelism the leaf selects, at construction, the
+    ``dsa_prefill_topk`` leaf that scores gathered index-K rows of its format
+    (the ``index_k_workspace_rows`` feature): a platform without one fails at
+    startup with the format named, not in the first sharded prefill."""
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    other = "bf16" if index_k_format == "fp8_scaled" else "fp8_scaled"
+    rows = _register_rows_leaf(
+        "unit_rows", index_k_format=index_k_format, takes_rows=True
+    )
+    plane = _register_rows_leaf(
+        "unit_plane", index_k_format=index_k_format, takes_rows=False
+    )
+    foreign = _register_rows_leaf("unit_foreign", index_k_format=other, takes_rows=True)
+    try:
+        backend = _backend(0, workspace_rows=0, index_k_format=index_k_format)
+        backend.batch_invariant = True
+        spec = SimpleNamespace(index_n_heads=16)
+        backend.kernel_solution = "unit_rows"
+        backend._probe_history_gather_topk_leaf(spec)
+        # A leaf of the format that reads planes only, or a rows leaf of the
+        # other format, is no leaf for these rows.
+        for solution in ("unit_plane", "unit_foreign"):
+            backend.kernel_solution = solution
+            with pytest.raises(
+                NoKernelFoundError, match=f"index_k_format={index_k_format!r}"
+            ):
+                backend._probe_history_gather_topk_leaf(spec)
+    finally:
+        for name in (rows, plane, foreign):
+            KernelRegistry.get()._unregister(name)

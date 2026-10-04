@@ -100,43 +100,50 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self.layerwise_load_tracker.wait_for_layer(layer_id)
         return self.index_k_buffer[layer_id]
 
-    def gather_index_k_rows(self, layer_id: int, slots: torch.Tensor) -> torch.Tensor:
+    def gather_index_k_rows(
+        self, layer_id: int, slots: torch.Tensor, *, index_k_format: str
+    ) -> torch.Tensor:
         """Read index-K rows out of the plane as packed bytes, one row per slot.
 
         The read side of :meth:`set_index_k_buffer`, for the rows a
-        query-context-parallel history gather contributes; the plane's dtype
-        is its format, as on the write side. A uint8 (``fp8_scaled``) plane
-        stores every page as its ``page_size`` FP8 rows followed by their
-        fp32 scales (``index_k_block_split_scatter``), and each row comes back
-        as its FP8 bytes followed by its scale bytes so one gather moves both;
-        a bf16 plane's row is its key's bytes. :func:`split_index_k_rows`
-        views the packed rows apart again.
+        query-context-parallel history gather contributes. The caller names
+        the format it packs rows in (``DSAConfig.index_k_format``) and the
+        plane must be that format's dtype (``index_k_plane_dtype``). An
+        ``fp8_scaled`` plane stores every page as its ``page_size`` FP8 rows
+        followed by their fp32 scales (``index_k_block_split_scatter``), and
+        each row comes back as its FP8 bytes followed by its scale bytes so
+        one gather moves both; a ``bf16`` plane's row is its key's bytes.
+        :func:`split_index_k_rows` views the packed rows apart again.
 
         Args:
             layer_id: The indexer layer whose plane to read.
             slots: ``[rows]`` int64 local cache slots.
+            index_k_format: The format to pack rows in, one of
+                ``configs/dsa.py`` ``INDEX_K_FORMATS``.
 
         Returns:
-            ``[rows, index_k_row_bytes(index_head_dim, format)]`` uint8 rows
-            in ``slots`` order.
+            ``[rows, index_k_row_bytes(index_head_dim, index_k_format)]`` uint8
+            rows in ``slots`` order.
         """
         buf = self.get_index_k_buffer(layer_id)
-        head_dim = self.index_head_dim
-        if buf.dtype == torch.bfloat16:
-            return buf.reshape(-1, head_dim)[slots].view(torch.uint8)
-        if buf.dtype != torch.uint8:
-            raise TypeError(
-                f"index-K plane dtype {buf.dtype} has no read path: uint8 "
-                "(fp8_scaled) or bfloat16 (bf16)"
+        plane_dtype = index_k_plane_dtype(index_k_format)
+        if buf.dtype != plane_dtype:
+            raise ValueError(
+                f"layer {layer_id} index-K plane is {buf.dtype}, not the "
+                f"{plane_dtype} of index_k_format={index_k_format!r}"
             )
+        head_dim = self.index_head_dim
+        if index_k_format != "fp8_scaled":
+            # A plain plane: the row is the key's bytes.
+            return buf.reshape(-1, head_dim)[slots].view(torch.uint8)
         page_size = int(self.arena.kv_page_size)
-        groups = head_dim // _INDEX_K_FP8_GROUP_SIZE
-        row_bytes = head_dim + groups * 4
+        row_bytes = index_k_row_bytes(head_dim, index_k_format)
+        scale_bytes = row_bytes - head_dim
         page_bytes = page_size * row_bytes
         num_pages = buf.numel() // page_bytes
         pages = buf.reshape(-1)[: num_pages * page_bytes].view(num_pages, page_bytes)
         fp8 = pages[:, : page_size * head_dim].view(num_pages, page_size, head_dim)
-        scale = pages[:, page_size * head_dim :].view(num_pages, page_size, groups * 4)
+        scale = pages[:, page_size * head_dim :].view(num_pages, page_size, scale_bytes)
         page = torch.div(slots, page_size, rounding_mode="floor")
         offset = slots - page * page_size
         return torch.cat((fp8[page, offset], scale[page, offset]), dim=1)

@@ -35,7 +35,11 @@ the DSA leaf's index-K history gather rebuilds the plane in its own format
 from __future__ import annotations
 
 import socket
-from types import SimpleNamespace
+from test.runtime.dsa_index_k_test_utils import (
+    expected_index_k_rows,
+    index_k_pool,
+    write_index_k_plane,
+)
 
 import pytest
 import torch
@@ -263,60 +267,42 @@ def test_history_gather_rebuilds_every_group_in_position_order():
 INDEX_HEAD_DIM = 128
 
 
-def _reference_fp8(virtual_slots: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """The replicated ``fp8_scaled`` plane: slot ``v`` holds bytes
-    ``(7 v + i) mod 256`` and the scale ``v + 0.5``."""
-    v = virtual_slots.to(torch.int64).unsqueeze(1)
-    fp8 = ((v * 7 + torch.arange(INDEX_HEAD_DIM)) % 256).to(torch.uint8)
-    return fp8, (virtual_slots.to(torch.float32) + 0.5).unsqueeze(1)
-
-
-def _reference_bf16(virtual_slots: torch.Tensor) -> torch.Tensor:
-    """The replicated ``bf16`` plane: slot ``v`` holds ``v + i / 4``."""
-    v = virtual_slots.to(torch.float32).unsqueeze(1)
+def _index_k_keys() -> torch.Tensor:
+    """The replicated index-K history: virtual slot ``v`` holds the key
+    ``v + i / 4`` (``i`` the element), in bf16."""
+    v = torch.arange(VIRTUAL_BLOCKS * GRANULARITY, dtype=torch.float32).unsqueeze(1)
     return (v + torch.arange(INDEX_HEAD_DIM, dtype=torch.float32) / 4).to(
         torch.bfloat16
     )
 
 
-def _local_index_k_plane(rank: int, index_k_format: str) -> torch.Tensor:
-    """This rank's physical index-K plane in the pool's layout for the format:
-    block-split pages of ``GRANULARITY`` rows (FP8 rows then fp32 scales) for
-    ``fp8_scaled``, flat ``[slots, head_dim]`` keys for ``bf16``."""
+def _local_index_k_planes(index_k_format: str) -> list[torch.Tensor]:
+    """Every rank's physical index-K plane: the virtual slots it owns, written
+    at their local slots through the pool's production write path (built in
+    the parent, so the gloo workers stay host-only)."""
     local_pages = 1 + (VIRTUAL_BLOCKS - 1 + WORLD - 1) // WORLD
-    local_slots = local_pages * GRANULARITY
     every = torch.arange(VIRTUAL_BLOCKS * GRANULARITY, dtype=torch.int64)
-    local, owned = virtual_slots_to_local(
-        every,
-        rows_per_page=GRANULARITY,
-        virtual_block_count=VIRTUAL_BLOCKS,
-        degree=WORLD,
-        rank=rank,
-    )
-    if index_k_format == "bf16":
-        plane = torch.full(
-            (local_slots, INDEX_HEAD_DIM), float("nan"), dtype=torch.bfloat16
+    keys = _index_k_keys()
+    planes = []
+    for rank in range(WORLD):
+        local, owned = virtual_slots_to_local(
+            every,
+            rows_per_page=GRANULARITY,
+            virtual_block_count=VIRTUAL_BLOCKS,
+            degree=WORLD,
+            rank=rank,
         )
-        plane[local[owned]] = _reference_bf16(every)[owned]
-        return plane
-    fp8 = torch.full((local_slots, INDEX_HEAD_DIM), 255, dtype=torch.uint8)
-    scale = torch.full((local_slots, 1), float("nan"), dtype=torch.float32)
-    ref_fp8, ref_scale = _reference_fp8(every)
-    fp8[local[owned]] = ref_fp8[owned]
-    scale[local[owned]] = ref_scale[owned]
-    row_bytes = INDEX_HEAD_DIM + 4
-    pages = []
-    for page in range(local_pages):
-        rows = slice(page * GRANULARITY, (page + 1) * GRANULARITY)
-        pages.append(
-            torch.cat(
-                (
-                    fp8[rows].reshape(-1),
-                    scale[rows].contiguous().view(torch.uint8).reshape(-1),
-                )
+        planes.append(
+            write_index_k_plane(
+                index_k_format,
+                head_dim=INDEX_HEAD_DIM,
+                page_size=GRANULARITY,
+                slots=local_pages * GRANULARITY,
+                loc=local[owned],
+                keys=keys[owned],
             )
         )
-    return torch.stack(pages).view(local_slots, row_bytes)
+    return planes
 
 
 def _dsa_leaf(rank: int, index_k_format: str, *, max_model_len: int):
@@ -340,7 +326,13 @@ def _dsa_leaf(rank: int, index_k_format: str, *, max_model_len: int):
     return backend
 
 
-def _run_index_k(rank: int, port: int, index_k_format: str) -> None:
+def _run_index_k(
+    rank: int,
+    port: int,
+    index_k_format: str,
+    plane: torch.Tensor,
+    expected: tuple[torch.Tensor, torch.Tensor | None],
+) -> None:
     from tokenspeed.runtime.distributed.comm_backend import registry
     from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
     from tokenspeed.runtime.distributed.mapping import Mapping
@@ -350,7 +342,6 @@ def _run_index_k(rank: int, port: int, index_k_format: str) -> None:
     from tokenspeed.runtime.layers.attention.backends.paged.dsa import (
         QueryShardHistoryGroup,
     )
-    from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     mapping = Mapping(
@@ -369,15 +360,8 @@ def _run_index_k(rank: int, port: int, index_k_format: str) -> None:
     registry._global_backend = backend_comm
 
     leaf = _dsa_leaf(rank, index_k_format, max_model_len=int(SEQ_LENS.sum()))
-    plane = _local_index_k_plane(rank, index_k_format)
-    pool = SimpleNamespace(
-        get_index_k_buffer=lambda layer_id: plane,
-        arena=SimpleNamespace(kv_page_size=GRANULARITY),
-        index_head_dim=INDEX_HEAD_DIM,
-    )
-    pool.gather_index_k_rows = lambda layer_id, slots: (
-        DSATokenToKVPool.gather_index_k_rows(pool, layer_id, slots)
-    )
+    pool = index_k_pool(plane, head_dim=INDEX_HEAD_DIM, page_size=GRANULARITY)
+    expected_keys, expected_scale = expected
     placement = leaf.cache_placement(None)
     assert placement == _placement(rank)
     table = _page_table()
@@ -408,14 +392,12 @@ def _run_index_k(rank: int, port: int, index_k_format: str) -> None:
         workspace = leaf.history_gather_workspace()
         assert keys.shape == (rows, INDEX_HEAD_DIM)
         assert keys.data_ptr() == workspace.index_k.data_ptr()
+        assert torch.equal(keys, expected_keys[virtual_slots])
         if index_k_format == "fp8_scaled":
-            ref_fp8, ref_scale = _reference_fp8(virtual_slots)
-            assert keys.dtype == torch.uint8 and torch.equal(keys, ref_fp8)
-            assert scale.dtype == torch.float32 and torch.equal(scale, ref_scale)
+            assert keys.dtype == torch.uint8 and scale.dtype == torch.float32
+            assert torch.equal(scale, expected_scale[virtual_slots])
         else:
-            assert scale is None
-            assert keys.dtype == torch.bfloat16
-            assert torch.equal(keys, _reference_bf16(virtual_slots))
+            assert keys.dtype == torch.bfloat16 and scale is None
         row_base += rows
     assert set(backend_comm.gathered_dtypes) == {torch.bfloat16}
 
@@ -423,9 +405,11 @@ def _run_index_k(rank: int, port: int, index_k_format: str) -> None:
     dist.destroy_process_group()
 
 
-def _index_k_worker(rank: int, port: int, index_k_format: str, errors) -> None:
+def _index_k_worker(
+    rank: int, port: int, index_k_format: str, planes, expected, errors
+):
     try:
-        _run_index_k(rank, port, index_k_format)
+        _run_index_k(rank, port, index_k_format, planes[rank], expected)
     except Exception:  # pragma: no cover - reported to the parent
         import traceback
 
@@ -438,13 +422,19 @@ def test_the_dsa_leaf_gathers_the_index_k_history_in_the_planes_format(
 ):
     """``DSABackend.gather_history_index_k`` over page-sharded planes rebuilds
     every group's index-K history in position order on every rank in the
-    plane's own format: FP8 bytes plus fp32 scales, or bf16 keys with no
-    scale (the ``index_k_fp8``/``index_k_scale`` and ``index_k_bf16`` rows of
-    ``dsa_prefill_topk``), through the bf16-only collective."""
+    plane's own format -- the bytes the pool's write path stored: FP8 bytes
+    plus fp32 scales, or bf16 keys with no scale (the
+    ``index_k_fp8``/``index_k_scale`` and ``index_k_bf16`` rows of
+    ``dsa_prefill_topk``) -- through the bf16-only collective."""
+    planes = _local_index_k_planes(index_k_format)
+    expected = expected_index_k_rows(index_k_format, _index_k_keys())
     port = _get_open_port()
     errors = mp.Manager().dict()
     mp.spawn(
-        _index_k_worker, args=(port, index_k_format, errors), nprocs=WORLD, join=True
+        _index_k_worker,
+        args=(port, index_k_format, planes, expected, errors),
+        nprocs=WORLD,
+        join=True,
     )
     if errors:
         raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in errors.items()))

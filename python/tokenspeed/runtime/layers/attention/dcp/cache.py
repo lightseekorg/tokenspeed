@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.distributed.comm_ops import token_all_gather_rows
-from tokenspeed.runtime.layers.attention.configs.dsa import index_k_plane_dtype
 from tokenspeed.runtime.layers.attention.dcp.comm import gather_owned_rows
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
@@ -83,7 +82,9 @@ class HistoryGatherWorkspace:
             (FP8 bytes then fp32 scales, or the bf16 key's bytes;
             ``kv_cache.dsa.split_index_k_rows`` views them apart).
         index_k_format: The index-K plane format the rows are packed in
-            (``configs.dsa.INDEX_K_FORMATS``).
+            (``configs.dsa.INDEX_K_FORMATS``), recorded as the allocating
+            leaf named it; the leaf that adopts the workspace checks it
+            against its own.
     """
 
     rows: int
@@ -104,8 +105,6 @@ class HistoryGatherWorkspace:
                 f"{tuple(self.kv.shape)} / index_k {tuple(self.index_k.shape)} "
                 f"{self.index_k.dtype}"
             )
-        # Refuses a format name the planes do not have.
-        index_k_plane_dtype(self.index_k_format)
 
     @property
     def nbytes(self) -> int:
