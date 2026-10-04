@@ -37,8 +37,10 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         handler.attn_dp_size = 1
         handler.attn_dp_cpu_group = None
         handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-        handler._replica_flush_want_buf = torch.zeros(4, dtype=torch.int32)
+        handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
         handler._pending_weight_ops = deque()
+        handler._pending_internal_ops = deque()
+        handler._internal_op_completer = None
         handler._device = mock.Mock()
         handler._device.delete_l3_namespace.return_value = True
         return handler
@@ -284,8 +286,10 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         handler.attn_dp_size = 1
         handler.attn_dp_cpu_group = None
         handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-        handler._replica_flush_want_buf = torch.zeros(4, dtype=torch.int32)
+        handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
         handler._pending_weight_ops = deque()
+        handler._pending_internal_ops = deque()
+        handler._internal_op_completer = None
         handler.can_clear_cache_fn = mock.Mock(return_value=True)
         handler._device.delete_l3_namespace.return_value = True
         return handler

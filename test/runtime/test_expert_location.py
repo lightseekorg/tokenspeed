@@ -327,6 +327,7 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
         init_expert_location="trivial",
         expert_distribution_recorder_mode="stat",
         ep_dispatch_algorithm="static",
+        enable_eplb=False,
     )
     model_config = SimpleNamespace(hf_config=None)
     assert not BaseCausalLM.supports_expert_placement

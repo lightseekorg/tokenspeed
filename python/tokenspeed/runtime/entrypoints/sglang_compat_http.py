@@ -45,6 +45,7 @@ from tokenspeed.runtime.cache.l3.backend import (
 from tokenspeed.runtime.engine.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqInput,
+    RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
@@ -246,6 +247,25 @@ async def update_weights_from_mooncake(request: Request) -> JSONResponse:
         success, message = await llm.update_weights_from_mooncake(obj)
         if success:
             message = _stamp_weight_version(request, obj.weight_version, message)
+        return {"success": success, "message": message}
+
+    return await _guarded(_do)
+
+
+@router.post("/rebalance_experts")
+async def rebalance_experts(request: Request) -> JSONResponse:
+    """Start one online expert rebalance now (``--enable-eplb``).
+
+    No body. The reply arrives once every worker took its load snapshot; the
+    weight moves follow over the next scheduling rounds. Fails while a
+    rebalance is already in progress or the server runs without
+    ``--enable-eplb``.
+    """
+
+    async def _do() -> dict[str, Any]:
+        success, message = await _llm(request).rebalance_experts(
+            RebalanceExpertsReqInput()
+        )
         return {"success": success, "message": message}
 
     return await _guarded(_do)

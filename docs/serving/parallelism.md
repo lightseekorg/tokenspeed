@@ -233,9 +233,10 @@ uniform share of routes, and the rank holding them carries the layer's
 critical path. `--ep-num-redundant-experts R` gives every MoE layer
 `P = E + R` physical expert slots, `P / ep_size` per rank, and an *expert
 placement* decides which logical expert each slot holds, so a hot expert is
-replicated across ranks. The placement is derived once, at startup, from
-recorded load with DeepSeek's EPLB algorithm; experts are not moved while
-serving (`--enable-eplb` is refused). Models opt in explicitly
+replicated across ranks. The placement is derived from recorded load with
+DeepSeek's EPLB algorithm — once at startup from a profile record, or online
+from the live counters ([dynamic rebalancing](#dynamic-expert-rebalancing)
+below). Models opt in explicitly
 (`supports_expert_placement` on the model class) by building their MoE layers
 from the placement and loading every placed slot — LongCat-Flash does. The
 placement flags are refused for any other model, so a placement is never
@@ -318,6 +319,80 @@ traffic it serves: record on production traffic and re-derive when it
 drifts. Decode benefit depends on the kernel being row-bound; where a grouped
 GEMM streams every touched expert regardless of row count (small decode
 batches), balancing the rows changes little.
+
+### Dynamic expert rebalancing
+
+`--enable-eplb` re-derives the placement while serving and moves the expert
+weights to match, so a drift in the traffic's expert distribution is
+followed without a restart. Every choice it depends on is explicit:
+
+```bash
+--enable-eplb \
+--ep-num-redundant-experts 128 \
+--expert-distribution-recorder-mode stat \
+--ep-dispatch-algorithm static_with_zero_expert \
+--eplb-rebalance-num-iterations 10000 \
+--eplb-rebalance-layers-per-chunk 4
+```
+
+`--eplb-rebalance-num-iterations N` is the recording window: every `N`
+forwards (real or DP-idle, so every rank counts the same) the routing load
+since the previous snapshot is read, the EPLB algorithm derives a new
+placement, and the weights move. `--eplb-rebalance-layers-per-chunk L`
+bounds the stall each scheduling round pays: the model's MoE layers are
+switched `L` per round, each layer's weights first and its routing tables
+right after, so a forward never sees a layer whose tables and slots disagree.
+`--ep-num-redundant-experts 0` is allowed: the rebalance then only permutes
+experts across ranks. `--init-expert-location` still seeds the first
+placement. `POST /rebalance_experts` starts one rebalance now (it replies
+once the load snapshot was taken; the moves follow). The `EXPERT_LOAD` profile
+activity is refused under `--enable-eplb`, since the rebalance owns the same
+counters; the engine log reports the balancedness each snapshot saw and the
+one the new placement is expected to reach.
+
+How a rebalance runs, and why it needs no new communication:
+
+1. **Snapshot.** The counters are copied to the host and zeroed in one step
+   on the execution stream, so the window boundary is exact at forward
+   granularity. Under replicated-input EP (every rank routes every token)
+   each rank's counters already are the group load, and the ranks' checksums
+   are compared — a difference means the ranks routed differently within a
+   forward, a correctness bug that fails the server rather than being
+   averaged away. Under all-to-all EP (DeepEP) each rank counted its own
+   tokens, and the load is summed over the EP group.
+2. **Compute and commit.** EP rank 0 derives the placement in a CPU-only
+   background thread (the DeepSeek algorithm with stable tie-breaking and
+   double-precision counts); 200 forwards later the result is broadcast over
+   the EP group, and every rank plans the same slot moves from the old and
+   new rows. Only the `[layers, slots]` map crosses the wire; the inverse
+   tables are rebuilt locally.
+3. **Apply, one chunk per round.** Each incoming slot is received into a
+   staging buffer reserved at startup (one layer's worth, before the KV
+   arena is sized) while each outgoing slot is sent from its live tensor, in
+   one batched P2P over the EP group; a same-GPU move goes through staging
+   too, and a slot that needs an expert an earlier local slot just received
+   copies it from there. Both ends order the P2P by logical expert id, so
+   the pairs match on every rank by construction. A same-node source is
+   preferred and destinations spread evenly over the sources. The processed
+   parameters move as bytes — quantized weights and scales included — so
+   nothing is re-derived.
+
+Every step is an internal control op completed through the same
+attention-DP same-round gate as the RL weight ops, so all ranks switch a
+layer in the same round and a weight update can never interleave with a
+chunk (both are blocking device ops, one per round). A weight update between
+chunks lands in the current placement: the loader reads the live map, and
+the pending chunks copy whatever the source slots hold. An idle engine takes
+no snapshot (the counter is frozen) and a pending commit waits for forwards;
+a memory-saver release is refused while a rebalance is in progress.
+
+The routing path is unchanged: slot ownership stays contiguous per rank, the
+replica choice is a pure function of the token, and a placement change alters
+only table entries and slot contents. Under `--numerics rl-bitwise` the
+MoE combine must be placement-independent (slot-order combine) for the
+output to stay bitwise identical across a rebalance; a build without that
+combine refuses `--enable-eplb` under the envelope (see
+`docs/design/numerics.md`).
 
 ## Multi-Node
 

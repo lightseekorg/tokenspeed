@@ -43,6 +43,7 @@ def test_placement_is_requested_only_when_it_changes_routing():
             ep_num_redundant_experts=0,
             init_expert_location="trivial",
             expert_distribution_recorder_mode=None,
+            enable_eplb=False,
         )
         base.update(kw)
         return SimpleNamespace(**base)
@@ -51,6 +52,7 @@ def test_placement_is_requested_only_when_it_changes_routing():
     assert expert_placement_requested(args(ep_num_redundant_experts=8))
     assert expert_placement_requested(args(init_expert_location="/tmp/load.pt"))
     assert expert_placement_requested(args(expert_distribution_recorder_mode="stat"))
+    assert expert_placement_requested(args(enable_eplb=True))
 
 
 def test_dispatch_algorithm_vocabulary_is_defined_once():
@@ -110,9 +112,50 @@ class TestServerArgsPlacementValidation:
         with pytest.raises(ValueError, match="has no effect"):
             ServerArgs(model="x", ep_dispatch_algorithm="static")
 
-    def test_runtime_rebalancing_is_refused(self):
-        with pytest.raises(ValueError, match="--enable-eplb"):
-            ServerArgs(model="x", enable_eplb=True)
+    def test_online_rebalancing_spells_out_every_choice(self):
+        ep = dict(attn_tp_size=2, ep_size=2)
+        full = dict(
+            enable_eplb=True,
+            expert_distribution_recorder_mode="stat",
+            ep_dispatch_algorithm="static_with_zero_expert",
+            eplb_rebalance_num_iterations=10000,
+            eplb_rebalance_layers_per_chunk=4,
+            **ep,
+        )
+        args = ServerArgs(model="x", **full)
+        assert args.enable_eplb and expert_placement_requested(args)
+        assert args.ep_num_redundant_experts == 0  # pure permutation is allowed
+        # Nothing is auto-set: each missing or wrong choice is named.
+        for drop, match in (
+            ("expert_distribution_recorder_mode", "recorder-mode stat"),
+            ("eplb_rebalance_num_iterations", "num-iterations"),
+            ("eplb_rebalance_layers_per_chunk", "layers-per-chunk"),
+        ):
+            with pytest.raises(ValueError, match=match):
+                ServerArgs(model="x", **{**full, drop: None})
+        with pytest.raises(ValueError, match="num-iterations"):
+            ServerArgs(model="x", **{**full, "eplb_rebalance_num_iterations": 0})
+        with pytest.raises(ValueError, match="layers-per-chunk"):
+            ServerArgs(model="x", **{**full, "eplb_rebalance_layers_per_chunk": 0})
+        for algorithm in ("dynamic_with_zero_expert", "fake", None):
+            with pytest.raises(ValueError, match="static replica choice"):
+                ServerArgs(model="x", **{**full, "ep_dispatch_algorithm": algorithm})
+        with pytest.raises(ValueError, match="ep_size=1"):
+            ServerArgs(model="x", **{**full, "ep_size": 1, "attn_tp_size": 1})
+        # The knobs mean nothing without the switch.
+        with pytest.raises(ValueError, match="no effect without --enable-eplb"):
+            ServerArgs(model="x", eplb_rebalance_num_iterations=10, **ep)
+        with pytest.raises(ValueError, match="no effect without --enable-eplb"):
+            ServerArgs(model="x", eplb_rebalance_layers_per_chunk=1, **ep)
+        # Under a bitwise envelope the placement-independent MoE combine is
+        # required, which this build does not provide.
+        with pytest.raises(ValueError, match="moe-combine-order slot"):
+            ServerArgs(model="x", numerics="rl-bitwise", **full)
+
+    def test_recorder_buffer_size_knob_is_gone(self):
+        assert "expert_distribution_recorder_buffer_size" not in {
+            f.name for f in __import__("dataclasses").fields(ServerArgs)
+        }
 
     def test_only_stat_recording_exists(self):
         with pytest.raises(ValueError, match="only 'stat'"):

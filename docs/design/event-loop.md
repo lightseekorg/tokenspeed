@@ -326,6 +326,7 @@ Current inventory:
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
 | `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries) | `count_plan_ops`, `poll_ready_events` |
 | `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests`, `revalidate_queued_hits`, `prepare_forward` |
+| `_eplb_hooks` | `EplbHooks` — `engine/eplb_hooks.py` | glue (`ExpertRebalanceController` in `moe/expert_rebalance.py` is the state machine; handed the `DeviceHandle`, the request handler and the EP gloo group; no loop reference) | `note_round` |
 
 `_pause_hooks` and `_pd_hooks` are also handed the `DeviceHandle`: both have
 work that must land on the data plane — the DP idle forward and the KV repair
@@ -333,6 +334,18 @@ after a memory-saver wake, and the device writes a completed remote prefill
 lands. `PauseHooks` additionally supplies `reset_caches_for_release` and
 `kv_repair_after_wake` to the memory-occupation controller as callbacks; those
 are not loop entry points, they fire on release/wake.
+
+`EplbHooks` is the online expert rebalance (`--enable-eplb`). The
+controller counts the forwards this rank submitted — real or DP-idle, so the
+count is rank-identical — and decides when a rebalance's steps are due; the
+hooks enqueue them as *internal control ops* on the request handler's second
+FIFO and complete them, once the same-round gate (below) agrees, through two
+named handle operations (`snapshot_expert_load`, `apply_expert_placement`)
+and two EP-group gloo agreements (the summed load under all-to-all EP, the
+committed map broadcast from EP rank 0). The placement itself is derived on
+EP rank 0 in a CPU-only thread, off both planes. The loop's one line is
+`note_round(forwarded=...)` after its forward submission; nothing in the
+loop body knows a rebalance exists.
 
 `L3CacheHooks` owns prefix registration at submission, candidate revalidation
 before planning, and replica-wide prefetch recovery. It returns the safe forward
@@ -391,7 +404,8 @@ For orientation, one iteration of `event_loop`:
    waits on the zeroing fence inside its submission, which the FIFO orders
    after the write-back fence), then the plan's batch to the model. `planned` is
    None on idle and empty rounds; the plan's own work (hygiene, the remote
-   streams) still runs. Then commit from the queue head down to the
+   streams) still runs. The rebalance hook notes whether this rank forwarded
+   (`_eplb_hooks.note_round`). Then commit from the queue head down to the
    effective depth and poll PD transfer events.
 5. **Advance the scheduler (tail call site)** with the round's
    `request_changes`, publish KV events (once), and resolve any pending
@@ -448,7 +462,22 @@ For orientation, one iteration of `event_loop`:
   yet dequeued its copy would keep looping and wait for this rank in the
   per-round all-reduce, a deadlock. One op completes per round, and its
   result is MIN-reduced across the replica before the L3 weight version
-  is published or the reply sent. They then MIN-reduce a
+  is published or the reply sent. The same gate carries the online expert
+  rebalance's *internal* ops (`EplbSnapshot`, `EplbCommit`,
+  `EplbApplyChunk`) from a second FIFO with three more lanes: frontend
+  ops arrive on different DP workers in different rounds while internal
+  ops are enqueued at rank-identical rounds, so one shared FIFO would
+  make the heads differ in kind across ranks and trip the mismatch
+  check; two FIFOs compare kind-for-kind. When both are ready the
+  frontend op completes this round and the internal op the next — still
+  one blocking device call per round. Because every EP rank is inside a
+  gated op at once, the rebalance may run a gloo collective over the EP
+  group there (summing the load under all-to-all EP, broadcasting the
+  committed map), which the profile's `dump_expert_load` must not. The
+  manual `POST /rebalance_experts` is a frontend op on the first FIFO
+  that starts the same internal sequence; a memory-saver release is
+  refused while a rebalance is in progress and, once drained, waits while
+  chunk ops still write the weights. They then MIN-reduce a
   non-mutating `can_clear_cache` probe across the replica (attention TP,
   then CP, then PP) and then across attention DP — DP replicas share
   Mooncake objects — then MIN-reduce an error-returning L3

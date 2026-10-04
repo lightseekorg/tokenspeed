@@ -100,14 +100,16 @@ PIPELINE_SPEC_ALGORITHMS = ("DSPARK", "MTP")
 def expert_placement_requested(server_args) -> bool:
     """Whether serving needs an expert placement beyond the trivial identity.
 
-    Redundant experts, a non-trivial initial location and load recording all
-    need the placement tables (``moe/expert_location.py``); plain EP serving
-    does not and keeps its routing untouched.
+    Redundant experts, a non-trivial initial location, load recording and
+    online rebalancing all need the placement tables
+    (``moe/expert_location.py``); plain EP serving does not and keeps its
+    routing untouched.
     """
     return (
         server_args.ep_num_redundant_experts > 0
         or server_args.init_expert_location != "trivial"
         or server_args.expert_distribution_recorder_mode is not None
+        or server_args.enable_eplb
     )
 
 
@@ -284,9 +286,11 @@ class ServerArgs:
     expert_distribution_recorder_mode: (
         Literal["stat", "stat_approx", "per_pass", "per_token"] | None
     ) = None
-    expert_distribution_recorder_buffer_size: int | None = None
     enable_expert_distribution_metrics: bool = False
+    # Online expert rebalancing; the two knobs below are required with it.
     enable_eplb: bool = False
+    eplb_rebalance_num_iterations: int | None = None
+    eplb_rebalance_layers_per_chunk: int | None = None
 
     # Dense GEMM selection is independent of routed-expert kernels.
     dense_gemm_backend: str = "auto"
@@ -1321,19 +1325,67 @@ class ServerArgs:
     def validate_expert_placement_options(self):
         """Check the expert placement flags (redundant experts, recorded load).
 
-        Experts are placed once at startup; runtime rebalancing
-        (``--enable-eplb``) is not implemented. A placement needs an explicit
-        dispatch algorithm, and under rl-bitwise a deterministic one: the
-        replicated-input EP path relies on every rank choosing the same
-        replica for a route.
+        A placement needs an explicit dispatch algorithm, and under rl-bitwise
+        a deterministic one: the replicated-input EP path relies on every rank
+        choosing the same replica for a route. Online rebalancing
+        (``--enable-eplb``) spells out every choice it depends on -- the load
+        counters, a static dispatch algorithm, the snapshot interval and the
+        layers switched per round -- rather than auto-setting any of them.
         """
         if self.enable_eplb:
+            if self.expert_distribution_recorder_mode != "stat":
+                raise ValueError(
+                    "--enable-eplb rebalances from the routing load counters; "
+                    "pass --expert-distribution-recorder-mode stat explicitly."
+                )
+            if self.ep_dispatch_algorithm not in STATIC_EP_DISPATCH_ALGORITHMS:
+                raise ValueError(
+                    "--enable-eplb needs a static replica choice "
+                    "(--ep-dispatch-algorithm static or static_with_zero_expert); "
+                    f"got {self.ep_dispatch_algorithm!r}."
+                )
+            if (
+                self.eplb_rebalance_num_iterations is None
+                or self.eplb_rebalance_num_iterations <= 0
+            ):
+                raise ValueError(
+                    "--enable-eplb requires --eplb-rebalance-num-iterations N > 0: "
+                    "the forwards between two load snapshots."
+                )
+            if (
+                self.eplb_rebalance_layers_per_chunk is None
+                or self.eplb_rebalance_layers_per_chunk < 1
+            ):
+                raise ValueError(
+                    "--enable-eplb requires --eplb-rebalance-layers-per-chunk L >= 1: "
+                    "the MoE layers whose experts move in one scheduling round "
+                    "(at most the model's MoE layer count)."
+                )
+            if self.mapping.moe.ep_size <= 1:
+                raise ValueError(
+                    "--enable-eplb balances expert load across expert-parallel "
+                    f"ranks, but the MoE layers run with ep_size="
+                    f"{self.mapping.moe.ep_size}; enable expert parallelism."
+                )
+            if self.numerics != "auto":
+                # Under a bitwise envelope the rank-order MoE combine makes the
+                # output depend on the placement, which a rebalance changes.
+                # The slot-order combine (--moe-combine-order slot) is
+                # placement-independent; this build has no such flag yet, so
+                # the combination is refused until it lands.
+                raise ValueError(
+                    f"--enable-eplb under --numerics {self.numerics} requires "
+                    "--moe-combine-order slot (a placement-independent MoE "
+                    "combine), which this build does not provide."
+                )
+        elif (
+            self.eplb_rebalance_num_iterations is not None
+            or self.eplb_rebalance_layers_per_chunk is not None
+        ):
             raise ValueError(
-                "--enable-eplb (runtime expert rebalancing) is not supported. "
-                "Record expert load with --expert-distribution-recorder-mode stat "
-                "and the EXPERT_LOAD profile activity, then serve a static "
-                "placement with --ep-num-redundant-experts and "
-                "--init-expert-location <load.pt>."
+                "--eplb-rebalance-num-iterations and "
+                "--eplb-rebalance-layers-per-chunk have no effect without "
+                "--enable-eplb."
             )
         if self.expert_distribution_recorder_mode not in (None, "stat"):
             raise ValueError(
@@ -1941,12 +1993,6 @@ class ServerArgs:
             "EXPERT_LOAD profile activity can dump a load record.",
         )
         parser.add_argument(
-            "--expert-distribution-recorder-buffer-size",
-            type=int,
-            default=ServerArgs.expert_distribution_recorder_buffer_size,
-            help="Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
-        )
-        parser.add_argument(
             "--enable-expert-distribution-metrics",
             action="store_true",
             help="Enable logging metrics for expert balancedness",
@@ -1954,8 +2000,28 @@ class ServerArgs:
         parser.add_argument(
             "--enable-eplb",
             action="store_true",
-            help="Runtime expert rebalancing; not supported (rejected at startup). "
-            "Use a static placement from a recorded load instead.",
+            help="Online expert rebalancing: every --eplb-rebalance-num-iterations "
+            "forwards the routing load since the previous snapshot is balanced "
+            "with the EPLB algorithm and the expert weights move between slots, "
+            "--eplb-rebalance-layers-per-chunk layers per scheduling round. "
+            "Requires --expert-distribution-recorder-mode stat and a static "
+            "--ep-dispatch-algorithm, both explicit; POST /rebalance_experts "
+            "triggers one rebalance manually.",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-num-iterations",
+            type=int,
+            default=ServerArgs.eplb_rebalance_num_iterations,
+            help="Forwards between two expert load snapshots under --enable-eplb "
+            "(required with it).",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-layers-per-chunk",
+            type=int,
+            default=ServerArgs.eplb_rebalance_layers_per_chunk,
+            help="MoE layers whose experts move in one scheduling round under "
+            "--enable-eplb (required with it; at most the MoE layer count). "
+            "Fewer layers per chunk bound the per-round stall.",
         )
         parser.add_argument(
             "--dense-gemm-backend",

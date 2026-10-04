@@ -681,13 +681,15 @@ class _DetailAccumulator(_UtilizationRateAccumulator):
 class _StatAccumulator(_UtilizationRateAccumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._global_physical_count_of_buffered_step = _Buffer.init_new(
-            item_shape=(
+        # A running sum since the last reset, one window: the per-step
+        # circular buffer (and its size knob) had no consumer.
+        self._global_physical_count_of_buffered_step = torch.zeros(
+            (
+                1,
                 self._expert_location_metadata.num_layers,
                 # Cannot use local_physical_count to support select_experts
                 self._expert_location_metadata.num_physical_experts,
             ),
-            buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
             dtype=torch.int32,
             device=self._server_args.device,
         )
@@ -700,18 +702,17 @@ class _StatAccumulator(_UtilizationRateAccumulator):
         single_pass_data: dict,
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data)
-        # Can optimize if overhead here is large
-        self._global_physical_count_of_buffered_step.append(
-            single_pass_data["global_physical_count"]
-        )
+        self._global_physical_count_of_buffered_step[0] += single_pass_data[
+            "global_physical_count"
+        ]
 
     def reset(self):
         super().reset()
-        self._global_physical_count_of_buffered_step.reset()
+        self._global_physical_count_of_buffered_step.zero_()
 
     def dump(self, output_mode: _OutputMode):
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
-            self._global_physical_count_of_buffered_step.get_all(),
+            self._global_physical_count_of_buffered_step,
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
@@ -746,71 +747,6 @@ def _dump_to_file(name, data):
     if not save_dir.exists():
         save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(data, str(path_output))
-
-
-class _Buffer:
-    @staticmethod
-    def init_new(item_shape: tuple, buffer_size: int, dtype, device):
-        if buffer_size < 0:
-            return _InfiniteBuffer(item_shape, dtype=dtype, device=device)
-        else:
-            return _CircularBuffer(item_shape, buffer_size, dtype=dtype, device=device)
-
-    def append(self, value: torch.Tensor):
-        raise NotImplementedError
-
-    def get_all(self) -> torch.Tensor:
-        raise NotImplementedError
-
-    def reset(self):
-        raise NotImplementedError
-
-
-class _CircularBuffer(_Buffer):
-    def __init__(self, item_shape: tuple, buffer_size: int, dtype, device):
-        self._buffer = torch.zeros(
-            (buffer_size, *item_shape), dtype=dtype, device=device
-        )
-        self._curr_index = 0
-
-    def append(self, value: torch.Tensor):
-        self._buffer[self._curr_index] = value
-        self._curr_index = (self._curr_index + 1) % len(self._buffer)
-
-    def get_all(self) -> torch.Tensor:
-        return self._buffer
-
-    def reset(self):
-        self._buffer[...] = 0
-
-
-class _InfiniteBuffer(_Buffer):
-    def __init__(self, item_shape: tuple, dtype, device):
-        self._item_shape = item_shape
-        self._buffer = torch.zeros((128, *item_shape), dtype=dtype, device=device)
-        self._size = 0
-
-    def append(self, value: torch.Tensor):
-        curr_buffer_size = len(self._buffer)
-        dtype = self._buffer.dtype
-        device = self._buffer.device
-
-        if self._size == curr_buffer_size:
-            new_buffer = torch.zeros(
-                (2 * curr_buffer_size, *self._item_shape), dtype=dtype, device=device
-            )
-            new_buffer[:curr_buffer_size] = self._buffer
-            self._buffer = new_buffer
-
-        self._buffer[self._size] = value
-        self._size += 1
-
-    def get_all(self) -> torch.Tensor:
-        return self._buffer[: self._size]
-
-    def reset(self):
-        self._buffer[...] = 0
-        self._size = 0
 
 
 def _convert_global_physical_count_to_logical_count(

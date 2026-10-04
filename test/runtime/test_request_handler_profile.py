@@ -27,6 +27,8 @@ def _attn_mapping(
 def _make_handler(attn_mapping: SimpleNamespace | None = None) -> RequestHandler:
     handler = RequestHandler.__new__(RequestHandler)
     handler.forward_ct = 0
+    # EXPERT_LOAD is refused under --enable-eplb; plain serving here.
+    handler.server_args = SimpleNamespace(enable_eplb=False)
     attn_mapping = attn_mapping or _attn_mapping()
     handler.attn_tp_rank = attn_mapping.tp_rank
     handler.attn_tp_cpu_group = None
@@ -383,6 +385,16 @@ class TestRequestHandlerExpertLoadProfile(unittest.TestCase):
         result = self.handler.profile(self._start())
         self.assertFalse(result.success)
         self.assertIn("device handle", result.message)
+
+    def test_init_refuses_under_online_rebalancing(self):
+        # The rebalance snapshots and zeroes the same counters, so a profile
+        # window would be cut at every snapshot.
+        self.handler.server_args = SimpleNamespace(enable_eplb=True)
+        result = self.handler.profile(self._start())
+        self.assertFalse(result.success)
+        self.assertIn("--enable-eplb", result.message)
+        self.assertFalse(self.handler.profile_in_progress)
+        self.device.reset_expert_load.assert_not_called()
 
 
 if __name__ == "__main__":

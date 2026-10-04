@@ -436,6 +436,10 @@ class ExpertRebalanceController:
     # -------------------------------- round driving -------------------------------
 
     @property
+    def commit_delay_forwards(self) -> int:
+        return self._commit_delay
+
+    @property
     def is_idle(self) -> bool:
         return self.phase is RebalancePhase.IDLE
 

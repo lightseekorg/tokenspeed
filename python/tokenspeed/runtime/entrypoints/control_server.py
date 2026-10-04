@@ -436,6 +436,11 @@ async def update_weights_from_tensor(request: Request):
     return await _proxy_to_rl_control(request)
 
 
+@app.post("/rebalance_experts")
+async def rebalance_experts(request: Request):
+    return await _proxy_to_rl_control(request)
+
+
 @app.post("/update_weights_from_disk")
 async def update_weights_from_disk(request: Request):
     return await _proxy_to_rl_control(request)

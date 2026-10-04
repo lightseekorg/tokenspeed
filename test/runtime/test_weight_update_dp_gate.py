@@ -42,6 +42,8 @@ from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqInput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    RebalanceExpertsReqInput,
+    RebalanceExpertsReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -52,12 +54,18 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from tokenspeed.runtime.engine.request_handler import (
+    _INTERNAL_OP_CODES,
     _WEIGHT_OP_CODES,
     RequestHandler,
 )
 from tokenspeed.runtime.engine.scheduler_control_client import (
     SchedulerControlClient,
     combined_weight_update_output,
+)
+from tokenspeed.runtime.moe.expert_rebalance import (
+    EplbApplyChunk,
+    EplbCommit,
+    EplbSnapshot,
 )
 
 MAX = torch.distributed.ReduceOp.MAX
@@ -83,12 +91,21 @@ def _mooncake(version: int = 7, flush_cache: bool = True, weight_version=None):
 class _DpPeer:
     """The other attention-DP rank, as seen through ``all_reduce``.
 
-    MAX reduces merge this rank's gate vector with the peer's; MIN reduces
-    (replica decisions) pass unless ``min_ok`` is False.
+    MAX reduces merge this rank's seven-lane gate vector with the peer's
+    (``head``: the peer's frontend op, ``internal``: its internal op); MIN
+    reduces (replica decisions) pass unless ``min_ok`` is False.
     """
 
-    def __init__(self, *, head: type | None, flush: bool = False, min_ok=True):
+    def __init__(
+        self,
+        *,
+        head: type | None,
+        flush: bool = False,
+        min_ok=True,
+        internal: type | None = None,
+    ):
         self.head = head
+        self.internal = internal
         self.flush = flush
         self.min_ok = min_ok
         self.calls: list[tuple[object, object]] = []
@@ -99,8 +116,17 @@ class _DpPeer:
         if op == MAX:
             self.gate_vectors.append(buf.tolist())
             code = 0 if self.head is None else _WEIGHT_OP_CODES[self.head]
+            internal = 0 if self.internal is None else _INTERNAL_OP_CODES[self.internal]
             peer = torch.tensor(
-                [1 if self.flush else 0, -1 if self.head else 0, code, -code],
+                [
+                    1 if self.flush else 0,
+                    -1 if self.head else 0,
+                    code,
+                    -code,
+                    -1 if self.internal else 0,
+                    internal,
+                    -internal,
+                ],
                 dtype=buf.dtype,
             )
             buf.copy_(torch.maximum(buf, peer))
@@ -123,8 +149,10 @@ def _handler(*, dp_size: int = 1):
     handler.attn_dp_size = dp_size
     handler.attn_dp_cpu_group = "dp" if dp_size > 1 else None
     handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-    handler._replica_flush_want_buf = torch.zeros(4, dtype=torch.int32)
+    handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
     handler._pending_weight_ops = deque()
+    handler._pending_internal_ops = deque()
+    handler._internal_op_completer = None
     handler._device = mock.Mock()
     handler._device.delete_l3_namespace.return_value = True
     handler._device.update_weights.return_value = (True, "ok")
@@ -150,7 +178,7 @@ class TestSameRoundGate(unittest.TestCase):
         self.assertEqual(list(handler._pending_weight_ops), [req])
         # Only the gate itself was reduced; no flush collectives.
         self.assertEqual(peer.calls, [("dp", MAX)])
-        self.assertEqual(peer.gate_vectors, [[0, -1, 2, -2]])
+        self.assertEqual(peer.gate_vectors, [[0, -1, 2, -2, 0, 0, 0]])
 
     def test_ready_op_flushes_updates_and_replies_once(self):
         handler = _handler(dp_size=2)
@@ -289,6 +317,160 @@ class TestSameRoundGate(unittest.TestCase):
         replies = _replies(handler)
         self.assertEqual(len(replies), 1)
         self.assertTrue(replies[0].success)
+
+
+class _Completer:
+    """The rebalance hooks as the handler sees them: completes ops, triggers."""
+
+    def __init__(self, *, manual_ok: bool = True):
+        self.completed: list = []
+        self.manual_ok = manual_ok
+        self.manual_calls = 0
+
+    def complete(self, op) -> None:
+        self.completed.append(op)
+
+    def begin_manual_rebalance(self) -> tuple[bool, str]:
+        self.manual_calls += 1
+        return (True, "snapshot taken") if self.manual_ok else (False, "busy")
+
+
+def _with_internal_ops(handler) -> _Completer:
+    completer = _Completer()
+    handler.set_internal_op_completer(completer)
+    return completer
+
+
+class TestInternalOpGate(unittest.TestCase):
+    """Internal ops (the expert rebalance) ride the same gate from a second FIFO."""
+
+    def test_internal_op_waits_until_every_dp_rank_holds_one(self):
+        handler = _handler(dp_size=2)
+        completer = _with_internal_ops(handler)
+        handler.enqueue_internal_op(EplbSnapshot())
+        peer = _DpPeer(head=None)
+
+        with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
+            handler.process_requests([])
+
+        self.assertEqual(completer.completed, [])
+        self.assertEqual(list(handler._pending_internal_ops), [EplbSnapshot()])
+        self.assertEqual(peer.gate_vectors, [[0, 0, 0, 0, -1, 1, -1]])
+
+        arrived = _DpPeer(head=None, internal=EplbSnapshot)
+        with mock.patch.object(torch.distributed, "all_reduce", arrived.all_reduce):
+            handler.process_requests([])
+        self.assertEqual(completer.completed, [EplbSnapshot()])
+        self.assertEqual(handler._pending_internal_ops, deque())
+        # No reply and no flush collectives for an internal op.
+        handler.send_func.send_pyobj.assert_not_called()
+        self.assertEqual(arrived.calls, [("dp", MAX)])
+
+    def test_frontend_op_arriving_later_on_a_peer_does_not_trip_the_gate(self):
+        # Rank A holds an internal op and receives a frontend op; the peer
+        # holds only the internal op this round. Two FIFOs: the heads compare
+        # kind-for-kind, the internal op completes, the frontend op waits.
+        handler = _handler(dp_size=2)
+        completer = _with_internal_ops(handler)
+        handler.enqueue_internal_op(EplbCommit())
+        peer = _DpPeer(head=None, internal=EplbCommit)
+        req = _distributed(flush_cache=False, weight_version=None)
+
+        with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
+            handler.process_requests([req])
+
+        self.assertEqual(completer.completed, [EplbCommit()])
+        self.assertEqual(list(handler._pending_weight_ops), [req])
+        handler._device.update_weights.assert_not_called()
+
+    def test_frontend_op_takes_precedence_and_internal_waits_a_round(self):
+        handler = _handler(dp_size=2)
+        completer = _with_internal_ops(handler)
+        chunk = EplbApplyChunk((0, 1))
+        handler.enqueue_internal_op(chunk)
+        req = _distributed(flush_cache=False, weight_version=None)
+        peer = _DpPeer(
+            head=UpdateWeightsFromDistributedReqInput, internal=EplbApplyChunk
+        )
+
+        with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
+            handler.process_requests([req])
+
+        # One blocking device call per round: the frontend op this round.
+        handler._device.update_weights.assert_called_once_with(req)
+        self.assertEqual(completer.completed, [])
+        self.assertEqual(list(handler._pending_internal_ops), [chunk])
+
+        with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
+            handler.process_requests([])
+        self.assertEqual(completer.completed, [chunk])
+        self.assertEqual(handler._pending_internal_ops, deque())
+
+    def test_one_internal_op_per_round_in_enqueue_order(self):
+        handler = _handler(dp_size=2)
+        completer = _with_internal_ops(handler)
+        ops = [EplbCommit(), EplbApplyChunk((0,)), EplbApplyChunk((1,))]
+        for op in ops:
+            handler.enqueue_internal_op(op)
+        for expected, internal in zip(
+            ops, (EplbCommit, EplbApplyChunk, EplbApplyChunk)
+        ):
+            peer = _DpPeer(head=None, internal=internal)
+            with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
+                handler.process_requests([])
+            self.assertEqual(completer.completed[-1], expected)
+        self.assertEqual(completer.completed, ops)
+
+    def test_mismatched_internal_heads_raise(self):
+        handler = _handler(dp_size=2)
+        _with_internal_ops(handler)
+        handler.enqueue_internal_op(EplbSnapshot())
+        peer = _DpPeer(head=None, internal=EplbCommit)
+        with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
+            with self.assertRaisesRegex(RuntimeError, "internal control"):
+                handler.process_requests([])
+
+    def test_enqueue_requires_a_completer_and_an_internal_kind(self):
+        handler = _handler()
+        with self.assertRaisesRegex(RuntimeError, "completer"):
+            handler.enqueue_internal_op(EplbSnapshot())
+        _with_internal_ops(handler)
+        with self.assertRaisesRegex(TypeError, "not an internal"):
+            handler.enqueue_internal_op(_distributed())
+        with self.assertRaisesRegex(RuntimeError, "already installed"):
+            handler.set_internal_op_completer(_Completer())
+
+    def test_manual_trigger_rides_the_frontend_fifo_and_replies(self):
+        handler = _handler(dp_size=2)
+        completer = _with_internal_ops(handler)
+        peer = _DpPeer(head=RebalanceExpertsReqInput)
+        with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
+            handler.process_requests([RebalanceExpertsReqInput()])
+        self.assertEqual(completer.manual_calls, 1)
+        handler._device.update_weights.assert_not_called()
+        # Gate MAX, then the replica MIN on the decision; no flush.
+        self.assertEqual(peer.calls, [("dp", MAX), ("dp", MIN)])
+        reply = _replies(handler)[0]
+        self.assertIsInstance(reply, RebalanceExpertsReqOutput)
+        self.assertTrue(reply.success)
+
+        # A peer that refused fails the trigger everywhere.
+        handler = _handler(dp_size=2)
+        _with_internal_ops(handler)
+        peer = _DpPeer(head=RebalanceExpertsReqInput, min_ok=False)
+        with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
+            handler.process_requests([RebalanceExpertsReqInput()])
+        reply = _replies(handler)[0]
+        self.assertFalse(reply.success)
+        self.assertIn("another rank", reply.message)
+
+    def test_manual_trigger_without_eplb_is_refused(self):
+        handler = _handler()
+        handler.process_requests([RebalanceExpertsReqInput()])
+        reply = _replies(handler)[0]
+        self.assertIsInstance(reply, RebalanceExpertsReqOutput)
+        self.assertFalse(reply.success)
+        self.assertIn("--enable-eplb", reply.message)
 
 
 class TestSingleReplicaUnchanged(unittest.TestCase):

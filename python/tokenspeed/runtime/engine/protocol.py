@@ -73,6 +73,7 @@ from tokenspeed.runtime.engine.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
+    RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SetInternalStateReq,
@@ -184,6 +185,11 @@ class EngineClient(Protocol):
     async def update_weights_from_mooncake(
         self,
         obj: UpdateWeightsFromMooncakeReqInput,
+    ) -> tuple[bool, str]: ...
+
+    async def rebalance_experts(
+        self,
+        obj: RebalanceExpertsReqInput,
     ) -> tuple[bool, str]: ...
 
     async def update_weights_from_tensor(

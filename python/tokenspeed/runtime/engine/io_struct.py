@@ -1008,6 +1008,20 @@ class UpdateWeightsFromMooncakeReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class RebalanceExpertsReqInput(BaseReq, kw_only=True):
+    """Start one online expert rebalance now (``--enable-eplb``).
+
+    Takes the load snapshot the periodic trigger would take at its next
+    interval; the commit and the per-chunk weight moves follow on the same
+    schedule. Refused while a rebalance is already in progress.
+    """
+
+
+class RebalanceExpertsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     name: str
     truncate_size: int = 100

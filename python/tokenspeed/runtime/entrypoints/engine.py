@@ -70,6 +70,7 @@ from tokenspeed.runtime.engine.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -445,6 +446,12 @@ class Engine(EngineBase):
         if success and weight_version is not None:
             self.server_args.weight_version = str(weight_version)
         return result
+
+    def rebalance_experts(self) -> tuple[bool, str]:
+        """Start one online expert rebalance now (``--enable-eplb``)."""
+        return self.llm.run(
+            self.tokenizer_manager.rebalance_experts(RebalanceExpertsReqInput())
+        )
 
     def update_weights_from_tensor(
         self,

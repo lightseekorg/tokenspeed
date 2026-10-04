@@ -40,6 +40,11 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.engine.batch_log import BatchLogger
 from tokenspeed.runtime.engine.cache_hooks import L2CacheHooks
+from tokenspeed.runtime.engine.eplb_hooks import (
+    EplbHooks,
+    make_expert_rebalance_controller,
+    rebalance_release_refusal,
+)
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
 from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender, NullSender
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks
@@ -443,12 +448,21 @@ class EventLoop:
         self._pause = PauseController(self.send_to_tokenizer)
         self._pause_hooks = PauseHooks(self, self._pause, self._device)
 
+        # Online expert rebalance (--enable-eplb): the controller is the
+        # self-contained state machine (moe/expert_rebalance.py); EplbHooks
+        # below is the loop-side glue. None without the flag.
+        self._eplb = make_expert_rebalance_controller(
+            self.server_args, specs.expert_rebalance
+        )
+
         # GPU-memory data plane (release/resume_memory_occupation). Reuses the
         # pause controller's drain machinery; frees memory via the memory-saver
         # adapter once the scheduler drains. See memory_occupation.py.
         # Releasing KV is only safe if any prefix cache it backs can be cleared:
         # either prefix caching is off, or the scheduler exposes a clear. Decide
         # once here (static config) and let the controller reject unsafe releases.
+        # A release is refused while an expert rebalance is in progress, and a
+        # drained release waits while chunk ops still write the weights.
         kv_cache_release_allowed = (
             not self.server_args.enable_prefix_caching
             or callable(getattr(self.scheduler, "clear_l1_cache", None))
@@ -463,6 +477,12 @@ class EventLoop:
             reset_caches_fn=self._pause_hooks.reset_caches_for_release,
             kv_repair_fn=self._pause_hooks.kv_repair_after_wake,
             kv_cache_release_allowed=kv_cache_release_allowed,
+            weights_release_refusal_fn=rebalance_release_refusal(self._eplb),
+            weights_busy_fn=(
+                (lambda: False)
+                if self._eplb is None
+                else (lambda: self._eplb.is_applying)
+            ),
         )
 
         self.metrics = EngineMetrics(
@@ -492,6 +512,21 @@ class EventLoop:
             pause_controller=self._pause,
             memory_controller=self._memory,
             device=self._device,
+        )
+
+        # The rebalance's loop-side glue: the controller's ops ride the request
+        # handler's internal-op FIFO through the same-round gate and complete
+        # through the handle's named operations (see eplb_hooks.py).
+        self._eplb_hooks = EplbHooks(
+            self._eplb,
+            self.request_handler,
+            self._device,
+            ep_cpu_group=(
+                pg_manager.get_process_group("gloo", mapping.moe.ep_group)
+                if self._eplb is not None and len(mapping.moe.ep_group) > 1
+                else None
+            ),
+            ep_group_ranks=tuple(mapping.moe.ep_group),
         )
 
         self.output_processor = OutputProcesser(
@@ -1147,6 +1182,12 @@ class EventLoop:
                         self._device.run_idle_forward(dp_metadata)
                     if pending is not None:
                         in_flight.append((forward_op, pending))
+                    # Online expert rebalance: count this rank's forward (real
+                    # or DP-idle, rank-identical) and enqueue the ops it makes
+                    # due; they complete through the request handler's gate.
+                    self._eplb_hooks.note_round(
+                        forwarded=pending is not None or need_idle_forward
+                    )
 
                 if not paused_round:
                     # Commit from the head once the queue exceeds the depth
@@ -1237,6 +1278,7 @@ class EventLoop:
 
     def close(self) -> None:
         self.load_reporter.close()
+        self._eplb_hooks.close()
         # Best-effort: tell an attached SMG frontend this engine is going away
         # (msgpack mode only; the pickle sender has no such helper) so the
         # worker is marked dead instead of staying healthy-idle.
