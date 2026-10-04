@@ -41,14 +41,25 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
-from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
+from tokenspeed.runtime.layers.attention.backends.support import (
+    CudaGraphSupport,
+    TreeSupport,
+)
 from tokenspeed.runtime.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeDraftInputs,
+        TreeVerifyInputs,
+    )
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        HistoryGatherWorkspace,
     )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -86,6 +97,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     # Declared here as well as on AttentionBackend: the refactor made the two
     # separate roots, so a paged leaf inherits only this one.
     supports_layer_sliding_window: bool = False
+    supports_mla_dcp: bool = False
 
     @classmethod
     def resolve_kernel_page_size(
@@ -130,6 +142,27 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self.page_table_buf: torch.Tensor | None = None
         self.seq_lens_buf: torch.Tensor | None = None
         self._decode_views_by_bs: dict[int, Any] = {}
+        # Draft-tree verify inputs; unset for chains and for draft leaves.
+        self.tree_verify: TreeVerifyInputs | None = None
+        # Draft-tree lane inputs; set on the drafter's leaves only.
+        self.tree_draft: TreeDraftInputs | None = None
+
+    def tree_support(self) -> TreeSupport:
+        name = type(self).__name__
+        return TreeSupport(
+            verify_blocker=f"{name} has no tree verify path; use --attention-backend trtllm",
+            draft_blocker=f"{name} has no tree lane path; use --drafter-attention-backend trtllm",
+        )
+
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        self.tree_verify = inputs
+
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        self.tree_draft = inputs
+
+    @property
+    def tree_lane_step_active(self) -> bool:
+        return self.tree_draft is not None and self.tree_draft.active
 
     # ------------------------------------------------------------------
     # Static shape / lifecycle
@@ -228,6 +261,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
         **kwargs,
     ) -> None:
         """Build extend/mixed (or idle warmup) metadata.
@@ -246,6 +281,17 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
             extend_with_prefix: Whether any extend request continues a cached or
                 chunked prefix (some ``extend_prefix_lens`` entry is non-zero);
                 leaves that size ragged-vs-paged prefill metadata read it.
+            query_shard: The rows of the extend span this rank computes under
+                query context parallelism, or ``None`` when every rank computes
+                every row. Every length above describes the whole span; a leaf
+                without a gathered-history extend arm calls
+                :func:`reject_query_shard`.
+            page_table_cpu: Host mirror of ``page_table``'s extend rows
+                (``[num_extends, cols]`` int32 kernel pages, unpadded) when the
+                forward is sharded, else ``None``. The only host-side table a
+                leaf sees: the sharded extend arm counts how many history rows
+                each page owner holds from it, so the gather's per-rank split
+                never waits on the device.
         """
 
     @abstractmethod
@@ -288,12 +334,35 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         refreshes. Override only for a kernel-imposed capture asymmetry."""
         self.refresh_decode_metadata(bs, 0, seq_lens, page_table, for_graph_replay=True)
 
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        """A leaf without the sharded extend arm reserves nothing; the router
+        sums its leaves and the registry checks the total against the plan."""
+        del max_model_len
+        return 0
+
+    def adopt_history_gather_workspace(self, workspace: HistoryGatherWorkspace) -> None:
+        """A leaf without the sharded extend arm has nothing to gather into."""
+        del workspace
+
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """Publish a drafter's in-graph seq_lens edits into this leaf's own
         cache-seqlens buffer (one token per request per step)."""
         buf = self.decode_seq_lens_buffer
         bs = seq_lens.shape[0]
         buf[:bs].copy_(seq_lens[:bs])
+
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        """Publish a multi-depth MTP drafter's re-anchored window: every depth
+        re-runs ``spec_num_tokens`` rows per request ending at ``frontier``
+        (``[bs]`` committed lengths), in-graph.
+
+        The decode kernels derive each row's causal bound from the request's
+        single cache length, so for most leaves this is the same seq_lens
+        edit as :meth:`advance_draft_forward_metadata`. A leaf holding
+        per-row decode metadata (DSA's per-token indexer rows) re-expands it
+        to the k-row shape here instead.
+        """
+        self.advance_draft_forward_metadata(frontier)
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """DFLASH: broadcast each request's block-end length to its
@@ -318,9 +387,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         Default no-op for leaves with separate prefill/decode slots."""
         yield
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         return False
 
     def set_request_slots(self, req_pool_indices: torch.Tensor) -> None:
@@ -348,10 +415,10 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool: CachePool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        """Decode attention over the current ``forward_decode_metadata``."""
+        """Decode attention over the current ``forward_decode_metadata``; the
+        prologue has already written this forward's KV rows."""
 
     @abstractmethod
     def forward_extend(
@@ -363,10 +430,10 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool: CachePool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        """Extend attention over the current extend metadata."""
+        """Extend attention over the current extend metadata; the prologue has
+        already written this forward's KV rows."""
 
     def forward_extend_chunked(self, *args, **kwargs):
         """DeepSeek's chunked prefix replay (MLA family); others never call it."""

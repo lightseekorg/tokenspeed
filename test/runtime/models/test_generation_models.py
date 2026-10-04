@@ -104,6 +104,7 @@ CI_MODELS = [
             "speculative_num_steps": 3,
             "speculative_eagle_topk": 1,
             "speculative_num_draft_tokens": 4,
+            "enable_replay_ssm": False,
             "gpu_memory_utilization": 0.9,
         },
     ),
@@ -167,6 +168,7 @@ class TestGenerationModels(unittest.TestCase):
 
         with RTRunner(
             model_path,
+            disable_autotune=True,
             world_size=model_case.tp_size,
             torch_dtype=torch_dtype,
             model_type="generation",

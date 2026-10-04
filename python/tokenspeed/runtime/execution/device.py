@@ -75,8 +75,9 @@ import contextlib
 import enum
 import os
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -87,8 +88,14 @@ from tokenspeed.runtime.execution.types import (
     PendingExecution,
     PlannedForward,
 )
+from tokenspeed.runtime.moe.expert_location import (
+    ExpertLoadSnapshot,
+    get_global_expert_location_metadata,
+)
+from tokenspeed.runtime.moe.expert_rebalance import ExpertRebalanceSpecs, SlotMoves
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.host_sync import allow_host_sync
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
@@ -147,14 +154,25 @@ class DeviceSpecs:
             (rather than by the capturable side-stream executor), which is
             what makes a grammar batch depend on the pending commit.
         supports_disaggregation: The KV arena can hand pages to a peer node.
-        supports_pd_layerwise_finalization: The drafter can finalize
-            layerwise KV writes, required for PD layerwise transfer.
+        supports_pd_layerwise_finalization: This rank can finalize layerwise
+            KV writes with speculation on, required for PD layerwise
+            transfer: the draft-field writer (producer or drafter) declares
+            it, and a pipeline stage owning no draft fields has nothing to
+            finalize.
+        supports_prompt_logprobs: This engine can serve a request that asks
+            for prompt (input) logprobs: either it never computes the prompt
+            rows (the PD decode role, whose prefill node returns them) or its
+            LM head scores every prompt row on this rank (no row narrowing,
+            no pipeline split). The ingress refuses such requests otherwise.
         cache_state_group_ids: Group ids of the state-family cache groups,
             for the per-group page-usage debug line. Empty for pools with no
             recurrent/conv state.
         num_host_pages: The L2 host tier's page count (incl. the null page),
             sized here because it depends on the pools' transfer layout; 0
             without ``--enable-kvstore``. The scheduler is configured from it.
+        expert_rebalance: The expert placement's geometry and this rank's
+            position in its EP group, for the online rebalance controller;
+            None unless the server started with ``--enable-eplb``.
     """
 
     cache_geometry: Any
@@ -166,8 +184,24 @@ class DeviceSpecs:
     uses_eager_grammar: bool
     supports_disaggregation: bool
     supports_pd_layerwise_finalization: bool
+    supports_prompt_logprobs: bool
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
+    expert_rebalance: ExpertRebalanceSpecs | None
+
+
+def speculative_widths(
+    spec_algo: str | None, spec_num_steps: int | None, spec_num_tokens: int | None
+) -> tuple[int, int]:
+    """The ``DeviceSpecs`` speculation widths: (draft steps, verify width).
+
+    ``ServerArgs`` keeps its default widths with speculation off, so the
+    algorithm, not the widths, says whether speculation is on. Both are 0
+    without it: the accept-length log views verify rows by them.
+    """
+    if spec_algo is None:
+        return 0, 0
+    return spec_num_steps or 0, spec_num_tokens or 0
 
 
 @dataclass(frozen=True)
@@ -450,6 +484,7 @@ class DeviceHandle:
                 capture_next_input_ids=capture_next_input_ids,
                 ngram_inputs=planned.ngram_inputs,
                 request_history_seeds=planned.request_history_seeds,
+                input_logprob_plan=planned.input_logprob_plan,
             )
 
         return PendingExecution(self._thread.submit(_forward))
@@ -747,14 +782,124 @@ class DeviceHandle:
         # decode, and PD completions are rare enough to afford the wait.
         self._thread.run(_land)
 
+    def reset_expert_load(self) -> None:
+        """Zero the router's expert load counters, ordered against forwards.
+
+        The counters are bumped on the execution stream by every forward's
+        routing, so the reset rides that stream too: it lands after the
+        forwards already issued and before the next one.
+        """
+        placement = _recording_expert_placement()
+        executor = self._executor
+
+        def _reset():
+            with executor.device_module.stream(executor.execution_stream):
+                placement.reset_load()
+
+        self._thread.run(_reset)
+
+    def dump_expert_load(self, path: str) -> dict[str, torch.Tensor | int]:
+        """Write this rank's expert load counted since the last reset to ``path``.
+
+        The counters are read back on the data plane (the one deliberate host
+        wait) and saved unreduced, as this rank's record: its physical and
+        logical counts, the placement that produced them and its EP rank.
+        No collective runs here -- a profile stop reaches attention-DP
+        workers independently, so a rank reducing inside the request would
+        wait on a peer still synchronizing its round. The ranks' records are
+        summed where they are consumed (``merge_expert_load_records``, which
+        ``--init-expert-location <dir>`` applies).
+
+        Args:
+            path: Destination ``.pt`` file; parent directories are created.
+
+        Returns:
+            The saved record.
+        """
+        placement = _recording_expert_placement()
+        executor = self._executor
+
+        def _dump():
+            with executor.device_module.stream(executor.execution_stream):
+                with allow_host_sync("expert load dump"):
+                    physical = placement.physical_load.cpu()
+            record = placement.load_record(physical)
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(record, path)
+            return record
+
+        return self._thread.run(_dump)
+
+    def snapshot_expert_load(self) -> ExpertLoadSnapshot:
+        """Read this rank's expert load since the previous snapshot and start a new window.
+
+        The online rebalance's recording window: the counters are copied to
+        the host (the one deliberate host wait) and zeroed on the execution
+        stream, behind the in-flight forward and ahead of the next one, so the
+        boundary is exact at forward granularity. Rank-local like
+        ``dump_expert_load``; the caller reduces the result over the EP group
+        where that is needed (inside the same-round gate, never here).
+
+        Returns:
+            The host counters with the placement they were counted under.
+        """
+        placement = _recording_expert_placement()
+        executor = self._executor
+
+        def _snapshot():
+            with executor.device_module.stream(executor.execution_stream):
+                with allow_host_sync("expert load snapshot"):
+                    return placement.snapshot_load()
+
+        return self._thread.run(_snapshot)
+
+    def apply_expert_placement(
+        self,
+        layer_ids: Sequence[int],
+        new_rows: torch.Tensor,
+        moves_by_layer: Mapping[int, SlotMoves],
+    ) -> None:
+        """Move one chunk of layers' expert weights and switch their routing tables.
+
+        Runs on the forward thread inside the execution stream: the P2P over
+        the EP group and the slot copies land behind the in-flight forward,
+        each layer's tables switch right after its slots, and the next forward
+        is enqueued after the whole chunk. The stream is synchronized at the
+        end -- a deliberate, low-rate host wait like ``update_weights`` -- so a
+        P2P failure surfaces in this call rather than in a later forward.
+
+        Args:
+            layer_ids: The chunk's layers.
+            new_rows: ``[len(layer_ids), num_physical]`` host rows of the
+                committed placement.
+            moves_by_layer: This rank's ``SlotMoves`` per layer.
+
+        Raises:
+            RuntimeError: The server did not start with ``--enable-eplb``.
+        """
+        updater = self._executor.model_runner.expert_location_updater
+        if updater is None:
+            raise RuntimeError(
+                "expert placement updates need the server to start with --enable-eplb"
+            )
+        executor = self._executor
+
+        def _apply():
+            with executor.device_module.stream(executor.execution_stream):
+                updater.apply(layer_ids, new_rows, moves_by_layer)
+                with allow_host_sync("expert placement chunk"):
+                    executor.execution_stream.synchronize()
+
+        self._thread.run(_apply)
+
     def update_weights(self, req) -> tuple[bool, str]:
         """Apply one in-place RL weight-sync request, ordered against forwards.
 
         Type-dispatched on the request — join the trainer's NCCL group,
-        receive and apply one broadcast, or tear the group down. One entry
-        point because it is one capability: rewriting model parameters in
-        place, which must be ordered against forwards rather than raced with
-        them.
+        receive and apply one broadcast, read one committed version from the
+        Mooncake weight store, or tear the group down. One entry point because
+        it is one capability: rewriting model parameters in place, which must
+        be ordered against forwards rather than raced with them.
 
         Args:
             req: An ``io_struct`` weight-update request.
@@ -769,6 +914,7 @@ class DeviceHandle:
             DestroyWeightsUpdateGroupReqInput,
             InitWeightsUpdateGroupReqInput,
             UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
         )
 
         runner = self._executor.model_runner
@@ -777,23 +923,72 @@ class DeviceHandle:
             UpdateWeightsFromDistributedReqInput: (
                 runner.update_weights_from_distributed
             ),
+            UpdateWeightsFromMooncakeReqInput: (
+                lambda req: runner.update_weights_from_mooncake(
+                    req.version, self._mooncake_update_models()
+                )
+            ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
         }
         handler = handlers.get(type(req))
         if handler is None:
             raise TypeError(f"unsupported weight-update request {type(req).__name__}")
+        loads_weights = type(req) in (
+            UpdateWeightsFromDistributedReqInput,
+            UpdateWeightsFromMooncakeReqInput,
+        )
 
         def _apply_update():
             result = handler(req)
-            if (
-                type(req) is UpdateWeightsFromDistributedReqInput
-                and result[0]
-                and self._executor.drafter is not None
-            ):
+            if loads_weights and result[0] and self._executor.drafter is not None:
                 self._executor.drafter.on_target_weights_updated()
             return result
 
         return self._thread.run(_apply_update)
+
+    def _mooncake_update_models(self) -> list:
+        """The modules a Mooncake update streams into, target first.
+
+        ``--model-update-draft-weights refresh`` adds the speculative draft
+        model when one is loaded; ``retain`` keeps the draft's weights.
+        """
+        runner = self._executor.model_runner
+        models = [runner.model]
+        draft_runner = self._executor.draft_model_runner
+        if (
+            runner.server_args.model_update_draft_weights == "refresh"
+            and draft_runner is not None
+        ):
+            models.append(draft_runner.model)
+        return models
+
+
+def _recording_expert_placement():
+    placement = get_global_expert_location_metadata()
+    if placement is None or placement.physical_load is None:
+        raise RuntimeError(
+            "expert load is not being recorded; start the server with "
+            "--expert-distribution-recorder-mode stat"
+        )
+    return placement
+
+
+def start_expert_load_window(executor) -> None:
+    """Zero the expert load counters once the startup forwards are done.
+
+    Autotune, warm-up and graph capture route tokens through the MoE layers,
+    and none of that is traffic: the first window a rebalance
+    (``--enable-eplb``) or an ``EXPERT_LOAD`` profile sees must start at the
+    first served forward. The device is drained first so no startup kernel
+    is still bumping the counters, then the reset rides the execution stream
+    like the serving-time resets. A no-op without load recording.
+    """
+    placement = get_global_expert_location_metadata()
+    if placement is None or placement.physical_load is None:
+        return
+    executor.device_module.synchronize()
+    with executor.device_module.stream(executor.execution_stream):
+        placement.reset_load()
 
 
 def arm_data_plane_sync_debug(device: str) -> None:
@@ -1123,6 +1318,7 @@ def build_device_side(
         executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
     # Tuning and capture draw from the generator; this is the state startup leaves.
     set_random_seed(48)
+    start_expert_load_window(executor)
 
     # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
     if attn_tp_rank == 0:
@@ -1167,7 +1363,6 @@ def build_device_side(
                 server_args.kvstore_storage_backend_extra_config,
                 host_buffer=l2_cache_executor.host_storage.host_buffer,
                 tp_size=server_args.mapping.attn.tp_size,
-                cp_size=server_args.mapping.attn.cp_size,
                 pp_size=(
                     server_args.mapping.pp_size if server_args.mapping.has_pp else 1
                 ),
@@ -1232,7 +1427,6 @@ def build_device_side(
                 draft_quantization=draft_quantization,
             )
             attn_tp_size = int(server_args.mapping.attn.tp_size)
-            cp_size = int(server_args.mapping.attn.cp_size)
             eagle3_layers_to_capture: list[int] = []
             if server_args.speculative_algorithm == "EAGLE3":
                 configured_layers = server_args.eagle3_layers_to_capture
@@ -1259,7 +1453,6 @@ def build_device_side(
                     cache_signature=cache_signature,
                     pipeline_rank=pipeline_rank,
                     attn_tp_size=attn_tp_size,
-                    cp_size=cp_size,
                     draft_model=draft_model,
                     draft_revision=draft_revision,
                     draft_weight_version=weight_version if draft_model else "",
@@ -1275,7 +1468,6 @@ def build_device_side(
                 storage_backend,
                 key_prefix=prefix_for_weight_version(server_args.weight_version),
                 rank=attn_tp_rank,
-                cp_rank=server_args.mapping.attn.cp_rank,
                 prefix_for_weight_version=prefix_for_weight_version,
             )
 
@@ -1291,21 +1483,26 @@ def build_device_side(
         global_rank=global_rank,
     )
 
+    spec_num_steps, spec_num_tokens = speculative_widths(
+        executor.config.spec_algo,
+        executor.config.spec_num_steps,
+        executor.config.spec_num_tokens,
+    )
     specs = DeviceSpecs(
         cache_geometry=views.cache_geometry,
         cache_groups=views.cache_groups,
         cache_storage=attention.cache_storage,
         multimodal_encoder_dtype=target.multimodal_encoder_dtype,
-        spec_num_steps=executor.config.spec_num_steps or 0,
-        spec_num_tokens=executor.config.spec_num_tokens or 0,
+        spec_num_steps=spec_num_steps,
+        spec_num_tokens=spec_num_tokens,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
-        supports_pd_layerwise_finalization=bool(
-            getattr(
-                executor.dspark_context_producer or executor.drafter,
-                "supports_pd_layerwise_finalization",
-                False,
-            )
+        supports_pd_layerwise_finalization=_supports_pd_layerwise_finalization(
+            executor, server_args.mapping
+        ),
+        supports_prompt_logprobs=(
+            server_args.disaggregation_mode == "decode"
+            or executor.supports_prompt_logprobs
         ),
         cache_state_group_ids=tuple(
             str(spec.group_id)
@@ -1314,6 +1511,11 @@ def build_device_side(
         ),
         num_host_pages=(
             l2_cache_executor.num_host_pages if l2_cache_executor is not None else 0
+        ),
+        expert_rebalance=(
+            target.expert_location_updater.specs
+            if target.expert_location_updater is not None
+            else None
         ),
     )
 
@@ -1457,6 +1659,21 @@ def _resolve_role(kv_transfer) -> DeviceRole:
     raise TypeError("kv_transfer must be a Disagg{Prefill,Decode}Executor.")
 
 
+def _supports_pd_layerwise_finalization(executor, mapping) -> bool:
+    """Whether this rank can finalize layerwise CachePD writes with speculation on.
+
+    The draft cache fields are the last pipeline stage's trailing producer
+    step (``CacheLayerOwnership``), so a stage before it owns none: its
+    readiness is the target layers' alone and nothing remains to finalize.
+    The owning stage, like a non-PP engine, answers for the executor's
+    ``draft_field_writer``. Without speculation the answer is unused.
+    """
+    if mapping.has_pp and not mapping.is_last_pp_rank:
+        return True
+    writer = executor.draft_field_writer
+    return writer is not None and writer.supports_pd_layerwise_finalization
+
+
 def _build_kv_transfer(
     server_args,
     executor,
@@ -1489,7 +1706,6 @@ def _build_kv_transfer(
 
     mapping = server_args.mapping
     topology = PDParallelTopology.from_mapping(mapping)
-    topology.require_cache_pd_supported()
 
     # PP: transfer-status consensus must span every stage — all ranks run the
     # same deterministic scheduler and must agree on Bootstrapped/Succeeded

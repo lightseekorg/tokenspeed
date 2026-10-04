@@ -218,6 +218,7 @@ def test_gdn_chain_pdl_toggle(
             output_state_indices=writes,
             pad_slot_id=-1,
             validate_data=False,
+            parent_indices=None,
         )
         if steps == 1:
             # Actual decode uses packed, strided Q/K/V views.
@@ -257,6 +258,7 @@ def test_gdn_chain_pdl_toggle(
                 disable_state_update=False,
                 output_state_indices=writes,
                 intermediate_states_buffer=None,
+                parent_indices=None,
             )
         return rmsnorm_fn(
             out.reshape(-1, dim),

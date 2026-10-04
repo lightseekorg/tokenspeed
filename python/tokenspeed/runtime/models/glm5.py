@@ -65,7 +65,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3MoE,
     get_layer_id,
 )
-from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _INDEXER_PREFILL_MAX_LOGITS_MB_ARG = "deepseek_v4_indexer_prefill_max_logits_mb"
@@ -254,7 +254,6 @@ class GlmDsaIndexer(nn.Module):
 
 
 class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
-    _MLA_KERNEL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "dsa")
     _RAGGED_PREFILL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "dsa")
     rope_is_neox_style = False
 
@@ -1015,7 +1014,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         prefill_topk: GlmDsaPrefillTopK,
         cache_num_tokens: int | None = None,
     ) -> torch.Tensor:
-        Q, _ = self.forward_absorb_qkv_proj(
+        Q = self.forward_absorb_qkv_proj(
             q,
             latent_cache,
             positions,
@@ -1055,7 +1054,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        Q, K = self.forward_absorb_qkv_proj(
+        Q = self.forward_absorb_qkv_proj(
             q,
             latent_cache,
             positions,
@@ -1064,7 +1063,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         )
         return self.forward_absorb_attn_v_proj(
             Q,
-            K,
             ctx,
             output,
             topk_indices=topk_indices,
@@ -1074,22 +1072,17 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
     def forward_absorb_attn_v_proj(
         self,
         Q,
-        K,
         ctx: ForwardContext,
         output: torch.Tensor,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        need_save_kv = False
-        if self.attention_backend not in self._MLA_KERNEL_BACKENDS:
-            need_save_kv = not self.use_fused_set_kv_buffer
-
         attn_output = self.attn_mqa(
             Q,
-            K,
-            K[..., : self.kv_lora_rank] if K is not None else None,
-            ctx,
-            save_kv_cache=need_save_kv,
+            k=None,
+            v=None,
+            positions=None,
+            ctx=ctx,
             topk_indices=topk_indices,
             topk_lens=topk_lens,
         )
@@ -1176,6 +1169,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 ),
                 prefix=add_prefix("mlp", prefix),
                 is_shared_expert=False,
+                batch_invariant=False,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1186,8 +1180,10 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
             layer_id=self.layer_id,
             is_moe=self.is_moe_layer,
             prev_is_moe=self._is_moe_layer(layer_id - 1, is_nextn, config),
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(
@@ -1318,13 +1314,75 @@ def pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn) -> None:
         return
     n_pad = ((n + 127) // 128) * 128
     pad = weight.new_zeros(n_pad - n, weight.shape[1])
-    proj.weight = torch.nn.Parameter(
+    padded = torch.nn.Parameter(
         torch.cat([weight.data, pad], dim=0), requires_grad=False
     )
+    # Keep the attributes the quant method attached (``weight_loader``,
+    # ``input_dim`` / ``output_dim``, ...): a live weight update streams the
+    # q_a / kv_a shards into this parameter by row offset through
+    # ``weight_loader``, and the padding rows stay zero.
+    set_weight_attrs(padded, dict(vars(weight)))
+    proj.weight = padded
 
 
 class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
     model_cls = GlmMoeDsaModel
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mapping: Mapping,
+        model: GlmMoeDsaModel | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            config,
+            mapping,
+            model=model,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self._init_indexer_pairing_state()
+
+    def _init_indexer_pairing_state(self) -> None:
+        """Declare the indexer pairing caches (also for subclasses that skip
+        ``__init__``, such as the NextN draft)."""
+        # FP8 indexer ``wk`` weight and block scale waiting for each other
+        # before the bf16 fused projection shard is written; a live update
+        # streams the checkpoint in chunks, so the pair may straddle a
+        # ``load_weights`` call.
+        self._pending_fp8_wk: dict[str, dict[str, torch.Tensor]] = {}
+        # Fused indexer projection shards seen so far, per module; both must
+        # arrive before the module switches to the fused path.
+        self._loaded_fused_indexer_shards: dict[str, set[int]] = {}
+
+    def begin_weight_update(self) -> None:
+        super().begin_weight_update()
+        self._pending_fp8_wk.clear()
+        self._loaded_fused_indexer_shards.clear()
+
+    def abort_weight_update(self) -> None:
+        super().abort_weight_update()
+        self._pending_fp8_wk.clear()
+        self._loaded_fused_indexer_shards.clear()
+
+    def end_weight_update(self) -> None:
+        """Close the session; an FP8 indexer weight without its scale fails it.
+
+        Raises:
+            RuntimeError: An FP8 ``indexer.wk`` weight or its block scale was
+                streamed without the other, so the bf16 fused projection still
+                holds the previous values.
+        """
+        if self._pending_fp8_wk:
+            unpaired = sorted(self._pending_fp8_wk)
+            self.abort_weight_update()
+            raise RuntimeError(
+                f"{type(self).__name__}: the update streamed an FP8 indexer wk "
+                f"weight or scale without its partner for {unpaired}"
+            )
+        super().end_weight_update()
 
     def _record_fused_indexer_projection_shard(
         self,
@@ -1464,11 +1522,14 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                 loaded_shards=loaded_shards,
             )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
         modules_dict = dict(self.named_modules())
-        pending_fp8_wk: dict[str, dict[str, torch.Tensor]] = {}
-        loaded_fused_indexer_shards: dict[str, set[int]] = {}
+        pending_fp8_wk = self._pending_fp8_wk
+        loaded_fused_indexer_shards = self._loaded_fused_indexer_shards
+        # ``get_param`` remaps checkpoint names; report the parameter's own.
+        param_names = {id(param): name for name, param in params_dict.items()}
+        loaded: set[str] = set()
 
         def base_weights():
             for name, loaded_weight in weights:
@@ -1488,6 +1549,7 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                loaded.add(param_names[id(param)])
                 self._try_load_fused_indexer_projection(
                     name=name,
                     loaded_weight=loaded_weight,
@@ -1497,8 +1559,9 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                     loaded_shards=loaded_fused_indexer_shards,
                 )
 
-        super().load_weights(base_weights())
+        loaded |= super().load_weights(base_weights())
         self._pad_fused_qkv_a_proj_for_fp8_blockscale()
+        return loaded
 
     def _pad_fused_qkv_a_proj_for_fp8_blockscale(self) -> None:
         """Pad each decoder layer's fused QKV-A projection to a 128-multiple.

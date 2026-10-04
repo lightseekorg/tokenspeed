@@ -31,7 +31,7 @@ def test_gb300_slurm_path_filter_covers_shared_and_own_workflow_changes():
         {"tokenspeed-mla/src/kernel.cu"}, group, "pull_request", REPO_ROOT
     )
     assert should_run(
-        {".github/workflows/gb300-slurm-per-commit.yml"},
+        {".github/workflows/nvidia-gb300-tests.yml"},
         group,
         "pull_request",
         REPO_ROOT,
@@ -58,7 +58,7 @@ def test_gb300_slurm_path_filter_ignores_other_vendor_workflows():
         f"{KERNEL}/ops/attention/mha/__init__.py",
         f"{KERNEL}/ops/attention/mha/triton.py",
         f"{KERNEL}/ops/attention/mha/_triton/decode.py",
-        f"{KERNEL}/ops/gemm/routed_gemv.py",
+        f"{KERNEL}/ops/gemm/triton_gemv.py",
         f"{KERNEL}/thirdparty/__init__.py",
         "python/tokenspeed/runtime/sampling/backends/flashinfer.py",
     ],
@@ -101,7 +101,7 @@ def test_amd_owned_paths_require_only_amd(path):
         f"{KERNEL}/ops/attention/rmha/_cute_dsl/rel_decode.py",
         f"{KERNEL}/ops/attention/gdn/_flashinfer/adapter.py",
         f"{KERNEL}/ops/moe/deep_gemm/_triton/mega_moe_stage.py",
-        f"{KERNEL}/ops/moe/flashinfer/tactics/kimi-k3,ep=8,tp=1.json",
+        f"{KERNEL}/ops/moe/flashinfer/trtllm_mxfp4.py",
         f"{KERNEL}/ops/communication/_cuda/lamport_a2a.cu",
         f"{KERNEL}/thirdparty/cute_dsl/ll_bf16.py",
         f"{KERNEL}/thirdparty/msa/csrc/fmha_sm100_plan.cu",

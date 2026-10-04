@@ -44,9 +44,10 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsMetadata,
-    _force_deterministic_rsag,
+    _dist_argmax_vetoed,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -167,7 +168,6 @@ class DFlash(BaseDrafter):
         # Legacy alias: callers that predate the verify/draft split.
         self.block_size = self.verify_width
         self.hidden_size = int(getattr(cfg, "hidden_size"))
-        self.idle_forward_steps = 1
         self._init_native_buffers()
         self._validate_draft_attention_window()
         self._greedy_gathered_max: torch.Tensor | None = None
@@ -175,6 +175,14 @@ class DFlash(BaseDrafter):
         self._greedy_gather_cap = 0
         self._init_fused_kv_helper()
         self._init_incremental_proj()
+
+    @override
+    def idle_forward_global_num_tokens(
+        self, global_num_tokens: list[int], global_bs: list[int]
+    ) -> list[list[int]]:
+        # Block drafter: one draft forward proposes the whole block.
+        del global_bs
+        return [global_num_tokens]
 
     def _validate_draft_attention_window(self) -> None:
         """Reject a drafter backend that would drop the draft's window.
@@ -283,7 +291,7 @@ class DFlash(BaseDrafter):
         shard = int(head.shard_indices.num_org_elements)
         tp_size = int(self.logits_processor.tp_size)
         if (
-            _force_deterministic_rsag()
+            _dist_argmax_vetoed()
             or not 2 <= tp_size <= 32
             or int(head.num_embeddings) != int(head.org_vocab_size)
             or shard * tp_size != int(head.org_vocab_size)
@@ -383,7 +391,7 @@ class DFlash(BaseDrafter):
         ):
             metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
             logits = self.logits_processor._get_logits(
-                hidden_states, self.lm_head, metadata
+                hidden_states, self.lm_head, metadata, require_full_vocab=False
             )
             if bias_fn is not None:
                 logits = logits + bias_fn(0, int(logits.shape[-1])).to(logits.dtype)
@@ -725,30 +733,6 @@ class DFlash(BaseDrafter):
                 self._fused_kv_k_buffers, self._fused_kv_v_buffers
             )
 
-            self._fused_kv_inv_k_scales = None
-            self._fused_kv_inv_v_scales = None
-            if self._fused_kv_k_buffers[0].dtype == torch.float8_e4m3fn:
-                has_scale = any(
-                    getattr(layer.self_attn.attn, "k_scale", None) is not None
-                    or getattr(layer.self_attn.attn, "v_scale", None) is not None
-                    for layer in layers
-                )
-                if has_scale:
-                    inv_k_vals = []
-                    inv_v_vals = []
-                    for layer in layers:
-                        attn = layer.self_attn.attn
-                        k_s = getattr(attn, "k_scale", None)
-                        v_s = getattr(attn, "v_scale", None)
-                        inv_k_vals.append(1.0 / float(k_s) if k_s is not None else 1.0)
-                        inv_v_vals.append(1.0 / float(v_s) if v_s is not None else 1.0)
-                    self._fused_kv_inv_k_scales = torch.tensor(
-                        inv_k_vals, dtype=torch.float32, device=self.device
-                    )
-                    self._fused_kv_inv_v_scales = torch.tensor(
-                        inv_v_vals, dtype=torch.float32, device=self.device
-                    )
-
             self._fused_kv_enabled = True
 
             max_total_ctx = self.input_buffers.max_bs * self.spec_num_tokens
@@ -791,10 +775,6 @@ class DFlash(BaseDrafter):
         pool = self.token_to_kv_pool
         if not isinstance(pool, MLATokenToKVPool):
             return decline("the draft KV pool is not an MLA latent pool")
-        if type(pool).set_mla_kv_buffer is not MLATokenToKVPool.set_mla_kv_buffer:
-            # An override adds something this write does not reproduce, and
-            # fusing past it would drop that silently.
-            return decline(f"{type(pool).__name__} overrides the latent write")
         if getattr(pool, "quant_method", "none") == "per_token_head":
             return decline("the latent cache is per-token-head quantized")
 
@@ -822,6 +802,10 @@ class DFlash(BaseDrafter):
                 return decline("the latent down-projection is quantized")
             if getattr(attn, "rotary_emb", None) is not rotary:
                 return decline("the draft's layers do not share one RoPE table")
+            if attn.kv_lora_scale is not None:
+                # The fused write norms the latent but applies no runtime
+                # scale (--mla-lora-scale runtime); the per-layer path does.
+                return decline("the latent carries a runtime LoRA norm scale")
             start = int(attn.q_lora_rank)
             weight_rows.append(weight[start : start + kv_width])
             norm_rows.append(attn.kv_a_layernorm.weight)
@@ -1075,14 +1059,7 @@ class DFlash(BaseDrafter):
                 k = attn.apply_k_rope(target_positions, k)
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-                self.token_to_kv_pool.set_kv_buffer(
-                    attn.attn,
-                    target_cache_locs,
-                    k,
-                    v,
-                    attn.attn.k_scale,
-                    attn.attn.v_scale,
-                )
+                self.token_to_kv_pool.set_kv_buffer(attn.attn, target_cache_locs, k, v)
             return
 
         total_ctx = int(ctx_hidden.shape[0])
@@ -1107,8 +1084,6 @@ class DFlash(BaseDrafter):
             self._fused_kv_num_kv_heads,
             self._fused_kv_head_dim,
             self._fused_kv_rotary_dim,
-            self._fused_kv_inv_k_scales,
-            self._fused_kv_inv_v_scales,
         )
 
     @staticmethod
@@ -1203,6 +1178,12 @@ class DFlash(BaseDrafter):
             token_to_kv_pool=self.token_to_kv_pool,
             bs=bs,
             num_extends=metadata_num_extends,
+            output_layout=ForwardOutputLayout(
+                metadata_num_extends,
+                metadata_num_extends,
+                bs - metadata_num_extends,
+                self.draft_query_width,
+            ),
             input_num_tokens=bs * self.draft_query_width,
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.FULL,

@@ -72,6 +72,8 @@ def test_kv_release_waits_until_cache_can_be_cleared(resume_tags):
         enabled=True,
         reset_caches_fn=lambda: next(clear_results),
         kv_repair_fn=lambda: None,
+        weights_release_refusal_fn=lambda: None,
+        weights_busy_fn=lambda: False,
     )
 
     controller.handle_release(ReleaseMemoryOccupationReqInput(tags=["kv_cache"]))

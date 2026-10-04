@@ -66,7 +66,7 @@ def _mapping() -> SimpleNamespace:
         nnodes=1,
         world_size=8,
         moe=SimpleNamespace(ep_size=8, tp_size=1),
-        attn=SimpleNamespace(tp_size=1, cp_size=1, dp_size=8),
+        attn=SimpleNamespace(tp_size=1, dp_size=8),
         dense=SimpleNamespace(tp_size=1),
     )
 
@@ -283,12 +283,11 @@ def test_petit_shared_options(petit_args, overrides, error) -> None:
         ServerArgs.validate_petit_moe_options(petit_args)
 
 
-@pytest.mark.parametrize("attn_tp,attn_cp,dense_tp", [(2, 1, 1), (1, 2, 1), (1, 1, 2)])
-def test_petit_shared_parallelism(petit_args, attn_tp, attn_cp, dense_tp) -> None:
+@pytest.mark.parametrize("attn_tp,dense_tp", [(2, 1), (1, 2)])
+def test_petit_shared_parallelism(petit_args, attn_tp, dense_tp) -> None:
     petit_args.mapping.attn.tp_size = attn_tp
-    petit_args.mapping.attn.cp_size = attn_cp
     petit_args.mapping.dense.tp_size = dense_tp
-    with pytest.raises(ValueError, match="attention TP1, CP1, and dense TP1"):
+    with pytest.raises(ValueError, match="attention TP1 and dense TP1"):
         ServerArgs.validate_petit_moe_options(petit_args)
 
 

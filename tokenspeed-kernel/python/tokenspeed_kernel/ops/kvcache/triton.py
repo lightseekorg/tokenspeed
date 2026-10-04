@@ -50,6 +50,7 @@ def _use_pdl(enable_pdl: bool | None) -> bool:
 
 __all__ = [
     "HOST_CACHE_TRANSFER_CHUNK_BYTES",
+    "compact_window_rows",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
     "gather_page_table_with_padding",
@@ -844,7 +845,7 @@ def _sf_interleaved_offset(slot, page_tokens, sf_page_stride):
 
 @triton.jit
 def _mxfp8_quantize_row(x, HEAD_DIM: tl.constexpr):
-    """Quantize one [HEAD_DIM] row to MXFP8 (flashinfer bit-parity).
+    """Quantize one [HEAD_DIM] row to MXFP8 (flashinfer bit-parity on finite inputs).
 
     Per 32-element group: amax -> ``e8m0 = clamp(ceil(log2(amax / 448)),
     -127, 127) + 127`` and ``fp8 = rn(x * 2^-exp)`` (zero groups quantize
@@ -996,7 +997,7 @@ def _set_mla_kv_buffer_kernel(
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
-    pid_loc = tl.program_id(0)
+    pid_loc = tl.program_id(0).to(tl.int64)
     pid_blk = tl.program_id(1)
 
     base = pid_blk * BLOCK
@@ -1067,7 +1068,7 @@ def _set_mla_kv_buffer_per_loc_kernel(
         tl.extra.cuda.gdc_wait()
 
     pid = tl.program_id(0)
-    loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
+    loc_indices = (pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)).to(tl.int64)
     loc_mask = loc_indices < n_loc
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
     if write_mask_ptr is not None:
@@ -1418,7 +1419,7 @@ def _get_mla_kv_buffer_kernel(
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
-    pid_loc = tl.program_id(0)
+    pid_loc = tl.program_id(0).to(tl.int64)
     pid_blk = tl.program_id(1)
 
     base = pid_blk * BLOCK
@@ -1459,7 +1460,7 @@ def _get_mla_kv_buffer_per_loc_kernel(
         tl.extra.cuda.gdc_wait()
 
     pid = tl.program_id(0)
-    loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
+    loc_indices = (pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)).to(tl.int64)
     loc_mask = loc_indices < n_loc
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
 
@@ -1590,8 +1591,8 @@ def _store_kv_cache_kernel(
     requirement is ``stride(-1) == 1`` so we can use linear addressing on
     the flattened head_dim×num_kv_heads axis.
     """
-    is_v = tl.program_id(0)
-    row = tl.program_id(1)
+    row = tl.program_id(0).to(tl.int64)
+    is_v = tl.program_id(1)
     offsets = tl.arange(0, BLOCK)
     mask = offsets < n_kv_per_token
 
@@ -1657,7 +1658,7 @@ def store_kv_cache(
     kwargs = {}
     if use_pdl:
         kwargs["launch_pdl"] = True
-    _store_kv_cache_kernel[(2, n_tokens)](
+    _store_kv_cache_kernel[(n_tokens, 2)](
         k_src,
         v_src,
         k_dst,
@@ -1687,8 +1688,6 @@ def _process_fp8_kv_tensor(
     page_offset,
     input_ptr,
     cache_ptr,
-    inv_scale,
-    use_provided_scale: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     input_stride_token: tl.constexpr,
@@ -1721,18 +1720,13 @@ def _process_fp8_kv_tensor(
         )
         block = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
 
-        if use_provided_scale:
-            block_fp8 = (block * inv_scale).to(tl.float8e4nv)
-        else:
-            block_fp8 = block.to(tl.float8e4nv)
-
         cache_offsets = (
             page_id * cache_stride_page
             + page_offset * cache_stride_offset
             + head_offsets[:, None] * cache_stride_head
             + dim_offsets[None, :] * cache_stride_dim
         )
-        tl.store(cache_ptr + cache_offsets, block_fp8, mask=mask)
+        tl.store(cache_ptr + cache_offsets, block.to(tl.float8e4nv), mask=mask)
 
 
 @triton.jit
@@ -1742,9 +1736,6 @@ def _fused_fp8_set_kv_buffer_kernel(
     k_cache_ptr,
     v_cache_ptr,
     cache_loc_ptr,
-    inv_k_scale_ptr,
-    inv_v_scale_ptr,
-    use_provided_scale: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     page_size: tl.constexpr,
@@ -1766,7 +1757,7 @@ def _fused_fp8_set_kv_buffer_kernel(
     BLOCK_DIM: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    token_id = tl.program_id(0).to(tl.int64)
     head_block_id = tl.program_id(1)
     kv_idx = tl.program_id(2)
 
@@ -1778,10 +1769,6 @@ def _fused_fp8_set_kv_buffer_kernel(
     page_offset = cache_loc % page_size
 
     if kv_idx == 0:
-        if use_provided_scale:
-            inv_scale = tl.load(inv_k_scale_ptr)
-        else:
-            inv_scale = 1.0
         _process_fp8_kv_tensor(
             token_id,
             head_block_id,
@@ -1789,8 +1776,6 @@ def _fused_fp8_set_kv_buffer_kernel(
             page_offset,
             k_ptr,
             k_cache_ptr,
-            inv_scale,
-            use_provided_scale,
             num_kv_heads,
             head_dim,
             k_stride_token,
@@ -1804,10 +1789,6 @@ def _fused_fp8_set_kv_buffer_kernel(
             BLOCK_DIM,
         )
     else:
-        if use_provided_scale:
-            inv_scale = tl.load(inv_v_scale_ptr)
-        else:
-            inv_scale = 1.0
         _process_fp8_kv_tensor(
             token_id,
             head_block_id,
@@ -1815,8 +1796,6 @@ def _fused_fp8_set_kv_buffer_kernel(
             page_offset,
             v_ptr,
             v_cache_ptr,
-            inv_scale,
-            use_provided_scale,
             num_kv_heads,
             head_dim,
             v_stride_token,
@@ -1840,8 +1819,6 @@ def fused_fp8_set_kv_buffer(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     cache_loc: torch.Tensor,
-    k_scale: float | torch.Tensor | None = None,
-    v_scale: float | torch.Tensor | None = None,
     page_size: int = 16,
     enable_pdl: bool | None = None,
 ) -> None:
@@ -1857,10 +1834,6 @@ def fused_fp8_set_kv_buffer(
         v_cache: Destination V cache with the same shape convention as
             ``k_cache``.
         cache_loc: Cache slot index for each input token.
-        k_scale: Optional scalar K scale. When provided with ``v_scale``, K is
-            divided by this scale before FP8 conversion.
-        v_scale: Optional scalar V scale. When provided with ``k_scale``, V is
-            divided by this scale before FP8 conversion.
         page_size: Number of tokens per cache page.
         enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
             the platform policy; pass ``False`` to disable it explicitly.
@@ -1925,27 +1898,10 @@ def fused_fp8_set_kv_buffer(
         v_cache_stride_head = v_cache.stride(2)
         v_cache_stride_dim = v_cache.stride(3)
 
-    use_provided_scale = k_scale is not None and v_scale is not None
-
-    block_head = min(num_kv_heads, 8)
-    block_dim = min(head_dim, 128)
+    block_head = min(triton.next_power_of_2(num_kv_heads), 8)
+    block_dim = min(triton.next_power_of_2(head_dim), 128)
     num_head_blocks = (num_kv_heads + block_head - 1) // block_head
     grid = (num_tokens, num_head_blocks, 2)
-    device = k_3d.device
-
-    def _to_tensor_scale(scale):
-        if isinstance(scale, torch.Tensor):
-            return scale.to(device=device, dtype=torch.float32)
-        return torch.tensor(float(scale), device=device, dtype=torch.float32)
-
-    if use_provided_scale:
-        k_scale_tensor = _to_tensor_scale(k_scale)
-        v_scale_tensor = _to_tensor_scale(v_scale)
-        inv_k_scale_ptr = (1.0 / k_scale_tensor).to(device=device, dtype=torch.float32)
-        inv_v_scale_ptr = (1.0 / v_scale_tensor).to(device=device, dtype=torch.float32)
-    else:
-        inv_k_scale_ptr = k_3d
-        inv_v_scale_ptr = k_3d
 
     use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
@@ -1958,9 +1914,6 @@ def fused_fp8_set_kv_buffer(
         k_cache,
         v_cache,
         cache_loc,
-        inv_k_scale_ptr,
-        inv_v_scale_ptr,
-        use_provided_scale,
         num_kv_heads,
         head_dim,
         page_size,
@@ -2657,7 +2610,7 @@ def _quantize_store_kv_mxfp8_kernel(
 
     Replaces the five-launch sequence (k/v quantize_mxfp8, store_kv_cache,
     2x store_sf_interleaved) with one launch. Bit-parity contract with
-    flashinfer's mxfp8_quantize: per 32-element group,
+    flashinfer's mxfp8_quantize on finite inputs: per 32-element group,
     ``e8m0 = clamp(ceil(log2(amax / 448)), -127, 127) + 127`` and
     ``fp8 = rn(x * 2^-exp)`` (zero rows quantize to exponent -127, data 0).
     SF layout matches _store_sf_interleaved_kernel: page-major, per-head
@@ -2665,8 +2618,8 @@ def _quantize_store_kv_mxfp8_kernel(
     row -> (row % 32) * 4 + row // 32, 4 head_dim-group bytes packed
     little-endian in one u32.
     """
-    is_v = tl.program_id(0)
-    tok = tl.program_id(1)
+    tok = tl.program_id(0).to(tl.int64)
+    is_v = tl.program_id(1)
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -2724,6 +2677,18 @@ def quantize_store_kv_mxfp8(
             the platform policy; pass ``False`` to disable it explicitly.
     """
     assert page_tokens % 128 == 0
+    if (
+        k_dst.dim() != 3
+        or k_dst.shape[-1] != 128
+        or (k.dim() == 3 and k.shape[-1] != 128)
+        or k.shape[1:].numel() != k_dst.shape[1:].numel()
+    ):
+        raise ValueError(
+            f"MXFP8 KV caches store 128-wide heads, one row per token: "
+            f"{tuple(k.shape[1:])} into {tuple(k_dst.shape[1:])}"
+        )
+    if v.shape != k.shape or v_dst.shape != k_dst.shape or v_dst.dtype != k_dst.dtype:
+        raise ValueError("MXFP8 value rows and cache must match the key rows and cache")
     t = k.shape[0]
     if t == 0:
         return
@@ -2739,7 +2704,7 @@ def quantize_store_kv_mxfp8(
     chunks_per_page = page_tokens // 128
     sf_page_stride = nheads * chunks_per_page * 128
 
-    grid = (2, t)
+    grid = (t, 2)
     use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
     if use_pdl:
@@ -2851,7 +2816,7 @@ def _index_k_scatter_kernel(
     BLOCK_HD: tl.constexpr,  # next_pow2(HD); masked so HD need not be pow2
     BLOCK_NG: tl.constexpr,  # next_pow2(NG)
 ):
-    t = tl.program_id(0)
+    t = tl.program_id(0).to(tl.int64)
     # loc >= 0 makes // and % exact.
     loc = tl.load(loc_ptr + t).to(tl.int64)
     page = loc // PAGE_SIZE
@@ -2946,4 +2911,71 @@ def index_k_block_split_scatter(
         NG=ng,
         BLOCK_HD=_next_power_of_two(head_dim),
         BLOCK_NG=_next_power_of_two(ng),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Draft-tree window compaction
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _compact_window_rows_kernel(
+    addresses_ptr,  # [num_buffers] int64 base address of each token-row buffer
+    locations_ptr,  # [bs * N] int32 token slot of each window row
+    path_ptr,  # [bs, N] int32 accepted window row per depth, -1 past the path
+    N: tl.constexpr,
+    ROW_I32: tl.constexpr,
+    BLOCK_I32: tl.constexpr,
+):
+    """Program (buffer, request): move the accepted path's rows to the front
+    of the request's window, one depth after another."""
+    buf = tl.cast(tl.load(addresses_ptr + tl.program_id(0)), tl.pointer_type(tl.int32))
+    req = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK_I32)
+    # The path is increasing, so row d never overwrites a later row's source.
+    for d in range(N):
+        src = tl.load(path_ptr + req * N + d)
+        if (src >= 0) & (src != d):
+            src_row = (
+                buf + tl.load(locations_ptr + req * N + src).to(tl.int64) * ROW_I32
+            )
+            dst_row = buf + tl.load(locations_ptr + req * N + d).to(tl.int64) * ROW_I32
+            for start in range(0, ROW_I32, BLOCK_I32):
+                cols = start + offsets
+                row = tl.load(src_row + cols, mask=cols < ROW_I32)
+                tl.store(dst_row + cols, row, mask=cols < ROW_I32)
+
+
+def compact_window_rows(
+    addresses: torch.Tensor,
+    locations: torch.Tensor,
+    path: torch.Tensor,
+    *,
+    row_bytes: int,
+) -> None:
+    """Pack each request's accepted draft-tree path to the front of its
+    verify window in every token-row buffer, in one launch.
+
+    Args:
+        addresses: ``[num_buffers]`` int64 base addresses of contiguous
+            token-row buffers (e.g. every layer's K and V planes) of one row
+            width; aliased buffers must appear once.
+        locations: ``[bs * N]`` int32 token slot of each window row.
+        path: ``[bs, N]`` int32 accepted window row at each depth, root
+            first, ``-1`` past the path; increasing along each row.
+        row_bytes: bytes per token row, a multiple of 4.
+    """
+    bs, n = path.shape
+    if row_bytes % 4:
+        raise ValueError(f"token rows of {row_bytes} bytes are not 4-byte words")
+    if bs == 0 or addresses.numel() == 0:
+        return
+    _compact_window_rows_kernel[(addresses.numel(), bs)](
+        addresses,
+        locations,
+        path,
+        N=n,
+        ROW_I32=row_bytes // 4,
+        BLOCK_I32=1024,
     )

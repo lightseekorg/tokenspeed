@@ -275,7 +275,8 @@ def fused_qkv_split_gdn_prefill(
     """Split packed post-conv GDN QKV into contiguous FLA prefill tensors.
 
     Replaces ``torch.split + view`` with a single Triton launch.
-    Strided inputs are forced contiguous before the kernel (b3).
+    Row-strided inputs (unit inner stride, e.g. a slice of a wider projection)
+    are read in place; other layouts are made contiguous first.
 
     Args:
         mixed_qkv: ``[T, qkv_dim]``, possibly strided.
@@ -290,7 +291,8 @@ def fused_qkv_split_gdn_prefill(
         (q, k, v) each shaped ``[1, T, H, D]``.
     """
     enable_pdl = pdl_enabled()
-    if not mixed_qkv.is_contiguous():
+    # A transposed layout would make every row read uncoalesced.
+    if mixed_qkv.stride(-1) != 1:
         mixed_qkv = mixed_qkv.contiguous()
 
     seq_len = mixed_qkv.shape[0]

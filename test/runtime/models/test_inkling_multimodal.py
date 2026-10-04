@@ -362,6 +362,7 @@ class TestInklingMultimodalE2E(unittest.TestCase):
         cls.vision = load_inkling_config().vision_config
         cls.audio = load_inkling_config().audio_config
         cls.engine = Engine(
+            disable_autotune=True,
             model=INKLING_BF16,
             hf_overrides=truncation_hf_overrides(),
             load_format="dummy",

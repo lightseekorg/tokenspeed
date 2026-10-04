@@ -23,8 +23,8 @@
 
 This is adapted from the a16w16-8wave ``v1_sliceMN_BK64_nS2`` tutorial kernel
 from https://github.com/ROCm/gfx950-gluon-tutorials developed by Lixun Zhang.
-It's an 8-wave, 256x256x64, two-buffer warp-pipelined MFMA/LDS GEMM for large,
-aligned dense16 projection shapes.
+It's an 8-wave, 256x256x64, two-buffer warp-pipelined MFMA/LDS GEMM for
+large-M dense16 projection shapes.
 """
 
 from __future__ import annotations
@@ -42,11 +42,42 @@ LARGEM_NUM_WARPS = 8
 LARGEM_WARPS_M = 2
 LARGEM_WARPS_N = 4
 LARGEM_NUM_XCDS = 8
+LARGEM_NUM_CUS = 256
 LARGEM_GROUP_SIZE_M = 4
 LARGEM_K_TILE_PAIR = 2 * LARGEM_BLOCK_K
 LARGEM_MIN_K = 4 * LARGEM_BLOCK_K
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
+
+# Kimi K3 TP8 per-rank BF16 projections, as (N, K), where cold-cache rocprofv3
+# sweeps on MI355X find this kernel ahead of hipBLASLt when its workgroups keep
+# enough CUs busy.
+_PREFILL_SHAPES = frozenset(
+    {
+        (6288, 7168),  # KDA fused q/k/v/gate/f_a/beta
+        (2112, 7168),  # MLA q_a + kv_a
+        (1536, 7168),  # MLA output gate; shared expert gate/up
+        (3648, 7168),  # MLA q_a + kv_a + output gate
+        (3072, 512),  # MLA kv_b
+        (7168, 1536),  # attention output
+        (7168, 768),  # shared expert down
+        (8448, 7168),  # dense MLP gate/up
+        (7168, 4224),  # dense MLP down
+        (3584, 7168),  # latent down
+        (7168, 3584),  # latent up
+    }
+)
+# Each workgroup computes one 256x256 output block and occupies a whole CU, so
+# the workgroups run in rounds of one per CU and a partly filled final round
+# costs as much as a full one. This is the minimum fraction of CU time doing
+# work over all rounds; hipBLASLt picks among many block shapes and wins when
+# this kernel leaves more CUs idle.
+_PREFILL_MIN_CU_UTILIZATION = 0.77
+# Long reductions past two rounds favor hipBLASLt's larger blocks unless
+# nearly every CU stays busy.
+_PREFILL_LONG_K = 3584
+_PREFILL_LONG_K_MAX_ROUNDS = 2
+_PREFILL_LONG_K_MIN_CU_UTILIZATION = 0.92
 
 
 def _dense16_mm_launch_metadata(grid, kernel, args):
@@ -111,6 +142,7 @@ def largem_mfma_lds_tile(
     row_base,
     col_base,
     last_row,
+    last_col,
     right_delta,
     stride_am,
     stride_ak,
@@ -141,6 +173,8 @@ def largem_mfma_lds_tile(
             row_base``. Rows past it clamp onto it so a partial row tile stays
             in bounds, and the caller masks those rows out of its stores. On a
             full tile the clamp is the identity.
+        last_col: Highest valid weight column offset from ``col_base``,
+            ``N - 1 - col_base``. Columns past it clamp the same way.
         right_delta: Column distance from the left half to the right half.
             ``BLOCK_N // 2`` walks the tile contiguously; another value pairs
             halves that are not adjacent, and 0 parks the right half on the
@@ -255,11 +289,13 @@ def largem_mfma_lds_tile(
 
     rows_top = gl.minimum(offs_am, last_row)
     rows_bot = gl.minimum(offs_am + BLOCK_M // 2, last_row)
+    cols_left = gl.minimum(offs_bn, last_col)
+    cols_right = gl.minimum(offs_bn + right_delta, last_col)
 
     a_top_offsets = rows_top[:, None] * stride_am + offs_ak[None, :] * stride_ak
     a_bot_offsets = rows_bot[:, None] * stride_am + offs_ak[None, :] * stride_ak
-    b_left_offsets = offs_bk[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-    b_right_offsets = b_left_offsets + right_delta * stride_bn
+    b_left_offsets = offs_bk[:, None] * stride_bk + cols_left[None, :] * stride_bn
+    b_right_offsets = offs_bk[:, None] * stride_bk + cols_right[None, :] * stride_bn
 
     a_top_offsets_next = a_top_offsets + BLOCK_K * stride_ak
     a_bot_offsets_next = a_bot_offsets + BLOCK_K * stride_ak
@@ -410,7 +446,12 @@ def largem_mfma_lds_tile(
     return acc_tl, acc_bl, acc_tr, acc_br
 
 
-@gluon.jit(launch_metadata=_dense16_mm_launch_metadata)
+# M and GRID_MN follow the token count and only feed row masks and the tile
+# order, so every batch shape shares one binary.
+@gluon.jit(
+    launch_metadata=_dense16_mm_launch_metadata,
+    do_not_specialize=("M", "GRID_MN"),
+)
 def gluon_mm_a16w16_prefill_gfx950(
     a_ptr,
     b_ptr,
@@ -429,12 +470,11 @@ def gluon_mm_a16w16_prefill_gfx950(
     BLOCK_K: gl.constexpr,
     WARPS_M: gl.constexpr,
     WARPS_N: gl.constexpr,
-    # Follows M (the token count); runtime so every batch shape shares one binary.
     GRID_MN,
     NUM_XCDS: gl.constexpr,
     GROUP_SIZE_M: gl.constexpr,
 ):
-    """8-wave 256x256x64 MFMA/LDS GEMM for large aligned dense16 tiles."""
+    """8-wave 256x256x64 MFMA/LDS GEMM for large-M dense16 problems."""
     pid_m, pid_n = largem_get_pids(
         M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M
     )
@@ -446,6 +486,7 @@ def gluon_mm_a16w16_prefill_gfx950(
         row_base,
         col_base,
         M - 1 - row_base,
+        N - 1 - col_base,
         BLOCK_N // 2,
         stride_am,
         stride_ak,
@@ -459,8 +500,11 @@ def gluon_mm_a16w16_prefill_gfx950(
         WARPS_N=WARPS_N,
     )
 
+    # Spread all warps along M so a 128x128 quadrant is covered exactly once;
+    # a [WARPS_M, WARPS_N] split would replicate it across the N warps and
+    # store every element several times.
     gStoreLayoutC: gl.constexpr = gl.BlockedLayout(
-        [4, 8], [4, 16], [WARPS_M, WARPS_N], [1, 0]
+        [4, 8], [4, 16], [WARPS_M * WARPS_N, 1], [1, 0]
     )
     offs_cm = gl.arange(0, BLOCK_M // 2, gl.SliceLayout(1, gStoreLayoutC))
     offs_cn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gStoreLayoutC))
@@ -469,24 +513,72 @@ def gluon_mm_a16w16_prefill_gfx950(
     c_bl_base = c_tl_base + (BLOCK_M // 2) * stride_cm
     c_tr_base = c_tl_base + (BLOCK_N // 2) * stride_cn
     c_br_base = c_bl_base + (BLOCK_N // 2) * stride_cn
+    # Partial row and column tiles computed clamped duplicates; drop them.
+    top_rows = (offs_cm < M - row_base)[:, None]
+    bot_rows = (offs_cm < M - row_base - BLOCK_M // 2)[:, None]
+    left_cols = (offs_cn < N - col_base)[None, :]
+    right_cols = (offs_cn < N - col_base - BLOCK_N // 2)[None, :]
 
     c_tl = gl.convert_layout(acc_tl.to(c_ptr.dtype.element_ty), layout=gStoreLayoutC)
-    cdna4.buffer_store(ptr=c_tl_base, offsets=c_quad_offsets, stored_value=c_tl)
+    cdna4.buffer_store(
+        ptr=c_tl_base,
+        offsets=c_quad_offsets,
+        stored_value=c_tl,
+        mask=top_rows & left_cols,
+    )
     c_bl = gl.convert_layout(acc_bl.to(c_ptr.dtype.element_ty), layout=gStoreLayoutC)
-    cdna4.buffer_store(ptr=c_bl_base, offsets=c_quad_offsets, stored_value=c_bl)
+    cdna4.buffer_store(
+        ptr=c_bl_base,
+        offsets=c_quad_offsets,
+        stored_value=c_bl,
+        mask=bot_rows & left_cols,
+    )
     c_tr = gl.convert_layout(acc_tr.to(c_ptr.dtype.element_ty), layout=gStoreLayoutC)
-    cdna4.buffer_store(ptr=c_tr_base, offsets=c_quad_offsets, stored_value=c_tr)
+    cdna4.buffer_store(
+        ptr=c_tr_base,
+        offsets=c_quad_offsets,
+        stored_value=c_tr,
+        mask=top_rows & right_cols,
+    )
     c_br = gl.convert_layout(acc_br.to(c_ptr.dtype.element_ty), layout=gStoreLayoutC)
-    cdna4.buffer_store(ptr=c_br_base, offsets=c_quad_offsets, stored_value=c_br)
+    cdna4.buffer_store(
+        ptr=c_br_base,
+        offsets=c_quad_offsets,
+        stored_value=c_br,
+        mask=bot_rows & right_cols,
+    )
 
 
 def _supports_largem_shape(M: int, N: int, K: int) -> bool:
+    # Partial M and N tiles clamp their loads and mask their stores; only the
+    # reduction must run the unrolled-by-two loop with no tail.
+    return M >= 1 and N >= 1 and K >= LARGEM_MIN_K and K % LARGEM_K_TILE_PAIR == 0
+
+
+def supports_gluon_mm_a16w16_prefill_gfx950(M: int, N: int, K: int) -> bool:
+    """Whether the prefill GEMM beats hipBLASLt for this K3 projection.
+
+    Args:
+        M: Token count.
+        N: Output width.
+        K: Reduction width.
+
+    Returns:
+        True for a measured K3 ``(N, K)`` whose workgroups keep the CUs at
+        least ``_PREFILL_MIN_CU_UTILIZATION`` busy, and for ``K`` of at least
+        ``_PREFILL_LONG_K``, run in at most ``_PREFILL_LONG_K_MAX_ROUNDS``
+        rounds or keep the CUs ``_PREFILL_LONG_K_MIN_CU_UTILIZATION`` busy.
+    """
+    if M < 1 or (N, K) not in _PREFILL_SHAPES:
+        return False
+    workgroups = triton.cdiv(M, LARGEM_BLOCK_M) * triton.cdiv(N, LARGEM_BLOCK_N)
+    rounds = triton.cdiv(workgroups, LARGEM_NUM_CUS)
+    if workgroups < _PREFILL_MIN_CU_UTILIZATION * rounds * LARGEM_NUM_CUS:
+        return False
     return (
-        M >= LARGEM_BLOCK_M
-        and M % LARGEM_BLOCK_M == 0
-        and N % LARGEM_BLOCK_N == 0
-        and K >= LARGEM_MIN_K
-        and K % LARGEM_K_TILE_PAIR == 0
+        K < _PREFILL_LONG_K
+        or rounds <= _PREFILL_LONG_K_MAX_ROUNDS
+        or workgroups >= _PREFILL_LONG_K_MIN_CU_UTILIZATION * rounds * LARGEM_NUM_CUS
     )
 
 
@@ -526,7 +618,7 @@ def launch_gluon_mm_a16w16_prefill_gfx950(
     alpha: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """Compute large, aligned dense16 ``A @ B.T`` with an 8-wave MFMA/LDS tile."""
+    """Compute large-M dense16 ``A @ B.T`` with an 8-wave MFMA/LDS tile."""
     if A.ndim != 2 or B.ndim != 2:
         return None
     if A.dtype not in _SUPPORTED_DTYPES or B.dtype not in _SUPPORTED_DTYPES:

@@ -140,6 +140,7 @@ from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
 from tokenspeed_kernel.ops.moe.triton import (
     decode_sigmoid_topk as _moe_triton_decode_sigmoid_topk,
 )
+from tokenspeed_kernel.ops.moe.triton import fp8 as _moe_triton_fp8
 from tokenspeed_kernel.ops.moe.triton import (
     kimi3_sigmoid_topk as _moe_triton_kimi3_sigmoid_topk,
 )
@@ -238,6 +239,7 @@ _RELOAD_MODULES = [
     _moe_native,
     _moe_triton_bf16,
     _moe_triton_decode_sigmoid_topk,
+    _moe_triton_fp8,
     _moe_triton_kimi3_sigmoid_topk,
     _moe_triton_sqrt_softplus,
     _moe_triton_mxfp4,
@@ -855,6 +857,26 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
     )
     assert tensor_scaled.shape == (4, 128)
     assert tensor_scaled.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("b_layout", ["KN", "NK"])
+def test_mm_fp8_reference_selection_follows_b_layout(monkeypatch, b_layout) -> None:
+    monkeypatch.setattr(
+        _gemm_pkg,
+        "select_kernel",
+        partial(_gemm_pkg.select_kernel, solution="reference"),
+    )
+    gen = torch.Generator().manual_seed(0)
+    a = torch.randn((4, 256), generator=gen).to(_fp8_dtype())
+    b_kn = torch.randn((256, 128), generator=gen).to(_fp8_dtype())
+    b = b_kn if b_layout == "KN" else b_kn.t().contiguous()
+    scale = torch.ones((1,), dtype=torch.float32)
+
+    out = tokenspeed_kernel.mm(
+        a, b, A_scales=scale, B_scales=scale, out_dtype=torch.float32, quant="fp8"
+    )
+
+    torch.testing.assert_close(out, a.float() @ b_kn.float())
 
 
 def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
@@ -1524,6 +1546,7 @@ def _attention_dsa_decode() -> object:
     topk_slots = torch.empty((2, 512), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1727,6 +1750,7 @@ def _attention_dsa_decode_fp8_dense_rank128_q4(
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1754,6 +1778,7 @@ def _attention_dsa_decode_fp8_dense_rank512(
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1781,6 +1806,7 @@ def _attention_dsa_decode_fp8_sparse_rank512(
     topk_slots = torch.empty((8, 2048), dtype=torch.int32)
     topk_lens = torch.empty((8,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1806,6 +1832,7 @@ def _attention_dsa_decode_glm53_flash_bf16_dense() -> object:
     topk_slots = torch.empty((4, 2051), dtype=torch.int32)
     topk_lens = torch.empty((4,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1834,6 +1861,7 @@ def _attention_dsa_prefill() -> object:
     topk_slots = torch.empty((2, 512), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -1854,6 +1882,7 @@ def _attention_dsa_prefill_glm53_flash_bf16_dense() -> object:
     topk_slots = torch.empty((1, 2051), dtype=torch.int32)
     topk_lens = torch.empty((1,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1876,6 +1905,7 @@ def _attention_dsa_prefill_glm53_flash_fp8_dense(
     topk_slots = torch.empty((1, 2051), dtype=torch.int32)
     topk_lens = torch.empty((1,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1902,6 +1932,7 @@ def _attention_dsa_prefill_fp8_dense(
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1926,6 +1957,7 @@ def _attention_dsa_decode_fp8_dense_rank128() -> object:
     topk_slots = torch.empty((2, 2048), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_decode(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1946,6 +1978,7 @@ def _attention_dsa_prefill_bf16_dense_rank128() -> object:
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1966,6 +1999,7 @@ def _attention_dsa_prefill_fp8_dense_rank128() -> object:
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=kv_cache,
         sparse_kv_cache=None,
@@ -1986,6 +2020,7 @@ def _attention_dsa_prefill_fp8_packed_rank512() -> object:
     topk_slots = torch.empty((2, 1024), dtype=torch.int32)
     topk_lens = torch.empty((2,), dtype=torch.int32)
     return _attention_dsa_pkg.dsa_prefill(
+        slot_order="selection",
         q=q,
         kv_cache=None,
         sparse_kv_cache=sparse_kv_cache,
@@ -2319,44 +2354,92 @@ def test_dsa_topk_selection_receives_index_heads(
     assert captured["index_heads"] == index_heads
 
 
-def test_dsa_prefill_topk_forwards_cpu_candidate_lens_to_deep_gemm(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("declares_feature", [True, False])
+def test_dsa_prefill_topk_forwards_cpu_candidate_lens_by_registered_feature(
+    fresh_registry, h100_platform, declares_feature: bool
 ) -> None:
-    """The optional host mirror reaches DeepGEMM without affecting selection."""
+    """The optional host mirror reaches exactly the leaves registered with
+    ``CANDIDATE_LENS_CPU_FEATURE``; the facade reads the registration, so a
+    ``*args, **kwargs`` wrapper whose launcher cannot take the keyword never
+    sees it, and selection is unaffected either way."""
+    from tokenspeed_kernel.registry import KernelSpec
+    from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+    _ = fresh_registry
     captured: dict[str, object] = {}
+    empty = (
+        torch.full((2, 1), -1, dtype=torch.int32),
+        torch.zeros((2,), dtype=torch.int32),
+    )
 
-    class _SelectedKernel:
-        name = "deep_gemm_dsa_prefill_topk"
+    def launcher(*, q, candidate_lens_cpu=None, **kwargs):
+        captured["candidate_lens_cpu"] = candidate_lens_cpu
+        return empty
 
-        def __call__(self, **kwargs):
-            captured.update(kwargs)
-            return (
-                torch.full((2, 1), -1, dtype=torch.int32),
-                torch.zeros((2,), dtype=torch.int32),
-            )
+    def leaf(*args, **kwargs):
+        # Opaque wrapper, as the AMD gluon registrations are.
+        return launcher(*args, **kwargs)
 
-    monkeypatch.setattr(
-        _attention_dsa_pkg,
-        "select_kernel",
-        lambda *args, **kwargs: _SelectedKernel(),
+    features = {"batch_invariant"}
+    if declares_feature:
+        features.add(_attention_dsa_pkg.CANDIDATE_LENS_CPU_FEATURE)
+    KernelRegistry.get().register(
+        KernelSpec(
+            name="unit_dsa_prefill_topk",
+            family="attention",
+            mode="dsa_prefill_topk",
+            solution="unit",
+            features=frozenset(features),
+            format_signatures=frozenset(
+                {
+                    format_signature(
+                        q=dense_tensor_format(torch.bfloat16),
+                        weights=dense_tensor_format(torch.float32),
+                    )
+                }
+            ),
+            traits={"index_k_format": frozenset({"fp8_scaled"})},
+        ),
+        leaf,
     )
     candidate_lens_cpu = torch.tensor([8, 16], dtype=torch.int64)
 
-    _attention_dsa_pkg.dsa_prefill_topk(
-        torch.empty((2, 2, 128), dtype=torch.bfloat16),
-        torch.empty((2, 2), dtype=torch.float32),
-        torch.arange(16, dtype=torch.int64),
-        torch.tensor([0, 0], dtype=torch.int32),
-        torch.tensor([8, 16], dtype=torch.int32),
-        topk=1,
-        softmax_scale=1.0,
-        batch_invariant=False,
-        index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
-        page_size=64,
-        candidate_lens_cpu=candidate_lens_cpu,
-    )
+    real_platform = Platform.get()
+    Platform.override(h100_platform)
+    try:
+        _attention_dsa_pkg.dsa_prefill_topk(
+            torch.empty((2, 2, 128), dtype=torch.bfloat16),
+            torch.empty((2, 2), dtype=torch.float32),
+            torch.arange(16, dtype=torch.int64),
+            torch.tensor([0, 0], dtype=torch.int32),
+            torch.tensor([8, 16], dtype=torch.int32),
+            topk=1,
+            softmax_scale=1.0,
+            batch_invariant=True,
+            index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
+            page_size=64,
+            candidate_lens_cpu=candidate_lens_cpu,
+        )
+    finally:
+        Platform.override(real_platform)
 
-    assert captured["candidate_lens_cpu"] is candidate_lens_cpu
+    if declares_feature:
+        assert captured["candidate_lens_cpu"] is candidate_lens_cpu
+    else:
+        assert captured["candidate_lens_cpu"] is None
+
+
+def test_deep_gemm_prefill_topk_declares_the_candidate_lens_cpu_feature() -> None:
+    """The one in-tree leaf taking the keyword registers the feature; the
+    decode leaf and the opaque gluon wrappers do not."""
+    registry = KernelRegistry.get()
+    spec = registry.get_by_name("deep_gemm_dsa_prefill_topk")
+    if spec is None:
+        pytest.skip("DeepGEMM DSA leaves are not registered on this platform")
+    assert _attention_dsa_pkg.CANDIDATE_LENS_CPU_FEATURE in spec.features
+    for other in registry.list_kernels("attention", "dsa_prefill_topk"):
+        if other.name != spec.name:
+            assert _attention_dsa_pkg.CANDIDATE_LENS_CPU_FEATURE not in other.features
 
 
 def test_deep_gemm_prefill_bound_resolution_preserves_both_host_inputs() -> None:
@@ -2701,6 +2784,7 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
             activation_clamped=False,
             expert_id_repeats=False,
             fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -2742,6 +2826,7 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
                 activation_clamped=False,
                 expert_id_repeats=False,
                 fast_math=True,
+                combine_order="rank",
             )
     finally:
         Platform.override(real_platform)
@@ -2772,6 +2857,7 @@ def test_moe_plan_rejects_persistent_workspace_for_ordinary_kernel(
                 activation_clamped=False,
                 expert_id_repeats=False,
                 fast_math=True,
+                combine_order="rank",
             )
     finally:
         Platform.override(real_platform)
@@ -2826,6 +2912,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
             activation_clamped=False,
             expert_id_repeats=False,
             fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -2850,6 +2937,7 @@ def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] is None
@@ -2880,6 +2968,7 @@ def test_moe_plan_rejects_invalid_deepep_mode(
             activation_clamped=False,
             expert_id_repeats=False,
             fast_math=True,
+            combine_order="rank",
         )
 
 
@@ -3158,6 +3247,7 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
             activation_clamped=False,
             expert_id_repeats=False,
             fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -3194,6 +3284,7 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             activation_clamped=False,
             expert_id_repeats=False,
             fast_math=True,
+            combine_order="rank",
         )
         assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     finally:
@@ -3256,6 +3347,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
             activation_clamped=False,
             expert_id_repeats=False,
             fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -3301,6 +3393,7 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
             activation_clamped=False,
             expert_id_repeats=False,
             fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -3335,6 +3428,7 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
             activation_clamped=False,
             expert_id_repeats=False,
             fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -3426,6 +3520,7 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
             activation_clamped=False,
             expert_id_repeats=False,
             fast_math=True,
+            combine_order="rank",
         )
     finally:
         Platform.override(real_platform)
@@ -3643,6 +3738,7 @@ def _moe_apply_unquant_trtllm() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3704,6 +3800,7 @@ def _moe_apply_unquant_cutlass() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3729,6 +3826,7 @@ def _moe_apply_fp8_cutlass() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3770,6 +3868,7 @@ def _moe_apply_mxfp4_plan(
         internal_activation_dtype=internal_activation_dtype,
         solution=solution,
         fast_math=True,
+        combine_order="rank",
     )
 
 
@@ -3951,6 +4050,7 @@ def _moe_apply_fp8_trtllm() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -3976,6 +4076,7 @@ def _moe_apply_nvfp4_trtllm() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -4007,6 +4108,7 @@ def _moe_apply_nvfp4_cutlass() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -4033,6 +4135,7 @@ def _moe_apply_nvfp4_trtllm_routed() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -4071,6 +4174,7 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -4098,6 +4202,7 @@ def _moe_apply_unquant_trtllm_routed() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -4136,6 +4241,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -4165,6 +4271,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -4200,6 +4307,7 @@ def _moe_apply_mxfp4_trtllm() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -4226,12 +4334,44 @@ def _moe_apply_mxfp4_triton() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
         apply="triton_mxfp4_precomputed_moe_apply",
         preprocessor="triton_mxfp4_moe_weights",
     )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    topk_weights = torch.empty((4, 2), dtype=torch.float32)
+    topk_ids = torch.empty((4, 2), dtype=torch.int64)
+    return tokenspeed_kernel.moe_apply(
+        plan,
+        x,
+        torch.nn.Module(),
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+
+
+def _moe_apply_fp8_block(ispp: int, apply: str, preprocessor: str | None) -> object:
+    plan = tokenspeed_kernel.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        ep_size=1,
+        ispp=ispp,
+        fp8_scale_block_shape=(128, 128),
+        internal_activation_dtype="input",
+        hidden=6144,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
+    )
+    _assert_moe_plan(plan, apply=apply, preprocessor=preprocessor)
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
@@ -4261,6 +4401,7 @@ def _moe_apply_unquant_triton() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -4294,6 +4435,7 @@ def _moe_apply_mxfp4_gluon() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -4318,6 +4460,7 @@ def _moe_apply_mxint4_trtllm() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -4342,6 +4485,7 @@ def _moe_apply_mxfp4_dynamic_tp() -> object:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     _assert_moe_plan(
         plan,
@@ -5757,6 +5901,39 @@ _CASES = [
         "gluon_mxfp4_dynamic_moe_apply",
         _moe_apply_mxfp4_dynamic_tp,
     ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "moe",
+        "apply",
+        "triton_fp8_block_precomputed_moe_apply",
+        partial(
+            _moe_apply_fp8_block, 256, "triton_fp8_block_precomputed_moe_apply", None
+        ),
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "triton_fp8_block_precomputed_moe_apply",
+        partial(
+            _moe_apply_fp8_block, 256, "triton_fp8_block_precomputed_moe_apply", None
+        ),
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "moe",
+        "apply",
+        "gluon_fp8_block_precomputed_moe_apply",
+        partial(
+            _moe_apply_fp8_block,
+            512,
+            "gluon_fp8_block_precomputed_moe_apply",
+            "gluon_fp8_moe_weights",
+        ),
+    ),
 ]
 
 
@@ -5963,6 +6140,7 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
             activation_clamped=False,
             expert_id_repeats=False,
             fast_math=True,
+            combine_order="rank",
         )
 
         assert plan["apply_kernel_name"] == ("flashinfer_trtllm_fp8_routed_moe_apply")

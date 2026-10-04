@@ -31,11 +31,6 @@ import torch
 import torch.distributed
 from tokenspeed_kernel.ops.communication import (
     allgather_dual_rmsnorm,
-)
-from tokenspeed_kernel.ops.communication import (
-    allreduce_lane_latent_norm as kernel_allreduce_lane_latent_norm,
-)
-from tokenspeed_kernel.ops.communication import (
     allreduce_residual_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication import (
@@ -50,9 +45,6 @@ from tokenspeed.runtime.distributed.comm_backend import (
     Group,
     get_global_backend,
 )
-
-# Re-exported for reduce-strategy callers (e.g. kimi3_join_reduce_moe):
-# tensor collections past the one-shot window take an NCCL path.
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # noqa: F401
     MAX_ONESHOT_BYTES as COMM_ONESHOT_MAX_BYTES,
 )
@@ -160,6 +152,7 @@ def prepare_all_reduce_buffers(
     attnres_max_numel: int,
     attnres_max_rows: int,
     enable_lamport: bool,
+    moe_tail_max_rows: int,
     dtype: torch.dtype,
     backend: CommBackend | None,
 ) -> bool:
@@ -172,6 +165,8 @@ def prepare_all_reduce_buffers(
         attnres_max_numel: Maximum fused AttnRes payload in elements.
         attnres_max_rows: Maximum fused AttnRes payload in rows.
         enable_lamport: Allow Lamport for eligible producer-direct payloads.
+        moe_tail_max_rows: Maximum rows in the reusable symmetric result buffer;
+            zero skips its allocation.
         dtype: Element type shared by the prepared paths.
         backend: Backend to prepare, or ``None`` to use the global backend.
 
@@ -188,6 +183,7 @@ def prepare_all_reduce_buffers(
         attnres_max_numel=attnres_max_numel,
         attnres_max_rows=attnres_max_rows,
         enable_lamport=enable_lamport,
+        moe_tail_max_rows=moe_tail_max_rows,
         dtype=dtype,
     )
 
@@ -209,30 +205,6 @@ def prepare_all_reduce_fusion(
         )
     except Exception:
         return False
-
-
-def all_reduce_latent_norm(
-    lane: torch.Tensor,
-    norm_weight: torch.Tensor,
-    latent_width: int,
-    group: Group,
-    *,
-    eps: float,
-    max_token_num: int,
-) -> torch.Tensor:
-    """All-reduce a routed/shared lane and RMS-normalize its routed prefix."""
-
-    process_group = _get_process_group(group)
-    return kernel_allreduce_lane_latent_norm(
-        lane,
-        norm_weight,
-        latent_width,
-        rank=process_group.rank(),
-        group=process_group,
-        eps=eps,
-        max_token_num=max_token_num,
-        trigger_completion_at_end=True,
-    )
 
 
 def can_acquire_all_reduce_outputs(
@@ -314,11 +286,143 @@ def all_to_all_single(
     input: torch.Tensor,
     group: Group,
     backend: CommBackend | None = None,
+    output_split_sizes: list[int] | None = None,
+    input_split_sizes: list[int] | None = None,
 ) -> None:
-    """Even-split all_to_all into a pre-allocated output buffer."""
+    """All-to-all along dim 0 into a pre-allocated output buffer.
+
+    Without split sizes the exchange is even; see
+    ``CommBackend.all_to_all_single`` for the uneven form.
+    """
     if backend is None:
         backend = get_global_backend()
-    backend.all_to_all_single(output, input, group)
+    backend.all_to_all_single(
+        output,
+        input,
+        group,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+    )
+
+
+def _check_split_sizes(split_sizes: list[int], group: Group, rows: int) -> None:
+    if len(split_sizes) != len(group):
+        raise ValueError(
+            f"expected one row count per rank of a {len(group)}-rank group, got "
+            f"{len(split_sizes)}"
+        )
+    if any(count < 0 for count in split_sizes):
+        raise ValueError(f"row counts must be non-negative, got {split_sizes}")
+    if sum(split_sizes) != rows:
+        raise ValueError(
+            f"row counts {split_sizes} sum to {sum(split_sizes)}, but the tensor "
+            f"has {rows} rows"
+        )
+
+
+def all_to_all_transpose(
+    x: torch.Tensor,
+    group: Group,
+    input_split_sizes: list[int],
+    backend: CommBackend | None = None,
+) -> torch.Tensor:
+    """Exchange token shards for feature shards across ``group``.
+
+    ``x`` is ``[T_full, F_local]``: this rank's feature shard of every rank's
+    tokens, rows rank-major (``input_split_sizes[i]`` rows belong to the
+    group's ``i``-th rank). The result is ``[T_own, W * F_local]``: this
+    rank's own tokens with the feature shards of all ``W`` ranks concatenated
+    in rank order. Pure data movement, so the bytes do not depend on the row
+    counts. A rank may own zero rows.
+
+    This is the tail of a column-parallel GEMM on hidden (TP batch
+    invariance), the logits transpose of a vocab-sharded LM head under
+    attention DP, and the heads-to-tokens leg of head-sharded attention.
+    """
+    if x.dim() != 2:
+        raise ValueError(f"all_to_all_transpose takes a 2-D tensor, got {x.dim()}-D")
+    world_size = len(group)
+    _check_split_sizes(input_split_sizes, group, x.shape[0])
+    if world_size == 1:
+        return x
+    rows = input_split_sizes[group.index(torch.distributed.get_rank())]
+    width = x.shape[1]
+    if x.shape[0] == 0:
+        # Nothing to move for the whole group (every rank reads the same
+        # counts, so every rank skips the collective together).
+        return x.new_empty(0, world_size * width)
+    received = x.new_empty(world_size * rows, width)
+    all_to_all_single(
+        received,
+        x.contiguous(),
+        group,
+        backend=backend,
+        output_split_sizes=[rows] * world_size,
+        input_split_sizes=input_split_sizes,
+    )
+    # Received chunk i is rank i's feature shard of my rows.
+    return (
+        received.view(world_size, rows, width)
+        .transpose(0, 1)
+        .reshape(rows, world_size * width)
+    )
+
+
+def all_to_all_head_scatter(
+    x: torch.Tensor,
+    group: Group,
+    output_split_sizes: list[int],
+    backend: CommBackend | None = None,
+) -> torch.Tensor:
+    """Inverse of ``all_to_all_transpose`` for per-head activations.
+
+    ``x`` is ``[T_own, W * H_local, D]``: this rank's own tokens with every
+    rank's head block in rank order. The result is ``[T_full, H_local, D]``:
+    this rank's head block of every rank's tokens, rows rank-major
+    (``output_split_sizes[i]`` rows from the group's ``i``-th rank). Pure data
+    movement; a rank may own zero rows.
+    """
+    if x.dim() != 3:
+        raise ValueError(
+            f"all_to_all_head_scatter takes a [tokens, heads, dim] tensor, got "
+            f"{x.dim()}-D"
+        )
+    world_size = len(group)
+    if x.shape[1] % world_size:
+        raise ValueError(
+            f"{x.shape[1]} heads do not split over {world_size} ranks evenly"
+        )
+    rows_full = sum(output_split_sizes)
+    _check_split_sizes(output_split_sizes, group, rows_full)
+    if world_size == 1:
+        return x
+    rows_own, heads, dim = x.shape
+    heads_local = heads // world_size
+    if output_split_sizes[group.index(torch.distributed.get_rank())] != rows_own:
+        raise ValueError(
+            f"this rank owns {rows_own} rows but the row counts "
+            f"{output_split_sizes} give it "
+            f"{output_split_sizes[group.index(torch.distributed.get_rank())]}"
+        )
+    if rows_full == 0:
+        # Nothing to move for the whole group; every rank skips together.
+        return x.new_empty(0, heads_local, dim)
+    # Head block i (destined for rank i) becomes send chunk i.
+    sent = (
+        x.view(rows_own, world_size, heads_local * dim)
+        .transpose(0, 1)
+        .reshape(world_size * rows_own, heads_local * dim)
+    )
+    received = x.new_empty(rows_full, heads_local * dim)
+    all_to_all_single(
+        received,
+        sent,
+        group,
+        backend=backend,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=[rows_own] * world_size,
+    )
+    return received.view(rows_full, heads_local, dim)
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +556,44 @@ def token_all_gather(
     if backend is None:
         backend = get_global_backend()
     return backend.token_all_gather(tensor, group, scattered_num_tokens)
+
+
+def token_all_gather_rows(
+    rows: torch.Tensor,
+    group: Group,
+    scattered_num_tokens: list[int],
+    backend=None,
+) -> torch.Tensor:
+    """Token-aware all-gather of 2-D rows of any dtype, byte-preserving.
+
+    :func:`token_all_gather` moves bf16 rows (its low-latency solution
+    asserts the dtype); pure data movement -- gathered cache rows, packed
+    index-K bytes, fp32 scales, token ids -- has no dtype of its own, so
+    non-bf16 rows travel as bf16 pairs of their bytes and come back viewed
+    as the input dtype. The row byte width must be even.
+
+    Args:
+        rows: ``[local_rows, width]`` this rank's rows.
+        group: The gather group.
+        scattered_num_tokens: Rows every rank of the group contributes.
+
+    Returns:
+        ``[sum(scattered_num_tokens), width]`` rows in rank order, ``rows``'
+        dtype.
+    """
+    if rows.dim() != 2:
+        raise ValueError(f"token_all_gather_rows takes 2-D rows, got {rows.dim()}-D")
+    if rows.dtype == torch.bfloat16:
+        return token_all_gather(rows.contiguous(), group, scattered_num_tokens, backend)
+    row_bytes = rows.shape[1] * rows.element_size()
+    if row_bytes % 2:
+        raise ValueError(
+            f"rows of {row_bytes} bytes cannot travel as bf16 pairs; pad the row "
+            "to an even byte width"
+        )
+    payload = rows.contiguous().view(torch.uint8).view(torch.bfloat16)
+    gathered = token_all_gather(payload, group, scattered_num_tokens, backend)
+    return gathered.view(torch.uint8).view(rows.dtype)
 
 
 def token_reduce_scatter(

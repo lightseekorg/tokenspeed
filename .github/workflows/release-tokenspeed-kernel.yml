@@ -10,6 +10,11 @@ on:
         required: false
         default: false
         type: boolean
+      replace_nightly:
+        description: "Replace existing nightly assets and refresh their pip index hashes (main only)."
+        required: false
+        default: false
+        type: boolean
       tag_name:
         description: "Git tag prefix to create or update. Defaults to tokenspeed-kernel-v<version>; non-release refs include the date and source SHA."
         required: false
@@ -94,9 +99,14 @@ jobs:
           NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
           VERSION_DATE: ${{ inputs.version_date }}
           REQUESTED_TAG: ${{ inputs.tag_name }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
           PUBLISH_PYPI: ${{ inputs.publish_pypi }}
           PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
         run: |
+          if [ "$REPLACE_NIGHTLY" = "true" ] && { [ "$NIGHTLY" != "true" ] || [ "$PUBLISH_GITHUB" != "true" ] || [ "$GITHUB_REF" != "refs/heads/main" ]; }; then
+            echo "Replacing nightly assets requires nightly publication from main." >&2
+            exit 1
+          fi
           if [ "$NIGHTLY" = "true" ]; then
             if [ "$PUBLISH_PYPI" = "true" ]; then
               echo "Nightly builds cannot publish to PyPI." >&2
@@ -200,13 +210,22 @@ jobs:
           ARG MANYLINUX_ARCH=x86_64
           FROM quay.io/pypa/manylinux_2_28_${MANYLINUX_ARCH}
 
+          ARG MANYLINUX_ARCH
           ARG CUDA_PKG_VERSION=13-0
           ARG CUDA_REPO_ARCH=x86_64
 
-          RUN curl -o /etc/yum.repos.d/cuda-rhel8.repo \
-                  https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${CUDA_REPO_ARCH}/cuda-rhel8.repo \
+          # CUDA 13 uses a self-contained repository to avoid network metadata drift.
+          RUN if [ "$CUDA_PKG_VERSION" = "13-0" ]; then \
+                  curl -fSL --retry 3 -o /tmp/cuda-local.rpm \
+                      https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda-repo-rhel8-13-0-local-13.0.2_580.95.05-1.${MANYLINUX_ARCH}.rpm \
+                  && rpm -i /tmp/cuda-local.rpm; \
+              else \
+                  curl -o /etc/yum.repos.d/cuda-rhel8.repo \
+                      https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${CUDA_REPO_ARCH}/cuda-rhel8.repo; \
+              fi \
               && yum install -y \
                   cuda-nvcc-${CUDA_PKG_VERSION} \
+                  cuda-cuobjdump-${CUDA_PKG_VERSION} \
                   cuda-cccl-${CUDA_PKG_VERSION} \
                   cuda-cudart-devel-${CUDA_PKG_VERSION} \
                   cuda-driver-devel-${CUDA_PKG_VERSION} \
@@ -217,6 +236,10 @@ jobs:
                   gcc-toolset-13-gcc \
                   gcc-toolset-13-gcc-c++ \
                   ninja-build \
+              && if [ "$CUDA_PKG_VERSION" = "13-0" ]; then \
+                  rpm -e "$(rpm -qp --qf '%{NAME}' /tmp/cuda-local.rpm)" \
+                  && rm -f /tmp/cuda-local.rpm; \
+              fi \
               && yum clean all \
               && rm -rf /var/cache/yum \
               && ln -s /usr/bin/ninja-build /usr/local/bin/ninja
@@ -238,6 +261,7 @@ jobs:
             -f Dockerfile.tokenspeed-kernel-release \
             -t tokenspeed-kernel-release:${{ matrix.cuda.variant }}-${{ matrix.arch.name }} .
 
+      # Include H100 in published wheels; local builds retain their own defaults.
       - name: Build wheel
         run: |
           mkdir -p dist
@@ -245,6 +269,7 @@ jobs:
             -e PYTHON_TAG=${{ matrix.python.tag }} \
             -e TORCH_INDEX_URL=${{ matrix.cuda.torch_index_url }} \
             -e TOKENSPEED_KERNEL_BACKEND=cuda \
+            -e FLASHINFER_CUDA_ARCH_LIST="9.0a 10.0a 10.3a" \
             -e TOKENSPEED_KERNEL_NIGHTLY=${{ needs.metadata.outputs.nightly }} \
             -e TOKENSPEED_KERNEL_VERSION_DATE=${{ needs.metadata.outputs.version_date }} \
             -e TOKENSPEED_KERNEL_GIT_SHA=$GITHUB_SHA \
@@ -266,6 +291,13 @@ jobs:
               rm -rf build *.egg-info
               PIP_EXTRA_INDEX_URL="${TORCH_INDEX_URL}" \
                 "${PYBIN}/python" -m build --wheel --no-isolation --outdir /output
+
+              # Package metadata alone cannot catch a missing GPU architecture.
+              cuobjdump --list-elf tokenspeed_kernel/thirdparty/cuda/objs/rope/rope.so \
+                > /tmp/rope-architectures.txt
+              for arch in 90a 100a 103a; do
+                grep -F ".sm_${arch}.cubin" /tmp/rope-architectures.txt
+              done
 
               python_tag="${PYTHON_TAG%%-*}"
               abi_tag="${PYTHON_TAG#*-}"
@@ -344,6 +376,7 @@ jobs:
           VERSION: ${{ needs.metadata.outputs.version }}
           CUDA_VARIANT: ${{ needs.metadata.outputs.cuda_variant }}
           NIGHTLY: ${{ needs.metadata.outputs.nightly }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
           PRERELEASE: ${{ inputs.prerelease }}
           SOURCE_SHA: ${{ github.sha }}
         run: |
@@ -379,7 +412,12 @@ jobs:
                   --repo "$RELEASE_REPOSITORY" \
                   --prerelease
               fi
-              if [ "$NIGHTLY" = "true" ]; then
+              if [ "$REPLACE_NIGHTLY" = "true" ]; then
+                gh release upload "$release_tag" "${assets[@]}" \
+                  --repo "$RELEASE_REPOSITORY" --clobber
+                gh release edit "$release_tag" --repo "$RELEASE_REPOSITORY" \
+                  --notes "$release_title replacement assets built from lightseekorg/tokenspeed@$SOURCE_SHA"
+              elif [ "$NIGHTLY" = "true" ]; then
                 # Same-day reruns preserve existing assets, including their hashes.
                 existing_assets=$(gh release view "$release_tag" --repo "$RELEASE_REPOSITORY" --json assets --jq '.assets[].name')
                 for asset in "${assets[@]}"; do
@@ -434,12 +472,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
         run: |
           test "$(gh api user --jq .login)" = lightseek-bot
           test "$(gh repo view lightseekorg/whl --json visibility --jq .visibility)" = PUBLIC
           gh api "repos/lightseekorg/whl/releases/tags/${TAG_NAME}-cu130" > nightly-release.json
-          python .github/scripts/update-nightly-index.py \
-            --package tokenspeed-kernel wheelhouse nightly-release.json dist
+          replace_args=()
+          if [ "$REPLACE_NIGHTLY" = "true" ]; then
+            replace_args+=(--replace)
+          fi
+          python .github/scripts/update-nightly-index.py "${replace_args[@]}" \
+            --package tokenspeed-kernel --variant cu130 wheelhouse nightly-release.json dist
           cd wheelhouse
           git config user.name lightseek-bot
           git config user.email 243258330+lightseek-bot@users.noreply.github.com

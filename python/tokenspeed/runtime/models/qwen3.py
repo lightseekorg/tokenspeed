@@ -26,7 +26,6 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
-from tokenspeed_kernel.ops.layernorm import qk_rmsnorm
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
@@ -51,7 +50,6 @@ from tokenspeed.runtime.layers.utils import get_layer_id
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
-    kv_cache_scales_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.utils import validate_attention_partition
@@ -194,26 +192,9 @@ class Qwen3Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=sliding_window_size,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
-
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return qk_rmsnorm(
-            q,
-            k,
-            self.q_norm.weight.data,
-            self.k_norm.weight.data,
-            self.q_norm.variance_epsilon,
-        )
-
-    def _rotate_half(self, x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
-        return torch.cat((-x2, x1), dim=-1)
-
-    def _apply_rotary_pos_emb(self, t, cos, sin):
-        return (t * cos) + self._rotate_half(t) * sin
 
     def forward(
         self,
@@ -224,9 +205,7 @@ class Qwen3Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, ctx)
+        attn_output = self.attn(q, k, v, positions, ctx)
         if len(attn_output.size()) == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)
@@ -409,26 +388,6 @@ class Qwen3Model(nn.Module):
             )
         return hidden_states, None
 
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        tp_size = self.mapping.attn.tp_size
-        tp_rank = self.mapping.attn.tp_rank
-        for layer_idx, scaling_factor in kv_cache_scales_loader(
-            quantization_param_path,
-            tp_rank,
-            tp_size,
-            self.config.num_hidden_layers,
-            self.config.__class__.model_type,
-        ):
-            if not isinstance(self.layers[layer_idx], nn.Identity):
-                layer_self_attn = self.layers[layer_idx].self_attn
-            if hasattr(layer_self_attn.attn, "k_scale"):
-                layer_self_attn.attn.k_scale = scaling_factor
-                layer_self_attn.attn.v_scale = scaling_factor
-            else:
-                raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
-                )
-
 
 class Qwen3ForCausalLM(BaseCausalLM):
     model_cls = Qwen3Model
@@ -542,9 +501,6 @@ class Qwen3ForCausalLM(BaseCausalLM):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
 
 
 EntryClass = Qwen3ForCausalLM

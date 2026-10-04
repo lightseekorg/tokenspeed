@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import inspect
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -36,7 +35,6 @@ from tokenspeed_kernel import (
 
 import tokenspeed.runtime.distributed.comm_manager as comm_manager_module
 import tokenspeed.runtime.layers.hyperconnection as hyperconnection_module
-import tokenspeed.runtime.models.qwen4_exp as qwen4_exp_module
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.hyperconnection import (
@@ -314,7 +312,13 @@ def test_residual_fusion_gather_boundaries_match_communication(
 ) -> None:
     mapping = SimpleNamespace(
         has_attn_tp=attn_tp > 1,
-        attn=SimpleNamespace(tp_size=attn_tp, tp_group=list(range(attn_tp))),
+        attn=SimpleNamespace(
+            tp_size=attn_tp,
+            tp_rank=0,
+            tp_group=list(range(attn_tp)),
+            has_qcp=False,
+            qcp_size=1,
+        ),
         dense=SimpleNamespace(tp_size=other_tp),
         moe=SimpleNamespace(tp_ep_size=other_tp),
     )
@@ -325,6 +329,8 @@ def test_residual_fusion_gather_boundaries_match_communication(
         prev_is_moe=is_moe,
         input_layernorm=None,
         post_attn_layernorm=None,
+        dense_batch_invariant=False,
+        query_sharded=False,
     )
     x = torch.arange(12).reshape(3, 4)
     gather = mock.Mock(side_effect=lambda value, **kwargs: value.repeat(2, 1))
@@ -336,16 +342,17 @@ def test_residual_fusion_gather_boundaries_match_communication(
     expected_pre = layer_id > 0 and expected_final
     assert manager.needs_pre_attn_all_gather() == expected_pre
     assert manager.needs_final_all_gather() == expected_final
+    ctx = SimpleNamespace(query_shard=None)
     for operation, expected in (
         (manager.pre_attn_comm, expected_pre),
         (manager.gather_residual, expected_pre),
     ):
         gather.reset_mock()
-        result = operation(x, None)
+        result = operation(x, ctx)
         assert gather.call_count == int(expected)
         assert (result is x) == (not expected)
     gather.reset_mock()
-    result, residual = manager.post_final_norm_comm(x, x, None)
+    result, residual = manager.post_final_norm_comm(x, x, ctx)
     assert gather.call_count == int(expected_final)
     assert residual is x and (result is x) == (not expected_final)
 
@@ -459,13 +466,8 @@ def _tail_fusion_model(
     ],
 )
 def test_mlp_tail_fusion_preserves_intervening_operations(
-    monkeypatch, dtype: torch.dtype, boundary: str
+    dtype: torch.dtype, boundary: str
 ) -> None:
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "get_global_expert_distribution_recorder",
-        lambda: SimpleNamespace(with_current_layer=lambda index: nullcontext()),
-    )
     torch.manual_seed(103)
     model = _tail_fusion_model(dtype, boundary, 3)
     ids = torch.arange(4, device="cuda")
@@ -518,13 +520,8 @@ def test_mlp_tail_fusion_preserves_intervening_operations(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize(("rows", "layer_count"), [(0, 1), (1, 3), (4, 1)])
 def test_mlp_tail_fusion_graph_replay_keeps_current_residual(
-    monkeypatch, rows: int, layer_count: int
+    rows: int, layer_count: int
 ) -> None:
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "get_global_expert_distribution_recorder",
-        lambda: SimpleNamespace(with_current_layer=lambda index: nullcontext()),
-    )
     torch.manual_seed(109)
     model = _tail_fusion_model(torch.bfloat16, "none", layer_count)
     ids = torch.arange(rows, device="cuda")

@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
 CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P = "triton_full_min_p"
@@ -78,6 +79,9 @@ CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P = "triton_full_top_k_top_p_min_
 
 class TritonFullSamplingBackend(TritonSamplingBackend):
     """Full sampling backend with TokenSpeed-owned state and Triton kernels."""
+
+    # verify() here adds penalties and logit processors with no tree path yet.
+    supports_tree_verify = False
 
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
@@ -445,11 +449,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             sampling_info.req_pool_indices, logits.shape[0]
         )
         logits = self._apply_penalties_and_bias(logits, req_pool_indices)
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         sampled = self._gumbel_sample_full_logits(
             logits,
             req_pool_indices,
@@ -480,7 +480,13 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        *,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if tree is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot verify draft trees"
+            )
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
 
@@ -515,11 +521,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             num_tokens_per_req=num_tokens_per_req,
         )
 
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         target_sampled = self._gumbel_sample_full_logits(
             logits,
             req_pool_indices,

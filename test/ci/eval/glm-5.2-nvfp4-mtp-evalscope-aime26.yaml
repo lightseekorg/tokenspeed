@@ -3,7 +3,6 @@ name: eval-glm-5.2-nvfp4-mtp-aime26
 type: eval
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
 runner:
   labels:
@@ -23,7 +22,6 @@ server:
     --max-num-seqs 16
     --max-prefill-tokens 8192
     --chunked-prefill-size 8192
-    --gpu-memory-utilization 0.95
     --disable-cuda-graph-padding
     --trust-remote-code
     --moe-backend flashinfer_trtllm

@@ -218,6 +218,7 @@ def gluon_latent_input_largem_gfx950(
         # A partial row tile clamps onto the last valid row; the stores below
         # mask those duplicated rows back out.
         M - 1 - row_base,
+        TOTAL_N - 1 - col_base,
         right_delta,
         stride_am,
         stride_ak,

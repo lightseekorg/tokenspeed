@@ -282,6 +282,7 @@ def _extend(backend, tables, lengths, prefixes, replays, prompt_lens):
         extend_replay_lens_cpu=torch.tensor(replays, dtype=torch.int32),
         extend_prompt_lens_cpu=torch.tensor(prompt_lens, dtype=torch.int32),
         extend_with_prefix=any(prefixes),
+        query_shard=None,
     )
     return backend.query_metadata(ForwardMode.EXTEND)
 
@@ -407,6 +408,7 @@ def test_packed_mixed_metadata_and_count_validation(verify_width):
         extend_replay_lens_cpu=torch.tensor([0]),
         extend_prompt_lens_cpu=torch.tensor([5]),
         extend_with_prefix=True,
+        query_shard=None,
         num_tokens=3 + verify_width,
     )
     backend.init_forward_metadata(
@@ -570,14 +572,20 @@ def test_write_global_masks_rows_below_the_replay_floor(monkeypatch):
 def test_decoder_view_is_the_identity_for_decode_and_complete_short_chunks():
     backend = _backend("cpu", 2)
     tables = _tables("cpu")
-    meta = _extend(backend, tables, [5, 3], [0, 2], [0, 0], [5, 5])
+    meta = _extend(backend, tables, [5, 3], [0, 0], [0, 0], [5, 3])
     view = backend.decoder_view()
     assert view.keep_rows is None and view.logits_rows is None
     assert view.metadata is meta and view.prefill is meta
     assert [(s.request, s.offset, s.prefix, s.count) for s in view.spans] == [
         (0, 0, 0, 5),
-        (1, 5, 2, 3),
+        (1, 5, 0, 3),
     ]
+    # Keeping every query row does not make an older SWA prefix visible.
+    meta = _extend(backend, tables, [5, 3], [0, 2], [0, 0], [5, 5])
+    view = backend.decoder_view()
+    assert view.keep_rows.tolist() == list(range(8))
+    assert view.logits_rows.tolist() == [4, 7]
+    assert view.metadata is not meta
     backend.refresh_decode_metadata(
         2,
         2,
@@ -608,10 +616,29 @@ def test_decoder_view_is_the_identity_for_decode_and_complete_short_chunks():
     assert backend.decoder_view()[1:] == (None, (), None, None)
 
 
-def test_decoder_view_keeps_one_row_per_open_chunk_and_the_final_window():
+@pytest.mark.parametrize("open_count", [1, 17])
+def test_decoder_view_preserves_compute_rows_without_open_chunk_logits(open_count):
+    backend = _verify_backend("cpu", 2, 1)
+    _extend(
+        backend,
+        _tables("cpu"),
+        [128, open_count],
+        [0, 0],
+        [0, 0],
+        [128, 256],
+    )
+    view = backend.decoder_view()
+    # Dropping the last row changes the GEMM shape seen by the completing
+    # request. Keep that computation, but never sample the open request.
+    assert view.keep_rows.tolist() == list(range(128)) + [127 + open_count]
+    assert view.metadata.request_indices.tolist() == [0] * 128 + [1]
+    assert view.logits_rows.tolist() == [127]
+
+
+def test_decoder_view_keeps_compute_rows_and_selects_only_valid_logits():
     """The CED decoder runs on each prompt-completing chunk's last window
-    (the whole chunk when shorter), on one row of every other chunk, and on
-    every decode row; sampled rows are the last kept row per request."""
+    (the whole chunk when shorter), on one numerical-shape row of an open
+    chunk, and on every decode row; open chunks have no sampled row."""
     backend = _verify_backend("cpu", 3, 2)
     tables = _tables("cpu")
     tables = {gid: torch.cat((t, t[:1])) for gid, t in tables.items()}
@@ -627,22 +654,22 @@ def test_decoder_view_keeps_one_row_per_open_chunk_and_the_final_window():
         extend_prefix_lens=torch.tensor([4, 2]),
         extend_prefix_lens_cpu=torch.tensor([4, 2]),
         extend_replay_lens_cpu=torch.tensor([4, 0]),
-        extend_prompt_lens_cpu=torch.tensor([12, 5]),
+        extend_prompt_lens_cpu=torch.tensor([9, 12]),
         extend_with_prefix=True,
+        query_shard=None,
     )
     full = backend.query_metadata(ForwardMode.MIXED)
     view = backend.decoder_view()
-    # Request 0 continues past this chunk: one row. Request 1 completes: all
-    # three rows. The verify-width-2 decode request keeps both rows.
-    assert view.keep_rows.tolist() == [4, 5, 6, 7, 8, 9]
-    assert view.metadata.positions.tolist() == [8, 2, 3, 4, 7, 8]
-    assert view.metadata.request_indices.tolist() == [0, 1, 1, 1, 2, 2]
-    assert view.logits_rows.tolist() == [0, 3, 4, 5]
+    # Keep the open request's last compute row, but omit it from logits.
+    assert view.keep_rows.tolist() == [0, 1, 2, 3, 4, 7, 8, 9]
+    assert view.metadata.positions.tolist() == [4, 5, 6, 7, 8, 4, 7, 8]
+    assert view.metadata.request_indices.tolist() == [0, 0, 0, 0, 0, 1, 2, 2]
+    assert view.logits_rows.tolist() == [4, 6, 7]
     assert view.spans == (
-        V41PrefillSpan(0, 0, 8, 1, 8),
-        V41PrefillSpan(1, 1, 2, 3, 2),
+        V41PrefillSpan(0, 0, 4, 5, 4),
+        V41PrefillSpan(1, 5, 4, 1, 4),
     )
-    assert view.prefill.positions.tolist() == [8, 2, 3, 4]
+    assert view.prefill.positions.tolist() == [4, 5, 6, 7, 8, 4]
     assert torch.equal(
         view.metadata.swa_write_slots, full.swa_write_slots[view.keep_rows]
     )
@@ -937,7 +964,14 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         data_parallel_size=2,
         mapping=SimpleNamespace(
             attn=SimpleNamespace(
-                tp_size=1, dp_size=2, dcp_size=1, dcp_rank=0, dcp_group=(0,)
+                tp_size=1,
+                dp_size=2,
+                dcp_size=1,
+                dcp_rank=0,
+                dcp_group=(0,),
+                qcp_size=1,
+                qcp_rank=0,
+                qcp_group=(0,),
             )
         ),
         prefix_granularity=128,
@@ -1664,6 +1698,7 @@ def test_mixed_metadata_query_windows_and_capacity():
         extend_replay_lens_cpu=torch.tensor([0]),
         extend_prompt_lens_cpu=torch.tensor([5]),
         extend_with_prefix=True,
+        query_shard=None,
     )
     assert backend.query_metadata(ForwardMode.MIXED).positions.tolist() == [2, 3, 4, 8]
     assert backend.query_metadata(ForwardMode.EXTEND).request_indices.tolist() == [
@@ -2156,6 +2191,7 @@ def test_mixed_compressor_plan_windows_match_combined_pooling(
         extend_replay_lens_cpu=torch.tensor([0]),
         extend_prompt_lens_cpu=torch.tensor([5]),
         extend_with_prefix=True,
+        query_shard=None,
     )
     full = backend.query_metadata(ForwardMode.MIXED).compressor
     extend = backend.query_metadata(ForwardMode.EXTEND).compressor
@@ -2220,3 +2256,14 @@ def test_compressor_plan_ragged_windows_rebase_only_predecessors(device):
                 assert got.data_ptr() == parent[start:stop].data_ptr()
     for original, value in zip(before, full, strict=True):
         torch.testing.assert_close(value, original, rtol=0, atol=0)
+
+
+def test_open_prefill_chunk_has_no_decoder_or_logits_rows():
+    backend = _verify_backend("cpu", 1, 1)
+    _extend(backend, _tables("cpu"), [8], [0], [0], [64])
+    view = backend.decoder_view()
+    assert view.keep_rows.numel() == 0
+    assert view.logits_rows.numel() == 0
+    assert view.metadata.positions.numel() == 0
+    assert view.prefill.positions.numel() == 0
+    assert view.spans == ()

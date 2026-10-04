@@ -57,8 +57,10 @@ from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata imp
 )
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
+    _reject_skip_term,
     logger,
 )
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 if TYPE_CHECKING:
@@ -642,6 +644,7 @@ class KdaAttnBackend(MambaAttnBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -653,6 +656,7 @@ class KdaAttnBackend(MambaAttnBackend):
         norm_weight: torch.Tensor | None,
         norm_eps: float | None,
     ) -> torch.Tensor:
+        _reject_skip_term(D)
         seq_len = query.shape[0]
         num_heads = query.shape[2]
         head_k_dim = query.shape[3]
@@ -693,6 +697,11 @@ class KdaAttnBackend(MambaAttnBackend):
                 enable_pdl=pdl_enabled(),
             ).view(1, -1, num_value_heads, head_v_dim)
         return core_attn_out.squeeze(0)
+
+    @override
+    def tree_support(self) -> TreeSupport:
+        blocker = "the fused KDA verify kernel follows a chain; no draft trees yet"
+        return TreeSupport(verify_blocker=blocker, draft_blocker=blocker)
 
     @override
     def _verify(
@@ -861,6 +870,7 @@ class KdaAttnBackend(MambaAttnBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -873,6 +883,7 @@ class KdaAttnBackend(MambaAttnBackend):
         lower_bound: float | None,
     ) -> torch.Tensor:
 
+        _reject_skip_term(D)
         from tokenspeed_kernel.ops.attention.kda.triton import (
             kda_recurrent_decode_mtp,
         )
@@ -915,10 +926,15 @@ class KdaAttnBackend(MambaAttnBackend):
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     @override
-    def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
-        """Replay and eagerly commit this round's accepted KDA prefix."""
+    def commit_verified_state(
+        self, accepted_length: torch.Tensor, *, accepted_path: torch.Tensor | None
+    ) -> None:
+        """Replay and eagerly commit this round's accepted KDA prefix (a chain:
+        KDA refuses draft trees)."""
         if not self._replay_active:
-            return super().commit_verified_state(accepted_length)
+            return super().commit_verified_state(
+                accepted_length, accepted_path=accepted_path
+            )
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
@@ -995,6 +1011,7 @@ class KdaAttnBackend(MambaAttnBackend):
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
+        D: torch.Tensor | None,
         a: torch.Tensor | None,
         b: torch.Tensor | None,
         g_raw: torch.Tensor | None,
@@ -1022,6 +1039,7 @@ class KdaAttnBackend(MambaAttnBackend):
         ``inputs_packed`` carries the producer promise defined by the kernel
         facade; being inside a graph alone does not establish that promise.
         """
+        _reject_skip_term(D)
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
 

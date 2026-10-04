@@ -320,7 +320,6 @@ class L2CacheExecutor:
         *,
         key_prefix: str,
         rank: int,
-        cp_rank: int,
         prefix_for_weight_version,
     ) -> None:
         """Bind an L3 backend to the compact Host buffer after allocation.
@@ -343,7 +342,6 @@ class L2CacheExecutor:
             self.host_storage,
             key_prefix=key_prefix,
             rank=rank,
-            cp_rank=cp_rank,
         )
 
     def set_l3_weight_version(self, weight_version: str) -> None:

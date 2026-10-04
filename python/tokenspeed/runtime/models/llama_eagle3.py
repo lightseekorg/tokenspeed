@@ -37,7 +37,6 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.common import concat
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
@@ -75,9 +74,10 @@ class LlamaAttention(BaseLlamaAttention):
     Inherits the projection setup (with ``qkv_input_size=2*hidden_size`` for
     the [embed || hidden] concat) and ``forward`` (= qkv_proj + o_proj
     scaffolding) from base. Overrides ``_attn`` so the draft's first step
-    skips dead catch-up rows: on backends that support fused KV pre-write, q
-    is sliced to one live row per request and dispatched as DECODE; otherwise
-    the fallback runs the full N-row attn and post-slices the output.
+    skips dead catch-up rows: on backends that support a narrowed draft
+    decode, the prologue writes every row and q is sliced to one live row per
+    request and dispatched as DECODE; otherwise the fallback runs the full
+    N-row attn and post-slices the output.
     Inactive draft steps delegate to base.
     """
 
@@ -89,38 +89,13 @@ class LlamaAttention(BaseLlamaAttention):
         v: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        # Active draft first step (the drafter attached the narrowing).
-        # Covers both decode catch-up and prefill catch-up; multi-step decode
-        # delegates to base.
+        # Only the active draft first step narrows; later steps delegate to base.
         if ctx.draft_narrowing is None:
             return super()._attn(positions, q, k, v, ctx)
 
-        if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            fused_kv_arg = self._build_fused_kv_arg(v, ctx)
-            if fused_kv_arg is not None:
-                # The sliced single-token decode attends over the accepted
-                # prefix; the post-slice fallback below still runs the full
-                # N-row attn over the verify window and must not publish.
-                ctx.draft_narrowing.publish_accepted_prefix()
-                q_rope = self._fused_rope_kv_write(
-                    positions, q, k, fused_kv_arg
-                ).index_select(0, ctx.gather_ids)
-                # record_kv_cache (keyed off the real mode) forces the backend's
-                # PD layerwise cache-step record that the DECODE dispatch would
-                # otherwise skip on an EXTEND/MIXED catch-up.
-                return ctx.attn_backend.forward(
-                    q_rope,
-                    None,
-                    None,
-                    self.attn,
-                    ctx.token_to_kv_pool,
-                    ForwardMode.DECODE,
-                    ctx.bs,
-                    save_kv_cache=False,
-                    record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
-                )
-        q, k = self.rotary_emb(positions, q, k)
-        return self.attn(q, k, v, ctx=ctx).index_select(0, ctx.gather_ids)
+        if not ctx.attn_backend.supports_narrowed_draft_decode(ctx.forward_mode):
+            return self.attn(q, k, v, positions, ctx).index_select(0, ctx.gather_ids)
+        return self.attn.attend_live_rows(q, k, v, positions, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -590,17 +565,25 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
 
         self.load_lm_head_from_target = False
         if self.config.tie_word_embeddings:
+            if mapping.attn.has_dp and mapping.lm_head.has_tp:
+                raise ValueError(
+                    "--lm-head-tp-size > 1 vocab-shards the LM head, but this "
+                    "draft ties it to its replicated embedding (tie_word_embeddings)"
+                )
             self.lm_head = self.model.embed_tokens
         else:
             if getattr(config, "draft_vocab_size", None) is None:
                 self.load_lm_head_from_target = True
+            # The draft's head follows the target's LM-head layout
+            # (mapping.lm_head): the shared target head arrives in that
+            # layout, and a draft-vocab head shards the same way.
             self.lm_head = ParallelLMHead(
                 getattr(config, "draft_vocab_size", None) or config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                tp_rank=mapping.attn.tp_rank,
-                tp_size=mapping.attn.tp_size,
-                tp_group=mapping.attn.tp_group,
+                tp_rank=mapping.lm_head.tp_rank,
+                tp_size=mapping.lm_head.tp_size,
+                tp_group=mapping.lm_head.tp_group,
                 prefix=add_prefix("lm_head", prefix),
             )
 
@@ -608,9 +591,10 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             config,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
+            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
         self.capture_aux_hidden_states = True
         self.hot_token_id = None

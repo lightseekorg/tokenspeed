@@ -141,8 +141,6 @@ class _Harness:
             self.device if exists_flags is not None else None,
             attn_tp_size=1,
             attn_tp_cpu_group=None,
-            attn_cp_size=1,
-            attn_cp_cpu_group=None,
             pp_size=1,
             pp_cpu_group=None,
         )
@@ -212,7 +210,7 @@ def test_submit_skips_register_when_l3_misses() -> None:
     assert ctx.scheduler.unregistered == ([0], ["h4"], [0])
 
 
-def test_replica_min_reduces_tp_then_cp_then_pp(monkeypatch) -> None:
+def test_replica_min_reduces_tp_then_pp(monkeypatch) -> None:
     groups_seen = []
 
     def fake_all_reduce(flags, *, op, group):
@@ -230,46 +228,15 @@ def test_replica_min_reduces_tp_then_cp_then_pp(monkeypatch) -> None:
         ctx.device,
         attn_tp_size=2,
         attn_tp_cpu_group="tp",
-        attn_cp_size=2,
-        attn_cp_cpu_group="cp",
         pp_size=2,
         pp_cpu_group="pp",
     )
 
     ctx.hooks.submit_requests([_spec("r0", [1, 2, 3, 4])])
 
-    assert groups_seen == ["tp", "cp", "pp"]
+    assert groups_seen == ["tp", "pp"]
     assert ctx.scheduler.registered is None
     assert ctx.scheduler.unregistered == ([0], ["h4"], [0])
-
-
-def test_enable_cp_min_uses_cp_group_when_tp_is_one(monkeypatch) -> None:
-    groups_seen = []
-
-    def fake_all_reduce(flags, *, op, group):
-        groups_seen.append(group)
-
-    monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.dist.all_reduce",
-        fake_all_reduce,
-    )
-
-    ctx = _Harness(exists_flags=[True])
-    ctx.hooks = L3CacheHooks(
-        ctx.scheduler,
-        ctx.device,
-        attn_tp_size=1,
-        attn_tp_cpu_group="tp",
-        attn_cp_size=4,
-        attn_cp_cpu_group="cp",
-        pp_size=1,
-        pp_cpu_group=None,
-    )
-
-    ctx.hooks.submit_requests([_spec("r0", [1, 2, 3, 4])])
-
-    assert groups_seen == ["cp"]
-    assert ctx.scheduler.registered == ([0], ["h4"], [0])
 
 
 def test_pp_min_runs_when_attn_tp_is_one(monkeypatch) -> None:
@@ -289,8 +256,6 @@ def test_pp_min_runs_when_attn_tp_is_one(monkeypatch) -> None:
         ctx.device,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
-        attn_cp_size=1,
-        attn_cp_cpu_group=None,
         pp_size=2,
         pp_cpu_group="pp",
     )
@@ -768,8 +733,6 @@ def test_l3_recovery_preserves_round_order(
         device,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
-        attn_cp_size=1,
-        attn_cp_cpu_group=None,
         pp_size=1,
         pp_cpu_group=None,
     )

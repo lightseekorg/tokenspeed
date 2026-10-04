@@ -42,6 +42,7 @@ __all__ = [
     "AutotuneParams",
     "SelectionPolicy",
     "select_kernel",
+    "resolve_kernel_override",
     "set_selection_policy",
     "register_oracle",
     "kernel_override",
@@ -333,6 +334,7 @@ _SHAPE_DIMS: tuple[str, ...] = ("batch", "m", "n", "k")
 _BOUND_SUFFIXES: tuple[tuple[str, Callable[[int, int], bool]], ...] = (
     ("_align", lambda value, alignment: value % alignment == 0),
     ("_min", lambda value, minimum: value >= minimum),
+    ("_max", lambda value, maximum: value <= maximum),
 )
 
 
@@ -345,20 +347,21 @@ def spec_matches_shape_traits(spec: KernelSpec, traits: dict[str, Any]) -> bool:
     * ``<dim>``: the exact supported values.
     * ``<dim>_align``: the value must be a multiple of one declared alignment.
     * ``<dim>_min``: the value must reach one declared minimum.
+    * ``<dim>_max``: the value must not exceed one declared maximum.
 
     Rules those cannot express go in ``mnk_problem_filter``, a set of
     ``(m, n, k) -> bool`` predicates of which at least one must accept.
 
     A declared bound is a hard requirement: a spec that declares
-    ``<dim>_align`` or ``<dim>_min`` rejects any request that does not supply
-    ``<dim>``, and a ``mnk_problem_filter`` rejects a request missing any of
-    ``m``, ``n`` or ``k``. Exact sets are matched by value membership; for the
-    GEMM dimensions ``batch``, ``m``, ``n`` and ``k`` that is also enforced
-    here and a spec constraining one of them rejects a request that omits it.
-    Dimensions a spec does not constrain are ignored.
+    ``<dim>_align``, ``<dim>_min`` or ``<dim>_max`` rejects any request that
+    does not supply ``<dim>``, and a ``mnk_problem_filter`` rejects a request
+    missing any of ``m``, ``n`` or ``k``. Exact sets are matched by value
+    membership; for the GEMM dimensions ``batch``, ``m``, ``n`` and ``k`` that
+    is also enforced here and a spec constraining one of them rejects a request
+    that omits it. Dimensions a spec does not constrain are ignored.
 
-    By convention a trait dict lists the shape traits first, each ``_align``
-    and ``_min`` bound right after the dimension it bounds and
+    By convention a trait dict lists the shape traits first, each ``_align``,
+    ``_min`` and ``_max`` bound right after the dimension it bounds and
     ``mnk_problem_filter`` last, followed by the remaining traits in
     alphabetical order.
     """
@@ -452,6 +455,16 @@ def _log_selection(
         )
 
 
+def resolve_kernel_override(family: str, mode: str, override: str | None) -> str | None:
+    """Resolve the effective kernel name for family/mode, or return None.
+
+    The environment takes precedence over the context manager and call-site
+    override. Dispatch shortcuts must use this before consulting tuned routes.
+    """
+    env_key = f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
+    return os.environ.get(env_key) or _global_overrides.get((family, mode)) or override
+
+
 def select_kernel(
     family: str,
     mode: str,
@@ -487,16 +500,7 @@ def select_kernel(
     """
     platform = platform or current_platform()
 
-    # Context-manager global overrides
-    global_override = _global_overrides.get((family, mode))
-    if global_override:
-        override = global_override
-
-    # Environment variables take precedence over context-manager overrides.
-    env_key = f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
-    env_override = os.environ.get(env_key)
-    if env_override:
-        override = env_override
+    override = resolve_kernel_override(family, mode, override)
     registry = KernelRegistry.get()
 
     # Fast path: check cache (skipped when override is active)
@@ -688,12 +692,10 @@ def explain_selection(
             missing = spec.capability.missing_features(platform)
             if missing:
                 reasons.append(f"missing features: {', '.join(missing)}")
-            if spec.capability.min_arch_version:
-                if not (platform.arch_version >= spec.capability.min_arch_version):
-                    reasons.append(
-                        f"arch mismatch (requires "
-                        f"{spec.capability.min_arch_version})"
-                    )
+            min_arch_version = spec.capability.min_arch_version_for(platform.vendor)
+            if min_arch_version:
+                if not (platform.arch_version >= min_arch_version):
+                    reasons.append(f"arch mismatch (requires {min_arch_version})")
             if format_signature and not spec.supports_format_signature(
                 format_signature
             ):

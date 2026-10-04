@@ -104,25 +104,22 @@ def storage_object_key(
     *,
     prefix: str,
     rank: int,
-    cp_rank: int,
 ) -> str:
     """Return the L3 object key for one packed Host CacheBlock.
 
     TokenSpeed's Host pool is one compact byte buffer (flat KV). One Mooncake
     object stores the packed bytes of a single CacheBlock, keyed by the
     scheduler content hash plus the group/offset/rank that uniquely identify
-    the shard. Attention TP and context-parallel ranks each own a different
-    physical KV slice; ``ENABLE_CP`` folds requested TP into CP and leaves
-    every worker at ``attn_tp_rank == 0``, so the CP rank must be in the key.
+    the shard. Attention TP ranks each own a different physical KV slice.
+    The trailing ``|c0`` is the retired context-parallel shard id, kept
+    literal so objects written before its removal stay addressable; drop it
+    with the next deliberate key-format bump.
     """
 
     if not content_hash:
         raise ValueError("content_hash must be non-empty")
     tagged = f"{prefix}_{content_hash}" if prefix else content_hash
-    return (
-        f"{tagged}|g{int(group_id)}|o{int(page_offset)}"
-        f"|r{int(rank)}|c{int(cp_rank)}"
-    )
+    return f"{tagged}|g{int(group_id)}|o{int(page_offset)}|r{int(rank)}|c0"
 
 
 def cache_layout_signature(layout: Any, *, cache_dtype: str) -> str:
@@ -942,7 +939,6 @@ def storage_key_prefix(
     cache_signature: str,
     pipeline_rank: int,
     attn_tp_size: int,
-    cp_size: int,
     draft_model: str,
     draft_revision: str,
     draft_weight_version: str,
@@ -956,8 +952,8 @@ def storage_key_prefix(
     """Return a collision-resistant namespace for compatible L3 objects.
 
     Every component is required so a new caller cannot omit the checkpoint
-    identity, cache layout, pipeline stage, attention-TP width,
-    context-parallel width, draft pool, cache-quantization config (target
+    identity, cache layout, pipeline stage, attention-TP width, draft pool,
+    cache-quantization config (target
     and draft), runtime HF overrides, resolved target/draft attention backends,
     the KV-producer compat epoch,
     ``--skip-softmax-threshold``, or the resolved EAGLE3 capture layers
@@ -982,9 +978,10 @@ def storage_key_prefix(
     capture layers change which target hidden states the draft consumes
     and therefore the KV those layers produce. Empty strings and an empty
     override dict are valid and mean "unset" (no draft pool, no extra cache
-    scales, no HF overrides). ``cp_size`` belongs here rather than only in
-    the per-object ``c{cp_rank}`` shard id: zigzag CP assigns different token
-    blocks to the same rank under different widths. ``attn_tp_size``
+    scales, no HF overrides). The payload keeps a literal ``cp_size`` of 1,
+    the retired context-parallel width, so the namespace of every existing
+    deployment is unchanged until the next deliberate key-format bump.
+    ``attn_tp_size``
     belongs here rather than only in the per-object ``r{tp_rank}`` shard
     id: GQA with TP above the KV-head count keeps one local KV head per
     rank, so packed Host geometry is unchanged, while
@@ -1005,7 +1002,7 @@ def storage_key_prefix(
             "cache_signature": str(cache_signature),
             "pipeline_rank": int(pipeline_rank),
             "attn_tp_size": int(attn_tp_size),
-            "cp_size": int(cp_size),
+            "cp_size": 1,
             "draft_model": str(draft_model),
             "draft_revision": str(draft_revision),
             "draft_weight_version": str(draft_weight_version),
