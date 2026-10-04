@@ -553,10 +553,13 @@ def test_single_stage_never_builds_a_context_producer():
         # Stages before the last own no draft fields: nothing to finalize.
         (True, False, None, None, True),
         # The last stage answers for the draft-field writer, like a non-PP engine.
+        # Mtp enqueues every depth's KV write inside run(), so it finalizes
+        # layerwise like Eagle; the vanilla base drafter does not.
         (True, True, None, Eagle, True),
-        (True, True, None, Mtp, False),
+        (True, True, None, Mtp, True),
         (False, True, None, Eagle, True),
-        (False, True, None, Mtp, False),
+        (False, True, None, Mtp, True),
+        (False, True, None, BaseDrafter, False),
         # A configured context producer owns the draft writes.
         (True, True, "producer", DSpark, True),
         # No speculation: unused, and nothing claims support.

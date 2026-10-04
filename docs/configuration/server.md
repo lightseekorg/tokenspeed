@@ -460,10 +460,10 @@ because the target embedding lives on the first stage. `DFLASH` and `EAGLE3` rea
 target taps from several stages and are rejected on a pipeline. Layerwise
 transfer (`--disaggregation-layerwise-interval`) is decided per stage: stages
 before the last own no draft cache and always allow it; the last stage allows
-it exactly when the same drafter would on a single-stage server, so an MTP
-drafter class that does not support layerwise finalization (the vanilla
-multi-layer `Mtp` drafter, e.g. Inkling NextN, as opposed to the EAGLE-style
-NextN drafts of Kimi K3 and DeepSeek V4) is still rejected at startup there.
+it exactly when the same drafter would on a single-stage server (the `Mtp`
+and EAGLE-style drafters enqueue every depth's KV write inside their run, so
+they finalize layerwise; a drafter class without that guarantee is still
+rejected at startup there).
 
 A block drafter writes its KV at the target's cache locations, so it shares the
 target's page table: `--block-size` is a target-side choice and the draft
