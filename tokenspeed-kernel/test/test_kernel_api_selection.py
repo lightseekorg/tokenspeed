@@ -2126,6 +2126,7 @@ def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) ->
         softmax_scale=1.0,
         batch_invariant=False,
         index_k_cache=index_k,
+        slot_order="selection",
     )
 
 
@@ -2147,6 +2148,7 @@ def _attention_dsa_decode_topk_logical() -> object:
         index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
         topk_layout="logical_offsets",
         block_table_base_offsets=torch.tensor([3, 5], dtype=torch.int32),
+        slot_order="selection",
     )
 
 
@@ -2176,6 +2178,7 @@ def _attention_dsa_prefill_topk(
         page_size=page_size,
         solution=solution,
         override=override,
+        slot_order="selection",
     )
 
 
@@ -2261,6 +2264,7 @@ def _attention_dsa_decode_topk_standard(
         batch_invariant=False,
         index_k_cache=index_k_cache,
         q_scales=q_scales,
+        slot_order="selection",
     )
 
 
@@ -2292,6 +2296,7 @@ def _attention_dsa_prefill_topk_standard(
         index_k_cache=index_k_cache,
         page_size=64,
         q_scales=q_scales,
+        slot_order="selection",
     )
 
 
@@ -2336,6 +2341,7 @@ def test_dsa_topk_selection_receives_index_heads(
             softmax_scale=1.0,
             batch_invariant=False,
             index_k_cache=index_k_cache,
+            slot_order="selection",
         )
     else:
         _attention_dsa_pkg.dsa_prefill_topk(
@@ -2349,6 +2355,7 @@ def test_dsa_topk_selection_receives_index_heads(
             batch_invariant=False,
             index_k_cache=index_k_cache,
             page_size=64,
+            slot_order="selection",
         )
 
     assert captured["index_heads"] == index_heads
@@ -2419,6 +2426,7 @@ def test_dsa_prefill_topk_forwards_cpu_candidate_lens_by_registered_feature(
             index_k_cache=torch.zeros((128, 132), dtype=torch.uint8),
             page_size=64,
             candidate_lens_cpu=candidate_lens_cpu,
+            slot_order="selection",
         )
     finally:
         Platform.override(real_platform)
@@ -2528,6 +2536,7 @@ def test_dsa_topk_selection_receives_cache_layout(
             softmax_scale=1.0,
             batch_invariant=False,
             index_k_cache=cache,
+            slot_order="selection",
         )
     else:
         _attention_dsa_pkg.dsa_prefill_topk(
@@ -2541,6 +2550,7 @@ def test_dsa_topk_selection_receives_cache_layout(
             batch_invariant=False,
             index_k_cache=cache,
             page_size=64,
+            slot_order="selection",
         )
 
     assert captured["index_k_layout"] == expected
@@ -2566,6 +2576,7 @@ def test_dsa_prefill_topk_rejects_incomplete_workspace_rows(missing: str) -> Non
             batch_invariant=False,
             page_size=64,
             **inputs,
+            slot_order="selection",
         )
 
 

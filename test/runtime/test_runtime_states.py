@@ -70,6 +70,22 @@ def test_draft_probs_start_as_sentinel_with_a_zero_bonus_slot():
     assert torch.equal(probs[:, -1], torch.zeros(5, 32))
 
 
+def test_draft_tree_parents_are_declared_at_construction():
+    # A PD decode destination writes its bootstrap token through
+    # write_decode_input_ids, which reads future_parent_map, before any reset
+    # or drafter has touched the slot: the fields exist from construction.
+    states = RuntimeStates(4, 32, 3, "cpu")
+    assert states.chain_parents is None
+    assert states.future_parent_map is None
+
+    states.init_draft_trees(num_nodes=3)
+    assert torch.equal(
+        states.chain_parents, torch.tensor([-1, 0, 1], dtype=torch.int32)
+    )
+    assert states.future_parent_map.shape == (5, 3)
+    assert torch.equal(states.future_parent_map, states.chain_parents.repeat(5, 1))
+
+
 def test_init_draft_probs_needs_a_verify_column():
     states = RuntimeStates(4, 32, 3, "cpu")
     with pytest.raises(ValueError, match="verify column"):

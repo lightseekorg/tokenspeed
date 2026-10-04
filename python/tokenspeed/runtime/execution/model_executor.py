@@ -829,15 +829,14 @@ class ModelExecutor:
             self.forward_step.warmup_decode_path(batch_sizes=(1,), graph_phase=True)
             logger.info("Finished prewarming Triton RSAG communication states")
 
-        # Prompt (input) logprobs need the LM head to score every prompt row on
-        # this rank: one activation row per input token, which a model that
-        # narrows its prefill rows (NarrowingPrefillModel) does not keep, and
-        # the logits themselves, which only the last pipeline stage has.
-        # Decided here, once, so the ingress refuses such requests instead of
-        # the data plane finding out.
+        # Prompt (input) logprobs need the LM head to score every prompt row:
+        # one activation row per input token, which a model that narrows its
+        # prefill rows (NarrowingPrefillModel) does not keep. The last pipeline
+        # stage scores them and the commit path broadcasts the result to the
+        # other stages with the sampled tokens. Decided here, once, so the
+        # ingress refuses such requests instead of the data plane finding out.
         self.supports_prompt_logprobs: bool = (
-            self.config.pp_size == 1
-            and narrowing_prefill_model(self.model_runner.model) is None
+            narrowing_prefill_model(self.model_runner.model) is None
         )
 
         # Breakable prefill (extend) CUDA graphs, the extend-mode analogue of
@@ -1678,6 +1677,8 @@ class ModelExecutor:
                     extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:0],
                     extend_replay_lens_cpu=ib.extend_replay_lens_cpu[:0],
                     extend_prompt_lens_cpu=ib.extend_prompt_lens_cpu[:0],
+                    # No request, so no group tables on either side.
+                    block_tables_cpu={},
                 )
             return
 
@@ -2063,7 +2064,7 @@ class ModelExecutor:
                     ),
                     gather_ids=gather_ids,
                     input_logprob_rows=self._input_logprob_rows(
-                        input_logprob_plan, num_extends, total_tokens
+                        input_logprob_plan, num_extends, total_tokens, query_shard
                     ),
                     decode_input_ids=decode_input_ids,
                     output_layout=output_layout,
@@ -2268,13 +2269,18 @@ class ModelExecutor:
             output_nan_flags=output_nan_flags,
             spec_candidate_tokens=spec_candidate_tokens,
             input_token_logprobs=input_token_logprobs,
-            input_logprob_plan=(
-                input_logprob_plan if input_token_logprobs is not None else None
-            ),
+            # The plan rides along whether or not this rank scored the rows: a
+            # pipeline stage without logits adopts the last stage's logprobs on
+            # the commit path and pairs them with its own (mirrored) plan.
+            input_logprob_plan=input_logprob_plan,
         )
 
     def _input_logprob_rows(
-        self, plan: InputLogprobPlan | None, num_extends: int, total_tokens: int
+        self,
+        plan: InputLogprobPlan | None,
+        num_extends: int,
+        total_tokens: int,
+        query_shard: QueryShardPlan | None,
     ) -> InputLogprobRows | None:
         """Expand the plan into device rows, targets and slots for the logits processor.
 
@@ -2287,6 +2293,15 @@ class ModelExecutor:
         boundary). A target outside the vocabulary flags its request through
         the NaN guard, which terminates it; the clamp only keeps the gather
         from faulting on a flagged row.
+
+        Under a query shard every rank stages the whole plan's targets and
+        slots (the shifted ids are the whole span on every rank; every rank
+        scores every row once the planned activations are gathered, and the
+        target audit flags the same requests everywhere) and keeps as its
+        ``rows`` the ones inside its shard, re-based to it: the plan's rows
+        are sorted batch-global rows, so each rank's are one contiguous run
+        and the per-rank counts are host arithmetic over the shard boundaries
+        (``QueryShardPlan.rows_per_rank``).
         """
         if plan is None:
             return None
@@ -2307,12 +2322,20 @@ class ModelExecutor:
             targets, slots, num_extends, self.runtime_states.vocab_size
         )
         targets.clamp_(0, self.runtime_states.vocab_size - 1)
+        rows_per_rank = None
+        num_input_rows = total_tokens
+        if query_shard is not None and query_shard.size > 1:
+            rows_per_rank = query_shard.rows_per_rank(rows_cpu)
+            local = query_shard.local_rows_run(rows_per_rank)
+            rows = rows[local] - query_shard.local_start
+            num_input_rows = query_shard.local_rows
         return InputLogprobRows(
             rows=rows,
             targets=targets,
             slots=slots,
-            num_input_rows=total_tokens,
+            num_input_rows=num_input_rows,
             chunk_tokens=self.config.input_logprob_chunk_tokens,
+            rows_per_rank=rows_per_rank,
         )
 
     def write_remote_spec_candidate_ids(

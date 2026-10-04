@@ -633,6 +633,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 plan=metadata._dsa_plan,
                 out=topk_slice,
                 lens_out=topk_lens_slice,
+                slot_order=global_server_args_dict["dsa_slot_order"],
             )
         return GlmDsaDecodeTopK(
             topk_indices=topk_indices,
@@ -812,6 +813,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 page_size=ctx.token_to_kv_pool.arena.kv_page_size,
                 max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
                 candidate_lens_cpu=candidate_lens_cpu,
+                slot_order=global_server_args_dict["dsa_slot_order"],
             )
         return GlmDsaPrefillTopK(
             workspace_indices=workspace_indices,

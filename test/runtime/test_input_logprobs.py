@@ -613,10 +613,10 @@ def test_executor_expands_the_plan_into_rows_targets_and_slots(monkeypatch):
     # Two extend slots: rows 0..2 (slot 0) and 3..5 (slot 1) of a 6-row forward.
     shifted = [11, 12, 13, 21, 22, 23]
     executor = _staging_executor(monkeypatch, shifted_ids=shifted)
-    assert executor._input_logprob_rows(None, 2, 6) is None
+    assert executor._input_logprob_rows(None, 2, 6, None) is None
 
     plan = InputLogprobPlan(row_starts=(0, 4), counts=(3, 2), position_starts=(5, 0))
-    staged = executor._input_logprob_rows(plan, 2, 6)
+    staged = executor._input_logprob_rows(plan, 2, 6, None)
     assert staged.rows.tolist() == [0, 1, 2, 4, 5]
     assert staged.targets.tolist() == [11, 12, 13, 22, 23]
     assert staged.slots.tolist() == [0, 0, 0, 1, 1]
@@ -625,19 +625,23 @@ def test_executor_expands_the_plan_into_rows_targets_and_slots(monkeypatch):
     )
     assert staged.num_input_rows == 6
     assert staged.chunk_tokens == 3
+    assert staged.rows_per_rank is None and staged.num_result_rows == 5
     assert executor.nan_guard.flags.tolist() == [0, 0, 0, 0]
 
     # A slot without rows contributes nothing and shifts no other slot.
     plan = InputLogprobPlan(
         row_starts=(0, 0, 3), counts=(2, 0, 1), position_starts=(0, 0, 7)
     )
-    staged = executor._input_logprob_rows(plan, 3, 6)
+    staged = executor._input_logprob_rows(plan, 3, 6, None)
     assert staged.rows.tolist() == [0, 1, 3]
     assert staged.slots.tolist() == [0, 0, 2]
 
     with pytest.raises(RuntimeError, match="past the forward"):
         executor._input_logprob_rows(
-            InputLogprobPlan(row_starts=(4,), counts=(3,), position_starts=(0,)), 1, 6
+            InputLogprobPlan(row_starts=(4,), counts=(3,), position_starts=(0,)),
+            1,
+            6,
+            None,
         )
 
 
@@ -647,9 +651,48 @@ def test_executor_flags_an_out_of_vocab_target_instead_of_scoring_it(monkeypatch
     only so the gather cannot fault."""
     executor = _staging_executor(monkeypatch, shifted_ids=[1, 9, 2, 3], vocab_size=8)
     plan = InputLogprobPlan(row_starts=(0, 2), counts=(2, 2), position_starts=(0, 0))
-    staged = executor._input_logprob_rows(plan, 2, 4)
+    staged = executor._input_logprob_rows(plan, 2, 4, None)
     assert staged.targets.tolist() == [1, 7, 2, 3]
     assert executor.nan_guard.flags.tolist() == [1, 0, 0, 0]
+
+
+def test_executor_stages_a_shards_rows_of_the_plan(monkeypatch):
+    """Under a query shard each rank keeps as its rows the plan's rows inside
+    its shard, re-based to it, with the per-rank split of the activation
+    gather; the targets and slots stay the whole plan's (every rank scores
+    every row once the activations are gathered) and the target audit runs
+    over the whole plan on every rank, so the NaN flags agree across the
+    group. A rank without any planned row stages none and still carries the
+    split."""
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    # Two requests of 4 and 6 rows over four shards of [3, 3, 2, 2] rows; the
+    # plan wants rows 1..3 of the first and rows 4..7 of the second (slot 1's
+    # first two rows 4, 5 are on rank 1, rows 6, 7 on rank 2; rank 3 none).
+    shifted = list(range(100, 110))
+    shifted[6] = 999  # out of vocab: flags slot 1 on every rank
+    plans = {}
+    for rank in range(4):
+        executor = _staging_executor(monkeypatch, shifted_ids=shifted, vocab_size=200)
+        shard = QueryShardPlan.from_forward(
+            total_tokens=10, input_lengths=[4, 6], size=4, rank=rank
+        )
+        plan = InputLogprobPlan(
+            row_starts=(1, 4), counts=(3, 4), position_starts=(1, 0)
+        )
+        staged = executor._input_logprob_rows(plan, 2, 10, shard)
+        plans[rank] = staged
+        assert staged.rows_per_rank == (2, 3, 2, 0)
+        assert staged.num_input_rows == shard.local_rows
+        assert staged.num_result_rows == 7
+        assert staged.slots.tolist() == [0, 0, 0, 1, 1, 1, 1]
+        # The flagged row's target is clamped; every rank holds every target.
+        assert staged.targets.tolist() == [101, 102, 103, 104, 105, 199, 107]
+        assert executor.nan_guard.flags.tolist() == [0, 1, 0, 0]
+    assert plans[0].rows.tolist() == [1, 2]
+    assert plans[1].rows.tolist() == [0, 1, 2]  # rows 3, 4, 5 re-based to shard 1
+    assert plans[2].rows.tolist() == [0, 1]  # rows 6, 7 re-based to shard 2
+    assert plans[3].rows.tolist() == []
 
 
 def test_nan_guard_flags_the_slot_of_a_non_finite_prompt_logprob():
@@ -678,6 +721,10 @@ def _handler(disaggregation_mode: str) -> RequestHandler:
     handler.tokenizer = None
     handler.hf_eos_token_id = None
     handler.max_req_len = 4096
+    # The layouts that refuse prompt logprobs or cap the generation budget
+    # (LM-head TP / head TP under attention DP) are off in these cases.
+    handler.supports_input_logprobs = True
+    handler.max_new_tokens_budget = None
     return handler
 
 

@@ -332,7 +332,9 @@ def _worker_lm_head(rank: int, rendezvous: str) -> None:
         torch.testing.assert_close(logits, expected[: live[rank]], atol=1e-5, rtol=1e-5)
 
         # A shape with no table (not every rank decodes) exchanges the counts.
-        mixed = LogitsMetadata(ForwardMode.DECODE, all_decode_or_idle=False)
+        mixed = LogitsMetadata(
+            ForwardMode.DECODE, all_decode_or_idle=False, query_shard=None
+        )
         with mock.patch.object(
             lp_module, "all_gather", wraps=lp_module.all_gather
         ) as ag:

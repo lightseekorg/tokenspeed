@@ -92,6 +92,10 @@ class _EventLoopHarness:
         self._pd_hooks = SimpleNamespace(
             poll_transfer_events=lambda: (self.trace.append("poll_pd"), [])[1]
         )
+        self._eplb_hooks = SimpleNamespace(
+            note_round=lambda *, forwarded: self.trace.append("eplb_round"),
+            close=lambda: self.trace.append("close_eplb"),
+        )
         self.load_reporter = SimpleNamespace(
             observe=lambda _stats, _running: self.trace.append("observe_load"),
             sample_and_observe=lambda _running: self.trace.append("sample_load"),
@@ -152,6 +156,9 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
         "stats",
         "observe_load",
         "metrics",
+        # Every non-paused round reports its forward (none here) to the
+        # expert-rebalance hooks after the device call.
+        "eplb_round",
         "poll_pd",
         "publish_kv",
         "pause_finish",
@@ -227,6 +234,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
             self.max_model_len = 4096
             self.max_req_input_len = 512
             self.multimodal_encoder_dtype = None
+            self.supports_prompt_logprobs = True
             self.model_config = SimpleNamespace(context_len=4096)
             self.has_dp = False
             self.use_overlap_schedule = False
