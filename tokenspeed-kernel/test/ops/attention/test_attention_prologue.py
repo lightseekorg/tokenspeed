@@ -2223,13 +2223,15 @@ def test_mla_token_count_reuses_compiled_tiles():
             run(count)
 
 
+@pytest.mark.parametrize("fused", ["composite", "triton"])
 @pytest.mark.parametrize("masked", [False, True])
-def test_the_storeless_prologue_and_latent_store_write_the_fused_bytes(masked):
+def test_the_storeless_prologue_and_latent_store_write_the_fused_bytes(masked, fused):
     """``mla_prologue(cache=None)`` rotates and returns the latent for
     ``latent_store``; rotation then store (the query-context-parallel write,
     where other ranks' rows are gathered in between) must leave the query and
-    every stored row byte-equal to the fused one-launch write, including the
-    rows an owner mask skips."""
+    every stored row byte-equal to the fused one-launch write -- the
+    composite's and the production Triton kernel's, which agree with each
+    other -- including the rows an owner mask skips."""
     from tokenspeed_kernel.ops.attention.prologue import latent_store
 
     heads, rank, rope, tokens, total = 4, 512, 64, 96, 128
@@ -2254,7 +2256,7 @@ def test_the_storeless_prologue_and_latent_store_write_the_fused_bytes(masked):
                 expanded=None,
                 rotary=rotary,
                 cache=target,
-                solution="composite",
+                solution=fused,
                 override=None,
             )
             assert out.latent is None

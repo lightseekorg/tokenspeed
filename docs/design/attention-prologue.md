@@ -174,8 +174,11 @@ rotation with no store, returning the rotated latent — all-gathers that
 latent over the query group with the plan's per-rank row counts into the
 whole span (every rank holds the span's slots), and stores it through the
 same `resolve_cache_slots` target with `latent_store`, the composite's store
-step on its own. Rotation and store round once each way, so the bytes equal
-the fused write's (`tokenspeed-kernel/test/ops/attention/test_attention_prologue.py`).
+step on its own. Rotation and store round once each way, so the stored rows
+and the query are byte-equal to the fused one-launch write of both the
+composite and the production Triton kernel, masked rows included
+(`test_the_storeless_prologue_and_latent_store_write_the_fused_bytes` in
+`tokenspeed-kernel/test/ops/attention/test_attention_prologue.py`).
 The gather sits inside the prologue wrapper, so it adds no writer to the
 list above; a sparse indexer's keys are gathered the same way by the model
 before their quantization and masked write. A rank whose shard is empty
