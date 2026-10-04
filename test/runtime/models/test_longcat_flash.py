@@ -377,6 +377,74 @@ class TestLongcatRowLayout(unittest.TestCase):
         self.assertEqual(rows_seen["moe"], 4)
         self.assertEqual(out.shape[0], 4)
 
+    def test_pure_attention_dp_with_ep_needs_no_bridge(self):
+        from tokenspeed.runtime.distributed import comm_manager as comm_module
+        from tokenspeed.runtime.distributed.mapping import Mapping
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        # Attention TP 1 x DP 4 with EP 4: the MoE pattern (RSAG) differs from
+        # the dense one (all-reduce), but a one-rank attention-TP group holds
+        # all of its rows either way, so the only gather is the MoE's own
+        # TP-EP one and all-reduce fusion stays inert as before.
+        mapping = Mapping(
+            rank=1,
+            world_size=4,
+            attn_tp_size=1,
+            attn_dp_size=4,
+            dense_tp_size=1,
+            moe_ep_size=4,
+        )
+        rows_seen: dict = {}
+        with mock.patch.dict(
+            global_server_args_dict, {"enable_allreduce_fusion": True}
+        ):
+            layer = self._layer(mapping, rows_seen)
+        self.assertFalse(layer.moe_rows_differ)
+
+        ctx = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            input_num_tokens=4,
+            global_num_tokens=[4] * 4,
+            collective_num_tokens=None,
+            collective_global_num_tokens=None,
+        )
+        gathers: list = []
+        with mock.patch.multiple(comm_module, **_fake_comm_ops(mapping.rank, gathers)):
+            out, residual = layer.forward(
+                torch.arange(4), torch.randn(4, self.HIDDEN), ctx, None
+            )
+
+        self.assertEqual(gathers, [mapping.moe.tp_ep_group])
+        self.assertNotIn(mapping.attn.tp_group, gathers)
+        self.assertEqual((rows_seen["attn0"], rows_seen["attn1"]), (4, 4))
+        self.assertEqual(rows_seen["moe"], 16)
+        self.assertEqual((out.shape[0], residual.shape[0]), (4, 4))
+
+    def test_row_bridges_reject_the_wrong_input_layout(self):
+        from tokenspeed.runtime.distributed.mapping import Mapping
+
+        mapping = Mapping(
+            rank=1,
+            world_size=4,
+            attn_tp_size=2,
+            attn_dp_size=2,
+            dense_tp_size=2,
+            moe_ep_size=4,
+        )
+        layer = self._layer(mapping, {})
+        ctx = SimpleNamespace(
+            input_num_tokens=4,
+            global_num_tokens=[4] * 4,
+            collective_num_tokens=None,
+            collective_global_num_tokens=None,
+        )
+        # Full rows (4) where this rank's scattered share (2) is expected.
+        with self.assertRaisesRegex(RuntimeError, "scattered share"):
+            layer.moe_comm.gather_scattered_rows(torch.randn(4, self.HIDDEN), ctx)
+        # A scattered share where the full rows are expected.
+        with self.assertRaisesRegex(RuntimeError, "full rows"):
+            layer.moe_comm.slice_scattered_rows(torch.randn(2, self.HIDDEN), ctx)
+
     def test_idle_rank_joins_the_cross_dp_dense_collectives(self):
         from tokenspeed.runtime.distributed import comm_manager as comm_module
         from tokenspeed.runtime.distributed.mapping import Mapping

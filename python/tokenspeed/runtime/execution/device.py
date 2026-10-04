@@ -170,6 +170,20 @@ class DeviceSpecs:
     num_host_pages: int
 
 
+def speculative_widths(
+    spec_algo: str | None, spec_num_steps: int | None, spec_num_tokens: int | None
+) -> tuple[int, int]:
+    """The ``DeviceSpecs`` speculation widths: (draft steps, verify width).
+
+    ``ServerArgs`` keeps its default widths with speculation off, so the
+    algorithm, not the widths, says whether speculation is on. Both are 0
+    without it: the accept-length log views verify rows by them.
+    """
+    if spec_algo is None:
+        return 0, 0
+    return spec_num_steps or 0, spec_num_tokens or 0
+
+
 @dataclass(frozen=True)
 class DeviceBuild:
     """What constructing the device side produces, split by how long the
@@ -1291,22 +1305,18 @@ def build_device_side(
         global_rank=global_rank,
     )
 
+    spec_num_steps, spec_num_tokens = speculative_widths(
+        executor.config.spec_algo,
+        executor.config.spec_num_steps,
+        executor.config.spec_num_tokens,
+    )
     specs = DeviceSpecs(
         cache_geometry=views.cache_geometry,
         cache_groups=views.cache_groups,
         cache_storage=attention.cache_storage,
         multimodal_encoder_dtype=target.multimodal_encoder_dtype,
-        # The server-args widths keep their defaults with speculation off.
-        spec_num_steps=(
-            executor.config.spec_num_steps or 0
-            if executor.config.spec_algo is not None
-            else 0
-        ),
-        spec_num_tokens=(
-            executor.config.spec_num_tokens or 0
-            if executor.config.spec_algo is not None
-            else 0
-        ),
+        spec_num_steps=spec_num_steps,
+        spec_num_tokens=spec_num_tokens,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
         supports_pd_layerwise_finalization=bool(

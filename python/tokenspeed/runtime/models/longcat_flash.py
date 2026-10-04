@@ -488,9 +488,13 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             for branch_id in range(2)
         ]
         self.final_norm_comm = self.branch_comm[1]
-        self.moe_rows_differ: bool = self.moe_comm.use_all_reduce(
-            is_moe=True
-        ) != self.moe_comm.use_all_reduce(is_moe=False)
+        # Without attention TP the one rank of the attention-TP group holds
+        # every row of its DP group either way, so the two layouts coincide
+        # and no bridge is needed (pure attention DP with EP lands here).
+        self.moe_rows_differ: bool = self.mapping.has_attn_tp and (
+            self.moe_comm.use_all_reduce(is_moe=True)
+            != self.moe_comm.use_all_reduce(is_moe=False)
+        )
         if self.moe_rows_differ and global_server_args_dict.get(
             "enable_allreduce_fusion", False
         ):

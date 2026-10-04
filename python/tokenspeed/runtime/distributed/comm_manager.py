@@ -184,6 +184,12 @@ class CommManager:
     ) -> torch.Tensor:
         """All-gather the scattered shares back into full rows."""
         token_list = self.attn_tp_group_scattered_num_tokens(ctx)
+        if hidden_states.shape[0] != token_list[self.mapping.attn.tp_rank]:
+            raise RuntimeError(
+                "gather_scattered_rows expects this rank's scattered share: "
+                f"got {hidden_states.shape[0]} rows for scattered counts "
+                f"{token_list} at attention-TP rank {self.mapping.attn.tp_rank}"
+            )
         if sum(token_list) == 0:
             return hidden_states
         return token_all_gather(
