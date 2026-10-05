@@ -257,7 +257,7 @@ def _top_k_top_p_candidates_stage1_kernel(
     mask = token_offsets < vocab_size
 
     vals = tl.load(
-        logits_ptr + row * logits_row_stride + token_offsets,
+        logits_ptr + row.to(tl.int64) * logits_row_stride + token_offsets,
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
@@ -632,7 +632,7 @@ def _top_k_top_p_qrita_gumbel_kernel(
         offset = tl.load(offsets_pool_ptr + pool_idx).to(tl.int64) + spec_pos
         gumbel_seed = tl.randint(seed, offset)
 
-        logits_row = logits_ptr + row * logits_row_stride
+        logits_row = logits_ptr + row.to(tl.int64) * logits_row_stride
         buffer_row = qrita_buffer_ptr + pid * qrita_buffer_row_stride
 
         final_pivot = -float("inf")

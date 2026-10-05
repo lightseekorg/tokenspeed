@@ -26,11 +26,14 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
 
+_RELU2_FP8_MAX = tl.constexpr(448.0)
+
 __all__ = [
     "add3",
     "fused_gate_sigmoid_mul_add",
     "fused_swiglu_fp8_ue8m0",
     "fused_swiglu_fp8_ue8m0_masked_packed",
+    "relu2",
     "sigmoid_mul",
     "silu_and_mul",
     "situ_and_mul",
@@ -1477,5 +1480,76 @@ def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
         num_warps=8,
         ENABLE_PDL=enable_pdl,
         **pdl_kwargs,
+    )
+    return out
+
+
+@triton.jit
+def _relu2_kernel(
+    x_ptr,
+    out_ptr,
+    fp8_scale_ptr,
+    stride_x,
+    stride_out,
+    n_cols,
+    BLOCK: tl.constexpr,
+    HAS_FP8: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    if HAS_FP8:
+        inv_scale = 1.0 / tl.load(fp8_scale_ptr).to(tl.float32)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+    y = tl.maximum(x, 0.0)
+    y = y * y
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    if HAS_FP8:
+        # Quantize the activation-dtype square, as the consumer would.
+        y = y.to(x_ptr.dtype.element_ty).to(tl.float32)
+        y = tl.clamp(y * inv_scale, -_RELU2_FP8_MAX, _RELU2_FP8_MAX)
+    tl.store(
+        out_ptr + row * stride_out + cols, y.to(out_ptr.dtype.element_ty), mask=mask
+    )
+
+
+def relu2(
+    x: torch.Tensor, out: torch.Tensor, *, fp8_scale: torch.Tensor | None
+) -> torch.Tensor:
+    """Squared ReLU, ``relu(x) ** 2`` in FP32, optionally quantized to static FP8.
+
+    Args:
+        x: ``[M, N]`` input, rows may be strided but columns dense.
+        out: ``[M, N]`` output; FP8 exactly when ``fp8_scale`` is given.
+        fp8_scale: One-element FP32 dequant scale of the consuming linear.
+
+    Returns:
+        ``out``.
+    """
+    if x.dim() != 2 or out.shape != x.shape or x.stride(1) != 1 or out.stride(1) != 1:
+        raise ValueError("relu2 operands must be [M, N] with dense columns")
+    if (fp8_scale is not None) != (out.dtype == torch.float8_e4m3fn):
+        raise ValueError("relu2 writes FP8 exactly when fp8_scale is given")
+    rows, cols = x.shape
+    if rows == 0:
+        return out
+    block = 1024
+    enable_pdl = pdl_enabled()
+    _relu2_kernel[(rows, triton.cdiv(cols, block))](
+        x,
+        out,
+        x if fp8_scale is None else fp8_scale,
+        x.stride(0),
+        out.stride(0),
+        cols,
+        BLOCK=block,
+        HAS_FP8=fp8_scale is not None,
+        ENABLE_PDL=enable_pdl,
+        num_warps=4,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return out

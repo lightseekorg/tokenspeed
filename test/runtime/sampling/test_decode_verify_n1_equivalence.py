@@ -56,6 +56,9 @@ MAX_BS = 4
 
 def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        enable_speculative_sampling=False,
+        sampling_stream="batch",
+        logprob_order="torch",
         max_bs=MAX_BS,
         max_draft_tokens_per_req=1,
         max_req_pool_size=POOL,
@@ -134,7 +137,7 @@ def test_verify_n1_matches_sample(backend_name, greedy):
     req2 = _prepare(backend2, bs, greedy)
     candidates = torch.randint(0, VOCAB, (bs, 1), dtype=torch.int32, device="cuda")
     predict, accept = backend2.verify(
-        _logits_output(logits.clone()), _info(req2, offsets), candidates
+        _logits_output(logits.clone()), _info(req2, offsets), candidates, tree=None
     )
 
     torch.testing.assert_close(predict.view(bs).cpu(), sampled.view(bs).cpu())
@@ -152,7 +155,7 @@ def test_verify_n1_flashinfer_stochastic_is_valid():
     candidates = torch.randint(0, VOCAB, (bs, 1), dtype=torch.int32, device="cuda")
 
     predict, accept = backend.verify(
-        _logits_output(logits.clone()), _info(req), candidates
+        _logits_output(logits.clone()), _info(req), candidates, tree=None
     )
     predict = predict.view(bs)
     assert ((predict >= 0) & (predict < VOCAB)).all()
@@ -161,7 +164,7 @@ def test_verify_n1_flashinfer_stochastic_is_valid():
     backend2 = _backend("flashinfer")
     req2 = _prepare(backend2, bs, greedy=False)
     predict2, _ = backend2.verify(
-        _logits_output(logits.clone()), _info(req2), candidates
+        _logits_output(logits.clone()), _info(req2), candidates, tree=None
     )
     torch.testing.assert_close(predict.cpu(), predict2.view(bs).cpu())
 
@@ -181,7 +184,7 @@ def test_verify_n1_ignores_candidate_content(backend_name):
         req = _prepare(backend, bs, greedy=True)
         candidates = torch.full((bs, 1), fill, dtype=torch.int32, device="cuda")
         predict, accept = backend.verify(
-            _logits_output(logits.clone()), _info(req), candidates
+            _logits_output(logits.clone()), _info(req), candidates, tree=None
         )
         torch.testing.assert_close(accept.cpu(), torch.ones(bs, dtype=torch.int32))
         outs.append(predict.view(bs).clone())

@@ -48,7 +48,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     LINEAR_ATTENTION,
     CacheGroupSpec,
 )
-from tokenspeed.runtime.layers.attention.registry import _prepare_verify_workspace
+from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
 
 register_cuda_ci(
     est_time=10,
@@ -300,6 +300,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         prefix_granularity=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
+        speculative_eagle_topk=1,
     )
 
     setup = prepare_cache_setup(
@@ -339,16 +340,24 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
 
 
 @pytest.mark.parametrize(
-    ("replay_enabled", "replay_supported", "expected_workspace_bytes"),
+    ("replay_enabled", "replay_supported", "topk", "expected_workspace_bytes"),
     # Non-replay stages conv+ssm for 8 verify rows: 8 * (8 + 8). Replay: 64
     # conv staging bytes plus the captured payload (6 rows of 7 bf16
     # channels) and the fp32 A_log/dt_bias pairs -- 64 + 84 + 16.
-    ((False, True, 128), (True, False, 128), (True, True, 164)),
+    # A replayed draft tree (topk 2) adds one 8-byte ssm state per draft position: 2 * 3 * 8.
+    (
+        (False, True, 1, 128),
+        (True, False, 1, 128),
+        (True, True, 1, 164),
+        (False, True, 2, 128),
+        (True, True, 2, 212),
+    ),
 )
 def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     monkeypatch,
     replay_enabled: bool,
     replay_supported: bool,
+    topk: int,
     expected_workspace_bytes: int,
 ) -> None:
     monkeypatch.setattr(
@@ -378,6 +387,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=3,
+        speculative_eagle_topk=topk,
         enable_replay_ssm=replay_enabled,
     )
 
@@ -398,6 +408,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     linear_attn = attn_config.component(LinearAttnConfig)
     assert linear_attn is not None
     assert linear_attn.replay_ssm is (replay_enabled and replay_supported)
+    assert linear_attn.draft_tree is (topk > 1)
 
 
 @pytest.mark.parametrize("speculative,width", [(False, 1), (True, 1), (True, 3)])
@@ -441,6 +452,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=width,
+        speculative_eagle_topk=1,
         enable_replay_ssm=False,
     )
     setup = prepare_cache_setup(
@@ -478,7 +490,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         root = Qwen4ExpBackend(
             attn_config, AttentionBackend(attn_config, target_spec), backend, None
         )
-        _prepare_verify_workspace(
+        _prepare_fixed_workspaces(
             server_args=server_args,
             config=attn_config,
             backend=root,

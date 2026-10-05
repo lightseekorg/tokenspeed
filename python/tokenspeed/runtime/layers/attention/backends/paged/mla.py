@@ -35,6 +35,8 @@ from tokenspeed_kernel.ops.attention.mla import (
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -92,6 +94,11 @@ class MLADecodeMetadata:
     # per layer.
     block_page_table: torch.Tensor | None = None
     block_seq_lens: torch.Tensor | None = None
+    # DSA wrapper's per-token indexer rows (``[bs * spec_num_tokens, 1]``
+    # context lengths) and their opaque ``dsa_plan`` (None when the selected
+    # kernel needs none); the dense leaf itself never reads them.
+    _dsa_seq_lens_2d: torch.Tensor | None = None
+    _dsa_plan: object | None = None
 
     @property
     def seq_lens_k(self) -> torch.Tensor:
@@ -212,8 +219,12 @@ class MLAAttnBackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
         **kwargs,
     ) -> None:
+        reject_query_shard(query_shard, "MLAAttnBackend")
+        del page_table_cpu
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "MLA decode metadata goes through refresh_decode_metadata; "

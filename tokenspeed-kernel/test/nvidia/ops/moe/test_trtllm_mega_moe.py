@@ -237,6 +237,7 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     w, ref = _weights(plan)
     tokens = live_tokens if dist.get_rank() == 0 else max(1, live_tokens - 2)

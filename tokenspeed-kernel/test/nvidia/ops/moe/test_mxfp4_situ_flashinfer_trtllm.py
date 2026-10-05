@@ -244,6 +244,7 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_situ_moe_apply"
     assert plan["support_routing"] is True
@@ -279,6 +280,7 @@ def test_situ_dispatch_autotune_preserves_normal_output(
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
         fp8_scale_block_shape=None,
         internal_activation_dtype="fp8",
         with_bias=False,

@@ -282,6 +282,7 @@ def _extend(backend, tables, lengths, prefixes, replays, prompt_lens):
         extend_replay_lens_cpu=torch.tensor(replays, dtype=torch.int32),
         extend_prompt_lens_cpu=torch.tensor(prompt_lens, dtype=torch.int32),
         extend_with_prefix=any(prefixes),
+        query_shard=None,
     )
     return backend.query_metadata(ForwardMode.EXTEND)
 
@@ -407,6 +408,7 @@ def test_packed_mixed_metadata_and_count_validation(verify_width):
         extend_replay_lens_cpu=torch.tensor([0]),
         extend_prompt_lens_cpu=torch.tensor([5]),
         extend_with_prefix=True,
+        query_shard=None,
         num_tokens=3 + verify_width,
     )
     backend.init_forward_metadata(
@@ -654,6 +656,7 @@ def test_decoder_view_keeps_compute_rows_and_selects_only_valid_logits():
         extend_replay_lens_cpu=torch.tensor([4, 0]),
         extend_prompt_lens_cpu=torch.tensor([9, 12]),
         extend_with_prefix=True,
+        query_shard=None,
     )
     full = backend.query_metadata(ForwardMode.MIXED)
     view = backend.decoder_view()
@@ -961,7 +964,14 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         data_parallel_size=2,
         mapping=SimpleNamespace(
             attn=SimpleNamespace(
-                tp_size=1, dp_size=2, dcp_size=1, dcp_rank=0, dcp_group=(0,)
+                tp_size=1,
+                dp_size=2,
+                dcp_size=1,
+                dcp_rank=0,
+                dcp_group=(0,),
+                qcp_size=1,
+                qcp_rank=0,
+                qcp_group=(0,),
             )
         ),
         prefix_granularity=128,
@@ -1688,6 +1698,7 @@ def test_mixed_metadata_query_windows_and_capacity():
         extend_replay_lens_cpu=torch.tensor([0]),
         extend_prompt_lens_cpu=torch.tensor([5]),
         extend_with_prefix=True,
+        query_shard=None,
     )
     assert backend.query_metadata(ForwardMode.MIXED).positions.tolist() == [2, 3, 4, 8]
     assert backend.query_metadata(ForwardMode.EXTEND).request_indices.tolist() == [
@@ -2180,6 +2191,7 @@ def test_mixed_compressor_plan_windows_match_combined_pooling(
         extend_replay_lens_cpu=torch.tensor([0]),
         extend_prompt_lens_cpu=torch.tensor([5]),
         extend_with_prefix=True,
+        query_shard=None,
     )
     full = backend.query_metadata(ForwardMode.MIXED).compressor
     extend = backend.query_metadata(ForwardMode.EXTEND).compressor

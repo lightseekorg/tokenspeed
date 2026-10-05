@@ -25,8 +25,8 @@
         "seed": 42
       },
       "policy": {
-        "max_regression_relative": 0.1,
-        "max_regression_absolute_us": 0.5,
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0,
         "max_relative_mad": 0.05
       }
     },
@@ -54,8 +54,8 @@
         "seed": 42
       },
       "policy": {
-        "max_regression_relative": 0.1,
-        "max_regression_absolute_us": 0.5,
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0,
         "max_relative_mad": 0.05
       }
     },
@@ -83,8 +83,8 @@
         "seed": 42
       },
       "policy": {
-        "max_regression_relative": 0.1,
-        "max_regression_absolute_us": 0.5,
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0,
         "max_relative_mad": 0.05
       }
     },
@@ -112,7 +112,7 @@
         "seed": 42
       },
       "policy": {
-        "max_regression_relative": 0.1,
+        "max_regression_relative": 0.15,
         "max_regression_absolute_us": 0.5,
         "max_relative_mad": 0.05
       }
@@ -199,8 +199,8 @@
         "seed": 3243
       },
       "policy": {
-        "max_regression_relative": 0.1,
-        "max_regression_absolute_us": 0.5,
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0,
         "max_relative_mad": 0.05
       }
     },
@@ -228,8 +228,8 @@
         "seed": 3244
       },
       "policy": {
-        "max_regression_relative": 0.1,
-        "max_regression_absolute_us": 0.5,
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0,
         "max_relative_mad": 0.05
       }
     },

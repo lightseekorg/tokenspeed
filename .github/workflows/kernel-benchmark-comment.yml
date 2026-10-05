@@ -2,7 +2,7 @@ name: AMD Kernel Benchmark PR Comment
 
 on:
   workflow_run:
-    workflows: ["PR Test AMD"]
+    workflows: ["AMD Tests"]
     types: [completed]
 
 permissions:

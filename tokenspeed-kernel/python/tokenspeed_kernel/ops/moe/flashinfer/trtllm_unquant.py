@@ -32,10 +32,21 @@ from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
 
+_RELU2_TRAITS = {
+    "weight_dtype": frozenset({"unquant"}),
+    "activation": frozenset({"relu2"}),
+    "supports_deferred_finalize": frozenset({True}),
+    "supports_ep": frozenset({True}),
+    "supports_all_to_all_ep": frozenset({False}),
+    "ispp_alignment": frozenset({128}),
+    "internal_activation_dtype": frozenset({"input"}),
+    "supports_bias": frozenset({False}),
+}
+
 
 if platform.is_nvidia:
     from flashinfer import trtllm_bf16_moe
-    from flashinfer.fused_moe import trtllm_bf16_routed_moe
+    from flashinfer.fused_moe import ActivationType, trtllm_bf16_routed_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
     )
@@ -44,16 +55,18 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
 
-    def flashinfer_trtllm_unquant_moe_weights(plan: dict, w: torch.nn.Module):
+    def _flashinfer_trtllm_unquant_moe_weights(w: torch.nn.Module, *, gated: bool):
         cache_permute_indices = {}
         num_experts = w.w13_weight.shape[0]
         epilogue_tile_m = 128
         block_k = 128
 
-        half_w = w.w13_weight.shape[1] // 2
-        w1_weight = w.w13_weight.data[:, :half_w, :].clone()
-        w.w13_weight.data[:, :half_w, :] = w.w13_weight.data[:, half_w:, :]
-        w.w13_weight.data[:, half_w:, :] = w1_weight
+        if gated:
+            # The fused gated activation expects [W3(up), W1(gate)].
+            half_w = w.w13_weight.shape[1] // 2
+            w1_weight = w.w13_weight.data[:, :half_w, :].clone()
+            w.w13_weight.data[:, :half_w, :] = w.w13_weight.data[:, half_w:, :]
+            w.w13_weight.data[:, half_w:, :] = w1_weight
 
         old_shape_w13 = w.w13_weight.data[0].shape
         old_shape_w2 = w.w2_weight.data[0].shape
@@ -65,6 +78,7 @@ if platform.is_nvidia:
                 cache_permute_indices,
                 w.w13_weight.data[idx].view(torch.uint8),
                 epilogue_tile_m,
+                is_gated_act_gemm=gated,
             )
             tmp_weights1 = (
                 w.w13_weight.data[idx]
@@ -102,6 +116,12 @@ if platform.is_nvidia:
         w.w2_weight.data = w.w2_weight.data.reshape(num_experts, *new_shape_w2)
         return None
 
+    def flashinfer_trtllm_unquant_moe_weights(plan: dict, w: torch.nn.Module):
+        return _flashinfer_trtllm_unquant_moe_weights(w, gated=True)
+
+    def flashinfer_trtllm_unquant_relu2_moe_weights(plan: dict, w: torch.nn.Module):
+        return _flashinfer_trtllm_unquant_moe_weights(w, gated=False)
+
     def _flashinfer_trtllm_unquant_moe_apply(
         x: torch.Tensor,
         w: torch.nn.Module,
@@ -111,12 +131,15 @@ if platform.is_nvidia:
         do_finalize: bool,
         enable_pdl: bool,
         routed: bool,
+        activation_type: ActivationType,
     ):
         """Shared body for the in-kernel-routing and precomputed-topk variants.
 
         ``routed`` selects between ``trtllm_bf16_moe`` (in-kernel routing from
         ``router_logits``) and ``trtllm_bf16_routed_moe`` (precomputed
         ``topk_ids``/``topk_weights``); everything else is identical.
+        ``activation_type`` is SwiGLU for gated experts and Relu2 for
+        non-gated ones.
         """
         if x.shape[0] == 0:
             # Idle DP ranks run a dummy forward with 0 tokens; the fused kernel
@@ -144,6 +167,7 @@ if platform.is_nvidia:
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
             tune_max_num_tokens=get_autotune_max_num_tokens(),
+            activation_type=int(activation_type),
         )
 
         if routed:
@@ -256,6 +280,7 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=False,
+            activation_type=ActivationType.Swiglu,
         )
 
     @register_kernel(
@@ -312,4 +337,86 @@ if platform.is_nvidia:
             do_finalize,
             enable_pdl,
             routed=True,
+            activation_type=ActivationType.Swiglu,
+        )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_trtllm_unquant_relu2_moe_apply",
+        solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_unquant_relu2_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={**_RELU2_TRAITS, "routing_mode": frozenset({"kernel_routing"})},
+        priority=Priority.SPECIALIZED,
+    )
+    def flashinfer_trtllm_unquant_relu2_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        return _flashinfer_trtllm_unquant_moe_apply(
+            x,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            do_finalize,
+            enable_pdl,
+            routed=False,
+            activation_type=ActivationType.Relu2,
+        )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="flashinfer_trtllm_unquant_relu2_routed_moe_apply",
+        solution="flashinfer_trtllm",
+        weight_preprocessor=flashinfer_trtllm_unquant_relu2_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={**_RELU2_TRAITS, "routing_mode": frozenset({"precomputed_topk"})},
+        priority=Priority.PERFORMANT + 3,
+    )
+    def flashinfer_trtllm_unquant_relu2_routed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        assert (
+            topk_weights is not None and topk_ids is not None
+        ), "precomputed_topk plan requires topk_weights and topk_ids"
+        return _flashinfer_trtllm_unquant_moe_apply(
+            x,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            do_finalize,
+            enable_pdl,
+            routed=True,
+            activation_type=ActivationType.Relu2,
         )

@@ -862,6 +862,37 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         param.data.copy_(loaded_weight)
 
 
+def bind_or_copy(existing: torch.Tensor | None, derived: torch.Tensor) -> torch.Tensor:
+    """Keep a derived weight's storage across live weight updates.
+
+    Derived weights such as the absorbed MLA ``w_kc``/``w_vc`` are rebuilt
+    from the loaded parameters after every load. Captured CUDA graphs hold the
+    address of the tensor the model used at capture time, so a live update
+    must write the new values into that tensor rather than rebind the
+    attribute. Returns ``derived`` on the first build (``existing`` is None),
+    otherwise copies it into ``existing`` and returns ``existing``.
+
+    Raises:
+        ValueError: ``existing`` and ``derived`` differ in shape, dtype or
+            device. A live update rewrites values, never geometry; silently
+            rebinding would leave captured graphs on the old tensor.
+    """
+    if existing is None:
+        return derived
+    if (
+        existing.shape != derived.shape
+        or existing.dtype != derived.dtype
+        or existing.device != derived.device
+    ):
+        raise ValueError(
+            "derived weight changed geometry across a live update: existing "
+            f"{tuple(existing.shape)!s}/{existing.dtype!s}/{existing.device!s}, "
+            f"derived {tuple(derived.shape)!s}/{derived.dtype!s}/{derived.device!s}"
+        )
+    existing.copy_(derived)
+    return existing
+
+
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 

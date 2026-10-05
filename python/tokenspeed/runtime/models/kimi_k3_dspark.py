@@ -248,8 +248,10 @@ class K3DSparkDecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=False,
             prev_is_moe=False,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(

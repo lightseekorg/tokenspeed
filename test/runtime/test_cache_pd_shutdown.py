@@ -21,6 +21,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine import event_loop as event_loop_module  # noqa: E402
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks  # noqa: E402
@@ -74,8 +75,6 @@ class _EventLoopHarness:
             None,
             attn_tp_size=1,
             attn_tp_cpu_group=None,
-            attn_cp_size=1,
-            attn_cp_cpu_group=None,
             pp_size=1,
             pp_cpu_group=None,
         )
@@ -92,6 +91,10 @@ class _EventLoopHarness:
         )
         self._pd_hooks = SimpleNamespace(
             poll_transfer_events=lambda: (self.trace.append("poll_pd"), [])[1]
+        )
+        self._eplb_hooks = SimpleNamespace(
+            note_round=lambda *, forwarded: self.trace.append("eplb_round"),
+            close=lambda: self.trace.append("close_eplb"),
         )
         self.load_reporter = SimpleNamespace(
             observe=lambda _stats, _running: self.trace.append("observe_load"),
@@ -153,6 +156,9 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
         "stats",
         "observe_load",
         "metrics",
+        # Every non-paused round reports its forward (none here) to the
+        # expert-rebalance hooks after the device call.
+        "eplb_round",
         "poll_pd",
         "publish_kv",
         "pause_finish",
@@ -228,6 +234,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
             self.max_model_len = 4096
             self.max_req_input_len = 512
             self.multimodal_encoder_dtype = None
+            self.supports_prompt_logprobs = True
             self.model_config = SimpleNamespace(context_len=4096)
             self.has_dp = False
             self.use_overlap_schedule = False
@@ -255,11 +262,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
         def send(self, message: object) -> None:
             self.messages.append(message)
 
-    mapping = SimpleNamespace(
-        rank=0,
-        nprocs_per_node=1,
-        attn=SimpleNamespace(tp_rank=0, dp_rank=0),
-    )
+    mapping = Mapping(rank=0)
     server_args = SimpleNamespace(
         mapping=mapping,
         device="cpu",

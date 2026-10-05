@@ -28,6 +28,7 @@ from tokenspeed.runtime.engine.io_struct import (
     MsgpackEncoder,
     TokenizedGenerateReqInput,
 )
+from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
 
 logger = logging.getLogger(__name__)
 
@@ -57,33 +58,73 @@ class MsgpackRecvSocket:
     RequestHandler's drain loop relies on.
 
     ``vocab_size`` lets this socket run ``sampling_params.verify`` on each
-    generate request, and ``enable_output_logprobs`` gates ``return_logprob``
-    (the pickle path enforces both in the tokenizer_manager's input processor,
-    which the msgpack path bypasses; the pure wire ``to_io_struct`` has neither
-    value). An invalid request is not dropped — that would hang the frontend's
-    stream with no terminal frame. It is marked via ``validation_error`` so
-    RequestHandler admits it pre-finished (FINISH_ABORT) and OutputProcesser
-    emits a terminal "abort" output.
+    generate request, ``enable_output_logprobs`` gates ``return_logprob`` and
+    ``supports_prompt_logprobs`` (the engine's startup verdict, see
+    ``DeviceSpecs``) gates a ``logprob_start_len`` that asks for prompt
+    logprobs (the pickle path enforces all three in the tokenizer_manager's
+    input processor, which the msgpack path bypasses; the pure wire
+    ``to_io_struct`` has none of these values). An invalid request is not
+    dropped — that would hang the frontend's stream with no terminal frame. It
+    is marked via ``validation_error`` so RequestHandler admits it pre-finished
+    (FINISH_ABORT) and OutputProcesser emits a terminal "abort" output.
     """
 
     def __init__(
         self,
         socket: zmq.Socket,
         vocab_size: int,
-        enable_output_logprobs: bool = False,
+        *,
+        enable_output_logprobs: bool,
+        supports_prompt_logprobs: bool,
     ) -> None:
         self._socket = socket
         self._vocab_size = vocab_size
         self._enable_output_logprobs = enable_output_logprobs
+        self._supports_prompt_logprobs = supports_prompt_logprobs
         self._pending: collections.deque = collections.deque()
 
     def _validation_error(self, obj: TokenizedGenerateReqInput) -> str | None:
-        """Return the reason ``obj`` must be rejected, or None if it is valid."""
+        """Return the reason ``obj`` must be rejected, or None if it is valid.
+
+        Mirrors the tokenizer-side ``InputProcessor`` gate for the SGLang
+        logprob knobs. ``logprob_start_len`` is resolved in place (-1 -> last
+        prompt token). A start that asks for prompt logprobs is refused when
+        the engine cannot compute them (``supports_prompt_logprobs``), and
+        otherwise because the slim per-step output (``BatchTokenIDOutSlim``)
+        has no prompt-logprob columns -- computing them would silently drop
+        them on the wire.
+        """
         if obj.return_logprob and not self._enable_output_logprobs:
             return (
                 "logprobs were requested but the server was started without "
                 "--enable-output-logprobs"
             )
+        if obj.return_logprob:
+            if obj.top_logprobs_num:
+                return (
+                    "top_logprobs_num > 0 (output top-k logprobs) is not supported yet"
+                )
+            if obj.token_ids_logprob:
+                return "token_ids_logprob is not supported yet"
+            if obj.input_ids is None:
+                return "return_logprob requires token inputs"
+            try:
+                obj.logprob_start_len = resolve_logprob_start_len(
+                    obj.logprob_start_len, len(obj.input_ids)
+                )
+            except ValueError as exc:
+                return str(exc)
+            if obj.logprob_start_len < len(obj.input_ids) - 1:
+                if not self._supports_prompt_logprobs:
+                    return (
+                        "logprob_start_len >= 0 (prompt logprobs) is not supported by "
+                        "this engine: the model narrows its prefill rows or runs "
+                        "pipeline parallel; use logprob_start_len=-1"
+                    )
+                return (
+                    "logprob_start_len >= 0 (prompt logprobs) is not carried on the "
+                    "msgpack output wire; use logprob_start_len=-1"
+                )
         try:
             obj.sampling_params.verify(self._vocab_size)
         except ValueError as exc:
@@ -225,7 +266,9 @@ def connect_msgpack_engine(
     engine_index: int,
     ready_response: "zmq_wire.WireEngineCoreReadyResponse",
     vocab_size: int,
-    enable_output_logprobs: bool = False,
+    *,
+    enable_output_logprobs: bool,
+    supports_prompt_logprobs: bool,
 ) -> tuple[MsgpackRecvSocket, MsgpackSendSocket]:
     """Run the startup handshake against SMG and return the wrapped
     data-plane sockets.
@@ -282,7 +325,12 @@ def connect_msgpack_engine(
     handshake.close()
     logger.info(f"msgpack handshake: complete (engine_index={engine_index!s})")
     return (
-        MsgpackRecvSocket(input_socket, vocab_size, enable_output_logprobs),
+        MsgpackRecvSocket(
+            input_socket,
+            vocab_size,
+            enable_output_logprobs=enable_output_logprobs,
+            supports_prompt_logprobs=supports_prompt_logprobs,
+        ),
         MsgpackSendSocket(output_socket, engine_index=engine_index),
     )
 
@@ -343,4 +391,5 @@ def connect_msgpack_engine_for_loop(
         ready_response,
         loop.model_config.vocab_size,
         enable_output_logprobs=server_args.enable_output_logprobs,
+        supports_prompt_logprobs=loop.supports_prompt_logprobs,
     )

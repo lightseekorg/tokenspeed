@@ -171,7 +171,9 @@ def test_the_loader_checks_the_scale_file_of_an_fp8_cache(
         kv_cache_dtype=kv_cache_dtype, quantization_param_path=path
     )
     with pytest.raises(RuntimeError, match="would load now"):
-        weight_loader.WeightLoader.load_model(None, server_args, "cuda", 0, None)
+        weight_loader.WeightLoader.load_model(
+            None, server_args, "cuda", 0, None, checkpoint_load_group=None
+        )
     assert checks == ([path] if checked else [])
 
 

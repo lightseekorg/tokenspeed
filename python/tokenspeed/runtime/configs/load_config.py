@@ -65,6 +65,11 @@ class LoadConfig:
         checkpoints.
     decryption_key_file: If set, decrypts the output files with a password read
         from this file (after PBKDF2).
+    checkpoint_load_group: Global ranks a distributed loader (InstantTensor)
+        synchronizes with when the model declares no ``checkpoint_load_group``
+        of its own; None means every rank. A model loaded on a subset of the
+        ranks -- a pipeline stage's draft -- must name that subset, or the
+        collective waits for ranks that never load it.
     """
 
     load_format: str | LoadFormat = LoadFormat.AUTO
@@ -74,6 +79,7 @@ class LoadConfig:
     decryption_key_file: str | None = None
     weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 8
+    checkpoint_load_group: tuple[int, ...] | None = None
 
     ext_yaml: str | None = None
 

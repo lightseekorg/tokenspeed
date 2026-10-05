@@ -237,6 +237,8 @@ def gluon_linear_attnres_partials_m4_gfx950(
             output_ptr,
             output_ptr,
             output_ptr,
+            output_ptr,
+            output_ptr,
             4,
             output_size,
             _INPUT_SIZE,
@@ -258,6 +260,8 @@ def gluon_linear_attnres_partials_m4_gfx950(
             NUM_BUFFERS=3,
             GROUP_SIZE_M=1,
             ADD3=False,
+            SPLIT_K=1,
+            NUM_XCDS=1,
             PID_OFFSET=4,
         )
     else:

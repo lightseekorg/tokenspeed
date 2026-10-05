@@ -46,6 +46,7 @@ from functools import lru_cache
 import torch
 from tokenspeed_kernel.ops.attention.prologue.checks import (
     check_gqa_request,
+    check_latent_store,
     check_mla_request,
 )
 from tokenspeed_kernel.ops.attention.prologue.types import (
@@ -232,7 +233,7 @@ def mla_prologue(
     *,
     expanded: MLAExpandedKV | None,
     rotary: Rotary | None,
-    cache: LatentKVCache,
+    cache: LatentKVCache | None,
     solution: str | None,
     override: str | None,
 ) -> MLAPrologueOutput:
@@ -256,7 +257,12 @@ def mla_prologue(
             and leaves every input as given, so a graph segment can run it
             ahead of a break that still reads them.
         rotary: Rotary embedding, or ``None`` for NoPE.
-        cache: Latent cache destination.
+        cache: Latent cache destination, or ``None`` to rotate without
+            storing: absorbed attention only, the rotated latent rows come
+            back as ``latent`` for :func:`latent_store`, so a caller can gather
+            rows from other ranks between the rotation and the store (query
+            context parallelism) and still write the bytes the fused path
+            writes.
         solution: Optional registered solution to select.
         override: Optional exact kernel name; it must serve the request.
 
@@ -269,16 +275,31 @@ def mla_prologue(
     rope_dim = q_pe.shape[-1]
     kv_lora_rank = latent_cache.shape[-1] - rope_dim
 
-    traits = {
-        "token_heads": num_tokens * num_heads,
-        "expanded": expanded is not None,
-        "full_write": cache.slots.numel() == num_tokens,
-        "kv_format": cache.format.value,
-        "kv_convert": cache.format is KVCacheFormat.NATIVE
-        and cache.kv_cache.dtype is not query.dtype,
-        "rope_style": "none" if rotary is None else rotary.style.value,
-        "sanitize": cache.sanitize,
-    }
+    if cache is None:
+        # No destination: the cache-derived traits take the native full-write
+        # values and ``store`` selects the solutions that return the latent.
+        traits = {
+            "token_heads": num_tokens * num_heads,
+            "expanded": False,
+            "full_write": True,
+            "kv_format": KVCacheFormat.NATIVE.value,
+            "kv_convert": False,
+            "rope_style": "none" if rotary is None else rotary.style.value,
+            "sanitize": False,
+            "store": False,
+        }
+    else:
+        traits = {
+            "token_heads": num_tokens * num_heads,
+            "expanded": expanded is not None,
+            "full_write": cache.slots.numel() == num_tokens,
+            "kv_format": cache.format.value,
+            "kv_convert": cache.format is KVCacheFormat.NATIVE
+            and cache.kv_cache.dtype is not query.dtype,
+            "rope_style": "none" if rotary is None else rotary.style.value,
+            "sanitize": cache.sanitize,
+            "store": True,
+        }
     kernel = _select(
         "mla_prologue", query.dtype, tuple(traits.items()), solution, override
     )
@@ -310,6 +331,42 @@ def mla_prologue(
         )
 
 
+def latent_store(
+    latent: torch.Tensor,
+    *,
+    kv_lora_rank: int,
+    cache: LatentKVCache,
+) -> None:
+    """Store rotated latent rows into a native latent cache.
+
+    The store step of :func:`mla_prologue` on its own, for rows the prologue
+    rotated without a cache (``cache=None``): the leading
+    ``cache.slots.numel()`` rows of ``latent`` land at ``cache.slots``, rows
+    whose ``write_mask`` entry is False are skipped. Writes the bytes the
+    fused prologue writes for a native cache, since both round the rotation
+    once.
+
+    Args:
+        latent: ``[num_tokens, kv_lora_rank + rope_dim]`` rotated latent rows
+            in the activation dtype (``MLAPrologueOutput.latent``, possibly
+            gathered across ranks since).
+        kv_lora_rank: Width of the latent part; the rest of a row is RoPE.
+        cache: Native latent cache destination with its slots and write mask.
+    """
+    from tokenspeed_kernel.ops.attention.prologue.composite import (
+        composite_latent_store,
+    )
+
+    check_latent_store(latent, cache)
+    if not 0 < kv_lora_rank < latent.shape[-1]:
+        raise ValueError(
+            f"kv_lora_rank {kv_lora_rank} must split a {latent.shape[-1]}-wide row"
+        )
+    composite_latent_store(
+        latent, kv_lora_rank=kv_lora_rank, cache=cache, enable_pdl=pdl_enabled()
+    )
+
+
 __all__ = [
     "GQAPrologueOutput",
     "HeadKVCache",
@@ -324,6 +381,7 @@ __all__ = [
     "RopeStyle",
     "Rotary",
     "gqa_prologue",
+    "latent_store",
     "mla_prologue",
     "qk_norm_rope",
 ]
