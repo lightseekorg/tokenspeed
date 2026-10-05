@@ -30,6 +30,7 @@ have no such component.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import AttnComponentSpec
@@ -66,6 +67,8 @@ class LinearAttnConfig(AttnComponentSpec):
     replay_ssm: bool = False
     # Draft-tree verify windows (topk > 1); a ReplaySSM tree keeps node states in one shared workspace.
     draft_tree: bool = False
+    # Whether that workspace exists: Mamba2 rebuilds a branch's state by replaying its ancestors instead.
+    tree_node_state_workspace: ClassVar[bool] = True
 
     def __post_init__(self):
         if not self.layer_ids:
@@ -160,6 +163,7 @@ class Mamba2Config(LinearAttnConfig):
 
     chunk_size: int
     dt_limit: tuple[float, float]
+    tree_node_state_workspace: ClassVar[bool] = False
 
     @classmethod
     def generate(

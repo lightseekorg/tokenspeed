@@ -261,7 +261,8 @@ class QwenGDNRecipe(CacheRecipe):
     def _tree_state_bytes(self) -> int:
         """A ReplaySSM tree verify's node states: one layer's worth per draft
         position, shared by every layer (``MambaAttnBackend._tree_node_states``)."""
-        if not self.draft_tree:
+        linear_attn = self.attn_config.component(LinearAttnConfig)
+        if not self.draft_tree or not linear_attn.tree_node_state_workspace:
             return 0
         _, _, ssm_shape, ssm_dtype = self._state_shapes
         rows = self.attn_config.max_bs * int(

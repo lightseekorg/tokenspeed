@@ -85,11 +85,24 @@ decode's reload does, and the destination write is a runtime branch, so
 decode, verify and replay produce bit-identical states and verify outputs
 match decode outputs bit for bit, for fp32 and bf16 state pools alike.
 
+With `parent_indices` the window is a draft tree: token `t` continues from the
+state after its parent token rather than token `t - 1`. At such a branch a
+staged verify reloads the parent's destination row; without one the kernel
+replays the parent's ancestors, which precede it in the window, over the
+read state with the same per-token rounding. A few elementwise steps from
+cached inputs cost less than staging a full state per token and layer (4 MiB on
+Nemotron-3 Super) and reading it back. Each token's state equals a chain verify
+of its root path bit for bit. Its output matches to rounding, bit for bit at
+Nemotron's geometry with an fp32 state pool: the tree build contracts
+multiply-adds differently, so outputs can differ in their last fp32 bits
+(several bf16 ulps near zero) at the chain's accuracy against an fp64 reference.
+
 ## Tests
 
 `test/nvidia/ops/attention/test_mamba2.py` compares the ops with a sequential
 fp64 recurrence. It covers single-token and multi-chunk sequences, nonzero
 initial states, resuming a split scan, padded update rows, and decode steps
 that continue a prefill, checks verify and replay bit for bit against
-consecutive decode updates, and guards every kernel against recompiling when
+consecutive decode updates, checks tree windows against chain verifies of each
+token's root path, and guards every kernel against recompiling when
 the batch shape changes.

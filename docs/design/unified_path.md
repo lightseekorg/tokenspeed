@@ -1186,13 +1186,16 @@ extension to the native wrapper is required.
 These preparation changes modify neither the native scan, its gate math, nor
 GEMM arithmetic.
 
-## Experimental KDA prefill subgraphs
+## Recurrent prefill subgraphs (KDA, Mamba2)
 
-### Capturing KDA in the outer graph
+### Capturing recurrent layers in the outer graph
 
+`CapacityPrefillBackend` (`state/prefill_capacity.py`) owns this contract for
+KDA and Mamba2; each subclass only states which forwards it admits and whether
+uncaptured shapes also run the capacity layout. GDN does not capture its layers.
 Supported pure-extend forwards use `prepare_prefill_metadata` before eager
 execution, startup capture and replay. This consumer-stream seam builds or
-refreshes `KdaPrefillMetadata` with the selected token and request capacities.
+refreshes `CapacityPrefillMetadata` with the selected token and request capacities.
 Eager execution uses the live count; replay may round up to a captured count.
 The same metadata contract controls scan capacity, checkpoint packing and
 output restoration in every case; there is no temporary metadata binding or
@@ -1202,6 +1205,15 @@ Whether a shape can be captured is also asked on its own, through
 `admits_prefill_graph`, which reads no forward context and writes nothing; the
 seam must return the same answer, and startup capture raises when a backend
 admits a shape and then refuses to prepare it.
+
+Mamba2 keeps the scheduler metadata for uncaptured shapes: its chunk plans
+need only live bounds, so the capacity layout would only add packing to eager
+forwards. A retained shape owns one persistent chunk plan per scan (body and
+tail), sized `extent // chunk_size + sequences` and padded with empty chunks;
+the preparation seam rewrites both in place, in one pinned upload, before each
+use. Mamba2 chunks align to the packed token axis, so when one-token dummy tails
+shift a later request's tail, a multi-request capture matches eager within
+rounding rather than bit for bit; a one-request capture matches exactly.
 
 For retained shapes, the hybrid wrapper can omit the KDA attention break and
 capture neighboring projections, KDA kernels and post-attention compute together.
@@ -1301,8 +1313,9 @@ orchestrator.
 
 ### Fixed-capacity execution metadata
 
-The private KDA metadata overrides only the packed execution extent; real
-host lengths and GPU boundaries still agree. An explicit
+The capacity metadata overrides only the packed execution extent; real
+host lengths and GPU boundaries still agree. Its `PrefillCapacity` validates
+the packed bounds it builds. For KDA, an explicit
 `KdaPrefillCapacity` passed to the kernel facade admits the live CPU lengths:
 each sequence may fill the bucket, but their combined tokens must also fit it.
 The CuTeDSL adapter alone converts this descriptor to native planning bounds.

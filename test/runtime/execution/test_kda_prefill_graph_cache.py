@@ -37,13 +37,13 @@ register_cuda_ci(est_time=60, suite="runtime-1gpu")
 from tokenspeed.runtime.execution.memory_delta import (  # noqa: E402
     NULL_MEMORY_DELTA_OBSERVER,
 )
-from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata import (  # noqa: E402
-    _checkpoint_slot_batch,
-    _clone_metadata,
-    prepare_kda_prefill_metadata,
-)
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E402
     MambaForwardMetadata,
+)
+from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (  # noqa: E402
+    _checkpoint_slot_batch,
+    _clone_metadata,
+    prepare_capacity_prefill_metadata,
 )
 
 
@@ -263,8 +263,8 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
 def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eager_shapes():
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
-    from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata import (
-        KdaPrefillMetadata,
+    from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
+        CapacityPrefillMetadata,
     )
 
     backend = object.__new__(KdaAttnBackend)
@@ -275,7 +275,7 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
     backend.forward_metadata = original
     backend.prepare_prefill_metadata(8, 1, ForwardMode.EXTEND, capture=False)
     eager = backend.forward_metadata
-    assert isinstance(eager, KdaPrefillMetadata)
+    assert isinstance(eager, CapacityPrefillMetadata)
     assert not backend.prefill_metadata_is_capture_ready
     assert not backend._prefill_metadata
     backend.forward_metadata = original
@@ -513,7 +513,7 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         expected_conv, expected_states = conv.clone(), states.clone()
         # Uncaptured shapes use the same builder with transient storage. Check
         # its eager output/state too, not just eager on a retained graph buffer.
-        backend.forward_metadata = prepare_kda_prefill_metadata(
+        backend.forward_metadata = prepare_capacity_prefill_metadata(
             source, bucket, 128, None
         )
         reset()

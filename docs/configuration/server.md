@@ -64,6 +64,8 @@ switch an envelope folds is also available individually under `auto`.
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
 | `--weight-version` | Initial model-weight version stamped into generation metadata. Defaults to `default`. |
+| `--rl-control-host` | Bind host for the in-engine RL control app. Defaults to `--host`. |
+| `--rl-control-api-key` | Bearer token required on every RL control route. Unset leaves the app open, which is what slime expects by default. |
 | `--model-update-config` | JSON object handed to the Model Updater SDK for `POST /update_weights_from_mooncake`. Requires the three flags below; see [Mooncake Weight Updates](#mooncake-weight-updates). |
 | `--model-update-sdk-module` | Import path of the Model Updater SDK module. Imported in the scheduler process on the first Mooncake update, not at startup. Required with `--model-update-config`. |
 | `--model-update-engine-type` | SDK `EngineType` member name for this engine, resolved as `EngineType[value.upper()]`. Required with `--model-update-config`. |
@@ -203,10 +205,15 @@ The following slime paths are not yet supported end to end:
   `--rollout-top-p 1.0` until TokenSpeed returns that metadata;
 - rollout routing replay (`--use-rollout-routing-replay`).
 
-The HTTP routes for `update_weights_from_tensor` and `update_weights_from_disk`
-remain for SGLang clients, but TokenSpeed's scheduler does not implement their
-receive paths: the scheduler replies `success=false` with
-"not supported on this engine". Use the distributed or Mooncake update mode.
+`POST /update_weights_from_disk` and `POST /update_weights_from_tensor` stay on
+the router for slime-compatible clients, but answer `501 Not Implemented` with
+`{"success": false, "message": "..."}` before anything reaches the scheduler:
+TokenSpeed's scheduler implements neither the disk load path nor the CUDA-IPC
+receive path and would answer such a request with `success=false` ("not
+supported on this engine"). Use `POST /update_weights_from_distributed` or the
+Mooncake update described below. For the same reason the engine advertises
+`rl.update_from = "distributed,mooncake"`, so a gateway never routes a disk
+or tensor update here.
 
 ### Weight Updates Under Attention DP
 
@@ -292,6 +299,24 @@ Trainer-side contract:
   version is not advanced. Re-issue the update (a successful retry streams
   the whole checkpoint and restores consistency) or restart the engine before
   resuming dispatch; the same holds for the distributed update.
+
+### Driving TokenSpeed from an external gateway
+
+A gateway that fronts several engines (for example SMG with `--enable-rl`)
+talks to this control app directly; the `ts serve` sidecar is not involved.
+Launch the engine with `--rl-control-port <port>` and
+`--rl-control-host <address the gateway can reach>` (the default binds
+localhost only), and set `--rl-control-api-key` unless the network is trusted:
+an open control app on a routable host accepts weight updates from anyone who
+can connect. The engine puts the resulting control URL and its capabilities
+(`rl.control_url`, `rl.pause_modes`, `rl.update_from`, ...) into its server
+info, and SMG reads them when it registers the gRPC worker, so nothing has to
+be configured on the gateway side. The routes keep slime's expectations:
+`POST /pause_generation` accepts `{"mode": "wait"|"abort"|"keep"}` (default
+`wait`), and `/flush_cache` answers on both GET and POST. Routes with optional
+bodies accept an omitted body, but malformed or non-object JSON answers `400`
+before any control operation runs. Wildcard bind addresses (`0.0.0.0` or `::`)
+are not advertised as control URLs; use a concrete address for gateway discovery.
 
 ## Scheduler And Memory
 
