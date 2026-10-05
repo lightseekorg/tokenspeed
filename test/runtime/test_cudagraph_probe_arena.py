@@ -332,6 +332,7 @@ def test_a_probe_arena_cannot_also_carry_a_reserve() -> None:
                 0,
                 0,
                 graph_reserve_bytes=reserve,
+                post_profile_bytes=0,
                 probe_batch_rows=rows,
                 profiled_cache_bytes=None,
                 reuse_target_backend=None,
