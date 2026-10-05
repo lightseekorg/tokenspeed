@@ -33,8 +33,12 @@ Configure `LIGHTSEEK_BOT_TOKEN` for the `lightseek-bot` account with repository
 and workflow access, and the existing `DOCKERHUB_USERNAME` variable and
 `DOCKERHUB_TOKEN` secret. Component workflows continue to use the `pypi`
 environment and their existing PyPI trusted publishers. Environment approvals
-and branch rules still apply. Version PRs require successful lint and completed
-checks; the controller does not bypass protection or use administrator merges.
+still apply. Version PRs require successful lint, all required checks, and
+completed checks. If every applicable repository approval rule explicitly
+lists the bot as an always-allowed bypass actor, the controller can merge its
+own version PR without human approval after CI succeeds. Otherwise it waits
+for the existing approval rules. Requested changes and merge conflicts always
+stop automatic merging. The workflow never changes repository rules.
 
 Source provenance checks read the repository and source claims that PyPI serves,
 including the artifact digest. They do not perform independent signature

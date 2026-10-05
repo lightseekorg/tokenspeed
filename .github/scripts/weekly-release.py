@@ -304,7 +304,7 @@ def update_metadata(stage, versions):
         )
 
 
-def checks_ready(pr):
+def checks_ready(pr, *, required_checks, bypass_reviews):
     checks = pr["statusCheckRollup"]
     for check in checks:
         result = check.get("conclusion") or check.get("state")
@@ -328,12 +328,58 @@ def checks_ready(pr):
         or c.get("state") == "SUCCESS"
         for c in checks
     )
+    required = all(
+        any(
+            (c.get("name") or c.get("context")) == name
+            and (c.get("conclusion") == "SUCCESS" or c.get("state") == "SUCCESS")
+            for c in checks
+        )
+        for name in required_checks
+    )
+    review_only_block = (
+        bypass_reviews
+        and pr["mergeStateStatus"] == "BLOCKED"
+        and pr["reviewDecision"] == "REVIEW_REQUIRED"
+        and pr["mergeable"] == "MERGEABLE"
+    )
     return (
         lint
         and complete
+        and required
         and pr["reviewDecision"] != "CHANGES_REQUESTED"
-        and pr["mergeStateStatus"] in ("CLEAN", "HAS_HOOKS")
+        and (pr["mergeStateStatus"] in ("CLEAN", "HAS_HOOKS") or review_only_block)
     )
+
+
+def merge_policy():
+    """Use an existing, explicit bot exemption; never change repository rules."""
+    user_id = int(command("gh", "api", "user", "--jq", ".id"))
+    rules = api("rules/branches/main")
+    required = {
+        check["context"]
+        for rule in rules
+        if rule["type"] == "required_status_checks"
+        for check in rule["parameters"]["required_status_checks"]
+    }
+    approvals = [rule for rule in rules if rule["type"] == "pull_request"]
+    bypass = bool(approvals)
+    for rule in approvals:
+        if (
+            rule["ruleset_source"] != REPO
+            or rule["ruleset_source_type"] != "Repository"
+        ):
+            bypass = False
+            break
+        actors = api(f"rulesets/{rule['ruleset_id']}")["bypass_actors"]
+        if not any(
+            actor["actor_type"] == "User"
+            and actor["actor_id"] == user_id
+            and actor["bypass_mode"] == "always"
+            for actor in actors
+        ):
+            bypass = False
+            break
+    return required, bypass
 
 
 def index_release(root, variant, package, release):
@@ -641,7 +687,7 @@ class Release:
                     "--repo",
                     REPO,
                     "--json",
-                    "state,headRefOid,mergeCommit,statusCheckRollup,mergeStateStatus,reviewDecision",
+                    "state,headRefOid,mergeCommit,statusCheckRollup,mergeStateStatus,reviewDecision,mergeable",
                 )
             )
             if pr["state"] == "MERGED":
@@ -659,7 +705,11 @@ class Release:
                 raise RuntimeError("Version PR was closed without merging")
             if pr["headRefOid"] != phase.get("head"):
                 raise RuntimeError("Version PR head changed outside this run")
-            if checks_ready(pr):
+            required, bypass = merge_policy()
+            if checks_ready(pr, required_checks=required, bypass_reviews=bypass):
+                # The bot may already be explicitly exempt from review requirements.
+                # Still require every registered and required CI check to succeed.
+                merge_args = ["--admin"] if pr["mergeStateStatus"] == "BLOCKED" else []
                 command(
                     "gh",
                     "pr",
@@ -670,6 +720,7 @@ class Release:
                     "--squash",
                     "--match-head-commit",
                     pr["headRefOid"],
+                    *merge_args,
                 )
             else:
                 self.pause()

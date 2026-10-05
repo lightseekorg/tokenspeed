@@ -162,17 +162,21 @@ def test_push_run_lookup_requires_exact_source_and_actor(
 
 def test_version_pr_requires_registered_lint_and_pending_checks(release_module):
     pr = {"statusCheckRollup": [], "reviewDecision": "", "mergeStateStatus": "CLEAN"}
-    assert not release_module.checks_ready(pr)
+    assert not release_module.checks_ready(
+        pr, required_checks=set(), bypass_reviews=False
+    )
     pr["statusCheckRollup"] = [
         {"name": "lint", "conclusion": "SUCCESS"},
         {"name": "build", "status": "IN_PROGRESS"},
     ]
-    assert not release_module.checks_ready(pr)
+    assert not release_module.checks_ready(
+        pr, required_checks=set(), bypass_reviews=False
+    )
     pr["statusCheckRollup"][1]["conclusion"] = "FAILURE"
     with pytest.raises(RuntimeError, match="PR check failed"):
-        release_module.checks_ready(pr)
+        release_module.checks_ready(pr, required_checks=set(), bypass_reviews=False)
     pr["statusCheckRollup"][1]["conclusion"] = "SKIPPED"
-    assert release_module.checks_ready(pr)
+    assert release_module.checks_ready(pr, required_checks=set(), bypass_reviews=False)
 
 
 def test_metadata_updates_both_versions_and_keeps_kernel_boundary(
@@ -478,3 +482,55 @@ def test_stable_index_retries_after_concurrent_nightly_push(
     assert "tokenspeed-v0.1.4" in real_command(
         "git", "show", "gh-pages:cu130/tokenspeed/index.html", cwd=bare
     )
+
+
+def test_existing_bot_review_exemption_still_requires_required_ci(release_module):
+    pr = {
+        "statusCheckRollup": [{"name": "lint", "conclusion": "SUCCESS"}],
+        "reviewDecision": "REVIEW_REQUIRED",
+        "mergeStateStatus": "BLOCKED",
+        "mergeable": "MERGEABLE",
+    }
+    assert not release_module.checks_ready(
+        pr, required_checks={"finish"}, bypass_reviews=True
+    )
+    pr["statusCheckRollup"].append({"name": "finish", "conclusion": "SUCCESS"})
+    assert not release_module.checks_ready(
+        pr, required_checks={"finish"}, bypass_reviews=False
+    )
+    assert release_module.checks_ready(
+        pr, required_checks={"finish"}, bypass_reviews=True
+    )
+    pr["reviewDecision"] = "CHANGES_REQUESTED"
+    assert not release_module.checks_ready(
+        pr, required_checks={"finish"}, bypass_reviews=True
+    )
+
+
+def test_merge_policy_requires_explicit_existing_bot_exemption(
+    release_module, monkeypatch
+):
+    monkeypatch.setattr(release_module, "command", lambda *a: "123")
+    actors = [{"actor_type": "User", "actor_id": 123, "bypass_mode": "always"}]
+
+    def api(path, *, data=None):
+        assert data is None
+        if path == "rules/branches/main":
+            return [
+                {
+                    "type": "required_status_checks",
+                    "parameters": {"required_status_checks": [{"context": "finish"}]},
+                },
+                {
+                    "type": "pull_request",
+                    "ruleset_source": release_module.REPO,
+                    "ruleset_source_type": "Repository",
+                    "ruleset_id": 1,
+                },
+            ]
+        return {"bypass_actors": actors}
+
+    monkeypatch.setattr(release_module, "api", api)
+    assert release_module.merge_policy() == ({"finish"}, True)
+    actors[0]["bypass_mode"] = "pull_request"
+    assert release_module.merge_policy() == ({"finish"}, False)
