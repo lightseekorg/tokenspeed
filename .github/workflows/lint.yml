@@ -86,6 +86,11 @@ jobs:
             --select F401,F841,F821,F823,F811,F541,TID251,UP035,UP006,UP007,UP045 \
             python/tokenspeed/runtime
 
+      - name: Check release orchestration
+        run: |
+          python -m pip install pytest packaging cryptography pyyaml
+          python -m pytest -q test/ci_system/test_weekly_release.py
+
       - name: Install scheduler C++ lint tools
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |

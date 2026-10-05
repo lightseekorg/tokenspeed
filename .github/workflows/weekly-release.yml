@@ -1,0 +1,104 @@
+name: Weekly release
+
+on:
+  schedule:
+    - cron: '0 20 * * 0'
+      timezone: America/Los_Angeles
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional TokenSpeed stable version; otherwise increment the patch.'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: weekly-release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: plan
+      previous: ''
+      version: ${{ inputs.version || '' }}
+    secrets: inherit
+
+  amd:
+    needs: plan
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: amd
+      previous: plan
+    secrets: inherit
+
+  kernel:
+    needs: amd
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: kernel
+      previous: amd
+    secrets: inherit
+
+  tokenspeed:
+    needs: kernel
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: tokenspeed
+      previous: kernel
+    secrets: inherit
+
+  index:
+    needs: tokenspeed
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: index
+      previous: tokenspeed
+    secrets: inherit
+
+  docker:
+    needs: index
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: docker
+      previous: index
+    secrets: inherit
+
+  release:
+    needs: docker
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: release
+      previous: docker
+    secrets: inherit
+
+  result:
+    if: always()
+    needs: [plan, amd, kernel, tokenspeed, index, docker, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report release result
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          results = json.loads(os.environ['RESULTS'])
+          failed = [stage for stage, value in results.items() if value['result'] != 'success']
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+              for stage, value in results.items():
+                  print(f"- {stage}: {value['result']}", file=summary)
+              if failed:
+                  print('\nManual intervention required. Inspect the first failed stage and its '
+                        'weekly-state artifact. Repair or rerun its recorded child workflow, '
+                        'then rerun failed jobs here. Do not start a new weekly run to resume.',
+                        file=summary)
+          if failed:
+              raise SystemExit('Weekly release incomplete; manual intervention required.')
+          PY
