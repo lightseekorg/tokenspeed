@@ -218,6 +218,26 @@ class TestSameRoundGate(unittest.TestCase):
         handler._device.update_weights.assert_called_once_with(req)
         self.assertEqual(len(_replies(handler)), 1)
 
+    def test_disk_update_is_a_gated_load(self):
+        handler = _handler(dp_size=2)
+        req = UpdateWeightFromDiskReqInput(model_path="/m", weight_version="v2")
+        waiting = _DpPeer(head=None)
+        with mock.patch.object(torch.distributed, "all_reduce", waiting.all_reduce):
+            handler.process_requests([req])
+        handler._device.update_weights.assert_not_called()
+        self.assertEqual(list(handler._pending_weight_ops), [req])
+
+        arrived = _DpPeer(head=UpdateWeightFromDiskReqInput)
+        with mock.patch.object(torch.distributed, "all_reduce", arrived.all_reduce):
+            handler.process_requests([])
+
+        handler.clear_cache_fn.assert_called_once_with()
+        handler._device.update_weights.assert_called_once_with(req)
+        handler._device.set_l3_weight_version.assert_called_once_with("v2")
+        (reply,) = _replies(handler)
+        self.assertIsInstance(reply, UpdateWeightFromDiskReqOutput)
+        self.assertTrue(reply.success)
+
     def test_one_op_per_round(self):
         handler = _handler(dp_size=2)
         first, second = _distributed(flush_cache=False, weight_version=None), _mooncake(
@@ -512,26 +532,6 @@ class TestSingleReplicaUnchanged(unittest.TestCase):
         self.assertIsInstance(reply, UpdateWeightsFromTensorReqOutput)
         self.assertFalse(reply.success)
         self.assertIn("not supported on this engine", reply.message)
-
-    def test_disk_update_is_a_gated_load(self):
-        handler = _handler(dp_size=2)
-        req = UpdateWeightFromDiskReqInput(model_path="/m", weight_version="v2")
-        waiting = _DpPeer(head=None)
-        with mock.patch.object(torch.distributed, "all_reduce", waiting.all_reduce):
-            handler.process_requests([req])
-        handler._device.update_weights.assert_not_called()
-        self.assertEqual(list(handler._pending_weight_ops), [req])
-
-        arrived = _DpPeer(head=UpdateWeightFromDiskReqInput)
-        with mock.patch.object(torch.distributed, "all_reduce", arrived.all_reduce):
-            handler.process_requests([])
-
-        handler.clear_cache_fn.assert_called_once_with()
-        handler._device.update_weights.assert_called_once_with(req)
-        handler._device.set_l3_weight_version.assert_called_once_with("v2")
-        (reply,) = _replies(handler)
-        self.assertIsInstance(reply, UpdateWeightFromDiskReqOutput)
-        self.assertTrue(reply.success)
 
 
 class TestMooncakeOp(unittest.TestCase):

@@ -557,10 +557,10 @@ class ModelRunner:
                     consumed += 1
                     yield name, tensor
 
-            # Same session and KV-scale screen as a distributed load.
-            rejected: list[str] = []
+            # Same session as a distributed load. The loader's iterator
+            # already refuses KV-cache scales other than one.
             with weight_update_session([self.model]):
-                self.model.load_weights(record_non_unit_kv_scales(_counted(), rejected))
+                self.model.load_weights(_counted())
             if consumed == 0:
                 return False, (
                     f"no checkpoint tensors found at {model_path!r}; "
@@ -568,12 +568,6 @@ class ModelRunner:
                 )
             if self.device != "cpu":
                 torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
-            if rejected:
-                return False, (
-                    f"loaded {consumed} checkpoint tensors from {model_path}, but "
-                    "the update is rejected and its weight version not advanced: "
-                    f"{non_unit_kv_scale_message(rejected)}"
-                )
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_disk failed")
             return False, str(e)

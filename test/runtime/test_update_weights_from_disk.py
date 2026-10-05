@@ -297,7 +297,8 @@ class TestRealCheckpoint(unittest.TestCase):
         self.assertEqual(runner.model_config.model_path, str(self.root / "step-1"))
 
     def test_non_unit_kv_scale_fails_the_update(self):
-        # Same screen as a distributed load: KV caches run at unit scale.
+        # The startup loader's screen applies to a reload: KV caches run at
+        # unit scale.
         directory = self.root / "scaled"
         directory.mkdir()
         save_file(
