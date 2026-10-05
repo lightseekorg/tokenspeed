@@ -3,6 +3,13 @@ from __future__ import annotations
 import os
 
 import torch
+
+# The package defines its feature names before importing its leaves, so the
+# partially initialized package already carries them here.
+from tokenspeed_kernel.ops.attention.dsa import (
+    CANDIDATE_LENS_CPU_FEATURE,
+    INDEX_K_WORKSPACE_ROWS_FEATURE,
+)
 from tokenspeed_kernel.ops.attention.dsa.cuda import (
     has_ragged_decode_topk,
     ragged_decode_topk,
@@ -48,6 +55,13 @@ def _use_cute_dsl_decode_topk() -> bool:
 # tie-break top-k exists.
 _TOPK_FEATURES = frozenset({"forced_initial_local"}) | (
     frozenset({"batch_invariant"}) if has_deterministic_decode_topk() else frozenset()
+)
+# The prefill leaf sizes its chunk launches from the host mirror of each
+# token's candidate count (``candidate_lens_cpu``) and scores FP8 rows handed
+# to it in workspace-row order (``index_k_fp8`` + ``index_k_scale``), so it
+# declares the features the facade routes those keywords by.
+_PREFILL_TOPK_FEATURES = _TOPK_FEATURES | frozenset(
+    {CANDIDATE_LENS_CPU_FEATURE, INDEX_K_WORKSPACE_ROWS_FEATURE}
 )
 
 
@@ -429,7 +443,7 @@ if platform.is_hopper_plus:
         "dsa_prefill_topk",
         name="deep_gemm_dsa_prefill_topk",
         solution="deep_gemm",
-        features=_TOPK_FEATURES,
+        features=_PREFILL_TOPK_FEATURES,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),

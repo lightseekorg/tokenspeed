@@ -223,9 +223,22 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // consumers additionally require a larger prompt tail (for example, to
     // rebuild request-persistent state that is not stored in the KV cache).
     // Limit the probe itself so excluded hit pages are never claimed: admission
-    // will allocate private writable pages for the replayed suffix.
+    // will allocate private writable pages for the replayed suffix. A request
+    // may tighten the bound further (RequestSpec::max_cached_prefix_tokens) so
+    // the positions it needs logits for are recomputed rather than matched.
+    // A readmission after retraction relaxes it to the positions whose
+    // results had landed before the retraction: their logits exist, so
+    // matching them back (its own snapshot, or anyone's equal pages) loses
+    // nothing. The probe matches the global cache, not the victim's snapshot,
+    // so it may reach no further than that -- a deeper hit on another
+    // request's pages would stand in for logits never produced.
     const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
-    const std::int32_t max_cacheable_tokens = std::max(request->PrefillSize() - replay_tokens, 0);
+    const auto* retracted = request->GetIf<fsm::Retracted>();
+    const std::int32_t request_bound = retracted == nullptr
+                                           ? request->MaxCachedPrefixTokens()
+                                           : std::max(request->MaxCachedPrefixTokens(), retracted->LandedTokens());
+    const std::int32_t max_cacheable_tokens =
+        std::max(std::min(request->PrefillSize() - replay_tokens, request_bound), 0);
     const std::int32_t probe_prefix_pages = max_cacheable_tokens / prefix_granularity;
     const std::int32_t candidate_prefix_pages = std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
     std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);

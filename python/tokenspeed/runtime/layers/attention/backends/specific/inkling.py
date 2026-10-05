@@ -64,9 +64,11 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     reject_bounded_replay,
+    reject_query_shard,
 )
 
 if TYPE_CHECKING:
@@ -490,9 +492,11 @@ class InklingAttnBackend(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ):
         reject_bounded_replay(extend_replay_lens_cpu, "InklingAttentionBackend")
+        reject_query_shard(query_shard, "InklingAttentionBackend")
         if forward_mode.is_mixed():
             raise RuntimeError(
                 "Inkling sconv does not support MIXED batches: the prefill "
@@ -544,6 +548,7 @@ class InklingAttnBackend(AttentionBackend):
             extend_replay_lens_cpu=extend_replay_lens_cpu,
             extend_prompt_lens_cpu=extend_prompt_lens_cpu,
             extend_with_prefix=extend_with_prefix,
+            query_shard=query_shard,
             **kwargs,
         )
 

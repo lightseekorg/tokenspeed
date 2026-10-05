@@ -146,6 +146,9 @@ def _seed_coins(backend, *, bs: int, n: int, seed: int):
 
 def _build_backend(*, max_bs: int, max_n: int, vocab: int, device, group):
     cfg = SamplingBackendConfig(
+        enable_speculative_sampling=False,
+        sampling_stream="batch",
+        logprob_order="torch",
         enable_output_logprobs=False,
         max_bs=max_bs,
         max_draft_tokens_per_req=max_n,
@@ -172,12 +175,14 @@ def _build_processor(
         tp_rank=tp_rank,
         tp_size=tp_size,
         tp_group=tp_group,
+        dp_lm_head_tp=False,
     )
 
 
 def _build_metadata():
     return LogitsMetadata(
         forward_mode=ForwardMode.DECODE,
+        query_shard=None,
         capture_hidden_mode=CaptureHiddenMode.NULL,
     )
 
@@ -264,7 +269,9 @@ def _test_dp_chain_matches_legacy(
     req_pool_indices = torch.arange(bs, dtype=torch.int64, device=device)
 
     legacy_meta = _build_metadata()
-    legacy_logits = processor._get_logits(hidden_states.clone(), lm_head, legacy_meta)
+    legacy_logits = processor._get_logits(
+        hidden_states.clone(), lm_head, legacy_meta, require_full_vocab=False
+    )
     assert legacy_logits.shape == (
         bs * n,
         vocab,
@@ -291,7 +298,7 @@ def _test_dp_chain_matches_legacy(
         num_tokens_per_req=n,
     )
     dp_logits = processor._get_logits(
-        hidden_states.clone(), lm_head, dp_meta, plan=dp_plan
+        hidden_states.clone(), lm_head, dp_meta, plan=dp_plan, require_full_vocab=False
     )
     reqs_per_rank = pad_bs // tp_size
     assert dp_logits.shape == (

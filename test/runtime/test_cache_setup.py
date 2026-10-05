@@ -48,7 +48,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     LINEAR_ATTENTION,
     CacheGroupSpec,
 )
-from tokenspeed.runtime.layers.attention.registry import _prepare_verify_workspace
+from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
 
 register_cuda_ci(
     est_time=10,
@@ -490,7 +490,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         root = Qwen4ExpBackend(
             attn_config, AttentionBackend(attn_config, target_spec), backend, None
         )
-        _prepare_verify_workspace(
+        _prepare_fixed_workspaces(
             server_args=server_args,
             config=attn_config,
             backend=root,

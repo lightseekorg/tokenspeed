@@ -610,6 +610,7 @@ def test_qsa_extend_table_bound_includes_prefix_and_mixed_decode(
         extend_replay_lens_cpu=torch.zeros_like(query_lengths),
         extend_prompt_lens_cpu=seq_lens[: len(queries)],
         extend_with_prefix=any(prefixes),
+        query_shard=None,
     )
     metadata = indexer.forward_extend_metadata
     table = indexer._tables.table(QWEN4_EXP_QSA_CACHE_GROUP, bs)
@@ -661,6 +662,7 @@ def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
         extend_prompt_lens_cpu=torch.tensor([5], dtype=torch.int32)
         + torch.tensor([3], dtype=torch.int32),
         extend_with_prefix=True,
+        query_shard=None,
     )
     extend = indexer.forward_extend_metadata
     indexer.refresh_decode_metadata(

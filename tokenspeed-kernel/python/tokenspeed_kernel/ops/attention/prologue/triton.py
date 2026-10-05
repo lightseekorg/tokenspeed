@@ -453,6 +453,9 @@ def triton_gqa_prologue(
         "kv_convert": BOOLS,
         "rope_style": ROPE_STYLES,
         "sanitize": BOOLS,
+        # The fused kernel writes the cache; the store-less form is the
+        # composite's.
+        "store": frozenset({True}),
     },
 )
 def triton_mla_prologue(

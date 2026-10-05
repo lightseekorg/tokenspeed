@@ -580,6 +580,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner = object.__new__(PrefillGraph)
     # KDA has no CED narrowing; the split encoder/decoder capture stays off.
     owner._narrowing = None
+    owner._expert_load_rows = None
     owner._captures = {
         (8, None): (capture("ordinary"), CapturedForward(torch.ones(8, 4), None)),
         (8, capture_bs): (
@@ -598,7 +599,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner._embed_tokens = lambda ids: torch.zeros(8, 4)
     owner._land_input_embeds = lambda *args: None
     owner._padded_to = lambda *args: nullcontext()
-    owner.config = SimpleNamespace(model_is_mrope=False)
+    owner.config = SimpleNamespace(model_is_mrope=False, world_size=1)
     owner.input_buffers = SimpleNamespace(
         input_ids_buf=torch.ones(8, dtype=torch.int64),
         positions_buf=torch.ones(8, dtype=torch.int64),
@@ -606,8 +607,12 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner.text_model = SimpleNamespace(
         lm_head=None, logits_processor=lambda ids, hidden, *args: hidden
     )
+    # global_num_tokens: replay reads every rank's live rows (None outside DP).
     ctx = SimpleNamespace(
-        input_num_tokens=num_tokens, bs=batch_size, forward_mode=ForwardMode.EXTEND
+        input_num_tokens=num_tokens,
+        bs=batch_size,
+        forward_mode=ForwardMode.EXTEND,
+        global_num_tokens=None,
     )
     with patch(
         "tokenspeed.runtime.execution.prefill_graph.LogitsMetadata.from_forward_context",
@@ -764,7 +769,7 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
 
     events = []
     mode = ForwardMode[mode]
-    ctx = SimpleNamespace(forward_mode=mode, bs=2, input_num_tokens=7)
+    ctx = SimpleNamespace(forward_mode=mode, bs=2, input_num_tokens=7, query_shard=None)
     executor = object.__new__(ModelExecutor)
     executor.config = SimpleNamespace(pp_size=1, data_parallel_size=dp_size)
     executor._active_positions_override = torch.arange(7)

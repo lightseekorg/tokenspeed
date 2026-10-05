@@ -142,6 +142,7 @@ class _KDA:
                 extend_replay_lens_cpu=torch.zeros_like(prefixes),
                 extend_prompt_lens_cpu=torch.tensor([prompt_tokens], dtype=torch.int32),
                 extend_with_prefix=begin > 0,
+                query_shard=None,
             )
         else:
             self.backend.refresh_decode_metadata(

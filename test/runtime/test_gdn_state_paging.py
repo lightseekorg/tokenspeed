@@ -124,6 +124,7 @@ def _extend_kwargs(torch, extend_seq_lens_cpu, extend_prefix_lens_cpu, device):
         extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens_cpu),
         extend_prompt_lens_cpu=extend_prefix_lens_cpu + extend_seq_lens_cpu,
         extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
+        query_shard=None,
     )
 
 

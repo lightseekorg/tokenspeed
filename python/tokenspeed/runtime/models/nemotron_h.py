@@ -183,7 +183,9 @@ class NemotronHNorm(RMSNorm):
             layer_id=layer_index,
             is_moe=False,
             prev_is_moe=False,
+            dense_batch_invariant=False,
             post_attn_layernorm=self,
+            query_sharded=False,
         )
 
     def add_norm(
@@ -634,7 +636,12 @@ class NemotronHMoE(nn.Module):
             config, mapping, quant_config, f"{prefix}.shared_experts"
         )
         self.comm_manager = CommManager(
-            mapping=mapping, layer_id=layer_index, is_moe=True, prev_is_moe=False
+            mapping=mapping,
+            layer_id=layer_index,
+            is_moe=True,
+            prev_is_moe=False,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         self.fc2_reduce_group = _fc2_reduce_group(
             self.fc2_latent_proj, config.mlp_bias, mapping

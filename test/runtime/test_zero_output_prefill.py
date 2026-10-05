@@ -81,6 +81,7 @@ class Output:
     next_token_logprobs: torch.Tensor | None = None
     hidden_states: torch.Tensor | None = None
     logits_layout_plan: object = None
+    input_token_logprobs: torch.Tensor | None = None
 
 
 class SharedBufferSampler:
@@ -360,12 +361,14 @@ def test_zero_rows_return_before_lm_head_and_retain_empty_taps():
     )
     metadata = SimpleNamespace(
         logits_rows_selected=True,
-        extend_return_logprob=False,
+        input_logprob_rows=None,
         capture_hidden_mode=SimpleNamespace(need_capture=lambda: True),
     )
     # No LM-head method exists on this object; reaching it fails the test.
+    # (A replicated head: LM-head TP peers under attention DP would still
+    # join the row exchange with no rows.)
     output = forward(
-        SimpleNamespace(config=SimpleNamespace(vocab_size=32)),
+        SimpleNamespace(config=SimpleNamespace(vocab_size=32), dp_lm_head_tp=False),
         torch.arange(4),
         torch.empty(0, 8),
         None,
@@ -385,7 +388,7 @@ def test_selected_logits_do_not_gather_original_input_indices():
     )
     metadata = SimpleNamespace(
         logits_rows_selected=True,
-        extend_return_logprob=False,
+        input_logprob_rows=None,
         gather_ids=torch.tensor([127, 255, 256]),
         capture_hidden_mode=SimpleNamespace(need_capture=lambda: False),
     )
@@ -705,6 +708,7 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
         "ForwardMode": SimpleNamespace(MIXED=object()),
         "V41_GROUP_GEOMETRY": {},
         "V41_SWA_GROUP_ID": "swa",
+        "reject_query_shard": lambda plan, name: None,
     }
     for name in (
         "V41PrefillSpan",
@@ -753,6 +757,7 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
         extend_replay_lens_cpu=torch.tensor(replays),
         extend_prompt_lens_cpu=torch.tensor(targets),
         extend_with_prefix=any(prefixes),
+        query_shard=None,
     )
     layout = ForwardOutputLayout.from_prefill(
         prefix_lengths=prefixes,
@@ -877,6 +882,7 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         _prepare_decode_metadata=lambda *args, **kwargs: None,
         _cuda_graph_key=lambda bs: bs,
         _graph_debug=False,
+        _expert_load_rows=None,
         device="cuda",
         max_tokens_per_req=width,
         drafter=None,
@@ -892,11 +898,16 @@ def test_graph_padding_restores_live_output_layout(live_bs):
             )
         },
         output_buffers={
-            padded_bs: (torch.arange(padded_bs * width), torch.ones(padded_bs), None)
+            padded_bs: (
+                torch.arange(padded_bs * width),
+                torch.ones(padded_bs),
+                None,
+                None,
+            )
         },
     )
     empty = torch.empty(0, dtype=torch.int32)
-    tokens, lengths, _ = run(
+    tokens, lengths, _, _ = run(
         runner,
         live_bs,
         ctx,
@@ -908,6 +919,7 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         extend_seq_lens_cpu=empty,
         extend_replay_lens_cpu=empty,
         extend_prompt_lens_cpu=empty,
+        block_tables_cpu={},
     )
     assert observed == [(padded_bs, ForwardOutputLayout(0, 0, padded_bs, width))]
     assert ctx.bs == live_bs

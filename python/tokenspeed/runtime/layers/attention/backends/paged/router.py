@@ -72,8 +72,12 @@ from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
     from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
         TreeVerifyInputs,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        HistoryGatherWorkspace,
     )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -279,6 +283,28 @@ class CacheGroupRouter(AttentionBackend):
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         for leaf in self.leaves.values():
             leaf.init_prefill_graph_state(max_num_tokens, max_bs)
+
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        return sum(
+            leaf.preallocate_history_gather_workspace(max_model_len)
+            for leaf in self.leaves.values()
+        )
+
+    def history_gather_workspace(self) -> HistoryGatherWorkspace | None:
+        workspaces = [
+            workspace
+            for leaf in self.leaves.values()
+            if (workspace := leaf.history_gather_workspace()) is not None
+        ]
+        if len(workspaces) > 1:
+            raise RuntimeError(
+                "CacheGroupRouter holds more than one history gather workspace"
+            )
+        return workspaces[0] if workspaces else None
+
+    def adopt_history_gather_workspace(self, workspace: HistoryGatherWorkspace) -> None:
+        for leaf in self.leaves.values():
+            leaf.adopt_history_gather_workspace(workspace)
 
     def register_step_counter(self, step_counter) -> None:
         # The MLA leaves record the PD layerwise step inside their chunked
@@ -569,6 +595,8 @@ class CacheGroupRouter(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        block_tables_cpu: Mapping[str, torch.Tensor],
         **kwargs,
     ) -> None:
         """Extend / mixed / idle-warmup metadata for every leaf.
@@ -578,11 +606,18 @@ class CacheGroupRouter(AttentionBackend):
         window), then hands every leaf its ``[bs, max_num_pages]`` kernel page
         table. ``extend_with_prefix`` (some extend request continues a cached
         or chunked prefix) travels with the extend lengths: leaves size their
-        paged-prefix metadata by it, so it must reach them unchanged.
+        paged-prefix metadata by it, so it must reach them unchanged. A
+        ``query_shard`` reaches every leaf too, with the host mirror of the
+        extend rows of its kernel page table (``block_tables_cpu``, the
+        runner's host mirror of ``block_tables``, expanded the way the stack
+        expands the device tables), so a leaf that gathers history by page
+        owner can split the gather without a device sync; an unsharded
+        forward reads nothing from the mirror.
         """
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
         del kwargs
+        sharded = query_shard is not None and query_shard.size > 1
         # A new forward: the sparse layers' shared top-k is per forward.
         self.sparse_topk.clear()
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
@@ -619,6 +654,12 @@ class CacheGroupRouter(AttentionBackend):
                 extend_prefix_lens=extend_prefix_lens,
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_with_prefix=extend_with_prefix,
+                query_shard=query_shard,
+                page_table_cpu=(
+                    self.stacks.host_table(gid, block_tables_cpu[gid], num_extends)
+                    if sharded
+                    else None
+                ),
             )
             leaf.set_request_slots(req_pool_indices[:bs])
 
@@ -809,9 +850,11 @@ class CacheGroupRouter(AttentionBackend):
     def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
         """Vanilla MTP re-anchor: seq_lens become the committed frontier,
         in-graph. Seq-lens-only like :meth:`advance_draft_forward_metadata`;
-        the drafter publishes its k-window explicitly."""
+        the drafter publishes its k-window explicitly. Each leaf's own hook
+        decides whether the k-row window needs more than the seq_lens edit
+        (the leaf default is that edit; DSA re-expands its per-token rows)."""
         for leaf in self.leaves.values():
-            leaf.advance_draft_forward_metadata(frontier)
+            leaf.update_draft_forward_metadata(frontier)
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         for leaf in self.leaves.values():
@@ -984,6 +1027,23 @@ class CacheGroupRouter(AttentionBackend):
     def forward_sparse_prefill(self, *args, **kwargs):
         return self._sole_leaf("forward_sparse_prefill").forward_sparse_prefill(
             *args, **kwargs
+        )
+
+    # ------------------------------------------------------------------
+    # DSA query-shard surface: a sparse-attention model's own top-k over KVP
+    # pages reads the sharded extend's request groups and gathers each
+    # group's index-K history through the leaf (``docs/design/unified_path.md``,
+    # "Query context parallelism").
+    # ------------------------------------------------------------------
+
+    def require_query_shard_metadata(self):
+        return self._sole_leaf(
+            "require_query_shard_metadata"
+        ).require_query_shard_metadata()
+
+    def gather_history_index_k(self, layer_id: int, token_to_kv_pool, group):
+        return self._sole_leaf("gather_history_index_k").gather_history_index_k(
+            layer_id, token_to_kv_pool, group
         )
 
     # ------------------------------------------------------------------

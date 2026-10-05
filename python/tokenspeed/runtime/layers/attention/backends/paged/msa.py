@@ -38,8 +38,10 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     current_forward_ctx,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
+    reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
@@ -162,8 +164,12 @@ class MSAAttnBackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
         **kwargs,
     ):
+        reject_query_shard(query_shard, "MSAAttnBackend")
+        del page_table_cpu
         assert not forward_mode.is_mixed(), "MSA backend does not support mixed batch"
         if not forward_mode.is_extend_or_mixed():
             raise RuntimeError(

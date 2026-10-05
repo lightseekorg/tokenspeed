@@ -132,10 +132,19 @@ class CommBackend(ABC):
 
     @abstractmethod
     def all_to_all_single(
-        self, output: torch.Tensor, input: torch.Tensor, group: Group
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: Group,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
     ) -> None:
-        """Even-split all_to_all. output and input must have same numel
-        divisible by len(group).
+        """All-to-all along dim 0 into a pre-allocated output buffer.
+
+        Without split sizes both tensors split evenly into ``len(group)``
+        chunks. With them, ``input_split_sizes[i]`` rows go to the group's
+        ``i``-th rank and ``output_split_sizes[i]`` rows arrive from it (a
+        zero-row chunk is allowed); the sizes must sum to the tensors' rows.
         """
         ...
 

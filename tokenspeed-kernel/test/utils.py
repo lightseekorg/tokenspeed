@@ -107,6 +107,15 @@ def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
         )
 
 
+def compiled_kernels(kernel: Any) -> list[Any]:
+    """Every binary this process has compiled for a Triton ``kernel``, from its JIT cache."""
+    return [
+        binary
+        for cache in kernel.device_caches.values()
+        for binary in cache[0].values()
+    ]
+
+
 def int_specialization_class(value: int) -> str:
     """The class Triton specializes a runtime integer on."""
     return "one" if value == 1 else "div16" if value % 16 == 0 else "other"

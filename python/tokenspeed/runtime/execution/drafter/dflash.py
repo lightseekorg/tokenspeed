@@ -47,7 +47,7 @@ from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsMetadata,
-    _force_deterministic_rsag,
+    _dist_argmax_vetoed,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -168,7 +168,6 @@ class DFlash(BaseDrafter):
         # Legacy alias: callers that predate the verify/draft split.
         self.block_size = self.verify_width
         self.hidden_size = int(getattr(cfg, "hidden_size"))
-        self.idle_forward_steps = 1
         self._init_native_buffers()
         self._validate_draft_attention_window()
         self._greedy_gathered_max: torch.Tensor | None = None
@@ -176,6 +175,14 @@ class DFlash(BaseDrafter):
         self._greedy_gather_cap = 0
         self._init_fused_kv_helper()
         self._init_incremental_proj()
+
+    @override
+    def idle_forward_global_num_tokens(
+        self, global_num_tokens: list[int], global_bs: list[int]
+    ) -> list[list[int]]:
+        # Block drafter: one draft forward proposes the whole block.
+        del global_bs
+        return [global_num_tokens]
 
     def _validate_draft_attention_window(self) -> None:
         """Reject a drafter backend that would drop the draft's window.
@@ -284,7 +291,7 @@ class DFlash(BaseDrafter):
         shard = int(head.shard_indices.num_org_elements)
         tp_size = int(self.logits_processor.tp_size)
         if (
-            _force_deterministic_rsag()
+            _dist_argmax_vetoed()
             or not 2 <= tp_size <= 32
             or int(head.num_embeddings) != int(head.org_vocab_size)
             or shard * tp_size != int(head.org_vocab_size)
@@ -382,9 +389,10 @@ class DFlash(BaseDrafter):
         if not hasattr(self.lm_head, "weight") or not hasattr(
             self.lm_head, "shard_indices"
         ):
-            metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+            # Replicated draft rows: no query shard.
+            metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
             logits = self.logits_processor._get_logits(
-                hidden_states, self.lm_head, metadata
+                hidden_states, self.lm_head, metadata, require_full_vocab=False
             )
             if bias_fn is not None:
                 logits = logits + bias_fn(0, int(logits.shape[-1])).to(logits.dtype)
@@ -795,6 +803,10 @@ class DFlash(BaseDrafter):
                 return decline("the latent down-projection is quantized")
             if getattr(attn, "rotary_emb", None) is not rotary:
                 return decline("the draft's layers do not share one RoPE table")
+            if attn.kv_lora_scale is not None:
+                # The fused write norms the latent but applies no runtime
+                # scale (--mla-lora-scale runtime); the per-layer path does.
+                return decline("the latent carries a runtime LoRA norm scale")
             start = int(attn.q_lora_rank)
             weight_rows.append(weight[start : start + kv_width])
             norm_rows.append(attn.kv_a_layernorm.weight)

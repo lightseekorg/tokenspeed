@@ -49,6 +49,7 @@ from tokenspeed.runtime.utils.common import ceil_div
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
     from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
         TreeDraftInputs,
         TreeVerifyInputs,
@@ -56,6 +57,9 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        HistoryGatherWorkspace,
     )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
@@ -257,6 +261,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
         **kwargs,
     ) -> None:
         """Build extend/mixed (or idle warmup) metadata.
@@ -275,6 +281,17 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
             extend_with_prefix: Whether any extend request continues a cached or
                 chunked prefix (some ``extend_prefix_lens`` entry is non-zero);
                 leaves that size ragged-vs-paged prefill metadata read it.
+            query_shard: The rows of the extend span this rank computes under
+                query context parallelism, or ``None`` when every rank computes
+                every row. Every length above describes the whole span; a leaf
+                without a gathered-history extend arm calls
+                :func:`reject_query_shard`.
+            page_table_cpu: Host mirror of ``page_table``'s extend rows
+                (``[num_extends, cols]`` int32 kernel pages, unpadded) when the
+                forward is sharded, else ``None``. The only host-side table a
+                leaf sees: the sharded extend arm counts how many history rows
+                each page owner holds from it, so the gather's per-rank split
+                never waits on the device.
         """
 
     @abstractmethod
@@ -317,12 +334,35 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         refreshes. Override only for a kernel-imposed capture asymmetry."""
         self.refresh_decode_metadata(bs, 0, seq_lens, page_table, for_graph_replay=True)
 
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        """A leaf without the sharded extend arm reserves nothing; the router
+        sums its leaves and the registry checks the total against the plan."""
+        del max_model_len
+        return 0
+
+    def adopt_history_gather_workspace(self, workspace: HistoryGatherWorkspace) -> None:
+        """A leaf without the sharded extend arm has nothing to gather into."""
+        del workspace
+
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """Publish a drafter's in-graph seq_lens edits into this leaf's own
         cache-seqlens buffer (one token per request per step)."""
         buf = self.decode_seq_lens_buffer
         bs = seq_lens.shape[0]
         buf[:bs].copy_(seq_lens[:bs])
+
+    def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
+        """Publish a multi-depth MTP drafter's re-anchored window: every depth
+        re-runs ``spec_num_tokens`` rows per request ending at ``frontier``
+        (``[bs]`` committed lengths), in-graph.
+
+        The decode kernels derive each row's causal bound from the request's
+        single cache length, so for most leaves this is the same seq_lens
+        edit as :meth:`advance_draft_forward_metadata`. A leaf holding
+        per-row decode metadata (DSA's per-token indexer rows) re-expands it
+        to the k-row shape here instead.
+        """
+        self.advance_draft_forward_metadata(frontier)
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """DFLASH: broadcast each request's block-end length to its

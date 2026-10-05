@@ -172,6 +172,7 @@ class DataParallelController:
         self.max_num_seqs = None
         self.chunked_prefill_size = None
         self.max_model_len = None
+        self.supports_prompt_logprobs = None
         self.server_args = server_args
         self.port_args = port_args
         self.load_balance_method = LoadBalanceMethod.from_str(
@@ -394,6 +395,7 @@ class DataParallelController:
             "multimodal_encoder_dtype"
         )
         self.cache_storage = scheduler_info[0]["cache_storage"]
+        self.supports_prompt_logprobs = scheduler_info[0]["supports_prompt_logprobs"]
 
     def dispatch_generate_request(self, req):
         """Route one tokenized request, honoring an attention-DP hard pin.
@@ -480,6 +482,7 @@ def run_data_parallel_controller_process(
                 "max_model_len": controller.max_model_len,
                 "multimodal_encoder_dtype": controller.multimodal_encoder_dtype,
                 "cache_storage": controller.cache_storage,
+                "supports_prompt_logprobs": controller.supports_prompt_logprobs,
             }
         )
         if server_args.node_rank == 0:

@@ -138,6 +138,28 @@ def test_strided_input(nq, nv, hq, hv, T):
         assert torch.equal(got, ref)
 
 
+def test_column_slice_past_int32_offsets_is_copied_first():
+    """Rows whose strided span passes int32 offsets split exactly, via a copy."""
+    nq, nk, nv, hq, hk, hv = 2, 2, 4, 32, 32, 24
+    width = nq * hq + nk * hk + nv * hv
+    # Each row offset fits int32; the last row's (row index times stride) does not.
+    rows, row_stride = 2049, 2**20
+    storage = torch.zeros(
+        (rows - 1) * row_stride + width, dtype=torch.bfloat16, device="cuda"
+    )
+    strided = storage.as_strided((rows, width), (row_stride, 1))
+    strided.copy_(torch.randn(rows, width, dtype=torch.bfloat16, device="cuda"))
+
+    q_ref, k_ref, v_ref = _ref_split(strided.contiguous(), nq, nk, nv, hq, hk, hv)
+    q, k, v = fused_qkv_split_gdn_prefill(
+        strided, nq, nk, nv, hq, hk, hv, fuse_l2norm=False
+    )
+
+    assert torch.equal(q, q_ref)
+    assert torch.equal(k, k_ref)
+    assert torch.equal(v, v_ref)
+
+
 @pytest.mark.parametrize("fuse_l2norm", [False, True])
 def test_split_packs_replay_payload(fuse_l2norm):
     """The split launch also stores raw K/V and both replay gate inputs."""

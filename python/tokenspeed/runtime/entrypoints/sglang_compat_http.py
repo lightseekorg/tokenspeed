@@ -45,11 +45,14 @@ from tokenspeed.runtime.cache.l3.backend import (
 from tokenspeed.runtime.engine.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqInput,
+    RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromMooncakeReqInput,
     UpdateWeightsFromTensorReqInput,
+    mooncake_load_weight_version,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -195,6 +198,74 @@ async def update_weights_from_distributed(request: Request) -> JSONResponse:
         success, message = await llm.update_weights_from_distributed(obj)
         if success:
             message = _stamp_weight_version(request, obj.weight_version, message)
+        return {"success": success, "message": message}
+
+    return await _guarded(_do)
+
+
+@router.post("/update_weights_from_mooncake")
+async def update_weights_from_mooncake(request: Request) -> JSONResponse:
+    """Load one committed Model Updater SDK version on every worker.
+
+    Body: ``{"version": int, "flush_cache": bool = true,
+    "weight_version": str | null}``. The ``flush_cache`` wire default mirrors
+    the reference engine's (FluentLLM's) API so its trainer clients work
+    unchanged; the request object itself carries every field explicitly. A
+    flushed load publishes ``weight_version`` (default ``str(version)``,
+    see ``mooncake_load_weight_version``); an unflushed load keeps the current
+    namespace unless one is given, and with L3 storage a new
+    ``weight_version`` requires ``flush_cache``.
+    """
+    body = await request.json()
+
+    async def _do() -> dict[str, Any]:
+        version = body.get("version")
+        if version is None:
+            raise ValueError("Missing 'version' in request body")
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ValueError("'version' must be an integer")
+        flush_cache = bool(body.get("flush_cache", True))
+        llm = _llm(request)
+        requested_version = body.get("weight_version")
+        weight_version = resolve_l3_weight_version(
+            llm.server_args.weight_version,
+            mooncake_load_weight_version(
+                version=version,
+                flush_cache=flush_cache,
+                weight_version=(
+                    None if requested_version is None else str(requested_version)
+                ),
+            ),
+            flush_cache=flush_cache,
+            storage_backend=getattr(llm.server_args, "kvstore_storage_backend", None),
+        )
+        obj = UpdateWeightsFromMooncakeReqInput(
+            version=version,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
+        success, message = await llm.update_weights_from_mooncake(obj)
+        if success:
+            message = _stamp_weight_version(request, obj.weight_version, message)
+        return {"success": success, "message": message}
+
+    return await _guarded(_do)
+
+
+@router.post("/rebalance_experts")
+async def rebalance_experts(request: Request) -> JSONResponse:
+    """Start one online expert rebalance now (``--enable-eplb``).
+
+    No body. The reply arrives once every worker took its load snapshot; the
+    weight moves follow over the next scheduling rounds. Fails while a
+    rebalance is already in progress or the server runs without
+    ``--enable-eplb``.
+    """
+
+    async def _do() -> dict[str, Any]:
+        success, message = await _llm(request).rebalance_experts(
+            RebalanceExpertsReqInput()
+        )
         return {"success": success, "message": message}
 
     return await _guarded(_do)

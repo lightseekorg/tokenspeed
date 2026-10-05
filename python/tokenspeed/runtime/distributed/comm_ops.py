@@ -286,11 +286,143 @@ def all_to_all_single(
     input: torch.Tensor,
     group: Group,
     backend: CommBackend | None = None,
+    output_split_sizes: list[int] | None = None,
+    input_split_sizes: list[int] | None = None,
 ) -> None:
-    """Even-split all_to_all into a pre-allocated output buffer."""
+    """All-to-all along dim 0 into a pre-allocated output buffer.
+
+    Without split sizes the exchange is even; see
+    ``CommBackend.all_to_all_single`` for the uneven form.
+    """
     if backend is None:
         backend = get_global_backend()
-    backend.all_to_all_single(output, input, group)
+    backend.all_to_all_single(
+        output,
+        input,
+        group,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=input_split_sizes,
+    )
+
+
+def _check_split_sizes(split_sizes: list[int], group: Group, rows: int) -> None:
+    if len(split_sizes) != len(group):
+        raise ValueError(
+            f"expected one row count per rank of a {len(group)}-rank group, got "
+            f"{len(split_sizes)}"
+        )
+    if any(count < 0 for count in split_sizes):
+        raise ValueError(f"row counts must be non-negative, got {split_sizes}")
+    if sum(split_sizes) != rows:
+        raise ValueError(
+            f"row counts {split_sizes} sum to {sum(split_sizes)}, but the tensor "
+            f"has {rows} rows"
+        )
+
+
+def all_to_all_transpose(
+    x: torch.Tensor,
+    group: Group,
+    input_split_sizes: list[int],
+    backend: CommBackend | None = None,
+) -> torch.Tensor:
+    """Exchange token shards for feature shards across ``group``.
+
+    ``x`` is ``[T_full, F_local]``: this rank's feature shard of every rank's
+    tokens, rows rank-major (``input_split_sizes[i]`` rows belong to the
+    group's ``i``-th rank). The result is ``[T_own, W * F_local]``: this
+    rank's own tokens with the feature shards of all ``W`` ranks concatenated
+    in rank order. Pure data movement, so the bytes do not depend on the row
+    counts. A rank may own zero rows.
+
+    This is the tail of a column-parallel GEMM on hidden (TP batch
+    invariance), the logits transpose of a vocab-sharded LM head under
+    attention DP, and the heads-to-tokens leg of head-sharded attention.
+    """
+    if x.dim() != 2:
+        raise ValueError(f"all_to_all_transpose takes a 2-D tensor, got {x.dim()}-D")
+    world_size = len(group)
+    _check_split_sizes(input_split_sizes, group, x.shape[0])
+    if world_size == 1:
+        return x
+    rows = input_split_sizes[group.index(torch.distributed.get_rank())]
+    width = x.shape[1]
+    if x.shape[0] == 0:
+        # Nothing to move for the whole group (every rank reads the same
+        # counts, so every rank skips the collective together).
+        return x.new_empty(0, world_size * width)
+    received = x.new_empty(world_size * rows, width)
+    all_to_all_single(
+        received,
+        x.contiguous(),
+        group,
+        backend=backend,
+        output_split_sizes=[rows] * world_size,
+        input_split_sizes=input_split_sizes,
+    )
+    # Received chunk i is rank i's feature shard of my rows.
+    return (
+        received.view(world_size, rows, width)
+        .transpose(0, 1)
+        .reshape(rows, world_size * width)
+    )
+
+
+def all_to_all_head_scatter(
+    x: torch.Tensor,
+    group: Group,
+    output_split_sizes: list[int],
+    backend: CommBackend | None = None,
+) -> torch.Tensor:
+    """Inverse of ``all_to_all_transpose`` for per-head activations.
+
+    ``x`` is ``[T_own, W * H_local, D]``: this rank's own tokens with every
+    rank's head block in rank order. The result is ``[T_full, H_local, D]``:
+    this rank's head block of every rank's tokens, rows rank-major
+    (``output_split_sizes[i]`` rows from the group's ``i``-th rank). Pure data
+    movement; a rank may own zero rows.
+    """
+    if x.dim() != 3:
+        raise ValueError(
+            f"all_to_all_head_scatter takes a [tokens, heads, dim] tensor, got "
+            f"{x.dim()}-D"
+        )
+    world_size = len(group)
+    if x.shape[1] % world_size:
+        raise ValueError(
+            f"{x.shape[1]} heads do not split over {world_size} ranks evenly"
+        )
+    rows_full = sum(output_split_sizes)
+    _check_split_sizes(output_split_sizes, group, rows_full)
+    if world_size == 1:
+        return x
+    rows_own, heads, dim = x.shape
+    heads_local = heads // world_size
+    if output_split_sizes[group.index(torch.distributed.get_rank())] != rows_own:
+        raise ValueError(
+            f"this rank owns {rows_own} rows but the row counts "
+            f"{output_split_sizes} give it "
+            f"{output_split_sizes[group.index(torch.distributed.get_rank())]}"
+        )
+    if rows_full == 0:
+        # Nothing to move for the whole group; every rank skips together.
+        return x.new_empty(0, heads_local, dim)
+    # Head block i (destined for rank i) becomes send chunk i.
+    sent = (
+        x.view(rows_own, world_size, heads_local * dim)
+        .transpose(0, 1)
+        .reshape(world_size * rows_own, heads_local * dim)
+    )
+    received = x.new_empty(rows_full, heads_local * dim)
+    all_to_all_single(
+        received,
+        sent,
+        group,
+        backend=backend,
+        output_split_sizes=output_split_sizes,
+        input_split_sizes=[rows_own] * world_size,
+    )
+    return received.view(rows_full, heads_local, dim)
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +540,11 @@ def fused_all_gather(
 # Token-aware ops (uneven token distribution via TritonRSAG)
 # ---------------------------------------------------------------------------
 
+# The wire alignment of a byte-preserving row gather: the low-latency
+# all-gather moves 16-byte vectors, so every rank's payload must be a
+# multiple of it whatever its row count.
+_ROW_GATHER_ALIGN_BYTES = 16
+
 
 def token_all_gather(
     tensor: torch.Tensor,
@@ -424,6 +561,53 @@ def token_all_gather(
     if backend is None:
         backend = get_global_backend()
     return backend.token_all_gather(tensor, group, scattered_num_tokens)
+
+
+def token_all_gather_rows(
+    rows: torch.Tensor,
+    group: Group,
+    scattered_num_tokens: list[int],
+    backend=None,
+) -> torch.Tensor:
+    """Token-aware all-gather of 2-D rows of any dtype, byte-preserving.
+
+    :func:`token_all_gather` moves bf16 rows (its low-latency solution
+    asserts the dtype); pure data movement -- gathered cache rows, packed
+    index-K bytes, fp32 scales, token ids -- has no dtype of its own, so
+    non-bf16 rows travel as bf16 pairs of their bytes and come back viewed
+    as the input dtype. The row byte width must be even. A row is padded
+    to a multiple of ``_ROW_GATHER_ALIGN_BYTES`` on the wire: the
+    low-latency solution moves 16-byte vectors and the row counts are the
+    caller's (a query shard, a page owner's rows), so a narrow row -- one
+    int64 token id is 8 bytes -- would only align for even counts.
+
+    Args:
+        rows: ``[local_rows, width]`` this rank's rows.
+        group: The gather group.
+        scattered_num_tokens: Rows every rank of the group contributes.
+
+    Returns:
+        ``[sum(scattered_num_tokens), width]`` rows in rank order, ``rows``'
+        dtype.
+    """
+    if rows.dim() != 2:
+        raise ValueError(f"token_all_gather_rows takes 2-D rows, got {rows.dim()}-D")
+    row_bytes = rows.shape[1] * rows.element_size()
+    pad_bytes = -row_bytes % _ROW_GATHER_ALIGN_BYTES
+    if rows.dtype == torch.bfloat16 and pad_bytes == 0:
+        return token_all_gather(rows.contiguous(), group, scattered_num_tokens, backend)
+    if row_bytes % 2:
+        raise ValueError(
+            f"rows of {row_bytes} bytes cannot travel as bf16 pairs; pad the row "
+            "to an even byte width"
+        )
+    payload = rows.contiguous().view(torch.uint8).view(torch.bfloat16)
+    if pad_bytes:
+        payload = torch.nn.functional.pad(payload, (0, pad_bytes // 2))
+    gathered = token_all_gather(payload, group, scattered_num_tokens, backend)
+    if pad_bytes:
+        gathered = gathered[:, : row_bytes // 2].contiguous()
+    return gathered.view(torch.uint8).view(rows.dtype)
 
 
 def token_reduce_scatter(

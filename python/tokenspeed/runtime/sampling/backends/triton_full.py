@@ -449,11 +449,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             sampling_info.req_pool_indices, logits.shape[0]
         )
         logits = self._apply_penalties_and_bias(logits, req_pool_indices)
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         sampled = self._gumbel_sample_full_logits(
             logits,
             req_pool_indices,
@@ -525,11 +521,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             num_tokens_per_req=num_tokens_per_req,
         )
 
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         target_sampled = self._gumbel_sample_full_logits(
             logits,
             req_pool_indices,

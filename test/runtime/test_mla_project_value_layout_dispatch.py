@@ -104,6 +104,9 @@ def test_weight_layout_matches_what_the_kernel_wants():
     class _Attn:
         qk_nope_head_dim = 128
         v_head_dim = 128
+        # First build: nothing to copy into (see bind_or_copy).
+        w_kc = None
+        w_vc = None
 
     heads, latent = 16, 512
     w = torch.randn(

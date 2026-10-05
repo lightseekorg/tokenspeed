@@ -20,14 +20,20 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
+from tokenspeed.runtime.layers.utils import get_layer_id
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,16 @@ class CheckpointPlanEntry:
 @dataclass(frozen=True)
 class ExpertWeightPlanEntry(CheckpointPlanEntry):
     local_expert_id: int
+    # The decoder layer this entry serves, or None when every layer shares it
+    # (contiguous ownership). An expert placement assigns slots per layer.
+    # Explicit at every construction: which of the two it is selects how the
+    # entry matches checkpoint names.
+    layer_id: int | None
+
+    def matches(self, checkpoint_name: str) -> bool:
+        return super().matches(checkpoint_name) and (
+            self.layer_id is None or get_layer_id(checkpoint_name) == self.layer_id
+        )
 
 
 @dataclass(frozen=True)
@@ -89,8 +105,8 @@ def _build_default_expert_plan(
     ep_rank: int,
     ep_size: int,
 ) -> list[ExpertWeightPlanEntry]:
-    # Expert ownership is assumed to be a contiguous per-rank range here.
-    # EPLB-aware remapping would need a different planning step.
+    # Contiguous ownership: rank r holds logical experts [r*n, (r+1)*n) of
+    # every layer. ``_build_placed_expert_plan`` is the placement-aware twin.
     num_local_experts = _ep_partition(num_experts, ep_rank, ep_size)
     start_expert = num_local_experts * ep_rank
     expert_plan: list[ExpertWeightPlanEntry] = []
@@ -104,9 +120,44 @@ def _build_default_expert_plan(
                 ),
                 shard_id=shard_id,
                 local_expert_id=local_expert_id,
+                # Contiguous ownership: the same slot serves every layer.
+                layer_id=None,
             )
             for param_name, semantic, shard_id in _expert_shards(schema)
         )
+    return expert_plan
+
+
+def _build_placed_expert_plan(
+    schema: ExpertCheckpointSchema,
+    *,
+    expert_placement: ExpertLocationMetadata,
+    ep_rank: int,
+) -> list[ExpertWeightPlanEntry]:
+    """Plan one entry per (layer, local slot, projection) from the placement.
+
+    Slot ``s`` of this rank in layer ``L`` holds logical expert
+    ``physical_to_logical_map_cpu[L, ep_rank * n + s]``; a logical expert
+    with several local replicas yields one entry per slot, all matching the
+    same checkpoint tensor.
+    """
+    expert_plan: list[ExpertWeightPlanEntry] = []
+    for layer_id in range(expert_placement.num_layers):
+        for local_expert_id, expert_id in enumerate(
+            expert_placement.local_slot_logical_experts(layer_id, ep_rank)
+        ):
+            expert_plan.extend(
+                ExpertWeightPlanEntry(
+                    param_name=param_name,
+                    checkpoint_weight_name=schema.make_expert_weight_name(
+                        expert_id, semantic
+                    ),
+                    shard_id=shard_id,
+                    local_expert_id=local_expert_id,
+                    layer_id=layer_id,
+                )
+                for param_name, semantic, shard_id in _expert_shards(schema)
+            )
     return expert_plan
 
 
@@ -228,23 +279,53 @@ def _build_default_fused_plan(
     return fused_plan
 
 
+def _local_slot_experts(
+    *,
+    num_experts: int,
+    ep_rank: int,
+    ep_size: int,
+    expert_placement: ExpertLocationMetadata | None,
+    layer_id: int | None,
+) -> list[int]:
+    """The logical expert held by each of this rank's slots, in slot order."""
+    if expert_placement is None:
+        num_local_experts = _ep_partition(num_experts, ep_rank, ep_size)
+        start_expert = num_local_experts * ep_rank
+        return list(range(start_expert, start_expert + num_local_experts))
+    if layer_id is None:
+        raise MoECheckpointLoadError(
+            "an expert placement assigns slots per layer, but the checkpoint "
+            "tensor name carries no 'layers.<n>.' index"
+        )
+    return expert_placement.local_slot_logical_experts(layer_id, ep_rank)
+
+
+def _select_local_experts(
+    stacked: torch.Tensor, slot_experts: list[int]
+) -> torch.Tensor:
+    """Rows of a ``[logical experts, ...]`` tensor for this rank's slots.
+
+    A contiguous ascending range slices (a view, no copy); anything else --
+    a placement replicating or reordering experts -- gathers.
+    """
+    if not slot_experts:
+        return stacked[0:0]
+    first = slot_experts[0]
+    if slot_experts == list(range(first, first + len(slot_experts))):
+        return stacked[first : first + len(slot_experts)]
+    return stacked[slot_experts]
+
+
 def _load_fused_expert_tensor(
     param,
     loaded_weight,
     *,
     shard_id: str,
-    num_experts: int,
-    ep_rank: int,
-    ep_size: int,
+    slot_experts: list[int],
 ) -> None:
-    # Expert ownership is assumed to be a contiguous per-rank range here.
-    # EPLB-aware remapping would need a different loading step.
-    num_local_experts = _ep_partition(num_experts, ep_rank, ep_size)
-    start_expert = num_local_experts * ep_rank
-    end_expert = start_expert + num_local_experts
+    """Load ``loaded_weight[expert]`` into every local slot, from a fused tensor."""
     weight_loader = param.weight_loader
-    for expert_id in range(start_expert, end_expert):
-        local_expert_id = expert_id - start_expert
+    for local_expert_id, expert_id in enumerate(slot_experts):
         weight_loader(
             param,
             loaded_weight[expert_id],
@@ -266,6 +347,7 @@ class MoECheckpointLoader:
         ep_size: int = 1,
         fused_load_style: str = "per_expert",
         transpose_local_tensor_non_bias: bool = False,
+        expert_placement: ExpertLocationMetadata | None = None,
     ) -> None:
         self._params_dict = params_dict
         self._expert_plan = tuple(expert_plan)
@@ -276,6 +358,17 @@ class MoECheckpointLoader:
         self._ep_size = ep_size
         self._fused_load_style = fused_load_style
         self._transpose_local_tensor_non_bias = transpose_local_tensor_non_bias
+        # None: contiguous ownership. A placement assigns this rank's slots
+        # per layer, and a logical expert may fill several of them.
+        self._expert_placement = expert_placement
+        # Entries by the layer they serve (None: every layer), so a name is
+        # matched against its own layer's slots rather than every layer's.
+        by_layer: dict[int | None, list[ExpertWeightPlanEntry]] = defaultdict(list)
+        for plan_entry in self._expert_plan:
+            by_layer[plan_entry.layer_id].append(plan_entry)
+        self._expert_plan_by_layer: dict[
+            int | None, tuple[ExpertWeightPlanEntry, ...]
+        ] = {layer_id: tuple(entries) for layer_id, entries in by_layer.items()}
 
         if self._fused_plan and self._num_experts is None:
             raise ValueError("num_experts is required when fused_plan is used")
@@ -286,11 +379,19 @@ class MoECheckpointLoader:
     def _matches_plan(plan: Sequence[CheckpointPlanEntry], name: str) -> bool:
         return any(plan_entry.matches(name) for plan_entry in plan)
 
+    def _expert_plan_for(self, name: str) -> tuple[ExpertWeightPlanEntry, ...]:
+        """The per-expert entries that may serve ``name``: the layer-agnostic
+        ones plus those of the layer named in ``name``."""
+        shared = self._expert_plan_by_layer.get(None, ())
+        if len(self._expert_plan_by_layer) == 1 and shared:
+            return shared
+        return shared + self._expert_plan_by_layer.get(get_layer_id(name), ())
+
     def matches(self, name: str) -> bool:
         plan = (
             self._global_expert_plan
             if name.endswith(".input_scale")
-            else self._expert_plan
+            else self._expert_plan_for(name)
         )
         return self._matches_plan(self._fused_plan, name) or self._matches_plan(
             plan, name
@@ -313,8 +414,11 @@ class MoECheckpointLoader:
 
     def _load_expert(self, name: str, loaded_weight: torch.Tensor) -> str | None:
         input_scale = name.endswith(".input_scale")
-        plan = self._global_expert_plan if input_scale else self._expert_plan
+        plan = self._global_expert_plan if input_scale else self._expert_plan_for(name)
         mapped_name: str | None = None
+        loaded_name: str | None = None
+        # Every matching entry loads: under an expert placement one logical
+        # expert's tensor fills each local slot that replicates it.
         for plan_entry in plan:
             if not plan_entry.matches(name):
                 continue
@@ -330,8 +434,12 @@ class MoECheckpointLoader:
                 shard_id=plan_entry.shard_id,
                 local_expert_id=None if input_scale else plan_entry.local_expert_id,
             )
-            return mapped_name
+            loaded_name = mapped_name
+            if input_scale:
+                return loaded_name
 
+        if loaded_name is not None:
+            return loaded_name
         if mapped_name is not None:
             self._raise_unloaded_match(name, mapped_name)
         return None
@@ -393,26 +501,35 @@ class MoECheckpointLoader:
                     plan_entry.split_chunks, dim=plan_entry.split_dim
                 )[plan_entry.split_index]
 
+            slot_experts = _local_slot_experts(
+                num_experts=self._num_experts,
+                ep_rank=self._ep_rank,
+                ep_size=self._ep_size,
+                expert_placement=self._expert_placement,
+                layer_id=get_layer_id(name),
+            )
             if self._fused_load_style == "per_expert":
                 _load_fused_expert_tensor(
                     param,
                     tensor_to_load,
                     shard_id=plan_entry.shard_id,
-                    num_experts=self._num_experts,
-                    ep_rank=self._ep_rank,
-                    ep_size=self._ep_size,
+                    slot_experts=slot_experts,
                 )
             else:
                 if self._transpose_local_tensor_non_bias and "bias" not in mapped_name:
                     tensor_to_load = tensor_to_load.transpose(-2, -1)
 
                 local_num_experts = param.shape[0]
-                assert local_num_experts * self._ep_size == tensor_to_load.shape[0]
-                local_experts = tensor_to_load[
-                    local_num_experts
-                    * self._ep_rank : local_num_experts
-                    * (self._ep_rank + 1)
-                ]
+                if local_num_experts != len(slot_experts):
+                    raise MoECheckpointLoadError(
+                        f"{mapped_name} holds {local_num_experts} local experts, "
+                        f"the loader plans {len(slot_experts)} slots"
+                    )
+                # A fused checkpoint tensor stacks every logical expert. This
+                # rank's slots are a view when they form a contiguous range
+                # (always without a placement); a placement that repeats or
+                # reorders experts needs the gather.
+                local_experts = _select_local_experts(tensor_to_load, slot_experts)
                 if getattr(param, "block_scale_inv", None) is not None:
                     raise MoECheckpointLoadError(
                         f"{mapped_name} needs online FP8 block quantization, "
@@ -455,21 +572,52 @@ def build_moe_checkpoint_loader(
     include_bias: bool = False,
     fused_load_style: str = "per_expert",
     transpose_local_tensor_non_bias: bool = False,
+    expert_placement: ExpertLocationMetadata | None = None,
 ) -> MoECheckpointLoader:
+    """Build the loader for a model's routed experts.
+
+    Args:
+        expert_placement: The model's expert placement, or None for contiguous
+            ownership of ``num_experts`` logical experts. With a placement
+            ``num_experts`` is the physical slot count (routed + redundant)
+            and each layer's local slots are filled from the logical experts
+            the placement assigns them, replicas included.
+    """
+    if expert_placement is not None:
+        if num_experts != expert_placement.num_physical_experts:
+            raise ValueError(
+                f"num_experts={num_experts} must be the placement's "
+                f"{expert_placement.num_physical_experts} physical experts"
+            )
+        if ep_size != expert_placement.ep_size:
+            raise ValueError(
+                f"ep_size={ep_size} differs from the placement's {expert_placement.ep_size}"
+            )
     expert_plan: Sequence[ExpertWeightPlanEntry] = ()
     global_expert_plan: Sequence[CheckpointPlanEntry] = ()
     if expert_schema is not None:
         if num_experts is None:
             raise ValueError("num_experts is required when expert_schema is used")
-        expert_plan = _build_default_expert_plan(
-            expert_schema,
-            num_experts=num_experts,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-        )
+        if expert_placement is None:
+            expert_plan = _build_default_expert_plan(
+                expert_schema,
+                num_experts=num_experts,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+            )
+        else:
+            expert_plan = _build_placed_expert_plan(
+                expert_schema,
+                expert_placement=expert_placement,
+                ep_rank=ep_rank,
+            )
         global_expert_plan = _build_global_expert_name_plan(
             expert_schema,
-            num_experts=num_experts,
+            num_experts=(
+                num_experts
+                if expert_placement is None
+                else expert_placement.num_logical_experts
+            ),
         )
 
     fused_plan: Sequence[FusedExpertWeightPlanEntry] = ()
@@ -490,4 +638,5 @@ def build_moe_checkpoint_loader(
         ep_size=ep_size,
         fused_load_style=fused_load_style,
         transpose_local_tensor_non_bias=transpose_local_tensor_non_bias,
+        expert_placement=expert_placement,
     )

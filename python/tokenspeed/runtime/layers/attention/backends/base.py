@@ -57,6 +57,7 @@ from tokenspeed.runtime.layers.attention.backends.support import (  # noqa: F401
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
     from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
         TreeDraftInputs,
         TreeVerifyInputs,
@@ -64,6 +65,9 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        HistoryGatherWorkspace,
     )
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -192,6 +196,31 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Allocate static buffers the breakable prefill graphs bake.
         Default: no-op — attention stays eager at the break points."""
 
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        """Allocate the query-context-parallel history gather workspace and
+        return its bytes (the recipe reserved them from the cache budget;
+        the registry checks the two agree). Only a tree with the GPU DSA
+        sharded extend arm has one."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no sharded extend arm; query context "
+            "parallelism needs GPU DSA attention"
+        )
+
+    def history_gather_workspace(self) -> HistoryGatherWorkspace | None:
+        """The allocated history gather workspace of this tree, or ``None``
+        before :meth:`preallocate_history_gather_workspace` ran (or on a tree
+        without the sharded extend arm)."""
+        return None
+
+    def adopt_history_gather_workspace(self, workspace: HistoryGatherWorkspace) -> None:
+        """Share another tree's history gather workspace: the draft tree
+        gathers into the target's buffers, which are idle while the draft
+        runs. A leaf without the sharded extend arm ignores it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no sharded extend arm to share a history "
+            "gather workspace with"
+        )
+
     @property
     def prefill_metadata_is_capture_ready(self) -> bool:
         """Whether the current execution metadata supports a captured forward."""
@@ -259,6 +288,7 @@ class AttentionBackend(CachePoolBinding, ABC):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
         """Build metadata for an extend / mixed (or idle warmup) forward.
@@ -287,6 +317,11 @@ class AttentionBackend(CachePoolBinding, ABC):
                 prompt from an intermediate one.
             extend_with_prefix: Whether any extend row continues a cached or
                 chunked prefix (some ``extend_prefix_lens`` entry is non-zero).
+            query_shard: The rows of the extend span this rank computes under
+                query context parallelism, or ``None`` when every rank computes
+                every row. The lengths above describe the whole span on every
+                rank; a node that cannot attend a query shard calls
+                :func:`reject_query_shard`.
             **kwargs: Model-side extras (positions, capture mode, ...) a
                 node may ignore.
         """
@@ -618,6 +653,26 @@ class AttentionBackend(CachePoolBinding, ABC):
         **kwargs,
     ):
         raise NotImplementedError()
+
+
+def reject_query_shard(query_shard: QueryShardPlan | None, node: str) -> None:
+    """Fail loud when a forward shards its query rows over a node that attends
+    every row.
+
+    Under query context parallelism the model feeds a node its shard of the
+    extend rows while the metadata describes the whole span; only a backend
+    whose extend arm gathers each request's history for its local rows may
+    accept the shard.
+
+    Args:
+        query_shard: The forward's shard plan, or ``None`` when not sharded.
+        node: Backend name for the diagnostic.
+    """
+    if query_shard is not None and query_shard.size > 1:
+        raise RuntimeError(
+            f"{node} cannot attend a query shard; query context parallelism "
+            "needs the gathered-history DSA extend arm"
+        )
 
 
 def reject_bounded_replay(extend_replay_lens_cpu: torch.Tensor, node: str) -> None:
