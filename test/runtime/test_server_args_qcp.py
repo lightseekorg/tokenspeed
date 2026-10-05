@@ -66,8 +66,10 @@ def test_off_by_default_everywhere():
     "argv,match",
     [
         (
+            # The mapping refuses the partial shard first (a query shard spans
+            # the whole group); validate_qcp repeats the rule for its callers.
             ["--attn-tp-size", "4", "--prefill-context-parallel-size", "2"],
-            "must equal the attention TP size",
+            "must be 1 or the attention TP size",
         ),
         (["--disaggregation-mode", "null"], "requires --disaggregation-mode prefill"),
         (["--disaggregation-mode", "decode"], "requires --disaggregation-mode prefill"),
@@ -113,6 +115,107 @@ def test_dense_and_moe_groups_are_one_or_the_attention_width():
     assert args.mapping.moe.tp_ep_size == 4
     with pytest.raises(ValueError, match="1 or the attention TP width"):
         prepare_server_args(wide + ["--dense-tp-size", "2"])
+
+
+def test_the_default_attention_weights_are_head_replicated():
+    args = prepare_server_args(BASE)
+    args.mapping.rank = 1
+    assert args.mapping.attn.head_tp_size == 1
+    assert not args.mapping.attn.has_head_tp
+    assert args.mapping.attn.head_tp_group == (1,)
+
+
+def test_head_tp_over_the_query_shards():
+    """``--attn-head-tp-size`` equal to the shard group is the prefill-role
+    head-TP layout: the head group is the shard group, ``--tp-batch-invariant
+    attn`` selects the column-parallel o_proj, and none of the decode-only
+    gates (role, decode-shaped autotune, generation budget) apply -- they key
+    on ``head_tp_serves_decode_only``, False here."""
+    args = prepare_server_args(BASE + ["--attn-head-tp-size", "2"])
+    args.mapping.rank = 1
+    attn = args.mapping.attn
+    assert attn.has_head_tp and attn.has_qcp
+    assert not attn.head_tp_serves_decode_only
+    assert attn.head_tp_group == attn.qcp_group == (0, 1)
+    assert args.disaggregation_mode == "prefill"
+    assert args.tp_batch_invariant == "none"
+
+    bi = prepare_server_args(
+        BASE + ["--attn-head-tp-size", "2", "--tp-batch-invariant", "attn"]
+    )
+    assert bi.tp_batch_invariant == "attn"
+    assert bi.mapping.attn.has_head_tp
+
+
+@pytest.mark.parametrize(
+    "argv,match",
+    [
+        (["--attn-head-tp-size", "4"], "must equal qcp_size"),
+        (
+            ["--attn-head-tp-size", "1", "--tp-batch-invariant", "attn"],
+            "attn-head-tp-size",
+        ),
+    ],
+)
+def test_head_tp_on_the_prefill_role_is_the_shard_group(argv, match):
+    with pytest.raises(ValueError, match=match):
+        prepare_server_args(BASE + argv)
+
+
+@pytest.mark.parametrize("dense_tp", ["1", "2"])
+def test_the_batch_invariant_dense_tail_has_no_layout_under_query_sharding(dense_tp):
+    """``--tp-batch-invariant attn+dense`` replaces the token reduce-scatter
+    of a dense group wider than attention TP; under query sharding the dense
+    group is 1 or the attention TP width, so the selection is refused at
+    argument resolution (CommManager would refuse it at construction)."""
+    argv = BASE + [
+        "--attn-head-tp-size",
+        "2",
+        "--dense-tp-size",
+        dense_tp,
+        "--tp-batch-invariant",
+        "attn+dense",
+    ]
+    with pytest.raises(ValueError, match="only --tp-batch-invariant attn applies"):
+        prepare_server_args(argv)
+    args = prepare_server_args(argv[:-1] + ["attn"])
+    assert args.tp_batch_invariant == "attn"
+    assert args.mapping.dense.tp_size == int(dense_tp)
+
+
+def test_head_tp_on_the_prefill_role_still_needs_the_shard():
+    """Without a query shard the attention TP ranks hold the same rows, so
+    head TP on the prefill role is the decode-only layout, refused as before."""
+    with pytest.raises(ValueError, match="attention TP 1"):
+        prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--attn-tp-size",
+                "2",
+                "--disaggregation-mode",
+                "prefill",
+                "--attention-backend",
+                "dsa",
+                "--attn-head-tp-size",
+                "4",
+            ]
+        )
+    with pytest.raises(ValueError, match="disaggregation-mode decode"):
+        prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--attn-tp-size",
+                "1",
+                "--data-parallel-size",
+                "2",
+                "--disaggregation-mode",
+                "prefill",
+                "--attn-head-tp-size",
+                "2",
+            ]
+        )
 
 
 def test_validate_qcp_rejects_a_shard_below_the_tp_width():

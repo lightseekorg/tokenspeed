@@ -282,8 +282,9 @@ def test_kimi_k3_amd_gates_use_eagle3():
     )
     assert tasks[0]["score_threshold"] == 0.90
     perf_server_tokens = shlex.split(tasks[1]["server"]["command"])
-    assert flag_value(perf_server_tokens, "--init-expert-location") == "trivial"
-    assert flag_value(perf_server_tokens, "--ep-dispatch-algorithm") == "static"
+    # EP1 has no expert placement, so server-arg validation rejects these.
+    assert "--init-expert-location" not in perf_server_tokens
+    assert "--ep-dispatch-algorithm" not in perf_server_tokens
     assert flag_value(perf_server_tokens, "--attention-backend") == "gluon"
     assert flag_value(perf_server_tokens, "--drafter-attention-backend") == "gluon"
     assert flag_value(perf_server_tokens, "--max-model-len") == "65536"

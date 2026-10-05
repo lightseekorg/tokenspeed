@@ -86,6 +86,7 @@ def _prefill(lengths: list[int], max_logits_bytes: int) -> list[set[int]]:
         candidate_lens_cpu=torch.tensor(lengths, dtype=torch.int64),
         initial_tokens=_INITIAL,
         local_tokens=_LOCAL,
+        slot_order="selection",
     )
     rows, lens = rows.cpu(), lens.cpu()
     return [
@@ -132,6 +133,7 @@ def _decode(seq_lens: list[int]) -> list[set[int]]:
         plan=dsa_plan(page_size=_PAGE, seq_lens_2d=seq_lens_2d),
         initial_tokens=_INITIAL,
         local_tokens=_LOCAL,
+        slot_order="selection",
     )
     slots, counts = slots.cpu(), counts.cpu()
     base = [r * max_pages * _PAGE for r in range(reqs)]

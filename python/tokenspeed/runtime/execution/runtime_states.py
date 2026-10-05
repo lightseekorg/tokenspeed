@@ -61,6 +61,9 @@ class RuntimeStates:
         # (--enable-speculative-sampling), see init_draft_probs.
         self.draft_probs: torch.Tensor | None = None
         self.draft_probs_sentinel: float = 0.0
+        # Draft trees (init_draft_trees): next round's parents next to its tokens.
+        self.chain_parents: torch.Tensor | None = None
+        self.future_parent_map: torch.Tensor | None = None
 
     def init_draft_probs(
         self, *, spec_num_tokens: int, reject_threshold: float
@@ -108,9 +111,6 @@ class RuntimeStates:
         if self.draft_probs is None:
             return
         self.draft_probs[:, :-1].index_fill_(0, pool_indices, self.draft_probs_sentinel)
-        # Draft trees (init_draft_trees): next round's parents next to its tokens.
-        self.chain_parents: torch.Tensor | None = None
-        self.future_parent_map: torch.Tensor | None = None
 
     def init_draft_trees(self, num_nodes: int) -> None:
         """Allocate each pool slot's next-round tree parents, starting as the chain.

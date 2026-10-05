@@ -322,8 +322,10 @@ class Engine(EngineBase):
 
     def get_server_info(self):
         internal_states = self.llm.run(self.tokenizer_manager.get_internal_state())
+        server_args = dataclasses.asdict(self.tokenizer_manager.server_args)
+        server_args.pop("rl_control_api_key", None)
         return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),
+            **server_args,
             **self.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,

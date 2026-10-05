@@ -49,7 +49,7 @@ switch an envelope folds is also available individually under `auto`.
 | `--layer-boundary-norm {fused,unfused}` | `unfused` materializes `hidden + residual` in bf16 before the norm that opens each physical layer and before the final norm, instead of the fused add+norm kernel; also vetoes all-reduce+norm fusion. Folded to `unfused` by `rl-bitwise`. |
 | `--router-topk {fused,torch}` | Correction-bias MoE routing: the fused CUDA kernel, or fp32 `torch.softmax` + `torch.topk(probs + bias)` with PyTorch tie order and `-1` zero-expert ids. Folded to `torch` by `rl-bitwise`. |
 | `--logprob-order {torch,megatron}` | Order of the selected-token log-softmax: `torch.log_softmax`, or Megatron's vocab-parallel cross-entropy order over fixed 32768-wide vocab blocks; output and prompt (input) logprobs share it. Changes logprobs only. Folded to `megatron` by `rl-bitwise`. |
-| `--dsa-slot-order {selection,sorted}` | The order the sparse (DSA) attention cores reduce a token's selected KV slots in: as the top-k leaf emitted them, or ascending (`sorted`, batch-invariant whenever the selected set is; served only by cores declaring the `slot_order` trait, the `aok` leaves). Folded to `sorted` by `rl-bitwise`. |
+| `--dsa-slot-order {selection,sorted}` | The order a token's selected KV rows are reduced in by the sparse (DSA) attention: as the top-k leaf emitted them (`selection`), or in ascending position order (`sorted`: one reduction order per selected set, invariant across batch compositions, runs and engines -- not ascending slot order, which follows the page placement). The top-k leaf emits the order and the core keeps it, so both must declare the `slot_order` trait (the `aok` leaves); a silent kernel is refused under `sorted`. Folded to `sorted` by `rl-bitwise`. |
 | `--moe-combine-order {rank,slot}` | How a token's routed-expert contributions meet across the MoE TP-EP group. `rank`: the MoE kernel returns this rank's partial and the host sums the partials, adding LongCat's identity zero-expert residual once around the reduction. `slot`: the MoE kernel folds the token's top-k slots in fp32 slot order across the EP group itself, residual included, as the trainer's grouped MLP does, and the host reduces nothing; needs MoE TP 1 and a kernel declaring `combine_order` with `slot` (the `aok` leaf), and vetoes all-reduce+norm fusion. Folded to `slot` by `rl-bitwise`. |
 
 ## API Surface
@@ -64,6 +64,8 @@ switch an envelope folds is also available individually under `auto`.
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
 | `--weight-version` | Initial model-weight version stamped into generation metadata. Defaults to `default`. |
+| `--rl-control-host` | Bind host for the in-engine RL control app. Defaults to `--host`. |
+| `--rl-control-api-key` | Bearer token required on every RL control route. Unset leaves the app open, which is what slime expects by default. |
 | `--model-update-config` | JSON object handed to the Model Updater SDK for `POST /update_weights_from_mooncake`. Requires the three flags below; see [Mooncake Weight Updates](#mooncake-weight-updates). |
 | `--model-update-sdk-module` | Import path of the Model Updater SDK module. Imported in the scheduler process on the first Mooncake update, not at startup. Required with `--model-update-config`. |
 | `--model-update-engine-type` | SDK `EngineType` member name for this engine, resolved as `EngineType[value.upper()]`. Required with `--model-update-config`. |
@@ -132,14 +134,23 @@ non-finite value.
 A request with `logprob_start_len >= 0` that asks for at least one prompt
 logprob is refused at the ingress with a 400 when the engine cannot score
 every prompt position: models that narrow their prefill rows (DeepSeek V4.1's
-CED decoder keeps only each prompt's last window for the LM head) and
-pipeline-parallel deployments (`--pp-size > 1`, where the logits live on the
-last stage only). The scheduler reports this capability at startup and the
-frontend checks it before admitting the request, so the data plane never has
-to. Multimodal prompts are refused too (their media positions carry
-content-hash ids, not tokens), as is a prompt whose client-supplied
-`input_ids` fall outside the vocabulary. `logprob_start_len=-1` is always
-accepted.
+CED decoder keeps only each prompt's last window for the LM head). The
+scheduler reports this capability at startup and the frontend checks it
+before admitting the request, so the data plane never has to. Multimodal
+prompts are refused too (their media positions carry content-hash ids, not
+tokens), as is a prompt whose client-supplied `input_ids` fall outside the
+vocabulary. `logprob_start_len=-1` is always accepted.
+
+Under pipeline parallelism (`--pp-size > 1`) the last stage scores the prompt
+rows and the commit path carries both logprob vectors to the other stages
+with the sampled tokens. Under query context parallelism
+(`--prefill-context-parallel-size N`) the prompt rows of a chunk live on the
+rank whose shard holds them; since the LM head is vocab-sharded over the same
+ranks, the planned rows' activations are gathered to the group and every rank
+scores the whole plan, so each rank's `--input-logprob-chunk-tokens` chunks
+cover the chunk's planned rows exactly as without sharding (the per-chunk
+transient of the row above is the same), and the result is identical on every
+rank. The sampled rows are gathered only after the prompt rows are scored.
 
 In a disaggregated deployment the prefill node and the decode node each
 return their own frames, exactly as SGLang's do: the prefill node's finished
@@ -155,8 +166,7 @@ scheduler drive (SMG) carries sampled-token logprobs only: it refuses a
 `logprob_start_len` that would produce prompt logprobs rather than compute
 and drop them.
 
-`top_logprobs_num > 0` and `token_ids_logprob` are not supported yet. Output
-logprobs are not propagated across pipeline-parallel stages (`--pp-size > 1`).
+`top_logprobs_num > 0` and `token_ids_logprob` are not supported yet.
 
 This runtime requires a `tokenspeed-scheduler` build that has
 `RequestSpec.max_cached_prefix_tokens` (the admission-probe bound; see
@@ -195,10 +205,15 @@ The following slime paths are not yet supported end to end:
   `--rollout-top-p 1.0` until TokenSpeed returns that metadata;
 - rollout routing replay (`--use-rollout-routing-replay`).
 
-The HTTP routes for `update_weights_from_tensor` and `update_weights_from_disk`
-remain for SGLang clients, but TokenSpeed's scheduler does not implement their
-receive paths: the scheduler replies `success=false` with
-"not supported on this engine". Use the distributed or Mooncake update mode.
+`POST /update_weights_from_disk` and `POST /update_weights_from_tensor` stay on
+the router for slime-compatible clients, but answer `501 Not Implemented` with
+`{"success": false, "message": "..."}` before anything reaches the scheduler:
+TokenSpeed's scheduler implements neither the disk load path nor the CUDA-IPC
+receive path and would answer such a request with `success=false` ("not
+supported on this engine"). Use `POST /update_weights_from_distributed` or the
+Mooncake update described below. For the same reason the engine advertises
+`rl.update_from = "distributed,mooncake"`, so a gateway never routes a disk
+or tensor update here.
 
 ### Weight Updates Under Attention DP
 
@@ -285,6 +300,24 @@ Trainer-side contract:
   the whole checkpoint and restores consistency) or restart the engine before
   resuming dispatch; the same holds for the distributed update.
 
+### Driving TokenSpeed from an external gateway
+
+A gateway that fronts several engines (for example SMG with `--enable-rl`)
+talks to this control app directly; the `ts serve` sidecar is not involved.
+Launch the engine with `--rl-control-port <port>` and
+`--rl-control-host <address the gateway can reach>` (the default binds
+localhost only), and set `--rl-control-api-key` unless the network is trusted:
+an open control app on a routable host accepts weight updates from anyone who
+can connect. The engine puts the resulting control URL and its capabilities
+(`rl.control_url`, `rl.pause_modes`, `rl.update_from`, ...) into its server
+info, and SMG reads them when it registers the gRPC worker, so nothing has to
+be configured on the gateway side. The routes keep slime's expectations:
+`POST /pause_generation` accepts `{"mode": "wait"|"abort"|"keep"}` (default
+`wait`), and `/flush_cache` answers on both GET and POST. Routes with optional
+bodies accept an omitted body, but malformed or non-object JSON answers `400`
+before any control operation runs. Wildcard bind addresses (`0.0.0.0` or `::`)
+are not advertised as control URLs; use a concrete address for gateway discovery.
+
 ## Scheduler And Memory
 
 | Parameter | Purpose |
@@ -330,10 +363,10 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
 | `--decode-context-parallel-size` | Shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages. Allowed on aggregated engines and with `--disaggregation-mode prefill` (every rank of the subgroup sends its owned pages to an unsharded decode). Not supported yet: the decode role; speculative decoding on any ordinary MLA/DSA model (the recipe refuses to shard a cache holding a draft group, whichever dense kernel runs it -- only the DeepSeek V4 and Kimi K3 recipes shard with a draft, and FlashMLA/GPU DSA reject speculation under DCP outright); and the Host KVStore, so pass `--disable-kvstore`. |
-| `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous attention-DP ranks; each rank keeps its own KV and the attention exchanges heads for tokens. Needs attention TP 1, attention DP and `--disaggregation-mode decode`; the layout serves decode rows only, so it sets `--disable-prefill-graph`, tunes on a decode step, and admits only requests whose `max_new_tokens` is at most 4096 (the scheduler then never retracts them, so no local recovery prefill is scheduled). Defaults to the attention TP size (no exchange). See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
+| `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous ranks that hold different rows; the attention exchanges heads for tokens around its core. Over attention-DP ranks (needs attention TP 1, attention DP and `--disaggregation-mode decode`; each rank keeps its own KV) the layout serves decode rows only, so it sets `--disable-prefill-graph`, tunes on a decode step, and admits only requests whose `max_new_tokens` is at most 4096 (the scheduler then never retracts them, so no local recovery prefill is scheduled). Over the query shards of a prefill engine (must equal `--prefill-context-parallel-size`) the extend rows run the absorbed sparse prefill through the exchange and none of the decode-only rules apply. Defaults to the ranks holding the same rows: the attention TP size, or 1 (head-replicated) under `--prefill-context-parallel-size`. See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
 | `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers the ranks' rows before the logits GEMM and transposes the shards back. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`; under attention DP, requests asking for prompt logprobs (`logprob_start_len`) are refused. |
-| `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs `--dense-tp-size` > 1; both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
-| `--prefill-context-parallel-size` | Query context parallelism on the PD prefill role: shard every extend forward's rows over the attention TP group, rank `r` computing a contiguous slice of the chunk against the gathered KV history of its requests (the KV write, index-K write and sampled rows are gathered across the group; the scheduler, cache allocation and PD transfer are unchanged, and `--chunked-prefill-size` keeps counting the whole chunk). Must equal `--attn-tp-size`; requires `--disaggregation-mode prefill`, `--disable-prefill-graph`, attention DP 1, no `--enable-mixed-batch`, a DSA-family attention backend with a bf16 KV cache (the gathered write stores native latent rows), `--dense-tp-size` and the MoE TP×EP group each 1 or the attention TP width, and `--decode-context-parallel-size` 1 or equal to it (the sharded-page combination inherits DCP's `--disable-kvstore` requirement). 1 (default) is off. |
+| `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs a dense TP group wider than attention TP (so not under `--prefill-context-parallel-size`, whose dense group is 1 or the attention TP width; only `attn` applies there); both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
+| `--prefill-context-parallel-size` | Query context parallelism on the PD prefill role: shard every extend forward's rows over the attention TP group, rank `r` computing a contiguous slice of the chunk against the gathered KV history of its requests (the KV write, index-K write, sampled rows and prompt-logprob rows are gathered across the group; the scheduler, cache allocation and PD transfer are unchanged, and `--chunked-prefill-size` keeps counting the whole chunk). Must equal `--attn-tp-size`; requires `--disaggregation-mode prefill`, `--disable-prefill-graph`, attention DP 1, no `--enable-mixed-batch`, a DSA-family attention backend with a bf16 KV cache (the gathered write stores native latent rows), `--dense-tp-size` and the MoE TP×EP group each 1 or the attention TP width, and `--decode-context-parallel-size` 1 or equal to it (the sharded-page combination inherits DCP's `--disable-kvstore` requirement). The attention weights are head-replicated unless `--attn-head-tp-size` equals it, which shards them over the shard group. 1 (default) is off. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention TP width: the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |

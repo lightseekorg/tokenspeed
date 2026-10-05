@@ -24,7 +24,7 @@ path. The TP-agreed path has one owner, the backend's packed verify output
 
 * the attention backend moves the path's target KV (every layer) to the
   window's leading slots (`compact_verify_window`; the cache-group router owns
-  the K/V address table and the `compact_window_rows` kernel copies words, so
+  a K/V address table per cache group and the `compact_window_rows` kernel copies words, so
   it is dtype-agnostic);
 * `TreeSpec.compact_rows` moves the target hidden rows to the front of the
   window and the positions back from `vc + depth` to `vc + i`;
@@ -66,15 +66,15 @@ kernel. Verify runs it with `R = W = N`; draft lanes with `R = K` over the
 
 ### Recurrent state follows the parent
 
-Linear-attention (GDN) layers keep one conv window and one recurrent state per
-verify node in the backend's verify scratch. Node `t` starts from the state
-after its parent, not after node `t - 1`: `gdn_decode_mtp` takes
-`parent_indices` and reloads the parent's state at branch points (a chain never
-reloads); `causal_conv1d_update` with `parent_indices` rebuilds each node's
+Linear-attention (GDN and Mamba2) layers keep one conv window and one recurrent
+state per verify node in the backend's verify scratch. Node `t` starts from the
+state after its parent, not after node `t - 1`: `gdn_decode_mtp` and
+`mamba2_verify_scan` take `parent_indices` and reload the parent's state at
+branch points (a chain never reloads); `causal_conv1d_update` with `parent_indices` rebuilds each node's
 window from its ancestors' inputs and the initial window. The commit copies the scratch row of the
 last accepted node, `1 + path[accept_len - 1]`, which for a chain is the
-familiar `accept_len`. The fused KDA verify kernel and the Mamba2 verify scan
-follow a chain and refuse trees.
+familiar `accept_len`. The fused KDA verify kernel follows a chain and refuses
+trees.
 
 Draft trees use ReplaySSM like chains (on by default; staging a recurrent
 state per node and per layer grows with the tree, Qwen3.8: 3 MiB x 48 layers
@@ -82,13 +82,17 @@ per node). Under ReplaySSM the verify
 never writes the state pool. The state of every branch point (a node with a
 child other than the next node) goes to one workspace shared by all layers
 (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per node),
-and a branch reloads its parent from there. The commit packs the
+and a branch reloads its parent from there. Mamba2 has no such workspace: its
+elementwise update lets a branch replay the parent's ancestors over the read
+state, cheaper than storing and reloading a 4 MiB state. The commit packs the
 accepted path's replay payload rows to the window's front (`compact_window_rows`)
-and replays them like a chain (`gdn_replay_commit`). With `--disable-replay-ssm`,
+and replays them like a chain (`gdn_replay_commit`, or `mamba2_replay_commit` for
+Mamba2). With `--disable-replay-ssm`,
 or where the replay kernel is unsupported, the per-node staged path above remains.
 
 KV compaction covers the attention layers only (`history_group_by_layer`, read
-by the router from its bound pool) and moves each physical region once.
+by the router from its bound pool) and moves each physical region once per
+cache group, at that group's own verify window.
 
 ### Draft lanes write the draft cache like any draft step
 
@@ -155,8 +159,8 @@ executor refuses tree drafting with them at startup.
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
 drafter refuses trees at startup); `greedy` and `triton` sampling backends; the `trtllm`
-attention backend with bf16 KV and one KV cache group, alone or inside the
-hybrid linear-attention backend (GDN, ReplaySSM or staged); no structured output,
+attention backend with bf16 KV in full-history KV cache groups, alone or inside the
+hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,
 no mixed batches, no pipeline parallelism, no prefill/decode disaggregation, no
 attention data parallelism, no sliding window or attention sinks in the target
 or draft layers, no target or draft that reads request token history or
@@ -198,7 +202,7 @@ workspace), so nothing here is a cache group for the C++ scheduler to own.
 * `test/runtime/test_draft_tree.py` — tree construction against a per-request
   EAGLE-2 reference, depth-first order, strided roots, NaN scores.
 * `test/runtime/test_tree_spec.py` — hidden-row and position compaction; the
-  fresh-spec chain; router compaction over aliased layer buffers.
+  fresh-spec chain; per-group router compaction over aliased layer buffers.
 * `test/runtime/test_tree_support_resolution.py` — backend capability
   resolution: supported trees, linear-attention layers, each named blocker.
 * `test/runtime/test_cli_config_compat.py` — tree options and every startup refusal.

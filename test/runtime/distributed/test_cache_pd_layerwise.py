@@ -716,6 +716,9 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
     backend.qk_rope_head_dim = 0
     backend.kernel_page_size = 64
     backend.kernel_solution = None
+    backend.slot_order = "selection"
+    backend.num_local_heads = 1
+    backend.num_attention_heads = 1
     backend.query_shard_metadata = None
     backend.step_counter = SimpleNamespace(record_cache=lambda: events.append("ready"))
 

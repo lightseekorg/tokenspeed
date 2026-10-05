@@ -385,6 +385,7 @@ def test_verify_scan_steps_exactly_like_consecutive_decode_updates(state_dtype):
         dt_bias,
         state_indices=reads,
         dst_state_indices=rows,
+        parent_indices=None,
         null_slot=-1,
         out=out,
     )
@@ -405,6 +406,7 @@ def test_verify_scan_steps_exactly_like_consecutive_decode_updates(state_dtype):
         dt_bias,
         state_indices=reads,
         dst_state_indices=None,
+        parent_indices=None,
         null_slot=-1,
         out=replay_out,
     )
@@ -420,6 +422,7 @@ def test_verify_scan_rejects_strided_heads_and_malformed_parameters():
     args = dict(
         state_indices=torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
         dst_state_indices=None,
+        parent_indices=None,
         null_slot=-1,
         out=torch.empty_like(x),
     )
@@ -451,6 +454,7 @@ def test_verify_scan_skips_padded_requests_and_destinations():
         dt_bias,
         state_indices=torch.tensor([1, -1], dtype=torch.int32, device="cuda"),
         dst_state_indices=rows,
+        parent_indices=None,
         null_slot=-1,
         out=out,
     )
@@ -461,6 +465,155 @@ def test_verify_scan_skips_padded_requests_and_destinations():
         x[1, :1], dt[1, :1], A_log, B[1, :1], C[1, :1], D, dt_bias, zero_start
     )
     assert _relative(pool[4], first) < 1e-4
+
+
+# Request 0 branches at nodes 0, 1 and 3; request 1 is a chain.
+_TREE_PARENTS = [[-1, 0, 1, 0, 3, 3, 1], [-1, 0, 1, 2, 3, 4, 5]]
+
+
+def _tree_path(parents: list[int], node: int) -> list[int]:
+    path = [node]
+    while parents[path[-1]] >= 0:
+        path.append(parents[path[-1]])
+    return path[::-1]
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("staged", [True, False])
+def test_tree_verify_scan_steps_each_node_like_its_root_path(state_dtype, staged):
+    """Each tree node's output equals a chain verify of its root path to rounding and
+    its staged state bit for bit; without destinations the pool stays untouched."""
+    batch, steps = len(_TREE_PARENTS), len(_TREE_PARENTS[0])
+    A_log, D, dt_bias = _params(50)
+    x, dt, B, C = _verify_window(batch, steps, 51)
+    g = torch.Generator(device="cuda").manual_seed(52)
+    slots = 1 + batch + batch * steps
+    pool = (
+        0.1 * torch.randn(slots, HEADS, HEAD_DIM, D_STATE, generator=g, device="cuda")
+    ).to(state_dtype)
+    reads = torch.arange(1, batch + 1, dtype=torch.int32, device="cuda")
+    rows = (batch + 1 + torch.arange(batch * steps, device="cuda")).int()
+    rows = rows.view(batch, steps)
+    parents = torch.tensor(_TREE_PARENTS, dtype=torch.int32, device="cuda")
+    tree_pool = pool.clone()
+    out = torch.empty_like(x)
+    mamba2_verify_scan(
+        tree_pool,
+        x,
+        dt,
+        A_log,
+        B,
+        C,
+        D,
+        dt_bias,
+        state_indices=reads,
+        dst_state_indices=rows if staged else None,
+        parent_indices=parents,
+        null_slot=-1,
+        out=out,
+    )
+    if not staged:
+        assert torch.equal(tree_pool, pool)
+    for i, request_parents in enumerate(_TREE_PARENTS):
+        for node in range(steps):
+            path = torch.tensor(_tree_path(request_parents, node), device="cuda")
+            chain_pool = pool.clone()
+            chain_out = torch.empty_like(x[i : i + 1, path])
+            chain_rows = rows[i : i + 1, : len(path)].contiguous()
+            mamba2_verify_scan(
+                chain_pool,
+                x[i : i + 1, path],
+                dt[i : i + 1, path],
+                A_log,
+                B[i : i + 1, path],
+                C[i : i + 1, path],
+                D,
+                dt_bias,
+                state_indices=reads[i : i + 1],
+                dst_state_indices=chain_rows,
+                parent_indices=None,
+                null_slot=-1,
+                out=chain_out,
+            )
+            if state_dtype == torch.float32:
+                assert torch.equal(out[i, node], chain_out[0, -1]), (i, node)
+            else:
+                # A bf16 pool's tree build contracts multiply-adds differently.
+                torch.testing.assert_close(
+                    out[i, node], chain_out[0, -1], atol=1e-6, rtol=2**-7
+                )
+            if staged:
+                staged_state = tree_pool[rows[i, node]]
+                assert torch.equal(staged_state, chain_pool[chain_rows[0, -1]]), (
+                    i,
+                    node,
+                )
+
+
+@pytest.mark.parametrize(
+    "steps, parent_dtype, match",
+    [
+        (3, torch.int64, "parent_indices must be contiguous int32"),
+        (65, torch.int32, "at most 64 tokens"),
+    ],
+)
+def test_tree_verify_scan_rejects_malformed_parents(steps, parent_dtype, match):
+    batch = 2
+    A_log, D, dt_bias = _params(53)
+    x, dt, B, C = _verify_window(batch, steps, 54)
+    pool = torch.zeros(1 + batch, HEADS, HEAD_DIM, D_STATE, device="cuda")
+    parents = torch.arange(-1, steps - 1, device="cuda").to(parent_dtype)
+    with pytest.raises(ValueError, match=match):
+        mamba2_verify_scan(
+            pool,
+            x,
+            dt,
+            A_log,
+            B,
+            C,
+            D,
+            dt_bias,
+            state_indices=torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
+            dst_state_indices=None,
+            parent_indices=parents.expand(batch, steps).contiguous(),
+            null_slot=-1,
+            out=torch.empty_like(x),
+        )
+
+
+def test_staged_tree_replays_a_parent_without_a_destination():
+    """A branch whose parent has a null destination row replays its ancestors instead."""
+    batch, steps = 1, 5
+    A_log, D, dt_bias = _params(55)
+    x, dt, B, C = _verify_window(batch, steps, 56)
+    pool = 0.1 * torch.randn(8, HEADS, HEAD_DIM, D_STATE, device="cuda")
+    reads = torch.tensor([1], dtype=torch.int32, device="cuda")
+    parents = torch.tensor([[-1, 0, 1, 1, 3]], dtype=torch.int32, device="cuda")
+
+    def verify(dst):
+        out = torch.empty_like(x)
+        mamba2_verify_scan(
+            pool.clone(),
+            x,
+            dt,
+            A_log,
+            B,
+            C,
+            D,
+            dt_bias,
+            state_indices=reads,
+            dst_state_indices=dst,
+            parent_indices=parents,
+            null_slot=-1,
+            out=out,
+        )
+        return out
+
+    every_row = verify(
+        torch.tensor([[2, 3, 4, 5, 6]], dtype=torch.int32, device="cuda")
+    )
+    dropped = verify(torch.tensor([[2, -1, 4, 5, 6]], dtype=torch.int32, device="cuda"))
+    assert torch.equal(dropped, every_row)
 
 
 def _replay_payload(x, dt, B):
@@ -519,6 +672,7 @@ def test_replay_commit_rebuilds_the_accepted_state_of_every_layer(state_dtype):
             dt_bias,
             state_indices=torch.arange(1, batch + 1, dtype=torch.int32, device="cuda"),
             dst_state_indices=rows,
+            parent_indices=None,
             null_slot=-1,
             out=torch.empty_like(x),
         )
@@ -621,6 +775,7 @@ def test_verify_and_replay_compile_once_across_batch_sizes():
             dt_bias,
             state_indices=reads,
             dst_state_indices=None,
+            parent_indices=None,
             null_slot=-1,
             out=torch.empty_like(x),
         )
@@ -824,7 +979,17 @@ def test_verify_and_decode_reject_more_requests_than_their_grid_holds():
     args = dict(state_indices=reads, dst_state_indices=None, null_slot=-1)
     with pytest.raises(ValueError, match="verify grid holds"):
         mamba2_verify_scan(
-            pool, x, dt, zeros, B, B, zeros, zeros, **args, out=torch.empty_like(x)
+            pool,
+            x,
+            dt,
+            zeros,
+            B,
+            B,
+            zeros,
+            zeros,
+            **args,
+            parent_indices=None,
+            out=torch.empty_like(x),
         )
     args["dst_state_indices"] = reads
     with pytest.raises(ValueError, match="verify grid holds"):

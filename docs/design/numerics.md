@@ -126,12 +126,19 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               batch_invariant=True); the tuned top-k
 │   │                               kernels switch algorithm and CTA split
 │   │                               with the row count, which moves ties
-│   ├── sorted slot reduction       dsa_slot_order=sorted: the sparse cores
-│   │                               reduce a token's selected slots in
-│   │                               ascending order, not in the top-k leaf's
-│   │                               tie order (dsa_decode / dsa_prefill
-│   │                               slot_order trait; silent cores are
-│   │                               refused rather than assumed)
+│   ├── position-order reduction    dsa_slot_order=sorted: a token's selected
+│   │                               KV rows are reduced in ascending POSITION
+│   │                               order, not in the top-k leaf's tie order
+│   │                               and never in physical slot order (a
+│   │                               request's pages are allocated in arbitrary
+│   │                               id order once pages recycle, so slot order
+│   │                               follows the page placement and differs
+│   │                               between runs and engines). The top-k leaf
+│   │                               emits that order (dsa_decode_topk /
+│   │                               dsa_prefill_topk slot_order trait) and the
+│   │                               sparse core keeps it (dsa_decode /
+│   │                               dsa_prefill slot_order trait); silent
+│   │                               kernels are refused rather than assumed
 │   └── per-row GEMMs               fixed-order GEMM leaves (see aok below)
 ├── logprob.topology-invariant      (deferred) TP-invariant projection
 │                                   layouts on top of the vocab-block
@@ -199,7 +206,16 @@ two, and `dsa_decode_topk` / `dsa_prefill_topk` read `index_k_format` and
 only a leaf declaring `index_k_format={"bf16"}` (the kernel package's DSA
 README has the table); the GLM-5.3-Flash recipe plans pooled `fp8_scaled`
 rows and refuses any other plane. `candidate_lens_cpu` reaches every top-k
-leaf registered with the `candidate_lens_cpu` feature and no other. In-tree
+leaf registered with the `candidate_lens_cpu` feature and no other. Index
+keys handed to `dsa_prefill_topk` as rows in workspace-row order (the
+query-context-parallel history gather over page-sharded caches,
+`docs/design/unified_path.md`) keep the plane's format -- `index_k_fp8` +
+`index_k_scale`, or `index_k_bf16` -- and reach only leaves declaring the
+`index_k_workspace_rows` feature for it (selection requires the feature,
+overrides included, and the keywords are routed by it), so a bf16 leaf that
+scores gathered rows declares that feature and takes the `index_k_bf16`
+keyword; the GPU DSA leaf selects that leaf once at construction under
+query context parallelism, so a missing one fails at startup. In-tree
 drafts fold no LoRA norm scale; a draft that
 does must read `--mla-lora-scale` exactly as the target does, folding only
 under `folded`.
@@ -297,19 +313,63 @@ Within one deployment they keep the contract as follows.
 
 Every collective query context parallelism adds (`docs/design/unified_path.md`)
 is data movement: row slicing, the all-gather of rotated latent rows, index-K
-rows, gathered history rows and sampled rows. The per-row kernels — sparse
-attention over the gathered history with every head and no LSE merge, the
-indexer's top-k over pre-gathered rows, RoPE, the GEMMs — see for each row
-exactly the operands a single GPU would, so a row's bits do not depend on
-which rank computes it or on the batch it shares: the layout preserves run
-and batch invariance by construction. What differs from the TP8 prefill
-baseline is the output projection's form: this landing keeps it replicated
-over every head (the TP1 / trainer form), whereas TP8's row-parallel
-projection folds per-rank partials, the same gap as between the decode
-side's batch-invariant TP layout and an ordered fold. Only the drafter's
-decode steps on a sharded engine merge partials across page owners
-(`combine_attention_partials(keep_all_heads=True)`), with the ordered fold
-under rl-bitwise.
+rows, gathered history rows, sampled rows and the planned prompt-logprob rows'
+activations. The per-row kernels — sparse attention over the gathered history
+with every head and no LSE merge, the indexer's top-k over pre-gathered rows,
+RoPE, the GEMMs — see for each row exactly the operands a single GPU would,
+so a row's bits do not depend on which rank computes it or on the batch it
+shares: the layout preserves run and batch invariance by construction. The
+prompt logprobs in particular are the tensor-parallel path's bit for bit:
+once the planned rows are gathered, every rank runs the same chunk loop over
+the same rows against the same vocab-sharded head
+(`test/runtime/distributed/test_qcp_prompt_logprobs.py` asserts
+`torch.equal` against that path). Head TP over the query shards
+(`--attn-head-tp-size` equal to the shard group) adds the head exchanges —
+all-to-all transposes, permutations of bytes — and the `o_proj` tail. What
+can differ from the TP8 prefill baseline is therefore the output projection
+alone: its form, and for the row-parallel form the order in which the
+per-rank head partials are summed.
+
+Head TP with the row-parallel `o_proj` computes the same per-rank partials
+TP8 does, but reduce-scatters them to the shard rows where TP8 all-reduces,
+and under rl-bitwise (`--batch-invariant-collectives`) the two collectives
+do not take the same route (`comm_backend/auto.py: route`): a
+reduce-scatter always takes the ordered fold (ranks 0..W-1 left to right in
+fp32, one rounding), while a 2-D bf16 all-reduce on a multicast-reachable
+group takes the NVLS in-switch reduction through a fixed issuer, whose
+association order is a property of the GPU set and has been measured to
+differ between sets (`comm_backend/self_check.py`). So **QCP with head TP
+is bitwise the TP8 engine only when both engines sum `o_proj` in the same
+order** — both on the fold, i.e. the TP8 engine launched with
+`--force-deterministic-rsag` (or pinned there by its self-check); that is
+also what makes the comparison hold across machines, which the in-switch
+order does not promise. Within the QCP engine itself the two forward forms
+reduce differently too: the sharded extend reduce-scatters (the fold), the
+drafter's replicated decode steps all-reduce (the in-switch route where it
+applies); `--force-deterministic-rsag` on the engine pins both to the fold.
+Each form is run- and batch-invariant on its own either way. (Making the
+extend's tail all-reduce and slice, so one engine sums one way and matches
+TP8 on the same GPU set without the flag, was considered and left out: it
+moves W× the reduce-scatter's bytes on every layer of a prefill engine
+whose point is the extend, and buys nothing across GPU sets.) Known gap: the
+GPU validation of this layout against a plain TP4 prefill engine matched
+tokens and logprobs bitwise on prompts within `index_topk`, while one
+prompt whose context exceeded it — the indexer's top-k selecting a strict
+subset of the history — kept the tokens but diverged in logprobs from
+position 0 (max |Δ| 3.96e-2); unresolved, so the statement above is
+validated within `index_topk` only.
+
+The head-replicated default (one GEMM over every head, the TP1 / trainer
+form) and head TP with `--tp-batch-invariant attn` (full-K column-parallel
+GEMM, a transpose back) have no cross-rank sum in `o_proj` at all and
+reproduce the TP1 / decode-side batch-invariant form — the one the RL
+trainer alignment wants, and the same gap to TP8 as between the decode
+side's batch-invariant layout and a cross-rank sum. The drafter's decode
+steps on a sharded engine merge partials across the KVP page owners (the
+page-sharded KV of `--decode-context-parallel-size`;
+`combine_attention_partials`, every head under the head-replicated layout,
+the attention-TP slice under head TP), with the ordered fold under
+rl-bitwise.
 
 ## Kernel selection
 

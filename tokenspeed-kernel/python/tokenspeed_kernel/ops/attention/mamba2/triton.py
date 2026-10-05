@@ -534,6 +534,7 @@ def triton_mamba2_state_update(
         dt_bias,
         state_indices=state_indices,
         dst_state_indices=dst_state_indices[:, None],
+        parent_indices=None,
         null_slot=null_slot,
         out=out[:, None],
     )
@@ -551,6 +552,7 @@ def _mamba2_verify_scan_kernel(
     dt_bias,
     state_indices,
     dst_state_indices,
+    parent_indices,
     out,
     null_slot,
     has_dst,
@@ -576,6 +578,7 @@ def _mamba2_verify_scan_kernel(
     HEAD_DIM: tl.constexpr,
     D_STATE: tl.constexpr,
     HEADS_PER_GROUP: tl.constexpr,
+    HAS_PARENT_INDICES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -614,16 +617,58 @@ def _mamba2_verify_scan_kernel(
     dt_next = tl.load(dt_row)
     B_next = tl.load(B_row, mask=mask_n, other=0.0)
     C_next = tl.load(C_row, mask=mask_n, other=0.0)
+    parents_row = parent_indices + pid_b * T
     for t in tl.static_range(T):
         xv = x_next.to(tl.float32)
         dt_t = dt_next.to(tl.float32)
         Bv = B_next.to(tl.float32)
         Cv = C_next.to(tl.float32)
+        if HAS_PARENT_INDICES and t > 0:
+            parent = parent_next
         if t + 1 < T:
             x_next = tl.load(x_row + (t + 1) * stride_x_t, mask=mask_m, other=0.0)
             dt_next = tl.load(dt_row + (t + 1) * stride_dt_t)
             B_next = tl.load(B_row + (t + 1) * stride_B_t, mask=mask_n, other=0.0)
             C_next = tl.load(C_row + (t + 1) * stride_C_t, mask=mask_n, other=0.0)
+            if HAS_PARENT_INDICES:
+                parent_next = tl.load(parents_row + t + 1)
+        if HAS_PARENT_INDICES and t > 0:
+            if parent != t - 1:
+                # Rebuild the parent's state: its staged row, else replay its ancestors over the read state.
+                staged = tl.zeros((), tl.int64) + null_slot
+                if has_dst != 0 and parent >= 0:
+                    staged = tl.load(
+                        dst_state_indices + pid_b * stride_dst_batch + parent
+                    ).to(tl.int64)
+                row = read
+                ancestors = tl.full((), 0, tl.int64)
+                if staged != null_slot:
+                    row = staged
+                else:
+                    node = parent
+                    walked = tl.full((), 0, tl.int32)
+                    # Bounded by t so a malformed (cyclic) parent table cannot hang the kernel.
+                    while (node >= 0) & (walked < t):
+                        ancestors |= tl.full((), 1, tl.int64) << node.to(tl.int64)
+                        node = tl.load(parents_row + node)
+                        walked += 1
+                h = tl.load(
+                    state + row * stride_state_slot + tile,
+                    mask=mask & (row != null_slot),
+                    other=0.0,
+                ).to(tl.float32)
+                # A tree numbers ancestors in order, so the set bits replay root first.
+                while ancestors != 0:
+                    j = libdevice.ffs(ancestors) - 1
+                    ancestors &= ancestors - 1
+                    xj = tl.load(x_row + j * stride_x_t, mask=mask_m, other=0.0)
+                    Bj = tl.load(B_row + j * stride_B_t, mask=mask_n, other=0.0)
+                    dt_j = tl.load(dt_row + j * stride_dt_t).to(tl.float32)
+                    step_j = _softplus(dt_j + bias)
+                    dA_j = _exp(A * step_j)
+                    dB_j = Bj.to(tl.float32) * step_j
+                    h = h * dA_j + dB_j * xj.to(tl.float32)[:, None]
+                    h = h.to(state.dtype.element_ty).to(tl.float32)
         step = _softplus(dt_t + bias)
         dA = _exp(A * step)
         dB = Bv * step
@@ -664,6 +709,7 @@ def triton_mamba2_verify_scan(
     *,
     state_indices: torch.Tensor,
     dst_state_indices: torch.Tensor | None,
+    parent_indices: torch.Tensor | None,
     null_slot: int,
     out: torch.Tensor,
 ) -> None:
@@ -686,6 +732,7 @@ def triton_mamba2_verify_scan(
         dt_bias,
         state_indices,
         state_indices if dst_state_indices is None else dst_state_indices,
+        state_indices if parent_indices is None else parent_indices,
         out,
         null_slot,
         int(dst_state_indices is not None),
@@ -711,6 +758,7 @@ def triton_mamba2_verify_scan(
         HEAD_DIM=head_dim,
         D_STATE=d_state,
         HEADS_PER_GROUP=num_heads // B.shape[2],
+        HAS_PARENT_INDICES=parent_indices is not None,
         BLOCK_M=block_m,
         BLOCK_N=triton.next_power_of_2(d_state),
         ENABLE_PDL=enable_pdl,

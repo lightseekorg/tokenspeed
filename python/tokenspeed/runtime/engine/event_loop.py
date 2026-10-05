@@ -825,10 +825,18 @@ class EventLoop:
         outputs. Every rank's C++ scheduler expects the REAL bootstrap
         payload in the final chunk's ExtendResult — the sampled first token
         (read back as LastToken) and the drafter candidates its remote
-        decode will carry — so the last stage broadcasts (output_tokens,
-        output_lengths, next_input_ids) over the PP gloo group and the
-        others adopt them. Runs on the commit path (queue head), off the
-        dispatch hot path.
+        decode will carry — and every rank's output processor owns the
+        request state the logprobs land in and takes the abort-or-finish
+        branch the NaN guard decides, so the last stage broadcasts
+        (output_tokens, output_lengths, next_input_ids, output_logprobs,
+        input_token_logprobs, output_nan_flags) over the PP gloo group and
+        the others adopt them. The flags travel with the values they audit:
+        only the last stage holds logits and prompt logprobs to flag, and a
+        stage recording the adopted (sanitized) logprobs as healthy while
+        the last stage aborts the request would leave the stages' schedulers
+        disagreeing on it. The prompt-logprob plan the flat vector follows
+        is mirrored on every rank already. Runs on the commit path (queue
+        head), off the dispatch hot path.
         """
         mapping = self.server_args.mapping
         if not mapping.has_pp:
@@ -844,14 +852,21 @@ class EventLoop:
                     results.output_tokens,
                     results.output_lengths,
                     results.next_input_ids,
+                    results.output_logprobs,
+                    results.input_token_logprobs,
+                    results.output_nan_flags,
                 )
             ]
         dist.broadcast_object_list(payload, src=src_global_rank, group=group)
         if not mapping.is_last_pp_rank:
-            tokens, lengths, next_ids = payload[0]
-            results.output_tokens = tokens
-            results.output_lengths = lengths
-            results.next_input_ids = next_ids
+            (
+                results.output_tokens,
+                results.output_lengths,
+                results.next_input_ids,
+                results.output_logprobs,
+                results.input_token_logprobs,
+                results.output_nan_flags,
+            ) = payload[0]
 
     def _commit_forward_results(
         self,

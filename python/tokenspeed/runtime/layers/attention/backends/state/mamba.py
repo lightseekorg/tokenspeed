@@ -462,6 +462,9 @@ class MambaAttnBackend(AttentionBackend):
         self._gdn_replay: _GDNReplayWorkspace | None = None
         # ReplaySSM tree verify: node states shared by all layers; payload addresses for the commit.
         self.draft_tree = linear_attn is not None and bool(linear_attn.draft_tree)
+        self._tree_node_state_workspace = (
+            linear_attn is not None and linear_attn.tree_node_state_workspace
+        )
         self._tree_node_states: torch.Tensor | None = None
         self._replay_payload_addresses: torch.Tensor | None = None
         self._replay_payload_rows: torch.Tensor | None = None
@@ -762,12 +765,13 @@ class MambaAttnBackend(AttentionBackend):
                     ),
                     state_dtype=ssm.dtype,
                 )
-            if self.draft_tree:
+            if self.draft_tree and self._tree_node_state_workspace:
                 self._tree_node_states = torch.zeros(
                     (max_bs, draft_token_num, *ssm.shape[1:]),
                     dtype=ssm.dtype,
                     device=ssm.device,
                 )
+            if self.draft_tree:
                 payload = self._gdn_replay.payload
                 self._replay_payload_addresses = torch.tensor(
                     [payload[i].data_ptr() for i in range(payload.shape[0])],
@@ -908,8 +912,8 @@ class MambaAttnBackend(AttentionBackend):
         continue from its parent's scratch row; commit reads the accepted path."""
         if self.replay_ssm and not self.draft_tree:
             raise RuntimeError(
-                "ReplaySSM draft-tree verify needs the node-state workspace the GDN "
-                "recipe plans for draft trees (LinearAttnConfig.draft_tree)"
+                "ReplaySSM draft-tree verify needs the draft-tree workspaces the "
+                "cache recipe plans (LinearAttnConfig.draft_tree)"
             )
         self.tree_verify = inputs
 
