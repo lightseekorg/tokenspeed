@@ -50,6 +50,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.kvcache.triton import compact_window_rows
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.attention.backends.base import (
@@ -67,9 +68,17 @@ from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
     GroupTableStacks,
 )
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeVerifyInputs,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        HistoryGatherWorkspace,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
@@ -149,6 +158,9 @@ class CacheGroupRouter(AttentionBackend):
         self.is_draft = bool(is_draft)
         self.spec_num_tokens = max(int(spec_num_tokens or 1), 1)
         self.device = device
+        # Draft-tree verify: compaction's K/V address table, rebuilt on every pool bind.
+        self._tree_verify_armed = False
+        self._tree_window_rows: dict[str, tuple[torch.Tensor, int]] = {}
         self._init_pool_binding()
         self._forget_bound_pool_state()
 
@@ -250,6 +262,8 @@ class CacheGroupRouter(AttentionBackend):
             for leaf in self.leaves.values():
                 leaf.set_cache_pool(cache_pool)
         super()._publish_cache_pool(cache_pool)
+        if self._tree_verify_armed:
+            self._bind_tree_window_rows()
 
     def configure_runtime(self, **kwargs) -> None:
         specs = {
@@ -268,6 +282,28 @@ class CacheGroupRouter(AttentionBackend):
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         for leaf in self.leaves.values():
             leaf.init_prefill_graph_state(max_num_tokens, max_bs)
+
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        return sum(
+            leaf.preallocate_history_gather_workspace(max_model_len)
+            for leaf in self.leaves.values()
+        )
+
+    def history_gather_workspace(self) -> HistoryGatherWorkspace | None:
+        workspaces = [
+            workspace
+            for leaf in self.leaves.values()
+            if (workspace := leaf.history_gather_workspace()) is not None
+        ]
+        if len(workspaces) > 1:
+            raise RuntimeError(
+                "CacheGroupRouter holds more than one history gather workspace"
+            )
+        return workspaces[0] if workspaces else None
+
+    def adopt_history_gather_workspace(self, workspace: HistoryGatherWorkspace) -> None:
+        for leaf in self.leaves.values():
+            leaf.adopt_history_gather_workspace(workspace)
 
     def register_step_counter(self, step_counter) -> None:
         # The MLA leaves record the PD layerwise step inside their chunked
@@ -396,10 +432,13 @@ class CacheGroupRouter(AttentionBackend):
         extend requests are skipped). DFLASH reads the TARGET router's verify
         window through this to copy target-aligned KV into the draft cache
         (the pools share one page-id space)."""
+        return self._decode_window_of(self.group_ids[self._draft_history_index()])
+
+    def _decode_window_of(self, gid: str) -> torch.Tensor:
+        """Group ``gid``'s current decode write window view (see ``decode_window_locations``)."""
         published = self.decode_write_locations
         if published is None:
             raise RuntimeError("decode window requested before any decode refresh")
-        gid = self.group_ids[self._draft_history_index()]
         locs = published.by_group[gid]
         if self._decode_request_offset:
             locs = locs[self._decode_request_offset * published.tokens_per_req :]
@@ -412,6 +451,62 @@ class CacheGroupRouter(AttentionBackend):
             raise RuntimeError("extend spans requested before init_forward_metadata")
         gid = self.group_ids[self._draft_history_index()]
         return self._extend_write_locations[gid]
+
+    def tree_support(self) -> TreeSupport:
+        unsupported = []
+        for gid in self.group_ids:
+            retention, _ = self.geometry.retentions[gid]
+            _, entry_stride_tokens = self.geometry.row_geometry[gid]
+            if retention != "full_history" or entry_stride_tokens not in (None, 1):
+                unsupported.append(gid)
+        if not unsupported:
+            return TreeSupport(verify_blocker=None, draft_blocker=None)
+        blocker = (
+            "draft trees need full-history cache groups of one row per token; "
+            f"{', '.join(unsupported)} slide or pack several tokens per row"
+        )
+        return TreeSupport(verify_blocker=blocker, draft_blocker=blocker)
+
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        super().bind_tree_verify(inputs)
+        self._tree_verify_armed = True
+        if self.cache_pool is not None:
+            self._bind_tree_window_rows()
+
+    def _bind_tree_window_rows(self) -> None:
+        """Per group, the address table of the K/V token-row buffers compaction moves rows in."""
+        pool = self.cache_pool
+        buffers_by_group: dict[str, list[torch.Tensor]] = {}
+        for layer, gid in sorted(pool.history_group_by_layer().items()):
+            if gid in self.leaves:
+                buffers_by_group.setdefault(gid, []).extend(pool.get_kv_buffer(layer))
+        self._tree_window_rows = {}
+        for gid, buffers in buffers_by_group.items():
+            row_bytes = {buf[0].numel() * buf.element_size() for buf in buffers}
+            contiguous = all(buf.is_contiguous() for buf in buffers)
+            if len(row_bytes) != 1 or not contiguous:
+                raise NotImplementedError(
+                    "draft-tree compaction needs contiguous K/V token rows of one "
+                    f"width per cache group; {gid} has widths {sorted(row_bytes)}, "
+                    f"contiguous={contiguous}"
+                )
+            # Layers may alias one region through the memory plan; move each region once.
+            addresses = torch.tensor(
+                sorted({buf.data_ptr() for buf in buffers}),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self._tree_window_rows[gid] = (addresses, row_bytes.pop())
+        if not self._tree_window_rows:
+            raise NotImplementedError(
+                f"draft-tree compaction found no K/V rows in cache groups {self.group_ids}"
+            )
+
+    def compact_verify_window(self, path: torch.Tensor) -> None:
+        for gid, (addresses, row_bytes) in self._tree_window_rows.items():
+            compact_window_rows(
+                addresses, self._decode_window_of(gid), path, row_bytes=row_bytes
+            )
 
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
@@ -515,6 +610,8 @@ class CacheGroupRouter(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        block_tables_cpu: Mapping[str, torch.Tensor],
         **kwargs,
     ) -> None:
         """Extend / mixed / idle-warmup metadata for every leaf.
@@ -524,11 +621,18 @@ class CacheGroupRouter(AttentionBackend):
         window), then hands every leaf its ``[bs, max_num_pages]`` kernel page
         table. ``extend_with_prefix`` (some extend request continues a cached
         or chunked prefix) travels with the extend lengths: leaves size their
-        paged-prefix metadata by it, so it must reach them unchanged.
+        paged-prefix metadata by it, so it must reach them unchanged. A
+        ``query_shard`` reaches every leaf too, with the host mirror of the
+        extend rows of its kernel page table (``block_tables_cpu``, the
+        runner's host mirror of ``block_tables``, expanded the way the stack
+        expands the device tables), so a leaf that gathers history by page
+        owner can split the gather without a device sync; an unsharded
+        forward reads nothing from the mirror.
         """
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
         del kwargs
+        sharded = query_shard is not None and query_shard.size > 1
         # A new forward: the sparse layers' shared top-k is per forward.
         self.sparse_topk.clear()
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
@@ -565,6 +669,12 @@ class CacheGroupRouter(AttentionBackend):
                 extend_prefix_lens=extend_prefix_lens,
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                 extend_with_prefix=extend_with_prefix,
+                query_shard=query_shard,
+                page_table_cpu=(
+                    self.stacks.host_table(gid, block_tables_cpu[gid], num_extends)
+                    if sharded
+                    else None
+                ),
             )
             leaf.set_request_slots(req_pool_indices[:bs])
 
@@ -755,9 +865,11 @@ class CacheGroupRouter(AttentionBackend):
     def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
         """Vanilla MTP re-anchor: seq_lens become the committed frontier,
         in-graph. Seq-lens-only like :meth:`advance_draft_forward_metadata`;
-        the drafter publishes its k-window explicitly."""
+        the drafter publishes its k-window explicitly. Each leaf's own hook
+        decides whether the k-row window needs more than the seq_lens edit
+        (the leaf default is that edit; DSA re-expands its per-token rows)."""
         for leaf in self.leaves.values():
-            leaf.advance_draft_forward_metadata(frontier)
+            leaf.update_draft_forward_metadata(frontier)
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         for leaf in self.leaves.values():
@@ -930,6 +1042,23 @@ class CacheGroupRouter(AttentionBackend):
     def forward_sparse_prefill(self, *args, **kwargs):
         return self._sole_leaf("forward_sparse_prefill").forward_sparse_prefill(
             *args, **kwargs
+        )
+
+    # ------------------------------------------------------------------
+    # DSA query-shard surface: a sparse-attention model's own top-k over KVP
+    # pages reads the sharded extend's request groups and gathers each
+    # group's index-K history through the leaf (``docs/design/unified_path.md``,
+    # "Query context parallelism").
+    # ------------------------------------------------------------------
+
+    def require_query_shard_metadata(self):
+        return self._sole_leaf(
+            "require_query_shard_metadata"
+        ).require_query_shard_metadata()
+
+    def gather_history_index_k(self, layer_id: int, token_to_kv_pool, group):
+        return self._sole_leaf("gather_history_index_k").gather_history_index_k(
+            layer_id, token_to_kv_pool, group
         )
 
     # ------------------------------------------------------------------

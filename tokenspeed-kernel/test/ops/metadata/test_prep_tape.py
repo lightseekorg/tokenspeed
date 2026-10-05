@@ -87,14 +87,16 @@ def test_dependent_source_write_precedes_gather_read():
     assert dst.item() == 123
 
 
-def test_state_pages_matches_reference():
+@pytest.mark.parametrize("BS", [8, 300])
+def test_state_pages_matches_reference(BS):
     torch.manual_seed(1)
     dev = "cuda"
-    BS, SLOTS, P = 8, 6, 64
+    SLOTS, P = 6, 64
     rows = torch.randint(1, 500, (BS, SLOTS), dtype=torch.int32, device=dev)
-    seq_lens = torch.tensor(
-        [1, 63, 64, 65, 128, 129, 200, 384], dtype=torch.int32, device=dev
-    )
+    edges = torch.tensor([1, 63, 64, 65, 128, 129, 200, 384], dtype=torch.int32)
+    seq_lens = torch.cat(
+        [edges, torch.randint(1, SLOTS * P + 1, (BS - 8,), dtype=torch.int32)]
+    ).to(dev)
     state_in = torch.zeros(BS + 4, dtype=torch.int32, device=dev)
     state_out = torch.zeros(BS + 4, dtype=torch.int32, device=dev)
 

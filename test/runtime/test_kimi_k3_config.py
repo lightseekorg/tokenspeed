@@ -230,9 +230,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             world_size=8,
             pp_size=1,
             pp_rank=0,
-            attn=SimpleNamespace(
-                tp_size=8, cp_size=1, dp_size=1, dp_rank=0, dp_group=(0,)
-            ),
+            attn=SimpleNamespace(tp_size=8, dp_size=1, dp_rank=0, dp_group=(0,)),
             moe=SimpleNamespace(
                 tp_rank=0,
                 tp_size=1,
@@ -661,6 +659,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
         attention = DeepseekV3AttentionMLA.__new__(DeepseekV3AttentionMLA)
         torch.nn.Module.__init__(attention)
+        attention.has_head_tp = False
         attention.num_local_heads = 2
         attention.v_head_dim = 3
         attention.attn_mha = SimpleNamespace(group_id="full_attention")
@@ -948,7 +947,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
             world_size=8,
             attn=SimpleNamespace(
                 tp_size=8,
-                cp_size=1,
                 dp_size=1,
                 dp_rank=0,
                 dp_group=(0,),

@@ -94,12 +94,16 @@ class DFlash2(DFlash):
 
     def wire_target(self, target_model) -> None:
         super().wire_target(target_model)
+        # The target's LM-head layout, so a vocab-sharded head under attention
+        # DP (--lm-head-tp-size) transposes its logits back the same way.
         self.candidate_logits_processor = LogitsProcessor(
             self.model.config,
+            skip_all_gather=self.logits_processor.skip_all_gather,
             logit_scale=self.output_multiplier,
             tp_rank=self.logits_processor.tp_rank,
             tp_size=self.logits_processor.tp_size,
             tp_group=self.logits_processor.tp_group,
+            dp_lm_head_tp=self.logits_processor.dp_lm_head_tp,
         )
         self.candidate_logits_processor.final_logit_softcapping = (
             self.final_logit_softcapping if self.final_logit_softcapping > 0 else None
@@ -126,9 +130,10 @@ class DFlash2(DFlash):
             raise RuntimeError("DFlash2 must be wired to the target before drafting.")
         if self.candidate_topk.enabled:
             return self.candidate_topk(hidden_states)
-        metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+        # Replicated draft rows: no query shard.
+        metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
         logits = self.candidate_logits_processor._get_logits(
-            hidden_states, self.lm_head, metadata
+            hidden_states, self.lm_head, metadata, require_full_vocab=False
         )
         unary_logits, candidate_ids = torch.topk(
             logits, self.selector_top_k, dim=-1, sorted=False

@@ -34,13 +34,17 @@ from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
 )
+from tokenspeed_kernel.ops.attention.tree import tree_window_attention
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.workspace import workspace_pool
+from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
@@ -131,6 +135,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # Padded decode requests have seq_len=1; with q_len=spec_num_tokens
         # they'd hit an empty causal span and the kernel returns NaN.
         self.spec_cache_seqlens_buf: torch.Tensor | None = None
+        # Draft-tree verify: committed keys per request, the cascade's prefix.
+        self.tree_prefix_lens_buf: torch.Tensor | None = None
         # Pure aranges per bs: pool-independent, so a rebind keeps them.
         self._cu_seqlens_by_bs: dict[int, torch.Tensor] = {}
         self._verify_views_by_bs: dict[int, TRTLLMMHAMetadata] = {}
@@ -140,6 +146,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.forward_prefill_metadata = None
         self.forward_decode_metadata = None
         self.spec_cache_seqlens_buf = None
+        self.tree_prefix_lens_buf = None
         self._verify_views_by_bs = {}
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
@@ -163,8 +170,12 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
         **kwargs,
     ):
+        reject_query_shard(query_shard, "TRTLLMMHAAttnBackend")
+        del page_table_cpu
         if not forward_mode.is_extend_or_mixed():
             raise RuntimeError(
                 "trtllm decode metadata goes through refresh_decode_metadata; "
@@ -213,6 +224,9 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
         self.spec_cache_seqlens_buf = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
+        self.tree_prefix_lens_buf = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
         )
         self._cu_seqlens_by_bs = {}
@@ -302,6 +316,12 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 self.spec_num_tokens,
                 out=self.spec_cache_seqlens_buf[:bs],
             )
+            if self.tree_verify is not None:
+                torch.sub(
+                    self.spec_cache_seqlens_buf[:bs],
+                    self.tree_verify.num_nodes,
+                    out=self.tree_prefix_lens_buf[:bs],
+                )
             self.forward_prefill_metadata = self._verify_views(bs)
 
     # ------------------------------------------------------------------
@@ -359,6 +379,20 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         bs: int,
         **kwargs,
     ) -> torch.Tensor:
+        if self.tree_lane_step_active:
+            lanes = self.tree_draft
+            return self._tree_cascade(
+                self._prepare_q(q, layer),
+                layer,
+                token_to_kv_pool,
+                page_table=self.page_table_buf[:bs],
+                seq_lens=lanes.window_seq_lens[:bs],
+                prefix_lens=lanes.frontier[:bs],
+                mask=lanes.lane_mask[: bs * lanes.topk],
+                rows=lanes.topk,
+                window=lanes.num_slots,
+                sinks=kwargs.get("sinks"),
+            )
         if self.block_decode_active:
             # DFLASH draft block: metadata is expanded to bs*spec_num_tokens
             # single-query entries, so use the decode slot directly. Inferring
@@ -376,6 +410,20 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             )
 
         q = self._prepare_q(q, layer)
+        if self.tree_verify is not None and metadata.max_seq_len_q > 1:
+            nodes = self.tree_verify.num_nodes
+            return self._tree_cascade(
+                q,
+                layer,
+                token_to_kv_pool,
+                page_table=metadata.page_table,
+                seq_lens=metadata.cache_seqlens_int32,
+                prefix_lens=self.tree_prefix_lens_buf[:bs],
+                mask=self.tree_verify.mask[: bs * nodes],
+                rows=nodes,
+                window=nodes,
+                sinks=kwargs.get("sinks"),
+            )
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
 
         attention_sink = kwargs.get("sinks", None)
@@ -397,6 +445,70 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             q_len_per_req=metadata.max_seq_len_q,
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def tree_support(self) -> TreeSupport:
+        if self.kv_cache_dtype == self.dtype:
+            return TreeSupport(verify_blocker=None, draft_blocker=None)
+        return TreeSupport(
+            verify_blocker=f"{type(self).__name__} reads the verify window K/V back "
+            f"unquantized; kv_cache_dtype {self.kv_cache_dtype} is not supported yet",
+            draft_blocker=f"{type(self).__name__} reads the lane window K/V back "
+            f"unquantized; kv_cache_dtype {self.kv_cache_dtype} is not supported yet",
+        )
+
+    def _tree_cascade(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        *,
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        mask: torch.Tensor,
+        rows: int,
+        window: int,
+        sinks: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Draft-tree attention (verify nodes or drafting lanes): trtllm-gen's causal
+        ``rows``-token decode over the committed prefix, then the tree window
+        and the prefix tail merged into it (``tree_window_attention``)."""
+        if layer.sliding_window_size >= 0 or sinks is not None:
+            raise NotImplementedError(
+                "draft trees have no sliding-window or attention-sink path yet"
+            )
+        k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
+        # trtllm-gen also loads the key right after the prefix: the window's first slot, written this forward.
+        prefix_out, prefix_lse = trtllm_batch_decode_with_kv_cache(
+            query=q,
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=self.workspace_buffer,
+            block_tables=page_table,
+            seq_lens=prefix_lens,
+            max_seq_len=self.max_context_len,
+            bmm1_scale=layer.scaling,
+            bmm2_scale=1.0,
+            out_dtype=self.dtype,
+            q_len_per_req=rows,
+            return_lse=True,
+        )
+        kv_heads, dim = layer.tp_k_head_num, layer.head_dim
+        k_rows, v_rows = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        out = tree_window_attention(
+            q,
+            k_rows.view(-1, kv_heads, dim),
+            v_rows.view(-1, kv_heads, dim),
+            page_table,
+            seq_lens,
+            mask,
+            prefix_out,
+            prefix_lse,
+            rows_per_req=rows,
+            window=window,
+            page_size=self.kernel_page_size,
+            sm_scale=layer.scaling,
+        )
+        return out.view(-1, layer.tp_q_head_num * dim)
 
     def forward_extend(
         self,

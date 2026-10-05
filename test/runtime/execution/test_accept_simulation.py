@@ -92,7 +92,7 @@ class _NoAcceptSampler:
         rows = logits_output.next_token_logits.shape[0]
         return torch.zeros(rows, dtype=torch.int32), torch.ones(rows, dtype=torch.int32)
 
-    def verify(self, logits_output, sampling_info, candidates):
+    def verify(self, logits_output, sampling_info, candidates, *, tree):
         rows = candidates.shape[0]
         self.lengths[:rows].fill_(1)
         return torch.zeros(candidates.numel(), dtype=torch.int32), self.lengths[:rows]
@@ -101,6 +101,7 @@ class _NoAcceptSampler:
 def _executor(pool_indices: list[int], cache_lengths: torch.Tensor) -> ModelExecutor:
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.sampling_backend = _NoAcceptSampler()
+    executor.tree_spec = None
     executor._simulated_accept_length = _scaled("2.7")
     req_pool_indices = torch.zeros(8, dtype=torch.int64)
     req_pool_indices[: len(pool_indices)] = torch.tensor(pool_indices)

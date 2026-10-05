@@ -731,6 +731,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_replay_lens_cpu=torch.zeros_like(prefix),
             extend_prompt_lens_cpu=prefix + new,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         kind, bs, num_extends, page_table, mode = leaves[FULL].calls[-2]
         self.assertEqual(
@@ -774,6 +776,8 @@ class CacheGroupRouterTest(unittest.TestCase):
                 extend_replay_lens_cpu=torch.zeros_like(no_extends),
                 extend_prompt_lens_cpu=no_extends + no_extends,
                 extend_with_prefix=False,
+                query_shard=None,
+                block_tables_cpu={},
             )
 
     def test_extend_init_rejects_bounded_replay_rows(self):
@@ -799,6 +803,8 @@ class CacheGroupRouterTest(unittest.TestCase):
                 extend_replay_lens_cpu=torch.tensor([2, 0], dtype=torch.int32),
                 extend_prompt_lens_cpu=prefix + new,
                 extend_with_prefix=True,
+                query_shard=None,
+                block_tables_cpu={},
             )
 
     def test_mixed_round_slices_decode_requests_after_the_extend_requests(self):
@@ -823,6 +829,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_prompt_lens_cpu=torch.tensor([4], dtype=torch.int32)
             + torch.tensor([5], dtype=torch.int32),
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         self.assertEqual(
             router.write_locations(_layer(FULL), ForwardMode.EXTEND).tolist(),
@@ -872,6 +880,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_replay_lens_cpu=torch.zeros_like(four),
             extend_prompt_lens_cpu=four + five,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         padded = router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 8)
         self.assertEqual(padded.tolist(), [24, 25, 26, 27, 0, 39, 0, 0])
@@ -896,6 +906,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens),
             extend_prompt_lens_cpu=extend_prefix_lens + extend_seq_lens,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             1,
@@ -937,6 +949,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_replay_lens_cpu=torch.zeros_like(prefix),
             extend_prompt_lens_cpu=prefix + one,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             1,
@@ -972,6 +986,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens),
             extend_prompt_lens_cpu=extend_prefix_lens + extend_seq_lens,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             2,
@@ -1076,6 +1092,33 @@ class CacheGroupRouterTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "single attention cache group"):
             _ = multi.chunked_prefill_metadata
 
+    def test_dsa_query_shard_surface_proxies_to_the_sole_leaf(self):
+        """A DSA model's own selection over KVP pages reaches the leaf's
+        sharded-extend plan and index-K history gather through the router."""
+        leaf = _StubLeaf(4)
+        meta = object()
+        gathered = (object(), None)
+        calls = []
+        leaf.require_query_shard_metadata = lambda: meta
+        leaf.gather_history_index_k = lambda layer_id, pool, group: (
+            calls.append((layer_id, pool, group)) or gathered
+        )
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.bind(_geometry(), {FULL: leaf})
+        self.assertIs(router.require_query_shard_metadata(), meta)
+        pool, group = object(), object()
+        self.assertIs(router.gather_history_index_k(3, pool, group), gathered)
+        self.assertEqual(calls, [(3, pool, group)])
+        multi, _ = self._router()
+        with self.assertRaisesRegex(RuntimeError, "single attention cache group"):
+            multi.require_query_shard_metadata()
+
     def test_draft_write_locations_ride_the_history_stack(self):
         """The drafters' in-graph slot math reads the router's address-stable
         full-history table in the stack: page-size invariant vs the raw table,
@@ -1128,6 +1171,37 @@ class CacheGroupRouterTest(unittest.TestCase):
         self.assertEqual(leaves[SWA].seq_lens_buf[:2].tolist(), [7, 7])
         self.assertEqual(router.child_backends(), (leaves[FULL], leaves[SWA]))
 
+    def test_mtp_frontier_reaches_each_leaf_through_its_own_hook(self):
+        """The MTP re-anchor is dispatched to the leaf's
+        ``update_draft_forward_metadata``: a leaf with per-row metadata (DSA)
+        re-expands its k-row shape there, while the leaf default is the plain
+        seq_lens edit, so leaves without an override keep today's behavior."""
+
+        class _KRowLeaf(_StubLeaf):
+            def __init__(self, kernel_page_size):
+                super().__init__(kernel_page_size)
+                self.frontiers: list[list[int]] = []
+
+            def update_draft_forward_metadata(self, frontier):
+                self.frontiers.append(frontier.tolist())
+
+        leaves = {FULL: _KRowLeaf(4), SWA: _StubLeaf(2)}
+        router = CacheGroupRouter(
+            None,
+            is_draft=True,
+            spec_num_tokens=4,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.bind(_geometry(), leaves)
+        router.init_cuda_graph_state(4)
+
+        router.update_draft_forward_metadata(torch.tensor([7, 3], dtype=torch.int32))
+
+        self.assertEqual(leaves[FULL].frontiers, [[7, 3]])
+        self.assertEqual(leaves[FULL].seq_lens_buf[:2].tolist(), [0, 0])
+        self.assertEqual(leaves[SWA].seq_lens_buf[:2].tolist(), [7, 3])
+
     def test_every_metadata_build_clears_the_sparse_topk_share(self):
         """The sparse layers' shared selection is per forward: extend init,
         decode refresh and capture seeding each start it empty, so a "shared"
@@ -1157,6 +1231,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_replay_lens_cpu=torch.zeros_like(prefix),
             extend_prompt_lens_cpu=prefix + new,
             extend_with_prefix=False,
+            query_shard=None,
+            block_tables_cpu={},
         )
         self.assertEqual((share.prefill, share.decode), (None, None))
 
@@ -1506,6 +1582,7 @@ class PagedLeafRebindTest(unittest.TestCase):
                 "forward_prefill_metadata",
                 "forward_decode_metadata",
                 "spec_cache_seqlens_buf",
+                "tree_prefix_lens_buf",
             ],
         )
 

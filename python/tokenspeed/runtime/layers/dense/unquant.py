@@ -25,6 +25,7 @@ from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.selection import resolve_kernel_override
 from torch.nn.parameter import Parameter
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.utils import set_weight_attrs
 
@@ -65,8 +66,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
-        if global_server_args_dict["numerics"] == "rl-bitwise":
-            # Bitwise envelope: one batch-invariant GEMM for every shape. The
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+            # Bitwise envelopes: one batch-invariant GEMM for every shape. The
             # GEMV and large-M fast paths below switch kernels by shape, which
             # is exactly the row-result drift the envelope forbids. A missing
             # "aok" leaf fails selection loudly rather than falling back.

@@ -231,8 +231,13 @@ class MLAPrologueOutput:
             in the returned query's dtype for expanded attention, else ``None``.
         value: Per-head values in the returned query's dtype for expanded attention,
             else ``None``.
+        latent: The rotated latent rows ``[num_tokens, kv_lora_rank + rope_dim]``
+            in the activation dtype when the prologue ran without a cache
+            (``cache=None``) and left the store to :func:`latent_store`;
+            ``None`` when the prologue wrote the cache itself.
     """
 
     query: torch.Tensor
     key: torch.Tensor | None
     value: torch.Tensor | None
+    latent: torch.Tensor | None = None

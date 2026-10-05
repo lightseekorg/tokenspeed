@@ -94,6 +94,8 @@ class _Results:
         self.output_nan_flags = None
         self.grammar_completion = None
         self.next_input_ids = None
+        self.input_token_logprobs = None
+        self.input_logprob_plan = None
 
 
 class _ForwardOp:
@@ -126,6 +128,7 @@ def _state(input_ids: list[int]) -> RequestState:
         sampling_params=SamplingParams(max_new_tokens=8, stop=[], ignore_eos=True),
         stream=False,
         tokenizer=_Tokenizer(),
+        computes_prompt_logprobs=True,
     )
 
 

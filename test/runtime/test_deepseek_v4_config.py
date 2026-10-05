@@ -256,6 +256,7 @@ def _extend_kwargs(
         extend_prompt_lens_cpu=extend_prefix_lens_cpu
         + extend_seq_lens_cpu[: extend_prefix_lens_cpu.numel()],
         extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
+        query_shard=None,
     )
 
 
@@ -624,6 +625,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertTrue(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -652,6 +654,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertFalse(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -684,6 +687,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertFalse(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -1606,6 +1610,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 speculative_algorithm=None,
                 load_format="auto",
                 ext_yaml=None,
+                validate_tp_batch_invariant_weights=lambda *args: None,
             )
             hf_config = make_hf_config()
             with (
@@ -1733,7 +1738,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(is_deepseek_v4(model_config.hf_config))
 
-        configure_deepseek_v4_attention(model_config)
+        configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
 
         self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
         self.assertEqual(model_config.head_dim, 512)
@@ -1773,7 +1778,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
-        configure_deepseek_v4_attention(model_config)
+        configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
 
         self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
         self.assertEqual(model_config.head_dim, 512)
@@ -2270,17 +2275,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         target_model.set_dspark_layers_to_capture.assert_not_called()
 
     def test_dspark_tp_only_contract_uses_resolved_mapping(self):
-        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
+        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1))
         DeepseekV4DSpark._validate_tp_only_mapping(mapping)
 
-        for field in ("dp_size", "cp_size"):
-            invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
-            setattr(invalid.attn, field, 2)
-            with (
-                self.subTest(field=field),
-                self.assertRaisesRegex(ValueError, "tensor parallelism only"),
-            ):
-                DeepseekV4DSpark._validate_tp_only_mapping(invalid)
+        invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=2))
+        with self.assertRaisesRegex(ValueError, "tensor parallelism only"):
+            DeepseekV4DSpark._validate_tp_only_mapping(invalid)
 
     def test_dspark_padding_slots_reset_before_every_graph_replay(self):
         drafter = object.__new__(DeepseekV4DSpark)

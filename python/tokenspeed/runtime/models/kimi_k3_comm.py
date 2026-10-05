@@ -175,21 +175,16 @@ class K3AttnComm:
         )
         logger.info(f"Kimi K3 attention reduce: {attention_reduce_backend}")
 
-    def acquire_prefill_projection_output(
+    def acquire_projection_output(
         self,
         like: torch.Tensor,
         projection,
-        *,
-        is_prefill: bool,
-        sharded_moe_supported: bool,
     ) -> torch.Tensor | None:
         """Return prepared storage for an eligible attention producer, or None."""
         from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
 
         if (
-            not is_prefill
-            or not sharded_moe_supported
-            or not current_platform().is_cdna4
+            not current_platform().is_cdna4
             or like.ndim != 2
             or not _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS
             <= like.shape[0]
@@ -218,7 +213,7 @@ class K3AttnComm:
             shapes, like, group, backend=None, op=dist.ReduceOp.SUM
         )[0]
 
-    def prefill_reduce_for_attnres(
+    def reduce_for_attnres(
         self,
         partial: torch.Tensor,
         prefix: torch.Tensor | None,
@@ -234,7 +229,7 @@ class K3AttnComm:
             reduced = all_reduce(partial, self.mapping.attn.tp_group)
         return (reduced, None) if prefix is None else (prefix, reduced)
 
-    def prefill_mix_for_moe(
+    def mix_for_moe(
         self,
         partial: torch.Tensor,
         prefix: torch.Tensor | None,
@@ -289,9 +284,13 @@ class K3AttnComm:
             allreduce_residual_attnres_combine_supported,
         )
 
-        return not global_server_args_dict.get(
+        # A symmetric-memory reduction in the kernel's own order: off under
+        # the NCCL-only knob and under the batch-invariant contract alike.
+        if global_server_args_dict.get(
             "force_deterministic_rsag", False
-        ) and allreduce_residual_attnres_combine_supported(
+        ) or global_server_args_dict.get("batch_invariant_collectives", False):
+            return False
+        return allreduce_residual_attnres_combine_supported(
             partial,
             residual,
             score_weight,
@@ -308,6 +307,7 @@ class K3AttnComm:
         prefix_sum: torch.Tensor | None,
         combine: tuple | None = None,
         *,
+        producer_direct: bool,
         mlp_wp: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """All-reduce the attention partial and accumulate the residual.
@@ -412,8 +412,10 @@ class K3AttnComm:
                     eps=eps,
                 )
                 return residual_out, h
-        reduced = all_reduce(attn_partial, self.mapping.attn.tp_group)
-        return (reduced if prefix_sum is None else prefix_sum + reduced), None
+        residual, delta = self.reduce_for_attnres(
+            attn_partial, prefix_sum, producer_direct=producer_direct
+        )
+        return (residual if delta is None else residual + delta), None
 
 
 class K3MoeTailComm:

@@ -72,6 +72,8 @@ class MemoryOccupationController:
         enabled: bool,
         reset_caches_fn: Callable[[], bool],
         kv_repair_fn: Callable[[], None],
+        weights_release_refusal_fn: Callable[[], str | None],
+        weights_busy_fn: Callable[[], bool],
         kv_cache_release_allowed: bool = True,
     ) -> None:
         self._send = send_func
@@ -80,6 +82,13 @@ class MemoryOccupationController:
         self._enabled = enabled
         self._reset_caches = reset_caches_fn
         self._kv_repair = kv_repair_fn
+        # The online expert rebalance writes the weights from the control
+        # plane's gated ops: a release is refused while one is in progress
+        # (``weights_release_refusal_fn`` names why), and a drained release
+        # waits while chunk ops still write the weights (``weights_busy_fn``),
+        # which complete through the gate without further forwards.
+        self._weights_release_refusal = weights_release_refusal_fn
+        self._weights_busy = weights_busy_fn
         # Whether releasing the ``kv_cache`` region is safe in this engine. False
         # when prefix caching is on but the scheduler exposes no prefix-cache
         # reset: discarded KV would leave stale cache entries that survive wake
@@ -118,15 +127,27 @@ class MemoryOccupationController:
         if self._pause.is_drain_pending:
             self._fail_release("a pause or release is already in progress")
             return
+        refusal = self._weights_release_refusal()
+        if refusal is not None:
+            self._fail_release(f"cannot release memory: {refusal}")
+            return
         # Defer the actual free until the scheduler drains. wait-mode: let
         # in-flight requests finish (the RL rollout is idle between steps).
         # A post-finish L2 transfer can outlive the request; keep the release
-        # pending until ClearL1Cache can atomically invalidate its cache refs.
+        # pending until ClearL1Cache can atomically invalidate its cache refs,
+        # and until no gated op is still writing the weights.
+        reset_caches = self._reset_caches if "kv_cache" in tags else None
+
+        def ready() -> bool:
+            if self._weights_busy():
+                return False
+            return reset_caches is None or reset_caches()
+
         self._pause.request_drain(
             abort_inflight=False,
             on_drained=lambda: self._finish_release(tags),
             on_cancelled=lambda: self._fail_release("resumed before release drained"),
-            ready=self._reset_caches if "kv_cache" in tags else None,
+            ready=ready,
         )
 
     def _finish_release(self, tags: list[str]) -> None:

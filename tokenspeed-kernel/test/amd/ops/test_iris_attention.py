@@ -444,6 +444,9 @@ def _attention_worker(rank: int, port: int) -> None:
         )
     torch.testing.assert_close(flags_before, state._producer_direct_ready_flags)
     torch.testing.assert_close(partial, source)
+    # Peers must not enter the MoE tail collective below while a slower rank
+    # is still asserting that the rejections left its flags intact.
+    dist.barrier()
 
     # A real MoE tail shares the input, scratch, and epochs with attention.
     gen.manual_seed(3004)

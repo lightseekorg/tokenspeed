@@ -319,6 +319,11 @@ class _Harness:
             **self.conv_tables,
             **{gid: attn_table for gid in self.attn_groups},
         }
+        # The runner's host mirror of the tables, as the router's extend
+        # metadata contract requires (read only under a query shard).
+        self.block_tables_cpu = {
+            gid: table.cpu() for gid, table in self.block_tables.items()
+        }
         self.seq_len = 0
         # Unified decode path: decode metadata is refreshed into persistent
         # buffers allocated here (production allocates them unconditionally
@@ -380,7 +385,9 @@ class _Harness:
             extend_replay_lens_cpu=torch.zeros(1, dtype=torch.int32),
             extend_prompt_lens_cpu=torch.tensor([T], dtype=torch.int32),
             extend_with_prefix=False,
+            query_shard=None,
             block_tables=self.block_tables,
+            block_tables_cpu=self.block_tables_cpu,
         )
         self.seq_len = T
         self._check_write_locations(ForwardMode.EXTEND, 0, T)

@@ -182,6 +182,8 @@ class IdleReplayScrubTest(unittest.TestCase):
             "extend_seq_lens_cpu",
         ):
             self.assertEqual(extend_kwargs[name].numel(), 0, name)
+        # And the runner's required host tables: no request, no groups.
+        self.assertEqual(extend_kwargs["block_tables_cpu"], {})
 
 
 if __name__ == "__main__":

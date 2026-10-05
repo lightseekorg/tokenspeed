@@ -61,8 +61,9 @@ def combine_attention_partials(
     group: tuple[int, ...],
     rank: int,
     sink: torch.Tensor | None,
+    keep_all_heads: bool,
 ) -> torch.Tensor:
-    """Gather LSE and reduce-scatter weighted partials to the TP head owner.
+    """Gather LSE and combine weighted partials across the context shards.
 
     Args:
         local_output: CUDA local context output [tokens, gathered_heads, head_dim].
@@ -71,21 +72,43 @@ def combine_attention_partials(
         rank: This process's position in group.
         sink: Required keyword: TP-local sink logits, or explicitly None for
             attention without a sink. There is no implicit sink policy.
+        keep_all_heads: Required keyword. ``False`` is the head-sharded form:
+            the query heads were gathered from every rank of the group and the
+            weighted partials are reduce-scattered back so each rank keeps its
+            TP-local heads. ``True`` is the head-replicated form (a layer
+            holding every head, as under query context parallelism): every
+            rank attended all heads over its own pages and the weighted
+            partials are all-reduced, so every rank returns every head; no
+            sink yet. Both forms share the weighting kernel, which splits the
+            heads by the group's degree, so ``heads % len(group) == 0`` holds
+            for either.
 
     Returns:
-        Original-dtype output [tokens, TP-local heads, head_dim], with the
-        sink applied once after combining every context shard.
+        Original-dtype output [tokens, heads, head_dim] -- the TP-local heads,
+        or every head with ``keep_all_heads`` -- with the sink applied once
+        after combining every context shard.
     """
     degree = len(group)
     if not 0 <= rank < degree or local_output.shape[1] % degree:
         raise ValueError("DCP combine topology does not partition query heads")
     if local_lse.shape != local_output.shape[:-1]:
         raise ValueError("DCP combine output and LSE shapes disagree")
+    if keep_all_heads and sink is not None:
+        raise ValueError("the head-replicated DCP combine takes no sink")
     heads = local_output.shape[1] // degree
     if sink is not None and sink.numel() < heads:
         raise ValueError("DCP sink must cover the TP-local heads")
     gathered_lse = all_gather(local_lse.float().unsqueeze(0).contiguous(), group, dim=0)
     weighted, lse = dcp_weight_for_reduce_scatter(local_output, gathered_lse, rank)
+    if keep_all_heads:
+        # Every head's partial is weighted; the sum over owners is the full
+        # attention of every head on every rank.
+        return (
+            all_reduce(weighted, group)
+            .movedim(0, 1)
+            .to(dtype=local_output.dtype, memory_format=torch.contiguous_format)
+            .contiguous()
+        )
     output = reduce_scatter(weighted, group).movedim(0, 1)
     if sink is None:
         # Request token-major storage during the cast to avoid copying twice.

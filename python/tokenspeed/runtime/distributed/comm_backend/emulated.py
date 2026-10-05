@@ -26,6 +26,14 @@ from tokenspeed.runtime.distributed.comm_backend.base import CommBackend
 from tokenspeed.runtime.distributed.mapping import Group
 
 
+def _tile_rows(tensor: torch.Tensor, rows: int) -> torch.Tensor:
+    """``rows`` rows repeating ``tensor``'s, or zeros if it has none."""
+    if tensor.shape[0] == 0:
+        return tensor.new_zeros((rows, *tensor.shape[1:]))
+    repeats = (rows + tensor.shape[0] - 1) // tensor.shape[0]
+    return tensor.repeat(repeats, *([1] * (tensor.dim() - 1)))[:rows]
+
+
 class EmulatedRankBackend(CommBackend):
     """Local stand-ins for the collectives of a rank that has no peers.
 
@@ -69,9 +77,18 @@ class EmulatedRankBackend(CommBackend):
         return tensor[start : start + rows].clone()
 
     def all_to_all_single(
-        self, output: torch.Tensor, input: torch.Tensor, group: Group
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: Group,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
     ) -> None:
-        output.copy_(input)
+        if output_split_sizes is None and input_split_sizes is None:
+            output.copy_(input)
+            return
+        # Peers may send this rank more rows than it sends.
+        output.copy_(_tile_rows(input, output.shape[0]))
 
     def token_all_gather(
         self,
@@ -79,13 +96,8 @@ class EmulatedRankBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        total = sum(scattered_num_tokens)
-        rows = tensor.shape[0]
-        if rows == 0:
-            return tensor.new_zeros((total, *tensor.shape[1:]))
         # Peers may own more rows than this rank, so tile the local rows.
-        repeats = (total + rows - 1) // rows
-        return tensor.repeat(repeats, *([1] * (tensor.dim() - 1)))[:total]
+        return _tile_rows(tensor, sum(scattered_num_tokens))
 
     def token_reduce_scatter(
         self,

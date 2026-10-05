@@ -201,6 +201,11 @@ class AttnConfig:
     dcp_size: int = 1
     dcp_rank: int = 0
     dcp_group: tuple[int, ...] = (0,)
+    # Query context parallelism: the extend rows this rank computes are a
+    # contiguous shard of the chunk; the group is the attention TP group.
+    qcp_size: int = 1
+    qcp_rank: int = 0
+    qcp_group: tuple[int, ...] = (0,)
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):
@@ -212,6 +217,29 @@ class AttnConfig:
                 "AttnConfig requires exactly one softmax-family component, got "
                 f"{[type(c).__name__ for c in self.components] or 'none'}"
             )
+        if self.qcp_size > 1:
+            softmax = softmax_components[0]
+            # The gathered-history extend arm exists on the GPU DSA leaf only;
+            # every other leaf rejects a query shard at its metadata build.
+            if not (softmax.is_dsa and softmax.backend_name in (None, "dsa")):
+                raise ValueError(
+                    "query context parallelism requires GPU DSA attention; "
+                    f"got {softmax.backend_name!r}"
+                )
+            if torch.device(self.device).type != "cuda":
+                raise ValueError("GPU DSA query context parallelism requires CUDA")
+            # The sharded KV write gathers the rotated latent and stores it
+            # with latent_store, which writes native (bf16) rows only.
+            if (
+                self.kv_cache_dtype is not torch.bfloat16
+                or self.kv_cache_mxfp8
+                or self.kv_cache_quant_method != "none"
+            ):
+                raise ValueError(
+                    "query context parallelism requires a bf16 KV cache; got "
+                    f"{self.kv_cache_dtype} (mxfp8={self.kv_cache_mxfp8}, quant "
+                    f"method {self.kv_cache_quant_method!r})"
+                )
         if self.dcp_size > 1:
             softmax = softmax_components[0]
             if softmax.backend_name == "flashmla":
@@ -302,6 +330,9 @@ def model_wide_kwargs(
         dcp_size=attn_mapping.dcp_size,
         dcp_rank=attn_mapping.dcp_rank,
         dcp_group=attn_mapping.dcp_group,
+        qcp_size=attn_mapping.qcp_size,
+        qcp_rank=attn_mapping.qcp_rank,
+        qcp_group=attn_mapping.qcp_group,
     )
     if server_args.speculative_algorithm is not None:
         kwargs.update(

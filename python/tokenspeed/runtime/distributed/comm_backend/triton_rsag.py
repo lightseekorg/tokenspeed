@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.communication.triton import (
     all_gather_inner,
     create_state,
     reduce_scatter,
+    rsag_all_reduce,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -40,6 +41,15 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.utils import ceil_div
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+# The multimem kernels move 16 bytes per thread: a row must hold a whole
+# number of such chunks (``nvidia_rsag_get_launch_config``).
+_MULTIMEM_ROW_ALIGNMENT = 8
+# Rank in the group that issues the in-switch loads of the batch-invariant
+# all-reduce. Fixed for the deployment: the in-switch association order
+# depends on the issuer (``nvidia_rsag_all_reduce``), so moving it would move
+# the bits.
+MULTIMEM_ALL_REDUCE_ISSUER = 0
 
 
 class TritonRSAGBackend:
@@ -54,6 +64,56 @@ class TritonRSAGBackend:
         self._fallback = fallback
         # (group_tuple, hidden_size) -> Triton RS/AG state
         self._instances = {}
+
+    # ---- The batch-invariant all-reduce (no fallback) ----
+
+    @staticmethod
+    def serves_multimem_all_reduce(tensor: torch.Tensor) -> bool:
+        """Whether ``multimem_all_reduce`` can take ``tensor`` at all.
+
+        Static properties of the call site only -- platform, rank, dtype,
+        row width -- never the row count: the route a site takes must not
+        change with the batch, so capacity is checked (and refused, not
+        rerouted) inside ``multimem_all_reduce``.
+        """
+        return (
+            current_platform().is_nvidia
+            and tensor.dim() == 2
+            and tensor.dtype == torch.bfloat16
+            and tensor.size(-1) % _MULTIMEM_ROW_ALIGNMENT == 0
+        )
+
+    def multimem_all_reduce(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
+        """In-place all-reduce through the group's fixed issuer's in-switch load.
+
+        ``rsag_all_reduce`` with ``MULTIMEM_ALL_REDUCE_ISSUER``: one function
+        of the inputs for the deployment's lifetime (see the kernel's note on
+        issuer dependence). No fallback -- a payload past the RS/AG state's
+        capacity is a sizing bug and raises, because the ordered fold would
+        return different bits for that batch alone.
+        """
+        if not self.serves_multimem_all_reduce(tensor):
+            raise ValueError(
+                "the multimem all-reduce takes 2-D bf16 rows whose width is a "
+                f"multiple of {_MULTIMEM_ROW_ALIGNMENT} on NVIDIA; got "
+                f"{tuple(tensor.shape)} {tensor.dtype}"
+            )
+        state = self._get_or_create(group, tensor.size(-1))
+        if tensor.size(0) > state.max_token_num:
+            raise RuntimeError(
+                f"the multimem all-reduce over group {group} was handed "
+                f"{tensor.size(0)} rows, past the {state.max_token_num} its "
+                "communication buffer was sized for from the launch; the "
+                "batch-invariant contract forbids rerouting this batch to the fold"
+            )
+        reduced = rsag_all_reduce(
+            state,
+            tensor.contiguous(),
+            issuer=MULTIMEM_ALL_REDUCE_ISSUER,
+            safe=False,
+        )
+        tensor.copy_(reduced)
+        return tensor
 
     def _get_or_create(self, group: Group, hidden_size: int):
         key = (group, hidden_size)

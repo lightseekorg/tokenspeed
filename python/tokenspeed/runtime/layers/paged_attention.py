@@ -29,7 +29,7 @@ contracts must satisfy: a group must retain every token its layers can see.
 """
 
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 import torch
@@ -42,14 +42,42 @@ from tokenspeed_kernel.ops.attention.prologue import (
     MLAPrologueOutput,
     Rotary,
     gqa_prologue,
+    latent_store,
     mla_prologue,
 )
 from torch import nn
 
+from tokenspeed.runtime.distributed.comm_ops import token_all_gather
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+
+
+@dataclass(frozen=True)
+class QueryShardGather:
+    """Where a query shard's latent rows come together before the KV write.
+
+    Under query context parallelism every rank rotates its own rows and the
+    prologue all-gathers the rotated latent over ``group`` (per-rank counts
+    ``plan.row_counts``) to the whole extend span before the owner-masked
+    store, so page ownership stays independent of the query shard.
+
+    Attributes:
+        plan: The forward's shard plan (``ctx.query_shard``).
+        group: The query-context-parallel group (``mapping.attn.qcp_group``).
+    """
+
+    plan: QueryShardPlan
+    group: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.group) != self.plan.size:
+            raise ValueError(
+                f"query shard group of {len(self.group)} ranks does not match a "
+                f"plan over {self.plan.size}"
+            )
 
 
 def hf_sliding_window_to_window_left(sliding_window: int) -> int:
@@ -297,6 +325,7 @@ class PagedAttention(nn.Module):
         *,
         slots: torch.Tensor,
         expanded: MLAExpandedKV | None,
+        key_rows: QueryShardGather | None,
     ) -> MLAPrologueOutput:
         """Run an MLA layer's prologue: rotate, write the latent rows to
         ``slots``, and return attention inputs (FP8 for an FP8 cache, not
@@ -309,23 +338,72 @@ class PagedAttention(nn.Module):
             latent_cache: Normalized latent and unrotated key RoPE part.
             positions: Token positions.
             ctx: Forward context.
-            slots: Cache slots of the leading latent rows to write.
+            slots: Cache slots of the leading latent rows to write. Under a
+                query shard this is the whole extend span (every rank holds
+                it) while the rows above are this rank's shard.
             expanded: Per-head keys and values for non-absorbed attention.
+            key_rows: The query shard's gather, or ``None`` when the rows
+                are the whole span. With a shard the prologue rotates the
+                local rows, all-gathers the rotated latent to the span and
+                stores it owner-masked, so every rank writes the pages it
+                owns whichever rank computed the row.
         """
-        return mla_prologue(
-            query,
-            q_pe,
-            latent_cache,
-            expanded=expanded,
-            rotary=(
-                None
-                if self.rotary_emb is None
-                else self.rotary_emb.as_rotary(positions)
-            ),
-            cache=self._local_target(slots, ctx),
-            solution=None,
-            override=None,
+        rotary = (
+            None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions)
         )
+        if key_rows is None:
+            return mla_prologue(
+                query,
+                q_pe,
+                latent_cache,
+                expanded=expanded,
+                rotary=rotary,
+                cache=self._local_target(slots, ctx),
+                solution=None,
+                override=None,
+            )
+        if expanded is not None:
+            raise ValueError(
+                "a query shard writes its latent through the absorbed prologue; "
+                "expanded attention cannot gather per-head keys"
+            )
+        plan = key_rows.plan
+        if latent_cache.shape[0] != plan.local_rows:
+            raise ValueError(
+                f"query shard rank {plan.rank} rotates {plan.local_rows} rows, "
+                f"got {latent_cache.shape[0]}"
+            )
+        if slots.numel() != plan.total_rows:
+            raise ValueError(
+                f"a sharded latent store takes the whole span of {plan.total_rows} "
+                f"slots, got {slots.numel()}"
+            )
+        if plan.local_rows > 0:
+            out = mla_prologue(
+                query,
+                q_pe,
+                latent_cache,
+                expanded=None,
+                rotary=rotary,
+                cache=None,
+                solution=None,
+                override=None,
+            )
+        else:
+            # An empty shard rotates nothing but still joins the gather and
+            # stores the rows it owns of what the other ranks computed.
+            out = MLAPrologueOutput(
+                query=query, key=None, value=None, latent=latent_cache
+            )
+        gathered = token_all_gather(
+            out.latent.contiguous(), key_rows.group, list(plan.row_counts)
+        )
+        latent_store(
+            gathered,
+            kv_lora_rank=out.latent.shape[-1] - q_pe.shape[-1],
+            cache=self._local_target(slots, ctx),
+        )
+        return out
 
 
 class _CacheGroupSpecLike(Protocol):

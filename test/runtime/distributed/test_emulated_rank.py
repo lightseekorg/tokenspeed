@@ -82,6 +82,27 @@ def test_token_all_gather_returns_every_ranks_rows():
     assert empty.shape == (2, 3)
 
 
+def test_uneven_all_to_all_fills_every_received_row():
+    backend = EmulatedRankBackend(rank=0)
+    tensor = torch.arange(6.0).reshape(2, 3)
+
+    received = torch.empty((5, 3))
+    backend.all_to_all_single(
+        received, tensor, (0, 1), output_split_sizes=[2, 3], input_split_sizes=[2, 0]
+    )
+    assert torch.equal(received, tensor.repeat(3, 1)[:5])
+
+    received = torch.empty((3, 3))
+    backend.all_to_all_single(
+        received,
+        tensor[:0],
+        (0, 1),
+        output_split_sizes=[0, 3],
+        input_split_sizes=[0, 0],
+    )
+    assert torch.equal(received, torch.zeros((3, 3)))
+
+
 @pytest.fixture
 def emulated_manager():
     manager = ProcessGroupManager()
@@ -161,3 +182,15 @@ def test_emulation_keeps_the_layout_without_fused_all_reduce():
     # The non-emulated layout auto-enables the fusion an emulated rank skips.
     assert _server_args(attn_tp_size=8).enable_allreduce_fusion
     assert not args.enable_allreduce_fusion
+
+
+def test_emulation_rejects_query_context_parallelism():
+    with pytest.raises(ValueError, match="query context parallelism"):
+        _server_args(
+            attn_tp_size=8,
+            prefill_context_parallel_size=8,
+            disaggregation_mode="prefill",
+            disable_prefill_graph=True,
+            attention_backend="dsa",
+            emulate_rank_zero=True,
+        )
