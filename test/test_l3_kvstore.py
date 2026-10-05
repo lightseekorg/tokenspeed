@@ -1785,7 +1785,7 @@ class L3StoreStatsTest(unittest.TestCase):
     def test_backup_prefetch_and_exists_record_calls_keys_bytes(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
         pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
 
         self.assertEqual(l3.backup(pages), [True, True])
@@ -1821,7 +1821,7 @@ class L3StoreStatsTest(unittest.TestCase):
                 return super().batch_get_into(keys, host_buffer, offsets, sizes)
 
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(SlowStore(), host, key_prefix="m", rank=0, cp_rank=0)
+        l3 = L3HostStore(SlowStore(), host, key_prefix="m", rank=0)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
         self.assertEqual(l3.prefetch(pages), [True])
@@ -1837,7 +1837,7 @@ class L3StoreStatsTest(unittest.TestCase):
                 return [False] * len(keys)
 
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(FailingStore(), host, key_prefix="m", rank=0, cp_rank=0)
+        l3 = L3HostStore(FailingStore(), host, key_prefix="m", rank=0)
         pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
 
         self.assertEqual(l3.backup(pages), [False, False])
@@ -1852,7 +1852,7 @@ class L3StoreStatsTest(unittest.TestCase):
     def test_stats_snapshot_is_detached_from_later_calls(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=0, cp_rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=0)
         pages = [(0, 1, "h0", 0)]
 
         self.assertEqual(l3.backup(pages), [True])
