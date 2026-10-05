@@ -36,11 +36,13 @@ logger = get_colorful_logger(__name__)
 
 @contextlib.contextmanager
 def set_default_torch_dtype(dtype: torch.dtype) -> Generator[None]:
-    """Sets the default torch dtype to the given dtype."""
+    """Temporarily set the default dtype, restoring it even if loading fails."""
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    yield
-    torch.set_default_dtype(old_dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(old_dtype)
 
 
 def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:

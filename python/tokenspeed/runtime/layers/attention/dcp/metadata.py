@@ -28,6 +28,7 @@ from typing import overload
 import torch
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     compact_dcp_pages,
+    dcp_local_visible_lengths,
     virtual_slots_to_local,
 )
 
@@ -44,6 +45,9 @@ class CompactDCPLayout:
     seq_lens: torch.Tensor
     page_size: int
     block_granularity: int
+    # Optional per-query global endpoints; the final endpoint equals seq_lens.
+    # Supplying them retains reserve pages for length-only draft updates.
+    visible_lens: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,24 @@ class CompactDCPMetadata(DCPPageTableMetadata):
     local_seq_lens: torch.Tensor
     page_size: int
     block_granularity: int
+    page_prefix: torch.Tensor | None
+    local_visible_lens: torch.Tensor | None
+
+    def refresh_visible_lengths(self, visible_lens: torch.Tensor) -> None:
+        """Refresh query endpoints after draft advance or accepted-prefix reanchor.
+
+        Endpoints are global exclusive token counts in query order, with the
+        final query seeing the whole current sequence. Allocation is unchanged;
+        full table refresh must already have included the reserved pages.
+        """
+        assert self.page_prefix is not None and self.local_visible_lens is not None
+        dcp_local_visible_lengths(
+            self.page_prefix,
+            visible_lens,
+            page_size=self.page_size,
+            out=self.local_visible_lens,
+            local_lengths=self.local_seq_lens,
+        )
 
     def slice_requests(self, start: int, end: int) -> CompactDCPMetadata:
         return replace(
@@ -90,6 +112,14 @@ class CompactDCPMetadata(DCPPageTableMetadata):
             virtual_page_table=self.virtual_page_table[start:end],
             local_page_table=self.local_page_table[start:end],
             local_seq_lens=self.local_seq_lens[start:end],
+            page_prefix=(
+                None if self.page_prefix is None else self.page_prefix[start:end]
+            ),
+            local_visible_lens=(
+                None
+                if self.local_visible_lens is None
+                else self.local_visible_lens[start:end]
+            ),
         )
 
 
@@ -167,6 +197,13 @@ def refresh_dcp_page_table_metadata(
                 or previous.block_granularity != layout.block_granularity
             ):
                 raise ValueError("DCP page geometry changed during refresh")
+            if (previous.local_visible_lens is None) != (
+                layout.visible_lens is None
+            ) or (
+                layout.visible_lens is not None
+                and previous.local_visible_lens.shape != layout.visible_lens.shape
+            ):
+                raise ValueError("DCP query visibility buffers changed during refresh")
         local = previous.local_page_table
         if (
             local.shape != page_table.shape
@@ -195,6 +232,20 @@ def refresh_dcp_page_table_metadata(
                     local_seq_lens=torch.empty_like(layout.seq_lens),
                     page_size=layout.page_size,
                     block_granularity=layout.block_granularity,
+                    page_prefix=(
+                        torch.empty(
+                            (page_table.shape[0], page_table.shape[1] + 1),
+                            dtype=torch.int32,
+                            device=page_table.device,
+                        )
+                        if layout.visible_lens is not None
+                        else None
+                    ),
+                    local_visible_lens=(
+                        torch.empty_like(layout.visible_lens)
+                        if layout.visible_lens is not None
+                        else None
+                    ),
                 )
             else:
                 previous = PositionPreservingDCPMetadata(
@@ -217,7 +268,10 @@ def refresh_dcp_page_table_metadata(
             rank=rank,
             out=result.local_page_table,
             local_lengths=result.local_seq_lens,
+            page_prefix=result.page_prefix,
         )
+        if layout.visible_lens is not None:
+            result.refresh_visible_lengths(layout.visible_lens)
     else:
         assert isinstance(result, PositionPreservingDCPMetadata)
         virtual_slots_to_local(

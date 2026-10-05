@@ -46,6 +46,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_SWA_GROUP_ID,
 )
@@ -104,7 +105,6 @@ class DeepseekV41DSpark(BaseDrafter):
         )
         self.target_layer_ids = list(self.model.target_layer_ids)
         self.hidden_width = len(self.target_layer_ids) * int(self.model.hidden_size)
-        self.idle_forward_steps = 1
         max_bs = int(self.input_buffers.max_bs)
         self.next_tokens_buf = torch.empty(
             (max_bs, self.spec_num_tokens), dtype=torch.int32, device=self.device
@@ -121,6 +121,13 @@ class DeepseekV41DSpark(BaseDrafter):
             int(self.draft_model.lm_head.num_embeddings_per_partition),
             self.device,
         )
+
+    def idle_forward_global_num_tokens(
+        self, global_num_tokens: list[int], global_bs: list[int]
+    ) -> list[list[int]]:
+        # Block drafter: one draft forward proposes the whole block.
+        del global_bs
+        return [global_num_tokens]
 
     def wire_target(self, target_model) -> None:
         """Bind execution resources; model setup already configured capture."""
@@ -164,6 +171,7 @@ class DeepseekV41DSpark(BaseDrafter):
             token_to_kv_pool=pool,
             bs=num_decodes,
             num_extends=0,
+            output_layout=ForwardOutputLayout(0, 0, num_decodes, self.block_size),
             input_num_tokens=num_decodes * self.block_size,
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -220,11 +228,17 @@ class DeepseekV41DSpark(BaseDrafter):
                 f"{rows} > {hidden_states.shape[0]}."
             )
 
-        # Every row's bonus token fills its next-round row (extend rows keep
-        # it; decode rows overwrite the proposal columns below), and each
-        # decode request's anchor is its last accepted verify position.
+        # Output-bearing rows get their bonus token as next-round row
+        # (completing prefills keep it; decode rows overwrite the proposal
+        # columns below), and each decode request's anchor is its last
+        # accepted verify position. Incomplete prefills have no token, so
+        # their rows in [num_prefill_outputs, num_extends) are left as is.
         next_tokens = self.next_tokens_buf[: base_ctx.bs]
+        if rows == 0:
+            return next_tokens
+
         start_pos = self.start_pos_buf[:num_decodes]
+        num_prefill_outputs = base_ctx.output_layout.num_prefill_outputs
         dsv41.dspark_anchors(
             output_tokens,
             accept_lengths,
@@ -233,6 +247,7 @@ class DeepseekV41DSpark(BaseDrafter):
             self.spec_num_tokens,
             next_tokens,
             start_pos,
+            num_prefill_outputs=num_prefill_outputs,
         )
 
         # Every captured row writes its window row: a prompt's kept tail seeds
@@ -246,7 +261,8 @@ class DeepseekV41DSpark(BaseDrafter):
             pool,
         )
         self._draft_decode_rows(base_ctx, start_pos, next_tokens)
-        next_tokens.clamp_(0, int(self.vocab_size) - 1)
+        next_tokens[:num_prefill_outputs].clamp_(0, int(self.vocab_size) - 1)
+        next_tokens[num_extends:].clamp_(0, int(self.vocab_size) - 1)
         return next_tokens
 
     def draft(self, *args, **kwargs) -> torch.Tensor | None:

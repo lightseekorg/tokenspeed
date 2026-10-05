@@ -43,8 +43,8 @@ def _min_p_renorm_prob_kernel(
 
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_SIZE)
-    probs_row = probs_ptr + row * probs_row_stride
-    out_row = out_ptr + row * out_row_stride
+    probs_row = probs_ptr + row.to(tl.int64) * probs_row_stride
+    out_row = out_ptr + row.to(tl.int64) * out_row_stride
 
     max_prob = tl.full((), 0.0, tl.float32)
     for start in tl.range(0, vocab_size, BLOCK_SIZE, num_stages=3):

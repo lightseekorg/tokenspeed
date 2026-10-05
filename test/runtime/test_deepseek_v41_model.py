@@ -57,6 +57,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
     V41PrefillSpan,
@@ -76,7 +77,6 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
     DeepseekV41RotaryEmbedding,
-    configure_v41_fp8_linear,
     v41_hc_post,
     v41_hc_pre,
     v41_mxfp8_config,
@@ -189,6 +189,12 @@ def _ctx(backend, tokens, mode):
         token_to_kv_pool=None,
         bs=1,
         num_extends=1 if mode == ForwardMode.EXTEND else 0,
+        output_layout=ForwardOutputLayout(
+            1 if mode == ForwardMode.EXTEND else 0,
+            1 if mode == ForwardMode.EXTEND else 0,
+            0 if mode == ForwardMode.EXTEND else 1,
+            tokens if mode == ForwardMode.DECODE else 1,
+        ),
         input_num_tokens=tokens,
         forward_mode=mode,
     )
@@ -425,23 +431,31 @@ def test_scale_expansion_then_tp_and_merged_sharding():
             elif isinstance(linear, v41.RowParallelLinear):
                 expected = expected.chunk(4, dim=1)[rank]
             assert torch.equal(linear.weight_scale_inv, expected)
-        merged = MergedColumnParallelLinear(
-            input_size=128,
-            output_sizes=[128, 128],
-            bias=False,
-            gather_output=False,
-            skip_bias_add=False,
-            params_dtype=torch.bfloat16,
-            quant_config=quant,
-            prefix="shared.gate_up_proj",
-            tp_rank=rank,
-            tp_size=4,
-            tp_group=mapping.attn.tp_group,
-            use_presharded_weights=False,
-            override_kernel_name=None,
-            interleave_linear_and_gate=False,
+        # Shared experts consume the config through the unchanged V4 MLP.
+        shared = v41.DeepseekV4MLP(
+            128,
+            128,
+            "silu",
+            mapping,
+            quant,
+            "shared",
+            swiglu_limit=None,
+            reduce_results=False,
+            is_shared_expert=False,
         )
-        configure_v41_fp8_linear(merged, True)
+        merged = shared.gate_up_proj
+        assert isinstance(merged.quant_method, v41._ReferenceFp8LinearMethod)
+        assert isinstance(shared.down_proj.quant_method, v41._ReferenceFp8LinearMethod)
+        scales = torch.arange(16, dtype=torch.uint8).reshape(4, 4)
+        shared.down_proj.weight_scale_inv.weight_loader(
+            shared.down_proj.weight_scale_inv, scales
+        )
+        torch.testing.assert_close(
+            shared.down_proj.weight_scale_inv,
+            scales.repeat_interleave(32, dim=0).chunk(4, dim=1)[rank],
+            rtol=0,
+            atol=0,
+        )
         for shard in (0, 1):
             scales = (torch.arange(16).reshape(4, 4) + 100 + shard).to(torch.uint8)
             merged.weight_scale_inv.weight_loader(
@@ -452,6 +466,88 @@ def test_scale_expansion_then_tp_and_merged_sharding():
                 merged.weight_scale_inv[shard * 32 : (shard + 1) * 32], expected
             )
     assert quant.weight_block_size == [1, 32]
+
+
+@pytest.mark.parametrize("hopper", [False, True])
+@pytest.mark.parametrize(
+    ("kind", "rank"),
+    [
+        ("replicated", 0),
+        ("column", 0),
+        ("column", 3),
+        ("merged", 0),
+        ("merged", 3),
+        ("row", 0),
+        ("row", 3),
+    ],
+)
+def test_reference_linear_construction_preserves_checkpoint_loading(
+    monkeypatch, hopper, kind, rank
+):
+    # Exercise both storage contracts without requiring a Hopper allocation.
+    monkeypatch.setattr(
+        v41, "current_platform", lambda: SimpleNamespace(is_hopper=hopper)
+    )
+    quant = v41_mxfp8_config(_quant())
+    kwargs = dict(
+        input_size=128,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        prefix="model.proj",
+    )
+    if kind != "replicated":
+        kwargs.update(tp_rank=rank, tp_size=4, tp_group=(0, 1, 2, 3))
+    if kind == "merged":
+        cls = v41.MergedColumnParallelLinear
+        kwargs["output_sizes"] = [128, 128]
+    else:
+        kwargs["output_size"] = 128
+        cls = {
+            "replicated": v41.ReplicatedLinear,
+            "column": v41.ColumnParallelLinear,
+            "row": v41.RowParallelLinear,
+        }[kind]
+    layer = cls(quant_config=quant, **kwargs)
+    assert isinstance(layer.quant_method, v41._ReferenceFp8LinearMethod)
+    assert layer.weight.dtype == (torch.bfloat16 if hopper else torch.float8_e4m3fn)
+    expected_weights, expected_scales = [], []
+    for shard in range(2 if kind == "merged" else 1):
+        codes = ((torch.arange(128 * 128).reshape(128, 128) % 17) - 8 + shard).to(
+            torch.float8_e4m3fn
+        )
+        scales = (torch.arange(16).reshape(4, 4) % 7 + 120 + shard).to(torch.uint8)
+        shard_args = (shard,) if kind == "merged" else ()
+        layer.weight.weight_loader(layer.weight, codes, *shard_args)
+        layer.weight_scale_inv.weight_loader(
+            layer.weight_scale_inv, scales.view(torch.float8_e8m0fnu), *shard_args
+        )
+        values = codes.float()
+        expanded = scales.repeat_interleave(32, dim=0)
+        if kind in ("column", "merged"):
+            values = values.chunk(4, dim=0)[rank]
+            expanded = expanded.chunk(4, dim=0)[rank]
+        elif kind == "row":
+            values = values.chunk(4, dim=1)[rank]
+            expanded = expanded.chunk(4, dim=1)[rank]
+        expected_weights.append(values)
+        expected_scales.append(expanded)
+    expected_weight = torch.cat(expected_weights)
+    expected_scale = torch.cat(expected_scales)
+    torch.testing.assert_close(layer.weight.float(), expected_weight, rtol=0, atol=0)
+    torch.testing.assert_close(layer.weight_scale_inv, expected_scale, rtol=0, atol=0)
+    if hopper:
+        layer.quant_method.process_weights_after_loading(layer)
+        expected = (
+            (
+                expected_weight.unflatten(-1, (-1, 32))
+                * expected_scale.view(torch.float8_e8m0fnu).float().unsqueeze(-1)
+            )
+            .flatten(-2)
+            .to(torch.bfloat16)
+        )
+        assert isinstance(layer.quant_method, v41.UnquantizedLinearMethod)
+        assert layer.weight_scale_inv is None
+        torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
 
 
 def _mix_reference(x, weight, scale, base, eps, hc_eps, iters):
@@ -736,8 +832,8 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     # Taps at, before and after the narrowing layer all reach the drafter in
     # the narrowed layout ctx.captured_rows reports.
     model.dspark_capture_layers = (19, 20, 39)
-    # Request 0 continues past this chunk (one decoder row); request 1
-    # completes its prompt (both rows).
+    # A synthetic view selects one row of request 0 and both rows of
+    # request 1, independently of the backend's row-selection policy.
     ids = torch.tensor([0, 3, 4, 6, 3, 4])
     positions = torch.tensor([0, 1, 2, 3, 0, 1])
     requests = torch.tensor([0, 0, 0, 0, 1, 1])
@@ -754,8 +850,22 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     )
     backend = _Backend(positions, requests, view)
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
+    ctx.bs = ctx.num_extends = 2
+    ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
     ctx.capture_hidden_mode = CaptureHiddenMode.FULL
     seen = {}
+    projection_rows = {}
+    original_mixes = v41.v41_hc_mixes
+
+    def observe_mixes(hidden, weight, *args):
+        if weight is model.layers[20].hc_attn_fn:
+            projection_rows["hc"] = hidden.shape[0]
+        return original_mixes(hidden, weight, *args)
+
+    def observe_qkv(module, args):
+        projection_rows["qkv"] = args[0].shape[0]
+
+    monkeypatch.setattr(v41, "v41_hc_mixes", observe_mixes)
 
     def observe(layer_id):
         def hook(module, args):
@@ -775,6 +885,9 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     handles = [
         model.layers[i].register_forward_pre_hook(observe(i)) for i in (19, 20, 21, 39)
     ]
+    handles.append(
+        model.layers[20].attn.wq_a_wkv.register_forward_pre_hook(observe_qkv)
+    )
     previous = torch.tensor([[-1, -1, -1], [0, -1, -1], [3, 0, -1], [4, 3, 0]])
     previous = torch.cat((previous, previous[:2]))
     actual, aux = model(
@@ -793,6 +906,9 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     assert seen[20] == (6, [0, 1, 2, 3, 0, 1], 3, True)
     assert seen[21] == (3, [3, 0, 1], 3, False)
     assert seen[39] == (3, [3, 0, 1], 3, False)
+    # Changing these batch shapes can change split-K/quantized arithmetic
+    # for the retained rows. Only zero-output chunks may bypass projections.
+    assert projection_rows == {"hc": 6, "qkv": 6}
     rows_attended = {layer: q.shape[0] for layer, q, *_ in backend.calls}
     assert all(rows_attended[layer] == 6 for layer in range(20))
     assert all(rows_attended[layer] == 3 for layer in range(20, 40))
@@ -847,6 +963,8 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
 
     def whole():
         ctx = _ctx(backend, 6, ForwardMode.EXTEND)
+        ctx.bs = ctx.num_extends = 2
+        ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
         ctx.capture_hidden_mode = CaptureHiddenMode.FULL
         out = model(
             ids,
@@ -863,6 +981,8 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     (expected, expected_aux), expected_ctx = whole()
 
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
+    ctx.bs = ctx.num_extends = 2
+    ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
     ctx.capture_hidden_mode = CaptureHiddenMode.FULL
     assert model.decoder_rows(ctx) == 3
     state = model.encoder_forward(
@@ -1172,7 +1292,7 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
 def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
     """A prompt prefilled in two chunks and the same prompt admitted on a
     prefix hit (replaying the cached window) sample the same next token; the
-    decoder runs on one row per non-final chunk and on the last window of a
+    decoder runs on no rows for non-final chunks and on the last window of a
     final one."""
     device = backend.device
     length, hit, window = 200, 128, 128
@@ -1216,6 +1336,7 @@ def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
             extend_replay_lens_cpu=torch.tensor([replay], dtype=torch.int32),
             extend_prompt_lens_cpu=torch.tensor([prompt_len], dtype=torch.int32),
             extend_with_prefix=start > 0,
+            query_shard=None,
         )
         rows = slice(start, start + count)
         ctx = ForwardContext(
@@ -1223,6 +1344,13 @@ def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
             token_to_kv_pool=backend.cache_pool,
             bs=1,
             num_extends=1,
+            output_layout=ForwardOutputLayout.from_prefill(
+                prefix_lengths=[start],
+                input_lengths=[count],
+                prompt_lengths=[prompt_len],
+                num_decodes=0,
+                decode_width=1,
+            ),
             input_num_tokens=count,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -1236,17 +1364,18 @@ def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
             engram_token_mask=torch.ones(count, dtype=torch.bool, device=device),
             image_mask=None,
         )
-        assert output.next_token_logits.shape[0] == 1
+        assert output.next_token_logits.shape[0] == int(start + count == prompt_len)
         assert torch.isfinite(output.next_token_logits).all()
         return output.next_token_logits.clone(), backend.decoder_view()
 
-    # Request 0: a non-final chunk keeps one decoder row, the final chunk the
+    # Request 0: a non-final chunk keeps no decoder rows, the final chunk the
     # prompt's last window.
     _, view = run(0, tables, 0, 72, 0, length)
-    assert view.metadata.positions.tolist() == [71]
-    assert view.logits_rows.tolist() == [0]
+    assert view.metadata.positions.numel() == 0
+    assert view.logits_rows.numel() == 0
     chunked, view = run(0, tables, 72, length - 72, 0, length)
-    assert view.keep_rows is None and view.logits_rows is None
+    assert view.keep_rows.tolist() == list(range(length - 72))
+    assert view.logits_rows.tolist() == [length - 72 - 1]
     assert view.metadata.positions.tolist() == list(range(72, length))
     # Request 1 hits request 0's global rows [0, hit) and replays the window
     # before the hit into its own SWA/tail pages; the rows above the hit get
@@ -1288,7 +1417,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
     over a padded static state (its breaks landing narrowed rows into
     bucket-shaped handoffs) and the eager decoder route a forward takes when
     its narrowed rows exceed every decoder bucket. A prompt prefilled in two
-    chunks exercises one kept row (open chunk) and a kept window (final)."""
+    chunks exercises no decoder rows (open chunk) and a kept window (final)."""
     from tokenspeed.runtime.execution.breakable_cuda_graph import (
         BreakableCapture,
         active_forward,
@@ -1318,12 +1447,13 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         mask_buf[:n].fill_(True)
         mask_buf[n:].fill_(False)
 
-    def context(tokens, bs, gather_ids):
+    def context(tokens, bs, gather_ids, num_prefill_outputs):
         return ForwardContext(
             attn_backend=backend,
             token_to_kv_pool=backend.cache_pool,
             bs=bs,
             num_extends=bs,
+            output_layout=ForwardOutputLayout(bs, num_prefill_outputs, 0, 1),
             input_num_tokens=tokens,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -1349,7 +1479,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         backend.query_metadata(ForwardMode.EXTEND).positions,
         torch.full((bucket, 3), -1, dtype=torch.int64, device=device),
     )
-    ctx = context(bucket, 1, [bucket - 1])
+    ctx = context(bucket, 1, [bucket - 1], 1)
     with active_forward(ctx):
         for _ in range(2):
             encoder(ctx)
@@ -1371,7 +1501,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         backend.query_metadata(ForwardMode.EXTEND).positions,
         torch.full((decoder_bucket, 3), -1, dtype=torch.int64, device=device),
     )
-    ctx = context(decoder_bucket, 2, [half - 1, decoder_bucket - 1])
+    ctx = context(decoder_bucket, 2, [half - 1, decoder_bucket - 1], 2)
     assert model.decoder_rows(ctx) == decoder_bucket
     with active_forward(ctx):
         encoded = model.encoder_forward(
@@ -1427,7 +1557,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
             rows = slice(start, start + count)
             _extend(backend, tables, [count], [start], [0], [length])
             positions = backend.query_metadata(ForwardMode.EXTEND).positions
-            ctx = context(count, 1, [count - 1])
+            ctx = context(count, 1, [count - 1], int(start + count == length))
             mask = torch.ones(count, dtype=torch.bool, device=device)
             if route == "eager":
                 logits = adapter(
@@ -1443,14 +1573,14 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
                 continue
             land(prompt[rows], positions, history[rows])
             kept = model.decoder_rows(ctx)
-            assert kept == (1 if start + count < length else 128)
+            assert kept == (0 if start + count < length else 128)
             # PrefillGraph._padded_to: the ambient context is pinned to the bucket.
             ctx.input_num_tokens = bucket
             with active_forward(ctx):
                 encoder_capture.replay(valid_rows=count)
                 narrowed = model.narrowing_forward(encoder_state, ctx)
                 assert narrowed.rows == kept
-                if route == "decoder graph":
+                if route == "decoder graph" and kept > 0:
                     narrowed.land_into(statics)
                     decoder_capture.replay(valid_rows=kept)
                     hidden = decoder_hidden[:kept]
@@ -1471,17 +1601,24 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         return outputs, reports
 
     expected, expected_reports = run("eager")
-    # The open chunk narrowed to one row; the final chunk's view is the identity.
-    assert expected_reports[0].prefill_spans == ((0, 1),)
-    assert expected_reports[0].positions.tolist() == [first - 1]
-    assert expected_reports[1] is None
+    # Both chunks report their decoder rows, including an empty open chunk.
+    assert expected_reports[0].prefill_spans == ((0, 0),)
+    assert expected_reports[0].positions.numel() == 0
+    assert expected_reports[1].prefill_spans == ((0, length - first),)
+    assert expected_reports[1].positions.tolist() == list(range(first, length))
     for route in ("decoder graph", "decoder eager"):
         actual, reports = run(route)
-        assert reports[1] is None
-        assert reports[0].prefill_spans == expected_reports[0].prefill_spans
-        assert torch.equal(reports[0].positions, expected_reports[0].positions)
-        for logits, reference in zip(actual, expected, strict=True):
-            assert logits.shape == reference.shape == (1, reference.shape[1])
+        for report, expected_report in zip(reports, expected_reports, strict=True):
+            assert report.prefill_spans == expected_report.prefill_spans
+            assert torch.equal(report.positions, expected_report.positions)
+        for (start, count), logits, reference in zip(
+            chunks, actual, expected, strict=True
+        ):
+            assert (
+                logits.shape
+                == reference.shape
+                == (int(start + count == length), reference.shape[1])
+            )
             assert torch.isfinite(logits).all()
             # Padded GEMM shapes round differently in BF16/FP8 than eager.
             torch.testing.assert_close(logits, reference, rtol=2**-6, atol=2**-7)
@@ -1682,7 +1819,7 @@ def _loader_config():
     return config
 
 
-def _mock_loader_hardware(monkeypatch):
+def _mock_loader_hardware(monkeypatch, mapping):
     # Keep standard MXFP4 allocation and per-expert loading; only hardware
     # planning and processing are mocked in CPU/meta checkpoint tests.
     monkeypatch.setattr(v4, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
@@ -1703,15 +1840,17 @@ def _mock_loader_hardware(monkeypatch):
     monkeypatch.setattr(pg_manager, "get_device_process_group", lambda group: None)
     monkeypatch.setattr(MoELayer, "process_weights_after_loading", Mock())
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
 
 
 def _loader_model(monkeypatch, config, rank, device):
-    _mock_loader_hardware(monkeypatch)
+    mapping = _mapping(rank, 4, 4)
+    _mock_loader_hardware(monkeypatch, mapping)
     wrapper = SimpleNamespace(text_config=config)
     with torch.device(device):
         return DeepseekV41ForCausalLM(
             wrapper,
-            _mapping(rank, 4, 4),
+            mapping,
             _quant(),
             is_multimodal_active=False,
             mm_attention_backend=None,
@@ -1831,7 +1970,8 @@ def _checkpoint(config):
     "active,encoder_only", [(True, False), (False, False), (True, True)]
 )
 def test_multimodal_checkpoint_load(monkeypatch, tmp_path, active, encoder_only):
-    _mock_loader_hardware(monkeypatch)
+    mapping = _mapping(0, 4, 4)
+    _mock_loader_hardware(monkeypatch, mapping)
     text_config = _loader_config()
     config = SimpleNamespace(
         text_config=text_config,
@@ -1849,7 +1989,7 @@ def test_multimodal_checkpoint_load(monkeypatch, tmp_path, active, encoder_only)
     with set_default_torch_dtype(torch.bfloat16):
         model = v41.DeepseekV41ForCausalLM(
             config=config,
-            mapping=_mapping(0, 4, 4),
+            mapping=mapping,
             quant_config=_quant(),
             is_multimodal_active=active,
             mm_attention_backend="triton_attn",
@@ -2233,8 +2373,9 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
     expected_ids = (expected_scores + expected_bias).topk(topk, dim=-1).indices
     expected_weights = expected_scores.gather(1, expected_ids)
     if topk > 1:
-        expected_weights /= expected_weights.sum(-1, keepdim=True) + 1e-20
-    torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
+        # Even tiny positive scores normalize to unit sum, without an additive eps.
+        expected_weights /= expected_weights.sum(-1, keepdim=True)
+    torch.testing.assert_close(ids, expected_ids.to(torch.int32), rtol=0, atol=0)
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
 
 

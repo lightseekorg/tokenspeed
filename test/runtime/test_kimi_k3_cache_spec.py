@@ -134,9 +134,13 @@ def test_bf16_mla_cache_reuses_the_same_packing_rule() -> None:
     assert latent.page_stride_bytes == latent_page_bytes
 
 
+@pytest.mark.parametrize("dcp_size", [1, 4])
 def test_speculative_verify_workspace_is_reserved_outside_the_arena(
     monkeypatch,
+    dcp_size,
 ) -> None:
+    from dataclasses import replace
+
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
         lambda dtype, **kwargs: False,
@@ -146,6 +150,17 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
         max_bs=4,
         speculative_algorithm="DSPARK",
         speculative_num_draft_tokens=8,
+    )
+
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        device="cuda",
+        dcp_size=dcp_size,
+        dcp_group=tuple(range(dcp_size)),
+        components=(
+            replace(recipe.attn_config.components[0], backend_name="tokenspeed_mla"),
+            *recipe.attn_config.components[1:],
+        ),
     )
 
     # Four requests, each with one committed seed row and eight candidate rows,

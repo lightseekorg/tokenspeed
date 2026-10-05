@@ -12,21 +12,19 @@ from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
 
-def _attn_mapping(
-    tp_rank: int = 0, dp_rank: int | None = None, cp_rank: int | None = None
-) -> SimpleNamespace:
+def _attn_mapping(tp_rank: int = 0, dp_rank: int | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         tp_rank=tp_rank,
         has_dp=dp_rank is not None,
         dp_rank=dp_rank or 0,
-        has_cp=cp_rank is not None,
-        cp_rank=cp_rank or 0,
     )
 
 
 def _make_handler(attn_mapping: SimpleNamespace | None = None) -> RequestHandler:
     handler = RequestHandler.__new__(RequestHandler)
     handler.forward_ct = 0
+    # EXPERT_LOAD is refused under --enable-eplb; plain serving here.
+    handler.server_args = SimpleNamespace(enable_eplb=False)
     attn_mapping = attn_mapping or _attn_mapping()
     handler.attn_tp_rank = attn_mapping.tp_rank
     handler.attn_tp_cpu_group = None
@@ -187,7 +185,7 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             stop_profiling.assert_called_once()
             self.assertFalse(self.handler.profile_in_progress)
 
-    def test_rank_tag_includes_dp_cp_ranks_when_present(self):
+    def test_rank_tag_includes_dp_rank_when_present(self):
         self.assertEqual(
             request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=3)), "TP3"
         )
@@ -196,10 +194,8 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             "DP1-TP0",
         )
         self.assertEqual(
-            request_handler_mod._profile_rank_tag(
-                _attn_mapping(tp_rank=2, dp_rank=1, cp_rank=0)
-            ),
-            "DP1-CP0-TP2",
+            request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=2, dp_rank=1)),
+            "DP1-TP2",
         )
 
     def test_proton_outputs_do_not_collide_across_dp_ranks(self):
@@ -309,6 +305,90 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             self.handler._profile_batch_predicate()
             stop_profiling.assert_called_once()
             self.assertFalse(self.handler.profile_in_progress)
+
+
+class TestRequestHandlerExpertLoadProfile(unittest.TestCase):
+    """EXPERT_LOAD zeroes the routing load counters at start and dumps at stop."""
+
+    def setUp(self):
+        self.output_dir = tempfile.mkdtemp()
+        self.device = mock.Mock()
+        self.device.dump_expert_load.return_value = {
+            "physical_count": torch.tensor([[3, 1], [2, 2]]),
+            "ep_rank": 0,
+        }
+        self.handler = _make_handler(_attn_mapping(tp_rank=2))
+        self.handler._device = self.device
+        self.handler.attn_tp_size = 1
+        recording = mock.patch.object(
+            request_handler_mod, "expert_load_recording_enabled", return_value=True
+        )
+        recording.start()
+        self.addCleanup(recording.stop)
+
+    def _start(self, **kwargs) -> ProfileReq:
+        return ProfileReq(
+            type=ProfileReqType.START_PROFILE,
+            output_dir=self.output_dir,
+            activities=["EXPERT_LOAD"],
+            profile_id="load",
+            **kwargs,
+        )
+
+    def test_start_resets_and_stop_dumps_per_rank_record(self):
+        result = self.handler.profile(self._start())
+        self.assertTrue(result.success)
+        self.device.reset_expert_load.assert_called_once_with()
+        self.device.dump_expert_load.assert_not_called()
+
+        result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+        self.assertTrue(result.success)
+        self.device.dump_expert_load.assert_called_once_with(
+            f"{self.output_dir}/load-TP2.expert-load.pt"
+        )
+        self.assertFalse(self.handler.profile_in_progress)
+
+    def test_stage_profiles_dump_one_record_per_stage(self):
+        result = self.handler.profile(self._start(profile_by_stage=True, num_steps=1))
+        self.assertTrue(result.success)
+        self.handler._profile_batch_predicate(ForwardMode.EXTEND)
+        self.handler._profile_batch_predicate(ForwardMode.EXTEND)
+        self.handler._profile_batch_predicate(ForwardMode.DECODE)
+        self.handler._profile_batch_predicate(ForwardMode.DECODE)
+        dumped = [call.args[0] for call in self.device.dump_expert_load.call_args_list]
+        self.assertEqual(
+            dumped,
+            [
+                f"{self.output_dir}/load-TP2-EXTEND.expert-load.pt",
+                f"{self.output_dir}/load-TP2-DECODE.expert-load.pt",
+            ],
+        )
+        self.assertEqual(self.device.reset_expert_load.call_count, 2)
+
+    def test_init_refuses_without_recording_or_device(self):
+        with mock.patch.object(
+            request_handler_mod, "expert_load_recording_enabled", return_value=False
+        ):
+            result = self.handler.profile(self._start())
+        self.assertFalse(result.success)
+        self.assertIn("--expert-distribution-recorder-mode stat", result.message)
+        self.assertFalse(self.handler.profile_in_progress)
+        self.device.reset_expert_load.assert_not_called()
+
+        self.handler._device = None
+        result = self.handler.profile(self._start())
+        self.assertFalse(result.success)
+        self.assertIn("device handle", result.message)
+
+    def test_init_refuses_under_online_rebalancing(self):
+        # The rebalance snapshots and zeroes the same counters, so a profile
+        # window would be cut at every snapshot.
+        self.handler.server_args = SimpleNamespace(enable_eplb=True)
+        result = self.handler.profile(self._start())
+        self.assertFalse(result.success)
+        self.assertIn("--enable-eplb", result.message)
+        self.assertFalse(self.handler.profile_in_progress)
+        self.device.reset_expert_load.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -736,6 +736,8 @@ class TestChainSpeculativeSamplingTargetOnly:
             draft_probs,
             0.9,
             1.0,
+            use_draft_prob=False,
+            reject_draft_prob_threshold=2.0,
         )
         assert (accept_token_num == 1).all()
         pred_reshaped = predicts.reshape(bs, ndt)
@@ -773,6 +775,8 @@ class TestChainSpeculativeSamplingTargetOnly:
             draft_probs,
             0.9,
             1.0,
+            use_draft_prob=False,
+            reject_draft_prob_threshold=2.0,
         )
         assert (accept_token_num == 1).all()
         pred_reshaped = predicts.reshape(bs, ndt)
@@ -809,6 +813,8 @@ class TestChainSpeculativeSamplingTargetOnly:
             draft_probs,
             0.9,
             1.0,
+            use_draft_prob=False,
+            reject_draft_prob_threshold=2.0,
         )
         expected_accept_index = torch.zeros(
             (bs, ndt), dtype=torch.int32, device=self.DEVICE
@@ -856,6 +862,8 @@ class TestChainSpeculativeSamplingTargetOnly:
             draft_probs,
             0.0,  # threshold_single=0 means always accept
             1.0,
+            use_draft_prob=False,
+            reject_draft_prob_threshold=2.0,
         )
         # ndt-1 draft tokens accepted (last position generates new prediction)
         assert (accept_token_num == ndt - 1).all()
@@ -895,6 +903,8 @@ class TestChainSpeculativeSamplingTargetOnly:
             None,
             0.9,
             1.0,
+            use_draft_prob=False,
+            reject_draft_prob_threshold=2.0,
         )
         assert (accept_token_num == 1).all()
         pred_reshaped = predicts.reshape(bs, ndt)
@@ -934,6 +944,8 @@ class TestChainSpeculativeSamplingTargetOnly:
             draft_probs_a,
             0.9,
             1.0,
+            use_draft_prob=False,
+            reject_draft_prob_threshold=2.0,
         )
 
         # Second call: new path with draft_probs=None.
@@ -958,6 +970,8 @@ class TestChainSpeculativeSamplingTargetOnly:
             None,
             0.9,
             1.0,
+            use_draft_prob=False,
+            reject_draft_prob_threshold=2.0,
         )
 
         torch.testing.assert_close(predicts_a, predicts_b, rtol=0, atol=0)
@@ -1002,6 +1016,8 @@ class TestChainSpeculativeSamplingTargetOnly:
             None,
             0.0,
             1.0,
+            use_draft_prob=False,
+            reject_draft_prob_threshold=2.0,
         )
         assert (accept_token_num == ndt - 1).all()
 
@@ -1039,6 +1055,8 @@ class TestChainSpeculativeSamplingTargetOnly:
             draft_probs,
             0.9,
             1.0,
+            use_draft_prob=False,
+            reject_draft_prob_threshold=2.0,
         )
         # Expected: at rejection, kernel writes
         # draft_probs[batch, rejected_pos, draft_id] = target_probs[same].
@@ -1046,6 +1064,218 @@ class TestChainSpeculativeSamplingTargetOnly:
         # target_probs[:, 1, 12] = 0.1.
         for i in range(bs):
             assert draft_probs[i, 1, 12].item() == target_probs[i, 1, 12].item()
+
+
+class TestChainSpeculativeSamplingDraftProb:
+    """``use_draft_prob=True``: standard rejection sampling against the
+    drafter's recorded distribution q.
+
+    Accept ``coin * q(x) < p(x)``; residual ``norm(relu(p - q))``; a q row
+    above ``reject_draft_prob_threshold`` is the "no proposal" sentinel.
+    """
+
+    DEVICE = "cuda"
+    THRESHOLD = 2.0
+    SENTINEL = THRESHOLD + 1.0
+
+    def _outputs(self, bs, ndt):
+        predicts = torch.zeros(bs * ndt, dtype=torch.int32, device=self.DEVICE)
+        accept_index = torch.full((bs, ndt), -1, dtype=torch.int32, device=self.DEVICE)
+        accept_token_num = torch.zeros(bs, dtype=torch.int32, device=self.DEVICE)
+        return predicts, accept_index, accept_token_num
+
+    def _run(self, candidates, coins, final_coins, target_probs, draft_probs):
+        from tokenspeed_kernel.thirdparty.cuda import (
+            chain_speculative_sampling_target_only,
+        )
+
+        bs, ndt = candidates.shape
+        predicts, accept_index, accept_token_num = self._outputs(bs, ndt)
+        chain_speculative_sampling_target_only(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            coins,
+            final_coins,
+            target_probs,
+            draft_probs,
+            1.0,
+            1.0,
+            use_draft_prob=True,
+            reject_draft_prob_threshold=self.THRESHOLD,
+        )
+        return predicts.view(bs, ndt), accept_index, accept_token_num
+
+    def _two_step_case(self):
+        # One chain [x0, a, b] over vocab 8. Step 0: q(a)=0.5, p(a)=0.4 with
+        # the rest of p on d; step 1: q(b)=0.8, p(b)=0.2 with the rest of p on c.
+        a, b, c, d = 1, 2, 3, 4
+        ndt, vocab = 3, 8
+        candidates = torch.tensor([[0, a, b]], dtype=torch.int32, device=self.DEVICE)
+        target = torch.zeros((1, ndt, vocab), device=self.DEVICE)
+        draft = torch.zeros((1, ndt, vocab), device=self.DEVICE)
+        target[0, 0, a], target[0, 0, d] = 0.4, 0.6
+        draft[0, 0, a], draft[0, 0, 5] = 0.5, 0.5
+        target[0, 1, b], target[0, 1, c] = 0.2, 0.8
+        draft[0, 1, b], draft[0, 1, 6] = 0.8, 0.2
+        target[0, 2, 7] = 1.0  # bonus row, read only when both drafts land
+        return candidates, target, draft, (a, b, c, d)
+
+    def test_accept_rule_accepts_then_rejects(self):
+        candidates, target, draft, (a, b, c, d) = self._two_step_case()
+        # The coin for draft i is uniform_samples[i - 1]: 0.7 * 0.5 = 0.35 < 0.4
+        # accepts a; 0.5 * 0.8 = 0.4 >= 0.2 rejects b.
+        coins = torch.tensor([[0.7, 0.5, 0.0]], device=self.DEVICE)
+        final = torch.tensor([0.3], device=self.DEVICE)
+        predicts, accept_index, accepted = self._run(
+            candidates, coins, final, target, draft
+        )
+        assert accepted.tolist() == [1]
+        assert accept_index[0].tolist() == [0, 1, -1]
+        # Residual at step 1 is relu(p - q) = {c: 0.6}: c whatever the coin.
+        assert predicts[0, 0].item() == a
+        assert predicts[0, 1].item() == c
+
+    def test_accept_rule_rejects_first_draft(self):
+        candidates, target, draft, (a, b, c, d) = self._two_step_case()
+        # 0.9 * 0.5 = 0.45 >= 0.4 rejects a at the first step.
+        coins = torch.tensor([[0.9, 0.5, 0.0]], device=self.DEVICE)
+        final = torch.tensor([0.99], device=self.DEVICE)
+        predicts, accept_index, accepted = self._run(
+            candidates, coins, final, target, draft
+        )
+        assert accepted.tolist() == [0]
+        assert accept_index[0].tolist() == [0, -1, -1]
+        # relu(p - q) at step 0 is {d: 0.6}; the rejected lane a is zero.
+        assert predicts[0, 0].item() == d
+
+    def test_all_accepted_samples_bonus_from_target(self):
+        candidates, target, draft, (a, b, c, d) = self._two_step_case()
+        # 0.1 * 0.5 < 0.4 and 0.1 * 0.8 < 0.2: both drafts land.
+        coins = torch.tensor([[0.1, 0.1, 0.0]], device=self.DEVICE)
+        final = torch.tensor([0.5], device=self.DEVICE)
+        predicts, accept_index, accepted = self._run(
+            candidates, coins, final, target, draft
+        )
+        assert accepted.tolist() == [2]
+        assert accept_index[0].tolist() == [0, 1, 2]
+        assert predicts[0].tolist() == [a, b, 7]
+
+    def test_sentinel_row_rejects_and_samples_full_target(self):
+        ndt, vocab = 3, 8
+        candidates = torch.tensor([[0, 1, 2]], dtype=torch.int32, device=self.DEVICE)
+        target = torch.zeros((1, ndt, vocab), device=self.DEVICE)
+        target[0, 0, :4] = 0.25  # the candidate 1 has p = 0.25 > 0
+        draft = torch.full((1, ndt, vocab), self.SENTINEL, device=self.DEVICE)
+        # Coins that would accept under any real q are irrelevant: the row
+        # has no recorded proposal.
+        coins = torch.zeros((1, ndt), device=self.DEVICE)
+        for final_coin, expected in ((0.1, 0), (0.3, 1), (0.6, 2), (0.9, 3)):
+            final = torch.tensor([final_coin], device=self.DEVICE)
+            predicts, accept_index, accepted = self._run(
+                candidates, coins, final, target, draft.clone()
+            )
+            assert accepted.tolist() == [0]
+            assert accept_index[0].tolist() == [0, -1, -1]
+            # Sentinel q reads as zero: the residual is the full target.
+            assert predicts[0, 0].item() == expected
+
+    def test_mixed_batch_sentinel_and_recorded_rows(self):
+        candidates, target, draft, (a, b, c, d) = self._two_step_case()
+        candidates = candidates.repeat(2, 1)
+        target = target.repeat(2, 1, 1)
+        draft = torch.cat([draft, torch.full_like(draft, self.SENTINEL)])
+        coins = torch.tensor([[0.7, 0.5, 0.0], [0.7, 0.5, 0.0]], device=self.DEVICE)
+        final = torch.tensor([0.3, 0.9], device=self.DEVICE)
+        predicts, accept_index, accepted = self._run(
+            candidates, coins, final, target, draft
+        )
+        assert accepted.tolist() == [1, 0]
+        assert predicts[0, :2].tolist() == [a, c]
+        # Row 1 samples step 0's full target: cdf(a)=0.4 < 0.9 picks d.
+        assert predicts[1, 0].item() == d
+
+    @pytest.mark.parametrize("vocab", [16, 1000, 4096])
+    def test_residual_matches_torch_reference(self, vocab):
+        torch.manual_seed(0)
+        bs, ndt = 4, 2
+        target = torch.softmax(torch.randn(bs, ndt, vocab, device=self.DEVICE), -1)
+        draft = torch.softmax(torch.randn(bs, ndt, vocab, device=self.DEVICE), -1)
+        candidates = torch.randint(
+            0, vocab, (bs, ndt), dtype=torch.int32, device=self.DEVICE
+        )
+        # Make the drafted token certain to be rejected: coin * q(x) with
+        # q(x) = 1 exceeds any softmax(randn) mass p(x).
+        for i in range(bs):
+            x = candidates[i, 1]
+            draft[i, 0].zero_()
+            draft[i, 0, x] = 1.0
+        coins = torch.full((bs, ndt), 0.999, device=self.DEVICE)
+        residual = torch.relu(target[:, 0] - draft[:, 0])
+        cdf = residual.cumsum(-1) / residual.sum(-1, keepdim=True)
+        # Aim the residual coin at the two heaviest tokens of each row, in the
+        # middle of their mass interval, so block-scan rounding cannot flip
+        # the id.
+        heavy = residual.topk(2, dim=-1).indices
+        for k in range(2):
+            expected_ids = heavy[:, k]
+            lower = torch.where(
+                expected_ids > 0,
+                cdf.gather(1, (expected_ids - 1).clamp_min(0)[:, None])[:, 0],
+                torch.zeros_like(cdf[:, 0]),
+            )
+            upper = cdf.gather(1, expected_ids[:, None])[:, 0]
+            final = (lower + upper) / 2
+            predicts, _, accepted = self._run(candidates, coins, final, target, draft)
+            assert accepted.tolist() == [0] * bs
+            assert predicts[:, 0].tolist() == expected_ids.tolist()
+
+    def test_no_writeback_into_draft_probs(self):
+        candidates, target, draft, _ = self._two_step_case()
+        before = draft.clone()
+        coins = torch.tensor([[0.9, 0.5, 0.0]], device=self.DEVICE)
+        final = torch.tensor([0.5], device=self.DEVICE)
+        self._run(candidates, coins, final, target, draft)
+        torch.testing.assert_close(draft, before, rtol=0, atol=0)
+
+    def test_deterministic_repeat(self):
+        torch.manual_seed(1)
+        bs, ndt, vocab = 8, 4, 2048
+        target = torch.softmax(torch.randn(bs, ndt, vocab, device=self.DEVICE), -1)
+        draft = torch.softmax(torch.randn(bs, ndt, vocab, device=self.DEVICE), -1)
+        candidates = torch.randint(
+            0, vocab, (bs, ndt), dtype=torch.int32, device=self.DEVICE
+        )
+        coins = torch.rand(bs, ndt, device=self.DEVICE)
+        final = torch.rand(bs, device=self.DEVICE)
+        first = self._run(candidates, coins, final, target, draft)
+        second = self._run(candidates, coins, final, target, draft)
+        for x, y in zip(first, second):
+            torch.testing.assert_close(x, y, rtol=0, atol=0)
+
+    def test_requires_draft_probs(self):
+        from tokenspeed_kernel.thirdparty.cuda import (
+            chain_speculative_sampling_target_only,
+        )
+
+        candidates, target, _, _ = self._two_step_case()
+        predicts, accept_index, accept_token_num = self._outputs(1, 3)
+        with pytest.raises(ValueError, match="requires the recorded draft_probs"):
+            chain_speculative_sampling_target_only(
+                predicts,
+                accept_index,
+                accept_token_num,
+                candidates,
+                torch.zeros((1, 3), device=self.DEVICE),
+                torch.zeros((1,), device=self.DEVICE),
+                target,
+                None,
+                1.0,
+                1.0,
+                use_draft_prob=True,
+                reject_draft_prob_threshold=self.THRESHOLD,
+            )
 
 
 # ───────────────────────────────────────────────────────────────────────────────

@@ -34,6 +34,7 @@ import pytest
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext, ForwardMode
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 
 
 def _make_mapping(rank: int) -> Mapping:
@@ -55,6 +56,7 @@ def _draft_first_step_ctx(bs: int, global_bs, global_num_tokens) -> ForwardConte
         token_to_kv_pool=None,
         bs=bs,
         num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, bs, 1),
         input_num_tokens=bs,
         forward_mode=ForwardMode.DECODE,
         global_num_tokens=global_num_tokens,
@@ -67,7 +69,12 @@ def _draft_first_step_ctx(bs: int, global_bs, global_num_tokens) -> ForwardConte
 def test_capture_global_bs_none_diverges_from_replay():
     """Missing global_bs leaves collectives sized for target verify rows."""
     cm = CommManager(
-        mapping=_make_mapping(0), layer_id=0, is_moe=True, prev_is_moe=True
+        mapping=_make_mapping(0),
+        layer_id=0,
+        is_moe=True,
+        prev_is_moe=True,
+        dense_batch_invariant=False,
+        query_sharded=False,
     )
     bs = 1
 
@@ -93,7 +100,12 @@ def test_capture_global_bs_none_diverges_from_replay():
 def test_draft_collectives_use_narrowed_counts_on_all_ranks(rank: int):
     """Every DP rank uses the draft's counts instead of the target verify width."""
     cm = CommManager(
-        mapping=_make_mapping(rank), layer_id=0, is_moe=True, prev_is_moe=True
+        mapping=_make_mapping(rank),
+        layer_id=0,
+        is_moe=True,
+        prev_is_moe=True,
+        dense_batch_invariant=False,
+        query_sharded=False,
     )
     bs = 1
     ctx = _draft_first_step_ctx(bs, global_bs=[bs] * 4, global_num_tokens=[bs * 4] * 4)

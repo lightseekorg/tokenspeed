@@ -20,16 +20,27 @@
 
 """CPU-only tests for GPU memory release coordination."""
 
+import os
+import sys
+
 import pytest
 
-from tokenspeed.runtime.engine.io_struct import (
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
+from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
 )
-from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
-from tokenspeed.runtime.engine.pause import PauseController, PauseState
+from tokenspeed.runtime.engine.memory_occupation import (  # noqa: E402
+    MemoryOccupationController,
+)
+from tokenspeed.runtime.engine.pause import PauseController, PauseState  # noqa: E402
 
 
 class _Sender:
@@ -72,6 +83,8 @@ def test_kv_release_waits_until_cache_can_be_cleared(resume_tags):
         enabled=True,
         reset_caches_fn=lambda: next(clear_results),
         kv_repair_fn=lambda: None,
+        weights_release_refusal_fn=lambda: None,
+        weights_busy_fn=lambda: False,
     )
 
     controller.handle_release(ReleaseMemoryOccupationReqInput(tags=["kv_cache"]))

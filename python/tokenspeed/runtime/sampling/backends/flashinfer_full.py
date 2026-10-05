@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     min_p_renorm_prob,
 )
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
     SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
@@ -54,6 +55,7 @@ from tokenspeed.runtime.sampling.backends.flashinfer import (
     canonical_greedy_verify,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -61,6 +63,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
 class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
@@ -275,7 +278,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones.
-        # Applied before raw_logprobs capture so constrained logprobs reflect
+        # Applied before the raw logits are kept so constrained logprobs reflect
         # the grammar-masked distribution.
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
@@ -283,51 +286,52 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             )
 
         # Raw-distribution logprobs (pre-penalty, pre-temperature) when the
-        # server flag is on. Gather is done after we know the sampled id.
-        raw_logprobs = (
-            torch.log_softmax(logits, dim=-1)
-            if self.config.enable_output_logprobs
-            else None
-        )
+        # server flag is on: keep the pre-penalty logits (the penalties return
+        # a new tensor) and gather once the sampled id is known.
+        raw_logits = logits if self.config.enable_output_logprobs else None
 
         logits = self._apply_penalties_and_bias(logits, sampling_info)
 
-        temperatures, top_ks, top_ps, min_ps, seeds, offsets = (
-            gather_and_expand_scalars(
-                sampling_info.req_pool_indices,
-                temperature=self._temperature_pool,
-                top_k=self._top_k_pool,
-                top_p=self._top_p_pool,
-                min_p=self._min_p_pool,
-                seed=self._seed_pool,
-                offsets=sampling_info.valid_cache_lengths,
-            )
-        )
-
-        probs = softmax(logits, temperature=temperatures.view(-1, 1))
-
-        if _FUSED_TOPK_TOPP_AVAILABLE:
-            # Fused replacement for the back-to-back top_k_renorm_prob +
-            # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
-            # K = 1<<30 in top_ks routes per-row through the radix top-p
-            # only path.
-            probs = fused_topk_topp_renorm(
-                probs,
-                top_ks,
-                top_ps,
+        if self.config.sampling_stream == "per-request":
+            batch_next_token_ids, top_ks = self._sample_per_request(
+                logits, sampling_info, min_p_pool=self._min_p_pool
             )
         else:
-            probs = top_k_renorm_prob(probs, top_ks)
-            probs = top_p_renorm_prob(probs, top_ps, is_deterministic=True)
+            temperatures, top_ks, top_ps, min_ps, seeds, offsets = (
+                gather_and_expand_scalars(
+                    sampling_info.req_pool_indices,
+                    temperature=self._temperature_pool,
+                    top_k=self._top_k_pool,
+                    top_p=self._top_p_pool,
+                    min_p=self._min_p_pool,
+                    seed=self._seed_pool,
+                    offsets=sampling_info.valid_cache_lengths,
+                )
+            )
+            probs = softmax(logits, temperature=temperatures.view(-1, 1))
 
-        batch_next_token_ids = min_p_sampling_from_probs(
-            probs,
-            min_ps,
-            seed=seeds,
-            offset=offsets,
-            deterministic=True,
-        )
-        if global_server_args_dict["numerics"] == "rl-bitwise":
+            if _FUSED_TOPK_TOPP_AVAILABLE:
+                # Fused replacement for the back-to-back top_k_renorm_prob +
+                # top_p_renorm_prob(is_deterministic=True) pair. Sentinel
+                # K = 1<<30 in top_ks routes per-row through the radix top-p
+                # only path.
+                probs = fused_topk_topp_renorm(
+                    probs,
+                    top_ks,
+                    top_ps,
+                )
+            else:
+                probs = top_k_renorm_prob(probs, top_ks)
+                probs = top_p_renorm_prob(probs, top_ps, is_deterministic=True)
+
+            batch_next_token_ids = min_p_sampling_from_probs(
+                probs,
+                min_ps,
+                seed=seeds,
+                offset=offsets,
+                deterministic=True,
+            )
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
             # Greedy maximizes the penalized logits.
             batch_next_token_ids = canonical_greedy_tokens(
                 logits, top_ks, batch_next_token_ids
@@ -337,15 +341,19 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         # TP-rank sync BEFORE _accumulate_counts so per-rank counts stay aligned.
         # For fused top-k + top-p, the results are bit-identical across ranks.
-        # So we don't need to broadcast the results.
-        if not _FUSED_TOPK_TOPP_AVAILABLE:
+        # So we don't need to broadcast the results. The per-request route
+        # reads the gathered logits, which are not bit-identical across ranks,
+        # so it syncs like FlashInferSamplingBackend.sample.
+        if (
+            not _FUSED_TOPK_TOPP_AVAILABLE
+            or self.config.sampling_stream == "per-request"
+        ):
             self.maybe_broadcast(sampled)
 
-        if raw_logprobs is not None:
-
-            logits_output.next_token_logprobs = raw_logprobs.gather(
-                -1, sampled.unsqueeze(-1)
-            ).squeeze(-1)
+        if raw_logits is not None:
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                raw_logits, sampled, logprob_order=self.config.logprob_order
+            )
 
         # Accumulate sampled tokens into counts (greedy path accumulates too
         # so mixed later batches see the correct history).
@@ -365,7 +373,13 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        *,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if tree is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot verify draft trees"
+            )
 
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
@@ -382,7 +396,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
 
         # Per-draft-position grammar bitmask: buffer shape
         # [bs * num_tokens_per_req, V/32] matches the flat target logits.
-        # Applied before raw_logprobs capture so constrained logprobs reflect
+        # Applied before the raw logits are kept so constrained logprobs reflect
         # the grammar-masked distribution.
         if sampling_info.vocab_mask is not None:
             sampling_info.apply_vocab_mask(
@@ -390,13 +404,9 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 vocab_mask=sampling_info.vocab_mask,
             )
 
-        # Raw (pre-penalty) logprobs captured before penalty application to
-        # match sample()'s semantics.
-        raw_logprobs = (
-            torch.log_softmax(logits, dim=-1)
-            if self.config.enable_output_logprobs
-            else None
-        )
+        # Raw (pre-penalty) logits kept for the logprob gather, matching
+        # sample()'s semantics.
+        raw_logits = logits if self.config.enable_output_logprobs else None
 
         logits = self._apply_penalties_and_bias(
             logits,
@@ -440,6 +450,17 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
         coins = self._coins_buf[row0 : row0 + bs, :num_tokens_per_req]
         coins_for_final_sampling = self._final_coins_buf[row0 : row0 + bs]
 
+        use_draft_prob = sampling_info.draft_probs is not None
+        draft_probs = (
+            self._gather_draft_probs(
+                sampling_info.draft_probs,
+                sampling_info.req_pool_indices,
+                bs,
+                num_tokens_per_req,
+            )
+            if use_draft_prob
+            else None
+        )
         chain_speculative_sampling_target_only(
             predicts=predict,
             accept_index=accept_index,
@@ -448,12 +469,14 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
-            draft_probs=None,
+            draft_probs=draft_probs,
             threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
             deterministic=True,
+            use_draft_prob=use_draft_prob,
+            reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
         )
-        if global_server_args_dict["numerics"] == "rl-bitwise":
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
             canonical_greedy_verify(
                 logits=logits,
                 top_ks=top_ks,
@@ -490,11 +513,10 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
             valid.reshape(-1).to(torch.int32),
         )
 
-        if raw_logprobs is not None:
-
-            logits_output.next_token_logprobs = raw_logprobs.gather(
-                -1, predict.unsqueeze(-1)
-            ).squeeze(-1)
+        if raw_logits is not None:
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                raw_logits, predict, logprob_order=self.config.logprob_order
+            )
 
         return predict, accept_length
 

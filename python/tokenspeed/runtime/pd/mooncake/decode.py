@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import struct
 import threading
 import time
 from collections import defaultdict
@@ -60,7 +61,13 @@ class PrefillParallelInfo:
 
 def parse_prefill_status_message(
     parts: list[bytes],
-) -> tuple[int, int, int, int, list[int] | None, int]:
+) -> tuple[int, int, int, int, list[int] | None, int, float | None]:
+    """Decode one Prefill status multipart message.
+
+    Frames: room, status, prefill rank, bootstrap token, speculative candidate
+    ids, cached tokens, bootstrap logprob. The last three are optional trailing
+    frames older senders omit; an empty logprob frame means "none".
+    """
     bootstrap_room = int(parts[0].decode("ascii"))
     status = int(parts[1].decode("ascii"))
     prefill_rank = int(parts[2].decode("ascii"))
@@ -68,6 +75,9 @@ def parse_prefill_status_message(
     spec_candidate_ids = None
     if len(parts) > 4 and parts[4] != b"":
         spec_candidate_ids = np.frombuffer(parts[4], dtype=np.int32).copy().tolist()
+    bootstrap_logprob = None
+    if len(parts) > 6 and parts[6] != b"":
+        (bootstrap_logprob,) = struct.unpack("<d", parts[6])
     return (
         bootstrap_room,
         status,
@@ -75,6 +85,7 @@ def parse_prefill_status_message(
         bootstrap_token,
         spec_candidate_ids,
         int(parts[5].decode("ascii")) if len(parts) > 5 else 0,
+        bootstrap_logprob,
     )
 
 
@@ -123,8 +134,10 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         self.bootstrap_token_table: dict[int, int] = {}
         self.spec_candidate_ids_table: dict[int, list[int]] = {}
         self.cached_tokens_table: dict[int, int] = {}
+        self.bootstrap_logprob_table: dict[int, float] = {}
         self._pending_bootstrap_token_table: dict[int, int] = {}
         self._pending_spec_candidate_ids_table: dict[int, list[int]] = {}
+        self._pending_bootstrap_logprob_table: dict[int, float] = {}
 
         def decode_thread():
             while True:
@@ -200,6 +213,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         bootstrap_token: int,
         spec_candidate_ids: list[int] | None,
         cached_tokens: int,
+        bootstrap_logprob: float | None,
     ) -> None:
         if bootstrap_room not in self.request_status:
             return
@@ -234,6 +248,10 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                 self._pending_spec_candidate_ids_table.setdefault(
                     bootstrap_room, spec_candidate_ids
                 )
+            if bootstrap_logprob is not None:
+                self._pending_bootstrap_logprob_table.setdefault(
+                    bootstrap_room, bootstrap_logprob
+                )
 
             expected_response_num = len(expected_prefill_ranks)
             arrived_response_num = len(self.prefill_response_tracker[bootstrap_room])
@@ -259,6 +277,10 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                 self.spec_candidate_ids_table[bootstrap_room] = (
                     self._pending_spec_candidate_ids_table.pop(bootstrap_room)
                 )
+            if bootstrap_room in self._pending_bootstrap_logprob_table:
+                self.bootstrap_logprob_table[bootstrap_room] = (
+                    self._pending_bootstrap_logprob_table.pop(bootstrap_room)
+                )
             self.update_status(bootstrap_room, TransferPoll.Success)
             return
 
@@ -278,11 +300,12 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
 
     def pop_prefill_metadata(
         self, bootstrap_room: int
-    ) -> tuple[int, list[int] | None, int]:
+    ) -> tuple[int, list[int] | None, int, float | None]:
         return (
             self.bootstrap_token_table.pop(bootstrap_room, -1),
             self.spec_candidate_ids_table.pop(bootstrap_room, None),
             self.cached_tokens_table.pop(bootstrap_room, 0),
+            self.bootstrap_logprob_table.pop(bootstrap_room, None),
         )
 
     def get_session_id(self):

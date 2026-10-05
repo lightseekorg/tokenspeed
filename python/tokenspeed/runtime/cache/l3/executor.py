@@ -133,13 +133,11 @@ class L3HostStore:
         *,
         key_prefix: str,
         rank: int,
-        cp_rank: int,
     ):
         self.backend = backend
         self.host_storage = host_storage
         self._base_key_prefix = key_prefix
         self.rank = int(rank)
-        self.cp_rank = int(cp_rank)
         self._stats = L3StoreStats()
 
     @property
@@ -188,7 +186,6 @@ class L3HostStore:
             page_offset,
             prefix=self.key_prefix,
             rank=self.rank,
-            cp_rank=self.cp_rank,
         )
 
     def stats(self) -> L3StoreStatsSnapshot:

@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 import zmq
@@ -61,19 +62,41 @@ from tokenspeed.runtime.engine.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    RebalanceExpertsReqInput,
+    RebalanceExpertsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     ResumeSchedulerReqInput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     TokenizedGenerateReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromMooncakeReqInput,
+    UpdateWeightsFromMooncakeReqOutput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput,
+    mooncake_load_weight_version,
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
-from tokenspeed.runtime.engine.scheduler_utils import make_spec
+from tokenspeed.runtime.engine.scheduler_utils import (
+    RETRACTION_SAFE_STEPS,
+    UNBOUNDED_CACHED_PREFIX_TOKENS,
+    make_spec,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
+from tokenspeed.runtime.moe.expert_location import (
+    EXPERT_LOAD_RECORD_SUFFIX,
+    expert_load_recording_enabled,
+)
+from tokenspeed.runtime.moe.expert_rebalance import (
+    EplbApplyChunk,
+    EplbCommit,
+    EplbSnapshot,
+)
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.utils import PipelinedPyobjBroadcaster
@@ -87,13 +110,77 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Frontend ops the scheduler completes through the attention-DP same-round
+# gate (``_rendezvous_replica_flush``), with the reply type for each: the
+# weight ops, and the manual expert-rebalance trigger, which starts the same
+# internal op sequence the periodic trigger does. The position is the op's
+# type code on the wire of that gate; append only.
+_WEIGHT_OPS: tuple[tuple[type, type], ...] = (
+    (InitWeightsUpdateGroupReqInput, InitWeightsUpdateGroupReqOutput),
+    (UpdateWeightsFromDistributedReqInput, UpdateWeightsFromDistributedReqOutput),
+    (DestroyWeightsUpdateGroupReqInput, DestroyWeightsUpdateGroupReqOutput),
+    (UpdateWeightsFromMooncakeReqInput, UpdateWeightsFromMooncakeReqOutput),
+    (RebalanceExpertsReqInput, RebalanceExpertsReqOutput),
+)
+_WEIGHT_OP_CODES: dict[type, int] = {
+    req_type: code for code, (req_type, _) in enumerate(_WEIGHT_OPS, start=1)
+}
+_WEIGHT_OP_OUTPUTS: dict[type, type] = dict(_WEIGHT_OPS)
+# Ops that rewrite model parameters: they may ask for a cache flush and they
+# publish the L3 weight version; group init/teardown do neither.
+_WEIGHT_LOAD_OPS = (
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromMooncakeReqInput,
+)
+# Internal control ops: the online expert rebalance's steps, enqueued by the
+# engine itself at rank-identical rounds (``enqueue_internal_op``) and
+# completed through the same gate from their own FIFO. Frontend ops arrive on
+# different DP workers in different rounds, so sharing one FIFO would make the
+# heads differ in kind across ranks. Position is the wire code; append only.
+_INTERNAL_OPS: tuple[type, ...] = (EplbSnapshot, EplbCommit, EplbApplyChunk)
+_INTERNAL_OP_CODES: dict[type, int] = {
+    kind: code for code, kind in enumerate(_INTERNAL_OPS, start=1)
+}
+_WEIGHT_GATE_WIDTH = 7
+
+
+class InternalOpCompleter(Protocol):
+    """Completes a ready internal op through named ``DeviceHandle`` operations.
+
+    Installed by the engine's rebalance hooks (``engine/eplb_hooks.py``); the
+    handler owns the FIFO and the gate, the completer owns the op semantics.
+    """
+
+    def complete(self, op) -> None: ...
+
+    def begin_manual_rebalance(self) -> tuple[bool, str]: ...
+
+
+def _weight_op_wants_flush(recv_req) -> bool:
+    return isinstance(recv_req, _WEIGHT_LOAD_OPS) and bool(recv_req.flush_cache)
+
+
+def _requested_weight_version(recv_req) -> str | None:
+    """The L3 namespace a load op asks to publish, read off the request.
+
+    A flushed Mooncake load without an explicit ``weight_version`` publishes
+    the committed version's own identity (``mooncake_load_weight_version``);
+    the request object is left as it arrived.
+    """
+    if isinstance(recv_req, UpdateWeightsFromMooncakeReqInput):
+        return mooncake_load_weight_version(
+            version=recv_req.version,
+            flush_cache=recv_req.flush_cache,
+            weight_version=recv_req.weight_version,
+        )
+    return recv_req.weight_version
+
+
 def _profile_rank_tag(attn_mapping) -> str:
     """File-name tag identifying this scheduler process's profile outputs."""
     parts = []
     if attn_mapping.has_dp:
         parts.append(f"DP{attn_mapping.dp_rank}")
-    if attn_mapping.has_cp:
-        parts.append(f"CP{attn_mapping.cp_rank}")
     parts.append(f"TP{attn_mapping.tp_rank}")
     return "-".join(parts)
 
@@ -149,24 +236,12 @@ class RequestHandler:
                 "gloo", mapping.world_group
             )
             self.attn_tp_src_rank = mapping.world_group[0]
-        elif mapping.has_attn_cp:
-            # ENABLE_CP folds requested TP into CP and leaves every worker
-            # at attn_tp_rank 0, so the TP broadcaster never runs and each
-            # CP rank would otherwise PULL a different ZMQ message. Fan
-            # recv_reqs across CP the same way PP fans them across WORLD
-            # so L3 exists MIN (and later CP collectives) see one stream.
-            self.attn_tp_size = mapping.attn.cp_size
-            self.attn_tp_rank = mapping.attn.cp_rank
-            self.attn_tp_cpu_group = pg_manager.get_process_group(
-                "gloo", mapping.attn.cp_group
-            )
-            self.attn_tp_src_rank = mapping.attn.cp_group[0]
         else:
             self.attn_tp_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.attn.tp_group
             )
             self.attn_tp_src_rank = mapping.attn.tp_group[0]
-        # Cache-owning ranks in this DP replica (attention TP × CP × PP).
+        # Cache-owning ranks in this DP replica (attention TP × PP).
         # Distinct from attn_tp_* above: with PP those become WORLD so the
         # request stream is identical across stages, which would also pull
         # DP ranks into the TP MIN. Exists uses these replica groups;
@@ -175,21 +250,15 @@ class RequestHandler:
         self._replica_tp_cpu_group = pg_manager.get_process_group(
             "gloo", mapping.attn.tp_group
         )
-        self.attn_cp_size = mapping.attn.cp_size
-        self.attn_cp_cpu_group = (
-            pg_manager.get_process_group("gloo", mapping.attn.cp_group)
-            if mapping.has_attn_cp
-            else None
-        )
         self.pp_size = mapping.pp_size
         self.pp_cpu_group = (
             pg_manager.get_process_group("gloo", mapping.pp_group)
             if mapping.has_pp
             else None
         )
-        # Flush MIN includes attention DP after TP/CP/PP: object keys omit
+        # Flush MIN includes attention DP after TP/PP: object keys omit
         # DP rank, so DP replicas share the Mooncake namespace. Exists,
-        # prefetch, and WriteBackDone stay TP/CP/PP only (EventLoop /
+        # prefetch, and WriteBackDone stay TP/PP only (EventLoop /
         # L2CacheHooks); those ranks hold different sequences.
         self.attn_dp_size = mapping.attn.dp_size
         self.attn_dp_cpu_group = (
@@ -213,10 +282,42 @@ class RequestHandler:
         self._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
         # Same constraint as _profile_sync: gloo barrier would CUDA-allocate.
         self._replica_decision_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
-        self._replica_flush_want_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
+        # Per-round attention-DP MAX all-reduce: standalone flush intent plus
+        # the weight-op gate (see _rendezvous_replica_flush for the layout).
+        self._replica_flush_want_buf = torch.zeros(
+            _WEIGHT_GATE_WIDTH, dtype=torch.int32, device="cpu"
+        )
+        # Weight ops (NCCL group init/teardown, distributed and Mooncake
+        # loads) in arrival order. The head completes only in a round where
+        # every attention-DP rank holds the same op at its head: the device
+        # call blocks this control thread in a collective or an SDK read, and
+        # a peer that had not dequeued its copy would wait for this rank in
+        # the per-round DP all-reduce -- a deadlock. One op per round.
+        self._pending_weight_ops: deque = deque()
+        # Internal control ops (the expert rebalance's steps) in enqueue
+        # order, completed through the same gate; see _INTERNAL_OPS. The
+        # completer is installed by the rebalance hooks when --enable-eplb.
+        self._pending_internal_ops: deque = deque()
+        self._internal_op_completer: InternalOpCompleter | None = None
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
+        # Head TP over attention-DP ranks serves decode rows only, so that
+        # engine cannot run the local recovery prefill a capacity retraction
+        # would need; it admits only requests the scheduler never retracts
+        # (generation budget within one safe-step window,
+        # docs/design/scheduler.md section 4). Head TP over the query shards
+        # of a prefill engine serves its extend rows and keeps no budget.
+        self.max_new_tokens_budget: int | None = (
+            RETRACTION_SAFE_STEPS if mapping.attn.head_tp_serves_decode_only else None
+        )
+        # LM-head TP under attention DP exchanges the logits rows with the
+        # group once per forward (LogitsProcessor._lm_head_tp_row_counts); the
+        # prompt-logprob chunk loop would run that exchange a per-rank number
+        # of times, so this engine refuses requests asking for prompt logprobs.
+        self.supports_input_logprobs: bool = not (
+            mapping.attn.has_dp and mapping.lm_head.has_tp
+        )
         self.vocab_size = vocab_size
         self.clear_cache_fn = clear_cache_fn
         self.can_clear_cache_fn = can_clear_cache_fn
@@ -278,7 +379,6 @@ class RequestHandler:
         """Dispatch control requests and return new generate request specs and states."""
         new_req_specs, req_states, bootstrap_infos, abort_rids = [], [], [], []
         pending_flush_outputs = 0
-        pending_weight_updates = []
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 req_spec, req_state, bootstrap_info = self.handle_generate_request(
@@ -318,37 +418,88 @@ class RequestHandler:
                 self.send_func.send_pyobj(
                     SetInternalStateReqOutput(updated=False, server_args={})
                 )
-            elif isinstance(recv_req, InitWeightsUpdateGroupReqInput):
-                # RL weight sync: join the trainer's NCCL group on this worker.
-                ok, msg = self._device.update_weights(recv_req)
-                self.send_func.send_pyobj(
-                    InitWeightsUpdateGroupReqOutput(success=ok, message=msg)
-                )
-            elif isinstance(recv_req, UpdateWeightsFromDistributedReqInput):
+            elif isinstance(
+                recv_req,
+                (
+                    InitWeightsUpdateGroupReqInput,
+                    DestroyWeightsUpdateGroupReqInput,
+                    RebalanceExpertsReqInput,
+                ),
+            ):
+                # RL weight sync: join / leave the trainer's NCCL group, and
+                # the manual rebalance trigger. Gated like the loads: the
+                # rendezvous blocks this thread too.
+                self._pending_weight_ops.append(recv_req)
+            elif isinstance(recv_req, _WEIGHT_LOAD_OPS):
                 ok, msg = self._require_weight_version_for_l3_flush(recv_req)
                 if ok:
                     ok, msg = self._require_flush_for_l3_version_switch(recv_req)
                 if not ok:
                     self.send_func.send_pyobj(
-                        UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+                        _WEIGHT_OP_OUTPUTS[type(recv_req)](success=ok, message=msg)
                     )
                 else:
-                    pending_weight_updates.append(recv_req)
-            elif isinstance(recv_req, DestroyWeightsUpdateGroupReqInput):
-                # RL weight sync: tear down the trainer's NCCL group on this worker.
-                ok, msg = self._device.update_weights(recv_req)
+                    self._pending_weight_ops.append(recv_req)
+            # The in-engine RL control app refuses these two sources up front
+            # (SUPPORTED_WEIGHT_UPDATE_SOURCES in io_struct, also advertised to
+            # gateways as rl.update_from); keep that set in step with the load
+            # branches above.
+            elif isinstance(recv_req, UpdateWeightsFromTensorReqInput):
                 self.send_func.send_pyobj(
-                    DestroyWeightsUpdateGroupReqOutput(success=ok, message=msg)
+                    UpdateWeightsFromTensorReqOutput(
+                        success=False,
+                        message="update_weights_from_tensor is not supported on "
+                        "this engine",
+                    )
+                )
+            elif isinstance(recv_req, UpdateWeightFromDiskReqInput):
+                self.send_func.send_pyobj(
+                    UpdateWeightFromDiskReqOutput(
+                        success=False,
+                        message="update_weights_from_disk is not supported on "
+                        "this engine",
+                        num_paused_requests=0,
+                    )
                 )
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
-        flush_success = self._rendezvous_replica_flush(
-            pending_flush_outputs=pending_flush_outputs,
-            weight_updates=pending_weight_updates,
+        flush_success, ready_op, ready_internal = self._rendezvous_replica_flush(
+            pending_flush_outputs=pending_flush_outputs
         )
-        for recv_req in pending_weight_updates:
-            self._complete_weight_update(recv_req, flush_success=flush_success)
+        if ready_op is not None:
+            self._complete_weight_update(ready_op, flush_success=flush_success)
+        elif ready_internal is not None:
+            self._complete_internal_op(ready_internal)
         return new_req_specs, req_states, bootstrap_infos, abort_rids
+
+    # ------------------------------------------------------------------
+    # Internal control ops (online expert rebalance)
+    # ------------------------------------------------------------------
+
+    def set_internal_op_completer(self, completer: InternalOpCompleter) -> None:
+        """Install the owner of the internal ops (once, at startup)."""
+        if self._internal_op_completer is not None:
+            raise RuntimeError("an internal op completer is already installed")
+        self._internal_op_completer = completer
+
+    def enqueue_internal_op(self, op) -> None:
+        """Queue an internal control op for the same-round gate.
+
+        Called at a rank-identical round (the rebalance controller's forward
+        count), so every attention-DP rank queues the same op in the same
+        round and the gate completes it as soon as every rank holds it.
+        """
+        if type(op) not in _INTERNAL_OP_CODES:
+            raise TypeError(f"{type(op).__name__} is not an internal control op")
+        if self._internal_op_completer is None:
+            raise RuntimeError("no internal op completer is installed")
+        self._pending_internal_ops.append(op)
+
+    def _complete_internal_op(self, op) -> None:
+        """Run a gate-agreed internal op through the completer's named device ops."""
+        if self._internal_op_completer is None:
+            raise RuntimeError("no internal op completer is installed")
+        self._internal_op_completer.complete(op)
 
     def _require_weight_version_for_l3_flush(self, recv_req) -> tuple[bool, str]:
         """Reject a flushed L3 update that has no checkpoint identity.
@@ -364,7 +515,7 @@ class RequestHandler:
         if (
             storage_backend is None
             or not recv_req.flush_cache
-            or recv_req.weight_version is not None
+            or _requested_weight_version(recv_req) is not None
         ):
             return True, ""
         return False, L3_FLUSH_REQUIRES_WEIGHT_VERSION
@@ -384,7 +535,7 @@ class RequestHandler:
             return True, ""
         version = resolve_l3_weight_version(
             self.server_args.weight_version,
-            recv_req.weight_version,
+            _requested_weight_version(recv_req),
             flush_cache=False,
             storage_backend=storage_backend,
         )
@@ -397,51 +548,141 @@ class RequestHandler:
             "and in-flight writebacks cannot land in the new namespace",
         )
 
-    def _rendezvous_replica_flush(
-        self, *, pending_flush_outputs: int, weight_updates: list
-    ) -> bool:
-        """Enter flush collectives from every rank on every round.
+    def _rendezvous_replica_flush(self, *, pending_flush_outputs: int):
+        """Enter flush collectives from every rank on every round; gate weight ops.
 
-        ``FlushCacheReqInput`` is sent separately to each attention-DP
-        worker. If only the worker that dequeued it entered
-        ``_try_clear_replica_cache``, that rank would DP all-reduce while a
-        lagging peer continued to ``EventLoop._dp_sync_and_check`` and
-        world-gathered. MAX-reduce flush intent on the DP group first so
-        every DP rank takes the same MIN-reduce path, then reply.
+        ``FlushCacheReqInput`` and the weight ops are sent separately to each
+        attention-DP worker. If only the worker that dequeued one entered
+        ``_try_clear_replica_cache`` or blocked in ``update_weights``, that
+        rank would DP all-reduce (or sit in the trainer's NCCL broadcast)
+        while a lagging peer continued to ``EventLoop._dp_sync_and_check``
+        and world-gathered. One MAX all-reduce on the DP group settles both
+        on every rank identically, plus the internal ops' FIFO::
+
+            [0] standalone flush intent (any rank)
+            [1] -1 if this rank has a queued weight op, else 0
+                -> MAX is -1 only when every rank has one
+            [2] +type code of the head op (0 without one)
+            [3] -type code of the head op
+                -> [2] == -[3] means every head is the same kind of op
+            [4] -1 if this rank has a queued internal op, else 0
+            [5] +type code of the internal head (0 without one)
+            [6] -type code of the internal head
+
+        A head is popped only when every rank has one; the flush intent of
+        a load op then counts because every rank reads it off its own copy
+        of the same op. Standalone flushes reply here. When both FIFOs are
+        ready, the frontend op completes this round and the internal op
+        waits for the next: one blocking device call per round.
+
+        Returns:
+            ``(flush_success, ready_op, ready_internal)`` -- the frontend op
+            to complete this round, or the internal op to complete, or
+            neither (never both).
+
+        Raises:
+            RuntimeError: Attention-DP ranks hold different kinds of ops at
+                their queue heads. The frontend sends every op to every
+                worker in one order and internal ops are enqueued at
+                rank-identical rounds, so this is a transport bug, and
+                completing mismatched ops would hang the collectives.
         """
 
-        want_flush = pending_flush_outputs > 0 or any(
-            bool(recv_req.flush_cache) for recv_req in weight_updates
-        )
+        head = self._pending_weight_ops[0] if self._pending_weight_ops else None
+        head_code = 0 if head is None else _WEIGHT_OP_CODES[type(head)]
+        internal = self._pending_internal_ops[0] if self._pending_internal_ops else None
+        internal_code = 0 if internal is None else _INTERNAL_OP_CODES[type(internal)]
+        want_standalone_flush = pending_flush_outputs > 0
+        all_have_head = head is not None
+        all_have_internal = internal is not None
         if self.attn_dp_size > 1 and self.attn_dp_cpu_group is not None:
             buf = self._replica_flush_want_buf
-            buf[0] = 1 if want_flush else 0
+            buf[0] = 1 if want_standalone_flush else 0
+            buf[1] = -1 if head is not None else 0
+            buf[2] = head_code
+            buf[3] = -head_code
+            buf[4] = -1 if internal is not None else 0
+            buf[5] = internal_code
+            buf[6] = -internal_code
             torch.distributed.all_reduce(
                 buf, op=torch.distributed.ReduceOp.MAX, group=self.attn_dp_cpu_group
             )
-            want_flush = bool(buf.item())
+            reduced = buf.tolist()
+            want_standalone_flush = reduced[0] > 0
+            all_have_head = reduced[1] == -1
+            if all_have_head and reduced[2] != -reduced[3]:
+                raise RuntimeError(
+                    "attention-DP ranks hold different weight-update operations "
+                    f"at their queue heads (local {type(head).__name__}); the "
+                    "frontend must send every weight op to every DP worker in "
+                    "the same order"
+                )
+            all_have_internal = reduced[4] == -1
+            if all_have_internal and reduced[5] != -reduced[6]:
+                raise RuntimeError(
+                    "attention-DP ranks hold different internal control "
+                    f"operations at their queue heads (local "
+                    f"{type(internal).__name__}); the rebalance controller "
+                    "must enqueue the same ops in the same rounds on every rank"
+                )
+        ready_op = self._pending_weight_ops.popleft() if all_have_head else None
+        ready_internal = (
+            self._pending_internal_ops.popleft()
+            if all_have_internal and ready_op is None
+            else None
+        )
+        want_flush = want_standalone_flush or (
+            ready_op is not None and _weight_op_wants_flush(ready_op)
+        )
         flush_success = True
         if want_flush:
             flush_success = self._try_clear_replica_cache()
         for _ in range(pending_flush_outputs):
             self.send_func.send_pyobj(FlushCacheReqOutput(success=flush_success))
-        return flush_success
+        return flush_success, ready_op, ready_internal
 
     def _complete_weight_update(self, recv_req, *, flush_success: bool) -> None:
-        """Finish a validated weight update after the rank-identical flush."""
+        """Finish a gated weight op after the rank-identical flush.
 
-        if recv_req.flush_cache and not flush_success:
+        The device result is MIN-reduced across the replica (attention TP,
+        CP, PP, then DP) before the L3 weight version is published and the
+        reply is sent, so one rank's failed load fails the update everywhere
+        and no rank serves the new namespace against old weights.
+        """
+
+        if isinstance(recv_req, RebalanceExpertsReqInput):
+            # Not a weight op: the frontend trigger of the internal rebalance
+            # sequence. The decision is rank-identical (the controller's phase
+            # is), and the snapshot it takes runs its collectives inside this
+            # gated round like the weight ops do.
+            if self._internal_op_completer is None:
+                local_ok, msg = False, (
+                    "expert rebalancing needs the server to start with --enable-eplb"
+                )
+            else:
+                local_ok, msg = self._internal_op_completer.begin_manual_rebalance()
+            ok = self._converge_replica_decision(local_ok)
+            if local_ok and not ok:
+                msg = f"rebalance refused on another rank in the replica ({msg})"
+            self.send_func.send_pyobj(
+                RebalanceExpertsReqOutput(success=ok, message=msg)
+            )
+            return
+        if _weight_op_wants_flush(recv_req) and not flush_success:
             ok = False
             msg = (
                 "cache flush failed; retry the update after in-flight "
                 "Host writebacks drain"
             )
         else:
-            ok, msg = self._device.update_weights(recv_req)
-            if ok:
+            local_ok, msg = self._device.update_weights(recv_req)
+            ok = self._converge_replica_decision(local_ok)
+            if local_ok and not ok:
+                msg = f"weight update failed on another rank in the replica ({msg})"
+            if ok and isinstance(recv_req, _WEIGHT_LOAD_OPS):
                 ok, msg = self._commit_l3_weight_version(recv_req, msg)
         self.send_func.send_pyobj(
-            UpdateWeightsFromDistributedReqOutput(success=ok, message=msg)
+            _WEIGHT_OP_OUTPUTS[type(recv_req)](success=ok, message=msg)
         )
 
     def _try_clear_replica_cache(self) -> bool:
@@ -472,7 +713,7 @@ class RequestHandler:
     def _converge_replica_decision(self, local_ok: bool) -> bool:
         """MIN-reduce a yes/no across every rank that shares this flush.
 
-        Attention TP, then CP, then PP (same order as
+        Attention TP, then PP (same order as
         ``EventLoop._converge_l3_exists``), then attention DP. Exists and
         WriteBackDone omit DP because those ranks hold different sequences.
         Flush includes DP: ``storage_object_key`` has no DP rank, so a
@@ -484,8 +725,6 @@ class RequestHandler:
         groups = []
         if self._replica_tp_size > 1 and self._replica_tp_cpu_group is not None:
             groups.append(self._replica_tp_cpu_group)
-        if self.attn_cp_size > 1 and self.attn_cp_cpu_group is not None:
-            groups.append(self.attn_cp_cpu_group)
         if self.pp_size > 1 and self.pp_cpu_group is not None:
             groups.append(self.pp_cpu_group)
         if self.attn_dp_size > 1 and self.attn_dp_cpu_group is not None:
@@ -524,7 +763,7 @@ class RequestHandler:
             return False, err
         version = resolve_l3_weight_version(
             self.server_args.weight_version,
-            recv_req.weight_version,
+            _requested_weight_version(recv_req),
             flush_cache=recv_req.flush_cache,
             storage_backend=getattr(self.server_args, "kvstore_storage_backend", None),
         )
@@ -541,14 +780,28 @@ class RequestHandler:
         if recv_req.bootstrap_port is None:
             recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
-        req_spec = make_spec(
-            rid=recv_req.rid,
-            tokens=recv_req.input_ids,
-        )
+        # The decode role never computes prompt rows (the prefill node returns
+        # the prompt logprobs), so it neither accumulates them nor caps its
+        # admission probe for them.
+        computes_prompt_logprobs = self.server_args.disaggregation_mode != "decode"
         req_state = RequestState.from_recv_req(
             recv_req,
             tokenizer=self.tokenizer,
             eos_token_ids=self.hf_eos_token_id,
+            computes_prompt_logprobs=computes_prompt_logprobs,
+        )
+        # Prompt logprobs need logits for every position from the start on, so
+        # the admission probe may not match those positions from the prefix
+        # cache.
+        max_cached_prefix_tokens = (
+            req_state.logprob_start_len
+            if req_state.wants_input_logprobs
+            else UNBOUNDED_CACHED_PREFIX_TOKENS
+        )
+        req_spec = make_spec(
+            rid=recv_req.rid,
+            tokens=recv_req.input_ids,
+            max_cached_prefix_tokens=max_cached_prefix_tokens,
         )
 
         # A transport that validates requests itself (msgpack ZMQ) marks
@@ -585,15 +838,8 @@ class RequestHandler:
                 ),
             )
 
-        req_state.sampling_params.max_new_tokens = min(
-            (
-                req_state.sampling_params.max_new_tokens
-                if req_state.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
-            self.max_req_len - len(req_state.prompt_input_ids) - 1,
-        )
-        req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
+        self._refuse_unsupported_input_logprobs(req_state)
+        self._apply_generation_budget(req_spec, req_state)
         return (
             req_spec,
             req_state,
@@ -603,6 +849,39 @@ class RequestHandler:
                 recv_req.bootstrap_room,
             ),
         )
+
+    def _refuse_unsupported_input_logprobs(self, req_state) -> None:
+        """Finish a request asking for prompt logprobs with an abort when this
+        engine's LM-head layout cannot compute them (``supports_input_logprobs``)."""
+        if req_state.wants_input_logprobs and not self.supports_input_logprobs:
+            req_state.finished_reason = FINISH_ABORT(
+                "Invalid request: prompt logprobs (logprob_start_len) are not "
+                "available with --lm-head-tp-size > 1 under attention DP"
+            )
+
+    def _apply_generation_budget(self, req_spec, req_state) -> None:
+        """Clamp ``max_new_tokens`` to the context; refuse what exceeds this
+        engine's per-request budget (``max_new_tokens_budget``), finishing the
+        request with an abort instead of admitting work the engine cannot
+        complete."""
+        req_state.sampling_params.max_new_tokens = min(
+            (
+                req_state.sampling_params.max_new_tokens
+                if req_state.sampling_params.max_new_tokens is not None
+                else 1 << 30
+            ),
+            self.max_req_len - len(req_state.prompt_input_ids) - 1,
+        )
+        req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
+        if (
+            self.max_new_tokens_budget is not None
+            and req_spec.max_new_tokens > self.max_new_tokens_budget
+        ):
+            req_state.finished_reason = FINISH_ABORT(
+                "Invalid request: this decode engine (--attn-head-tp-size) serves "
+                f"at most {self.max_new_tokens_budget} new tokens per request; "
+                f"got max_new_tokens={req_spec.max_new_tokens}"
+            )
 
     # ------------------------------------------------------------------
     # Profiling: torch / cuda / viztracer / mem-snapshot / proton, driven
@@ -680,6 +959,27 @@ class RequestHandler:
                     "process (e.g. via TOKENSPEED_KERNEL_PROFILE); it cannot "
                     "be controlled through /start_profile.",
                 )
+        if "EXPERT_LOAD" in activities:
+            if self._device is None:
+                return ProfileReqOutput(
+                    success=False,
+                    message="EXPERT_LOAD needs the device handle.",
+                )
+            if self.server_args.enable_eplb:
+                # The rebalance owns the counters: its snapshot zeroes them,
+                # so a profile window would be cut at every snapshot.
+                return ProfileReqOutput(
+                    success=False,
+                    message="EXPERT_LOAD cannot run under --enable-eplb: the "
+                    "online rebalance snapshots and resets the same load "
+                    "counters (its log reports the balancedness it saw).",
+                )
+            if not expert_load_recording_enabled():
+                return ProfileReqOutput(
+                    success=False,
+                    message="EXPERT_LOAD needs the routing load counters; start "
+                    "the server with --expert-distribution-recorder-mode stat.",
+                )
 
         self.profile_by_stage = profile_by_stage
         self.profiler_output_dir = output_dir
@@ -740,6 +1040,10 @@ class RequestHandler:
 
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
+
+        if "EXPERT_LOAD" in activities:
+            # Routing counts every route; the window starts from zero.
+            self._device.reset_expert_load()
 
         if "PROTON" in activities:
             Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
@@ -842,6 +1146,21 @@ class RequestHandler:
 
         if "CUDA_PROFILER" in self.profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
+
+        if "EXPERT_LOAD" in self.profiler_activities:
+            # Per-rank, unreduced (a collective here would wait on DP peers);
+            # the ranks' records are summed when the directory is consumed.
+            record_path = os.path.join(
+                self.profiler_output_dir,
+                f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}"
+                f"{EXPERT_LOAD_RECORD_SUFFIX}",
+            )
+            record = self._device.dump_expert_load(record_path)
+            logger.info(
+                f"Expert load: {int(record['physical_count'].sum())} routes counted "
+                f"on EP rank {record['ep_rank']} written to {record_path}; pass the "
+                "directory to --init-expert-location to merge every rank's record"
+            )
 
         proton_error: Exception | None = None
         if "PROTON" in self.profiler_activities:

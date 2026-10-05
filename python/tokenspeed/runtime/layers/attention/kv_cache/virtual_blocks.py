@@ -30,8 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-import torch
-from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
+import numpy as np
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
@@ -39,24 +38,30 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 )
 
 
-def local_pages(
-    virtual_blocks: Sequence[int],
+def owned_local_pages(
+    virtual_blocks: Sequence[int] | np.ndarray,
     *,
     shard_count: int,
     rank: int,
     virtual_block_count: int,
-) -> list[int]:
-    """Translate a batch of scheduler blocks to owned local pages on the CPU.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Translate scheduler blocks to owned local pages, keeping the owner mask.
 
     Args:
-        virtual_blocks: Scheduler block IDs, including reserved null ID 0.
+        virtual_blocks: Scheduler block IDs, including reserved null ID 0; a
+            sequence or an integer array (the scheduler's zero-copy export).
         shard_count: Cyclic owner count from the group's spec; 1 is replicated.
         rank: This process's rank in the DCP subgroup.
         virtual_block_count: Exclusive bound from the arena's runtime contract.
 
     Returns:
-        Owned local page IDs in input order, preserving duplicates and
-        excluding null and remote blocks.
+        ``(owned, local)``: a boolean mask over the input marking the blocks
+        this rank owns (the null block is never owned), and the local page ID
+        of every owned block as an int64 array in input order, preserving
+        duplicates. The mask lets a caller that pairs each source block with
+        a destination (the PD sender) keep the matching destination
+        subsequence. No Python int is built per page: a long prompt's
+        admission is thousands of them.
 
     Raises:
         IndexError: If any virtual block ID is outside the contract's bounds.
@@ -65,25 +70,52 @@ def local_pages(
     require_positive_int("shard_count", shard_count)
     if rank < 0 or (shard_count > 1 and rank >= shard_count):
         raise ValueError("DCP rank is out of range")
-    blocks = torch.tensor(virtual_blocks, dtype=torch.int64, device="cpu")
-    if ((blocks < 0) | (blocks >= virtual_block_count)).any():
+    blocks = np.asarray(virtual_blocks, dtype=np.int64).reshape(-1)
+    if blocks.size == 0:
+        return np.zeros(0, dtype=bool), blocks
+    if blocks.min() < 0 or blocks.max() >= virtual_block_count:
         raise IndexError("virtual cache block ID is out of range")
-    local, owned = virtual_slots_to_local(
-        blocks,
-        rows_per_page=1,
+    # Same placement as the device kernels' virtual_block_to_local: block 0 is
+    # the null page, the rest are dealt cyclically to the shard_count owners.
+    positive = blocks - 1
+    owned = blocks > 0
+    if shard_count > 1:
+        owned &= positive % shard_count == rank
+    local = positive // shard_count + 1
+    return owned, local[owned]
+
+
+def local_pages(
+    virtual_blocks: Sequence[int] | np.ndarray,
+    *,
+    shard_count: int,
+    rank: int,
+    virtual_block_count: int,
+) -> np.ndarray:
+    """Translate a batch of scheduler blocks to owned local pages on the CPU.
+
+    The same translation as :func:`owned_local_pages` without the mask, for
+    callers such as zeroing that only need the pages this rank holds.
+
+    Returns:
+        Owned local page IDs as an int64 array in input order, preserving
+        duplicates and excluding null and remote blocks.
+    """
+    _, local = owned_local_pages(
+        virtual_blocks,
+        shard_count=shard_count,
+        rank=rank,
         virtual_block_count=virtual_block_count,
-        degree=shard_count,
-        rank=rank if shard_count > 1 else 0,
     )
-    return local[owned].tolist()
+    return local
 
 
 def local_pages_by_group(
-    virtual_blocks_by_group: Mapping[str, Sequence[int]],
+    virtual_blocks_by_group: Mapping[str, Sequence[int] | np.ndarray],
     *,
     contract: CacheRuntimeContract,
     rank: int,
-) -> dict[str, list[int]]:
+) -> dict[str, np.ndarray]:
     """Translate every group's scheduler blocks through :func:`local_pages`.
 
     Args:
@@ -93,7 +125,7 @@ def local_pages_by_group(
         rank: This process's rank in the DCP subgroup.
 
     Returns:
-        Owned local page IDs keyed by the same group ids.
+        Owned local page ID arrays keyed by the same group ids.
     """
     shard_counts = {spec.group_id: spec.shard_count for spec in contract.group_specs}
     counts = contract.virtual_block_counts

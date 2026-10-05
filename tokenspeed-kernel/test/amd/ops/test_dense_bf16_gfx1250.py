@@ -35,7 +35,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
 
 
 @pytest.mark.parametrize("split_k", [1, 2, 4, 8, None])
-@pytest.mark.parametrize("m,n", [(1, 80), (17, 128)])
+@pytest.mark.parametrize("m,n", [(1, 80), (17, 128), (17, 7168)])
 def test_dense_split_k_strided_output_and_replay(split_k, m, n):
     torch.manual_seed(1250)
     k = 8192

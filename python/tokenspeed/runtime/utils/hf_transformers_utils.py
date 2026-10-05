@@ -65,6 +65,7 @@ from tokenspeed.runtime.configs import (
     Qwen4ExpTextConfig,
 )
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
+from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
@@ -91,6 +92,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
     Glm53FlashConfig.model_type: Glm53FlashConfig,
+    NemotronHConfig.model_type: NemotronHConfig,
     "glm5_next": Glm53FlashConfig,
 }
 

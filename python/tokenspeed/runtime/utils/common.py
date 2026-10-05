@@ -749,11 +749,6 @@ def crash_on_warnings():
     return get_bool_env_var("CI") or get_bool_env_var("GITHUB_ACTIONS")
 
 
-def print_warning_once(msg: str) -> None:
-    # Set the stacklevel to 2 to print the caller's line info
-    logger.warning(msg, stacklevel=2)
-
-
 def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_name(device_id)

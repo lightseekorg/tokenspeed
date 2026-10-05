@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -236,6 +237,32 @@ def test_load_suite_expands_parameter_lists_as_cartesian_product(tmp_path):
     )
 
 
+def test_case_filters_match_expanded_ids_with_or_semantics(tmp_path):
+    definition = _definition()
+    definition["parameters"]["N"] = [32, 64]
+    definition["parameters"]["M"] = [1, 2]
+    payload = _suite_payload(
+        [
+            {
+                "id": "gemm.bmm/listed",
+                "comparison_epoch": 1,
+                "definition": definition,
+                "policy": _policy(),
+            }
+        ]
+    )
+
+    suite = load_suite(
+        _write_suite(tmp_path, payload),
+        [r"_0$", r"_3$"],
+    )
+
+    assert [case.id for case in suite.cases] == [
+        "gemm.bmm/listed_0",
+        "gemm.bmm/listed_3",
+    ]
+
+
 def test_load_suite_preserves_id_for_one_literal_list_value(tmp_path):
     definition = _definition()
     definition["parameters"]["literal_shape"] = [[7, 8]]
@@ -387,6 +414,34 @@ def test_run_suite_uses_one_harness_for_mixed_measurement_blocks(tmp_path):
 
     assert runs == [(42, 5), (43, 30)]
     assert [case["measurement_blocks"] for case in payload["cases"]] == [5, 30]
+
+
+def test_run_suite_binds_profiler_to_case_id(tmp_path):
+    suite = load_suite(_write_suite(tmp_path, _suite_payload()))
+    regions = []
+
+    class Profiler:
+        @contextmanager
+        def profile(self, case_id, phase, invocation_index):
+            regions.append((case_id, phase, invocation_index))
+            yield
+
+    class Harness:
+        def run(self, request, *, measurement_blocks, profile_invocation):
+            assert measurement_blocks == 5
+            with profile_invocation("graph_replay", 2):
+                pass
+            return _success_result(request)
+
+    run_suite(
+        suite,
+        _REVISION,
+        harness_factory=lambda _config: Harness(),
+        environment_provider=lambda: _ENVIRONMENT,
+        profiler=Profiler(),
+    )
+
+    assert regions == [("gemm.bmm/example", "graph_replay", 2)]
 
 
 def test_suite_defaults_to_cold_cache_and_can_disable_it(tmp_path):
@@ -600,12 +655,15 @@ def test_main_writes_successful_run_document(tmp_path, monkeypatch):
         *,
         harness_factory,
         environment_provider,
+        profiler,
     ):
         assert harness_factory is benchmark_ci._create_harness
         assert environment_provider is benchmark_ci._collect_environment
+        assert profiler is None
         return expected
 
     monkeypatch.setattr(benchmark_ci, "run_suite", fake_run_suite)
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BENCHMARK_PROFILER", "none")
 
     exit_code = main(
         [

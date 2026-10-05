@@ -36,6 +36,8 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention._common import (
 
 cdna5 = gl.amd.cdna5
 
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
 
 @gluon.aggregate
 class AttentionConfig:
@@ -405,6 +407,24 @@ class AttentionProgram:
         return gl.where(valid, qk, -float("inf"))
 
     @gluon.jit
+    def mask_keys(self, qk, kv_start):
+        # Rows past q_len are never stored, so only keys need masking.
+        cfg = self.cfg
+        offs_n = kv_start + gl.arange(
+            0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout)
+        )
+        if cfg.IS_CAUSAL:
+            offs_m = self.q_start + gl.arange(
+                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout)
+            )
+            # Align the last query with the last key for q_len != kv_len.
+            last_key = gl.minimum(offs_m + self.kv_len - self.q_len, self.kv_len - 1)
+            valid = offs_n[None, :] <= last_key[:, None]
+        else:
+            valid = (offs_n < self.kv_len)[None, :]
+        return gl.where(valid, qk, -float("inf"))
+
+    @gluon.jit
     def init_state(self):
         cfg = self.cfg
         m_i = gl.full(
@@ -535,6 +555,105 @@ def process_query_block(program: AttentionProgram, num_tiles, main_end):
 
 
 @gluon.jit
+def _attend_tile_fp8(
+    program: AttentionProgram,
+    q_smem,
+    q_rope_smem,
+    tile_idx,
+    num_tiles,
+    m_i,
+    l_i,
+    acc,
+    MASKED: gl.constexpr,
+):
+    cfg = program.cfg
+    buffer_index = tile_idx % cfg.NUM_BUFFERS
+    if tile_idx + 1 < num_tiles:
+        cdna5.tdm.async_wait(3)
+    else:
+        cdna5.tdm.async_wait(0)
+    kv_start = tile_idx * cfg.BLOCK_N
+
+    qk = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout)
+    # Half-width NoPE operands keep the peak inside the three-wave register
+    # budget.
+    half_dim: gl.constexpr = cfg.HEAD_DIM // 2
+    for half in gl.static_range(2):
+        q = q_smem.slice(half * half_dim, half_dim, 1).load(layout=cfg.q_layout)
+        k = (
+            program.k_buffer.index(buffer_index)
+            .slice(half * half_dim, half_dim, 1)
+            .permute([1, 0])
+            .load(layout=cfg.k_layout)
+        )
+        qk = cdna5.wmma(q, k, qk)
+    q_rope = q_rope_smem.load(layout=cfg.q_layout)
+    k_rope = program.shared_load_k_rope(buffer_index)
+    qk = cdna5.wmma(q_rope, k_rope, qk)
+    if MASKED:
+        qk = program.mask_keys(qk, kv_start)
+    p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+    # TDM zero-fills tile rows past kv_len, and their scores are -inf, so V
+    # needs no mask of its own.
+    v = program.shared_load_v(buffer_index)
+    acc = program.compute_pv(p, v, acc)
+
+    if tile_idx + 2 < num_tiles:
+        next_tile_idx = tile_idx + 2
+        program.issue_tile_loads(
+            next_tile_idx * cfg.BLOCK_N, next_tile_idx % cfg.NUM_BUFFERS
+        )
+    return m_i, l_i, acc
+
+
+@gluon.jit
+def process_query_block_fp8(program: AttentionProgram, num_tiles, main_end):
+    # Q is re-read from LDS on every tile so that a wave fits the register
+    # budget of three waves per SIMD.
+    cfg = program.cfg
+    q = program.load_q_nope()
+    q_rope = program.load_q_rope()
+    q_smem = gl.allocate_shared_memory(
+        q.dtype,
+        [cfg.BLOCK_M, cfg.HEAD_DIM],
+        gl.PaddedSharedLayout.with_identity_for(
+            [[cfg.HEAD_DIM, 16]], [cfg.BLOCK_M, cfg.HEAD_DIM], [1, 0]
+        ),
+    )
+    q_rope_smem = gl.allocate_shared_memory(
+        q_rope.dtype,
+        [cfg.BLOCK_M, cfg.ROPE_DIM],
+        gl.PaddedSharedLayout.with_identity_for(
+            [[cfg.ROPE_DIM, 16]], [cfg.BLOCK_M, cfg.ROPE_DIM], [1, 0]
+        ),
+    )
+    q_smem.store(q)
+    q_rope_smem.store(q_rope)
+    m_i, l_i, acc = program.init_state()
+
+    program.issue_tile_loads(0, 0)
+    if num_tiles > 1:
+        program.issue_tile_loads(cfg.BLOCK_N, 1)
+
+    # Separate loops keep the mask out of the fully visible tiles: a masked
+    # branch inside one loop is flattened into selects on every tile.
+    for tile_idx in range(0, main_end):
+        m_i, l_i, acc = _attend_tile_fp8(
+            program, q_smem, q_rope_smem, tile_idx, num_tiles, m_i, l_i, acc, False
+        )
+    for tile_idx in range(main_end, num_tiles):
+        m_i, l_i, acc = _attend_tile_fp8(
+            program, q_smem, q_rope_smem, tile_idx, num_tiles, m_i, l_i, acc, True
+        )
+
+    program.store_lse(l_i, m_i)
+    denom = gl.where(l_i > 0.0, l_i, 1.0)
+    output = acc * (1.0 / denom)[:, None]
+    output = gl.convert_layout(output, cfg.store_layout)
+    program.store_output(output)
+
+
+@gluon.jit
 def store_empty_query_block(program: AttentionProgram):
     cfg = program.cfg
     m_i, l_i, acc = program.init_state()
@@ -616,7 +735,10 @@ def gluon_mla_prefill_gfx1250(
             main_end = program.kv_len // cfg.BLOCK_N
         num_tiles = (kv_end + cfg.BLOCK_N - 1) // cfg.BLOCK_N
         if num_tiles > 0:
-            process_query_block(program, num_tiles, main_end)
+            if cfg.IS_FP8:
+                process_query_block_fp8(program, num_tiles, main_end)
+            else:
+                process_query_block(program, num_tiles, main_end)
         else:
             store_empty_query_block(program)
 
@@ -630,6 +752,7 @@ class LaunchConfig(NamedTuple):
     block_m: int
     block_n: int
     num_warps: int
+    waves_per_eu: int
     grid: tuple[int, ...]
 
 
@@ -650,6 +773,10 @@ def get_config(
     block_m = 128
     block_n = 64
     num_warps = 4
+    # The FP8 loop is sized for three waves per SIMD, so other workgroups'
+    # waves run while one waits. 16-bit operands need more registers than that
+    # allows.
+    waves_per_eu = 3 if q.dtype in _FP8_DTYPES else 1
     batch_size = cu_seqlens_q.numel() - 1
     return LaunchConfig(
         n_heads=n_heads,
@@ -660,6 +787,7 @@ def get_config(
         block_m=block_m,
         block_n=block_n,
         num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
         grid=(batch_size, n_heads, _cdiv(max_seqlen_q, block_m)),
     )
 
@@ -712,13 +840,12 @@ def launch_gluon_mla_prefill_gfx1250(
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if tensor.stride(-1) != 1:
             raise ValueError(f"{name} must have contiguous last dimension")
-    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
-    supported_dtypes = (torch.float16, torch.bfloat16, *fp8_dtypes)
+    supported_dtypes = (torch.float16, torch.bfloat16, *_FP8_DTYPES)
     if q.dtype not in supported_dtypes:
         raise TypeError(f"unsupported MLA prefill dtype {q.dtype}")
     if k.dtype != q.dtype or v.dtype != q.dtype:
         raise TypeError("q, k, and v must use the same dtype")
-    is_fp8 = q.dtype in fp8_dtypes
+    is_fp8 = q.dtype in _FP8_DTYPES
 
     total_tokens, n_heads, _ = q.shape
     output_shape = (total_tokens, n_heads, 128)
@@ -771,7 +898,7 @@ def launch_gluon_mla_prefill_gfx1250(
         config.block_n,
         is_fp8,
         num_warps=config.num_warps,
-        waves_per_eu=1,
+        waves_per_eu=config.waves_per_eu,
     )
     if return_lse:
         return out, lse

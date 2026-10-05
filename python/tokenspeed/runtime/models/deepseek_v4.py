@@ -1777,8 +1777,7 @@ class DeepseekV4MoE(nn.Module):
         )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=config.n_routed_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=routed_quant_config,
@@ -2350,6 +2349,7 @@ class DeepseekV4Indexer(nn.Module):
                 page_size=indexer_block_size,
                 max_logits_bytes=max_logits_mb * 1024 * 1024,
                 out=topk_out[token_slice],
+                slot_order=global_server_args_dict["dsa_slot_order"],
             )
             selected_i64 = selected.to(torch.int64)
             row_starts_i64 = row_starts.to(torch.int64)
@@ -2383,6 +2383,7 @@ class DeepseekV4Indexer(nn.Module):
             index_k_cache=indexer_cache,
             topk_layout="logical_offsets",
             out=topk_out[decode_slice],
+            slot_order=global_server_args_dict["dsa_slot_order"],
         )
         return topk_out
 
@@ -3239,6 +3240,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=True,
             prev_is_moe=True,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

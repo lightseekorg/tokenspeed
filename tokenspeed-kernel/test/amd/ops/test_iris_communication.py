@@ -21,7 +21,6 @@
 
 import math
 import socket
-import sys
 import time
 import traceback
 from dataclasses import replace
@@ -38,6 +37,14 @@ pytestmark = pytest.mark.skipif(
     not current_platform().is_amd,
     reason="Iris communication tests require AMD ROCm",
 )
+
+
+@pytest.fixture(autouse=True)
+def _require_iris():
+    pytest.importorskip(
+        "tokenspeed_kernel.ops.communication.iris", exc_type=ImportError
+    )
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -78,6 +85,7 @@ def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
 
 @pytest.mark.parametrize("enable_lamport", [False, True])
 def test_iris_state_uses_path_capacities(monkeypatch, enable_lamport):
+    from tokenspeed_kernel.ops.communication import iris as iris_ops
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     created = []
@@ -86,25 +94,24 @@ def test_iris_state_uses_path_capacities(monkeypatch, enable_lamport):
         created.append(kwargs)
         return SimpleNamespace(**kwargs)
 
-    iris_ops = SimpleNamespace(IRIS_AR_STATES={}, create_iris_state=create_iris_state)
-    monkeypatch.setitem(
-        sys.modules, "tokenspeed_kernel.ops.communication.iris", iris_ops
-    )
+    monkeypatch.setattr(iris_ops, "IRIS_AR_STATES", {})
+    monkeypatch.setattr(iris_ops, "create_iris_state", create_iris_state)
     state = SimpleNamespace(
         group=object(),
         rank_in_group=0,
         max_numel=16,
-        max_bytes=64,
+        max_bytes=8192 * 10752 * 2,
         attnres_max_numel=55,
         max_token_num=5,
         enable_lamport=enable_lamport,
+        moe_tail_max_rows=0,
         device=torch.device("cpu"),
     )
 
     iris_state = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
 
     assert iris_state.staged_max_numel == 16
-    assert iris_state.producer_direct_max_numel == 32
+    assert iris_state.producer_direct_max_numel == 8192 * 10752
     assert iris_state.attnres_max_numel == 55
     assert iris_state.attnres_max_rows == 5
     assert iris_state.enable_lamport is enable_lamport
@@ -117,6 +124,16 @@ def test_iris_state_uses_path_capacities(monkeypatch, enable_lamport):
     assert other.enable_lamport is not enable_lamport
     assert len(created) == 2
 
+    # A tail request cannot reuse a state without an output buffer.
+    state.moe_tail_max_rows = 512
+    with_result = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
+    assert with_result is not other
+    assert with_result.moe_tail_max_rows == 512
+    assert len(created) == 3
+    state.moe_tail_max_rows = 256
+    assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is with_result
+    assert len(created) == 3
+
 
 @pytest.mark.parametrize("prepared_lamport", [False, True])
 @pytest.mark.parametrize("requested_lamport", [False, True])
@@ -124,6 +141,7 @@ def test_iris_state_uses_path_capacities(monkeypatch, enable_lamport):
 def test_iris_state_reuses_prepared_capacity(
     monkeypatch, prepared_lamport, requested_lamport, max_bytes
 ):
+    from tokenspeed_kernel.ops.communication import iris as iris_ops
     from tokenspeed_kernel.ops.communication import triton as triton_ops
 
     group = object()
@@ -138,13 +156,11 @@ def test_iris_state_reuses_prepared_capacity(
         attnres_max_numel=32,
         attnres_max_rows=4,
         enable_lamport=prepared_lamport,
+        moe_tail_max_rows=0,
     )
-    iris_ops = SimpleNamespace(
-        IRIS_AR_STATES={"prepared": prepared},
-        create_iris_state=lambda **kwargs: SimpleNamespace(**kwargs),
-    )
-    monkeypatch.setitem(
-        sys.modules, "tokenspeed_kernel.ops.communication.iris", iris_ops
+    monkeypatch.setattr(iris_ops, "IRIS_AR_STATES", {"prepared": prepared})
+    monkeypatch.setattr(
+        iris_ops, "create_iris_state", lambda **kwargs: SimpleNamespace(**kwargs)
     )
     state = SimpleNamespace(
         group=group,
@@ -154,6 +170,7 @@ def test_iris_state_reuses_prepared_capacity(
         attnres_max_numel=8,
         max_token_num=1,
         enable_lamport=requested_lamport,
+        moe_tail_max_rows=0,
         device=device,
     )
 
@@ -436,11 +453,15 @@ def _ar_graph_shape_cases() -> List[Tuple[int, ...]]:
 def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
     """Producer-direct collections spanning one, two, and three outputs."""
     return [
+        ((16, 7168),),
+        ((37, 7168),),
+        ((8191, 7168),),
         ((1, 7168), (1, 3584)),
         ((2, 7168), (2, 3584)),
         ((4, 7168), (4, 3584)),
         ((8, 7168), (8, 3584)),
         ((16, 7168), (16, 3584)),
+        ((513, 7168), (513, 3584)),
         ((3, 20), (2, 12)),
         ((3, 5), (1, 1)),
         ((2, 16),),
@@ -493,6 +514,7 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         staged_max_numel = max(staged_max_numel, attnres_max_numel)
         state = create_iris_state(
             enable_lamport=False,
+            moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=staged_max_numel,
@@ -568,7 +590,6 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             assert state._staged_two_stage_input_buf is None
             assert state._staged_two_stage_scratch_buf is None
             assert state._staged_two_stage_ready_flags is None
-        assert state._reduced_output_buf.numel() == producer_direct_max_numel
         if attnres_max_numel:
             assert state._attnres_push_inbox.shape == (
                 2,
@@ -628,12 +649,16 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                 device,
             )
 
+        # These dtype checks only use the small shape. Their states share the
+        # fixed heap, so do not reserve another full BF16 prefill capacity.
+        other_dtype_max_numel = 16 * (7168 + 3584)
         fp16_state = create_iris_state(
             enable_lamport=False,
+            moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
-            producer_direct_max_numel=producer_direct_max_numel,
+            producer_direct_max_numel=other_dtype_max_numel,
             attnres_max_numel=0,
             attnres_max_rows=0,
             dtype=torch.float16,
@@ -658,10 +683,11 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
 
         fp32_state = create_iris_state(
             enable_lamport=False,
+            moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
-            producer_direct_max_numel=producer_direct_max_numel,
+            producer_direct_max_numel=other_dtype_max_numel,
             attnres_max_numel=0,
             attnres_max_rows=0,
             dtype=torch.float32,
@@ -834,6 +860,8 @@ def _check_all_reduce_symmetric_outputs(
     for index, output in enumerate(outputs, start=1):
         output.fill_(index * (rank + 1))
     results = iris_all_reduce_symmetric(state, outputs)
+    result_bytes = sum(output.numel() for output in outputs) * state.dtype.itemsize
+    assert all(result.untyped_storage().nbytes() == result_bytes for result in results)
     expected_value = world_size * (world_size + 1) // 2
     for index, (output, result) in enumerate(zip(outputs, results), start=1):
         torch.testing.assert_close(
@@ -848,7 +876,7 @@ def _check_all_reduce_symmetric_outputs(
         for index, output in enumerate(outputs, start=1):
             output.fill_(scale * index * (rank + 1))
         results = iris_all_reduce_symmetric(state, outputs)
-        snapshots.append(tuple(result.clone() for result in results))
+        snapshots.append(results)
     torch.cuda.synchronize()
     for scale, results in enumerate(snapshots, start=1):
         for index, (output, result) in enumerate(zip(outputs, results), start=1):
@@ -866,7 +894,11 @@ def _check_all_reduce_symmetric_outputs(
             output.fill_(index * (rank + 1))
         graph_results = iris_all_reduce_symmetric(state, outputs)
     dist.barrier()
-    for _ in range(4):
+    eager_results = []
+    for scale in range(2, 6):
+        for index, output in enumerate(outputs, start=1):
+            output.fill_(scale * index * (rank + 1))
+        eager_results.append(iris_all_reduce_symmetric(state, outputs))
         graph.replay()
     torch.cuda.synchronize()
     for index, (output, result) in enumerate(zip(outputs, graph_results), start=1):
@@ -876,6 +908,14 @@ def _check_all_reduce_symmetric_outputs(
             atol=0,
             rtol=0,
         )
+    for scale, results in enumerate(eager_results, start=2):
+        for index, result in enumerate(results, start=1):
+            torch.testing.assert_close(
+                result,
+                torch.full_like(result, scale * index * expected_value),
+                atol=0,
+                rtol=0,
+            )
 
 
 def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
@@ -1025,6 +1065,110 @@ def test_iris_all_reduce_correctness_world8():
     _run_ar_test(world_size=8)
 
 
+def _ar_epoch_worker_fn(rank, world_size, port, producer_direct, rows, error_dict):
+    try:
+        _ar_epoch_worker_main(rank, world_size, port, producer_direct, rows)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+
+
+def _ar_epoch_worker_main(rank, world_size, port, producer_direct, rows):
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    from tokenspeed_kernel.ops.communication.iris import (
+        create_iris_state,
+        iris_acquire_outputs,
+        iris_all_reduce,
+        iris_all_reduce_symmetric,
+    )
+
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        state = create_iris_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            staged_max_numel=16 * 7168,
+            producer_direct_max_numel=16 * 7168,
+            attnres_max_numel=0,
+            attnres_max_rows=0,
+            enable_lamport=False,
+            moe_tail_max_rows=0,
+            dtype=torch.bfloat16,
+            heap_size=None,
+            device=device,
+        )
+        if producer_direct:
+            local = iris_acquire_outputs(state, ((rows, 7168),))[0]
+            flags = state._producer_direct_ready_flags
+        else:
+            local = torch.empty((rows, 7168), dtype=torch.bfloat16, device=device)
+            flags = state._staged_two_stage_ready_flags
+
+        def reduce():
+            if producer_direct:
+                return iris_all_reduce_symmetric(state, (local,))[0]
+            return iris_all_reduce(
+                state, local, op=dist.ReduceOp.SUM, safe=True, async_op=False
+            )
+
+        local.fill_(rank + 1)
+        reduce()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = reduce()
+
+        for replay in (False, True):
+            # Include entry and intermediate-stage wraps, plus a normal epoch.
+            for index, initial_epoch in enumerate((17, 2**31 - 1, -1, 2**31 - 2, -2)):
+                torch.cuda.synchronize()
+                dist.barrier()
+                flags.fill_(initial_epoch)
+                local.zero_()
+                torch.cuda.synchronize()
+                dist.barrier()
+                # A stale flag must not let peers read before this producer.
+                if rank == world_size - 1:
+                    time.sleep(0.1)
+                scale = index + 2
+                local.fill_(scale * (rank + 1))
+                if replay:
+                    graph.replay()
+                    result = captured
+                else:
+                    result = reduce()
+                torch.cuda.synchronize()
+                expected = scale * world_size * (world_size + 1) // 2
+                mismatches = [None] * world_size
+                dist.all_gather_object(
+                    mismatches, int(torch.count_nonzero(result != expected).item())
+                )
+                assert not any(mismatches), (
+                    f"{producer_direct=} {rows=} {initial_epoch=} {replay=}: "
+                    f"mismatched elements per rank: {mismatches}"
+                )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("producer_direct,rows", [(True, 1), (True, 16), (False, 16)])
+def test_iris_all_reduce_epoch_rollover(producer_direct, rows):
+    _skip_if_unsupported(8, "Iris epoch rollover tests")
+    if not current_platform().is_cdna4:
+        pytest.skip("Producer-direct Iris reductions require CDNA4")
+    _spawn_and_collect(
+        _ar_epoch_worker_fn,
+        (8, _get_open_port(), producer_direct, rows),
+        8,
+    )
+
+
 def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
     try:
         device = torch.device(f"cuda:{rank}")
@@ -1048,6 +1192,7 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
 
         state = create_iris_state(
             enable_lamport=False,
+            moe_tail_max_rows=0,
             group=group,
             rank_in_group=group_rank,
             staged_max_numel=4 * 7,
