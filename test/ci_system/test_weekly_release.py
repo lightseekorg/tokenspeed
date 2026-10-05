@@ -214,6 +214,9 @@ def test_metadata_updates_both_versions_and_keeps_kernel_boundary(
         in Path(release_module.PR_FILES["kernel"][1]).read_text()
     )
     assert release_module.next_version("0.1.3", "0.1.3", "") == "0.1.4"
+    assert release_module.next_version("0.1.4", "0.1.3", "") == "0.1.5"
+    with pytest.raises(ValueError, match="reuse or downgrade"):
+        release_module.next_version("0.1.4", "0.1.3", "0.1.4")
     with pytest.raises(ValueError, match="reuse or downgrade"):
         release_module.next_version("0.1.3", "0.1.3", "0.1.3")
 

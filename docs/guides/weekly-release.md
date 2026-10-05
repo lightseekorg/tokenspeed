@@ -3,8 +3,9 @@
 The **Weekly release** workflow starts every Sunday at 20:00 in
 `America/Los_Angeles`, including daylight saving changes. It can also be started
 manually from `main`, with an optional stable TokenSpeed version. Otherwise,
-published versions advance by one patch; a newer version already prepared on
-`main` is used as-is.
+the greater of the version on `main` and the published version advances by one
+patch. A manually specified version must be greater than both. This ensures
+the final version PR changes `version.py` and triggers its PyPI workflow.
 
 The workflow completes these stages in order:
 

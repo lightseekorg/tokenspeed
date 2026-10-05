@@ -255,14 +255,12 @@ def next_version(current, published, requested):
         if value and not re.fullmatch(r"\d+\.\d+\.\d+", value):
             raise ValueError(f"Expected a stable major.minor.patch version: {value}")
     if requested:
-        if Version(requested) <= Version(published) or Version(requested) < Version(
+        if Version(requested) <= Version(published) or Version(requested) <= Version(
             current
         ):
             raise ValueError("Requested version would reuse or downgrade a release")
         return requested
-    if Version(current) > Version(published):
-        return current
-    major, minor, patch = Version(published).release
+    major, minor, patch = max(Version(current), Version(published)).release
     return f"{major}.{minor}.{patch + 1}"
 
 
