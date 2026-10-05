@@ -1016,6 +1016,41 @@ geometry module is a table keyed by format name and knows nothing about
 architectures. Adding a platform probe below the config layer would give one
 parent two possible sizes with no single place that decided which.
 
+### DeepSeek V4 checkpoint/cache contract for refactors
+
+The three released checkpoints below do not differ only by model size. These
+are the **base-layer** schedules; trailing `compress_ratios` entries describe
+attached draft layers, not extra backbone layers.
+
+| Checkpoint | Backbone and long-history schedule | Index selection | Cache contract |
+| --- | --- | --- | --- |
+| V4 Flash | 43 layers: 0-1 SWA only, even 2-42 C4, odd 3-41 C128 | C4 top 512 | 128-token SWA plus per-layer compressed KV and C4 index-K; 584 bytes per SWA row |
+| V4 Pro | 61 layers: 0-1 C128, even 2-60 C4, odd 3-59 C128 | C4 top 1024 | Same V4 group types and SWA row width, but no SWA-only base layers |
+| V4.1 Flash | 40 layers: 0-1 SWA only; encoder 2-19 ratio-2, decoder 20-39 ratio-1 | Full owners 2, 8, 14, 20; decoder Reindex 24, 28, 32, 36; top 512 (Reindex searches bounded candidates) | Shared owner KV/index-K, replayable SWA and compressor tail; native rows: 528-byte SWA, 288-byte global KV, 68-byte index-K |
+
+V4 has overlapping C4 compression, hierarchical C128 and a learned indexer
+only on C4 layers. V4.1's CSA2 instead shares global KV across reuse layers;
+its decoder reads encoder outputs and prefills only the bounded decoder tail.
+Its `v4` cache format on Hopper is a *row encoding* (584/584/132-byte
+SWA/global/index rows), not the V4 compression or ownership algorithm. Row
+widths are payloads, not a complete estimate of allocated cache: padding,
+compressor state, pages, graph workspace and draft storage still count.
+
+All three checkpoints attach three DSpark stages with a five-position block.
+V4's config says `num_nextn_predict_layers=1`, so that field cannot determine
+its stage count: inspect the indexed `mtp.*` weights. V4 keeps drafter-private
+windows and must replay a prefix-hit tail; V4.1 stores its draft rows in the
+replayable target SWA group and advertises zero *additional drafter-private*
+replay tokens. Neither policy is interchangeable with ordinary NextN.
+
+The runtime sources of these contracts are `attention/deepseek_v4_geometry.py`,
+`attention/deepseek_v41_geometry.py`, and the two family cache recipes. The
+portable V4.1 selected-attention path gathers bounded rows and calls the V4
+prefill operator; native GPU readers and indexers are selected by registered
+kernel capabilities, not by the cache family name alone. Kernel selection and
+prefill/decode throughput must be compared on GPU before changing those
+contracts; cache payload widths alone are not a performance baseline.
+
 ### Storage vs. visibility
 
 An attention layer has two contracts that a single `layer_types` string used
