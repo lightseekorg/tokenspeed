@@ -611,7 +611,7 @@ if mm_fp4 is not error_fn:
         solution="flashinfer",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 7),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=_NVFP4_FORMAT_SIGNATURES,

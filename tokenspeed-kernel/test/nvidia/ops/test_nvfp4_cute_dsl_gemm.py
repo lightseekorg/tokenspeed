@@ -23,13 +23,13 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel.platform import current_platform
 
 _platform = current_platform()
 _KERNEL = "flashinfer_cute_dsl_mm_nvfp4"
 pytestmark = pytest.mark.skipif(
-    not (_platform.is_nvidia and _platform.arch_version == ArchVersion(10, 0)),
-    reason="flashinfer_cute_dsl_mm_nvfp4 is selected on SM100 only",
+    not _platform.is_blackwell,
+    reason="flashinfer_cute_dsl_mm_nvfp4 is selected on SM100, SM103 and SM107 only",
 )
 
 # Qwen3.8 MLP down projection, a small-N and a small-K shape, gate_up, and the

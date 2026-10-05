@@ -5618,7 +5618,7 @@ _CASES = [
         "blackwell-sm103",
         "gemm",
         "mm",
-        "cublaslt_mm_nvfp4",
+        "flashinfer_cute_dsl_mm_nvfp4",
         partial(_mm_nvfp4, 4, 128, 64),
     ),
     _case(
