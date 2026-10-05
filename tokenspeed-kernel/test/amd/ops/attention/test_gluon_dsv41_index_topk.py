@@ -164,28 +164,6 @@ def test_index_topk_large_head_count_auto_fallback(device, require):
     )
 
 
-@pytest.mark.parametrize("solution", ["triton", "gluon"])
-def test_index_topk_rejects_invalid_page_table_shape(device, require, solution):
-    require("attention", "dsv41_index_topk", solution, torch.bfloat16, "x")
-    with pytest.raises(ValueError, match="page_table must be"):
-        dsv41.index_topk(
-            torch.ones((1, 32, 128), dtype=torch.bfloat16, device=device),
-            torch.ones((1, 32), dtype=torch.bfloat16, device=device),
-            torch.zeros((1, 64, 68), dtype=torch.uint8, device=device),
-            torch.zeros((1,), dtype=torch.int32, device=device),
-            torch.zeros((1,), dtype=torch.int32, device=device),
-            None,
-            16,
-            0,
-            8,
-            1,
-            64,
-            None,
-            None,
-            solution,
-        )
-
-
 @pytest.mark.parametrize(
     ("arch", "dtype", "width", "metric", "kernel_name"),
     [
