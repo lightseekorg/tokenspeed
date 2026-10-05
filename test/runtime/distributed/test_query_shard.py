@@ -99,6 +99,69 @@ def test_zero_row_ranks_join_with_empty_shards():
     assert plans[1].local_sampled_first == 0 and plans[1].local_sampled_rows == 1
 
 
+@pytest.mark.parametrize(
+    "lengths,size,rows",
+    [
+        ([5, 3, 7], 4, [0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13]),
+        ([5, 3, 7], 4, [14]),  # one row, on the last rank
+        ([2], 4, [0]),  # zero-row ranks behind a short chunk
+        ([16], 8, list(range(16))),
+        ([16], 8, []),  # an empty row list splits into zeros
+    ],
+)
+def test_rows_per_rank_splits_sorted_rows_by_shard(lengths, size, rows):
+    """The prompt-logprob rows of a plan (sorted batch-global rows): each
+    rank's share is the rows inside its shard, rank order is row order, so
+    the local run is contiguous and the shares sum to the whole plan."""
+    total = sum(lengths)
+    plans = _plans(total, lengths, size)
+    rows_t = torch.tensor(rows, dtype=torch.int64)
+    counts = plans[0].rows_per_rank(rows_t)
+    assert all(p.rows_per_rank(rows_t) == counts for p in plans)
+    assert sum(counts) == len(rows)
+    for plan in plans:
+        expected = [r for r in rows if plan.local_start <= r < plan.local_end]
+        assert counts[plan.rank] == len(expected)
+        run = plan.local_rows_run(counts)
+        assert rows[run] == expected
+        # Re-based to the shard, the local rows index the shard's activations.
+        local = rows_t[run] - plan.local_start
+        assert all(0 <= r < plan.local_rows for r in local.tolist())
+    # The concatenation of every rank's run is the plan in row order.
+    assert sum((rows[p.local_rows_run(counts)] for p in plans), []) == rows
+
+
+def test_rows_per_rank_refuses_rows_past_the_span_unsorted_and_device_rows():
+    plan = _plans(10, [4, 6], 4)[0]
+    with pytest.raises(ValueError, match="exceed"):
+        plan.rows_per_rank(torch.tensor([3, 10]))
+    with pytest.raises(ValueError, match="1-D host"):
+        plan.rows_per_rank(torch.tensor([[1, 2]]))
+    # The split counts rows below each shard boundary, so unsorted rows
+    # would be miscounted silently: refused loudly instead.
+    with pytest.raises(ValueError, match="sorted"):
+        plan.rows_per_rank(torch.tensor([5, 3]))
+    # Ties and a single row are sorted (shards [3, 3, 2, 2]).
+    assert plan.rows_per_rank(torch.tensor([3, 3, 9])) == (0, 2, 0, 1)
+    assert plan.rows_per_rank(torch.tensor([9])) == (0, 0, 0, 1)
+
+
+@pytest.mark.parametrize(
+    "lengths,size", [([5, 3, 7], 4), ([1, 1, 1], 4), ([2], 4), ([16], 8), ([], 2)]
+)
+def test_the_sampled_rows_take_the_same_split_as_any_sorted_rows(lengths, size):
+    """``sampled_rows_per_rank`` is ``rows_per_rank`` over the sampled rows:
+    one split, so the sampled-row gather and the prompt-row gather can never
+    disagree on which rank a row belongs to."""
+    plan = _plans(sum(lengths), lengths, size)[0]
+    sampled_rows = torch.tensor(_gather_rows(lengths), dtype=torch.int64)
+    assert plan.sampled_rows_per_rank == plan.rows_per_rank(sampled_rows)
+    assert (
+        plan.local_sampled_first
+        == plan.local_rows_run(plan.sampled_rows_per_rank).start
+    )
+
+
 def test_rows_for_collective_names_the_shard_or_the_sampled_rows():
     plan = _plans(12, [5, 7], 4)[1]
     assert plan.rows_for_collective(None) == plan.row_counts
@@ -165,17 +228,15 @@ def test_sharded_models_read_their_rows_from_tensors_not_the_chunk_count():
         assert not hits, f"{path.name} reads ctx.input_num_tokens: {hits}"
 
 
-def test_the_model_exit_gathers_sampled_rows_and_keeps_the_shard_capture(monkeypatch):
-    """``BaseCausalLM.exit_logits`` under a shard: the LM head sees the
-    gathered ``[bs, H]`` rows, the context marks them selected, and a FULL
-    capture for the drafter stays the shard's own rows."""
+def test_the_model_exit_hands_the_processor_the_shard_and_its_plan():
+    """``BaseCausalLM.exit_logits`` under a shard: the logits processor
+    receives the shard's own rows (not pre-selected ones) with the plan on its
+    metadata, so it can score the prompt rows on the shard before gathering
+    the sampled rows; the exit itself selects nothing."""
     from types import SimpleNamespace
 
     from tokenspeed.runtime.execution.context import ForwardContext
-    from tokenspeed.runtime.execution.forward_batch_info import (
-        CaptureHiddenMode,
-        ForwardMode,
-    )
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.models.base import causal_lm
 
     lengths = [4, 1, 5]
@@ -183,44 +244,17 @@ def test_the_model_exit_gathers_sampled_rows_and_keeps_the_shard_capture(monkeyp
         total_tokens=10, input_lengths=lengths, size=4, rank=1
     )
     shard = torch.arange(plan.local_rows * 2, dtype=torch.float32).reshape(-1, 2)
-    gathered = torch.full((3, 2), 9.0)
     seen = {}
-
-    def fake_gather(hidden_states, ctx, *, group):
-        seen["gather"] = (hidden_states, group)
-        return gathered
 
     class Processor:
         def __call__(self, input_ids, hidden_states, lm_head, metadata, aux):
             seen["processor"] = (hidden_states, metadata, aux)
             return SimpleNamespace(hidden_states=hidden_states)
 
-    monkeypatch.setattr(causal_lm, "gather_sampled_rows", fake_gather)
     model = causal_lm.BaseCausalLM.__new__(causal_lm.BaseCausalLM)
-    model.mapping = SimpleNamespace(attn=SimpleNamespace(qcp_group=(0, 1, 2, 3)))
     model.logits_processor = Processor()
     model.lm_head = object()
-    for mode in (CaptureHiddenMode.FULL, CaptureHiddenMode.LAST):
-        ctx = ForwardContext(
-            attn_backend=None,
-            token_to_kv_pool=None,
-            bs=3,
-            num_extends=3,
-            input_num_tokens=10,
-            forward_mode=ForwardMode.EXTEND,
-            output_layout=None,
-            capture_hidden_mode=mode,
-            gather_ids=torch.cumsum(torch.tensor(lengths), 0) - 1,
-            query_shard=plan,
-        )
-        out = model.exit_logits(None, shard, None, ctx)
-        assert seen["gather"] == (shard, (0, 1, 2, 3))
-        assert seen["processor"][0] is gathered
-        assert ctx.logits_rows_selected and seen["processor"][1].logits_rows_selected
-        assert out.hidden_states is (
-            shard if mode is CaptureHiddenMode.FULL else gathered
-        )
-    # Unsharded forwards do not gather and leave the rows as given.
+    rows = object()
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -230,11 +264,16 @@ def test_the_model_exit_gathers_sampled_rows_and_keeps_the_shard_capture(monkeyp
         forward_mode=ForwardMode.EXTEND,
         output_layout=None,
         gather_ids=torch.cumsum(torch.tensor(lengths), 0) - 1,
+        query_shard=plan,
+        input_logprob_rows=rows,
     )
-    seen.clear()
-    model.exit_logits(None, shard, None, ctx)
-    assert "gather" not in seen and seen["processor"][0] is shard
-    assert not ctx.logits_rows_selected
+    out = model.exit_logits(None, shard, None, ctx)
+    hidden, metadata, aux = seen["processor"]
+    assert hidden is shard and aux is None and out.hidden_states is shard
+    assert metadata.query_shard is plan
+    assert metadata.input_logprob_rows is rows
+    assert metadata.gather_ids is ctx.gather_ids
+    assert not metadata.logits_rows_selected and not ctx.logits_rows_selected
 
 
 def test_the_executor_hands_the_model_its_shard_of_the_row_inputs():
@@ -273,14 +312,12 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
     """Eagle's step-0 extend under a shard: the shifted prefill ids are the
     shard's slice (after the last-token patch over the whole span) while the
     draft's ``gather_ids`` stay the batch's full layout, exactly as on the
-    target's context -- one convention, so the model exit's
+    target's context -- one convention, so the logits processor's
     ``gather_sampled_rows`` is the one place that cuts them to the shard."""
     from types import SimpleNamespace
 
     from tokenspeed.runtime.distributed import comm_manager
-    from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.drafter.eagle import Eagle
-    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
     lengths = [4, 1, 5]  # sampled rows 3, 4, 9 over shards [3, 3, 2, 2]
     total = sum(lengths)
@@ -320,26 +357,15 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
         ]
         assert local.tolist() == expected
         assert len(expected) == plan.local_sampled_rows == [0, 2, 0, 1][rank]
-        ctx = ForwardContext(
-            attn_backend=None,
-            token_to_kv_pool=None,
-            bs=3,
-            num_extends=3,
-            input_num_tokens=total,
-            forward_mode=ForwardMode.EXTEND,
-            output_layout=None,
-            gather_ids=gather_ids,
-            query_shard=plan,
-        )
         monkeypatch.setattr(
             comm_manager,
-            "token_all_gather",
+            "token_all_gather_rows",
             lambda t, g, counts, r=rank: gathered_by_rank.setdefault(
                 r, (t.clone(), counts)
             ),
         )
         comm_manager.gather_sampled_rows(
-            hidden[plan.local_slice], ctx, group=(0, 1, 2, 3)
+            hidden[plan.local_slice], plan, gather_ids, group=(0, 1, 2, 3)
         )
         contributed, counts = gathered_by_rank[rank]
         assert counts == [0, 2, 0, 1]

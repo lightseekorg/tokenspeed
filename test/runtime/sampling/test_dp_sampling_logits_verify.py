@@ -182,6 +182,7 @@ def _build_processor(
 def _build_metadata():
     return LogitsMetadata(
         forward_mode=ForwardMode.DECODE,
+        query_shard=None,
         capture_hidden_mode=CaptureHiddenMode.NULL,
     )
 

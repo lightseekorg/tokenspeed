@@ -738,12 +738,12 @@ def triton_dsa_prefill_topk_fp8(
     softmax_scale: float,
     index_k_cache: torch.Tensor | None = None,
     page_size: int | None = None,
-    index_k_fp8: torch.Tensor | None = None,
-    index_k_scale: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # Reads the plane only: the leaf declares no INDEX_K_WORKSPACE_ROWS_FEATURE,
+    # so the facade never hands it rows in workspace-row order.
     return _triton_dsa_prefill_topk_fp8_impl(
         q=q,
         weights=weights,
@@ -754,8 +754,6 @@ def triton_dsa_prefill_topk_fp8(
         softmax_scale=softmax_scale,
         index_k_cache=index_k_cache,
         page_size=page_size,
-        index_k_fp8=index_k_fp8,
-        index_k_scale=index_k_scale,
         max_logits_bytes=max_logits_bytes,
         out=out,
         lens_out=lens_out,

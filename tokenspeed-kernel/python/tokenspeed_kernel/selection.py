@@ -413,21 +413,38 @@ def _resolve_override(
     format_signature: object,
     override: str,
     platform: PlatformInfo,
+    features: frozenset[str] | None,
 ) -> SelectedKernel:
-    impl = registry.get_impl(override)
-    if impl is not None:
-        return SelectedKernel(name=override, impl=impl)
+    """Resolve a kernel name or solution forced by ``override``.
 
-    specs = registry.get_for_operator(family, mode, solution=override)
-    if specs:
-        kernel_name = specs[0].name
-        impl = registry.get_impl(kernel_name)
-        if impl is not None:
-            return SelectedKernel(name=kernel_name, impl=impl)
-
-    raise NoKernelFoundError(
-        f"Override '{override}' not found for {family}.{mode} ({format_signature})"
-    )
+    An override skips platform, format-signature and trait matching, but not
+    the operator's required ``features``: a feature names a keyword or
+    behaviour the facade relies on (the kernel's launcher takes it), so a
+    kernel without it would fail inside the leaf, not at selection. A kernel
+    lacking one is refused here with the feature named.
+    """
+    spec = registry.get_by_name(override)
+    if spec is None:
+        candidates = registry.get_for_operator(family, mode, solution=override)
+        if not candidates:
+            raise NoKernelFoundError(
+                f"Override '{override}' not found for {family}.{mode} "
+                f"({format_signature})"
+            )
+        # The solution's highest-priority kernel declaring every required
+        # feature; without one, its first kernel names the refusal below.
+        spec = next(
+            (s for s in candidates if features is None or features <= s.features),
+            candidates[0],
+        )
+    if features is not None and not features <= spec.features:
+        missing = sorted(features - spec.features)
+        raise NoKernelFoundError(
+            f"Override '{override}' resolves to {spec.name!r} for {family}.{mode} "
+            f"({format_signature}), which does not declare the required "
+            f"feature(s) {missing}"
+        )
+    return SelectedKernel(name=spec.name, impl=registry.get_impl(spec.name))
 
 
 def _log_selection(
@@ -492,7 +509,9 @@ def select_kernel(
                (e.g., {"head_dim": 128, "num_kv_heads": 8})
         solution: Restrict selection to a registered solution while preserving
             normal platform, format signature, and trait filtering.
-        override: Force a specific kernel name or solution string
+        override: Force a specific kernel name or solution string, skipping
+            platform, format-signature and trait matching but still refusing
+            a kernel that lacks a required feature.
 
     Returns:
         A :class:`SelectedKernel` that is directly callable and also
@@ -520,7 +539,7 @@ def select_kernel(
 
     if override:
         return _resolve_override(
-            registry, family, mode, format_signature, override, platform
+            registry, family, mode, format_signature, override, platform, features
         )
 
     # Get candidates (same filtering for both strategies)

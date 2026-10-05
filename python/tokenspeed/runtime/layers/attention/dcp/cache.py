@@ -76,13 +76,21 @@ class HistoryGatherWorkspace:
     Attributes:
         rows: Row capacity, a whole number of kernel pages.
         kv: ``[rows, kv_cache_dim]`` latent rows in the KV cache dtype.
-        index_k: ``[rows, row_bytes]`` packed uint8 index-K rows (FP8 bytes
-            then fp32 scales, ``kv_cache.dsa.split_index_k_rows``).
+        index_k: ``[rows, row_bytes]`` uint8 index-K rows packed in the
+            plane's format, ``row_bytes`` being
+            ``configs.dsa.index_k_row_bytes(index_head_dim, index_k_format)``
+            (FP8 bytes then fp32 scales, or the bf16 key's bytes;
+            ``kv_cache.dsa.split_index_k_rows`` views them apart).
+        index_k_format: The index-K plane format the rows are packed in
+            (``configs.dsa.INDEX_K_FORMATS``), recorded as the allocating
+            leaf named it; the leaf that adopts the workspace checks it
+            against its own.
     """
 
     rows: int
     kv: torch.Tensor
     index_k: torch.Tensor
+    index_k_format: str
 
     def __post_init__(self) -> None:
         if (

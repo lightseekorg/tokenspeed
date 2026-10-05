@@ -98,12 +98,19 @@ class CapturedRows:
 class InputLogprobRows:
     """Device-side form of an ``InputLogprobPlan`` for the logits processor.
 
-    ``rows`` indexes the forward's full ``[num_input_rows, hidden]``
-    activations, ``targets`` names the token each row predicts and ``slots``
-    the extend slot each row belongs to (for per-request NaN flags); all three
-    are int64 device tensors of equal length. ``chunk_tokens`` bounds how many
-    rows the processor pushes through the LM head at once (a memory knob, not
-    a numerics one: log-softmax is row-local).
+    ``rows`` indexes the activations this rank holds, ``[num_input_rows,
+    hidden]``: the planned rows it contributes. ``targets`` names the token
+    every planned row of the forward predicts and ``slots`` the extend slot
+    it belongs to (for per-request NaN flags) -- the whole plan's, in row
+    order, on every rank, since every rank scores every row: the head is
+    vocab-sharded, so a row's logits need every rank. Under a query shard
+    ``rows`` are the plan's rows inside the shard, re-based to it, and
+    ``rows_per_rank`` is the plan's row count on every rank of the group,
+    the split of the activation gather that puts the whole plan's rows on
+    every rank; without a shard it is ``None`` and ``rows`` are already the
+    whole plan's. All index tensors are int64 on the device. ``chunk_tokens``
+    bounds how many rows the processor pushes through the LM head at once (a
+    memory knob, not a numerics one: log-softmax is row-local).
     """
 
     rows: torch.Tensor
@@ -111,6 +118,12 @@ class InputLogprobRows:
     slots: torch.Tensor
     num_input_rows: int
     chunk_tokens: int
+    rows_per_rank: tuple[int, ...] | None
+
+    @property
+    def num_result_rows(self) -> int:
+        """Rows of the result: the whole plan's."""
+        return self.targets.shape[0]
 
 
 @dataclass

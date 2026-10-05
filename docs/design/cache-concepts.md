@@ -1249,7 +1249,10 @@ the whole span before the owner-masked store — so a replicated group
 (`shard_count` 1) is a local gather and one owner, the same path with the
 degree as a parameter. A history gather workspace of one whole history is
 reserved from the cache budget by the recipe (`workspace_bytes`) like a
-verify workspace.
+verify workspace; its index-K rows are packed in the plane's own format
+(`DSAConfig.index_k_format`: FP8 bytes with scales, or bf16 keys), so the
+recipe's bytes and the leaf's allocation follow one row width and the
+gather hands the indexer the plane's form, sharded pages or not.
 
 Consumers bind a pool's compute view and read its arena's runtime contract.
 Views sharing an arena share that contract, rather than accepting separately

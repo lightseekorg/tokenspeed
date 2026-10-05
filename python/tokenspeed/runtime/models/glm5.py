@@ -633,6 +633,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 plan=metadata._dsa_plan,
                 out=topk_slice,
                 lens_out=topk_lens_slice,
+                slot_order=global_server_args_dict["dsa_slot_order"],
             )
         return GlmDsaDecodeTopK(
             topk_indices=topk_indices,
@@ -812,6 +813,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 page_size=ctx.token_to_kv_pool.arena.kv_page_size,
                 max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
                 candidate_lens_cpu=candidate_lens_cpu,
+                slot_order=global_server_args_dict["dsa_slot_order"],
             )
         return GlmDsaPrefillTopK(
             workspace_indices=workspace_indices,
@@ -1022,10 +1024,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             out_cache_loc,
             cache_num_tokens=cache_num_tokens,
         )
-        attn_output = ctx.attn_backend.forward_sparse_prefill(
-            q=Q,
-            layer=self.attn_mqa,
-            token_to_kv_pool=ctx.token_to_kv_pool,
+        # The host's sparse core + value projection (``mla_project_value``
+        # is this bmm on NVIDIA; the gluon kernel elsewhere).
+        return self.sparse_prefill_attn_v_proj(
+            Q,
+            ctx,
+            output,
             kv_seq_lens=prefill_topk.kv_seq_lens,
             topk_slots=workspace_topk_to_global_slots(
                 workspace_indices=prefill_topk.workspace_indices,
@@ -1034,14 +1038,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             topk_lens=prefill_topk.topk_lens,
             max_seq_len=prefill_topk.max_seq_len,
         )
-        attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
-        torch.bmm(
-            attn_output.transpose(0, 1),
-            self.w_vc,
-            out=output_view.transpose(0, 1),
-        )
-        return output
 
     def forward_absorb(
         self,

@@ -82,6 +82,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 )
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
@@ -1093,6 +1094,13 @@ class PrefillGraph:
         :meth:`_dummy_group_tables`. Backends with extra cache groups
         (DeepSeek-V4 DSA: SWA + compressor + indexer state) need every group
         table, or their extend metadata is incomplete.
+
+        On a query-sharding engine (``config.query_shard_size > 1``) the
+        dummy carries the shard plan a real extend of these rows would, so the
+        one extend form the engine runs is what startup tunes on; the model
+        then takes ``ctx.query_shard.local_slice`` of the span, as
+        ``ModelExecutor._run_target_forward`` does. (Query sharding refuses
+        the prefill graph, so this serves the autotune alone.)
         """
         ib = self.input_buffers
         # Logical context_len, deliberately NOT physical_context_len: the
@@ -1130,6 +1138,14 @@ class PrefillGraph:
             batch_size=bs, num_extends=bs, decode_width=1
         )
 
+        query_shard = None
+        if self.config.query_shard_size > 1:
+            query_shard = QueryShardPlan.from_forward(
+                total_tokens=num_tokens,
+                input_lengths=seq_lens,
+                size=self.config.query_shard_size,
+                rank=self.config.query_shard_rank,
+            )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -1144,6 +1160,7 @@ class PrefillGraph:
                 else CaptureHiddenMode.NULL
             ),
             gather_ids=torch.cumsum(seq_lens_gpu.to(torch.int64), dim=0) - 1,
+            query_shard=query_shard,
         )
         if self.dp_size > 1:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
@@ -1191,9 +1208,7 @@ class PrefillGraph:
             extend_replay_lens_cpu=ib.extend_replay_lens_cpu[:bs],
             extend_prompt_lens_cpu=ib.extend_prompt_lens_cpu[:bs],
             extend_with_prefix=False,
-            # Query context parallelism refuses prefill graphs, so a capture
-            # forward is never sharded.
-            query_shard=None,
+            query_shard=query_shard,
             **extra_metadata_kwargs,
         )
         return ctx

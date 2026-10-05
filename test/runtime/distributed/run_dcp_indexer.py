@@ -143,6 +143,7 @@ def main() -> None:
         seq_lens_2d=seq2d,
         plan=dsa_plan(page_size=64, seq_lens_2d=seq2d),
         solution="deep_gemm",
+        slot_order="selection",
     )
     # Main's native indexer has no forced-window arguments. Compare its
     # unforced policy separately; the checks above exercise mandatory windows.

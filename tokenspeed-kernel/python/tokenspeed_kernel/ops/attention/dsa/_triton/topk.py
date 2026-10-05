@@ -1350,8 +1350,6 @@ def _triton_dsa_prefill_topk_fp8_impl(
     softmax_scale: float,
     index_k_cache: torch.Tensor | None = None,
     page_size: int | None = None,
-    index_k_fp8: torch.Tensor | None = None,
-    index_k_scale: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,

@@ -33,8 +33,6 @@ server:
     --eagle3-layers-to-capture 2,46,90
     --tp 8
     --ep-size 1
-    --init-expert-location trivial
-    --ep-dispatch-algorithm static
     --attention-backend gluon
     --drafter-attention-backend gluon
     --moe-backend auto

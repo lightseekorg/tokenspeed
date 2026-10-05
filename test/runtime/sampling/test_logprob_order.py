@@ -143,6 +143,7 @@ def _prompt_rows(rows: list[int], targets: list[int], *, num_input_rows: int):
         slots=torch.zeros(len(rows), dtype=torch.int64),
         num_input_rows=num_input_rows,
         chunk_tokens=2,
+        rows_per_rank=None,
     )
 
 
@@ -159,6 +160,7 @@ def test_prompt_logprobs_follow_the_order(monkeypatch):
     def run(order: str) -> torch.Tensor:
         metadata = LogitsMetadata(
             forward_mode=ForwardMode.EXTEND,
+            query_shard=None,
             gather_ids=torch.tensor([3]),
             input_logprob_rows=_prompt_rows(rows, targets, num_input_rows=4),
         )

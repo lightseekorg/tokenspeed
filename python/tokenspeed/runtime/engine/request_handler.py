@@ -302,12 +302,14 @@ class RequestHandler:
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
-        # Head TP serves decode rows only, so this engine cannot run the local
-        # recovery prefill a capacity retraction would need; it admits only
-        # requests the scheduler never retracts (generation budget within one
-        # safe-step window, docs/design/scheduler.md section 4).
+        # Head TP over attention-DP ranks serves decode rows only, so that
+        # engine cannot run the local recovery prefill a capacity retraction
+        # would need; it admits only requests the scheduler never retracts
+        # (generation budget within one safe-step window,
+        # docs/design/scheduler.md section 4). Head TP over the query shards
+        # of a prefill engine serves its extend rows and keeps no budget.
         self.max_new_tokens_budget: int | None = (
-            RETRACTION_SAFE_STEPS if mapping.attn.has_head_tp else None
+            RETRACTION_SAFE_STEPS if mapping.attn.head_tp_serves_decode_only else None
         )
         # LM-head TP under attention DP exchanges the logits rows with the
         # group once per forward (LogitsProcessor._lm_head_tp_row_counts); the

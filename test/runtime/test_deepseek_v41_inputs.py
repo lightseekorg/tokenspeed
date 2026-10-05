@@ -230,12 +230,15 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         "valid_cache_lengths",
         "future_input_map",
         "remote_spec_candidate_ready",
+        "draft_probs",
+        "draft_probs_sentinel",
         "chain_parents",
         "future_parent_map",
         "ngram_accepted_tokens",
         "ngram_needs_seed",
         "ngram_request_ids",
         "request_token_history_ids",
+        "draft_request_token_history_ids",
     }
     assert not runtime.has_request_token_history
     assert runtime.ngram_accepted_tokens.shape == (6, 3)
@@ -666,6 +669,7 @@ def test_executor_input_capacity_covers_decode_capture(
         vocab_size=VOCAB_SIZE,
         output_length=width,
         enable_nan_detection=False,
+        enable_speculative_sampling=False,
     )
     runner = SimpleNamespace(
         mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),

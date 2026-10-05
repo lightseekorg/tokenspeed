@@ -540,6 +540,11 @@ def fused_all_gather(
 # Token-aware ops (uneven token distribution via TritonRSAG)
 # ---------------------------------------------------------------------------
 
+# The wire alignment of a byte-preserving row gather: the low-latency
+# all-gather moves 16-byte vectors, so every rank's payload must be a
+# multiple of it whatever its row count.
+_ROW_GATHER_ALIGN_BYTES = 16
+
 
 def token_all_gather(
     tensor: torch.Tensor,
@@ -570,7 +575,11 @@ def token_all_gather_rows(
     asserts the dtype); pure data movement -- gathered cache rows, packed
     index-K bytes, fp32 scales, token ids -- has no dtype of its own, so
     non-bf16 rows travel as bf16 pairs of their bytes and come back viewed
-    as the input dtype. The row byte width must be even.
+    as the input dtype. The row byte width must be even. A row is padded
+    to a multiple of ``_ROW_GATHER_ALIGN_BYTES`` on the wire: the
+    low-latency solution moves 16-byte vectors and the row counts are the
+    caller's (a query shard, a page owner's rows), so a narrow row -- one
+    int64 token id is 8 bytes -- would only align for even counts.
 
     Args:
         rows: ``[local_rows, width]`` this rank's rows.
@@ -583,16 +592,21 @@ def token_all_gather_rows(
     """
     if rows.dim() != 2:
         raise ValueError(f"token_all_gather_rows takes 2-D rows, got {rows.dim()}-D")
-    if rows.dtype == torch.bfloat16:
-        return token_all_gather(rows.contiguous(), group, scattered_num_tokens, backend)
     row_bytes = rows.shape[1] * rows.element_size()
+    pad_bytes = -row_bytes % _ROW_GATHER_ALIGN_BYTES
+    if rows.dtype == torch.bfloat16 and pad_bytes == 0:
+        return token_all_gather(rows.contiguous(), group, scattered_num_tokens, backend)
     if row_bytes % 2:
         raise ValueError(
             f"rows of {row_bytes} bytes cannot travel as bf16 pairs; pad the row "
             "to an even byte width"
         )
     payload = rows.contiguous().view(torch.uint8).view(torch.bfloat16)
+    if pad_bytes:
+        payload = torch.nn.functional.pad(payload, (0, pad_bytes // 2))
     gathered = token_all_gather(payload, group, scattered_num_tokens, backend)
+    if pad_bytes:
+        gathered = gathered[:, : row_bytes // 2].contiguous()
     return gathered.view(torch.uint8).view(rows.dtype)
 
 

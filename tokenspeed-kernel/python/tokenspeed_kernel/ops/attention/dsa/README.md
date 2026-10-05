@@ -38,13 +38,33 @@ convert a plane:
 | `uint8` | `fp8_scaled` | `page_planar` | any other uint8 shape: per-page planes of keys and scales, the outer page stride possibly padded |
 | `bfloat16` | `bf16` | `packed` | `[slots, head_dim]`: the keys as the indexer produced them, no scale plane |
 
-`dsa_prefill_topk`'s workspace-row form (`index_k_fp8` + `index_k_scale`) is
-always `fp8_scaled`. The in-tree DeepGEMM, Triton and Gluon leaves score
-`fp8_scaled` planes; a leaf scoring the checkpoint's bf16 keys (an indexer
-in the RL trainer's order) registers `index_k_format={"bf16"}`,
-`index_k_layout={"packed"}` and the `batch_invariant` and
-`forced_initial_local` features, so a bf16 plane selects it and nothing
-else. A plane of any other dtype is a `TypeError`.
+The in-tree DeepGEMM, Triton and Gluon leaves score `fp8_scaled` planes; a
+leaf scoring the checkpoint's bf16 keys (an indexer in the RL trainer's
+order) registers `index_k_format={"bf16"}`, `index_k_layout={"packed"}` and
+the `batch_invariant` and `forced_initial_local` features, so a bf16 plane
+selects it and nothing else. A plane of any other dtype is a `TypeError`.
+
+`dsa_prefill_topk` also takes the index keys as rows already in
+workspace-row order instead of a plane (the query-context-parallel history
+gather over page-sharded caches assembles them): `index_k_fp8` +
+`index_k_scale` are the rows of an `fp8_scaled` plane (`[workspace_rows,
+head_dim]` uint8 or float8_e4m3fn, `[workspace_rows, head_dim / 128]` fp32),
+`index_k_bf16` the rows of a `bf16` one (`[workspace_rows, head_dim]` bf16),
+each one row per entry of `kv_workspace_slots` and selecting with that
+`index_k_format` and `index_k_layout="packed"`, never together and never with
+`index_k_cache`; a call with neither a plane nor rows is a `ValueError`.
+Rows additionally REQUIRE the `index_k_workspace_rows` feature
+(`dsa.INDEX_K_WORKSPACE_ROWS_FEATURE`): a leaf declares it exactly when its
+launcher takes the row keywords for its format (DeepGEMM does, for the FP8
+pair; a bf16 leaf declares it and takes the `index_k_bf16` keyword), the
+facade hands the keywords to declaring leaves only, and a leaf that only
+reads planes -- the portable Triton leaf, the Gluon wrappers -- is never
+selected for rows, not by ranking and not by a kernel override (an override
+skips traits but not required features). The failure is a
+`NoKernelFoundError` at selection; a host whose sharded prefill will hand
+rows probes that selection at construction with
+`dsa.select_dsa_prefill_topk_for_rows(index_k_format=, ...)`, which makes a
+platform without a declaring leaf a startup error.
 
 A `dsa_decode_topk` leaf bounds every query row itself: row `j` of a request
 scored with `q_len_per_req` rows (spec verify, a multi-depth draft's k-row

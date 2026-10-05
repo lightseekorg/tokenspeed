@@ -28,8 +28,10 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode,
     dsa_plan,
     dsa_prefill,
+    select_dsa_prefill_topk_for_rows,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import NoKernelFoundError
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
@@ -47,7 +49,7 @@ from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     DSAConfig,
     dsa_history_gather_workspace_rows,
-    dsa_index_k_row_bytes,
+    index_k_row_bytes,
 )
 from tokenspeed.runtime.layers.attention.dcp.cache import (
     HistoryGatherPlan,
@@ -177,15 +179,10 @@ class DSABackend(PagedAttentionBackend):
         self.qcp_rank = config.qcp_rank
         if len(self.qcp_group) > 1 and spec.index_kpool is not None:
             raise ValueError("DSA query context parallelism does not support KPool")
-        if len(self.qcp_group) > 1 and spec.index_k_format != "fp8_scaled":
-            # The history gather reads the fp8_scaled block-split plane
-            # (DSATokenToKVPool.gather_index_k_rows); the workspace plan
-            # (dsa_history_gather_workspace_bytes) refuses the same.
-            raise ValueError(
-                "DSA query context parallelism gathers fp8_scaled index-K rows; "
-                f"got index_k_format={spec.index_k_format!r}"
-            )
         self.index_head_dim = spec.index_head_dim
+        # The index-K plane's format (configs/dsa.py INDEX_K_FORMATS): the
+        # history gather packs rows in it and hands the indexer that form.
+        self.index_k_format = spec.index_k_format
         self.query_shard_metadata: DSAQueryShardMetadata | None = None
         # Allocated by the target leaf (preallocate_history_gather_workspace),
         # shared with the draft leaf (adopt_history_gather_workspace).
@@ -204,9 +201,10 @@ class DSABackend(PagedAttentionBackend):
         # rl-bitwise pins the sparse decode onto the batch-invariant no-split
         # leaves; without one registered, selection fails at the first decode
         # instead of silently serving an occupancy-split kernel.
-        self.kernel_solution: str | None = (
-            "aok" if global_server_args_dict["numerics"] in BITWISE_ENVELOPES else None
+        self.batch_invariant: bool = (
+            global_server_args_dict["numerics"] in BITWISE_ENVELOPES
         )
+        self.kernel_solution: str | None = "aok" if self.batch_invariant else None
         # --dsa-slot-order: how the cores reduce the selected slots
         # (docs/design/numerics.md, invariance.batch).
         self.slot_order: str = global_server_args_dict["dsa_slot_order"]
@@ -221,6 +219,44 @@ class DSABackend(PagedAttentionBackend):
             # replay explicitly in its model code, so the class-level DSA
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
+        if len(self.qcp_group) > 1:
+            self._probe_history_gather_topk_leaf(spec)
+
+    def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:
+        """Select, at construction, the indexer leaf the sharded extend arm
+        will hand gathered index-K rows to.
+
+        Under query context parallelism the indexer scores each request
+        group's history as rows in workspace-row order of this leaf's
+        ``index_k_format`` (``gather_history_index_k``, then
+        ``dsa_prefill_topk(index_k_fp8=, index_k_scale=)`` or
+        ``(index_k_bf16=)``), which only a leaf declaring the kernel package's
+        ``index_k_workspace_rows`` feature for that format serves. Selection
+        would otherwise first run in the first sharded prefill; probing it here
+        turns a platform without such a leaf into a startup error. The probe
+        uses the forward's selection inputs this leaf knows: the model dtype
+        for the indexer query, fp32 weights, the spec's indexer geometry, this
+        leaf's page size, and the envelope's batch-invariance and solution pin.
+        """
+        try:
+            select_dsa_prefill_topk_for_rows(
+                index_k_format=self.index_k_format,
+                q_dtype=self.q_data_type,
+                weights_dtype=torch.float32,
+                index_heads=spec.index_n_heads,
+                head_dim=self.index_head_dim,
+                topk=self.index_topk,
+                page_size=self.kernel_page_size,
+                batch_invariant=self.batch_invariant,
+                solution=self.kernel_solution,
+            )
+        except NoKernelFoundError as e:
+            raise NoKernelFoundError(
+                "DSA query context parallelism hands the indexer gathered "
+                f"index-K rows of index_k_format={self.index_k_format!r}; no "
+                "dsa_prefill_topk leaf declaring the index_k_workspace_rows "
+                f"feature for that format is registered on this platform: {e}"
+            ) from e
 
     def configure_runtime(
         self,
@@ -255,12 +291,14 @@ class DSABackend(PagedAttentionBackend):
             kv=torch.empty(
                 (rows, self.kv_cache_dim), dtype=self.data_type, device=self.device
             ),
-            # Packed index-K rows (FP8 bytes then fp32 scales), one gather per group.
+            # Index-K rows packed in the plane's format (FP8 bytes then fp32
+            # scales, or bf16 keys), one gather per group.
             index_k=torch.empty(
-                (rows, dsa_index_k_row_bytes(self.index_head_dim)),
+                (rows, index_k_row_bytes(self.index_head_dim, self.index_k_format)),
                 dtype=torch.uint8,
                 device=self.device,
             ),
+            index_k_format=self.index_k_format,
         )
         return self._history_workspace.nbytes
 
@@ -271,22 +309,24 @@ class DSABackend(PagedAttentionBackend):
         """Gather into another leaf's workspace (the draft into the target's).
 
         The two leaves must agree on the row geometry the gathers write:
-        latent width and dtype, packed index-K row bytes, and whole kernel
-        pages of this leaf's page size.
+        latent width and dtype, the index-K format and its packed row bytes,
+        and whole kernel pages of this leaf's page size.
         """
+        row_bytes = index_k_row_bytes(self.index_head_dim, self.index_k_format)
         if (
             workspace.kv.shape[1] != self.kv_cache_dim
             or workspace.kv.dtype != self.data_type
-            or workspace.index_k.shape[1] != dsa_index_k_row_bytes(self.index_head_dim)
+            or workspace.index_k_format != self.index_k_format
+            or workspace.index_k.shape[1] != row_bytes
             or workspace.rows % self.kernel_page_size
         ):
             raise ValueError(
                 "history gather workspace geometry mismatch: "
                 f"kv {tuple(workspace.kv.shape)} {workspace.kv.dtype}, index_k "
-                f"{tuple(workspace.index_k.shape)}, rows {workspace.rows}; this "
-                f"leaf gathers [{self.kv_cache_dim}] {self.data_type} latent, "
-                f"{dsa_index_k_row_bytes(self.index_head_dim)}-byte index-K rows "
-                f"in pages of {self.kernel_page_size}"
+                f"{tuple(workspace.index_k.shape)} {workspace.index_k_format}, "
+                f"rows {workspace.rows}; this leaf gathers [{self.kv_cache_dim}] "
+                f"{self.data_type} latent, {row_bytes}-byte {self.index_k_format} "
+                f"index-K rows in pages of {self.kernel_page_size}"
             )
         self._history_workspace = workspace
 
@@ -716,42 +756,74 @@ class DSABackend(PagedAttentionBackend):
 
     def gather_history_index_k(
         self, layer_id: int, token_to_kv_pool, group: QueryShardHistoryGroup
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Assemble one group's index-K rows: ``[rows, index_head_dim]`` FP8
-        bytes and ``[rows, groups]`` fp32 scales in position order, the
-        ``index_k_fp8`` / ``index_k_scale`` inputs of ``dsa_prefill_topk``
-        (views of the gather workspace). One collective over the page owners
-        moves the rows packed (FP8 bytes then scale bytes per row)."""
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Assemble one group's index-K rows in position order, in this leaf's
+        ``index_k_format`` (the pool read, the workspace rows and the split
+        all follow it), as the rows ``dsa_prefill_topk`` takes in
+        workspace-row order: ``fp8_scaled`` gives ``[rows, index_head_dim]``
+        FP8 bytes and ``[rows, groups]`` fp32 scales (``index_k_fp8`` /
+        ``index_k_scale``); ``bf16`` gives ``[rows, index_head_dim]`` bf16 keys
+        and ``None`` (``index_k_bf16``). Views of the gather workspace, valid
+        until the next group's gather. One collective over the page owners
+        moves the rows packed as bytes."""
         if self._history_workspace is None:
             raise RuntimeError("DSA history gather workspace is not allocated")
         packed = token_to_kv_pool.gather_index_k_rows(
-            layer_id, group.gather.local_fetch_slots
+            layer_id,
+            group.gather.local_fetch_slots,
+            index_k_format=self.index_k_format,
         )
         gathered = gather_history_rows(
             group.gather, packed, out=self._history_workspace.index_k
         )
-        return split_index_k_rows(gathered, index_head_dim=self.index_head_dim)
+        return split_index_k_rows(
+            gathered,
+            index_head_dim=self.index_head_dim,
+            index_k_format=self.index_k_format,
+        )
 
     # ------------------------------------------------------------------
     # Validation helpers
     # ------------------------------------------------------------------
 
-    def _layer_holds_every_head(self, layer) -> bool:
-        """Whether ``layer``'s query heads are the model's (head-replicated
-        attention weights, as under query context parallelism) or the
-        attention-TP slice. The DCP combine's form follows the layer, never a
-        mapping assumption: replicated heads attend every head over the owned
-        pages and all-reduce the weighted partials; sharded heads gather the
-        group's query heads in and reduce-scatter their own back out."""
-        heads = layer.tp_q_head_num
-        if heads == self.num_local_heads:
-            return False
-        if heads == self.num_attention_heads:
-            return True
-        raise ValueError(
-            f"DSA layer holds {heads} query heads, neither the attention-TP slice "
-            f"({self.num_local_heads}) nor every head ({self.num_attention_heads})"
-        )
+    def _query_heads(self, q: torch.Tensor, layer) -> int:
+        """The heads ``q`` carries: ``[rows, heads, head_dim]``, or
+        ``[rows, heads * head_dim]``.
+
+        The sparse cores take their head count from the query, not from
+        ``layer.tp_q_head_num``: one model layer serves a forward whose rows
+        carry every head (head-replicated weights; head TP, whose exchange
+        delivered every head of this rank's own rows) and one whose rows
+        carry the attention-TP slice (plain attention TP; the replicated-row
+        forwards of a head-TP engine, which exchange nothing). Any other
+        count is a layout bug, refused here.
+        """
+        if q.dim() == 3:
+            heads, head_dim = q.shape[1], q.shape[2]
+        elif q.dim() == 2:
+            heads, head_dim = divmod(q.shape[1], layer.head_dim)
+            head_dim = layer.head_dim if head_dim == 0 else -1
+        else:
+            raise ValueError(f"DSA query must be 2-D or 3-D, got {tuple(q.shape)}")
+        if head_dim != layer.head_dim:
+            raise ValueError(
+                f"DSA query {tuple(q.shape)} does not split into heads of "
+                f"{layer.head_dim}"
+            )
+        if heads not in (self.num_local_heads, self.num_attention_heads):
+            raise ValueError(
+                f"DSA query carries {heads} heads, neither the attention-TP slice "
+                f"({self.num_local_heads}) nor every head ({self.num_attention_heads})"
+            )
+        return heads
+
+    def _query_holds_every_head(self, heads: int) -> bool:
+        """Whether a query of ``heads`` heads carries the model's heads rather
+        than the attention-TP slice (``_query_heads``). The DCP combine's form
+        follows it, never a mapping assumption: every head attends the owned
+        pages and all-reduces the weighted partials; the slice gathers the
+        group's query heads in and reduce-scatters its own back out."""
+        return heads != self.num_local_heads
 
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
         if logits_soft_cap and logits_soft_cap > 0:
@@ -901,8 +973,12 @@ class DSABackend(PagedAttentionBackend):
         rows ``gather_history_index_k`` scored): per request group the KV
         history is gathered from its page owners into one buffer and the
         local rows attend it with every head -- pure data movement, so a
-        row's bytes are those of an unsharded forward, and no LSE merge.
+        row's bytes are those of an unsharded forward, and no LSE merge. The
+        query must carry every head (head-replicated weights, or head TP over
+        the shard group, whose exchange delivers every head of the local
+        rows before the core); the attention-TP slice is refused.
         """
+        heads = self._query_heads(q, layer)
         if layer.logit_cap and layer.logit_cap > 0:
             self._validate_logit_cap(layer.logit_cap)
         if getattr(token_to_kv_pool, "quant_method", None) == "per_token_head":
@@ -935,7 +1011,14 @@ class DSABackend(PagedAttentionBackend):
                     "DSA sparse prefill top-k shape mismatch: "
                     f"indices={tuple(topk_slots.shape)}"
                 )
-            q_view = q.view(q.shape[0], layer.tp_q_head_num, layer.head_dim)
+            if not self._query_holds_every_head(heads):
+                raise RuntimeError(
+                    "the sharded DSA extend attends the gathered history with every "
+                    f"head; the query carries the attention-TP slice of {heads} "
+                    "heads (under head TP the exchange delivers every head of the "
+                    "local rows before the core)"
+                )
+            q_view = q.view(q.shape[0], heads, layer.head_dim)
             if self.data_type == torch.float8_e4m3fn and q_view.dtype != self.data_type:
                 q_view = q_view.to(self.data_type)
             out = self._forward_sharded_sparse_prefill(
@@ -949,9 +1032,9 @@ class DSABackend(PagedAttentionBackend):
             )
             if self.step_counter is not None:
                 self.step_counter.record_cache()
-            return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return out.reshape(-1, heads * layer.v_head_dim)
         if q.shape[0] == 0:
-            return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
+            return q.new_empty((0, heads * layer.v_head_dim))
         # KPool selection can append up to pool_size - 1 visible tail tokens,
         # so its workspace may be wider than the configured pooled top-k.
         if topk_slots.dim() != 2 or topk_slots.shape[1] <= 0:
@@ -959,13 +1042,13 @@ class DSABackend(PagedAttentionBackend):
                 "DSA sparse prefill top-k shape mismatch: "
                 f"indices={tuple(topk_slots.shape)}"
             )
-        q_view = q.view(q.shape[0], layer.tp_q_head_num, layer.head_dim)
+        q_view = q.view(q.shape[0], heads, layer.head_dim)
         if self.data_type == torch.float8_e4m3fn and q_view.dtype != self.data_type:
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         use_dcp = len(self.dcp_group) > 1
-        keep_all_heads = use_dcp and self._layer_holds_every_head(layer)
+        keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         if use_dcp:
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
             topk_slots = torch.where(owned, slots, -1)
@@ -1011,7 +1094,7 @@ class DSABackend(PagedAttentionBackend):
         # observe either cache field before it is ready.
         if self.step_counter is not None:
             self.step_counter.record_cache()
-        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return out.reshape(-1, heads * layer.v_head_dim)
 
     def _forward_sharded_sparse_prefill(
         self,
@@ -1033,7 +1116,7 @@ class DSABackend(PagedAttentionBackend):
                 f"rows, got {q_view.shape[0]}"
             )
         out = q_view.new_empty(
-            (q_view.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+            (q_view.shape[0], q_view.shape[1], layer.v_head_dim),
             dtype=(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
             ),
@@ -1173,7 +1256,8 @@ class DSABackend(PagedAttentionBackend):
                 seq_lens.unsqueeze(1).add(offsets).clamp_min(0).reshape(-1).contiguous()
             )
 
-        q_view = q.view(num_tokens, layer.tp_q_head_num, layer.head_dim)
+        heads = self._query_heads(q, layer)
+        q_view = q.view(num_tokens, heads, layer.head_dim)
         if self.data_type == torch.float8_e4m3fn:
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
@@ -1182,12 +1266,14 @@ class DSABackend(PagedAttentionBackend):
             getattr(metadata, "max_seq_len_k", 0) or self.max_context_len
         )
         use_dcp = len(self.dcp_group) > 1
-        # The combine's form follows the layer's head layout: a layer holding
-        # every head (head-replicated attention weights, as a query shard's
-        # drafter steps have) keeps all heads -- no query-head gather in, an
-        # all-reduce of the weighted partials out; a layer holding the TP
-        # slice gathers heads in and reduce-scatters them back.
-        keep_all_heads = use_dcp and self._layer_holds_every_head(layer)
+        # The combine's form follows the query's heads: every head
+        # (head-replicated attention weights, as the drafter's steps on a
+        # query-sharding engine without head TP carry) keeps all heads -- no
+        # query-head gather in, an all-reduce of the weighted partials out;
+        # the attention-TP slice (plain attention TP, or the drafter's steps
+        # under head TP over the query shards, which exchange nothing)
+        # gathers heads in and reduce-scatters them back.
+        keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         topk_slots = topk_indices.view(num_tokens, -1)
         if use_dcp:
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
@@ -1226,7 +1312,7 @@ class DSABackend(PagedAttentionBackend):
             ).to(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
             )
-        return out.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return out.reshape(-1, heads * layer.v_head_dim)
 
 
 register_backend("dsa", {AttentionArch.DSA}, DSABackend)
