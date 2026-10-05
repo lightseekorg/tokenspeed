@@ -18,8 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU tests for TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN: the simulated widths
-and where ModelExecutor applies them after verify."""
+"""CPU tests for TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN: the simulated widths,
+the tokens that match them, and where ModelExecutor applies both after
+verify."""
 
 from __future__ import annotations
 
@@ -42,6 +43,7 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 from tokenspeed.runtime.execution.accept_simulation import (  # noqa: E402
     parse_simulated_accept_length,
     simulated_accept_lengths,
+    simulated_output_tokens,
 )
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
 from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
@@ -59,8 +61,15 @@ VERIFY_WIDTH = 4
 
 def _scaled(length: str) -> int:
     return parse_simulated_accept_length(
-        length, spec_algorithm="MTP", verify_width=VERIFY_WIDTH
+        length, spec_algorithm="MTP", verify_width=VERIFY_WIDTH, draft_tree=False
     )
+
+
+def test_draft_trees_are_refused():
+    with pytest.raises(ValueError, match="chain drafts only"):
+        parse_simulated_accept_length(
+            "2", spec_algorithm="EAGLE3", verify_width=VERIFY_WIDTH, draft_tree=True
+        )
 
 
 @pytest.mark.parametrize("length", ["1", "2", "2.7", "3.25", "4"])
@@ -82,10 +91,26 @@ def test_widths_alternate_around_the_average(length):
         assert abs(total - average * steady.shape[1]) <= 1
 
 
+def test_simulated_tokens_are_the_drafts_each_width_accepts():
+    candidates = torch.tensor([[10, 11, 12, 13]] * 4, dtype=torch.int32)
+    # Verify accepted draft 11 and wrote bonus 50; 99 is a stale entry.
+    tokens = torch.tensor([[11, 50, 99, 99]] * 4, dtype=torch.int32)
+    kept = torch.tensor([1, 2, 3, 4])
+
+    out = simulated_output_tokens(tokens, candidates, torch.full((4,), 2), kept)
+    emitted = [out[row, :width].tolist() for row, width in enumerate(kept.tolist())]
+    assert emitted == [[11], [11, 50], [11, 12, 13], [11, 12, 13, 13]]
+
+
 class _NoAcceptSampler:
-    """Verify accepts no draft, writing width 1 into one shared buffer."""
+    """Verify accepts no draft: width 1 and each row's bonus token go into
+    shared buffers, whose entries past the bonus stay stale."""
+
+    BONUS = 7
+    STALE = 99
 
     def __init__(self):
+        self.tokens = torch.full((8 * VERIFY_WIDTH,), self.STALE, dtype=torch.int32)
         self.lengths = torch.zeros(8, dtype=torch.int32)
 
     def sample(self, logits_output, sampling_info):
@@ -94,8 +119,31 @@ class _NoAcceptSampler:
 
     def verify(self, logits_output, sampling_info, candidates, *, tree):
         rows = candidates.shape[0]
+        tokens = self.tokens[: candidates.numel()]
+        tokens.view(rows, -1)[:, 0] = self.BONUS
         self.lengths[:rows].fill_(1)
-        return torch.zeros(candidates.numel(), dtype=torch.int32), self.lengths[:rows]
+        return tokens, self.lengths[:rows]
+
+
+def _candidates(rows: int) -> torch.Tensor:
+    return torch.arange(10, 10 + rows * VERIFY_WIDTH, dtype=torch.int32).view(rows, -1)
+
+
+def _emitted(tokens: torch.Tensor, widths: list[int]) -> list[list[int]]:
+    rows = tokens.view(len(widths), -1)
+    return [rows[row, :width].tolist() for row, width in enumerate(widths)]
+
+
+def _accepted_drafts(candidates: torch.Tensor, widths: list[int]) -> list[list[int]]:
+    """What rows whose verify accepted nothing emit when they keep ``widths``."""
+    return [
+        (
+            [_NoAcceptSampler.BONUS]
+            if width == 1
+            else candidates[row, 1 : width + 1].tolist()
+        )
+        for row, width in enumerate(widths)
+    ]
 
 
 def _executor(pool_indices: list[int], cache_lengths: torch.Tensor) -> ModelExecutor:
@@ -113,33 +161,39 @@ def _executor(pool_indices: list[int], cache_lengths: torch.Tensor) -> ModelExec
     return executor
 
 
-def test_decode_verify_keeps_simulated_widths_in_the_sampler_buffer():
+def test_decode_verify_keeps_simulated_widths_and_drafts_in_the_sampler_buffers():
     cache_lengths = torch.arange(100, 108, dtype=torch.int32)
     pool = [5, 2, 7]
     executor = _executor(pool, cache_lengths)
+    sampler = executor.sampling_backend
     ctx = SimpleNamespace(
         bs=3,
         num_extends=0,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(0, 0, 3, VERIFY_WIDTH),
     )
-    candidates = torch.zeros(3, VERIFY_WIDTH, dtype=torch.int32)
+    candidates = _candidates(3)
 
-    _, lengths = executor._run_sampling(object(), object(), ctx, candidates)
+    tokens, lengths = executor._run_sampling(object(), object(), ctx, candidates)
     expected = simulated_accept_lengths(cache_lengths[pool], _scaled("2.7")).tolist()
+    assert expected == [3, 3, 1]
     assert lengths.tolist() == expected
-    assert lengths.data_ptr() == executor.sampling_backend.lengths.data_ptr()
+    assert _emitted(tokens, expected) == _accepted_drafts(candidates, expected)
+    assert lengths.data_ptr() == sampler.lengths.data_ptr()
+    assert tokens.data_ptr() == sampler.tokens.data_ptr()
 
-    # Rows the scheduler forces to one token keep one token.
+    # Rows the scheduler forces to one token keep verify's token.
     executor.input_buffers.force_single_token_verify_buf[1] = True
     ctx.decode_input_ids = [-1, 9, -1]
-    _, lengths = executor._run_sampling(object(), object(), ctx, candidates)
-    assert lengths.tolist() == [expected[0], 1, expected[2]]
+    tokens, lengths = executor._run_sampling(object(), object(), ctx, candidates)
+    forced = [expected[0], 1, expected[2]]
+    assert lengths.tolist() == forced
+    assert _emitted(tokens, forced) == _accepted_drafts(candidates, forced)
 
 
 def test_mixed_round_simulates_only_its_decode_rows():
     cache_lengths = torch.arange(200, 208, dtype=torch.int32)
-    pool = [3, 4, 6, 1]
+    pool = [3, 4, 2, 0]
     executor = _executor(pool, cache_lengths)
     ctx = SimpleNamespace(
         bs=4,
@@ -149,8 +203,10 @@ def test_mixed_round_simulates_only_its_decode_rows():
     )
     logits = LogitsProcessorOutput(next_token_logits=torch.zeros(2 + 2 * 4, 16))
     info = SamplingBatchInfo(req_pool_indices=torch.tensor(pool), device="cpu")
-    candidates = torch.zeros(2, VERIFY_WIDTH, dtype=torch.int32)
+    candidates = _candidates(2)
 
-    _, lengths = executor._run_sampling(logits, info, ctx, candidates)
-    decode = simulated_accept_lengths(cache_lengths[pool[2:]], _scaled("2.7"))
-    assert lengths.tolist() == [1, 1, *decode.tolist()]
+    tokens, lengths = executor._run_sampling(logits, info, ctx, candidates)
+    decode = simulated_accept_lengths(cache_lengths[pool[2:]], _scaled("2.7")).tolist()
+    assert decode == [3, 2]
+    assert lengths.tolist() == [1, 1, *decode]
+    assert _emitted(tokens[2:], decode) == _accepted_drafts(candidates, decode)

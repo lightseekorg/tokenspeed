@@ -22,7 +22,8 @@
 
 Under dummy weights or an emulated rank the target accepts whatever drafts its
 outputs happen to match. ``TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN`` replaces each
-verify step's accepted widths with the average a real run measured.
+chain verify step's accepted widths with the average a real run measured, and
+its tokens with the drafts those widths accept.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ ACCEPT_LENGTH_SCALE = 1000
 
 
 def parse_simulated_accept_length(
-    value: str, *, spec_algorithm: str | None, verify_width: int
+    value: str, *, spec_algorithm: str | None, verify_width: int, draft_tree: bool
 ) -> int | None:
     """Validate the simulated tokens per verify step.
 
@@ -42,13 +43,14 @@ def parse_simulated_accept_length(
         value: Raw ``TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN``; empty disables it.
         spec_algorithm: Speculative algorithm, or None without drafting.
         verify_width: Most tokens one verify step keeps per request.
+        draft_tree: Whether the drafts form a tree rather than a chain.
 
     Returns:
         The average scaled by ``ACCEPT_LENGTH_SCALE``, or None when disabled.
 
     Raises:
-        ValueError: Drafting is off, or the value is not a number in
-            ``[1, verify_width]``.
+        ValueError: Drafting is off or drafts a tree, or the value is not a
+            number in ``[1, verify_width]``.
     """
     if not value:
         return None
@@ -61,6 +63,13 @@ def parse_simulated_accept_length(
     if spec_algorithm is None:
         raise ValueError(
             "TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN requires speculative decoding"
+        )
+    if draft_tree:
+        # Tree verify keeps the accepted path for compaction, which a
+        # simulated width would run past.
+        raise ValueError(
+            "TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN supports chain drafts only, "
+            "not --speculative-eagle-topk > 1"
         )
     if not 1 <= length <= verify_width:
         raise ValueError(
@@ -91,3 +100,36 @@ def simulated_accept_lengths(
     cached = cache_lengths.to(torch.int64)
     steps = ((cached + 1) * ACCEPT_LENGTH_SCALE + scaled_length - 1) // scaled_length
     return steps * scaled_length // ACCEPT_LENGTH_SCALE - cached
+
+
+def simulated_output_tokens(
+    tokens: torch.Tensor,
+    candidates: torch.Tensor,
+    verified_lengths: torch.Tensor,
+    kept_lengths: torch.Tensor,
+) -> torch.Tensor:
+    """A chain verify's tokens, made to match the widths each row keeps.
+
+    Verify writes a row's tokens only through the width it accepted; past
+    that the sampler's buffer holds earlier steps' tokens, possibly another
+    request's. Each kept position before the last emits the draft after it,
+    as accepting that draft would, and so does the last one when verify did
+    not write it.
+
+    Args:
+        tokens: ``[rows, N]`` tokens verify wrote.
+        candidates: ``[rows, N]`` verify window: the last verified token,
+            then the drafts.
+        verified_lengths: ``[rows]`` widths verify accepted.
+        kept_lengths: ``[rows]`` widths the step keeps, each in ``[1, N]``.
+
+    Returns:
+        ``[rows, N]`` tokens; each row emits its first ``kept_lengths``.
+    """
+    width = candidates.shape[1]
+    following = torch.cat((candidates[:, 1:], candidates[:, -1:]), dim=1)
+    position = torch.arange(width, device=tokens.device)
+    drafted = (position < kept_lengths.unsqueeze(1) - 1) | (
+        position >= verified_lengths.unsqueeze(1)
+    )
+    return torch.where(drafted, following.to(tokens.dtype), tokens)
