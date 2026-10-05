@@ -184,13 +184,32 @@ def test_emulation_keeps_the_layout_without_fused_all_reduce():
     assert not args.enable_allreduce_fusion
 
 
-def test_emulation_rejects_query_context_parallelism():
-    with pytest.raises(ValueError, match="query context parallelism"):
-        _server_args(
-            attn_tp_size=8,
-            prefill_context_parallel_size=8,
-            disaggregation_mode="prefill",
-            disable_prefill_graph=True,
-            attention_backend="dsa",
-            emulate_rank_zero=True,
-        )
+@pytest.mark.parametrize(
+    ("overrides", "rejected"),
+    [
+        ({"moe_tp_size": 4}, "an MoE TP x EP size other than the attention TP size"),
+        ({"mm_encoder_tp_mode": "data"}, "--mm-encoder-tp-mode data"),
+        (
+            {
+                "prefill_context_parallel_size": 8,
+                "disaggregation_mode": "prefill",
+                "disable_prefill_graph": True,
+                "attention_backend": "dsa",
+            },
+            "query context parallelism",
+        ),
+        ({"enable_allreduce_fusion": True}, "--enable-allreduce-fusion"),
+        (
+            {
+                "enable_expert_parallel": True,
+                "enable_eplb": True,
+                "expert_distribution_recorder_mode": "stat",
+                "ep_dispatch_algorithm": "static",
+            },
+            "--enable-eplb",
+        ),
+    ],
+)
+def test_emulation_rejects_layouts_that_need_real_peers(overrides, rejected):
+    with pytest.raises(ValueError, match=rejected):
+        _server_args(attn_tp_size=8, emulate_rank_zero=True, **overrides)

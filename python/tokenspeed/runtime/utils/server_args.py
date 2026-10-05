@@ -1740,6 +1740,8 @@ class ServerArgs:
             unsupported.append(f"--all2all-backend {self.all2all_backend}")
         if self.enable_allreduce_fusion:
             unsupported.append("--enable-allreduce-fusion")
+        if self.enable_eplb:
+            unsupported.append("--enable-eplb")
         if unsupported:
             raise ValueError(
                 f"--emulate-rank-zero does not support {', '.join(unsupported)}"
