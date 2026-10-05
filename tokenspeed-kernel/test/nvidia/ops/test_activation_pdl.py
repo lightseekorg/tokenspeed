@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Activation PDL chains with producers that publish inputs after early release."""
+"""Activation and RMSNorm PDL chains with producers that publish inputs after
+early release."""
 
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     situ_and_mul,
     swiglu_oai,
 )
+from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 pytestmark = pytest.mark.skipif(
@@ -168,6 +170,30 @@ def test_add3_waits_for_published_inputs():
     pdl_enabled(overwrite=True)
     pdl = add3(*targets)
     assert torch.equal(pdl, serial)
+
+
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_rmsnorm_waits_for_published_inputs(with_residual: bool):
+    x = torch.randn(17, 4096, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn_like(x)
+    weight = torch.rand(4096, device="cuda", dtype=torch.bfloat16) + 0.5
+    options = {"round_residual_sum_bf16": True, "x_scale": 0.5, "residual_scale": 1.5}
+
+    def run(x, residual, weight, enable_pdl):
+        if not with_residual:
+            return (rmsnorm(x, weight, 1e-6, enable_pdl=enable_pdl),)
+        return rmsnorm(
+            x, weight, 1e-6, residual=residual, enable_pdl=enable_pdl, **options
+        )
+
+    serial = run(x, residual, weight, enable_pdl=False)
+    # Compile the PDL variant first so that the launch below races the producer.
+    run(x, residual, weight, enable_pdl=True)
+    targets = _unpublished(x, residual, weight)
+
+    _publish((x, residual, weight), targets)
+    pdl = run(*targets, enable_pdl=True)
+    assert all(torch.equal(a, b) for a, b in zip(pdl, serial, strict=True))
 
 
 def test_fused_swiglu_fp8_ue8m0_waits_for_published_input():
