@@ -178,14 +178,6 @@ def test_invalid_dp_layout_fails_before_collective(monkeypatch):
             )
 
 
-def test_dp_cp_rejected():
-    mapping = _mapping_class()(
-        rank=0, world_size=4, attn_tp_size=1, attn_cp_size=2, attn_dp_size=2
-    )
-    with pytest.raises(ValueError, match="CP=1"):
-        _lookup(mapping)
-
-
 def test_lookup_handle_lifecycle():
     mapping = _mapping_class()(rank=0, world_size=1)
     lookup, other = _lookup(mapping), _lookup(mapping)

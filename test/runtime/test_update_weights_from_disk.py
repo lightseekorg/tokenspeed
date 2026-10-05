@@ -34,6 +34,7 @@ import os
 import sys
 import tempfile
 import unittest
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -124,7 +125,10 @@ def _handler(device) -> RequestHandler:
     handler.attn_dp_size = 1
     handler.attn_dp_cpu_group = None
     handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-    handler._replica_flush_want_buf = torch.zeros(1, dtype=torch.int32)
+    handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
+    handler._pending_weight_ops = deque()
+    handler._pending_internal_ops = deque()
+    handler._internal_op_completer = None
     handler.can_clear_cache_fn = mock.Mock(return_value=True)
     handler.clear_cache_fn = mock.Mock(return_value=True)
     return handler
@@ -291,6 +295,25 @@ class TestRealCheckpoint(unittest.TestCase):
         self._load(runner, self.root / "step-1")
 
         self.assertEqual(runner.model_config.model_path, str(self.root / "step-1"))
+
+    def test_non_unit_kv_scale_fails_the_update(self):
+        # Same screen as a distributed load: KV caches run at unit scale.
+        directory = self.root / "scaled"
+        directory.mkdir()
+        save_file(
+            {"w": torch.ones(4, 3), "attn.k_scale": torch.tensor([2.0])},
+            str(directory / "model.safetensors"),
+        )
+        model = _TinyModel()
+        model.attn = torch.nn.Module()
+        model.attn.k_scale = torch.nn.Parameter(torch.ones(1))
+        runner = _runner(model, self.root / "step-0")
+
+        ok, message = self._load(runner, directory)
+
+        self.assertFalse(ok)
+        self.assertIn("only unit KV-cache scales are supported", message)
+        self.assertEqual(runner.model_config.model_path, str(self.root / "step-0"))
 
     def test_checkpoint_with_no_tensors_is_a_failure(self):
         empty = self.root / "empty"

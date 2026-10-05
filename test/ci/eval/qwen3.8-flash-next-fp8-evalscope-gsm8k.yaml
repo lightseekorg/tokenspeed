@@ -21,6 +21,7 @@ server:
     --quantization fp8
     --moe-backend flashinfer_trtllm
     --speculative-algorithm MTP
+    --disable-replay-ssm
     --speculative-num-steps 3
     --max-model-len 8192
     --max-num-seqs 16

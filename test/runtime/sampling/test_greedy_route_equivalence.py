@@ -54,6 +54,9 @@ MAX_N = 4
 
 def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        enable_speculative_sampling=False,
+        sampling_stream="batch",
+        logprob_order="torch",
         max_bs=MAX_BS,
         max_draft_tokens_per_req=MAX_N,
         max_req_pool_size=POOL,
@@ -228,6 +231,7 @@ def test_verify_top_k1_equals_greedy_chain(backend_name):
         _logits_output(logits.clone()),
         _sampling_info(req_pool_indices),
         candidates,
+        tree=None,
     )
 
     ref_predict, ref_accept = _chain_greedy_reference(

@@ -59,6 +59,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     instanttensor_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    require_unit_kv_scales,
     safetensors_filtered_weights_iterator,
     safetensors_weights_iterator,
 )
@@ -396,8 +397,9 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
-        # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        return require_unit_kv_scales(
+            (source.prefix + name, tensor) for (name, tensor) in weights_iterator
+        )
 
     def _get_all_weights(
         self,
@@ -416,7 +418,11 @@ class DefaultModelLoader(BaseModelLoader):
                 getattr(model, "fall_back_to_pt_during_load", False),
             )
             bind_checkpoint_dir(hf_folder)
+        # A model that reads a stage-specific checkpoint subset names its own
+        # group; otherwise the caller says which ranks load this model at all.
         checkpoint_load_group = getattr(model, "checkpoint_load_group", None)
+        if checkpoint_load_group is None:
+            checkpoint_load_group = self.load_config.checkpoint_load_group
 
         primary_weights = DefaultModelLoader.Source(
             model_config.model_path,

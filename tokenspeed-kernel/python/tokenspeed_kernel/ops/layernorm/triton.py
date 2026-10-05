@@ -4,6 +4,8 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
+_FP8_E4M3_MAX = tl.constexpr(448.0)
+
 
 @triton.jit
 def _rmsnorm_kernel(
@@ -542,6 +544,7 @@ def _fused_qk_rmsnorm_kernel(
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     eps: tl.constexpr,
+    WEIGHT_OFFSET: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
@@ -549,7 +552,7 @@ def _fused_qk_rmsnorm_kernel(
     # heads in [num_q_heads, num_q_heads + num_kv_heads) handle k rows.
     # Inputs may be non-contiguous along the leading axis (e.g. views from a
     # qkv split) — we use the explicit token strides to compute addresses.
-    token = tl.program_id(0)
+    token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     is_k = head >= num_q_heads
     local_head = tl.where(is_k, head - num_q_heads, head)
@@ -576,6 +579,9 @@ def _fused_qk_rmsnorm_kernel(
 
     # Weights are parameters nothing in the decode graph writes; safe to load before the PDL wait.
     w = tl.load(w_addrs, mask=mask, other=0.0).to(tl.float32)
+    # Adding +0.0 would turn a -0.0 weight into +0.0.
+    if WEIGHT_OFFSET != 0.0:
+        w = w + WEIGHT_OFFSET
 
     if ENABLE_PDL:
         # Wait for the producer's stores before the first dependent load.
@@ -596,9 +602,12 @@ def qk_rmsnorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     eps: float,
+    *,
+    weight_offset: float,
     enable_pdl: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-head RMSNorm of q and k in a single kernel launch.
+    """Per-head RMSNorm of q and k in a single kernel launch; heads scale by
+    ``weight_offset + weight``, formed in fp32.
 
     Reads from possibly non-contiguous q/k (e.g. views into a qkv-split tensor)
     and writes to fresh contiguous output tensors. The kernel uses the input
@@ -646,212 +655,12 @@ def qk_rmsnorm(
         num_kv_heads,
         head_dim,
         eps,
+        WEIGHT_OFFSET=weight_offset,
         BLOCK=block,
         ENABLE_PDL=enable_pdl,
         **kwargs,
     )
     return q_out, k_out
-
-
-@triton.jit
-def _fused_qk_rmsnorm_rope_gate_kernel(
-    q_gate_ptr,
-    k_ptr,
-    q_out_ptr,
-    k_out_ptr,
-    gate_out_ptr,
-    q_weight_ptr,
-    k_weight_ptr,
-    cos_sin_cache_ptr,
-    positions_ptr,
-    q_gate_stride_t,
-    k_stride_t,
-    q_out_stride_t,
-    k_out_stride_t,
-    gate_out_stride_t,
-    cache_stride_p,
-    num_q_heads: tl.constexpr,
-    num_kv_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    rotary_dim: tl.constexpr,
-    half_rotary: tl.constexpr,
-    eps: tl.constexpr,
-    INPUT_DTYPE: tl.constexpr,
-    HEAD_BLOCK: tl.constexpr,
-    ROT_HALF_BLOCK: tl.constexpr,
-    HAS_PASS: tl.constexpr,
-):
-    token = tl.program_id(0)
-    head = tl.program_id(1)
-    is_k = head >= num_q_heads
-    local_head = tl.where(is_k, head - num_q_heads, head)
-
-    if is_k:
-        in_base = k_ptr + token * k_stride_t + local_head * head_dim
-        w_ptr = k_weight_ptr
-        out_base = k_out_ptr + token * k_out_stride_t + local_head * head_dim
-    else:
-        in_base = q_gate_ptr + token * q_gate_stride_t + local_head * 2 * head_dim
-        w_ptr = q_weight_ptr
-        out_base = q_out_ptr + token * q_out_stride_t + local_head * head_dim
-
-    # --- RMSNorm: variance over the full head_dim ---
-    head_offs = tl.arange(0, HEAD_BLOCK)
-    head_mask = head_offs < head_dim
-    x = tl.load(in_base + head_offs, mask=head_mask, other=0.0).to(tl.float32)
-    var = tl.sum(x * x, axis=0) / head_dim
-    inv_rms = tl.rsqrt(var + eps)
-    w = tl.load(w_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32)
-    # Round-trip through INPUT_DTYPE so the RoPE input matches the bf16-storage
-    # behavior of the unfused (qk_rmsnorm → memory → apply_rope) reference path.
-    x_norm = (x * inv_rms * w).to(INPUT_DTYPE).to(tl.float32)
-
-    # --- Pass-through tail [rotary_dim, head_dim): RMSNorm-only, no rotation ---
-    # The rotary head [0, rotary_dim) will be overwritten by the RoPE store below.
-    if HAS_PASS:
-        pass_mask = head_mask & (head_offs >= rotary_dim)
-        tl.store(out_base + head_offs, x_norm, mask=pass_mask)
-
-    # --- Partial RoPE on the first rotary_dim elements ---
-    # Triton lacks easy sub-vector slicing of x_norm, so we recompute the
-    # normalized rotary halves on a smaller block (next_pow2(half_rotary)).
-    # The extra ~rotary_dim element reload hits L1, so the cost is negligible.
-    rot_offs = tl.arange(0, ROT_HALF_BLOCK)
-    rot_mask = rot_offs < half_rotary
-    x_rot1 = tl.load(in_base + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
-    x_rot2 = tl.load(in_base + half_rotary + rot_offs, mask=rot_mask, other=0.0).to(
-        tl.float32
-    )
-    w_rot1 = tl.load(w_ptr + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
-    w_rot2 = tl.load(w_ptr + half_rotary + rot_offs, mask=rot_mask, other=0.0).to(
-        tl.float32
-    )
-    x_rot1 = (x_rot1 * inv_rms * w_rot1).to(INPUT_DTYPE).to(tl.float32)
-    x_rot2 = (x_rot2 * inv_rms * w_rot2).to(INPUT_DTYPE).to(tl.float32)
-
-    # Always use int64 for position to avoid overflow in address computation.
-    pos = tl.load(positions_ptr + token).to(tl.int64)
-    cache_offset = pos * cache_stride_p
-    cos = tl.load(
-        cos_sin_cache_ptr + cache_offset + rot_offs, mask=rot_mask, other=0.0
-    ).to(tl.float32)
-    sin = tl.load(
-        cos_sin_cache_ptr + cache_offset + half_rotary + rot_offs,
-        mask=rot_mask,
-        other=0.0,
-    ).to(tl.float32)
-
-    o1 = x_rot1 * cos - x_rot2 * sin
-    o2 = x_rot2 * cos + x_rot1 * sin
-    tl.store(out_base + rot_offs, o1, mask=rot_mask)
-    tl.store(out_base + half_rotary + rot_offs, o2, mask=rot_mask)
-
-    # --- Gate copy (q heads only, verbatim) ---
-    if not is_k:
-        gate_in_base = in_base + head_dim
-        gate_out_base = gate_out_ptr + token * gate_out_stride_t + local_head * head_dim
-        g = tl.load(gate_in_base + head_offs, mask=head_mask, other=0.0)
-        tl.store(gate_out_base + head_offs, g, mask=head_mask)
-
-
-def fused_qk_rmsnorm_rope_gate(
-    q_gate: torch.Tensor,
-    k: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    positions: torch.Tensor,
-    eps: float,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    rotary_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused split + QK-RMSNorm + (partial) RoPE + gate copy for Qwen3.5 attn.
-
-    Replaces 4 kernel launches (2 contiguous copies + qk_rmsnorm + RoPE)
-    with a single triton kernel.  Supports partial RoPE: only the first
-    ``rotary_dim`` elements of each head are rotated; the remaining
-    ``head_dim - rotary_dim`` elements pass through after RMSNorm only.
-    Qwen3.5 uses ``partial_rotary_factor=0.25``, so ``rotary_dim = head_dim // 4``.
-
-    Args:
-        q_gate: (n_tokens, num_q_heads * 2 * head_dim) — per head: [q|gate]
-        k: (n_tokens, num_kv_heads * head_dim)
-        q_weight: (head_dim,) GemmaRMSNorm weight (already +1)
-        k_weight: (head_dim,) GemmaRMSNorm weight (already +1)
-        cos_sin_cache: (max_pos, rotary_dim) packed [cos|sin], float32
-        positions: (n_tokens,) int32 or int64
-        eps: RMSNorm epsilon
-        num_q_heads: number of Q heads (after TP split)
-        num_kv_heads: number of KV heads (after TP split)
-        head_dim: per-head dimension
-        rotary_dim: rotary dimension; must be even and <= head_dim
-
-    Returns:
-        (q_out, k_out, gate_out) — all contiguous (n_tokens, heads * head_dim)
-    """
-    if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2 != 0:
-        raise ValueError(
-            f"rotary_dim must be a positive even integer <= head_dim, "
-            f"got rotary_dim={rotary_dim}, head_dim={head_dim}"
-        )
-
-    n_tokens = q_gate.shape[0]
-    if n_tokens == 0:
-        q_out = torch.empty(
-            (0, num_q_heads * head_dim), dtype=q_gate.dtype, device=q_gate.device
-        )
-        k_out = torch.empty(
-            (0, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
-        )
-        gate_out = torch.empty_like(q_out)
-        return q_out, k_out, gate_out
-
-    q_out = torch.empty(
-        (n_tokens, num_q_heads * head_dim), dtype=q_gate.dtype, device=q_gate.device
-    )
-    k_out = torch.empty(
-        (n_tokens, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
-    )
-    gate_out = torch.empty_like(q_out)
-
-    half_rotary = rotary_dim // 2
-    head_block = triton.next_power_of_2(head_dim)
-    rot_half_block = triton.next_power_of_2(half_rotary)
-    num_warps = max(1, head_block // 64)
-
-    grid = (n_tokens, num_q_heads + num_kv_heads)
-    _fused_qk_rmsnorm_rope_gate_kernel[grid](
-        q_gate,
-        k,
-        q_out,
-        k_out,
-        gate_out,
-        q_weight,
-        k_weight,
-        cos_sin_cache,
-        positions,
-        q_gate.stride(0),
-        k.stride(0),
-        q_out.stride(0),
-        k_out.stride(0),
-        gate_out.stride(0),
-        cos_sin_cache.stride(0),
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        rotary_dim,
-        half_rotary,
-        eps,
-        INPUT_DTYPE=tl.bfloat16 if q_gate.dtype == torch.bfloat16 else tl.float16,
-        HEAD_BLOCK=head_block,
-        ROT_HALF_BLOCK=rot_half_block,
-        HAS_PASS=rotary_dim < head_dim,
-        num_warps=num_warps,
-        num_stages=2,
-    )
-    return q_out, k_out, gate_out
 
 
 def rmsnorm_fused_parallel(
@@ -919,164 +728,125 @@ def rmsnorm_fused_parallel(
 
 
 @triton.jit
-def _fused_qk_rmsnorm_rope_kernel(
-    q_ptr,
-    k_ptr,
-    q_out_ptr,
-    k_out_ptr,
-    q_weight_ptr,
-    k_weight_ptr,
-    cos_sin_cache_ptr,
-    positions_ptr,
-    q_stride_t,
-    k_stride_t,
-    q_out_stride_t,
-    k_out_stride_t,
-    cache_stride_p,
-    num_q_heads: tl.constexpr,
-    num_kv_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    half_dim: tl.constexpr,
-    eps: tl.constexpr,
-    INPUT_DTYPE: tl.constexpr,
-    HALF_BLOCK: tl.constexpr,
+def _add_rmsnorm_kernel(
+    x_ptr,
+    x2_ptr,
+    residual_ptr,
+    weight_ptr,
+    out_ptr,
+    out_fp8_ptr,
+    fp8_scale_ptr,
+    stride_x,
+    stride_x2,
+    stride_residual,
+    stride_out,
+    stride_out_fp8,
+    n_cols,
+    eps,
+    BLOCK: tl.constexpr,
+    HAS_X2: tl.constexpr,
+    HAS_FP8: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
-    """Fused per-head QK-RMSNorm + full RoPE kernel (no gate, rotary_dim == head_dim)."""
-    token = tl.program_id(0)
-    head = tl.program_id(1)
-    is_k = head >= num_q_heads
-    local_head = tl.where(is_k, head - num_q_heads, head)
-
-    if is_k:
-        in_base = k_ptr + token * k_stride_t + local_head * head_dim
-        w_ptr = k_weight_ptr
-        out_base = k_out_ptr + token * k_out_stride_t + local_head * head_dim
-    else:
-        in_base = q_ptr + token * q_stride_t + local_head * head_dim
-        w_ptr = q_weight_ptr
-        out_base = q_out_ptr + token * q_out_stride_t + local_head * head_dim
-
-    # --- RMSNorm over the full head_dim ---
-    # Load both halves for the variance computation.
-    offs = tl.arange(0, HALF_BLOCK)
-    mask = offs < half_dim
-    x1 = tl.load(in_base + offs, mask=mask, other=0.0).to(tl.float32)
-    x2 = tl.load(in_base + half_dim + offs, mask=mask, other=0.0).to(tl.float32)
-    var = (tl.sum(x1 * x1, axis=0) + tl.sum(x2 * x2, axis=0)) / head_dim
-    inv_rms = tl.rsqrt(var + eps)
-
-    w1 = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    w2 = tl.load(w_ptr + half_dim + offs, mask=mask, other=0.0).to(tl.float32)
-    x1_norm = (x1 * inv_rms * w1).to(INPUT_DTYPE).to(tl.float32)
-    x2_norm = (x2 * inv_rms * w2).to(INPUT_DTYPE).to(tl.float32)
-
-    # --- Full RoPE (rotary_dim == head_dim) ---
-    pos = tl.load(positions_ptr + token).to(tl.int64)
-    cache_offset = pos * cache_stride_p
-    cos = tl.load(cos_sin_cache_ptr + cache_offset + offs, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    sin = tl.load(
-        cos_sin_cache_ptr + cache_offset + half_dim + offs, mask=mask, other=0.0
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    # Weights and the quant scale are model constants, loaded before the wait.
+    weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    if HAS_FP8:
+        inv_scale = 1.0 / tl.load(fp8_scale_ptr).to(tl.float32)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    addend = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0)
+    if HAS_X2:
+        # Sum the two addends in their own dtype, as an all-reduce input would be.
+        addend += tl.load(x2_ptr + row * stride_x2 + cols, mask=mask, other=0.0)
+    total = addend.to(tl.float32) + tl.load(
+        residual_ptr + row * stride_residual + cols, mask=mask, other=0.0
     ).to(tl.float32)
+    tl.store(
+        residual_ptr + row * stride_residual + cols,
+        total.to(residual_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    variance = tl.sum(total * total, axis=0) / n_cols
+    normed = (total * tl.rsqrt(variance + eps) * weight).to(out_ptr.dtype.element_ty)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    tl.store(out_ptr + row * stride_out + cols, normed, mask=mask)
+    if HAS_FP8:
+        quant = tl.clamp(
+            normed.to(tl.float32) * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+        )
+        tl.store(
+            out_fp8_ptr + row * stride_out_fp8 + cols,
+            quant.to(out_fp8_ptr.dtype.element_ty),
+            mask=mask,
+        )
 
-    o1 = x1_norm * cos - x2_norm * sin
-    o2 = x2_norm * cos + x1_norm * sin
-    tl.store(out_base + offs, o1, mask=mask)
-    tl.store(out_base + half_dim + offs, o2, mask=mask)
 
-
-def fused_qk_rmsnorm_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    positions: torch.Tensor,
+def add_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
     eps: float,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused split + QK-RMSNorm + full RoPE for DFLASH attention layers.
-
-    Replaces 3 kernel launches (qk_rmsnorm + RoPE) with a single triton
-    kernel.  Assumes rotary_dim == head_dim (full rotation, no pass-through
-    tail).
+    *,
+    x2: torch.Tensor | None,
+    out: torch.Tensor,
+    out_fp8: torch.Tensor | None,
+    fp8_scale: torch.Tensor | None,
+) -> None:
+    """``residual += x (+ x2)``, then RMSNorm, optionally also into static FP8.
 
     Args:
-        q: (n_tokens, num_q_heads * head_dim) — possibly non-contiguous view
-        k: (n_tokens, num_kv_heads * head_dim) — possibly non-contiguous view
-        q_weight: (head_dim,) RMSNorm scale weight (standard: weight; Gemma: weight+1)
-        k_weight: (head_dim,) RMSNorm scale weight (standard: weight; Gemma: weight+1)
-        cos_sin_cache: (max_pos, head_dim) packed [cos|sin], float32
-        positions: (n_tokens,) int32 or int64
-        eps: RMSNorm epsilon
-        num_q_heads: number of Q heads (after TP split)
-        num_kv_heads: number of KV heads (after TP split)
-        head_dim: per-head dimension (must be even)
-
-    Returns:
-        (q_out, k_out) — both contiguous (n_tokens, heads * head_dim)
+        x: ``[M, N]`` addend, rows may be strided but columns dense.
+        residual: ``[M, N]`` residual stream, updated in place.
+        weight: ``[N]`` norm weight.
+        eps: Norm epsilon.
+        x2: Optional second ``[M, N]`` addend, summed with ``x`` in their own dtype.
+        out: ``[M, N]`` normalized output; may alias ``x``.
+        out_fp8: Optional ``[M, N]`` FP8 output quantized with ``fp8_scale``.
+        fp8_scale: One-element FP32 dequant scale, given exactly with
+            ``out_fp8``.
     """
-    if head_dim % 2 != 0:
-        raise ValueError(f"head_dim must be even, got {head_dim}")
-
-    n_tokens = q.shape[0]
-    if n_tokens == 0:
-        q_out = torch.empty((0, num_q_heads * head_dim), dtype=q.dtype, device=q.device)
-        k_out = torch.empty(
-            (0, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
-        )
-        return q_out, k_out
-
-    q_out = torch.empty(
-        (n_tokens, num_q_heads * head_dim), dtype=q.dtype, device=q.device
-    )
-    k_out = torch.empty(
-        (n_tokens, num_kv_heads * head_dim), dtype=k.dtype, device=k.device
-    )
-
-    half_dim = head_dim // 2
-    half_block = triton.next_power_of_2(half_dim)
-    num_warps = max(1, half_block // 64)
-
-    q_stride = q.stride(0) if q.dim() > 1 else q.shape[-1]
-    k_stride = k.stride(0) if k.dim() > 1 else k.shape[-1]
-
-    grid = (n_tokens, num_q_heads + num_kv_heads)
-    _fused_qk_rmsnorm_rope_kernel[grid](
-        q,
-        k,
-        q_out,
-        k_out,
-        q_weight,
-        k_weight,
-        cos_sin_cache,
-        positions,
-        q_stride,
-        k_stride,
-        q_out.stride(0),
-        k_out.stride(0),
-        cos_sin_cache.stride(0),
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        half_dim,
+    if (out_fp8 is None) != (fp8_scale is None):
+        raise ValueError("out_fp8 and fp8_scale are given together")
+    tensors = [t for t in (x, x2, residual, out, out_fp8) if t is not None]
+    if any(t.dim() != 2 or t.shape != x.shape or t.stride(1) != 1 for t in tensors):
+        raise ValueError("add_rmsnorm operands must be [M, N] with dense columns")
+    rows, cols = x.shape
+    if rows == 0:
+        return
+    block = triton.next_power_of_2(cols)
+    enable_pdl = pdl_enabled()
+    _add_rmsnorm_kernel[(rows,)](
+        x,
+        x if x2 is None else x2,
+        residual,
+        weight,
+        out,
+        x if out_fp8 is None else out_fp8,
+        weight if fp8_scale is None else fp8_scale,
+        x.stride(0),
+        0 if x2 is None else x2.stride(0),
+        residual.stride(0),
+        out.stride(0),
+        0 if out_fp8 is None else out_fp8.stride(0),
+        cols,
         eps,
-        INPUT_DTYPE=tl.bfloat16 if q.dtype == torch.bfloat16 else tl.float16,
-        HALF_BLOCK=half_block,
-        num_warps=num_warps,
-        num_stages=2,
+        BLOCK=block,
+        HAS_X2=x2 is not None,
+        HAS_FP8=out_fp8 is not None,
+        ENABLE_PDL=enable_pdl,
+        num_warps=min(max(block // 256, 1), 8),
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
-    return q_out, k_out
 
 
 __all__ = [
+    "add_rmsnorm",
     "grouped_gemma_rmsnorm",
     "rmsnorm",
     "qk_rmsnorm",
-    "fused_qk_rmsnorm_rope_gate",
-    "fused_qk_rmsnorm_rope",
     "rmsnorm_fused_parallel",
 ]

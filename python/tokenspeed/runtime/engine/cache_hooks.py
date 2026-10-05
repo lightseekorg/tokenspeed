@@ -76,8 +76,6 @@ class L2CacheHooks:
         attn_tp_rank: int,
         attn_tp_size: int,
         attn_tp_cpu_group,
-        attn_cp_size: int,
-        attn_cp_cpu_group,
         pp_size: int,
         pp_cpu_group,
         global_rank: int,
@@ -100,8 +98,6 @@ class L2CacheHooks:
         replica_groups = []
         if attn_tp_size > 1 and attn_tp_cpu_group is not None:
             replica_groups.append((attn_tp_size, attn_tp_cpu_group))
-        if attn_cp_size > 1 and attn_cp_cpu_group is not None:
-            replica_groups.append((attn_cp_size, attn_cp_cpu_group))
         if pp_size > 1 and pp_cpu_group is not None:
             replica_groups.append((pp_size, pp_cpu_group))
         self._replica_groups = replica_groups

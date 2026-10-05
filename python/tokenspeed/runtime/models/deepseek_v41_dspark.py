@@ -217,12 +217,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
     local_base_logits = DeepseekV4DSparkModel.local_base_logits
 
     def __init__(self, config, mapping, quant_config, prefix):
-        if (
-            mapping.attn.dp_size != 1
-            or mapping.attn.cp_size != 1
-            or mapping.pp_size != 1
-        ):
-            raise NotImplementedError("V4.1 DSpark requires attention DP=CP=PP=1")
+        if mapping.attn.dp_size != 1 or mapping.pp_size != 1:
+            raise NotImplementedError("V4.1 DSpark requires attention DP=PP=1")
         stages = int(config.dspark_num_stages)
         block_size = int(config.dspark_block_size)
         taps = tuple(config.dspark_target_layer_ids)

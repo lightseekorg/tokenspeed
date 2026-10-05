@@ -59,6 +59,15 @@ using namespace cub;
     __VA_ARGS__                                                   \
   }
 
+#define DISPATCH_USE_DRAFT_PROB(use_draft_prob, USE_DRAFT_PROB, ...) \
+  if (use_draft_prob) {                                              \
+    constexpr bool USE_DRAFT_PROB = true;                            \
+    __VA_ARGS__                                                      \
+  } else {                                                           \
+    constexpr bool USE_DRAFT_PROB = false;                           \
+    __VA_ARGS__                                                      \
+  }
+
 #define DISPATCH_COMPUTE_CAP_NUM_THREADS(compute_capacity, BLOCK_THREADS, ...) \
   if (compute_capacity.first >= 8) {                                           \
     constexpr uint32_t BLOCK_THREADS = 1024;                                   \
@@ -2132,9 +2141,24 @@ inline cudaError_t VerifyChainGreedy(
     return cudaSuccess;
 }
 
+// Chain speculative verification over one draft chain per CTA. Two accept
+// rules share the output layout (predicts / accept_index / accept_token_num)
+// and the residual sampler:
+//
+// * USE_DRAFT_PROB == false ("target-only"): accept draft x with probability
+//   p(x) (thresholds at 1.0); the residual is p with the rejected lane zeroed.
+//   The output law is p for ANY proposal, so draft_probs is optional and only
+//   read when the caller passes a buffer.
+// * USE_DRAFT_PROB == true (standard rejection sampling): the drafter sampled
+//   x from its own distribution q and recorded it in draft_probs; accept when
+//   coin * q(x) < p(x), the residual is norm(relu(p - q)) (the rejected lane
+//   is zero there by construction: rejection means q(x) >= p(x)). A q row
+//   whose entries exceed reject_draft_prob_threshold is a sentinel for "no
+//   recorded proposal" (fresh admission, PD landing): its candidate is
+//   rejected and the row samples the full target distribution.
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
     BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
-    typename DType, typename IdType>
+    bool USE_DRAFT_PROB, typename DType, typename IdType>
 __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
     IdType* predicts,          // mutable
     IdType* accept_index,      // mutable
@@ -2148,7 +2172,8 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
     uint32_t num_draft_tokens,
     uint32_t d,  // vocab_size
     DType threshold_single,
-    DType threshold_acc) {
+    DType threshold_acc,
+    DType reject_draft_prob_threshold) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   extern __shared__ __align__(alignof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
       uint8_t smem_sampling[];
@@ -2170,10 +2195,12 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
   // The first token is always accepted.
   accept_index[cur_index] = cur_index;
 
-  // Track the rejected token's id in a register. Every thread in the CTA
-  // executes the acceptance loop and sees the same candidates/target_probs
-  // values, so this is naturally broadcast without shared memory or sync.
-  // -1 sentinel = no rejection (all draft tokens accepted).
+  // Target-only mode tracks the rejected token's id in a register. Every
+  // thread in the CTA executes the acceptance loop and sees the same
+  // candidates/target_probs values, so this is naturally broadcast without
+  // shared memory or sync. -1 sentinel = no rejection (all draft tokens
+  // accepted). Draft-prob mode never sets it: relu(p - q) is already zero at
+  // the rejected lane.
   IdType rejected_id = IdType(-1);
 
   for (uint32_t i = 1; i < num_draft_tokens; i++) {
@@ -2182,28 +2209,47 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
     // Get target prob of next token.
     DType target_prob = target_probs[cur_prob_offset + draft_id];
 
-    // If target_porb is bigger than threshold_single, accept this token directly.
-    // Otherwise, accept this token with prob target_prob / threshold_acc. coin
-    // is a uniform random number in [0, 1).
-    if (target_prob >= threshold_single || coin <= target_prob / threshold_acc) {
-      // accept the draft models output
-      predicts[bx * num_draft_tokens + i - 1] = draft_id;
-      // get next coin and next token's prob offset
-      coin = uniform_samples[bx * num_draft_tokens + i];
-      cur_prob_offset = (bx * num_draft_tokens + i) * d;
-      num_accepted_tokens++;
-      cur_index++;
-      accept_index[bx * num_draft_tokens + i] = cur_index;
+    if constexpr (USE_DRAFT_PROB) {
+      DType draft_prob = draft_probs[cur_prob_offset + draft_id];
+      if (draft_prob > reject_draft_prob_threshold) {
+        // Sentinel row: no recorded proposal for this slot, always reject.
+        pos = i - 1;
+        break;
+      } else if (coin * draft_prob < target_prob) {
+        predicts[bx * num_draft_tokens + i - 1] = draft_id;
+        coin = uniform_samples[bx * num_draft_tokens + i];
+        cur_prob_offset = (bx * num_draft_tokens + i) * d;
+        num_accepted_tokens++;
+        cur_index++;
+        accept_index[bx * num_draft_tokens + i] = cur_index;
+      } else {
+        pos = i - 1;
+        break;
+      }
     } else {
-      // Track the rejected token in a register instead of writing through
-      // GMEM. The final-sample loop applies the same effect by injecting
-      // p_vec[lane] = q_vec[lane] at the matching lane (relu = 0). Caller's
-      // draft_probs (if any) gets the same single-element update at kernel
-      // exit, preserving observable behavior with no draft_probs round-trip.
-      rejected_id = draft_id;
-      // record rejected position for final sampling
-      pos = i - 1;
-      break;
+      // If target_porb is bigger than threshold_single, accept this token directly.
+      // Otherwise, accept this token with prob target_prob / threshold_acc. coin
+      // is a uniform random number in [0, 1).
+      if (target_prob >= threshold_single || coin <= target_prob / threshold_acc) {
+        // accept the draft models output
+        predicts[bx * num_draft_tokens + i - 1] = draft_id;
+        // get next coin and next token's prob offset
+        coin = uniform_samples[bx * num_draft_tokens + i];
+        cur_prob_offset = (bx * num_draft_tokens + i) * d;
+        num_accepted_tokens++;
+        cur_index++;
+        accept_index[bx * num_draft_tokens + i] = cur_index;
+      } else {
+        // Track the rejected token in a register instead of writing through
+        // GMEM. The final-sample loop applies the same effect by injecting
+        // p_vec[lane] = q_vec[lane] at the matching lane (relu = 0). Caller's
+        // draft_probs (if any) gets the same single-element update at kernel
+        // exit, preserving observable behavior with no draft_probs round-trip.
+        rejected_id = draft_id;
+        // record rejected position for final sampling
+        pos = i - 1;
+        break;
+      }
     }
   }
   accept_token_num[bx] = num_accepted_tokens;
@@ -2228,15 +2274,24 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
         p_vec.load(draft_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
       }
     }
-    // Register-level rejection mask: force p_vec[lane] = q_vec[lane] at the
-    // rejected token's lane so relu(q - p) = 0 there. Replaces the
-    // line-2181-style GMEM write+readback with a per-thread compare.
-    if (rejected_id != IdType(-1)) {
+    if constexpr (USE_DRAFT_PROB) {
+      // A sentinel row contributes nothing, so relu(q - 0) = q samples the
+      // full target distribution.
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        uint32_t global_idx = i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE + j;
-        if (global_idx == static_cast<uint32_t>(rejected_id)) {
-          p_vec[j] = q_vec[j];
+        p_vec[j] = (p_vec[j] > reject_draft_prob_threshold) ? DType(0) : p_vec[j];
+      }
+    } else {
+      // Register-level rejection mask: force p_vec[lane] = q_vec[lane] at the
+      // rejected token's lane so relu(q - p) = 0 there. Replaces the
+      // line-2181-style GMEM write+readback with a per-thread compare.
+      if (rejected_id != IdType(-1)) {
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          uint32_t global_idx = i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE + j;
+          if (global_idx == static_cast<uint32_t>(rejected_id)) {
+            p_vec[j] = q_vec[j];
+          }
         }
       }
     }
@@ -2268,12 +2323,19 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
         p_vec.load(draft_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
       }
     }
-    if (rejected_id != IdType(-1)) {
+    if constexpr (USE_DRAFT_PROB) {
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        uint32_t global_idx = i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE + j;
-        if (global_idx == static_cast<uint32_t>(rejected_id)) {
-          p_vec[j] = q_vec[j];
+        p_vec[j] = (p_vec[j] > reject_draft_prob_threshold) ? DType(0) : p_vec[j];
+      }
+    } else {
+      if (rejected_id != IdType(-1)) {
+#pragma unroll
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          uint32_t global_idx = i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE + j;
+          if (global_idx == static_cast<uint32_t>(rejected_id)) {
+            p_vec[j] = q_vec[j];
+          }
         }
       }
     }
@@ -2295,13 +2357,16 @@ __global__ void ChainSpeculativeSamplingKernelTargetOnlyFastPath(
   // set the first rejected token
   predicts[bx * num_draft_tokens + pos] = temp_storage.sampled_id;
 
-  // Preserve the observable line-2181 effect for callers that provide a real
-  // draft_probs buffer: write the single rejected-position update once at
-  // kernel exit. Skipped entirely when draft_probs is nullptr (target-only
-  // mode — caller never reads the buffer).
-  if (draft_probs != nullptr && rejected_id != IdType(-1) && tx == 0) {
-    draft_probs[cur_prob_offset + rejected_id] =
-        target_probs[cur_prob_offset + rejected_id];
+  if constexpr (!USE_DRAFT_PROB) {
+    // Preserve the observable line-2181 effect for callers that provide a real
+    // draft_probs buffer: write the single rejected-position update once at
+    // kernel exit. Skipped entirely when draft_probs is nullptr (target-only
+    // mode — caller never reads the buffer). Draft-prob mode never writes the
+    // recorded distributions: they belong to the drafter.
+    if (draft_probs != nullptr && rejected_id != IdType(-1) && tx == 0) {
+      draft_probs[cur_prob_offset + rejected_id] =
+          target_probs[cur_prob_offset + rejected_id];
+    }
   }
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -2323,6 +2388,8 @@ cudaError_t ChainSpeculativeSamplingTargetOnly(
     uint32_t batch_size,
     uint32_t num_draft_tokens,
     uint32_t d,
+    bool use_draft_prob,
+    DType reject_draft_prob_threshold,
     DType threshold_single = 1,
     DType threshold_acc = 1,
     bool deterministic = true,
@@ -2345,30 +2412,34 @@ cudaError_t ChainSpeculativeSamplingTargetOnly(
   config.attrs = attrs;
   DISPATCH_ALIGNED_VEC_SIZE(
       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
-        auto kernel = ChainSpeculativeSamplingKernelTargetOnlyFastPath<
-            BLOCK_THREADS,
-            SCAN_ALGO,
-            REDUCE_ALGO,
-            VEC_SIZE,
-            DETERMINISTIC,
-            DType,
-            IdType>;
-        FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
-            &config, kernel,
-            predicts,
-            accept_index,
-            output_accepted_token_num,
-            candidates,
-            uniform_samples,
-            uniform_samples_for_final_sampling,
-            target_probs,
-            draft_probs,
-            batch_size,
-            num_draft_tokens,
-            d,
-            threshold_single,
-            capped_threshold_acc));
+        DISPATCH_USE_DRAFT_PROB(use_draft_prob, USE_DRAFT_PROB, {
+          auto kernel = ChainSpeculativeSamplingKernelTargetOnlyFastPath<
+              BLOCK_THREADS,
+              SCAN_ALGO,
+              REDUCE_ALGO,
+              VEC_SIZE,
+              DETERMINISTIC,
+              USE_DRAFT_PROB,
+              DType,
+              IdType>;
+          FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
+              &config, kernel,
+              predicts,
+              accept_index,
+              output_accepted_token_num,
+              candidates,
+              uniform_samples,
+              uniform_samples_for_final_sampling,
+              target_probs,
+              draft_probs,
+              batch_size,
+              num_draft_tokens,
+              d,
+              threshold_single,
+              capped_threshold_acc,
+              reject_draft_prob_threshold));
+        })
       })});
   return cudaSuccess;
 }

@@ -43,6 +43,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
     KimiK3Recipe,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.mamba2 import (
+    Mamba2Recipe,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     OrdinaryRecipe,
 )
@@ -58,8 +61,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 
 # A cache family names one registered recipe and pool factory. The in-tree
-# families are mha, mla, dsa, msa, qwen_gdn, qwen4_exp, inkling, kimi_k3,
-# glm53_flash, deepseek_v4 and deepseek_v41; plugins register their own.
+# families are mha, mla, dsa, msa, qwen_gdn, qwen4_exp, mamba2, inkling,
+# kimi_k3, glm53_flash, deepseek_v4 and deepseek_v41; plugins register their own.
 CacheModelFamily = str
 
 
@@ -162,6 +165,7 @@ _RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
     "msa": partial(OrdinaryRecipe, family="msa"),
     "qwen_gdn": QwenGDNRecipe,
     "qwen4_exp": Qwen4ExpRecipe,
+    "mamba2": Mamba2Recipe,
     "inkling": InklingRecipe,
     "kimi_k3": KimiK3Recipe,
     "glm53_flash": Glm53FlashRecipe,

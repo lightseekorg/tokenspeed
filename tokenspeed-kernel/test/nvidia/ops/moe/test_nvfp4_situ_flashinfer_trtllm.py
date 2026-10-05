@@ -388,6 +388,7 @@ def test_moe_plan_selects_nvfp4_situ_routed_kernel(
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
     assert plan["support_routing"] is False
@@ -537,7 +538,7 @@ def test_nvfp4_situ_deferred_triple_matches_finalized() -> None:
     )
     torch.cuda.synchronize()
 
-    # Triple contract, as consumed by KimiK3LatentTailOp.call_deferred.
+    # Triple contract, as consumed by allreduce_fusion.
     assert gemm2_out.dtype == torch.bfloat16
     assert expert_weights.dtype == torch.bfloat16
     assert torch.equal(expert_weights, topk_weights)  # routed variant echoes

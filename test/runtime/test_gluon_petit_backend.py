@@ -29,6 +29,9 @@ import torch
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
+from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.models.base.decoder_layer import CompiledMoEDecoderLayer
 from tokenspeed.runtime.models.base.module_spec import ModuleKind
@@ -36,12 +39,34 @@ from tokenspeed.runtime.models.base.placement import ParallelGroup, Replicate
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
+def _compressed_mxfp4_config(quant_format: str) -> CompressedTensorsConfig:
+    return CompressedTensorsConfig.from_config(
+        {
+            "format": quant_format,
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 4,
+                        "type": "float",
+                        "strategy": "group",
+                        "group_size": 32,
+                        "symmetric": True,
+                        "dynamic": False,
+                    },
+                    "input_activations": None,
+                }
+            },
+        }
+    )
+
+
 def _mapping() -> SimpleNamespace:
     return SimpleNamespace(
         nnodes=1,
         world_size=8,
         moe=SimpleNamespace(ep_size=8, tp_size=1),
-        attn=SimpleNamespace(tp_size=1, cp_size=1, dp_size=8),
+        attn=SimpleNamespace(tp_size=1, dp_size=8),
         dense=SimpleNamespace(tp_size=1),
     )
 
@@ -258,12 +283,11 @@ def test_petit_shared_options(petit_args, overrides, error) -> None:
         ServerArgs.validate_petit_moe_options(petit_args)
 
 
-@pytest.mark.parametrize("attn_tp,attn_cp,dense_tp", [(2, 1, 1), (1, 2, 1), (1, 1, 2)])
-def test_petit_shared_parallelism(petit_args, attn_tp, attn_cp, dense_tp) -> None:
+@pytest.mark.parametrize("attn_tp,dense_tp", [(2, 1), (1, 2)])
+def test_petit_shared_parallelism(petit_args, attn_tp, dense_tp) -> None:
     petit_args.mapping.attn.tp_size = attn_tp
-    petit_args.mapping.attn.cp_size = attn_cp
     petit_args.mapping.dense.tp_size = dense_tp
-    with pytest.raises(ValueError, match="attention TP1, CP1, and dense TP1"):
+    with pytest.raises(ValueError, match="attention TP1 and dense TP1"):
         ServerArgs.validate_petit_moe_options(petit_args)
 
 
@@ -271,6 +295,44 @@ def test_petit_shared_parallelism(petit_args, attn_tp, attn_cp, dense_tp) -> Non
     "mapping_overrides,moe_overrides,options,layer_overrides,is_cdna4,error",
     [
         ({}, {}, {}, {}, True, None),
+        (
+            {},
+            {},
+            {},
+            {
+                "top_k": 16,
+                "num_experts": 896,
+                "hidden_size": 3584,
+                "intermediate_size": 3072,
+                "activation": "situ",
+                "activation_situ_beta": 4.0,
+                "activation_situ_linear_beta": 25.0,
+                "routing_mode": "precomputed_topk",
+                "quant_config": _compressed_mxfp4_config("mxfp4-pack-quantized"),
+            },
+            True,
+            None,
+        ),
+        (
+            {},
+            {},
+            {},
+            {"quant_config": _compressed_mxfp4_config("pack-quantized")},
+            True,
+            "serialized MXFP4 expert weights",
+        ),
+        (
+            {},
+            {},
+            {},
+            {
+                "quant_config": Mxfp4Config(
+                    ignored_layers=[], is_checkpoint_mxfp4_serialized=False
+                )
+            },
+            True,
+            "serialized MXFP4 expert weights",
+        ),
         ({}, {}, {"init_expert_location": "trivial"}, {}, True, None),
         ({}, {}, {}, {}, False, "requires AMD CDNA4"),
         (
@@ -373,4 +435,7 @@ def test_petit_layer_constraints(
             assert plan.call_args.kwargs["ep_size"] == 8
             assert plan.call_args.kwargs["solution"] == "gluon"
             assert plan.call_args.kwargs["a2a_backend"] == "gluon_petit"
+            assert plan.call_args.kwargs["activation"] == layer_args.get(
+                "activation", "silu"
+            )
             weights.assert_called_once()

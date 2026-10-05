@@ -74,8 +74,6 @@ def apply_rope_with_cos_sin_cache_inplace(
 
     if fused_set_kv_buffer_arg is not None:
         a = fused_set_kv_buffer_arg
-        if a.k_scale is not None or a.v_scale is not None:
-            raise ValueError("k_scale/v_scale are not supported yet")
         if a.cache_loc is None:
             raise ValueError("fused_set_kv_buffer_arg.cache_loc is required")
         if a.cache_loc.dtype not in (torch.int32, torch.int64):

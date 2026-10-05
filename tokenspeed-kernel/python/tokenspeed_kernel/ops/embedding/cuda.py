@@ -43,11 +43,11 @@ if platform.is_nvidia:
         priority=Priority.PERFORMANT,
         traits={
             "head_size": frozenset({64, 128, 256, 512}),
+            # Its vector loads straddle the NEOX cos/sin halves below 32-channel multiples.
+            "rotary_dim": frozenset(range(32, 513, 32)),
             "partial_rotary": frozenset({True, False}),
             "is_neox": frozenset({True, False}),
             "has_fused_kv": frozenset({True, False}),
-            "has_fused_mla_kv": frozenset({False}),
-            "fused_mla_full_query": frozenset({False}),
             "has_q_out": frozenset({True, False}),
             "has_k_out": frozenset({True, False}),
         },
@@ -61,13 +61,10 @@ if platform.is_nvidia:
         cos_sin_cache: torch.Tensor,
         is_neox: bool = True,
         fused_set_kv_buffer_arg: Any = None,
-        fused_mla_set_kv_buffer_arg: Any = None,
         q_rope_out: torch.Tensor | None = None,
         k_rope_out: torch.Tensor | None = None,
         enable_pdl: bool = False,
     ) -> None:
-        if fused_mla_set_kv_buffer_arg is not None:
-            raise ValueError("CUDA RoPE does not support MLA fused KV write")
         apply_rope_with_cos_sin_cache_inplace(
             positions=positions,
             query=q,

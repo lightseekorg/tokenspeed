@@ -20,11 +20,20 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
 from tokenspeed.runtime.layers.moe import expert as expert_mod
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 # The alignment declared by the flashinfer_trtllm unquant MoE kernels
 # (tokenspeed_kernel/ops/moe/flashinfer/trtllm_unquant.py, ispp_alignment).
@@ -34,14 +43,15 @@ _UNQUANT_ALIGNMENT = 128
 @dataclass
 class _SpecStub:
     intermediate_size: int
+    gated: bool
 
 
-def _padding_stub(intermediate_size: int, tp_size: int = 2):
+def _padding_stub(intermediate_size: int, tp_size: int = 2, gated: bool = True):
     stub = SimpleNamespace(
         intermediate_size=intermediate_size,
         tp_size=tp_size,
         prefix="model.layers.0.mlp.experts",
-        _spec=_SpecStub(intermediate_size=intermediate_size),
+        _spec=_SpecStub(intermediate_size=intermediate_size, gated=gated),
     )
     apply = MoELayer._apply_trtllm_ispp_padding.__get__(stub)
     return stub, apply
@@ -88,3 +98,23 @@ def test_trtllm_ispp_padding_noop_for_other_backends(monkeypatch):
 
     assert stub.intermediate_size == 2000
     assert stub._spec.intermediate_size == 2000
+
+
+def test_auto_backend_pads_non_gated_experts_for_trtllm(monkeypatch):
+    monkeypatch.setattr(
+        expert_mod, "get_moe_backend", lambda: SimpleNamespace(value="auto")
+    )
+    # Nemotron-3 Super at TP2: ispp = 2688 / 2 = 1344 -> 1408, the relu2 kernels' alignment.
+    relu2, apply_relu2 = _padding_stub(intermediate_size=2688, tp_size=2, gated=False)
+    swiglu, apply_swiglu = _padding_stub(intermediate_size=2688, tp_size=2)
+
+    apply_relu2(_UNQUANT_ALIGNMENT, "test")
+    apply_swiglu(_UNQUANT_ALIGNMENT, "test")
+
+    assert relu2.intermediate_size == 1408 * 2
+    assert relu2._spec.intermediate_size == 1408 * 2
+    assert swiglu.intermediate_size == 2688
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -68,8 +68,10 @@ class NanGuard:
     Lifecycle per ``execute_forward_op``::
 
         guard.reset(bs)                    # outside the graph
+        guard.audit_input_logprob_targets(...)         # prefill with prompt logprobs
         ... per forward cycle (in-graph):
             guard.audit_logits(logits_output, ctx)     # pre-sampling
+            guard.audit_input_logprobs(...)            # prefill with prompt logprobs
             guard.merge_oov(tokens, ctx, vocab_size)   # OOV backstop
         flags = guard.flags_cpu            # with the output D2H batch
     """
@@ -96,6 +98,8 @@ class NanGuard:
         so their legitimate ``-inf`` entries survive sanitize.
         """
         logits = logits_output.next_token_logits
+        if logits.shape[0] == 0:
+            return
         if logits_output.logits_layout_plan is None:
             self._or_per_request(torch.isnan(logits.amax(dim=-1)), ctx)
         torch.nan_to_num_(
@@ -112,6 +116,51 @@ class NanGuard:
         """
         self._or_per_request((output_tokens < 0) | (output_tokens >= vocab_size), ctx)
 
+    def audit_input_logprob_targets(
+        self,
+        targets: torch.Tensor,
+        slots: torch.Tensor,
+        num_extends: int,
+        vocab_size: int,
+    ) -> None:
+        """Flag extend requests whose prompt-logprob targets fall outside [0, vocab).
+
+        The targets are prompt token ids read from the device input buffer; the
+        ingress already refused prompts that could carry one, so a hit here is
+        corruption and terminates the request like a NaN. The caller clamps the
+        ids afterwards so the gather cannot fault; the clamped column is never
+        returned as a value, the request is aborted.
+        """
+        self._or_per_extend_slot(
+            (targets < 0) | (targets >= vocab_size), slots, num_extends
+        )
+
+    def audit_input_logprobs(
+        self, logprobs: torch.Tensor, slots: torch.Tensor, num_extends: int
+    ) -> None:
+        """Flag extend requests with a NaN/Inf prompt logprob, then sanitize in place.
+
+        The sampled rows are audited on their logits (``audit_logits``); the
+        prompt rows are audited on the gathered logprobs, which is the value
+        that would otherwise ship. A finite log-softmax row never yields Inf,
+        so either sign flags like a NaN.
+        """
+        self._or_per_extend_slot(~torch.isfinite(logprobs), slots, num_extends)
+        torch.nan_to_num_(
+            logprobs, nan=_NEG_SANITIZED, posinf=_POS_SANITIZED, neginf=_NEG_SANITIZED
+        )
+
+    def _or_per_extend_slot(
+        self, rows: torch.Tensor, slots: torch.Tensor, num_extends: int
+    ) -> None:
+        """OR a per-row bool vector into the flags of the extend slots it names.
+
+        Extend slots are the leading ``num_extends`` request rows of the batch.
+        """
+        hits = torch.zeros(num_extends, dtype=torch.int32, device=self.flags.device)
+        hits.index_put_((slots,), rows.to(torch.int32), accumulate=True)
+        self.flags[:num_extends] |= (hits > 0).to(torch.int32)
+
     @property
     def flags_cpu(self) -> torch.Tensor | None:
         """Async D2H of this step's flags (order with the copy event)."""
@@ -120,16 +169,20 @@ class NanGuard:
     def _or_per_request(self, rows: torch.Tensor, ctx: ForwardContext) -> None:
         """OR a per-row bool vector into per-request flags.
 
-        Row layout mirrors ``_run_sampling``: ``[num_extends]`` extend rows,
-        then ``num_decodes * n`` decode/verify rows.
+        Prefill rows may be omitted; flags always use original request rows.
         """
         ne = ctx.num_extends
         nd = ctx.bs - ne
-        if ne > 0:
-            self.flags[:ne] |= rows[:ne].to(torch.int32)
+        layout = ctx.output_layout
+        prefill = layout.prefill_slice
+        decode_requests = layout.decode_request_slice
+        decode_outputs = layout.decode_output_slice
+        if layout.num_prefill_outputs:
+            self.flags[prefill] |= rows[prefill].to(torch.int32)
         if nd > 0:
-            n = (rows.shape[0] - ne) // nd
-            self.flags[ne : ctx.bs] |= rows[ne:].view(nd, n).any(dim=-1).to(torch.int32)
+            self.flags[decode_requests] |= (
+                rows[decode_outputs].view(nd, -1).any(dim=-1).to(torch.int32)
+            )
 
 
 class _DisabledNanGuard(NanGuard):
@@ -145,6 +198,14 @@ class _DisabledNanGuard(NanGuard):
         pass
 
     def merge_oov(self, output_tokens, ctx, vocab_size) -> None:
+        pass
+
+    def audit_input_logprob_targets(
+        self, targets, slots, num_extends, vocab_size
+    ) -> None:
+        pass
+
+    def audit_input_logprobs(self, logprobs, slots, num_extends) -> None:
         pass
 
     @property

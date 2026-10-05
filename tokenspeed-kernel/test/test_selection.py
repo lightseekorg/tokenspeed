@@ -27,7 +27,12 @@ import pytest
 import tokenspeed_kernel.ops.gemm as gemm
 import torch
 from tokenspeed_kernel.platform import PlatformInfo
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.registry import (
+    KernelRegistry,
+    KernelSpec,
+    Priority,
+    register_kernel,
+)
 from tokenspeed_kernel.selection import (
     AutotuneParams,
     NoKernelFoundError,
@@ -363,6 +368,19 @@ class TestSpecMatchesShapeTraits:
         assert not spec_matches_shape_traits(spec, {"n": 64, "k": 4096})
         assert not spec_matches_shape_traits(spec, {"n": 128, "k": 96})
 
+    def test_maximum_trait_matches(self):
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={"token_heads_max": frozenset({2048})},
+        )
+
+        assert spec_matches_shape_traits(spec, {"token_heads": 2048})
+        assert spec_matches_shape_traits(spec, {"token_heads": 1})
+        assert not spec_matches_shape_traits(spec, {"token_heads": 2049})
+        assert not spec_matches_shape_traits(spec, {})
+
     def test_constrained_dim_must_be_supplied(self):
         spec = KernelSpec(
             name="k",
@@ -586,6 +604,88 @@ class TestSelectKernel:
             platform=h100_platform,
         )
         assert callable(impl)
+
+    def test_stateful_kernel_class_selected_once(self, h100_platform):
+        @register_kernel(
+            "stateful",
+            "forward",
+            name="portable_stateful",
+            solution="python",
+            signatures={INPUT_BF16},
+            priority=Priority.PORTABLE,
+        )
+        class Portable(torch.nn.Module):
+            def __init__(self, scale):
+                super().__init__()
+                self.scale = scale
+                self.calls = 0
+
+            def forward(self, x):
+                self.calls += 1
+                return self.scale * x + self.calls
+
+        @register_kernel(
+            "stateful",
+            "forward",
+            name="specialized_stateful",
+            solution="python",
+            signatures={INPUT_BF16},
+            traits={"head_dim": frozenset({128})},
+            priority=Priority.SPECIALIZED,
+        )
+        class Specialized(Portable):
+            pass
+
+        selected = select_kernel(
+            "stateful",
+            "forward",
+            INPUT_BF16,
+            platform=h100_platform,
+            traits={"head_dim": 128},
+        )
+        assert selected.name == "specialized_stateful"
+        assert selected.impl is Specialized
+        first = selected(2)
+        second = selected(3)
+        assert (first(4), first(4)) == (9, 10)
+        assert second(4) == 13
+        assert first.calls == 2
+        assert second.calls == 1
+        assert (
+            select_kernel(
+                "stateful",
+                "forward",
+                INPUT_BF16,
+                platform=h100_platform,
+                traits={"head_dim": 128},
+            )
+            is selected
+        )
+        assert (
+            select_kernel(
+                "stateful",
+                "forward",
+                INPUT_BF16,
+                platform=h100_platform,
+                traits={"head_dim": 64},
+            ).impl
+            is Portable
+        )
+
+    def test_function_kernel_still_callable(self, h100_platform):
+        @register_kernel(
+            "stateless",
+            "forward",
+            solution="python",
+            signatures={INPUT_BF16},
+        )
+        def stateless(x):
+            return x + 1
+
+        selected = select_kernel(
+            "stateless", "forward", INPUT_BF16, platform=h100_platform
+        )
+        assert selected(2) == 3
 
     def test_cached_on_second_call(self, sample_specs, h100_platform):
         reg = KernelRegistry.get()
@@ -816,6 +916,76 @@ class TestSelectKernel:
                 platform=h100_platform,
             )
             assert impl() == "reference_decode"
+
+    def test_override_refuses_a_kernel_lacking_a_required_feature(
+        self, sample_specs, h100_platform
+    ):
+        """An override skips platform, signature and trait matching, but a
+        required feature names a keyword or behaviour the facade relies on:
+        a kernel without it is refused at selection, by name or by solution,
+        and the error names the feature."""
+        reg = KernelRegistry.get()
+        register_all_samples(reg, sample_specs)
+        reg.register(
+            KernelSpec(
+                name="triton_decode_plain",
+                family="attention",
+                mode="decode",
+                solution="triton",
+                format_signatures=frozenset({ATTN_DECODE_BF16}),
+                priority=12,
+            ),
+            lambda: "triton_decode_plain",
+        )
+
+        # Every sample decode kernel declares "paged"; the plain one does not.
+        impl = select_kernel(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            features=frozenset({"paged"}),
+            override="reference_decode",
+        )
+        assert impl() == "reference_decode"
+        with pytest.raises(NoKernelFoundError, match="'paged'"):
+            select_kernel(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+                features=frozenset({"paged"}),
+                override="triton_decode_plain",
+            )
+        # By solution: the solution's highest-priority kernel declaring the
+        # feature, not its highest-priority kernel.
+        impl = select_kernel(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            features=frozenset({"paged"}),
+            override="triton",
+        )
+        assert impl() == "triton_decode"
+        with pytest.raises(NoKernelFoundError, match="'unpaged'"):
+            select_kernel(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+                features=frozenset({"unpaged"}),
+                override="triton",
+            )
+        # Without required features an override is honoured as before.
+        impl = select_kernel(
+            "attention",
+            "decode",
+            ATTN_DECODE_BF16,
+            platform=h100_platform,
+            override="triton_decode_plain",
+        )
+        assert impl() == "triton_decode_plain"
 
     def test_amd_platform_selects_aiter(self, sample_specs, mi350_platform):
         reg = KernelRegistry.get()

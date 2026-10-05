@@ -348,6 +348,7 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
             tp_rank=self.mapping.attn.tp_rank,
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
 
     def get_hot_token_id(self):
@@ -356,10 +357,21 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
     def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
-        del self.model.embed_tokens.weight
+    def set_embed_and_head(
+        self, embed: torch.Tensor | None, head: torch.Tensor
+    ) -> None:
+        """Alias the target's weights; ``embed=None`` keeps the checkpoint copy.
+
+        A pipeline's last stage has no target embedding to share (it lives on
+        the first stage), so it passes ``embed=None`` and the draft keeps the
+        ``embed_tokens`` it loaded (``load_weights`` rejects a pipeline
+        checkpoint without one). The head is always the target's: the
+        checkpoint's ``shared_head.head`` is never loaded.
+        """
+        if embed is not None:
+            del self.model.embed_tokens.weight
+            self.model.embed_tokens.weight = embed
         del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
@@ -573,6 +585,13 @@ class DeepseekV4ForCausalLMNextN(nn.Module):
                 "DeepSeek V4 MTP checkpoint is missing required core weights: "
                 f"{missing_core_weights}. Use a complete MTP checkpoint or "
                 "disable NEXTN speculative decoding."
+            )
+        if self.mapping.has_pp and "model.embed_tokens.weight" not in loaded_params:
+            # Off the pipeline the target's embedding replaces this copy; the
+            # pipeline's last stage drafts with it (see set_embed_and_head).
+            raise ValueError(
+                "DeepSeek V4 MTP on a pipeline needs the checkpoint's MTP "
+                "embed_tokens weight"
             )
         self.post_load_weights()
         return loaded_params

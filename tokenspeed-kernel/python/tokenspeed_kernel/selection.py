@@ -42,6 +42,7 @@ __all__ = [
     "AutotuneParams",
     "SelectionPolicy",
     "select_kernel",
+    "resolve_kernel_override",
     "set_selection_policy",
     "register_oracle",
     "kernel_override",
@@ -333,6 +334,7 @@ _SHAPE_DIMS: tuple[str, ...] = ("batch", "m", "n", "k")
 _BOUND_SUFFIXES: tuple[tuple[str, Callable[[int, int], bool]], ...] = (
     ("_align", lambda value, alignment: value % alignment == 0),
     ("_min", lambda value, minimum: value >= minimum),
+    ("_max", lambda value, maximum: value <= maximum),
 )
 
 
@@ -345,20 +347,21 @@ def spec_matches_shape_traits(spec: KernelSpec, traits: dict[str, Any]) -> bool:
     * ``<dim>``: the exact supported values.
     * ``<dim>_align``: the value must be a multiple of one declared alignment.
     * ``<dim>_min``: the value must reach one declared minimum.
+    * ``<dim>_max``: the value must not exceed one declared maximum.
 
     Rules those cannot express go in ``mnk_problem_filter``, a set of
     ``(m, n, k) -> bool`` predicates of which at least one must accept.
 
     A declared bound is a hard requirement: a spec that declares
-    ``<dim>_align`` or ``<dim>_min`` rejects any request that does not supply
-    ``<dim>``, and a ``mnk_problem_filter`` rejects a request missing any of
-    ``m``, ``n`` or ``k``. Exact sets are matched by value membership; for the
-    GEMM dimensions ``batch``, ``m``, ``n`` and ``k`` that is also enforced
-    here and a spec constraining one of them rejects a request that omits it.
-    Dimensions a spec does not constrain are ignored.
+    ``<dim>_align``, ``<dim>_min`` or ``<dim>_max`` rejects any request that
+    does not supply ``<dim>``, and a ``mnk_problem_filter`` rejects a request
+    missing any of ``m``, ``n`` or ``k``. Exact sets are matched by value
+    membership; for the GEMM dimensions ``batch``, ``m``, ``n`` and ``k`` that
+    is also enforced here and a spec constraining one of them rejects a request
+    that omits it. Dimensions a spec does not constrain are ignored.
 
-    By convention a trait dict lists the shape traits first, each ``_align``
-    and ``_min`` bound right after the dimension it bounds and
+    By convention a trait dict lists the shape traits first, each ``_align``,
+    ``_min`` and ``_max`` bound right after the dimension it bounds and
     ``mnk_problem_filter`` last, followed by the remaining traits in
     alphabetical order.
     """
@@ -410,21 +413,38 @@ def _resolve_override(
     format_signature: object,
     override: str,
     platform: PlatformInfo,
+    features: frozenset[str] | None,
 ) -> SelectedKernel:
-    impl = registry.get_impl(override)
-    if impl is not None:
-        return SelectedKernel(name=override, impl=impl)
+    """Resolve a kernel name or solution forced by ``override``.
 
-    specs = registry.get_for_operator(family, mode, solution=override)
-    if specs:
-        kernel_name = specs[0].name
-        impl = registry.get_impl(kernel_name)
-        if impl is not None:
-            return SelectedKernel(name=kernel_name, impl=impl)
-
-    raise NoKernelFoundError(
-        f"Override '{override}' not found for {family}.{mode} ({format_signature})"
-    )
+    An override skips platform, format-signature and trait matching, but not
+    the operator's required ``features``: a feature names a keyword or
+    behaviour the facade relies on (the kernel's launcher takes it), so a
+    kernel without it would fail inside the leaf, not at selection. A kernel
+    lacking one is refused here with the feature named.
+    """
+    spec = registry.get_by_name(override)
+    if spec is None:
+        candidates = registry.get_for_operator(family, mode, solution=override)
+        if not candidates:
+            raise NoKernelFoundError(
+                f"Override '{override}' not found for {family}.{mode} "
+                f"({format_signature})"
+            )
+        # The solution's highest-priority kernel declaring every required
+        # feature; without one, its first kernel names the refusal below.
+        spec = next(
+            (s for s in candidates if features is None or features <= s.features),
+            candidates[0],
+        )
+    if features is not None and not features <= spec.features:
+        missing = sorted(features - spec.features)
+        raise NoKernelFoundError(
+            f"Override '{override}' resolves to {spec.name!r} for {family}.{mode} "
+            f"({format_signature}), which does not declare the required "
+            f"feature(s) {missing}"
+        )
+    return SelectedKernel(name=spec.name, impl=registry.get_impl(spec.name))
 
 
 def _log_selection(
@@ -450,6 +470,16 @@ def _log_selection(
             f"[tokenspeed_kernel] {family!s}.{mode!s}({format_signature!s}) -> "
             f"{winner.name!s} ({platform.arch!s})",
         )
+
+
+def resolve_kernel_override(family: str, mode: str, override: str | None) -> str | None:
+    """Resolve the effective kernel name for family/mode, or return None.
+
+    The environment takes precedence over the context manager and call-site
+    override. Dispatch shortcuts must use this before consulting tuned routes.
+    """
+    env_key = f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
+    return os.environ.get(env_key) or _global_overrides.get((family, mode)) or override
 
 
 def select_kernel(
@@ -479,7 +509,9 @@ def select_kernel(
                (e.g., {"head_dim": 128, "num_kv_heads": 8})
         solution: Restrict selection to a registered solution while preserving
             normal platform, format signature, and trait filtering.
-        override: Force a specific kernel name or solution string
+        override: Force a specific kernel name or solution string, skipping
+            platform, format-signature and trait matching but still refusing
+            a kernel that lacks a required feature.
 
     Returns:
         A :class:`SelectedKernel` that is directly callable and also
@@ -487,16 +519,7 @@ def select_kernel(
     """
     platform = platform or current_platform()
 
-    # Context-manager global overrides
-    global_override = _global_overrides.get((family, mode))
-    if global_override:
-        override = global_override
-
-    # Environment variables take precedence over context-manager overrides.
-    env_key = f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
-    env_override = os.environ.get(env_key)
-    if env_override:
-        override = env_override
+    override = resolve_kernel_override(family, mode, override)
     registry = KernelRegistry.get()
 
     # Fast path: check cache (skipped when override is active)
@@ -516,7 +539,7 @@ def select_kernel(
 
     if override:
         return _resolve_override(
-            registry, family, mode, format_signature, override, platform
+            registry, family, mode, format_signature, override, platform, features
         )
 
     # Get candidates (same filtering for both strategies)
@@ -688,12 +711,10 @@ def explain_selection(
             missing = spec.capability.missing_features(platform)
             if missing:
                 reasons.append(f"missing features: {', '.join(missing)}")
-            if spec.capability.min_arch_version:
-                if not (platform.arch_version >= spec.capability.min_arch_version):
-                    reasons.append(
-                        f"arch mismatch (requires "
-                        f"{spec.capability.min_arch_version})"
-                    )
+            min_arch_version = spec.capability.min_arch_version_for(platform.vendor)
+            if min_arch_version:
+                if not (platform.arch_version >= min_arch_version):
+                    reasons.append(f"arch mismatch (requires {min_arch_version})")
             if format_signature and not spec.supports_format_signature(
                 format_signature
             ):

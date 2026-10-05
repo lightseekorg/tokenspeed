@@ -748,6 +748,54 @@ def _test_backend_registry(rank, world_size, device, group, ref_group):
 # ---------------------------------------------------------------------------
 
 
+class _RowGatherBackend:
+    """A fake backend whose all-gather is the low-latency solution's shape:
+    bf16 only, every rank's payload a whole number of 16-byte vectors."""
+
+    def __init__(self, world: int):
+        self.world = world
+        self.payloads: list[torch.Tensor] = []
+
+    def token_all_gather(self, tensor, group, scattered_num_tokens):
+        assert tensor.dtype == torch.bfloat16
+        assert tensor.numel() % 8 == 0, "payload is not 16-byte aligned"
+        self.payloads.append(tensor)
+        # Every rank holds the same bytes here; concatenate the counts' worth.
+        return torch.cat([tensor] * self.world)[: sum(scattered_num_tokens)]
+
+
+@pytest.mark.parametrize(
+    "dtype,width", [(torch.int64, 1), (torch.float32, 3), (torch.bfloat16, 5)]
+)
+def test_token_all_gather_rows_pads_narrow_rows_to_the_wire_alignment(dtype, width):
+    """A query shard gathers its token ids (one int64 per row) and fp32
+    scales; the row count is the shard's, so odd counts must still land
+    aligned, and the bytes come back as the caller's dtype, unpadded."""
+    from tokenspeed.runtime.distributed.comm_ops import token_all_gather_rows
+
+    local_rows = 5  # odd: 5 x 8 bytes is not a multiple of 16
+    rows = (torch.arange(local_rows * width) * 3).reshape(local_rows, width).to(dtype)
+    backend = _RowGatherBackend(world=2)
+    gathered = token_all_gather_rows(
+        rows, (0, 1), [local_rows, local_rows], backend=backend
+    )
+    assert gathered.dtype == dtype and gathered.shape == (2 * local_rows, width)
+    assert torch.equal(gathered[:local_rows], rows) and torch.equal(
+        gathered[local_rows:], rows
+    )
+    assert len(backend.payloads) == 1
+
+
+def test_token_all_gather_rows_leaves_aligned_bf16_rows_alone():
+    from tokenspeed.runtime.distributed.comm_ops import token_all_gather_rows
+
+    rows = torch.arange(3 * 8, dtype=torch.bfloat16).reshape(3, 8)  # 16-byte rows
+    backend = _RowGatherBackend(world=1)
+    gathered = token_all_gather_rows(rows, (0,), [3], backend=backend)
+    assert torch.equal(gathered, rows)
+    assert backend.payloads[0].data_ptr() == rows.data_ptr()
+
+
 class TestFusionParams:
     def test_default_params(self):
         from tokenspeed.runtime.distributed.comm_ops import FusionOp, FusionParams

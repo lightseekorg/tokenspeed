@@ -49,6 +49,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
@@ -93,6 +94,9 @@ def test_verify_reads_decode_rows_own_coins():
     )
 
     config = SamplingBackendConfig(
+        enable_speculative_sampling=False,
+        sampling_stream="batch",
+        logprob_order="torch",
         max_bs=MAX_BS,
         max_draft_tokens_per_req=MAX_N,
         max_req_pool_size=POOL,
@@ -154,6 +158,7 @@ def test_verify_reads_decode_rows_own_coins():
             LogitsProcessorOutput(next_token_logits=logits),
             decode_info,
             candidates,
+            tree=None,
         )
     finally:
         fi.chain_speculative_sampling_target_only = original
@@ -172,6 +177,9 @@ def test_mixed_round_preserves_prefill_outputs():
     )
 
     config = SamplingBackendConfig(
+        enable_speculative_sampling=False,
+        sampling_stream="batch",
+        logprob_order="torch",
         max_bs=MAX_BS,
         max_draft_tokens_per_req=MAX_N,
         max_req_pool_size=POOL,
@@ -212,6 +220,7 @@ def test_mixed_round_preserves_prefill_outputs():
         pass
 
     ctx = _Ctx()
+    ctx.output_layout = ForwardOutputLayout(num_extends, num_extends, num_decodes, n)
     ctx.num_extends = num_extends
     ctx.bs = bs
     ctx.decode_input_ids = None
@@ -244,6 +253,9 @@ def test_mixed_round_preserves_prefill_logprobs():
     from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
 
     config = SamplingBackendConfig(
+        enable_speculative_sampling=False,
+        sampling_stream="batch",
+        logprob_order="torch",
         max_bs=MAX_BS,
         max_draft_tokens_per_req=MAX_N,
         max_req_pool_size=POOL,
@@ -291,6 +303,7 @@ def test_mixed_round_preserves_prefill_logprobs():
         pass
 
     ctx = _Ctx()
+    ctx.output_layout = ForwardOutputLayout(num_extends, num_extends, num_decodes, n)
     ctx.num_extends = num_extends
     ctx.bs = bs
     ctx.decode_input_ids = None

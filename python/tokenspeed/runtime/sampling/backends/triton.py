@@ -37,8 +37,10 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_top_k_top_p_from_pools,
     gumbel_sample_top_k_top_p_qrita_from_pools,
     gumbel_sample_top_p_parallel_from_pools,
+    gumbel_scratch_shape,
     selected_token_logprobs,
     verify_chain_target_sampled,
+    verify_tree,
 )
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -48,16 +50,17 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, _TOP_K_DISABLED
-from tokenspeed.runtime.sampling.utils import nan_guard_logits
+from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs, nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
 
 
-_GUMBEL_BLOCK_SIZE = 1024
 _COMPACT_GUMBEL_BLOCK_SIZE = 4096
 _COMPACT_GUMBEL_VOCAB_MAX = 32768
 _TOP_K_TOP_P_SMALL_BLOCK_SIZE = 1024
@@ -95,6 +98,7 @@ class TritonSamplingBackend(SamplingBackend):
     """TokenSpeed pool-state backend using Triton Gumbel-Max kernels."""
 
     _HAS_POOL_STATE = True
+    supports_tree_verify = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
@@ -123,27 +127,15 @@ class TritonSamplingBackend(SamplingBackend):
         )
 
     def _init_triton_buffers(self, config: SamplingBackendConfig) -> None:
-        pool_rows = config.max_req_pool_size + 1
-        self._zero_offsets_pool = torch.zeros(
-            (pool_rows,), dtype=torch.int64, device=config.device
-        )
-
         vocab_size = max(int(config.vocab_size), 1)
-        gumbel_blocks = (vocab_size + _GUMBEL_BLOCK_SIZE - 1) // _GUMBEL_BLOCK_SIZE
+        gumbel_scratch = gumbel_scratch_shape(config.max_bs, vocab_size)
         self._gumbel_local_ids = torch.empty(
-            (config.max_bs, gumbel_blocks),
-            dtype=torch.int32,
-            device=config.device,
+            gumbel_scratch, dtype=torch.int32, device=config.device
         )
         self._gumbel_local_scores = torch.empty(
-            (config.max_bs, gumbel_blocks),
-            dtype=torch.float32,
-            device=config.device,
+            gumbel_scratch, dtype=torch.float32, device=config.device
         )
         self._gumbel_out = torch.empty(
-            (config.max_bs,), dtype=torch.int32, device=config.device
-        )
-        self._req_pool_indices_i32 = torch.empty(
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
         self._gumbel_verify_out = torch.empty(
@@ -151,15 +143,14 @@ class TritonSamplingBackend(SamplingBackend):
             dtype=torch.int32,
             device=config.device,
         )
+        verify_scratch = gumbel_scratch_shape(
+            config.max_bs * config.max_draft_tokens_per_req, vocab_size
+        )
         self._gumbel_verify_local_ids = torch.empty(
-            (config.max_bs * config.max_draft_tokens_per_req, gumbel_blocks),
-            dtype=torch.int32,
-            device=config.device,
+            verify_scratch, dtype=torch.int32, device=config.device
         )
         self._gumbel_verify_local_scores = torch.empty(
-            (config.max_bs * config.max_draft_tokens_per_req, gumbel_blocks),
-            dtype=torch.float32,
-            device=config.device,
+            verify_scratch, dtype=torch.float32, device=config.device
         )
 
         topk_blocks = (vocab_size + _TOP_K_TOP_P_SMALL_BLOCK_SIZE - 1) // (
@@ -254,21 +245,6 @@ class TritonSamplingBackend(SamplingBackend):
             (top_p_rows,), dtype=torch.float32, device=config.device
         )
 
-    def _req_pool_indices_for_kernels(
-        self, req_pool_indices: torch.Tensor, rows: int
-    ) -> torch.Tensor:
-        req_pool_indices = req_pool_indices[:rows]
-        if req_pool_indices.dtype == torch.int32:
-            return req_pool_indices
-        if req_pool_indices.dtype != torch.int64:
-            raise ValueError(
-                "Triton sampling requires int32/int64 req_pool_indices, "
-                f"got {req_pool_indices.dtype}"
-            )
-        out = self._req_pool_indices_i32[:rows]
-        out.copy_(req_pool_indices, non_blocking=True)
-        return out
-
     def _write_logprob_outputs(
         self,
         logits_output: LogitsProcessorOutput,
@@ -278,6 +254,13 @@ class TritonSamplingBackend(SamplingBackend):
         if not self.config.enable_output_logprobs:
             return
 
+        if self.config.logprob_order != "torch":
+            # Megatron's order is a torch-level reduction tree; the fused
+            # Triton gather below is torch.log_softmax's order.
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, sampled, logprob_order=self.config.logprob_order
+            )
+            return
         rows = logits.shape[0]
         selected_out = self._selected_logprob_out[:rows]
         logits_output.next_token_logprobs = selected_token_logprobs(
@@ -427,11 +410,7 @@ class TritonSamplingBackend(SamplingBackend):
         # so the pool route below serves them too — same path the CUDA graph
         # captures. Equivalence to argmax is pinned by
         # test_greedy_route_equivalence.py.
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         bs = logits.shape[0]
         req_pool_indices = self._req_pool_indices_for_kernels(
             sampling_info.req_pool_indices, bs
@@ -519,12 +498,150 @@ class TritonSamplingBackend(SamplingBackend):
 
         return sampled, self._ones_buf[: logits.shape[0]]
 
+    def _sample_verify_targets(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        pools: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        offsets_pool: torch.Tensor,
+        rows: int,
+        num_tokens_per_req: int,
+    ) -> torch.Tensor:
+        """The target's pick per verify row: a Gumbel sample keyed by (seed, position)."""
+        temperature, top_k, top_p, seed = pools
+        if self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
+            if logits.shape[1] <= _COMPACT_GUMBEL_VOCAB_MAX:
+                target_sampled = gumbel_sample_from_pools_compact(
+                    logits,
+                    req_pool_indices,
+                    temperature,
+                    seed,
+                    offsets_pool,
+                    self._gumbel_verify_out[:rows],
+                    block_size=_COMPACT_GUMBEL_BLOCK_SIZE,
+                    num_tokens_per_req=num_tokens_per_req,
+                )
+            else:
+                target_sampled = gumbel_sample_from_pools(
+                    logits,
+                    req_pool_indices,
+                    temperature,
+                    seed,
+                    offsets_pool,
+                    self._gumbel_verify_local_ids[:rows],
+                    self._gumbel_verify_local_scores[:rows],
+                    self._gumbel_verify_out[:rows],
+                    num_tokens_per_req=num_tokens_per_req,
+                )
+        elif self._sample_route in (
+            _SAMPLE_ROUTE_GUMBEL_TOP_K,
+            _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+        ):
+            if self._use_qrita_verify_top_k_route(rows, logits.shape[1]):
+                target_sampled = gumbel_sample_top_k_top_p_qrita_from_pools(
+                    logits,
+                    req_pool_indices,
+                    temperature,
+                    top_k,
+                    top_p,
+                    seed,
+                    offsets_pool,
+                    self._qrita_verify_buffer,
+                    self._qrita_percentile_to_std_table,
+                    self._gumbel_verify_out[:rows],
+                    num_tokens_per_req=num_tokens_per_req,
+                    num_programs=min(self._qrita_verify_num_programs, rows),
+                )
+            else:
+                target_sampled = gumbel_sample_top_k_top_p_from_pools(
+                    logits,
+                    req_pool_indices,
+                    temperature,
+                    top_k,
+                    top_p,
+                    seed,
+                    offsets_pool,
+                    self._topk_verify_candidate_ids[:rows],
+                    self._topk_verify_candidate_logits[:rows],
+                    self._gumbel_verify_out[:rows],
+                    block_size=_TOP_K_TOP_P_SMALL_BLOCK_SIZE,
+                    top_k_pad=self._top_k_top_p_pad,
+                    num_tokens_per_req=num_tokens_per_req,
+                )
+        elif self._sample_route == _SAMPLE_ROUTE_GUMBEL_TOP_P:
+            target_sampled = gumbel_sample_top_p_parallel_from_pools(
+                logits,
+                req_pool_indices,
+                temperature,
+                top_p,
+                seed,
+                offsets_pool,
+                self._top_p_local_max[:rows],
+                self._top_p_local_sum[:rows],
+                self._top_p_local_argmax[:rows],
+                self._top_p_local_scores[:rows],
+                self._top_p_local_logits[:rows],
+                self._top_p_local_ids[:rows],
+                self._top_p_row_max[:rows],
+                self._top_p_row_total[:rows],
+                self._top_p_row_argmax[:rows],
+                self._top_p_row_candidate_logits[:rows],
+                self._top_p_row_candidate_ids[:rows],
+                self._top_p_accepted[:rows],
+                self._gumbel_verify_out[:rows],
+                block_size=_TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE,
+                num_attempts=_TOP_P_PARALLEL_VERIFY_ATTEMPTS,
+                num_tokens_per_req=num_tokens_per_req,
+            )
+        else:
+            target_sampled = gumbel_sample_from_pools_generic(
+                logits,
+                req_pool_indices,
+                temperature,
+                top_k,
+                top_p,
+                seed,
+                offsets_pool,
+                self._gumbel_verify_out[:rows],
+                num_tokens_per_req=num_tokens_per_req,
+            )
+        return target_sampled
+
+    def _sample_tree_targets(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        offsets_pool: torch.Tensor,
+        tree: TreeVerifyBatch,
+        bs: int,
+    ) -> torch.Tensor:
+        """Per-node target picks keyed by the node's position (vc + depth), not its row.
+
+        Every node row becomes its own sampling row: its request's parameters
+        gathered per row, and its noise offset advanced by its depth, so the
+        accepted token at each position is exactly what plain decoding samples there.
+        """
+        num_nodes = tree.parents.shape[1]
+        rows = bs * num_nodes
+        row_pool = req_pool_indices[:bs].long().repeat_interleave(num_nodes)
+        pools = (
+            self._temperature_pool[row_pool],
+            self._top_k_pool[row_pool],
+            self._top_p_pool[row_pool],
+            self._seed_pool[row_pool],
+        )
+        offsets = offsets_pool[row_pool] + tree.depths.reshape(-1)
+        row_ids = torch.arange(rows, dtype=torch.int32, device=logits.device)
+        return self._sample_verify_targets(logits, row_ids, pools, offsets, rows, 1)
+
     @nvtx_range("sampling:verify", color="yellow")
     def verify(
         self,
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        *,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
@@ -548,126 +665,53 @@ class TritonSamplingBackend(SamplingBackend):
             )
 
         # Greedy verifies through the same pool route (top_k=1); see sample().
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         req_pool_indices = self._req_pool_indices_for_kernels(
             sampling_info.req_pool_indices, bs
         )
-        if self._sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
-            if logits.shape[1] <= _COMPACT_GUMBEL_VOCAB_MAX:
-                target_sampled = gumbel_sample_from_pools_compact(
-                    logits,
-                    req_pool_indices,
-                    self._temperature_pool,
-                    self._seed_pool,
-                    offsets_pool,
-                    self._gumbel_verify_out[: bs * num_tokens_per_req],
-                    block_size=_COMPACT_GUMBEL_BLOCK_SIZE,
-                    num_tokens_per_req=num_tokens_per_req,
-                )
-            else:
-                target_sampled = gumbel_sample_from_pools(
-                    logits,
-                    req_pool_indices,
-                    self._temperature_pool,
-                    self._seed_pool,
-                    offsets_pool,
-                    self._gumbel_verify_local_ids[: bs * num_tokens_per_req],
-                    self._gumbel_verify_local_scores[: bs * num_tokens_per_req],
-                    self._gumbel_verify_out[: bs * num_tokens_per_req],
-                    num_tokens_per_req=num_tokens_per_req,
-                )
-        elif self._sample_route in (
-            _SAMPLE_ROUTE_GUMBEL_TOP_K,
-            _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
-        ):
-            rows = bs * num_tokens_per_req
-            if self._use_qrita_verify_top_k_route(rows, logits.shape[1]):
-                target_sampled = gumbel_sample_top_k_top_p_qrita_from_pools(
-                    logits,
-                    req_pool_indices,
-                    self._temperature_pool,
-                    self._top_k_pool,
-                    self._top_p_pool,
-                    self._seed_pool,
-                    offsets_pool,
-                    self._qrita_verify_buffer,
-                    self._qrita_percentile_to_std_table,
-                    self._gumbel_verify_out[:rows],
-                    num_tokens_per_req=num_tokens_per_req,
-                    num_programs=min(self._qrita_verify_num_programs, rows),
-                )
-            else:
-                target_sampled = gumbel_sample_top_k_top_p_from_pools(
-                    logits,
-                    req_pool_indices,
-                    self._temperature_pool,
-                    self._top_k_pool,
-                    self._top_p_pool,
-                    self._seed_pool,
-                    offsets_pool,
-                    self._topk_verify_candidate_ids[:rows],
-                    self._topk_verify_candidate_logits[:rows],
-                    self._gumbel_verify_out[:rows],
-                    block_size=_TOP_K_TOP_P_SMALL_BLOCK_SIZE,
-                    top_k_pad=self._top_k_top_p_pad,
-                    num_tokens_per_req=num_tokens_per_req,
-                )
-        elif self._sample_route == _SAMPLE_ROUTE_GUMBEL_TOP_P:
-            rows = bs * num_tokens_per_req
-            target_sampled = gumbel_sample_top_p_parallel_from_pools(
-                logits,
-                req_pool_indices,
-                self._temperature_pool,
-                self._top_p_pool,
-                self._seed_pool,
-                offsets_pool,
-                self._top_p_local_max[:rows],
-                self._top_p_local_sum[:rows],
-                self._top_p_local_argmax[:rows],
-                self._top_p_local_scores[:rows],
-                self._top_p_local_logits[:rows],
-                self._top_p_local_ids[:rows],
-                self._top_p_row_max[:rows],
-                self._top_p_row_total[:rows],
-                self._top_p_row_argmax[:rows],
-                self._top_p_row_candidate_logits[:rows],
-                self._top_p_row_candidate_ids[:rows],
-                self._top_p_accepted[:rows],
-                self._gumbel_verify_out[:rows],
-                block_size=_TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE,
-                num_attempts=_TOP_P_PARALLEL_VERIFY_ATTEMPTS,
-                num_tokens_per_req=num_tokens_per_req,
+        if tree is not None:
+            target_sampled = self._sample_tree_targets(
+                logits, req_pool_indices, offsets_pool, tree, bs
+            )
+            # The accepted path rides in accept_index so the TP broadcast below carries it.
+            verify_tree(
+                predict,
+                accept_length,
+                accept_index,
+                candidates.to(torch.int32),
+                tree.parents,
+                target_sampled,
             )
         else:
-            target_sampled = gumbel_sample_from_pools_generic(
+            target_sampled = self._sample_verify_targets(
                 logits,
                 req_pool_indices,
-                self._temperature_pool,
-                self._top_k_pool,
-                self._top_p_pool,
-                self._seed_pool,
+                (
+                    self._temperature_pool,
+                    self._top_k_pool,
+                    self._top_p_pool,
+                    self._seed_pool,
+                ),
                 offsets_pool,
-                self._gumbel_verify_out[: bs * num_tokens_per_req],
-                num_tokens_per_req=num_tokens_per_req,
+                bs * num_tokens_per_req,
+                num_tokens_per_req,
             )
-        verify_chain_target_sampled(
-            predicts=predict,
-            accept_index=accept_index,
-            accept_token_num=accept_length,
-            candidates=candidates,
-            target_sampled=target_sampled,
-        )
-
-        accept_length += 1
+            verify_chain_target_sampled(
+                predicts=predict,
+                accept_index=accept_index,
+                accept_token_num=accept_length,
+                candidates=candidates,
+                target_sampled=target_sampled,
+            )
+            accept_length += 1
 
         # Rank 0 remains the source of truth for attention-TP agreement.
         self.broadcast_verify_outputs()
 
         if self.config.enable_output_logprobs:
+            if tree is not None:
+                # predict is packed along the path; score it against the path's own rows.
+                logits = logits.index_select(0, accepted_path_rows(accept_index))
             self._write_logprob_outputs(
                 logits_output,
                 logits,
