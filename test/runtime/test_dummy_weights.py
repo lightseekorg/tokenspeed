@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 """Dummy loading gives integer parameters valid values before post-processing
-reads them."""
+reads them, and tells an EAGLE3 draft its embedding is initialized."""
 
 from __future__ import annotations
 
@@ -75,3 +75,18 @@ def test_the_dummy_loader_fills_integers_before_post_processing(monkeypatch):
         device_config=SimpleNamespace(device="cpu"),
     )
     assert len(seen) == 1 and torch.all(seen[0] == 0)
+
+
+def test_the_dummy_loader_marks_the_draft_embedding_initialized(monkeypatch):
+    marked = []
+
+    class _Draft(_QuantizedLinear):
+        def mark_embedding_initialized(self) -> None:
+            marked.append(True)
+
+    monkeypatch.setattr(loader, "_initialize_model", lambda *args: _Draft())
+    loader.DummyModelLoader(LoadConfig()).load_model(
+        model_config=SimpleNamespace(dtype=torch.float32),
+        device_config=SimpleNamespace(device="cpu"),
+    )
+    assert marked == [True]

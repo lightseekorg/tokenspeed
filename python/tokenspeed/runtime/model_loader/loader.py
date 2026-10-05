@@ -544,8 +544,9 @@ class DummyModelLoader(BaseModelLoader):
             initialize_dummy_integer_weights(model)
             # An EAGLE3 draft cannot share a vocab-sharded target embedding,
             # and its own dummy embedding is as valid as a loaded one.
-            if hasattr(model, "_embed_loaded_from_checkpoint"):
-                model._embed_loaded_from_checkpoint = True
+            mark_initialized = getattr(model, "mark_embedding_initialized", None)
+            if callable(mark_initialized):
+                mark_initialized()
             if getattr(model, "post_load_weights", None):
                 model.post_load_weights()
 
