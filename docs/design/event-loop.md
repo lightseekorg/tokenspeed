@@ -190,7 +190,8 @@ raises there instead, and CI serving jobs run with it.
 The same mark closes the kernel package's compile switch
 (`compile_monitor.is_serving()`), installed monitor or not. A kernel whose
 library compiles once per batch shape outside Triton -- FlashInfer's joint BF16
-GEMM compiles some runners once per exact row count -- runs only before it:
+GEMM and the ll_bf16 router's dot-product kernel compile once per exact row
+count -- runs only before it:
 graph capture records it, and eager calls after it take a GEMM that never
 compiles instead of compiling on the forward thread.
 

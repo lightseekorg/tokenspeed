@@ -189,8 +189,8 @@ at their call sites.
 The end-of-startup mark is also the package's compile switch, set whether or
 not the monitor is installed. A kernel whose library compiles once per batch
 shape and cannot bucket it, such as FlashInfer's joint BF16 GEMM (some runners
-compile per exact row count), checks `compile_monitor.is_serving()` where it
-is dispatched: startup tuning and graph capture use it, and eager calls while
+compile per exact row count) or the ll_bf16 router's dot-product kernel, checks
+`compile_monitor.is_serving()` where it is dispatched: startup tuning and graph capture use it, and eager calls while
 serving take a GEMM that never compiles (cuBLAS through torch on NVIDIA).
 
 ### Plugins
