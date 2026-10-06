@@ -46,8 +46,6 @@ jobs:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
-          TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ${{ vars.TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS }}
-          TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED: ${{ vars.TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED }}
         run: python3 .github/scripts/pr-ci-model.py prepare
 
       - name: Generate CI plan

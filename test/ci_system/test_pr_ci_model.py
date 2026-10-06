@@ -55,12 +55,11 @@ def test_escaped_sensitive_summary_cannot_be_published(tmp_path, monkeypatch):
         "head": "a" * 40,
         "base": "b" * 40,
         "paths": [],
-        "broad_groups": [],
         "catalog": [],
-        "floor": [],
+        "test_files": [],
     }
     tmp_path.joinpath("context.json").write_text(json.dumps(data))
-    raw = r'{"summary":"h\u0074tps:\/\/ex\u0061mple.com/v1","tasks":[],"conflicts":""}'
+    raw = r'{"summary":"h\u0074tps:\/\/ex\u0061mple.com/v1","tests":[],"tasks":[],"conflicts":""}'
     # The wire representation hides the URL; the decoded comment must be screened.
     module._check_public_output(raw, tmp_path)
 

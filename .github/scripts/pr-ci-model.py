@@ -100,7 +100,6 @@ capabilities = ["thinking", "tool_use"]
         Path(os.environ["GITHUB_WORKSPACE"]),
         os.environ["PR_HEAD_SHA"],
         os.environ["PR_BASE_SHA"],
-        root / "changed-files.txt",
     )
     pr = json.loads(
         _command(
@@ -114,6 +113,8 @@ capabilities = ["thinking", "tool_use"]
     ):
         raise SystemExit("The PR source changed; retry with a fresh event.")
     data["mergeable"] = pr["mergeable"]
+    data["title"] = pr["title"]
+    data["body"] = pr["body"] or ""
     root.joinpath("context.json").write_text(json.dumps(data, indent=2))
 
 

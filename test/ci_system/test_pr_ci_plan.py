@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Regression coverage for the deterministic floor around model proposals."""
+"""Keep semantic validation priorities focused and bound to existing targets."""
 
 import importlib.util
 import json
@@ -36,35 +36,59 @@ planner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(planner)
 
 
-def test_shared_change_cannot_drop_baseline(monkeypatch, tmp_path):
+def test_model_change_keeps_focused_tests_and_manual_ci(monkeypatch):
     monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
     monkeypatch.setenv("PR_NUMBER", "1")
     monkeypatch.setenv("TOKENSPEED_B200_RUNNER_LABEL", "b200v2")
-    monkeypatch.setenv(
-        "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", "slurm-gb200,slurm-gb300"
-    )
-    monkeypatch.setenv("TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED", "true")
+    test = "test/runtime/test_deepseek_v41_engram.py"
+    package_test = "tokenspeed-scheduler/python/tests/test_kv_cache.py"
     monkeypatch.setattr(
         subprocess,
         "run",
-        lambda *a, **k: SimpleNamespace(stdout="python/tokenspeed/__init__.py\n"),
+        lambda args, **k: SimpleNamespace(
+            stdout=(
+                test + "\n" + package_test + "\n"
+                if args[1] == "ls-files"
+                else "python/tokenspeed/runtime/engram.py\n"
+            )
+        ),
     )
-    data = planner.context(REPO, "a" * 40, "b" * 40, tmp_path / "changed.txt")
+    data = planner.context(REPO, "a" * 40, "b" * 40)
+    assert package_test in data["test_files"]
+    config = "test/ci/ut/deepseek-v4.1-flash-pd-1p1d.yaml"
+    task = next(t for t in data["catalog"] if t["config"] == config)
+    assert task["triggers"] == ["manual"]
+    assert task["runners"] == ["b200v2-4gpu"]
+    assert "test_deepseek_v41_pd_1p1d.py" in task["targets"]["commands"][0]
+    assert any("qwen" in t["config"] for t in data["catalog"])
     result = planner.proposal(
-        json.dumps({"summary": "Shared runtime change.", "tasks": [], "conflicts": ""}),
+        "Evidence summary from the CLI.\n\n```json\n"
+        + json.dumps(
+            {
+                "summary": "Engram changes affect DeepSeek V4.1 cache history.",
+                "tests": [{"path": test, "reason": "Verify Engram history updates."}],
+                "tasks": [
+                    {
+                        "config": config,
+                        "runner": "b200v2-4gpu",
+                        "reason": "Verify history across PD cache handoff.",
+                    }
+                ],
+                "conflicts": "",
+            }
+        )
+        + "\n```",
         data,
     )
-    assert data["catalog"]
-    assert any(t["runner"].startswith("slurm-gb200-") for t in data["catalog"])
-    assert any(t["runner"].startswith("slurm-gb300-") for t in data["catalog"])
-    assert set(data["floor"]) == {planner.task_key(t) for t in data["catalog"]}
-    assert {planner.task_key(t) for t in result["tasks"]} == set(data["floor"])
+    assert [t["path"] for t in result["tests"]] == [test]
+    assert [t["config"] for t in result["tasks"]] == [config]
+    assert "qwen" not in planner.render(result)
 
 
 def test_proposal_cannot_invent_runner_or_command():
     task = {
         "config": "test/ci/ut/example.yaml",
-        "runner": "b200v2-1gpu",
+        "runners": ["b200v2-1gpu"],
         "name": "example",
     }
     data = {
@@ -74,11 +98,11 @@ def test_proposal_cannot_invent_runner_or_command():
         "head": "a" * 40,
         "base": "b" * 40,
         "catalog": [task],
-        "floor": [],
-        "broad_groups": [],
+        "test_files": [],
     }
     response = {
         "summary": "Focused validation.",
+        "tests": [],
         "tasks": [
             {
                 "config": task["config"],
@@ -89,4 +113,10 @@ def test_proposal_cannot_invent_runner_or_command():
         "conflicts": "",
     }
     with pytest.raises(ValueError):
+        planner.proposal(json.dumps(response), data)
+    response["tasks"] = []
+    response["tests"] = [
+        {"path": "python/tokenspeed/__init__.py", "reason": "Not a test."}
+    ]
+    with pytest.raises(ValueError, match="existing test file"):
         planner.proposal(json.dumps(response), data)

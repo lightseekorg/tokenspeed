@@ -122,13 +122,13 @@ publishing steps. Failed, empty, oversized, or sensitive output is not published
 raw CLI events and logs are not uploaded. Same-repository contributors can edit
 the workflow, so repository write access remains the trust boundary.
 
-[The coverage validator](.github/scripts/pr_ci_plan.py) uses the existing CI path
-classifier and task catalog. Shared changes retain the full affected baseline;
-vendor-owned changes can propose a focused model/performance subset after the
-unit-test floor. Directly changed per-commit task declarations remain included.
-The task-only and benchmark-suite narrowing uses the existing `pipeline.py scan`
-entrypoint. This workflow posts a proposal; required checks and review follow the
-existing repository merge policy.
+[The coverage validator](.github/scripts/pr_ci_plan.py) reuses the existing task
+loader and UT target discovery, including manual tasks. The planner verifies PR
+title/body hints against changed code, callers and test assertions, then orders a
+small set of focused test files and model CI tasks with code-to-coverage reasons.
+It does not append a full baseline merely because a shared directory changed.
+Recommendations must refer to tracked test files and catalogued tasks/runners.
+This is advisory prioritization; required checks and merge policy are unchanged.
 
 Run diagnostics through the existing K8s Dispatch and Slurm Dispatch workflows.
 Retry Failed CI Cases replays retained Slurm reports. Completion evaluation,

@@ -18,14 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Build and validate a source-bound CI coverage proposal."""
+"""Provide existing validation targets and validate a focused CI recommendation."""
 
-import io
 import json
 import os
 import subprocess
 import sys
-from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -33,17 +31,15 @@ def task_key(task: dict) -> str:
     return f"{task['config']}@{task['runner']}"
 
 
-def context(source: Path, head: str, base: str, changed_file: Path) -> dict:
-    # Only the established task loader and path classifier determine the floor.
+def context(source: Path, head: str, base: str) -> dict:
+    # Reuse task validation and target discovery, including manual-only tasks.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "test/ci_system"))
-    from ci_path_filter import (
-        RUNNER_GROUPS,
-        VENDOR_WORKFLOWS,
-        path_requires_group,
-        path_vendor,
-        task_runner_labels,
+    from pipeline import (
+        find_task_files,
+        normalize_task,
+        resolve_runner_labels,
+        summarize_task_targets,
     )
-    from pipeline import main as scan
 
     paths = subprocess.run(
         [
@@ -59,78 +55,30 @@ def context(source: Path, head: str, base: str, changed_file: Path) -> dict:
         capture_output=True,
         text=True,
     ).stdout.splitlines()
-    tasks = {}
-    floor = set()
-    broad = []
-    changed_file.write_text("\n".join(paths) + "\n")
-    for group in RUNNER_GROUPS:
-        if (
-            group == "nvidia-gb300-slurm"
-            and os.environ.get("TOKENSPEED_CI_GB300_SLURM_PER_COMMIT_ENABLED") != "true"
-        ):
-            continue
-        affected = [p for p in paths if path_requires_group(p, group, source)]
-        if not affected:
-            continue
-        # Vendor-owned sources and task declarations are the only narrowable
-        # classes. Shared or unclassified affected paths retain the full suite.
-        full = any(
-            path_vendor(p, source) is None and task_runner_labels(p, source) is None
-            for p in affected
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=source, check=True, capture_output=True, text=True
+    ).stdout.splitlines()
+    tests = [
+        p
+        for p in tracked
+        if {"test", "tests"}.intersection(Path(p).parts[:-1])
+        and (Path(p).name.startswith("test_") or Path(p).name.endswith("_test.py"))
+        and p.endswith(".py")
+    ]
+    tasks = []
+    for path in find_task_files(source / "test/ci"):
+        task = normalize_task(path, source)
+        tasks.append(
+            {
+                "config": task["_source_path"],
+                "name": task["name"],
+                "type": task["type"],
+                "runners": resolve_runner_labels(task["runner"]["labels"]),
+                "triggers": task["triggers"],
+                "targets": summarize_task_targets(task, source),
+                "server_command": task.get("server", {}).get("command", ""),
+            }
         )
-        if full:
-            broad.append(group)
-        saved = os.environ.get("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", "")
-        if group == "nvidia-x86":
-            os.environ["TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"] = f"h100,b300,{saved}"
-        elif group.endswith("-slurm"):
-            os.environ["TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"] = ""
-        args = [
-            "scan",
-            "--repo-root",
-            str(source),
-            "--changed-files",
-            str(changed_file),
-            "--trigger",
-            "per-commit",
-            "--runner-group",
-            "nvidia-arm" if group.endswith("-slurm") else group,
-            "--multi-node",
-            "only" if group == "nvidia-gb300-slurm" else "exclude",
-        ]
-        if group == "nvidia-gb300-slurm":
-            args += ["--workflow-stage", "model-test"]
-        output = io.StringIO()
-        try:
-            # Reuse the scanner's task-only and benchmark-suite filtering.
-            with redirect_stdout(output):
-                scan(args)
-            entries = json.loads(output.getvalue())["include"]
-        finally:
-            os.environ["TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"] = saved
-        if group in {"nvidia-arm", "nvidia-x86"}:
-            entries = [
-                t
-                for t in entries
-                if t.get("workflow_stage") in {"unit-test", "model-test"}
-            ]
-        if group == "nvidia-arm":
-            entries = [t for t in entries if not t["runner"].startswith("slurm-")]
-        elif group == "nvidia-gb200-slurm":
-            entries = [t for t in entries if t["runner"].startswith("slurm-gb200-")]
-        for task in entries:
-            # Optional checks remain optional, including on a broad diff.
-            if task["optional"]:
-                continue
-            key = task_key(task)
-            task["workflow"] = Path(VENDOR_WORKFLOWS[group]).name
-            tasks[key] = task
-            if (
-                full
-                or task.get("workflow_stage") == "unit-test"
-                or task["config"] in paths
-            ):
-                floor.add(key)
     return {
         "version": 1,
         "repository": os.environ["GITHUB_REPOSITORY"],
@@ -138,19 +86,29 @@ def context(source: Path, head: str, base: str, changed_file: Path) -> dict:
         "head": head,
         "base": base,
         "paths": paths,
-        "broad_groups": broad,
-        "catalog": list(tasks.values()),
-        "floor": sorted(floor),
+        "test_files": tests,
+        "catalog": tasks,
     }
 
 
 def proposal(raw: str, data: dict) -> dict:
-    try:
-        response = json.loads(raw)
-    except json.JSONDecodeError:
-        raise ValueError("Expected one JSON object without Markdown fences.") from None
+    # The CLI can prepend an evidence summary or wrap its final JSON in a fence.
+    # Publish only the validated final object; the raw text is screened separately.
+    lines = raw.strip().splitlines()
+    if lines and lines[-1] == "```":
+        lines.pop()
+    for index, line in enumerate(lines):
+        if line.startswith("{"):
+            try:
+                response = json.loads("\n".join(lines[index:]))
+                break
+            except json.JSONDecodeError:
+                continue
+    else:
+        raise ValueError("Expected a final JSON object.")
     if not isinstance(response, dict) or set(response) != {
         "summary",
+        "tests",
         "tasks",
         "conflicts",
     }:
@@ -160,13 +118,26 @@ def proposal(raw: str, data: dict) -> dict:
         for k in ("summary", "conflicts")
     ):
         raise ValueError("Invalid proposal summary.")
-    if not isinstance(response["tasks"], list):
+    if not all(isinstance(response[k], list) for k in ("tests", "tasks")):
         raise ValueError("Invalid proposed task list.")
-    catalog = {task_key(t): t for t in data["catalog"]}
-    selected = {
-        key: {**catalog[key], "reason": "Required by the deterministic coverage floor."}
-        for key in data["floor"]
+    tests = {}
+    for choice in response["tests"]:
+        if (
+            not isinstance(choice, dict)
+            or set(choice) != {"path", "reason"}
+            or not all(isinstance(v, str) for v in choice.values())
+            or choice["path"] not in data["test_files"]
+            or not choice["reason"].strip()
+            or len(choice["reason"]) > 1000
+        ):
+            raise ValueError("Proposed test must be an existing test file.")
+        tests[choice["path"]] = choice
+    catalog = {
+        task_key({"config": t["config"], "runner": runner}): t
+        for t in data["catalog"]
+        for runner in t["runners"]
     }
+    selected = {}
     for choice in response["tasks"]:
         if not isinstance(choice, dict) or set(choice) != {
             "config",
@@ -183,7 +154,7 @@ def proposal(raw: str, data: dict) -> dict:
             or len(choice["reason"]) > 1000
         ):
             raise ValueError("Proposed task must belong to the coverage catalog.")
-        selected[key] = {**catalog[key], "reason": choice["reason"]}
+        selected[key] = {**catalog[key], **choice}
     return {
         "version": data["version"],
         "repository": data["repository"],
@@ -192,7 +163,7 @@ def proposal(raw: str, data: dict) -> dict:
         "base": data["base"],
         "summary": response["summary"],
         "conflicts": response["conflicts"],
-        "broad_groups": data["broad_groups"],
+        "tests": list(tests.values()),
         "tasks": list(selected.values()),
     }
 
@@ -205,21 +176,22 @@ def render(plan: dict) -> str:
         "",
         plan["summary"],
         "",
-        "This is a coverage proposal. Required checks and review follow the existing repository merge policy.",
+        "Prioritize the checks below; existing required CI and merge policy remain unchanged.",
     ]
-    if plan["broad_groups"]:
-        lines += ["", "Shared changes retain the full affected test baseline."]
+    if plan["tests"]:
+        lines += ["", "**Focused tests, in priority order**", ""]
+        for test in plan["tests"]:
+            lines.append(f"- `{test['path']}`: {test['reason']}")
     if plan["tasks"]:
-        lines += ["", "<details>", "<summary>Selected GPU tasks</summary>", ""]
+        lines += ["", "**Existing CI tasks, in priority order**", ""]
         for task in plan["tasks"]:
             lines.append(
                 f"- `{task['config']}` on `{task['runner']}`: {task['reason']}"
             )
-        lines += ["", "</details>"]
     else:
         lines += [
             "",
-            "The existing path classifier requires no GPU tasks for this diff.",
+            "No GPU CI task is prioritized for this change.",
         ]
     if plan["conflicts"]:
         lines += ["", "### Conflict assistance", "", plan["conflicts"]]
