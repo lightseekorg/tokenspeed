@@ -126,6 +126,8 @@ the workflow, so repository write access remains the trust boundary.
 loader and UT target discovery, including manual tasks. The planner verifies PR
 title/body hints against changed code, callers and test assertions, then orders a
 small set of focused test files and model CI tasks with code-to-coverage reasons.
+Comments use one scope sentence, a priority table with short source-linked names,
+and a status line; runner routing and material coverage limits stay explicit.
 It does not append a full baseline merely because a shared directory changed.
 Recommendations must refer to tracked test files and catalogued tasks/runners.
 This is advisory prioritization; required checks and merge policy are unchanged.

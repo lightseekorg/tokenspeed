@@ -67,12 +67,19 @@ def test_model_change_keeps_focused_tests_and_manual_ci(monkeypatch):
         + json.dumps(
             {
                 "summary": "Engram changes affect DeepSeek V4.1 cache history.",
-                "tests": [{"path": test, "reason": "Verify Engram history updates."}],
+                "tests": [
+                    {
+                        "path": test,
+                        "label": "Engram inputs",
+                        "reason": "History commits | graph\npadding [scrub]",
+                    }
+                ],
                 "tasks": [
                     {
                         "config": config,
                         "runner": "b200-4gpu",
                         "cluster": "gb200",
+                        "label": "PD handoff",
                         "reason": "Verify history across PD cache handoff.",
                     }
                 ],
@@ -84,8 +91,17 @@ def test_model_change_keeps_focused_tests_and_manual_ci(monkeypatch):
     )
     assert [t["path"] for t in result["tests"]] == [test]
     assert [t["config"] for t in result["tasks"]] == [config]
-    assert "qwen" not in planner.render(result)
-    assert "Slurm `gb200`" in planner.render(result)
+    body = planner.render(result)
+    assert "qwen" not in body
+    assert "| Order | Check | Verifies | Run on |" in body
+    assert "History commits \\| graph padding \\[scrub\\]" in body
+    assert (
+        f"[Engram inputs](https://github.com/lightseekorg/tokenspeed/blob/{'a' * 40}/{test})"
+        in body
+    )
+    assert "Slurm GB200 / 4 GPU" in body
+    assert "GB300 if full" in body
+    assert "tests not run; required CI unchanged" in body
 
 
 def test_proposal_cannot_invent_runner_or_command():
@@ -111,6 +127,7 @@ def test_proposal_cannot_invent_runner_or_command():
                 "config": task["config"],
                 "runner": "arbitrary-command",
                 "cluster": "gb200",
+                "label": "Example CI",
                 "reason": "Changed caller.",
             }
         ],
@@ -120,7 +137,11 @@ def test_proposal_cannot_invent_runner_or_command():
         planner.proposal(json.dumps(response), data)
     response["tasks"] = []
     response["tests"] = [
-        {"path": "python/tokenspeed/__init__.py", "reason": "Not a test."}
+        {
+            "path": "python/tokenspeed/__init__.py",
+            "label": "Example test",
+            "reason": "Not a test.",
+        }
     ]
     with pytest.raises(ValueError, match="existing test file"):
         planner.proposal(json.dumps(response), data)

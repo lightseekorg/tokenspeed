@@ -76,3 +76,10 @@ def test_escaped_sensitive_summary_cannot_be_published(tmp_path, monkeypatch):
     tmp_path.joinpath("context.json").write_text(json.dumps(data))
     with pytest.raises(SystemExit, match="public-output check"):
         module._check_public_output("example.com", tmp_path)
+    link = module.source_url(data, data["catalog"][0]["config"])
+    with pytest.raises(SystemExit, match="public-output check"):
+        module._check_public_output(link, tmp_path)
+    module._check_public_output(f"[CI]({link})", tmp_path, source_links=True)
+    for text in (f"[CI]({link}) example.com", f"[CI]({link}?extra=1)"):
+        with pytest.raises(SystemExit, match="public-output check"):
+            module._check_public_output(text, tmp_path, source_links=True)

@@ -31,7 +31,7 @@ import tomllib
 from pathlib import Path
 from urllib.parse import urlparse
 
-from pr_ci_plan import context, proposal, render
+from pr_ci_plan import context, proposal, render, source_url
 
 
 def _command(*args: str) -> str:
@@ -139,7 +139,7 @@ def _model_body(root: Path) -> str:
     return body.strip()
 
 
-def _check_public_output(body: str, root: Path) -> None:
+def _check_public_output(body: str, root: Path, *, source_links: bool = False) -> None:
     config = tomllib.loads(
         Path(os.environ["KIMI_CODE_HOME"], "config.toml").read_text()
     )
@@ -156,16 +156,29 @@ def _check_public_output(body: str, root: Path) -> None:
     ]
     # Public task identifiers can contain the configured model's name. Allow
     # only exact catalog identifiers; free text still cannot identify it.
+    data = json.loads(root.joinpath("context.json").read_text())
     scanned = body
-    for task in json.loads(root.joinpath("context.json").read_text())["catalog"]:
+    for task in data["catalog"]:
         for field in ("config", "name"):
             scanned = scanned.replace(task[field], "")
     model = config["models"]["planner"]["model"]
+    links = body
+    if source_links:
+        allowed = {source_url(data)} | {
+            source_url(data, path)
+            for path in [*data["test_files"], *(t["config"] for t in data["catalog"])]
+        }
+        links = re.sub(
+            r"https?://[^\s)<>]+",
+            lambda match: "SOURCE_LINK" if match[0] in allowed else match[0],
+            links,
+        )
     if (
         any(value and value in body for value in private)
         or (model and model in scanned)
+        or re.search(r"https?://|github\.com|\bwww\.", links)
         or re.search(
-            r"https?://|github\.com|\b(?:sk-|ghp_|gho_|github_pat_)|"
+            r"\b(?:sk-|ghp_|gho_|github_pat_)|"
             r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|/(?:home|root|tmp|proc)/",
             body,
         )
@@ -212,8 +225,13 @@ def plan(root: Path) -> None:
     except ValueError as error:
         # The validator emits fixed messages, never the model response.
         raise SystemExit(f"Invalid CI proposal: {error}") from None
+    # Check decoded text before presentation escaping can change its spelling.
+    editorial = [plan["summary"], plan["conflicts"]]
+    for item in [*plan["tests"], *plan["tasks"]]:
+        editorial += [item["label"], item["reason"]]
+    _check_public_output("\n".join(editorial), root)
     body = render(plan)
-    _check_public_output(body, root)
+    _check_public_output(body, root, source_links=True)
     root.joinpath("comment.md").write_text(body)
 
 

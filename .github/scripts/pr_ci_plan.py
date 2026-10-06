@@ -22,9 +22,32 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
+
+
+def source_url(data: dict, path: str = "") -> str:
+    root = f"https://github.com/{data['repository']}"
+    if path:
+        return f"{root}/blob/{data['head']}/{quote(path, safe='/')}"
+    return f"{root}/commit/{data['head']}"
+
+
+def _short_text(value: object, limit: int) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and len(value) <= limit
+        and not re.search(r"(?<!\w)@\w", value)
+    )
+
+
+def _cell(value: str) -> str:
+    # Keep model text literal inside a table cell or a generated link label.
+    return re.sub(r"([\\`*\[\]|<>&_])", r"\\\1", " ".join(value.split()))
 
 
 def task_key(task: dict) -> str:
@@ -129,9 +152,11 @@ def proposal(raw: str, data: dict) -> dict:
         "conflicts",
     }:
         raise ValueError("Expected the CI proposal schema.")
-    if not all(
-        isinstance(response[k], str) and len(response[k]) <= 2000
-        for k in ("summary", "conflicts")
+    if (
+        not _short_text(response["summary"], 200)
+        or not isinstance(response["conflicts"], str)
+        or len(response["conflicts"]) > 2000
+        or re.search(r"(?<!\w)@\w", response["conflicts"])
     ):
         raise ValueError("Invalid proposal summary.")
     if not all(isinstance(response[k], list) for k in ("tests", "tasks")):
@@ -140,11 +165,11 @@ def proposal(raw: str, data: dict) -> dict:
     for choice in response["tests"]:
         if (
             not isinstance(choice, dict)
-            or set(choice) != {"path", "reason"}
+            or set(choice) != {"path", "label", "reason"}
             or not all(isinstance(v, str) for v in choice.values())
             or choice["path"] not in data["test_files"]
-            or not choice["reason"].strip()
-            or len(choice["reason"]) > 1000
+            or not _short_text(choice["label"], 60)
+            or not _short_text(choice["reason"], 120)
         ):
             raise ValueError("Proposed test must be an existing test file.")
         tests[choice["path"]] = choice
@@ -160,6 +185,7 @@ def proposal(raw: str, data: dict) -> dict:
             "config",
             "runner",
             "cluster",
+            "label",
             "reason",
         }:
             raise ValueError("Invalid proposed task.")
@@ -168,8 +194,8 @@ def proposal(raw: str, data: dict) -> dict:
         key = task_key(choice)
         if (
             key not in catalog
-            or not choice["reason"].strip()
-            or len(choice["reason"]) > 1000
+            or not _short_text(choice["label"], 60)
+            or not _short_text(choice["reason"], 120)
         ):
             raise ValueError("Proposed task must belong to the coverage catalog.")
         selected[key] = {**catalog[key], **choice}
@@ -188,37 +214,49 @@ def proposal(raw: str, data: dict) -> dict:
 
 def render(plan: dict) -> str:
     lines = [
-        f"Reviewed commit: `{plan['head']}`",
-        "",
         "### CI plan",
         "",
-        plan["summary"],
-        "",
-        "Prioritize the checks below; existing required CI and merge policy remain unchanged.",
+        _cell(plan["summary"]),
     ]
-    if plan["tests"]:
-        lines += ["", "**Focused tests, in priority order**", ""]
-        for test in plan["tests"]:
-            lines.append(f"- `{test['path']}`: {test['reason']}")
-    if plan["tasks"]:
-        lines += ["", "**Existing CI tasks, in priority order**", ""]
-        for task in plan["tasks"]:
-            target = f"`{task['runner']}`"
-            if task["cluster"]:
-                target = f"Slurm `{task['cluster']}` (logical runner {target})"
-                if task["runner"].removeprefix("slurm-").startswith("b200-"):
-                    target += "; cross-hardware validation of a B200-declared task"
-            lines.append(f"- `{task['config']}` on {target}: {task['reason']}")
-        if any(task["cluster"] == "gb200" for task in plan["tasks"]):
-            lines += [
-                "",
-                "Use GB200 first; check GB300 capacity if GB200 is full. Do not submit the same validation to both clusters.",
-            ]
-    else:
+    rows = [(t, t["path"], "Targeted UT") for t in plan["tests"]]
+    for task in plan["tasks"]:
+        if task["cluster"]:
+            target = f"Slurm {task['cluster'].upper()}"
+        elif task["runner"].startswith("amd-"):
+            target = "K8s AMD"
+        else:
+            target = f"K8s {task['runner']}"
+        gpus = re.search(r"(?:^|-)(\d+)gpu(?:-|$)", task["runner"])
+        if gpus and (task["cluster"] or target == "K8s AMD"):
+            target += f" / {gpus[1]} GPU"
+        rows.append((task, task["config"], target))
+    if rows:
         lines += [
             "",
-            "No GPU CI task is prioritized for this change.",
+            "| Order | Check | Verifies | Run on |",
+            "| --- | --- | --- | --- |",
+        ]
+        for order, (item, path, target) in enumerate(rows, 1):
+            label = f"[{_cell(item['label'])}]({source_url(plan, path)})"
+            lines.append(
+                f"| {order} | {label} | {_cell(item['reason'])} | {_cell(target)} |"
+            )
+    if not plan["tasks"]:
+        lines += ["", "**GPU:** no task recommended."]
+    if any(t["cluster"] == "gb200" for t in plan["tasks"]):
+        lines += ["", "**Routing:** GB200 first; GB300 if full. One cluster per task."]
+    if any(
+        t["cluster"] and t["runner"].removeprefix("slurm-").startswith("b200-")
+        for t in plan["tasks"]
+    ):
+        lines += [
+            "",
+            "**Hardware:** B200-labelled Slurm tasks are cross-hardware checks.",
         ]
     if plan["conflicts"]:
-        lines += ["", "### Conflict assistance", "", plan["conflicts"]]
+        lines += ["", f"**Conflicts:** {_cell(plan['conflicts'])}"]
+    lines += [
+        "",
+        f"**Status:** recommendations only; tests not run; required CI unchanged. [Commit {plan['head'][:8]}]({source_url(plan)}).",
+    ]
     return "\n".join(lines) + "\n"
