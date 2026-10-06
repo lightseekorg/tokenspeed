@@ -36,6 +36,34 @@ after workspace corruption, and output equality with the upstream operator.
 Expert-partition tests retain the loader's global activation input scales while
 sharding expert weights, and select SiTU through FlashInfer's activation enum.
 
+## BF16 intermediate sizes that are multiples of 64
+
+FlashInfer's BF16 TRT-LLM launcher (`Bf16MoeLauncher::check_moe`) rejects an
+intermediate size per partition that is not a multiple of 128. Its BF16 cubins
+need only 64 for gated activations: GEMM1's rows, twice the intermediate size,
+are tiled by 128, and GEMM2 reads its K, the intermediate size, in 128-byte
+blocks of 64 elements. Non-gated activations still need 128.
+
+`thirdparty/flashinfer/trtllm_bf16_moe.py` builds a private copy of the
+installed launcher in which only that check requires 64 for gated and 128 for
+non-gated activations. Like the NVFP4 adapter, it uses a source-keyed JIT
+module, private operator names and cloned entry points, and refuses a launcher
+whose check it does not find exactly once. `trtllm_unquant.py`'s SiLU/SwiGLU
+kernels declare `ispp_alignment` 64 when the adapter applies to the installed
+FlashInfer and FlashInfer's JIT can compile the private module, and 128
+otherwise, with a warning that names the reason. The ReLU2 kernels in that file
+keep 128. The private module is not in FlashInfer's AOT jit-cache, and ninja
+rebuilds a module left in the JIT workspace whenever the build changes, so this
+needs `FLASHINFER_DISABLE_JIT` unset and FlashInfer's nvcc (`FLASHINFER_NVCC`,
+else `bin/nvcc` under its CUDA home). This is decided once per process at
+import, without compiling, so kernel selection and layer padding agree. Only
+sizes that are not multiples of 128 run on the private launcher; the first such
+layer JIT-compiles the whole private TRT-LLM MoE module during warmup. Other
+sizes keep FlashInfer's stock module. The NVFP4 routing-map initialization is
+not added: the routing workspace does not depend on the intermediate size, so
+these layers keep FlashInfer's BF16 routing behavior. Remove the adapter once
+the minimum supported FlashInfer accepts these sizes.
+
 ## Qwen3.8 low-batch tactic
 
 For Qwen3.8's 2,560-hidden, 640-intermediate, 512-expert NVFP4 MoE with

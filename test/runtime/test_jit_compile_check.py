@@ -32,7 +32,9 @@ from tokenspeed.runtime.utils import jit_compile_check
 
 
 @pytest.fixture
-def uninstall():
+def uninstall(monkeypatch):
+    # Marking serving closes the process-wide compile switch; reopen it afterwards.
+    monkeypatch.setattr(compile_monitor, "_serving", False)
     yield
     compile_monitor.uninstall_compile_monitor()
 
@@ -45,14 +47,16 @@ def test_install_follows_the_env(monkeypatch, uninstall, mode):
     assert not compile_monitor._hooks.monitor.serving
     jit_compile_check.mark_jit_compile_serving()
     assert compile_monitor._hooks.monitor.serving
+    assert compile_monitor.is_serving()
 
 
 def test_off_leaves_the_monitor_uninstalled(monkeypatch, uninstall):
     monkeypatch.setenv("TOKENSPEED_JIT_COMPILE_CHECK", "off")
     jit_compile_check.install_jit_compile_check()
     assert compile_monitor.compile_stats() is None
-    # Marking serving without a monitor is a no-op.
+    # Without a monitor, marking serving still closes the compile switch.
     jit_compile_check.mark_jit_compile_serving()
+    assert compile_monitor.is_serving()
 
 
 def test_install_rejects_unknown_modes(monkeypatch, uninstall):
