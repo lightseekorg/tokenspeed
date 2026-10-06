@@ -411,6 +411,23 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     EXPECT_EQ(specs[1].cache_blocks_per_lcm_block, 1);
 }
 
+TEST(CacheGroupConfigKindTest, EachValidFamilyRetentionPairHasOneKind) {
+    CacheGroupConfig full_grp;
+    full_grp.retention = CacheGroupConfig::Retention::FullHistory;
+    EXPECT_EQ(full_grp.Kind(), AttnKind::kFull);
+
+    CacheGroupConfig swa_grp;
+    swa_grp.retention = CacheGroupConfig::Retention::SlidingWindow;
+    swa_grp.sliding_window_tokens = 128;
+    EXPECT_EQ(swa_grp.Kind(), AttnKind::kSlidingWindow);
+    swa_grp.replayable = true;
+    EXPECT_EQ(swa_grp.Kind(), AttnKind::kSlidingWindow);
+
+    CacheGroupConfig state_grp;
+    state_grp.family = CacheGroupFamily::State;
+    EXPECT_EQ(state_grp.Kind(), AttnKind::kMambaState);
+}
+
 TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     SchedulerConfig config;
     config.prefix_granularity = 128;
