@@ -179,8 +179,9 @@ def _input_norm(
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """The layer-opening add + norm, plus a static-FP8 copy for ``fp8_scale``'s projection.
 
-    Without attention TP one kernel adds, normalizes and quantizes; otherwise the
-    communication policy runs the norm and the projection quantizes for itself.
+    Past the first layer, without attention TP and with the fused layer boundary, one
+    kernel adds, normalizes and quantizes; otherwise the communication policy runs the
+    norm and the projection quantizes for itself.
     """
     if (
         residual is None

@@ -851,31 +851,6 @@ def _mul_ftz(a, b):
 
 
 @triton.jit
-def _e4m3_bits(x):
-    return tl.inline_asm_elementwise(
-        "{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f32 t, 0f00000000, $1; cvt.u32.u16 $0, t; }",
-        "=r,f",
-        [x],
-        dtype=tl.int32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
-def _e4m3_bits_to_f32(bits):
-    return tl.inline_asm_elementwise(
-        "{ .reg .b16 t; .reg .b32 h; .reg .f16 lo, hi; cvt.u16.u32 t, $1; "
-        "cvt.rn.f16x2.e4m3x2 h, t; mov.b32 {lo, hi}, h; cvt.f32.f16 $0, lo; }",
-        "=f,r",
-        [bits],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-
-
-@triton.jit
 def _e2m1x2(lo, hi):
     # One byte, lo in the low nibble: cvt puts its first source in the upper half.
     return tl.inline_asm_elementwise(
@@ -907,10 +882,10 @@ def _store_nvfp4(
     vec_max = tl.max(tl.abs(blocks), axis=1).to(tl.float32)
     # Its zero test flushes too: a subnormal block amax counts as zero.
     vec_max = tl.where(vec_max < 1.1754943508222875e-38, 0.0, vec_max)
-    sf_bits = _e4m3_bits(_mul_ftz(sf_scale, _mul_ftz(vec_max, rcp6)))
+    sf = _mul_ftz(sf_scale, _mul_ftz(vec_max, rcp6)).to(tl.float8e4nv)
     out_scale = tl.where(
         vec_max != 0,
-        _rcp_approx_ftz(_mul_ftz(_e4m3_bits_to_f32(sf_bits), rcp_sf_scale)),
+        _rcp_approx_ftz(_mul_ftz(sf.to(tl.float32), rcp_sf_scale)),
         0.0,
     )
     scaled = _mul_ftz(blocks.to(tl.float32), out_scale[:, None])
@@ -920,7 +895,10 @@ def _store_nvfp4(
         fp4_ptr + row * stride_fp4 + c * (BLOCK // 2) + tl.arange(0, BLOCK // 2), packed
     )
     k = c * (BLOCK // 16) + tl.arange(0, BLOCK // 16)
-    tl.store(sf_ptr + _fp8_swizzled_scale_offset(row, k, K_TILES), sf_bits.to(tl.uint8))
+    tl.store(
+        sf_ptr + _fp8_swizzled_scale_offset(row, k, K_TILES),
+        sf.to(tl.uint8, bitcast=True),
+    )
 
 
 @triton.jit(do_not_specialize=["n_rows"])

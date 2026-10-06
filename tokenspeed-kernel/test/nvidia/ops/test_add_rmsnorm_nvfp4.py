@@ -136,6 +136,40 @@ def test_nvfp4_copy_in_place_at_prefill_rows() -> None:
     _assert_matches_fp4_quantize(x, values, scales, global_scale)
 
 
+@pytest.mark.parametrize("cols", [512, 5120])
+def test_nvfp4_copy_of_strided_rows_with_nan_and_inf(cols: int) -> None:
+    rows = 129
+    torch.manual_seed(cols)
+    wide = torch.randn(rows, 2 * cols, device="cuda").bfloat16()
+    neighbours = wide[:, cols:].clone()
+    x = wide[:, :cols]
+    x[0] = float("nan")
+    x[64, 7] = float("inf")
+    x[128, 3] = float("-inf")
+    residual = torch.randn(rows, cols, device="cuda").bfloat16()
+    weight = (torch.randn(cols, device="cuda") * 0.3).bfloat16()
+    global_scale = torch.tensor([7.5], device="cuda")
+    values = torch.empty(rows, cols // 2, dtype=torch.uint8, device="cuda")
+    scales = torch.full((256, cols // 16), 0xFF, dtype=torch.uint8, device="cuda")
+
+    add_rmsnorm(
+        x,
+        residual,
+        weight,
+        1e-6,
+        x2=None,
+        out=x,
+        out_fp8=None,
+        fp8_scale=None,
+        out_fp4=(values, scales),
+        fp4_scale=global_scale,
+        gemma=True,
+    )
+
+    assert torch.equal(wide[:, cols:], neighbours)
+    _assert_matches_fp4_quantize(x.contiguous(), values, scales, global_scale)
+
+
 def test_nvfp4_copy_flushes_subnormal_blocks() -> None:
     # fp4_quantize is built flush-to-zero: a block of subnormal values quantizes as an all-zero block.
     rows, cols = 4, 5120

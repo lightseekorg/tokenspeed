@@ -110,6 +110,30 @@ def test_add_norm_with_fp4_matches_forward(
         assert torch.equal(normed_fp4[1], scales.view(torch.uint8))
 
 
+@pytest.mark.skipif(not _IS_BLACKWELL, reason="the NVFP4 copy is made on Blackwell")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+        "FLASHINFER_NVFP4_4OVER6",
+    ],
+)
+@pytest.mark.parametrize("value", ["1", "true"])
+def test_add_norm_with_fp4_skips_other_fp4_quantize_recipes(
+    monkeypatch, name: str, value: str
+) -> None:
+    # fp4_quantize leaves its default recipe only when one of these is exactly "1".
+    monkeypatch.setenv(name, value)
+    norm, x, residual = _norm_and_rows(14, 5120)
+
+    _, normed_fp4, _ = norm.add_norm_with_fp4(
+        x, residual, torch.tensor([7.5], device="cuda")
+    )
+
+    assert (normed_fp4 is None) == (value == "1")
+
+
 def test_add_norm_with_fp4_copies_bf16_rows_only() -> None:
     torch.manual_seed(0)
     norm = GemmaRMSNorm(5120, eps=1e-6).to(device="cuda", dtype=torch.float16)
