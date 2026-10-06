@@ -100,14 +100,14 @@ and runs triggered by `dependabot[bot]` are skipped. It uses a GitHub-hosted CPU
 runner and posts a summary comment for the exact reviewed head commit; a newer
 push cancels the previous run. It does not approve PRs or gate merges.
 
-Configure these organization Actions variables and secrets with selected-repository
-access granted to TokenSpeed. Keep the publishing token as a repository secret:
+The API must implement the OpenAI-compatible protocol. Configure these organization
+Actions variables and secrets with `all` repository access to share them across the
+organization. Keep the publishing token as a repository secret:
 
 | Setting | Kind | Value |
 | --- | --- | --- |
 | `KIMI_API_URL` | Organization variable | Provider API base URL, including its API version path |
 | `KIMI_MODEL` | Organization variable | Model ID accepted by that endpoint |
-| `KIMI_PROVIDER_TYPE` | Organization variable | Kimi CLI provider type, such as `openai` or `kimi` |
 | `KIMI_API_KEY` | Organization secret | API token for that endpoint |
 | `LIGHTSEEK_BOT_TOKEN` | Repository secret | Token for `lightseek-bot` with repository variable read and PR comment write access |
 
