@@ -609,7 +609,7 @@ def _top_k_top_p_qrita_gumbel_kernel(
     out_ptr,
     logits_row_stride: tl.constexpr,
     qrita_buffer_row_stride: tl.constexpr,
-    batch_size: tl.constexpr,
+    batch_size,
     vocab_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_TRUNC: tl.constexpr,

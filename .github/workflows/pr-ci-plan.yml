@@ -1,0 +1,63 @@
+name: PR CI Plan
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-ci-plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: CI Coverage Plan
+    if: >-
+      github.repository == 'lightseekorg/tokenspeed'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout source commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install planning CLI
+        run: npm install --global @moonshot-ai/kimi-code@2.1.1
+
+      - name: Install task catalog dependency
+        run: python3 -m pip install pyyaml
+
+      - name: Prepare CI plan
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+        run: python3 .github/scripts/pr-ci-model.py prepare
+
+      - name: Generate CI plan
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          KIMI_CODE_HOME: ${{ runner.temp }}/ci-assist-home
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/pr-ci-model.py plan
+
+      - name: Publish CI plan
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/pr-ci-model.py publish

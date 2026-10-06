@@ -36,6 +36,12 @@ KERNEL = "ops.example._kernel"
 SITE = "runtime/models/example.py:12 (forward)"
 
 
+@pytest.fixture(autouse=True)
+def startup(monkeypatch):
+    # mark_serving() closes the process-wide compile switch; reopen it afterwards.
+    monkeypatch.setattr(compile_monitor, "_serving", False)
+
+
 def _record(monitor, n, block=64, site=SITE):
     monitor.record(
         KERNEL,
@@ -154,6 +160,13 @@ def test_error_mode_raises():
     _record(monitor, 5)
     with pytest.raises(UnboundedSpecializationError, match="parameter N"):
         _record(monitor, 7)
+
+
+def test_serving_mark_closes_the_compile_switch_without_a_monitor(monkeypatch):
+    monkeypatch.setattr(compile_monitor, "_hooks", None)
+    assert not compile_monitor.is_serving()
+    compile_monitor.mark_serving()
+    assert compile_monitor.is_serving()
 
 
 def test_rejects_unknown_mode():

@@ -51,6 +51,7 @@ class _FusedMoeActivationFunction(enum.IntEnum):
     silu_dot = 0
     openai_swiglu = 1
     kimi_situ = 2
+    clamped_silu_dot = 3
 
 
 class _FusedMoeStage1Buffering(enum.IntEnum):
@@ -72,6 +73,7 @@ class MegaMoeActivationFunction(enum.Enum):
     silu = "silu"
     swiglu = "swiglu"
     kimi_situ = "kimi_situ"
+    silu_clamped = "silu_clamped"
 
 
 class MegaMoeStages(enum.IntEnum):
@@ -207,7 +209,10 @@ def _select_mega_moe_producer_geometry(
         return _MegaMoeProducerGeometry.cta56
     if num_experts <= 56:
         return _MegaMoeProducerGeometry.cta56
-    if activation_function is MegaMoeActivationFunction.silu:
+    if activation_function in (
+        MegaMoeActivationFunction.silu,
+        MegaMoeActivationFunction.silu_clamped,
+    ):
         if num_experts == 256 and 12 <= num_tokens < 1024:
             return _MegaMoeProducerGeometry.cta192
         if num_experts == 384 and num_tokens < 512:
@@ -301,10 +306,20 @@ class MegaMoeConfig:
             and not self.has_bias
             and activation_function is MegaMoeActivationFunction.kimi_situ
         )
+        deepseek_v41_config = (
+            self.world_size == 8
+            and (self.num_experts, self.topk) in ((384, 6), (128, 3))
+            and self.model_dim == 5120
+            and self.inter_dim == 2560
+            and not self.has_bias
+            and activation_function is MegaMoeActivationFunction.silu_clamped
+        )
         supported = (
             stages is MegaMoeStages.two_stage
             and activation is MegaMoeActivation.mxfp4
-            and (gpt_oss_config or deepseek_config or kimi_config)
+            and (
+                gpt_oss_config or deepseek_config or kimi_config or deepseek_v41_config
+            )
         )
         if not supported:
             raise ValueError("unsupported registered MegaMoE configuration")
@@ -326,12 +341,17 @@ class MegaMoeConfig:
                 stages=_FusedMoeStages(stages),
                 w2_tile_shape=_MegaMoeTileShape.n256,
                 activation_function=(
-                    _FusedMoeActivationFunction.silu_dot
-                    if activation_function is MegaMoeActivationFunction.silu
+                    _FusedMoeActivationFunction.clamped_silu_dot
+                    if activation_function is MegaMoeActivationFunction.silu_clamped
                     else (
-                        _FusedMoeActivationFunction.kimi_situ
-                        if activation_function is MegaMoeActivationFunction.kimi_situ
-                        else _FusedMoeActivationFunction.openai_swiglu
+                        _FusedMoeActivationFunction.silu_dot
+                        if activation_function is MegaMoeActivationFunction.silu
+                        else (
+                            _FusedMoeActivationFunction.kimi_situ
+                            if activation_function
+                            is MegaMoeActivationFunction.kimi_situ
+                            else _FusedMoeActivationFunction.openai_swiglu
+                        )
                     )
                 ),
                 has_bias=self.has_bias,

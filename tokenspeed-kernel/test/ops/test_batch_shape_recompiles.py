@@ -1187,3 +1187,68 @@ def test_mhc_hc4_coefficients_split_count():
         for n_splits in (5, 7, 12, 64, 112):
             for got, want in zip(run(n_splits), expected, strict=True):
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_qrita_top_k_top_p_row_count():
+    from tokenspeed_kernel.ops.sampling.triton import topk_topp
+
+    vocab, pools = 1025, 4
+    table = torch.tensor(
+        topk_topp._QRITA_PERCENTILE_TO_STD_TABLE, dtype=torch.float32, device=DEVICE
+    )
+
+    def run(rows):
+        logits = torch.randn(rows, vocab, device=DEVICE) * 2.0
+        # Top-k of one leaves only the argmax to sample.
+        got = topk_topp.gumbel_sample_top_k_top_p_qrita_from_pools(
+            logits,
+            torch.arange(rows, dtype=torch.int32, device=DEVICE) % pools,
+            torch.ones(pools, device=DEVICE),
+            torch.ones(pools, dtype=torch.int32, device=DEVICE),
+            torch.ones(pools, device=DEVICE),
+            torch.arange(pools, dtype=torch.int64, device=DEVICE),
+            torch.zeros(pools, dtype=torch.int64, device=DEVICE),
+            torch.empty(pools, vocab, dtype=torch.float32, device=DEVICE),
+            table,
+            torch.empty(rows, dtype=torch.int32, device=DEVICE),
+            num_programs=pools,
+        )
+        torch.testing.assert_close(got, logits.argmax(-1).int(), rtol=0, atol=0)
+
+    for rows in (1, 16, 3):
+        run(rows)
+    with assert_no_triton_compile(topk_topp._top_k_top_p_qrita_gumbel_kernel):
+        for rows in (5, 6, 7, 9, 12, 130, 131):
+            run(rows)
+
+
+def test_marlin_deepep_pack_global_token_count():
+    from tokenspeed_kernel.ops.moe.marlin import deepep_layout
+
+    experts, recv_m, hidden, top_k, block_m = 4, 24, 256, 2, 16
+    counts = torch.tensor([5, 0, 17, 3], dtype=torch.int32, device=DEVICE)
+    recv_x = torch.randn(experts, recv_m, hidden, device=DEVICE, dtype=torch.bfloat16)
+
+    def run(tokens):
+        packed, sorted_ids, _, _, offsets = deepep_layout.pack_recv_rows(
+            recv_x, counts, tokens, top_k, block_m
+        )
+        capacity = deepep_layout.compact_row_capacity(
+            tokens, top_k, experts, recv_m, block_m
+        )
+        assert packed.shape[0] == capacity
+        for expert, count in enumerate(counts.tolist()):
+            start = int(offsets[expert])
+            live = packed[start : start + count]
+            torch.testing.assert_close(live, recv_x[expert, :count], rtol=0, atol=0)
+            padding = sorted_ids[start + count : start + -(-count // block_m) * block_m]
+            assert (padding == capacity).all()
+        return capacity
+
+    run(13)
+    with assert_no_triton_compile(
+        deepep_layout._layout_kernel, deepep_layout._pack_kernel
+    ):
+        capacities = {run(tokens) for tokens in range(14, 41)}
+    # The sweep must cross several capacities, each a compile while it was constexpr.
+    assert len(capacities) >= 4

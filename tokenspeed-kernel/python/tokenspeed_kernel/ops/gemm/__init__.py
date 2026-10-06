@@ -37,6 +37,7 @@ import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm_cutedsl  # noqa: F401
 import torch
+from tokenspeed_kernel.compile_monitor import is_serving
 from tokenspeed_kernel.ops.gemm.deep_gemm import (
     _warmup_deep_gemm_fp8_linears,
     ceil_to_ue8m0,
@@ -1498,6 +1499,7 @@ def mm(
             bias is None
             and M <= BF16_GEMM_MAX_M
             and flashinfer_joint_bf16_supported(A, B, out)
+            and not is_serving()
         ):
             shape_params = {"M": M, "N": N, "K": K}
             ShapeCapture.get().record(
