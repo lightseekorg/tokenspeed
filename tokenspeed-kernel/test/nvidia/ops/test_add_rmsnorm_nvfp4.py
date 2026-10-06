@@ -226,7 +226,7 @@ def test_nvfp4_copy_contract() -> None:
             **common,
         )
     narrow = torch.randn(4, 2560, device="cuda").bfloat16()
-    with pytest.raises(ValueError, match="nvfp4_copy_supported"):
+    with pytest.raises(ValueError, match="no NVFP4 copy"):
         add_rmsnorm(
             narrow,
             narrow.clone(),

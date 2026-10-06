@@ -57,6 +57,7 @@ def _assert_same_norm(normed, residual, expected, expected_residual) -> None:
     assert torch.equal(residual, expected_residual)
     # Same FP32 math; the sum of squares may add in another order, so within one bf16 ulp.
     torch.testing.assert_close(normed, expected, atol=0, rtol=2**-7)
+    assert (normed != expected).sum().item() <= normed.numel() // 1000
 
 
 @pytest.mark.parametrize("rows", [0, 1, 14, 112])
@@ -107,3 +108,19 @@ def test_add_norm_with_fp4_matches_forward(
         values, scales = fp4_quantize(normed, scale)
         assert torch.equal(normed_fp4[0], values.view(torch.uint8))
         assert torch.equal(normed_fp4[1], scales.view(torch.uint8))
+
+
+def test_add_norm_with_fp4_copies_bf16_rows_only() -> None:
+    torch.manual_seed(0)
+    norm = GemmaRMSNorm(5120, eps=1e-6).to(device="cuda", dtype=torch.float16)
+    norm.weight.data.normal_(0, 0.3)
+    x = torch.randn(14, 5120, device="cuda", dtype=torch.float16)
+    residual = torch.randn_like(x)
+
+    expected, expected_residual = norm(x.clone(), residual.clone())
+    normed, normed_fp4, new_residual = norm.add_norm_with_fp4(
+        x.clone(), residual.clone(), torch.tensor([7.5], device="cuda")
+    )
+
+    _assert_same_norm(normed, new_residual, expected, expected_residual)
+    assert normed_fp4 is None

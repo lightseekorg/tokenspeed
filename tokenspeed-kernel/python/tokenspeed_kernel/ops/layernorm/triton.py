@@ -5,6 +5,7 @@ import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.quantization.triton import _fp8_swizzled_scale_offset
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _FP8_E4M3_MAX = tl.constexpr(448.0)
@@ -888,14 +889,6 @@ def _e2m1x2(lo, hi):
 
 
 @triton.jit
-def _nvfp4_scale_offsets(row, k, N_COLS: tl.constexpr):
-    # fp4_quantize's 128x4 swizzled layout: [m tile, k tile, row % 32, row % 128 // 32, k % 4].
-    k_tiles: tl.constexpr = (N_COLS // 16 + 3) // 4
-    base = (row // 128) * (k_tiles * 512) + (row % 32) * 16 + ((row % 128) // 32) * 4
-    return base + (k // 4) * 512 + k % 4
-
-
-@triton.jit
 def _store_nvfp4(
     normed,
     row,
@@ -907,7 +900,7 @@ def _store_nvfp4(
     rcp_sf_scale,
     rcp6,
     BLOCK,
-    N_COLS,
+    K_TILES,
 ):
     # fp4_quantize's E4M3-scale recipe, bit for bit: block amax / 6 scaled into E4M3, values into E2M1.
     blocks = tl.reshape(normed, [BLOCK // 16, 16])
@@ -927,7 +920,7 @@ def _store_nvfp4(
         fp4_ptr + row * stride_fp4 + c * (BLOCK // 2) + tl.arange(0, BLOCK // 2), packed
     )
     k = c * (BLOCK // 16) + tl.arange(0, BLOCK // 16)
-    tl.store(sf_ptr + _nvfp4_scale_offsets(row, k, N_COLS), sf_bits.to(tl.uint8))
+    tl.store(sf_ptr + _fp8_swizzled_scale_offset(row, k, K_TILES), sf_bits.to(tl.uint8))
 
 
 @triton.jit(do_not_specialize=["n_rows"])
@@ -961,6 +954,8 @@ def _add_rmsnorm_kernel(
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
+    # fp4_quantize's 128x4 scale layout counts 4 scales (64 columns) per k tile.
+    K_TILES: tl.constexpr = n_cols // 64
     if HAS_FP4:
         if row >= n_rows:
             # Rows past the batch in the last 128-row scale tile get zero scales, as fp4_quantize writes them.
@@ -969,7 +964,7 @@ def _add_rmsnorm_kernel(
             for c in tl.static_range(CHUNKS):
                 k = c * (BLOCK // 16) + tl.arange(0, BLOCK // 16)
                 tl.store(
-                    out_sf_ptr + _nvfp4_scale_offsets(row, k, n_cols),
+                    out_sf_ptr + _fp8_swizzled_scale_offset(row, k, K_TILES),
                     tl.zeros([BLOCK // 16], dtype=tl.uint8),
                 )
             return
@@ -1047,7 +1042,7 @@ def _add_rmsnorm_kernel(
                 rcp_sf_scale,
                 rcp6,
                 BLOCK,
-                n_cols,
+                K_TILES,
             )
 
 
@@ -1065,18 +1060,23 @@ _FP4_RECIPE_ENV = (
 )
 
 
-def nvfp4_copy_supported(n_cols: int) -> bool:
-    """Whether ``add_rmsnorm`` can write the NVFP4 copy of ``n_cols``-wide rows.
-
-    It needs Blackwell's E2M1 conversions, whole chunks of 4 x 16-wide scale
-    groups, and ``fp4_quantize`` running its default recipe, which the copy
-    reproduces bit for bit.
-    """
+def _nvfp4_copy_possible(n_cols: int) -> bool:
+    # Blackwell's E2M1 conversions, and row chunks of whole 4 x 16-wide scale groups.
     return (
         current_platform().is_blackwell
         and n_cols % 64 == 0
         and n_cols % _row_block(n_cols) == 0
-        and not any(os.environ.get(name) == "1" for name in _FP4_RECIPE_ENV)
+    )
+
+
+def nvfp4_copy_supported(n_cols: int) -> bool:
+    """Whether ``add_rmsnorm``'s NVFP4 copy of ``n_cols``-wide rows equals ``fp4_quantize``'s.
+
+    The copy needs Blackwell and widths in whole chunks of 4 x 16-wide scale
+    groups, and reproduces ``fp4_quantize``'s default recipe bit for bit.
+    """
+    return _nvfp4_copy_possible(n_cols) and not any(
+        os.environ.get(name) == "1" for name in _FP4_RECIPE_ENV
     )
 
 
@@ -1107,7 +1107,7 @@ def add_rmsnorm(
         fp8_scale: One-element FP32 dequant scale, given exactly with
             ``out_fp8``.
         out_fp4: Optional ``(values, scales)`` NVFP4 copy, as ``fp4_quantize``
-            returns it: ``[M, N // 2]`` uint8 E2M1 pairs and ``[ceil(M / 128) * 128,
+            returns it with its default recipe: ``[M, N // 2]`` uint8 E2M1 pairs and ``[ceil(M / 128) * 128,
             N // 16]`` uint8 E4M3 block scales in its 128x4 swizzled layout.
         fp4_scale: One-element FP32 global scale the NVFP4 copy is quantized
             with (``fp4_quantize``'s ``global_scale``), given exactly with ``out_fp4``.
@@ -1131,10 +1131,8 @@ def add_rmsnorm(
     if out_fp4 is not None:
         values, scales = out_fp4
         grid_rows = triton.cdiv(rows, 128) * 128
-        if not nvfp4_copy_supported(cols):
-            raise ValueError(
-                f"no NVFP4 copy here for N={cols}; check nvfp4_copy_supported first"
-            )
+        if not _nvfp4_copy_possible(cols):
+            raise ValueError(f"no NVFP4 copy of N={cols} rows on this device")
         if (
             values.shape != (rows, cols // 2)
             or values.stride(1) != 1

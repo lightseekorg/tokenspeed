@@ -372,6 +372,8 @@ def test_add_rmsnorm_matches_unfused_reference(
 
     assert torch.equal(residual, total.to(torch.bfloat16))
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+    # Another summation order may flip only the rare value next to a rounding boundary.
+    assert (out != ref.to(torch.bfloat16)).sum().item() <= out.numel() // 1000
     if with_fp8:
         expected, _ = static_quant_fp8(out, scale)
         assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
