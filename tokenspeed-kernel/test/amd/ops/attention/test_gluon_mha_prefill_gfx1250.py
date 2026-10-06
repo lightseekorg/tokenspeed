@@ -731,13 +731,13 @@ def test_select_qk_ds_group_stride():
 
 
 @pytest.mark.parametrize(
-    "n_q_heads,n_kv_heads,expected_block_m,expected_wpe,expected_group,expected_ds,expected_scheduler,expected_wide,window_left",
+    "n_q_heads,n_kv_heads,expected_block_m,expected_wpe,expected_group,expected_ds,expected_scheduler,expected_wide,expected_fused,window_left",
     [
-        (8, 1, 256, 0, 4, 8, "amdgpu-sched-strategy=coexec", False, -1),
-        (8, 8, 256, 0, 4, 8, "amdgpu-sched-strategy=coexec", False, -1),
-        (32, 8, 128, 2, 0, 0, "amdgpu-sched-strategy=coexec", True, -1),
-        (32, 1, 128, 2, 4, 0, "amdgpu-sched-strategy=coexec", True, -1),
-        (8, 1, 128, 2, 0, 0, "amdgpu-sched-strategy=coexec", False, 512),
+        (8, 1, 256, 0, 4, 8, "amdgpu-sched-strategy=coexec", False, False, -1),
+        (8, 8, 256, 0, 4, 8, "amdgpu-sched-strategy=coexec", False, False, -1),
+        (32, 8, 128, 2, 0, 0, "amdgpu-sched-strategy=coexec", True, True, -1),
+        (32, 1, 128, 2, 4, 0, "amdgpu-sched-strategy=coexec", True, False, -1),
+        (8, 1, 128, 2, 0, 0, "amdgpu-sched-strategy=coexec", False, False, 512),
     ],
 )
 def test_mha_prefill_bf16_exact_route_config(
@@ -750,6 +750,7 @@ def test_mha_prefill_bf16_exact_route_config(
     expected_ds,
     expected_scheduler,
     expected_wide,
+    expected_fused,
     window_left,
 ):
     captured = {}
@@ -797,6 +798,7 @@ def test_mha_prefill_bf16_exact_route_config(
     assert captured["wide"] is expected_wide
     if expected_wide:
         assert captured["args"][20] is (n_kv_heads == 1)
+        assert captured["args"][21] is expected_fused
     else:
         assert captured["args"][20] == expected_block_m
         assert captured["args"][29] is True
