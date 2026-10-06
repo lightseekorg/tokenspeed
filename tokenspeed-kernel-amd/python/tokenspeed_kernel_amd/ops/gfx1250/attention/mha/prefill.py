@@ -31,6 +31,11 @@ import math
 from typing import NamedTuple
 
 import torch
+from tokenspeed_kernel_amd._scheduling import (
+    sched_barrier,
+    sched_barrier_compile_options,
+    sched_group,
+)
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx1250.attention._common import (
     _INV_LN2,
@@ -857,11 +862,21 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
 
 
 @gluon.jit
-def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
+def process_attention_tile_deep(
+    program: AttentionProgram,
+    kv_start,
+    num_tiles,
+    QK_VALU_GROUP_SIZE: gl.constexpr,
+):
     """Three-tile K-ahead/V-behind schedule from dense FAv3."""
     cfg = program.cfg
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
+    qk_wmmas_per_wave: gl.constexpr = (
+        (cfg.BLOCK_M // (16 * cfg.NUM_WARPS))
+        * (cfg.BLOCK_N // 16)
+        * (cfg.HEAD_DIM // 32)
+    )
 
     program.tdm_load_global_to_shared_k(kv_start, 0)
     program.tdm_load_global_to_shared_k(kv_start + cfg.BLOCK_N, 1)
@@ -884,6 +899,8 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
     for tile_idx in range(1, num_tiles - 2):
         cur_kv_start = kv_start + tile_idx * cfg.BLOCK_N
 
+        if QK_VALU_GROUP_SIZE > 0:
+            sched_barrier()
         qk = program.compute_qk(q, k)
         if cfg.WINDOW_LEFT < 0:
             if cur_kv_start + cfg.BLOCK_N > program.q_start:
@@ -891,6 +908,11 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
         else:
             qk = program.apply_mask(qk, cur_kv_start)
         p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+        if QK_VALU_GROUP_SIZE > 0:
+            for _ in gl.static_range(qk_wmmas_per_wave):
+                sched_group("mfma", 1)
+                sched_group("valu", QK_VALU_GROUP_SIZE)
+            sched_barrier()
         v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=2)
 
         program.tdm_load_global_to_shared_k(
@@ -1154,8 +1176,10 @@ def gluon_mha_prefill_gfx1250_wide_transport(
     SM_SCALE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    DISABLE_XDL_ARB_STALL: gl.constexpr,
 ):
-    gl.amd.hint.disable_xdl_arb_stall()
+    if DISABLE_XDL_ARB_STALL:
+        gl.amd.hint.disable_xdl_arb_stall()
     q_strides = InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D)
     k_strides = InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D)
     v_strides = InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D)
@@ -1244,8 +1268,10 @@ def gluon_mha_prefill_gfx1250(
     COMPACT_RAGGED: gl.constexpr,
     WIDE_ADDRESSING: gl.constexpr,
     DISABLE_XDL_ARB_STALL: gl.constexpr,
+    QK_VALU_GROUP_SIZE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    SCHED_LIBRARY_HASH: gl.constexpr,
 ):
     if DISABLE_XDL_ARB_STALL:
         gl.amd.hint.disable_xdl_arb_stall()
@@ -1296,10 +1322,14 @@ def gluon_mha_prefill_gfx1250(
         num_tiles = (kv_end - kv_start) // cfg.BLOCK_N
         if cfg.DEEP_PIPELINE:
             if not cfg.PACKED_GQA:
-                process_attention_tile_deep(program, kv_start, num_tiles)
+                process_attention_tile_deep(
+                    program, kv_start, num_tiles, QK_VALU_GROUP_SIZE
+                )
             else:
                 if num_tiles >= 3:
-                    process_attention_tile_deep(program, kv_start, num_tiles)
+                    process_attention_tile_deep(
+                        program, kv_start, num_tiles, QK_VALU_GROUP_SIZE
+                    )
                 elif num_tiles == 1:
                     process_single_attention_tile(program, kv_start)
                 else:
@@ -1439,11 +1469,12 @@ def _select_packed_gqa(
     packed_q_block_bytes: int,
 ) -> bool:
     """Select packed query-head rows only on measured gfx1250 workloads."""
+    primary_tuple = (n_heads, n_kv_heads) == (8, 1)
+    bf16_head_tuple = (n_heads, n_kv_heads) in ((8, 8), (32, 8), (32, 1))
     if (
         dtype not in (torch.bfloat16, torch.float16)
         or head_dim != 128
-        or n_heads != 8
-        or n_kv_heads != 1
+        or not (primary_tuple or bf16_head_tuple)
         or has_sink
         or has_lse
         or packed_q_block_bytes > 2**32
@@ -1453,6 +1484,13 @@ def _select_packed_gqa(
 
     uniform = all(seqlen == max_seqlen for seqlen in seqlens)
     batch_size = len(seqlens)
+    if bf16_head_tuple:
+        return (
+            dtype == torch.bfloat16
+            and window_left < 0
+            and uniform
+            and (batch_size, max_seqlen) == (4, 4096)
+        )
     if window_left == 512:
         return uniform and batch_size == 4 and max_seqlen == 4096
     if window_left >= 0:
@@ -1479,19 +1517,25 @@ def _select_wide_transport(
     has_lse: bool,
     wide_addressing: bool,
 ) -> bool:
-    """Select BN128 transport with sequential BN64 compute at measured S1024."""
+    """Select BN128 transport with sequential BN64 compute on measured routes."""
+    if (
+        dtype not in (torch.bfloat16, torch.float16)
+        or head_dim != 128
+        or not seqlens
+        or not all(seqlen == max_seqlen for seqlen in seqlens)
+        or window_left >= 0
+        or has_sink
+        or has_lse
+        or wide_addressing
+    ):
+        return False
+    if (n_heads, n_kv_heads) == (8, 1):
+        return len(seqlens) == 8 and max_seqlen == 1024
     return (
-        dtype in (torch.bfloat16, torch.float16)
-        and head_dim == 128
-        and n_heads == 8
-        and n_kv_heads == 1
-        and len(seqlens) == 8
-        and max_seqlen == 1024
-        and all(seqlen == max_seqlen for seqlen in seqlens)
-        and window_left < 0
-        and not has_sink
-        and not has_lse
-        and not wide_addressing
+        dtype == torch.bfloat16
+        and (n_heads, n_kv_heads) in ((32, 8), (32, 1))
+        and len(seqlens) == 4
+        and max_seqlen == 4096
     )
 
 
@@ -1518,6 +1562,39 @@ def _select_disable_xdl_arb_stall(
         and not guarded_query_rows
         and waves_per_eu == 2
     )
+
+
+def _select_qk_valu_group_size(
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+    n_heads: int,
+    n_kv_heads: int,
+    seqlens: list[int],
+    max_seqlen: int,
+    window_left: int,
+    has_sink: bool,
+    has_lse: bool,
+    wide_addressing: bool,
+) -> int:
+    """Interleave QK WMMAs with independent prior-tile VALU on measured routes."""
+    if (
+        dtype != torch.bfloat16
+        or head_dim != 128
+        or window_left >= 0
+        or has_sink
+        or has_lse
+        or wide_addressing
+        or not seqlens
+        or not all(seqlen == max_seqlen for seqlen in seqlens)
+    ):
+        return 0
+    shape = (len(seqlens), max_seqlen)
+    if (n_heads, n_kv_heads) == (8, 1) and shape in ((4, 4096), (2, 8192)):
+        return 4
+    if (n_heads, n_kv_heads) == (32, 1) and shape == (4, 4096):
+        return 4
+    return 0
 
 
 def _select_m_tile(
@@ -1710,7 +1787,10 @@ def launch_gluon_mha_prefill_gfx1250(
             and (config.batch_size, config.max_seqlen)
             in ((4, 2048), (4, 4096), (2, 8192))
         )
-        wide_packed_gqa = fast_four_wave and config.max_seqlen >= 4096
+        group_size = config.n_heads // config.n_kv_heads
+        wide_packed_gqa = (
+            fast_four_wave and config.max_seqlen >= 4096 and group_size in (1, 8)
+        )
         block_m = 256 if wide_packed_gqa else 128
         block_n = 32 if config.window_left == 512 else 64
         config = config._replace(
@@ -1800,6 +1880,11 @@ def launch_gluon_mha_prefill_gfx1250(
             )
         elif guarded_query_rows and q.dtype == torch.bfloat16:
             llvm_fn_attrs = "amdgpu-sched-strategy=coexec"
+        elif q.dtype == torch.bfloat16 and (
+            config.n_heads,
+            config.n_kv_heads,
+        ) == (32, 8):
+            llvm_fn_attrs = "amdgpu-sched-strategy=max-memory-clause"
         elif q.dtype == torch.float16 and config.max_seqlen > 1024:
             llvm_fn_attrs = "amdgpu-sched-strategy=max-ilp"
         else:
@@ -1818,6 +1903,23 @@ def launch_gluon_mha_prefill_gfx1250(
                 )
             )
         )
+
+    qk_valu_group_size = _select_qk_valu_group_size(
+        dtype=q.dtype,
+        head_dim=config.head_dim,
+        n_heads=config.n_heads,
+        n_kv_heads=config.n_kv_heads,
+        seqlens=seqlens,
+        max_seqlen=config.max_seqlen,
+        window_left=config.window_left,
+        has_sink=sinks is not None,
+        has_lse=return_lse,
+        wide_addressing=wide_addressing,
+    )
+    wide_disable_xdl_arb_stall = (config.n_heads, config.n_kv_heads) in (
+        (8, 1),
+        (32, 1),
+    )
 
     if wide_transport:
         gluon_mha_prefill_gfx1250_wide_transport[config.grid](
@@ -1841,6 +1943,7 @@ def launch_gluon_mha_prefill_gfx1250(
             config.sm_scale,
             config.num_warps,
             config.num_buffers,
+            wide_disable_xdl_arb_stall,
             num_warps=config.num_warps,
             waves_per_eu=config.waves_per_eu,
             llvm_fn_attrs="amdgpu-sched-strategy=coexec",
@@ -1882,12 +1985,14 @@ def launch_gluon_mha_prefill_gfx1250(
             compact_ragged,
             wide_addressing,
             disable_xdl_arb_stall,
+            qk_valu_group_size,
             config.num_warps,
             config.num_buffers,
             num_warps=config.num_warps,
             waves_per_eu=config.waves_per_eu,
             llvm_fn_attrs=llvm_fn_attrs,
             enable_fp_fusion=True,
+            **sched_barrier_compile_options(),
         )
     if return_lse:
         return output, lse

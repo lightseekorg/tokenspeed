@@ -57,6 +57,13 @@ entry:
   ret i32 0
 }
 
+; Four VALU instructions.
+define i32 @__tokenspeed_sched_group_barrier_2_4() alwaysinline {
+entry:
+  call void @llvm.amdgcn.sched.group.barrier(i32 2, i32 4, i32 0)
+  ret i32 0
+}
+
 ; Three VMEM instructions.
 define i32 @__tokenspeed_sched_group_barrier_16_3() alwaysinline {
 entry:
