@@ -48,9 +48,11 @@ jobs:
           test "$(git rev-parse HEAD)" = "$PR_HEAD_SHA"
           gh auth status
           test "$(gh api user --jq .login)" = lightseek-bot
-          KIMI_API_URL=$(gh api "repos/$GITHUB_REPOSITORY/actions/variables/KIMI_API_URL" --jq .value)
-          KIMI_MODEL=$(gh api "repos/$GITHUB_REPOSITORY/actions/variables/KIMI_MODEL" --jq .value)
-          KIMI_PROVIDER_TYPE=$(gh api "repos/$GITHUB_REPOSITORY/actions/variables/KIMI_PROVIDER_TYPE" --jq .value)
+          variables=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/organization-variables?per_page=30" \
+            --jq '.variables[]' | jq -s '.')
+          KIMI_API_URL=$(jq -r '.[] | select(.name == "KIMI_API_URL") | .value' <<< "$variables")
+          KIMI_MODEL=$(jq -r '.[] | select(.name == "KIMI_MODEL") | .value' <<< "$variables")
+          KIMI_PROVIDER_TYPE=$(jq -r '.[] | select(.name == "KIMI_PROVIDER_TYPE") | .value' <<< "$variables")
           export KIMI_API_URL KIMI_MODEL KIMI_PROVIDER_TYPE
           test -n "$KIMI_API_URL"
           test -n "$KIMI_MODEL"
