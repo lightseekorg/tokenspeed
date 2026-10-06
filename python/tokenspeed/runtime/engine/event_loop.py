@@ -257,6 +257,8 @@ class EventLoop:
         cache_groups = specs.cache_groups
         # The builder may have lowered this to the cache-group checkpoint grain.
         max_scheduled_tokens = server_args.chunked_prefill_size
+        # The forward token bound also caps each multimodal encoder call.
+        self._max_encoder_tokens = max_scheduled_tokens
 
         self.attn_tp_size = server_args.attn_tp_size or mapping.attn.tp_size
         self.world_size = server_args.world_size or mapping.world_size
@@ -1170,7 +1172,9 @@ class EventLoop:
                             input_logprob_plan=input_logprob_plan,
                             multimodal_context=(
                                 multimodal_context_for_forward(
-                                    forward_op, self.output_processor.rid_to_state
+                                    forward_op,
+                                    self.output_processor.rid_to_state,
+                                    self._max_encoder_tokens,
                                 )
                                 if self.model_config.is_multimodal_active
                                 else None
