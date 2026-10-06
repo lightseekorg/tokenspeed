@@ -129,6 +129,13 @@ class XGrammarGrammar(BaseGrammarObject):
             matcher, self.vocab_size, self.ctx, self.override_stop_tokens
         )
 
+    @property
+    def memory_size_bytes(self) -> int:
+
+        # The compiled grammar (xgrammar's estimate) and this object's
+        # matcher, mostly a token bitset of the vocabulary size.
+        return self.ctx.memory_size_bytes + self.vocab_size // 8
+
 
 class XGrammarGrammarBackend(BaseGrammarBackend):
     def __init__(
@@ -144,7 +151,13 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             tokenizer, vocab_size=vocab_size
         )
 
-        self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        # BaseGrammarBackend keeps the compiled grammars that requests reuse,
+        # within RETAINED_GRAMMAR_LIMIT_BYTES. xgrammar's own cache is off:
+        # its heap keeps growing past cache_limit_bytes as distinct schemas
+        # arrive, and clear_cache() does not free all of it.
+        self.grammar_compiler = GrammarCompiler(
+            tokenizer_info=tokenizer_info, cache_enabled=False
+        )
 
         self.vocab_size = vocab_size
         self.override_stop_tokens = None
@@ -209,4 +222,5 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     def reset(self):
 
+        super().reset()
         self.grammar_compiler and self.grammar_compiler.clear_cache()
