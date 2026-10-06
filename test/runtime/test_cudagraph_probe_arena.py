@@ -198,6 +198,7 @@ def test_the_floor_is_the_widest_row_count_the_probe_fabricates(
         max_forward_tokens=tokens,
         context_len=context,
         capture_batch_sizes=capture_batch_sizes,
+        decoder_requests=0,
     )
     assert floor == expected
     widest = max(
@@ -214,16 +215,19 @@ def test_the_floor_is_the_widest_row_count_the_probe_fabricates(
 
 
 @pytest.mark.parametrize(
-    "ceiling, capture_batch_sizes, context, expected",
+    "ceiling, capture_batch_sizes, context, rows_per_request, max_num_seqs, expected",
     [
-        (None, None, 4096, 2),
+        (None, None, 4096, None, 80, 2),
         # A graph ladder wider than the per-forward token budget.
-        (65536, None, 4096, 16),
-        (None, [1, 8, 32], 40960, 32),
+        (65536, None, 4096, None, 80, 16),
+        (None, [1, 8, 32], 40960, None, 80, 32),
+        # A narrowing decoder ladder fabricates a request per 128 rows, up to max_num_seqs.
+        (None, None, 40960, 128, 80, 64),
+        (None, None, 40960, 128, 16, 16),
     ],
 )
 def test_the_boot_floor_reads_both_knobs(
-    ceiling, capture_batch_sizes, context, expected
+    ceiling, capture_batch_sizes, context, rows_per_request, max_num_seqs, expected
 ) -> None:
     server_args = SimpleNamespace(
         all2all_backend="none",
@@ -231,9 +235,13 @@ def test_the_boot_floor_reads_both_knobs(
         chunked_prefill_size=8192,
         max_total_tokens=None,
         prefill_graph_capture_batch_sizes=capture_batch_sizes,
+        max_num_seqs=max_num_seqs,
     )
     floor = device.probe_arena_floor(
-        server_args, SimpleNamespace(context_len=context), 8192
+        server_args,
+        SimpleNamespace(context_len=context),
+        8192,
+        decoder_rows_per_request=rows_per_request,
     )
     assert floor == expected
 
@@ -322,7 +330,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         factory, "ModelExecutorConfig", SimpleNamespace(from_server_args=lambda **_: 0)
     )
     monkeypatch.setattr(registry, "create_attn_components", build)
-    monkeypatch.setattr(device, "probe_arena_floor", lambda *_: 1)
+    monkeypatch.setattr(device, "probe_arena_floor", lambda *_, **__: 1)
     monkeypatch.setattr(device, "pool_views", views)
     monkeypatch.setattr(device, "_rebind_under_reserve", rebind)
     server_args = SimpleNamespace(
@@ -417,8 +425,14 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "set_random_seed",
     ]
     refusal, probe_build, _, _, serving, _ = calls
-    # The target's model: the narrowing refusal must not read the draft's.
-    assert ast.unparse(refusal.args[-1]) == "target.model"
+    assert [ast.unparse(arg) for arg in refusal.args] == ["server_args"]
+    # The target's model: the narrowing floor must not read the draft's.
+    (narrowing,) = (
+        n
+        for n in ast.walk(build)
+        if isinstance(n, ast.Call) and _callee(n) == "narrowing_prefill_model"
+    )
+    assert ast.unparse(narrowing.args[0]) == "target.model"
     rows = next(kw.value for kw in probe_build.keywords if kw.arg == "probe_batch_rows")
     assert isinstance(rows, ast.IfExp) and ast.unparse(rows.orelse) == "None"
     assert _callee(rows.body) == "probe_arena_floor"
@@ -546,29 +560,15 @@ def test_pool_staged_verify_scratch_keeps_the_serving_concurrency(monkeypatch) -
 
 
 def test_each_refusal_turns_the_probe_off_and_names_itself() -> None:
-    plain = SimpleNamespace(model=object())
-
-    class _Narrowing:
-        max_decoder_rows_per_request = 128
-
-        def encoder_forward(self): ...
-        def narrowing_forward(self): ...
-        def decoder_forward(self): ...
-        def finish_forward(self): ...
-        def decoder_rows(self): ...
-        def allocate_decoder_state(self): ...
-
-    def refusal(disable=False, eager=False, model=plain):
+    def refusal(disable=False, eager=False):
         args = SimpleNamespace(
             disable_cudagraph_memory_reserve=disable, enforce_eager=eager
         )
-        return device._cudagraph_probe_refusal(args, model)
+        return device._cudagraph_probe_refusal(args)
 
     assert refusal() is None
     assert "--disable-cudagraph-memory-reserve" in refusal(disable=True)
     assert "--enforce-eager" in refusal(eager=True)
-    # The protocol lives on the inner text model, not the causal-LM wrapper.
-    assert "narrowing" in refusal(model=SimpleNamespace(model=_Narrowing()))
 
 
 if __name__ == "__main__":

@@ -1223,7 +1223,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         prepare_communication_runtime=lambda tokens: None,
     )
     monkeypatch.setattr(factory, "create_model_runner", lambda *a: (target, None))
-    monkeypatch.setattr(device, "probe_arena_floor", lambda *a: 8)
+    monkeypatch.setattr(device, "probe_arena_floor", lambda *a, **k: 8)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
         chunked_prefill_size=8192,
