@@ -51,6 +51,18 @@ logger = get_colorful_logger(__name__)
 QueueEntry = tuple["object", "RequestState", "object"]  # (spec, state, bootstrap_info)
 
 
+def _compiled_value(future: futures.Future):
+    """The grammar a finished compile future resolved to."""
+    # init_value_impl is supposed to fold compile errors into an
+    # InvalidGrammarObject, but it can leak (e.g. KeyError from the
+    # structural_tag legacy dict-walk in xgrammar_backend). Catching
+    # here keeps the leak from re-raising out of the event loop.
+    try:
+        return future.result()
+    except Exception as exc:
+        return InvalidGrammarObject(f"{type(exc).__name__}: {exc}")
+
+
 class GrammarManager:
     def __init__(
         self,
@@ -130,6 +142,8 @@ class GrammarManager:
 
         Returns True if the request is admittable now (no grammar, cache hit, or
         already aborted), False if it must be queued until its future resolves.
+        With attention TP > 1 a cache hit is queued too (as a resolved future),
+        so that every rank admits the request in the same iteration.
         """
         sp = state.sampling_params
 
@@ -164,6 +178,14 @@ class GrammarManager:
         value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
         state.grammar_key = key
 
+        if cache_hit and self.grammar_sync_size > 1:
+            # Another attention TP rank may still be compiling this key, or
+            # may no longer cache it: admit through the queue, whose
+            # all_gather admits the request on every rank in one iteration.
+            done = futures.Future()
+            done.set_result(value)
+            value, cache_hit = done, False
+
         if cache_hit:
             if value.is_invalid:
                 state.set_finish_with_abort(
@@ -195,7 +217,8 @@ class GrammarManager:
         Per-rank: scan futures, mark ready/failed locally.
         Cross-rank (attn TP > 1): all_gather indices and admit only the
         intersection of ready sets and the union of failed sets, so every rank
-        admits the same requests in the same iteration.
+        admits the same requests in the same iteration. A ready request whose
+        grammar is invalid on any rank is aborted on every rank.
 
         Caller is responsible for invoking this every loop iteration when
         ``grammar_sync_size > 1`` so the collective stays in sync; with size 1
@@ -257,17 +280,37 @@ class GrammarManager:
                 else:
                     failed_idxs.add(i)
 
+        # Invalid grammars among the ready requests, by queue index.
+        invalid: dict[int, InvalidGrammarObject] = {}
+
         if self.grammar_sync_size > 1:
-            gathered: list[tuple[set, set]] = [None] * self.grammar_sync_size
+            # Each rank compiles and caches on its own, so a request ready on
+            # every rank can still be invalid on some of them only (a timeout
+            # marker cached on one rank, a compile that raised on one). Send
+            # those too: the request is then aborted on every rank, with the
+            # lowest such rank's reason.
+            for i in ready_idxs:
+                state = self.grammar_queue[i][1]
+
+                if not state.finished and state.grammar is not None:
+                    value = _compiled_value(state.grammar)
+
+                    if value.is_invalid:
+                        invalid[i] = value
+
+            gathered: list[tuple[set, set, dict]] = [None] * self.grammar_sync_size
 
             torch.distributed.all_gather_object(
                 gathered,
-                (ready_idxs, failed_idxs),
+                (ready_idxs, failed_idxs, invalid),
                 group=self.grammar_sync_group,
             )
 
             ready_idxs = set.intersection(*[g[0] for g in gathered])
             failed_idxs = set.union(*[g[1] for g in gathered])
+
+            for g in reversed(gathered):
+                invalid.update(g[2])
 
         if not ready_idxs and not failed_idxs:
             return []
@@ -281,14 +324,7 @@ class GrammarManager:
             if state.finished or state.grammar is None:
                 continue
 
-            # init_value_impl is supposed to fold compile errors into an
-            # InvalidGrammarObject, but it can leak (e.g. KeyError from the
-            # structural_tag legacy dict-walk in xgrammar_backend). Catching
-            # here keeps the leak from re-raising out of the event loop.
-            try:
-                value = state.grammar.result()
-            except Exception as exc:
-                value = InvalidGrammarObject(f"{type(exc).__name__}: {exc}")
+            value = invalid[i] if i in invalid else _compiled_value(state.grammar)
 
             if value.is_invalid:
                 state.grammar = None
@@ -319,8 +355,14 @@ class GrammarManager:
             # done() so we don't falsely time out a compile that just
             # finished — the cost of one extra ``result()`` here is
             # negligible compared to the hours a user could spend
-            # debugging a phantom timeout.
-            if isinstance(state.grammar, futures.Future) and state.grammar.done():
+            # debugging a phantom timeout. Not with attention TP > 1: the
+            # failed set is the group's, and a compile that finished on
+            # this rank alone must not admit the request here only.
+            if (
+                self.grammar_sync_size == 1
+                and isinstance(state.grammar, futures.Future)
+                and state.grammar.done()
+            ):
                 try:
                     value = state.grammar.result()
                 except BaseException:
