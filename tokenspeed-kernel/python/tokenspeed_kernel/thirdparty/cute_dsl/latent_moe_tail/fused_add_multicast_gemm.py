@@ -42,7 +42,9 @@ from typing import Any
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import cutlass.pipeline as pipeline
+import cutlass.tensor_utils
 import cutlass.utils as utils
 import torch
 import torch.distributed as dist
@@ -51,6 +53,9 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.common import CacheEvictionPriority
 from cutlass.cute.runtime import from_dlpack
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from tokenspeed_kernel.thirdparty.cute_dsl import (
+    static_persistent_tile_scheduler as tile_scheduler,
+)
 
 from .fused_add_multicast_skinny_gemm import (
     FusedAddMulticastSkinnyGemmKernel,
@@ -313,6 +318,7 @@ class FusedAddMulticastGemm:
     def _create_tiled_mma(self):
         return utils.sm100.make_trivial_tiled_mma(
             self.a_dtype,
+            self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
             self.acc_dtype,
@@ -363,7 +369,7 @@ class FusedAddMulticastGemm:
             self.a_dtype,
             self.b_dtype,
             self.c_dtype,
-            utils.get_smem_capacity_in_bytes(),
+            cutlass.memory.get_smem_capacity_in_bytes(),
             c_smem_layout,
         )
 
@@ -408,9 +414,13 @@ class FusedAddMulticastGemm:
         self.a_dtype: type[cutlass.Numeric] = a.element_type
         self.b_dtype: type[cutlass.Numeric] = b.element_type
         self.c_dtype: type[cutlass.Numeric] = c.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            a
+        ).mma_major_mode()
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            b
+        ).mma_major_mode()
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
 
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
@@ -508,7 +518,7 @@ class FusedAddMulticastGemm:
         b_smem_layout_staged: cute.ComposedLayout,
         c_smem_layout_staged: cute.Layout | cute.ComposedLayout,
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
         shared_shard: cute.Tensor,
     ):
         self._gemm_device(
@@ -543,7 +553,7 @@ class FusedAddMulticastGemm:
         b_smem_layout_staged: cute.ComposedLayout,
         c_smem_layout_staged: cute.Layout | cute.ComposedLayout,
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
         shared_shard: cute.Tensor,
     ):
         warp_idx = cute.arch.warp_idx()
@@ -574,7 +584,7 @@ class FusedAddMulticastGemm:
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -611,12 +621,12 @@ class FusedAddMulticastGemm:
             barrier_id=self.tmem_alloc_sync_bar_id,
             num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_id)),
         )
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = cutlass.memory.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],
             is_two_cta=False,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
         pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
@@ -709,7 +719,7 @@ class FusedAddMulticastGemm:
         pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
         gemm_grid_z = cute.arch.grid_dim()[2]
-        tile_sched = utils.StaticPersistentTileScheduler.create(
+        tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
             tile_sched_params,
             cute.arch.block_idx(),
             (
@@ -931,17 +941,17 @@ class FusedAddMulticastGemm:
         cta_tile_shape_mnk: tuple[int, int, int],
         cluster_shape_mn: tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
-    ) -> tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]:
+    ) -> tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]:
         """Build the static persistent schedule."""
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
-        tile_sched_params = utils.PersistentTileSchedulerParams(
+        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
             num_ctas_mnl, cluster_shape_mnl
         )
-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters
         )
 

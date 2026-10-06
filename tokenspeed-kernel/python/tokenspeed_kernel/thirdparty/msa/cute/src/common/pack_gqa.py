@@ -20,7 +20,7 @@ from typing import Optional
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from quack import layout_utils
 
 from . import utils
@@ -296,7 +296,7 @@ class PackGQAComb(PackGQA):
         block: Int32,
         num_splits: Int32,
         seqlen: Int32,
-        num_heads_divmod: FastDivmodDivisor,
+        num_heads_divmod: FastDivmodDivisorV2,
         mCounter: Optional[cute.Tensor] = None,
         batch_idx: Optional[Int32] = None,
         qhead_per_kvhead: Int32 = Int32(1),

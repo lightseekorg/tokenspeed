@@ -19,6 +19,7 @@ from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import cutlass.pipeline as cutlass_pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Float32, Int32, Int64, const_expr
@@ -408,16 +409,18 @@ class SparseAttentionForwardNvfp4KvSm100:
         cta_group = tcgen05.CtaGroup.ONE
         tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             Float32,
             cta_group,
             self.mma_tiler_qk[:2],
         )
         tiled_mma_pv = sm100_utils.make_trivial_tiled_mma(
             self.v_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.v_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
             Float32,
             cta_group,
             self.mma_tiler_pv[:2],
@@ -446,7 +449,7 @@ class SparseAttentionForwardNvfp4KvSm100:
             total_q_stages * self.q_tokens_per_group * q_load_subtiles_per_token
         )
         sQ_load_layout = sm100_utils.make_smem_layout(
-            tcgen05.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             (self.qheadperkv, q_load_tile),
             self.q_dtype,
             num_subtiles_total,
@@ -791,7 +794,7 @@ class SparseAttentionForwardNvfp4KvSm100:
         # ------------------------------------------------------------------
         #  SMEM allocation (all warps — same SharedStorage type from __call__)
         # ------------------------------------------------------------------
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
@@ -836,12 +839,12 @@ class SparseAttentionForwardNvfp4KvSm100:
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
             num_threads=tmem_alloc_threads,
         )
-        tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = cutlass.memory.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=False,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
         # ------------------------------------------------------------------

@@ -1,0 +1,845 @@
+--- flash_attn/cute/blackwell_helpers.py
++++ flash_attn/cute/blackwell_helpers.py
+@@ -139 +139 @@
+-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++                if const_expr(op.a_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -155 +155 @@
+-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -255 +255 @@
+-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++                if const_expr(op.a_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -271 +271 @@
+-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -427 +427 @@
+-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++                if const_expr(op.a_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -443 +443 @@
+-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -646 +646 @@
+-                if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++                if const_expr(op.a_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -661 +661 @@
+-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
+--- flash_attn/cute/compute_block_sparsity.py
++++ flash_attn/cute/compute_block_sparsity.py
+@@ -0,0 +1 @@
++import cutlass.memory
+@@ -147 +148 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flash_attn/cute/cu_blocks_kernel.py
++++ flash_attn/cute/cu_blocks_kernel.py
+@@ -0,0 +1 @@
++import cutlass.memory
+@@ -76 +77 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flash_attn/cute/flash_bwd.py
++++ flash_attn/cute/flash_bwd.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -146 +147 @@
+-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
++        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_80")
+@@ -609 +610 @@
+-            smem = cutlass.utils.SmemAllocator()
++            smem = cutlass.memory.SmemAllocator()
+--- flash_attn/cute/flash_bwd_mla_dk_sm100.py
++++ flash_attn/cute/flash_bwd_mla_dk_sm100.py
+@@ -29,0 +30,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -88 +90 @@
+-        self.c_layout = utils.LayoutEnum.ROW_MAJOR
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+@@ -152 +154 @@
+-            batch_divmod = cute.FastDivmodDivisor(dS.shape[0])
++            batch_divmod = cute.FastDivmodDivisorV2(dS.shape[0])
+@@ -158 +160 @@
+-            batch_divmod = cute.FastDivmodDivisor(0)
++            batch_divmod = cute.FastDivmodDivisorV2(0)
+@@ -217 +219 @@
+-        smem_capacity = utils.get_smem_capacity_in_bytes()
++        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -422 +424 @@
+-        batch_divmod: cute.FastDivmodDivisor,
++        batch_divmod: cute.FastDivmodDivisorV2,
+@@ -461 +463 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -531 +533 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flash_attn/cute/flash_bwd_mla_dq_dqv_sm100.py
++++ flash_attn/cute/flash_bwd_mla_dq_dqv_sm100.py
+@@ -33,0 +34,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -43 +45 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -155 +157 @@
+-        seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
++        seqlen_q_divmod = FastDivmodDivisorV2(seqlen_q)
+@@ -199,5 +201,5 @@
+-        self.ds_major_mode = utils.LayoutEnum.from_tensor(mdS).mma_major_mode()
+-        self.kv_major_mode = utils.LayoutEnum.from_tensor(mV).mma_major_mode()
+-        self.dq_layout = utils.LayoutEnum.from_tensor(mdQv)
+-        if const_expr(self.compute_dQ):
+-            assert self.dq_layout == utils.LayoutEnum.from_tensor(mdQ)
++        self.ds_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(mdS).mma_major_mode()
++        self.kv_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(mV).mma_major_mode()
++        self.dq_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mdQv)
++        if const_expr(self.compute_dQ):
++            assert self.dq_layout == cutlass.tensor_utils.LayoutEnum.from_tensor(mdQ)
+@@ -209 +211 @@
+-            self.ds_dtype,
++            self.ds_dtype, self.ds_dtype,
+@@ -218 +220 @@
+-                self.ds_dtype,
++                self.ds_dtype, self.ds_dtype,
+@@ -258 +260 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -452 +454 @@
+-        seqlen_q_divmod: FastDivmodDivisor,
++        seqlen_q_divmod: FastDivmodDivisorV2,
+@@ -495 +497 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -571 +573 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1271 +1273 @@
+-        seqlen_q_divmod: FastDivmodDivisor,
++        seqlen_q_divmod: FastDivmodDivisorV2,
+--- flash_attn/cute/flash_bwd_mla_sm100.py
++++ flash_attn/cute/flash_bwd_mla_sm100.py
+@@ -2,0 +3,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -182,6 +184,6 @@
+-        self.major_mode_V = tcgen05.OperandMajorMode.K
+-        self.major_mode_dO = tcgen05.OperandMajorMode.K
+-        self.major_mode_Pt = tcgen05.OperandMajorMode.MN
+-        self.major_mode_dOt = tcgen05.OperandMajorMode.MN
+-        self.major_mode_dSt = tcgen05.OperandMajorMode.MN
+-        self.major_mode_Qvt = tcgen05.OperandMajorMode.MN
++        self.major_mode_V = cute.nvgpu.OperandMajorMode.K
++        self.major_mode_dO = cute.nvgpu.OperandMajorMode.K
++        self.major_mode_Pt = cute.nvgpu.OperandMajorMode.MN
++        self.major_mode_dOt = cute.nvgpu.OperandMajorMode.MN
++        self.major_mode_dSt = cute.nvgpu.OperandMajorMode.MN
++        self.major_mode_Qvt = cute.nvgpu.OperandMajorMode.MN
+@@ -448 +450 @@
+-                dtype_a, major_a, major_b, self.dtype_acc, self.cta_group, mma_tiler[:2], operand_source_a,
++                dtype_a, dtype_a, major_a, major_b, self.dtype_acc, self.cta_group, mma_tiler[:2], operand_source_a,
+@@ -475 +477 @@
+-        self.P_layout_major = cutlass.utils.LayoutEnum.from_tensor(mP)
++        self.P_layout_major = cutlass.tensor_utils.LayoutEnum.from_tensor(mP)
+@@ -537,2 +539,2 @@
+-        self.dS_layout_major = cutlass.utils.LayoutEnum.from_tensor(mdS)
+-        self.dV_layout_major = cutlass.utils.LayoutEnum.from_tensor(mdV)
++        self.dS_layout_major = cutlass.tensor_utils.LayoutEnum.from_tensor(mdS)
++        self.dV_layout_major = cutlass.tensor_utils.LayoutEnum.from_tensor(mdV)
+@@ -705 +707 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -713 +715 @@
+-        tmem = cutlass.utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flash_attn/cute/flash_bwd_postprocess.py
++++ flash_attn/cute/flash_bwd_postprocess.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -16 +17 @@
+-from cutlass.utils import LayoutEnum
++from cutlass.tensor_utils import LayoutEnum
+@@ -122,2 +123,2 @@
+-                warpgroup.OperandMajorMode.K,  # These don't matter, we only care about the accum
+-                warpgroup.OperandMajorMode.K,
++                cute.nvgpu.OperandMajorMode.K,  # These don't matter, we only care about the accum
++                cute.nvgpu.OperandMajorMode.K,
+@@ -132,3 +133,3 @@
+-                self.dtype,
+-                tcgen05.OperandMajorMode.MN,  # dS_major_mode
+-                tcgen05.OperandMajorMode.MN,  # Kt_major_mode
++                self.dtype, self.dtype,
++                cute.nvgpu.OperandMajorMode.MN,  # dS_major_mode
++                cute.nvgpu.OperandMajorMode.MN,  # Kt_major_mode
+@@ -339 +340 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flash_attn/cute/flash_bwd_sm100.py
++++ flash_attn/cute/flash_bwd_sm100.py
+@@ -1,0 +2 @@
++import cutlass.memory
+@@ -10 +11 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -12 +13 @@
+-from cutlass.utils import LayoutEnum
++from cutlass.tensor_utils import LayoutEnum
+@@ -269,3 +270,3 @@
+-            self.q_dtype,
+-            tcgen05.OperandMajorMode.K,
+-            tcgen05.OperandMajorMode.K,
++            self.q_dtype, self.q_dtype,
++            cute.nvgpu.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.K,
+@@ -278,3 +279,3 @@
+-            self.do_dtype,
+-            tcgen05.OperandMajorMode.K,
+-            tcgen05.OperandMajorMode.K,
++            self.do_dtype, self.do_dtype,
++            cute.nvgpu.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.K,
+@@ -287,3 +288,3 @@
+-            self.do_dtype,
+-            tcgen05.OperandMajorMode.K,  # P_major_mode
+-            tcgen05.OperandMajorMode.MN,  # dO_major_mode
++            self.do_dtype, self.do_dtype,
++            cute.nvgpu.OperandMajorMode.K,  # P_major_mode
++            cute.nvgpu.OperandMajorMode.MN,  # dO_major_mode
+@@ -301,3 +302,3 @@
+-            self.do_dtype,
+-            tcgen05.OperandMajorMode.K,  # dS_major_mode
+-            tcgen05.OperandMajorMode.MN,  # Q_major_mode
++            self.do_dtype, self.do_dtype,
++            cute.nvgpu.OperandMajorMode.K,  # dS_major_mode
++            cute.nvgpu.OperandMajorMode.MN,  # Q_major_mode
+@@ -311,3 +312,3 @@
+-            self.k_dtype,
+-            tcgen05.OperandMajorMode.MN,  # dS_major_mode
+-            tcgen05.OperandMajorMode.MN,  # Kt_major_mode
++            self.k_dtype, self.k_dtype,
++            cute.nvgpu.OperandMajorMode.MN,  # dS_major_mode
++            cute.nvgpu.OperandMajorMode.MN,  # Kt_major_mode
+@@ -563 +564 @@
+-            if const_expr(dK_major_mode != tcgen05.OperandMajorMode.K):
++            if const_expr(dK_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -565 +566 @@
+-            if const_expr(dV_major_mode != tcgen05.OperandMajorMode.K):
++            if const_expr(dV_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -927,2 +928,2 @@
+-            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+-            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
++            seqlen_q_divmod = FastDivmodDivisorV2(seqlen_q)
++            seqlen_k_divmod = FastDivmodDivisorV2(seqlen_k)
+@@ -1120 +1121 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1161 +1162 @@
+-        tmem = cutlass.utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -3054 +3055 @@
+-                    else FastDivmodDivisor(seqlen.seqlen_q),
++                    else FastDivmodDivisorV2(seqlen.seqlen_q),
+@@ -3057 +3058 @@
+-                    else FastDivmodDivisor(seqlen.seqlen_k),
++                    else FastDivmodDivisorV2(seqlen.seqlen_k),
+--- flash_attn/cute/flash_bwd_sm120.py
++++ flash_attn/cute/flash_bwd_sm120.py
+@@ -7,0 +8 @@
++import cutlass.memory
+@@ -52 +53 @@
+-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
++        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
+--- flash_attn/cute/flash_bwd_sm90.py
++++ flash_attn/cute/flash_bwd_sm90.py
+@@ -0,0 +1 @@
++import cutlass.memory
+@@ -11 +12 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -13 +14 @@
+-from cutlass.utils import LayoutEnum
++from cutlass.tensor_utils import LayoutEnum
+@@ -264,2 +265,2 @@
+-            warpgroup.OperandMajorMode.K,
+-            warpgroup.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.K,
+@@ -278 +279 @@
+-                warpgroup.OperandMajorMode.MN
++                cute.nvgpu.OperandMajorMode.MN
+@@ -280,2 +281,2 @@
+-                else warpgroup.OperandMajorMode.K,
+-                warpgroup.OperandMajorMode.MN,
++                else cute.nvgpu.OperandMajorMode.K,
++                cute.nvgpu.OperandMajorMode.MN,
+@@ -298,2 +299,2 @@
+-            warpgroup.OperandMajorMode.K if not self.dQ_swapAB else warpgroup.OperandMajorMode.MN,
+-            warpgroup.OperandMajorMode.MN if not self.dQ_swapAB else warpgroup.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.K if not self.dQ_swapAB else cute.nvgpu.OperandMajorMode.MN,
++            cute.nvgpu.OperandMajorMode.MN if not self.dQ_swapAB else cute.nvgpu.OperandMajorMode.K,
+@@ -563,2 +564,2 @@
+-            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+-            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
++            seqlen_q_divmod = FastDivmodDivisorV2(seqlen_q)
++            seqlen_k_divmod = FastDivmodDivisorV2(seqlen_k)
+@@ -569 +570 @@
+-            qhead_per_kvhead_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
++            qhead_per_kvhead_divmod = FastDivmodDivisorV2(self.qhead_per_kvhead)
+@@ -672 +673 @@
+-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
++        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
+@@ -687 +688 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -880 +881 @@
+-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
++        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
+@@ -1148 +1149 @@
+-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
++        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
+@@ -1317 +1318 @@
+-                    else FastDivmodDivisor(seqlen.seqlen_q),
++                    else FastDivmodDivisorV2(seqlen.seqlen_q),
+@@ -1320 +1321 @@
+-                    else FastDivmodDivisor(seqlen.seqlen_k),
++                    else FastDivmodDivisorV2(seqlen.seqlen_k),
+@@ -1668 +1669 @@
+-        qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
++        qhead_per_kvhead_divmod: Optional[FastDivmodDivisorV2] = None,
+--- flash_attn/cute/flash_fwd.py
++++ flash_attn/cute/flash_fwd.py
+@@ -7,0 +8 @@
++import cutlass.memory
+@@ -20 +21 @@
+-from cutlass.base_dsl.arch import Arch
++from cutlass.base_dsl.enums import Arch
+@@ -169 +170 @@
+-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
++        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_80")
+@@ -842 +843 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flash_attn/cute/flash_fwd_combine.py
++++ flash_attn/cute/flash_fwd_combine.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -25 +26 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -296,3 +297,3 @@
+-        # Create FastDivmodDivisor objects for efficient division
+-        seqlen_divmod = FastDivmodDivisor(seqlen)
+-        head_divmod = FastDivmodDivisor(num_head)
++        # Create FastDivmodDivisorV2 objects for efficient division
++        seqlen_divmod = FastDivmodDivisorV2(seqlen)
++        head_divmod = FastDivmodDivisorV2(num_head)
+@@ -372,2 +373,2 @@
+-        seqlen_divmod: FastDivmodDivisor,
+-        head_divmod: FastDivmodDivisor,
++        seqlen_divmod: FastDivmodDivisorV2,
++        head_divmod: FastDivmodDivisorV2,
+@@ -394 +395 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -458 +459 @@
+-                        # Calculate actual sequence position and head using FastDivmodDivisor
++                        # Calculate actual sequence position and head using FastDivmodDivisorV2
+--- flash_attn/cute/flash_fwd_mla_sm100.py
++++ flash_attn/cute/flash_fwd_mla_sm100.py
+@@ -2,0 +3,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -13 +15 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -211,6 +213,6 @@
+-        self.major_mode_Q = tcgen05.OperandMajorMode.K
+-        self.major_mode_Qvi = tcgen05.OperandMajorMode.K
+-        self.major_mode_K = tcgen05.OperandMajorMode.K
+-        self.major_mode_Vi = tcgen05.OperandMajorMode.K
+-        self.major_mode_Vti = tcgen05.OperandMajorMode.MN
+-        self.major_mode_P = tcgen05.OperandMajorMode.K
++        self.major_mode_Q = cute.nvgpu.OperandMajorMode.K
++        self.major_mode_Qvi = cute.nvgpu.OperandMajorMode.K
++        self.major_mode_K = cute.nvgpu.OperandMajorMode.K
++        self.major_mode_Vi = cute.nvgpu.OperandMajorMode.K
++        self.major_mode_Vti = cute.nvgpu.OperandMajorMode.MN
++        self.major_mode_P = cute.nvgpu.OperandMajorMode.K
+@@ -451,2 +453,2 @@
+-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+-        self.p_layout = cutlass.utils.LayoutEnum.ROW_MAJOR
++        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO)
++        self.p_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+@@ -454 +456 @@
+-            assert cutlass.utils.LayoutEnum.from_tensor(mP) == self.p_layout
++            assert cutlass.tensor_utils.LayoutEnum.from_tensor(mP) == self.p_layout
+@@ -478 +480 @@
+-                dtype_a, major_a, major_b, self.dtype_acc, self.cta_group, mma_tiler[:2], operand_source_a,
++                dtype_a, dtype_a, major_a, major_b, self.dtype_acc, self.cta_group, mma_tiler[:2], operand_source_a,
+@@ -814 +816 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -822 +824 @@
+-        tmem = cutlass.utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1573 +1575 @@
+-                page_size_divmod = FastDivmodDivisor(cute.size(mV.shape[0]))
++                page_size_divmod = FastDivmodDivisorV2(cute.size(mV.shape[0]))
+--- flash_attn/cute/flash_fwd_sm100.py
++++ flash_attn/cute/flash_fwd_sm100.py
+@@ -15,0 +16,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -31 +33 @@
+-from cutlass.base_dsl.arch import Arch
++from cutlass.base_dsl.enums import Arch
+@@ -56 +58 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -535,4 +537,4 @@
+-        q_major_mode = tcgen05.OperandMajorMode.K
+-        k_major_mode = tcgen05.OperandMajorMode.K
+-        v_major_mode = tcgen05.OperandMajorMode.MN
+-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
++        q_major_mode = cute.nvgpu.OperandMajorMode.K
++        k_major_mode = cute.nvgpu.OperandMajorMode.K
++        v_major_mode = cute.nvgpu.OperandMajorMode.MN
++        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO)
+@@ -541 +543 @@
+-        p_major_mode = tcgen05.OperandMajorMode.K
++        p_major_mode = cute.nvgpu.OperandMajorMode.K
+@@ -543 +545 @@
+-            self.q_dtype,
++            self.q_dtype, self.q_dtype,
+@@ -551 +553 @@
+-            self.v_dtype,
++            self.v_dtype, self.v_dtype,
+@@ -804 +806 @@
+-            head_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
++            head_divmod = FastDivmodDivisorV2(self.qhead_per_kvhead)
+@@ -953 +955 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -966 +968 @@
+-        tmem = cutlass.utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1570 +1572 @@
+-                    FastDivmodDivisor(page_size),
++                    FastDivmodDivisorV2(page_size),
+@@ -2153 +2155 @@
+-                    else FastDivmodDivisor(seqlen.seqlen_q),
++                    else FastDivmodDivisorV2(seqlen.seqlen_q),
+@@ -2156 +2158 @@
+-                    else FastDivmodDivisor(seqlen.seqlen_k),
++                    else FastDivmodDivisorV2(seqlen.seqlen_k),
+--- flash_attn/cute/flash_fwd_sm120.py
++++ flash_attn/cute/flash_fwd_sm120.py
+@@ -7,0 +8 @@
++import cutlass.memory
+@@ -10 +11 @@
+-from cutlass.base_dsl.arch import Arch
++from cutlass.base_dsl.enums import Arch
+@@ -56 +57 @@
+-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
++        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
+--- flash_attn/cute/flash_fwd_sm90.py
++++ flash_attn/cute/flash_fwd_sm90.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -14 +15 @@
+-from cutlass.utils import LayoutEnum
++from cutlass.tensor_utils import LayoutEnum
+@@ -18 +19 @@
+-from cutlass.base_dsl.arch import Arch
++from cutlass.base_dsl.enums import Arch
+@@ -46 +47 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -100,2 +101,2 @@
+-            warpgroup.OperandMajorMode.K,
+-            warpgroup.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.K,
+@@ -109,2 +110,2 @@
+-            warpgroup.OperandMajorMode.K,
+-            warpgroup.OperandMajorMode.MN,
++            cute.nvgpu.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.MN,
+@@ -453 +454 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -733 +734 @@
+-                        FastDivmodDivisor(mK.shape[0]),
++                        FastDivmodDivisorV2(mK.shape[0]),
+@@ -1070 +1071 @@
+-                    else FastDivmodDivisor(seqlen.seqlen_q),
++                    else FastDivmodDivisorV2(seqlen.seqlen_q),
+@@ -1073 +1074 @@
+-                    else FastDivmodDivisor(seqlen.seqlen_k),
++                    else FastDivmodDivisorV2(seqlen.seqlen_k),
+--- flash_attn/cute/mma_sm100_desc.py
++++ flash_attn/cute/mma_sm100_desc.py
+@@ -172,2 +172,2 @@
+-        Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+-        Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
++        Major.K if op.a_major_mode == cute.nvgpu.OperandMajorMode.K else Major.MN,
++        Major.K if op.b_major_mode == cute.nvgpu.OperandMajorMode.K else Major.MN,
+--- flash_attn/cute/paged_kv.py
++++ flash_attn/cute/paged_kv.py
+@@ -11 +11 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -23 +23 @@
+-    page_size_divmod: FastDivmodDivisor
++    page_size_divmod: FastDivmodDivisorV2
+@@ -50 +50 @@
+-        page_size_divmod: FastDivmodDivisor,
++        page_size_divmod: FastDivmodDivisorV2,
+--- flash_attn/cute/prepare_scheduler.py
++++ flash_attn/cute/prepare_scheduler.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -11 +12 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -110,2 +111,2 @@
+-        tile_m_divmod = FastDivmodDivisor(self.tile_m)
+-        tile_n_divmod = FastDivmodDivisor(self.tile_n)
++        tile_m_divmod = FastDivmodDivisorV2(self.tile_m)
++        tile_n_divmod = FastDivmodDivisorV2(self.tile_n)
+@@ -168,2 +169,2 @@
+-        tile_m_divmod: FastDivmodDivisor,
+-        tile_n_divmod: FastDivmodDivisor,
++        tile_m_divmod: FastDivmodDivisorV2,
++        tile_n_divmod: FastDivmodDivisorV2,
+@@ -183 +184 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -286 +287 @@
+-        tile_m_divmod: FastDivmodDivisor,
++        tile_m_divmod: FastDivmodDivisorV2,
+@@ -325 +326 @@
+-        tile_n_divmod: FastDivmodDivisor,
++        tile_n_divmod: FastDivmodDivisorV2,
+--- flash_attn/cute/sm100_hd256_2cta_fmha_backward_dkdvkernel.py
++++ flash_attn/cute/sm100_hd256_2cta_fmha_backward_dkdvkernel.py
+@@ -10,0 +11,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -353,8 +355,8 @@
+-        self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
+-        self.K_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
+-        self.dK_major_mode = utils.LayoutEnum.from_tensor(dK).mma_major_mode()
+-        self.V_major_mode = utils.LayoutEnum.from_tensor(V).mma_major_mode()
+-        self.dV_major_mode = utils.LayoutEnum.from_tensor(dV).mma_major_mode()
+-        self.dO_major_mode = utils.LayoutEnum.from_tensor(dO).mma_major_mode()
+-
+-        if cutlass.const_expr(self.Q_major_mode != tcgen05.OperandMajorMode.K):
++        self.Q_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(Q).mma_major_mode()
++        self.K_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(K).mma_major_mode()
++        self.dK_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(dK).mma_major_mode()
++        self.V_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(V).mma_major_mode()
++        self.dV_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(dV).mma_major_mode()
++        self.dO_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(dO).mma_major_mode()
++
++        if cutlass.const_expr(self.Q_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -362 +364 @@
+-        if cutlass.const_expr(self.K_major_mode != tcgen05.OperandMajorMode.K):
++        if cutlass.const_expr(self.K_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -364 +366 @@
+-        if cutlass.const_expr(self.dK_major_mode != tcgen05.OperandMajorMode.K):
++        if cutlass.const_expr(self.dK_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -366 +368 @@
+-        if cutlass.const_expr(self.V_major_mode != tcgen05.OperandMajorMode.K):
++        if cutlass.const_expr(self.V_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -368 +370 @@
+-        if cutlass.const_expr(self.dV_major_mode != tcgen05.OperandMajorMode.K):
++        if cutlass.const_expr(self.dV_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -378,3 +380,3 @@
+-            K.element_type,
+-            tcgen05.OperandMajorMode.K,
+-            tcgen05.OperandMajorMode.K,
++            K.element_type, K.element_type,
++            cute.nvgpu.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.K,
+@@ -387,3 +389,3 @@
+-            V.element_type,
+-            tcgen05.OperandMajorMode.K,
+-            tcgen05.OperandMajorMode.K,
++            V.element_type, V.element_type,
++            cute.nvgpu.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.K,
+@@ -396,3 +398,3 @@
+-            dO.element_type,
+-            tcgen05.OperandMajorMode.K,
+-            tcgen05.OperandMajorMode.MN,
++            dO.element_type, dO.element_type,
++            cute.nvgpu.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.MN,
+@@ -406,3 +408,3 @@
+-            Q.element_type,
+-            tcgen05.OperandMajorMode.K,
+-            tcgen05.OperandMajorMode.MN,
++            Q.element_type, Q.element_type,
++            cute.nvgpu.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.MN,
+@@ -416,3 +418,3 @@
+-            K.element_type,
+-            tcgen05.OperandMajorMode.MN,
+-            tcgen05.OperandMajorMode.MN,
++            K.element_type, K.element_type,
++            cute.nvgpu.OperandMajorMode.MN,
++            cute.nvgpu.OperandMajorMode.MN,
+@@ -469,2 +471,2 @@
+-        is_k_major = tiled_mma.op.a_major_mode == tcgen05.OperandMajorMode.K
+-        a_major_mode = tcgen05.OperandMajorMode.K if is_k_major else tcgen05.OperandMajorMode.MN
++        is_k_major = tiled_mma.op.a_major_mode == cute.nvgpu.OperandMajorMode.K
++        a_major_mode = cute.nvgpu.OperandMajorMode.K if is_k_major else cute.nvgpu.OperandMajorMode.MN
+@@ -605,2 +607,2 @@
+-        dK_layout_enum = utils.LayoutEnum.from_tensor(dK)
+-        dV_layout_enum = utils.LayoutEnum.from_tensor(dV)
++        dK_layout_enum = cutlass.tensor_utils.LayoutEnum.from_tensor(dK)
++        dV_layout_enum = cutlass.tensor_utils.LayoutEnum.from_tensor(dV)
+@@ -856 +858 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -993 +995 @@
+-        tmem_holding_buf = storage.tmem_holding_buf
++        tmem_holding_buf = storage.tmem_holding_buf.ptr
+@@ -1031 +1033 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1137 +1139 @@
+-                cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
++                cute.arch.setmaxregister_decrease(self.num_regs_load)
+@@ -1139 +1141 @@
+-                cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
++                cute.arch.setmaxregister_increase(self.num_regs_mma)
+@@ -1141 +1143 @@
+-                cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
++                cute.arch.setmaxregister_increase(self.num_regs_compute)
+@@ -1143 +1145 @@
+-                cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
++                cute.arch.setmaxregister_decrease(self.num_regs_empty)
+@@ -1552 +1554 @@
+-                cute.arch.warpgroup_reg_dealloc(self.num_regs_load)
++                cute.arch.setmaxregister_decrease(self.num_regs_load)
+@@ -1609 +1611 @@
+-                cute.arch.warpgroup_reg_alloc(self.num_regs_mma)
++                cute.arch.setmaxregister_increase(self.num_regs_mma)
+@@ -1646 +1648 @@
+-                cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
++                cute.arch.setmaxregister_increase(self.num_regs_compute)
+@@ -1701 +1703 @@
+-                cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
++                cute.arch.setmaxregister_decrease(self.num_regs_empty)
+--- flash_attn/cute/sm100_hd256_2cta_fmha_backward_dqkernel.py
++++ flash_attn/cute/sm100_hd256_2cta_fmha_backward_dqkernel.py
+@@ -2,0 +3,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -310,7 +312,7 @@
+-        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
+-        self.do_major_mode = utils.LayoutEnum.from_tensor(do).mma_major_mode()
+-        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
+-        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
+-        self.dq_layout = utils.LayoutEnum.from_tensor(dq)
+-
+-        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
++        self.q_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(q).mma_major_mode()
++        self.do_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(do).mma_major_mode()
++        self.k_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(k).mma_major_mode()
++        self.v_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(v).mma_major_mode()
++        self.dq_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(dq)
++
++        if cutlass.const_expr(self.q_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -318 +320 @@
+-        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
++        if cutlass.const_expr(self.k_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -320 +322 @@
+-        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.K):
++        if cutlass.const_expr(self.v_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -322 +324 @@
+-        if cutlass.const_expr(self.do_major_mode != tcgen05.OperandMajorMode.K):
++        if cutlass.const_expr(self.do_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -338,2 +340,2 @@
+-        ds_major_mode = tcgen05.OperandMajorMode.K
+-        k_trans_major_mode = tcgen05.OperandMajorMode.MN
++        ds_major_mode = cute.nvgpu.OperandMajorMode.K
++        k_trans_major_mode = cute.nvgpu.OperandMajorMode.MN
+@@ -341 +343 @@
+-            self.q_dtype,
++            self.q_dtype, self.q_dtype,
+@@ -349 +351 @@
+-            self.do_dtype,
++            self.do_dtype, self.do_dtype,
+@@ -357 +359 @@
+-            self.q_dtype,
++            self.q_dtype, self.q_dtype,
+@@ -646 +648 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -753 +755 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -895 +897 @@
+-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++                cute.arch.setmaxregister_decrease(self.num_regs_other)
+@@ -919 +921 @@
+-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++            cute.arch.setmaxregister_decrease(self.num_regs_other)
+@@ -1196 +1198 @@
+-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++            cute.arch.setmaxregister_decrease(self.num_regs_other)
+@@ -1827 +1829 @@
+-            cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
++            cute.arch.setmaxregister_increase(self.num_regs_compute)
+@@ -1942 +1944 @@
+-            cute.arch.warpgroup_reg_dealloc(self.num_regs_epilogue)
++            cute.arch.setmaxregister_decrease(self.num_regs_epilogue)
+@@ -2034 +2036 @@
+-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++                cute.arch.setmaxregister_decrease(self.num_regs_other)
+@@ -2046 +2048 @@
+-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++                    cute.arch.setmaxregister_decrease(self.num_regs_other)
+@@ -2049 +2051 @@
+-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++                cute.arch.setmaxregister_decrease(self.num_regs_other)
+--- flash_attn/cute/sm100_hd256_2cta_fmha_forward.py
++++ flash_attn/cute/sm100_hd256_2cta_fmha_forward.py
+@@ -2,0 +3,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -410,6 +412,6 @@
+-        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
+-        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
+-        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
+-        self.o_layout = utils.LayoutEnum.from_tensor(o)
+-
+-        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
++        self.q_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(q).mma_major_mode()
++        self.k_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(k).mma_major_mode()
++        self.v_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(v).mma_major_mode()
++        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(o)
++
++        if cutlass.const_expr(self.q_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -417 +419 @@
+-        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
++        if cutlass.const_expr(self.k_major_mode != cute.nvgpu.OperandMajorMode.K):
+@@ -419 +421 @@
+-        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
++        if cutlass.const_expr(self.v_major_mode != cute.nvgpu.OperandMajorMode.MN):
+@@ -432 +434 @@
+-        p_major_mode = tcgen05.OperandMajorMode.K
++        p_major_mode = cute.nvgpu.OperandMajorMode.K
+@@ -434 +436 @@
+-            self.q_dtype,
++            self.q_dtype, self.q_dtype,
+@@ -442 +444 @@
+-            self.v_dtype,
++            self.v_dtype, self.v_dtype,
+@@ -635 +637 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -709 +711 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -816 +818 @@
+-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++                cute.arch.setmaxregister_decrease(self.num_regs_other)
+@@ -840 +842 @@
+-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++            cute.arch.setmaxregister_decrease(self.num_regs_other)
+@@ -1068 +1070 @@
+-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++            cute.arch.setmaxregister_decrease(self.num_regs_other)
+@@ -1318 +1320 @@
+-            cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
++            cute.arch.setmaxregister_increase(self.num_regs_softmax)
+@@ -1438 +1440 @@
+-            cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
++            cute.arch.setmaxregister_decrease(self.num_regs_correction)
+@@ -1532 +1534 @@
+-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++                cute.arch.setmaxregister_decrease(self.num_regs_other)
+@@ -1544 +1546 @@
+-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++                    cute.arch.setmaxregister_decrease(self.num_regs_other)
+@@ -1547 +1549 @@
+-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
++                cute.arch.setmaxregister_decrease(self.num_regs_other)
+--- flash_attn/cute/tile_scheduler.py
++++ flash_attn/cute/tile_scheduler.py
+@@ -17 +17 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -229 +229 @@
+-        num_splits_divmod: FastDivmodDivisor
++        num_splits_divmod: FastDivmodDivisorV2
+@@ -244 +244 @@
+-                FastDivmodDivisor(args.num_splits),
++                FastDivmodDivisorV2(args.num_splits),
+@@ -355,2 +355,2 @@
+-        num_block_cluster_divmod: FastDivmodDivisor
+-        num_head_divmod: FastDivmodDivisor
++        num_block_cluster_divmod: FastDivmodDivisorV2
++        num_head_divmod: FastDivmodDivisorV2
+@@ -367,2 +367,2 @@
+-                FastDivmodDivisor(num_block_cluster),
+-                FastDivmodDivisor(args.num_head),
++                FastDivmodDivisorV2(num_block_cluster),
++                FastDivmodDivisorV2(args.num_head),
+@@ -467,4 +467,4 @@
+-        num_head_divmod: FastDivmodDivisor
+-        l2_minor_divmod: FastDivmodDivisor
+-        l2_major_divmod: FastDivmodDivisor
+-        l2_minor_residual_divmod: FastDivmodDivisor
++        num_head_divmod: FastDivmodDivisorV2
++        l2_minor_divmod: FastDivmodDivisorV2
++        l2_major_divmod: FastDivmodDivisorV2
++        l2_minor_residual_divmod: FastDivmodDivisorV2
+@@ -472 +472 @@
+-        num_splits_divmod: FastDivmodDivisor
++        num_splits_divmod: FastDivmodDivisorV2
+@@ -517,4 +517,4 @@
+-                num_head_divmod=FastDivmodDivisor(args.num_head),
+-                l2_minor_divmod=FastDivmodDivisor(swizzle),
+-                l2_major_divmod=FastDivmodDivisor(swizzle * args.num_block),
+-                l2_minor_residual_divmod=FastDivmodDivisor(max(num_hb_remainder, 1)),
++                num_head_divmod=FastDivmodDivisorV2(args.num_head),
++                l2_minor_divmod=FastDivmodDivisorV2(swizzle),
++                l2_major_divmod=FastDivmodDivisorV2(swizzle * args.num_block),
++                l2_minor_residual_divmod=FastDivmodDivisorV2(max(num_hb_remainder, 1)),
+@@ -523 +523 @@
+-                num_splits_divmod=FastDivmodDivisor(args.num_splits),
++                num_splits_divmod=FastDivmodDivisorV2(args.num_splits),
+@@ -732,4 +732,4 @@
+-        num_head_divmod: FastDivmodDivisor
+-        l2_minor_divmod: FastDivmodDivisor
+-        l2_major_divmod: FastDivmodDivisor
+-        l2_minor_residual_divmod: FastDivmodDivisor
++        num_head_divmod: FastDivmodDivisorV2
++        l2_minor_divmod: FastDivmodDivisorV2
++        l2_major_divmod: FastDivmodDivisorV2
++        l2_minor_residual_divmod: FastDivmodDivisorV2
+@@ -770,4 +770,4 @@
+-                num_head_divmod=FastDivmodDivisor(args.num_head),
+-                l2_minor_divmod=FastDivmodDivisor(swizzle),
+-                l2_major_divmod=FastDivmodDivisor(swizzle * num_block),
+-                l2_minor_residual_divmod=FastDivmodDivisor(
++                num_head_divmod=FastDivmodDivisorV2(args.num_head),
++                l2_minor_divmod=FastDivmodDivisorV2(swizzle),
++                l2_major_divmod=FastDivmodDivisorV2(swizzle * num_block),
++                l2_minor_residual_divmod=FastDivmodDivisorV2(
+--- flash_attn/cute/utils.py
++++ flash_attn/cute/utils.py
+@@ -14 +14 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -199 +199 @@
+-    """Compute FastDivmodDivisor pairs for aux_tensors index computation.
++    """Compute FastDivmodDivisorV2 pairs for aux_tensors index computation.
+@@ -211 +211 @@
+-    return (FastDivmodDivisor(seqlen_q), FastDivmodDivisor(seqlen_k))
++    return (FastDivmodDivisorV2(seqlen_q), FastDivmodDivisorV2(seqlen_k))

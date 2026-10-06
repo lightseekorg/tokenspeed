@@ -1,0 +1,3654 @@
+--- flashinfer/attention/prims_ts/kernels/fmha_context/fmha_kernel.py
++++ flashinfer/attention/prims_ts/kernels/fmha_context/fmha_kernel.py
+@@ -134,0 +135,2 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
+@@ -657 +659 @@
+-        utils.PersistentTileSchedulerParams
++        tile_scheduler.PersistentTileSchedulerParams
+@@ -1752 +1754 @@
+-    return utils.get_smem_capacity_in_bytes("sm_100") - fixed_smem_bytes
++    return cutlass.memory.get_smem_capacity_in_bytes("sm_100") - fixed_smem_bytes
+@@ -2374 +2376 @@
+-        utils.PersistentTileSchedulerParams
++        tile_scheduler.PersistentTileSchedulerParams
+@@ -3085 +3087 @@
+-            tile_sched_params = utils.PersistentTileSchedulerParams(
++            tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -3089 +3091 @@
+-            grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++            grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+@@ -3163 +3165 @@
+-            utils.PersistentTileSchedulerParams
++            tile_scheduler.PersistentTileSchedulerParams
+--- flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py
++++ flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py
+@@ -611 +611 @@
+-    heads_q_per_kv_fdd = cute.fast_divmod_create_divisor(heads_q_per_kv)
++    heads_q_per_kv_fdd = cute.fast_divmod_create_divisor_v2(heads_q_per_kv)
+@@ -747 +747 @@
+-            heads_q_per_kv_fdd = cute.fast_divmod_create_divisor(heads_q_per_kv)
++            heads_q_per_kv_fdd = cute.fast_divmod_create_divisor_v2(heads_q_per_kv)
+--- flashinfer/attention/prims_ts/kernels/mla_decode/helpers/tile_scheduler.py
++++ flashinfer/attention/prims_ts/kernels/mla_decode/helpers/tile_scheduler.py
+@@ -43 +43 @@
+-    fallback_divisor: cute.FastDivmodDivisor,
++    fallback_divisor: cute.FastDivmodDivisorV2,
+@@ -67,3 +67,3 @@
+-        problem_shape_b_fdd: cute.FastDivmodDivisor = None,
+-        problem_shape_s_fdd: cute.FastDivmodDivisor = None,
+-        split_kv_fdd: cute.FastDivmodDivisor = None,
++        problem_shape_b_fdd: cute.FastDivmodDivisorV2 = None,
++        problem_shape_s_fdd: cute.FastDivmodDivisorV2 = None,
++        split_kv_fdd: cute.FastDivmodDivisorV2 = None,
+@@ -83 +83 @@
+-            self.problem_shape_b_fdd = cute.fast_divmod_create_divisor(
++            self.problem_shape_b_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -87 +87 @@
+-            self.problem_shape_s_fdd = cute.fast_divmod_create_divisor(
++            self.problem_shape_s_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -91 +91 @@
+-            self.split_kv_fdd = cute.fast_divmod_create_divisor(
++            self.split_kv_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -115 +115 @@
+-            self.problem_shape_b_fdd, (values[3],)
++            self.problem_shape_b_fdd, values[3:5]
+@@ -118,3 +118,3 @@
+-            self.problem_shape_s_fdd, (values[4],)
+-        )
+-        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd, (values[5],))
++            self.problem_shape_s_fdd, values[5:7]
++        )
++        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd, values[7:9])
+@@ -293 +293 @@
+-        new_params = cutlass.new_from_mlir_values(self.params, values[0:6])
++        new_params = cutlass.new_from_mlir_values(self.params, values[0:9])
+@@ -295,3 +295,3 @@
+-            self.current_work_linear_idx, [values[6]]
+-        )
+-        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord, values[7:10])
++            self.current_work_linear_idx, [values[9]]
++        )
++        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord, values[10:13])
+--- flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py
++++ flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py
+@@ -24,0 +25 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
+@@ -39 +40 @@
+-from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
++from flashinfer._tokenspeed_static_persistent_tile_scheduler import WorkTileInfo
+@@ -1886 +1887 @@
+-            tile_sched_params = utils.PersistentTileSchedulerParams(
++            tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -1894 +1895 @@
+-            grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++            grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/attn_scores/kernels/fp4_paged_mqa_logits.py
++++ flashinfer/attn_scores/kernels/fp4_paged_mqa_logits.py
+@@ -61,0 +62,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -869,2 +871,2 @@
+-        a_major = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        b_major = utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
++        a_major = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        b_major = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
+@@ -881 +883 @@
+-            tcgen05.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.K,
+@@ -1139 +1141 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1307,2 +1309,2 @@
+-        tmem = utils.TmemAllocator(
+-            storage.tmem_holding_buf,
++        tmem = cutlass.memory.TmemAllocator(
++            storage.tmem_holding_buf.ptr,
+@@ -1494 +1496 @@
+-        c_layout = utils.LayoutEnum.ROW_MAJOR
++        c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+@@ -1508 +1510 @@
+-        # the early-loaded schedule metadata AFTER its warpgroup_reg_alloc/
++        # the early-loaded schedule metadata AFTER its setmaxregister_increase/
+@@ -1523 +1525 @@
+-            cute.arch.warpgroup_reg_dealloc(24)
++            cute.arch.setmaxregister_decrease(24)
+@@ -1744 +1746 @@
+-            cute.arch.warpgroup_reg_dealloc(24)
++            cute.arch.setmaxregister_decrease(24)
+@@ -1850 +1852 @@
+-            cute.arch.warpgroup_reg_dealloc(24)
++            cute.arch.setmaxregister_decrease(24)
+@@ -2078 +2080 @@
+-            cute.arch.warpgroup_reg_dealloc(24)
++            cute.arch.setmaxregister_decrease(24)
+@@ -2254 +2256 @@
+-            cute.arch.warpgroup_reg_alloc(240)
++            cute.arch.setmaxregister_increase(240)
+@@ -2257 +2259 @@
+-            # Derived AFTER warpgroup_reg_alloc(240) so the loop-carried
++            # Derived AFTER setmaxregister_increase(240) so the loop-carried
+@@ -3219 +3221 @@
+-            cute.arch.warpgroup_reg_dealloc(24)
++            cute.arch.setmaxregister_decrease(24)
+--- flashinfer/attn_scores/kernels/fp8_paged_mqa_logits.py
++++ flashinfer/attn_scores/kernels/fp8_paged_mqa_logits.py
+@@ -72,0 +73,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -401 +403 @@
+-            smem_capacity = utils.get_smem_capacity_in_bytes()
++            smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -445 +447 @@
+-            a_dtype,
++            a_dtype, a_dtype,
+@@ -554,2 +556,2 @@
+-        a_major = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        b_major = utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
++        a_major = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        b_major = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
+@@ -566 +568 @@
+-            tcgen05.OperandMajorMode.K,
++            cute.nvgpu.OperandMajorMode.K,
+@@ -746 +748 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -882,2 +884,2 @@
+-        tmem = utils.TmemAllocator(
+-            storage.tmem_holding_buf,
++        tmem = cutlass.memory.TmemAllocator(
++            storage.tmem_holding_buf.ptr,
+@@ -1039 +1041 @@
+-        c_layout = utils.LayoutEnum.ROW_MAJOR
++        c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+@@ -1072 +1074 @@
+-        # the early-loaded schedule metadata AFTER its warpgroup_reg_alloc/
++        # the early-loaded schedule metadata AFTER its setmaxregister_increase/
+@@ -1088 +1090 @@
+-            cute.arch.warpgroup_reg_dealloc(24)
++            cute.arch.setmaxregister_decrease(24)
+@@ -1275 +1277 @@
+-            cute.arch.warpgroup_reg_dealloc(24)
++            cute.arch.setmaxregister_decrease(24)
+@@ -1377 +1379 @@
+-            cute.arch.warpgroup_reg_dealloc(24)
++            cute.arch.setmaxregister_decrease(24)
+@@ -1473 +1475 @@
+-            cute.arch.warpgroup_reg_dealloc(24)
++            cute.arch.setmaxregister_decrease(24)
+@@ -1563 +1565 @@
+-            cute.arch.warpgroup_reg_alloc(240)
++            cute.arch.setmaxregister_increase(240)
+@@ -1566 +1568 @@
+-            # Derived AFTER warpgroup_reg_alloc(240) so the loop-carried
++            # Derived AFTER setmaxregister_increase(240) so the loop-carried
+@@ -2432 +2434 @@
+-            cute.arch.warpgroup_reg_dealloc(24)
++            cute.arch.setmaxregister_decrease(24)
+--- flashinfer/attn_scores/kernels/schedule_kernel.py
++++ flashinfer/attn_scores/kernels/schedule_kernel.py
+@@ -36 +36 @@
+-from cutlass.utils.smem_allocator import SmemAllocator
++from cutlass.memory import SmemAllocator
+--- flashinfer/comm/mnnvl_cutedsl/kernel_bt/device_kernels.py
++++ flashinfer/comm/mnnvl_cutedsl/kernel_bt/device_kernels.py
+@@ -18,0 +19 @@
++import cutlass.memory
+@@ -159 +160 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -368 +369 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -667 +668 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1255 +1256 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/comm/mnnvl_cutedsl/kernel_ht/device_kernel.py
++++ flashinfer/comm/mnnvl_cutedsl/kernel_ht/device_kernel.py
+@@ -18,0 +19 @@
++import cutlass.memory
+@@ -313 +314 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/comm/mnnvl_cutedsl/kernel_ll/device_kernels.py
++++ flashinfer/comm/mnnvl_cutedsl/kernel_ll/device_kernels.py
+@@ -18,0 +19 @@
++import cutlass.memory
+@@ -173 +174 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -384 +385 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -968 +969 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/cute_dsl/add_rmsnorm_fp4quant.py
++++ flashinfer/cute_dsl/add_rmsnorm_fp4quant.py
+@@ -31,0 +32 @@
++import cutlass.memory
+@@ -545 +546 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/cute_dsl/attention/collective_builder.py
++++ flashinfer/cute_dsl/attention/collective_builder.py
+@@ -74 +74 @@
+-        q_dtype,
++        q_dtype, q_dtype,
+@@ -82 +82 @@
+-        v_dtype,
++        v_dtype, v_dtype,
+@@ -442 +442 @@
+-        q_dtype,
++        q_dtype, q_dtype,
+@@ -450 +450 @@
+-        v_dtype,
++        v_dtype, v_dtype,
+@@ -716 +716 @@
+-        q_dtype,
++        q_dtype, q_dtype,
+@@ -724 +724 @@
+-        v_dtype,
++        v_dtype, v_dtype,
+--- flashinfer/cute_dsl/attention/compat.py
++++ flashinfer/cute_dsl/attention/compat.py
+@@ -22 +22 @@
+-    getattr(cute.arch, "warpgroup_reg_dealloc", None),
++    getattr(cute.arch, "setmaxregister_decrease", None),
+@@ -28 +28 @@
+-    getattr(cute.arch, "warpgroup_reg_alloc", None),
++    getattr(cute.arch, "setmaxregister_increase", None),
+--- flashinfer/cute_dsl/attention/dsa/hca_fp8.py
++++ flashinfer/cute_dsl/attention/dsa/hca_fp8.py
+@@ -28,0 +29 @@
++import cutlass.memory
+@@ -1044 +1045 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1048 +1049 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1670 +1671 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/cute_dsl/attention/dsa/hca_helpers.py
++++ flashinfer/cute_dsl/attention/dsa/hca_helpers.py
+@@ -44,3 +44,3 @@
+-        problem_shape_b_fdd: cute.FastDivmodDivisor = None,
+-        problem_shape_s_fdd: cute.FastDivmodDivisor = None,
+-        split_kv_fdd: cute.FastDivmodDivisor = None,
++        problem_shape_b_fdd: cute.FastDivmodDivisorV2 = None,
++        problem_shape_s_fdd: cute.FastDivmodDivisorV2 = None,
++        split_kv_fdd: cute.FastDivmodDivisorV2 = None,
+@@ -74 +74 @@
+-            self.problem_shape_b_fdd = cute.fast_divmod_create_divisor(
++            self.problem_shape_b_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -78 +78 @@
+-            self.problem_shape_s_fdd = cute.fast_divmod_create_divisor(
++            self.problem_shape_s_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -82 +82 @@
+-            self.split_kv_fdd = cute.fast_divmod_create_divisor(
++            self.split_kv_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -106 +106 @@
+-            self.problem_shape_b_fdd, (values[3],)
++            self.problem_shape_b_fdd, values[3:5]
+@@ -109,3 +109,3 @@
+-            self.problem_shape_s_fdd, (values[4],)
+-        )
+-        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd, (values[5],))
++            self.problem_shape_s_fdd, values[5:7]
++        )
++        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd, values[7:9])
+@@ -289,2 +289,2 @@
+-        assert len(values) == 13
+-        new_params = cutlass.new_from_mlir_values(self.params, values[0:6])
++        assert len(values) == 16
++        new_params = cutlass.new_from_mlir_values(self.params, values[0:9])
+@@ -292,4 +292,4 @@
+-            self.current_work_linear_idx, [values[6]]
+-        )
+-        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord, values[7:10])
+-        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape, values[10:])
++            self.current_work_linear_idx, [values[9]]
++        )
++        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord, values[10:13])
++        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape, values[13:])
+--- flashinfer/cute_dsl/attention/fmha/fmha.py
++++ flashinfer/cute_dsl/attention/fmha/fmha.py
+@@ -30,0 +31,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -46 +48 @@
+-from cutlass.base_dsl.arch import Arch
++from cutlass.base_dsl.enums import Arch
+@@ -496,4 +498,4 @@
+-        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
+-        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
+-        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
+-        self.o_layout = utils.LayoutEnum.from_tensor(o)
++        self.q_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(q).mma_major_mode()
++        self.k_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(k).mma_major_mode()
++        self.v_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(v).mma_major_mode()
++        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(o)
+@@ -815 +817 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -936 +938 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py
++++ flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py
+@@ -30,0 +31,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -49 +51 @@
+-from cutlass.base_dsl.arch import Arch
++from cutlass.base_dsl.enums import Arch
+@@ -631,4 +633,4 @@
+-        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
+-        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
+-        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
+-        self.o_layout = utils.LayoutEnum.from_tensor(o)
++        self.q_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(q).mma_major_mode()
++        self.k_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(k).mma_major_mode()
++        self.v_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(v).mma_major_mode()
++        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(o)
+@@ -1034 +1036 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1176 +1178 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flashinfer/cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py
++++ flashinfer/cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py
+@@ -218 +218 @@
+-            self.cluster_shape_major_fdd = cute.fast_divmod_create_divisor(
++            self.cluster_shape_major_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -223 +223 @@
+-            self.cluster_shape_minor_fdd = cute.fast_divmod_create_divisor(
++            self.cluster_shape_minor_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -256 +256 @@
+-                # Extract MLIR values from FastDivmodDivisor objects
++                # Extract MLIR values from FastDivmodDivisorV2 objects
+@@ -297 +297 @@
+-            # FastDivmodDivisor now emits multiple MLIR values per object (see issue #3243);
++            # FastDivmodDivisorV2 now emits multiple MLIR values per object (see issue #3243);
+--- flashinfer/cute_dsl/attention/gqa_decode.py
++++ flashinfer/cute_dsl/attention/gqa_decode.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -338 +339 @@
+-        smem_capacity_bits = utils.get_smem_capacity_in_bytes("sm_100") * 8
++        smem_capacity_bits = cutlass.memory.get_smem_capacity_in_bytes("sm_100") * 8
+@@ -559 +560 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/cute_dsl/attention/gqa_decode_paged.py
++++ flashinfer/cute_dsl/attention/gqa_decode_paged.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -313 +314 @@
+-        smem_capacity_bits = utils.get_smem_capacity_in_bytes("sm_100") * 8
++        smem_capacity_bits = cutlass.memory.get_smem_capacity_in_bytes("sm_100") * 8
+@@ -572 +573 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/cute_dsl/attention/mla_decode.py
++++ flashinfer/cute_dsl/attention/mla_decode.py
+@@ -11,0 +12 @@
++import cutlass.memory
+@@ -370 +371 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -373 +374 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -641 +642 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/cute_dsl/attention/mla_decode_fp8.py
++++ flashinfer/cute_dsl/attention/mla_decode_fp8.py
+@@ -19,0 +20 @@
++import cutlass.memory
+@@ -374 +375 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -377 +378 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -564 +565 @@
+-                self.q_dtype,
++                self.q_dtype, self.q_dtype,
+@@ -660 +661 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/cute_dsl/attention/monolithic/mla_decode_fp16.py
++++ flashinfer/cute_dsl/attention/monolithic/mla_decode_fp16.py
+@@ -29,0 +30 @@
++import cutlass.memory
+@@ -46 +47 @@
+-    getattr(cute.arch, "warpgroup_reg_dealloc", None),
++    getattr(cute.arch, "setmaxregister_decrease", None),
+@@ -51 +52 @@
+-    getattr(cute.arch, "warpgroup_reg_alloc", None),
++    getattr(cute.arch, "setmaxregister_increase", None),
+@@ -68 +69 @@
+-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
++from cutlass.cute.nvgpu import OperandMajorMode
+@@ -74 +75 @@
+-from cutlass.base_dsl.arch import Arch
++from cutlass.base_dsl.enums import Arch
+@@ -631,3 +632,3 @@
+-        self.q_major_mode = tcgen05.OperandMajorMode.K
+-        self.k_major_mode = tcgen05.OperandMajorMode.K
+-        self.v_major_mode = tcgen05.OperandMajorMode.MN
++        self.q_major_mode = cute.nvgpu.OperandMajorMode.K
++        self.k_major_mode = cute.nvgpu.OperandMajorMode.K
++        self.v_major_mode = cute.nvgpu.OperandMajorMode.MN
+@@ -639 +640 @@
+-        p_major_mode = tcgen05.OperandMajorMode.K
++        p_major_mode = cute.nvgpu.OperandMajorMode.K
+@@ -641 +642 @@
+-            self.q_dtype,
++            self.q_dtype, self.q_dtype,
+@@ -649 +650 @@
+-            self.v_dtype,
++            self.v_dtype, self.v_dtype,
+@@ -1119 +1120 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1123 +1124 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1752 +1753 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/cute_dsl/attention/monolithic/mla_decode_fp8.py
++++ flashinfer/cute_dsl/attention/monolithic/mla_decode_fp8.py
+@@ -29,0 +30 @@
++import cutlass.memory
+@@ -39 +40 @@
+-from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
++from cutlass.cute.nvgpu import OperandMajorMode
+@@ -46 +47 @@
+-    getattr(cute.arch, "warpgroup_reg_dealloc", None),
++    getattr(cute.arch, "setmaxregister_decrease", None),
+@@ -51 +52 @@
+-    getattr(cute.arch, "warpgroup_reg_alloc", None),
++    getattr(cute.arch, "setmaxregister_increase", None),
+@@ -678 +679 @@
+-            self.q_dtype,
++            self.q_dtype, self.q_dtype,
+@@ -686 +687 @@
+-            self.v_dtype,
++            self.v_dtype, self.v_dtype,
+@@ -1226 +1227 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1235 +1236 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -2003 +2004 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/cute_dsl/attention/monolithic/mla_helpers.py
++++ flashinfer/cute_dsl/attention/monolithic/mla_helpers.py
+@@ -43,3 +43,3 @@
+-        problem_shape_b_fdd: cute.FastDivmodDivisor = None,
+-        problem_shape_s_fdd: cute.FastDivmodDivisor = None,
+-        split_kv_fdd: cute.FastDivmodDivisor = None,
++        problem_shape_b_fdd: cute.FastDivmodDivisorV2 = None,
++        problem_shape_s_fdd: cute.FastDivmodDivisorV2 = None,
++        split_kv_fdd: cute.FastDivmodDivisorV2 = None,
+@@ -70 +70 @@
+-            self.problem_shape_b_fdd = cute.fast_divmod_create_divisor(
++            self.problem_shape_b_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -74 +74 @@
+-            self.problem_shape_s_fdd = cute.fast_divmod_create_divisor(
++            self.problem_shape_s_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -78 +78 @@
+-            self.split_kv_fdd = cute.fast_divmod_create_divisor(
++            self.split_kv_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -102 +102 @@
+-            self.problem_shape_b_fdd, (values[3],)
++            self.problem_shape_b_fdd, values[3:5]
+@@ -105,3 +105,3 @@
+-            self.problem_shape_s_fdd, (values[4],)
+-        )
+-        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd, (values[5],))
++            self.problem_shape_s_fdd, values[5:7]
++        )
++        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd, values[7:9])
+@@ -278,2 +278,2 @@
+-        assert len(values) == 13
+-        new_params = cutlass.new_from_mlir_values(self.params, values[0:6])
++        assert len(values) == 16
++        new_params = cutlass.new_from_mlir_values(self.params, values[0:9])
+@@ -281,4 +281,4 @@
+-            self.current_work_linear_idx, [values[6]]
+-        )
+-        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord, values[7:10])
+-        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape, values[10:])
++            self.current_work_linear_idx, [values[9]]
++        )
++        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord, values[10:13])
++        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape, values[13:])
+--- flashinfer/cute_dsl/attention/prefill.py
++++ flashinfer/cute_dsl/attention/prefill.py
+@@ -3,0 +4,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -241,4 +243,4 @@
+-        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
+-        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
+-        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
+-        self.o_layout = utils.LayoutEnum.from_tensor(o)
++        self.q_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(q).mma_major_mode()
++        self.k_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(k).mma_major_mode()
++        self.v_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(v).mma_major_mode()
++        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(o)
+@@ -322 +324 @@
+-        smem_capacity = utils.get_smem_capacity_in_bytes(arch)
++        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(arch)
+@@ -499 +501 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -610 +612 @@
+-            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_empty)
++            cute.arch.setmaxregister_decrease(self.schedule.num_regs_empty)
+@@ -630 +632 @@
+-            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
++            cute.arch.setmaxregister_decrease(self.schedule.num_regs_other)
+@@ -662 +664 @@
+-            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
++            cute.arch.setmaxregister_decrease(self.schedule.num_regs_other)
+@@ -694 +696 @@
+-            cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_other)
++            cute.arch.setmaxregister_decrease(self.schedule.num_regs_other)
+@@ -711 +713 @@
+-            cute.arch.warpgroup_reg_alloc(self.schedule.num_regs_softmax)
++            cute.arch.setmaxregister_increase(self.schedule.num_regs_softmax)
+@@ -747 +749 @@
+-            cute.arch.warpgroup_reg_alloc(self.schedule.num_regs_softmax)
++            cute.arch.setmaxregister_increase(self.schedule.num_regs_softmax)
+@@ -783 +785 @@
+-                cute.arch.warpgroup_reg_dealloc(self.schedule.num_regs_correction)
++                cute.arch.setmaxregister_decrease(self.schedule.num_regs_correction)
+--- flashinfer/cute_dsl/attention/roles/mla_compute.py
++++ flashinfer/cute_dsl/attention/roles/mla_compute.py
+@@ -30 +30 @@
+-from cutlass.base_dsl.arch import Arch
++from cutlass.base_dsl.enums import Arch
+--- flashinfer/cute_dsl/attention/roles/mla_correction.py
++++ flashinfer/cute_dsl/attention/roles/mla_correction.py
+@@ -111 +111 @@
+-            self.v_dtype,
++            self.v_dtype, self.v_dtype,
+--- flashinfer/cute_dsl/attention/roles/mla_mma.py
++++ flashinfer/cute_dsl/attention/roles/mla_mma.py
+@@ -99 +99 @@
+-            self.q_dtype,
++            self.q_dtype, self.q_dtype,
+@@ -114 +114 @@
+-            self.v_dtype,
++            self.v_dtype, self.v_dtype,
+--- flashinfer/cute_dsl/attention/roles/mla_mma_fp8.py
++++ flashinfer/cute_dsl/attention/roles/mla_mma_fp8.py
+@@ -93 +93 @@
+-            self.q_dtype,
++            self.q_dtype, self.q_dtype,
+@@ -108 +108 @@
+-            self.v_dtype,
++            self.v_dtype, self.v_dtype,
+--- flashinfer/cute_dsl/attention/roles/mma.py
++++ flashinfer/cute_dsl/attention/roles/mma.py
+@@ -102 +102 @@
+-            self.q_dtype,
++            self.q_dtype, self.q_dtype,
+@@ -118 +118 @@
+-            self.v_dtype,
++            self.v_dtype, self.v_dtype,
+--- flashinfer/cute_dsl/attention/scheduler/mla_persistent.py
++++ flashinfer/cute_dsl/attention/scheduler/mla_persistent.py
+@@ -35,3 +35,3 @@
+-        problem_shape_b_fdd: cute.FastDivmodDivisor = None,
+-        problem_shape_s_fdd: cute.FastDivmodDivisor = None,
+-        split_kv_fdd: cute.FastDivmodDivisor = None,
++        problem_shape_b_fdd: cute.FastDivmodDivisorV2 = None,
++        problem_shape_s_fdd: cute.FastDivmodDivisorV2 = None,
++        split_kv_fdd: cute.FastDivmodDivisorV2 = None,
+@@ -50 +50 @@
+-            self.problem_shape_b_fdd = cute.fast_divmod_create_divisor(
++            self.problem_shape_b_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -54 +54 @@
+-            self.problem_shape_s_fdd = cute.fast_divmod_create_divisor(
++            self.problem_shape_s_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -58 +58 @@
+-            self.split_kv_fdd = cute.fast_divmod_create_divisor(
++            self.split_kv_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -82 +82 @@
+-            self.problem_shape_b_fdd, (values[3],)
++            self.problem_shape_b_fdd, values[3:5]
+@@ -85,3 +85,3 @@
+-            self.problem_shape_s_fdd, (values[4],)
+-        )
+-        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd, (values[5],))
++            self.problem_shape_s_fdd, values[5:7]
++        )
++        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd, values[7:9])
+@@ -240,2 +240,2 @@
+-        assert len(values) == 13
+-        new_params = cutlass.new_from_mlir_values(self.params, values[0:6])
++        assert len(values) == 16
++        new_params = cutlass.new_from_mlir_values(self.params, values[0:9])
+@@ -243,4 +243,4 @@
+-            self.current_work_linear_idx, [values[6]]
+-        )
+-        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord, values[7:10])
+-        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape, values[10:])
++            self.current_work_linear_idx, [values[9]]
++        )
++        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord, values[10:13])
++        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape, values[13:])
+--- flashinfer/cute_dsl/availability.py
++++ flashinfer/cute_dsl/availability.py
+@@ -136 +136 @@
+-        from cutlass.base_dsl.arch import Arch
++        from cutlass.base_dsl.enums import Arch
+@@ -173 +173 @@
+-        from cutlass.base_dsl.arch import Arch
++        from cutlass.base_dsl.enums import Arch
+@@ -206 +206 @@
+-    from cutlass.base_dsl.arch import Arch
++    from cutlass.base_dsl.enums import Arch
+--- flashinfer/cute_dsl/gemm_allreduce_two_shot.py
++++ flashinfer/cute_dsl/gemm_allreduce_two_shot.py
+@@ -0,0 +1,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -352 +355 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes(sm_version)
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(sm_version)
+@@ -386 +389 @@
+-            self.a_dtype,
++            self.a_dtype, self.a_dtype,
+@@ -515,3 +518,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -527 +530 @@
+-            self.a_dtype,
++            self.a_dtype, self.a_dtype,
+@@ -674 +677 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -716 +719 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -890 +893 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -998 +1001 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1179 +1182 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1391 +1394 @@
+-                tile_sched = utils.StaticPersistentTileScheduler.create(
++                tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1684 +1687 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -1704 +1707 @@
+-        :type c_layout: utils.LayoutEnum
++        :type c_layout: cutlass.tensor_utils.LayoutEnum
+@@ -1781 +1784 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -1796 +1799 @@
+-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
++        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
+@@ -1803 +1806 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -1806 +1809 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/cute_dsl/rmsnorm_fp4quant.py
++++ flashinfer/cute_dsl/rmsnorm_fp4quant.py
+@@ -25,0 +26 @@
++import cutlass.memory
+@@ -360 +361 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/cute_dsl/sparse/sm100_blk128/blackwell_helpers.py
++++ flashinfer/cute_dsl/sparse/sm100_blk128/blackwell_helpers.py
+@@ -120 +120 @@
+-                    op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
++                    op.a_major_mode == cute.nvgpu.OperandMajorMode.K
+@@ -137 +137 @@
+-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -237 +237 @@
+-                    op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
++                    op.a_major_mode == cute.nvgpu.OperandMajorMode.K
+@@ -254 +254 @@
+-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -414 +414 @@
+-                    op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
++                    op.a_major_mode == cute.nvgpu.OperandMajorMode.K
+@@ -431 +431 @@
+-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -650 +650 @@
+-                    op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
++                    op.a_major_mode == cute.nvgpu.OperandMajorMode.K
+@@ -666 +666 @@
+-            if const_expr(op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
++            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
+--- flashinfer/cute_dsl/sparse/sm100_blk128/flash_fwd_sm100.py
++++ flashinfer/cute_dsl/sparse/sm100_blk128/flash_fwd_sm100.py
+@@ -9,0 +10,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -24 +26 @@
+-from cutlass.base_dsl.arch import Arch
++from cutlass.base_dsl.enums import Arch
+@@ -387,4 +389,4 @@
+-        q_major_mode = tcgen05.OperandMajorMode.K
+-        k_major_mode = tcgen05.OperandMajorMode.K
+-        v_major_mode = tcgen05.OperandMajorMode.MN
+-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
++        q_major_mode = cute.nvgpu.OperandMajorMode.K
++        k_major_mode = cute.nvgpu.OperandMajorMode.K
++        v_major_mode = cute.nvgpu.OperandMajorMode.MN
++        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO)
+@@ -393 +395 @@
+-        p_major_mode = tcgen05.OperandMajorMode.K
++        p_major_mode = cute.nvgpu.OperandMajorMode.K
+@@ -395 +397 @@
+-            self.q_dtype,
++            self.q_dtype, self.q_dtype,
+@@ -403 +405 @@
+-            self.v_dtype,
++            self.v_dtype, self.v_dtype,
+@@ -728 +730 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -744,2 +746,2 @@
+-        tmem = cutlass.utils.TmemAllocator(
+-            storage.tmem_holding_buf,
++        tmem = cutlass.memory.TmemAllocator(
++            storage.tmem_holding_buf.ptr,
+@@ -749 +751 @@
+-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
++            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
+--- flashinfer/cute_dsl/sparse/sm100_blk128/mma_sm100_desc.py
++++ flashinfer/cute_dsl/sparse/sm100_blk128/mma_sm100_desc.py
+@@ -175 +175 @@
+-        if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
++        if op.a_major_mode == cute.nvgpu.OperandMajorMode.K
+@@ -178 +178 @@
+-        if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K
++        if op.b_major_mode == cute.nvgpu.OperandMajorMode.K
+--- flashinfer/cute_dsl/sparse/sm100_blk128/tile_scheduler.py
++++ flashinfer/cute_dsl/sparse/sm100_blk128/tile_scheduler.py
+@@ -13 +13 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -73 +73 @@
+-        num_splits_divmod: FastDivmodDivisor
++        num_splits_divmod: FastDivmodDivisorV2
+@@ -85 +85 @@
+-                FastDivmodDivisor(args.num_splits),
++                FastDivmodDivisorV2(args.num_splits),
+@@ -173,2 +173,2 @@
+-        num_block_cluster_divmod: FastDivmodDivisor
+-        num_head_divmod: FastDivmodDivisor
++        num_block_cluster_divmod: FastDivmodDivisorV2
++        num_head_divmod: FastDivmodDivisorV2
+@@ -195,2 +195,2 @@
+-                FastDivmodDivisor(num_block_cluster),
+-                FastDivmodDivisor(args.num_head),
++                FastDivmodDivisorV2(num_block_cluster),
++                FastDivmodDivisorV2(args.num_head),
+--- flashinfer/cute_dsl/sparse/sm100_blk64/block_sparse_tile_scheduler.py
++++ flashinfer/cute_dsl/sparse/sm100_blk64/block_sparse_tile_scheduler.py
+@@ -9 +9 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -33,3 +33,3 @@
+-        num_block_divmod: FastDivmodDivisor
+-        num_head_divmod: FastDivmodDivisor
+-        num_splits_divmod: FastDivmodDivisor
++        num_block_divmod: FastDivmodDivisorV2
++        num_head_divmod: FastDivmodDivisorV2
++        num_splits_divmod: FastDivmodDivisorV2
+@@ -60,3 +60,3 @@
+-                FastDivmodDivisor(args.num_block),
+-                FastDivmodDivisor(args.num_head),
+-                FastDivmodDivisor(args.num_splits),
++                FastDivmodDivisorV2(args.num_block),
++                FastDivmodDivisorV2(args.num_head),
++                FastDivmodDivisorV2(args.num_splits),
+--- flashinfer/cute_dsl/sparse/sm100_blk64/bsa_fwd_combine.py
++++ flashinfer/cute_dsl/sparse/sm100_blk64/bsa_fwd_combine.py
+@@ -5,0 +6 @@
++import cutlass.memory
+@@ -19 +20 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -282,2 +283,2 @@
+-        # Create FastDivmodDivisor objects for efficient division
+-        seqlen_divmod = FastDivmodDivisor(seqlen)
++        # Create FastDivmodDivisorV2 objects for efficient division
++        seqlen_divmod = FastDivmodDivisorV2(seqlen)
+@@ -336 +337 @@
+-        seqlen_divmod: FastDivmodDivisor,
++        seqlen_divmod: FastDivmodDivisorV2,
+@@ -353 +354 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -420 +421 @@
+-                    # Calculate actual sequence position and head using FastDivmodDivisor
++                    # Calculate actual sequence position and head using FastDivmodDivisorV2
+--- flashinfer/cute_dsl/sparse/sm100_blk64/bsa_fwd_helpers.py
++++ flashinfer/cute_dsl/sparse/sm100_blk64/bsa_fwd_helpers.py
+@@ -643 +643 @@
+-                if const_expr(op.a_major_mode == tcgen05.OperandMajorMode.K)
++                if const_expr(op.a_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -659 +659 @@
+-            if const_expr(op.b_major_mode == tcgen05.OperandMajorMode.K)
++            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
+--- flashinfer/cute_dsl/sparse/sm100_blk64/bsa_fwd_sm100.py
++++ flashinfer/cute_dsl/sparse/sm100_blk64/bsa_fwd_sm100.py
+@@ -9,0 +10,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -24 +26 @@
+-from cutlass.base_dsl.arch import Arch
++from cutlass.base_dsl.enums import Arch
+@@ -514,4 +516,4 @@
+-        q_major_mode = tcgen05.OperandMajorMode.K
+-        k_major_mode = tcgen05.OperandMajorMode.K
+-        v_major_mode = tcgen05.OperandMajorMode.MN
+-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
++        q_major_mode = cute.nvgpu.OperandMajorMode.K
++        k_major_mode = cute.nvgpu.OperandMajorMode.K
++        v_major_mode = cute.nvgpu.OperandMajorMode.MN
++        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO)
+@@ -520 +522 @@
+-        p_major_mode = tcgen05.OperandMajorMode.K
++        p_major_mode = cute.nvgpu.OperandMajorMode.K
+@@ -525 +527 @@
+-            self.q_dtype,
++            self.q_dtype, self.q_dtype,
+@@ -533 +535 @@
+-            self.v_dtype,
++            self.v_dtype, self.v_dtype,
+@@ -947 +949 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -963,2 +965,2 @@
+-        tmem = cutlass.utils.TmemAllocator(
+-            storage.tmem_holding_buf,
++        tmem = cutlass.memory.TmemAllocator(
++            storage.tmem_holding_buf.ptr,
+--- flashinfer/cute_dsl/sparse/sm100_blk64/copy_utils.py
++++ flashinfer/cute_dsl/sparse/sm100_blk64/copy_utils.py
+@@ -12 +12 @@
+-from cutlass.base_dsl.arch import Arch
++from cutlass.base_dsl.enums import Arch
+--- flashinfer/cute_dsl/sparse/sm100_blk64/mma_sm100_desc.py
++++ flashinfer/cute_dsl/sparse/sm100_blk64/mma_sm100_desc.py
+@@ -175,2 +175,2 @@
+-        Major.K if op.a_major_mode == tcgen05.OperandMajorMode.K else Major.MN,
+-        Major.K if op.b_major_mode == tcgen05.OperandMajorMode.K else Major.MN,
++        Major.K if op.a_major_mode == cute.nvgpu.OperandMajorMode.K else Major.MN,
++        Major.K if op.b_major_mode == cute.nvgpu.OperandMajorMode.K else Major.MN,
+--- flashinfer/cute_dsl/sparse/sm100_blk64/tcgen05_mma_helpers.py
++++ flashinfer/cute_dsl/sparse/sm100_blk64/tcgen05_mma_helpers.py
+@@ -150 +150 @@
+-                if const_expr(op.a_major_mode == tcgen05.OperandMajorMode.K)
++                if const_expr(op.a_major_mode == cute.nvgpu.OperandMajorMode.K)
+@@ -166 +166 @@
+-            if const_expr(op.b_major_mode == tcgen05.OperandMajorMode.K)
++            if const_expr(op.b_major_mode == cute.nvgpu.OperandMajorMode.K)
+--- flashinfer/cute_dsl/sparse/sm100_blk64/tile_scheduler.py
++++ flashinfer/cute_dsl/sparse/sm100_blk64/tile_scheduler.py
+@@ -14 +14 @@
+-from cutlass.cute import FastDivmodDivisor
++from cutlass.cute import FastDivmodDivisorV2
+@@ -129 +129 @@
+-        num_splits_divmod: FastDivmodDivisor
++        num_splits_divmod: FastDivmodDivisorV2
+@@ -141 +141 @@
+-                FastDivmodDivisor(args.num_splits),
++                FastDivmodDivisorV2(args.num_splits),
+--- flashinfer/cute_dsl/sparse/sm120_blk64/flash_fwd_sm120.py
++++ flashinfer/cute_dsl/sparse/sm120_blk64/flash_fwd_sm120.py
+@@ -14,0 +15,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -116 +118 @@
+-        shared_storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage_t)
++        shared_storage = cutlass.memory.SmemAllocator().allocate(self.shared_storage_t)
+@@ -560,4 +562,4 @@
+-        Q_layout = utils.LayoutEnum.from_tensor(mQ)
+-        K_layout = utils.LayoutEnum.from_tensor(mK)
+-        V_layout = utils.LayoutEnum.from_tensor(mV)
+-        O_layout = utils.LayoutEnum.from_tensor(mO)
++        Q_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mQ)
++        K_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mK)
++        V_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mV)
++        O_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO)
+--- flashinfer/cute_dsl/sparse/sm120_blk64/flash_fwd_sm120_sage.py
++++ flashinfer/cute_dsl/sparse/sm120_blk64/flash_fwd_sm120_sage.py
+@@ -24,0 +25,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -194 +196 @@
+-        shared_storage = cutlass.utils.SmemAllocator().allocate(self.shared_storage_t)
++        shared_storage = cutlass.memory.SmemAllocator().allocate(self.shared_storage_t)
+@@ -680,4 +682,4 @@
+-        Q_layout = utils.LayoutEnum.from_tensor(mQ)
+-        K_layout = utils.LayoutEnum.from_tensor(mK)
+-        V_layout = utils.LayoutEnum.from_tensor(mV)
+-        O_layout = utils.LayoutEnum.from_tensor(mO)
++        Q_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mQ)
++        K_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mK)
++        V_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mV)
++        O_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO)
+--- flashinfer/cute_dsl/utils.py
++++ flashinfer/cute_dsl/utils.py
+@@ -42 +42 @@
+-        cute.nvgpu.OperandMajorMode = cute.nvgpu.tcgen05.OperandMajorMode
++        cute.nvgpu.OperandMajorMode = cute.nvgpu.cute.nvgpu.OperandMajorMode
+--- flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/bf16/fma_fc2.py
++++ flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/bf16/fma_fc2.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -48 +49 @@
+-    shared = utils.SmemAllocator().allocate_tensor(
++    shared = cutlass.memory.SmemAllocator().allocate_tensor(
+--- flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/mxfp8/fma_fc1.py
++++ flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/mxfp8/fma_fc1.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -58 +59 @@
+-    shared = utils.SmemAllocator().allocate_tensor(
++    shared = cutlass.memory.SmemAllocator().allocate_tensor(
+--- flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/mxfp8/fma_fc2.py
++++ flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/mxfp8/fma_fc2.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -43 +44 @@
+-    shared = utils.SmemAllocator().allocate_tensor(
++    shared = cutlass.memory.SmemAllocator().allocate_tensor(
+--- flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/nvfp4/fma_fc1_o2.py
++++ flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/nvfp4/fma_fc1_o2.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -77 +78 @@
+-    smem = utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+--- flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/nvfp4/fma_fc1_o4.py
++++ flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/nvfp4/fma_fc1_o4.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -76 +77 @@
+-    intermediate_values = utils.SmemAllocator().allocate_tensor(
++    intermediate_values = cutlass.memory.SmemAllocator().allocate_tensor(
+--- flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/nvfp4/fma_fc2.py
++++ flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/nvfp4/fma_fc2.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -84 +85 @@
+-    shared = utils.SmemAllocator().allocate_tensor(
++    shared = cutlass.memory.SmemAllocator().allocate_tensor(
+--- flashinfer/experimental/deepseek_v41/hca_v41.py
++++ flashinfer/experimental/deepseek_v41/hca_v41.py
+@@ -40,0 +41 @@
++import cutlass.memory
+@@ -903 +904 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -907 +908 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1743 +1744 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
++++ flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
+@@ -28,0 +29,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -284 +287 @@
+-        self.batch_fdd = cute.fast_divmod_create_divisor(
++        self.batch_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -289 +292 @@
+-        self.cluster_shape_m_fdd = cute.fast_divmod_create_divisor(
++        self.cluster_shape_m_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -294 +297 @@
+-        self.cluster_shape_n_fdd = cute.fast_divmod_create_divisor(
++        self.cluster_shape_n_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -337 +340 @@
+-    cutlass.utils.PersistentTileSchedulerParams.__init__ = (
++    tile_scheduler.PersistentTileSchedulerParams.__init__ = (
+@@ -340 +343 @@
+-    cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = hooked_get_cluster_work_idx_with_fastdivmod
++    tile_scheduler.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = hooked_get_cluster_work_idx_with_fastdivmod
+@@ -627 +630 @@
+-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
++        self.num_smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -982,3 +985,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -1396 +1399 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -1443 +1446 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1533 +1536 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1763 +1766 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1961 +1964 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2205 +2208 @@
+-                tile_sched = utils.StaticPersistentTileScheduler.create(
++                tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2286 +2289 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2486 +2489 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2837 +2840 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -5611 +5614 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -5632 +5635 @@
+-        :type c_layout: utils.LayoutEnum
++        :type c_layout: cutlass.tensor_utils.LayoutEnum
+@@ -5726 +5729 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -5741 +5744 @@
+-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
++        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
+@@ -5748 +5751 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -5751 +5754 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py
++++ flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py
+@@ -28,0 +29,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -264 +267 @@
+-        self.batch_fdd = cute.fast_divmod_create_divisor(
++        self.batch_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -269 +272 @@
+-        self.cluster_shape_m_fdd = cute.fast_divmod_create_divisor(
++        self.cluster_shape_m_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -274 +277 @@
+-        self.cluster_shape_n_fdd = cute.fast_divmod_create_divisor(
++        self.cluster_shape_n_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -317 +320 @@
+-    cutlass.utils.PersistentTileSchedulerParams.__init__ = (
++    tile_scheduler.PersistentTileSchedulerParams.__init__ = (
+@@ -320 +323 @@
+-    cutlass.utils.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = hooked_get_cluster_work_idx_with_fastdivmod
++    tile_scheduler.StaticPersistentTileScheduler._get_cluster_work_idx_with_fastdivmod = hooked_get_cluster_work_idx_with_fastdivmod
+@@ -477 +480 @@
+-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
++        self.num_smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -493,2 +496,2 @@
+-            and self.a_major_mode == tcgen05.OperandMajorMode.K
+-            and self.b_major_mode == tcgen05.OperandMajorMode.K
++            and self.a_major_mode == cute.nvgpu.OperandMajorMode.K
++            and self.b_major_mode == cute.nvgpu.OperandMajorMode.K
+@@ -750,3 +753,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.gemm_output_layout = utils.LayoutEnum.ROW_MAJOR
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.gemm_output_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+@@ -1166,2 +1169,2 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
+-        tile_sched_params_n: Optional[utils.PersistentTileSchedulerParams],
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
++        tile_sched_params_n: Optional[tile_scheduler.PersistentTileSchedulerParams],
+@@ -1211 +1214 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1280 +1283 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1534 +1537 @@
+-        tile_sched = utils.StaticPersistentTileScheduler.create(
++        tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1539 +1542 @@
+-            tile_sched_n = utils.StaticPersistentTileScheduler.create(
++            tile_sched_n = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2695 +2698 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -2712 +2715 @@
+-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
++        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
+@@ -2724 +2727 @@
+-            tile_sched_params = utils.PersistentTileSchedulerParams(
++            tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -2731 +2734 @@
+-            tile_sched_params = utils.PersistentTileSchedulerParams(
++            tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -2734 +2737 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_swapab_grouped_gemm.py
++++ flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_swapab_grouped_gemm.py
+@@ -54,0 +55,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -300 +303 @@
+-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
++        self.num_smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -485 +488 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -488 +491 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+@@ -558,2 +561,2 @@
+-        self.a_major_mode = utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
+@@ -882 +885 @@
+-            utils.LayoutEnum.ROW_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+@@ -941 +944 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -971 +974 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1022 +1025 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1133 +1136 @@
+-        tile_sched = utils.StaticPersistentTileScheduler.create(
++        tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+--- flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py
++++ flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py
+@@ -35,0 +36,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -193 +196 @@
+-            self.mma_dtype,
++            self.mma_dtype, self.mma_dtype,
+@@ -702,3 +705,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -707 +710 @@
+-            utils.LayoutEnum.from_tensor(a_scale).mma_major_mode()
++            cutlass.tensor_utils.LayoutEnum.from_tensor(a_scale).mma_major_mode()
+@@ -715 +718 @@
+-            self.mma_dtype,
++            self.mma_dtype, self.mma_dtype,
+@@ -898 +901 @@
+-            utils.PersistentTileSchedulerParams,
++            tile_scheduler.PersistentTileSchedulerParams,
+@@ -922 +925 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1016 +1019 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -2377 +2380 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -2433 +2436 @@
+-        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
++        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -2558 +2561 @@
+-            utils.PersistentTileSchedulerParams,
++            tile_scheduler.PersistentTileSchedulerParams,
+@@ -2576 +2579 @@
+-            tile_sched_params = utils.PersistentTileSchedulerParams(
++            tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_dynamic/gated.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_dynamic/gated.py
+@@ -4,0 +5,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -795 +797 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
+@@ -3749,2 +3751,2 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
+-        self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(packed_a)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(b_w13)
+@@ -3753 +3755 @@
+-        self.c_layout = utils.LayoutEnum.ROW_MAJOR
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+@@ -3995 +3997 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_dynamic/generic.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_dynamic/generic.py
+@@ -50,0 +51,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -325 +327 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
+@@ -616,2 +618,2 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
+-        self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(packed_a)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(b_w13)
+@@ -620 +622 @@
+-        self.c_layout = utils.LayoutEnum.ROW_MAJOR
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+@@ -823 +825 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_utils/moe_epilogue.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_utils/moe_epilogue.py
+@@ -15,0 +16 @@
++import cutlass.tensor_utils
+@@ -126 +127 @@
+-            cutlass.utils.LayoutEnum.ROW_MAJOR, self.out_dtype, self.epi_tile(tile)[1]
++            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR, self.out_dtype, self.epi_tile(tile)[1]
+@@ -319 +320 @@
+-            cutlass.utils.LayoutEnum.COL_MAJOR, out_dtype, tile[0]
++            cutlass.tensor_utils.LayoutEnum.COL_MAJOR, out_dtype, tile[0]
+@@ -325 +326 @@
+-            cutlass.utils.LayoutEnum.COL_MAJOR, self.out_dtype, self.epi_tile(tile)[0]
++            cutlass.tensor_utils.LayoutEnum.COL_MAJOR, self.out_dtype, self.epi_tile(tile)[0]
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_utils/moe_kernel_builder.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_utils/moe_kernel_builder.py
+@@ -15,0 +16,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -155 +157 @@
+-                cutlass.utils.LayoutEnum.ROW_MAJOR, smem_dtype, box[1]
++                cutlass.tensor_utils.LayoutEnum.ROW_MAJOR, smem_dtype, box[1]
+@@ -316 +318 @@
+-        capacity = cutlass.utils.SmemAllocator.capacity_in_bytes() - cls.MBAR_RESERVE
++        capacity = cutlass.memory.SmemAllocator.capacity_in_bytes() - cls.MBAR_RESERVE
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_fc1_act.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_fc1_act.py
+@@ -15,0 +16,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -710,2 +712,2 @@
+-        a_layout = utils.LayoutEnum.from_tensor(t_a)
+-        b_layout = utils.LayoutEnum.from_tensor(t_b)
++        a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_a)
++        b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_b)
+@@ -852 +854 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_fc1_act_q1.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_fc1_act_q1.py
+@@ -15,0 +16,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -736,2 +738,2 @@
+-        a_layout = utils.LayoutEnum.from_tensor(t_a)
+-        b_layout = utils.LayoutEnum.from_tensor(t_b)
++        a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_a)
++        b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_b)
+@@ -891 +893 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_fc2_finalize.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_fc2_finalize.py
+@@ -15,0 +16,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -357,2 +359,2 @@
+-        a_layout = utils.LayoutEnum.from_tensor(t_a)
+-        b_layout = utils.LayoutEnum.from_tensor(t_b)
++        a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_a)
++        b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_b)
+@@ -491 +493 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_gemm.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_gemm.py
+@@ -15,0 +16,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -528,2 +530,2 @@
+-        a_layout = utils.LayoutEnum.from_tensor(t_a)
+-        b_layout = utils.LayoutEnum.from_tensor(t_b)
++        a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_a)
++        b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_b)
+@@ -663 +665 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_fc1_act.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_fc1_act.py
+@@ -15,0 +16,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -797,2 +799,2 @@
+-        a_layout = cutlass.utils.LayoutEnum.from_tensor(t_a)
+-        b_layout = cutlass.utils.LayoutEnum.from_tensor(t_b)
++        a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_a)
++        b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_b)
+@@ -988 +990 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_fc1_act_q1.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_fc1_act_q1.py
+@@ -15,0 +16,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -834,2 +836,2 @@
+-        a_layout = cutlass.utils.LayoutEnum.from_tensor(t_a)
+-        b_layout = cutlass.utils.LayoutEnum.from_tensor(t_b)
++        a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_a)
++        b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_b)
+@@ -1046 +1048 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_fc2_finalize.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_fc2_finalize.py
+@@ -15,0 +16,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -391,2 +393,2 @@
+-        a_layout = cutlass.utils.LayoutEnum.from_tensor(t_a)
+-        b_layout = cutlass.utils.LayoutEnum.from_tensor(t_b)
++        a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_a)
++        b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_b)
+@@ -538 +540 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_gemm.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_gemm.py
+@@ -15,0 +16,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -516,2 +518,2 @@
+-        a_layout = cutlass.utils.LayoutEnum.from_tensor(t_a)
+-        b_layout = cutlass.utils.LayoutEnum.from_tensor(t_b)
++        a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_a)
++        b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(t_b)
+@@ -670 +672 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_micro_kernel.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_micro_kernel.py
+@@ -84,0 +85,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -415 +417 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
+@@ -672,2 +674,2 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
+-        self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(packed_a)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(b_w13)
+@@ -675 +677 @@
+-        self.c_layout = utils.LayoutEnum.ROW_MAJOR
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+@@ -867 +869 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_static_kernel.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_static_kernel.py
+@@ -88,0 +89,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -510 +512 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
+@@ -992,2 +994,2 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(packed_a)
+-        self.b_layout = utils.LayoutEnum.from_tensor(b_w13)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(packed_a)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(b_w13)
+@@ -995 +997 @@
+-        self.c_layout = utils.LayoutEnum.ROW_MAJOR
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+@@ -1218 +1220 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_w4a16_kernel.py
++++ flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_w4a16_kernel.py
+@@ -4,0 +5 @@
++import cutlass.memory
+@@ -999 +1000 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -4396 +4397 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/hopper/contiguous_gather_grouped_gemm_act_fusion.py
++++ flashinfer/fused_moe/cute_dsl/hopper/contiguous_gather_grouped_gemm_act_fusion.py
+@@ -54,0 +55,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -273 +276 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_90")
+@@ -295 +298 @@
+-            self.a_dtype,
++            self.a_dtype, self.a_dtype,
+@@ -383,3 +386,3 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(a)
+-        self.b_layout = utils.LayoutEnum.from_tensor(b)
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(a)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(b)
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -486 +489 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -511 +514 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -671 +674 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -839 +842 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1229 +1232 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -1235 +1238 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/fused_moe/cute_dsl/hopper/contiguous_grouped_gemm_finalize_fusion.py
++++ flashinfer/fused_moe/cute_dsl/hopper/contiguous_grouped_gemm_finalize_fusion.py
+@@ -34,0 +35,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -184 +187 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_90")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_90")
+@@ -205 +208 @@
+-            self.a_dtype,
++            self.a_dtype, self.a_dtype,
+@@ -273,2 +276,2 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(a)
+-        self.b_layout = utils.LayoutEnum.from_tensor(b)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(a)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(b)
+@@ -392 +395 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -417 +420 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -557 +560 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -612 +615 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -665 +668 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -968 +971 @@
+-        a_layout: utils.LayoutEnum,
++        a_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -970 +973 @@
+-        b_layout: utils.LayoutEnum,
++        b_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -1016 +1019 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -1022 +1025 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/fused_moe/cute_dsl/hopper/utils.py
++++ flashinfer/fused_moe/cute_dsl/hopper/utils.py
+@@ -9,0 +10 @@
++import cutlass.tensor_utils
+@@ -29 +30 @@
+-    a_layout: utils.LayoutEnum,
++    a_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -31 +32 @@
+-    b_layout: utils.LayoutEnum,
++    b_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -34 +35 @@
+-    c_layout: utils.LayoutEnum,
++    c_layout: cutlass.tensor_utils.LayoutEnum,
+--- flashinfer/fused_moe/cute_dsl/mxfp4_routing.py
++++ flashinfer/fused_moe/cute_dsl/mxfp4_routing.py
+@@ -19,0 +20 @@
++import cutlass.memory
+@@ -517 +518 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py
++++ flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py
+@@ -28,0 +29,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -220 +223 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
+@@ -782,3 +785,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -1251 +1254 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -1293 +1296 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1449 +1452 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1630 +1633 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1768 +1771 @@
+-                tile_sched = utils.StaticPersistentTileScheduler.create(
++                tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1877 +1880 @@
+-                tile_sched = utils.StaticPersistentTileScheduler.create(
++                tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2017 +2020 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2116 +2119 @@
+-                tile_sched = utils.StaticPersistentTileScheduler.create(
++                tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2238 +2241 @@
+-                tile_sched = utils.StaticPersistentTileScheduler.create(
++                tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2304 +2307 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2459 +2462 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2861 +2864 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -3438 +3441 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -3460 +3463 @@
+-        :type c_layout: utils.LayoutEnum
++        :type c_layout: cutlass.tensor_utils.LayoutEnum
+@@ -3553 +3556 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -3568 +3571 @@
+-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
++        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
+@@ -3575 +3578 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -3578 +3581 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py
++++ flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py
+@@ -46,0 +47,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -179 +182 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
+@@ -608,3 +611,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.ROW_MAJOR  # Always N-major for GEMM output
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR  # Always N-major for GEMM output
+@@ -907 +910 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -935 +938 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -985 +988 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1112 +1115 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1676 +1679 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -1687 +1690 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -1690 +1693 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py
++++ flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py
+@@ -85,0 +86,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -95 +97,2 @@
+-from cutlass.utils import TensorMapManager, TensorMapUpdateMode
++from cutlass.tensor_utils import TensorMapUpdateMode
++from cutlass.utils import TensorMapManager
+@@ -668 +671 @@
+-            cutlass.utils.LayoutEnum.from_tensor(o),
++            cutlass.tensor_utils.LayoutEnum.from_tensor(o),
+@@ -1008 +1011 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1053 +1056 @@
+-        tmem = cutlass.utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flashinfer/gdn_kernels/blackwell/gated_delta_net_cp.py
++++ flashinfer/gdn_kernels/blackwell/gated_delta_net_cp.py
+@@ -2,0 +3 @@
++import cutlass.memory
+@@ -1167 +1168 @@
+-        allocator = utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+@@ -1335 +1336 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -2034 +2035 @@
+-        allocator = utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+@@ -2161 +2162 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flashinfer/gdn_kernels/blackwell/gated_delta_net_cp_prefill.py
++++ flashinfer/gdn_kernels/blackwell/gated_delta_net_cp_prefill.py
+@@ -45,0 +46,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -55 +57,2 @@
+-from cutlass.utils import TensorMapManager, TensorMapUpdateMode
++from cutlass.tensor_utils import TensorMapUpdateMode
++from cutlass.utils import TensorMapManager
+@@ -680 +683 @@
+-            cutlass.utils.LayoutEnum.from_tensor(o),
++            cutlass.tensor_utils.LayoutEnum.from_tensor(o),
+@@ -1057 +1060 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1098 +1101 @@
+-        tmem = cutlass.utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flashinfer/gdn_kernels/blackwell/gated_delta_net_tile_scheduler.py
++++ flashinfer/gdn_kernels/blackwell/gated_delta_net_tile_scheduler.py
+@@ -65,2 +65,2 @@
+-        num_seqs_fdd: cute.FastDivmodDivisor = None,
+-        num_heads_fdd: cute.FastDivmodDivisor = None,
++        num_seqs_fdd: cute.FastDivmodDivisorV2 = None,
++        num_heads_fdd: cute.FastDivmodDivisorV2 = None,
+@@ -85 +85 @@
+-            self.num_seqs_fdd = cute.fast_divmod_create_divisor(
++            self.num_seqs_fdd = cute.fast_divmod_create_divisor_v2(
+@@ -89 +89 @@
+-            self.num_heads_fdd = cute.fast_divmod_create_divisor(
++            self.num_heads_fdd = cute.fast_divmod_create_divisor_v2(
+--- flashinfer/gdn_kernels/delta_rule_dsl/collective_store_tma.py
++++ flashinfer/gdn_kernels/delta_rule_dsl/collective_store_tma.py
+@@ -6 +6,2 @@
+-from cutlass.utils.tensormap_manager import TensorMapManager, TensorMapUpdateMode
++from cutlass.tensor_utils import TensorMapUpdateMode
++from cutlass.utils.tensormap_manager import TensorMapManager
+--- flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py
++++ flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py
+@@ -0,0 +1 @@
++import cutlass.memory
+@@ -362 +363 @@
+-            allocator = cutlass.utils.SmemAllocator()
++            allocator = cutlass.memory.SmemAllocator()
+@@ -1426 +1427 @@
+-        allocator = cutlass.utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+@@ -2210 +2211 @@
+-        allocator = cutlass.utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+@@ -2741 +2742 @@
+-        allocator = cutlass.utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+@@ -4841 +4842 @@
+-        allocator = cutlass.utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+--- flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm90.py
++++ flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm90.py
+@@ -0,0 +1 @@
++import cutlass.memory
+@@ -344 +345 @@
+-            allocator = cutlass.utils.SmemAllocator()
++            allocator = cutlass.memory.SmemAllocator()
+@@ -1421 +1422 @@
+-        allocator = cutlass.utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+@@ -2214 +2215 @@
+-        allocator = cutlass.utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+@@ -2615 +2616 @@
+-        allocator = cutlass.utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+@@ -3972 +3973 @@
+-        allocator = cutlass.utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+--- flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py
++++ flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py
+@@ -0,0 +1 @@
++import cutlass.memory
+@@ -1775 +1776 @@
+-        allocator = cutlass.utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+--- flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm90.py
++++ flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm90.py
+@@ -0,0 +1 @@
++import cutlass.memory
+@@ -2060 +2061 @@
+-        allocator = cutlass.utils.SmemAllocator()
++        allocator = cutlass.memory.SmemAllocator()
+--- flashinfer/gdn_kernels/gdn_decode_bf16_state.py
++++ flashinfer/gdn_kernels/gdn_decode_bf16_state.py
+@@ -40,0 +41 @@
++import cutlass.memory
+@@ -230 +231 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -962 +963 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+@@ -2004 +2005 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gdn_kernels/gdn_decode_bf16_wy_output_only.py
++++ flashinfer/gdn_kernels/gdn_decode_bf16_wy_output_only.py
+@@ -31,0 +32 @@
++import cutlass.memory
+@@ -865 +866 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache.py
++++ flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache.py
+@@ -68,0 +69 @@
++import cutlass.memory
+@@ -965 +966 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache_flush.py
++++ flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache_flush.py
+@@ -107,0 +108 @@
++import cutlass.memory
+@@ -1487 +1488 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gdn_kernels/gdn_decode_mtp.py
++++ flashinfer/gdn_kernels/gdn_decode_mtp.py
+@@ -39,0 +40 @@
++import cutlass.memory
+@@ -289 +290 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+@@ -1714 +1715 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gdn_kernels/gdn_decode_nontranspose.py
++++ flashinfer/gdn_kernels/gdn_decode_nontranspose.py
+@@ -22,0 +23 @@
++import cutlass.memory
+@@ -106 +107 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -337 +338 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gdn_kernels/gdn_decode_pretranspose.py
++++ flashinfer/gdn_kernels/gdn_decode_pretranspose.py
+@@ -22,0 +23 @@
++import cutlass.memory
+@@ -93 +94 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+@@ -415 +416 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gdn_kernels/qk_l2norm.py
++++ flashinfer/gdn_kernels/qk_l2norm.py
+@@ -18,0 +19 @@
++import cutlass.memory
+@@ -147 +148 @@
+-        partials = cutlass.utils.SmemAllocator().allocate_tensor(
++        partials = cutlass.memory.SmemAllocator().allocate_tensor(
+--- flashinfer/gemm/kernels/bmm_fp8_blackwell.py
++++ flashinfer/gemm/kernels/bmm_fp8_blackwell.py
+@@ -41,0 +42,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -195 +198 @@
+-            self.a_dtype,
++            self.a_dtype, self.a_dtype,
+@@ -251 +254 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -306,3 +309,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -419 +422 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -460 +463 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -507,2 +510,2 @@
+-        tmem = utils.TmemAllocator(
+-            storage.tmem_holding_buf,
++        tmem = cutlass.memory.TmemAllocator(
++            storage.tmem_holding_buf.ptr,
+@@ -596 +599 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -652 +655 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -721 +724 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -770 +773 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -777 +780 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -780 +783 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/gemm/kernels/bmm_fp8_rubin.py
++++ flashinfer/gemm/kernels/bmm_fp8_rubin.py
+@@ -42,0 +43,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -115 +118 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
+@@ -275 +278 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -318 +321 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -365,2 +368,2 @@
+-        tmem = utils.TmemAllocator(
+-            storage.tmem_holding_buf,
++        tmem = cutlass.memory.TmemAllocator(
++            storage.tmem_holding_buf.ptr,
+@@ -454 +457 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -510 +513 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -626 +629 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -734,3 +737,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+--- flashinfer/gemm/kernels/cute_dsl/dense_gemm_bf16_fp4_sm100.py
++++ flashinfer/gemm/kernels/cute_dsl/dense_gemm_bf16_fp4_sm100.py
+@@ -37,0 +38,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -142 +145 @@
+-            self.mma_dtype,
++            self.mma_dtype, self.mma_dtype,
+@@ -568,3 +571,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -573 +576 @@
+-            utils.LayoutEnum.from_tensor(a_scale).mma_major_mode()
++            cutlass.tensor_utils.LayoutEnum.from_tensor(a_scale).mma_major_mode()
+@@ -581 +584 @@
+-            self.mma_dtype,
++            self.mma_dtype, self.mma_dtype,
+@@ -758 +761 @@
+-            utils.PersistentTileSchedulerParams,
++            tile_scheduler.PersistentTileSchedulerParams,
+@@ -782 +785 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -874 +877 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -2161 +2164 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -2217 +2220 @@
+-        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
++        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -2342 +2345 @@
+-            utils.PersistentTileSchedulerParams,
++            tile_scheduler.PersistentTileSchedulerParams,
+@@ -2360 +2363 @@
+-            tile_sched_params = utils.PersistentTileSchedulerParams(
++            tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+--- flashinfer/gemm/kernels/cute_dsl/dense_gemm_bf16_fp4_sm12x.py
++++ flashinfer/gemm/kernels/cute_dsl/dense_gemm_bf16_fp4_sm12x.py
+@@ -34,0 +35,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -240 +243 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
+@@ -357,3 +360,3 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(a)
+-        self.b_layout_compute = utils.LayoutEnum.ROW_MAJOR
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(a)
++        self.b_layout_compute = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -551 +554 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -587 +590 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -716 +719 @@
+-        tile_sched = utils.StaticPersistentTileScheduler.create(
++        tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1336 +1339 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -1342 +1345 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/gemm/kernels/cute_dsl/low_latency_blockscaled_gemm.py
++++ flashinfer/gemm/kernels/cute_dsl/low_latency_blockscaled_gemm.py
+@@ -60,0 +61,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -102 +104 @@
+-_SMEM_CAPACITY_BYTES = cutlass.utils.get_smem_capacity_in_bytes("sm_100")
++_SMEM_CAPACITY_BYTES = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -476,3 +478,3 @@
+-        self.a_major_mode = cutlass.utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = cutlass.utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.c_layout = cutlass.utils.LayoutEnum.from_tensor(c)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -822 +824 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gemm/kernels/dense_bf16_gemm_direct.py
++++ flashinfer/gemm/kernels/dense_bf16_gemm_direct.py
+@@ -13,0 +14 @@
++import cutlass.memory
+@@ -264 +265 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py
++++ flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py
+@@ -12,0 +13,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -28 +30 @@
+-_SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
++_SMEM_CAPACITY_BYTES = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -376 +378 @@
+-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
++            smem=cute.Int64(cutlass.memory.get_smem_capacity_in_bytes("sm_100")),
+@@ -396,2 +398,2 @@
+-            utils.LayoutEnum.from_tensor(mA).mma_major_mode(),
+-            utils.LayoutEnum.from_tensor(mB).mma_major_mode(),
++            cutlass.tensor_utils.LayoutEnum.from_tensor(mA).mma_major_mode(),
++            cutlass.tensor_utils.LayoutEnum.from_tensor(mB).mma_major_mode(),
+@@ -561 +563 @@
+-                utils.LayoutEnum.from_tensor(mC),
++                cutlass.tensor_utils.LayoutEnum.from_tensor(mC),
+--- flashinfer/gemm/kernels/dense_bf16_gemm_warp_splitk.py
++++ flashinfer/gemm/kernels/dense_bf16_gemm_warp_splitk.py
+@@ -6,0 +7 @@
++import cutlass.memory
+@@ -38 +39 @@
+-_SMEM_CAPACITY = cutlass.utils.get_smem_capacity_in_bytes("sm_100")
++_SMEM_CAPACITY = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+--- flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100.py
++++ flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100.py
+@@ -32,0 +33,2 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
+@@ -252 +254 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -611 +613 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -665 +667 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -928 +930 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1164 +1166 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1449 +1451 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1686 +1688 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -1709 +1711 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -1712 +1714 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100_common.py
++++ flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100_common.py
+@@ -29,0 +30 @@
++import cutlass.tensor_utils
+@@ -98,3 +99,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c_tensor)
+@@ -269 +270 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -292 +293 @@
+-            c_layout (utils.LayoutEnum): Layout of operand C.
++            c_layout (cutlass.tensor_utils.LayoutEnum): Layout of operand C.
+--- flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100_splitk.py
++++ flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100_splitk.py
+@@ -31,0 +32 @@
++import cutlass.memory
+@@ -307 +308 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -732 +733 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gemm/kernels/dense_blockscaled_gemm_sm103.py
++++ flashinfer/gemm/kernels/dense_blockscaled_gemm_sm103.py
+@@ -32,0 +33,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -161 +164 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_103")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_103")
+@@ -360,3 +363,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c_tensor)
+@@ -603 +606 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -654 +657 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -717 +720 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -915 +918 @@
+-        tile_sched = utils.StaticPersistentTileScheduler.create(
++        tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2020 +2023 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -2040 +2043 @@
+-        :type c_layout: utils.LayoutEnum
++        :type c_layout: cutlass.tensor_utils.LayoutEnum
+@@ -2146 +2149 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -2161 +2164 @@
+-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
++        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
+@@ -2168 +2171 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -2171 +2174 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py
++++ flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py
+@@ -31,0 +32,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -209 +212 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
+@@ -231 +234 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -243 +246 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -249 +252 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+@@ -403 +406 @@
+-            c_layout = utils.LayoutEnum.COL_MAJOR
++            c_layout = cutlass.tensor_utils.LayoutEnum.COL_MAJOR
+@@ -405 +408 @@
+-            c_layout = utils.LayoutEnum.ROW_MAJOR
++            c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+@@ -447 +450 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -469 +472 @@
+-        :type c_layout: utils.LayoutEnum
++        :type c_layout: cutlass.tensor_utils.LayoutEnum
+@@ -898 +901 @@
+-        layouts: cutlass.Constexpr[Tuple[OperandMajorMode, OperandMajorMode, utils.LayoutEnum]],
++        layouts: cutlass.Constexpr[Tuple[OperandMajorMode, OperandMajorMode, cutlass.tensor_utils.LayoutEnum]],
+@@ -951 +954 @@
+-        if cutlass.const_expr(self.c_layout == utils.LayoutEnum.ROW_MAJOR):
++        if cutlass.const_expr(self.c_layout == cutlass.tensor_utils.LayoutEnum.ROW_MAJOR):
+@@ -1260 +1263 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -1306 +1309 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1340 +1343 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1506 +1509 @@
+-        tile_sched = utils.StaticPersistentTileScheduler.create(
++        tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1965 +1968 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -2789 +2792 @@
+-        layouts: cutlass.Constexpr[Tuple[OperandMajorMode, OperandMajorMode, utils.LayoutEnum]],
++        layouts: cutlass.Constexpr[Tuple[OperandMajorMode, OperandMajorMode, cutlass.tensor_utils.LayoutEnum]],
+@@ -2846 +2849 @@
+-        if cutlass.const_expr(self.c_layout == utils.LayoutEnum.ROW_MAJOR):
++        if cutlass.const_expr(self.c_layout == cutlass.tensor_utils.LayoutEnum.ROW_MAJOR):
+@@ -3213 +3216 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -3259 +3262 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -3293 +3296 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -3466 +3469 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -3604 +3607 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -3821 +3824 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -3893,2 +3896,2 @@
+-        preferred_tile_sched_params: utils.PersistentTileSchedulerParams,
+-        fallback_tile_sched_params: utils.PersistentTileSchedulerParams,
++        preferred_tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
++        fallback_tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -3994 +3997 @@
+-        utils.PersistentTileSchedulerParams,
++        tile_scheduler.PersistentTileSchedulerParams,
+@@ -3996 +3999 @@
+-        utils.PersistentTileSchedulerParams,
++        tile_scheduler.PersistentTileSchedulerParams,
+@@ -4018 +4021 @@
+-            utils.PersistentTileSchedulerParams,
++            tile_scheduler.PersistentTileSchedulerParams,
+@@ -4020 +4023 @@
+-            utils.PersistentTileSchedulerParams
++            tile_scheduler.PersistentTileSchedulerParams
+@@ -4033 +4036 @@
+-        preferred_tile_sched_params = utils.PersistentTileSchedulerParams(
++        preferred_tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -4036 +4039 @@
+-        preferred_grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        preferred_grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+@@ -4043 +4046 @@
+-        fallback_tile_sched_params = utils.PersistentTileSchedulerParams(
++        fallback_tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -4046 +4049 @@
+-        fallback_grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        fallback_grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+@@ -4102 +4105 @@
+-            c_layout = utils.LayoutEnum.COL_MAJOR
++            c_layout = cutlass.tensor_utils.LayoutEnum.COL_MAJOR
+@@ -4104 +4107 @@
+-            c_layout = utils.LayoutEnum.ROW_MAJOR
++            c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
+--- flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py
++++ flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py
+@@ -31,0 +32,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -50 +53 @@
+-from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
++from flashinfer._tokenspeed_static_persistent_tile_scheduler import WorkTileInfo
+@@ -145 +148 @@
+-_orig_extract = utils.PersistentTileSchedulerParams.__extract_mlir_values__
++_orig_extract = tile_scheduler.PersistentTileSchedulerParams.__extract_mlir_values__
+@@ -162 +165 @@
+-utils.PersistentTileSchedulerParams.__extract_mlir_values__ = _patched_extract
++tile_scheduler.PersistentTileSchedulerParams.__extract_mlir_values__ = _patched_extract
+@@ -314 +317 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
+@@ -435 +438 @@
+-                utils.LayoutEnum.ROW_MAJOR,
++                cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+@@ -445 +448 @@
+-                utils.LayoutEnum.ROW_MAJOR,
++                cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+@@ -518,3 +521,3 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(a)
+-        self.b_layout = utils.LayoutEnum.from_tensor(b)
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(a)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(b)
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -1048 +1051 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -1115 +1118 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1428 +1431 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2772 +2775 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -2778 +2781 @@
+-            grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++            grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/gemm/kernels/epilogue_utils.py
++++ flashinfer/gemm/kernels/epilogue_utils.py
+@@ -33 +33 @@
+-from cutlass.utils.static_persistent_tile_scheduler import StaticPersistentTileScheduler
++from flashinfer._tokenspeed_static_persistent_tile_scheduler import StaticPersistentTileScheduler
+--- flashinfer/gemm/kernels/grouped_gemm_contiguous_blackwell.py
++++ flashinfer/gemm/kernels/grouped_gemm_contiguous_blackwell.py
+@@ -30,0 +31,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -291 +294 @@
+-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
++        self.num_smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -547,3 +550,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -774 +777 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -813 +816 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -899 +902 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1130 +1133 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1188 +1191 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1305 +1308 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1575 +1578 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1761 +1764 @@
+-                tile_sched = utils.StaticPersistentTileScheduler.create(
++                tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1908 +1911 @@
+-                tile_sched = utils.StaticPersistentTileScheduler.create(
++                tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2010 +2013 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2387 +2390 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2855 +2858 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -2880 +2883 @@
+-        :type c_layout: utils.LayoutEnum
++        :type c_layout: cutlass.tensor_utils.LayoutEnum
+@@ -2961 +2964 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -2976 +2979 @@
+-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
++        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
+@@ -2983 +2986 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -2986 +2989 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/gemm/kernels/grouped_gemm_masked_blackwell.py
++++ flashinfer/gemm/kernels/grouped_gemm_masked_blackwell.py
+@@ -28,0 +29,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -58 +60 @@
+-from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
++from flashinfer._tokenspeed_static_persistent_tile_scheduler import WorkTileInfo
+@@ -427 +429 @@
+-    epi_layout: utils.LayoutEnum,
++    epi_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -696 +698 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes(sm_version)
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(sm_version)
+@@ -903,3 +905,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c_tensor)
+@@ -1221 +1223 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -2391 +2393 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -2417 +2419 @@
+-        :type c_layout: utils.LayoutEnum
++        :type c_layout: cutlass.tensor_utils.LayoutEnum
+--- flashinfer/gemm/kernels/grouped_gemm_masked_rubin.py
++++ flashinfer/gemm/kernels/grouped_gemm_masked_rubin.py
+@@ -6,0 +7,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -186 +188 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
+@@ -215 +217 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -237 +239 @@
+-        :type c_layout: utils.LayoutEnum
++        :type c_layout: cutlass.tensor_utils.LayoutEnum
+@@ -687,3 +689,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c_tensor)
+@@ -1056 +1058 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1060 +1062 @@
+-        tmem_holding_buf = storage.tmem_holding_buf
++        tmem_holding_buf = storage.tmem_holding_buf.ptr
+--- flashinfer/gemm/kernels/native_bf16_fp4/grouped_kernel.py
++++ flashinfer/gemm/kernels/native_bf16_fp4/grouped_kernel.py
+@@ -4,0 +5 @@
++import cutlass.memory
+@@ -417 +418 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gemm/kernels/native_bf16_fp4/n64_staged_kernel.py
++++ flashinfer/gemm/kernels/native_bf16_fp4/n64_staged_kernel.py
+@@ -4,0 +5 @@
++import cutlass.memory
+@@ -118 +119 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gemm/kernels/native_bf16_fp4/prefetch_kernel.py
++++ flashinfer/gemm/kernels/native_bf16_fp4/prefetch_kernel.py
+@@ -4,0 +5 @@
++import cutlass.memory
+@@ -365 +366 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gemm/kernels/native_bf16_fp4/staged_kernel.py
++++ flashinfer/gemm/kernels/native_bf16_fp4/staged_kernel.py
+@@ -4,0 +5 @@
++import cutlass.memory
+@@ -186 +187 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gemm/kernels/native_bf16_fp4/tiled_staged_kernel.py
++++ flashinfer/gemm/kernels/native_bf16_fp4/tiled_staged_kernel.py
+@@ -4,0 +5 @@
++import cutlass.memory
+@@ -127 +128 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/gemm/kernels/sm12x_cute/independent_small.py
++++ flashinfer/gemm/kernels/sm12x_cute/independent_small.py
+@@ -15 +15 @@
+-from cutlass.utils import SmemAllocator
++from cutlass.memory import SmemAllocator
+--- flashinfer/gemm/kernels/sm12x_cute/independent_tma.py
++++ flashinfer/gemm/kernels/sm12x_cute/independent_tma.py
+@@ -16 +16 @@
+-from cutlass.utils import SmemAllocator
++from cutlass.memory import SmemAllocator
+--- flashinfer/gemm/kernels/sm12x_cute/raw.py
++++ flashinfer/gemm/kernels/sm12x_cute/raw.py
+@@ -28,0 +29,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -89 +92 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
+@@ -224,3 +227,3 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(a)
+-        self.b_layout = utils.LayoutEnum.from_tensor(b)
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(a)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(b)
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -407 +410 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -468 +471 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -618 +621 @@
+-        tile_sched = utils.StaticPersistentTileScheduler.create(
++        tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1380 +1383 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -1386 +1389 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/gemm/kernels/tgv_gemm_cute_ext.py
++++ flashinfer/gemm/kernels/tgv_gemm_cute_ext.py
+@@ -102,0 +103,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -261 +263 @@
+-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
++            smem=cute.Int64(cutlass.memory.get_smem_capacity_in_bytes("sm_100")),
+@@ -284,2 +286,2 @@
+-        a_major = utils.LayoutEnum.from_tensor(mA).mma_major_mode()
+-        b_major = utils.LayoutEnum.from_tensor(mB).mma_major_mode()
++        a_major = cutlass.tensor_utils.LayoutEnum.from_tensor(mA).mma_major_mode()
++        b_major = cutlass.tensor_utils.LayoutEnum.from_tensor(mB).mma_major_mode()
+@@ -288 +290 @@
+-        d_layout = utils.LayoutEnum.from_tensor(mC)
++        d_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mC)
+--- flashinfer/kda_kernels/fused_kda_decode.py
++++ flashinfer/kda_kernels/fused_kda_decode.py
+@@ -33 +33 @@
+-from cutlass.utils import SmemAllocator
++from cutlass.memory import SmemAllocator
+--- flashinfer/kda_kernels/fused_kda_decode_multitoken.py
++++ flashinfer/kda_kernels/fused_kda_decode_multitoken.py
+@@ -35,0 +36 @@
++import cutlass.memory
+@@ -193 +194 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+--- flashinfer/kda_kernels/kda_chunked_bt16_small_bh.py
++++ flashinfer/kda_kernels/kda_chunked_bt16_small_bh.py
+@@ -14,0 +15,2 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
+@@ -479 +481 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -483 +485 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+@@ -568 +570 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -578 +580 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -642 +644 @@
+-                tile_sched = utils.StaticPersistentTileScheduler.create(
++                tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -787 +789 @@
+-                    tile_sched = utils.StaticPersistentTileScheduler.create(
++                    tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -870 +872 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -971 +973 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -2165 +2167 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/kda_kernels/kda_decode_wy_output_only.py
++++ flashinfer/kda_kernels/kda_decode_wy_output_only.py
+@@ -82,0 +83 @@
++import cutlass.memory
+@@ -446 +447 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1743 +1744 @@
+-    smem = utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+--- flashinfer/kda_kernels/packed_kda_decode_cute.py
++++ flashinfer/kda_kernels/packed_kda_decode_cute.py
+@@ -52,0 +53 @@
++import cutlass.memory
+@@ -837 +838 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+@@ -1405 +1406 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+--- flashinfer/kda_kernels/recurrent_kda.py
++++ flashinfer/kda_kernels/recurrent_kda.py
+@@ -49 +49 @@
+-from cutlass.utils import SmemAllocator
++from cutlass.memory import SmemAllocator
+--- flashinfer/kda_kernels/sm120_prefill/decomp.py
++++ flashinfer/kda_kernels/sm120_prefill/decomp.py
+@@ -66,0 +67 @@
++import cutlass.memory
+@@ -3275 +3276 @@
+-    alloc = cutlass.utils.SmemAllocator()
++    alloc = cutlass.memory.SmemAllocator()
+@@ -4214 +4215 @@
+-    alloc = cutlass.utils.SmemAllocator()
++    alloc = cutlass.memory.SmemAllocator()
+--- flashinfer/kda_kernels/sm120_prefill/fused.py
++++ flashinfer/kda_kernels/sm120_prefill/fused.py
+@@ -53,0 +54 @@
++import cutlass.memory
+@@ -1478 +1479 @@
+-    or cute.arch.warpgroup_reg_dealloc
++    or cute.arch.setmaxregister_decrease
+@@ -1481 +1482 @@
+-    getattr(cute.arch, "setmaxregister_increase", None) or cute.arch.warpgroup_reg_alloc
++    getattr(cute.arch, "setmaxregister_increase", None) or cute.arch.setmaxregister_increase
+@@ -3550 +3551 @@
+-    alloc = cutlass.utils.SmemAllocator()
++    alloc = cutlass.memory.SmemAllocator()
+--- flashinfer/mamba/ssd_kernel.py
++++ flashinfer/mamba/ssd_kernel.py
+@@ -29,0 +30,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -41 +43 @@
+-# replacing the deprecated warpgroup_reg_dealloc/alloc.
++# replacing the deprecated setmaxregister_decrease/alloc.
+@@ -43,2 +45,2 @@
+-    cute.arch.setmaxregister_decrease = cute.arch.warpgroup_reg_dealloc
+-    cute.arch.setmaxregister_increase = cute.arch.warpgroup_reg_alloc
++    cute.arch.setmaxregister_decrease = cute.arch.setmaxregister_decrease
++    cute.arch.setmaxregister_increase = cute.arch.setmaxregister_increase
+@@ -130 +132 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -204 +206 @@
+-            utils.LayoutEnum.ROW_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+@@ -234 +236 @@
+-                utils.LayoutEnum.COL_MAJOR,
++                cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
+@@ -247 +249 @@
+-                utils.LayoutEnum.ROW_MAJOR,
++                cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+@@ -276 +278 @@
+-            utils.LayoutEnum.COL_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
+@@ -292 +294 @@
+-            utils.LayoutEnum.COL_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
+@@ -306 +308 @@
+-                utils.LayoutEnum.COL_MAJOR,
++                cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
+@@ -328 +330 @@
+-            utils.LayoutEnum.COL_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
+@@ -843 +845 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -3364 +3366 @@
+-            io_dtype,
++            io_dtype, io_dtype,
+@@ -3373 +3375 @@
+-            io_dtype,
++            io_dtype, io_dtype,
+@@ -3384 +3386 @@
+-            io_dtype,
++            io_dtype, io_dtype,
+@@ -3395 +3397 @@
+-            io_dtype,
++            io_dtype, io_dtype,
+--- flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/fc1_fc2_fuse_sched.py
++++ flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/fc1_fc2_fuse_sched.py
+@@ -854 +854 @@
+-                cluster_token_block_idx = local_id // cute.fast_divmod_create_divisor(
++                cluster_token_block_idx = local_id // cute.fast_divmod_create_divisor_v2(
+@@ -869 +869 @@
+-                cluster_token_block_idx = local_id // cute.fast_divmod_create_divisor(
++                cluster_token_block_idx = local_id // cute.fast_divmod_create_divisor_v2(
+--- flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py
++++ flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py
+@@ -11,0 +12,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -345,2 +347,2 @@
+-        mixed.a_major_mode = mixed.b_major_mode = tcgen05.OperandMajorMode.K
+-        mixed.c_layout = utils.LayoutEnum.from_tensor(output_tensor)
++        mixed.a_major_mode = mixed.b_major_mode = cute.nvgpu.OperandMajorMode.K
++        mixed.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(output_tensor)
+@@ -355 +357 @@
+-            mixed.mma_dtype,
++            mixed.mma_dtype, mixed.mma_dtype,
+@@ -415 +417 @@
+-        capacity = utils.get_smem_capacity_in_bytes("sm_100")
++        capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+@@ -781 +783 @@
+-            cutlass.BFloat16,
++            cutlass.BFloat16, cutlass.BFloat16,
+@@ -1141 +1143 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1189 +1191 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_bf16_glu/epilogue_bf16.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_bf16_glu/epilogue_bf16.py
+@@ -4,0 +5 @@
++import cutlass.tensor_utils
+@@ -104 +105 @@
+-        fc1_output_layout: utils.LayoutEnum,
++        fc1_output_layout: cutlass.tensor_utils.LayoutEnum,
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_bf16_glu/kernel_bf16_glu_fc12.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_bf16_glu/kernel_bf16_glu_fc12.py
+@@ -6,0 +7,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -216 +218 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -823 +825 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+@@ -826 +828 @@
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+@@ -829 +831 @@
+-        self.fc1_output_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
++        self.fc1_output_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_output_gemm)
+@@ -1128 +1130 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1189 +1191 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_bf16_glu/mega_reference_bf16.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_bf16_glu/mega_reference_bf16.py
+@@ -19,0 +20,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -424 +427 @@
+-            self.a_dtype,
++            self.a_dtype, self.a_dtype,
+@@ -492 +495 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -562,3 +565,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+-        self.c_layout = utils.LayoutEnum.from_tensor(c)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
++        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
+@@ -669 +672 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -718 +721 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -765 +768 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -888 +891 @@
+-        tile_sched = utils.StaticPersistentTileScheduler.create(
++        tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1174 +1177 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -1189 +1192 @@
+-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
++        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
+@@ -1196 +1199 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -1199 +1202 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_mxfp8_bf16_glu/kernel_mxfp8_bf16_glu_fc12.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_mxfp8_bf16_glu/kernel_mxfp8_bf16_glu_fc12.py
+@@ -23,0 +24,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -973 +975 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+@@ -976 +978 @@
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+@@ -1668 +1670 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1761 +1763 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_mxfp8_glu/epilogue_mxfp8.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_mxfp8_glu/epilogue_mxfp8.py
+@@ -8,0 +9 @@
++import cutlass.tensor_utils
+@@ -162 +163 @@
+-        fc1_output_layout: utils.LayoutEnum,
++        fc1_output_layout: cutlass.tensor_utils.LayoutEnum,
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_mxfp8_glu/kernel_mxfp8_glu_fc12.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_mxfp8_glu/kernel_mxfp8_glu_fc12.py
+@@ -6,0 +7,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -215 +217 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -993 +995 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+@@ -996 +998 @@
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+@@ -999 +1001 @@
+-        self.fc1_output_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
++        self.fc1_output_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_output_gemm)
+@@ -1409 +1411 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1470 +1472 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/benchmark_p2p.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/benchmark_p2p.py
+@@ -11,0 +12 @@
++import cutlass.memory
+@@ -137 +138 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+@@ -373 +374 @@
+-        return int(cutlass.utils.get_smem_capacity_in_bytes(arch))
++        return int(cutlass.memory.get_smem_capacity_in_bytes(arch))
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/epilogue.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/epilogue.py
+@@ -9,0 +10 @@
++import cutlass.tensor_utils
+@@ -1991 +1992 @@
+-        fc1_output_layout: utils.LayoutEnum,
++        fc1_output_layout: cutlass.tensor_utils.LayoutEnum,
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/epilogue_refactor.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/epilogue_refactor.py
+@@ -13,0 +14 @@
++import cutlass.tensor_utils
+@@ -1135 +1136 @@
+-            utils.LayoutEnum.ROW_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/kernel_fc12.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/kernel_fc12.py
+@@ -4,0 +5,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -197 +199 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -1048 +1050 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+@@ -1051 +1053 @@
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+@@ -1473 +1475 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1530 +1532 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1645 +1647 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -1682 +1684 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -1867 +1869 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -2153 +2155 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -2357 +2359 @@
+-                cute.arch.warpgroup_reg_alloc(self.epi_reg_cnt)
++                cute.arch.setmaxregister_increase(self.epi_reg_cnt)
+@@ -2403 +2405 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/mega_reference.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/mega_reference.py
+@@ -15,0 +16,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -467 +470 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -647 +650 @@
+-            Tuple[OperandMajorMode, OperandMajorMode, utils.LayoutEnum]
++            Tuple[OperandMajorMode, OperandMajorMode, cutlass.tensor_utils.LayoutEnum]
+@@ -713 +716 @@
+-        if cutlass.const_expr(self.c_layout == utils.LayoutEnum.ROW_MAJOR):
++        if cutlass.const_expr(self.c_layout == cutlass.tensor_utils.LayoutEnum.ROW_MAJOR):
+@@ -982 +985 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -1025 +1028 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1064 +1067 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1265 +1268 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1433 +1436 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1616 +1619 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1968 +1971 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -1989 +1992 @@
+-        :type c_layout: utils.LayoutEnum
++        :type c_layout: cutlass.tensor_utils.LayoutEnum
+@@ -2079 +2082 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -2098 +2101 @@
+-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
++        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
+@@ -2108 +2111 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -2111 +2114 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+@@ -2513 +2516 @@
+-            utils.LayoutEnum.ROW_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/src/dispatch_kernel.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/src/dispatch_kernel.py
+@@ -6,0 +7 @@
++import cutlass.memory
+@@ -80 +81 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+--- flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/src/inputs_process.py
++++ flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/src/inputs_process.py
+@@ -20,0 +21 @@
++import cutlass.memory
+@@ -260 +261 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -348 +349 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -450 +451 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/shim/dependencies.py
++++ flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/shim/dependencies.py
+@@ -18 +18 @@
+-        from cutlass.base_dsl.arch import Arch
++        from cutlass.base_dsl.enums import Arch
+--- flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/communication/nvlink_domain/token_comm.py
++++ flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/communication/nvlink_domain/token_comm.py
+@@ -2,0 +3 @@
++import cutlass.memory
+@@ -401 +402 @@
+-        smem_allocator = cutlass.utils.SmemAllocator()
++        smem_allocator = cutlass.memory.SmemAllocator()
+--- flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
++++ flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py
+@@ -11,0 +12 @@
++import cutlass.tensor_utils
+@@ -1098 +1099 @@
+-            utils.LayoutEnum.ROW_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+--- flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
++++ flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py
+@@ -2,0 +3 @@
++import cutlass.memory
+@@ -632 +633 @@
+-        return utils.TmemAllocator(
++        return cutlass.memory.TmemAllocator(
+--- flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
++++ flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py
+@@ -27,0 +28 @@
++import cutlass.memory
+@@ -770 +771 @@
+-        return utils.TmemAllocator(
++        return cutlass.memory.TmemAllocator(
+--- flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
++++ flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py
+@@ -2,0 +3 @@
++import cutlass.memory
+@@ -897 +898 @@
+-        smem_allocator = utils.SmemAllocator()
++        smem_allocator = cutlass.memory.SmemAllocator()
+@@ -997 +998 @@
+-            cute.arch.warpgroup_reg_dealloc(self.scheduler_register_count)
++            cute.arch.setmaxregister_decrease(self.scheduler_register_count)
+@@ -1023 +1024 @@
+-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
++            cute.arch.setmaxregister_decrease(self.other_warp_register_count)
+@@ -1043 +1044 @@
+-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
++            cute.arch.setmaxregister_decrease(self.other_warp_register_count)
+@@ -1065 +1066 @@
+-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
++            cute.arch.setmaxregister_decrease(self.other_warp_register_count)
+@@ -1078 +1079 @@
+-            cute.arch.warpgroup_reg_alloc(self.epilogue_register_count)
++            cute.arch.setmaxregister_increase(self.epilogue_register_count)
+@@ -1111 +1112 @@
+-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
++            cute.arch.setmaxregister_decrease(self.other_warp_register_count)
+--- flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
++++ flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py
+@@ -27,0 +28 @@
++import cutlass.memory
+@@ -912 +913 @@
+-        smem_allocator = utils.SmemAllocator()
++        smem_allocator = cutlass.memory.SmemAllocator()
+@@ -1016 +1017 @@
+-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
++            cute.arch.setmaxregister_decrease(self.other_warp_register_count)
+@@ -1044 +1045 @@
+-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
++            cute.arch.setmaxregister_decrease(self.other_warp_register_count)
+@@ -1064 +1065 @@
+-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
++            cute.arch.setmaxregister_decrease(self.other_warp_register_count)
+@@ -1086 +1087 @@
+-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
++            cute.arch.setmaxregister_decrease(self.other_warp_register_count)
+@@ -1110 +1111 @@
+-            cute.arch.warpgroup_reg_alloc(self.epilogue_register_count)
++            cute.arch.setmaxregister_increase(self.epilogue_register_count)
+@@ -1177 +1178 @@
+-            cute.arch.warpgroup_reg_dealloc(self.other_warp_register_count)
++            cute.arch.setmaxregister_decrease(self.other_warp_register_count)
+--- flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py
++++ flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py
+@@ -48,0 +49 @@
++import cutlass.memory
+@@ -1061 +1062 @@
+-        storage = cutlass.utils.SmemAllocator().allocate(self._smem_workspace.storage_class())
++        storage = cutlass.memory.SmemAllocator().allocate(self._smem_workspace.storage_class())
+--- flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_mxfp8_glu/epilogue_mxfp8.py
++++ flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_mxfp8_glu/epilogue_mxfp8.py
+@@ -8,0 +9 @@
++import cutlass.tensor_utils
+@@ -159 +160 @@
+-        fc1_output_layout: utils.LayoutEnum,
++        fc1_output_layout: cutlass.tensor_utils.LayoutEnum,
+--- flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_mxfp8_glu/kernel_mxfp8_glu_fc12.py
++++ flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_mxfp8_glu/kernel_mxfp8_glu_fc12.py
+@@ -6,0 +7,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -226 +228 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -983,3 +985,3 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(activation_gemm).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(fc1_weight_gemm).mma_major_mode()
+-        self.fc1_output_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(activation_gemm).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_weight_gemm).mma_major_mode()
++        self.fc1_output_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_output_gemm)
+@@ -1390 +1392 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1455 +1457 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/benchmark_p2p.py
++++ flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/benchmark_p2p.py
+@@ -11,0 +12 @@
++import cutlass.memory
+@@ -133 +134 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+@@ -376 +377 @@
+-        return int(cutlass.utils.get_smem_capacity_in_bytes(arch))
++        return int(cutlass.memory.get_smem_capacity_in_bytes(arch))
+--- flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue.py
++++ flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue.py
+@@ -9,0 +10 @@
++import cutlass.tensor_utils
+@@ -1957 +1958 @@
+-        fc1_output_layout: utils.LayoutEnum,
++        fc1_output_layout: cutlass.tensor_utils.LayoutEnum,
+--- flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue_refactor.py
++++ flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue_refactor.py
+@@ -13,0 +14 @@
++import cutlass.tensor_utils
+@@ -1047 +1048 @@
+-            utils.LayoutEnum.ROW_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+--- flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/kernel_fc12.py
++++ flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/kernel_fc12.py
+@@ -4,0 +5,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -183 +185 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -957,2 +959,2 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(fc1_weight_gemm).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(activation_gemm).mma_major_mode()
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_weight_gemm).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(activation_gemm).mma_major_mode()
+@@ -1368 +1370 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1427 +1429 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1543 +1545 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -1581 +1583 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -1762 +1764 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -2057 +2059 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -2213 +2215 @@
+-                cute.arch.warpgroup_reg_alloc(self.epi_reg_cnt)
++                cute.arch.setmaxregister_increase(self.epi_reg_cnt)
+@@ -2262 +2264 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+--- flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/mega_reference.py
++++ flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/mega_reference.py
+@@ -15,0 +16,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -455 +458 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -635 +638 @@
+-            Tuple[OperandMajorMode, OperandMajorMode, utils.LayoutEnum]
++            Tuple[OperandMajorMode, OperandMajorMode, cutlass.tensor_utils.LayoutEnum]
+@@ -701 +704 @@
+-        if cutlass.const_expr(self.c_layout == utils.LayoutEnum.ROW_MAJOR):
++        if cutlass.const_expr(self.c_layout == cutlass.tensor_utils.LayoutEnum.ROW_MAJOR):
+@@ -969 +972 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -1012 +1015 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1051 +1054 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1252 +1255 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1420 +1423 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1603 +1606 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1955 +1958 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -1976 +1979 @@
+-        :type c_layout: utils.LayoutEnum
++        :type c_layout: cutlass.tensor_utils.LayoutEnum
+@@ -2066 +2069 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -2085 +2088 @@
+-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
++        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
+@@ -2095 +2098 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -2098 +2101 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+@@ -2500 +2503 @@
+-            utils.LayoutEnum.ROW_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+--- flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_sm120_mxfp8_swapab/kernel_fc12.py
++++ flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_sm120_mxfp8_swapab/kernel_fc12.py
+@@ -4,0 +5,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -265 +267 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
+@@ -1003,2 +1005,2 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(fc1_weight_gemm)
+-        self.b_layout = utils.LayoutEnum.from_tensor(activation_gemm)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_weight_gemm)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(activation_gemm)
+@@ -1086 +1088 @@
+-            utils.LayoutEnum.COL_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
+@@ -1312 +1314 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1496 +1498 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -2482,2 +2484,2 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(fc1_weight_gemm)
+-        self.b_layout = utils.LayoutEnum.from_tensor(activation_gemm)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_weight_gemm)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(activation_gemm)
+@@ -2548 +2550 @@
+-            utils.LayoutEnum.COL_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
+@@ -2915 +2917 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -3106 +3108 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -3150 +3152 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -3164 +3166 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -3361 +3363 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -3682 +3684 @@
+-                cute.arch.warpgroup_reg_alloc(self.epi_reg_cnt)
++                cute.arch.setmaxregister_increase(self.epi_reg_cnt)
+@@ -4528 +4530 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+--- flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/src/dispatch_kernel.py
++++ flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/src/dispatch_kernel.py
+@@ -6,0 +7 @@
++import cutlass.memory
+@@ -80 +81 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+--- flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/src/inputs_process.py
++++ flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/src/inputs_process.py
+@@ -20,0 +21 @@
++import cutlass.memory
+@@ -275 +276 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -369 +370 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -491 +492 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/epilogue_fp8.py
++++ flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/epilogue_fp8.py
+@@ -4,0 +5 @@
++import cutlass.tensor_utils
+@@ -84 +85 @@
+-        fc1_output_layout: utils.LayoutEnum,
++        fc1_output_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -304 +305 @@
+-            utils.LayoutEnum.ROW_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+--- flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/epilogue_fp8_swapab.py
++++ flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/epilogue_fp8_swapab.py
+@@ -4,0 +5 @@
++import cutlass.tensor_utils
+@@ -127 +128 @@
+-        fc1_output_layout: utils.LayoutEnum,
++        fc1_output_layout: cutlass.tensor_utils.LayoutEnum,
+--- flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/kernel_fp8_glu_fc12.py
++++ flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/kernel_fp8_glu_fc12.py
+@@ -4,0 +5,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -389 +391 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
+@@ -450 +452 @@
+-            self.a_dtype,
++            self.a_dtype, self.a_dtype,
+@@ -2325,2 +2327,2 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(activation_gemm)
+-        self.b_layout = utils.LayoutEnum.from_tensor(fc1_weight_gemm)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(activation_gemm)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_weight_gemm)
+@@ -2329 +2331 @@
+-        self.fc1_output_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
++        self.fc1_output_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_output_gemm)
+@@ -2857 +2859 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/kernel_fp8_glu_fc12_swapab.py
++++ flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/kernel_fp8_glu_fc12_swapab.py
+@@ -4,0 +5,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -344 +346 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
+@@ -858,2 +860,2 @@
+-        self.a_layout = utils.LayoutEnum.from_tensor(fc1_weight_gemm)
+-        self.b_layout = utils.LayoutEnum.from_tensor(activation_gemm)
++        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_weight_gemm)
++        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(activation_gemm)
+@@ -862 +864 @@
+-        self.fc1_output_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
++        self.fc1_output_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_output_gemm)
+@@ -1370 +1372 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/benchmark_p2p.py
++++ flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/benchmark_p2p.py
+@@ -11,0 +12 @@
++import cutlass.memory
+@@ -133 +134 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+@@ -376 +377 @@
+-        return int(cutlass.utils.get_smem_capacity_in_bytes(arch))
++        return int(cutlass.memory.get_smem_capacity_in_bytes(arch))
+--- flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue.py
++++ flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue.py
+@@ -9,0 +10 @@
++import cutlass.tensor_utils
+@@ -1957 +1958 @@
+-        fc1_output_layout: utils.LayoutEnum,
++        fc1_output_layout: cutlass.tensor_utils.LayoutEnum,
+--- flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue_refactor.py
++++ flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue_refactor.py
+@@ -13,0 +14 @@
++import cutlass.tensor_utils
+@@ -1048 +1049 @@
+-            utils.LayoutEnum.ROW_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+--- flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/kernel_fc12.py
++++ flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/kernel_fc12.py
+@@ -4,0 +5,2 @@
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -183 +185 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -957,2 +959,2 @@
+-        self.a_major_mode = utils.LayoutEnum.from_tensor(fc1_weight_gemm).mma_major_mode()
+-        self.b_major_mode = utils.LayoutEnum.from_tensor(activation_gemm).mma_major_mode()
++        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_weight_gemm).mma_major_mode()
++        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(activation_gemm).mma_major_mode()
+@@ -1368 +1370 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1427 +1429 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1543 +1545 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -1581 +1583 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -1762 +1764 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -2057 +2059 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+@@ -2213 +2215 @@
+-                cute.arch.warpgroup_reg_alloc(self.epi_reg_cnt)
++                cute.arch.setmaxregister_increase(self.epi_reg_cnt)
+@@ -2262 +2264 @@
+-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
++                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
+--- flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/mega_reference.py
++++ flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/mega_reference.py
+@@ -15,0 +16,3 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
++import cutlass.memory
++import cutlass.tensor_utils
+@@ -455 +458 @@
+-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
+@@ -635 +638 @@
+-            Tuple[OperandMajorMode, OperandMajorMode, utils.LayoutEnum]
++            Tuple[OperandMajorMode, OperandMajorMode, cutlass.tensor_utils.LayoutEnum]
+@@ -701 +704 @@
+-        if cutlass.const_expr(self.c_layout == utils.LayoutEnum.ROW_MAJOR):
++        if cutlass.const_expr(self.c_layout == cutlass.tensor_utils.LayoutEnum.ROW_MAJOR):
+@@ -970 +973 @@
+-        tile_sched_params: utils.PersistentTileSchedulerParams,
++        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+@@ -1013 +1016 @@
+-        smem = utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1052 +1055 @@
+-        tmem = utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+@@ -1253 +1256 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1421 +1424 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1604 +1607 @@
+-            tile_sched = utils.StaticPersistentTileScheduler.create(
++            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
+@@ -1956 +1959 @@
+-        c_layout: utils.LayoutEnum,
++        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -1977 +1980 @@
+-        :type c_layout: utils.LayoutEnum
++        :type c_layout: cutlass.tensor_utils.LayoutEnum
+@@ -2067 +2070 @@
+-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
++    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+@@ -2086 +2089 @@
+-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
++        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
+@@ -2096 +2099 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+@@ -2099 +2102 @@
+-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
++        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
+@@ -2501 +2504 @@
+-            utils.LayoutEnum.ROW_MAJOR,
++            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+--- flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/src/dispatch_kernel.py
++++ flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/src/dispatch_kernel.py
+@@ -6,0 +7 @@
++import cutlass.memory
+@@ -80 +81 @@
+-    smem = cutlass.utils.SmemAllocator()
++    smem = cutlass.memory.SmemAllocator()
+--- flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/src/inputs_process.py
++++ flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/src/inputs_process.py
+@@ -20,0 +21 @@
++import cutlass.memory
+@@ -275 +276 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -369 +370 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -491 +492 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/msa_ops/cute_dsl/proxy_score_fp4_sm12x.py
++++ flashinfer/msa_ops/cute_dsl/proxy_score_fp4_sm12x.py
+@@ -23,0 +24 @@
++import cutlass.memory
+@@ -220 +221 @@
+-            smem = cutlass.utils.SmemAllocator()
++            smem = cutlass.memory.SmemAllocator()
+@@ -777 +778 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/msa_ops/cute_dsl/proxy_score_sm12x.py
++++ flashinfer/msa_ops/cute_dsl/proxy_score_sm12x.py
+@@ -19,0 +20 @@
++import cutlass.memory
+@@ -249 +250 @@
+-            smem = cutlass.utils.SmemAllocator()
++            smem = cutlass.memory.SmemAllocator()
+@@ -655 +656 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -931 +932 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1551 +1552 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -2109 +2110 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/msa_ops/cute_dsl/sparse_decode_sm12x.py
++++ flashinfer/msa_ops/cute_dsl/sparse_decode_sm12x.py
+@@ -19,0 +20 @@
++import cutlass.memory
+@@ -352 +353 @@
+-            smem = cutlass.utils.SmemAllocator()
++            smem = cutlass.memory.SmemAllocator()
+@@ -911 +912 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1338 +1339 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/msa_ops/cute_dsl/sparse_prefill_sm12x.py
++++ flashinfer/msa_ops/cute_dsl/sparse_prefill_sm12x.py
+@@ -19,0 +20 @@
++import cutlass.memory
+@@ -413 +414 @@
+-            smem = cutlass.utils.SmemAllocator()
++            smem = cutlass.memory.SmemAllocator()
+--- flashinfer/msa_ops/cute_dsl/topk_select_chunked_sm12x.py
++++ flashinfer/msa_ops/cute_dsl/topk_select_chunked_sm12x.py
+@@ -22,0 +23 @@
++import cutlass.memory
+@@ -142 +143 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -224 +225 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -311 +312 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/msa_ops/cute_dsl/topk_select_countrank_sm12x.py
++++ flashinfer/msa_ops/cute_dsl/topk_select_countrank_sm12x.py
+@@ -19,0 +20 @@
++import cutlass.memory
+@@ -88 +89 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/msa_ops/cute_dsl/topk_select_radix_sm12x.py
++++ flashinfer/msa_ops/cute_dsl/topk_select_radix_sm12x.py
+@@ -18,0 +19 @@
++import cutlass.memory
+@@ -121 +122 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/norm/kernels/fused_add_rmsnorm.py
++++ flashinfer/norm/kernels/fused_add_rmsnorm.py
+@@ -23,0 +24 @@
++import cutlass.memory
+@@ -251 +252 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -580 +581 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/norm/kernels/layernorm.py
++++ flashinfer/norm/kernels/layernorm.py
+@@ -21,0 +22 @@
++import cutlass.memory
+@@ -146 +147 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/norm/kernels/rmsnorm.py
++++ flashinfer/norm/kernels/rmsnorm.py
+@@ -24,0 +25 @@
++import cutlass.memory
+@@ -267 +268 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -568 +569 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -848 +849 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/prims_ts/batched_gemm/batched_gemm_kernel.py
++++ flashinfer/prims_ts/batched_gemm/batched_gemm_kernel.py
+@@ -22,0 +23 @@
++from flashinfer import _tokenspeed_static_persistent_tile_scheduler as tile_scheduler
+@@ -2995 +2996 @@
+-        tile_sched_params = utils.PersistentTileSchedulerParams(
++        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
+--- flashinfer/quantization/kernels/mxfp4_quantize.py
++++ flashinfer/quantization/kernels/mxfp4_quantize.py
+@@ -29,0 +30 @@
++import cutlass.memory
+@@ -910 +911 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/quantization/kernels/mxfp8_quantize.py
++++ flashinfer/quantization/kernels/mxfp8_quantize.py
+@@ -29,0 +30 @@
++import cutlass.memory
+@@ -1138 +1139 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/quantization/kernels/nvfp4_quantize.py
++++ flashinfer/quantization/kernels/nvfp4_quantize.py
+@@ -32,0 +33 @@
++import cutlass.memory
+@@ -1035 +1036 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1611 +1612 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -2008 +2009 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- flashinfer/topk_varlen/kernels/block_scan.py
++++ flashinfer/topk_varlen/kernels/block_scan.py
+@@ -21 +21 @@
+-from cutlass.utils.smem_allocator import SmemAllocator
++from cutlass.memory import SmemAllocator
+--- flashinfer/topk_varlen/kernels/gvr2_topk_decode.py
++++ flashinfer/topk_varlen/kernels/gvr2_topk_decode.py
+@@ -62 +62 @@
+-from cutlass.utils.smem_allocator import SmemAllocator
++from cutlass.memory import SmemAllocator
+--- flashinfer/topk_varlen/kernels/gvr_topk_decode.py
++++ flashinfer/topk_varlen/kernels/gvr_topk_decode.py
+@@ -37 +37 @@
+-from cutlass.utils.smem_allocator import SmemAllocator
++from cutlass.memory import SmemAllocator
+--- flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py
++++ flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py
+@@ -36 +36 @@
+-from cutlass.utils.smem_allocator import SmemAllocator
++from cutlass.memory import SmemAllocator
+--- flashinfer/topk_varlen/kernels/radix_topk.py
++++ flashinfer/topk_varlen/kernels/radix_topk.py
+@@ -28 +28 @@
+-from cutlass.utils.smem_allocator import SmemAllocator
++from cutlass.memory import SmemAllocator

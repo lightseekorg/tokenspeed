@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl-dev \
         libopenmpi-dev \
         libnuma1 \
+        patch \
         pkg-config && \
     rm -rf /var/lib/apt/lists/*
 
@@ -32,6 +33,7 @@ RUN python3 -m pip install cmake ninja && \
     TOKENSPEED_KERNEL_BACKEND=cuda \
     python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
     python3 -m pip install tokenspeed-scheduler/ && \
-    python3 -m pip install ./python --no-build-isolation
+    python3 -m pip install ./python --no-build-isolation && \
+    python3 test/ci_system/patch_cute_dsl_dependencies.py
 
 CMD ["/bin/bash"]

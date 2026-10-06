@@ -18,7 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import importlib.metadata
 import inspect
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -34,3 +39,36 @@ def test_cutlass_4_7_dependency_contract() -> None:
     assert callable(cute.compile[()])
     assert hasattr(cute.arch, "sub_packed_f32x2")
     assert callable(msa_utils.ex2_emulation_2)
+
+
+def test_cute_dsl_dependency_imports_without_deprecations() -> None:
+    distribution = importlib.metadata.distribution("flashinfer-python")
+    if not distribution.locate_file(
+        "flashinfer/_tokenspeed_static_persistent_tile_scheduler.py"
+    ).is_file():
+        pytest.skip("Requires the CI CuTe DSL dependency patches")
+    root = Path(__file__).resolve().parents[3]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(root / "tokenspeed-kernel/python"),
+            str(root / "tokenspeed-mla/python"),
+            env.get("PYTHONPATH", ""),
+        ]
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-W",
+            "error::DeprecationWarning",
+            "-c",
+            "import flashinfer; import flash_attn.cute.interface; "
+            "import quack.copy_utils; import tokenspeed_mla.fmha; "
+            "import tokenspeed_kernel",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

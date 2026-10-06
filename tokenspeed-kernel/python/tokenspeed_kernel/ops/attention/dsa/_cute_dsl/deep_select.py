@@ -62,7 +62,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass._mlir.dialects import llvm
-from cutlass.utils.smem_allocator import SmemAllocator
+from cutlass.memory import SmemAllocator
 
 # Geometry shared with DeepSelect's FP32 configuration.
 NUM_THREADS = 512

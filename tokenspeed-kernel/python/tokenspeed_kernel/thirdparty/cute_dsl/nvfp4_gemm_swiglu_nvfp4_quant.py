@@ -22,13 +22,18 @@ from typing import Optional, Tuple, Type, Union
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import cutlass.pipeline as pipeline
+import cutlass.tensor_utils
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from flashinfer.fused_moe.cute_dsl.blackwell.utils import fmin, silu_f32
+from tokenspeed_kernel.thirdparty.cute_dsl import (
+    static_persistent_tile_scheduler as tile_scheduler,
+)
 
 """
 This example provides an experimental implementation of the SM100 batched dense blockscaled
@@ -233,7 +238,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             barrier_id=3,
             num_threads=32 * len((self.mma_warp_id, *self.epilog_warp_id)),
         )
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
         SM100_TMEM_CAPACITY_COLUMNS = 512
         self.num_tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
@@ -483,9 +488,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.b_dtype: Type[cutlass.Numeric] = b_tensor.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa_tensor.element_type
         self.c_dtype: Type[cutlass.Numeric] = c_tensor.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            a_tensor
+        ).mma_major_mode()
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            b_tensor
+        ).mma_major_mode()
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c_tensor)
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -743,7 +752,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfb_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
         m_total: cutlass.Int32,
         use_pdl: cutlass.Constexpr,
@@ -788,7 +797,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -823,12 +832,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = cutlass.memory.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
             is_two_cta=use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
         # Cluster arrive after barrier init
@@ -1029,7 +1038,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
@@ -1252,7 +1261,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
@@ -1472,7 +1481,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
@@ -2099,7 +2108,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         b_dtype: Type[cutlass.Numeric],
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: cutlass.tensor_utils.LayoutEnum,
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         smem_capacity: int,
@@ -2120,7 +2129,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param c_dtype: Data type of operand C (output).
         :type c_dtype: type[cutlass.Numeric]
         :param c_layout: Layout enum of operand C.
-        :type c_layout: utils.LayoutEnum
+        :type c_layout: cutlass.tensor_utils.LayoutEnum
         :param sf_dtype: Data type of Scale factor.
         :type sf_dtype: type[cutlass.Numeric]
         :param sf_vec_size: Scale factor vector size.
@@ -2208,7 +2217,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
         :param c: The output tensor C
@@ -2223,17 +2232,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :return: A tuple containing:
             - tile_sched_params: Parameters for the persistent tile scheduler.
             - grid: Grid shape for kernel launch.
-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
+        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
         """
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
-        tile_sched_params = utils.PersistentTileSchedulerParams(
+        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
             num_ctas_mnl, cluster_shape_mnl
         )
-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters
         )
 

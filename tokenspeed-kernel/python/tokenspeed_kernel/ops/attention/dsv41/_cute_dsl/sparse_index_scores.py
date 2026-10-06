@@ -37,6 +37,7 @@ query scale is already folded into ``weights`` by the fused quantizer.
 """
 
 import cutlass
+import cutlass.memory
 from cuda.bindings.driver import CUstream
 from cutlass import Float8E4M3FN, Float32, Int32, Int64, cute
 from cutlass.cute.nvgpu import cpasync, warp
@@ -193,7 +194,7 @@ class SparseIndexScoreKernel:
             ),
         )
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sK_all = smem.allocate_tensor(
             Float8E4M3FN,
             sK_pipe.outer,

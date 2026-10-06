@@ -14,6 +14,7 @@ from typing import Optional
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import torch
 from cutlass import Int32, const_expr
 from src.common import copy_utils, utils
@@ -448,7 +449,7 @@ class SparseAttentionPrepareFwdSplitAtomicSm100:
         tidx = cute.arch.thread_idx()[0]
         block_idx = cute.arch.block_idx()[0]
         if block_idx < mWorkCount[Int32(0)]:
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(self.shared_storage)
             sRow = storage.sRow.get_tensor(cute.make_layout((3,)))
             head_kv_idx = mSchedulerMetadata[block_idx, Int32(0)]

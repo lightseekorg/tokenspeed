@@ -5,6 +5,7 @@
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 from cuda.bindings.driver import CUstream
 from cutlass import const_expr
 
@@ -308,7 +309,7 @@ class LLBf16Dotprod:
 
         # Cross-warp reduction via shared memory
         smem_red_layout = cute.make_layout((M, num_warps), stride=(num_warps, 1))
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sm = smem.allocate_tensor(cutlass.Float32, smem_red_layout, byte_alignment=16)
         with cute.arch.elect_one():
             for m in cutlass.range_constexpr(M):

@@ -46,6 +46,7 @@ registered solution on NVIDIA.
 
 from dataclasses import dataclass
 
+import cutlass.memory
 import torch
 import torch.distributed as _dist
 import torch.distributed._symmetric_memory as _symm_mem
@@ -651,7 +652,7 @@ if _CUTE_AVAILABLE:
             mO_idx = domain_offset_i64((bidx * tiler_mn[0],), mO_idx)
             cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             sX = smem.allocate_tensor(
                 mX.element_type,
                 cute.make_ordered_layout(tiler_mn, order=(1, 0)),

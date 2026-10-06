@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 from cuda.bindings.driver import CUstream
 from cutlass import const_expr
 
@@ -255,7 +256,7 @@ class CuteSkinnyGemm:
             (num_rows, outputs_per_block, num_warps),
             stride=(outputs_per_block * num_warps, num_warps, 1),
         )
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         partials = smem.allocate_tensor(cutlass.Float32, smem_layout, byte_alignment=16)
         with cute.arch.elect_one():
             for mi in cutlass.range_constexpr(num_rows):

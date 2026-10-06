@@ -11,6 +11,7 @@ from typing import Literal
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -613,7 +614,7 @@ class Fp4IndexerStagedMmaSm100:
             k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             tmem_holding_buf: cutlass.Int32
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQ_public = smem.allocate_tensor(
             _AB_DTYPE, q_smem_layout.outer, 128, swizzle=q_smem_layout.inner
@@ -700,7 +701,7 @@ class Fp4IndexerStagedMmaSm100:
             cute.append(acc_shape, self.num_acc_stage)
         )
 
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=pipeline.NamedBarrier(
                 barrier_id=1,
@@ -1840,7 +1841,7 @@ class Fp4IndexerDecodePackedQSm100:
             k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             tmem_holding_buf: cutlass.Int32
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQ_public = smem.allocate_tensor(
             _AB_DTYPE, q_smem_layout.outer, 128, swizzle=q_smem_layout.inner
@@ -1920,7 +1921,7 @@ class Fp4IndexerDecodePackedQSm100:
         tKsKS_tma = cute.filter_zeros(tKsKS_tma)
         tKgKS_tma = cute.filter_zeros(tKgKS_tma)
 
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=pipeline.NamedBarrier(
                 barrier_id=1,

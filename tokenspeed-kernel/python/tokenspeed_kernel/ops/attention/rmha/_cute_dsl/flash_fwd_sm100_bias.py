@@ -28,6 +28,8 @@ from typing import Callable, Literal, Optional, Tuple
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
+import cutlass.tensor_utils
 import cutlass.torch as cutlass_torch
 import torch
 from cutlass.cute.runtime import from_dlpack
@@ -45,8 +47,8 @@ import cutlass.pipeline as cutlass_pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import Boolean, Float32, Int32, Int64, const_expr, pipeline
-from cutlass.base_dsl.arch import Arch
-from cutlass.cute import FastDivmodDivisor
+from cutlass.base_dsl.enums import Arch
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -971,15 +973,16 @@ class FlashAttentionForwardSm100:
         cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
-        q_major_mode = tcgen05.OperandMajorMode.K
-        k_major_mode = tcgen05.OperandMajorMode.K
-        v_major_mode = tcgen05.OperandMajorMode.MN
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+        q_major_mode = cute.nvgpu.OperandMajorMode.K
+        k_major_mode = cute.nvgpu.OperandMajorMode.K
+        v_major_mode = cute.nvgpu.OperandMajorMode.MN
+        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO)
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
-        p_major_mode = tcgen05.OperandMajorMode.K
+        p_major_mode = cute.nvgpu.OperandMajorMode.K
         if const_expr(not self.qk_blockscaled):
             tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
+                self.q_dtype,
                 self.q_dtype,
                 q_major_mode,
                 k_major_mode,
@@ -1014,6 +1017,7 @@ class FlashAttentionForwardSm100:
                 )
             )
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
+            self.v_mma_dtype,
             self.v_mma_dtype,
             p_major_mode,
             v_major_mode,
@@ -1099,6 +1103,7 @@ class FlashAttentionForwardSm100:
         )
         if const_expr(self.v_dequant):
             tiled_mma_pv_vq = sm100_utils_basic.make_trivial_tiled_mma(
+                self.v_dtype,
                 self.v_dtype,
                 p_major_mode,
                 v_major_mode,
@@ -1362,9 +1367,9 @@ class FlashAttentionForwardSm100:
             )
 
         if const_expr(mBias is not None):
-            bias_layout_enum = cutlass.utils.LayoutEnum.from_tensor(mBias)
+            bias_layout_enum = cutlass.tensor_utils.LayoutEnum.from_tensor(mBias)
             self.bias_major_mode = bias_layout_enum.mma_major_mode()
-            if const_expr(self.bias_major_mode != tcgen05.OperandMajorMode.K):
+            if const_expr(self.bias_major_mode != cute.nvgpu.OperandMajorMode.K):
                 raise RuntimeError("The layout of mBias is wrong")
             # (m_block_size, n_block_size, q_stage)
             sBias_layout = sm100_utils_basic.make_smem_layout_epi(
@@ -1665,7 +1670,7 @@ class FlashAttentionForwardSm100:
 
         head_divmod = None
         if cutlass.const_expr(self.pack_gqa):
-            head_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
+            head_divmod = FastDivmodDivisorV2(self.qhead_per_kvhead)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
@@ -1864,7 +1869,7 @@ class FlashAttentionForwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
@@ -1880,7 +1885,7 @@ class FlashAttentionForwardSm100:
             ),
         )
         # Tensor memory dealloc barrier init
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
@@ -2835,7 +2840,7 @@ class FlashAttentionForwardSm100:
                     mPageTable,
                     mK,
                     mV,
-                    FastDivmodDivisor(page_size),
+                    FastDivmodDivisorV2(page_size),
                     batch_idx,
                     head_idx_kv,
                     tidx,
@@ -3852,12 +3857,12 @@ class FlashAttentionForwardSm100:
                     (
                         seqlen_q_divmod
                         if not recompute_fastdiv_mods_q
-                        else FastDivmodDivisor(seqlen.seqlen_q)
+                        else FastDivmodDivisorV2(seqlen.seqlen_q)
                     ),
                     (
                         seqlen_k_divmod
                         if not recompute_fastdiv_mods_k
-                        else FastDivmodDivisor(seqlen.seqlen_k)
+                        else FastDivmodDivisorV2(seqlen.seqlen_k)
                     ),
                 )
 

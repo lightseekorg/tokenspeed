@@ -36,6 +36,7 @@ from typing import Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -572,7 +573,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             mma_tile_m * mma_tile_n * self.sp_stages * mma_dtype.width
         )  # P
 
-        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
         kv_smem_dtype = k_iter.dtype
         self.kv_stages = (smem_capacity * 8 - smem_alloc_bits) // (
             mma_tile_m * mma_tile_k * kv_smem_dtype.width
@@ -765,7 +766,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
         # Smem alloc helper
         svector_align = 16
         stensor_align = 128
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         ##############################
         # Prefetch TMA descriptor

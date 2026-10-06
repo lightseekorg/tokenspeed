@@ -42,6 +42,7 @@ from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import torch
 
 from .top_k.single_pass_multi_cta_radix_topk import (
@@ -218,7 +219,7 @@ class CuteDSLTopKDecodeSinglePassMultiCTARunner:
     @classmethod
     def _compute_max_chunk(cls, dtype, num_copy_bits: int = 256):
         """Compute the maximum chunk_size a single CTA can handle."""
-        max_smem = cutlass.utils.get_smem_capacity_in_bytes()
+        max_smem = cutlass.memory.get_smem_capacity_in_bytes()
         # Fixed shared memory overhead (excludes shared_ordered[chunk_size]):
         # local_histogram[256]*4 + prefix_buf[256]*4 + scalars[4]*4 + warp_sums[8]*4
         overhead = 256 * 4 * 2 + 4 * 4 + 8 * 4

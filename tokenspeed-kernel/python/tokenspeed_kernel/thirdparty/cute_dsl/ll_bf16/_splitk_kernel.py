@@ -7,6 +7,7 @@ import math
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 from cuda.bindings.driver import CUstream
 from cutlass import const_expr
 from cutlass._mlir import ir as _ir
@@ -355,7 +356,7 @@ class LLBf16SplitK:
         gA = cute.make_tensor(gA.iterator.align(16), gA.layout)
         gB = cute.make_tensor(gB.iterator.align(16), gB.layout)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage_ptr = smem.allocate(shared_storage.size_in_bytes(), byte_alignment=16)  # type: ignore[attr-defined]
         storage = shared_storage(storage_ptr)  # type: ignore[call-arg]
         sA = storage.a.get_tensor(sA_layout)

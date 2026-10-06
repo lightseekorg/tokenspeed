@@ -28,6 +28,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.cute.testing as testing
+import cutlass.memory
 import torch
 
 # Compat shim: setmaxregister_{decrease,increase} added in cutlass-dsl 4.4;
@@ -35,12 +36,12 @@ import torch
 _setmaxregister_decrease = getattr(
     cute.arch,
     "setmaxregister_decrease",
-    getattr(cute.arch, "warpgroup_reg_dealloc", None),
+    getattr(cute.arch, "setmaxregister_decrease", None),
 )
 _setmaxregister_increase = getattr(
     cute.arch,
     "setmaxregister_increase",
-    getattr(cute.arch, "warpgroup_reg_alloc", None),
+    getattr(cute.arch, "setmaxregister_increase", None),
 )
 
 # Compat shim: get_max_tmem_alloc_cols added in cutlass-dsl 4.4;
@@ -564,6 +565,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         p_major_mode = OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
+            self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.acc_dtype,
@@ -571,6 +573,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             self.mma_qk_tiler[:2],
         )
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
@@ -1026,16 +1029,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = cutlass.memory.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
             arch=self.arch,
         )
 
@@ -1559,7 +1562,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         local_split_kv = cute.ceil_div(k_tile_total - k_tile_lo, max(1, k_tile_per_cta))
 
         # Alloc shared memory
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(MAX_SPLITS * self.acc_dtype.width // 8, 16)
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
         smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))

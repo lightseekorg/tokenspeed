@@ -49,11 +49,16 @@ from typing import Tuple, Type, Union
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import cutlass.pipeline as pipeline
+import cutlass.tensor_utils
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from tokenspeed_kernel.thirdparty.cute_dsl import (
+    static_persistent_tile_scheduler as tile_scheduler,
+)
 
 """
 High-performance persistent blockwise dense GEMM (C = (SFA * A) * (SFB * B)) example for the NVIDIA Blackwell
@@ -246,7 +251,7 @@ class Sm100BlockwiseGemmKernel:
             barrier_id=3,
             num_threads=self.threads_per_warp,
         )
-        self.num_smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.num_smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
         # TMEM offset for final accumulator
         self.tmem_final_offset = 384
 
@@ -266,6 +271,7 @@ class Sm100BlockwiseGemmKernel:
         """
         # Configure tiled mma
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.a_dtype,
             self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
@@ -435,9 +441,13 @@ class Sm100BlockwiseGemmKernel:
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.sfa_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.sfb_dtype: Type[cutlass.Numeric] = sfb.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            a
+        ).mma_major_mode()
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            b
+        ).mma_major_mode()
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -447,6 +457,7 @@ class Sm100BlockwiseGemmKernel:
         self._setup_attributes()
 
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.a_dtype,
             self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
@@ -653,7 +664,7 @@ class Sm100BlockwiseGemmKernel:
         sfa_smem_layout_staged: cute.Layout,
         sfb_smem_layout_staged: cute.Layout,
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
     ):
         """
@@ -692,11 +703,11 @@ class Sm100BlockwiseGemmKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr
-        tmem_holding_buf = storage.tmem_holding_buf
+        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.ptr
+        tmem_holding_buf = storage.tmem_holding_buf.ptr
 
         # Initialize mainloop ab_pipeline (barrier) and states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -783,7 +794,7 @@ class Sm100BlockwiseGemmKernel:
         )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             tmem_holding_buf,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -986,11 +997,11 @@ class Sm100BlockwiseGemmKernel:
         # Specialized Schedule warp
         #
         if warp_idx == self.sched_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_sched_warps)
+            cute.arch.setmaxregister_decrease(self.num_regs_sched_warps)
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             # First tile
@@ -1034,11 +1045,11 @@ class Sm100BlockwiseGemmKernel:
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            cute.arch.setmaxregister_decrease(self.num_regs_uniform_warps)
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             # First tile
@@ -1153,11 +1164,11 @@ class Sm100BlockwiseGemmKernel:
         # Specialized Scale load warp
         #
         if warp_idx == self.scale_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            cute.arch.setmaxregister_decrease(self.num_regs_uniform_warps)
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             # First tile
@@ -1328,7 +1339,7 @@ class Sm100BlockwiseGemmKernel:
         # Specialized MMA warp
         #
         if warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+            cute.arch.setmaxregister_decrease(self.num_regs_uniform_warps)
             #
             # Bar sync for retrieve tensor memory ptr from shared mem
             #
@@ -1344,7 +1355,7 @@ class Sm100BlockwiseGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
@@ -1486,7 +1497,7 @@ class Sm100BlockwiseGemmKernel:
         # Specialized acc update warps
         #
         if warp_idx <= self.acc_update_warp_id[-1]:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_acc_update_warps)
+            cute.arch.setmaxregister_increase(self.num_regs_acc_update_warps)
             #
             # Bar sync for retrieve tensor memory ptr from shared memory
             #
@@ -1529,7 +1540,7 @@ class Sm100BlockwiseGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
@@ -1718,7 +1729,7 @@ class Sm100BlockwiseGemmKernel:
         # Specialized epilogue warps
         #
         if warp_idx <= self.epilog_warp_id[-1] and warp_idx >= self.epilog_warp_id[0]:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_epilogue_warps)
+            cute.arch.setmaxregister_increase(self.num_regs_epilogue_warps)
             #
             # Alloc tensor memory buffer
             #
@@ -1773,7 +1784,7 @@ class Sm100BlockwiseGemmKernel:
             #
             # Persistent tile scheduling loop
             #
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
@@ -2228,7 +2239,7 @@ class Sm100BlockwiseGemmKernel:
         b_dtype: Type[cutlass.Numeric],
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: cutlass.tensor_utils.LayoutEnum,
         sfa_dtype: Type[cutlass.Numeric],
         sfb_dtype: Type[cutlass.Numeric],
         sfa_count: int,
@@ -2251,7 +2262,7 @@ class Sm100BlockwiseGemmKernel:
         :param c_dtype: Data type of operand C (output).
         :type c_dtype: type[cutlass.Numeric]
         :param c_layout: Layout of operand C.
-        :type c_layout: utils.LayoutEnum
+        :type c_layout: cutlass.tensor_utils.LayoutEnum
         :param num_smem_capacity: Total available shared memory capacity in bytes.
         :type num_smem_capacity: int
         :param occupancy: Target number of CTAs per SM (occupancy).
@@ -2329,7 +2340,7 @@ class Sm100BlockwiseGemmKernel:
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
-    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+    ) -> Tuple[tile_scheduler.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size for the output tensor C.
 
         :param c: The output tensor C
@@ -2344,17 +2355,17 @@ class Sm100BlockwiseGemmKernel:
         :return: A tuple containing:
             - tile_sched_params: Parameters for the persistent tile scheduler.
             - grid: Grid shape for kernel launch.
-        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
+        :rtype: Tuple[tile_scheduler.PersistentTileSchedulerParams, tuple[int, int, int]]
         """
         c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
         gc = cute.zipped_divide(c, tiler=c_shape)
         num_ctas_mnl = gc[(0, (None, None, None))].shape
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
-        tile_sched_params = utils.PersistentTileSchedulerParams(
+        tile_sched_params = tile_scheduler.PersistentTileSchedulerParams(
             num_ctas_mnl, cluster_shape_mnl
         )
-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+        grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters
         )
 

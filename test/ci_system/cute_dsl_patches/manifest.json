@@ -1,0 +1,1269 @@
+{
+  "cutlass_version": "4.8.0",
+  "packages": [
+    {
+      "name": "flashinfer-python",
+      "version": "0.7.1rc2",
+      "root": "flashinfer",
+      "patch": "flashinfer-python-0.7.1rc2.patch",
+      "files": [
+        {
+          "path": "flashinfer/attention/prims_ts/kernels/fmha_context/fmha_kernel.py",
+          "before": "0b5591b525a945c845e130fd58fbfa0ac2ea669f506e42dd54bbdbfec31e86a4",
+          "after": "5e7eba8300601a62bc7649f4139bf65fd5064cc4955210b8145596301f941e75"
+        },
+        {
+          "path": "flashinfer/attention/prims_ts/kernels/fmha_decode/fmha_decode_resources/helpers_common.py",
+          "before": "cb84ef8cbf2a3bd0327e7ed5e49b2f13309a3c0ecffb24af78bd2c54778e135e",
+          "after": "27aa25f826e37a6d9f2d7e5c724b63502070d4e084e76a66018561006870ef2d"
+        },
+        {
+          "path": "flashinfer/attention/prims_ts/kernels/mla_decode/helpers/tile_scheduler.py",
+          "before": "0a4e3ae1d94aa9e8f30a7195f6a95e7efe5369e8c4c6bfdb394cc8fd6ad74bca",
+          "after": "2aa6cd807e39ee04a1e8e61826c126a0154053c9f7e5abf7825f86255b6a0f15"
+        },
+        {
+          "path": "flashinfer/attention/prims_ts/kernels/mla_decode/throughput_latency_1cta/kernel.py",
+          "before": "dfcfb522ca2f05c7e2c3fbd4721267bbabf5148dc25716a8107a156077a40612",
+          "after": "f98e68e5812cfcd43acbcd0de9dd2cd7fa4918662c0486f1a3f5077ebada424b"
+        },
+        {
+          "path": "flashinfer/attn_scores/kernels/fp4_paged_mqa_logits.py",
+          "before": "a4f152ca867db8b2c335390184c56c2b01dffb806111171461c67bd95f6a57fa",
+          "after": "e399b8b4ffb185bd217f52c752f148d1905d164394a5b02ff6ee320b822b36c6"
+        },
+        {
+          "path": "flashinfer/attn_scores/kernels/fp8_paged_mqa_logits.py",
+          "before": "b921463dbf7a46fd9a0d0e6c3e7739d75fc9752477afc568f8e9cc16e5a504e7",
+          "after": "c1b30827a54f955a080e15e48f173cc687cfc5ab2a8e1cb16e106e35ce3416dc"
+        },
+        {
+          "path": "flashinfer/attn_scores/kernels/schedule_kernel.py",
+          "before": "1c4c274cef976544edd6ca3fb541ae89715e3ba1ad1a2ae712cc61699a865ac5",
+          "after": "2bec1506a7f7b511bfc271a79c26df61f771f49c5db1e57b39a4b1b48f13504b"
+        },
+        {
+          "path": "flashinfer/comm/mnnvl_cutedsl/kernel_bt/device_kernels.py",
+          "before": "855290efe3a6b9f9631618571c8002e784e05c156094537952e3761cb0d75deb",
+          "after": "7ce5c10ac7c5691cf6b8af3a8de5c85d38da4e5364083604e354c6cf5d95a1b0"
+        },
+        {
+          "path": "flashinfer/comm/mnnvl_cutedsl/kernel_ht/device_kernel.py",
+          "before": "31b34fb46e8a9381ce6a89ffb53b610c7ad4194a1082c5d7524c56f3356630b5",
+          "after": "ec86103417c74c4c48627ca6a5a2a41479734eb1385e862e50cd8419837eac84"
+        },
+        {
+          "path": "flashinfer/comm/mnnvl_cutedsl/kernel_ll/device_kernels.py",
+          "before": "df7757e9a9dc6e4ea3a3877e418216e1632d4d98ca83264e2ea0e42e62e80bd7",
+          "after": "b5baccd63e1f7cbd693f733df5eeeb42661c53ad67e16b357b45aad692f8fa08"
+        },
+        {
+          "path": "flashinfer/cute_dsl/add_rmsnorm_fp4quant.py",
+          "before": "6c61b1170085e7c08bfa23a57b915a7b8af40cdc16e08a2dbe3028ce38af0534",
+          "after": "0c606bc35abeddaa1212b5ab0b60122250bace3c74c81adb4403a3f1a39d109c"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/collective_builder.py",
+          "before": "f39b326e13eb4e18faa1dfa3a378a0d7c95cc5fb77712767f124b62c02b1ec9c",
+          "after": "09007badc0fd50a3f0c2ee67a4ed4542f63cdd77bed9ece588440faf28356398"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/compat.py",
+          "before": "914fedaf1c5a9cd67bb217bfd3b39fe329d1e645fb78ab6b77046fd65b7b0cf4",
+          "after": "09f1fff5c97244221fe2df0c0cae527ee12423fc2b81b0e9e5c0adf235bf5c31"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/dsa/hca_fp8.py",
+          "before": "eece7c92e186608a787b0279b61169470ddb3f7052b3bf1fa89448f737811bb2",
+          "after": "5b52bb626eaacfda44c8888e1f25d5b218b7c567bff4a2f10cfb949226eaea27"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/dsa/hca_helpers.py",
+          "before": "e61929e52b90da2c1036f9283b4c2adfa070367d304d2472369124b25a9bdb98",
+          "after": "0840a7623a61436f0fcd9b09f6b174cac57d28f0b98ca567d93580711a57c638"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/fmha/fmha.py",
+          "before": "65c93987c040838d495488f36d31845792fe46127677f7055f07b8d6065c57d6",
+          "after": "8ea06a0d30c76d5501317b0a715f978b653a0f0a30b7e78a6c063e1345f2d1cd"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",
+          "before": "53e576ffb1dc5948074c860331551051314d4d21eed16fc9a8d678143a71abea",
+          "after": "17bfd5eda8c6da3eca59aae5072c76179e1cce726327d78b47ac7b69d1b5cd46"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
+          "before": "f6547bc732d517c7fb57a3211e95a4da976b15b89ed29dbf41e5f77ceb9cb024",
+          "after": "7cbd4e2b9b5dfde334c7c2b5e541f8a24ee7682b72ad73725d035ec8db5eed1b"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/gqa_decode.py",
+          "before": "237cd83c2a487fa6be9d41220fd8d273bf42c90d1b79a37d997002b800ec0c58",
+          "after": "c7b499377e8cda86bc5a66a2eb18aa9cc56f1d988a1c5f183416108285e96f3a"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/gqa_decode_paged.py",
+          "before": "f8018db21366e9efc0d912897cd87b04b2e77644bf83b626c55d94098acbd3be",
+          "after": "9aadc69dda4503e81f9a0508542d6ba3eab273cd6b0dfc6f79b8ef9696122daf"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/mla_decode.py",
+          "before": "55a2c362b0f1f647e1ba5874c32bbc931f5ae99c734dd37ab83aa67176de0467",
+          "after": "3c24f59593a929899576dba242ee7d8d33fdbe1cbae15caff9c7e3b96380de5d"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/mla_decode_fp8.py",
+          "before": "4fc962f1ec03d5b92adb451de20d48a92de63385ab176fa694f1e7b02fb69719",
+          "after": "f4f10e8a34cb0646761462a0fa56b427a68ee7f0715d91fe5aa576dc30590918"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/monolithic/mla_decode_fp16.py",
+          "before": "9c38566f82d6331e84fe162dcd56acd038b1563d701bfdc8553c21bd97d955a5",
+          "after": "5e872661098c149870c71e509d975f8fd57851efc6f37771b0b104eb17219be5"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/monolithic/mla_decode_fp8.py",
+          "before": "c200e16d661ab2b3feb86c2b2bced767de406b847f8ba10e992c880784446d90",
+          "after": "c876503bbd424fa8c9bfb3946197e244de43c04e54efb12a11e2f1defa8e3200"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/monolithic/mla_helpers.py",
+          "before": "7a3065df9ec6811fadf125fc1f11c463bf87619da4aa7dd71dde799b6f69c625",
+          "after": "fef8e7b10539e335dab78ef1d71003ee358075eb71434f1b1ac10ff568ace78a"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/prefill.py",
+          "before": "3a1810aadcb7eca6d22d8cb1c7d0a134ea6ba92911b9ffdf5a535ede2d470d0c",
+          "after": "5bf4953612aaa978d6fbcdb204d813f06eb909748571d297f6c5984e1b50621f"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/roles/mla_compute.py",
+          "before": "1c7031cc65548b79448dc00ad6c9d615d40853323ca844b71709efd01feab102",
+          "after": "b3895b738ffae8a0b63a337ede0108e2c466bfa884f4a0fad9b0f4c65bac8aa8"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/roles/mla_correction.py",
+          "before": "46376b76a81ceb66bd6c78a87ab1a7fc4a4a2e424e5ccd19e73fde3ba961e820",
+          "after": "7fc1fb463b285332bd5c6539c428e0caab57bcc5fd021f46ea2dcc0ec77db759"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/roles/mla_mma.py",
+          "before": "6d29637fbfc7b5e8fe58bf7497ff07e27a182be1f254056413ec43d130efaf0e",
+          "after": "3790de8db7f9f6a23ec9b400b854702f4a9ba5ab755208474c164142ce1d5021"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/roles/mla_mma_fp8.py",
+          "before": "9aa2a84dd7db49bf2520770dd57d6be9fee167dc0a584a70cacb0101f571cb6a",
+          "after": "503aa55e50e1c2d745e7503439ccb315e5b276408b707b0585acbc2b3de148f4"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/roles/mma.py",
+          "before": "fa422f6c2c862257c3af2bc0e214ebd24d640393b20bcb9cf07d0db55128c355",
+          "after": "b728fc8702c82e780cbed5b1fca20492162f4ada3ceeaefda3cde4e2d6819b9a"
+        },
+        {
+          "path": "flashinfer/cute_dsl/attention/scheduler/mla_persistent.py",
+          "before": "cb88bff635c7bd65b2765678ac99d3c4e9e399d3063363902c22f13425e24c91",
+          "after": "459f0927f99fdfb4c135560950ba1b43120c6954446ebf5160e86c9038aacec0"
+        },
+        {
+          "path": "flashinfer/cute_dsl/availability.py",
+          "before": "39d47171f5dc1c92d73290a5dfdc7c018da7fd2bcdee498b16547e6ea08bc024",
+          "after": "29b8282d52eec0d2d811c2e992b097254422818219496683880af90802af918c"
+        },
+        {
+          "path": "flashinfer/cute_dsl/gemm_allreduce_two_shot.py",
+          "before": "d6b8d6bc85fb18d14d23db059a758fea87b2873330730d8912633093f785b38b",
+          "after": "e459f04d593118983a67126408d4dca46f924657d1823c8a41b39514cc28ce16"
+        },
+        {
+          "path": "flashinfer/cute_dsl/rmsnorm_fp4quant.py",
+          "before": "ec32fae9254adb9b888c0affd99822c89806a5881de04db0b0a755d81f6f90a3",
+          "after": "cfcffff828e3eaaabd28d51f3fd0745bcfdec1481d8fa823df52ca28c23f2a1e"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk128/blackwell_helpers.py",
+          "before": "6f4d64f0eb354b76f2ffc2f24594c057b0e979b03e91d2a8eedeaecbf22930d8",
+          "after": "c81a838d16f8a3b4210c03ab52db4b6db1a8d91a6bd7f88cf07d36dc8954c2b6"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk128/flash_fwd_sm100.py",
+          "before": "1ddccf7e8fea30613fb39024480e778a2c953ec2f73c96d8c656ef6e783e977d",
+          "after": "433f4ae6d49260e91371c0d3c50a2bc17301680dcea8bf2958b83ee2d7f283a8"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk128/mma_sm100_desc.py",
+          "before": "49ada5dbb01ccbe34f013906a2612cda55a53f00c63bc6ea510617a61b5e0609",
+          "after": "9563b559214d1233eb60c8b96aa63366021963bfbbe3dcae661a58fabc4447db"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk128/tile_scheduler.py",
+          "before": "684c4de35366366253c92ddc7d01efd739e3bdecd7d2efa50837094b4a485f22",
+          "after": "94d29d28c4510849e72e536e20ea1b0216558fe680aab2a2f8da5c7c7a4ac575"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk64/block_sparse_tile_scheduler.py",
+          "before": "d920ab274bb32cdb99614fe383a3a5e887b6554e707ea875b655762901f5308b",
+          "after": "ce5a1b2c0fc34f3d085893f07f3b1fe1cdee15796088092e012882962c6b7904"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk64/bsa_fwd_combine.py",
+          "before": "66f66868b23e0f1f77c82825bd4c1b01530830fc58c151bd10c410ff6cfd70ab",
+          "after": "3962783453c103c062e529fc7323b1c325cf19e972b629bc60affb485b9ce9f1"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk64/bsa_fwd_helpers.py",
+          "before": "2972255a3d3b8a5395903b4c96f3315623146abf054dbf3d13a7e1ec48ac64d1",
+          "after": "c2812b33acd4bb4159d5de2963fa4589b3f25c5f4e4b02924931ae4cb2b64422"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk64/bsa_fwd_sm100.py",
+          "before": "bb2280c03cec9bb42c38d25f9a941327587be12c5f6ea803e5295ae9d38ddc07",
+          "after": "97b6fbfacb9da93627439dda0911f5f859a54aeeaaf3a8fb326aa87017ad2629"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk64/copy_utils.py",
+          "before": "e84f90a9a285e3fe20ccc7b7997463e0806b6351d3b13db362ea657bcbc6249c",
+          "after": "43fa859245a62e7d2cfff7ea2bf00f2aca70fe6f49bbe5dd8693aef271971f3c"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk64/mma_sm100_desc.py",
+          "before": "923fe63a5b9d79b21e79c24f0662da71a2c9e5d2fd9e84823948420d3eaccd9e",
+          "after": "0aae3b146ef17c5ded0bc0ec3321626413e6fc6337c1394eea2f4af4be821079"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk64/tcgen05_mma_helpers.py",
+          "before": "9e73ad876698417f419d18819ee9827199d2b77603d46f10e9b5e311b9adae58",
+          "after": "dd98f991dc369abb9a73d29ffffaf42e1258f7a0ddbbeba71d4d6556460dc52d"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm100_blk64/tile_scheduler.py",
+          "before": "70fb2deffbc253262c2e2519056dbe1f84813678a068fb86b6fbee07cc34016a",
+          "after": "c6a68077c545b7e688e7e1177a15686938a9e43b38aa315d736a40f6a34d1df3"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm120_blk64/flash_fwd_sm120.py",
+          "before": "0ebb538477f8f4e7e0ce3e3d5e94583d3e8c68c7eb381c5d8d0955994b16ee8f",
+          "after": "835caff0c14b057bf9103bc3f52d57d187fdf93e4e74c6edb23c1c8dee015ab1"
+        },
+        {
+          "path": "flashinfer/cute_dsl/sparse/sm120_blk64/flash_fwd_sm120_sage.py",
+          "before": "e0801d56003fd6a9cdb8a9415f82e14d5d97831185f71d8ac62caac7500b8fdb",
+          "after": "6faf16f17537bc6546cbfef17134cbabadc6796941913da6c24a155c9b0dd6ba"
+        },
+        {
+          "path": "flashinfer/cute_dsl/utils.py",
+          "before": "971faf2b712c8d973cf7b81fdb97b12d04d0fb9ff350c314981c1049b3816a25",
+          "after": "90a7679b7de3f324a456d9860957e6923b64277b16e05a38a4b1ee4a31107cad"
+        },
+        {
+          "path": "flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/bf16/fma_fc2.py",
+          "before": "0ce6a8b2ce0d9a0f11cd12025cd14d403aa544e6d922612d61d49c6d604705d1",
+          "after": "7d0e2ca926fcfd4442357149f250909700e3a26f6bc82c6f6acad5addf5e322b"
+        },
+        {
+          "path": "flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/mxfp8/fma_fc1.py",
+          "before": "bb8695596212bcc4733177d6c94d40851187fac08107e6e11f31657ec79d04d5",
+          "after": "8ebfc5d30a3ddbe55a212f72d45ba7e8c77bfe5ccb36f1541554e67d2f206266"
+        },
+        {
+          "path": "flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/mxfp8/fma_fc2.py",
+          "before": "1908b1e357e68c4f483134404cd2e3d088683410e0b43ec618a87cf76e7b5279",
+          "after": "0fc9c3e59a111387613a79e6080d7b1e4c7c33eb1e6e6448f24be0a73c064b30"
+        },
+        {
+          "path": "flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/nvfp4/fma_fc1_o2.py",
+          "before": "46766c40e9441aece7d48c60632fa8f57e99ab2dd1aef4d009c625a3c0f6ab75",
+          "after": "c4bea9a7df680c3800906a2bd7a14711d1318546bf9b313185cec6d41a126f35"
+        },
+        {
+          "path": "flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/nvfp4/fma_fc1_o4.py",
+          "before": "e9ec08c3a8599b0eb2ac361aa937db637243754a2327e8b3b605cb68e6006134",
+          "after": "2dfe457730a89f639badd2724b25532af05e621b9ae0ef277cecedad08949052"
+        },
+        {
+          "path": "flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/nvfp4/fma_fc2.py",
+          "before": "4f5323123066cde16f0e85992ffaa07cd689e4cbcd68aa975a8636227b3ca90c",
+          "after": "527ffa6fe9ab3823b49f0f13a4ad89faa76f2e9b22d267176abc4bc81d9f0209"
+        },
+        {
+          "path": "flashinfer/experimental/deepseek_v41/hca_v41.py",
+          "before": "5edaf4fa83168a473986f2870aa2da6b1ac6a0f8751f17c6be84ab1888a5ba47",
+          "after": "c651d3d717a5124327ceee39cb5b382d7f49ff919fe2f68fe993841b4fb6ce18"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py",
+          "before": "d1c658a640433c2a5cd3a07a5ec13ca44b14c52388d6f520cad55c4339bc6e8d",
+          "after": "136e65c7b059309af526bfc9fed71f07ec7da5d45701f3ebab3229ea5f76e650"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
+          "before": "e8fea978a0ad457968fe904fa5b8bf4598b9bfa912dcc87b9a259489fe178b58",
+          "after": "9a6410719fc8bb6ab0db75dca2f65bef7f27e7e484afc359b90aa337af980677"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_swapab_grouped_gemm.py",
+          "before": "4f6aeceed32ff482d3aefc4aea164e03790d5d518a57727e67829134335a25d2",
+          "after": "44bae62130a0b797691c73077cd1609604186ba97f41eae19d40f1c454571bfa"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py",
+          "before": "0f6cc660f048a9f5f72071b589bb90e93607d911d03f31e869c99c31a839e10f",
+          "after": "2aabedb14b7d1e19f1d7e315444da4f199d84f4f314be3877f2b1f0c4a910d51"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_dynamic/gated.py",
+          "before": "ef75010e0837aba4704cc2a9582c5692d779089829e5ffb8d5dcb481035ac1d2",
+          "after": "3f4a8f56f40b9cf0172fbc8e991548c6009b07da78889f6e0fcc990f15375ec3"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_dynamic/generic.py",
+          "before": "6f9f1384c2b4e96dd8416e4d54d9ef24b8cff14628e82decd44cda50b65ebb2a",
+          "after": "bc8ea8a3ea398871a3175e069eb66ecb5329ff2778456ad8a1fbd68da4901f98"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_utils/moe_epilogue.py",
+          "before": "18005e1e260a6893412d5042b941df42bc55268ce0350a8b597b09792a7a587f",
+          "after": "3ac4e35123218dd4c13f42f5fd6ccc340bafd43011b8171ee863753c46b98b38"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/_moe_utils/moe_kernel_builder.py",
+          "before": "48ecf9a39a110fc51faa4658df84a0f1f9483e418c7b755269469102bd44d41c",
+          "after": "be245b429843a8e3b664f8d500b6638d4418a8c782fce36820257f8c8e037188"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_fc1_act.py",
+          "before": "b2aed6a89591a9f88bb9c2d0bc16a1f601d192649a5a84c29597479b17361359",
+          "after": "2d57e69673aeeba7bfd910a22ef02eba0ac68a82c69c9547765438b48ab3c516"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_fc1_act_q1.py",
+          "before": "b663e8f29cad2a5af7d1918f75847fb373a517f7248e9a72ff646c62017e4480",
+          "after": "215ad34d1d0de86a071a17c701f4e055cea9a7cbf8f388170a9d7fc6db79849f"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_fc2_finalize.py",
+          "before": "6a596fa819bd76ab4b7fd2dbda1b0f54dc66f9550c08e1002541eb0c368317fe",
+          "after": "0f51c275b4067247c77acea25eb8f2e77d6247ce2190a9dd3c3ceeda1c7d8a05"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_fp8_gemm.py",
+          "before": "4fbf437fcd524827881a28bf0c4a353bca5b1195b9ab215354fc5a0c3a150c60",
+          "after": "21ee267a070202a4b5b18062646f8ef1412509992852dc106aff5d61286d5916"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_fc1_act.py",
+          "before": "32a7566a7af70a7ef0167018adf2b4de9e3646ff148c7fc9eb9f52d6ae406d4e",
+          "after": "de9598d52aa5e669655ad9abfd2a7c79f5d9a386bef49884060964a77a3e0db7"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_fc1_act_q1.py",
+          "before": "41fda2efd08ca3dc25b942cda55647ace7ea57583fe3945afa5ec1a65bbbb944",
+          "after": "abc4ce55f54f4d09d8965aa1147208d1c49d6aa795b83f58e6f95f547d583b9c"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_fc2_finalize.py",
+          "before": "67b6c76c61abe13ecac17c6d30aa0109b14694ab6b297f37c03b58e41fd97866",
+          "after": "6b7b93217bff62373d690da11967cf39a753847a0e22dd7ca417f03075b6cd9d"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/kernel_moe_mxfp8_mxfp4_gemm.py",
+          "before": "09898e9e1db9f2e31c36295ee1af69c52bbe8c7f8cf68ce449e5acae3f907cf8",
+          "after": "97afc01928e72fcf241c5c3e82731bfbb86b25b513b91fb8537614c095a9dbf1"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_micro_kernel.py",
+          "before": "f4a3430c07dd665ac08e21204129b393f8bca40a92b68ce121617b3b031699c5",
+          "after": "e116119ee066f9a9eb6a4b8142c09bccd8d751dcd501adab042d0e9982387883"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_static_kernel.py",
+          "before": "6d5c7f1c153ad8537278c96f1c78e2ed0a7f18330b541ac068c794e6949d494b",
+          "after": "3b07378299cb175dbdba646f145c5dedaafb2360a35c6559076290b1c3ba1384"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/blackwell_sm12x/moe_w4a16_kernel.py",
+          "before": "42eb512c4530d704aef433357bf171fed6113e7f7acdc2d497be0136575da746",
+          "after": "871389de2aa4a66c44668a6c98a2ef1074ee46adf62f1c8a1c094e990399db2b"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/hopper/contiguous_gather_grouped_gemm_act_fusion.py",
+          "before": "364e1498a7773225a042bd0bee0fc00e6bc4a3a04a461ca00d29e0d271c44014",
+          "after": "c727ecff12a623323d52c1ca69a54d95753c257e42235d777a596eeacf6583ba"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/hopper/contiguous_grouped_gemm_finalize_fusion.py",
+          "before": "2ebb6b3c47cd330578ae0dc67e5f33bd1cd19e6d511975dd062f8acf3f1994bf",
+          "after": "f70c208657fdba40949a55eadc751b679eab388f2ebba89e0f6c01162d1959e6"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/hopper/utils.py",
+          "before": "e855b5d630902538fa20583dc668d1c9eafb5d287087073edbeed1bf91614f61",
+          "after": "580ae091da18ed8fd732e861197822369315fdaca3f1f9a9533b0ae39b44d831"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/mxfp4_routing.py",
+          "before": "cbe6dfbd1d934c58b6a2c70a13370be9e3117066abc87650475ddbab03b0c759",
+          "after": "8908794145aa33a06d49c6bee4932dbf6f6654e389809d931ba4defe82708807"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion.py",
+          "before": "6393684e152bdf6d5cd3666666054641eb0b952737f0db2f20018260af1ac97c",
+          "after": "f49df07b6a376611592d4d09406370d128bbe1078958d8f092a1f48c6e442fa4"
+        },
+        {
+          "path": "flashinfer/fused_moe/cute_dsl/rubin/blockscaled_contiguous_grouped_gemm_finalize_fusion.py",
+          "before": "99480489eedb01dd405bf184d3fa30927fc443440b9236f3200f2ead1eebc6f6",
+          "after": "03eba2696dd0e298be322a57c8436c720dd7f2e1fdfd990c7aa20c0440998ff0"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py",
+          "before": "f5db6379519b82b6e293d1f95560fa75af3a19a59c5aeb3aa00cc798df3957bc",
+          "after": "fdd72e29ea26a55bdd733eeb5054937b428790f977df053a665d5724f62cbb78"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/blackwell/gated_delta_net_cp.py",
+          "before": "1dccc5f13356a506babe4a4640186933daf22ac2be70d2bca15583025c277c68",
+          "after": "f69f2e56c7a73961973c7501c2b9aecddc8a940cbf78e2ee85d04bd69186e12d"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/blackwell/gated_delta_net_cp_prefill.py",
+          "before": "91bc85a33f9742a0d9f5b4eb256f6cb41e81f17f61172d43d23e85d61c6e0408",
+          "after": "809fd18f64f2e26e5277f0df584a968d81432376201bf0f2ba60e7f79ce1ee0d"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/blackwell/gated_delta_net_tile_scheduler.py",
+          "before": "96654e5e496907907f211b0768a993144b1793c094d2dd9919a5bc78502ed4a9",
+          "after": "51f0a5c412c5457e81bfbf10a02f5fc7ffc9c355c147266be77392ee25650049"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/delta_rule_dsl/collective_store_tma.py",
+          "before": "92305a4f3b6aa168590a3cf67c0f1dd60c4e720bba9265e1c6709f2d117f10cd",
+          "after": "3600b388bf2ac95715795e2958b9913bb2cf6300047d97c5e0b97dc12b3344e1"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py",
+          "before": "76f00777b51a7676bda53cefb4bdd543ace5c40d6cd85587b10d09fd6a9576d9",
+          "after": "d4d662496f65d49af0c402a06aab49166057c0d4ba558fe3548b735e89a1e82e"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm90.py",
+          "before": "618c4e0124dd381c1c0c15fba870b73eccc81b5f2f1af8f0ede12d725f04b484",
+          "after": "ffef404b4968ddba275be291859623124586736ca3aff9eeb72377450b574916"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm120.py",
+          "before": "94fad8696bed061c577603f82670f038f55497231a6775717f8bef65facddb51",
+          "after": "330f53b83db788cd8a6ea969825e9e22365e7ae29328dd46e5bb6761f3d1cd20"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm90.py",
+          "before": "ee4c776ee3b01ac47e7146f6fc092f9b8b4004a4e4b39cb38335cc525ccc278c",
+          "after": "d5d3b2ed5c720a5f63ef4fcf08bbf776e0eb8ef0a95c32fdd2ac756216a8c225"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/gdn_decode_bf16_state.py",
+          "before": "588b0d424509ae35a20ca78b6fd766f92787207e066ae7a6f1328ff58c3b97c0",
+          "after": "6c9238ac9a52a32689c4e50050186e7d64b1697cd68d8f160927237f2b96df70"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/gdn_decode_bf16_wy_output_only.py",
+          "before": "bb8a676ed9f488ac041b44e0dce4ee02fd7dffd59bcf6b4f6327906fc1c6e9c5",
+          "after": "975d20b339c0d36d48a3627a7abdf2d75a2ef2639c7aa1df6e87d0df2257803f"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache.py",
+          "before": "e6e6c1118ee11b44213496de1bd973676a6d356a43dc95fb91db613c12e707d3",
+          "after": "c662c0b7d109c22fc984c15dc687fe73535fdbb8662b591e927f3e98bb100e87"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/gdn_decode_bf16_wy_ucache_flush.py",
+          "before": "f60e00d20a48e24be976d75a26250c05b837721a56bd82c0354f2fe8989188a4",
+          "after": "14ea0129f175c444e8cd71d2e002c225f442e68afa0a33433a36909ec4fcee0a"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/gdn_decode_mtp.py",
+          "before": "a5ce9cfd412c33f8ea6c9cb47628443d66bfca3c1eee6c6024ababaef5122db3",
+          "after": "af70be1dea6cd9074220fad6c9bebd734403ed7f5876081ed6015b6b2600888e"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/gdn_decode_nontranspose.py",
+          "before": "0bea2837830335a7a44c9942dc6d147b826d12ae5d93874338c0d3f939eb660e",
+          "after": "c7c270b9721dc722ce8892f6a1658b130600c3f0b6c4b45d3ba999a947fabc80"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/gdn_decode_pretranspose.py",
+          "before": "029fca8cd9b457b205fcccde61266b05064f92efe1389681e293a6d1b7d1683e",
+          "after": "af7ed7ed2a56a6be02676ca3a4211f85b28c3277994b154b6353cad588dff5c5"
+        },
+        {
+          "path": "flashinfer/gdn_kernels/qk_l2norm.py",
+          "before": "67f48e1b01d40632a0acd75441866281baab4439dc2a4a453c66f8f50a0625b2",
+          "after": "87c5973de7fa0bfb09159ff01a7e45f7afb4d391d57f046b36287b4bf3378dad"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/bmm_fp8_blackwell.py",
+          "before": "1b24de919897ef7ede911661150d67b044aa917ff50965dc08107b1aa9cacf30",
+          "after": "1750882603b232ac259a70cb891fc90b0ead9495c37063c072a3152024198ebd"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/bmm_fp8_rubin.py",
+          "before": "f10b5ee03096af8394b57cfbe7abb6ee3103baf87c6a58a60f576ead3f4386f3",
+          "after": "55a55c2396fad15677ac136ef181a83aa6415d0eea57c5503d7abd0ce143a117"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/cute_dsl/dense_gemm_bf16_fp4_sm100.py",
+          "before": "d286ba16c3007139c5d3526d066cec452b4933f74f26d723f19dceb06e496a30",
+          "after": "c1807991c07e82748f4a7d777516c840ecf961e5caf0a5a9d80d9fce54edbe50"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/cute_dsl/dense_gemm_bf16_fp4_sm12x.py",
+          "before": "04ca7ed6a5d23106858d79c26c20caab0e5670920e3822e30b716a089969961c",
+          "after": "f8d63130b42f32fc6c9f5763b9d1cc0f58eaa2b5388b2318ca68cebec9ce54c1"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/cute_dsl/low_latency_blockscaled_gemm.py",
+          "before": "118744bf9553da5fcbf6504739d499ec208dcf2034d473799ec11661e1313280",
+          "after": "0afab5b924029452bdb0510c5ab25c1d3610d6b62b822b61a3fe68bae2a0305f"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/dense_bf16_gemm_direct.py",
+          "before": "605ba1d46a3a98fedd1e0d2513f0629eb1ce129142673dc7ef197163f2064c54",
+          "after": "2cbb31935249abd860edb6354673905b0f204921b6649927e6839fb5268b4b80"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py",
+          "before": "f5edd4c11d95822c836a363dfa1dd19f7843b4e354e091c24c0acac12f52d9d2",
+          "after": "f987cfb0cb01a2719a094025518d6f62b2bef313edcb646637ecda7ea163b58e"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/dense_bf16_gemm_warp_splitk.py",
+          "before": "de56bdac4f4edd385e4dff052098aa1286e15173ad56e3e49715b6ceb458dc72",
+          "after": "8e70ea3e8b44e6d26a870cf093377dc75f3ee2134a53a27b3e05b7fdd55457c3"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100.py",
+          "before": "a07193ecc61c522a1dc26548662524d1cbf27a0b0257888fbb4ca241bd2c7593",
+          "after": "4061aedbf09554770b068b7cd869ea777076cda80493725fd6b67979afa0f2dd"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100_common.py",
+          "before": "fe37095a053c5c49d4c14ce29fc8adef894507a40c51e8efcabbeb4e4f2dd82c",
+          "after": "66a53b1300b5e6f4b8b22e9828c8b4d24ce3070ce835802864528694a16be960"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100_splitk.py",
+          "before": "9d649776c24658c739957c5173145ba972c790f40c6f68845cf27de93a1d1d7e",
+          "after": "bdf19f4ee7784411dc9fceb22f6d6b9f6c7221c3b264f86bc7bceba7cbb4f3fd"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm103.py",
+          "before": "207beb26008ab4a0a0edb6320ad7cfaae8e73bea88470652b03adebfb5df4334",
+          "after": "8509d84af74fbadefa9def7c8fe353103b9c0d17d8b86bd94168c01ede4cad20"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107.py",
+          "before": "5959d66e7b8becc0e4169aa081a0886c829712323531aa655b02b2013a14ed2d",
+          "after": "6c2ba61e8d1714e8729bcfb6aa24394aa0731632d39d935da65c323335bbd7b2"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py",
+          "before": "6739702e27afad21767b71024678b35c6892e3f9c74aaff375fb3f6734399f86",
+          "after": "92a761d0757fd5ffecc9a74120c7cee564b866fc2cc56566de5daafa6f33aebb"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/epilogue_utils.py",
+          "before": "ae48ecfca2220975cd3e0e1d60803f8634aa72827857aaff3b2af24205c01c92",
+          "after": "14b5b2beff2ede97e967286787496710b1a8fe270e5fdac60d293bf4879d7889"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/grouped_gemm_contiguous_blackwell.py",
+          "before": "9485ac36ce6f334400ddb553e57198e4d1ddf69e696f4dd762cbe7daaeda1de0",
+          "after": "2951815857e196c31466b861c90ec16feaf41a1aa5e952e735d5a2b5578fb48f"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/grouped_gemm_masked_blackwell.py",
+          "before": "3d7cedc70a4504225259ba9f9c6dd6bfa67df18b00f1e416ee2c184909b1ccab",
+          "after": "06e4ace8d1ff650221b5284559bd2361f68f3606ced68c3572614cf331c60ea6"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/grouped_gemm_masked_rubin.py",
+          "before": "729ead8b8e3cfc66b0ec57e4b452f571c95f185758444a9ed697b11e60005639",
+          "after": "330866c6c40a37346e748497a2d15e90262bad4364659f992f27312b3605858e"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/native_bf16_fp4/grouped_kernel.py",
+          "before": "c4a378349eb848bc9446178296b08702f43a1c33c95ab176227d34c18d0d669e",
+          "after": "f2ed6db58e2d1a7deb62d2bed6f79a9aca90b4e09c7e70cf1a389e2b1fd67cf0"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/native_bf16_fp4/n64_staged_kernel.py",
+          "before": "017e5ecef4c79ce02a043a456eec123299850c53047d3f128fd9991b6b0a44e3",
+          "after": "7082a43fa4ef4f8b95d97c11768daf7bfd264dfde0edd71399c7fc84775bb302"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/native_bf16_fp4/prefetch_kernel.py",
+          "before": "6e46b538367c2e28427e6739c84fe497f96d2bcf6f2a74908f51048f8796a43c",
+          "after": "befdcde178640912d34e83c586b172cfaaf34da7870f0b6b787f6e5bb4155208"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/native_bf16_fp4/staged_kernel.py",
+          "before": "4f282ca749757fb89ad1e4309616b548c205bb845d087545b89e011cb6949112",
+          "after": "b20217dc36e163421037fcc2fe6657bcfa4ab52c7feb9429b5abb1584079413e"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/native_bf16_fp4/tiled_staged_kernel.py",
+          "before": "ffb10c6db0775bacd0e54f15c0277e4ec5aa1fbfa2d27e2804caebb9cfd20a28",
+          "after": "d50b2fbc76baa03600461ee5e4886630ecb8def365e229e493ff3d048769fb8f"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/sm12x_cute/independent_small.py",
+          "before": "12c0834a320e3d6f9f00df28da3cb7f83c891011d9378364365fcf76183981aa",
+          "after": "bba24f4d96a4e444fd54475cc1a6d14be6b2b202a36f44f461abb91d02441992"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/sm12x_cute/independent_tma.py",
+          "before": "2bdfb8bbf759b80cc56b86027fe97949ce2c7a654466ab6135c24dd222ef7edf",
+          "after": "68524444493556ad9a980c7063d062d9293efd229102449735b66e9b62e1cc73"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/sm12x_cute/raw.py",
+          "before": "f5bd0a79dc153a1dcfd2e4ec828ef743bf2565046ca7ef26b1e2620e617345f6",
+          "after": "bedc7db437c5241c01b6ffb6b1d83027034670b3af2b84abd14f1e8cceb4873d"
+        },
+        {
+          "path": "flashinfer/gemm/kernels/tgv_gemm_cute_ext.py",
+          "before": "badae5c2638ac423dc5e0aac9fec29cfefe3cf6ee980b323dd3a9e541a3576cc",
+          "after": "79cb37c72c6f84dffb72373ee61715543b0175a39442a2f9244d2fc1169eb94c"
+        },
+        {
+          "path": "flashinfer/kda_kernels/fused_kda_decode.py",
+          "before": "4af1a30ceaeafacb0c970514054e84809f747ac33e15bbbbcab2b3bad62620ed",
+          "after": "802649dba3ad4d60f12477345245e056f58faf58eee8adbbcf4460198879d5fd"
+        },
+        {
+          "path": "flashinfer/kda_kernels/fused_kda_decode_multitoken.py",
+          "before": "59a0a0f1b0776dd6b30ca4524344bc958c6e43cfb437fb749974f6ba65edbd7e",
+          "after": "3db2739459351447fd3ce8c1b503ab7f195048e6a8db6b9b3c9886fd4ced3535"
+        },
+        {
+          "path": "flashinfer/kda_kernels/kda_chunked_bt16_small_bh.py",
+          "before": "86d2e9724d7fe8421032dac3763dd80d747775cfc7ad89a7c8ba4439e9300d6b",
+          "after": "f496325dc11073675698c3d6c3c8cd30fe56471cf3d5344bea798b711451fae7"
+        },
+        {
+          "path": "flashinfer/kda_kernels/kda_decode_wy_output_only.py",
+          "before": "d7ea7ac19bbbdd76b4f1b936601e5ace7570e79111099b9cc19d87885812c705",
+          "after": "6b45eedffa4c9ef46a2c94492b83d51d1b4711734d48ccc2c8910dcbe110ed83"
+        },
+        {
+          "path": "flashinfer/kda_kernels/packed_kda_decode_cute.py",
+          "before": "d003d4509ab7bdbb6487e7baa45edd2666e1fc4faced861ad10653bd17bc114a",
+          "after": "8c2d94d7cc8ef010770e7c904e6ab13efba731b147039f52b9fdb2f2c09fe907"
+        },
+        {
+          "path": "flashinfer/kda_kernels/recurrent_kda.py",
+          "before": "710136da7c8c67432ecb429c70ad706732f9af9366d18970d3ca72923c28f811",
+          "after": "4bb5f5239e5ddcdb9c46ac73da693cd8701df192d1c8c8594d4a018e5aba9120"
+        },
+        {
+          "path": "flashinfer/kda_kernels/sm120_prefill/decomp.py",
+          "before": "3e90a9f718a3e2484fb1777c394a9dfee9e50fbf489d267786f672611b3b400f",
+          "after": "35a563bc4fe5e72f2c8795fb6bb3bea3dac05d1cd42a927be996f59bc9b305e2"
+        },
+        {
+          "path": "flashinfer/kda_kernels/sm120_prefill/fused.py",
+          "before": "7ea9f63e7107c8ab881dc51e1b9403b85277f29ca04a3ba3002252e0f598fe08",
+          "after": "3b24468fd5e6b5592482409b09508cf0d8718c8ca70c053c7e079c42fd99d480"
+        },
+        {
+          "path": "flashinfer/mamba/ssd_kernel.py",
+          "before": "57e39eed324dc2efdd6fd0eb14b05dbef82c453161f9767044562f90145e5eef",
+          "after": "e90f349b5276d12791626a062407fb39684d25b71def68bb1163215abfba3d58"
+        },
+        {
+          "path": "flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/fc1_fc2_fuse_sched.py",
+          "before": "9edeb7437d8ee49ae50e0b87be39aaa056e54140beb02e94c5fc3bc4ac82d0df",
+          "after": "f182507511ada9dfb14b8f924ad85ecdf01137d62cfb52fc622539a04a6e4ecd"
+        },
+        {
+          "path": "flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py",
+          "before": "0fcee311c7e529809c30ed023ca7fa1d66a7864fec8f2cd58ff7a3d184c8f14f",
+          "after": "75f1ce66e7b386c546aeee8e7480bb3d2eb66d6fae580b97f0871a7da03eba96"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_bf16_glu/epilogue_bf16.py",
+          "before": "286ca794c4b1a2dda28686dbba2eef970f406d04d45c10b0865637338b1f37c7",
+          "after": "689416b9d17a4430cab37ee8cc57d42ec12e5e6db52ab87212e59ddfc2848947"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_bf16_glu/kernel_bf16_glu_fc12.py",
+          "before": "21db5b96576338369ef7950827b5a54e854fca5e8c68f199bc10bffb847b761c",
+          "after": "f43a0ea839c949a0fc980a95c764faf63102243ef8a271736fc918109e9a6107"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_bf16_glu/mega_reference_bf16.py",
+          "before": "fa28ad8207b32b1df826e6f2c0dea651feccaba4ae3c90bc5213fdafbc4711b8",
+          "after": "f080ab4c16eb83d29aba8785635bddbfd4c8a1265aaf089dfe509fb1c5d12c46"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_mxfp8_bf16_glu/kernel_mxfp8_bf16_glu_fc12.py",
+          "before": "88911bf6ed5ffc27cff2c083d2b2fd33da8fa2dd4b150c84f6f8cda502628d42",
+          "after": "2028f2813d193ce8f31aa7b63b59e00e7601fce92f2dc32b08bf75d2581bf8aa"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_mxfp8_glu/epilogue_mxfp8.py",
+          "before": "e0a2ee264065d07164db08c34660cc12bd1b08c555e91a2776ed072584e5e56e",
+          "after": "86771035426b7ce291c31051172ca9221de5fedfafdfd666a4dd01b3d3335a01"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_mxfp8_glu/kernel_mxfp8_glu_fc12.py",
+          "before": "6bd4c9d08d88f5bb7e68d8f2b1400e50788cdbc08178c5fed950ba1e08e9e19c",
+          "after": "b6758b616a676c4b45f831a42fbd10bd76ebea6e2d2d842e782bb06313b1bfdd"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/benchmark_p2p.py",
+          "before": "7488192028d53a11cc8096cda1cbc65fdc047f2a068699094204a6ab0d95a6de",
+          "after": "ff543fc5d15f5c4892beb60786c14f54112d00e4c61b8bb349796d7029e30a96"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/epilogue.py",
+          "before": "ed601642c43db4535bf5685e3d52e207f91a13bf0701c6152ae6cb91457360b5",
+          "after": "25f9566d254a10c3bc31324555098b042ed70e10ce10b8e6a4035700132becaa"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/epilogue_refactor.py",
+          "before": "471c99a432b055d31b6980217e4ce2c6ab8a56dab05978137978d9ff43fb4bf8",
+          "after": "f82dd1fe8a1d6a67df223a58e1ac5e4792473e2043468b0d717990c07faf26b8"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/kernel_fc12.py",
+          "before": "eecee8c2bc080abe4ff179416ca4c562a92d097e5c65ebdc9125382e8773cef5",
+          "after": "ec7c6beb64972248e680f92a5667b58349f83cc99564e26d6a9ae14db8792bc1"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/mega_reference.py",
+          "before": "b1ee93f294f1a2ece76d3ceb5333a71ceb729f8a1cf04819540c3eb87bf67be0",
+          "after": "5a6232710ded15a9aad9fe8e0393d0fa85ca8b5c99f3d67374a31a016b68b628"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/src/dispatch_kernel.py",
+          "before": "cdfea8a7b1d54bdbb3bb732e02f8400969862e004df57a3d74ef99f23d154252",
+          "after": "9769128599c68216dab51dcdaec0455a2022e3bdbfd5d4d36cca8f419485a9f5"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/src/inputs_process.py",
+          "before": "0f6a5d2d0000900065aec89e46616cfe27e4c9068760ce3fa60a5f9daa8854b2",
+          "after": "a87d06bbb68e2e8fc46df43be97aad2ef9c016fcbae0ffe123fda6b0bbbf74fd"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/shim/dependencies.py",
+          "before": "bb51648766e34e7cbc9d581106ca8a913fb46180eb059114719097b375663135",
+          "after": "bcdfdba754a55659ac71d62582c767cf5276b1222cd3ce5ab211277b39b20458"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/communication/nvlink_domain/token_comm.py",
+          "before": "68277503373924b3263a96cdcd1d38a386c76315fa39801b455c54eb124fc10d",
+          "after": "d62c8ad2e2628547e206634cf8d84909e9c4fbe2cabe0b0b435f552d8f0b5e3a"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_epilogue.py",
+          "before": "b4e8bf2729618064678aa11cc5c38476626f13cd97d40f675a9fbe3ced71dd02",
+          "after": "d0ad627bdaa6da2d84edae098e0b971f260fe4812acbcfc352d3bd1387cdb0e8"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py",
+          "before": "af86579a8b1c6dc90d42c735b40cc616a6906183a0e1c7bd35744a818fe69fac",
+          "after": "7f67e861dfd3608e716843a09a4e2a136633d1071a8c0abebc66f73267569291"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py",
+          "before": "3273d50b2eab07b68914161d3c92ff70fa685e8389e3f0ab6d3431efe1eb90c8",
+          "after": "950d027b9bd64664feb9d0afe7f190ae91625501d03786c3205181dfb7cc145c"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py",
+          "before": "c71337d9b8acbdffb3ca6fe1f1d1b66c01cece61b8277f5639fe040ab3854f57",
+          "after": "13c20bd96f756175e475aefeb313f61dcdaf5a068d18b84b0f0110a2c34dd65e"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py",
+          "before": "b356ed44504ae395374c027b58689aa09be021a0eeed0c01a4f2edcd453bbd4f",
+          "after": "9640d37a3df5a924426333eb6b92e6510701fc96a13a5225f721b90464888775"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/token_comm_gen_specialized.py",
+          "before": "c2779bd060bbbc32d472c08e78df8533138c07d9f8a61d82ee0769d77370931a",
+          "after": "243a133c3f47036857445f3d3b72416d135a069e7b27bad5ae393992e6269879"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_mxfp8_glu/epilogue_mxfp8.py",
+          "before": "0bae0e42fb0e746e6e253c3146ee9fb6d21ecba4c46c1fdf8f90e59462682f57",
+          "after": "7316fc60353b9f46895968feeac65bdf7ff12d0aa9452fef36151845e7612aaf"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_mxfp8_glu/kernel_mxfp8_glu_fc12.py",
+          "before": "1f0128469903be0497d9adbae50d5966d7744f2c77c1f8e7bb8b9a6bc156b3a4",
+          "after": "b361831436275ec634e664f441656f0843a9d37cd4161119717073ad68f0a28d"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/benchmark_p2p.py",
+          "before": "0a73008a084d479a1819274e1bb9264bfeebbadc5e4989f113a556e7d5301c33",
+          "after": "b6668fff6bcc8595959535f54c0d7a9e725cafda02acbaf06438c7d2248f8566"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue.py",
+          "before": "fd1f48f5af4d4b9c5bddaee8e04e4b0886faa25cc00f437b80bc2ef3e8d04685",
+          "after": "f53d74ccf70548f9b8c6cfe933882ee627cc0a38bea92d9ed7a268302be1542d"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue_refactor.py",
+          "before": "a601e5961759615b338b5b136bf3c62991e884ee6a6b7641a94ac60ec82bcc7d",
+          "after": "3931801eadc211bc83d91c7f135da8fe0caeeb2be4815e0de18ea47d6c4ad520"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/kernel_fc12.py",
+          "before": "57b782120a1be09f5de06c77d6973760a9cffe311cfdd819ed121b0708acae8d",
+          "after": "1484b0ecbca96c73d6842715252a3f1ef60330b965cf2a3667ae6318bb87026c"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_nvfp4_swapab/mega_reference.py",
+          "before": "011190885f72a0380271fb43979099b5a31c64695e6d95b9309d604098e5033d",
+          "after": "c21f4199e27b8cfc3c1cb78a9e0d4b1d3133214acfdc9cd04f17523409e38987"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/moe_sm120_mxfp8_swapab/kernel_fc12.py",
+          "before": "f83f1ed8e46f54338a86cf0d2c5caa6538e833f267317ccfdc5ef55207fa022a",
+          "after": "93a2e92c31609fa13361e54c99cd2adf8e9491cc8169853f99c8bfd2ff868a9e"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/src/dispatch_kernel.py",
+          "before": "cdfea8a7b1d54bdbb3bb732e02f8400969862e004df57a3d74ef99f23d154252",
+          "after": "9769128599c68216dab51dcdaec0455a2022e3bdbfd5d4d36cca8f419485a9f5"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/src/src/inputs_process.py",
+          "before": "ead7a60eb400fc61ed8f8ccedce1475df63407d5b7984b5c9a126a3c745dc8de",
+          "after": "74ea104f3b52de7bba41670907e6f6a393c8009d78f67d62f1fdadbddeaeacf0"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/epilogue_fp8.py",
+          "before": "8e75ab4d57c84676ed343dc0e992498aa0776e6984172965e9aa86e116f9849b",
+          "after": "f31fd71785328d25957dd1512ab19c2af1c8b8211acb370b68962d1ee4b10262"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/epilogue_fp8_swapab.py",
+          "before": "4fa558039c4812c774d90eeb6882bdaf3f87bed67862092ebc19434dd68a7464",
+          "after": "7757f00b15ed157018e7394614675751b8c9033f05b5cbcb937c8bd3c6df8eef"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/kernel_fp8_glu_fc12.py",
+          "before": "1d036065bae58ed43ec0d849543e05ff7a4417d3aa9138a035dae67c5f40b465",
+          "after": "da4c52c9048e269cd3647e1cae914beedbb3baeca915f961bb3869d41b76d4b7"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_hopper_fp8/kernel_fp8_glu_fc12_swapab.py",
+          "before": "10d87e7d203a064c79f72c0121bb6f91dd8182471a1a6301cd0f65f689b8568d",
+          "after": "996065c4005ce5a7948a94a9feca27a1c014b7a0b9e139877319fb24357a39be"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/benchmark_p2p.py",
+          "before": "0a73008a084d479a1819274e1bb9264bfeebbadc5e4989f113a556e7d5301c33",
+          "after": "b6668fff6bcc8595959535f54c0d7a9e725cafda02acbaf06438c7d2248f8566"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue.py",
+          "before": "fd1f48f5af4d4b9c5bddaee8e04e4b0886faa25cc00f437b80bc2ef3e8d04685",
+          "after": "f53d74ccf70548f9b8c6cfe933882ee627cc0a38bea92d9ed7a268302be1542d"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/epilogue_refactor.py",
+          "before": "6395d764d1a3380b073cd22b9a4eeac3b8c482ca9424bc72f35ed6aeb453ca4d",
+          "after": "83e269da28ebfcdee1910997ed51f2c1469ef2c7fa434ec5b0e84e2135cefb8b"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/kernel_fc12.py",
+          "before": "57b782120a1be09f5de06c77d6973760a9cffe311cfdd819ed121b0708acae8d",
+          "after": "1484b0ecbca96c73d6842715252a3f1ef60330b965cf2a3667ae6318bb87026c"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/moe_nvfp4_swapab/mega_reference.py",
+          "before": "953ddb34c496307130d41cc5845097a6457f4a0b46ddbdaf7641ccb9aaf43ca4",
+          "after": "49ff3c20099c9e879d69a7141ef42b19e59cb119e888101f98ccd15b6a0d571d"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/src/dispatch_kernel.py",
+          "before": "cdfea8a7b1d54bdbb3bb732e02f8400969862e004df57a3d74ef99f23d154252",
+          "after": "9769128599c68216dab51dcdaec0455a2022e3bdbfd5d4d36cca8f419485a9f5"
+        },
+        {
+          "path": "flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/src/src/inputs_process.py",
+          "before": "7d7c3ec6caf750e07fd20538f2d61fa61f3f3f275f27d4356d45636cfae137b2",
+          "after": "da6a2279a5a18e37189d2c35493b42a9a51ae85cc5adb691fdd659fbefdd4286"
+        },
+        {
+          "path": "flashinfer/msa_ops/cute_dsl/proxy_score_fp4_sm12x.py",
+          "before": "a2d0c0bc133ced86541c487fc8971b7651e1bbdc60f9af6e954f545c20e5906c",
+          "after": "b051448c2d7f0c30808551ccae6918fc387240629467d0ae59131452ca5af7bb"
+        },
+        {
+          "path": "flashinfer/msa_ops/cute_dsl/proxy_score_sm12x.py",
+          "before": "adbbe1eda6f5c5cecacc2a9eea25890a6eb4f730f4b97469a910ec39ead4088c",
+          "after": "eeb4d50c97d84352b0a96bc7becd5843ac37516cf48c9cc024b5590d379559a9"
+        },
+        {
+          "path": "flashinfer/msa_ops/cute_dsl/sparse_decode_sm12x.py",
+          "before": "384545ceffc3c63b48436e0533f80fd1f84f7c181088f3a8d01ecb994aed2f57",
+          "after": "e5e4e9a11e6996dd35287c493858581fbff1b411e8579a5008f36b10fa9e2415"
+        },
+        {
+          "path": "flashinfer/msa_ops/cute_dsl/sparse_prefill_sm12x.py",
+          "before": "cfdee49ee968868dee7ce1a0b4e2b62a79e2af8990a3961178388d209627a32f",
+          "after": "58cf073e81b8a1ea9bf2f2cca0b7a3cb1c91346563e6671bcdf247cf75dab1f4"
+        },
+        {
+          "path": "flashinfer/msa_ops/cute_dsl/topk_select_chunked_sm12x.py",
+          "before": "498cc3b880fbde88a623eb14e4122b96ec520c3433d284e85a55c35f627ffe03",
+          "after": "9def3259deabfc7ca7d9e40653702e8a7baf2cc9826e73dcfa2327d81f7b8195"
+        },
+        {
+          "path": "flashinfer/msa_ops/cute_dsl/topk_select_countrank_sm12x.py",
+          "before": "8381b2fb9d7e8b7ce7c6805b35da415aa0b563bb3e6fa2c32fd815b341d565d6",
+          "after": "c7980f795e3c973b07f5e6a56280fda9051e2ffbe66587486c27ef8445aa51e2"
+        },
+        {
+          "path": "flashinfer/msa_ops/cute_dsl/topk_select_radix_sm12x.py",
+          "before": "143495e486b675753cc8acfd01061e984dbdd5cbb7539ed0cb8ab90527d34c60",
+          "after": "70e63233a03e889f51b4f4c1bd24537f914026fc8b8e9ce0daf7df43d04f50fb"
+        },
+        {
+          "path": "flashinfer/norm/kernels/fused_add_rmsnorm.py",
+          "before": "e2ed311cf8e4fe9fea3f6aa997ac220322acc6781524b129e9ffbeb8f19c2d5e",
+          "after": "920d41ffe5746cbdd62618788f78d2a50c5469494f4a15b99b752e1347345fa6"
+        },
+        {
+          "path": "flashinfer/norm/kernels/layernorm.py",
+          "before": "123dd99aa37202ee499654e80c39c2edef5517b5b8b1e46c70885619c885fff0",
+          "after": "2471169b847ad1eaa7fa0b0b6139c348e0be5a24203d7e544210659352696283"
+        },
+        {
+          "path": "flashinfer/norm/kernels/rmsnorm.py",
+          "before": "7d42251b7a880af07799b26ddcfc768857d74c617755f1bcd35623cba241f114",
+          "after": "5cd4b1706944d1c5c8ed05b1e448ad1b4eb7c28263fc80628c6452bec1ed31cb"
+        },
+        {
+          "path": "flashinfer/prims_ts/batched_gemm/batched_gemm_kernel.py",
+          "before": "8963ccf24821db00f9ab405f3e9ccbbea96734211929acdd8962ae817800a556",
+          "after": "d70fb5995eb3956e5c5f88f60a4da26cf311a2c344a7b8b57cebbc5e46639367"
+        },
+        {
+          "path": "flashinfer/quantization/kernels/mxfp4_quantize.py",
+          "before": "b7eb8073517c286180b2312bf9888d9df5a9624681abe29b4c5f56008f0b2c4b",
+          "after": "39e1fd99be0f62cc4618dbd131c58502e9f2496e10f5e2f940349458f5c0e2bd"
+        },
+        {
+          "path": "flashinfer/quantization/kernels/mxfp8_quantize.py",
+          "before": "129253948841a8cced637da0df14049c32b8dbdebe1ddcdcceac6853fa899d30",
+          "after": "e253804b95a3072a6a510994acb3e055da4345eb9188cf718f5ab7ecc12192b9"
+        },
+        {
+          "path": "flashinfer/quantization/kernels/nvfp4_quantize.py",
+          "before": "88550172a3923e6e3417d151b22b0a97d5581bc9abc378d705d737058b4a6304",
+          "after": "52e32a305cfd9f52937cc56892ea1e7c26fe1bea531b8b11fc031484bef3cfdb"
+        },
+        {
+          "path": "flashinfer/topk_varlen/kernels/block_scan.py",
+          "before": "017c8cf2250401bfd66913be93fea959e37284fe00e4b952f0bf50cb3a5920d8",
+          "after": "105238c45789212ae546ead16739195f719eb4328fe12247804332d6d360eb10"
+        },
+        {
+          "path": "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
+          "before": "ebdbd8daf311bb582e3566c98ab78b996b16513de6e649e0d636ec01b7dffc04",
+          "after": "9ebfef3d0bfdd6ade4c1c4bcbc0d6beb4706f0e55dcb3d3245337cfec6a50596"
+        },
+        {
+          "path": "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
+          "before": "497500d8ad733968513b27ffee95cda046115e59f4bb3b454246336e01d22225",
+          "after": "d8ea6667701613872ea0aa0fb3983e188c0f9188d126d4a107e39f49c7df2671"
+        },
+        {
+          "path": "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
+          "before": "3ddfb1e022b282d8b25921ec70a9eb32dee6fd887a60177bc0ad99630aa691fc",
+          "after": "b3d141c1beb182e558d4c40ddf5a63e32d906206b7f39b5cc46ecb9a143f9636"
+        },
+        {
+          "path": "flashinfer/topk_varlen/kernels/radix_topk.py",
+          "before": "5de8a36c6e7f4b5fb8596fead55fae3421c16ca615f3ce6664f37fa25c322c8d",
+          "after": "2d80cd0b452cf7b4fb2d1abd65c4abbdeaf58f2945e94a3d530542456281feb6"
+        }
+      ]
+    },
+    {
+      "name": "tokenspeed-fa4",
+      "version": "4.0.0.post20260923",
+      "root": "flash_attn",
+      "patch": "tokenspeed-fa4-4.0.0.post20260923.patch",
+      "files": [
+        {
+          "path": "flash_attn/cute/blackwell_helpers.py",
+          "before": "134679d00bdc93a10b69611269782911812bc0c19f0d30eb472e1d21dd3dc423",
+          "after": "24fbbc9c5afd61b2c11f311304f5d77b487735dd0718d9f586d4d35bbfa7859e"
+        },
+        {
+          "path": "flash_attn/cute/compute_block_sparsity.py",
+          "before": "88a668f6a418f4bae08c810426d0fd6a43834f7c7cf8653599a62f5c46a4e92c",
+          "after": "51d73c434da6bd0691470ef6c7d017e0a6bc083b2ca5da348b72c5b3c83d73df"
+        },
+        {
+          "path": "flash_attn/cute/cu_blocks_kernel.py",
+          "before": "aebbf862f2b90d13f3b1c50ee79ef49ce7babec7f61d37cfcd426bf2ab113a09",
+          "after": "c1ed5fdecf7845456f7497e20bbf90d0bf05211059e2dbee9c13aac05166f090"
+        },
+        {
+          "path": "flash_attn/cute/flash_bwd.py",
+          "before": "80cb6bfb436160d73b7214529f94d28b7333c98dff75a53d20552eb33645fea2",
+          "after": "d672c8d187c87a3dcde70361bfd749f46dca9af332cf60a4d56bac3b57aaccdd"
+        },
+        {
+          "path": "flash_attn/cute/flash_bwd_mla_dk_sm100.py",
+          "before": "10990b4471c9d137726280f8e582c5400ef26b2e85aebaa08097ec00d85f1cff",
+          "after": "bd279f7ef47c4a978c87dd228df20a655e5137066c87059cbab98b97bd84fcd1"
+        },
+        {
+          "path": "flash_attn/cute/flash_bwd_mla_dq_dqv_sm100.py",
+          "before": "84546f26b52ce6cd2887e12711dc26f777ab35d0b9451cf3a7629e6c5c8c358e",
+          "after": "3ba48e7190a862f316d22371bae41f4ab8ff605159474e4a05a9b16b2d5efe87"
+        },
+        {
+          "path": "flash_attn/cute/flash_bwd_mla_sm100.py",
+          "before": "7add176d5a739b0fe63597559fe040f7cd58c016ba39716c98f5d6080b3f689e",
+          "after": "c8411f897cfb79ac69bc73cf8cb11e6904d287fa952721d483ad7a0daac84aa4"
+        },
+        {
+          "path": "flash_attn/cute/flash_bwd_postprocess.py",
+          "before": "df88b299cb938197abc145c3a85262515d1d810633229d0f929239e8291e8ce8",
+          "after": "5394b08dc821429235cb67b13db78dd38434b046f5716178e809a0bdf78a8166"
+        },
+        {
+          "path": "flash_attn/cute/flash_bwd_sm100.py",
+          "before": "448b189cf4a12a67cb1e3efbb7e5eb38b37a2fc921a1835454b6ac679a6bf408",
+          "after": "f39048af179ab1295d475ad3f211de0f08ea2b83591e71cfdaccf811ebd12655"
+        },
+        {
+          "path": "flash_attn/cute/flash_bwd_sm120.py",
+          "before": "ad2d802c97dbf654fd03724bcfa91702b18acec8518e5dd4a33f137ba238bf7d",
+          "after": "3fc8a3434ffd60fdf1fd0c839c5bb9b004eeffc17f02016100cd9e0f15792a9f"
+        },
+        {
+          "path": "flash_attn/cute/flash_bwd_sm90.py",
+          "before": "2170fcc979bd6843e73fb81133e3af23fc4d73e29b537a41a5e9a3f06492d840",
+          "after": "19324d60fea5595749f670ec598d9f6846f0df90c0a4d3dfe91024a0190a6c77"
+        },
+        {
+          "path": "flash_attn/cute/flash_fwd.py",
+          "before": "e9d890e10611ce48dc57c40570a7b65d1ab802c508f785e5536fb10044db65f3",
+          "after": "1e834049c8bf1ce1980be800ca5e90e68feaf5c7aa045db7a421c9e961738128"
+        },
+        {
+          "path": "flash_attn/cute/flash_fwd_combine.py",
+          "before": "f8e7f1369b892a0e4b6175e2980966348390b0ee3b1014ba195292653ebee1ae",
+          "after": "ba1caf57d825e7eaed6bee6968b963d101105c68ba8af6d4cedb178d7699a4d1"
+        },
+        {
+          "path": "flash_attn/cute/flash_fwd_mla_sm100.py",
+          "before": "d73a9e5629b2e5af21622763674de63af430740723b84d8cd93c49f2f57392be",
+          "after": "2326c790d34551180376198b19c3f8a221b9cf937da4f1a4063f7e009f5ca6f1"
+        },
+        {
+          "path": "flash_attn/cute/flash_fwd_sm100.py",
+          "before": "f5928a15a7aa559084d14aa12cc2c95efdc89c7b3a1f0d20219b24103a32456f",
+          "after": "282f1786d93b240af90f5be2d46f91701f2dbf2dba7642a251eec34ce49437e0"
+        },
+        {
+          "path": "flash_attn/cute/flash_fwd_sm120.py",
+          "before": "abd017add69914e46f0fcfc017ad51c3d07d79fd87d15f969036ddd82bcc7da2",
+          "after": "276cabd5381a28b77cabb6015c9c9f70c52b27b2a1335a70c2b936ce63ddff44"
+        },
+        {
+          "path": "flash_attn/cute/flash_fwd_sm90.py",
+          "before": "0261f8c67cef82cbfb3125637be1ade912fc9afd0ccc33d8bb5e1de9236eef1c",
+          "after": "9fec007575d8004fcdf4322b50f000e69202e769d5bde589c5f3d6d617bb8692"
+        },
+        {
+          "path": "flash_attn/cute/mma_sm100_desc.py",
+          "before": "ac6ec28b2f1a4b797c391a7807b88f83b430452d418262c3dfa7b0f3516e39f9",
+          "after": "efa02020a9685d5ac246a2af3623d884f167d1213cd7fd5fce99b6fff9b48b95"
+        },
+        {
+          "path": "flash_attn/cute/paged_kv.py",
+          "before": "95e84b59b3b3f84cefaa33e477332a9a1f311ef51f42960a3968a0d1eee8665a",
+          "after": "da5b59b0cfca490c1e0b297ecc230a5d6ad99c41bd26705b27306d24455a40a5"
+        },
+        {
+          "path": "flash_attn/cute/prepare_scheduler.py",
+          "before": "6823d3033f88acf91d664ce127928d73a37629afd9fd376b03ae76130c180cb8",
+          "after": "16809af8858ac209e9a262c788f66de836027ab618de6101682883ca6ed304cb"
+        },
+        {
+          "path": "flash_attn/cute/sm100_hd256_2cta_fmha_backward_dkdvkernel.py",
+          "before": "891ec6b0526eeecc9c59b8d43c4d23719d9efd4b8c722d806e0c680ca972801b",
+          "after": "4ae4eef706362a63afdda6a02205a21058f0b897f16953d90c3ef96c0834a40a"
+        },
+        {
+          "path": "flash_attn/cute/sm100_hd256_2cta_fmha_backward_dqkernel.py",
+          "before": "1aea91ccd068be8b6c88621ba995d86168955bcfc9326fd3c8a94a36db0c4e7f",
+          "after": "d476f08e92f042ded2d1632369707c3a56fa75ea0b9185a6464a3e5bc6bb56aa"
+        },
+        {
+          "path": "flash_attn/cute/sm100_hd256_2cta_fmha_forward.py",
+          "before": "7bc1fefbff85ac503115ee64a61440b1973b91b8c8bca376b25589e964c5f160",
+          "after": "7935b840690e95a1b056da7919a8a1f4e07343a66b077bbc7cebc7c3515d3782"
+        },
+        {
+          "path": "flash_attn/cute/tile_scheduler.py",
+          "before": "569393dcbdd91a8c873ebce93e8e9928f1b31d5bd9784fa2303683f1162da0c2",
+          "after": "c1c8d8bc0faa0857a3e7de01f00fc6c580f3e4ccd9172cd71aaadd012b965b50"
+        },
+        {
+          "path": "flash_attn/cute/utils.py",
+          "before": "c80d6ef6a62d005ac259829cf69c675f5f570ed93768d296e46e210768194c08",
+          "after": "5dc1232b2f55d62419db743c31f85a0b1afc070ead1a07f8e2c785d31e230913"
+        }
+      ]
+    },
+    {
+      "name": "tokenspeed-quack",
+      "version": "0.6.4.post20260923",
+      "root": "quack",
+      "patch": "tokenspeed-quack-0.6.4.post20260923.patch",
+      "files": [
+        {
+          "path": "quack/cache/async_compile.py",
+          "before": "249c927410503016c5cbc6f4ecc376a51bd856c729e8e5e123ce43a67c8af61b",
+          "after": "9ba0d170f905bb9e48f8d13a959e110af8bc222e1c85bfa9ffdb3a468e343edc"
+        },
+        {
+          "path": "quack/complex.py",
+          "before": "5a660d75ef55dd90cb68eb7bb6d0a78c7e03c5a85a9f8f8fbcb7e81c71d4fa3a",
+          "after": "9f455ddde766ea0a2dd170d3508f4d2cc1cc13ac1609866c2bd38552d456ce88"
+        },
+        {
+          "path": "quack/copy_utils.py",
+          "before": "99b43655339c99aa6c0e74fad94ba9904c21a5065deed7f4f36281c0b26d25b0",
+          "after": "14700c8705b7df151f22110a4be91cb200ecdd32960f929ee116d09d5a27a57f"
+        },
+        {
+          "path": "quack/cross_entropy.py",
+          "before": "e69483657c1272bb3b2ef7ea5839f9e81f64ebd1b1a03966158b46d3ace12fe0",
+          "after": "8d142e020b48f37f24f659a69394e6dd7c2876c6b7e75e7addb23af700771ba0"
+        },
+        {
+          "path": "quack/epilogue/ops.py",
+          "before": "0129211a55a5689b804b94a21f139a990ae248dadebf411a2bc747b669e0cdd3",
+          "after": "47d471a9d683c2e1cfffb6407ce362192d16c233688922986d200f14843dea65"
+        },
+        {
+          "path": "quack/epilogue/quantize_out.py",
+          "before": "cd4e0da5a74bd9d4f911bdda3b90aeede7cc04d7f67ccddd22858093ef8a8bba",
+          "after": "b17525a950313974066185beab3be310f80b5f1f1f56b4f2548d0f29cf981d06"
+        },
+        {
+          "path": "quack/fast_math.py",
+          "before": "4781e18b037d523d3e7f1e517b4e2253761219743d175fd56a0b410173c42cd4",
+          "after": "a2d4e231505b2554920bfb3dd698a67c4a0f7ff9c48e79f2a7a93ccfdf4ad117"
+        },
+        {
+          "path": "quack/gemm_base.py",
+          "before": "2847a1f3b536fcb29eb2a3f454735efc940f5e0b7c3d9e3820aed6ad11fd75ad",
+          "after": "2786deef6e80868a182806c8d2ba9e30780a64d4fdd9aa3fe5ca4889155cfa74"
+        },
+        {
+          "path": "quack/gemm_sm100.py",
+          "before": "a60ed28ddd2bb45ee4b054bcec9bbc50bbc7a3beeb86a12798037bfa85b13215",
+          "after": "f67b5b43b56b6e169abfcce231ec7fbb58ca65de697b69157adad029606a170f"
+        },
+        {
+          "path": "quack/gemm_sm120.py",
+          "before": "d14e5c3b7cf2722b6b236b1ffcf270e74cb871b9ef081e7f5c4c8db8967ff0b0",
+          "after": "2434a3ce6b3a52b4c103c34340ae1ddc7b3a209cfe4e3a65ac3246c73deef0a1"
+        },
+        {
+          "path": "quack/gemm_sm80.py",
+          "before": "40af41818594ca59d34b2d55f563052fa866d8a0f01b3a228bb384ad74cb1a06",
+          "after": "75f1de30e5e59c1d57c4ffc6cb01fce6d164613d71fa493ded0aaa16a1ff2aac"
+        },
+        {
+          "path": "quack/gemm_sm90.py",
+          "before": "aa0090ba8890ae3b41f22564c03a612fd70ebc1c22dd8d5ae801cf8f3ae81388",
+          "after": "448b17dc8253dd37d24390206203f9b14bd2c53a666f67abd4314433edac611c"
+        },
+        {
+          "path": "quack/reduction_base.py",
+          "before": "801185dff436d1cb9141f153c6980056932053bff0e716b0ec82fdd8558ecc3d",
+          "after": "91d764a45166793ddb76c1b48e64b14546f1d26033023660f5280ef174ae8297"
+        },
+        {
+          "path": "quack/rms_final_reduce.py",
+          "before": "cc0904bf4a8c21a27efb74bdc328854acb890004395adbc24a60bac83fd306f8",
+          "after": "e78eaf46a27f197330a29855757c4b3a3344a5b358748ee7ace3467e2a583ee5"
+        },
+        {
+          "path": "quack/rmsnorm.py",
+          "before": "f3fa67597b39b4eae227b13f80f54df4ddb7acc8cf6b7310342bc627c2a9d61b",
+          "after": "5a4e3ca71050e4fc652526f6975fc20bb16e7ce53b5f3246fbacdb5a31291977"
+        },
+        {
+          "path": "quack/rmsnorm_config.py",
+          "before": "5cb2fda1917dbed125c772c3075a7640f07c5264f9b926c35b2a3d1a79261772",
+          "after": "5c28421b55a4640ca2c51622e6a420c9997a965a86f2ae59b5a06b9eb10cd7b0"
+        },
+        {
+          "path": "quack/rotary.py",
+          "before": "21956bde45a1eb3386dc5721e4df89f1fa2d0a0df5283851ec8cbad794b01fde",
+          "after": "6bf83ce4f953ca9c1107e7c552a2ae4902798832a0251e652e447a15cbf5b69c"
+        },
+        {
+          "path": "quack/sm90_utils.py",
+          "before": "7a8537490c17e213e7deeb526c0a8bbfa97c5cc7066cbb69bf604a3c0da0567b",
+          "after": "c089903cf38352e16c2a671b7923c83c938441275addf4f1af332101a9686145"
+        },
+        {
+          "path": "quack/softmax.py",
+          "before": "1b2097bd328ab27c42e54d65f12fadf9b799d54917c5a83827299ece70ee8e7c",
+          "after": "221ffbf785e923dcab96315ff022b53f355621b6bf9819eb6c8bee6cad977410"
+        },
+        {
+          "path": "quack/spec/mma.py",
+          "before": "dd249088c9249dc6f7bee6a873d0e4afaf3bbc807111fee2727b1d589bf9ab9f",
+          "after": "00ab826e30674879e058ab3b492d30509fb5f73c89d137d5f8951d30cba78289"
+        },
+        {
+          "path": "quack/spec/smem.py",
+          "before": "d4c6bd507f9f8d9bb75467c8a801fc99aa79e3bf7c517eb31c5a9fdfc523f640",
+          "after": "92f2c5947b54f6473e17963000694a5408d04828912d701e94a98d05d166f810"
+        },
+        {
+          "path": "quack/spec/tensor_spec.py",
+          "before": "f2f098660f667141441ea24123c1e3901b460b8ece74b68ca5fdfa206d4690bd",
+          "after": "6fc0c43192ce24c3b35a7cf6843e12182c6ba7fbf0f18860ed74d1acdb438884"
+        },
+        {
+          "path": "quack/tensormap_manager.py",
+          "before": "b702cb7424bab3cf81098221e1761d3ed1375d7e0e0004879259ec1acb339cf8",
+          "after": "b58b552c2919cf4de64c11fc96ee4a7b829738469c5f343d54e85afc3674df5a"
+        },
+        {
+          "path": "quack/topk.py",
+          "before": "f477b78053fd306ba9d7e1500613dcc28efde1e2e4c601fd1431179188f06cf3",
+          "after": "6da03fd2c84785681de99ac8c789b4bcb3992642c4b1c009d910f3d16bcd06e2"
+        },
+        {
+          "path": "quack/transform/hadamard.py",
+          "before": "498fdc3b86128740da88489e624a9fa382a4cdce8f722a0bdcea2e8933b9c44d",
+          "after": "58f0a6a40fa1d29459c7415dccd7e8dda150018657f5a5fe757186bacca9c0a2"
+        }
+      ]
+    }
+  ]
+}

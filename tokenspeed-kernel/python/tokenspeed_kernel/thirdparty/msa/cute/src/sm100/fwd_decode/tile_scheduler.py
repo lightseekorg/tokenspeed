@@ -15,7 +15,7 @@ from typing import Tuple
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from quack.cute_dsl_utils import ParamsBase
 from src.common.tile_scheduler import SchedulingMode, WorkTileInfo
 
@@ -34,7 +34,7 @@ class DecodeTileScheduler:
     class Params(ParamsBase):
         work_capacity: Int32
         num_heads_kv: Int32
-        num_heads_kv_divmod: FastDivmodDivisor
+        num_heads_kv_divmod: FastDivmodDivisorV2
         total_tasks: Int32
         cluster_shape_m: cutlass.Constexpr[int] = 1
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
@@ -73,7 +73,7 @@ class DecodeTileScheduler:
         return DecodeTileScheduler.Params(
             args.work_capacity,
             args.num_heads_kv,
-            FastDivmodDivisor(args.num_heads_kv),
+            FastDivmodDivisorV2(args.num_heads_kv),
             total_tasks,
             cluster_shape_m=args.cluster_shape_mn[0],
             scheduling_mode=scheduling_mode,

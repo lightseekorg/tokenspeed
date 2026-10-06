@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.tensor_utils
 import cutlass.utils as cute_utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cuda.bindings.driver import CUstream
@@ -310,7 +311,7 @@ class FusedGatedResidualKernel:
         t2r = tcgen05.make_tmem_copy(
             sm100_utils.get_tmem_load_op(
                 (tile_m, self.n, 128),
-                cute_utils.LayoutEnum.COL_MAJOR,
+                cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
                 cutlass.Float32,
                 cutlass.Float32,
                 tile,
@@ -458,8 +459,8 @@ class FusedGatedResidualKernel:
         down_mma = sm100_utils.make_trivial_tiled_mma(
             dtype,
             dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             cutlass.Float32,
             self.group,
             (self.down_m, self.n),
@@ -467,8 +468,8 @@ class FusedGatedResidualKernel:
         up_mma = sm100_utils.make_trivial_tiled_mma(
             dtype,
             dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             cutlass.Float32,
             self.group,
             (self.up_m, self.n),

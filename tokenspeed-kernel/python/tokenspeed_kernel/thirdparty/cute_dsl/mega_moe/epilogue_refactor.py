@@ -19,6 +19,7 @@ from typing import Any, Callable, List, Literal, Optional, Tuple, Type, Union
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
+import cutlass.tensor_utils
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir import ir
@@ -1159,7 +1160,7 @@ class SwapABSwigluFp4Epilogue:
     ) -> Union[cute.Layout, cute.ComposedLayout]:
         layout = sm100_utils.make_smem_layout_epi(
             self.fc1_output_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
+            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
             (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize),
             n_stages,
         )

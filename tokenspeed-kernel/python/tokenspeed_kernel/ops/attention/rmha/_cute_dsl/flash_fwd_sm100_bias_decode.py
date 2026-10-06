@@ -48,6 +48,7 @@ from typing import NamedTuple, Tuple, Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
@@ -1373,7 +1374,7 @@ class FlashAttentionDecodeSm100Bias:
         smem_alloc_bits += o_stages * pipe_stage_bits  # o in tmem
         alignment_bits = 1024 - (smem_alloc_bits % 1024)
         # K, V
-        smem_capacity_bits = utils.get_smem_capacity_in_bytes("sm_100") * 8
+        smem_capacity_bits = cutlass.memory.get_smem_capacity_in_bytes("sm_100") * 8
         remaining_bits = smem_capacity_bits - smem_alloc_bits - alignment_bits
         kv_stage_bits = (
             k_stage_bits
@@ -2189,7 +2190,7 @@ class FlashAttentionDecodeSm100Bias:
         # Smem alloc helper
         svector_align = 16
         stensor_align = 128
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         # No multicast
         mcast_coord = 0

@@ -7,8 +7,6 @@ This keeps the local fake-layout -> real-layout epilogue needed by the lean
 sparse forward path.
 """
 
-# Modified Step 7: O_out write with SMEM fake->real column permutation.
-# O_partial dim is in STG.128 fake layout; O_out dim is real layout.
 import math
 from functools import partial
 from typing import Optional, Type
@@ -16,9 +14,13 @@ from typing import Optional, Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+
+# Modified Step 7: O_out write with SMEM fake->real column permutation.
+# O_partial dim is in STG.128 fake layout; O_out dim is real layout.
+import cutlass.memory
 import torch
 from cutlass import Boolean, Float32, Int32, Int64, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cute.nvgpu import cpasync
 from src.common import utils
 from src.common.cute_dsl_utils import assume_tensor_aligned, torch2cute_dtype_map
@@ -447,8 +449,8 @@ class SparseAttentionForwardCombine:
             else Int32(cu_seqlens.shape[0] - 1)
         )
 
-        seqlen_divmod = FastDivmodDivisor(seqlen)
-        head_divmod = FastDivmodDivisor(num_head)
+        seqlen_divmod = FastDivmodDivisorV2(seqlen)
+        head_divmod = FastDivmodDivisorV2(num_head)
 
         grid_dim = (
             cute.ceil_div(seqlen * num_head, self.tile_m),
@@ -496,7 +498,7 @@ class SparseAttentionForwardCombine:
     def decode_flat_row_idx(
         self,
         idx: Int32,
-        head_divmod: FastDivmodDivisor,
+        head_divmod: FastDivmodDivisorV2,
     ):
         """Decode flattened tile rows under the H_q-innermost contract."""
         q_idx_local, head_idx = divmod(idx, head_divmod)
@@ -527,8 +529,8 @@ class SparseAttentionForwardCombine:
         gmem_tiled_copy_O: cute.TiledCopy,
         gmem_tiled_copy_LSE: cute.TiledCopy,
         s2r_tiled_copy_LSE: cute.TiledCopy,
-        seqlen_divmod: FastDivmodDivisor,
-        head_divmod: FastDivmodDivisor,
+        seqlen_divmod: FastDivmodDivisorV2,
+        head_divmod: FastDivmodDivisorV2,
         use_pdl: cutlass.Constexpr[bool],
         varlen: cutlass.Constexpr[bool],
     ):
@@ -545,7 +547,7 @@ class SparseAttentionForwardCombine:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sLSE = storage.sLSE.get_tensor(smem_layout_lse)
         sLSE_temperature = storage.sLSETemperature.get_tensor(smem_layout_lse)

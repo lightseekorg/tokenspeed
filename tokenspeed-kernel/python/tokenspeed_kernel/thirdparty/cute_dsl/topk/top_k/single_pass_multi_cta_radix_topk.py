@@ -28,8 +28,8 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.typing import Int32 as CuteInt32
 from cutlass.cute.typing import Pointer as CutePointer
 from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.memory import SmemAllocator
 from cutlass.utils.distributed import atomicAdd
-from cutlass.utils.smem_allocator import SmemAllocator
 from tokenspeed_kernel.platform import pdl_enabled
 
 from ..utils import (

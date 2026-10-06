@@ -12,6 +12,7 @@ from typing import Callable, Optional
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 from cutlass import Float32, Int32, const_expr
 from quack.cute_dsl_utils import ParamsBase
 
@@ -279,7 +280,7 @@ class ShearingBias:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane_idx = cute.arch.lane_idx()
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         sPreBias = storage.sPreBias.get_tensor(sPreBias_layout)

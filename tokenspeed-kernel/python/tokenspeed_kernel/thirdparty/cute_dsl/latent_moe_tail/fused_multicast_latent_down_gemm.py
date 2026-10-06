@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import torch
 from cutlass import BFloat16, Float32, Int64, const_expr
 from cutlass.cute.runtime import from_dlpack
@@ -247,7 +248,7 @@ class FusedMulticastLatentDownGemm:
             (num_rows, outputs_per_block, num_warps),
             stride=(outputs_per_block * num_warps, num_warps, 1),
         )
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         partials = smem.allocate_tensor(
             Float32,
             smem_layout,

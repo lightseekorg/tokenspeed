@@ -300,6 +300,10 @@ else
     echo "No tokenspeed-fa4 pin found in ${THIRDPARTY_REQ}; skipping FA4 reinstall."
 fi
 
+# Pinned wheels still call APIs deprecated by CuTe DSL 4.8. Verify and migrate
+# their source before any runtime or kernel test imports the dependencies.
+python3 "${SCRIPT_DIR}/patch_cute_dsl_dependencies.py"
+
 # ============================================================
 # Step 9: Fix Triton ptxas (CUDA 13+ only)
 # ============================================================

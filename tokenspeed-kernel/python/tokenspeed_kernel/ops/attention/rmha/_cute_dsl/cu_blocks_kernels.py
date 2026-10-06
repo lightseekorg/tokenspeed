@@ -8,6 +8,7 @@ from typing import Callable
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 from cutlass import Int32
 
 from .fmha_bias_helper import get_batch_from_cu_tensor
@@ -60,7 +61,7 @@ class CuSeqlensToBlocksKernel:
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         warp_block_count = storage.warp_block_count.get_tensor(
             cute.make_layout(self.num_warps)

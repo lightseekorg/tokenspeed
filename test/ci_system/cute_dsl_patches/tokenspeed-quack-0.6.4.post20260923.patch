@@ -1,0 +1,205 @@
+--- quack/cache/async_compile.py
++++ quack/cache/async_compile.py
+@@ -190 +190 @@
+-    from cutlass.utils import get_smem_capacity_in_bytes
++    from cutlass.memory import get_smem_capacity_in_bytes
+--- quack/complex.py
++++ quack/complex.py
+@@ -23,0 +24 @@
++import cutlass.memory
+@@ -234 +235 @@
+-    Wraps `cutlass.utils.SmemAllocator.allocate_tensor(Complex64, ...)` and
++    Wraps `cutlass.memory.SmemAllocator.allocate_tensor(Complex64, ...)` and
+--- quack/copy_utils.py
++++ quack/copy_utils.py
+@@ -2,0 +3 @@
++import cutlass.tensor_utils
+@@ -15 +16,2 @@
+-from cutlass.utils import LayoutEnum, block_copy
++from cutlass.tensor_utils import LayoutEnum
++from cutlass.utils import block_copy
+@@ -562 +564 @@
+-    layout_c: cutlass.utils.LayoutEnum,
++    layout_c: cutlass.tensor_utils.LayoutEnum,
+--- quack/cross_entropy.py
++++ quack/cross_entropy.py
+@@ -3,0 +4 @@
++import cutlass.memory
+@@ -139 +140 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -482 +483 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- quack/epilogue/ops.py
++++ quack/epilogue/ops.py
+@@ -15,0 +16 @@
++import cutlass.tensor_utils
+@@ -85 +86 @@
+-    layout = cutlass.utils.LayoutEnum.from_tensor(tensor)
++    layout = cutlass.tensor_utils.LayoutEnum.from_tensor(tensor)
+@@ -916 +917 @@
+-        layout = cutlass.utils.LayoutEnum.from_tensor(tensor)
++        layout = cutlass.tensor_utils.LayoutEnum.from_tensor(tensor)
+@@ -1005 +1006 @@
+-                transpose=layout != cutlass.utils.LayoutEnum.ROW_MAJOR,
++                transpose=layout != cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
+@@ -1258 +1259 @@
+-        setattr(gemm, self._layout_gemm_attr(), cutlass.utils.LayoutEnum.from_tensor(tensor))
++        setattr(gemm, self._layout_gemm_attr(), cutlass.tensor_utils.LayoutEnum.from_tensor(tensor))
+--- quack/epilogue/quantize_out.py
++++ quack/epilogue/quantize_out.py
+@@ -30,0 +31 @@
++import cutlass.tensor_utils
+@@ -254 +255 @@
+-            val_layout = cutlass.utils.LayoutEnum.from_tensor(val_tensor)
++            val_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(val_tensor)
+--- quack/fast_math.py
++++ quack/fast_math.py
+@@ -24 +24 @@
+-    lean form without the add-back correction the stock cute FastDivmodDivisor
++    lean form without the add-back correction the stock cute FastDivmodDivisorV2
+--- quack/gemm_base.py
++++ quack/gemm_base.py
+@@ -13 +13 @@
+-from cutlass.utils import LayoutEnum
++from cutlass.tensor_utils import LayoutEnum
+--- quack/gemm_sm100.py
++++ quack/gemm_sm100.py
+@@ -4,0 +5 @@
++import cutlass.memory
+@@ -25 +26 @@
+-from cutlass.utils import LayoutEnum
++from cutlass.tensor_utils import LayoutEnum
+@@ -565 +566 @@
+-            cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
++            cutlass.memory.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
+@@ -1172 +1173 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -1199 +1200 @@
+-        tmem = cutlass.utils.TmemAllocator(
++        tmem = cutlass.memory.TmemAllocator(
+--- quack/gemm_sm120.py
++++ quack/gemm_sm120.py
+@@ -29,0 +30 @@
++import cutlass.memory
+@@ -403 +404 @@
+-        self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(f"sm_{self.arch}")
+@@ -820 +821 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- quack/gemm_sm80.py
++++ quack/gemm_sm80.py
+@@ -5,0 +6 @@
++import cutlass.memory
+@@ -123 +124 @@
+-        return cutlass.utils.get_smem_capacity_in_bytes(f"sm_{arch}")
++        return cutlass.memory.get_smem_capacity_in_bytes(f"sm_{arch}")
+--- quack/gemm_sm90.py
++++ quack/gemm_sm90.py
+@@ -5,0 +6 @@
++import cutlass.memory
+@@ -21 +22,2 @@
+-from cutlass.utils import LayoutEnum, SmemPartition
++from cutlass.tensor_utils import LayoutEnum
++from cutlass.utils import SmemPartition
+@@ -288 +290 @@
+-        self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes("sm_90")
++        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_90")
+@@ -380 +382 @@
+-            self.mma_a_dtype,
++            self.mma_a_dtype, self.mma_a_dtype,
+@@ -464 +466 @@
+-            cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
++            cutlass.memory.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
+@@ -954 +956 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- quack/reduction_base.py
++++ quack/reduction_base.py
+@@ -2,0 +3 @@
++import cutlass.memory
+@@ -71 +72 @@
+-        self, smem: cutlass.utils.SmemAllocator, tv_layout: cute.Layout
++        self, smem: cutlass.memory.SmemAllocator, tv_layout: cute.Layout
+--- quack/rms_final_reduce.py
++++ quack/rms_final_reduce.py
+@@ -5,0 +6 @@
++import cutlass.memory
+@@ -81 +82 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- quack/rmsnorm.py
++++ quack/rmsnorm.py
+@@ -2,0 +3 @@
++import cutlass.memory
+@@ -171 +172 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -770 +771 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- quack/rmsnorm_config.py
++++ quack/rmsnorm_config.py
+@@ -331 +331 @@
+-    from cutlass.utils import SmemAllocator
++    from cutlass.memory import SmemAllocator
+--- quack/rotary.py
++++ quack/rotary.py
+@@ -2,0 +3 @@
++import cutlass.memory
+@@ -151 +152 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- quack/sm90_utils.py
++++ quack/sm90_utils.py
+@@ -11 +11 @@
+-from cutlass.utils import LayoutEnum
++from cutlass.tensor_utils import LayoutEnum
+--- quack/softmax.py
++++ quack/softmax.py
+@@ -2,0 +3 @@
++import cutlass.memory
+@@ -107 +108 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+@@ -297 +298 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- quack/spec/mma.py
++++ quack/spec/mma.py
+@@ -13 +13 @@
+-from cutlass.utils import LayoutEnum
++from cutlass.tensor_utils import LayoutEnum
+--- quack/spec/smem.py
++++ quack/spec/smem.py
+@@ -12 +12 @@
+-from cutlass.utils import LayoutEnum
++from cutlass.tensor_utils import LayoutEnum
+--- quack/spec/tensor_spec.py
++++ quack/spec/tensor_spec.py
+@@ -47 +47 @@
+-from cutlass.utils import LayoutEnum
++from cutlass.tensor_utils import LayoutEnum
+--- quack/tensormap_manager.py
++++ quack/tensormap_manager.py
+@@ -9 +9,2 @@
+-from cutlass.utils import TensorMapUpdateMode, TensorMapManager
++from cutlass.tensor_utils import TensorMapUpdateMode
++from cutlass.utils import TensorMapManager
+--- quack/topk.py
++++ quack/topk.py
+@@ -2,0 +3 @@
++import cutlass.memory
+@@ -364 +365 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()
+--- quack/transform/hadamard.py
++++ quack/transform/hadamard.py
+@@ -2,0 +3 @@
++import cutlass.memory
+@@ -692 +693 @@
+-        smem = cutlass.utils.SmemAllocator()
++        smem = cutlass.memory.SmemAllocator()

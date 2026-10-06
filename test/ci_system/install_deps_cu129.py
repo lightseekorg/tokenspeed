@@ -231,6 +231,13 @@ def main() -> None:
             PYPI,
         )
     pip_install(["--no-build-isolation", "-e", str(workspace / "python")], PYPI)
+    subprocess.run(
+        [
+            sys.executable,
+            str(workspace / "test/ci_system/patch_cute_dsl_dependencies.py"),
+        ],
+        check=True,
+    )
     subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
 
 

@@ -33,6 +33,7 @@ from typing import Optional, Tuple, Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import torch
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.arch.nvvm_wrappers import FULL_MASK
@@ -345,7 +346,7 @@ class ReductionBase:
         )
 
     def _allocate_reduction_buffer_and_mbar(
-        self, smem: cutlass.utils.SmemAllocator, tv_layout: cute.Layout
+        self, smem: cutlass.memory.SmemAllocator, tv_layout: cute.Layout
     ) -> Tuple[cute.Tensor, Optional[cute.Pointer]]:
         reduction_buffer = smem.allocate_tensor(
             self.reduction_dtype,
@@ -488,7 +489,7 @@ class ArgmaxKernel(ReductionBase):
         mO_idx = domain_offset_i64((bidx * tiler_mn[0],), mO_idx)
         cX = cute.local_tile(idX, tiler_mn, (bidx, cluster_y))
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sX = smem.allocate_tensor(
             mX.element_type,
             cute.make_ordered_layout(tiler_mn, order=(1, 0)),

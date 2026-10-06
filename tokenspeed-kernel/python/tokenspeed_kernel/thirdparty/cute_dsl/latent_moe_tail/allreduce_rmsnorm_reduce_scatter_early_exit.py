@@ -11,6 +11,7 @@ from typing import Any
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
@@ -544,7 +545,7 @@ class AllReduceRMSNormWithReduceScatterEarlyExit:
                     init_val=Float32(0.0),
                     reduction_profile=0,
                 )
-                smem = cutlass.utils.SmemAllocator()
+                smem = cutlass.memory.SmemAllocator()
                 warp_sums = smem.allocate_tensor(
                     Float32, cute.make_layout((self.warps,)), byte_alignment=4
                 )

@@ -27,6 +27,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.testing as testing
+import cutlass.memory
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 
 # Compat shim: setmaxregister_{decrease,increase} added in cutlass-dsl 4.4;
@@ -34,12 +35,12 @@ from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 _setmaxregister_decrease = getattr(
     cute.arch,
     "setmaxregister_decrease",
-    getattr(cute.arch, "warpgroup_reg_dealloc", None),
+    getattr(cute.arch, "setmaxregister_decrease", None),
 )
 _setmaxregister_increase = getattr(
     cute.arch,
     "setmaxregister_increase",
-    getattr(cute.arch, "warpgroup_reg_alloc", None),
+    getattr(cute.arch, "setmaxregister_increase", None),
 )
 
 # Compat shim: get_max_tmem_alloc_cols added in cutlass-dsl 4.4;
@@ -708,6 +709,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         p_major_mode = OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
+            self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.acc_dtype,
@@ -716,6 +718,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.v_dtype,
+            self.v_dtype,
             p_major_mode,
             self.v_major_mode,
             self.acc_dtype,
@@ -723,6 +726,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.mma_pv_tiler[:2],
         )
         ws_tiled_mma_epi = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -735,6 +739,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             ),
         )
         ws_tiled_mma_splitn_epi = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -1294,16 +1299,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = cutlass.memory.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
             arch=self.arch,
         )
 
@@ -1884,7 +1889,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         local_split_kv = cute.ceil_div(k_tile_total - k_tile_lo, max(1, k_tile_per_cta))
 
         # Alloc shared memory
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         # LSE phase: one weight per lane of warp 0
         reducer_scale_count = (
             ceil_div(self.reducer_max_splits, self.threads_per_warp)

@@ -18,7 +18,9 @@ from typing import Callable, Optional
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import cutlass.pipeline as cutlass_pipeline
+import cutlass.tensor_utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass import Float32, Int32, Int64, const_expr
@@ -284,7 +286,7 @@ class SparseDecodeAttentionForwardSm100:
         if const_expr(mLSE_partial is not None):
             mLSE_partial = assume_tensor_aligned(mLSE_partial)
         mO_epilogue = mO_partial if const_expr(self.split_kv) else mO
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO_epilogue)
+        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO_epilogue)
         self.epi_tile = (self.m_block_size, self.head_dim)
 
         # ------------------------------------------------------------------
@@ -296,16 +298,18 @@ class SparseDecodeAttentionForwardSm100:
         cta_group = tcgen05.CtaGroup.ONE
         tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             Float32,
             cta_group,
             self.mma_tiler_qk[:2],
         )
         tiled_mma_pv = sm100_utils.make_trivial_tiled_mma(
             self.v_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.v_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
             Float32,
             cta_group,
             self.mma_tiler_pv[:2],
@@ -611,7 +615,7 @@ class SparseDecodeAttentionForwardSm100:
         # class in __call__ (Phase 1.3).  Every warp materialises the same
         # storage view; later phases populate sQ/sK/sV/mbar contents.
         # ------------------------------------------------------------------
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         # sQ is the MMA-operand layout and now also the Q TMA load target:
         # PackGQA makes the global Q view match the full BSA (tile_m, D) tile.
@@ -635,8 +639,8 @@ class SparseDecodeAttentionForwardSm100:
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
             num_threads=tmem_alloc_threads,
         )
-        tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = cutlass.memory.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
         )

@@ -9,6 +9,8 @@ from typing import Literal, Optional, Tuple, Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
+import cutlass.tensor_utils
 
 # Keep these as separate handlers (NOT a tuple `except (A, B)`): CuteDSL's
 # preprocessor import-walker (cutlass-dsl 4.5.0) raises AttributeError on
@@ -191,7 +193,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.epi_reg_cnt = 256
         self.task_reg_cnt = 72
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
     def name(self) -> str:
@@ -1017,10 +1019,10 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.b_dtype: Type[cutlass.Numeric] = activation_gemm.element_type
         self.fc1_output_dtype: Type[cutlass.Numeric] = fc1_output_gemm.element_type
         self.sf_dtype: Type[cutlass.Numeric] = fc1_weight_sf_gemm.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
             fc1_weight_gemm
         ).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
             activation_gemm
         ).mma_major_mode()
 
@@ -1442,7 +1444,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # MegaMoE-only ``token_comm_storage``: standalone SMEM region whose
@@ -1499,7 +1501,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             barrier_id=self.tmem_alloc_sync_bar_id,
             num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_id)),
         )
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],
@@ -1613,7 +1615,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # ════════════════════════════════════════════════════════════════════
         if warp_idx == self.sched_warp_id:
             if cutlass.const_expr(self.enable_token_comm):
-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
+                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
 
             # MegaMoE subclass uses this hook to wait for this CTA's
             # dispatch warps to finish ``_dispatch_barrier`` -- only then
@@ -1650,7 +1652,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # ── TMA-A warp (warp 5) ─────────────────────────────────────────────
         if warp_idx == self.tma_a_warp_id:
             if cutlass.const_expr(self.enable_token_comm):
-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
+                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
 
             a_full_mcast_mask = None
             sfa_full_mcast_mask = None
@@ -1835,7 +1837,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # ── TMA-B warp (warp 6) ─────────────────────────────────────────────
         if warp_idx == self.tma_b_warp_id:
             if cutlass.const_expr(self.enable_token_comm):
-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
+                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
 
             b_full_mcast_mask = None
             sfb_full_mcast_mask = None
@@ -2121,7 +2123,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # Both phases share tiled_mma and TMEM; only K-tile count differs.
         if warp_idx == self.mma_warp_id:
             if cutlass.const_expr(self.enable_token_comm):
-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
+                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
 
             tCrA = tiled_mma.make_fragment_A(sA)
             tCrB = tiled_mma.make_fragment_B(sB)
@@ -2281,7 +2283,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         #     after each fc1 task tile (release side of fc1->fc2 protocol)
         if warp_idx < self.mma_warp_id:
             if cutlass.const_expr(self.enable_token_comm):
-                cute.arch.warpgroup_reg_alloc(self.epi_reg_cnt)
+                cute.arch.setmaxregister_increase(self.epi_reg_cnt)
 
             tmem.allocate(self.num_tmem_alloc_cols)
             tmem.wait_for_alloc()
@@ -2327,7 +2329,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # to fc1 -> arrive on dispatch-to-sched NamedBarrier).
         if cutlass.const_expr(self.enable_token_comm):
             if warp_idx >= self.dispatch_warp_id[0]:
-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
+                cute.arch.setmaxregister_decrease(self.task_reg_cnt)
 
                 lane_idx_for_dispatch = cute.arch.lane_idx()
                 if cutlass.const_expr(self.token_back_standalone):

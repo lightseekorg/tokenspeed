@@ -20,6 +20,7 @@ Validated on SM100 only.
 from functools import cache
 
 import cutlass
+import cutlass.memory
 import torch
 from cuda.bindings.driver import CUstream
 from cutlass import Float8E4M3FN, Float16, Float32, Int32, Int64, Uint32, cute
@@ -171,7 +172,7 @@ class IndexDecodeScoreKernel:
         Q_TILES = cute.ceil_div(BLOCK_Q, MMA_N)
         EPI_Q = Q_TILES * MMA_N
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sK = smem.allocate_tensor(
             dtype,
             K_tma.smem_layout.outer,

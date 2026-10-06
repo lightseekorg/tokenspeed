@@ -4,7 +4,8 @@
 `ffddc5abd188f308adb5a2906112c2b1e7192d7d`:
 `tensorrt_llm/_torch/cute_dsl_kernels/blackwell/blockwise_gemm/blockwise_gemm.py`.
 Its original Apache-2.0 and BSD-3-Clause notices are retained; local source
-changes are limited to repository formatting. The adapter uses
+changes include the CuTe DSL 4.8 API migration (explicit tensor/memory imports,
+MMA operand types, register limits and scalar pointers). The adapter uses
 the upstream dynamic-shape wrapper; it does not require importing TensorRT-LLM.
 
 The contract is E4M3 A[M,K], E4M3 B[N,K], FP32 activation scales [M,K/128],
@@ -18,6 +19,10 @@ The adapter selects a tile by token count, not a runtime autotuning loop.
 The adapter passes the current PyTorch stream on every launch, so the same
 call path works in eager execution, auxiliary streams, and CUDA graphs.
 Input pointers and stream handles are never cached.
+
+The static tile scheduler is vendored under `thirdparty/cute_dsl/` from
+CUTLASS commit `0b55a2f691d69981583568fd9eb69687b1f0de8a`, retaining its
+BSD-3-Clause notice. Its FastDivmod parameters use the V2 serialization contract.
 
 The registered op has reference priority to preserve automatic selection.
 Use the prepared plan via `--dense-gemm-backend trtllm_cutedsl` to opt in.

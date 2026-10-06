@@ -10,8 +10,9 @@ from typing import Optional, Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 from cutlass import Boolean, Float32, Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cute.nvgpu import cpasync
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
@@ -313,9 +314,9 @@ class FlashAttentionForwardCombine:
             else Int32(cu_seqlens.shape[0] - 1)
         )
 
-        # Create FastDivmodDivisor objects for efficient division
-        seqlen_divmod = FastDivmodDivisor(seqlen)
-        head_divmod = FastDivmodDivisor(num_head)
+        # Create FastDivmodDivisorV2 objects for efficient division
+        seqlen_divmod = FastDivmodDivisorV2(seqlen)
+        head_divmod = FastDivmodDivisorV2(num_head)
 
         grid_dim = (
             cute.ceil_div(seqlen * num_head, self.tile_m),
@@ -370,8 +371,8 @@ class FlashAttentionForwardCombine:
         gmem_tiled_copy_O: cute.TiledCopy,
         gmem_tiled_copy_LSE: cute.TiledCopy,
         s2r_tiled_copy_LSE: cute.TiledCopy,
-        seqlen_divmod: FastDivmodDivisor,
-        head_divmod: FastDivmodDivisor,
+        seqlen_divmod: FastDivmodDivisorV2,
+        head_divmod: FastDivmodDivisorV2,
         varlen: cutlass.Constexpr[bool],
     ):
         # Thread and block indices
@@ -388,7 +389,7 @@ class FlashAttentionForwardCombine:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sLSE = storage.sLSE.get_tensor(smem_layout_lse)
         sMaxValidSplit = storage.sMaxValidSplit.get_tensor((self.tile_m,))
@@ -449,7 +450,7 @@ class FlashAttentionForwardCombine:
                 mi = tLSEcLSE[0, 0, m][1]  # Get m coordinate
                 idx = m_block * self.tile_m + mi
                 if idx < max_idx:
-                    # Calculate actual sequence position and head using FastDivmodDivisor
+                    # Calculate actual sequence position and head using FastDivmodDivisorV2
                     if const_expr(not varlen):
                         head_idx, m_idx = divmod(idx, seqlen_divmod)
                     else:

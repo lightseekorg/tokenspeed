@@ -10,9 +10,10 @@ from typing import Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.memory
 import torch
 from cutlass import Float32, Int32, Int64, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cute.nvgpu import cpasync
 from src.common.cute_dsl_utils import assume_tensor_aligned, torch2cute_dtype_map
 
@@ -215,7 +216,7 @@ class SparseDecodeForwardCombine:
         total_q = mO.shape[0]
         head_q = mO.shape[1]
         batch = mSplitCounts.shape[0]
-        head_divmod = FastDivmodDivisor(head_q)
+        head_divmod = FastDivmodDivisorV2(head_q)
         grid = (
             cute.ceil_div(seqlen_q * head_q, self.tile_m),
             cute.ceil_div(self.head_dim, self.k_block_size),
@@ -264,7 +265,7 @@ class SparseDecodeForwardCombine:
         gmem_tiled_copy_O: cute.TiledCopy,
         gmem_tiled_copy_LSE: cute.TiledCopy,
         s2r_tiled_copy_LSE: cute.TiledCopy,
-        head_divmod: FastDivmodDivisor,
+        head_divmod: FastDivmodDivisorV2,
         total_q: Int32,
         head_q: Int32,
         seqlen_q: Int32,
@@ -273,7 +274,7 @@ class SparseDecodeForwardCombine:
         tidx, _, _ = cute.arch.thread_idx()
         m_block, k_block, batch_idx = cute.arch.block_idx()
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sLSE = storage.sLSE.get_tensor(smem_layout_lse)
         sMaxValidSplit = storage.sMaxValidSplit.get_tensor((self.tile_m,))
