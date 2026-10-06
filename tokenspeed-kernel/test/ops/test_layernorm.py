@@ -324,7 +324,7 @@ def test_reference_rmsnorm_matches_eager_cast_order(
         reference_rmsnorm(x, weight[:-1], eps, None)
 
 
-@pytest.mark.parametrize("hidden_size", [128, 4096, 5120])
+@pytest.mark.parametrize("hidden_size", [128, 2560, 4096, 5120])
 @pytest.mark.parametrize("with_x2", [False, True])
 @pytest.mark.parametrize("with_fp8", [False, True])
 @pytest.mark.parametrize("pdl", [False, True])

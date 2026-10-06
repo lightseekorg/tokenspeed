@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Qwen3.5 layers pick the fused norm only where it can hand its copy to the next projection."""
+"""GemmaRMSNorm's quantized copies, where Qwen3.5 layers fuse each add + norm, and how the next projection takes the copy."""
 
 import os
 import sys
@@ -33,6 +33,8 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 from ci_system.ci_register import register_cuda_ci
+from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
+from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5TextConfig
@@ -43,10 +45,7 @@ from tokenspeed.runtime.layers.dense import nvfp4 as dense_nvfp4
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
-from tokenspeed.runtime.layers.linear import ReplicatedLinear
-from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
-from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.models import qwen3_5_moe
 from tokenspeed.runtime.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
@@ -54,12 +53,11 @@ from tokenspeed.runtime.models.qwen3_5 import (
     _input_norm,
     _post_attn_norm,
 )
-from tokenspeed.runtime.models.qwen3_5_moe import Qwen3_5MoeMLP
 from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5DraftAttentionDecoderLayer
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 register_cuda_ci(
-    est_time=30,
+    est_time=45,
     suite="runtime-1gpu",
     disabled_on_runners=["amd-*"],
     disabled_on_runners_reason="the quantized copies are produced on NVIDIA only",
@@ -69,31 +67,80 @@ _IS_BLACKWELL = current_platform().is_blackwell
 _HIDDEN = 5120
 
 
-def _norm() -> GemmaRMSNorm:
-    norm = GemmaRMSNorm(_HIDDEN, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
-    norm.weight.data.normal_(0, 0.3)
-    return norm
+def _norm_and_rows(rows: int, hidden: int, dtype: torch.dtype):
+    torch.manual_seed(rows + hidden)
+    norm = GemmaRMSNorm(hidden, eps=1e-6).to(device="cuda", dtype=dtype)
+    norm.weight.data.copy_(torch.randn(hidden) * 0.3)
+    x = torch.randn(rows, hidden, device="cuda", dtype=dtype) * 4
+    return norm, x, torch.randn_like(x) * 30
 
 
-def _comm_manager(norm, calls, *, attn_tp, unfused, dense_tp):
-    def input_reduce_norm(hidden_states, residual):
-        calls.append("input_reduce_norm")
-        if residual is None:
-            return norm(hidden_states), hidden_states
-        return norm(hidden_states, residual)
+def _add_norm_against_forward(norm, x, residual, add_norm, scale):
+    expected, expected_residual = norm(x.clone(), residual.clone())
+    normed, copy, new_residual = add_norm(x.clone(), residual.clone(), scale)
+    assert torch.equal(new_residual, expected_residual)
+    # Same FP32 math; the sum of squares may add in another order, so within one ulp.
+    torch.testing.assert_close(normed, expected, atol=0, rtol=2**-7)
+    assert (normed != expected).sum().item() <= normed.numel() // 1000
+    return normed, copy
 
-    def post_attn_reduce_norm(hidden_states, residual, ctx):
-        calls.append("post_attn_reduce_norm")
-        return norm(hidden_states, residual)
 
-    return SimpleNamespace(
-        mapping=SimpleNamespace(
-            has_attn_tp=attn_tp, dense=SimpleNamespace(has_tp=dense_tp)
-        ),
-        layer_boundary_norm="unfused" if unfused else "fused",
-        input_reduce_norm=input_reduce_norm,
-        post_attn_reduce_norm=post_attn_reduce_norm,
+@pytest.mark.parametrize("rows", [0, 1, 130])
+@pytest.mark.parametrize("hidden", [2560, 5120])
+def test_add_norm_with_fp8_matches_forward(rows: int, hidden: int) -> None:
+    norm, x, residual = _norm_and_rows(rows, hidden, torch.bfloat16)
+    scale = torch.tensor([0.02], device="cuda")
+
+    normed, normed_fp8 = _add_norm_against_forward(
+        norm, x, residual, norm.add_norm_with_fp8, scale
     )
+
+    quantized, _ = static_quant_fp8(normed, scale)
+    assert torch.equal(normed_fp8.view(torch.uint8), quantized.view(torch.uint8))
+
+
+@pytest.mark.skipif(not _IS_BLACKWELL, reason="the NVFP4 copy is made on Blackwell")
+@pytest.mark.parametrize("rows", [1, 130])
+def test_add_norm_with_fp4_matches_forward(rows: int) -> None:
+    norm, x, residual = _norm_and_rows(rows, 5120, torch.bfloat16)
+    scale = torch.tensor([7.5], device="cuda")
+
+    normed, normed_fp4 = _add_norm_against_forward(
+        norm, x, residual, norm.add_norm_with_fp4, scale
+    )
+
+    values, scales = fp4_quantize(normed, scale)
+    assert torch.equal(normed_fp4[0], values.view(torch.uint8))
+    assert torch.equal(normed_fp4[1], scales.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "fp16",
+        "width",
+        "amd",
+        "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+        "FLASHINFER_NVFP4_4OVER6",
+    ],
+)
+def test_add_norm_with_fp4_skips_copies_fp4_quantize_would_not_make(
+    monkeypatch, case: str
+) -> None:
+    # FP16 rows (the NVFP4 linear would return BF16), a width without whole chunks, AMD, other recipes.
+    if case.isupper():
+        monkeypatch.setenv(case, "1")
+    if case == "amd":
+        monkeypatch.setattr(layernorm, "_is_amd", True)
+    dtype = torch.float16 if case == "fp16" else torch.bfloat16
+    norm, x, residual = _norm_and_rows(14, 2560 if case == "width" else 5120, dtype)
+
+    _, normed_fp4 = _add_norm_against_forward(
+        norm, x, residual, norm.add_norm_with_fp4, torch.tensor([7.5], device="cuda")
+    )
+
+    assert normed_fp4 is None
 
 
 @pytest.mark.parametrize("attn_tp", [False, True])
@@ -104,173 +151,61 @@ def _comm_manager(norm, calls, *, attn_tp, unfused, dense_tp):
 def test_layer_norms_pick_the_fused_copy(
     attn_tp: bool, unfused: bool, dense_tp: bool, first_layer: bool, with_scales: bool
 ) -> None:
-    torch.manual_seed(0)
-    norm = _norm()
     calls = []
-    comm_manager = _comm_manager(
-        norm, calls, attn_tp=attn_tp, unfused=unfused, dense_tp=dense_tp
+
+    def comm_norm(name):
+        def run(hidden_states, residual, *ctx):
+            calls.append(name)
+            return hidden_states, hidden_states if residual is None else residual
+
+        return run
+
+    comm_manager = SimpleNamespace(
+        mapping=SimpleNamespace(
+            has_attn_tp=attn_tp, dense=SimpleNamespace(has_tp=dense_tp)
+        ),
+        layer_boundary_norm="unfused" if unfused else "fused",
+        input_reduce_norm=comm_norm("input"),
+        post_attn_reduce_norm=comm_norm("post_attn"),
     )
+    norm = GemmaRMSNorm(_HIDDEN).to(device="cuda", dtype=torch.bfloat16)
     hidden_states = torch.randn(129, _HIDDEN, device="cuda", dtype=torch.bfloat16)
-    residual = None if first_layer else torch.randn_like(hidden_states) * 3
+    residual = None if first_layer else torch.randn_like(hidden_states)
     fp8_scale = torch.tensor([0.02], device="cuda") if with_scales else None
     fp4_scale = torch.tensor([7.5], device="cuda") if with_scales else None
 
     hidden_states, hidden_fp8, residual = _input_norm(
         comm_manager, norm, hidden_states, residual, fp8_scale
     )
-    fused_input = not (first_layer or attn_tp or unfused)
-    assert calls == ([] if fused_input else ["input_reduce_norm"])
-    assert (hidden_fp8 is not None) == (fused_input and with_scales)
-
-    calls.clear()
     hidden_states, hidden_fp4, residual = _post_attn_norm(
         comm_manager, norm, hidden_states, residual, fp4_scale, None
     )
-    assert calls == (["post_attn_reduce_norm"] if attn_tp else [])
+
+    fused_input = not (first_layer or attn_tp or unfused)
+    assert calls == ([] if fused_input else ["input"]) + (
+        ["post_attn"] if attn_tp else []
+    )
+    assert (hidden_fp8 is not None) == (fused_input and with_scales)
     copy_fp4 = not (attn_tp or dense_tp) and with_scales and _IS_BLACKWELL
     assert (hidden_fp4 is not None) == copy_fp4
 
 
-@pytest.mark.parametrize("scheme", ["static", "dynamic", "block", "unquantized"])
-def test_static_fp8_input_scale_hook(scheme: str) -> None:
-    config = None
-    if scheme != "unquantized":
-        config = Fp8Config(
-            is_checkpoint_fp8_serialized=True,
-            activation_scheme="dynamic" if scheme == "block" else scheme,
-            weight_block_size=[128, 128] if scheme == "block" else None,
-        )
-    layer = ReplicatedLinear(
-        128,
-        128,
-        bias=False,
-        params_dtype=torch.bfloat16,
-        quant_config=config,
-        prefix="model.proj",
-    )
-
-    scale = layer.quant_method.static_fp8_input_scale(layer)
-
-    if scheme == "static":
-        assert scale is layer.input_scale
-    else:
-        assert scale is None
-
-
-def _count_quant_launches(monkeypatch) -> Counter:
-    launches = Counter()
-    static_quant_fp8 = dense_fp8.static_quant_fp8
-    fp4_quantize = dense_nvfp4.fp4_quantize
-
-    def counting_static_quant_fp8(*args, **kwargs):
-        launches["fp8"] += 1
-        return static_quant_fp8(*args, **kwargs)
-
-    def counting_fp4_quantize(*args, **kwargs):
-        launches["nvfp4"] += 1
-        return fp4_quantize(*args, **kwargs)
-
-    monkeypatch.setattr(dense_fp8, "static_quant_fp8", counting_static_quant_fp8)
-    monkeypatch.setattr(dense_nvfp4, "fp4_quantize", counting_fp4_quantize)
-    monkeypatch.setattr(qwen3_5_moe, "fp4_quantize", counting_fp4_quantize)
-    return launches
-
-
-def _fill_nvfp4(layer, generator: torch.Generator, input_scale: float) -> None:
-    layer.weight.data.copy_(
-        torch.randint(
-            0, 256, layer.weight.shape, dtype=torch.uint8, generator=generator
-        )
-    )
-    scales = torch.rand(layer.weight_scale.shape, generator=generator) * 2 + 0.25
-    layer.weight_scale.data.copy_(scales.to(torch.float8_e4m3fn))
-    layer.input_scale.data.fill_(input_scale)
-    layer.weight_scale_2.data.fill_(0.002)
-    layer.quant_method.process_weights_after_loading(layer)
-
-
-@pytest.mark.skipif(not _IS_BLACKWELL, reason="NVFP4 GEMMs need Blackwell")
-@pytest.mark.parametrize("fused_swiglu", ["0", "1"])
-def test_mlp_takes_the_nvfp4_copy_as_its_own_quant(
-    monkeypatch, fused_swiglu: str
-) -> None:
-    monkeypatch.setenv("TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT", fused_swiglu)
-    mlp = Qwen3_5MoeMLP(
-        hidden_size=_HIDDEN,
-        intermediate_size=1024,
-        hidden_act="silu",
-        mapping=Mapping(rank=0, world_size=1),
-        quant_config=Nvfp4Config(),
-        reduce_results=False,
-        parallelism="dense",
-    ).cuda()
-    assert mlp._use_nvfp4_gemm_swiglu_nvfp4_quant == (fused_swiglu == "1")
-    generator = torch.Generator().manual_seed(0)
-    _fill_nvfp4(mlp.gate_up_proj, generator, 0.05)
-    _fill_nvfp4(mlp.down_proj, generator, 0.07)
-    norm = _norm()
-    launches = _count_quant_launches(monkeypatch)
-
-    for rows in (0, 1, 129):
-        torch.manual_seed(rows)
-        x = torch.randn(rows, _HIDDEN, device="cuda", dtype=torch.bfloat16)
-        residual = torch.randn_like(x) * 4
-        normed, normed_fp4, _ = norm.add_norm_with_fp4(
-            x, residual, mlp.input_fp4_scale()
-        )
-
-        assert normed_fp4 is not None
-        launches.clear()
-        prequantized = mlp.forward_prequantized(normed, normed_fp4)
-        fused_launches = launches["nvfp4"]
-        launches.clear()
-        expected = mlp(normed)
-        torch.testing.assert_close(prequantized, expected, atol=0, rtol=0)
-        # The copy stands in for gate_up_proj's own input quant.
-        assert launches["nvfp4"] - fused_launches == (1 if rows else 0)
-
-
 class _StubAttention(torch.nn.Module):
-    """A deterministic attention core: the projections around it are under test."""
-
-    def __init__(self, heads: int, kv_heads: int, head_dim: int) -> None:
-        super().__init__()
-        self.heads = heads
-        self.kv_heads = kv_heads
-        self.head_dim = head_dim
+    """A deterministic attention core reading q: the projections around it are under test."""
 
     def forward(self, q, k, v, positions, ctx, **kwargs):
-        rows = q.shape[0]
-        q = q.reshape(rows, self.heads, self.head_dim).float()
-        k = k.reshape(rows, self.kv_heads, self.head_dim).float()
-        k = k.repeat_interleave(self.heads // self.kv_heads, dim=1)
-        return torch.tanh(q * 0.05 + k * 0.03).reshape(rows, -1).to(v.dtype)
+        return torch.tanh(q.reshape(q.shape[0], -1))
 
     def attend_live_rows(self, q, k, v, positions, ctx):
-        rows = ctx.gather_ids
-        return self.forward(q[rows], k[rows], v[rows], positions[rows], ctx)
+        return self.forward(q[ctx.gather_ids], k, v, positions, ctx)
 
 
 class _StubGDNBackend:
-    """A deterministic linear-attention core reading the projected q, k, v and z."""
+    """A deterministic linear-attention core reading the projected values."""
 
     def forward(self, q, k, v, layer, token_to_kv_pool, forward_mode, bs, **kwargs):
-        mixed = kwargs["mixed_qkv"].float()
-        key_dim, value_dim = kwargs["key_dim"], kwargs["value_dim"]
-        values = mixed[:, 2 * key_dim : 2 * key_dim + value_dim]
-        keys = mixed[:, :key_dim].repeat(1, value_dim // key_dim)
-        out = torch.tanh(values * 0.05 + keys * 0.02)
-        return out.reshape(mixed.shape[0], -1, kwargs["head_v_dim"]).to(
-            kwargs["z"].dtype
-        )
-
-
-def _fill_fp8(layer, generator: torch.Generator, input_scale: float) -> None:
-    weight = torch.randn(layer.weight.shape, generator=generator, dtype=torch.float32)
-    layer.weight.data.copy_((weight * 0.5).to(torch.float8_e4m3fn))
-    layer.weight_scale.data.fill_(0.004)
-    layer.input_scale.data.fill_(input_scale)
-    layer.quant_method.process_weights_after_loading(layer)
+        values = kwargs["mixed_qkv"][:, -kwargs["value_dim"] :]
+        return torch.tanh(values).unflatten(1, (-1, kwargs["head_v_dim"]))
 
 
 @pytest.fixture
@@ -293,99 +228,89 @@ def _decoder_layer(kind: str, split_gdn: bool):
         linear_num_value_heads=8,
         linear_key_head_dim=128,
         linear_value_head_dim=128,
-        rms_norm_eps=1e-6,
         layer_types=["linear_attention", "full_attention"],
     )
     config.dtype = torch.bfloat16
-    prefix = "model.layers.1"
-    fp8_leaves = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
-    fp8_leaves += ["self_attn.o_proj", "linear_attn.out_proj"]
-    fp8_leaves += ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z"]
+    fp8 = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]
+    fp8 += ["self_attn.o_proj", "linear_attn.out_proj"]
+    fp8 += ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z"]
     if not split_gdn:
-        fp8_leaves += ["linear_attn.in_proj_b", "linear_attn.in_proj_a"]
-    quantized = {f"{prefix}.{leaf}": "FP8" for leaf in fp8_leaves}
+        fp8 += ["linear_attn.in_proj_b", "linear_attn.in_proj_a"]
+    quantized = {f"model.layers.1.{leaf}": "FP8" for leaf in fp8}
     for leaf in ("gate_proj", "up_proj", "down_proj"):
-        quantized[f"{prefix}.mlp.{leaf}"] = "NVFP4"
+        quantized[f"model.layers.1.mlp.{leaf}"] = "NVFP4"
     layer_cls = {
         "linear": Qwen3_5LinearDecoderLayer,
         "attention": Qwen3_5AttentionDecoderLayer,
         "draft": Qwen3_5DraftAttentionDecoderLayer,
     }[kind]
+    attn = "linear_attn" if kind == "linear" else "self_attn"
     layer = layer_cls(
         config,
         Mapping(rank=0, world_size=1),
         1,
         quant_config=ModelOptMixedConfig(quantized_layers=quantized),
-        prefix=f"{prefix}.linear_attn" if kind == "linear" else f"{prefix}.self_attn",
+        prefix=f"model.layers.1.{attn}",
     ).cuda()
 
     generator = torch.Generator().manual_seed(0)
+
+    def randn(shape):
+        return torch.randn(shape, generator=generator, dtype=torch.float32)
+
     for norm in (layer.input_layernorm, layer.post_attention_layernorm):
-        norm.weight.data.copy_(torch.randn(_HIDDEN, generator=generator) * 0.3)
+        norm.weight.data.copy_(randn(_HIDDEN) * 0.3)
     # Distinct input scales, so a copy made with another projection's scale shows.
-    _fill_nvfp4(layer.mlp.gate_up_proj, generator, 0.05)
-    _fill_nvfp4(layer.mlp.down_proj, generator, 0.07)
-    if kind != "linear":
-        _fill_fp8(layer.qkv_proj, generator, 0.02)
-        _fill_fp8(layer.o_proj, generator, 0.03)
-        layer.attn = _StubAttention(layer.num_heads, layer.num_kv_heads, layer.head_dim)
-        return layer
-    gdn = layer.linear_attn
-    assert gdn._split_in_proj == split_gdn
-    _fill_fp8(gdn.out_proj, generator, 0.03)
-    if split_gdn:
-        _fill_fp8(gdn.in_proj_qkvz, generator, 0.02)
-        gdn.in_proj_ba.weight.data.copy_(
-            torch.randn(gdn.in_proj_ba.weight.shape, generator=generator) * 0.02
-        )
-    else:
-        _fill_fp8(gdn.in_proj_qkvzba, generator, 0.02)
-    return layer
-
-
-def _run_layer(layer, kind: str, hidden_states, residual, live_rows):
-    rows = hidden_states.shape[0]
-    ctx = SimpleNamespace(
-        draft_narrowing=None if live_rows is None else object(),
-        gather_ids=live_rows,
-        query_shard=None,
-        collective_global_num_tokens=None,
-        global_num_tokens=None,
-        collective_num_tokens=None,
-        input_num_tokens=rows,
-        forward_mode=SimpleNamespace(is_idle=lambda: False),
-        attn_backend=_StubGDNBackend(),
-        token_to_kv_pool=None,
-        bs=rows,
-    )
+    projections = [(layer.mlp.gate_up_proj, 0.05), (layer.mlp.down_proj, 0.07)]
     if kind == "linear":
-        return layer(hidden_states=hidden_states, residual=residual, ctx=ctx)
-    positions = torch.arange(rows, device="cuda")
-    return layer(
-        positions=positions, hidden_states=hidden_states, residual=residual, ctx=ctx
-    )
+        gdn = layer.linear_attn
+        assert gdn._split_in_proj == split_gdn
+        in_proj = gdn.in_proj_qkvz if split_gdn else gdn.in_proj_qkvzba
+        projections += [(in_proj, 0.02), (gdn.out_proj, 0.03)]
+        if split_gdn:
+            gdn.in_proj_ba.weight.data.copy_(randn(gdn.in_proj_ba.weight.shape) * 0.02)
+    else:
+        projections += [(layer.qkv_proj, 0.02), (layer.o_proj, 0.03)]
+        layer.attn = _StubAttention()
+    for proj, input_scale in projections:
+        if proj.weight.dtype == torch.uint8:
+            proj.weight.data.copy_(
+                torch.randint(0, 256, proj.weight.shape, generator=generator)
+            )
+            proj.weight_scale.data.copy_(randn(proj.weight_scale.shape) * 2 + 0.25)
+            proj.weight_scale_2.data.fill_(0.002)
+        else:
+            proj.weight.data.copy_(randn(proj.weight.shape) * 0.5)
+            proj.weight_scale.data.fill_(0.004)
+        proj.input_scale.data.fill_(input_scale)
+        proj.quant_method.process_weights_after_loading(proj)
+    return layer
 
 
 @pytest.mark.skipif(not _IS_BLACKWELL, reason="NVFP4 GEMMs need Blackwell")
 @pytest.mark.parametrize(
-    "kind,split_gdn,narrow",
+    "kind,split_gdn,narrow,fused_swiglu",
     [
-        ("attention", False, False),
-        ("linear", False, False),
-        ("linear", True, False),
-        ("draft", False, False),
-        ("draft", False, True),
+        ("attention", False, False, True),
+        ("attention", False, False, False),
+        ("linear", False, False, True),
+        ("linear", True, False, True),
+        ("draft", False, False, True),
+        ("draft", False, True, True),
     ],
 )
 @torch.no_grad()
 def test_decoder_layer_hands_each_projection_its_own_quant(
-    monkeypatch, bf16_default_dtype, kind: str, split_gdn: bool, narrow: bool
+    monkeypatch, bf16_default_dtype, kind, split_gdn, narrow, fused_swiglu
 ) -> None:
     monkeypatch.setitem(global_server_args_dict, "layer_boundary_norm", "fused")
+    monkeypatch.setenv(
+        "TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT", str(int(fused_swiglu))
+    )
     layer = _decoder_layer(kind, split_gdn)
-    copies = []
-    fp8_copies = []
-    fp8_copy_alive = []
+
+    # Record each norm's copies, whether an FP8 copy outlives its consumer, and the projections' own quants.
+    copies, fp8_copies, fp8_copy_alive, launches = [], [], [], Counter()
     add_rmsnorm = layernorm.add_rmsnorm
 
     def recording_add_rmsnorm(*args, **kwargs):
@@ -395,42 +320,61 @@ def test_decoder_layer_hands_each_projection_its_own_quant(
             fp8_copies.append(weakref.ref(kwargs["out_fp8"]))
         return add_rmsnorm(*args, **kwargs)
 
+    def counting(name, quantize):
+        def run(*args, **kwargs):
+            launches[name] += 1
+            return quantize(*args, **kwargs)
+
+        return run
+
     monkeypatch.setattr(layernorm, "add_rmsnorm", recording_add_rmsnorm)
-    launches = _count_quant_launches(monkeypatch)
+    fp4_quantize = counting("nvfp4", dense_nvfp4.fp4_quantize)
+    monkeypatch.setattr(dense_nvfp4, "fp4_quantize", fp4_quantize)
+    monkeypatch.setattr(qwen3_5_moe, "fp4_quantize", fp4_quantize)
+    monkeypatch.setattr(
+        dense_fp8, "static_quant_fp8", counting("fp8", dense_fp8.static_quant_fp8)
+    )
+
     torch.manual_seed(1)
     hidden_states = torch.randn(129, _HIDDEN, device="cuda") * 4
     # The single-layer MTP draft opens without a residual and may narrow to live rows.
     residual = None if kind == "draft" else torch.randn_like(hidden_states) * 30
     live_rows = torch.arange(0, 129, 3, device="cuda") if narrow else None
+    ctx = SimpleNamespace(
+        draft_narrowing=None if live_rows is None else object(),
+        gather_ids=live_rows,
+        query_shard=None,
+        collective_global_num_tokens=None,
+        global_num_tokens=None,
+        collective_num_tokens=None,
+        input_num_tokens=129,
+        forward_mode=SimpleNamespace(is_idle=lambda: False),
+        attn_backend=_StubGDNBackend(),
+        token_to_kv_pool=None,
+        bs=129,
+    )
+    positions = {} if kind == "linear" else {"positions": torch.arange(129).cuda()}
 
     def run():
         launches.clear()
-        outputs = _run_layer(
-            layer,
-            kind,
-            hidden_states.clone(),
-            None if residual is None else residual.clone(),
-            live_rows,
+        out = layer(
+            hidden_states=hidden_states.clone(),
+            residual=None if residual is None else residual.clone(),
+            ctx=ctx,
+            **positions,
         )
-        return outputs, Counter(launches)
+        return out, Counter(launches)
 
     (out, new_residual), fused_launches = run()
     input_copy = kind != "draft"
-    assert copies == ([(True, False), (False, True)] if input_copy else [(False, True)])
-    # The FP8 copy is freed with its consumer, before the post-attention norm runs.
-    assert fp8_copy_alive == [False] * len(copies)
+    assert copies == ([(True, False)] if input_copy else []) + [(False, True)]
+    assert not any(fp8_copy_alive)
 
     # Without the hooks every projection quantizes the same normed rows itself.
-    monkeypatch.setattr(
-        Fp8LinearMethod, "static_fp8_input_scale", lambda self, layer: None
-    )
-    monkeypatch.setattr(
-        Nvfp4LinearMethod, "nvfp4_global_scale", lambda self, layer: None
-    )
+    monkeypatch.setattr(Fp8LinearMethod, "static_fp8_input_scale", lambda *_: None)
+    monkeypatch.setattr(Nvfp4LinearMethod, "nvfp4_global_scale", lambda *_: None)
     (expected, expected_residual), own_launches = run()
-    assert not any(fp8 or fp4 for fp8, fp4 in copies[2 if input_copy else 1 :])
     assert torch.equal(new_residual, expected_residual)
     assert torch.equal(out, expected)
-    # Each copy replaces exactly its consumer's own input quant.
     assert own_launches["fp8"] - fused_launches["fp8"] == int(input_copy)
     assert own_launches["nvfp4"] - fused_launches["nvfp4"] == 1

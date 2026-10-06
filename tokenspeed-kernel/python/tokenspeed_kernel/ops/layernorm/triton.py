@@ -1040,7 +1040,7 @@ _FP4_RECIPE_ENV = (
 
 
 def _nvfp4_copy_possible(n_cols: int) -> bool:
-    # Blackwell's E2M1 conversions, and row chunks of whole 4 x 16-wide scale groups.
+    # Blackwell's E2M1 conversions, and a row the NVFP4 stores, which are unmasked, cover in whole chunks.
     return (
         current_platform().is_blackwell
         and n_cols % 64 == 0
@@ -1051,8 +1051,9 @@ def _nvfp4_copy_possible(n_cols: int) -> bool:
 def nvfp4_copy_supported(n_cols: int) -> bool:
     """Whether ``add_rmsnorm``'s NVFP4 copy of ``n_cols``-wide rows equals ``fp4_quantize``'s.
 
-    The copy needs Blackwell and widths in whole chunks of 4 x 16-wide scale
-    groups, and reproduces ``fp4_quantize``'s default recipe bit for bit.
+    The copy needs Blackwell and a width that is a power of two of at least 64
+    or a multiple of 1024 (walked in whole power-of-two chunks, 5120 = 5 x 1024),
+    and reproduces ``fp4_quantize``'s default recipe bit for bit.
     """
     return _nvfp4_copy_possible(n_cols) and not any(
         os.environ.get(name) == "1" for name in _FP4_RECIPE_ENV

@@ -707,7 +707,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 self.post_attention_layernorm,
                 hidden_states,
                 residual,
-                self.mlp.input_fp4_scale(),
+                self.mlp.nvfp4_global_scale(),
                 ctx,
             )
 
@@ -920,7 +920,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """Full attention forward pass."""
+        """Full attention forward pass; ``hidden_states`` may be qkv_proj's FP8 copy, which only ``_project_qkv`` reads."""
         q, k, v, gate = self._project_qkv(hidden_states)
         attn_output = self._attn(positions, q, k, v, gate, ctx)
         output, _ = self.o_proj(attn_output)
@@ -970,7 +970,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 self.post_attention_layernorm,
                 hidden_states,
                 residual,
-                self.mlp.input_fp4_scale(),
+                self.mlp.nvfp4_global_scale(),
                 ctx,
             )
 

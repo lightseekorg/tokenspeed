@@ -215,7 +215,7 @@ class Qwen3_5MoeMLP(nn.Module):
             and getattr(self.down_proj, "_use_deep_gemm_fp8", False)
         )
 
-    def input_fp4_scale(self) -> torch.Tensor | None:
+    def nvfp4_global_scale(self) -> torch.Tensor | None:
         """The global scale gate_up_proj quantizes its input to NVFP4 with, if it does."""
         return self.gate_up_proj.quant_method.nvfp4_global_scale(self.gate_up_proj)
 
@@ -357,7 +357,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             self.shared_expert = None
             self.shared_expert_gate = None
 
-    def input_fp4_scale(self) -> torch.Tensor | None:
+    def nvfp4_global_scale(self) -> torch.Tensor | None:
         """None: the experts quantize their own inputs, so no producer applies a scale."""
         return None
 

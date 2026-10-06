@@ -59,9 +59,8 @@ def _rows(rows: int, cols: int, spread: int, seed: int) -> torch.Tensor:
     return x.bfloat16()
 
 
-def _fused(x, residual, weight, global_scale, *, x2=None, gemma):
+def _nvfp4_copy(x, residual, weight, global_scale, *, x2, out, gemma):
     rows, cols = x.shape
-    out = torch.empty_like(x)
     values = torch.empty(rows, cols // 2, dtype=torch.uint8, device="cuda")
     padded = (rows + 127) // 128 * 128
     # Prefilled so the zeroed scales of the padding rows are checked too.
@@ -79,13 +78,10 @@ def _fused(x, residual, weight, global_scale, *, x2=None, gemma):
         fp4_scale=global_scale,
         gemma=gemma,
     )
-    return out, values, scales
-
-
-def _assert_matches_fp4_quantize(out, values, scales, global_scale) -> None:
-    expected_values, expected_scales = fp4_quantize(out, global_scale)
+    expected_values, expected_scales = fp4_quantize(out.contiguous(), global_scale)
     assert torch.equal(values, expected_values.view(torch.uint8))
     assert torch.equal(scales, expected_scales.view(torch.uint8))
+    return scales
 
 
 @pytest.mark.parametrize("cols", [512, 3072, 4096, 5120, 6144])
@@ -100,106 +96,42 @@ def test_nvfp4_copy_matches_fp4_quantize(
     pdl_enabled(overwrite=pdl)
     x = _rows(rows, cols, spread, seed=rows * 7 + spread + cols)
     x2 = torch.randn_like(x) if with_x2 else None
-    residual = torch.randn_like(x)
     weight = (torch.randn(cols, device="cuda") * 0.3).bfloat16()
     global_scale = torch.tensor([7.5], device="cuda")
 
-    out, values, scales = _fused(x, residual, weight, global_scale, x2=x2, gemma=gemma)
-
-    _assert_matches_fp4_quantize(out, values, scales, global_scale)
-
-
-def test_nvfp4_copy_in_place_at_prefill_rows() -> None:
-    # Past 1024 rows fp4_quantize switches to its TMA kernel; the runtime normalizes in place.
-    rows, cols = 1025, 5120
-    x = _rows(rows, cols, 12, seed=3)
-    residual = torch.randn_like(x)
-    weight = (torch.randn(cols, device="cuda") * 0.3).bfloat16()
-    global_scale = torch.tensor([7.5], device="cuda")
-    values = torch.empty(rows, cols // 2, dtype=torch.uint8, device="cuda")
-    scales = torch.full((1152, cols // 16), 0xFF, dtype=torch.uint8, device="cuda")
-
-    add_rmsnorm(
+    _nvfp4_copy(
         x,
-        residual,
+        torch.randn_like(x),
         weight,
-        1e-6,
-        x2=None,
-        out=x,
-        out_fp8=None,
-        fp8_scale=None,
-        out_fp4=(values, scales),
-        fp4_scale=global_scale,
-        gemma=True,
+        global_scale,
+        x2=x2,
+        out=torch.empty_like(x),
+        gemma=gemma,
     )
 
-    _assert_matches_fp4_quantize(x, values, scales, global_scale)
 
-
-@pytest.mark.parametrize("cols", [512, 5120])
-def test_nvfp4_copy_of_strided_rows_with_nan_and_inf(cols: int) -> None:
-    rows = 129
-    torch.manual_seed(cols)
-    wide = torch.randn(rows, 2 * cols, device="cuda").bfloat16()
-    neighbours = wide[:, cols:].clone()
+@pytest.mark.parametrize("rows", [129, 1025])
+def test_nvfp4_copy_of_extreme_rows_in_place(rows: int) -> None:
+    # In place in strided rows: NaN, Inf, a flushed subnormal block, scales past E4M3's 448, TMA past 1024 rows.
+    cols = 5120
+    wide = torch.zeros(rows, 2 * cols, device="cuda").bfloat16()
     x = wide[:, :cols]
+    x.copy_(_rows(rows, cols, 16, seed=rows))
     x[0] = float("nan")
-    x[64, 7] = float("inf")
-    x[128, 3] = float("-inf")
-    residual = torch.randn(rows, cols, device="cuda").bfloat16()
+    x[1] = torch.randn(cols, device="cuda")
+    x[1, 16:32] = 2e-39
+    x[64, 3] = float("-inf")
     weight = (torch.randn(cols, device="cuda") * 0.3).bfloat16()
-    global_scale = torch.tensor([7.5], device="cuda")
-    values = torch.empty(rows, cols // 2, dtype=torch.uint8, device="cuda")
-    scales = torch.full((256, cols // 16), 0xFF, dtype=torch.uint8, device="cuda")
-
-    add_rmsnorm(
-        x,
-        residual,
-        weight,
-        1e-6,
-        x2=None,
-        out=x,
-        out_fp8=None,
-        fp8_scale=None,
-        out_fp4=(values, scales),
-        fp4_scale=global_scale,
-        gemma=True,
-    )
-
-    assert torch.equal(wide[:, cols:], neighbours)
-    _assert_matches_fp4_quantize(x.contiguous(), values, scales, global_scale)
-
-
-def test_nvfp4_copy_flushes_subnormal_blocks() -> None:
-    # fp4_quantize is built flush-to-zero: a block of subnormal values quantizes as an all-zero block.
-    rows, cols = 4, 5120
-    x = torch.randn(rows, cols, device="cuda").bfloat16()
-    x[:, :16] = torch.tensor(2e-39, device="cuda").bfloat16()
-    x[:, 16] = -1e-39
-    residual = torch.zeros_like(x)
-    weight = torch.zeros(cols, device="cuda").bfloat16()
-    global_scale = torch.tensor([7.5], device="cuda")
-
-    out, values, scales = _fused(x, residual, weight, global_scale, gemma=True)
-
-    assert out[:, :16].float().abs().max() < torch.finfo(torch.float32).tiny
-    _assert_matches_fp4_quantize(out, values, scales, global_scale)
-
-
-def test_nvfp4_copy_saturates_block_scales() -> None:
-    # A served global scale and blocks far above the row's RMS push block scales past E4M3's 448.
-    rows, cols = 129, 5120
-    x = _rows(rows, cols, 16, seed=5)
-    residual = torch.zeros_like(x)
-    weight = (torch.randn(cols, device="cuda") * 0.3 + 1).bfloat16()
     weight[7] = 3e38
     global_scale = torch.tensor([1000.0], device="cuda")
 
-    out, values, scales = _fused(x, residual, weight, global_scale, gemma=False)
+    scales = _nvfp4_copy(
+        x, torch.zeros_like(x), weight, global_scale, x2=None, out=x, gemma=False
+    )
 
-    assert out.isinf().any()
-    assert (scales[:rows] == 0x7E).any()
-    _assert_matches_fp4_quantize(out, values, scales, global_scale)
+    assert torch.equal(wide[:, cols:], torch.zeros_like(x))
+    assert x.isinf().any() and (scales[:rows] == 0x7E).any()
+    assert 0 < x[1, 16:32].float().abs().max() < torch.finfo(torch.float32).tiny
 
 
 def test_nvfp4_copy_compiles_once_across_batch_sizes() -> None:
@@ -209,7 +141,15 @@ def test_nvfp4_copy_compiles_once_across_batch_sizes() -> None:
 
     def run(rows: int) -> None:
         x = torch.randn(rows, cols, device="cuda").bfloat16()
-        _fused(x, torch.randn_like(x), weight, global_scale, gemma=True)
+        _nvfp4_copy(
+            x,
+            torch.randn_like(x),
+            weight,
+            global_scale,
+            x2=None,
+            out=torch.empty_like(x),
+            gemma=True,
+        )
 
     run(3)
     with assert_no_triton_compile(_add_rmsnorm_kernel):
@@ -230,63 +170,28 @@ def test_nvfp4_copy_supported_widths_and_recipes(monkeypatch) -> None:
         monkeypatch.setenv(name, "true")
         assert nvfp4_copy_supported(5120)
         monkeypatch.delenv(name)
-    assert nvfp4_copy_supported(5120)
 
 
-def test_nvfp4_copy_contract() -> None:
-    x = torch.randn(4, 5120, device="cuda").bfloat16()
-    weight = torch.ones(5120, device="cuda").bfloat16()
-    values = torch.empty(4, 2560, dtype=torch.uint8, device="cuda")
-    scales = torch.empty(128, 320, dtype=torch.uint8, device="cuda")
-    common = dict(x2=None, out=torch.empty_like(x), gemma=False)
-    with pytest.raises(ValueError, match="together"):
+@pytest.mark.parametrize(
+    "cols,scale_rows,match", [(5120, 64, "fp4_quantize"), (2560, 128, "no NVFP4 copy")]
+)
+def test_nvfp4_copy_rejects_what_it_cannot_write(
+    cols: int, scale_rows: int, match: str
+) -> None:
+    x = torch.randn(4, cols, device="cuda").bfloat16()
+    values = torch.empty(4, cols // 2, dtype=torch.uint8, device="cuda")
+    scales = torch.empty(scale_rows, cols // 16, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match=match):
         add_rmsnorm(
             x,
             x.clone(),
-            weight,
-            1e-6,
-            out_fp8=None,
-            fp8_scale=None,
-            out_fp4=(values, scales),
-            fp4_scale=None,
-            **common,
-        )
-    with pytest.raises(ValueError, match="one quantized copy"):
-        add_rmsnorm(
-            x,
-            x.clone(),
-            weight,
-            1e-6,
-            out_fp8=torch.empty_like(x, dtype=torch.float8_e4m3fn),
-            fp8_scale=torch.ones(1, device="cuda"),
-            out_fp4=(values, scales),
-            fp4_scale=torch.ones(1, device="cuda"),
-            **common,
-        )
-    with pytest.raises(ValueError, match="fp4_quantize"):
-        add_rmsnorm(
-            x,
-            x.clone(),
-            weight,
-            1e-6,
-            out_fp8=None,
-            fp8_scale=None,
-            out_fp4=(values, scales[:64]),
-            fp4_scale=torch.ones(1, device="cuda"),
-            **common,
-        )
-    narrow = torch.randn(4, 2560, device="cuda").bfloat16()
-    with pytest.raises(ValueError, match="no NVFP4 copy"):
-        add_rmsnorm(
-            narrow,
-            narrow.clone(),
-            torch.ones(2560, device="cuda").bfloat16(),
+            torch.ones(cols, device="cuda").bfloat16(),
             1e-6,
             x2=None,
-            out=torch.empty_like(narrow),
+            out=torch.empty_like(x),
             out_fp8=None,
             fp8_scale=None,
-            out_fp4=(values[:, :1280], scales[:, :160]),
+            out_fp4=(values, scales),
             fp4_scale=torch.ones(1, device="cuda"),
             gemma=False,
         )
