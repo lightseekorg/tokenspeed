@@ -1749,14 +1749,14 @@ _AMD_MOE_JOIN_LANES: dict[tuple, torch.Tensor] = {}
 
 
 def _amd_moe_join_lane(like: torch.Tensor, width: int) -> torch.Tensor | None:
-    """Reuse a single-row lane or a CDNA5 strided-output buffer through M32."""
+    """Reuse a single-row lane or a CDNA5 strided-output buffer through M64."""
     lane = allreduce_fusion_lane(like, width, enabled=True)
     if lane is not None:
         return lane
     rows = like.shape[0]
     if (
         not current_platform().is_cdna5
-        or not 1 < rows <= 32
+        or not 1 < rows <= 64
         or rows * width * like.element_size() > COMM_ONESHOT_MAX_BYTES
     ):
         return None
