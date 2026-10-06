@@ -42,9 +42,17 @@ from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (  # noqa:
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig  # noqa: E402
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig  # noqa: E402
 
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=30,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="TRT-LLM tree attention requires an NVIDIA GPU.",
+)
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="needs an NVIDIA GPU",
+)
 
 PAGE = 64
 HQ, HKV, D = 16, 4, 128

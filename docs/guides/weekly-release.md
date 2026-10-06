@@ -31,7 +31,8 @@ The workflow completes these stages in order:
    12.9/13.0 variant wheels and ROCm 7.2 wheels. CUDA 13.0 supplies PyPI; all
    variants go to the wheelhouse.
 4. Update TokenSpeed's kernel requirement and both version declarations in one
-   PR. Wait for that exact merge's existing PyPI workflow, then publish its
+   PR. Keep the kernel's `.dev0` floor so CI retains matching in-tree builds.
+   Wait for that exact merge's existing PyPI workflow, then publish its
    identical distributions to the wheelhouse.
 5. Update the stable CUDA and ROCm pip indexes, preserving previous releases.
 6. Publish the existing NVIDIA Docker image for `linux/amd64` and `linux/arm64`.
