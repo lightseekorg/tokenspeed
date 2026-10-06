@@ -46,7 +46,6 @@ registered solution on NVIDIA.
 
 from dataclasses import dataclass
 
-import cutlass.memory
 import torch
 import torch.distributed as _dist
 import torch.distributed._symmetric_memory as _symm_mem
@@ -149,6 +148,7 @@ if _ARCH_SUPPORTED and _has_cluster_launch_support():
         import cuda.bindings.driver as cuda
         import cutlass
         import cutlass.cute as cute
+        import cutlass.memory
         from cutlass._mlir.dialects import llvm
         from cutlass.cute.runtime import from_dlpack
         from cutlass.cute.typing import Int32
