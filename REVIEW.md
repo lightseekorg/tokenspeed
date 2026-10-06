@@ -100,6 +100,10 @@ and runs triggered by `dependabot[bot]` are skipped. It uses a GitHub-hosted CPU
 runner and posts a summary comment for the exact reviewed head commit; a newer
 push cancels the previous run. It does not approve PRs or gate merges.
 
+The workflow calls [the review script](.github/scripts/kimi-code-review.py) with
+`prepare`, `review`, and `publish` stages. Maintain the reviewer instructions in
+[the agent prompt](.github/scripts/kimi-code-reviewer.md).
+
 The API must implement the OpenAI-compatible protocol. Configure these organization
 Actions variables and secrets with `all` repository access to share them across the
 organization. Keep the publishing token as a repository secret:

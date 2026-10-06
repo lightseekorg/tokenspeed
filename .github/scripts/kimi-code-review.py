@@ -1,0 +1,235 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Prepare, run, and publish the PR review in separate credential scopes."""
+
+import argparse
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import tomllib
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+def _command(*args: str) -> str:
+    return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+
+
+def _check_bot() -> None:
+    _command("gh", "auth", "status")
+    if _command("gh", "api", "user", "--jq", ".login").strip() != "lightseek-bot":
+        raise SystemExit("GitHub authentication must use lightseek-bot.")
+
+
+def prepare(root: Path) -> None:
+    if _command("git", "rev-parse", "HEAD").strip() != os.environ["PR_HEAD_SHA"]:
+        raise SystemExit("Checkout differs from the reviewed commit.")
+    _check_bot()
+    rows = _command(
+        "gh",
+        "api",
+        "--paginate",
+        f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/organization-variables?per_page=30",
+        "--jq",
+        ".variables[] | @json",
+    )
+    variables = {
+        row["name"]: row["value"]
+        for row in (json.loads(line) for line in rows.splitlines() if line.strip())
+    }
+    url = variables.get("KIMI_API_URL", "")
+    model = variables.get("KIMI_MODEL", "")
+    if not url or not model:
+        raise SystemExit("Set the KIMI_API_URL and KIMI_MODEL organization variables.")
+    for value in (url, model):
+        mask = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::add-mask::{mask}", flush=True)
+
+    home = Path(os.environ["RUNNER_TEMP"], "kimi-home")
+    home.mkdir(parents=True, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
+    with root.joinpath("pr.diff").open("w") as diff:
+        subprocess.run(
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                f"{os.environ['PR_BASE_SHA']}...{os.environ['PR_HEAD_SHA']}",
+            ],
+            check=True,
+            stdout=diff,
+        )
+    config = f"""default_model = "review"
+telemetry = false
+[providers.review]
+type = "openai"
+base_url = {json.dumps(url)}
+api_key_env = "KIMI_API_KEY"
+[models.review]
+provider = "review"
+model = {json.dumps(model)}
+max_context_size = 262144
+capabilities = ["thinking", "tool_use"]
+"""
+    home.joinpath("config.toml").write_text(config)
+    shutil.copyfile(
+        Path(__file__).with_name("kimi-code-reviewer.md"), root / "reviewer.md"
+    )
+
+
+def _review_body(root: Path) -> str:
+    events = [
+        json.loads(line)
+        for line in root.joinpath("events.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    # CLI 2.1.1 appends a session resume hint after the final assistant message.
+    messages = [event for event in events if event.get("role") != "meta"]
+    final = messages[-1] if messages else {}
+    body = final.get("content", "")
+    if (
+        final.get("role") != "assistant"
+        or final.get("tool_calls")
+        or not isinstance(body, str)
+        or not body.strip()
+    ):
+        raise SystemExit("Kimi did not produce a final review.")
+    config = tomllib.loads(
+        Path(os.environ["KIMI_CODE_HOME"], "config.toml").read_text()
+    )
+    url = config["providers"]["review"]["base_url"]
+    key = os.environ["KIMI_API_KEY"]
+    private = [
+        key,
+        key[:8],
+        base64.b64encode(key.encode()).decode(),
+        url,
+        urlparse(url).hostname,
+        config["models"]["review"]["model"],
+        os.environ["RUNNER_TEMP"],
+        os.environ["GITHUB_WORKSPACE"],
+    ]
+    if any(value and value in body for value in private) or re.search(
+        r"https?://|github\.com|\b(?:sk-|ghp_|gho_|github_pat_)|"
+        r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|/(?:home|root|tmp|proc)/",
+        body,
+    ):
+        raise SystemExit(
+            "Review failed the public-output check; no review was published."
+        )
+    if len(body) > 60000:
+        raise SystemExit("Review exceeds the comment size limit.")
+    return body.strip()
+
+
+def review(root: Path) -> None:
+    if not os.environ.get("KIMI_API_KEY"):
+        raise SystemExit("Set the KIMI_API_KEY organization secret.")
+    source = os.environ["GITHUB_WORKSPACE"]
+    # A neutral working directory avoids loading the PR's CLI/MCP configuration.
+    with (
+        root.joinpath("events.jsonl").open("w") as events,
+        root.joinpath("cli.stderr").open("w") as errors,
+    ):
+        result = subprocess.run(
+            [
+                "timeout",
+                "600",
+                "kimi",
+                "--agent-file",
+                str(root / "reviewer.md"),
+                "--output-format",
+                "stream-json",
+                "-p",
+                f"Review {root}/pr.diff. Source root: {source}. "
+                f"Read {source}/REVIEW.md and relevant source for context.",
+            ],
+            cwd=root,
+            stdout=events,
+            stderr=errors,
+        )
+    if result.returncode:
+        raise SystemExit("Kimi review failed or timed out; no review was published.")
+    body = _review_body(root)
+    root.joinpath("comment.md").write_text(
+        f"## Kimi Code review\n\nReviewed commit: `{os.environ['PR_HEAD_SHA']}`\n\n{body}\n"
+    )
+
+
+def publish(root: Path) -> None:
+    _check_bot()
+    repo = os.environ["GITHUB_REPOSITORY"]
+    number = os.environ["PR_NUMBER"]
+    if (
+        _command(
+            "gh", "repo", "view", repo, "--json", "visibility", "--jq", ".visibility"
+        ).strip()
+        != "PUBLIC"
+    ):
+        raise SystemExit("The review destination must be a public repository.")
+    head = _command(
+        "gh",
+        "pr",
+        "view",
+        number,
+        "--repo",
+        repo,
+        "--json",
+        "headRefOid",
+        "--jq",
+        ".headRefOid",
+    ).strip()
+    if head != os.environ["PR_HEAD_SHA"]:
+        print("PR head changed; skipping the obsolete review.")
+        return
+    comment_url = _command(
+        "gh",
+        "pr",
+        "comment",
+        number,
+        "--repo",
+        repo,
+        "--body-file",
+        str(root / "comment.md"),
+    ).strip()
+    comment_id = comment_url.rsplit("issuecomment-", 1)[-1]
+    published = _command(
+        "gh", "api", f"repos/{repo}/issues/comments/{comment_id}", "--jq", ".body"
+    )
+    root.joinpath("published.md").write_text(published)
+    # gh's --jq output adds a newline; compare after trimming it.
+    if published.rstrip() != root.joinpath("comment.md").read_text().rstrip():
+        raise SystemExit("Published review differs from the checked body.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("stage", choices=("prepare", "review", "publish"))
+    args = parser.parse_args()
+    stages = {"prepare": prepare, "review": review, "publish": publish}
+    try:
+        stages[args.stage](Path(os.environ["RUNNER_TEMP"], "kimi-review"))
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError):
+        # Configuration and raw model output must not appear in public tracebacks.
+        raise SystemExit(f"Review {args.stage} failed; raw output withheld.") from None
