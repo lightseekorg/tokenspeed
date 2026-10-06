@@ -156,7 +156,7 @@ def test_mha_prefill_selects_deep_pipeline(dtype, head_dim):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("group_size", [2, 4, 8])
+@pytest.mark.parametrize("group_size", [1, 2, 4, 8, 32])
 def test_mha_prefill_packed_gqa(dtype, group_size):
     """Check packed (sequence, query-head) rows across GQA group sizes."""
     device = "cuda"
@@ -396,11 +396,13 @@ def test_mha_prefill_addresses_past_four_gib():
         False,
         True,
         False,
+        0,
         4,
         2,
         num_warps=4,
         waves_per_eu=1,
         llvm_fn_attrs="",
+        **prefill.sched_barrier_compile_options(),
     )
     torch.cuda.synchronize()
     assert torch.equal(storage[:head_dim], sentinel)
@@ -510,6 +512,18 @@ def test_select_packed_gqa():
     assert prefill._select_packed_gqa(
         **(kwargs | {"seqlens": [8192] * 2, "max_seqlen": 8192})
     )
+    for n_heads, n_kv_heads in ((8, 8), (32, 8), (32, 1)):
+        assert prefill._select_packed_gqa(
+            **(
+                kwargs
+                | {
+                    "n_heads": n_heads,
+                    "n_kv_heads": n_kv_heads,
+                    "seqlens": [4096] * 4,
+                    "max_seqlen": 4096,
+                }
+            )
+        )
 
     for override in (
         {"dtype": torch.float8_e4m3fn},
@@ -524,6 +538,24 @@ def test_select_packed_gqa():
         {"packed_q_block_bytes": 2**32 + 1},
     ):
         assert not prefill._select_packed_gqa(**(kwargs | override))
+
+    for override in (
+        {"dtype": torch.float16},
+        {"seqlens": [2048] * 4, "max_seqlen": 2048},
+        {"window_left": 512},
+    ):
+        assert not prefill._select_packed_gqa(
+            **(
+                kwargs
+                | {
+                    "n_heads": 32,
+                    "n_kv_heads": 8,
+                    "seqlens": [4096] * 4,
+                    "max_seqlen": 4096,
+                }
+                | override
+            )
+        )
 
 
 def test_select_wide_transport():
@@ -541,6 +573,18 @@ def test_select_wide_transport():
     }
     assert prefill._select_wide_transport(**kwargs)
     assert prefill._select_wide_transport(**(kwargs | {"dtype": torch.float16}))
+    for n_heads, n_kv_heads in ((32, 8), (32, 1)):
+        assert prefill._select_wide_transport(
+            **(
+                kwargs
+                | {
+                    "n_heads": n_heads,
+                    "n_kv_heads": n_kv_heads,
+                    "seqlens": [4096] * 4,
+                    "max_seqlen": 4096,
+                }
+            )
+        )
 
     for override in (
         {"dtype": torch.float8_e4m3fn},
@@ -554,6 +598,12 @@ def test_select_wide_transport():
         {"has_sink": True},
         {"has_lse": True},
         {"wide_addressing": True},
+        {
+            "n_heads": 8,
+            "n_kv_heads": 8,
+            "seqlens": [4096] * 4,
+            "max_seqlen": 4096,
+        },
     ):
         assert not prefill._select_wide_transport(**(kwargs | override))
 
@@ -591,6 +641,116 @@ def test_select_disable_xdl_arb_stall():
         {"waves_per_eu": 2},
     ):
         assert not prefill._select_disable_xdl_arb_stall(**(kwargs | override))
+
+
+def test_select_qk_valu_group_size():
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "head_dim": 128,
+        "n_heads": 8,
+        "n_kv_heads": 1,
+        "seqlens": [4096] * 4,
+        "max_seqlen": 4096,
+        "window_left": -1,
+        "has_sink": False,
+        "has_lse": False,
+        "wide_addressing": False,
+    }
+    assert prefill._select_qk_valu_group_size(**kwargs) == 4
+    assert (
+        prefill._select_qk_valu_group_size(
+            **(
+                kwargs
+                | {
+                    "n_heads": 32,
+                    "n_kv_heads": 1,
+                }
+            )
+        )
+        == 4
+    )
+    assert (
+        prefill._select_qk_valu_group_size(
+            **(kwargs | {"seqlens": [8192] * 2, "max_seqlen": 8192})
+        )
+        == 4
+    )
+    for override in (
+        {"dtype": torch.float16},
+        {"head_dim": 64},
+        {"n_heads": 32, "n_kv_heads": 8},
+        {"seqlens": [4096, 3584, 2305, 1024]},
+        {"window_left": 512},
+        {"has_sink": True},
+        {"has_lse": True},
+        {"wide_addressing": True},
+    ):
+        assert prefill._select_qk_valu_group_size(**(kwargs | override)) == 0
+
+
+@pytest.mark.parametrize(
+    "n_q_heads,n_kv_heads,expected_block_m,expected_wpe,expected_group,expected_scheduler,expected_wide",
+    [
+        (8, 1, 256, 0, 4, "amdgpu-sched-strategy=coexec", False),
+        (8, 8, 256, 0, 0, "amdgpu-sched-strategy=coexec", False),
+        (32, 8, 128, 2, 0, "amdgpu-sched-strategy=coexec", True),
+        (32, 1, 128, 2, 4, "amdgpu-sched-strategy=coexec", True),
+    ],
+)
+def test_mha_prefill_bf16_exact_route_config(
+    monkeypatch,
+    n_q_heads,
+    n_kv_heads,
+    expected_block_m,
+    expected_wpe,
+    expected_group,
+    expected_scheduler,
+    expected_wide,
+):
+    captured = {}
+
+    class CaptureKernel:
+        def __init__(self, wide):
+            self.wide = wide
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                captured.update(
+                    grid=grid,
+                    args=args,
+                    kwargs=kwargs,
+                    wide=self.wide,
+                )
+
+            return launch
+
+    monkeypatch.setattr(prefill, "gluon_mha_prefill_gfx1250", CaptureKernel(False))
+    monkeypatch.setattr(
+        prefill,
+        "gluon_mha_prefill_gfx1250_wide_transport",
+        CaptureKernel(True),
+    )
+    seqlens = [4096] * 4
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        seqlens,
+        n_q_heads,
+        n_kv_heads,
+        128,
+        "cuda",
+        torch.bfloat16,
+    )
+    prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+
+    assert captured["wide"] is expected_wide
+    if expected_wide:
+        assert captured["args"][20] is (n_kv_heads == 1)
+    else:
+        assert captured["args"][20] == expected_block_m
+        assert captured["args"][29] is True
+        assert captured["args"][34] == expected_group
+    assert captured["kwargs"]["num_warps"] == 4
+    assert captured["kwargs"]["waves_per_eu"] == expected_wpe
+    assert captured["kwargs"]["llvm_fn_attrs"] == expected_scheduler
 
 
 def test_select_tdm_warp_hint():
