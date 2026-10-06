@@ -27,20 +27,50 @@ selection). Only the TRT-LLM activation quantizer and the selected kernel's
 body are replaced by CPU stand-ins that keep their contracts.
 """
 
+import dataclasses
+import os
+import sys
+
 import pytest
 import tokenspeed_kernel.ops.gemm as gemm
 import torch
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    Platform,
+    _get_cuda_sm_features,
+    current_platform,
+)
 from tokenspeed_kernel.selection import SelectedKernel
 
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia, reason="the TRT-LLM quantizer is NVIDIA's"
 )
 
 FP8 = torch.float8_e4m3fn
+
+
+@pytest.fixture(autouse=True)
+def sm100_platform():
+    """The dispatch under test is SM100's (TRT-LLM per-token quantizer, FP8
+    GEMM with per-channel scales); pin it whatever the host GPU is."""
+    original = current_platform()
+    arch = ArchVersion(10, 0)
+    Platform.override(
+        dataclasses.replace(
+            original, arch_version=arch, sm_features=_get_cuda_sm_features(arch)
+        )
+    )
+    yield
+    Platform.override(original)
 
 
 @pytest.fixture(params=["M1", "M"])
@@ -116,3 +146,7 @@ def test_dynamic_input_is_quantized_per_token(trtllm_quantizer, selected_kernel,
     codes = (x.float() / scale).clamp(-448, 448).to(FP8)
     reference = (codes.double() * scale.double()) @ weight.T
     assert torch.equal(out, reference.to(torch.bfloat16))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
