@@ -173,7 +173,7 @@ def review(root: Path) -> None:
         raise SystemExit("Kimi review failed or timed out; no review was published.")
     body = _review_body(root)
     root.joinpath("comment.md").write_text(
-        f"## Kimi Code review\n\nReviewed commit: `{os.environ['PR_HEAD_SHA']}`\n\n{body}\n"
+        f"Reviewed commit: `{os.environ['PR_HEAD_SHA']}`\n\n{body}\n"
     )
 
 
