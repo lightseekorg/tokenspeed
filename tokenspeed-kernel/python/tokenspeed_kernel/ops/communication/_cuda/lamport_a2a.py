@@ -200,7 +200,7 @@ class TokenSpeedA2ALamportState:
 
 @register_kernel(
     family="communication",
-    mode="all_to_all",
+    mode="stateful_all_to_all",
     name="cuda_tokenspeed_a2a_lamport",
     solution="cuda",
     signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
@@ -317,7 +317,7 @@ def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
 
 @register_kernel(
     family="communication",
-    mode="all_to_all_fp8_quantize",
+    mode="stateful_all_to_all_fp8_quantize",
     name="cuda_tokenspeed_a2a_lamport_fp8_quantize",
     solution="cuda",
     signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),

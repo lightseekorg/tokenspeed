@@ -1473,7 +1473,7 @@ if current_platform().is_nvidia:
 
     @register_kernel(
         "communication",
-        "stateful_allgather_fp8_quantize",
+        "stateful_all_gather_fp8_quantize",
         name="trtllm_allgather_fp8_quantize",
         solution="trtllm",
         signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
@@ -1516,7 +1516,7 @@ if current_platform().is_nvidia:
 
     @register_kernel(
         "communication",
-        "stateful_allgather",
+        "stateful_all_gather",
         name="trtllm_allgather",
         solution="trtllm",
         signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),

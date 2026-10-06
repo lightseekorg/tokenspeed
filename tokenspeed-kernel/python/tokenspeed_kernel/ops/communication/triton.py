@@ -28,8 +28,6 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import register_kernel
-from tokenspeed_kernel.signature import format_signatures
 
 logger = logging.getLogger(__file__)
 
@@ -101,102 +99,7 @@ def triton_pack_channel_shards_for_a2a(
     return workspace.view(peers * rows, shard)
 
 
-@triton.jit
-def _owner_reduce_kernel(
-    PTRS,
-    Y,
-    M,
-    H: tl.constexpr,
-    P: tl.constexpr,
-    R: tl.constexpr,
-    B: tl.constexpr,
-):
-    i = tl.program_id(0) * B + tl.arange(0, B)
-    total = tl.full((B,), 0, tl.float32)
-    for peer in tl.static_range(P):
-        # Symmetric allocation bases are 16-byte aligned. Recover this after
-        # the indirect load so BF16 reads can vectorize; owner offsets and
-        # tails may still require narrower accesses.
-        ptr = tl.load(PTRS + peer).to(tl.pointer_type(Y.dtype.element_ty))
-        ptr = tl.multiple_of(ptr, 16)
-        total += tl.load(ptr + R * M * H + i, mask=i < M * H, other=0).to(tl.float32)
-    tl.store(Y + i, total, mask=i < M * H)
-
-
-class ProjectionPeerState:
-    """Persistent TP4 scratch for reducing row-parallel projection partials.
-
-    Prepare the state collectively before graph capture. Each peer contributes
-    ``[4 * rows, hidden]`` partials in subgroup-rank order; reduction returns
-    the ``[rows, hidden]`` segment owned by the local token rank. Empty logical
-    owners still use equal positive physical rows and enter both barriers.
-    Calls and consumers are serialized on one stream because the input buffer
-    is borrowed and reused by the next projection.
-    """
-
-    def __init__(self, group, max_rows, hidden, device):
-        if group.size() != 4 or max_rows <= 0 or hidden <= 0:
-            raise ValueError(
-                "Projection peer reduction requires TP4 and positive capacity"
-            )
-        self.max_rows = max_rows
-        self.group = group
-        self.p, self.r, self.hidden = group.size(), group.rank(), hidden
-        self.buffer, self.handle = _alloc_symm(
-            (self.p * max_rows, hidden), torch.bfloat16, device, group
-        )
-        self.ptrs = _peer_ptrs_dev(
-            self.handle, self.buffer.shape, self.buffer.dtype, self.p, device
-        )
-
-    def input_buffer(self, rows):
-        """Return the borrowed GEMM destination for equal physical rows per peer."""
-        if not 0 < rows <= self.max_rows:
-            raise ValueError("Projection peer reduction exceeds prepared capacity")
-        return self.buffer[: self.p * rows]
-
-    def reduce(self, partial, rows):
-        """Return owned local rows; padded ranks must also participate."""
-        destination = self.input_buffer(rows)
-        if partial.shape != destination.shape or partial.dtype != destination.dtype:
-            raise ValueError("Projection partials have incompatible shape or dtype")
-        if (
-            partial.data_ptr() != destination.data_ptr()
-            or partial.stride() != destination.stride()
-        ):
-            destination.copy_(partial)
-        # Publish GEMM writes before peer reads; the second barrier protects
-        # this separate destination from being overwritten by the next GEMM.
-        self.handle.barrier(channel=0)
-        out = torch.empty(
-            (rows, self.hidden), device=partial.device, dtype=partial.dtype
-        )
-        _owner_reduce_kernel[(triton.cdiv(rows * self.hidden, 1024),)](
-            self.ptrs, out, rows, self.hidden, self.p, self.r, 1024
-        )
-        self.handle.barrier(channel=1)
-        return out
-
-
-@register_kernel(
-    "communication",
-    "projection_reduce_scatter",
-    name="triton_projection_reduce_scatter",
-    solution="triton",
-    signatures=format_signatures(("partial",), "dense", {torch.bfloat16}),
-)
-def triton_projection_reduce_scatter(state, partial, rows):
-    """Reduce TP4 [4*rows,H] partials to owned [rows,H] local-token outputs.
-
-    State is prepared collectively before capture. Calls and all consumers of
-    its borrowed input buffer must be serialized on one stream per subgroup.
-    """
-    return state.reduce(partial, rows)
-
-
 __all__ = [
-    "ProjectionPeerState",
-    "triton_projection_reduce_scatter",
     "triton_pack_channel_shards_for_a2a",
     "create_state",
     "get_token_dist",
