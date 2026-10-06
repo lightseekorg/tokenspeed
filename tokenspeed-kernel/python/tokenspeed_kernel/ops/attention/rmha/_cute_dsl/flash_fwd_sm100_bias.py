@@ -993,6 +993,7 @@ class FlashAttentionForwardSm100:
         else:
             tiled_mma_qk = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
                 self.q_dtype,
+                self.q_dtype,
                 q_major_mode,
                 k_major_mode,
                 self.sfq_dtype,
@@ -1007,6 +1008,7 @@ class FlashAttentionForwardSm100:
             self.mma_tiler_qk_sfk = (*mma_inst_shape_mn_sfk, self.mma_tiler_qk[2])
             self.tiled_mma_qk_sfk = (
                 sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                    self.q_dtype,
                     self.q_dtype,
                     q_major_mode,
                     k_major_mode,
@@ -1074,6 +1076,7 @@ class FlashAttentionForwardSm100:
             mma_tiler_pv_sfv = (*mma_inst_shape_mn_sfv, self.mma_tiler_pv[2])
             self.tiled_mma_pv_sfv = (
                 sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                    self.v_dtype,
                     self.v_dtype,
                     p_major_mode,
                     v_major_mode,
