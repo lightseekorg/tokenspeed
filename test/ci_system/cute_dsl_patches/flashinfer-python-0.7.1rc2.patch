@@ -1680,7 +1680,7 @@
 @@ -95 +97,2 @@
 -from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 +from cutlass.tensor_utils import TensorMapUpdateMode
-+from cutlass.utils import TensorMapManager
++from cutlass.tensor_utils import TensorMapManager
 @@ -668 +671 @@
 -            cutlass.utils.LayoutEnum.from_tensor(o),
 +            cutlass.tensor_utils.LayoutEnum.from_tensor(o),
@@ -1690,6 +1690,9 @@
 @@ -1053 +1056 @@
 -        tmem = cutlass.utils.TmemAllocator(
 +        tmem = cutlass.memory.TmemAllocator(
+@@ -4484 +4487 @@
+-        for k in cutlass.range_constexpr(cute.size(tTR_tCcShared)):
++        for k in cutlass.range(cute.size(tTR_tCcShared), unroll_full=True):
 --- flashinfer/gdn_kernels/blackwell/gated_delta_net_cp.py
 +++ flashinfer/gdn_kernels/blackwell/gated_delta_net_cp.py
 @@ -2,0 +3 @@
@@ -1714,7 +1717,7 @@
 @@ -55 +57,2 @@
 -from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 +from cutlass.tensor_utils import TensorMapUpdateMode
-+from cutlass.utils import TensorMapManager
++from cutlass.tensor_utils import TensorMapManager
 @@ -680 +683 @@
 -            cutlass.utils.LayoutEnum.from_tensor(o),
 +            cutlass.tensor_utils.LayoutEnum.from_tensor(o),
@@ -1724,6 +1727,9 @@
 @@ -1098 +1101 @@
 -        tmem = cutlass.utils.TmemAllocator(
 +        tmem = cutlass.memory.TmemAllocator(
+@@ -3159 +3162 @@
+-        for k in cutlass.range_constexpr(cute.size(tTR_tCcShared)):
++        for k in cutlass.range(cute.size(tTR_tCcShared), unroll_full=True):
 --- flashinfer/gdn_kernels/blackwell/gated_delta_net_tile_scheduler.py
 +++ flashinfer/gdn_kernels/blackwell/gated_delta_net_tile_scheduler.py
 @@ -65,2 +65,2 @@
@@ -1742,7 +1748,7 @@
 @@ -6 +6,2 @@
 -from cutlass.utils.tensormap_manager import TensorMapManager, TensorMapUpdateMode
 +from cutlass.tensor_utils import TensorMapUpdateMode
-+from cutlass.utils.tensormap_manager import TensorMapManager
++from cutlass.tensor_utils import TensorMapManager
 --- flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py
 +++ flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py
 @@ -0,0 +1 @@
@@ -1981,9 +1987,15 @@
 @@ -874 +877 @@
 -        tmem = utils.TmemAllocator(
 +        tmem = cutlass.memory.TmemAllocator(
+@@ -1160 +1163 @@
+-                tile_sched = utils.StaticPersistentRuntimeTileScheduler.create(
++                tile_sched = tile_scheduler.StaticPersistentRuntimeTileScheduler.create(
 @@ -2161 +2164 @@
 -        c_layout: utils.LayoutEnum,
 +        c_layout: cutlass.tensor_utils.LayoutEnum,
+@@ -2171 +2174 @@
+-        num_tmem_acc_col_per_stage = utils.get_num_tmem_alloc_cols(tCtAcc_stage1, True)
++        num_tmem_acc_col_per_stage = cutlass.memory.get_num_tmem_alloc_cols(tCtAcc_stage1, True)
 @@ -2217 +2220 @@
 -        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
 +        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
@@ -3639,9 +3651,36 @@
 +from cutlass.memory import SmemAllocator
 --- flashinfer/topk_varlen/kernels/gvr_topk_decode.py
 +++ flashinfer/topk_varlen/kernels/gvr_topk_decode.py
-@@ -37 +37 @@
+@@ -36,2 +36 @@
+-from cutlass.utils.distributed import atomicAdd
 -from cutlass.utils.smem_allocator import SmemAllocator
 +from cutlass.memory import SmemAllocator
+@@ -1948 +1947 @@
+-            atomicAdd(smem_hist.iterator + bin_i, cutlass.Int32(1))
++            cute.arch.atomic_add((smem_hist.iterator + bin_i).llvm_ptr, cutlass.Int32(1), sem="relaxed", scope="sys")
+@@ -2591,4 +2590 @@
+-                            bp_gt = atomicAdd(
+-                                s_iscalars.iterator + cutlass.Int32(4),
+-                                cnt_gt,
+-                            )
++                            bp_gt = cute.arch.atomic_add((s_iscalars.iterator + cutlass.Int32(4)).llvm_ptr, cnt_gt, sem="relaxed", scope="sys")
+@@ -2625,4 +2621 @@
+-                            bp_eq = atomicAdd(
+-                                s_iscalars.iterator + cutlass.Int32(4),
+-                                cnt_eq,
+-                            )
++                            bp_eq = cute.arch.atomic_add((s_iscalars.iterator + cutlass.Int32(4)).llvm_ptr, cnt_eq, sem="relaxed", scope="sys")
+@@ -3296,3 +3289 @@
+-                        pfill = atomicAdd(
+-                            s_iscalars.iterator + cutlass.Int32(7), cutlass.Int32(1)
+-                        )
++                        pfill = cute.arch.atomic_add((s_iscalars.iterator + cutlass.Int32(7)).llvm_ptr, cutlass.Int32(1), sem="relaxed", scope="sys")
+@@ -3389,4 +3380 @@
+-                            pfill = atomicAdd(
+-                                s_iscalars.iterator + cutlass.Int32(7),
+-                                cutlass.Int32(1),
+-                            )
++                            pfill = cute.arch.atomic_add((s_iscalars.iterator + cutlass.Int32(7)).llvm_ptr, cutlass.Int32(1), sem="relaxed", scope="sys")
 --- flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py
 +++ flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py
 @@ -36 +36 @@
@@ -3649,6 +3688,58 @@
 +from cutlass.memory import SmemAllocator
 --- flashinfer/topk_varlen/kernels/radix_topk.py
 +++ flashinfer/topk_varlen/kernels/radix_topk.py
-@@ -28 +28 @@
+@@ -27,2 +27 @@
+-from cutlass.utils.distributed import atomicAdd
 -from cutlass.utils.smem_allocator import SmemAllocator
 +from cutlass.memory import SmemAllocator
+@@ -439 +438 @@
+-                atomicAdd(local_histogram.iterator + bucket, val_one)
++                cute.arch.atomic_add((local_histogram.iterator + bucket).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -472 +471 @@
+-                atomicAdd(global_histogram_ptr + cutlass.Int32(i), count)
++                cute.arch.atomic_add((global_histogram_ptr + cutlass.Int32(i)).llvm_ptr, count, sem="relaxed", scope="sys")
+@@ -574 +573 @@
+-                atomicAdd(local_histogram.iterator + bucket, val_one)
++                cute.arch.atomic_add((local_histogram.iterator + bucket).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -722 +721 @@
+-                atomicAdd(local_histogram.iterator, warp_sum)
++                cute.arch.atomic_add((local_histogram.iterator).llvm_ptr, warp_sum, sem="relaxed", scope="sys")
+@@ -757 +756 @@
+-                local_pos = atomicAdd(local_histogram.iterator, val_one)
++                local_pos = cute.arch.atomic_add((local_histogram.iterator).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -767 +766 @@
+-                local_pos = atomicAdd(local_histogram.iterator, val_one)
++                local_pos = cute.arch.atomic_add((local_histogram.iterator).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -775 +774 @@
+-                local_pos = atomicAdd(local_histogram.iterator, val_one)
++                local_pos = cute.arch.atomic_add((local_histogram.iterator).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -810 +809 @@
+-                pos = atomicAdd(output_counter_ptr, val_one)
++                pos = cute.arch.atomic_add((output_counter_ptr).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -823 +822 @@
+-                pos = atomicAdd(output_counter_ptr, val_one)
++                pos = cute.arch.atomic_add((output_counter_ptr).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -831 +830 @@
+-                pos = atomicAdd(output_counter_ptr, val_one)
++                pos = cute.arch.atomic_add((output_counter_ptr).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -882 +881 @@
+-                local_histogram[1] = atomicAdd(output_counter_ptr, local_gt_count)
++                local_histogram[1] = cute.arch.atomic_add((output_counter_ptr).llvm_ptr, local_gt_count, sem="relaxed", scope="sys")
+@@ -959 +958 @@
+-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                pos = cute.arch.atomic_add((local_histogram.iterator + cutlass.Int32(2)).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -968 +967 @@
+-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                pos = cute.arch.atomic_add((local_histogram.iterator + cutlass.Int32(2)).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -975 +974 @@
+-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                pos = cute.arch.atomic_add((local_histogram.iterator + cutlass.Int32(2)).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -987 +986 @@
+-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                pos = cute.arch.atomic_add((local_histogram.iterator + cutlass.Int32(2)).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -997 +996 @@
+-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                pos = cute.arch.atomic_add((local_histogram.iterator + cutlass.Int32(2)).llvm_ptr, val_one, sem="relaxed", scope="sys")
+@@ -1005 +1004 @@
+-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
++                pos = cute.arch.atomic_add((local_histogram.iterator + cutlass.Int32(2)).llvm_ptr, val_one, sem="relaxed", scope="sys")

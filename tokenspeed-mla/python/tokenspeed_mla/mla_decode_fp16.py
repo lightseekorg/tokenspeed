@@ -2905,7 +2905,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         if cutlass.const_expr(self.arch == "sm_100"):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
             cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
-            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+            for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                 if apply_mask:
                     qk_col = tTR_tS[i][1]
                     if cutlass.const_expr(
@@ -3011,7 +3011,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             # branch so CuTe DSL can assign it a stable type at the join.
             cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
             if apply_mask:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                     qk_col = tTR_tS[i][1]
                     if cutlass.const_expr(
                         self.is_causal or common_params.local_visible_lens is not None
@@ -3094,7 +3094,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # if warps in N is 2, reduce row_max across warps (0, 1) and (2, 3)
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_max_new
-            self.softmax_exchange_sync_bar.wait()
+            self.softmax_exchange_sync_bar.arrive_and_wait()
             row_max_new = cute.arch.fmax(
                 row_max_new,
                 common_params.smem_exchange[
@@ -3486,7 +3486,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # exchange row_sum between warps (0, 1) and (2, 3)
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_sum
-            self.epilogue_exchange_sync_bar.wait()
+            self.epilogue_exchange_sync_bar.arrive_and_wait()
             # (64, 2)
             row_sum = (
                 row_sum

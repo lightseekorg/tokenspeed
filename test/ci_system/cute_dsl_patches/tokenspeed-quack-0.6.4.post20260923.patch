@@ -188,7 +188,7 @@
 @@ -9 +9,2 @@
 -from cutlass.utils import TensorMapUpdateMode, TensorMapManager
 +from cutlass.tensor_utils import TensorMapUpdateMode
-+from cutlass.utils import TensorMapManager
++from cutlass.tensor_utils import TensorMapManager
 --- quack/topk.py
 +++ quack/topk.py
 @@ -2,0 +3 @@

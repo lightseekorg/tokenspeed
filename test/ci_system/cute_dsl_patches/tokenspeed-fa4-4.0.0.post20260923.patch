@@ -477,6 +477,14 @@
 @@ -1073 +1074 @@
 -                    else FastDivmodDivisor(seqlen.seqlen_k),
 +                    else FastDivmodDivisorV2(seqlen.seqlen_k),
+--- flash_attn/cute/mask.py
++++ flash_attn/cute/mask.py
+@@ -1632 +1632 @@
+-        for i in cutlass.range_constexpr(cute.size(acc_qk), unroll_full=True):
++        for i in cutlass.range(cute.size(acc_qk), unroll_full=True):
+@@ -1685 +1685 @@
+-        for i in cutlass.range_constexpr(cute.size(acc_qk), unroll_full=True):
++        for i in cutlass.range(cute.size(acc_qk), unroll_full=True):
 --- flash_attn/cute/mma_sm100_desc.py
 +++ flash_attn/cute/mma_sm100_desc.py
 @@ -172,2 +172,2 @@
@@ -837,9 +845,13 @@
 @@ -14 +14 @@
 -from cutlass.cute import FastDivmodDivisor
 +from cutlass.cute import FastDivmodDivisorV2
-@@ -199 +199 @@
+@@ -17,0 +18 @@
++from quack.cute_dsl_utils import mlir_namedtuple
+@@ -22,0 +24 @@
++@mlir_namedtuple
+@@ -199 +201 @@
 -    """Compute FastDivmodDivisor pairs for aux_tensors index computation.
 +    """Compute FastDivmodDivisorV2 pairs for aux_tensors index computation.
-@@ -211 +211 @@
+@@ -211 +213 @@
 -    return (FastDivmodDivisor(seqlen_q), FastDivmodDivisor(seqlen_k))
 +    return (FastDivmodDivisorV2(seqlen_q), FastDivmodDivisorV2(seqlen_k))

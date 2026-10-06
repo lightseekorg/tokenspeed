@@ -37,7 +37,6 @@ from cutlass.cute.typing import Int32 as CuteInt32
 from cutlass.cute.typing import Pointer as CutePointer
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.memory import SmemAllocator
-from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.hardware_info import HardwareInfo
 from tokenspeed_kernel.platform import pdl_enabled
 
@@ -320,7 +319,12 @@ class SinglePassMultiCTARadixTopKClusterKernel(SinglePassMultiCTARadixTopKKernel
             local_histogram[0] = cutlass.Int32(0)  # local_offset_gt
             local_histogram[1] = cutlass.Int32(0)  # global_base_gt
             if local_gt_count > 0:
-                local_histogram[1] = atomicAdd(output_counter_ptr, local_gt_count)
+                local_histogram[1] = cute.arch.atomic_add(
+                    (output_counter_ptr).llvm_ptr,
+                    local_gt_count,
+                    sem="relaxed",
+                    scope="sys",
+                )
         cute.arch.barrier()
 
         # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)

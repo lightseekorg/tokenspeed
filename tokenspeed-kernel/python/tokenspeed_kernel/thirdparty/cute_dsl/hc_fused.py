@@ -748,7 +748,9 @@ class FusedGatedResidualKernel:
                         self._load_up(up, su, up_full, map_u, pid)
                 # Any recycled Down slot waits only for its own empty phase.
                 # Up weight requests have already been issued before that wait.
-                for tile in cutlass.range_constexpr(self.down_stages, self.k_tiles):
+                for tile in cutlass.range(
+                    self.down_stages, self.k_tiles, unroll_full=True
+                ):
                     stage = tile % self.down_stages
                     stage_uses = (
                         self.k_tiles + self.down_stages - 1 - stage
@@ -834,7 +836,7 @@ class FusedGatedResidualKernel:
                         down_b.iterator, down_b.layout, "k", next_src=None
                     )
                 )
-                for tile in cutlass.range_constexpr(self.k_tiles):
+                for tile in cutlass.range(self.k_tiles, unroll_full=True):
                     stage = tile % self.down_stages
                     stage_uses = (
                         self.k_tiles + self.down_stages - 1 - stage
@@ -970,9 +972,9 @@ class FusedGatedResidualKernel:
                 if warp == 0:
                     map_x = cute_ext.get_cta_v_map_ab(x, down_tiler, down_mma, "B")
                     gx = cute.local_tile(x, (self.n, self.down_k), (token, None, 0))
-                    for tile in cutlass.range_constexpr(self.k_tiles):
+                    for tile in cutlass.range(self.k_tiles, unroll_full=True):
                         stage = tile % self.down_stages
-                        if cutlass.const_expr(tile >= self.down_stages):
+                        if tile >= self.down_stages:
                             stage_uses = (
                                 self.k_tiles + self.down_stages - 1 - stage
                             ) // self.down_stages

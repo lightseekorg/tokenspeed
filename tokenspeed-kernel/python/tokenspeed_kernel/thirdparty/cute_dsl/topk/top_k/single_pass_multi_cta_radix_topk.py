@@ -29,7 +29,6 @@ from cutlass.cute.typing import Int32 as CuteInt32
 from cutlass.cute.typing import Pointer as CutePointer
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.memory import SmemAllocator
-from cutlass.utils.distributed import atomicAdd
 from tokenspeed_kernel.platform import pdl_enabled
 
 from ..utils import (
@@ -432,7 +431,12 @@ class SinglePassMultiCTARadixTopKKernel:
                     bucket = cutlass.Int32(
                         (ordered >> cutlass.Uint16(shift)) & cutlass.Uint16(0xFF)
                     )
-                atomicAdd(local_histogram.iterator + bucket, val_one)
+                cute.arch.atomic_add(
+                    (local_histogram.iterator + bucket).llvm_ptr,
+                    val_one,
+                    sem="relaxed",
+                    scope="sys",
+                )
         cute.arch.barrier()
 
     # ------------------------------------------------------------------
@@ -465,7 +469,12 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, self.radix, self.num_threads):
             count = local_histogram[i]
             if count > 0:
-                atomicAdd(global_histogram_ptr + cutlass.Int32(i), count)
+                cute.arch.atomic_add(
+                    (global_histogram_ptr + cutlass.Int32(i)).llvm_ptr,
+                    count,
+                    sem="relaxed",
+                    scope="sys",
+                )
 
     # ------------------------------------------------------------------
     # Step 2b: Prefix sum + find threshold bucket
@@ -567,7 +576,12 @@ class SinglePassMultiCTARadixTopKKernel:
                     bucket = cutlass.Int32(
                         (ordered >> cutlass.Uint16(shift)) & cutlass.Uint16(0xFF)
                     )
-                atomicAdd(local_histogram.iterator + bucket, val_one)
+                cute.arch.atomic_add(
+                    (local_histogram.iterator + bucket).llvm_ptr,
+                    val_one,
+                    sem="relaxed",
+                    scope="sys",
+                )
         cute.arch.barrier()
 
         # local_histogram is already the complete histogram — compute
@@ -715,7 +729,12 @@ class SinglePassMultiCTARadixTopKKernel:
         # Only lane 0 of each warp atomics the warp's total to smem.
         if cute.arch.lane_idx() == 0:
             if warp_sum > 0:
-                atomicAdd(local_histogram.iterator, warp_sum)
+                cute.arch.atomic_add(
+                    (local_histogram.iterator).llvm_ptr,
+                    warp_sum,
+                    sem="relaxed",
+                    scope="sys",
+                )
         cute.arch.barrier()
 
         return local_histogram[0]
@@ -750,7 +769,12 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, aligned_size, self.num_threads):
             ordered = shared_ordered[i]
             if ordered < ordered_pivot:
-                local_pos = atomicAdd(local_histogram.iterator, val_one)
+                local_pos = cute.arch.atomic_add(
+                    (local_histogram.iterator).llvm_ptr,
+                    val_one,
+                    sem="relaxed",
+                    scope="sys",
+                )
                 pos = local_histogram[1] + local_pos
                 output_indices_row[pos] = cutlass.Int32(
                     chunk_start + i + prologue_elems
@@ -760,7 +784,12 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, prologue_elems, self.num_threads):
             ordered = shared_ordered[i + aligned_size]
             if ordered < ordered_pivot:
-                local_pos = atomicAdd(local_histogram.iterator, val_one)
+                local_pos = cute.arch.atomic_add(
+                    (local_histogram.iterator).llvm_ptr,
+                    val_one,
+                    sem="relaxed",
+                    scope="sys",
+                )
                 pos = local_histogram[1] + local_pos
                 output_indices_row[pos] = cutlass.Int32(chunk_start + i)
                 if cutlass.const_expr(output_values_row is not None):
@@ -768,7 +797,12 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, left_size, self.num_threads):
             ordered = shared_ordered[i + aligned_size + prologue_elems]
             if ordered < ordered_pivot:
-                local_pos = atomicAdd(local_histogram.iterator, val_one)
+                local_pos = cute.arch.atomic_add(
+                    (local_histogram.iterator).llvm_ptr,
+                    val_one,
+                    sem="relaxed",
+                    scope="sys",
+                )
                 pos = local_histogram[1] + local_pos
                 output_indices_row[pos] = cutlass.Int32(
                     chunk_start + prologue_elems + aligned_size + i
@@ -803,7 +837,9 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, aligned_size, self.num_threads):
             ordered = shared_ordered[i]
             if ordered == ordered_pivot:
-                pos = atomicAdd(output_counter_ptr, val_one)
+                pos = cute.arch.atomic_add(
+                    (output_counter_ptr).llvm_ptr, val_one, sem="relaxed", scope="sys"
+                )
                 if pos < top_k:
                     output_indices_row[pos] = cutlass.Int32(
                         chunk_start + i + prologue_elems
@@ -816,7 +852,9 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, prologue_elems, self.num_threads):
             ordered = shared_ordered[i + aligned_size]
             if ordered == ordered_pivot:
-                pos = atomicAdd(output_counter_ptr, val_one)
+                pos = cute.arch.atomic_add(
+                    (output_counter_ptr).llvm_ptr, val_one, sem="relaxed", scope="sys"
+                )
                 if pos < top_k:
                     output_indices_row[pos] = cutlass.Int32(chunk_start + i)
                     if cutlass.const_expr(output_values_row is not None):
@@ -824,7 +862,9 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, left_size, self.num_threads):
             ordered = shared_ordered[i + aligned_size + prologue_elems]
             if ordered == ordered_pivot:
-                pos = atomicAdd(output_counter_ptr, val_one)
+                pos = cute.arch.atomic_add(
+                    (output_counter_ptr).llvm_ptr, val_one, sem="relaxed", scope="sys"
+                )
                 if pos < top_k:
                     output_indices_row[pos] = cutlass.Int32(
                         chunk_start + prologue_elems + aligned_size + i
@@ -875,7 +915,12 @@ class SinglePassMultiCTARadixTopKKernel:
             local_histogram[0] = cutlass.Int32(0)  # local_offset_gt
             local_histogram[1] = cutlass.Int32(0)  # global_base_gt
             if local_gt_count > 0:
-                local_histogram[1] = atomicAdd(output_counter_ptr, local_gt_count)
+                local_histogram[1] = cute.arch.atomic_add(
+                    (output_counter_ptr).llvm_ptr,
+                    local_gt_count,
+                    sem="relaxed",
+                    scope="sys",
+                )
         cute.arch.barrier()
 
         # Pass 1: float strictly greater than pivot (ordered < ordered_pivot)
@@ -952,7 +997,12 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, aligned_size, self.num_threads):
             ordered = shared_ordered[i]
             if ordered < ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
+                pos = cute.arch.atomic_add(
+                    (local_histogram.iterator + cutlass.Int32(2)).llvm_ptr,
+                    val_one,
+                    sem="relaxed",
+                    scope="sys",
+                )
                 output_indices_row[pos] = cutlass.Int32(
                     chunk_start + i + prologue_elems
                 )
@@ -961,14 +1011,24 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, prologue_elems, self.num_threads):
             ordered = shared_ordered[i + aligned_size]
             if ordered < ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
+                pos = cute.arch.atomic_add(
+                    (local_histogram.iterator + cutlass.Int32(2)).llvm_ptr,
+                    val_one,
+                    sem="relaxed",
+                    scope="sys",
+                )
                 output_indices_row[pos] = cutlass.Int32(chunk_start + i)
                 if cutlass.const_expr(output_values_row is not None):
                     output_values_row[pos] = self.from_ordered(ordered)
         for i in range(tidx, left_size, self.num_threads):
             ordered = shared_ordered[i + aligned_size + prologue_elems]
             if ordered < ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
+                pos = cute.arch.atomic_add(
+                    (local_histogram.iterator + cutlass.Int32(2)).llvm_ptr,
+                    val_one,
+                    sem="relaxed",
+                    scope="sys",
+                )
                 output_indices_row[pos] = cutlass.Int32(
                     chunk_start + prologue_elems + aligned_size + i
                 )
@@ -980,7 +1040,12 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, aligned_size, self.num_threads):
             ordered = shared_ordered[i]
             if ordered == ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
+                pos = cute.arch.atomic_add(
+                    (local_histogram.iterator + cutlass.Int32(2)).llvm_ptr,
+                    val_one,
+                    sem="relaxed",
+                    scope="sys",
+                )
                 if pos < top_k:
                     output_indices_row[pos] = cutlass.Int32(
                         chunk_start + i + prologue_elems
@@ -990,7 +1055,12 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, prologue_elems, self.num_threads):
             ordered = shared_ordered[i + aligned_size]
             if ordered == ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
+                pos = cute.arch.atomic_add(
+                    (local_histogram.iterator + cutlass.Int32(2)).llvm_ptr,
+                    val_one,
+                    sem="relaxed",
+                    scope="sys",
+                )
                 if pos < top_k:
                     output_indices_row[pos] = cutlass.Int32(chunk_start + i)
                     if cutlass.const_expr(output_values_row is not None):
@@ -998,7 +1068,12 @@ class SinglePassMultiCTARadixTopKKernel:
         for i in range(tidx, left_size, self.num_threads):
             ordered = shared_ordered[i + aligned_size + prologue_elems]
             if ordered == ordered_pivot:
-                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2), val_one)
+                pos = cute.arch.atomic_add(
+                    (local_histogram.iterator + cutlass.Int32(2)).llvm_ptr,
+                    val_one,
+                    sem="relaxed",
+                    scope="sys",
+                )
                 if pos < top_k:
                     output_indices_row[pos] = cutlass.Int32(
                         chunk_start + prologue_elems + aligned_size + i

@@ -3534,7 +3534,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cute.arch.fence_view_async_tmem_load()
             softmax_params.mma_s_pipeline.consumer_release(mma_s_consumer_state)
             mma_s_consumer_state.advance()
-            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+            for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                 if apply_mask:
                     qk_col = tTR_tS[i][1]
                     if cutlass.const_expr(
@@ -3645,7 +3645,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             mma_s_consumer_state.advance()
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
             if apply_mask:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                     if cutlass.const_expr(
                         self.is_causal or common_params.local_visible_lens is not None
                     ):
@@ -3746,9 +3746,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             common_params.smem_exchange[tidx] = row_max_new
             warp_in_group = tidx // self.threads_per_warp
             if warp_in_group % 2 == 0:
-                self.softmax_exchange_sync_bar_pair02.wait()
+                self.softmax_exchange_sync_bar_pair02.arrive_and_wait()
             else:
-                self.softmax_exchange_sync_bar_pair13.wait()
+                self.softmax_exchange_sync_bar_pair13.arrive_and_wait()
             row_max_new = cute.arch.fmax(
                 row_max_new,
                 common_params.smem_exchange[
@@ -4248,9 +4248,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             common_params.smem_exchange[tidx] = row_sum
             warp_in_group = tidx // self.threads_per_warp
             if warp_in_group % 2 == 0:
-                self.epilogue_exchange_sync_bar_pair02.wait()
+                self.epilogue_exchange_sync_bar_pair02.arrive_and_wait()
             else:
-                self.epilogue_exchange_sync_bar_pair13.wait()
+                self.epilogue_exchange_sync_bar_pair13.arrive_and_wait()
             # (64, 2)
             row_sum = (
                 row_sum

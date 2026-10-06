@@ -21,7 +21,6 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass._mlir.dialects import llvm
-from cutlass.utils.distributed import atomicAdd
 
 from .block_scan import block_prefix_sum_kernel, fence_acq_rel_cta
 
@@ -550,9 +549,11 @@ class FilteredTopKKernelVarlen:
 
                 for i in cutlass.range(cute.size(tXrX), unroll_full=True):
                     bin_val = self.to_coarse_key(tXrX[i])
-                    atomicAdd(
-                        s_histogram.iterator + cutlass.Int32(bin_val),
+                    cute.arch.atomic_add(
+                        (s_histogram.iterator + cutlass.Int32(bin_val)).llvm_ptr,
                         val_one,
+                        sem="relaxed",
+                        scope="sys",
                     )
 
             # for initial scalar load part.
@@ -560,9 +561,11 @@ class FilteredTopKKernelVarlen:
                 col_idx = cutlass.Int32(row_start + j)
                 raw = score[col_idx]
                 bin_val = self.to_coarse_key(raw)
-                atomicAdd(
-                    s_histogram.iterator + cutlass.Int32(bin_val),
+                cute.arch.atomic_add(
+                    (s_histogram.iterator + cutlass.Int32(bin_val)).llvm_ptr,
                     val_one,
+                    sem="relaxed",
+                    scope="sys",
                 )
 
             # for left part (left_size)
@@ -570,9 +573,11 @@ class FilteredTopKKernelVarlen:
                 col_idx = cutlass.Int32(left_start + j)
                 raw = score[col_idx]
                 bin_val = self.to_coarse_key(raw)
-                atomicAdd(
-                    s_histogram.iterator + cutlass.Int32(bin_val),
+                cute.arch.atomic_add(
+                    (s_histogram.iterator + cutlass.Int32(bin_val)).llvm_ptr,
                     val_one,
+                    sem="relaxed",
+                    scope="sys",
                 )
 
             cute.arch.barrier()
@@ -619,7 +624,12 @@ class FilteredTopKKernelVarlen:
                         cur_tXcX = tXcX[None, None, None, tile_idx]
                         bin_val = self.to_coarse_key(tXrX[i])
                         if bin_val < threshold_bin:
-                            pos = atomicAdd(s_counter.iterator, val_one)
+                            pos = cute.arch.atomic_add(
+                                (s_counter.iterator).llvm_ptr,
+                                val_one,
+                                sem="relaxed",
+                                scope="sys",
+                            )
                             idx = self.index_type(
                                 cur_tXcX[i // vec_size][1] + i % vec_size + vec_start
                             )
@@ -631,7 +641,12 @@ class FilteredTopKKernelVarlen:
                     raw = score[col_idx]
                     bin_val = self.to_coarse_key(raw)
                     if bin_val < threshold_bin:
-                        pos = atomicAdd(s_counter.iterator, val_one)
+                        pos = cute.arch.atomic_add(
+                            (s_counter.iterator).llvm_ptr,
+                            val_one,
+                            sem="relaxed",
+                            scope="sys",
+                        )
                         idx = self.index_type(col_idx)
                         s_indices[pos] = idx
 
@@ -641,7 +656,12 @@ class FilteredTopKKernelVarlen:
                     raw = score[col_idx]
                     bin_val = self.to_coarse_key(raw)
                     if bin_val < threshold_bin:
-                        pos = atomicAdd(s_counter.iterator, val_one)
+                        pos = cute.arch.atomic_add(
+                            (s_counter.iterator).llvm_ptr,
+                            val_one,
+                            sem="relaxed",
+                            scope="sys",
+                        )
                         idx = self.index_type(col_idx)
                         s_indices[pos] = idx
 
@@ -680,18 +700,30 @@ class FilteredTopKKernelVarlen:
                             cur_tXcX[i // vec_size][1] + i % vec_size + vec_start
                         )
                         if bin_val < threshold_bin:
-                            pos = atomicAdd(s_counter.iterator, val_one)
+                            pos = cute.arch.atomic_add(
+                                (s_counter.iterator).llvm_ptr,
+                                val_one,
+                                sem="relaxed",
+                                scope="sys",
+                            )
                             s_indices[pos] = idx
                         elif bin_val == threshold_bin:
                             # pos = atomicAdd(s_num_input[0], 1)
-                            pos = atomicAdd(s_num_input.iterator, val_one)
+                            pos = cute.arch.atomic_add(
+                                (s_num_input.iterator).llvm_ptr,
+                                val_one,
+                                sem="relaxed",
+                                scope="sys",
+                            )
                             if cutlass.const_expr(self.enable_gmem_store):
                                 if pos < self.filtered_topk_smem_input_size:
                                     s_input_idx[0, pos] = idx
                                 else:
-                                    buffer_pos = atomicAdd(
-                                        g_num_input.iterator,
+                                    buffer_pos = cute.arch.atomic_add(
+                                        (g_num_input.iterator).llvm_ptr,
                                         val_one,
+                                        sem="relaxed",
+                                        scope="sys",
                                     )
                                     buffer[0, buffer_pos] = cutlass.Int32(
                                         cutlass.Uint32(idx)
@@ -699,9 +731,13 @@ class FilteredTopKKernelVarlen:
                                 ordered = self.to_ordered(raw_input)
                                 sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                                 # atomicAdd(s_histogram[sub_bin], 1)
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
+                                cute.arch.atomic_add(
+                                    (
+                                        s_histogram.iterator + cutlass.Int32(sub_bin)
+                                    ).llvm_ptr,
                                     val_one,
+                                    sem="relaxed",
+                                    scope="sys",
                                 )
                             else:
                                 if pos < self.filtered_topk_smem_input_size:
@@ -709,9 +745,13 @@ class FilteredTopKKernelVarlen:
                                 ordered = self.to_ordered(raw_input)
                                 sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                                 # atomicAdd(s_histogram[sub_bin], 1)
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
+                                cute.arch.atomic_add(
+                                    (
+                                        s_histogram.iterator + cutlass.Int32(sub_bin)
+                                    ).llvm_ptr,
                                     val_one,
+                                    sem="relaxed",
+                                    scope="sys",
                                 )
 
                 # for initial scalar load part.
@@ -720,29 +760,42 @@ class FilteredTopKKernelVarlen:
                     raw = score[col_idx]
                     bin_val = self.to_coarse_key(raw)
                     if bin_val < threshold_bin:
-                        pos = atomicAdd(s_counter.iterator, val_one)
+                        pos = cute.arch.atomic_add(
+                            (s_counter.iterator).llvm_ptr,
+                            val_one,
+                            sem="relaxed",
+                            scope="sys",
+                        )
                         idx = self.index_type(col_idx)
                         s_indices[pos] = idx
                     elif bin_val == threshold_bin:
-                        pos = atomicAdd(
-                            s_num_input.iterator,
+                        pos = cute.arch.atomic_add(
+                            (s_num_input.iterator).llvm_ptr,
                             val_one,
+                            sem="relaxed",
+                            scope="sys",
                         )
                         # TODO: add gmem buffer here.
                         if cutlass.const_expr(self.enable_gmem_store):
                             if pos < self.filtered_topk_smem_input_size:
                                 s_input_idx[0, pos] = self.index_type(col_idx)
                             else:
-                                buffer_pos = atomicAdd(
-                                    g_num_input.iterator,
+                                buffer_pos = cute.arch.atomic_add(
+                                    (g_num_input.iterator).llvm_ptr,
                                     val_one,
+                                    sem="relaxed",
+                                    scope="sys",
                                 )
                                 buffer[0, buffer_pos] = cutlass.Int32(col_idx)
                             ordered = self.to_ordered(raw)
                             sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                            atomicAdd(
-                                s_histogram.iterator + cutlass.Int32(sub_bin),
+                            cute.arch.atomic_add(
+                                (
+                                    s_histogram.iterator + cutlass.Int32(sub_bin)
+                                ).llvm_ptr,
                                 val_one,
+                                sem="relaxed",
+                                scope="sys",
                             )
                         else:
                             # TODO: how to handle the type of sub_bin and ordered?
@@ -756,9 +809,13 @@ class FilteredTopKKernelVarlen:
                                 s_input_idx[0, pos] = self.index_type(col_idx)
                                 ordered = self.to_ordered(raw)
                                 sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
+                                cute.arch.atomic_add(
+                                    (
+                                        s_histogram.iterator + cutlass.Int32(sub_bin)
+                                    ).llvm_ptr,
                                     val_one,
+                                    sem="relaxed",
+                                    scope="sys",
                                 )
 
                 # for left part
@@ -767,29 +824,42 @@ class FilteredTopKKernelVarlen:
                     raw = score[col_idx]
                     bin_val = self.to_coarse_key(raw)
                     if bin_val < threshold_bin:
-                        pos = atomicAdd(s_counter.iterator, val_one)
+                        pos = cute.arch.atomic_add(
+                            (s_counter.iterator).llvm_ptr,
+                            val_one,
+                            sem="relaxed",
+                            scope="sys",
+                        )
                         idx = self.index_type(col_idx)
                         s_indices[pos] = idx
                     elif bin_val == threshold_bin:
-                        pos = atomicAdd(
-                            s_num_input.iterator,
+                        pos = cute.arch.atomic_add(
+                            (s_num_input.iterator).llvm_ptr,
                             val_one,
+                            sem="relaxed",
+                            scope="sys",
                         )
                         # TODO: add gmem buffer here.
                         if cutlass.const_expr(self.enable_gmem_store):
                             if pos < self.filtered_topk_smem_input_size:
                                 s_input_idx[0, pos] = self.index_type(col_idx)
                             else:
-                                buffer_pos = atomicAdd(
-                                    g_num_input.iterator,
+                                buffer_pos = cute.arch.atomic_add(
+                                    (g_num_input.iterator).llvm_ptr,
                                     val_one,
+                                    sem="relaxed",
+                                    scope="sys",
                                 )
                                 buffer[0, buffer_pos] = cutlass.Int32(col_idx)
                             ordered = self.to_ordered(raw)
                             sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                            atomicAdd(
-                                s_histogram.iterator + cutlass.Int32(sub_bin),
+                            cute.arch.atomic_add(
+                                (
+                                    s_histogram.iterator + cutlass.Int32(sub_bin)
+                                ).llvm_ptr,
                                 val_one,
+                                sem="relaxed",
+                                scope="sys",
                             )
                         else:
                             # TODO: how to handle the type of sub_bin and ordered?
@@ -803,9 +873,13 @@ class FilteredTopKKernelVarlen:
                                 s_input_idx[0, pos] = self.index_type(col_idx)
                                 ordered = self.to_ordered(raw)
                                 sub_bin = (ordered >> self.first_refine_shift) & 0xFF
-                                atomicAdd(
-                                    s_histogram.iterator + cutlass.Int32(sub_bin),
+                                cute.arch.atomic_add(
+                                    (
+                                        s_histogram.iterator + cutlass.Int32(sub_bin)
+                                    ).llvm_ptr,
                                     val_one,
+                                    sem="relaxed",
+                                    scope="sys",
                                 )
                 fence_acq_rel_cta()
                 cute.arch.barrier()
@@ -847,7 +921,12 @@ class FilteredTopKKernelVarlen:
                                 idx = cutlass.Int32(cutlass.Uint32(idx))
                                 bin_val = (self.to_ordered(score[idx]) >> offset) & 0xFF
                                 if bin_val < threshold:
-                                    pos = atomicAdd(s_counter.iterator, val_one)
+                                    pos = cute.arch.atomic_add(
+                                        (s_counter.iterator).llvm_ptr,
+                                        val_one,
+                                        sem="relaxed",
+                                        scope="sys",
+                                    )
                                     s_indices[pos] = self.index_type(idx)
                             if cutlass.const_expr(self.enable_gmem_store):
                                 for i in range(
@@ -860,7 +939,12 @@ class FilteredTopKKernelVarlen:
                                         self.to_ordered(score[idx]) >> offset
                                     ) & 0xFF
                                     if bin_val < threshold:
-                                        pos = atomicAdd(s_counter.iterator, val_one)
+                                        pos = cute.arch.atomic_add(
+                                            (s_counter.iterator).llvm_ptr,
+                                            val_one,
+                                            sem="relaxed",
+                                            scope="sys",
+                                        )
                                         s_indices[pos] = self.index_type(idx)
                             cute.arch.barrier()
                             # break
@@ -879,21 +963,32 @@ class FilteredTopKKernelVarlen:
                                 idx = self.index_type(idx_int32)
                                 bin_val = (self.to_ordered(raw_input) >> offset) & 0xFF
                                 if bin_val < threshold:
-                                    pos = atomicAdd(s_counter.iterator, val_one)
+                                    pos = cute.arch.atomic_add(
+                                        (s_counter.iterator).llvm_ptr,
+                                        val_one,
+                                        sem="relaxed",
+                                        scope="sys",
+                                    )
                                     s_indices[pos] = idx
                                 elif bin_val == threshold:
                                     if is_last_round:
-                                        cur_pos = atomicAdd(
-                                            s_last_remain.iterator,
+                                        cur_pos = cute.arch.atomic_add(
+                                            (s_last_remain.iterator).llvm_ptr,
                                             val_one_negative,
+                                            sem="relaxed",
+                                            scope="sys",
                                         )
                                         if cur_pos > 0:
                                             s_indices[self.top_k - cur_pos] = idx
                                     else:
                                         # pos = atomicAdd(s_num_input[r_idx ^ 1], 1)
-                                        cur_pos = atomicAdd(
-                                            s_num_input.iterator + (r_idx ^ 1),
+                                        cur_pos = cute.arch.atomic_add(
+                                            (
+                                                s_num_input.iterator + (r_idx ^ 1)
+                                            ).llvm_ptr,
                                             val_one,
+                                            sem="relaxed",
+                                            scope="sys",
                                         )
                                         # TODO: remove this if logic for gmem store?
                                         # num_input < filter_topk_smem_input_size
@@ -904,9 +999,14 @@ class FilteredTopKKernelVarlen:
                                             ):
                                                 s_input_idx[r_idx ^ 1, cur_pos] = idx
                                             else:
-                                                buffer_pos = atomicAdd(
-                                                    g_num_input.iterator + (r_idx ^ 1),
+                                                buffer_pos = cute.arch.atomic_add(
+                                                    (
+                                                        g_num_input.iterator
+                                                        + (r_idx ^ 1)
+                                                    ).llvm_ptr,
                                                     val_one,
+                                                    sem="relaxed",
+                                                    scope="sys",
                                                 )
                                                 buffer[r_idx ^ 1, buffer_pos] = (
                                                     idx_int32
@@ -914,10 +1014,14 @@ class FilteredTopKKernelVarlen:
                                             bin32 = self.to_ordered(raw_input)
                                             sub_bin = (bin32 >> (offset - 8)) & 0xFF
                                             # atomicAdd(s_histogram[sub_bin], 1)
-                                            atomicAdd(
-                                                s_histogram.iterator
-                                                + cutlass.Int32(sub_bin),
+                                            cute.arch.atomic_add(
+                                                (
+                                                    s_histogram.iterator
+                                                    + cutlass.Int32(sub_bin)
+                                                ).llvm_ptr,
                                                 val_one,
+                                                sem="relaxed",
+                                                scope="sys",
                                             )
                                         else:
                                             # TODO: how to handle the type of sub_bin and bin32?
@@ -937,10 +1041,14 @@ class FilteredTopKKernelVarlen:
                                                 bin32 = self.to_ordered(raw_input)
                                                 sub_bin = (bin32 >> (offset - 8)) & 0xFF
                                                 # atomicAdd(s_histogram[sub_bin], 1)
-                                                atomicAdd(
-                                                    s_histogram.iterator
-                                                    + cutlass.Int32(sub_bin),
+                                                cute.arch.atomic_add(
+                                                    (
+                                                        s_histogram.iterator
+                                                        + cutlass.Int32(sub_bin)
+                                                    ).llvm_ptr,
                                                     val_one,
+                                                    sem="relaxed",
+                                                    scope="sys",
                                                 )
 
                             cute.arch.barrier()
@@ -957,16 +1065,20 @@ class FilteredTopKKernelVarlen:
                                         self.to_ordered(raw_input) >> offset
                                     ) & 0xFF
                                     if bin_val < threshold:
-                                        pos = atomicAdd(
-                                            s_counter.iterator,
+                                        pos = cute.arch.atomic_add(
+                                            (s_counter.iterator).llvm_ptr,
                                             val_one,
+                                            sem="relaxed",
+                                            scope="sys",
                                         )
                                         s_indices[pos] = self.index_type(idx)
                                     elif bin_val == threshold:
                                         if is_last_round:
-                                            cur_pos = atomicAdd(
-                                                s_last_remain.iterator,
+                                            cur_pos = cute.arch.atomic_add(
+                                                (s_last_remain.iterator).llvm_ptr,
                                                 val_one_negative,
+                                                sem="relaxed",
+                                                scope="sys",
                                             )
                                             if cur_pos > 0:
                                                 s_indices[self.top_k - cur_pos] = (
@@ -974,9 +1086,13 @@ class FilteredTopKKernelVarlen:
                                                 )
                                         else:
                                             # pos = atomicAdd(s_num_input[r_idx ^ 1], 1)
-                                            cur_pos = atomicAdd(
-                                                s_num_input.iterator + (r_idx ^ 1),
+                                            cur_pos = cute.arch.atomic_add(
+                                                (
+                                                    s_num_input.iterator + (r_idx ^ 1)
+                                                ).llvm_ptr,
                                                 val_one,
+                                                sem="relaxed",
+                                                scope="sys",
                                             )
                                             if cutlass.const_expr(
                                                 self.enable_gmem_store
@@ -989,19 +1105,27 @@ class FilteredTopKKernelVarlen:
                                                         self.index_type(idx)
                                                     )
                                                 else:
-                                                    buffer_pos = atomicAdd(
-                                                        g_num_input.iterator
-                                                        + (r_idx ^ 1),
+                                                    buffer_pos = cute.arch.atomic_add(
+                                                        (
+                                                            g_num_input.iterator
+                                                            + (r_idx ^ 1)
+                                                        ).llvm_ptr,
                                                         val_one,
+                                                        sem="relaxed",
+                                                        scope="sys",
                                                     )
                                                     buffer[r_idx ^ 1, buffer_pos] = idx
                                                 bin32 = self.to_ordered(raw_input)
                                                 sub_bin = (bin32 >> (offset - 8)) & 0xFF
                                                 # atomicAdd(s_histogram[sub_bin], 1)
-                                                atomicAdd(
-                                                    s_histogram.iterator
-                                                    + cutlass.Int32(sub_bin),
+                                                cute.arch.atomic_add(
+                                                    (
+                                                        s_histogram.iterator
+                                                        + cutlass.Int32(sub_bin)
+                                                    ).llvm_ptr,
                                                     val_one,
+                                                    sem="relaxed",
+                                                    scope="sys",
                                                 )
                                             else:
                                                 if (
@@ -1016,10 +1140,14 @@ class FilteredTopKKernelVarlen:
                                                         bin32 >> (offset - 8)
                                                     ) & 0xFF
                                                     # atomicAdd(s_histogram[sub_bin], 1)
-                                                    atomicAdd(
-                                                        s_histogram.iterator
-                                                        + cutlass.Int32(sub_bin),
+                                                    cute.arch.atomic_add(
+                                                        (
+                                                            s_histogram.iterator
+                                                            + cutlass.Int32(sub_bin)
+                                                        ).llvm_ptr,
                                                         val_one,
+                                                        sem="relaxed",
+                                                        scope="sys",
                                                     )
                             fence_acq_rel_cta()
                             cute.arch.barrier()

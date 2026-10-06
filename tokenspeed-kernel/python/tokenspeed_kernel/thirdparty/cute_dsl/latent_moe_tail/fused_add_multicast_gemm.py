@@ -967,7 +967,9 @@ class FusedAddMulticastGemm:
         """Return the required tensor-memory column count."""
         acc_shape = tiled_mma.partition_shape_C(mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, num_acc_stage))
-        num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake, arch=arch)
+        num_tmem_alloc_cols = cutlass.memory.get_num_tmem_alloc_cols(
+            tCtAcc_fake, arch=arch
+        )
 
         return num_tmem_alloc_cols
 

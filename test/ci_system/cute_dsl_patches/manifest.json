@@ -420,7 +420,7 @@
         {
           "path": "flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py",
           "before": "f5db6379519b82b6e293d1f95560fa75af3a19a59c5aeb3aa00cc798df3957bc",
-          "after": "fdd72e29ea26a55bdd733eeb5054937b428790f977df053a665d5724f62cbb78"
+          "after": "c36f8de1076fb6a34c07b3b36a759f11914d69ade6cb04f008f03b4ba8b24b2f"
         },
         {
           "path": "flashinfer/gdn_kernels/blackwell/gated_delta_net_cp.py",
@@ -430,7 +430,7 @@
         {
           "path": "flashinfer/gdn_kernels/blackwell/gated_delta_net_cp_prefill.py",
           "before": "91bc85a33f9742a0d9f5b4eb256f6cb41e81f17f61172d43d23e85d61c6e0408",
-          "after": "809fd18f64f2e26e5277f0df584a968d81432376201bf0f2ba60e7f79ce1ee0d"
+          "after": "fec9e69ff98df96f50a315bbb8d5722a42c280b428f9691845437448559f9be4"
         },
         {
           "path": "flashinfer/gdn_kernels/blackwell/gated_delta_net_tile_scheduler.py",
@@ -440,7 +440,7 @@
         {
           "path": "flashinfer/gdn_kernels/delta_rule_dsl/collective_store_tma.py",
           "before": "92305a4f3b6aa168590a3cf67c0f1dd60c4e720bba9265e1c6709f2d117f10cd",
-          "after": "3600b388bf2ac95715795e2958b9913bb2cf6300047d97c5e0b97dc12b3344e1"
+          "after": "82dbcc3d556c4b81d005c05c8addd2ded499edd2a912f6c75c5b9827f32e9289"
         },
         {
           "path": "flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py",
@@ -515,7 +515,7 @@
         {
           "path": "flashinfer/gemm/kernels/cute_dsl/dense_gemm_bf16_fp4_sm100.py",
           "before": "d286ba16c3007139c5d3526d066cec452b4933f74f26d723f19dceb06e496a30",
-          "after": "c1807991c07e82748f4a7d777516c840ecf961e5caf0a5a9d80d9fce54edbe50"
+          "after": "01dde2b1ad2b8aa19b995ff490a42d6740c84eba22909c9912c7a08ff4e23627"
         },
         {
           "path": "flashinfer/gemm/kernels/cute_dsl/dense_gemm_bf16_fp4_sm12x.py",
@@ -985,7 +985,7 @@
         {
           "path": "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
           "before": "497500d8ad733968513b27ffee95cda046115e59f4bb3b454246336e01d22225",
-          "after": "d8ea6667701613872ea0aa0fb3983e188c0f9188d126d4a107e39f49c7df2671"
+          "after": "ce8dbd0fdd8ee8f033a0552df5c2a7af17f985b897535b50c98b4d3bc59cf2a1"
         },
         {
           "path": "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
@@ -995,7 +995,7 @@
         {
           "path": "flashinfer/topk_varlen/kernels/radix_topk.py",
           "before": "5de8a36c6e7f4b5fb8596fead55fae3421c16ca615f3ce6664f37fa25c322c8d",
-          "after": "2d80cd0b452cf7b4fb2d1abd65c4abbdeaf58f2945e94a3d530542456281feb6"
+          "after": "cfe826685a32366a3f08d7092d6a7481db3f1bb046c31b82b01f4971aff0a1db"
         }
       ]
     },
@@ -1091,6 +1091,11 @@
           "after": "9fec007575d8004fcdf4322b50f000e69202e769d5bde589c5f3d6d617bb8692"
         },
         {
+          "path": "flash_attn/cute/mask.py",
+          "before": "700209e91543f51b11d3bf7020885ef7442136b31dbc9e74b4c668f07d2cc6c7",
+          "after": "c64f797dc2477cd1a07b25f64ac9ef142860a83116c6c573c29cd3006165690d"
+        },
+        {
           "path": "flash_attn/cute/mma_sm100_desc.py",
           "before": "ac6ec28b2f1a4b797c391a7807b88f83b430452d418262c3dfa7b0f3516e39f9",
           "after": "efa02020a9685d5ac246a2af3623d884f167d1213cd7fd5fce99b6fff9b48b95"
@@ -1128,7 +1133,7 @@
         {
           "path": "flash_attn/cute/utils.py",
           "before": "c80d6ef6a62d005ac259829cf69c675f5f570ed93768d296e46e210768194c08",
-          "after": "5dc1232b2f55d62419db743c31f85a0b1afc070ead1a07f8e2c785d31e230913"
+          "after": "cc0769107518a17ab4c8a4a9a18d81f3d55e3c06da6b033221a17ae24a1d6187"
         }
       ]
     },
@@ -1251,7 +1256,7 @@
         {
           "path": "quack/tensormap_manager.py",
           "before": "b702cb7424bab3cf81098221e1761d3ed1375d7e0e0004879259ec1acb339cf8",
-          "after": "b58b552c2919cf4de64c11fc96ee4a7b829738469c5f343d54e85afc3674df5a"
+          "after": "733444016423be4a311503b45e644cc434bb9d75a9325cceed1e6a75e5b62d37"
         },
         {
           "path": "quack/topk.py",
