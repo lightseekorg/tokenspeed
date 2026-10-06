@@ -106,5 +106,31 @@ def test_get_quant_config_reads_hf_quant_config_json(tmp_path):
     assert get_quant_config(flat, None).exclude_modules == _SECTION["exclude_modules"]
 
 
+def test_per_tensor_fp8_experts_are_refused_by_name(monkeypatch):
+    """No MoE kernel takes FP8 experts with per-tensor scales: the layer says
+    so instead of failing on the missing weight block size."""
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "moe_mxfp4_fp8_activation", False)
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    with pytest.raises(
+        ValueError,
+        match=r"model.layers.1.mlp: FP8 experts without a weight block size "
+        r"\(per-tensor scales\) have no MoE kernel",
+    ):
+        MoELayer(
+            top_k=2,
+            num_experts=4,
+            hidden_size=128,
+            intermediate_size=128,
+            quant_config=ModelOptFp8Config.from_config(_FLAT),
+            layer_index=1,
+            prefix="model.layers.1.mlp",
+            tp_rank=0,
+            tp_size=1,
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
