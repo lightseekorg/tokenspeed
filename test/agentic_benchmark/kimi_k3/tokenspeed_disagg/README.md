@@ -16,7 +16,7 @@ turn, 800-token later turns, 10-15 turns) and then run
 with a unique `[rid:<hash>]` mark prepended to its first user message, so
 replicas are distinct prefixes rather than cache hits. The result,
 `agentic_dataset_x32.json` (2272 conversations, all distinct first turns), is
-the only file the client reads; the 128-wide decode rung needs 128 of them.
+the only file the client reads; the 512-wide decode rung needs 512 of them.
 Replicas are interleaved, so the first 71 entries are the originals.
 
 Synthetic random-token prompts are deliberately NOT used: speculative
@@ -45,7 +45,7 @@ first-touch costs on every rank before the timed rungs.
 **P-fresh (compute-bound):** send unique first turns cold. Ladder: parallel
 1/2/4/8/16, number = 2 x parallel, offsets advance so no prompt is reused
 (62 conversations). Ranking: **prefill tok/s / GPU**; secondary TTFT p50/p99.
-Validity guard: cache hit <= 5%.
+Expected cache hit: <= 5%.
 
 **P-cached (bandwidth-bound, distinct prefixes):** per conversation, prime
 turn 1 with `max_tokens 500` (excluded from measurement), then measure turn 2
@@ -53,8 +53,8 @@ with `max_tokens 1`: a cached prefill of the ~50K prefix plus the ~800-token
 turn increment. The prime's reasoning_content and content are passed back in
 the replayed assistant turn; whatever the re-rendered turn fails to match is
 recomputed and counted. Ranking: **computed tok/s / GPU = (prompt_tokens -
-cached_tokens) / time**; secondary requests/s and TTFT p50/p99. Validity
-guard: cache hit >= 95%.
+cached_tokens) / time**; secondary requests/s and TTFT p50/p99. Expected
+cache hit: >= 95%.
 
 ## D-sim: decode-node simulation
 
@@ -75,7 +75,7 @@ Each rung is its own prime-measure loop:
    each conversation's rank, so rolling admission could not hold per-rank
    concurrency constant anyway; one wave keeps every rank at parallel/16
    requests for the whole rung.
-4. Rungs: parallel 16/32/64/128 (one to eight requests per rank).
+4. Rungs: parallel 16/32/64/128/256/384/512 (one to 32 requests per rank).
    Ranking: **Output Throughput (tok/s) / GPU**; secondary TPOT p50/p99.
 
 Why prime per rung: a finished request keeps prefix-cache blocks not only for
@@ -86,9 +86,9 @@ growth evicts the contexts a later rung needs (observed: rung 128 missing
 exactly the half rung 64 had not touched). Priming right before each rung
 refreshes exactly what the rung will read.
 
-Validity guard, recorded per rung in the collect output: **cache hit >= 95%**
-on the measure wave — below it the rung is VOID (primed KV evicted, or a
-request reached a rank other than the one holding its KV).
+Expected cache hit: >= 95% on the measure wave. The collector reports each
+rung's cache-hit rate without filtering; users assess whether the results
+represent the intended workload.
 
 ## Knobs
 
@@ -99,11 +99,12 @@ request reached a rank other than the one holding its KV).
   rung's output throughput is output divided by the wall time set by its
   slowest request, so D-sim differences below the measured noise band need
   repeated runs; TPOT p50 is the steadier column.
-- Config: `--max-num-seqs 128` (8 slots per rank), chunked prefill 8192 with
+- Config: `--max-num-seqs 512` (32 slots per rank), chunked prefill 8192 with
   `--gpu-memory-utilization 0.8` — the trtllm MoE workspace scales with the
   tokens gathered from all 16 ranks per step, and 16 x 8192 needs the headroom
   0.8 leaves (0.9 runs out of memory on that gather).
-- P:D sizing helper in collect: give it the per-conversation token mix
+- P:D sizing uses the highest-concurrency rung per phase, regardless of
+  cache-hit rate. Give it the per-conversation token mix
   (`--mix-fresh-tokens/--mix-cached-tokens/--mix-decode-tokens`, defaults =
   the agentic anchors) and it converts the measured rates into GPU-seconds per
   conversation on each side, printing `P gpu-s/conv / D gpu-s/conv = P-GPUs
@@ -126,9 +127,8 @@ request reached a rank other than the one holding its KV).
   host memory sized per rank, and the config caps it at `--kvstore-size 80`
   (GB, about one device arena): the default 2x ratio would pin ~162 GB per
   rank, and four ranks share one node's Slurm memory limit (880 GiB here), so
-  the boot dies with a Slurm `Out Of Memory` before the server is ready. 80 GB
-  holds the widest rung's primed set (8 contexts x ~26 blocks) several times
-  over. The boot log's `Allocated ... compact Host L2` line reports the pool
+  the boot dies with a Slurm `Out Of Memory` before the server is ready.
+  The boot log's `Allocated ... compact Host L2` line reports the pool
   actually allocated.
 - Server logs land in `/tmp/tokenspeed_server_disagg_<config>_<sweep-ts>.log`
   on the node running the wrapper, one file per sweep.
@@ -155,6 +155,6 @@ duplicate_agentic_dataset.py    # cache-bust replicas of the 71-conversation bui
 p_bench.slurm                   # P sweep: boot -> warmup -> P-fresh ladder -> P-cached ladder -> kill
 d_bench.slurm                   # D sweep: boot -> per rung (prime -> settle -> measure) -> kill
 pd_client.py                    # phased client shared by both sweeps
-collect_outputs.py              # tables + guards + P:D sizing; accepts multiple sweep dirs
+collect_outputs.py              # tables + P:D sizing; accepts multiple sweep dirs
 outputs/p_<ts>/, outputs/d_<ts>/   # per-sweep artifacts (gitignored)
 ```

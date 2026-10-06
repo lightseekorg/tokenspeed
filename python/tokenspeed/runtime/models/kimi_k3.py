@@ -3290,6 +3290,9 @@ class KimiLinearModel(nn.Module):
         shared_parallel = validate_shared_expert_settings(mapping, shared_value)
         if shared_parallel is not None:
             initialize_shared_expert_group(shared_parallel)
+            logger.info(
+                f"K3 shared-expert TP enabled: tp_size={shared_parallel.tp_size}, num_groups={shared_parallel.dp_size}"
+            )
 
         alt_stream = (
             torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None
