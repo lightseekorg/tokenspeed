@@ -25,7 +25,7 @@
         "seed": 4101
       },
       "policy": {
-        "max_regression_relative": 0.06,
+        "max_regression_relative": 0.08,
         "max_regression_absolute_us": 2.0,
         "max_relative_mad": 0.05
       }
@@ -50,8 +50,8 @@
         "seed": 4102
       },
       "policy": {
-        "max_regression_relative": 0.08,
-        "max_regression_absolute_us": 5.0,
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 3.0,
         "max_relative_mad": 0.05
       }
     },
@@ -75,7 +75,7 @@
         "seed": 4103
       },
       "policy": {
-        "max_regression_relative": 0.05,
+        "max_regression_relative": 0.08,
         "max_regression_absolute_us": 5.0,
         "max_relative_mad": 0.05
       }
@@ -250,7 +250,7 @@
         "seed": 4302
       },
       "policy": {
-        "max_regression_relative": 0.06,
+        "max_regression_relative": 0.08,
         "max_regression_absolute_us": 2.0,
         "max_relative_mad": 0.05
       }

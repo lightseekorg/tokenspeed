@@ -355,10 +355,19 @@ def test_decode_rejects_unsupported_architectures(capability, is_fp8):
 class TestCompile:
     @pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
     @pytest.mark.parametrize(
-        "dtype,heads",
-        [("float8_e4m3fn", 16), ("float8_e4m3fn", 96), ("bfloat16", 16)],
+        "dtype,heads,local_visible",
+        [
+            ("float8_e4m3fn", 16, False),
+            ("float8_e4m3fn", 96, False),
+            ("float8_e4m3fn", 16, True),
+            ("float8_e4m3fn", 96, True),
+            ("bfloat16", 16, False),
+            ("bfloat16", 16, True),
+        ],
     )
-    def test_decode_architectures_and_causal_masks(self, capability, dtype, heads):
+    def test_decode_architectures_and_causal_masks(
+        self, capability, dtype, heads, local_visible
+    ):
         # No device or host occupancy query is needed to compile another target.
         script = textwrap.dedent(f"""
             import torch
@@ -375,6 +384,7 @@ class TestCompile:
                     is_var_seq=True,
                     is_var_split_kv=False,
                     compute_capability={capability!r},
+                    has_local_visible_lens={local_visible!r},
                     partial_fp16=False,
                     fold_sq_factor={4 if heads == 16 else 1},
                     causal_mask=causal_mask,
@@ -827,7 +837,178 @@ def _run_gpu_check(check, arguments, timeout):
             process.join()
 
 
+@pytest.mark.parametrize(
+    "invalid", ["dtype", "shape", "strides", "fp16", "window", "cp"]
+)
+def test_local_visible_lengths_reject_unsupported_inputs(invalid):
+    from tokenspeed_mla import tokenspeed_mla_decode
+
+    visible = torch.zeros((1, 4), dtype=torch.int32)
+    query = torch.zeros((1, 4, 16, 576), dtype=torch.bfloat16)
+    extra = {}
+    if invalid == "dtype":
+        visible = visible.to(torch.int64)
+    elif invalid == "shape":
+        visible = visible[:, :1]
+    elif invalid == "strides":
+        visible = torch.zeros((1, 8), dtype=torch.int32)[:, ::2]
+    elif invalid == "fp16":
+        query = query.to(torch.float16)
+    elif invalid == "window":
+        extra["window_left"] = 128
+    elif invalid == "cp":
+        extra["cp_world"] = 2
+    with pytest.raises(ValueError, match="local_visible_lens"):
+        tokenspeed_mla_decode(
+            query,
+            torch.zeros((1, 64, 576), dtype=query.dtype),
+            torch.empty(0, dtype=torch.int8),
+            512,
+            64,
+            torch.zeros((1, 2), dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+            64,
+            192**-0.5,
+            local_visible_lens=visible,
+            **extra,
+        )
+
+
+def _check_local_visible_gpu(
+    batch, heads, q_len, packed, persistent, kv_len, dtype, partial_fp16
+):
+    import tokenspeed_mla.mla_decode as decode
+    from tokenspeed_mla import tokenspeed_mla_decode
+
+    decode._FP16_PARTIALS = partial_fp16
+
+    original_compile = decode._get_compiled_mla_kernel
+    selections = []
+
+    def record_compile(*args, **kwargs):
+        selections.append(kwargs["is_workspace_size_zero"])
+        return original_compile(*args, **kwargs)
+
+    decode._get_compiled_mla_kernel = record_compile
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    case = _Case(batch, kv_len, heads, q_len)
+    q, kv, tables, lengths = _make_inputs(case, dtype, False, "cuda")
+    visible = torch.empty((batch, q_len), dtype=torch.int32, device="cuda")
+    workspace = torch.empty(64 * 1024**2, dtype=torch.int8, device="cuda")
+    out = torch.empty((batch, q_len, heads, 512), dtype=torch.bfloat16, device="cuda")
+    kwargs = dict(
+        query=q,
+        kv_cache=kv,
+        workspace_buffer=workspace,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=tables,
+        seq_lens=lengths,
+        max_seq_len=case.kv_len,
+        softmax_scale=192**-0.5,
+        out=out,
+        is_var_seq=not persistent,
+        causal_mask=True,
+        return_lse=True,
+        enable_packed_q=packed,
+        local_visible_lens=visible,
+    )
+    boundaries = [0, 1, 63, 64, 65, 127, 128, 129, 257, kv_len]
+    initial = torch.tensor(
+        [
+            sorted(boundaries[(b + t) % len(boundaries)] for t in range(q_len))
+            for b in range(batch)
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    # Small batches must cover long visible prefixes as well as empty early rows.
+    if batch == 1:
+        initial[0] = torch.tensor(
+            ([129] if q_len == 1 else [0] * (q_len - 2) + [kv_len - 65, kv_len]),
+            dtype=torch.int32,
+            device="cuda",
+        )
+    visible.copy_(initial)
+    tokenspeed_mla_decode(**kwargs)
+    assert selections[-1] == (batch == 128), "Expected direct/split-KV coverage changed"
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_out, captured_lse = tokenspeed_mla_decode(**kwargs)
+
+    for state in ("mixed", "zero_k", "empty_rows", "restored"):
+        lengths.fill_(case.kv_len)
+        visible.copy_(initial)
+        if state == "zero_k":
+            lengths[::2] = 0
+            visible[::2] = 0
+        elif state == "empty_rows":
+            visible.zero_()
+        expected = torch.zeros_like(out, dtype=torch.float32)
+        expected_lse = torch.full((batch, q_len, heads), -torch.inf, device="cuda")
+        for b in range(batch):
+            keys = (
+                kv.view(torch.uint8)[
+                    tables[b, : math.ceil(case.kv_len / kv.shape[1])].long()
+                ]
+                .view(kv.dtype)
+                .reshape(-1, 576)
+                .float()
+            )
+            for t, count in enumerate(visible[b].tolist()):
+                if count:
+                    scores = q[b, t].float() @ keys[:count].T * (192**-0.5)
+                    expected[b, t] = scores.softmax(-1) @ keys[:count, :512]
+                    expected_lse[b, t] = scores.logsumexp(-1) * math.log2(math.e)
+        # Poison old outputs/workspace to expose skipped writes on graph replay.
+        workspace.fill_(127)
+        out.fill_(torch.nan)
+        # Explicit local bounds also override the noncausal path. The captured
+        # causal variant must produce the same result for these same bounds.
+        kwargs["causal_mask"] = state != "restored"
+        eager_out, eager_lse = tokenspeed_mla_decode(**kwargs)
+        torch.cuda.synchronize()
+        _check_output(eager_out, expected, dtype)
+        torch.testing.assert_close(eager_lse, expected_lse, atol=2e-4, rtol=2e-4)
+        workspace.fill_(127)
+        out.fill_(torch.nan)
+        captured_lse.fill_(torch.nan)
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_output(captured_out, expected, dtype)
+        torch.testing.assert_close(captured_lse, expected_lse, atol=2e-4, rtol=2e-4)
+        empty = visible == 0
+        assert torch.count_nonzero(captured_out[empty]) == 0
+        assert torch.isneginf(captured_lse[empty]).all()
+
+
 class TestGPU:
+    @pytest.mark.parametrize(
+        "dtype,partial_fp16", [("bf16", False), ("fp8", False), ("fp8", True)]
+    )
+    @pytest.mark.parametrize(
+        "batch,heads,q_len,packed,persistent,kv_len",
+        [
+            (1, 96, 1, False, False, 385),
+            (1, 16, 4, False, False, 385),
+            (1, 96, 3, True, True, 385),
+            (128, 16, 4, False, False, 385),
+            (128, 96, 3, True, True, 385),
+            (1, 16, 4, False, False, 65537),
+            (1, 96, 4, False, False, 65537),
+        ],
+    )
+    def test_local_visible_lengths(
+        self, batch, heads, q_len, packed, persistent, kv_len, dtype, partial_fp16
+    ):
+        _run_gpu_check(
+            _check_local_visible_gpu,
+            (batch, heads, q_len, packed, persistent, kv_len, dtype, partial_fp16),
+            600,
+        )
+
     @pytest.mark.parametrize(
         "case,variable_kv",
         [

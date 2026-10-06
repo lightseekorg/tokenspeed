@@ -36,6 +36,8 @@ from tokenspeed_kernel.ops.attention.mha.flashinfer import (
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -44,7 +46,6 @@ from tokenspeed.runtime.layers.attention.chunk import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     TRTLLM_MLA_DEFAULT_PAGE_SIZE,
     TRTLLM_MLA_SUPPORTED_PAGE_SIZES,
@@ -135,6 +136,11 @@ class TRTLLMMLADecodeMetadata:
     seq_lens_k: torch.Tensor | None = None
     # Verify window width baked into the graph views (1 outside target verify).
     q_len_per_req: int = 1
+    # DSA wrapper's per-token indexer rows (``[bs * spec_num_tokens, 1]``
+    # context lengths) and their opaque ``dsa_plan`` (None when the selected
+    # kernel needs none); the dense leaf itself never reads them.
+    _dsa_seq_lens_2d: torch.Tensor | None = None
+    _dsa_plan: object | None = None
 
 
 class TRTLLMMLABackend(PagedAttentionBackend):
@@ -194,8 +200,12 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
         **kwargs,
     ):
+        reject_query_shard(query_shard, "TRTLLMMLABackend")
+        del page_table_cpu
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "trtllm_mla decode metadata goes through refresh_decode_metadata; "
@@ -363,23 +373,9 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        # q is whole Q [T, H, head_dim]; k is whole latent [T, 1, head_dim].
-        if save_kv_cache:
-            assert k is not None
-            local_slots, write_mask = resolve_cache_slots(
-                out_cache_loc, self.cache_placement(layer)
-            )
-            token_to_kv_pool.set_mla_kv_buffer(
-                layer,
-                local_slots,
-                k[..., : self.kv_lora_rank],
-                k[..., self.kv_lora_rank :],
-                write_mask=write_mask,
-            )
-
+        # q is the absorbed query [T, H, head_dim]; the prologue wrote the latent cache.
         metadata = self.forward_decode_metadata
         # A block drafter's decode metadata describes only decode rows, so
         # there are no leading extend rows to slice away.
@@ -415,14 +411,7 @@ class TRTLLMMLABackend(PagedAttentionBackend):
 
         if self.data_type == torch.float8_e4m3fn:
             query = query.to(self.data_type)
-            k_scale = (
-                layer.k_scale_float
-                if getattr(layer, "k_scale_float", None) is not None
-                else 1.0
-            )
-            bmm1_scale = k_scale * layer.scaling
-        else:
-            bmm1_scale = layer.scaling
+        bmm1_scale = layer.scaling
 
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         if self.data_type != k_cache.dtype:
@@ -455,7 +444,6 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         raise NotImplementedError(

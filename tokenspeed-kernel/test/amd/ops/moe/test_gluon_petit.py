@@ -59,6 +59,7 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
             internal_activation_dtype="mxfp4",
             with_bias=profile.has_bias,
             fast_math=True,
+            combine_order="rank",
             solution="gluon",
         )
 
@@ -87,6 +88,7 @@ def test_petit_cannot_replace_explicit_deepep(mi350_platform) -> None:
             internal_activation_dtype="mxfp4",
             with_bias=True,
             fast_math=True,
+            combine_order="rank",
             solution="gluon",
         )
 

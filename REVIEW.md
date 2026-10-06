@@ -55,6 +55,7 @@ be justified and documented in the same change.
 | C++ scheduler | [Scheduler](docs/design/scheduler.md): chunk admission, retraction, engine roles, recovery invariants |
 | Cache allocation, prefix reuse, transfer | [Cache concepts](docs/design/cache-concepts.md): logical/physical units, ownership, geometry, layering |
 | Attention metadata and decode execution | [Unified decode path](docs/design/unified_path.md): refresh-in-place metadata, padding, buffer capacity, graph mechanics |
+| QK norm, RoPE, KV quantization and KV writes | [Attention prologue](docs/design/attention-prologue.md): one entry, numerics contract, who writes the cache |
 | KDA prefill graphs | [KDA prefill subgraphs](docs/design/kda-prefill-subgraphs.md) |
 | Kernel registration and backends | [Kernel design](tokenspeed-kernel/README.md) and the affected operation's README |
 | CI task declarations and validation | [CI task specs](test/ci/README.md) |

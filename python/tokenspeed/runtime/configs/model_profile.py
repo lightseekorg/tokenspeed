@@ -31,6 +31,7 @@ from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -45,8 +46,12 @@ class ModelProfile:
 
     Attributes:
         configure_attention: Writes the attention geometry onto the
-            ``ModelConfig`` (``attention_arch``, head dimensions, scaling),
-            e.g. ``configure_mla_attention`` or ``configure_dsa_attention``.
+            ``ModelConfig`` (``attention_arch``, head dimensions, scaling,
+            a DSA model's ``index_k_format``), e.g. ``configure_mla_attention``
+            or ``configure_dsa_attention``. Receives the resolved launch too,
+            so a hook can key a choice on it (the index-K plane a model scores
+            under ``server_args.numerics``, say); the in-tree hooks read none
+            of it.
         cache_family: Registered cache recipe and pool family that owns this
             model's per-request state.
         linear_attention: Registered linear-attention backend serving the
@@ -64,12 +69,13 @@ class ModelProfile:
             the cache plans one plane per branch. Cache geometry, so it has
             no fallback: an omitted count would undersize the cache.
         numerics_envelopes: The ``--numerics`` envelopes the model is verified
-            under, always including ``"auto"``. A model lists another one
-            (e.g. ``"rl-bitwise"``) only once the bitwise invariance harness
-            passes for it; launching an unlisted envelope is refused.
+            under, always including ``"auto"``. A model lists ``"rl-bitwise"``
+            only once the bitwise invariance harness and the teacher-forced
+            logprob comparison against the trainer pass for it; launching an
+            unlisted envelope is refused.
     """
 
-    configure_attention: Callable[[ModelConfig], None]
+    configure_attention: Callable[[ModelConfig, ServerArgs], None]
     cache_family: str
     linear_attention: str | None
     default_attention_backend: str | None

@@ -127,6 +127,9 @@ def _build_backend(
     )
 
     cfg = SamplingBackendConfig(
+        enable_speculative_sampling=False,
+        sampling_stream="batch",
+        logprob_order="torch",
         enable_output_logprobs=enable_output_logprobs,
         max_bs=max_bs,
         max_draft_tokens_per_req=max_n,
@@ -211,7 +214,7 @@ def _test_verify_dp_matches_today(
     full_batch_in = _StubOutput()
     full_batch_in.next_token_logits = full_logits.clone()
     predict_full, accept_length_full = backend.verify(
-        full_batch_in, sampling_info_full_batch, candidates
+        full_batch_in, sampling_info_full_batch, candidates, tree=None
     )
     predict_full = predict_full.clone()
     accept_length_full = accept_length_full.clone()
@@ -246,17 +249,17 @@ def _test_verify_dp_matches_today(
             flashinfer_backend.write_output_logprobs = _fail_global_writer
             try:
                 predict_dp, accept_length_dp = backend.verify(
-                    dp_in, sampling_info_dp, candidates
+                    dp_in, sampling_info_dp, candidates, tree=None
                 )
             finally:
                 flashinfer_backend.write_output_logprobs = original_writer
         else:
             predict_dp, accept_length_dp = backend.verify(
-                dp_in, sampling_info_dp, candidates
+                dp_in, sampling_info_dp, candidates, tree=None
             )
     else:
         predict_dp, accept_length_dp = backend.verify(
-            dp_in, sampling_info_dp, candidates
+            dp_in, sampling_info_dp, candidates, tree=None
         )
 
     torch.testing.assert_close(predict_dp, predict_full, rtol=0, atol=0)

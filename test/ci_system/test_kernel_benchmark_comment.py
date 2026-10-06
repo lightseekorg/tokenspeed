@@ -110,6 +110,7 @@ class FakeGitHub:
         self,
         *,
         report_archive: bytes | None = None,
+        artifact_runner_label: str = "amd-mi350-1gpu-bench",
         pull_state: str = "open",
         merged: bool = False,
         head_sha: str = CANDIDATE_SHA,
@@ -121,6 +122,7 @@ class FakeGitHub:
         comments: list[dict[str, Any]] | None = None,
     ) -> None:
         self.report_archive = report_archive
+        self.artifact_runner_label = artifact_runner_label
         self.pull_state = pull_state
         self.merged = merged
         self.head_sha = head_sha
@@ -143,7 +145,7 @@ class FakeGitHub:
                         "id": 9001,
                         "name": (
                             "pr-test-kernel-benchmark-amd-gfx950-"
-                            f"amd-mi355-1gpu-bench-{RUN_ID}-{RUN_ATTEMPT}"
+                            f"{self.artifact_runner_label}-{RUN_ID}-{RUN_ATTEMPT}"
                         ),
                         "expired": False,
                     }
@@ -317,11 +319,19 @@ def test_download_report_treats_a_missing_artifact_as_a_normal_skip():
     assert client.writes == []
 
 
-def test_download_report_treats_an_artifact_without_a_report_as_a_normal_skip():
+@pytest.mark.parametrize(
+    "artifact_runner_label",
+    ["amd-mi350-1gpu-bench", "amd-mi35x-1gpu-test", "amd-mi355-1gpu-bench"],
+)
+def test_download_report_treats_an_artifact_without_a_report_as_a_normal_skip(
+    artifact_runner_label: str,
+):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("result.json", b"{}")
-    client = FakeGitHub(report_archive=buffer.getvalue())
+    client = FakeGitHub(
+        report_archive=buffer.getvalue(), artifact_runner_label=artifact_runner_label
+    )
 
     assert download_report(client, REPOSITORY, RUN_ID, RUN_ATTEMPT) == (None, True)
     assert client.writes == []
@@ -578,7 +588,7 @@ def test_comment_workflow_has_a_minimal_trusted_contract():
 
     assert triggers == {
         "workflow_run": {
-            "workflows": ["PR Test AMD"],
+            "workflows": ["AMD Tests"],
             "types": ["completed"],
         }
     }

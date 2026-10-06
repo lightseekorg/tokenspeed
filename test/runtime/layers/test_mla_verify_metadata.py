@@ -40,11 +40,14 @@ def _run_mla_decode(
     monkeypatch.setattr(
         mla_backend, "mla_decode_with_kvcache", fake_mla_decode_with_kvcache
     )
-    monkeypatch.setattr(
-        mla_backend,
-        "supports_mla_decode_query_blocks",
-        lambda **kwargs: query_blocks,
-    )
+
+    def probe(**kwargs):
+        assert kwargs["noncausal_block_size"] == (
+            q_len_per_req if draft_block_decode else 1
+        )
+        return query_blocks
+
+    monkeypatch.setattr(mla_backend, "supports_mla_decode_query_blocks", probe)
     backend = object.__new__(mla_backend.MLAAttnBackend)
     spec = block_size or q_len_per_req
     metadata_rows = bs * spec if draft_block_decode else bs
@@ -52,6 +55,12 @@ def _run_mla_decode(
     block_seq_lens = seq_lens
     if draft_block_decode:
         seq_lens = seq_lens.repeat_interleave(spec)
+    elif num_extends:
+        # Extend requests precede the decode requests in a mixed round.
+        metadata_rows += num_extends
+        seq_lens = torch.cat(
+            (torch.full((num_extends,), 999, dtype=torch.int32), seq_lens)
+        )
     backend.forward_decode_metadata = SimpleNamespace(
         num_extends=num_extends,
         page_table=torch.zeros(metadata_rows, 1, dtype=torch.int32),
@@ -79,7 +88,6 @@ def _run_mla_decode(
         v_head_dim=4,
         scaling=1.0,
         logit_cap=0.0,
-        k_scale_float=None,
         layer_id=0,
         sliding_window_size=sliding_window_size,
     )
@@ -95,7 +103,6 @@ def _run_mla_decode(
         out_cache_loc=torch.empty(0, dtype=torch.int32),
         token_to_kv_pool=token_to_kv_pool,
         bs=bs,
-        save_kv_cache=False,
     )
     return captured
 
@@ -110,6 +117,30 @@ def test_draft_cache_seqlens_count_forward_from_base_lengths(monkeypatch):
     cache_seqlens = _run_mla_decode(monkeypatch, is_draft=True)["cache_seqlens"]
 
     assert cache_seqlens.tolist() == [64, 65, 128, 129]
+
+
+@pytest.mark.parametrize("is_draft,expected", [(False, [64, 128]), (True, [67, 131])])
+def test_causal_query_blocks_pass_per_request_final_lengths(
+    monkeypatch, is_draft, expected
+):
+    """Query i sees cache_seqlens - q_len + i + 1 tokens on the query axis.
+
+    Target verify publishes the final length. Draft catch-up publishes the
+    length its first query sees, so the final length is q_len - 1 further.
+    """
+    captured = _run_mla_decode(
+        monkeypatch,
+        is_draft=is_draft,
+        q_len_per_req=4,
+        query_blocks=True,
+        num_extends=1,
+    )
+
+    assert captured["q"].shape[:2] == (2, 4)
+    assert captured["page_table"].shape[0] == 2
+    assert captured["cache_seqlens"].tolist() == expected
+    assert captured["noncausal_block_size"] == 1
+    assert captured["window_left"] == -1
 
 
 def test_fp8_decode_dispatches_with_native_fp8_query(monkeypatch):
@@ -285,6 +316,7 @@ def _run_cutedsl_decode(
         cutedsl_backend, "tokenspeed_mla_decode", fake_tokenspeed_mla_decode
     )
     backend = object.__new__(cutedsl_backend.CuteDSLMLABackend)
+    backend._dcp = None
     spec = block_size if draft_block_decode else 1
     seq_lens = torch.tensor([64, 128], dtype=torch.int32)[:bs]
     backend.forward_decode_metadata = cutedsl_backend.CuteDSLMLADecodeMetadata(
@@ -311,7 +343,6 @@ def _run_cutedsl_decode(
         head_dim=4,
         v_head_dim=4,
         scaling=1.0,
-        k_scale_float=None,
         layer_id=0,
         sliding_window_size=sliding_window_size,
     )
@@ -325,7 +356,6 @@ def _run_cutedsl_decode(
             get_key_buffer=lambda layer_id: torch.zeros(32, 4)
         ),
         bs=bs,
-        save_kv_cache=False,
     )
     return captured
 
@@ -378,6 +408,7 @@ def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None
 
     bs, spec, pages = 2, 4, 3
     backend = object.__new__(cutedsl_backend.CuteDSLMLABackend)
+    backend._dcp = None
     backend.spec_num_tokens = spec
     backend.max_context_len = 256
     backend.draft_block_decode = True

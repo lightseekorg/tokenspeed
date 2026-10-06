@@ -179,12 +179,14 @@ def test_runtime_states_seed_and_view_history() -> None:
         req_pool_indices=req_pool_indices,
         input_start_offsets=offsets,
         active_request_mask=mask,
+        row_offset=3,
     )
     assert view.history_token_ids is states.request_token_history_ids
     assert view.committed_lengths is states.valid_cache_lengths
     assert view.req_pool_indices is req_pool_indices
     assert view.input_start_offsets is offsets
     assert view.active_request_mask is mask
+    assert view.row_offset == 3
 
 
 def test_runtime_states_reject_bad_seeds_and_disabled_history() -> None:
@@ -260,6 +262,7 @@ def test_draft_table_is_separate_and_frontier_is_explicit() -> None:
         input_start_offsets=torch.tensor([0, 1], dtype=torch.int32),
         active_request_mask=torch.tensor([True]),
         committed_lengths=lengths,
+        row_offset=0,
     )
     assert view.history_token_ids is not states.request_token_history_ids
     assert view.committed_lengths is lengths
@@ -285,6 +288,7 @@ def test_draft_table_requires_capacity_and_enablement() -> None:
             input_start_offsets=torch.tensor([0, 1], dtype=torch.int32),
             active_request_mask=torch.tensor([True]),
             committed_lengths=torch.zeros(5, dtype=torch.int32),
+            row_offset=0,
         )
 
 
@@ -314,7 +318,7 @@ def test_idle_rank_hands_history_drafts_an_empty_view() -> None:
     executor.model_runner = SimpleNamespace(forward=lambda ctx, **kwargs: None)
     executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
     executor.drafter = SimpleNamespace(
-        spec_num_steps=2,
+        idle_forward_global_num_tokens=lambda tokens, bs: [tokens, bs],
         attn_backend=SimpleNamespace(),
         token_to_kv_pool=SimpleNamespace(),
         draft_model_runner=SimpleNamespace(

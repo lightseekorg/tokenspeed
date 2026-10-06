@@ -44,7 +44,10 @@ not in an engine-global cache. Lifetime tracks the owning request: when
 the request finishes and its ``RequestState`` is dropped, the tensors are
 released by GC. Across chunked-prefill iterations of the same request the
 item is identical Python object, so the second chunk sees ``item.encoded``
-already set and skips re-encoding.
+already set and skips re-encoding. Once the item's last encoder token is
+prefilled, its encoding moves to pinned host memory; only a retracted
+request's recompute reads it again, through ``_assemble``'s per-slice
+device copy.
 
 Within a single forward batch we still de-duplicate by modality and
 ``item.hash``: if two requests reference the same media content using
@@ -84,6 +87,34 @@ EncoderWarmupItemsFactory = Callable[[], list[MultimodalDataItem]]
 
 logger = logging.getLogger(__name__)
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
+
+
+def _offload_prefilled_encodings(items: list[MultimodalDataItem]) -> None:
+    """Move fully prefilled items' encodings to pinned host memory.
+
+    Runs after ``_assemble``, so this forward still scatters from the
+    device; a retracted request's recompute reads the host copy back
+    through ``_assemble``'s non-blocking per-slice device copy. An
+    encoding published by EPD admission was allocated on another stream,
+    so its block is pinned to the current stream before the last device
+    reference is dropped.
+    """
+    # Keyed by identity: aliases of one device tensor share one host copy.
+    host: dict[torch.Tensor, torch.Tensor] = {}
+
+    def offload(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        if tensor is None or tensor.device.type == "cpu":
+            return tensor
+        if tensor not in host:
+            tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            host[tensor] = torch.empty(
+                tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True
+            ).copy_(tensor, non_blocking=True)
+        return host[tensor]
+
+    for item in items:
+        item.encoded = offload(item.encoded)
+        item.encoded_deepstack = offload(item.encoded_deepstack)
 
 
 @dataclass
@@ -215,6 +246,8 @@ class EncodePlan:
     aliases_by_canonical: dict[MultimodalDataItem, list[MultimodalDataItem]] = field(
         default_factory=lambda: defaultdict(list)
     )
+    # Request-local items whose encoder tokens are all prefilled by chunk end.
+    prefilled: list[MultimodalDataItem] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         return bool(self.scatter_ranges)
@@ -321,6 +354,8 @@ class MultimodalEmbedder:
             else None
         )
         if not plan:
+            # A prefix hit may skip past an item; its encoding still leaves the GPU.
+            _offload_prefilled_encodings(plan.prefilled)
             return None, {}
 
         encode_started: float | None = None
@@ -371,6 +406,7 @@ class MultimodalEmbedder:
 
         cleanup_started = time.perf_counter() if LOG_MM_TIMING else None
         released_encoded_features = self._drop_encoded_features(ctx)
+        _offload_prefilled_encodings(plan.prefilled)
         cleanup_elapsed_ms = (
             (time.perf_counter() - cleanup_started) * 1000
             if cleanup_started is not None
@@ -470,6 +506,9 @@ class MultimodalEmbedder:
                         scheduled.add(canonical)
                         plan.misses_by_modality[canonical.modality].append(canonical)
                     src_cursor += span
+
+                if max(end for _, end in item.offsets) <= chunk_end_inc:
+                    plan.prefilled.append(item)
 
             base += seq
 
@@ -700,7 +739,7 @@ class MultimodalEmbedder:
                 )
             src = main[r.item_src_start : r.item_src_end + 1]
             input_embeds[r.flat_dst_start : r.flat_dst_end + 1] = src.to(
-                dtype=input_embeds.dtype, device=input_embeds.device
+                dtype=input_embeds.dtype, device=input_embeds.device, non_blocking=True
             )
 
             if deepstack_buffer is not None and r.item.encoded_deepstack is not None:
@@ -708,7 +747,9 @@ class MultimodalEmbedder:
                     r.item_src_start : r.item_src_end + 1
                 ]
                 deepstack_buffer[r.flat_dst_start : r.flat_dst_end + 1] = deep_src.to(
-                    dtype=input_embeds.dtype, device=input_embeds.device
+                    dtype=input_embeds.dtype,
+                    device=input_embeds.device,
+                    non_blocking=True,
                 )
 
         return input_embeds, kwargs

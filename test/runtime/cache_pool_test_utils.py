@@ -336,8 +336,9 @@ def _reduced(value: object, seen: set[int]) -> object:
 
 
 def storages_of(*tensors: torch.Tensor) -> set[int]:
-    """The untyped storages behind ``tensors``, so views at any offset are recognised."""
-    return {tensor.untyped_storage().data_ptr() for tensor in tensors}
+    """The untyped storages behind ``tensors``, so views at any offset are
+    recognised; an empty tensor has no storage to alias."""
+    return {tensor.untyped_storage().data_ptr() for tensor in tensors if tensor.numel()}
 
 
 def reachable_tensors(node: object) -> list[torch.Tensor]:
@@ -352,7 +353,8 @@ def assert_no_alias(node: object, storages: set[int]) -> None:
     for name, value in vars(node).items():
         for tensor in _tensors(value, set()):
             assert (
-                tensor.untyped_storage().data_ptr() not in storages
+                not tensor.numel()
+                or tensor.untyped_storage().data_ptr() not in storages
             ), f"{name} still aliases the old pool"
 
 

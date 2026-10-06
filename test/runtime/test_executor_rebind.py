@@ -73,7 +73,8 @@ class _Holder:
 def _executor(monkeypatch, log, *, with_draft: bool):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
-    executor.config = SimpleNamespace(spec_algo=None, enforce_eager=False)
+    # pp_size: `_build_graph_owners` decides `supports_prompt_logprobs` from it.
+    executor.config = SimpleNamespace(spec_algo=None, enforce_eager=False, pp_size=1)
     executor.model_runner = SimpleNamespace(model="target model")
     executor.attn_backend = _Holder("target", log)
     executor.token_to_kv_pool = _pool("probe")
@@ -172,7 +173,9 @@ def test_a_block_drafter_is_rechecked_against_the_targets_new_pool(
 ):
     log = []
     executor = _executor(monkeypatch, log, with_draft=True)
-    executor.config = SimpleNamespace(spec_algo=spec_algo, enforce_eager=False)
+    executor.config = SimpleNamespace(
+        spec_algo=spec_algo, enforce_eager=False, pp_size=1
+    )
     monkeypatch.setattr(
         module, "check_block_drafter_storage", lambda m, p: log.append(("check", m, p))
     )

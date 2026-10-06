@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.gemm import (
     linear_attnres_partials,
     linear_attnres_partials_available,
 )
+from utils import kernel_supported, make_fp8_per_channel_gemm_operands
 
 
 def test_mm_rejects_bad_out_layout() -> None:
@@ -662,3 +663,52 @@ def test_linear_attnres_partials_cuda_portable_strided_inputs() -> None:
             outputs[2],
             torch.einsum("bt,bth->th", unnormalized, values),
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("scale_shape", [(), (1,), (1, 1)])
+def test_mm_fp8_per_tensor_scale_any_rank(scale_shape) -> None:
+    """Checkpoints store per-tensor FP8 scales as 0-dim or [1]; mm takes any rank."""
+    fp8 = torch.float8_e4m3fn
+    gen = torch.Generator().manual_seed(0)
+    a = torch.randn(16, 256, generator=gen).cuda()
+    b = torch.randn(256, 128, generator=gen).cuda()
+    a_scale = (a.abs().max() / 448.0).float()
+    b_scale = (b.abs().max() / 448.0).float()
+    a_q = (a / a_scale).to(fp8)
+    b_q = (b / b_scale).to(fp8)
+    out = tokenspeed_kernel.mm(
+        a_q,
+        b_q,
+        A_scales=a_scale.reshape(scale_shape),
+        B_scales=b_scale.reshape(scale_shape),
+        out_dtype=torch.bfloat16,
+        quant="fp8",
+    )
+    ref = (a_q.float() * a_scale) @ (b_q.float() * b_scale)
+    torch.testing.assert_close(out.float(), ref, atol=1e-1, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k"), [(1, 6272, 7168), (64, 7168, 1536), (300, 512, 256)]
+)
+def test_triton_fp8_scaled_mm_per_channel_matches_reference(
+    m: int, n: int, k: int
+) -> None:
+    if not kernel_supported("triton_mm_fp8_scaled"):
+        pytest.skip("triton_mm_fp8_scaled is not supported on this device")
+    a, a_scales, b, b_scales = make_fp8_per_channel_gemm_operands(m, n, k, seed=m)
+
+    out = tokenspeed_kernel.mm(
+        a,
+        b.t(),
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=torch.bfloat16,
+        quant="fp8",
+        override="triton_mm_fp8_scaled",
+    )
+
+    expected = (a.float() * a_scales) @ (b.float() * b_scales).t()
+    # FP32 accumulation, then BF16 output rounding.
+    torch.testing.assert_close(out.float(), expected, rtol=2**-8, atol=5e-4)

@@ -43,7 +43,10 @@ from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
     is_deepseek_v41_config,
 )
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
-from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+    LinearAttnConfig,
+    Mamba2Config,
+)
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.configs.msa import (
@@ -272,6 +275,11 @@ _HYBRID_GDN_ARCHITECTURES = {
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForCausalLMNextN",
 }
+# Hybrid models whose linear layers are Mamba2 (SSD) and full-attention layers MHA.
+_HYBRID_MAMBA2_ARCHITECTURES = {
+    "NemotronHForCausalLM",
+    "NemotronHForCausalLMNextN",
+}
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
 # They share the same HybridLinearAttnBackend wrapper and cache-group pool;
@@ -311,6 +319,7 @@ class _AttnSideProfile:
     architectures: tuple[str, ...]
     requested_backend: str | None
     is_hybrid_gdn: bool
+    is_mamba2: bool
     is_kda: bool
     # KDA hybrid whose full-attention layers are DSA (GLM-5.3-Flash); a
     # subset of ``is_kda`` that selects the DSA history consumer and the
@@ -335,6 +344,8 @@ class _AttnSideProfile:
             return "kda"
         if self.is_hybrid_gdn:
             return "gdn"
+        if self.is_mamba2:
+            return "mamba2"
         return None
 
     @property
@@ -355,6 +366,7 @@ def _resolve_attn_side(
             architectures=tuple(architectures),
             requested_backend=requested_backend,
             is_hybrid_gdn=False,
+            is_mamba2=False,
             is_kda=False,
             is_dsa_kda=False,
             is_qwen4_exp=False,
@@ -372,6 +384,7 @@ def _resolve_attn_side(
         architectures=tuple(architectures),
         requested_backend=requested_backend,
         is_hybrid_gdn=any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures),
+        is_mamba2=any(a in _HYBRID_MAMBA2_ARCHITECTURES for a in architectures),
         is_kda=is_dsa_kda
         or any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures),
         is_dsa_kda=is_dsa_kda,
@@ -418,12 +431,19 @@ def _apply_backend_overrides(
     """The one place family resolution writes back into ``server_args``.
 
     The mutation is deliberate, not a shortcut: ``_create_attn_config`` reads
-    the backend choice through the generate() protocol, and the
-    ``global_server_args_dict`` snapshot serves models that pick kernel paths
-    at build time (e.g. ``deepseek_v3.attention_backend``). Must run before
-    any ``_create_attn_config`` call. The user's pre-override choice survives
+    the backend choice through the generate() protocol. Must run before any
+    ``_create_attn_config`` call. The user's pre-override choice survives
     as ``profile.requested_backend``.
     """
+    if (
+        draft is not None
+        and "K3DSparkModel" in draft.architectures
+        and server_args.decode_context_parallel_size > 1
+    ):
+        raise ValueError(
+            "K3 DSpark does not support DCP: context KV injection does not "
+            "translate virtual slots or mask nonowner writes"
+        )
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
     elif target.is_deepseek_v4:
@@ -436,6 +456,24 @@ def _apply_backend_overrides(
         # hybrid_linear_attn. The user's original choice stays in the profile
         # for the full-attention sub-backend (MHA for GDN, MLA for KDA).
         server_args.attention_backend = HYBRID_LINEAR_ATTN_BACKEND
+        if (
+            draft is not None
+            and target.is_kda
+            and not target.is_dsa_kda
+            and server_args.decode_context_parallel_size > 1
+            and server_args.drafter_attention_backend
+            in (None, HYBRID_LINEAR_ATTN_BACKEND)
+        ):
+            # A K3 continuation must resolve its history consumer before
+            # AttnConfig validates DCP. Inherit the target's resolved leaf,
+            # while preserving an explicitly requested draft leaf.
+            server_args.drafter_attention_backend = _resolve_hybrid_full_backend_name(
+                target.requested_backend,
+                is_kda=True,
+                is_dsa=False,
+                is_qsa=False,
+                has_cache_plan=True,
+            )
     elif server_args.attention_backend == HYBRID_LINEAR_ATTN_BACKEND:
         logger.warning(
             "Ignoring hybrid_linear_attn backend for non-hybrid model architectures="
@@ -515,6 +553,8 @@ def _resolve_cache_family(
         return "qwen4_exp"
     if profile.is_hybrid_gdn and _has_state_layers(config):
         return "qwen_gdn"
+    if profile.is_mamba2 and _has_state_layers(config):
+        return "mamba2"
     if profile.is_dsa_kda:
         return "glm53_flash"
     if profile.is_kda:
@@ -654,7 +694,7 @@ _LINEAR_ATTN_CLS: dict[str, type[LinearAttnConfig]] = {
         # metadata but must not acquire a linear-attention component.
         *_HYBRID_DSA_KDA_TARGET_ARCHITECTURES,
     )
-}
+} | {arch: Mamba2Config for arch in _HYBRID_MAMBA2_ARCHITECTURES}
 
 
 def _create_attn_config(
@@ -828,6 +868,17 @@ def _gdn_linear_attn_backend(
     return MambaAttnBackend(config, config.component(SoftmaxAttnConfig))
 
 
+def _mamba2_linear_attn_backend(
+    server_args: ServerArgs, config: AttnConfig
+) -> AttentionBackend:
+    del server_args
+    from tokenspeed.runtime.layers.attention.backends.state.mamba2 import (
+        Mamba2AttnBackend,
+    )
+
+    return Mamba2AttnBackend(config, config.component(SoftmaxAttnConfig))
+
+
 # Linear-attention backends by name: ``factory(server_args, config)`` builds
 # the backend a hybrid model's linear layers run on. Plugins add entries via
 # ``tokenspeed.runtime.plugins.registry.register_linear_attention_backend``.
@@ -836,6 +887,7 @@ _LINEAR_ATTN_BACKENDS: dict[
 ] = {
     "kda": _kda_linear_attn_backend,
     "gdn": _gdn_linear_attn_backend,
+    "mamba2": _mamba2_linear_attn_backend,
 }
 
 
@@ -1153,7 +1205,7 @@ def _create_draft_components(
     return backend, draft_pool
 
 
-def _prepare_verify_workspace(
+def _prepare_fixed_workspaces(
     *,
     server_args,
     config,
@@ -1163,26 +1215,51 @@ def _prepare_verify_workspace(
     is_inkling: bool,
     expected_bytes: int,
 ) -> None:
+    """Allocate the fixed workspaces the recipe reserved from the cache budget
+    (``CacheRecipe.workspace_bytes``) and check the bytes agree.
+
+    The verify workspaces of the paged-state families and the
+    query-context-parallel history gather workspace of GPU DSA: the target
+    tree allocates the latter once and the draft tree gathers into the same
+    buffers (the draft's extend step follows the target's forward on the
+    same stream), so the plan budgets one workspace.
+    """
     from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
         Qwen4ExpBackend,
     )
 
     width = int(server_args.speculative_num_draft_tokens or 1)
+    allocated = False
+    actual_bytes = 0
     if isinstance(backend, Qwen4ExpBackend):
-        actual_bytes = backend.preallocate_verify_workspace(config.max_bs, width)
+        actual_bytes += backend.preallocate_verify_workspace(config.max_bs, width)
+        allocated = True
     elif uses_paged_state_verify and expected_bytes:
-        actual_bytes = backend.linear_attn_backend.preallocate_verify_workspace(
+        actual_bytes += backend.linear_attn_backend.preallocate_verify_workspace(
             config.max_bs, width
         )
+        allocated = True
     elif is_inkling:
-        actual_bytes = backend.fixed_workspace_bytes()
+        actual_bytes += backend.fixed_workspace_bytes()
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()
-    else:
+        allocated = True
+    if config.qcp_size > 1:
+        actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
+        allocated = True
+        if draft_backend is not None:
+            workspace = backend.history_gather_workspace()
+            if workspace is None:
+                raise RuntimeError(
+                    "query context parallelism needs the target's history gather "
+                    "workspace for the draft to share"
+                )
+            draft_backend.adopt_history_gather_workspace(workspace)
+    if not allocated:
         return
     if actual_bytes != expected_bytes:
         raise RuntimeError(
-            "planned verify workspace does not match allocated tensors: "
+            "planned fixed workspace does not match allocated tensors: "
             f"{expected_bytes} planned, {actual_bytes} allocated"
         )
 
@@ -1247,6 +1324,7 @@ def create_attn_components(
     overlap_schedule_depth: int = 0,
     *,
     graph_reserve_bytes: int,
+    post_profile_bytes: int,
     probe_batch_rows: int | None,
     profiled_cache_bytes: int | None,
     reuse_target_backend: AttentionBackend | None,
@@ -1353,6 +1431,7 @@ def create_attn_components(
             tp_size=server_args.mapping.world_size,
             gpu_memory_utilization=server_args.gpu_memory_utilization,
             total_gpu_memory=gpu_memory,
+            post_profile_bytes=post_profile_bytes,
             world_group=server_args.mapping.world_group,
         )
     cache_memory = reserve_cache_budget(profiled_cache_bytes, graph_reserve_bytes)
@@ -1374,15 +1453,27 @@ def create_attn_components(
     num_target_cache_layers = cache_setup.num_target_layers
     num_draft_cache_layers = cache_setup.num_draft_layers
     if server_args.mapping.has_pp:
-        from tokenspeed.runtime.distributed.pp_stage import pp_stage_windows
+        from tokenspeed.runtime.distributed.pp_stage import (
+            pp_stage_cache_windows,
+            pp_stage_windows,
+        )
 
-        # K3 and V4, the supported PP targets, have one cache layer per
-        # execution block. Map their execution windows to the identical cache
-        # IDs here; cache ownership itself does not partition execution blocks.
-        target_cache_windows = pp_stage_windows(
-            model_config.num_hidden_layers,
-            server_args.mapping.pp_size,
-            server_args.mapping.pp_layer_partition,
+        # Stage windows partition execution blocks; cache ownership speaks
+        # cache-layer IDs, one per attention instance. A model's profile says
+        # how many instances each block owns (LongCat's paired layout: two);
+        # the in-tree PP targets K3 and V4 declare no profile and own one.
+        # Cache ownership itself does not partition execution blocks.
+        profile = model_config.model_profile
+        target_cache_windows = pp_stage_cache_windows(
+            pp_stage_windows(
+                model_config.num_hidden_layers,
+                server_args.mapping.pp_size,
+                server_args.mapping.pp_layer_partition,
+            ),
+            cache_layers_per_execution_layer=(
+                profile.attention_instances_per_layer if profile is not None else 1
+            ),
+            num_target_cache_layers=num_target_cache_layers,
         )
     else:
         target_cache_windows = [(0, num_target_cache_layers)]
@@ -1487,7 +1578,7 @@ def create_attn_components(
             continue
         side_backend.set_cache_pool(side_pool)
 
-    _prepare_verify_workspace(
+    _prepare_fixed_workspaces(
         server_args=server_args,
         config=config,
         backend=backend,

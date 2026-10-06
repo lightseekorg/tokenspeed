@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
-from utils import is_cdna4
+from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required for Gluon MLA tests", allow_module_level=True)
@@ -219,3 +221,221 @@ def test_native_fp8_mla_single_split_cuda_graph_replay(batch_size: int) -> None:
     ref_out, _ = _reference(q, kv_cache, _PAGE_SIZE)
     assert captured.data_ptr() == out.data_ptr()
     torch.testing.assert_close(captured.float(), ref_out, rtol=0.12, atol=0.12)
+
+
+def _query_block_reference(q, cache, table, lengths, softmax_scale=_SOFTMAX_SCALE):
+    output = torch.zeros((*q.shape[:-1], _KV_LORA_RANK), device=q.device)
+    lse = torch.full(q.shape[:-1], -float("inf"), device=q.device)
+    for request, length in enumerate(lengths.tolist()):
+        pages = table[request, : math.ceil(length / cache.shape[1])].long()
+        kv = cache[pages].reshape(-1, _QK_DIM)
+        for position in range(q.shape[1]):
+            visible = max(0, length - q.shape[1] + position + 1)
+            if visible:
+                values = kv[:visible].float()
+                scores = q[request, position].float() @ values.T * softmax_scale
+                output[request, position] = scores.softmax(-1) @ values[:, :512]
+                lse[request, position] = torch.logsumexp(scores, -1)
+    return output, lse
+
+
+def _query_block_decode(
+    q, cache, table, lengths, *, softmax_scale=_SOFTMAX_SCALE, **kwargs
+):
+    from tokenspeed_kernel.ops.attention.mla import mla_decode_with_kvcache
+
+    return mla_decode_with_kvcache(
+        q=q,
+        kv_cache=cache,
+        page_table=table,
+        cache_seqlens=lengths,
+        qk_nope_head_dim=128,
+        kv_lora_rank=_KV_LORA_RANK,
+        qk_rope_head_dim=_ROPE_DIM,
+        softmax_scale=softmax_scale,
+        solution="gluon",
+        **kwargs,
+    )
+
+
+def _make_query_block_inputs(cache_lengths, heads, page, width):
+    gen = torch.Generator(device="cuda").manual_seed(129)
+    pages_per_request = [math.ceil(length / page) for length in cache_lengths]
+    num_pages = sum(pages_per_request)
+    cache = (
+        torch.randn(num_pages + 1, page, 1, _QK_DIM, generator=gen, device="cuda")
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    cache[-1] = float("nan")
+    permutation = torch.randperm(num_pages, generator=gen, device="cuda")
+    table = torch.full(
+        (len(cache_lengths), max(pages_per_request)),
+        num_pages,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    offset = 0
+    for request, (length, pages) in enumerate(zip(cache_lengths, pages_per_request)):
+        table[request, :pages] = permutation[offset : offset + pages]
+        offset += pages
+        if length % page:
+            cache[table[request, pages - 1], length % page :] = float("nan")
+    q = (
+        torch.randn(
+            len(cache_lengths), width, heads, _QK_DIM, generator=gen, device="cuda"
+        )
+        * 0.25
+    ).to(cache.dtype)
+    lengths = torch.tensor(cache_lengths, device="cuda", dtype=torch.int32)
+    return q, cache, table, lengths
+
+
+@pytest.mark.parametrize(
+    "heads,page,width,cache_lengths,small_weights",
+    [
+        (12, 64, 4, [0, 3, 1025, 4095, 4096, 16385], False),
+        (12, 64, 4, [0, 1, 3, 63, 64, 65, 1025, 4095], False),
+        (8, 64, 8, [0, 7, 4095, 4096, 16385], False),
+        (12, 64, 5, [0, 4, 4095, 4096, 16385], False),
+        (24, 64, 5, [0] * 12 + [4095, 4096, 37888, 37889], False),
+        (16, 64, 15, [0, 14, 1025], False),
+        (24, 128, 6, [0, 5, 1025], False),
+        (128, 256, 4, [1025, 3] + [0] * 15, False),
+        (12, 64, 6, [0, 3, 4095, 4096, 51200, 51201, 65536, 65537], False),
+        (24, 64, 4, [0] * 12 + [4095, 4096, 31744, 31745], False),
+        pytest.param(12, 64, 4, [8192], True, id="small-weights"),
+        pytest.param(12, 64, 4, [16384], True, id="reuse-small-weights"),
+        pytest.param(12, 64, 6, [60000] + [0] * 7, True, id="wide-small-weights"),
+    ],
+)
+def test_query_block_mla_matches_reference(
+    heads, page, width, cache_lengths, small_weights
+):
+    q, cache, table, lengths = _make_query_block_inputs(
+        cache_lengths, heads, page, width
+    )
+    scale = _SOFTMAX_SCALE
+    if small_weights:
+        # Constant values make the exact average one, even when a logit spike
+        # pushes the other weights below the FP8 representable range.
+        q.zero_()
+        q[..., _KV_LORA_RANK] = 1
+        cache.zero_()
+        cache[..., 0] = 1
+        cache[table[0, 0], 0, 0, _KV_LORA_RANK] = 8
+        scale = 1.0
+    output = torch.empty(
+        *q.shape[:-1], _KV_LORA_RANK, device="cuda", dtype=torch.bfloat16
+    )
+    result, lse = _query_block_decode(
+        q,
+        cache,
+        table,
+        lengths,
+        max_seqlen_k=max(cache_lengths),
+        softmax_scale=scale,
+        return_lse=True,
+        out=output,
+    )
+    ref, ref_lse = _query_block_reference(q, cache, table, lengths, scale)
+    assert result.data_ptr() == output.data_ptr()
+    assert (output.float() - ref).norm() / ref.norm() < 0.05
+    torch.testing.assert_close(lse, ref_lse, atol=2e-4, rtol=2e-4)
+    assert torch.count_nonzero(output[lengths == 0]) == 0
+    if small_weights:
+        torch.testing.assert_close(
+            output[lengths > 0, ..., 0],
+            torch.ones_like(output[lengths > 0, ..., 0]),
+            atol=1e-2,
+            rtol=0,
+        )
+
+
+def test_query_block_mla_projected_graph_refreshes_page_and_causal_lengths():
+    batch_size, width = 8, 6
+    torch.manual_seed(0)
+    q, cache, table, lengths = _make_query_block_inputs(
+        [65537] * batch_size, _HEADS, _PAGE_SIZE, width
+    )
+    weights = torch.randn(
+        _HEADS, _KV_LORA_RANK, 128, device="cuda", dtype=torch.bfloat16
+    ) / math.sqrt(_KV_LORA_RANK)
+    gate = torch.randn(batch_size * width, 3648, device="cuda", dtype=torch.bfloat16)[
+        :, -_HEADS * 128 :
+    ]
+    output = torch.empty(
+        batch_size * width, _HEADS * 128, device="cuda", dtype=torch.bfloat16
+    )
+
+    def run():
+        return _query_block_decode(
+            q,
+            cache,
+            table,
+            lengths,
+            max_seqlen_k=1_048_576,
+            value_weight=weights,
+            gate=gate,
+            out=output,
+        )
+
+    lengths.fill_(65)
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    # Zero lengths are padded graph requests: their rows must be zero.
+    for short, long in (
+        (4095, 4096),
+        (51200, 51201),
+        (51201, 51200),
+        (65537, 0),
+        (0, 0),
+    ):
+        history = [short if row % 2 == 0 else long for row in range(batch_size)]
+        lengths.copy_(torch.tensor(history, device="cuda", dtype=torch.int32))
+        table.copy_(table.roll(1, 0))
+        output.fill_(float("nan"))
+        graph.replay()
+        reference, _ = _query_block_reference(q, cache, table, lengths)
+        projected = torch.einsum(
+            "bqhd,hdv->bqhv", reference, weights.float()
+        ).reshape_as(output)
+        expected = projected * torch.sigmoid(gate.float())
+        assert result.data_ptr() == output.data_ptr()
+        assert torch.isfinite(output).all()
+        assert (output.float() - expected).norm() / expected.norm().clamp_min(
+            1e-20
+        ) < 0.05
+
+
+def test_query_block_mla_verify_reuses_split_bucket_specialization():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla import decode
+
+    kernels = (
+        decode.gluon_mla_decode_fp8_query_blocks_gfx950,
+        decode.gluon_mla_decode_fp8_query_blocks_reduce_gfx950,
+    )
+
+    def check(batch_size, table_columns, softmax_scale):
+        q, cache, table, lengths = _make_query_block_inputs(
+            [4096] + [i + 4 for i in range(batch_size - 1)], _HEADS, _PAGE_SIZE, 6
+        )
+        table = torch.nn.functional.pad(table, (0, table_columns - table.shape[1]))
+        output = _query_block_decode(
+            q,
+            cache,
+            table,
+            lengths,
+            max_seqlen_k=1_048_576,
+            softmax_scale=softmax_scale,
+        )
+        reference, _ = _query_block_reference(q, cache, table, lengths, softmax_scale)
+        assert (output.float() - reference).norm() / reference.norm() < 0.05
+
+    # Keep both split buckets while changing counts (5/11 to 8/16) and
+    # crossing divisibility classes for the page-table stride (64 to 72).
+    check(22, 64, _SOFTMAX_SCALE)
+    with assert_no_triton_compile(*kernels):
+        check(16, 72, _SOFTMAX_SCALE * 0.75)

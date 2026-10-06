@@ -22,9 +22,9 @@
 
 A K/V block is elided when every query row of the tile votes that its max
 score falls far enough below the running max. Exposed via
-``gluon_mha_prefill_gfx950(..., skip_softmax_threshold=X)``, which also
-enables deferred V loads internally; ``test_mha_prefill_defer_v_load.py``
-reruns these same checks to confirm they hold on that path too.
+``gluon_mha_prefill_gfx950(..., skip_softmax_threshold=X)``. A nonzero
+threshold also defers V loads internally (there is no separate switch), so
+these checks cover that path too.
 
 Checks (bf16, causal):
   [1] NO-REGRESSION  threshold=0.0 matches dense SDPA
@@ -32,16 +32,15 @@ Checks (bf16, causal):
       0.0 compiles ENABLE_SKIP_SOFTMAX=False and never runs the skip
       branch's arithmetic at all.
   [3] DEGRADATION    threshold>0 vs dense stays bounded
-  [4] SKIP HAPPENS   larger threshold deviates from dense more than smaller
-  [5] HIGH THRESHOLD threshold>1.0 stays finite. Guards a pre/post-block
+  [4] HIGH THRESHOLD threshold>1.0 stays finite. Guards a pre/post-block
       running-max mixup: comparing against the post-block max forces the
       first K/V block of every tile to skip, giving all-NaN output.
-  [6] MASKING PATHS  sliding window and sinks stay finite across the range
-  [7] LSE            stays finite, never exceeds the dense LSE, and degrades
+  [5] MASKING PATHS  sliding window and sinks stay finite across the range
+  [6] LSE            stays finite, never exceeds the dense LSE, and degrades
       monotonically with the output
 
-The block-level rule itself is pinned by
-``test_mha_prefill_skip_softmax_update.py``.
+The block-level rule itself, including that elision actually fires, is
+pinned by ``test_mha_prefill_skip_softmax_update.py``.
 """
 
 from __future__ import annotations
@@ -176,17 +175,9 @@ def test_skip_softmax_ragged_seqlen_stays_bounded(threshold: float) -> None:
     assert _rel_err(out, dense) < _DEGRADATION_BOUND
 
 
-def test_skip_softmax_actually_skips() -> None:
-    q, k, v = _qkv()
-    dense = _dense_ref(q, k, v)
-    r_lo = _rel_err(_run(q, k, v, skip_softmax_threshold=_THRESHOLDS[0]), dense)
-    r_hi = _rel_err(_run(q, k, v, skip_softmax_threshold=_THRESHOLDS[-1]), dense)
-    assert r_hi > r_lo
-
-
 @pytest.mark.parametrize("threshold", [2.0, 5.0, 12.0])
 def test_skip_softmax_high_threshold_no_nan(threshold: float) -> None:
-    """[5] log2_threshold > 0 must stay finite.
+    """[4] log2_threshold > 0 must stay finite.
 
     Comparing against the post-block max instead of the pre-block max forces
     every tile's first K/V block to skip here, giving all-NaN output.
@@ -201,7 +192,7 @@ def test_skip_softmax_high_threshold_no_nan(threshold: float) -> None:
 def test_skip_softmax_sliding_window_stays_finite(
     threshold: float, window_left: int
 ) -> None:
-    """[6] The skip decision feeds m_new to the HAS_INVALID guard.
+    """[5] The skip decision feeds m_new to the HAS_INVALID guard.
 
     That guard protects rows whose running max is still -inf, so the two
     have to compose across the threshold range.
@@ -213,7 +204,7 @@ def test_skip_softmax_sliding_window_stays_finite(
 
 @pytest.mark.parametrize("threshold", [0.0, _TINY_THRESHOLD, 3e-1, 12.0])
 def test_skip_softmax_with_sinks_stays_finite(threshold: float) -> None:
-    """[6] Sinks initialise m_i finite, so an early block can legitimately skip."""
+    """[5] Sinks initialise m_i finite, so an early block can legitimately skip."""
     q, k, v = _qkv()
     sinks = torch.randn((_NUM_Q_HEADS,), device="cuda", dtype=torch.float32)
     out = _run(q, k, v, skip_softmax_threshold=threshold, sinks=sinks)
@@ -221,7 +212,7 @@ def test_skip_softmax_with_sinks_stays_finite(threshold: float) -> None:
 
 
 def test_skip_softmax_lse_is_finite_and_degrades_with_output() -> None:
-    """[7] Skipped blocks leave the denominator short, so the LSE is biased low.
+    """[6] Skipped blocks leave the denominator short, so the LSE is biased low.
 
     Callers combining partial results through it (chunked prefill,
     speculative decoding) need that to be a documented bound, not noise.

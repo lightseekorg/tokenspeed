@@ -64,9 +64,11 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     reject_bounded_replay,
+    reject_query_shard,
 )
 
 if TYPE_CHECKING:
@@ -490,9 +492,11 @@ class InklingAttnBackend(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ):
         reject_bounded_replay(extend_replay_lens_cpu, "InklingAttentionBackend")
+        reject_query_shard(query_shard, "InklingAttentionBackend")
         if forward_mode.is_mixed():
             raise RuntimeError(
                 "Inkling sconv does not support MIXED batches: the prefill "
@@ -544,6 +548,7 @@ class InklingAttnBackend(AttentionBackend):
             extend_replay_lens_cpu=extend_replay_lens_cpu,
             extend_prompt_lens_cpu=extend_prompt_lens_cpu,
             extend_with_prefix=extend_with_prefix,
+            query_shard=query_shard,
             **kwargs,
         )
 
@@ -628,6 +633,12 @@ class InklingAttnBackend(AttentionBackend):
 
     def write_locations(self, layer, forward_mode):
         return self.inner.write_locations(layer, forward_mode)
+
+    def forward_write_locations(self, layer, forward_mode):
+        return self.inner.forward_write_locations(layer, forward_mode)
+
+    def padded_write_locations(self, layer, forward_mode, rows):
+        return self.inner.padded_write_locations(layer, forward_mode, rows)
 
     def draft_history_view(self):
         return self.inner.draft_history_view()
@@ -718,42 +729,15 @@ class InklingAttnBackend(AttentionBackend):
         out_cache_loc,
         token_to_kv_pool,
         bs,
-        save_kv_cache=True,
+        save_kv_cache: bool,
         **kwargs,
     ):
-        rel_logits = kwargs.pop("rel_logits", None)
+        assert not save_kv_cache, "the attention prologue wrote this KV"
+        rel_logits = kwargs.pop("rel_logits")
         tau = kwargs.pop("log_scaling_tau", None)
-        if rel_logits is None:
-            return self.inner.forward_decode(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                **kwargs,
-            )
         inner = self.inner._leaf_for(layer)
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        if k is not None:
-            k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
-            v = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
         metadata = inner.forward_decode_metadata
-        out_cache_loc = self.inner.write_locations(layer, ForwardMode.DECODE)
-        if save_kv_cache:
-            # Decode-side rows and write locs must agree exactly: a shorter
-            # loc vector would make _save_kv_cache silently TRIM the rows
-            # (dropping most of a multi-token window's KV — the grouped-cache
-            # draft accept regression), a longer one would crash the store.
-            assert k is None or out_cache_loc.shape[0] == k.shape[0], (
-                f"Inkling decode KV write: {k.shape[0]} rows vs "
-                f"{out_cache_loc.shape[0]} write locs (layer "
-                f"{layer.layer_id}, group {layer.group_id!r}); a chaining "
-                "one-row-per-step draft loop is unsupported with grouped cache."
-            )
-            inner._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
         scale_kwargs = {}
         if inner.is_mxfp8:
             q, q_sf = inner._quantize_mxfp8_tokens(q)
@@ -791,23 +775,12 @@ class InklingAttnBackend(AttentionBackend):
         out_cache_loc,
         token_to_kv_pool,
         bs,
-        save_kv_cache=False,
+        save_kv_cache: bool,
         **kwargs,
     ):
-        rel_logits = kwargs.pop("rel_logits", None)
+        assert not save_kv_cache, "the attention prologue wrote this KV"
+        rel_logits = kwargs.pop("rel_logits")
         tau = kwargs.pop("log_scaling_tau", None)
-        if rel_logits is None:
-            return self.inner.forward_extend(
-                q,
-                k,
-                v,
-                layer,
-                out_cache_loc,
-                token_to_kv_pool,
-                bs,
-                save_kv_cache=save_kv_cache,
-                **kwargs,
-            )
         inner = self.inner._leaf_for(layer)
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
@@ -818,8 +791,6 @@ class InklingAttnBackend(AttentionBackend):
         # its handoff are bucket-shaped. Scrub the padded rows instead of using
         # the plain MHA path's exact-row kernel contract.
         scrub_padding_tail(_num_real, q, k, v)
-        out_cache_loc = self.inner.write_locations(layer, ForwardMode.EXTEND)
-        out_cache_loc = out_cache_loc[:_num_real]
         plan = rel_mha_plan(
             dtype=torch.float8_e4m3fn if inner.is_fp8 else inner.qkv_dtype,
             head_dim=inner.head_dim,
@@ -848,11 +819,7 @@ class InklingAttnBackend(AttentionBackend):
             output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
             if output.shape[0] > _num_real:
                 output[_num_real:].zero_()
-            if save_kv_cache:
-                inner._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
             return output
-        if save_kv_cache:
-            inner._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
         scale_kwargs = {}
         if inner.is_mxfp8:
             q, q_sf = inner._quantize_mxfp8_tokens(q)
@@ -883,8 +850,8 @@ class InklingAttnBackend(AttentionBackend):
             output[_num_real:].zero_()
         return output
 
-    def support_kv_cache_prewrite(self, forward_mode: ForwardMode | None = None):
-        return self.inner.support_kv_cache_prewrite(forward_mode)
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        return self.inner.supports_narrowed_draft_decode(forward_mode)
 
     def configure_runtime(self, **kwargs) -> None:
         self.inner.configure_runtime(**kwargs)
