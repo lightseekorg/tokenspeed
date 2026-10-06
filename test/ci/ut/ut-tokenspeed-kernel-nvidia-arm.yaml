@@ -31,6 +31,7 @@ install:
           --index-url https://flashinfer.ai/whl/cu134 "$jit_cache_url"
       fi
     '
+  - python3 test/ci_system/patch_cute_dsl_dependencies.py
   - |
     bash -ec '
       export WORKSPACE="$PWD"
