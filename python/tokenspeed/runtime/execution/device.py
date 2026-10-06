@@ -1307,7 +1307,7 @@ def build_device_side(
         if probing and current_platform().is_nvidia
         else NULL_MEMORY_DELTA_OBSERVER
     )
-    with startup_phase("executor.init"), startup_memory.measure("startup"):
+    with startup_memory.measure("startup"), startup_phase("executor.init"):
         executor = create_model_executor(
             server_args=server_args,
             config=ModelExecutorConfig.from_server_args(
@@ -1328,8 +1328,8 @@ def build_device_side(
         )
     # Once per process, before the probe: a graph keeps its capture-time tactic.
     with (
-        startup_phase("kernels.autotune"),
         startup_memory.measure("startup"),
+        startup_phase("kernels.autotune"),
         current_platform().restore_stack_limit(),
     ):
         executor.autotune()
