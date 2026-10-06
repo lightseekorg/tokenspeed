@@ -2,13 +2,27 @@
 # multi-architecture manifest.
 FROM lightseekorg/tokenspeed-runner:cu130-torch-2.14.0-flashinfer-0.6.18
 
+ARG TOKENSPEED_KERNEL_VERSION
+ARG TOKENSPEED_SCHEDULER_VERSION
+ARG TOKENSPEED_MLA_VERSION
+
 WORKDIR /workspace
 
 # The base image provides libnuma1 and libibverbs for TokenSpeed's published
 # runtime dependencies.
 COPY --chown=runner:runner python/ ./python/
 
-# Install TokenSpeed from this checkout. Its kernel and scheduler dependencies
-# resolve from published PyPI wheels using the bounds in python/pyproject.toml,
-# so rebuilding the same checkout may select newer compatible component releases.
-RUN python3 -m pip install --user --no-cache-dir ./python
+# Install the released component versions, even if newer compatible wheels exist.
+RUN test -n "$TOKENSPEED_KERNEL_VERSION" && \
+    test -n "$TOKENSPEED_SCHEDULER_VERSION" && \
+    test -n "$TOKENSPEED_MLA_VERSION" && \
+    printf '%s\n' \
+        "tokenspeed-kernel==${TOKENSPEED_KERNEL_VERSION}" \
+        "tokenspeed-scheduler==${TOKENSPEED_SCHEDULER_VERSION}" \
+        "tokenspeed-mla==${TOKENSPEED_MLA_VERSION}" > /tmp/release-constraints.txt && \
+    python3 -m pip install --user --no-cache-dir \
+        --constraint /tmp/release-constraints.txt ./python && \
+    python3 -c 'import importlib.metadata as m, sys; \
+assert all(m.version(p) == v for p, v in zip( \
+["tokenspeed-kernel", "tokenspeed-scheduler", "tokenspeed-mla"], sys.argv[1:]))' \
+        "$TOKENSPEED_KERNEL_VERSION" "$TOKENSPEED_SCHEDULER_VERSION" "$TOKENSPEED_MLA_VERSION"
