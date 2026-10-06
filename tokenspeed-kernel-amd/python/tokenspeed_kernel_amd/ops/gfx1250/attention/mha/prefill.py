@@ -47,6 +47,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention._common import (
 )
 
 cdna5 = gl.amd.cdna5
+_HAS_FUSED_TDM = hasattr(cdna5.tdm, "async_load_fused")
 
 _GFX1250_NUM_CUS = 256
 
@@ -462,6 +463,28 @@ class AttentionProgram:
             [kv_start, 0],
             self.v_buffer.index(buffer_index),
             warp_used_hint=warp_used_hint,
+        )
+
+    @gluon.jit
+    def tdm_load_global_to_shared_kv_fused(self, kv_start, buffer_index):
+        k_desc = cdna5.tdm.update_tensor_descriptor(
+            self.k_desc,
+            add_offsets=[kv_start, 0],
+            pred=True,
+            clamp_bounds=True,
+        )
+        v_desc = cdna5.tdm.update_tensor_descriptor(
+            self.v_desc,
+            add_offsets=[kv_start, 0],
+            pred=True,
+            clamp_bounds=True,
+        )
+        cdna5.tdm.async_load_fused(
+            [
+                (k_desc, self.k_buffer.index(buffer_index), 0x03),
+                (v_desc, self.v_buffer.index(buffer_index), 0x0C),
+            ],
+            cache_modifier=".cg",
         )
 
     @gluon.jit
@@ -1054,7 +1077,12 @@ def _process_wide_transport_half(
 
 
 @gluon.jit
-def process_attention_wide_transport(loader, program, num_tiles):
+def process_attention_wide_transport(
+    loader,
+    program,
+    num_tiles,
+    FUSED_TDM: gl.constexpr,
+):
     """Pipeline BN128 TDM transfers while computing one BN64 half at a time."""
     cfg = program.cfg
     q = program.load_q()
@@ -1062,8 +1090,11 @@ def process_attention_wide_transport(loader, program, num_tiles):
     full_loads = num_tiles // 2
 
     if full_loads > 0:
-        loader.tdm_load_global_to_shared_k(0, 0)
-        loader.tdm_load_global_to_shared_v(0, 0)
+        if FUSED_TDM:
+            loader.tdm_load_global_to_shared_kv_fused(0, 0)
+        else:
+            loader.tdm_load_global_to_shared_k(0, 0)
+            loader.tdm_load_global_to_shared_v(0, 0)
         for load_idx in range(full_loads):
             buffer_index = load_idx % cfg.NUM_BUFFERS
             cdna5.tdm.async_wait(0)
@@ -1071,8 +1102,14 @@ def process_attention_wide_transport(loader, program, num_tiles):
             if next_load < (num_tiles + 1) // 2:
                 next_buffer = next_load % cfg.NUM_BUFFERS
                 next_start = next_load * 2 * cfg.BLOCK_N
-                loader.tdm_load_global_to_shared_k(next_start, next_buffer)
-                loader.tdm_load_global_to_shared_v(next_start, next_buffer)
+                if FUSED_TDM:
+                    loader.tdm_load_global_to_shared_kv_fused(
+                        next_start,
+                        next_buffer,
+                    )
+                else:
+                    loader.tdm_load_global_to_shared_k(next_start, next_buffer)
+                    loader.tdm_load_global_to_shared_v(next_start, next_buffer)
 
             kv_start = load_idx * 2 * cfg.BLOCK_N
             state = _process_wide_transport_half(
@@ -1097,8 +1134,11 @@ def process_attention_wide_transport(loader, program, num_tiles):
     if num_tiles % 2:
         buffer_index = full_loads % cfg.NUM_BUFFERS
         if full_loads == 0:
-            loader.tdm_load_global_to_shared_k(0, buffer_index)
-            loader.tdm_load_global_to_shared_v(0, buffer_index)
+            if FUSED_TDM:
+                loader.tdm_load_global_to_shared_kv_fused(0, buffer_index)
+            else:
+                loader.tdm_load_global_to_shared_k(0, buffer_index)
+                loader.tdm_load_global_to_shared_v(0, buffer_index)
         cdna5.tdm.async_wait(0)
         state = _process_wide_transport_half(
             loader,
@@ -1184,6 +1224,7 @@ def gluon_mha_prefill_gfx1250_wide_transport(
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     DISABLE_XDL_ARB_STALL: gl.constexpr,
+    FUSED_TDM: gl.constexpr,
 ):
     if DISABLE_XDL_ARB_STALL:
         gl.amd.hint.disable_xdl_arb_stall()
@@ -1236,7 +1277,12 @@ def gluon_mha_prefill_gfx1250_wide_transport(
         q_span: gl.constexpr = 128 // group_size
         kv_end = gl.minimum(loader.q_start + q_span, loader.seq_len)
         kv_end = ((kv_end + 63) // 64) * 64
-        process_attention_wide_transport(loader, program, kv_end // 64)
+        process_attention_wide_transport(
+            loader,
+            program,
+            kv_end // 64,
+            FUSED_TDM,
+        )
 
 
 @gluon.jit
@@ -1983,6 +2029,15 @@ def launch_gluon_mha_prefill_gfx1250(
         (8, 1),
         (32, 1),
     )
+    wide_fused_tdm = (
+        _HAS_FUSED_TDM
+        and q.dtype == torch.bfloat16
+        and (
+            config.n_heads,
+            config.n_kv_heads,
+        )
+        == (32, 8)
+    )
 
     if wide_transport:
         gluon_mha_prefill_gfx1250_wide_transport[config.grid](
@@ -2007,6 +2062,7 @@ def launch_gluon_mha_prefill_gfx1250(
             config.num_warps,
             config.num_buffers,
             wide_disable_xdl_arb_stall,
+            wide_fused_tdm,
             num_warps=config.num_warps,
             waves_per_eu=config.waves_per_eu,
             llvm_fn_attrs="amdgpu-sched-strategy=coexec",
