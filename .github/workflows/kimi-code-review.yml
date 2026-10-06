@@ -139,7 +139,7 @@ jobs:
                      config["models"]["review"]["model"],
                      os.environ["RUNNER_TEMP"], os.environ["GITHUB_WORKSPACE"]]
           if any(value and value in body for value in private) or re.search(
-              r"https?://|github\.com|\b(?:sk-|ghp_|gho_|github_pat_)|[\w.+-]+@[\w.-]+|/(?:home|root|tmp|proc)/", body
+              r"https?://|github\.com|\b(?:sk-|ghp_|gho_|github_pat_)|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|/(?:home|root|tmp|proc)/", body
           ):
               raise SystemExit("Review failed the public-output check; no review was published.")
           if len(body) > 60000:
