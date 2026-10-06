@@ -217,7 +217,7 @@ class Qwen3_5MoeMLP(nn.Module):
 
     def input_fp4_scale(self) -> torch.Tensor | None:
         """The global scale gate_up_proj quantizes its input to NVFP4 with, if it does."""
-        return self.gate_up_proj.quant_method.nvfp4_input_scale(self.gate_up_proj)
+        return self.gate_up_proj.quant_method.nvfp4_global_scale(self.gate_up_proj)
 
     def forward(self, x):
         return self.forward_prequantized(x, None)

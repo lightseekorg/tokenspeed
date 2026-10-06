@@ -59,7 +59,7 @@ def _rows(rows: int, cols: int, spread: int, seed: int) -> torch.Tensor:
     return x.bfloat16()
 
 
-def _fused(x, residual, weight, global_scale, *, x2=None, gemma=True):
+def _fused(x, residual, weight, global_scale, *, x2=None, gemma):
     rows, cols = x.shape
     out = torch.empty_like(x)
     values = torch.empty(rows, cols // 2, dtype=torch.uint8, device="cuda")
@@ -180,7 +180,7 @@ def test_nvfp4_copy_flushes_subnormal_blocks() -> None:
     weight = torch.zeros(cols, device="cuda").bfloat16()
     global_scale = torch.tensor([7.5], device="cuda")
 
-    out, values, scales = _fused(x, residual, weight, global_scale)
+    out, values, scales = _fused(x, residual, weight, global_scale, gemma=True)
 
     assert out[:, :16].float().abs().max() < torch.finfo(torch.float32).tiny
     _assert_matches_fp4_quantize(out, values, scales, global_scale)
@@ -209,7 +209,7 @@ def test_nvfp4_copy_compiles_once_across_batch_sizes() -> None:
 
     def run(rows: int) -> None:
         x = torch.randn(rows, cols, device="cuda").bfloat16()
-        _fused(x, torch.randn_like(x), weight, global_scale)
+        _fused(x, torch.randn_like(x), weight, global_scale, gemma=True)
 
     run(3)
     with assert_no_triton_compile(_add_rmsnorm_kernel):
