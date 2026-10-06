@@ -1197,7 +1197,7 @@ class Release:
     def notes(self, generated, previous):
         versions = self.state["versions"]
         tag = f"v{versions['tokenspeed']}"
-        text = "Weekly component versions\n\n| Package | Version |\n| --- | --- |\n"
+        text = "Biweekly component versions\n\n| Package | Version |\n| --- | --- |\n"
         text += "".join(
             f"| {p} | [{v}](https://pypi.org/project/{p}/{v}/) |\n"
             for p, v in versions.items()
@@ -1268,7 +1268,10 @@ class Release:
                 release["draft"]
                 or release["prerelease"]
                 or not existing
-                or "Weekly component versions" not in release["body"]
+                or (
+                    "Biweekly component versions" not in release["body"]
+                    and "Weekly component versions" not in release["body"]
+                )
             ):
                 raise RuntimeError(
                     "Existing release page does not belong to this weekly release"

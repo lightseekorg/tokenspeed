@@ -426,7 +426,7 @@ def test_oversized_generated_notes_publish_bounded_body_with_all_links(
     )
     release.release()
     assert len(body[0].encode()) <= 100000
-    assert "Weekly component versions" in body[0]
+    assert "Biweekly component versions" in body[0]
     for package, version in publication_state["versions"].items():
         assert f"https://pypi.org/project/{package}/{version}/" in body[0]
     assert "tokenspeed-kernel-v0.1.4-rocm72" in body[0]
