@@ -91,3 +91,27 @@ Mention `@claude` in a new issue/PR conversation comment or inline PR review
 comment to request a reply. Both jobs load the official `pr-review-toolkit`
 plugin. This CPU runner reviews source and CI evidence; GPU tests remain in
 the repository's existing CI workflows.
+
+## Kimi workflow setup and operation
+
+[The Kimi workflow](.github/workflows/kimi-code-review.yml) reviews same-repository
+branch PRs on `opened`, `synchronize`, and `reopened`, including drafts. Fork PRs
+and runs triggered by `dependabot[bot]` are skipped. It uses a GitHub-hosted CPU
+runner and posts a summary comment for the exact reviewed head commit; a newer
+push cancels the previous run. It does not approve PRs or gate merges.
+
+Configure these repository Actions variables and secrets:
+
+| Setting | Kind | Value |
+| --- | --- | --- |
+| `KIMI_API_URL` | Variable | Provider API base URL, including its API version path |
+| `KIMI_MODEL` | Variable | Model ID accepted by that endpoint |
+| `KIMI_PROVIDER_TYPE` | Variable | Kimi CLI provider type, such as `openai` or `kimi` |
+| `KIMI_API_KEY` | Secret | API token for that endpoint |
+| `LIGHTSEEK_BOT_TOKEN` | Secret | Token for `lightseek-bot` with repository variable read and PR comment write access |
+
+Kimi runs from a separate temporary directory with only `Read`, `Grep`, and
+`Glob` tools. GitHub authentication is available only to the configuration and
+publishing steps. Failed, empty, oversized, or sensitive output is not published;
+raw CLI events and logs are not uploaded. Same-repository contributors can edit
+the workflow, so repository write access remains the trust boundary.
