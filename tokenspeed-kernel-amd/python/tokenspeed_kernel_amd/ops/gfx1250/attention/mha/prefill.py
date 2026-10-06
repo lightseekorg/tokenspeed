@@ -1926,7 +1926,7 @@ def launch_gluon_mha_prefill_gfx1250(
         if config.window_left >= 0:
             llvm_fn_attrs = (
                 "amdgpu-sched-strategy=coexec"
-                if q.dtype == torch.float16 and config.window_left == 512
+                if config.window_left == 512
                 else "amdgpu-sched-strategy=max-memory-clause"
             )
         elif guarded_query_rows and q.dtype == torch.bfloat16:

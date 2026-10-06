@@ -731,12 +731,13 @@ def test_select_qk_ds_group_stride():
 
 
 @pytest.mark.parametrize(
-    "n_q_heads,n_kv_heads,expected_block_m,expected_wpe,expected_group,expected_scheduler,expected_wide",
+    "n_q_heads,n_kv_heads,expected_block_m,expected_wpe,expected_group,expected_ds,expected_scheduler,expected_wide,window_left",
     [
-        (8, 1, 256, 0, 4, "amdgpu-sched-strategy=coexec", False),
-        (8, 8, 256, 0, 4, "amdgpu-sched-strategy=coexec", False),
-        (32, 8, 128, 2, 0, "amdgpu-sched-strategy=coexec", True),
-        (32, 1, 128, 2, 4, "amdgpu-sched-strategy=coexec", True),
+        (8, 1, 256, 0, 4, 8, "amdgpu-sched-strategy=coexec", False, -1),
+        (8, 8, 256, 0, 4, 8, "amdgpu-sched-strategy=coexec", False, -1),
+        (32, 8, 128, 2, 0, 0, "amdgpu-sched-strategy=coexec", True, -1),
+        (32, 1, 128, 2, 4, 0, "amdgpu-sched-strategy=coexec", True, -1),
+        (8, 1, 128, 2, 0, 0, "amdgpu-sched-strategy=coexec", False, 512),
     ],
 )
 def test_mha_prefill_bf16_exact_route_config(
@@ -746,8 +747,10 @@ def test_mha_prefill_bf16_exact_route_config(
     expected_block_m,
     expected_wpe,
     expected_group,
+    expected_ds,
     expected_scheduler,
     expected_wide,
+    window_left,
 ):
     captured = {}
 
@@ -781,7 +784,15 @@ def test_mha_prefill_bf16_exact_route_config(
         "cuda",
         torch.bfloat16,
     )
-    prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    prefill.launch_gluon_mha_prefill_gfx1250(
+        q,
+        k,
+        v,
+        cu,
+        cu_cpu,
+        max_seqlen,
+        window_left=window_left,
+    )
 
     assert captured["wide"] is expected_wide
     if expected_wide:
@@ -790,7 +801,7 @@ def test_mha_prefill_bf16_exact_route_config(
         assert captured["args"][20] == expected_block_m
         assert captured["args"][29] is True
         assert captured["args"][34] == expected_group
-        assert captured["args"][35] == 8
+        assert captured["args"][35] == expected_ds
     assert captured["kwargs"]["num_warps"] == 4
     assert captured["kwargs"]["waves_per_eu"] == expected_wpe
     assert captured["kwargs"]["llvm_fn_attrs"] == expected_scheduler
