@@ -357,7 +357,7 @@ def update_metadata(stage, versions):
         replace(
             PROJECTS["tokenspeed"],
             r'"tokenspeed-kernel>=[^"]+"',
-            f'"tokenspeed-kernel>={versions["tokenspeed-kernel"]}"',
+            f'"tokenspeed-kernel>={versions["tokenspeed-kernel"]}.dev0"',
         )
 
 

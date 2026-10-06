@@ -209,7 +209,12 @@ def test_metadata_updates_both_versions_and_keeps_kernel_boundary(
     )
     deps = release_module.requirements("python/pyproject.toml")
     assert (
-        str(deps["tokenspeed-kernel"].specifier) == f'>={versions["tokenspeed-kernel"]}'
+        str(deps["tokenspeed-kernel"].specifier)
+        == f'>={versions["tokenspeed-kernel"]}.dev0'
+    )
+    assert (
+        f'{versions["tokenspeed-kernel"]}.dev20260101+gitabcdef12'
+        in deps["tokenspeed-kernel"].specifier
     )
     assert "tokenspeed-kernel-amd" not in deps and "tokenspeed-mla" not in deps
     assert (
