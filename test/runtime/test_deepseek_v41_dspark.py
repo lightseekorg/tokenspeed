@@ -863,6 +863,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
             decode_input_tokens=6,
             overlap_schedule_depth=0,
             graph_reserve_bytes=0,
+            post_profile_bytes=0,
             probe_batch_rows=None,
             profiled_cache_bytes=None,
             reuse_target_backend=None,

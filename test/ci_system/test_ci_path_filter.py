@@ -102,6 +102,8 @@ def test_amd_owned_paths_require_only_amd(path):
         f"{KERNEL}/ops/attention/gdn/_flashinfer/adapter.py",
         f"{KERNEL}/ops/moe/deep_gemm/_triton/mega_moe_stage.py",
         f"{KERNEL}/ops/moe/flashinfer/trtllm_mxfp4.py",
+        f"{KERNEL}/ops/communication/_cuda/a2a_fp8.cuh",
+        f"{KERNEL}/ops/communication/_cuda/lamport_a2a.py",
         f"{KERNEL}/ops/communication/_cuda/lamport_a2a.cu",
         f"{KERNEL}/thirdparty/cute_dsl/ll_bf16.py",
         f"{KERNEL}/thirdparty/msa/csrc/fmha_sm100_plan.cu",

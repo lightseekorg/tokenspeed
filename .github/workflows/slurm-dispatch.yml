@@ -69,7 +69,8 @@ on:
           - test/ci/ut/ut-runtime-1gpu.yaml
           - test/ci/ut/ut-runtime-2gpu.yaml
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
-          - test/ci/ut/ut-tokenspeed-kernel.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-i.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-ii.yaml
       runners:
         description: "Logical bulk runners; GB300 maps B200/GB200 labels to matching GB300 runners"
         required: true

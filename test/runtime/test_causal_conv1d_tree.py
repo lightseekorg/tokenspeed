@@ -94,6 +94,56 @@ def test_tree_windows_match_per_path_reference():
     assert torch.equal(state[out_rows[2].long()], chain_state[out_rows[2].long()])
 
 
+@pytest.mark.parametrize("width", [2, 3, 4])
+def test_tree_update_is_bitwise_per_path_reference(width):
+    """Products round to bf16 and add left to right in fp32, so the reference is exact."""
+    torch.manual_seed(width)
+    bs, dim, t = 4, 1000, 6
+    parents = PARENTS + [[-1, 0, 0, 1, -1, 4]]
+    x = torch.randn(bs, t, dim, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    conv_state = torch.randn(
+        1 + bs * (t + 1), dim, width - 1, device="cuda", dtype=torch.bfloat16
+    )
+    base = torch.arange(bs, device="cuda", dtype=torch.int32) * (t + 1) + 1
+    base[1] = PAD_SLOT_ID
+    out_rows = base[:, None] + 1 + torch.arange(t, device="cuda", dtype=torch.int32)
+    out_rows[1] = -1
+    out_rows[2, 3] = -1
+    init = conv_state.float()
+    state = conv_state.clone()
+    out = causal_conv1d_update(
+        x,
+        state,
+        weight,
+        bias,
+        activation=None,
+        conv_state_indices=base,
+        output_state_indices=out_rows,
+        parent_indices=torch.tensor(parents, device="cuda", dtype=torch.int32),
+    )
+
+    expected_state = conv_state.clone()
+    for b, par in enumerate(parents):
+        if b == 1:
+            continue
+        for i in range(t):
+            path, node = [], i
+            while node >= 0:
+                path.append(node)
+                node = par[node]
+            seq = torch.cat([init[int(base[b])], x[b, :, path[::-1]].float()], dim=1)
+            ref = bias.float()
+            for c in range(width):
+                product = seq[:, c - width] * weight[:, c].float()
+                ref = ref + product.bfloat16().float()
+            assert torch.equal(out[b, :, i], ref.bfloat16())
+            if out_rows[b, i] >= 0:
+                expected_state[int(out_rows[b, i])] = seq[:, 1 - width :].bfloat16()
+    assert torch.equal(state, expected_state)
+
+
 @pytest.mark.parametrize(
     "broken", ["no_base", "int64_parents", "base_shape", "cache_seqlens"]
 )

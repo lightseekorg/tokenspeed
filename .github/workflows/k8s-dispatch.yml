@@ -67,7 +67,8 @@ on:
           - test/ci/ut/ut-runtime-2gpu.yaml
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml
-          - test/ci/ut/ut-tokenspeed-kernel.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-i.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-ii.yaml
       runner_pool:
         description: "Runner pool selected from the YAML labels"
         required: true
