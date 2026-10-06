@@ -1301,10 +1301,10 @@ def build_device_side(
             )
             server_args.chunked_prefill_size = aligned
 
-    # What startup keeps resident after the probe build joins the CUDA-graph reserve.
+    # On CUDA, what startup keeps resident after the probe build joins the reserve.
     startup_memory = (
         DriverMemoryDeltaObserver(torch.get_device_module(server_args.device), gpu_id)
-        if probing
+        if probing and current_platform().is_nvidia
         else NULL_MEMORY_DELTA_OBSERVER
     )
     with startup_phase("executor.init"), startup_memory.measure("startup"):
@@ -1343,7 +1343,7 @@ def build_device_side(
                 gpu_id,
                 attention,
                 requested_backends,
-                startup_resident_bytes=sum(startup_memory.samples["startup"]),
+                startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
 
     with startup_phase("graph.capture"):

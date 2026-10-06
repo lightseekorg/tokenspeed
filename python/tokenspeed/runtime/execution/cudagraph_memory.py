@@ -288,9 +288,10 @@ def probe_cudagraph_memory(
     The reserve is what the captures themselves took plus the projected cost
     of the entries skipped -- what a boot without a probe pays inside
     its capture windows, the one-time bytes the first captures allocate
-    there included -- plus the startup residue, what startup kept resident
-    between the probe build and the probe (``startup_resident_bytes``, net,
-    floored at zero), summed on each rank before the cross-rank MAX.
+    there included -- plus the startup residue the caller charges
+    (``startup_resident_bytes``: what startup kept resident between the probe
+    build and the probe, net, floored at zero; 0 where it is left to the
+    utilization headroom), summed on each rank before the cross-rank MAX.
     One-time bytes outside every capture (warmups, workspaces) are left to
     the utilization headroom, which funds them on a boot without a reserve
     too.
@@ -313,7 +314,7 @@ def probe_cudagraph_memory(
     )
     logger.info(
         f"CUDA-graph memory reserve: {reserve} bytes (this rank: startup residue "
-        f"{startup}, captured {estimate.measured_total}, unsampled "
+        f"reserved {startup}, captured {estimate.measured_total}, unsampled "
         f"entries {estimate.unsampled_total}; {per_series})"
     )
     # Per series: one ladder reading free is invisible in a non-zero total.

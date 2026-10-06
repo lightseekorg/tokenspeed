@@ -246,7 +246,7 @@ class _ServingCapture(Exception):
     """Ends a fabricated boot where the serving capture would begin."""
 
 
-def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager):
+def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nvidia):
     """Boot with fakes; returns (startup bytes each rebind got, devices read, stack kept)."""
     from tokenspeed.runtime.execution import factory
 
@@ -312,7 +312,9 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager):
     monkeypatch.setattr(
         device,
         "current_platform",
-        lambda: SimpleNamespace(restore_stack_limit=restore_stack_limit),
+        lambda: SimpleNamespace(
+            restore_stack_limit=restore_stack_limit, is_nvidia=is_nvidia
+        ),
     )
     monkeypatch.setattr(factory, "create_model_runner", lambda *a: (target, None))
     monkeypatch.setattr(factory, "create_model_executor", lambda **_: Executor())
@@ -357,7 +359,11 @@ def test_the_rebind_is_charged_what_executor_init_and_tuning_kept(
     monkeypatch, init_keeps, tune_keeps
 ) -> None:
     charged, devices, stack = _startup_charge(
-        monkeypatch, init_keeps=init_keeps, tune_keeps=tune_keeps, enforce_eager=False
+        monkeypatch,
+        init_keeps=init_keeps,
+        tune_keeps=tune_keeps,
+        enforce_eager=False,
+        is_nvidia=True,
     )
     # The signed net of both; the probe floors it.
     assert charged == [init_keeps + tune_keeps]
@@ -366,9 +372,26 @@ def test_the_rebind_is_charged_what_executor_init_and_tuning_kept(
 
 def test_a_boot_without_a_probe_reads_no_startup_memory(monkeypatch) -> None:
     charged, devices, stack = _startup_charge(
-        monkeypatch, init_keeps=1 << 30, tune_keeps=1 << 30, enforce_eager=True
+        monkeypatch,
+        init_keeps=1 << 30,
+        tune_keeps=1 << 30,
+        enforce_eager=True,
+        is_nvidia=True,
     )
     assert charged == [] and devices == set() and stack == 0
+
+
+def test_a_probe_off_nvidia_leaves_the_startup_residue_to_the_headroom(
+    monkeypatch,
+) -> None:
+    charged, devices, _ = _startup_charge(
+        monkeypatch,
+        init_keeps=1 << 30,
+        tune_keeps=1 << 30,
+        enforce_eager=False,
+        is_nvidia=False,
+    )
+    assert charged == [0] and devices == set()
 
 
 def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:

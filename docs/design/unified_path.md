@@ -161,13 +161,16 @@ from one first bound to that pool:
   a reserve takes it -- minus the projection. The reserve covers the bytes
   inside the capture windows as projected -- what a boot without a probe
   captures there, one-time bytes the first captures take included; the
-  probe releases them and the serving capture pays them again. What executor
-  init and kernel tuning keep resident between the probe build and the probe
-  -- buffers, and on a cold tuning cache the kernels of every tactic tried,
-  though not, on CUDA, the stack limit they raised, which is restored after
+  probe releases them and the serving capture pays them again. On CUDA, what
+  executor init and kernel tuning keep resident between the probe build and
+  the probe -- buffers, and on a cold tuning cache the kernels of every tactic
+  tried, though not the stack limit they raised, which is restored after
   tuning -- is measured the same way, including the free space a kept block
   pins in an allocator segment, and this startup residue joins each rank's
-  projection before the MAX; its net is floored at zero. The
+  projection before the MAX; its net is floored at zero. Off CUDA it stays on
+  the headroom, as on a boot without a reserve; on ROCm, ROCr keeps the
+  scratch memory tuning grows assigned to its queues, and reclaims it when a
+  device allocation fails. The
   utilization headroom covers everything else: activations, fragmentation,
   the warmups and workspaces a capture allocates around its windows, the
   local memory a kept kernel reserves when it raises the stack limit again

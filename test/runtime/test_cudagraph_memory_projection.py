@@ -411,7 +411,7 @@ def test_startup_residue_joins_the_reserve_before_the_reduction() -> None:
             )
         # One reduction over the sum; a release in the window credits nothing.
         assert totals[-1] == reserve == graphs + charged
-        assert f"startup residue {charged}," in info.call_args.args[0]
+        assert f"startup residue reserved {charged}," in info.call_args.args[0]
 
 
 def test_a_ladder_the_probe_could_not_price_warns_the_operator() -> None:
