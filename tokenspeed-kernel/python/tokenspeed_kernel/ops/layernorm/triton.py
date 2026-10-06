@@ -837,48 +837,71 @@ def _add_rmsnorm_kernel(
     stride_residual,
     stride_out,
     stride_out_fp8,
-    n_cols,
+    n_cols: tl.constexpr,
     eps,
     BLOCK: tl.constexpr,
+    CHUNKS: tl.constexpr,
     HAS_X2: tl.constexpr,
     HAS_FP8: tl.constexpr,
+    GEMMA: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
-    mask = cols < n_cols
     # Weights and the quant scale are model constants, loaded before the wait.
-    weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    weights = ()
+    for c in tl.static_range(CHUNKS):
+        offsets = c * BLOCK + cols
+        weight = tl.load(weight_ptr + offsets, mask=offsets < n_cols, other=0.0).to(
+            tl.float32
+        )
+        if GEMMA:
+            weight = 1.0 + weight
+        weights = weights + (weight,)
     if HAS_FP8:
         inv_scale = 1.0 / tl.load(fp8_scale_ptr).to(tl.float32)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
-    addend = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0)
-    if HAS_X2:
-        # Sum the two addends in their own dtype, as an all-reduce input would be.
-        addend += tl.load(x2_ptr + row * stride_x2 + cols, mask=mask, other=0.0)
-    total = addend.to(tl.float32) + tl.load(
-        residual_ptr + row * stride_residual + cols, mask=mask, other=0.0
-    ).to(tl.float32)
-    tl.store(
-        residual_ptr + row * stride_residual + cols,
-        total.to(residual_ptr.dtype.element_ty),
-        mask=mask,
-    )
-    variance = tl.sum(total * total, axis=0) / n_cols
-    normed = (total * tl.rsqrt(variance + eps) * weight).to(out_ptr.dtype.element_ty)
+    # Every row load before the in-place residual store, which loads cannot move past.
+    totals = ()
+    for c in tl.static_range(CHUNKS):
+        offsets = c * BLOCK + cols
+        mask = offsets < n_cols
+        addend = tl.load(x_ptr + row * stride_x + offsets, mask=mask, other=0.0)
+        if HAS_X2:
+            # Sum the two addends in their own dtype, as an all-reduce input would be.
+            addend += tl.load(x2_ptr + row * stride_x2 + offsets, mask=mask, other=0.0)
+        total = addend.to(tl.float32) + tl.load(
+            residual_ptr + row * stride_residual + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+        totals = totals + (total,)
+    squares = tl.zeros([BLOCK], dtype=tl.float32)
+    for c in tl.static_range(CHUNKS):
+        offsets = c * BLOCK + cols
+        tl.store(
+            residual_ptr + row * stride_residual + offsets,
+            totals[c].to(residual_ptr.dtype.element_ty),
+            mask=offsets < n_cols,
+        )
+        squares += totals[c] * totals[c]
+    variance = tl.sum(squares, axis=0) / n_cols
+    rstd = tl.rsqrt(variance + eps)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
-    tl.store(out_ptr + row * stride_out + cols, normed, mask=mask)
-    if HAS_FP8:
-        quant = tl.clamp(
-            normed.to(tl.float32) * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
-        )
-        tl.store(
-            out_fp8_ptr + row * stride_out_fp8 + cols,
-            quant.to(out_fp8_ptr.dtype.element_ty),
-            mask=mask,
-        )
+    for c in tl.static_range(CHUNKS):
+        offsets = c * BLOCK + cols
+        mask = offsets < n_cols
+        normed = (totals[c] * rstd * weights[c]).to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + row * stride_out + offsets, normed, mask=mask)
+        if HAS_FP8:
+            quant = tl.clamp(
+                normed.to(tl.float32) * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+            )
+            tl.store(
+                out_fp8_ptr + row * stride_out_fp8 + offsets,
+                quant.to(out_fp8_ptr.dtype.element_ty),
+                mask=mask,
+            )
 
 
 def add_rmsnorm(
@@ -891,6 +914,7 @@ def add_rmsnorm(
     out: torch.Tensor,
     out_fp8: torch.Tensor | None,
     fp8_scale: torch.Tensor | None,
+    gemma: bool,
 ) -> None:
     """``residual += x (+ x2)``, then RMSNorm, optionally also into static FP8.
 
@@ -904,6 +928,7 @@ def add_rmsnorm(
         out_fp8: Optional ``[M, N]`` FP8 output quantized with ``fp8_scale``.
         fp8_scale: One-element FP32 dequant scale, given exactly with
             ``out_fp8``.
+        gemma: Scale by ``1 + weight`` in FP32 (Gemma) instead of ``weight``.
     """
     if (out_fp8 is None) != (fp8_scale is None):
         raise ValueError("out_fp8 and fp8_scale are given together")
@@ -913,7 +938,10 @@ def add_rmsnorm(
     rows, cols = x.shape
     if rows == 0:
         return
-    block = triton.next_power_of_2(cols)
+    width = triton.next_power_of_2(cols)
+    # Whole power-of-two chunks spare the masked lanes of one rounded-up block (5120 = 5 x 1024).
+    chunk = cols & -cols
+    block = chunk if chunk >= 1024 else width
     enable_pdl = pdl_enabled()
     _add_rmsnorm_kernel[(rows,)](
         x,
@@ -931,10 +959,12 @@ def add_rmsnorm(
         cols,
         eps,
         BLOCK=block,
+        CHUNKS=triton.cdiv(cols, block),
         HAS_X2=x2 is not None,
         HAS_FP8=out_fp8 is not None,
+        GEMMA=gemma,
         ENABLE_PDL=enable_pdl,
-        num_warps=min(max(block // 256, 1), 8),
+        num_warps=min(max(width // 256, 1), 8),
         **({"launch_pdl": True} if enable_pdl else {}),
     )
 

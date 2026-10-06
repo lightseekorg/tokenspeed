@@ -36,7 +36,7 @@ from tokenspeed_kernel.ops.communication.trtllm import (
 from tokenspeed_kernel.ops.communication.trtllm import (
     reducescatter_residual_rmsnorm,
 )
-from tokenspeed_kernel.ops.layernorm import rmsnorm
+from tokenspeed_kernel.ops.layernorm import add_rmsnorm, rmsnorm
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -296,6 +296,38 @@ class GemmaRMSNorm(torch.nn.Module):
                 self.variance_epsilon,
             )
             return out
+
+    def add_norm_with_fp8(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        fp8_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """``forward(x, residual)``, plus the normed rows in static FP8 when ``fp8_scale`` is given.
+
+        Returns the normed rows (written into ``x``), their FP8 copy or ``None``,
+        and the updated residual.
+        """
+        if _is_amd:
+            x, residual = self(x, residual)
+            return x, None, residual
+        x_fp8 = (
+            None
+            if fp8_scale is None
+            else torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        )
+        add_rmsnorm(
+            x,
+            residual,
+            self.weight.data,
+            self.variance_epsilon,
+            x2=None,
+            out=x,
+            out_fp8=x_fp8,
+            fp8_scale=fp8_scale,
+            gemma=True,
+        )
+        return x, x_fp8, residual
 
     def forward_with_allreduce_fusion(
         self,

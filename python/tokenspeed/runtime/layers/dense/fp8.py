@@ -389,5 +389,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
         return super().apply_with_activation(layer, x, activation, bias)
 
+    def static_fp8_input_scale(self, layer: torch.nn.Module) -> torch.Tensor | None:
+        # Block and dynamic activation scales are found per call, so no producer can apply them.
+        return None if self.block_quant else layer.input_scale
+
     def prepared_linear_plan(self, layer: torch.nn.Module) -> object | None:
         return getattr(layer, "_prepared_fp8_linear", None)

@@ -324,12 +324,13 @@ def test_reference_rmsnorm_matches_eager_cast_order(
         reference_rmsnorm(x, weight[:-1], eps, None)
 
 
-@pytest.mark.parametrize("hidden_size", [128, 4096])
+@pytest.mark.parametrize("hidden_size", [128, 4096, 5120])
 @pytest.mark.parametrize("with_x2", [False, True])
 @pytest.mark.parametrize("with_fp8", [False, True])
 @pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("gemma", [False, True])
 def test_add_rmsnorm_matches_unfused_reference(
-    hidden_size: int, with_x2: bool, with_fp8: bool, pdl: bool, device: str
+    hidden_size: int, with_x2: bool, with_fp8: bool, pdl: bool, gemma: bool, device: str
 ) -> None:
     if with_fp8 and not platform.is_nvidia:
         pytest.skip("requires float8_e4m3fn CUDA")
@@ -346,9 +347,8 @@ def test_add_rmsnorm_matches_unfused_reference(
     scale = torch.tensor([4.0 / 448.0], device=device)
     # The two addends meet in BF16, as an all-reduce input would.
     total = (x + x2 if with_x2 else x).float() + residual.float()
-    ref = (
-        total * torch.rsqrt(total.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
-    )
+    scale_by = 1.0 + weight.float() if gemma else weight.float()
+    ref = total * torch.rsqrt(total.pow(2).mean(-1, keepdim=True) + eps) * scale_by
 
     out = torch.empty_like(x)
     out_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn) if with_fp8 else None
@@ -362,6 +362,7 @@ def test_add_rmsnorm_matches_unfused_reference(
             out=out,
             out_fp8=out_fp8,
             fp8_scale=scale if with_fp8 else None,
+            gemma=gemma,
         )
         torch.cuda.synchronize()
     finally:
@@ -386,7 +387,17 @@ def test_add_rmsnorm_writes_in_place_from_strided_rows(device: str) -> None:
     )
     untouched = wide[:, 256:].clone()
 
-    add_rmsnorm(x, residual, weight, eps, x2=None, out=x, out_fp8=None, fp8_scale=None)
+    add_rmsnorm(
+        x,
+        residual,
+        weight,
+        eps,
+        x2=None,
+        out=x,
+        out_fp8=None,
+        fp8_scale=None,
+        gemma=False,
+    )
 
     torch.testing.assert_close(x.float(), ref, atol=2e-2, rtol=2e-2)
     assert torch.equal(wide[:, 256:], untouched)
@@ -406,6 +417,7 @@ def test_add_rmsnorm_compiles_once_across_batch_sizes(device: str) -> None:
             out=torch.empty_like(x[:rows]),
             out_fp8=None,
             fp8_scale=None,
+            gemma=False,
         )
 
     run(3)
@@ -427,6 +439,7 @@ def test_add_rmsnorm_contract(device: str) -> None:
         out=empty,
         out_fp8=None,
         fp8_scale=None,
+        gemma=False,
     )
     with pytest.raises(ValueError, match="together"):
         add_rmsnorm(
@@ -438,6 +451,7 @@ def test_add_rmsnorm_contract(device: str) -> None:
             out=x,
             out_fp8=torch.empty_like(x, dtype=torch.float8_e4m3fn),
             fp8_scale=None,
+            gemma=False,
         )
     with pytest.raises(ValueError, match="dense columns"):
         add_rmsnorm(
@@ -449,4 +463,5 @@ def test_add_rmsnorm_contract(device: str) -> None:
             out=x.t(),
             out_fp8=None,
             fp8_scale=None,
+            gemma=False,
         )
