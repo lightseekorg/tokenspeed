@@ -824,6 +824,95 @@ def rmsnorm_fused_parallel(
 
 
 @triton.jit
+def _rcp_approx_ftz(x):
+    return tl.inline_asm_elementwise(
+        "rcp.approx.ftz.f32 $0, $1;",
+        "=f,f",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _e4m3_bits(x):
+    return tl.inline_asm_elementwise(
+        "{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f32 t, 0f00000000, $1; cvt.u32.u16 $0, t; }",
+        "=r,f",
+        [x],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _e4m3_bits_to_f32(bits):
+    return tl.inline_asm_elementwise(
+        "{ .reg .b16 t; .reg .b32 h; .reg .f16 lo, hi; cvt.u16.u32 t, $1; "
+        "cvt.rn.f16x2.e4m3x2 h, t; mov.b32 {lo, hi}, h; cvt.f32.f16 $0, lo; }",
+        "=f,r",
+        [bits],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _e2m1x2(lo, hi):
+    # One byte, lo in the low nibble: cvt puts its first source in the upper half.
+    return tl.inline_asm_elementwise(
+        "{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, $2, $1; cvt.u32.u8 $0, t; }",
+        "=r,f,f",
+        [lo, hi],
+        dtype=tl.int32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _nvfp4_scale_offsets(row, k, N_COLS: tl.constexpr):
+    # fp4_quantize's 128x4 swizzled layout: [m tile, k tile, row % 32, row % 128 // 32, k % 4].
+    k_tiles: tl.constexpr = (N_COLS // 16 + 3) // 4
+    base = (row // 128) * (k_tiles * 512) + (row % 32) * 16 + ((row % 128) // 32) * 4
+    return base + (k // 4) * 512 + k % 4
+
+
+@triton.jit
+def _store_nvfp4(
+    normed,
+    row,
+    c,
+    fp4_ptr,
+    sf_ptr,
+    stride_fp4,
+    sf_scale,
+    rcp_sf_scale,
+    rcp6,
+    BLOCK,
+    N_COLS,
+):
+    # fp4_quantize's E4M3-scale recipe, bit for bit: block amax / 6 scaled into E4M3, values into E2M1.
+    blocks = tl.reshape(normed, [BLOCK // 16, 16])
+    vec_max = tl.max(tl.abs(blocks), axis=1).to(tl.float32)
+    sf_bits = _e4m3_bits(sf_scale * (vec_max * rcp6))
+    out_scale = tl.where(
+        vec_max != 0, _rcp_approx_ftz(_e4m3_bits_to_f32(sf_bits) * rcp_sf_scale), 0.0
+    )
+    scaled = blocks.to(tl.float32) * out_scale[:, None]
+    even, odd = tl.split(tl.reshape(scaled, [BLOCK // 16, 8, 2]))
+    packed = tl.reshape(_e2m1x2(even, odd).to(tl.uint8), [BLOCK // 2])
+    tl.store(
+        fp4_ptr + row * stride_fp4 + c * (BLOCK // 2) + tl.arange(0, BLOCK // 2), packed
+    )
+    k = c * (BLOCK // 16) + tl.arange(0, BLOCK // 16)
+    tl.store(sf_ptr + _nvfp4_scale_offsets(row, k, N_COLS), sf_bits.to(tl.uint8))
+
+
+@triton.jit(do_not_specialize=["n_rows"])
 def _add_rmsnorm_kernel(
     x_ptr,
     x2_ptr,
@@ -832,22 +921,40 @@ def _add_rmsnorm_kernel(
     out_ptr,
     out_fp8_ptr,
     fp8_scale_ptr,
+    out_fp4_ptr,
+    out_sf_ptr,
+    fp4_scale_ptr,
     stride_x,
     stride_x2,
     stride_residual,
     stride_out,
     stride_out_fp8,
+    stride_out_fp4,
+    n_rows,
     n_cols: tl.constexpr,
     eps,
     BLOCK: tl.constexpr,
     CHUNKS: tl.constexpr,
     HAS_X2: tl.constexpr,
     HAS_FP8: tl.constexpr,
+    HAS_FP4: tl.constexpr,
     GEMMA: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
+    if HAS_FP4:
+        if row >= n_rows:
+            # Rows past the batch in the last 128-row scale tile get zero scales, as fp4_quantize writes them.
+            if ENABLE_PDL:
+                tl.extra.cuda.gdc_wait()
+            for c in tl.static_range(CHUNKS):
+                k = c * (BLOCK // 16) + tl.arange(0, BLOCK // 16)
+                tl.store(
+                    out_sf_ptr + _nvfp4_scale_offsets(row, k, n_cols),
+                    tl.zeros([BLOCK // 16], dtype=tl.uint8),
+                )
+            return
     # Weights and the quant scale are model constants, loaded before the wait.
     weights = ()
     for c in tl.static_range(CHUNKS):
@@ -860,6 +967,12 @@ def _add_rmsnorm_kernel(
         weights = weights + (weight,)
     if HAS_FP8:
         inv_scale = 1.0 / tl.load(fp8_scale_ptr).to(tl.float32)
+    if HAS_FP4:
+        sf_scale = tl.load(fp4_scale_ptr).to(tl.float32)
+        rcp_sf_scale = _rcp_approx_ftz(
+            tl.full([BLOCK // 16], 0.0, tl.float32) + sf_scale
+        )
+        rcp6 = _rcp_approx_ftz(tl.full([BLOCK // 16], 6.0, tl.float32))
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
     # Every row load before the in-place residual store, which loads cannot move past.
@@ -902,6 +1015,20 @@ def _add_rmsnorm_kernel(
                 quant.to(out_fp8_ptr.dtype.element_ty),
                 mask=mask,
             )
+        if HAS_FP4:
+            _store_nvfp4(
+                normed,
+                row,
+                c,
+                out_fp4_ptr,
+                out_sf_ptr,
+                stride_out_fp4,
+                sf_scale,
+                rcp_sf_scale,
+                rcp6,
+                BLOCK,
+                n_cols,
+            )
 
 
 def add_rmsnorm(
@@ -914,9 +1041,11 @@ def add_rmsnorm(
     out: torch.Tensor,
     out_fp8: torch.Tensor | None,
     fp8_scale: torch.Tensor | None,
+    out_fp4: tuple[torch.Tensor, torch.Tensor] | None,
+    fp4_scale: torch.Tensor | None,
     gemma: bool,
 ) -> None:
-    """``residual += x (+ x2)``, then RMSNorm, optionally also into static FP8.
+    """``residual += x (+ x2)``, then RMSNorm, optionally also into static FP8 or NVFP4.
 
     Args:
         x: ``[M, N]`` addend, rows may be strided but columns dense.
@@ -928,10 +1057,19 @@ def add_rmsnorm(
         out_fp8: Optional ``[M, N]`` FP8 output quantized with ``fp8_scale``.
         fp8_scale: One-element FP32 dequant scale, given exactly with
             ``out_fp8``.
+        out_fp4: Optional ``(values, scales)`` NVFP4 copy, as ``fp4_quantize``
+            returns it: ``[M, N // 2]`` uint8 E2M1 pairs and ``[ceil(M / 128) * 128,
+            N // 16]`` uint8 E4M3 block scales in its 128x4 swizzled layout.
+        fp4_scale: One-element FP32 global scale the NVFP4 copy is quantized
+            with (``fp4_quantize``'s ``global_scale``), given exactly with ``out_fp4``.
         gemma: Scale by ``1 + weight`` in FP32 (Gemma) instead of ``weight``.
     """
     if (out_fp8 is None) != (fp8_scale is None):
         raise ValueError("out_fp8 and fp8_scale are given together")
+    if (out_fp4 is None) != (fp4_scale is None):
+        raise ValueError("out_fp4 and fp4_scale are given together")
+    if out_fp8 is not None and out_fp4 is not None:
+        raise ValueError("add_rmsnorm writes one quantized copy, FP8 or NVFP4")
     tensors = [t for t in (x, x2, residual, out, out_fp8) if t is not None]
     if any(t.dim() != 2 or t.shape != x.shape or t.stride(1) != 1 for t in tensors):
         raise ValueError("add_rmsnorm operands must be [M, N] with dense columns")
@@ -942,8 +1080,23 @@ def add_rmsnorm(
     # Whole power-of-two chunks spare the masked lanes of one rounded-up block (5120 = 5 x 1024).
     chunk = cols & -cols
     block = chunk if chunk >= 1024 else width
+    grid_rows = rows
+    if out_fp4 is not None:
+        values, scales = out_fp4
+        grid_rows = triton.cdiv(rows, 128) * 128
+        if cols % block or cols % 64:
+            raise ValueError(
+                f"the NVFP4 copy needs whole chunks and 4 x 16-wide scale groups, got N={cols}"
+            )
+        if (
+            values.shape != (rows, cols // 2)
+            or values.stride(1) != 1
+            or scales.shape != (grid_rows, cols // 16)
+            or not scales.is_contiguous()
+        ):
+            raise ValueError("out_fp4 must be fp4_quantize's (values, scales) for x")
     enable_pdl = pdl_enabled()
-    _add_rmsnorm_kernel[(rows,)](
+    _add_rmsnorm_kernel[(grid_rows,)](
         x,
         x if x2 is None else x2,
         residual,
@@ -951,17 +1104,23 @@ def add_rmsnorm(
         out,
         x if out_fp8 is None else out_fp8,
         weight if fp8_scale is None else fp8_scale,
+        x if out_fp4 is None else out_fp4[0],
+        x if out_fp4 is None else out_fp4[1],
+        weight if fp4_scale is None else fp4_scale,
         x.stride(0),
         0 if x2 is None else x2.stride(0),
         residual.stride(0),
         out.stride(0),
         0 if out_fp8 is None else out_fp8.stride(0),
+        0 if out_fp4 is None else out_fp4[0].stride(0),
+        rows,
         cols,
         eps,
         BLOCK=block,
         CHUNKS=triton.cdiv(cols, block),
         HAS_X2=x2 is not None,
         HAS_FP8=out_fp8 is not None,
+        HAS_FP4=out_fp4 is not None,
         GEMMA=gemma,
         ENABLE_PDL=enable_pdl,
         num_warps=min(max(width // 256, 1), 8),

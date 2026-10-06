@@ -214,6 +214,8 @@ class NemotronHNorm(RMSNorm):
                 out=hidden_states,
                 out_fp8=normed_fp8,
                 fp8_scale=fp8_scale,
+                out_fp4=None,
+                fp4_scale=None,
                 gemma=False,
             )
             return hidden_states, normed_fp8, residual

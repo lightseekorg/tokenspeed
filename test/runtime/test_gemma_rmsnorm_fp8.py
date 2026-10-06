@@ -17,7 +17,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""GemmaRMSNorm's fused add + norm with a static-FP8 copy for the next projection."""
+"""GemmaRMSNorm's fused add + norm with a static-FP8 or NVFP4 copy for the next projection."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ register_cuda_ci(
     est_time=30,
     suite="runtime-1gpu",
     disabled_on_runners=["amd-*"],
-    disabled_on_runners_reason="the FP8 copy is produced on NVIDIA only",
+    disabled_on_runners_reason="the quantized copies are produced on NVIDIA only",
 )
 
 
@@ -65,3 +65,31 @@ def test_add_norm_with_fp8_matches_forward(rows: int, with_fp8: bool) -> None:
         assert torch.equal(normed_fp8.view(torch.uint8), quantized.view(torch.uint8))
     else:
         assert normed_fp8 is None
+
+
+@pytest.mark.parametrize("rows", [1, 14, 130])
+@pytest.mark.parametrize("with_fp4", [False, True])
+def test_add_norm_with_fp4_matches_forward(rows: int, with_fp4: bool) -> None:
+    from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+
+    torch.manual_seed(rows)
+    hidden = 5120
+    norm = GemmaRMSNorm(hidden, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    norm.weight.data.copy_(torch.randn(hidden) * 0.3)
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16) * 4
+    residual = torch.randn_like(x) * 30
+    scale = torch.tensor([7.5], device="cuda") if with_fp4 else None
+
+    expected, expected_residual = norm(x.clone(), residual.clone())
+    normed, normed_fp4, new_residual = norm.add_norm_with_fp4(
+        x.clone(), residual.clone(), scale
+    )
+
+    assert torch.equal(new_residual, expected_residual)
+    torch.testing.assert_close(normed, expected, atol=2e-2, rtol=1e-2)
+    if with_fp4:
+        values, scales = fp4_quantize(normed, scale)
+        assert torch.equal(normed_fp4[0], values.view(torch.uint8))
+        assert torch.equal(normed_fp4[1], scales.view(torch.uint8))
+    else:
+        assert normed_fp4 is None

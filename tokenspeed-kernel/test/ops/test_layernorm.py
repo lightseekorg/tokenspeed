@@ -362,6 +362,8 @@ def test_add_rmsnorm_matches_unfused_reference(
             out=out,
             out_fp8=out_fp8,
             fp8_scale=scale if with_fp8 else None,
+            out_fp4=None,
+            fp4_scale=None,
             gemma=gemma,
         )
         torch.cuda.synchronize()
@@ -396,6 +398,8 @@ def test_add_rmsnorm_writes_in_place_from_strided_rows(device: str) -> None:
         out=x,
         out_fp8=None,
         fp8_scale=None,
+        out_fp4=None,
+        fp4_scale=None,
         gemma=False,
     )
 
@@ -417,6 +421,8 @@ def test_add_rmsnorm_compiles_once_across_batch_sizes(device: str) -> None:
             out=torch.empty_like(x[:rows]),
             out_fp8=None,
             fp8_scale=None,
+            out_fp4=None,
+            fp4_scale=None,
             gemma=False,
         )
 
@@ -439,6 +445,8 @@ def test_add_rmsnorm_contract(device: str) -> None:
         out=empty,
         out_fp8=None,
         fp8_scale=None,
+        out_fp4=None,
+        fp4_scale=None,
         gemma=False,
     )
     with pytest.raises(ValueError, match="together"):
@@ -451,6 +459,8 @@ def test_add_rmsnorm_contract(device: str) -> None:
             out=x,
             out_fp8=torch.empty_like(x, dtype=torch.float8_e4m3fn),
             fp8_scale=None,
+            out_fp4=None,
+            fp4_scale=None,
             gemma=False,
         )
     with pytest.raises(ValueError, match="dense columns"):
@@ -463,5 +473,7 @@ def test_add_rmsnorm_contract(device: str) -> None:
             out=x.t(),
             out_fp8=None,
             fp8_scale=None,
+            out_fp4=None,
+            fp4_scale=None,
             gemma=False,
         )

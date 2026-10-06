@@ -194,6 +194,29 @@ def _input_norm(
     return norm.add_norm_with_fp8(hidden_states, residual, fp8_scale)
 
 
+def _post_attn_norm(
+    comm_manager: CommManager,
+    norm: GemmaRMSNorm,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    fp4_scale: torch.Tensor | None,
+    ctx: ForwardContext,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor]:
+    """The post-attention add + norm, plus gate_up_proj's NVFP4 input for ``fp4_scale``.
+
+    Without attention TP one kernel adds, normalizes and, unless dense TP gathers
+    the rows afterwards, quantizes; otherwise the communication policy runs the norm.
+    """
+    if comm_manager.mapping.has_attn_tp:
+        hidden_states, residual = comm_manager.post_attn_reduce_norm(
+            hidden_states, residual, ctx
+        )
+        return hidden_states, None, residual
+    if comm_manager.mapping.dense.has_tp:
+        fp4_scale = None
+    return norm.add_norm_with_fp4(hidden_states, residual, fp4_scale)
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -659,6 +682,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             ctx
         )
 
+        hidden_fp4 = None
         if not ctx.forward_mode.is_idle():
             hidden_states, hidden_fp8, residual = _input_norm(
                 self.comm_manager,
@@ -675,12 +699,18 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 ctx,
             )
 
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
+            hidden_states, hidden_fp4, residual = _post_attn_norm(
+                self.comm_manager,
+                self.post_attention_layernorm,
+                hidden_states,
+                residual,
+                self.mlp.input_fp4_scale(),
+                ctx,
             )
 
         hidden_states = self.forward_mlp(
             hidden_states,
+            hidden_fp4,
             residual,
             ctx,
             num_global_tokens,
@@ -692,6 +722,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     def forward_mlp(
         self,
         hidden_states,
+        hidden_fp4,
         residual,
         ctx: ForwardContext,
         num_global_tokens,
@@ -703,7 +734,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp.forward_prequantized(hidden_states, hidden_fp4)
             hidden_states, residual = self.comm_manager.post_mlp_fused(
                 hidden_states, residual, ctx
             )
@@ -912,6 +943,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             ctx
         )
 
+        hidden_fp4 = None
         if not ctx.forward_mode.is_idle():
             hidden_states, hidden_fp8, residual = _input_norm(
                 self.comm_manager,
@@ -928,12 +960,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 ctx=ctx,
             )
             residual = self._maybe_narrow_residual(residual, ctx)
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
+            hidden_states, hidden_fp4, residual = _post_attn_norm(
+                self.comm_manager,
+                self.post_attention_layernorm,
+                hidden_states,
+                residual,
+                self.mlp.input_fp4_scale(),
+                ctx,
             )
 
         hidden_states = self.forward_mlp(
             hidden_states,
+            hidden_fp4,
             residual,
             ctx,
             num_global_tokens,
@@ -945,6 +983,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     def forward_mlp(
         self,
         hidden_states,
+        hidden_fp4,
         residual,
         ctx: ForwardContext,
         num_global_tokens,
@@ -956,7 +995,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp.forward_prequantized(hidden_states, hidden_fp4)
             hidden_states, residual = self.comm_manager.post_mlp_fused(
                 hidden_states, residual, ctx
             )

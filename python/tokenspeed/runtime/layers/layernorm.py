@@ -325,9 +325,52 @@ class GemmaRMSNorm(torch.nn.Module):
             out=x,
             out_fp8=x_fp8,
             fp8_scale=fp8_scale,
+            out_fp4=None,
+            fp4_scale=None,
             gemma=True,
         )
         return x, x_fp8, residual
+
+    def add_norm_with_fp4(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        fp4_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor]:
+        """``forward(x, residual)``, plus ``fp4_quantize(rows, fp4_scale)`` when ``fp4_scale`` is given.
+
+        Returns the normed rows (written into ``x``), their NVFP4 ``(values,
+        scales)`` or ``None``, and the updated residual.
+        """
+        if _is_amd or x.shape[0] == 0:
+            x, residual = self(x, residual)
+            return x, None, residual
+        x_fp4 = None
+        if fp4_scale is not None:
+            rows, cols = x.shape
+            x_fp4 = (
+                torch.empty(rows, cols // 2, dtype=torch.uint8, device=x.device),
+                torch.empty(
+                    (rows + 127) // 128 * 128,
+                    cols // 16,
+                    dtype=torch.uint8,
+                    device=x.device,
+                ),
+            )
+        add_rmsnorm(
+            x,
+            residual,
+            self.weight.data,
+            self.variance_epsilon,
+            x2=None,
+            out=x,
+            out_fp8=None,
+            fp8_scale=None,
+            out_fp4=x_fp4,
+            fp4_scale=fp4_scale,
+            gemma=True,
+        )
+        return x, x_fp4, residual
 
     def forward_with_allreduce_fusion(
         self,

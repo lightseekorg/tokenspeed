@@ -215,13 +215,24 @@ class Qwen3_5MoeMLP(nn.Module):
             and getattr(self.down_proj, "_use_deep_gemm_fp8", False)
         )
 
+    def input_fp4_scale(self) -> torch.Tensor | None:
+        """The global scale gate_up_proj quantizes its input to NVFP4 with, if it does."""
+        return self.gate_up_proj.quant_method.nvfp4_input_scale(self.gate_up_proj)
+
     def forward(self, x):
+        return self.forward_prequantized(x, None)
+
+    def forward_prequantized(
+        self, x: torch.Tensor, x_nvfp4: tuple[torch.Tensor, torch.Tensor] | None
+    ) -> torch.Tensor:
+        """``forward(x)``, taking gate_up_proj's NVFP4 input from its producer when given."""
         if x.shape[0] == 0:
             return x
         if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
-            x_fc1_fp4, x_fc1_scale = fp4_quantize(
-                x,
-                self.gate_up_proj.input_scale_inv,
+            x_fc1_fp4, x_fc1_scale = (
+                fp4_quantize(x, self.gate_up_proj.input_scale_inv)
+                if x_nvfp4 is None
+                else x_nvfp4
             )
             x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
                 x_fc1_fp4,
@@ -233,7 +244,7 @@ class Qwen3_5MoeMLP(nn.Module):
             )
             x, _ = self.down_proj((x_fp4, x_scale))
             return x
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up, _ = self.gate_up_proj(x if x_nvfp4 is None else x_nvfp4)
         if self._uses_deep_gemm_fp8_mlp():
             x_fp8, x_scale = fused_swiglu_fp8_ue8m0(gate_up)
             if isinstance(self.down_proj, RowParallelLinear):
@@ -345,6 +356,10 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         else:
             self.shared_expert = None
             self.shared_expert_gate = None
+
+    def input_fp4_scale(self) -> torch.Tensor | None:
+        """None: the experts quantize their own inputs, so no producer applies a scale."""
+        return None
 
     def get_moe_routed_weights(self):
         """Return routed expert weights excluding auxiliary shared parameters."""
