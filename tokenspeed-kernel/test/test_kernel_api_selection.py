@@ -6221,8 +6221,12 @@ def test_mxfp8_quantizer_capabilities_match_architecture(
     assert "triton_quantize_mxfp8" in b200_names
 
 
-def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
-    b200_platform: PlatformInfo,
+# The DeepSeek FP8 kernel's only activation is gated SiLU, named either way.
+@pytest.mark.parametrize(
+    ("activation", "swiglu_form"), [("swiglu", "standard"), ("silu", None)]
+)
+def test_b200_fp8_gated_silu_selects_trtllm_routed_moe(
+    b200_platform: PlatformInfo, activation: str, swiglu_form: str | None
 ) -> None:
     if not Platform.get().is_nvidia:
         pytest.skip("FlashInfer MoE kernels are registered only on NVIDIA")
@@ -6237,14 +6241,14 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
         plan = tokenspeed_kernel.moe_plan(
             "fp8",
             input_dtype=torch.bfloat16,
-            activation="swiglu",
+            activation=activation,
             routing_mode="precomputed_topk",
             ep_size=4,
             ispp=2048,
             fp8_scale_block_shape=(128, 128),
             internal_activation_dtype="input",
             hidden=None,
-            swiglu_form="standard",
+            swiglu_form=swiglu_form,
             activation_clamped=False,
             expert_id_repeats=False,
             fast_math=True,
