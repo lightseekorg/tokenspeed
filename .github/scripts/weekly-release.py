@@ -33,9 +33,11 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+from fnmatch import fnmatchcase
 from html import escape
 from pathlib import Path
 
+import yaml
 from cryptography import x509
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
@@ -95,6 +97,61 @@ def api(path, *, data=None):
     return request(
         f"https://api.github.com/repos/{REPO}/{path}", github=True, data=data
     )
+
+
+def pages(path, key):
+    result = json.loads(
+        command("gh", "api", "--paginate", "--slurp", f"repos/{REPO}/{path}")
+    )
+    return [item for page in result for item in page[key]]
+
+
+def main_ci_sources(sha):
+    sources = {}
+    for workflow in pages("actions/workflows?per_page=100", "workflows"):
+        path = Path(workflow["path"])
+        if (
+            workflow["state"] != "active"
+            or not path.is_file()
+            or path.name.startswith(("release-", "publish-"))
+        ):
+            continue
+        triggers = yaml.load(path.read_text(), Loader=yaml.BaseLoader)["on"]
+        if "push" not in triggers:
+            continue
+        push = triggers["push"] or {}
+        if not any(fnmatchcase("main", p) for p in push.get("branches", ["main"])):
+            continue
+        if any(fnmatchcase("main", p) for p in push.get("branches-ignore", [])):
+            continue
+        patterns = push.get("paths", [])
+        pathspecs = [
+            f":(exclude,glob){p[1:]}" if p.startswith("!") else f":(glob){p}"
+            for p in patterns
+        ]
+        pathspecs += [f":(exclude,glob){p}" for p in push.get("paths-ignore", [])]
+        source = (
+            command(
+                "git",
+                "log",
+                "--first-parent",
+                "-1",
+                "--format=%H",
+                sha,
+                "--",
+                *pathspecs,
+            )
+            if pathspecs
+            else sha
+        )
+        if not source or command(
+            "git", "diff", "--name-only", source, sha, "--", *pathspecs
+        ):
+            raise RuntimeError(f"Cannot establish unchanged CI inputs for {path}")
+        sources[str(path)] = {"sha": source, "workflow_id": workflow["id"]}
+    if ".github/workflows/lint.yml" not in sources:
+        raise RuntimeError("The main CI gate requires an active Lint workflow")
+    return sources
 
 
 def pypi(package, version=None):
@@ -304,72 +361,27 @@ def update_metadata(stage, versions):
         )
 
 
-def checks_ready(pr, *, required_checks, bypass_reviews):
-    checks = pr["statusCheckRollup"]
-    for check in checks:
-        result = check.get("conclusion") or check.get("state")
-        if result in (
-            "FAILURE",
-            "ERROR",
-            "CANCELLED",
-            "TIMED_OUT",
-            "ACTION_REQUIRED",
-            "STARTUP_FAILURE",
-            "STALE",
-        ):
-            raise RuntimeError(
-                f"PR check failed: {check.get('name', check.get('context'))}"
-            )
-    lint = any(
-        c.get("name") == "lint" and c.get("conclusion") == "SUCCESS" for c in checks
-    )
-    complete = all(
-        c.get("conclusion") in ("SUCCESS", "SKIPPED", "NEUTRAL")
-        or c.get("state") == "SUCCESS"
-        for c in checks
-    )
-    required = all(
-        any(
-            (c.get("name") or c.get("context")) == name
-            and (c.get("conclusion") == "SUCCESS" or c.get("state") == "SUCCESS")
-            for c in checks
-        )
-        for name in required_checks
-    )
-    review_only_block = (
-        bypass_reviews
-        and pr["mergeStateStatus"] == "BLOCKED"
-        and pr["reviewDecision"] == "REVIEW_REQUIRED"
-        and pr["mergeable"] == "MERGEABLE"
-    )
-    return (
-        lint
-        and complete
-        and required
-        and pr["reviewDecision"] != "CHANGES_REQUESTED"
-        and (pr["mergeStateStatus"] in ("CLEAN", "HAS_HOOKS") or review_only_block)
-    )
+def version_pr_ready(pr):
+    if pr["isDraft"] or pr["reviewDecision"] == "CHANGES_REQUESTED":
+        raise RuntimeError("Version PR requires manual review")
+    if pr["mergeable"] == "CONFLICTING":
+        raise RuntimeError("Version PR has merge conflicts")
+    return pr["mergeable"] == "MERGEABLE"
 
 
 def merge_policy():
     """Use an existing, explicit bot exemption; never change repository rules."""
     user_id = int(command("gh", "api", "user", "--jq", ".id"))
     rules = api("rules/branches/main")
-    required = {
-        check["context"]
-        for rule in rules
-        if rule["type"] == "required_status_checks"
-        for check in rule["parameters"]["required_status_checks"]
-    }
-    approvals = [rule for rule in rules if rule["type"] == "pull_request"]
-    bypass = bool(approvals)
-    for rule in approvals:
+    verified = set()
+    for rule in rules:
         if (
             rule["ruleset_source"] != REPO
             or rule["ruleset_source_type"] != "Repository"
         ):
-            bypass = False
-            break
+            return False
+        if rule["ruleset_id"] in verified:
+            continue
         actors = api(f"rulesets/{rule['ruleset_id']}")["bypass_actors"]
         if not any(
             actor["actor_type"] == "User"
@@ -377,9 +389,9 @@ def merge_policy():
             and actor["bypass_mode"] == "always"
             for actor in actors
         ):
-            bypass = False
-            break
-    return required, bypass
+            return False
+        verified.add(rule["ruleset_id"])
+    return True
 
 
 def index_release(root, variant, package, release):
@@ -498,6 +510,170 @@ class Release:
         command("git", "fetch", "--no-tags", "origin", "main")
         command("git", "checkout", "--detach", "origin/main")
 
+    def require_main(self, sha):
+        remote = command("git", "ls-remote", "origin", "refs/heads/main")
+        if not remote or remote.split()[0] != sha:
+            raise RuntimeError(
+                "Main changed during release; manual intervention required"
+            )
+
+    def check_main_ci(self):
+        sha = command("git", "rev-parse", "HEAD")
+        ci = self.state.get("main_ci")
+        if ci is None:
+            ci = {"sha": sha, "workflows": main_ci_sources(sha), "validated": False}
+            self.state["main_ci"] = ci
+            self.save()
+        if ci["sha"] != sha:
+            raise RuntimeError("Main changed while validating CI; start a new release")
+        ci["validated"] = False
+        self.save()
+        while True:
+            self.require_main(sha)
+            ready = True
+            for path, record in ci["workflows"].items():
+                if "id" not in record:
+                    runs = pages(
+                        f"actions/workflows/{record['workflow_id']}/runs?branch=main&event=push&head_sha={record['sha']}&per_page=100",
+                        "workflow_runs",
+                    )
+                    if not runs:
+                        if record["sha"] != sha:
+                            raise RuntimeError(
+                                f"Missing source CI run for {path}; inspect manually"
+                            )
+                        ready = False
+                        continue
+                    record["id"] = max(runs, key=lambda r: r["id"])["id"]
+                    self.save()
+                run = api(f"actions/runs/{record['id']}")
+                if (
+                    run["head_sha"] != record["sha"]
+                    or run["head_branch"] != "main"
+                    or run["event"] != "push"
+                    or run["path"].split("@")[0] != path
+                ):
+                    raise RuntimeError("Main CI run does not match its recorded source")
+                if run["status"] != "completed":
+                    ready = False
+                    continue
+                if run["conclusion"] == "success":
+                    record["successful_attempt"] = run["run_attempt"]
+                    continue
+                if run["run_attempt"] >= 2:
+                    raise RuntimeError(
+                        f"Main CI failed after retry: {path}; inspect manually"
+                    )
+                retry = record.get("retry")
+                if retry is None:
+                    retry = {"attempt": run["run_attempt"], "requested": False}
+                    record["retry"] = retry
+                    self.save()
+                    try:
+                        command(
+                            "gh",
+                            "run",
+                            "rerun",
+                            str(record["id"]),
+                            "--repo",
+                            REPO,
+                            "--failed",
+                        )
+                    except subprocess.CalledProcessError:
+                        current = api(f"actions/runs/{record['id']}")
+                        if (
+                            current["run_attempt"] <= retry["attempt"]
+                            and current["status"] == "completed"
+                        ):
+                            raise RuntimeError(
+                                "CI retry outcome is unknown; inspect the recorded run"
+                            )
+                    retry["requested"] = True
+                    self.save()
+                elif not retry["requested"]:
+                    raise RuntimeError(
+                        "CI retry outcome is unknown; inspect the recorded run"
+                    )
+                ready = False
+            if ready:
+                self.require_main(sha)
+                ci["validated"] = True
+                self.save()
+                return
+            self.pause()
+
+    def version_base(self, stage):
+        ci = self.state.get("main_ci", {})
+        if not ci.get("validated"):
+            raise RuntimeError("Version merging requires successful main CI")
+        previous = {"kernel": "amd", "tokenspeed": "kernel"}.get(stage)
+        return self.state["stages"][previous]["sha"] if previous else ci["sha"]
+
+    def verify_version_diff(self, stage, base, head):
+        parents = command("git", "rev-list", "--parents", "-n", "1", head).split()
+        if parents != [head, base]:
+            raise RuntimeError(
+                "Version PR must be one commit on the validated main chain"
+            )
+        command("git", "checkout", "--detach", base)
+        options = ("--binary", "--full-index", "--no-ext-diff", "--no-renames")
+        try:
+            update_metadata(stage, self.state["versions"])
+            expected = command("git", "diff", *options, base)
+        finally:
+            command("git", "reset", "--hard", base)
+        actual = command("git", "diff", *options, base, head)
+        if not expected or actual != expected:
+            raise RuntimeError(
+                "Version PR contains changes outside the expected metadata update"
+            )
+
+    def fast_forward_version(self, stage, pr):
+        phase = self.state["stages"][stage]
+        base = self.version_base(stage)
+        if phase["base"] != base or pr["headRefOid"] != phase["head"]:
+            raise RuntimeError("Version PR source changed outside this release")
+        command("git", "fetch", "--no-tags", "origin", phase["head"])
+        self.verify_version_diff(stage, base, phase["head"])
+        remote = command("git", "ls-remote", "origin", "refs/heads/main").split()[0]
+        if remote == phase["head"]:
+            # A successful push may precede GitHub's asynchronous merged-state update.
+            self.pause()
+            return
+        self.require_main(base)
+        if pr["baseRefOid"] != base:
+            raise RuntimeError("Version PR base changed outside this release")
+        if not merge_policy():
+            raise RuntimeError(
+                "Version merging requires an existing explicit bot exemption"
+            )
+        live = json.loads(
+            command(
+                "gh",
+                "pr",
+                "view",
+                str(phase["pr"]),
+                "--repo",
+                REPO,
+                "--json",
+                "state,headRefOid,baseRefOid,isDraft,reviewDecision,mergeable",
+            )
+        )
+        if live["headRefOid"] != phase["head"] or live["baseRefOid"] != base:
+            raise RuntimeError("Version PR source changed before merging")
+        if live["state"] != "OPEN" or not version_pr_ready(live):
+            self.pause()
+            return
+        # The single commit is a fast-forward; the explicit lease atomically pins main.
+        command(
+            "git",
+            "push",
+            f"--force-with-lease=refs/heads/main:{base}",
+            "origin",
+            f"{phase['head']}:refs/heads/main",
+        )
+        self.require_main(phase["head"])
+
     def gate(self):
         versions = preflight()
         if self.state["versions"] and any(
@@ -510,6 +686,7 @@ class Release:
 
     def plan(self, requested):
         self.checkout_main()
+        self.check_main_ci()
         upstream = self.gate()
         if self.state["versions"]:
             return
@@ -563,6 +740,14 @@ class Release:
             return phase["sha"]
         self.checkout_main()
         self.gate()
+        base = self.version_base(stage)
+        main_head = command("git", "rev-parse", "HEAD")
+        if main_head not in (base, phase.get("head")):
+            raise RuntimeError("Version source differs from the validated main chain")
+        self.require_main(main_head)
+        if phase.setdefault("base", base) != base:
+            raise RuntimeError("Recorded version PR base changed")
+        self.save()
         package = PACKAGES[stage]
         version = self.state["versions"][package]
         branch = f"bot/weekly-{package}-{version}"
@@ -697,10 +882,17 @@ class Release:
                     "--repo",
                     REPO,
                     "--json",
-                    "state,headRefOid,mergeCommit,statusCheckRollup,mergeStateStatus,reviewDecision,mergeable",
+                    "state,headRefOid,baseRefOid,mergeCommit,isDraft,reviewDecision,mergeable",
                 )
             )
             if pr["state"] == "MERGED":
+                if (
+                    pr["headRefOid"] != phase.get("head")
+                    or pr["mergeCommit"]["oid"] != phase["head"]
+                ):
+                    raise RuntimeError(
+                        "Merged version PR differs from its recorded commit"
+                    )
                 phase["sha"] = pr["mergeCommit"]["oid"]
                 self.save()
                 command("git", "fetch", "--no-tags", "origin", phase["sha"])
@@ -715,23 +907,8 @@ class Release:
                 raise RuntimeError("Version PR was closed without merging")
             if pr["headRefOid"] != phase.get("head"):
                 raise RuntimeError("Version PR head changed outside this run")
-            required, bypass = merge_policy()
-            if checks_ready(pr, required_checks=required, bypass_reviews=bypass):
-                # The bot may already be explicitly exempt from review requirements.
-                # Still require every registered and required CI check to succeed.
-                merge_args = ["--admin"] if pr["mergeStateStatus"] == "BLOCKED" else []
-                command(
-                    "gh",
-                    "pr",
-                    "merge",
-                    str(phase["pr"]),
-                    "--repo",
-                    REPO,
-                    "--squash",
-                    "--match-head-commit",
-                    pr["headRefOid"],
-                    *merge_args,
-                )
+            if version_pr_ready(pr):
+                self.fast_forward_version(stage, pr)
             else:
                 self.pause()
 

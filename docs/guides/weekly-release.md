@@ -11,12 +11,21 @@ the final version PR changes `version.py` and triggers its PyPI workflow.
 
 The workflow completes these stages in order:
 
-1. Check that the latest stable MLA and scheduler releases contain all current
+1. Lock the latest `main` commit and require its CI to pass before reserving
+   versions. Wait for running jobs and retry failed jobs once. A failed second
+   attempt stops the release, including retries already requested by another
+   workflow. For path-filtered CI, require the push run for the latest first-parent
+   commit affecting that workflow's declared inputs. An older success is reused
+   only when those inputs are unchanged; a documentation-only head cannot hide
+   an earlier failed GPU test. Disabled workflows and package publishers are
+   excluded. Missing source runs, including commits inside a multi-commit push,
+   require manual intervention. A change to `main` stops this release.
+   Check that the latest stable MLA and scheduler releases contain all current
    changes in their component directories, using PyPI's published source
    provenance and Git history. Their versions on `main` and the MLA pin in the
    kernel and scheduler requirement in the runtime must match those releases.
    The two TokenSpeed version declarations must agree.
-2. Create a version PR for `tokenspeed-kernel-amd`, wait for checks, merge it,
+2. Create a version PR for `tokenspeed-kernel-amd`, verify its exact metadata diff, merge it,
    and publish its immutable `release/<version>` source to PyPI and the wheelhouse.
 3. Update the kernel's AMD dependency and version in one PR, then publish CUDA
    12.9/13.0 variant wheels and ROCm 7.2 wheels. CUDA 13.0 supplies PyPI; all
@@ -42,12 +51,18 @@ Configure `LIGHTSEEK_BOT_TOKEN` for the `lightseek-bot` account with repository
 and workflow access, and the existing `DOCKERHUB_USERNAME` variable and
 `DOCKERHUB_TOKEN` secret. Component workflows continue to use the `pypi`
 environment and their existing PyPI trusted publishers. Environment approvals
-still apply. Version PRs require successful lint, all required checks, and
-completed checks. If every applicable repository approval rule explicitly
-lists the bot as an always-allowed bypass actor, the controller can merge its
-own version PR without human approval after CI succeeds. Otherwise it waits
-for the existing approval rules. Requested changes and merge conflicts always
-stop automatic merging. The workflow never changes repository rules.
+still apply. Generated version PRs run full non-C++ pre-commit before committing,
+but do not wait for their repeated lint or GPU CI. The controller replays the
+expected version and dependency-pin updates and compares the complete diff,
+rejecting other changes even inside a metadata file. Each PR must contain one
+commit whose parent is the validated `main` or the preceding release commit.
+Every effective ruleset must explicitly allow the bot to bypass its requirements.
+The controller fast-forwards that exact PR commit to `main` with an expected-SHA
+lease, so a concurrent source commit prevents the merge without rewriting history.
+It then waits for GitHub to report the PR merged at that same commit. Requested
+changes, merge conflicts and missing bypass permission require manual intervention.
+The workflow never changes repository rules. Publication builds and verification
+remain mandatory for every released package and Docker image.
 
 Source provenance checks read the repository and source claims that PyPI serves,
 including the artifact digest. They do not perform independent signature
@@ -55,7 +70,7 @@ verification. Missing or conflicting provenance stops publication.
 
 ## Recovery
 
-Any failed check, publication or wait stops downstream stages and fails the
+Any failed main CI retry, publication or wait stops downstream stages and fails the
 weekly run. The summary and `weekly-state-<stage>` artifacts retain the reserved
 versions, PRs, source commits and child run IDs. Each stage allows up to 340
 minutes for checks, approvals, queueing and publication before requiring manual

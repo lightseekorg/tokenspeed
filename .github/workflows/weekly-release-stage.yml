@@ -40,7 +40,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install controller dependencies
-        run: python -m pip install packaging cryptography pre-commit
+        run: python -m pip install packaging cryptography pre-commit PyYAML
 
       - name: Preserve the controller from the triggering commit
         run: cp .github/scripts/weekly-release.py "$RUNNER_TEMP/weekly-release.py"

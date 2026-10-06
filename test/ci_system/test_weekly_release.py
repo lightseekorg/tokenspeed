@@ -160,23 +160,22 @@ def test_push_run_lookup_requires_exact_source_and_actor(
     assert controller.find_run("release-pypi.yml", sha, "main", "push") == 2
 
 
-def test_version_pr_requires_registered_lint_and_pending_checks(release_module):
-    pr = {"statusCheckRollup": [], "reviewDecision": "", "mergeStateStatus": "CLEAN"}
-    assert not release_module.checks_ready(
-        pr, required_checks=set(), bypass_reviews=False
-    )
+def test_version_pr_does_not_wait_for_repeated_ci(release_module):
+    pr = {
+        "isDraft": False,
+        "reviewDecision": "REVIEW_REQUIRED",
+        "mergeable": "MERGEABLE",
+    }
+    assert release_module.version_pr_ready(pr)
     pr["statusCheckRollup"] = [
         {"name": "lint", "conclusion": "SUCCESS"},
         {"name": "build", "status": "IN_PROGRESS"},
     ]
-    assert not release_module.checks_ready(
-        pr, required_checks=set(), bypass_reviews=False
-    )
+    assert release_module.version_pr_ready(pr)
     pr["statusCheckRollup"][1]["conclusion"] = "FAILURE"
-    with pytest.raises(RuntimeError, match="PR check failed"):
-        release_module.checks_ready(pr, required_checks=set(), bypass_reviews=False)
-    pr["statusCheckRollup"][1]["conclusion"] = "SKIPPED"
-    assert release_module.checks_ready(pr, required_checks=set(), bypass_reviews=False)
+    assert release_module.version_pr_ready(pr)
+    pr["mergeable"] = "UNKNOWN"
+    assert not release_module.version_pr_ready(pr)
 
 
 def test_metadata_updates_both_versions_and_keeps_kernel_boundary(
@@ -768,27 +767,18 @@ def test_stable_index_retries_after_concurrent_nightly_push(
     )
 
 
-def test_existing_bot_review_exemption_still_requires_required_ci(release_module):
+def test_version_pr_refuses_requested_changes_and_conflicts(release_module):
     pr = {
-        "statusCheckRollup": [{"name": "lint", "conclusion": "SUCCESS"}],
-        "reviewDecision": "REVIEW_REQUIRED",
-        "mergeStateStatus": "BLOCKED",
+        "isDraft": False,
+        "reviewDecision": "CHANGES_REQUESTED",
         "mergeable": "MERGEABLE",
     }
-    assert not release_module.checks_ready(
-        pr, required_checks={"finish"}, bypass_reviews=True
-    )
-    pr["statusCheckRollup"].append({"name": "finish", "conclusion": "SUCCESS"})
-    assert not release_module.checks_ready(
-        pr, required_checks={"finish"}, bypass_reviews=False
-    )
-    assert release_module.checks_ready(
-        pr, required_checks={"finish"}, bypass_reviews=True
-    )
-    pr["reviewDecision"] = "CHANGES_REQUESTED"
-    assert not release_module.checks_ready(
-        pr, required_checks={"finish"}, bypass_reviews=True
-    )
+    with pytest.raises(RuntimeError, match="manual review"):
+        release_module.version_pr_ready(pr)
+    pr["reviewDecision"] = ""
+    pr["mergeable"] = "CONFLICTING"
+    with pytest.raises(RuntimeError, match="merge conflicts"):
+        release_module.version_pr_ready(pr)
 
 
 def test_merge_policy_requires_explicit_existing_bot_exemption(
@@ -804,6 +794,9 @@ def test_merge_policy_requires_explicit_existing_bot_exemption(
                 {
                     "type": "required_status_checks",
                     "parameters": {"required_status_checks": [{"context": "finish"}]},
+                    "ruleset_source": release_module.REPO,
+                    "ruleset_source_type": "Repository",
+                    "ruleset_id": 2,
                 },
                 {
                     "type": "pull_request",
@@ -812,9 +805,202 @@ def test_merge_policy_requires_explicit_existing_bot_exemption(
                     "ruleset_id": 1,
                 },
             ]
-        return {"bypass_actors": actors}
+        return {"bypass_actors": actors if path == "rulesets/1" else ci_actors}
 
+    ci_actors = list(actors)
     monkeypatch.setattr(release_module, "api", api)
-    assert release_module.merge_policy() == ({"finish"}, True)
+    assert release_module.merge_policy()
+    ci_actors = []
+    assert not release_module.merge_policy()
+    ci_actors = list(actors)
     actors[0]["bypass_mode"] = "pull_request"
-    assert release_module.merge_policy() == ({"finish"}, False)
+    assert not release_module.merge_policy()
+
+
+@pytest.fixture
+def version_repository(release_module, tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in set(sum(release_module.PR_FILES.values(), [])):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, path)
+    monkeypatch.chdir(source)
+    command = release_module.command
+    command("git", "init", "-b", "main")
+    command("git", "config", "user.name", "lightseek-bot")
+    command("git", "config", "user.email", release_module.IDENTITY)
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "initial metadata")
+    return source
+
+
+def test_main_ci_inherits_only_unchanged_inputs_and_retries_once(
+    controller, release_module, version_repository, monkeypatch, tmp_path
+):
+    command = release_module.command
+    workflows = version_repository / ".github/workflows"
+    workflows.mkdir(parents=True)
+    names = ("lint.yml", "kernel.yml", "old.yml", "release-pypi.yml")
+    for name in names:
+        push = {"branches": ["main"]}
+        if name == "kernel.yml":
+            push["paths"] = [
+                "tokenspeed-kernel/test/**",
+                "!tokenspeed-kernel/test/amd/**",
+            ]
+        (workflows / name).write_text(yaml.safe_dump({"on": {"push": push}}))
+    kernel = version_repository / "tokenspeed-kernel/test/test_kernel.py"
+    kernel.parent.mkdir(parents=True)
+    kernel.write_text("# kernel test input\n")
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "CI inputs")
+    tested = command("git", "rev-parse", "HEAD")
+    ignored = kernel.parent / "amd/test_amd.py"
+    ignored.parent.mkdir()
+    ignored.write_text("# excluded input\n")
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "AMD input")
+    (version_repository / "README.md").write_text("Documentation\n")
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "docs")
+    head = command("git", "rev-parse", "HEAD")
+    bare = tmp_path / "origin.git"
+    command("git", "clone", "--bare", str(version_repository), str(bare))
+    command("git", "remote", "add", "origin", str(bare))
+    catalog = [
+        {
+            "id": i + 1,
+            "path": f".github/workflows/{name}",
+            "state": "disabled_manually" if name == "old.yml" else "active",
+        }
+        for i, name in enumerate(names)
+    ]
+    runs = {}
+    reruns = []
+
+    def pages(path, key):
+        if key == "workflows":
+            return catalog
+        workflow_id = int(path.split("/")[2])
+        sha = head if workflow_id == 1 else tested
+        run = {
+            "id": workflow_id,
+            "head_sha": sha,
+            "head_branch": "main",
+            "event": "push",
+            "path": catalog[workflow_id - 1]["path"]
+            + ("@refs/heads/main" if workflow_id == 1 else ""),
+            "status": "completed",
+            "conclusion": "success" if workflow_id == 1 else "failure",
+            "run_attempt": 1,
+        }
+        runs[workflow_id] = run
+        return [run]
+
+    def retry_command(*args, **kwargs):
+        if args[:3] == ("gh", "run", "rerun"):
+            run_id = int(args[3])
+            saved = json.loads(controller.path.read_text())["main_ci"]["workflows"]
+            assert saved[runs[run_id]["path"]]["retry"]["requested"] is False
+            assert args[-3:] == ("--repo", release_module.REPO, "--failed")
+            reruns.append(run_id)
+            return ""
+        return command(*args, **kwargs)
+
+    def finish_retry():
+        runs[2].update(run_attempt=2, conclusion="success")
+
+    monkeypatch.setattr(release_module, "pages", pages)
+    monkeypatch.setattr(
+        release_module, "api", lambda path: runs[int(path.split("/")[-1])]
+    )
+    monkeypatch.setattr(release_module, "command", retry_command)
+    monkeypatch.setattr(controller, "pause", finish_retry)
+    controller.check_main_ci()
+    ci = controller.state["main_ci"]
+    assert ci["validated"] and ci["sha"] == head
+    assert set(ci["workflows"]) == {catalog[0]["path"], catalog[1]["path"]}
+    assert ci["workflows"][catalog[1]["path"]]["sha"] == tested
+    assert reruns == [2]
+    runs[2]["conclusion"] = "failure"
+    resumed = release_module.Release(controller.path, "amd")
+    with pytest.raises(RuntimeError, match="Main CI failed after retry"):
+        resumed.check_main_ci()
+    assert reruns == [2]
+
+
+def test_version_diff_rejects_non_version_changes_in_metadata_file(
+    controller, release_module, version_repository
+):
+    command = release_module.command
+    base = command("git", "rev-parse", "HEAD")
+    versions = {
+        p: release_module.next_version(
+            release_module.read_version(p), release_module.read_version(p), ""
+        )
+        for p in release_module.PACKAGES.values()
+    }
+    controller.state["versions"] = versions
+    release_module.update_metadata("amd", versions)
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "version metadata")
+    head = command("git", "rev-parse", "HEAD")
+    controller.verify_version_diff("amd", base, head)
+    command("git", "checkout", "--detach", head)
+    metadata = Path(release_module.PR_FILES["amd"][0])
+    metadata.write_text(metadata.read_text() + "\n# extra non-version change\n")
+    command("git", "add", ".")
+    command("git", "commit", "-s", "--amend", "--no-edit")
+    with pytest.raises(RuntimeError, match="outside the expected metadata"):
+        controller.verify_version_diff("amd", base, command("git", "rev-parse", "HEAD"))
+
+
+def test_version_fast_forward_refuses_main_race(
+    controller, release_module, version_repository, tmp_path, monkeypatch
+):
+    command = release_module.command
+    base = command("git", "rev-parse", "HEAD")
+    versions = {
+        p: release_module.next_version(
+            release_module.read_version(p), release_module.read_version(p), ""
+        )
+        for p in release_module.PACKAGES.values()
+    }
+    controller.state.update(versions=versions, main_ci={"sha": base, "validated": True})
+    bare = tmp_path / "origin.git"
+    command("git", "clone", "--bare", str(version_repository), str(bare))
+    command("git", "remote", "add", "origin", str(bare))
+    release_module.update_metadata("amd", versions)
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "version metadata")
+    head = command("git", "rev-parse", "HEAD")
+    command("git", "push", "origin", f"{head}:refs/heads/bot/version")
+    command("git", "checkout", "--detach", base)
+    Path("README.md").write_text("Concurrent source change\n")
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "source update")
+    other = command("git", "rev-parse", "HEAD")
+    controller.phase.update(base=base, head=head, pr=1)
+    pr = {
+        "state": "OPEN",
+        "headRefOid": head,
+        "baseRefOid": base,
+        "isDraft": False,
+        "reviewDecision": "REVIEW_REQUIRED",
+        "mergeable": "MERGEABLE",
+    }
+
+    def racing_command(*args, **kwargs):
+        if args[:3] == ("gh", "pr", "view"):
+            return json.dumps(pr)
+        if args[:2] == ("git", "push"):
+            assert f"--force-with-lease=refs/heads/main:{base}" in args
+            command("git", "push", "origin", f"{other}:refs/heads/main")
+        return command(*args, **kwargs)
+
+    monkeypatch.setattr(release_module, "command", racing_command)
+    monkeypatch.setattr(release_module, "merge_policy", lambda: True)
+    with pytest.raises(release_module.subprocess.CalledProcessError):
+        controller.fast_forward_version("amd", pr)
+    assert command("git", "ls-remote", "origin", "refs/heads/main").split()[0] == other
