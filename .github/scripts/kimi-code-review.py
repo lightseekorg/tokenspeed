@@ -31,6 +31,8 @@ import tomllib
 from pathlib import Path
 from urllib.parse import urlparse
 
+from pr_ci_plan import context, proposal, render
+
 
 def _command(*args: str) -> str:
     return subprocess.run(args, check=True, capture_output=True, text=True).stdout
@@ -96,6 +98,24 @@ capabilities = ["thinking", "tool_use"]
     shutil.copyfile(
         Path(__file__).with_name("kimi-code-reviewer.md"), root / "reviewer.md"
     )
+    data = context(
+        Path(os.environ["GITHUB_WORKSPACE"]),
+        os.environ["PR_HEAD_SHA"],
+        os.environ["PR_BASE_SHA"],
+    )
+    pr = json.loads(
+        _command(
+            "gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/pulls/{data['pr']}"
+        )
+    )
+    if (
+        pr["head"]["sha"] != data["head"]
+        or pr["base"]["sha"] != data["base"]
+        or pr["head"]["repo"]["full_name"] != data["repository"]
+    ):
+        raise SystemExit("The PR source changed; retry with a fresh event.")
+    data["mergeable"] = pr["mergeable"]
+    root.joinpath("context.json").write_text(json.dumps(data, indent=2))
 
 
 def _review_body(root: Path) -> str:
@@ -130,10 +150,16 @@ def _review_body(root: Path) -> str:
         os.environ["RUNNER_TEMP"],
         os.environ["GITHUB_WORKSPACE"],
     ]
-    if any(value and value in body for value in private) or re.search(
+    # Public task identifiers can contain the configured model's name. Allow
+    # only exact catalog identifiers; free text still cannot identify it.
+    scanned = body
+    for task in json.loads(root.joinpath("context.json").read_text())["catalog"]:
+        for field in ("config", "name"):
+            scanned = scanned.replace(task[field], "")
+    if any(value and value in scanned for value in private) or re.search(
         r"https?://|github\.com|\b(?:sk-|ghp_|gho_|github_pat_)|"
         r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|/(?:home|root|tmp|proc)/",
-        body,
+        scanned,
     ):
         raise SystemExit(
             "Review failed the public-output check; no review was published."
@@ -162,8 +188,9 @@ def review(root: Path) -> None:
                 "--output-format",
                 "stream-json",
                 "-p",
-                f"Review {root}/pr.diff. Source root: {source}. "
-                f"Read {source}/REVIEW.md and relevant source for context.",
+                f"Plan CI coverage using {root}/context.json and {root}/pr.diff. "
+                f"Source root: {source}. Read relevant callers and CI task specs. "
+                "Return only the JSON schema in your instructions.",
             ],
             cwd=root,
             stdout=events,
@@ -171,10 +198,14 @@ def review(root: Path) -> None:
         )
     if result.returncode:
         raise SystemExit("Kimi review failed or timed out; no review was published.")
-    body = _review_body(root)
-    root.joinpath("comment.md").write_text(
-        f"Reviewed commit: `{os.environ['PR_HEAD_SHA']}`\n\n{body}\n"
+    plan = proposal(
+        _review_body(root), json.loads(root.joinpath("context.json").read_text())
     )
+    root.joinpath("plan.json").write_text(json.dumps(plan, indent=2) + "\n")
+    body = render(plan)
+    if len(body) > 60000:
+        raise SystemExit("CI plan exceeds the comment size limit.")
+    root.joinpath("comment.md").write_text(body)
 
 
 def publish(root: Path) -> None:

@@ -1,10 +1,26 @@
 name: Slurm Dispatch
+run-name: ${{ inputs.correlation || 'Slurm Dispatch' }}
 
 on:
   workflow_dispatch:
     inputs:
       pr:
         description: "Optional pull request number or URL; blank runs the selected workflow ref"
+        required: false
+        default: ""
+        type: string
+      commit:
+        description: "Optional immutable commit SHA; mutually exclusive with pr"
+        required: false
+        default: ""
+        type: string
+      runner:
+        description: "Optional exact declared runner for a single YAML"
+        required: false
+        default: ""
+        type: string
+      correlation:
+        description: "Optional diagnostic request identifier"
         required: false
         default: ""
         type: string
@@ -104,7 +120,7 @@ on:
           - slurm
 
 concurrency:
-  group: slurm-dispatch-${{ inputs.cluster }}-${{ github.ref }}-${{ inputs.pr || 'checkout' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}-${{ inputs.container_image || 'default-image' }}
+  group: slurm-dispatch-${{ inputs.cluster }}-${{ inputs.commit || github.ref }}-${{ inputs.pr || 'checkout' }}-${{ inputs.yaml }}-${{ inputs.runner || inputs.runners }}-${{ inputs.match }}-${{ inputs.container_image || 'default-image' }}
   cancel-in-progress: false
 
 jobs:
@@ -121,16 +137,18 @@ jobs:
         with:
           # PRs use the main dispatcher and merge in a temporary worktree.
           # Without a PR, test the exact commit selected for this manual run.
-          ref: ${{ inputs.pr && 'main' || github.sha }}
+          ref: ${{ (inputs.pr || inputs.commit) && 'main' || github.sha }}
           fetch-depth: 0
           persist-credentials: true
 
       - name: Submit and wait for Slurm tasks
         env:
           PR: ${{ inputs.pr }}
+          COMMIT: ${{ inputs.commit }}
+          EXACT_RUNNER: ${{ inputs.runner }}
           # A dispatched pull request may carry unmerged tokenspeed-mla changes,
           # and the Slurm coordinator has no gh to narrow that to its diff.
-          INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.pr && '1' || '0' }}
+          INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ (inputs.pr || inputs.commit) && '1' || '0' }}
           CONTAINER_IMAGE: ${{ inputs.container_image }}
           CLUSTER: ${{ inputs.cluster }}
           YAML_SELECTION: ${{ inputs.yaml }}
@@ -139,182 +157,7 @@ jobs:
           MATCH: ${{ inputs.match }}
           INCLUDE_MMLU: ${{ inputs.include_mmlu }}
           TRIGGER: ${{ inputs.trigger }}
-        run: |
-          set -euo pipefail
-          if [ -n "$CONTAINER_IMAGE" ]; then
-            [[ "$CONTAINER_IMAGE" =~ ^ghcr\.io/lightseekorg/tokenspeed-runner:[A-Za-z0-9_][A-Za-z0-9._-]{0,127}@sha256:[0-9a-f]{64}$ ]] || {
-              echo "container_image must be an immutable ghcr.io/lightseekorg/tokenspeed-runner image" >&2
-              exit 2
-            }
-            export TS_CI_CONTAINER_IMAGE="$CONTAINER_IMAGE"
-          fi
-          args=(--wait --report-dir "$RUNNER_TEMP/slurm-report")
-          [ -z "$PR" ] || args+=(--pr "$PR")
-
-          case "$CLUSTER" in
-            gb200)
-              runner_prefixes=(b200- gb200- slurm-gb200-)
-              ;;
-            gb300)
-              runner_prefixes=(gb300- slurm-gb300-)
-              coordinator_user=${USER:-$(id -un)}
-              export TS_CI_ARTIFACT_ROOT="/data/home/$coordinator_user/tokenspeed-slurm"
-              export TS_CI_CACHE_DIR="/data/home/$coordinator_user/tokenspeed-cache"
-              ;;
-            *)
-              echo "Unsupported Slurm cluster: $CLUSTER" >&2
-              exit 2
-              ;;
-          esac
-
-          runner_is_supported() {
-            local runner=$1 prefix
-            for prefix in "${runner_prefixes[@]}"; do
-              [[ "$runner" == "$prefix"* ]] && return 0
-            done
-            return 1
-          }
-
-          gb300_runner_for() {
-            local runner=$1
-            case "$runner" in
-              b200-*) echo "gb300-${runner#b200-}" ;;
-              gb200-*) echo "gb300-${runner#gb200-}" ;;
-              slurm-b200-*) echo "slurm-gb300-${runner#slurm-b200-}" ;;
-              slurm-gb200-*) echo "slurm-gb300-${runner#slurm-gb200-}" ;;
-              gb300-*|slurm-gb300-*) echo "$runner" ;;
-              *) return 1 ;;
-            esac
-          }
-
-          if [ "$YAML_SELECTION" != off ]; then
-            args+=(--config "$YAML_SELECTION")
-            yaml_metadata_output=$(
-              python3 - "$YAML_SELECTION" "$CLUSTER" "$PR" <<'PY'
-          import sys
-          from pathlib import Path
-
-          sys.path.insert(0, "test/ci_system")
-          from pipeline import normalize_task
-          from slurm_submit import pr_worktree
-
-          repo = Path.cwd()
-          selection = Path(sys.argv[1])
-          pr = sys.argv[3]
-          if pr:
-              with pr_worktree(repo, pr) as checkout:
-                  task = normalize_task(checkout / selection, checkout)
-          else:
-              task = normalize_task(repo / selection, repo)
-          prefixes = {
-              "gb200": ("b200-", "gb200-", "slurm-gb200-"),
-              "gb300": (
-                  "b200-",
-                  "gb200-",
-                  "slurm-b200-",
-                  "slurm-gb200-",
-                  "gb300-",
-                  "slurm-gb300-",
-              ),
-          }[sys.argv[2]]
-          print(f"type:{task['type']}")
-          for label in task["runner"]["labels"]:
-              if label.startswith(prefixes):
-                  print(label)
-          PY
-            )
-            mapfile -t yaml_metadata <<< "$yaml_metadata_output"
-            [[ "${yaml_metadata[0]-}" == type:* ]] || {
-              echo "Failed to read task metadata from $YAML_SELECTION" >&2
-              exit 2
-            }
-            yaml_task_type="${yaml_metadata[0]#type:}"
-            yaml_runners=("${yaml_metadata[@]:1}")
-            ((${#yaml_runners[@]})) || {
-              echo "No supported Slurm runners declared by $YAML_SELECTION" >&2
-              exit 2
-            }
-            args+=(--type "$yaml_task_type")
-            if [ "$CLUSTER" = gb300 ]; then
-              selected_runners=()
-              if [[ "${RUNNERS//[[:space:]]/}" == "b200-4gpu,gb200-4gpu" || \
-                    "${RUNNERS//[[:space:]]/}" == "b200-4gpu,gb200-4gpu,slurm-gb200-4gpu" ]]; then
-                selected_runners=("${yaml_runners[@]}")
-              else
-                IFS=',' read -ra values <<< "$RUNNERS"
-                for value in "${values[@]}"; do
-                  value="${value//[[:space:]]/}"
-                  [ -z "$value" ] && continue
-                  matches=0
-                  for yaml_runner in "${yaml_runners[@]}"; do
-                    effective_runner=$(gb300_runner_for "$yaml_runner") || continue
-                    if [ "$value" = "$yaml_runner" ] || [ "$value" = "$effective_runner" ]; then
-                      for selected_runner in "${selected_runners[@]}"; do
-                        [ "$selected_runner" != "$yaml_runner" ] || {
-                          echo "Runner $value selects $yaml_runner more than once" >&2
-                          exit 2
-                        }
-                      done
-                      selected_runners+=("$yaml_runner")
-                      ((matches += 1))
-                    fi
-                  done
-                  ((matches == 1)) || {
-                    echo "Runner $value does not identify exactly one runner declared by $YAML_SELECTION" >&2
-                    exit 2
-                  }
-                done
-              fi
-              for yaml_runner in "${selected_runners[@]}"; do
-                effective_runner=$(gb300_runner_for "$yaml_runner") || {
-                  echo "Runner $yaml_runner cannot run on the GB300 cluster" >&2
-                  exit 2
-                }
-                args+=(--runner-alias "$yaml_runner=$effective_runner")
-              done
-            else
-              for value in "${yaml_runners[@]}"; do
-                args+=(--runner "$value")
-              done
-            fi
-          else
-            args+=(--all)
-            IFS=',' read -ra values <<< "$RUNNERS"
-            for value in "${values[@]}"; do
-              value="${value//[[:space:]]/}"
-              [ -z "$value" ] && continue
-              if [ "$CLUSTER" = gb300 ]; then
-                effective_runner=$(gb300_runner_for "$value") || {
-                  echo "Runner $value cannot run on the GB300 cluster" >&2
-                  exit 2
-                }
-                args+=(--runner-alias "$value=$effective_runner")
-              else
-                runner_is_supported "$value" || {
-                  echo "Runner $value is not supported by the $CLUSTER cluster" >&2
-                  exit 2
-                }
-                args+=(--runner "$value")
-              fi
-            done
-
-            IFS=',' read -ra values <<< "$TASK_TYPES"
-            for value in "${values[@]}"; do
-              value="${value//[[:space:]]/}"
-              [ -z "$value" ] || args+=(--type "$value")
-            done
-
-            IFS=',' read -ra values <<< "$MATCH"
-            for value in "${values[@]}"; do
-              value="${value#"${value%%[![:space:]]*}"}"
-              value="${value%"${value##*[![:space:]]}"}"
-              [ -z "$value" ] || args+=(--match "$value")
-            done
-
-            [ "$INCLUDE_MMLU" = true ] || args+=(--exclude-match mmlu)
-            [ "$TRIGGER" = all ] || args+=(--trigger "$TRIGGER")
-          fi
-          exec test/ci/run_slurm.sh "${args[@]}"
+        run: bash .github/scripts/slurm-dispatch.sh
 
       - name: Publish job summary
         if: always()

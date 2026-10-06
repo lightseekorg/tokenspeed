@@ -1,4 +1,5 @@
 name: K8s Dispatch
+run-name: ${{ inputs.correlation || 'K8s Dispatch' }}
 
 on:
   workflow_dispatch:
@@ -10,6 +11,16 @@ on:
         type: string
       commit:
         description: "Optional full commit SHA; blank uses pr or latest main"
+        required: false
+        default: ""
+        type: string
+      runner:
+        description: "Optional exact runner label; blank keeps pool selection"
+        required: false
+        default: ""
+        type: string
+      correlation:
+        description: "Optional diagnostic request identifier"
         required: false
         default: ""
         type: string
@@ -125,6 +136,11 @@ jobs:
       comparison_candidate_ref: ${{ steps.source.outputs.comparison_candidate_ref }}
       install_tokenspeed_mla_from_source: ${{ steps.source.outputs.install_mla }}
     steps:
+      - name: Checkout dispatcher
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Resolve source
         id: source
         env:
@@ -222,6 +238,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.source.outputs.sha }}
+          path: ci-source
+          persist-credentials: false
 
       - name: Install scan dependency
         run: python3 -m pip install pyyaml
@@ -231,82 +249,23 @@ jobs:
         env:
           YAML_SELECTION: ${{ inputs.yaml }}
           RUNNER_POOL: ${{ inputs.runner_pool }}
+          EXACT_RUNNER: ${{ inputs.runner }}
           TASK_TYPES: ${{ inputs.task_types }}
           MATCH: ${{ inputs.match }}
           INCLUDE_MMLU: ${{ inputs.include_mmlu }}
           TRIGGER: ${{ inputs.trigger }}
+          SOURCE_REPO: ${{ github.workspace }}/ci-source
           TOKENSPEED_B200_RUNNER_LABEL: b200v2
           TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: h100,gb300
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import sys
-          from pathlib import Path
+        run: python3 .github/scripts/k8s-dispatch-matrix.py
 
-          repo = Path.cwd()
-          sys.path.insert(0, str(repo / "test/ci_system"))
-          from pipeline import build_matrix
-
-          def terms(name):
-              return [item.strip() for item in os.environ[name].split(",") if item.strip()]
-
-          selected_yaml = terms("YAML_SELECTION")
-          selected_types = set(terms("TASK_TYPES"))
-          matches = [item.lower() for item in terms("MATCH")]
-          trigger = os.environ["TRIGGER"]
-          matrix = build_matrix(
-              repo / "test/ci",
-              repo,
-              None if trigger == "all" else trigger,
-              runner_group="all",
-          )
-
-          if selected_yaml != ["all"]:
-              invalid = [
-                  item for item in selected_yaml
-                  if not item.startswith("test/ci/") or not (repo / item).is_file()
-              ]
-              if invalid:
-                  raise SystemExit(f"Invalid CI YAML: {', '.join(invalid)}")
-              selected_paths = set(selected_yaml)
-          else:
-              selected_paths = None
-
-          include = []
-          for task in matrix["include"]:
-              searchable = f"{task['name']} {task['config']}".lower()
-              runner = task["runner"]
-              if runner.startswith("slurm-"):
-                  continue
-              pool = os.environ["RUNNER_POOL"]
-              runner_families = {
-                  "b200v2": runner.startswith("b200v2-"),
-                  "amd": runner.startswith("amd-"),
-                  "gb200": runner.startswith("gb200-"),
-                  "b300": runner.startswith("b300-"),
-              }
-              if pool != "all" and not runner_families[pool]:
-                  continue
-              if selected_paths is not None and task["config"] not in selected_paths:
-                  continue
-              if task["type"] not in selected_types:
-                  continue
-              if matches and not any(term in searchable for term in matches):
-                  continue
-              if os.environ["INCLUDE_MMLU"] != "true" and "mmlu" in searchable:
-                  continue
-              include.append(task)
-
-          result = {"include": include}
-          output = os.environ["GITHUB_OUTPUT"]
-          with open(output, "a", encoding="utf-8") as stream:
-              stream.write(f"matrix={json.dumps(result, separators=(',', ':'))}\n")
-              stream.write(f"has_tasks={'true' if include else 'false'}\n")
-          if not include:
-              raise SystemExit("No CI tasks matched the requested filters")
-          print(json.dumps(result, indent=2))
-          PY
+      - name: Record diagnostic source
+        if: inputs.runner != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dispatch-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dispatch-source.json
+          retention-days: 7
 
   run:
     needs: scan

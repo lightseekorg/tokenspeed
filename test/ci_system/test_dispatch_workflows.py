@@ -39,9 +39,10 @@ def run_slurm_dispatch_script(
         for step in workflow["jobs"]["dispatch"]["steps"]
         if step.get("name") == "Submit and wait for Slurm tasks"
     )
-    original_script = step["run"]
+    assert step["run"] == "bash .github/scripts/slurm-dispatch.sh"
+    original_script = (REPO_ROOT / ".github/scripts/slurm-dispatch.sh").read_text()
     script = original_script.replace(
-        'exec test/ci/run_slurm.sh "${args[@]}"',
+        'bash test/ci/run_slurm.sh "${args[@]}"',
         """printf 'arg=%s\\n' "${args[@]}"
 printf 'artifact=%s\\n' "${TS_CI_ARTIFACT_ROOT-}"
 printf 'cache=%s\\n' "${TS_CI_CACHE_DIR-}"
@@ -49,7 +50,7 @@ printf 'image=%s\\n' "${TS_CI_CONTAINER_IMAGE-}"
 """,
     )
     script = script.replace(
-        "repo = Path.cwd()",
+        "repo = Path(sys.argv[4])",
         'repo = Path(__import__("os").environ.get("TOKENSPEED_TEST_REPO_ROOT", Path.cwd()))',
     )
     assert script != original_script
@@ -228,6 +229,29 @@ def eligible_config_paths(runner_prefixes: tuple[str, ...]) -> set[str]:
         if any(label.startswith(runner_prefixes) for label in labels):
             paths.add(path.relative_to(REPO_ROOT).as_posix())
     return paths
+
+
+def test_slurm_exact_runner_does_not_expand_single_yaml(tmp_path):
+    result = run_slurm_dispatch_script(
+        tmp_path,
+        YAML_SELECTION="test/ci/ut/ut-runtime-1gpu.yaml",
+        EXACT_RUNNER="b200-1gpu",
+    )
+    assert result.returncode == 0, result.stderr
+    args = [
+        line.removeprefix("arg=")
+        for line in result.stdout.splitlines()
+        if line.startswith("arg=")
+    ]
+    assert args.count("--runner") == 1
+    assert args[args.index("--runner") + 1] == "b200-1gpu"
+
+
+def test_slurm_rejects_mutable_or_ambiguous_source(tmp_path):
+    result = run_slurm_dispatch_script(tmp_path, COMMIT="main")
+    assert result.returncode == 2
+    result = run_slurm_dispatch_script(tmp_path, COMMIT="a" * 40, PR="123")
+    assert result.returncode == 2
 
 
 def eligible_slurm_config_paths() -> set[str]:
@@ -485,19 +509,18 @@ def test_slurm_dispatch_routes_gb300_to_its_coordinator():
         for step in workflow["jobs"]["dispatch"]["steps"]
         if step.get("name") == "Checkout trusted dispatcher"
     )
-    dispatch_script = next(
-        step["run"]
-        for step in workflow["jobs"]["dispatch"]["steps"]
-        if step.get("name") == "Submit and wait for Slurm tasks"
-    )
+    dispatch_script = (REPO_ROOT / ".github/scripts/slurm-dispatch.sh").read_text()
 
     assert workflow["jobs"]["dispatch"]["runs-on"] == (
         "${{ inputs.cluster == 'gb300' && "
         "'slurm-dispatch-gb300' || 'slurm-dispatch' }}"
     )
     assert "${{ inputs.cluster }}" in workflow["concurrency"]["group"]
-    assert checkout["with"]["ref"] == "${{ inputs.pr && 'main' || github.sha }}"
-    assert "${{ github.ref }}" in workflow["concurrency"]["group"]
+    assert (
+        checkout["with"]["ref"]
+        == "${{ (inputs.pr || inputs.commit) && 'main' || github.sha }}"
+    )
+    assert "inputs.commit || github.ref" in workflow["concurrency"]["group"]
     assert 'python3 - "$YAML_SELECTION" "$CLUSTER" "$PR"' in dispatch_script
     assert "from slurm_submit import pr_worktree" in dispatch_script
     assert "with pr_worktree(repo, pr) as checkout:" in dispatch_script
@@ -1135,7 +1158,7 @@ def test_slurm_dispatch_takes_a_dispatched_pr_from_its_own_tree():
     )
 
     assert step["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == (
-        "${{ inputs.pr && '1' || '0' }}"
+        "${{ (inputs.pr || inputs.commit) && '1' || '0' }}"
     )
 
 

@@ -94,11 +94,12 @@ the repository's existing CI workflows.
 
 ## Kimi workflow setup and operation
 
-[The Kimi workflow](.github/workflows/kimi-code-review.yml) reviews same-repository
+[The CI planning workflow](.github/workflows/kimi-code-review.yml) handles same-repository
 branch PRs on `opened`, `synchronize`, and `reopened`, including drafts. Fork PRs
 and runs triggered by `dependabot[bot]` are skipped. It uses a GitHub-hosted CPU
-runner and posts a summary comment for the exact reviewed head commit; a newer
-push cancels the previous run. It does not approve PRs or gate merges.
+runner and posts a coverage proposal for the exact head and base commits; a newer
+push cancels the previous run. General code review remains with the existing
+reviewer. It does not approve PRs, change required checks, or merge automatically.
 
 The workflow calls [the review script](.github/scripts/kimi-code-review.py) with
 `prepare`, `review`, and `publish` stages. Maintain the reviewer instructions in
@@ -113,10 +114,32 @@ organization. Keep the publishing token as a repository secret:
 | `KIMI_API_URL` | Organization variable | Provider API base URL, including its API version path |
 | `KIMI_MODEL` | Organization variable | Model ID accepted by that endpoint |
 | `KIMI_API_KEY` | Organization secret | API token for that endpoint |
-| `LIGHTSEEK_BOT_TOKEN` | Repository secret | Token for `lightseek-bot` with repository variable read and PR comment write access |
+| `LIGHTSEEK_BOT_TOKEN` | Repository secret | Token for `lightseek-bot` with variable/artifact read, PR comment write, and workflow dispatch access |
 
 Kimi runs from a separate temporary directory with only `Read`, `Grep`, and
 `Glob` tools. GitHub authentication is available only to the configuration and
 publishing steps. Failed, empty, oversized, or sensitive output is not published;
 raw CLI events and logs are not uploaded. Same-repository contributors can edit
 the workflow, so repository write access remains the trust boundary.
+
+[The coverage validator](.github/scripts/pr_ci_plan.py) uses the existing CI path
+classifier and task catalog. Shared changes retain the full affected baseline;
+vendor-owned changes can propose a focused model/performance subset after the
+unit-test floor. Directly changed per-commit task declarations remain included.
+The validated plan artifact contains only public coverage metadata.
+
+[CI assistance](.github/workflows/pr-ci-assist.yml) reads completion events using
+main's tooling, skips fork and obsolete heads, and reports readiness against the
+fresh proposal. Missing or stale plans require the full existing CI. CPU checks,
+review approval, explicit plan acceptance and merge authorization remain required.
+The existing close-event workflow cancels remaining PR tests after a merge.
+
+To diagnose a failed selected task, dispatch CI assistance with `action=dispatch`,
+the PR number, its exact `config` and `runner`, and `backend=auto`, `k8s`, `gb200`
+or `gb300`. It reuses the existing dispatch workflows with an immutable source
+commit and exactly one declared runner. Duplicate requests are skipped; attempt
+2 requires a failed first attempt. A retry pass is only a possible flake, and
+another GPU family is diagnostic evidence rather than an original-hardware pass.
+Completed diagnostics are reported only after their artifacts prove the tested
+commit, task and runner; queued runs and mismatched source records never count.
+Conflict guidance is included in the proposal; source repairs are a separate step.
