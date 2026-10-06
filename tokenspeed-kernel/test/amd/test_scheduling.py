@@ -54,9 +54,9 @@ def test_scheduler_library_is_package_data(schedule):
     patterns = config["tool"]["setuptools"]["package-data"][_PACKAGE]
     assert any(path.match(pattern) for pattern in patterns)
     # Triton links the library only for calls whose symbol contains its name.
-    symbols = set(re.findall(r"^define \S+ @(\w+)", path.read_text(), re.M))
-    hints = symbols - {schedule._READFIRSTLANE_SYMBOL}
-    assert hints and all(schedule._SCHED_LIBRARY_NAME in s for s in hints)
+    text = path.read_text()
+    symbols = set(re.findall(r"^define \S+ @(\w+)", text, re.M))
+    assert symbols and all(schedule._SCHED_LIBRARY_NAME in symbol for symbol in symbols)
 
 
 def test_changed_library_changes_compile_key(schedule, tmp_path):

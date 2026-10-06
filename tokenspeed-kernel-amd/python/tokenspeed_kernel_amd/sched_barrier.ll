@@ -25,7 +25,7 @@
 ; the value is already in an SGPR.
 declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
 
-define i32 @__tokenspeed_readfirstlane_i32(i32 %x) alwaysinline {
+define i32 @__tokenspeed_sched_readfirstlane_i32(i32 %x) alwaysinline {
 entry:
   %r = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %x)
   ret i32 %r
