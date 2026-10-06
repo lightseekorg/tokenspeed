@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -836,6 +837,19 @@ def _rcp_approx_ftz(x):
 
 
 @triton.jit
+def _mul_ftz(a, b):
+    # fp4_quantize is built with fast math: its products flush subnormal inputs and results to zero.
+    return tl.inline_asm_elementwise(
+        "mul.ftz.f32 $0, $1, $2;",
+        "=f,f,f",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def _e4m3_bits(x):
     return tl.inline_asm_elementwise(
         "{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f32 t, 0f00000000, $1; cvt.u32.u16 $0, t; }",
@@ -898,11 +912,15 @@ def _store_nvfp4(
     # fp4_quantize's E4M3-scale recipe, bit for bit: block amax / 6 scaled into E4M3, values into E2M1.
     blocks = tl.reshape(normed, [BLOCK // 16, 16])
     vec_max = tl.max(tl.abs(blocks), axis=1).to(tl.float32)
-    sf_bits = _e4m3_bits(sf_scale * (vec_max * rcp6))
+    # Its zero test flushes too: a subnormal block amax counts as zero.
+    vec_max = tl.where(vec_max < 1.1754943508222875e-38, 0.0, vec_max)
+    sf_bits = _e4m3_bits(_mul_ftz(sf_scale, _mul_ftz(vec_max, rcp6)))
     out_scale = tl.where(
-        vec_max != 0, _rcp_approx_ftz(_e4m3_bits_to_f32(sf_bits) * rcp_sf_scale), 0.0
+        vec_max != 0,
+        _rcp_approx_ftz(_mul_ftz(_e4m3_bits_to_f32(sf_bits), rcp_sf_scale)),
+        0.0,
     )
-    scaled = blocks.to(tl.float32) * out_scale[:, None]
+    scaled = _mul_ftz(blocks.to(tl.float32), out_scale[:, None])
     even, odd = tl.split(tl.reshape(scaled, [BLOCK // 16, 8, 2]))
     packed = tl.reshape(_e2m1x2(even, odd).to(tl.uint8), [BLOCK // 2])
     tl.store(
@@ -1007,8 +1025,10 @@ def _add_rmsnorm_kernel(
         normed = (totals[c] * rstd * weights[c]).to(out_ptr.dtype.element_ty)
         tl.store(out_ptr + row * stride_out + offsets, normed, mask=mask)
         if HAS_FP8:
-            quant = tl.clamp(
-                normed.to(tl.float32) * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+            # max then min, as static_quant_fp8 lowers its clamp: NaN becomes the lower bound.
+            quant = tl.minimum(
+                tl.maximum(normed.to(tl.float32) * inv_scale, -_FP8_E4M3_MAX),
+                _FP8_E4M3_MAX,
             )
             tl.store(
                 out_fp8_ptr + row * stride_out_fp8 + offsets,
@@ -1029,6 +1049,35 @@ def _add_rmsnorm_kernel(
                 BLOCK,
                 n_cols,
             )
+
+
+def _row_block(cols: int) -> int:
+    # Whole power-of-two chunks spare the masked lanes of one rounded-up block (5120 = 5 x 1024).
+    chunk = cols & -cols
+    return chunk if chunk >= 1024 else triton.next_power_of_2(cols)
+
+
+# fp4_quantize switches its recipe when one of these is exactly "1" at launch; the NVFP4 copy follows the default.
+_FP4_RECIPE_ENV = (
+    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6",
+)
+
+
+def nvfp4_copy_supported(n_cols: int) -> bool:
+    """Whether ``add_rmsnorm`` can write the NVFP4 copy of ``n_cols``-wide rows.
+
+    It needs Blackwell's E2M1 conversions, whole chunks of 4 x 16-wide scale
+    groups, and ``fp4_quantize`` running its default recipe, which the copy
+    reproduces bit for bit.
+    """
+    return (
+        current_platform().is_blackwell
+        and n_cols % 64 == 0
+        and n_cols % _row_block(n_cols) == 0
+        and not any(os.environ.get(name) == "1" for name in _FP4_RECIPE_ENV)
+    )
 
 
 def add_rmsnorm(
@@ -1077,16 +1126,14 @@ def add_rmsnorm(
     if rows == 0:
         return
     width = triton.next_power_of_2(cols)
-    # Whole power-of-two chunks spare the masked lanes of one rounded-up block (5120 = 5 x 1024).
-    chunk = cols & -cols
-    block = chunk if chunk >= 1024 else width
+    block = _row_block(cols)
     grid_rows = rows
     if out_fp4 is not None:
         values, scales = out_fp4
         grid_rows = triton.cdiv(rows, 128) * 128
-        if cols % block or cols % 64:
+        if not nvfp4_copy_supported(cols):
             raise ValueError(
-                f"the NVFP4 copy needs whole chunks and 4 x 16-wide scale groups, got N={cols}"
+                f"no NVFP4 copy here for N={cols}; check nvfp4_copy_supported first"
             )
         if (
             values.shape != (rows, cols // 2)
@@ -1131,6 +1178,7 @@ def add_rmsnorm(
 __all__ = [
     "add_rmsnorm",
     "grouped_gemma_rmsnorm",
+    "nvfp4_copy_supported",
     "rmsnorm",
     "qk_rmsnorm",
     "rmsnorm_fused_parallel",

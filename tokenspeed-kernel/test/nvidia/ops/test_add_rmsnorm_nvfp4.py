@@ -23,22 +23,32 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.layernorm import add_rmsnorm
+from tokenspeed_kernel.ops.layernorm import add_rmsnorm, nvfp4_copy_supported
+from tokenspeed_kernel.ops.layernorm.triton import _add_rmsnorm_kernel
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from utils import assert_no_triton_compile
 
 _platform = current_platform()
 pytestmark = pytest.mark.skipif(
     not _platform.is_blackwell, reason="the NVFP4 copy uses Blackwell E2M1 conversions"
 )
+_RECIPE_ENV = (
+    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6",
+)
 
 
-@pytest.mark.parametrize("rows", [1, 14, 130])
-@pytest.mark.parametrize("gemma", [False, True])
-@pytest.mark.parametrize("spread", [0, 12])
-def test_nvfp4_copy_matches_fp4_quantize(rows: int, gemma: bool, spread: int) -> None:
-    torch.manual_seed(rows * 7 + spread)
-    cols = 5120
+@pytest.fixture
+def pdl_state():
+    previous = pdl_enabled()
+    yield
+    pdl_enabled(overwrite=previous)
+
+
+def _rows(rows: int, cols: int, spread: int, seed: int) -> torch.Tensor:
+    torch.manual_seed(seed)
     x = torch.randn(rows, cols, device="cuda")
     if spread:
         # Blocks scaled far apart exercise every E4M3 scale and E2M1 rounding boundary.
@@ -46,21 +56,22 @@ def test_nvfp4_copy_matches_fp4_quantize(rows: int, gemma: bool, spread: int) ->
             -spread, spread + 1, (rows, cols // 16, 1), device="cuda"
         )
         x = (x.view(rows, cols // 16, 16) * torch.exp2(exponents)).view(rows, cols)
-    x = x.bfloat16()
-    residual = torch.randn_like(x)
-    weight = (torch.randn(cols, device="cuda") * 0.3).bfloat16()
-    global_scale = torch.tensor([7.5], device="cuda")
+    return x.bfloat16()
+
+
+def _fused(x, residual, weight, global_scale, *, x2=None, gemma=True):
+    rows, cols = x.shape
     out = torch.empty_like(x)
     values = torch.empty(rows, cols // 2, dtype=torch.uint8, device="cuda")
     padded = (rows + 127) // 128 * 128
+    # Prefilled so the zeroed scales of the padding rows are checked too.
     scales = torch.full((padded, cols // 16), 0xFF, dtype=torch.uint8, device="cuda")
-
     add_rmsnorm(
         x,
         residual,
         weight,
         1e-6,
-        x2=None,
+        x2=x2,
         out=out,
         out_fp8=None,
         fp8_scale=None,
@@ -68,10 +79,108 @@ def test_nvfp4_copy_matches_fp4_quantize(rows: int, gemma: bool, spread: int) ->
         fp4_scale=global_scale,
         gemma=gemma,
     )
+    return out, values, scales
 
+
+def _assert_matches_fp4_quantize(out, values, scales, global_scale) -> None:
     expected_values, expected_scales = fp4_quantize(out, global_scale)
     assert torch.equal(values, expected_values.view(torch.uint8))
     assert torch.equal(scales, expected_scales.view(torch.uint8))
+
+
+@pytest.mark.parametrize("cols", [512, 3072, 4096, 5120, 6144])
+@pytest.mark.parametrize("rows", [1, 14, 129])
+@pytest.mark.parametrize("gemma", [False, True])
+@pytest.mark.parametrize("spread", [0, 12])
+@pytest.mark.parametrize("with_x2", [False, True])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_nvfp4_copy_matches_fp4_quantize(
+    cols: int, rows: int, gemma: bool, spread: int, with_x2: bool, pdl: bool, pdl_state
+) -> None:
+    pdl_enabled(overwrite=pdl)
+    x = _rows(rows, cols, spread, seed=rows * 7 + spread + cols)
+    x2 = torch.randn_like(x) if with_x2 else None
+    residual = torch.randn_like(x)
+    weight = (torch.randn(cols, device="cuda") * 0.3).bfloat16()
+    global_scale = torch.tensor([7.5], device="cuda")
+
+    out, values, scales = _fused(x, residual, weight, global_scale, x2=x2, gemma=gemma)
+
+    _assert_matches_fp4_quantize(out, values, scales, global_scale)
+
+
+def test_nvfp4_copy_in_place_at_prefill_rows() -> None:
+    # Past 1024 rows fp4_quantize switches to its TMA kernel; the runtime normalizes in place.
+    rows, cols = 1025, 5120
+    x = _rows(rows, cols, 12, seed=3)
+    residual = torch.randn_like(x)
+    weight = (torch.randn(cols, device="cuda") * 0.3).bfloat16()
+    global_scale = torch.tensor([7.5], device="cuda")
+    values = torch.empty(rows, cols // 2, dtype=torch.uint8, device="cuda")
+    scales = torch.full((1152, cols // 16), 0xFF, dtype=torch.uint8, device="cuda")
+
+    add_rmsnorm(
+        x,
+        residual,
+        weight,
+        1e-6,
+        x2=None,
+        out=x,
+        out_fp8=None,
+        fp8_scale=None,
+        out_fp4=(values, scales),
+        fp4_scale=global_scale,
+        gemma=True,
+    )
+
+    _assert_matches_fp4_quantize(x, values, scales, global_scale)
+
+
+def test_nvfp4_copy_flushes_subnormal_blocks() -> None:
+    # fp4_quantize is built flush-to-zero: a block of subnormal values quantizes as an all-zero block.
+    rows, cols = 4, 5120
+    x = torch.randn(rows, cols, device="cuda").bfloat16()
+    x[:, :16] = torch.tensor(2e-39, device="cuda").bfloat16()
+    x[:, 16] = -1e-39
+    residual = torch.zeros_like(x)
+    weight = torch.zeros(cols, device="cuda").bfloat16()
+    global_scale = torch.tensor([7.5], device="cuda")
+
+    out, values, scales = _fused(x, residual, weight, global_scale)
+
+    assert out[:, :16].float().abs().max() < 1.1754943508222875e-38
+    _assert_matches_fp4_quantize(out, values, scales, global_scale)
+
+
+def test_nvfp4_copy_compiles_once_across_batch_sizes() -> None:
+    cols = 5120
+    weight = torch.ones(cols, device="cuda").bfloat16()
+    global_scale = torch.tensor([7.5], device="cuda")
+
+    def run(rows: int) -> None:
+        x = torch.randn(rows, cols, device="cuda").bfloat16()
+        _fused(x, torch.randn_like(x), weight, global_scale)
+
+    run(3)
+    with assert_no_triton_compile(_add_rmsnorm_kernel):
+        for rows in (1, 100, 128, 129, 300):
+            run(rows)
+
+
+def test_nvfp4_copy_supported_widths_and_recipes(monkeypatch) -> None:
+    for cols in (1024, 3072, 4096, 5120, 6144):
+        assert nvfp4_copy_supported(cols)
+    # 2560 = 5 x 512 would leave a masked tail block; 2000 is not a whole set of scale groups.
+    for cols in (1536, 2000, 2560, 3584):
+        assert not nvfp4_copy_supported(cols)
+    for name in _RECIPE_ENV:
+        monkeypatch.setenv(name, "1")
+        assert not nvfp4_copy_supported(5120)
+        # Like fp4_quantize, only exactly "1" switches the recipe.
+        monkeypatch.setenv(name, "true")
+        assert nvfp4_copy_supported(5120)
+        monkeypatch.delenv(name)
+    assert nvfp4_copy_supported(5120)
 
 
 def test_nvfp4_copy_contract() -> None:
@@ -115,4 +224,19 @@ def test_nvfp4_copy_contract() -> None:
             out_fp4=(values, scales[:64]),
             fp4_scale=torch.ones(1, device="cuda"),
             **common,
+        )
+    narrow = torch.randn(4, 2560, device="cuda").bfloat16()
+    with pytest.raises(ValueError, match="nvfp4_copy_supported"):
+        add_rmsnorm(
+            narrow,
+            narrow.clone(),
+            torch.ones(2560, device="cuda").bfloat16(),
+            1e-6,
+            x2=None,
+            out=torch.empty_like(narrow),
+            out_fp8=None,
+            fp8_scale=None,
+            out_fp4=(values[:, :1280], scales[:, :160]),
+            fp4_scale=torch.ones(1, device="cuda"),
+            gemma=False,
         )

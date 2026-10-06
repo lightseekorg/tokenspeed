@@ -377,6 +377,36 @@ def test_add_rmsnorm_matches_unfused_reference(
         assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
 
 
+def test_add_rmsnorm_fp8_copy_of_nan_rows_matches_static_quant(device: str) -> None:
+    if not platform.is_nvidia:
+        pytest.skip("requires float8_e4m3fn CUDA")
+    x = torch.randn(3, 4096, device=device, dtype=torch.bfloat16)
+    x[0] = float("nan")
+    x[1, 7] = float("inf")
+    residual = torch.zeros_like(x)
+    weight = torch.ones(4096, device=device, dtype=torch.bfloat16)
+    scale = torch.tensor([0.02], device=device)
+    out = torch.empty_like(x)
+    out_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+
+    add_rmsnorm(
+        x,
+        residual,
+        weight,
+        1e-6,
+        x2=None,
+        out=out,
+        out_fp8=out_fp8,
+        fp8_scale=scale,
+        out_fp4=None,
+        fp4_scale=None,
+        gemma=False,
+    )
+
+    expected, _ = static_quant_fp8(out, scale)
+    assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
+
+
 def test_add_rmsnorm_writes_in_place_from_strided_rows(device: str) -> None:
     eps = 1e-6
     wide = torch.randn(5, 2 * 256, device=device, dtype=torch.bfloat16)

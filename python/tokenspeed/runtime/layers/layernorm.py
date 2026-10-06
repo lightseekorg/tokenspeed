@@ -36,7 +36,11 @@ from tokenspeed_kernel.ops.communication.trtllm import (
 from tokenspeed_kernel.ops.communication.trtllm import (
     reducescatter_residual_rmsnorm,
 )
-from tokenspeed_kernel.ops.layernorm import add_rmsnorm, rmsnorm
+from tokenspeed_kernel.ops.layernorm import (
+    add_rmsnorm,
+    nvfp4_copy_supported,
+    rmsnorm,
+)
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -309,25 +313,19 @@ class GemmaRMSNorm(torch.nn.Module):
         and the updated residual.
         """
         if _is_amd:
-            x, residual = self(x, residual)
-            return x, None, residual
+            fp8_scale = None
         x_fp8 = (
             None
             if fp8_scale is None
             else torch.empty_like(x, dtype=torch.float8_e4m3fn)
         )
-        add_rmsnorm(
+        x, residual = self._add_norm(
             x,
             residual,
-            self.weight.data,
-            self.variance_epsilon,
-            x2=None,
-            out=x,
             out_fp8=x_fp8,
             fp8_scale=fp8_scale,
             out_fp4=None,
             fp4_scale=None,
-            gemma=True,
         )
         return x, x_fp8, residual
 
@@ -340,14 +338,14 @@ class GemmaRMSNorm(torch.nn.Module):
         """``forward(x, residual)``, plus ``fp4_quantize(rows, fp4_scale)`` when ``fp4_scale`` is given.
 
         Returns the normed rows (written into ``x``), their NVFP4 ``(values,
-        scales)`` or ``None``, and the updated residual.
+        scales)`` or ``None``, and the updated residual. Without a copy here
+        (see ``nvfp4_copy_supported``) the consumer quantizes for itself.
         """
-        if _is_amd or x.shape[0] == 0:
-            x, residual = self(x, residual)
-            return x, None, residual
+        rows, cols = x.shape
+        if fp4_scale is not None and not nvfp4_copy_supported(cols):
+            fp4_scale = None
         x_fp4 = None
         if fp4_scale is not None:
-            rows, cols = x.shape
             x_fp4 = (
                 torch.empty(rows, cols // 2, dtype=torch.uint8, device=x.device),
                 torch.empty(
@@ -357,6 +355,28 @@ class GemmaRMSNorm(torch.nn.Module):
                     device=x.device,
                 ),
             )
+        x, residual = self._add_norm(
+            x,
+            residual,
+            out_fp8=None,
+            fp8_scale=None,
+            out_fp4=x_fp4,
+            fp4_scale=fp4_scale,
+        )
+        return x, x_fp4, residual
+
+    def _add_norm(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        *,
+        out_fp8: torch.Tensor | None,
+        fp8_scale: torch.Tensor | None,
+        out_fp4: tuple[torch.Tensor, torch.Tensor] | None,
+        fp4_scale: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if _is_amd:
+            return self(x, residual)
         add_rmsnorm(
             x,
             residual,
@@ -364,13 +384,13 @@ class GemmaRMSNorm(torch.nn.Module):
             self.variance_epsilon,
             x2=None,
             out=x,
-            out_fp8=None,
-            fp8_scale=None,
-            out_fp4=x_fp4,
+            out_fp8=out_fp8,
+            fp8_scale=fp8_scale,
+            out_fp4=out_fp4,
             fp4_scale=fp4_scale,
             gemma=True,
         )
-        return x, x_fp4, residual
+        return x, residual
 
     def forward_with_allreduce_fusion(
         self,
