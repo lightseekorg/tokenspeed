@@ -21,6 +21,9 @@
 import torch
 
 from tokenspeed.runtime.layers.moe.weights.fp8 import create_fp8_block_scale_inverses
+from tokenspeed.runtime.layers.moe.weights.fp8_channel import (
+    create_fp8_channel_weight_pair,
+)
 from tokenspeed.runtime.layers.moe.weights.mxfp4 import (
     create_mxfp4_fp8_input_scales,
     create_mxfp4_weight_pair,
@@ -66,6 +69,10 @@ def create_layer_weights(
             intermediate_size_per_partition=ispp,
             block_shape=quant_config.weight_block_size,
         )
+        return
+
+    if quant_kind == "fp8_channel":
+        create_fp8_channel_weight_pair(spec, layer)
         return
 
     if quant_kind == "nvfp4":

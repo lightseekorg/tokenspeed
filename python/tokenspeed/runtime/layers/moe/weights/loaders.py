@@ -290,6 +290,52 @@ def load_per_tensor_weight_scale(
         raise ValueError(f"Unknown shard_id: {shard_id}")
 
 
+def load_channel_weight_scale(
+    param: torch.nn.Parameter,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    local_expert_id: int,
+    *,
+    tp_rank: int,
+    tp_size: int,
+    use_presharded_weights: bool = False,
+) -> None:
+    """Load one projection's scales into ``[experts, 2 * ispp]`` (w13) or
+    ``[experts, hidden]`` (w2) FP32 scales per output channel.
+
+    ``loaded_weight`` holds one scale per output channel (``[N, 1]`` or
+    ``[N]``) or one per tensor (one value, which fills the projection's
+    channels on every rank). Gate (``w1``) and up (``w3``) fill the first and
+    second half of w13's channels: ``tp_size * ispp`` of them, of which each
+    rank takes its partition as ``load_w13`` does for the weight rows (``ispp``
+    when presharded). ``w2``'s channels are the hidden size, which tensor
+    parallelism does not split: every rank holds all of them. Any other count
+    is refused. The values convert exactly to FP32 (from BF16, FP16, FP32 or
+    FP8 E4M3).
+    """
+    scale = loaded_weight.reshape(-1)
+    expert = param.data[local_expert_id]
+    if shard_id == "w2":
+        dst, channels = expert, expert.shape[0]
+    elif shard_id in {"w1", "w3"}:
+        size = expert.shape[0] // 2
+        dst = expert.narrow(0, 0 if shard_id == "w1" else size, size)
+        channels = size if use_presharded_weights else size * tp_size
+    else:
+        raise ValueError(f"Unknown shard_id: {shard_id}")
+    if scale.numel() == 1:
+        dst.copy_(scale.expand(dst.shape[0]))
+        return
+    if scale.numel() != channels:
+        raise ValueError(
+            f"{shard_id} scales per output channel: expected {channels}, got "
+            f"{tuple(loaded_weight.shape)}"
+        )
+    if channels != dst.shape[0]:
+        scale = scale.narrow(0, dst.shape[0] * tp_rank, dst.shape[0])
+    dst.copy_(scale)
+
+
 def load_per_tensor_input_scale(
     param: torch.nn.Parameter,
     loaded_weight: torch.Tensor,
@@ -317,6 +363,12 @@ def make_weight_loader(
     )
 
 
+def make_channel_scale_loader(spec: MoELayerSpec) -> Callable:
+    return partial(
+        load_channel_weight_scale, tp_rank=spec.tp_rank, tp_size=spec.tp_size
+    )
+
+
 def make_group_scale_loader(
     spec: MoELayerSpec,
     *,
@@ -335,8 +387,10 @@ def round_up(value: int, multiple: int) -> int:
 
 
 __all__ = [
+    "load_channel_weight_scale",
     "load_per_tensor_input_scale",
     "load_per_tensor_weight_scale",
+    "make_channel_scale_loader",
     "make_group_scale_loader",
     "make_weight_loader",
     "round_up",
