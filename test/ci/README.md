@@ -42,6 +42,11 @@ workflow still fails if either fails. Matrix entries within
 each stage run in parallel. A stage with no matching tasks is treated as
 successfully satisfied.
 
+`ut-tokenspeed-kernel-part-i` runs tests outside `tokenspeed-kernel/test/ops/`,
+keeping the numerics, TRT-LLM communication and CUDA suites in separate processes.
+`ut-tokenspeed-kernel-part-ii` runs `tokenspeed-kernel/test/ops/`; together the two
+tasks cover the kernel suite once.
+
 PRs labeled `high priority` start `unit-test` and `model-test` concurrently.
 Applying the label starts a new CI run immediately and cancels the older run
 through the workflow's concurrency policy. A unit-test failure does not cancel

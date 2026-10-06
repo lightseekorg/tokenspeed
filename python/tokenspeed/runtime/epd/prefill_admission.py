@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 from tokenspeed.runtime.epd.mooncake.receiver import (
     MooncakeEmbeddingReceiver,
 )
+from tokenspeed.runtime.epd.recv_pool import is_epd_prefill_node, recv_pool_geometry
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
 from tokenspeed.runtime.pd.base.status import TransferPoll
@@ -207,9 +208,8 @@ def _get_pool(engine: Any, device: Any) -> _RecvBufferPool | None:
     key = (id(engine), str(device))
     pool = _POOLS.get(key)
     if pool is None:
-        n_slots = envs.TOKENSPEED_EPD_RECV_POOL_SLOTS.get()
-        slot_mb = envs.TOKENSPEED_EPD_RECV_POOL_SLOT_MB.get()
-        if n_slots <= 0 or slot_mb <= 0:
+        n_slots, slot_mb = recv_pool_geometry()
+        if n_slots == 0:
             pool = False
         else:
             pool = _RecvBufferPool(engine, device, slot_mb << 20, n_slots)
@@ -898,7 +898,7 @@ def build_prefill_embedding_manager(server_args, global_rank, is_multimodal_acti
     at receive time). Construction spawns a daemon status thread, so build it
     exactly once per rank. Returns None for decode/encode/text-only nodes.
     """
-    if server_args.disaggregation_mode != "prefill" or not is_multimodal_active:
+    if not is_epd_prefill_node(server_args, is_multimodal_active):
         return None
 
     from tokenspeed.runtime.epd.entities import EmbeddingArgs, EmbeddingManagerArgs

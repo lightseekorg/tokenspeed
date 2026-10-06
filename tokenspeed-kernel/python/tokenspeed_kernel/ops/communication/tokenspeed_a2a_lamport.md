@@ -1,9 +1,9 @@
-# Experimental CUDA Lamport A2A
+# TokenSpeed Lamport A2A
 
-`cuda_lamport_a2a` is an opt-in TP4 BF16, intra-node NVLink experiment. It does
-not change model dispatch or replace an existing backend. It exchanges channel
-shards directly between `[M, K]` and `[4*M, K/4]`, including the inverse mapping,
-without a separate pack or output-restoration kernel.
+`tokenspeed_a2a_lamport` is a TP4 BF16, intra-node NVLink exchange. It exchanges
+channel shards directly between `[M, K]` and `[4*M, K/4]`, including the inverse
+mapping, without a separate pack or output-restoration kernel. Runtime backend
+selection remains outside this kernel API.
 
 ## Protocol
 
@@ -29,19 +29,25 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
 
 ## Contract and limits
 
-- The Python entry point lives in `cuda_lamport.py`. Both packet and chunk
-  exchange require **exactly four GPUs per process group on one host**,
+- The public Python entry point lives in `cuda.py`; its private implementation
+  lives under `_cuda/`. Both packet and chunk exchange require **exactly four
+  GPUs per process group on one host**,
   not necessarily four GPUs in the entire job. Peer indexing and scratch
   layouts are specialized for four peers; other group sizes are rejected.
-- Prepare `CudaLamportA2AState(group, max_rows, channels, device, blocks)` on all
+- Prepare `TokenSpeedA2ALamportState(group, max_rows, channels, device, blocks)` on all
   four peers before capture. This creates symmetric scratch and compiles the
   kernel. All peers must agree on the physical shape and direction of each call.
-- Inputs are contiguous BF16 matrices; `K` is a positive multiple of eight.
+- Inputs are contiguous, 16-byte-aligned BF16 matrices; `K` is a positive multiple of eight.
   Uneven/empty logical owners must be padded to the same positive physical `M`.
-- Serialize this communicator and its consumers on one CUDA stream. The result
-  borrows persistent **local output**, valid until the next call. Inputs must
-  not alias output or communication scratch. Retain the state while graphs
-  reference it; synchronize every rank before releasing it.
+- Serialize this communicator and its consumers on one CUDA stream. Pass
+  `out=None` to borrow persistent **local output**, valid until the next call.
+  Alternatively, supply a contiguous BF16 output with the exact result shape,
+  matching device and a 16-byte-aligned address. The kernel writes directly into
+  that tensor and returns it; later exchanges do not overwrite it. Supplied output
+  must not share storage with inputs or state buffers. Inputs must not alias
+  persistent output or communication scratch. Retain the state and destinations
+  while queued work or graphs reference them; synchronize every rank before
+  releasing the state.
 - Eager and CUDA Graph execution use the same kernel and GPU-owned generation.
   Recreate the communicator before `2^32` calls: generation overflow traps
   rather than risking acceptance of stale packets. There is no recovery from
@@ -50,8 +56,9 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
   scratch plus `S` output bytes per GPU, excluding metadata. Payload expansion
   also increases link traffic. This is a **low-latency**, not a large-message
   bandwidth optimization. Only four NVLink-connected GB300 GPUs have been
-  measured; no cross-node, other-dtype or full-model claim is made.
-- There is no implicit NCCL fallback. Existing production backends are unchanged.
+  measured; no cross-node or other-dtype claim is made.
+- The kernel itself has no implicit NCCL fallback. Its runtime caller owns
+  admission, padding and fallback selection.
 
 ## Optional large-message chunk exchange
 
@@ -61,9 +68,9 @@ Enable this explicitly on **every peer**, before capturing any graph:
 state.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
 ```
 
-The existing `cuda_lamport_a2a(state, inputs, inverse)` entry point then chooses
+The `tokenspeed_a2a_lamport(state, inputs, inverse, out)` entry point then chooses
 packet exchange below the threshold and chunk exchange at/above it. Both use
-the same layout contract and return the same local output buffer. Peers must
+the same layout contract and write the selected local output buffer. Peers must
 agree on physical shapes, direction and threshold. Chunk exchange additionally
 requires channels divisible by 32. The original packet-only behavior remains
 available by not preparing chunk exchange.
@@ -109,25 +116,42 @@ Packet format, generation checks, workspace size, and dispatch thresholds are
 unchanged; four rank variants increase compiled code size. GPU tests cover all
 ranks, both directions, and transitions across the packet/chunk boundary.
 
+## Fused FP8 receive-side quantization
+
+Call `state.prepare_fp8_quantization()` before capture, then
+`tokenspeed_a2a_lamport_fp8_quantize(state, inputs)` for the forward exchange.
+Input width must be divisible by 512: each TP4 channel shard contains whole
+128-element quantization groups. The kernel returns borrowed E4M3 values
+`[4*M,K/4]` and contiguous MN-major FP32 scales `[K/512,4*M]`.
+
+Packet polling or chunk acquire fences establish readiness before quantization.
+Both variants share their existing rings and generations with ordinary BF16
+A2A; there is no separate consumer-readiness protocol. The BF16 epsilon clamp,
+round-to-nearest divisions and FP8 conversion match the prepared FlashInfer
+quantizer. A following GEMM uses normal stream ordering and must finish reading
+the borrowed buffers before the next quantized call.
+
+Communication still carries BF16 data. The fusion removes local BF16 output
+materialization and a quantization launch, not link bytes. Persistent FP8 and
+scale outputs add `M*K + 4*M*K/128` bytes at the configured maximum M.
+The existing BF16 output remains available, and inverse exchange is unchanged.
+
 ## Validation and measurement methodology
 
 From the repository root, with optional CUDA/FlashInfer dependencies installed:
 
 ```bash
 python -m pytest -q \
-  test/runtime/distributed/test_comm_ops.py::TestCommOps::test_all_to_all_single
+  tokenspeed-kernel/test/nvidia/ops/communication/test_projection_tp.py
 ```
 
-The existing runtime test spawns its own workers (do not launch pytest with
-torchrun). It retains the two-/four-GPU runtime cases and adds one four-GPU
-custom-kernel case, without changing runtime backend selection. Only the
-custom case skips missing NVIDIA GPUs, full peer access, or optional FlashInfer;
-the original runtime cases retain their existing requirements.
-
-Correctness compares integer views against NCCL to check every bit. Coverage
-includes both directions, minimal/tail widths, changing shapes and payloads,
-an empty logical owner, delayed peers, consumers inside captured graphs, ring
-reuse, and crossing the signed-int32 generation boundary.
+The test spawns its own workers; do not launch pytest with torchrun. It skips
+when four NVIDIA GPUs, full peer access, or optional FlashInfer dependencies
+are unavailable. The focused correctness case compares TP4 C128, K=16384
+fused FP8 values and scales against ordinary Lamport exchange followed by the
+native quantizer, in eager execution and CUDA Graph replay. The existing
+runtime collective test covers bit-exact BF16 exchange through the
+compatibility API.
 
 Benchmark timings exclude startup/JIT. After 20 warmups, each sample times
 10 replays of a graph containing 100 exchanges using CUDA events, takes the

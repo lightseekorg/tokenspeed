@@ -1324,6 +1324,7 @@ def create_attn_components(
     overlap_schedule_depth: int = 0,
     *,
     graph_reserve_bytes: int,
+    post_profile_bytes: int,
     probe_batch_rows: int | None,
     profiled_cache_bytes: int | None,
     reuse_target_backend: AttentionBackend | None,
@@ -1430,6 +1431,7 @@ def create_attn_components(
             tp_size=server_args.mapping.world_size,
             gpu_memory_utilization=server_args.gpu_memory_utilization,
             total_gpu_memory=gpu_memory,
+            post_profile_bytes=post_profile_bytes,
             world_group=server_args.mapping.world_group,
         )
     cache_memory = reserve_cache_budget(profiled_cache_bytes, graph_reserve_bytes)

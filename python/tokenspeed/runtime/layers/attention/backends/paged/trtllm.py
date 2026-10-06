@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.mha.flashinfer import (
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
 )
@@ -124,6 +125,28 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # sharing the SAME block-end seq_len, so each block position attends
         # over the whole block; target verify and plain decode are untouched.
         self.draft_block_decode = bool(config.draft_block_decode)
+
+        # trtllm-gen's multi-CTA KV mode keeps one completion counter per
+        # (request, q head). Without a counter buffer FlashInfer zero-fills a
+        # fresh one on every call, one extra kernel per layer. The kernel
+        # resets its counters at the end of each launch, so a buffer zeroed
+        # once here serves every call; a batch it cannot hold falls back to
+        # FlashInfer's own allocation. It is pool-independent, so a rebind
+        # keeps it.
+        self._kv_counter_buffer = None
+        if torch.device(config.device).type == "cuda":
+            self._sm_count = torch.cuda.get_device_properties(
+                config.device
+            ).multi_processor_count
+            self._kv_counter_buffer = torch.zeros(
+                get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                    config.max_bs * self.block_decode_expansion,
+                    self.tp_q_head_num,
+                    self._sm_count,
+                ),
+                dtype=torch.uint8,
+                device=config.device,
+            )
 
         # Separate slots for prefill-kernel vs decode-kernel forward paths:
         # forward_extend reads prefill; forward_decode picks by q_len (target
@@ -339,6 +362,17 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         (buf,) = self._workspace_pool.allocate(((self._workspace_nbytes,), torch.uint8))
         return buf
 
+    def _kv_counter_buffer_for(
+        self, batch_size: int, num_qo_heads: int
+    ) -> torch.Tensor | None:
+        """The persistent multi-CTA KV counter buffer if it holds this batch."""
+        buf = self._kv_counter_buffer
+        if buf is None or buf.numel() < get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, num_qo_heads, self._sm_count
+        ):
+            return None
+        return buf
+
     def _get_kv_cache_permuted(self, layer: PagedAttention, token_to_kv_pool):
         """Get KV cache in [num_pages, num_kv_heads, page_size, head_dim] layout."""
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -443,6 +477,9 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             sinks=attention_sink,
             out_dtype=self.dtype,
             q_len_per_req=metadata.max_seq_len_q,
+            multi_ctas_kv_counter_buffer=self._kv_counter_buffer_for(
+                q.shape[0] // metadata.max_seq_len_q, q.shape[1]
+            ),
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -545,6 +582,9 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             out_dtype=self.dtype,
+            multi_ctas_kv_counter_buffer=self._kv_counter_buffer_for(
+                metadata.cu_seqlens_q.shape[0] - 1, q.shape[1]
+            ),
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

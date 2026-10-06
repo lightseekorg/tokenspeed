@@ -83,6 +83,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     PendingExecution,
@@ -1155,8 +1156,10 @@ def build_device_side(
     The chain is linear and the order is load-bearing: the multimodal runtime
     and persistent communication buffers must be prepared after weights are
     loaded and before ``create_attn_components`` profiles memory for the KV
-    budget, and the chunked-prefill limit must be aligned to the cache groups
-    before ``ModelExecutorConfig`` sizes the input buffers from it.
+    budget (the EPD receive pool, which the admission allocates later, is left
+    out of that budget instead), and the chunked-prefill limit must be aligned
+    to the cache groups before ``ModelExecutorConfig`` sizes the input buffers
+    from it.
 
     Args:
         server_args: Parsed server arguments. ``chunked_prefill_size`` may
@@ -1217,6 +1220,14 @@ def build_device_side(
         if draft is not None:
             draft.prepare_communication_runtime(max_forward_tokens)
 
+    post_profile_bytes = recv_pool_bytes(server_args, model_config.is_multimodal_active)
+    if post_profile_bytes:
+        logger.info(
+            f"KV cache budget leaves out the {post_profile_bytes / (1 << 30):.2f} GiB "
+            "EPD receive pool (TOKENSPEED_EPD_RECV_POOL_SLOTS x "
+            "TOKENSPEED_EPD_RECV_POOL_SLOT_MB)"
+        )
+
     @startup_phase("kv.build")
     def build_components(
         *,
@@ -1237,6 +1248,7 @@ def build_device_side(
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=overlap_schedule_depth,
             graph_reserve_bytes=graph_reserve_bytes,
+            post_profile_bytes=post_profile_bytes,
             probe_batch_rows=probe_batch_rows,
             profiled_cache_bytes=profiled_cache_bytes,
             reuse_target_backend=reuse_target_backend,
