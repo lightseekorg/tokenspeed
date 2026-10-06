@@ -98,6 +98,10 @@ change.
 * `docs/design/attention-prologue.md` — the one entry between projections
   and core attention: QK norm, RoPE, quantization and the KV write, the
   numerics contract every solution meets, and who writes the cache.
+* `docs/design/tree-speculation.md` — draft-tree speculation: the tree as a
+  parameter of the chain path (compaction), position vs slot, one tree
+  attention path (trtllm-gen prefix plus window cascade), and position-keyed
+  sampled verify.
 
 ## Public pull requests
 

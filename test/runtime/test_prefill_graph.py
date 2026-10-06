@@ -151,10 +151,16 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             global_rank=0,
             cudagraph_capture_sizes=[1, 2, 4],
             disable_cuda_graph_padding=False,
+            spec_topk=1,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
             autotune_cache_key=None,
             prefill_only=False,
+            input_logprob_chunk_tokens=1024,
+            enable_speculative_sampling=False,
+            decode_only_attention=False,
+            query_shard_size=1,
+            query_shard_rank=0,
         )
         with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
             ModelExecutorConfig(**config_args)
@@ -598,6 +604,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         specs,
         capture_bs,
         arena_blocks=64,
+        query_shard=(1, 0),
     ):
         """Drive make_dummy_batch to the backend hand-off and record it.
 
@@ -636,6 +643,8 @@ class DummyGroupTablesTest(unittest.TestCase):
             context_len=context_len,
             physical_context_len=physical,
             world_size=1,
+            query_shard_size=query_shard[0],
+            query_shard_rank=query_shard[1],
         )
         pg.dp_size = 1
         pg.drafter = None
@@ -671,6 +680,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertTrue(ib.active_request_mask_buf[:bs].all().item())
         self.assertIs(ctx.attn_backend, pg.attn_backend)
         self.assertIs(ctx.token_to_kv_pool, pg.token_to_kv_pool)
+        seen["ctx"] = ctx
         return seen
 
     def test_make_dummy_batch_tables_survive_the_cache_contract(self):
@@ -721,6 +731,46 @@ class DummyGroupTablesTest(unittest.TestCase):
                         specs=(spec,),
                         capture_bs=bs,
                     )
+
+    def test_a_query_sharding_engine_shards_the_dummy_extend(self):
+        """The one extend form a query-sharding engine runs is the sharded
+        one, so the autotune's dummy carries the plan a real extend of these
+        rows would -- on the context and in the metadata hand-off -- and an
+        engine that does not shard carries none."""
+        from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+        spec = _spec("full_attention", block_granularity=64)
+        seen = self._dummy_batch_probe(
+            num_tokens=1737,
+            context_len=2048,
+            physical=2048,
+            specs=(spec,),
+            capture_bs=2,
+            query_shard=(4, 3),
+        )
+        plan = seen["ctx"].query_shard
+        self.assertEqual(
+            plan,
+            QueryShardPlan.from_forward(
+                total_tokens=1737, input_lengths=[869, 868], size=4, rank=3
+            ),
+        )
+        self.assertIs(seen["query_shard"], plan)
+        self.assertEqual(sum(plan.row_counts), 1737)
+        self.assertEqual(plan.local_rows, plan.row_counts[3])
+        # The whole span still fills the buffers and the metadata; the model
+        # takes its slice (ModelExecutor.autotune).
+        self.assertEqual(seen["num_tokens"], 1737)
+        self.assertEqual(seen["extend_seq_lens_cpu"].tolist(), [869, 868])
+        unsharded = self._dummy_batch_probe(
+            num_tokens=1737,
+            context_len=2048,
+            physical=2048,
+            specs=(spec,),
+            capture_bs=2,
+        )
+        self.assertIsNone(unsharded["ctx"].query_shard)
+        self.assertIsNone(unsharded["query_shard"])
 
     def test_real_active_page_backend_gets_positions_alongside_its_tables(self):
         """A backend that validates live-page geometry (V4) is told how many
@@ -1244,11 +1294,17 @@ class PrefillRoleGraphsTest(unittest.TestCase):
             global_rank=0,
             cudagraph_capture_sizes=[1, 2, 4],
             disable_cuda_graph_padding=False,
+            spec_topk=1,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
             autotune_cache_key=None,
             prefill_only=prefill_only,
+            input_logprob_chunk_tokens=1024,
+            decode_only_attention=False,
             prefill_graph_capture_batch_sizes=None,
+            enable_speculative_sampling=False,
+            query_shard_size=1,
+            query_shard_rank=0,
             prefill_graph_max_tokens=256,
         )
 

@@ -36,6 +36,9 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "COMBINE_ORDERS",
+    "ExpertDispatch",
+    "dispatch_topk_ids",
     "native_latent_moe_available",
     "latent_moe_decode_pipeline_available",
     "latent_moe_expert_shared",
@@ -45,6 +48,29 @@ __all__ = [
     "moe_process_weights",
     "moe_topk",
 ]
+
+from tokenspeed_kernel.ops.moe.dispatch import (  # noqa: E402
+    ExpertDispatch,
+    dispatch_topk_ids,
+)
+
+# How a token's routed-expert contributions are combined across the MoE
+# TP-EP group (``moe_plan(combine_order=...)``):
+#
+# ``"rank"``
+#     The apply kernel returns this rank's partial (its experts, or its K-split
+#     of the down projection); the caller sums the partials rank by rank with
+#     its all-reduce / reduce-scatter and adds anything else (an identity
+#     zero-expert residual) around that reduction. Every registered kernel
+#     serves this form; declaring the trait is optional.
+# ``"slot"``
+#     The apply kernel exchanges the per-route outputs across the EP group
+#     itself (``plan["process_group"]``) and folds each token's top-k slots in
+#     fp32 in slot order, zero-expert residual included, returning the
+#     complete routed output: the caller must not reduce it again and must
+#     hand the kernel the raw top-k (zero-expert ids intact, weights kept).
+#     Only kernels declaring ``combine_order={"slot", ...}`` are eligible.
+COMBINE_ORDERS = ("rank", "slot")
 
 from tokenspeed_kernel.ops.moe.latent_decode import (  # noqa: E402
     latent_moe_decode_pipeline_available,
@@ -373,6 +399,34 @@ def _validate_selected_deepep_mode(
     )
 
 
+def _validate_combine_order(
+    combine_order: str, kernel_name: str, kernel_traits: dict[str, frozenset[Any]]
+) -> None:
+    """Reject a selected apply kernel that cannot combine in the planned order.
+
+    A kernel that declares ``combine_order`` must list the planned value. A
+    kernel that declares nothing serves ``"rank"`` (the caller reduces) but
+    cannot serve ``"slot"``, which only an in-kernel EP exchange provides.
+    """
+    declared = kernel_traits.get("combine_order")
+    if declared is None:
+        if combine_order == "slot":
+            raise ValueError(
+                f"MoE kernel {kernel_name!r} does not declare the combine_order "
+                "trait: it returns a per-rank partial for the caller's "
+                "rank-ordered reduction and cannot fold the top-k slots across "
+                "the EP group itself (combine_order='slot'); select a kernel "
+                "declaring the trait through solution="
+            )
+        return
+    if combine_order not in declared:
+        supported = ", ".join(sorted(declared))
+        raise ValueError(
+            f"MoE kernel {kernel_name!r} does not support "
+            f"combine_order={combine_order!r}; supported orders: {supported}"
+        )
+
+
 def _build_traits(
     *,
     weight_dtype: str,
@@ -389,11 +443,15 @@ def _build_traits(
     fp8_scale_block_shape: tuple[int, int] | None,
     internal_activation_dtype: str | None,
     with_bias: bool,
+    combine_order: str,
 ) -> dict[str, Any]:
     if internal_activation_dtype is None:
         internal_activation_dtype = "input"
 
     traits: dict[str, Any] = {"weight_dtype": weight_dtype}
+    # Seller-declared: excludes only kernels declaring another order; the
+    # post-selection check turns a silent kernel down for "slot".
+    traits["combine_order"] = combine_order
     if activation is not None:
         traits["activation"] = activation
     if requires_deferred_finalize:
@@ -452,6 +510,7 @@ def moe_plan(
     deepep_low_latency_max_num_tokens_per_gpu: int | None = None,
     persistent_max_num_tokens_per_gpu: int | None = None,
     fast_math: bool,
+    combine_order: str,
     solution: str | None = None,
 ) -> dict:
     """Create a MoE execution plan.
@@ -511,6 +570,14 @@ def moe_plan(
         fast_math: Whether the selected implementation may use fast math.
             Implementations without a fast-math path always compute precisely.
             Required keyword.
+        combine_order: How a token's routed contributions meet across the MoE
+            TP-EP group, one of ``COMBINE_ORDERS``. ``"rank"``: the kernel
+            returns this rank's partial and the caller reduces. ``"slot"``: the
+            kernel folds the top-k slots in fp32 slot order across the EP group
+            through ``process_group`` and returns the complete output, which
+            the caller must not reduce; it needs a kernel declaring the
+            ``combine_order`` trait with ``"slot"`` and, for ``ep_size > 1``,
+            the EP process group. Required keyword.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
 
@@ -518,12 +585,24 @@ def moe_plan(
     false requires precomputed top-k ids and weights when calling moe_apply.
     Weight preprocessing is selected from the ordered candidates advertised by
     the selected apply kernel, then pinned by callable in the returned plan so load
-    time does not rerun selection or conflict resolution.
+    time does not rerun selection or conflict resolution. The plan carries
+    ``combine_order`` and ``process_group`` for the apply kernel to read.
     """
     weight_dtype = _normalize_weight_dtype(weight_dtype)
     _validate_a2a_backend(a2a_backend)
     _validate_routing_mode(routing_mode)
     _validate_deepep_mode(a2a_backend, deepep_mode)
+    if combine_order not in COMBINE_ORDERS:
+        raise ValueError(
+            f"combine_order must be one of {list(COMBINE_ORDERS)}, got "
+            f"{combine_order!r}"
+        )
+    if combine_order == "slot" and ep_size is not None and ep_size > 1:
+        if process_group is None:
+            raise ValueError(
+                "combine_order='slot' with ep_size > 1 exchanges per-route "
+                "outputs inside the apply kernel and needs the EP process group"
+            )
     # DeepEP does not pin a solution: the ``supports_all_to_all_ep`` trait plus
     # ``weight_dtype`` already narrow the candidates to the apply kernels that
     # own the dispatch/combine legs (nvfp4 cutedsl, block-scale fp8 DeepGEMM).
@@ -544,6 +623,7 @@ def moe_plan(
         fp8_scale_block_shape=fp8_scale_block_shape,
         internal_activation_dtype=internal_activation_dtype,
         with_bias=with_bias,
+        combine_order=combine_order,
     )
     traits["persistent_workspace"] = persistent_max_num_tokens_per_gpu is not None
 
@@ -564,6 +644,7 @@ def moe_plan(
         apply_spec.name,
         apply_spec.traits,
     )
+    _validate_combine_order(combine_order, apply_spec.name, apply_spec.traits)
     if persistent_max_num_tokens_per_gpu is not None and True not in (
         apply_spec.traits.get("persistent_workspace", frozenset())
     ):
@@ -591,9 +672,14 @@ def moe_plan(
         ),
         "persistent_max_num_tokens_per_gpu": persistent_max_num_tokens_per_gpu,
         "fast_math": fast_math,
+        "combine_order": combine_order,
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
+        # routes, so routing may pick per-rank replicas. Otherwise every
+        # rank routes every token and must agree on one replica per route.
+        "supports_all_to_all_ep": traits["supports_all_to_all_ep"],
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
     }

@@ -157,9 +157,13 @@ def check_mla_request(
     latent_cache: torch.Tensor,
     expanded: MLAExpandedKV | None,
     rotary: Rotary | None,
-    cache: LatentKVCache,
+    cache: LatentKVCache | None,
 ) -> None:
-    """Reject an MLA request any solution would misread; metadata only."""
+    """Reject an MLA request any solution would misread; metadata only.
+
+    ``cache=None`` is the store-less form: the prologue returns the rotated
+    latent for :func:`latent_store` and the cache checks do not apply.
+    """
     expanded_key = (
         None
         if expanded is None
@@ -173,7 +177,7 @@ def check_mla_request(
         _layout(latent_cache),
         expanded_key,
         _rotary_key(rotary),
-        _cache_key(cache),
+        None if cache is None else _cache_key(cache),
     )
     _once(key, _check_mla_request, query, q_pe, latent_cache, expanded, rotary, cache)
 
@@ -342,7 +346,7 @@ def _check_mla_request(
     latent_cache: torch.Tensor,
     expanded: MLAExpandedKV | None,
     rotary: Rotary | None,
-    cache: LatentKVCache,
+    cache: LatentKVCache | None,
 ) -> None:
     """Reject an MLA request any solution would misread; metadata only."""
     if query.dim() != 3:
@@ -386,6 +390,70 @@ def _check_mla_request(
         raise ValueError(
             f"MLA RoPE is 64, 128, 256 or 512 channels wide, or absent, not {rope_dim}"
         )
+    if cache is None:
+        if expanded is not None:
+            raise ValueError("the store-less MLA prologue serves absorbed attention")
+    else:
+        _check_latent_cache(cache, query, num_tokens, kv_lora_rank, rope_dim)
+    if rotary is not None:
+        if rotary.mrope is not None:
+            raise ValueError("MLA does not take multimodal RoPE")
+        _check_rotary(rotary, num_tokens)
+        if rotary.rotary_dim != rope_dim:
+            raise ValueError(
+                f"rotary width {rotary.rotary_dim} is not the {rope_dim} RoPE channels"
+            )
+    if expanded is None and width - rope_dim != kv_lora_rank:
+        raise ValueError("an absorbed query's non-RoPE part is kv_lora_rank wide")
+    if expanded is not None and (
+        expanded.k_nope.shape != (num_tokens, num_heads, width - rope_dim)
+        or expanded.value.dim() != 3
+        or expanded.value.shape[:2] != (num_tokens, num_heads)
+        or not expanded.k_nope.dtype == expanded.value.dtype == query.dtype
+        or expanded.k_nope.stride(-1) != 1
+        or expanded.value.stride(-1) != 1
+        or _overlapping(expanded.k_nope)
+        or _overlapping(expanded.value)
+    ):
+        raise ValueError(
+            f"expanded k_nope {tuple(expanded.k_nope.shape)} / value "
+            f"{tuple(expanded.value.shape)} are not dense heads of query {tuple(query.shape)}"
+        )
+
+
+def check_latent_store(latent: torch.Tensor, cache: LatentKVCache) -> None:
+    """Reject a latent store any solution would misread; metadata only.
+
+    Args:
+        latent: Rotated latent rows ``[num_tokens, kv_lora_rank + rope_dim]``
+            in the activation dtype, as :func:`mla_prologue` returns them
+            without a cache.
+        cache: Latent cache destination, native rows only.
+    """
+    if latent.dim() != 2 or latent.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"latent {tuple(latent.shape)} {latent.dtype} is not fp16/bf16 "
+            "[tokens, rank + rope]"
+        )
+    if latent.stride(-1) != 1 or _overlapping(latent) or _misaligned(latent):
+        raise ValueError("latent rows must be dense, 16-byte aligned and non-aliasing")
+    if cache.format is not KVCacheFormat.NATIVE:
+        raise ValueError("latent_store writes native latent caches only")
+    if cache.kv_cache.shape[-1] != latent.shape[-1]:
+        raise ValueError(
+            f"latent rows are {latent.shape[-1]} wide but the cache holds "
+            f"{cache.kv_cache.shape[-1]}"
+        )
+    _check_latent_cache(cache, latent, latent.shape[0], 0, latent.shape[-1])
+
+
+def _check_latent_cache(
+    cache: LatentKVCache,
+    activation: torch.Tensor,
+    num_tokens: int,
+    kv_lora_rank: int,
+    rope_dim: int,
+) -> None:
     _check_slots(cache, num_tokens)
     _check_write_mask(cache)
     if cache.format is KVCacheFormat.FP8_PER_TOKEN_HEAD:
@@ -421,33 +489,10 @@ def _check_mla_request(
             "per-token-head planes share one row count and hold fp32 scales"
         )
     if cache.format is KVCacheFormat.NATIVE and cache.kv_cache.dtype not in (
-        query.dtype,
+        activation.dtype,
         torch.bfloat16,
     ):
         raise ValueError(
-            f"a native cache holds {query.dtype} or bf16 rows, not {cache.kv_cache.dtype}"
-        )
-    if rotary is not None:
-        if rotary.mrope is not None:
-            raise ValueError("MLA does not take multimodal RoPE")
-        _check_rotary(rotary, num_tokens)
-        if rotary.rotary_dim != rope_dim:
-            raise ValueError(
-                f"rotary width {rotary.rotary_dim} is not the {rope_dim} RoPE channels"
-            )
-    if expanded is None and width - rope_dim != kv_lora_rank:
-        raise ValueError("an absorbed query's non-RoPE part is kv_lora_rank wide")
-    if expanded is not None and (
-        expanded.k_nope.shape != (num_tokens, num_heads, width - rope_dim)
-        or expanded.value.dim() != 3
-        or expanded.value.shape[:2] != (num_tokens, num_heads)
-        or not expanded.k_nope.dtype == expanded.value.dtype == query.dtype
-        or expanded.k_nope.stride(-1) != 1
-        or expanded.value.stride(-1) != 1
-        or _overlapping(expanded.k_nope)
-        or _overlapping(expanded.value)
-    ):
-        raise ValueError(
-            f"expanded k_nope {tuple(expanded.k_nope.shape)} / value "
-            f"{tuple(expanded.value.shape)} are not dense heads of query {tuple(query.shape)}"
+            f"a native cache holds {activation.dtype} or bf16 rows, not "
+            f"{cache.kv_cache.dtype}"
         )

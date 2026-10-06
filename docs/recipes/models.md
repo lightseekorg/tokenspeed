@@ -29,7 +29,6 @@ ts serve \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --trust-remote-code \
     --attention-backend fa4 \
@@ -51,7 +50,6 @@ ts serve \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --trust-remote-code \
     --enable-prefix-caching \
@@ -78,7 +76,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --attention-backend trtllm \
     --kv-cache-dtype fp8 \
@@ -108,7 +105,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --attention-backend trtllm \
     --kv-cache-dtype fp8 \
@@ -330,7 +326,6 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --mm-encoder-tp-mode data \
   --ep-size 8 \
   --moe-backend flashinfer_trtllm \
-  --gpu-memory-utilization 0.94 \
   --max-num-seqs 32 \
   --disable-kvstore \
   --host 0.0.0.0 \
@@ -359,7 +354,6 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --enable-expert-parallel \
   --attention-backend mla \
   --moe-backend auto \
-  --gpu-memory-utilization 0.92 \
   --max-num-seqs 32 \
   --disable-kvstore \
   --host 0.0.0.0 \
@@ -617,7 +611,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -633,7 +627,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -658,7 +652,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -676,7 +670,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -710,7 +704,6 @@ MTP (the draft model path points at the same checkpoint):
 tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
   --served-model-name Qwen/Qwen3.8-27B-FP8 \
   --world-size 1 \
-  --gpu-memory-utilization 0.9 \
   --attention-backend trtllm \
   --moe-backend flashinfer_trtllm \
   --chunked-prefill-size 8192 \
@@ -861,7 +854,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --max-total-tokens 163840 \
   --chunked-prefill-size 8192 \
   --enable-mixed-batch \
-  --gpu-memory-utilization 0.9 \
   --disable-kvstore \
   --host 0.0.0.0 \
   --port 8000
@@ -880,7 +872,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Pro \
   --max-model-len 80000 \
   --max-total-tokens 2560000 \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.9 \
   --disable-kvstore \
   --host 0.0.0.0 \
   --port 8000
@@ -909,7 +900,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --max-total-tokens 16384 \
   --chunked-prefill-size 8192 \
   --prefill-graph-max-tokens 8192 \
-  --gpu-memory-utilization 0.9 \
   --disable-kvstore \
   --speculative-algorithm MTP \
   --speculative-num-steps 3 \
@@ -982,7 +972,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --chunked-prefill-size 8192 \
   --enable-mixed-batch \
   --enable-prefix-caching \
-  --gpu-memory-utilization 0.90 \
   --disable-kvstore \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
   --speculative-eagle-topk 1 \
@@ -1161,6 +1150,47 @@ the GB300 task selects `mlx5_0,mlx5_1,mlx5_2,mlx5_3` to keep transfers on the
 InfiniBand fabric. Automatic discovery also includes Ethernet RNICs, which can
 cause incompatible RoCE/InfiniBand endpoint pairings during the RDMA handshake.
 Without `PD_SLURM=1`, the same launcher retains the single-node smoke topology.
+
+## Nemotron-3 Super
+
+`nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` is a Nemotron-H hybrid. Its
+88 blocks are 40 Mamba2 layers, 40 latent MoE layers and 8 grouped-query
+attention layers without positional encoding. Only the Mamba2 and attention
+blocks own cache state, so the cache plans 48 layers. The routed experts use
+squared ReLU with NVFP4 weights on the FlashInfer TRT-LLM MoE, routed inside
+the kernel. Some dense projections are FP8 and the rest are BF16, as the
+checkpoint's per-layer ModelOpt config says.
+
+The checkpoint's KV cache scheme is FP8 with unit scales, which TokenSpeed does
+not detect automatically, so pass `--kv-cache-dtype fp8`. The Mamba2 SSM state
+is FP32.
+
+```bash
+tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --max-model-len 16384 \
+  --world-size 1 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+The checkpoint's multi-token prediction head serves as the draft model for
+speculative decoding. ReplaySSM is on by default: verification leaves the
+committed Mamba2 state untouched and one kernel then rebuilds every layer's
+accepted state, instead of storing a state per draft token
+(`--disable-replay-ssm` stores them).
+
+```bash
+tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --max-model-len 16384 \
+  --world-size 1 \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 3 \
+  --speculative-num-draft-tokens 4
+```
 
 ## Tuning Order
 

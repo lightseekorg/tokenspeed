@@ -329,8 +329,8 @@
         "seed": 2403
       },
       "policy": {
-        "max_regression_relative": 0.15,
-        "max_regression_absolute_us": 1.5,
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 1.0,
         "max_relative_mad": 0.05
       }
     },

@@ -26,12 +26,30 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.configs.numerics import require_verified_numerics
+from tokenspeed.runtime.execution.model_update import (
+    ModelUpdateAdapter,
+    model_update_adapter_for,
+)
 from tokenspeed.runtime.execution.multimodal_runtime import MultimodalRuntime
 from tokenspeed.runtime.execution.weight_loader import WeightLoader
+from tokenspeed.runtime.execution.weight_update_group import (
+    _assert_not_split,
+    _no_default_group_split,
+)
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.model_loader.weight_utils import (
     non_unit_kv_scale_message,
     record_non_unit_kv_scales,
+)
+from tokenspeed.runtime.models.base.weight_update import weight_update_session
+from tokenspeed.runtime.moe.expert_location import (
+    build_expert_placement,
+    get_global_expert_location_metadata,
+    set_global_expert_location_metadata,
+)
+from tokenspeed.runtime.moe.expert_location_updater import (
+    ExpertLocationUpdater,
+    build_expert_location_updater,
 )
 from tokenspeed.runtime.multimodal.embedder import warmup_multimodal_encoders
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -84,9 +102,23 @@ class ModelRunner:
         server_args: ServerArgs,
         gpu_id: int,
         global_rank: int,
+        *,
+        checkpoint_load_group: tuple[int, ...] | None,
         is_draft_worker: bool = False,
     ):
-        """Initialize ModelRunner with injected dependencies."""
+        """Initialize ModelRunner with injected dependencies.
+
+        Args:
+            model_config: The model to build and load.
+            server_args: Parsed server arguments.
+            gpu_id: Local device index.
+            global_rank: This worker's global rank.
+            checkpoint_load_group: Global ranks that load this model together,
+                for a distributed loader's collectives; None means every rank.
+                A pipeline stage's draft names its stage, since the other
+                stages may not build it (``create_model_runner``).
+            is_draft_worker: Whether this is the speculative draft model.
+        """
         # Store configuration
         self.model_config = model_config
         self.server_args = server_args
@@ -97,8 +129,18 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_draft_worker = is_draft_worker
+        self.checkpoint_load_group = checkpoint_load_group
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
+        # Model Updater SDK client for /update_weights_from_mooncake; None
+        # without --model-update-config and on the draft runner. Holds only
+        # the arguments until the first update imports the SDK (on the
+        # forward thread).
+        self.model_update: ModelUpdateAdapter | None = model_update_adapter_for(
+            server_args, global_rank=global_rank, is_draft_worker=is_draft_worker
+        )
+        # Set by load_model from the model's forward signature.
+        self._model_forward_accepts_spec_step_idx: bool = False
         self.mambaish_config = getattr(model_config, "mambaish_config", None)
         self.is_hybrid_gdn = getattr(model_config, "is_hybrid_gdn", False)
         # Target and draft alike: the envelope covers every model that serves.
@@ -107,6 +149,7 @@ class ModelRunner:
             model_profile=model_config.model_profile,
             architecture=resolve_architecture(model_config.hf_config),
             quantization=model_config.quantization,
+            vocab_size=model_config.vocab_size,
         )
 
         draft_moe_override = (
@@ -137,7 +180,30 @@ class ModelRunner:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
-        self.load_model()
+        # The target's expert placement (redundant replicas, load counters) is
+        # process-global so its model picks it up while it is built and loaded.
+        # A draft routes its own experts trivially: the target's placement is
+        # hidden while the draft is built, then restored for serving.
+        # Online rebalancing (--enable-eplb) moves the target's expert weights
+        # between slots: its staging buffer and P2P channels are reserved here,
+        # after the load and before the cache profile sizes the KV arena.
+        self.expert_location_updater: ExpertLocationUpdater | None = None
+        if self.is_draft_worker:
+            target_placement = get_global_expert_location_metadata()
+            set_global_expert_location_metadata(None)
+            try:
+                self.load_model()
+            finally:
+                set_global_expert_location_metadata(target_placement)
+        else:
+            set_global_expert_location_metadata(
+                build_expert_placement(server_args, model_config)
+            )
+            self.load_model()
+            if server_args.enable_eplb:
+                self.expert_location_updater = build_expert_location_updater(
+                    self.model, model_config, server_args
+                )
         if draft_moe_override:
             server_args.moe_backend = saved_moe_backend
             global_server_args_dict_update(server_args)
@@ -150,10 +216,22 @@ class ModelRunner:
             device=self.device,
             gpu_id=self.gpu_id,
             memory_saver_adapter=self.memory_saver_adapter,
+            checkpoint_load_group=self.checkpoint_load_group,
         )
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
             self.model, "spec_step_idx"
         )
+
+    @property
+    def forward_accepts_spec_step_idx(self) -> bool:
+        """Whether the model's ``forward`` declares ``spec_step_idx``.
+
+        :meth:`forward` passes ``spec_step_idx`` through only when this holds
+        (``**kwargs`` alone does not count); a drafter that selects depth by
+        step must check it at construction rather than discover at serve time
+        that every step ran depth 0.
+        """
+        return self._model_forward_accepts_spec_step_idx
 
     @property
     def multimodal_encoder_dtype(self) -> str | None:
@@ -186,7 +264,23 @@ class ModelRunner:
         )
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
-        """Allocate model communication buffers before cache planning."""
+        """Allocate model communication buffers before cache planning.
+
+        The expert load counters' live-row mask is reserved here too: it is
+        sized by the largest MoE input a forward can carry (the MoE TP-EP
+        group's all-gather of ``max_num_tokens`` rows per rank), must exist
+        before the first forward (captured graphs hold its address) and is
+        accounted for by the cache profile like the communication buffers.
+        """
+        placement = get_global_expert_location_metadata()
+        if (
+            not self.is_draft_worker
+            and placement is not None
+            and placement.load_rows is not None
+        ):
+            placement.reserve_load_rows(
+                self.server_args.mapping.moe.tp_ep_size * max_num_tokens
+            )
         prepare = getattr(self.model, "prepare_communication_runtime", None)
         if prepare is None:
             return False
@@ -224,9 +318,7 @@ class ModelRunner:
             kwargs["input_embeds"] = input_embeds
         if multimodal_context is not None:
             kwargs["multimodal_context"] = multimodal_context
-        if spec_step_idx is not None and getattr(
-            self, "_model_forward_accepts_spec_step_idx", False
-        ):
+        if spec_step_idx is not None and self.forward_accepts_spec_step_idx:
             kwargs["spec_step_idx"] = spec_step_idx
         if kv_sync_event is not None:
             kwargs["kv_sync_event"] = kv_sync_event
@@ -260,7 +352,10 @@ class ModelRunner:
         differently and never forms a joint communicator with a torch group, so
         the broadcast would deadlock. Build a standalone, non-default group (via
         the same private helper torch's own ``init_process_group`` uses) so it
-        never collides with the engine's own world.
+        never collides with the engine's own world. Because that world group is
+        created with a bound device, we also have to guard the new group
+        against torch silently splitting it off the engine's own communicator
+        instead of rendezvousing with the trainer.
         """
         from packaging.version import parse as _parse_version
         from torch.distributed.distributed_c10d import (
@@ -292,17 +387,23 @@ class ModelRunner:
                 if _parse_version(torch.__version__) >= _parse_version("2.6")
                 else "pg_options"
             )
-            pg, _ = _new_process_group_helper(
-                world_size,
-                rank,
-                [],
-                backend,
-                store,
-                group_name=group_name,
-                **{opt: None},
-                timeout=timeout,
-            )
+            with _no_default_group_split():
+                pg, _ = _new_process_group_helper(
+                    world_size,
+                    rank,
+                    [],
+                    backend,
+                    store,
+                    group_name=group_name,
+                    **{opt: None},
+                    timeout=timeout,
+                )
             _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+            try:
+                _assert_not_split(pg, device)
+            except RuntimeError:
+                torch.distributed.destroy_process_group(pg)
+                raise
 
             self._weight_update_pg = pg
             self._weight_update_device = device
@@ -340,9 +441,13 @@ class ModelRunner:
                     dist.broadcast(buf, src=0, group=pg)
                     yield name, buf
 
-            # The update loads to completion so the model stays consistent, then fails on a scale.
+            # The update loads to completion so the model stays consistent,
+            # then fails on a scale. A BaseCausalLM session screens the stream
+            # itself and raises at its end; this wrap covers the models that
+            # take no session (multimodal wrappers).
             rejected: list[str] = []
-            self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
+            with weight_update_session([self.model]):
+                self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
             torch.cuda.synchronize(device)
             if rejected:
                 return False, (
@@ -354,6 +459,41 @@ class ModelRunner:
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_distributed failed")
             return False, str(e)
+
+    def update_weights_from_mooncake(
+        self, version: int, models: list[torch.nn.Module]
+    ) -> tuple[bool, str]:
+        """Read one committed weight-store version into ``models`` in place.
+
+        Runs on the forward thread. The SDK streams partial ``load_weights``
+        calls, so the models are bracketed in a weight-update session; the
+        SDK's device staging buffers are released afterwards -- also when the
+        read failed partway -- because PyTorch would otherwise keep the blocks
+        cached against the KV arena.
+
+        Args:
+            version: The committed version to load.
+            models: Target first, then the draft when the server's
+                ``--model-update-draft-weights`` is ``refresh``.
+
+        Returns:
+            ``(ok, message)`` for the control plane.
+        """
+        if self.model_update is None:
+            return False, (
+                "update_weights_from_mooncake requires the server to start with "
+                "--model-update-config (target runner only)"
+            )
+        try:
+            with weight_update_session(models):
+                result = self.model_update.update(models, version)
+            torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
+            return True, f"applied model version {version}: {result}"
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("update_weights_from_mooncake failed")
+            return False, str(e)
+        finally:
+            torch.cuda.empty_cache()
 
     def destroy_weights_update_group(self, obj) -> tuple[bool, str]:
         """Tear down the trainer weight-update NCCL group joined in ``init``.

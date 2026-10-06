@@ -29,6 +29,7 @@ from math import prod
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.numerics.reference.gemm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: F401
+import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401

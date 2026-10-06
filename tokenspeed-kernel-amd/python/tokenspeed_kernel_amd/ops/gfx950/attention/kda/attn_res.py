@@ -31,27 +31,25 @@ _LOAD_ELEMS = gl.constexpr(2)
 
 
 @gluon.jit
-def _load_candidate(
-    prefix,
-    block_residual,
-    token,
-    hidden,
-    hidden_mask,
-    stride_block_t: gl.constexpr,
-    stride_block_n: tl.int64,
-    candidate: gl.constexpr,
-    N: gl.constexpr,
+def _attn_res_accumulate(
+    value,
+    scorer,
+    max_logit,
+    denominator,
+    mixed,
+    H: gl.constexpr,
+    SCORE_EPS: gl.constexpr,
 ):
-    if candidate == N - 1:
-        return prefix
-    # The stride fits int32, but candidate * stride can exceed it at large T.
-    ptr = block_residual + candidate * stride_block_n.to(gl.int64)
-    return cdna4.buffer_load(
-        ptr,
-        (token * stride_block_t + hidden).to(gl.int32),
-        mask=hidden_mask,
-        other=0.0,
-    ).to(gl.float32)
+    """Fold one candidate into the online softmax over candidate scores."""
+    square_sum = gl.sum(value * value, axis=0)
+    dot = gl.sum(value * scorer, axis=0)
+    score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
+    next_max = gl.maximum(max_logit, score)
+    old_scale = gl.exp(max_logit - next_max)
+    candidate_scale = gl.exp(score - next_max)
+    denominator = denominator * old_scale + candidate_scale
+    mixed = mixed * old_scale + candidate_scale * value
+    return next_max, denominator, mixed
 
 
 @gluon.jit
@@ -85,27 +83,22 @@ def _attn_res_mix_gfx950(
         max_logit = -float("inf")
         denominator = 0.0
         mixed = gl.full(prefix.shape, 0.0, gl.float32, prefix.type.layout)
-        for candidate in gl.static_range(N):
-            value = _load_candidate(
-                prefix,
-                block_residual,
-                token,
-                hidden,
-                hidden_mask,
-                stride_block_t,
-                stride_block_n,
-                candidate,
-                N,
+        # A runtime loop keeps one block snapshot live at a time; unrolling
+        # lets the compiler hoist every snapshot load and halves occupancy.
+        for candidate in range(N - 1):
+            # The stride fits int32, but candidate * stride can exceed it at large T.
+            value = cdna4.buffer_load(
+                block_residual + candidate * stride_block_n.to(gl.int64),
+                (token * stride_block_t + hidden).to(gl.int32),
+                mask=hidden_mask,
+                other=0.0,
+            ).to(gl.float32)
+            max_logit, denominator, mixed = _attn_res_accumulate(
+                value, scorer, max_logit, denominator, mixed, H, SCORE_EPS
             )
-            square_sum = gl.sum(value * value, axis=0)
-            dot = gl.sum(value * scorer, axis=0)
-            score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
-            next_max = gl.maximum(max_logit, score)
-            old_scale = gl.exp(max_logit - next_max)
-            candidate_scale = gl.exp(score - next_max)
-            denominator = denominator * old_scale + candidate_scale
-            mixed = mixed * old_scale + candidate_scale * value
-            max_logit = next_max
+        max_logit, denominator, mixed = _attn_res_accumulate(
+            prefix, scorer, max_logit, denominator, mixed, H, SCORE_EPS
+        )
         mixed /= denominator
     mixed = mixed.to(gl.bfloat16).to(gl.float32)
     inverse_rms = gl.rsqrt(gl.sum(mixed * mixed, axis=0) / H + OUTPUT_EPS)

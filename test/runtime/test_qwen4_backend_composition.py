@@ -49,7 +49,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.registry import (
     _compose_qwen4_exp_backend,
-    _prepare_verify_workspace,
+    _prepare_fixed_workspaces,
 )
 
 
@@ -65,6 +65,7 @@ def _config(*, is_draft: bool, width: int):
         speculative_num_draft_tokens=width,
         context_len=512,
         max_bs=4,
+        qcp_size=1,
     )
 
 
@@ -172,7 +173,7 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
     )
     target_verify = width > 1 and not is_draft
     expected_bytes = (3 * has_gdn + 5 * has_ple + 7 * has_qsa) if target_verify else 0
-    _prepare_verify_workspace(**kwargs, expected_bytes=expected_bytes)
+    _prepare_fixed_workspaces(**kwargs, expected_bytes=expected_bytes)
     assert calls == (
         ([("gdn", 2, width)] if has_gdn else [])
         + ([("ple", 2, width)] if has_ple else [])
@@ -181,7 +182,7 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
         else []
     )
     with pytest.raises(RuntimeError, match="does not match allocated tensors"):
-        _prepare_verify_workspace(**kwargs, expected_bytes=expected_bytes + 1)
+        _prepare_fixed_workspaces(**kwargs, expected_bytes=expected_bytes + 1)
 
 
 @pytest.mark.parametrize("is_qwen4", [False, True])
@@ -239,8 +240,10 @@ def test_hybrid_factory_selects_gdn_only_for_local_state(
         factory.assert_called_once_with(config, components[SoftmaxAttnConfig])
         gdn.set_kv_pool.assert_not_called()
         accepted = torch.tensor([1, 3], dtype=torch.int32)
-        backend.commit_speculative_state_after_verify(accepted, num_extends=0)
-        gdn.commit_verified_state.assert_called_once_with(accepted)
+        backend.commit_speculative_state_after_verify(
+            accepted, num_extends=0, accepted_path=None
+        )
+        gdn.commit_verified_state.assert_called_once_with(accepted, accepted_path=None)
     else:
         factory.assert_not_called()
         assert attention is full
@@ -269,8 +272,11 @@ def attention_root(request):
 def test_draft_hooks_and_sparse_share_reach_the_full_router(attention_root):
     root, router = attention_root
     seq_lens = torch.zeros(2, dtype=torch.int32)
+    # The router hands each hook to the leaf's hook of the same name (a leaf
+    # with per-row metadata re-expands its k-row shape in update_...).
     leaf = SimpleNamespace(
         advance_draft_forward_metadata=Mock(wraps=seq_lens.copy_),
+        update_draft_forward_metadata=Mock(wraps=seq_lens.copy_),
         fill_block_decode_seq_lens=lambda bs, out: out[:bs].copy_(seq_lens[:bs]),
     )
     router.leaves = {FULL_ATTENTION: leaf}
@@ -288,7 +294,8 @@ def test_draft_hooks_and_sparse_share_reach_the_full_router(attention_root):
     lengths = torch.full((3,), -1, dtype=torch.int32)
     root.fill_block_decode_seq_lens(2, lengths)
     assert lengths.tolist() == [5, 9, -1]
-    assert leaf.advance_draft_forward_metadata.call_count == 2
+    leaf.advance_draft_forward_metadata.assert_called_once_with(advance)
+    leaf.update_draft_forward_metadata.assert_called_once_with(frontier)
     indexer.advance_draft_forward_metadata.assert_called_once_with(advance)
     indexer.update_draft_forward_metadata.assert_called_once_with(frontier)
     indexer.fill_block_decode_seq_lens.assert_called_once_with(2, lengths)

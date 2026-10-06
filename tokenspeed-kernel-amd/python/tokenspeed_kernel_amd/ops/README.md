@@ -60,13 +60,22 @@ decode batches.
   `[M, K]` and `[N, K]`, producing BF16 output.
 - Padded row strides and caller-owned outputs are supported when their inner
   stride is one. Quantization scales and block sizes are not supported.
-- Automatic selection uses the prefill kernel when `2816 <= M <= 4096`, `M` is
-  divisible by 256, and `(N, K) = (3072, 512)`.
+- The prefill kernel takes any `M` and `N`; `K` must be a multiple of 128 and
+  at least 256.
+- Automatic selection uses the prefill kernel for the Kimi K3 projection shapes
+  in `_PREFILL_SHAPES` when its workgroups, one 256x256 output block per CU,
+  keep most CUs busy. Long reductions past two rounds of workgroups also need
+  nearly every CU busy.
 - The decode kernel takes contiguous inputs with `2 <= M <= 64` and writes BF16
   or FP32 (the MoE router). It runs only `(N, K)` and M buckets
   (`4, 8, 16, 32, 64`) with a measured config in `_DECODE_CONFIGS`; each
   entry beat `torch.mm` (hipBLASLt) by at least 4% in cold-cache sweeps at
   Kimi K3 TP8 shapes.
+- `launch_gluon_mm_a16w16_decode_add3_gfx950` computes `A @ B.T + X + Y` in
+  one launch, adding both BF16 addends to the FP32 accumulator before the
+  single rounding. It reuses the decode tile for `M` and accepts only buckets
+  without split-K (Kimi K3 latent up-projection, `2 <= M <= 32`), replacing a
+  separate add kernel.
 - Other shapes retain the default PyTorch path. The small- and medium-M
   kernels remain available for direct use but are not registered for
   automatic selection.
@@ -80,8 +89,9 @@ divide both the global-to-LDS loads and the output quadrants.
 Vectorized asynchronous copies stage A and B into padded, double-buffered LDS.
 MFMA work on one buffer overlaps loading the next K tile into the other buffer.
 The epilogue converts each accumulator quadrant to BF16 and stores it with
-vectorized buffer operations. XCD-aware grouped tile ordering distributes
-adjacent output tiles across the eight XCDs.
+vectorized buffer operations. Partial tiles clamp out-of-range rows and
+columns onto the last valid one and mask them out of the stores. XCD-aware
+grouped tile ordering distributes adjacent output tiles across the eight XCDs.
 
 Decode GEMMs are weight-bandwidth bound, so the decode kernel uses 16- or
 32-row tiles over one- to three-buffer LDS pipelines and splits K when the

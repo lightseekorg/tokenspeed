@@ -934,6 +934,9 @@ def _prepare_dsa_attention(
         "page_size": config.kv_page_size,
         "kv_seq_lens": causal_lens,
         "out": out,
+        # The benchmark times the tuned cores, which reduce the slots as
+        # selected.
+        "slot_order": "selection",
     }
     if prefill:
 

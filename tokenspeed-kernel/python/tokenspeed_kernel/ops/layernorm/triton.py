@@ -1,8 +1,26 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+
+_FP8_E4M3_MAX = tl.constexpr(448.0)
+
+
+@triton.jit
+def _mul_rn_f32(a, b):
+    # One IEEE round-to-nearest FP32 multiply that the compiler can neither
+    # contract into an FMA nor flush to zero.
+    return tl.inline_asm_elementwise(
+        "mul.rn.f32 $0, $1, $2;",
+        "=f,f,f",
+        [a, b],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
 
 
 @triton.jit
@@ -12,28 +30,48 @@ def _rmsnorm_kernel(
     weight_ptr,
     out_ptr,
     residual_out_ptr,
+    x_scale,
+    residual_scale,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     BLOCK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    ROUND_RESIDUAL_SUM_BF16: tl.constexpr,
+    SCALE_INPUTS_BF16: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
     mask = offsets < n_cols
     row_offsets = row * n_cols + offsets
 
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     x = tl.load(x_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
     if HAS_RESIDUAL:
         residual = tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(
             tl.float32
         )
+        if SCALE_INPUTS_BF16:
+            # Each product is rounded to BF16, as an eager BF16 tensor times a
+            # Python float is.
+            x = _mul_rn_f32(x, x_scale).to(tl.bfloat16).to(tl.float32)
+            residual = (
+                _mul_rn_f32(residual, residual_scale).to(tl.bfloat16).to(tl.float32)
+            )
         x += residual
+        if ROUND_RESIDUAL_SUM_BF16:
+            # Round the sum once to BF16, as an eager BF16 add does, so that
+            # the norm reads the stored residual.
+            x = x.to(tl.bfloat16).to(tl.float32)
         tl.store(residual_out_ptr + row_offsets, x, mask=mask)
 
     variance = tl.sum(x * x, axis=0) / n_cols
     x *= tl.rsqrt(variance + eps)
     weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     tl.store(out_ptr + row_offsets, x * weight, mask=mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -158,7 +196,57 @@ def rmsnorm(
     eps: float,
     residual: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    *,
+    enable_pdl: bool | None = False,
+    round_residual_sum_bf16: bool = False,
+    x_scale: float | None = None,
+    residual_scale: float | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Apply RMSNorm over the last dimension with FP32 intermediates.
+
+    Args:
+        x: Input shaped ``[..., hidden_size]``.
+        weight: ``[hidden_size]`` affine weight.
+        eps: Epsilon added to the mean of squares.
+        residual: Optional ``x``-shaped tensor added to ``x`` before the norm.
+        out: Optional contiguous output.
+        enable_pdl: Launch with programmatic dependent launch (NVIDIA Hopper
+            or newer): the kernel waits for the previous kernel before it
+            reads its inputs and releases dependent kernels after its last
+            store. None follows ``pdl_enabled()``.
+        round_residual_sum_bf16: Round the FP32 sum ``x + residual`` to BF16
+            before it is stored and normalized, so that the call equals an
+            eager BF16 ``x + residual`` followed by ``rmsnorm`` of the sum.
+            Needs BF16 ``x`` and ``residual``. By default the norm reads the
+            unrounded FP32 sum.
+        x_scale, residual_scale: Optional finite float multipliers of ``x``
+            and ``residual``; a missing one is 1.0. Each product is rounded to
+            BF16 before the add, as an eager BF16 tensor times a Python float
+            is. They are runtime arguments, so new values do not recompile.
+            Need ``round_residual_sum_bf16=True`` and an NVIDIA GPU.
+
+    Returns:
+        ``out``, or ``(out, residual_sum)`` when ``residual`` is given.
+    """
+    if round_residual_sum_bf16 and (
+        residual is None
+        or x.dtype != torch.bfloat16
+        or residual.dtype != torch.bfloat16
+    ):
+        raise ValueError("round_residual_sum_bf16 needs BF16 x and residual")
+    scale_inputs = x_scale is not None or residual_scale is not None
+    x_scale = 1.0 if x_scale is None else x_scale
+    residual_scale = 1.0 if residual_scale is None else residual_scale
+    if scale_inputs:
+        if not round_residual_sum_bf16:
+            raise ValueError(
+                "x_scale and residual_scale need round_residual_sum_bf16=True"
+            )
+        if not current_platform().is_nvidia:
+            raise ValueError("x_scale and residual_scale need an NVIDIA GPU")
+        for name, value in (("x_scale", x_scale), ("residual_scale", residual_scale)):
+            if not isinstance(value, float) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite float, got {value!r}")
     if x.shape[0] == 0:
         if residual is None:
             return x if out is None else out
@@ -188,16 +276,26 @@ def rmsnorm(
 
     residual_out = torch.empty_like(x) if residual is not None else None
     block = triton.next_power_of_2(hidden_size)
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
+    launch_kwargs = (
+        {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
+    )
     _rmsnorm_kernel[(x_2d.shape[0],)](
         x_2d,
         residual,
         weight,
         out_2d,
         residual_out,
+        x_scale,
+        residual_scale,
         hidden_size,
         eps,
         BLOCK=block,
         HAS_RESIDUAL=residual is not None,
+        ROUND_RESIDUAL_SUM_BF16=round_residual_sum_bf16,
+        SCALE_INPUTS_BF16=scale_inputs,
+        ENABLE_PDL=enable_pdl,
+        **launch_kwargs,
     )
     if residual is None:
         return out
@@ -725,7 +823,124 @@ def rmsnorm_fused_parallel(
     )
 
 
+@triton.jit
+def _add_rmsnorm_kernel(
+    x_ptr,
+    x2_ptr,
+    residual_ptr,
+    weight_ptr,
+    out_ptr,
+    out_fp8_ptr,
+    fp8_scale_ptr,
+    stride_x,
+    stride_x2,
+    stride_residual,
+    stride_out,
+    stride_out_fp8,
+    n_cols,
+    eps,
+    BLOCK: tl.constexpr,
+    HAS_X2: tl.constexpr,
+    HAS_FP8: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    # Weights and the quant scale are model constants, loaded before the wait.
+    weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    if HAS_FP8:
+        inv_scale = 1.0 / tl.load(fp8_scale_ptr).to(tl.float32)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    addend = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0)
+    if HAS_X2:
+        # Sum the two addends in their own dtype, as an all-reduce input would be.
+        addend += tl.load(x2_ptr + row * stride_x2 + cols, mask=mask, other=0.0)
+    total = addend.to(tl.float32) + tl.load(
+        residual_ptr + row * stride_residual + cols, mask=mask, other=0.0
+    ).to(tl.float32)
+    tl.store(
+        residual_ptr + row * stride_residual + cols,
+        total.to(residual_ptr.dtype.element_ty),
+        mask=mask,
+    )
+    variance = tl.sum(total * total, axis=0) / n_cols
+    normed = (total * tl.rsqrt(variance + eps) * weight).to(out_ptr.dtype.element_ty)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    tl.store(out_ptr + row * stride_out + cols, normed, mask=mask)
+    if HAS_FP8:
+        quant = tl.clamp(
+            normed.to(tl.float32) * inv_scale, -_FP8_E4M3_MAX, _FP8_E4M3_MAX
+        )
+        tl.store(
+            out_fp8_ptr + row * stride_out_fp8 + cols,
+            quant.to(out_fp8_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
+def add_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    x2: torch.Tensor | None,
+    out: torch.Tensor,
+    out_fp8: torch.Tensor | None,
+    fp8_scale: torch.Tensor | None,
+) -> None:
+    """``residual += x (+ x2)``, then RMSNorm, optionally also into static FP8.
+
+    Args:
+        x: ``[M, N]`` addend, rows may be strided but columns dense.
+        residual: ``[M, N]`` residual stream, updated in place.
+        weight: ``[N]`` norm weight.
+        eps: Norm epsilon.
+        x2: Optional second ``[M, N]`` addend, summed with ``x`` in their own dtype.
+        out: ``[M, N]`` normalized output; may alias ``x``.
+        out_fp8: Optional ``[M, N]`` FP8 output quantized with ``fp8_scale``.
+        fp8_scale: One-element FP32 dequant scale, given exactly with
+            ``out_fp8``.
+    """
+    if (out_fp8 is None) != (fp8_scale is None):
+        raise ValueError("out_fp8 and fp8_scale are given together")
+    tensors = [t for t in (x, x2, residual, out, out_fp8) if t is not None]
+    if any(t.dim() != 2 or t.shape != x.shape or t.stride(1) != 1 for t in tensors):
+        raise ValueError("add_rmsnorm operands must be [M, N] with dense columns")
+    rows, cols = x.shape
+    if rows == 0:
+        return
+    block = triton.next_power_of_2(cols)
+    enable_pdl = pdl_enabled()
+    _add_rmsnorm_kernel[(rows,)](
+        x,
+        x if x2 is None else x2,
+        residual,
+        weight,
+        out,
+        x if out_fp8 is None else out_fp8,
+        weight if fp8_scale is None else fp8_scale,
+        x.stride(0),
+        0 if x2 is None else x2.stride(0),
+        residual.stride(0),
+        out.stride(0),
+        0 if out_fp8 is None else out_fp8.stride(0),
+        cols,
+        eps,
+        BLOCK=block,
+        HAS_X2=x2 is not None,
+        HAS_FP8=out_fp8 is not None,
+        ENABLE_PDL=enable_pdl,
+        num_warps=min(max(block // 256, 1), 8),
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+
+
 __all__ = [
+    "add_rmsnorm",
     "grouped_gemma_rmsnorm",
     "rmsnorm",
     "qk_rmsnorm",

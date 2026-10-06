@@ -754,6 +754,7 @@ def test_latent_prologue_hands_attention_the_cache_dtype(hybrid, dtype):
         ),
         slots=torch.arange(3, device="cuda"),
         expanded=None,
+        key_rows=None,
     )
     assert out.query.dtype == dtype
 

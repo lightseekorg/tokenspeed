@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_top_k_top_p_from_pools,
     gumbel_sample_top_k_top_p_qrita_from_pools,
     gumbel_sample_top_p_parallel_from_pools,
+    gumbel_scratch_shape,
 )
 
 # Sentinel matching tokenspeed.runtime.sampling.sampling_params._TOP_K_DISABLED.
@@ -43,11 +44,20 @@ _TOP_K_DISABLED = 1 << 30
 
 
 def _gumbel_scratch(rows: int, vocab_size: int, device: str):
-    num_blocks = (vocab_size + 1023) // 1024
-    local_ids = torch.empty((rows, num_blocks), dtype=torch.int32, device=device)
-    local_scores = torch.empty((rows, num_blocks), dtype=torch.float32, device=device)
+    shape = gumbel_scratch_shape(rows, vocab_size)
+    local_ids = torch.empty(shape, dtype=torch.int32, device=device)
+    local_scores = torch.empty(shape, dtype=torch.float32, device=device)
     out = torch.empty((rows,), dtype=torch.int32, device=device)
     return local_ids, local_scores, out
+
+
+def test_gumbel_scratch_shape_covers_the_kernel_blocks() -> None:
+    # One (id, score) per 1024-token block, rounded up for the ragged tail.
+    assert gumbel_scratch_shape(4, 1024) == (4, 1)
+    assert gumbel_scratch_shape(4, 1025) == (4, 2)
+    assert gumbel_scratch_shape(0, 129280) == (0, 127)
+    with pytest.raises(ValueError, match="vocab_size > 0"):
+        gumbel_scratch_shape(4, 0)
 
 
 def _top_k_top_p_gumbel_scratch(rows: int, vocab_size: int, device: str):

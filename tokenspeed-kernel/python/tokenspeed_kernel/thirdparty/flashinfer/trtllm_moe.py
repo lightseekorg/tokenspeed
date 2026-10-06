@@ -23,8 +23,9 @@
 Keep the upstream routing, tuner and GEMM implementations. The native routing
 workspace allocation gains a stream-ordered initialization, recorded during
 capture and executed on every replay. One Qwen3.8 decode shape narrows the
-valid MoE tactics to tile 32. The installed package, upstream Python globals
-and upstream JIT artifacts remain untouched.
+valid MoE tactics to tile 32. A cache-key hook applies that policy to the target
+profile for this private runner only. The installed package and upstream JIT
+artifacts remain untouched.
 """
 
 from __future__ import annotations
@@ -43,6 +44,35 @@ _ROUTE_ALLOCATION = re.compile(
     r"alloc_tensor\(\{max_num_padded_tokens(?:\s*\+\s*1)?\},\s*"
     r"dl_int32,\s*hidden_states\.device\(\)\);"
 )
+_FIRST_NAMESPACE = re.compile(r"(?m)^namespace flashinfer \{$")
+# A kernel keeps the routing chain programmatic; a memset graph node costs ~4 us.
+_FILL_ROUTE_MAP = """
+__global__ void tokenspeed_fill_route_map(int32_t* map, int64_t n) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+  int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += stride) {
+    map[i] = -1;
+  }
+}
+
+static void tokenspeed_launch_fill_route_map(int32_t* map, int64_t n, cudaStream_t stream) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(static_cast<unsigned>(std::min<int64_t>((n + 255) / 256, 1024)));
+  config.blockDim = dim3(256);
+  config.stream = stream;
+  cudaLaunchAttribute attribute{};
+  attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attribute.val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = &attribute;
+  config.numAttrs = 1;
+  CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, tokenspeed_fill_route_map, map, n));
+}
+
+"""
 
 
 def _initialize_routing_map(source: str) -> str:
@@ -53,17 +83,28 @@ def _initialize_routing_map(source: str) -> str:
             "one permuted_idx_to_token_idx allocation; review the native adapter."
         )
     match = matches[0]
+    namespace = _FIRST_NAMESPACE.search(source, 0, match.start())
+    if namespace is None:
+        raise RuntimeError(
+            "Unsupported FlashInfer TRT-LLM launcher: no flashinfer namespace "
+            "before the routing workspace; review the native adapter."
+        )
     indent = match["indent"]
     lines = (
         "// Initialize tile padding and any guard entry before routing writes live rows.",
         "// Graph-pool reuse can overwrite this storage: initialization must replay.",
-        "CHECK_CUDA_ERROR(cudaMemsetAsync(",
-        "    permuted_idx_to_token_idx.data_ptr(), 0xff,",
-        "    static_cast<size_t>(permuted_idx_to_token_idx.numel()) * sizeof(int32_t),",
-        "    get_stream(hidden_states.device())));",
+        "tokenspeed_launch_fill_route_map(",
+        "    static_cast<int32_t*>(permuted_idx_to_token_idx.data_ptr()),",
+        "    permuted_idx_to_token_idx.numel(), get_stream(hidden_states.device()));",
     )
     initialization = "\n" + "\n".join(indent + line for line in lines)
-    return source[: match.end()] + initialization + source[match.end() :]
+    return (
+        source[: namespace.start()]
+        + _FILL_ROUTE_MAP
+        + source[namespace.start() : match.end()]
+        + initialization
+        + source[match.end() :]
+    )
 
 
 def _routing_initialized_spec(*args, **kwargs):
@@ -156,6 +197,35 @@ def _require_tactic_hooks(runner_type: type) -> None:
             )
 
 
+def _install_profile_cache_key(tuner_type: type, runner_type: type) -> None:
+    # FlashInfer's extras hook receives caller inputs on lookup and synthesized
+    # inputs on store. Its key builder is the point where both have the target
+    # profile, including bucket mapping for the final serving lookup.
+    original = tuner_type._get_cache_key.__func__
+    if tuple(inspect.signature(original).parameters) != (
+        "cls",
+        "custom_op",
+        "runner",
+        "input_shapes",
+        "tuning_config",
+        "extras",
+    ):
+        raise RuntimeError(
+            "Unsupported FlashInfer cache-key builder; review the profile adapter."
+        )
+
+    @functools.wraps(original)
+    def profile_cache_key(
+        cls, custom_op, runner, input_shapes, tuning_config, extras=()
+    ):
+        key = original(cls, custom_op, runner, input_shapes, tuning_config, extras)
+        if isinstance(runner, runner_type):
+            return runner.cache_key_for_profile(key)
+        return key
+
+    tuner_type._get_cache_key = classmethod(profile_cache_key)
+
+
 def _require_runner_rebinding(namespace: dict) -> None:
     names = (
         "trtllm_fp4_block_scale_moe",
@@ -188,9 +258,9 @@ def _entrypoints():
     class TokenSpeedFP4MoERunner(core.TrtllmMoERunner):
         """Keep low-M MoE tile selection separate from upstream tuning caches."""
 
-        def _matches_qwen38_decode_shape(self, inputs):
+        def _matches_qwen38_decode_shape(self, num_tokens):
             return _is_qwen38_decode_shape(
-                num_tokens=MoeRunnerInputs.from_list(inputs).hidden_states.shape[0],
+                num_tokens=num_tokens,
                 top_k=self.top_k,
                 num_experts=self.num_experts,
                 num_local_experts=self.num_local_experts,
@@ -199,18 +269,21 @@ def _entrypoints():
                 nvfp4=self.dtype_weights == DtypeTrtllmGen.E2m1,
             )
 
-        def get_cache_key_extras(self, inputs):
-            extras = super().get_cache_key_extras(inputs)
-            if self._matches_qwen38_decode_shape(inputs):
-                return (*extras, "tokenspeed-qwen38-tile32-v1")
-            return extras
+        def cache_key_for_profile(self, key):
+            hidden_index = MoeRunnerInputs._FIELDS.index("hidden_states")
+            num_tokens = key.nearest_profile[hidden_index][0]
+            if self._matches_qwen38_decode_shape(num_tokens):
+                return replace(key, extras=(*key.extras, "tokenspeed-qwen38-tile32-v1"))
+            return key
 
         def get_valid_tactics(self, inputs, profile):
             tactics = super().get_valid_tactics(inputs, profile)
-            if self._matches_qwen38_decode_shape(inputs):
+            num_tokens = MoeRunnerInputs.from_list(inputs).hidden_states.shape[0]
+            if self._matches_qwen38_decode_shape(num_tokens):
                 return _prefer_qwen38_decode_tile_32(tactics)
             return tactics
 
+    _install_profile_cache_key(core.AutoTuner, TokenSpeedFP4MoERunner)
     namespace = dict(vars(core))
     namespace["TrtllmMoERunner"] = TokenSpeedFP4MoERunner
     namespace["gen_trtllm_gen_fused_moe_sm100_module"] = _routing_initialized_spec

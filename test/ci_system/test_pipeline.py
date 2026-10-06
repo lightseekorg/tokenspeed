@@ -1168,6 +1168,42 @@ def test_scan_filters_task_yaml_only_changes(
     assert [entry["name"] for entry in matrix["include"]] == expected
 
 
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        ("tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n", ["bench"]),
+        (
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "test/ci/ut.yaml\n",
+            ["bench", "ut"],
+        ),
+        (
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "tokenspeed-kernel/python/tokenspeed_kernel/benchmark/harness.py\n",
+            ["bench", "ut"],
+        ),
+    ],
+)
+def test_scan_runs_only_kernel_benchmarks_for_suite_only_changes(
+    changed, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    _write_task_yaml(root, "ut.yaml", _default_body("ut", ["amd-mi350-1gpu"]))
+    bench = _default_body("bench", ["amd-mi350-1gpu-bench"])
+    bench = bench.replace("type: ut", "type: perf").replace(
+        "workflow_stage: unit-test", "workflow_stage: kernel-benchmark"
+    )
+    _write_task_yaml(root, "bench.yaml", bench + "perf:\n  command: true\n")
+    changed_file = tmp_path / "changed.txt"
+    changed_file.write_text(changed)
+    argv = ["scan", "--repo-root", str(tmp_path), "--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in matrix["include"]] == expected
+
+
 def test_validate_task_accepts_known_priorities(tmp_path):
     for priority in ("low", "normal", "high"):
         body = _default_body("ut-a", ["b300-1gpu"], extra=f"priority: {priority}\n")

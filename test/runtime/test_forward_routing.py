@@ -123,6 +123,7 @@ def _planned(*, num_extends=0):
         multimodal_context="MM",
         ngram_inputs=None,
         request_history_seeds=None,
+        input_logprob_plan=None,
     )
 
 

@@ -127,7 +127,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
     mapping = SimpleNamespace(
         world_size=2,
         rank=1,
-        attn=SimpleNamespace(dp_size=2, dp_rank=1, tp_size=1, cp_size=1),
+        attn=SimpleNamespace(dp_size=2, dp_rank=1, tp_size=1),
         moe=SimpleNamespace(
             ep_size=2,
             ep_rank=1,
