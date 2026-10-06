@@ -24,6 +24,7 @@
 
 import hashlib
 import importlib.util
+import re
 import tomllib
 from pathlib import Path
 
@@ -57,7 +58,10 @@ def test_scheduler_library_is_package_data(schedule):
     assert any(path.match(pattern) for pattern in patterns)
     text = path.read_text()
     assert f"define i32 @{schedule._SCHED_SYMBOL}() alwaysinline" in text
-    assert schedule._SCHED_LIBRARY_NAME in schedule._SCHED_SYMBOL
+    # Triton links the library only for calls whose symbol contains its name.
+    symbols = set(re.findall(r"^define \S+ @(\w+)", text, re.M))
+    hints = symbols - {schedule._READFIRSTLANE_SYMBOL}
+    assert hints and all(schedule._SCHED_LIBRARY_NAME in s for s in hints)
 
 
 def test_normal_compile_options_pin_library_path(schedule):
@@ -92,3 +96,10 @@ def test_compile_options_are_not_shared_mutable_state(schedule):
     assert again["extern_libs"] == {
         schedule._SCHED_LIBRARY_NAME: schedule._SCHED_LIBRARY_PATH
     }
+
+
+def test_sched_group_mask_ors_named_classes(schedule):
+    assert schedule._sched_group_mask("mfma") == 0x8
+    assert schedule._sched_group_mask(("valu", "trans")) == 0x402
+    with pytest.raises(ValueError, match="unknown sched_group class"):
+        schedule._sched_group_mask(("mfma", "lds"))

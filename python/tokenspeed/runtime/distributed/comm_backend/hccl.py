@@ -97,12 +97,23 @@ class HcclBackend(CommBackend):
         return output
 
     def all_to_all_single(
-        self, output: torch.Tensor, input: torch.Tensor, group: Group
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: Group,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
     ) -> None:
         if len(group) == 1:
             output.copy_(input)
             return
-        dist.all_to_all_single(output, input, group=self._process_group(group))
+        dist.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=self._process_group(group),
+        )
 
     def token_all_gather(
         self,

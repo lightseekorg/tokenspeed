@@ -22,6 +22,7 @@
 
 import math
 import os
+import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -38,7 +39,11 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
-from tokenspeed.runtime.execution.types import NGramInputs, RequestHistorySeeds
+from tokenspeed.runtime.execution.types import (
+    InputLogprobPlan,
+    NGramInputs,
+    RequestHistorySeeds,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
@@ -109,51 +114,129 @@ def ngram_inputs_for_forward(
     return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
 
 
-def request_history_seeds_for_forward(
+def input_logprob_plan_for_forward(
     forward_op, rid_to_state: Mapping
-) -> RequestHistorySeeds | None:
-    """Snapshot the committed prefix of every extend that resumes one.
+) -> InputLogprobPlan | None:
+    """Name the prompt rows of this forward whose next-token logprob is wanted.
 
-    An extend with a non-empty prefix resumes tokens its slot's history row
-    may not hold: a prefix-cache hit, a PD landing, a retraction recovery or
-    a chunk after the slot changed hands. Prompt/output lists hold physical
-    IDs. Returns None when no extend in the batch resumes a prefix.
+    An extend row ``i`` feeds prompt positions ``[extend_prefix_lens[i],
+    extend_prefix_lens[i] + input_lengths[i])`` (bounded replay re-feeds the
+    leading rows; they never reach ``logprob_start_len`` because the admission
+    probe is capped there). The request wants position ``p`` when
+    ``logprob_start_len <= p < input_length - 1``: the last prompt position
+    predicts the first generated token, which is the output logprob's job.
+    Positions past the prompt (a retracted request's rebased generation) and
+    requests that already finalized their prompt logprobs contribute nothing.
+    The plan is one triple per extend slot; the targets (each row's next
+    prompt token) are read on the device from the scheduler's shifted input
+    ids, which cover the chunk boundary, so nothing per row crosses here.
 
-    TODO(perf): this also reseeds consecutive chunks of one chunked prefill
-    whose slot never changed hands, moving O(N*k) tokens host->device for an
-    N-token prompt in k chunks. Tracking (request id, held length) per slot —
-    as the bounded n-gram path does — would let the gather skip prefixes the
-    slot demonstrably still holds without weakening the recovery and
-    PD-landing cases.
+    Returns:
+        The plan, or None when no row of the batch needs a prompt logprob.
     """
-    slots: list[int] = []
-    prefix_lengths: list[int] = []
-    tokens: list[tuple[int, ...]] = []
-    for i in range(forward_op.num_extends()):
-        boundary = int(forward_op.extend_prefix_lens[i])
-        if boundary == 0:
-            continue
-        state = rid_to_state[forward_op.request_ids[i]]
-        prompt, output = state.prompt_input_ids, state.output_ids
-        if boundary > len(prompt) + len(output):
-            raise ValueError(
-                f"Request history prefix {boundary} exceeds the physical tokens "
-                f"of {forward_op.request_ids[i]}"
-            )
-        if boundary <= len(prompt):
-            prefix = tuple(prompt[:boundary])
-        else:
-            prefix = tuple(prompt) + tuple(output[: boundary - len(prompt)])
-        slots.append(int(forward_op.request_pool_indices[i]))
-        prefix_lengths.append(boundary)
-        tokens.append(prefix)
-    if not slots:
+    num_extends = forward_op.num_extends()
+    if num_extends <= 0:
         return None
-    return RequestHistorySeeds(
-        slots=tuple(slots),
-        prefix_lengths=tuple(prefix_lengths),
-        tokens=tuple(tokens),
+    row_starts: list[int] = []
+    counts: list[int] = []
+    position_starts: list[int] = []
+    row_offset = 0
+    for i in range(num_extends):
+        state = rid_to_state[forward_op.request_ids[i]]
+        chunk_start = forward_op.extend_prefix_lens[i]
+        chunk_len = forward_op.input_lengths[i]
+        lo = max(chunk_start, state.logprob_start_len)
+        hi = min(chunk_start + chunk_len, state.input_length - 1)
+        if (
+            not state.wants_input_logprobs
+            or state.input_token_logprobs_val is not None
+            or lo >= hi
+        ):
+            row_starts.append(0)
+            counts.append(0)
+            position_starts.append(0)
+        else:
+            row_starts.append(row_offset + lo - chunk_start)
+            counts.append(hi - lo)
+            position_starts.append(lo)
+        row_offset += chunk_len
+    if not any(counts):
+        return None
+    return InputLogprobPlan(
+        row_starts=tuple(row_starts),
+        counts=tuple(counts),
+        position_starts=tuple(position_starts),
     )
+
+
+class RequestHistoryRows:
+    """Which request's committed tokens each executor history row holds.
+
+    Every forward appends its inputs to its slot's row at the committed
+    frontier, so a row holds request ``rid``'s tokens from position 0 once
+    rid has started there at position 0 or been seeded there, until another
+    request runs in the slot. That ownership decides when a forward must
+    seed its committed prefix: a prefix-cache hit, a slot handoff, a
+    retraction recovery into another slot, or a PD decode landing, whose
+    first local forward is a decode over a remotely prefilled prompt. Later
+    chunks of one prefill and ordinary decode steps never reseed.
+
+    Ownership is recorded per admission — the request's state object, held
+    weakly — not per request id: clients may reuse a finished request's id,
+    and a later request landing in the same slot must not inherit the row.
+
+    Call :meth:`seeds_for_forward` exactly once per forward the executor
+    runs, in dispatch order (the executor runs forwards in that order).
+    """
+
+    def __init__(self) -> None:
+        self._owners: dict[int, weakref.ref] = {}
+
+    def seeds_for_forward(
+        self, forward_op, rid_to_state: Mapping
+    ) -> RequestHistorySeeds | None:
+        """Record the batch's slot ownership; snapshot the prefixes it needs.
+
+        Prompt/output lists hold physical IDs. A decode's input is the
+        request's newest token, so its row must already hold every token
+        before it. Returns None when no row in the batch needs a seed.
+        """
+        slots: list[int] = []
+        prefix_lengths: list[int] = []
+        tokens: list[tuple[int, ...]] = []
+        num_extends = forward_op.num_extends()
+        for i, rid in enumerate(forward_op.request_ids):
+            slot = int(forward_op.request_pool_indices[i])
+            state = rid_to_state[rid]
+            owner = self._owners.get(slot)
+            held = owner is not None and owner() is state
+            self._owners[slot] = weakref.ref(state)
+            prompt, output = state.prompt_input_ids, state.output_ids
+            total = len(prompt) + len(output)
+            boundary = (
+                int(forward_op.extend_prefix_lens[i]) if i < num_extends else total - 1
+            )
+            if boundary <= 0 or held:
+                continue
+            if boundary > total:
+                raise ValueError(
+                    f"Request history prefix {boundary} exceeds the physical "
+                    f"tokens of {rid}"
+                )
+            if boundary <= len(prompt):
+                prefix = tuple(prompt[:boundary])
+            else:
+                prefix = tuple(prompt) + tuple(output[: boundary - len(prompt)])
+            slots.append(slot)
+            prefix_lengths.append(boundary)
+            tokens.append(prefix)
+        if not slots:
+            return None
+        return RequestHistorySeeds(
+            slots=tuple(slots),
+            prefix_lengths=tuple(prefix_lengths),
+            tokens=tuple(tokens),
+        )
 
 
 @dataclass(frozen=True)
@@ -230,11 +313,42 @@ def aligned_max_scheduled_tokens(
     return max_scheduled_tokens - max_scheduled_tokens % grain
 
 
-def make_spec(rid: str, tokens: list[int], max_new_tokens: int = 0) -> RequestSpec:
+# "No bound" for RequestSpec.max_cached_prefix_tokens (the C++ default).
+UNBOUNDED_CACHED_PREFIX_TOKENS = 2**31 - 1
+
+# The scheduler's retraction safe-step window (``kRetractionSafeSteps`` in
+# ``tokenspeed-scheduler/csrc/scheduler/operations/forward.cpp``; see
+# ``docs/design/scheduler.md`` section 4): a decoding role prepays this many
+# decode tokens of headroom at admission, so a request declaring
+# ``max_new_tokens`` within it holds its whole generation up front and is never
+# a retraction victim. A decode engine whose attention cannot run a recovery
+# prefill (``--attn-head-tp-size``) admits only such requests.
+RETRACTION_SAFE_STEPS = 4096
+
+
+def make_spec(
+    rid: str,
+    tokens: list[int],
+    *,
+    max_cached_prefix_tokens: int,
+    max_new_tokens: int = 0,
+) -> RequestSpec:
+    """Build the C++ scheduler's admission record for one request.
+
+    Args:
+        rid: Request id.
+        tokens: Prompt token ids.
+        max_cached_prefix_tokens: Longest prompt prefix the admission probe may
+            claim from the prefix cache. ``UNBOUNDED_CACHED_PREFIX_TOKENS``
+            keeps the ordinary rule; a request returning prompt logprobs from
+            position ``s`` passes ``s`` so those positions are recomputed.
+        max_new_tokens: Declared generation budget (0 = undeclared).
+    """
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = tokens
     spec.max_new_tokens = max_new_tokens
+    spec.max_cached_prefix_tokens = max_cached_prefix_tokens
     return spec
 
 

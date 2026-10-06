@@ -66,46 +66,30 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 @pytest.mark.parametrize("forward_name", ["forward_decode", "forward_extend"])
-@pytest.mark.parametrize("save_kv_cache", [False, True])
-def test_qsa_sparse_requires_cache_write(monkeypatch, forward_name, save_kv_cache):
+def test_qsa_sparse_attends_the_prewritten_cache(monkeypatch, forward_name):
     backend = object.__new__(QSAAttnBackend)
     sparse = Mock(return_value=object())
     monkeypatch.setattr(backend, "_sparse_attention", sparse)
-    args = tuple(object() for _ in range(6))
+    q, k, v, layer, locs, pool = (object() for _ in range(6))
     topk, ctx = object(), object()
-    forward = partial(
-        getattr(backend, forward_name),
-        *args,
-        bs=1,
-        save_kv_cache=save_kv_cache,
-        topk_indices=topk,
-        ctx=ctx,
+    output = getattr(backend, forward_name)(
+        q, k, v, layer, locs, pool, bs=1, topk_indices=topk, ctx=ctx
     )
-    if save_kv_cache:
-        assert forward() is sparse.return_value
-        sparse.assert_called_once_with(*args, topk, ctx)
-    else:
-        with pytest.raises(AssertionError, match="QSA.*requires save_kv_cache=True"):
-            forward()
-        sparse.assert_not_called()
+    assert output is sparse.return_value
+    sparse.assert_called_once_with(q, layer, pool, topk, ctx)
 
 
 @pytest.mark.parametrize("forward_name", ["forward_decode", "forward_extend"])
-@pytest.mark.parametrize("save_kv_cache", [False, True])
-def test_qsa_dense_forwards_cache_write_flag(monkeypatch, forward_name, save_kv_cache):
+def test_qsa_dense_falls_through_to_mha(monkeypatch, forward_name):
     backend = object.__new__(QSAAttnBackend)
     dense = Mock(return_value=object())
     monkeypatch.setattr(MHAAttnBackend, forward_name, dense)
     args = tuple(object() for _ in range(6))
     output = getattr(backend, forward_name)(
-        *args,
-        bs=1,
-        save_kv_cache=save_kv_cache,
-        topk_indices=None,
-        ctx=object(),
+        *args, bs=1, topk_indices=None, ctx=object()
     )
     assert output is dense.return_value
-    dense.assert_called_once_with(*args, 1, save_kv_cache=save_kv_cache)
+    dense.assert_called_once_with(*args, 1)
 
 
 def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:
@@ -458,7 +442,9 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
             # Both rounds must commit even without another host-side staging call.
             graph.replay()
         backend.commit_speculative_state_after_verify(
-            torch.tensor(accepted, dtype=torch.int32, device="cuda"), num_extends=0
+            torch.tensor(accepted, dtype=torch.int32, device="cuda"),
+            num_extends=0,
+            accepted_path=None,
         )
         assert state._verify_workspace is workspace
         source_cpu = source.cpu()
@@ -497,7 +483,7 @@ def test_qsa_only_target_verification_creates_state(
     with pytest.raises(RuntimeError, match="speculative target"):
         backend.verify_staging_buffers(1, 2)
     root.commit_speculative_state_after_verify(
-        torch.tensor([3, 1], dtype=torch.int32), num_extends=0
+        torch.tensor([3, 1], dtype=torch.int32), num_extends=0, accepted_path=None
     )
     assert commit_calls == []
 
@@ -624,6 +610,7 @@ def test_qsa_extend_table_bound_includes_prefix_and_mixed_decode(
         extend_replay_lens_cpu=torch.zeros_like(query_lengths),
         extend_prompt_lens_cpu=seq_lens[: len(queries)],
         extend_with_prefix=any(prefixes),
+        query_shard=None,
     )
     metadata = indexer.forward_extend_metadata
     table = indexer._tables.table(QWEN4_EXP_QSA_CACHE_GROUP, bs)
@@ -675,6 +662,7 @@ def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
         extend_prompt_lens_cpu=torch.tensor([5], dtype=torch.int32)
         + torch.tensor([3], dtype=torch.int32),
         extend_with_prefix=True,
+        query_shard=None,
     )
     extend = indexer.forward_extend_metadata
     indexer.refresh_decode_metadata(

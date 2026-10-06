@@ -28,10 +28,6 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.layernorm.triton import (
-    fused_qk_rmsnorm_rope_gate,
-    qk_rmsnorm,
-)
 from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
@@ -87,9 +83,6 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
 )
 from tokenspeed.runtime.models.qwen3_vision import Qwen3VLMoeVisionModel
 from tokenspeed.runtime.models.utils import validate_attention_partition
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -616,8 +609,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=is_moe,
             prev_is_moe=is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(
@@ -763,12 +758,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
 
         # Dense MLP for non-MoE variant
@@ -802,63 +801,34 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
         self.is_moe = is_moe
         self.comm_manager = CommManager(
             mapping=self.mapping,
             layer_id=self.layer_id,
             is_moe=is_moe,
             prev_is_moe=is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # qk_rmsnorm expects GemmaRMSNorm's effective gamma.
-        return qk_rmsnorm(
-            q,
-            k,
-            self.q_norm.gemma_weight,
-            self.k_norm.gemma_weight,
-            self.q_norm.variance_epsilon,
-        )
-
-    def _project_qkv_rope(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+    def _project_qkv(
+        self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """qkv_proj + split + rope (+ optional gate). ``gate`` is ``None`` when ``attn_output_gate=False``."""
+        """qkv_proj split into views; ``gate`` is ``None`` without ``attn_output_gate``."""
         qkv, _ = self.qkv_proj(hidden_states)
-        if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-            )
-            q, k, gate = fused_qk_rmsnorm_rope_gate(
-                q_gate,
-                k,
-                self.q_norm.gemma_weight,
-                self.k_norm.gemma_weight,
-                self.rotary_emb.cos_sin_cache,
-                positions,
-                self.q_norm.variance_epsilon,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.rotary_emb.rotary_dim,
-            )
-            return q, k, v, gate
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        return q, k, v, None
+        if not self.attn_output_gate:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            return q, k, v, None
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        heads = q_gate.view(q_gate.shape[0], self.num_heads, 2, self.head_dim)
+        q, gate = heads.unbind(dim=2)
+        return q, k, v, gate
 
     def _attn(
         self,
+        positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -866,8 +836,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         ctx: ForwardContext,
         **kwargs,
     ) -> torch.Tensor:
-        """Backend attention call + optional gate apply. Subclasses override."""
-        attn_output = self.attn(q, k, v, ctx, **kwargs)
+        """Attention with the optional output gate; draft subclasses override."""
+        attn_output = self.attn(q, k, v, positions, ctx, **kwargs)
         if gate is not None:
             sigmoid_mul(attn_output, gate)
         return attn_output
@@ -879,8 +849,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         ctx: ForwardContext,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
-        attn_output = self._attn(q, k, v, gate, ctx)
+        q, k, v, gate = self._project_qkv(hidden_states)
+        attn_output = self._attn(positions, q, k, v, gate, ctx)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1065,15 +1035,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 aux_hidden_states.append(
                     gathered if gathered is aux else gathered.clone()
                 )
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    ctx=ctx,
-                )
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                ctx=ctx,
+            )
 
             # Process deepstack embeddings if provided
             if (

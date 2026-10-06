@@ -73,11 +73,13 @@ from tokenspeed.runtime.engine.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     OpenSessionReqInput,
+    RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SetInternalStateReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromMooncakeReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -180,6 +182,16 @@ class EngineClient(Protocol):
         obj: UpdateWeightsFromDistributedReqInput,
     ) -> tuple[bool, str]: ...
 
+    async def update_weights_from_mooncake(
+        self,
+        obj: UpdateWeightsFromMooncakeReqInput,
+    ) -> tuple[bool, str]: ...
+
+    async def rebalance_experts(
+        self,
+        obj: RebalanceExpertsReqInput,
+    ) -> tuple[bool, str]: ...
+
     async def update_weights_from_tensor(
         self,
         obj: UpdateWeightsFromTensorReqInput,
@@ -218,12 +230,6 @@ class EngineClient(Protocol):
     ) -> Any: ...
 
     async def stop_profile(self) -> Any: ...
-
-    async def start_expert_distribution_record(self) -> None: ...
-
-    async def stop_expert_distribution_record(self) -> None: ...
-
-    async def dump_expert_distribution_record(self) -> None: ...
 
     # ---- Engine internal state -----------------------------------
 

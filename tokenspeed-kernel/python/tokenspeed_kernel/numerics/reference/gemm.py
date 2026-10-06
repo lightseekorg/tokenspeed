@@ -198,8 +198,8 @@ def torch_mm_fp8_scaled_mnk(
     assert (
         A_scales is not None and B_scales is not None
     ), "A_scales and B_scales are required for fp8 scaled reference"
-    assert A_scales.shape == (1,), "A_scales must have shape (1,)"
-    assert B_scales.shape == (1,), "B_scales must have shape (1,)"
+    assert A_scales.numel() == 1, "A_scales must be a single per-tensor scale"
+    assert B_scales.numel() == 1, "B_scales must be a single per-tensor scale"
 
     assert (
         A.shape[1] == B.shape[1]
@@ -246,8 +246,8 @@ def torch_mm_fp8_scaled_nkm(
     assert (
         A_scales is not None and B_scales is not None
     ), "A_scales and B_scales are required for fp8 scaled reference"
-    assert A_scales.shape == (1,), "A_scales must have shape (1,)"
-    assert B_scales.shape == (1,), "B_scales must have shape (1,)"
+    assert A_scales.numel() == 1, "A_scales must be a single per-tensor scale"
+    assert B_scales.numel() == 1, "B_scales must be a single per-tensor scale"
 
     assert (
         A.shape[1] == B.shape[0]

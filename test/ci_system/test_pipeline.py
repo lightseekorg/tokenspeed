@@ -714,6 +714,63 @@ def test_slurm_runner_override_keeps_task_env_and_uses_gb300_hardware(
     assert captured["env"]["LOGICAL_RUNNER_ENV"] == "preserved"
 
 
+@pytest.mark.parametrize(
+    ("task_type", "inherited", "task_env", "expected"),
+    [
+        ("eval", None, {}, "error"),
+        ("perf", None, {}, "error"),
+        ("server_smoke", None, {}, "error"),
+        ("eval", None, {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("eval", "off", {}, "error"),
+        ("perf", "off", {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("ut", None, {}, None),
+        ("ut", "warn", {}, "warn"),
+    ],
+)
+def test_serving_tasks_arm_the_jit_compile_check(
+    monkeypatch, tmp_path, task_type, inherited, task_env, expected
+):
+    if inherited is None:
+        monkeypatch.delenv("TOKENSPEED_JIT_COMPILE_CHECK", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_JIT_COMPILE_CHECK", inherited)
+    task = {
+        "name": "jit-check",
+        "type": task_type,
+        "runner": {"labels": ["b200-1gpu"]},
+        "env": task_env,
+        "ut": {"commands": ["run test"]},
+    }
+    captured = {}
+
+    class FakeProcessGroupManager:
+        def run(self, command, *, cwd, env, dry_run):
+            return {"returncode": 0, "output": ""}
+
+        def terminate_all(self, *, dry_run):
+            return None
+
+    def capture_setup(runner, env, cwd, dry_run, reuse_state, setup_mode):
+        captured.update(env=env.copy())
+        return env, FakeProcessGroupManager()
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "setup_runner", capture_setup)
+    monkeypatch.setattr(pipeline, "get_stage_commands", lambda task: [])
+
+    pipeline.execute_task(
+        config="task.yaml",
+        runner="b200-1gpu",
+        runner_override=None,
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=None,
+        setup_mode="ci",
+    )
+    assert captured["env"].get("TOKENSPEED_JIT_COMPILE_CHECK") == expected
+
+
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
     monkeypatch.setenv("TOKENSPEED_B200_RUNNER_LABEL", "b200v2")
     task = {
@@ -1106,6 +1163,42 @@ def test_scan_filters_task_yaml_only_changes(
         changed_file = tmp_path / "changed.txt"
         changed_file.write_text(changed)
         argv += ["--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in matrix["include"]] == expected
+
+
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        ("tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n", ["bench"]),
+        (
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "test/ci/ut.yaml\n",
+            ["bench", "ut"],
+        ),
+        (
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "tokenspeed-kernel/python/tokenspeed_kernel/benchmark/harness.py\n",
+            ["bench", "ut"],
+        ),
+    ],
+)
+def test_scan_runs_only_kernel_benchmarks_for_suite_only_changes(
+    changed, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    _write_task_yaml(root, "ut.yaml", _default_body("ut", ["amd-mi350-1gpu"]))
+    bench = _default_body("bench", ["amd-mi350-1gpu-bench"])
+    bench = bench.replace("type: ut", "type: perf").replace(
+        "workflow_stage: unit-test", "workflow_stage: kernel-benchmark"
+    )
+    _write_task_yaml(root, "bench.yaml", bench + "perf:\n  command: true\n")
+    changed_file = tmp_path / "changed.txt"
+    changed_file.write_text(changed)
+    argv = ["scan", "--repo-root", str(tmp_path), "--changed-files", str(changed_file)]
     assert pipeline.main(argv) == 0
     matrix = json.loads(capsys.readouterr().out)
     assert [entry["name"] for entry in matrix["include"]] == expected

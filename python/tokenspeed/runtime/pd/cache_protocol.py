@@ -32,7 +32,11 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from functools import cached_property
 
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+    virtual_block_count as sharded_virtual_block_count,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldLayout,
     CacheGroupLayout,
@@ -84,7 +88,9 @@ def _load_wire_json(raw: bytes, *, name: str, maximum: int) -> dict:
     return value
 
 
-@dataclass(frozen=True, slots=True)
+# No ``slots``: like ``CacheMemoryPlan``, the frozen contract caches its
+# lookup index in ``__dict__``; dataclass fields alone define the wire form.
+@dataclass(frozen=True)
 class CacheTransferContract:
     """Thin PD wire envelope around the cache-owned plan and group specs."""
 
@@ -101,6 +107,27 @@ class CacheTransferContract:
                 (field for field in self.plan.fields if field.group_id == group_id),
                 key=lambda field: field.field_id,
             )
+        )
+
+    # Resolved per manifest group on the transfer paths; index the immutable
+    # spec tuple once instead of scanning it per call.
+    @cached_property
+    def _specs_by_id(self) -> dict[str, CacheGroupSpec]:
+        return {spec.group_id: spec for spec in self.group_specs}
+
+    def group_spec(self, group_id: str) -> CacheGroupSpec:
+        return self._specs_by_id[group_id]
+
+    def virtual_block_count(self, group_id: str) -> int:
+        """Exclusive bound of the scheduler block IDs a manifest may carry.
+
+        Block manifests are read from the scheduler's tables, so a sharded
+        group's IDs run over ``shard_count`` times its physical page count;
+        the physical count bounds local arena addressing only.
+        """
+        return sharded_virtual_block_count(
+            self.plan.group(group_id).page_count,
+            self.group_spec(group_id).shard_count,
         )
 
     def field_dtype(self, field_id: str) -> str:
@@ -280,6 +307,14 @@ class CachePDGroupBlocks:
 
 @dataclass(frozen=True, slots=True)
 class CachePDBlockManifest:
+    """One request's transferable blocks per group, in logical slot order.
+
+    Block IDs are the publishing side's scheduler IDs -- virtual IDs for a
+    DCP-sharded group. The sender translates its own IDs to local pages when
+    it copies; the destination's IDs are addressed as the destination's
+    contract says.
+    """
+
     groups: tuple[CachePDGroupBlocks, ...]
     prefix_len: int
     prompt_len: int
@@ -359,6 +394,9 @@ def validate_cache_peer_layout(
     for local_spec, peer_spec in zip(
         layout.group_specs, peer_layout.group_specs, strict=True
     ):
+        # shard_count is deliberately not compared: a DCP-sharded Prefill
+        # transfers into an unsharded Decode. Which rank sets exchange which
+        # pages is the transfer planner's decision, not a contract mismatch.
         if (
             local_spec.family != peer_spec.family
             or local_spec.rows_per_page != peer_spec.rows_per_page
@@ -435,7 +473,7 @@ def validate_cache_manifest(
                 f"{peer} manifest group {group.group_id!r} block count disagrees "
                 "with its transfer policy"
             )
-        group_capacity = layout.plan.group(spec.group_id).page_count
+        group_capacity = layout.virtual_block_count(spec.group_id)
         if any(block <= 0 or block >= group_capacity for block in group.block_ids):
             raise CacheContractError(
                 f"{peer} manifest group {group.group_id!r} has an out-of-bounds block"
@@ -484,8 +522,8 @@ def build_cache_block_manifest(
         block_ids = tuple(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
         )
+        group_capacity = layout.virtual_block_count(spec.group_id)
         for logical_slot, block_id in zip(logical_slots, block_ids, strict=True):
-            group_capacity = layout.plan.group(spec.group_id).page_count
             if block_id <= 0 or block_id >= group_capacity:
                 raise CacheContractError(
                     f"table {spec.group_id!r} logical slot {logical_slot} "
@@ -588,7 +626,7 @@ def build_cache_layerwise_block_selection(
         source_block_ids = tuple(
             int(table[request_row, logical_slot]) for logical_slot in logical_slots
         )
-        group_capacity = layout.plan.group(spec.group_id).page_count
+        group_capacity = layout.virtual_block_count(spec.group_id)
         for logical_slot, block_id in zip(logical_slots, source_block_ids, strict=True):
             if block_id <= 0 or block_id >= group_capacity:
                 raise CacheContractError(

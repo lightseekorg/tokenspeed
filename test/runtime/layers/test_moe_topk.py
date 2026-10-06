@@ -62,6 +62,7 @@ def test_plain_route_uses_kernel_package_topk(
         router_logits=torch.empty((2, 8), dtype=torch.float32),
         topk_config=TopKConfig(
             top_k=2,
+            router_topk="fused",
             renormalize=True,
             routed_scaling_factor=2.5,
             topk_indices_dtype=torch.int32,
@@ -104,6 +105,7 @@ def test_correction_bias_route_forwards_renormalize(
         router_logits=torch.empty((1, 8), dtype=torch.float32),
         topk_config=TopKConfig(
             top_k=2,
+            router_topk="fused",
             renormalize=renormalize,
             correction_bias=torch.zeros((8,), dtype=torch.float32),
             routed_scaling_factor=1.0,
@@ -111,3 +113,111 @@ def test_correction_bias_route_forwards_renormalize(
     )
 
     assert calls == [renormalize]
+
+
+def _reference_torch_router_topk(
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    top_k: int,
+    num_real: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The trainer's eager formula, written out independently of the module."""
+    probs = torch.softmax(logits.float(), dim=-1)
+    ids = torch.topk(probs + bias, k=top_k, dim=-1, sorted=True).indices
+    weights = torch.gather(probs, 1, ids) * scale
+    return weights, torch.where(ids >= num_real, torch.full_like(ids, -1), ids)
+
+
+def test_torch_router_topk_matches_the_reference_formula_with_ties() -> None:
+    torch.manual_seed(0)
+    num_real, num_zero, top_k, scale = 6, 2, 4, 2.5
+    # Quantize so exact ties happen, then bias so a zero expert wins a slot.
+    logits = (torch.randn(5, num_real + num_zero) * 2).round() / 2
+    logits[0] = 0.0  # a fully tied row
+    bias = torch.zeros(num_real + num_zero)
+    bias[num_real] = 1.0  # a probability never exceeds 1: this slot wins
+    logits = logits.to(torch.bfloat16)
+
+    weights, ids = topk_module.torch_router_topk(
+        logits, bias, top_k, num_real, scale, torch.int32
+    )
+    ref_weights, ref_ids = _reference_torch_router_topk(
+        logits, bias, top_k, num_real, scale
+    )
+    assert ids.dtype == torch.int32
+    assert weights.dtype == torch.float32
+    assert torch.equal(ids, ref_ids.to(torch.int32))
+    assert torch.equal(weights, ref_weights)
+    # Zero experts: id -1, weight kept (the unbiased probability, scaled).
+    probs = torch.softmax(logits.float(), dim=-1)
+    assert (ids[:, 0] == -1).all()
+    assert torch.equal(weights[:, 0], probs[:, num_real] * scale)
+    # Selected weights are the unbiased probabilities, not the biased scores.
+    real = ids[1, 1:].long()
+    assert torch.equal(weights[1, 1:], probs[1, real] * scale)
+    # Descending biased score within a row (sorted=True).
+    biased = probs + bias
+    row = torch.where(ids[2] == -1, torch.tensor(num_real), ids[2].long())
+    assert (biased[2, row][:-1] >= biased[2, row][1:]).all()
+
+
+def test_correction_bias_route_can_take_the_torch_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse_fused(*_args, **_kwargs):
+        raise AssertionError("the fused kernel must not run under router_topk=torch")
+
+    monkeypatch.setattr(topk_module, "cuda_routing_flash", refuse_fused)
+    logits = torch.randn(3, 8)
+    bias = torch.randn(8) * 0.1
+    config = TopKConfig(
+        top_k=2,
+        router_topk="torch",
+        renormalize=False,
+        correction_bias=bias,
+        routed_scaling_factor=1.5,
+        zero_expert_num=2,
+        topk_indices_dtype=torch.int64,
+    )
+    output = select_experts(
+        hidden_states=torch.empty((3, 4)), router_logits=logits, topk_config=config
+    )
+    ref_weights, ref_ids = _reference_torch_router_topk(logits, bias, 2, 6, 1.5)
+    assert torch.equal(output.topk_ids, ref_ids)
+    assert torch.equal(output.topk_weights, ref_weights)
+    assert output.topk_ids.dtype == torch.int64
+
+
+def test_topk_reads_the_router_topk_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "router_topk", "torch")
+    assert TopK(top_k=2).topk_config.router_topk == "torch"
+    monkeypatch.setitem(global_server_args_dict, "router_topk", "fused")
+    assert TopK(top_k=2).topk_config.router_topk == "fused"
+
+
+def test_torch_router_refuses_renormalization_at_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    bias = torch.zeros(8)
+    monkeypatch.setitem(global_server_args_dict, "router_topk", "torch")
+    with pytest.raises(ValueError, match="--router-topk torch"):
+        TopK(top_k=2, renormalize=True, correction_bias=bias)
+    # Only the correction-bias route is the torch order's; other routes keep
+    # their own renormalization, and the fused route always may.
+    TopK(top_k=2, renormalize=False, correction_bias=bias)
+    TopK(top_k=2, renormalize=True)
+    TopK(
+        top_k=2,
+        renormalize=True,
+        correction_bias=bias,
+        use_grouped_topk=True,
+        num_expert_group=2,
+        topk_group=1,
+    )
+    monkeypatch.setitem(global_server_args_dict, "router_topk", "fused")
+    TopK(top_k=2, renormalize=True, correction_bias=bias)

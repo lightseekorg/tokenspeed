@@ -5,7 +5,7 @@ torchvision==0.29.0+cu126
 cuda-toolkit==12.6.3
 cuda-python==12.9.7
 cuda-bindings==12.9.7
-tokenspeed-mooncake==0.3.13.post20260825
+tokenspeed-mooncake==0.3.13.post20260929
 nvidia-cutlass-dsl-libs-cu13<0
 nvidia-cublas<0
 nvidia-cuda-runtime<0

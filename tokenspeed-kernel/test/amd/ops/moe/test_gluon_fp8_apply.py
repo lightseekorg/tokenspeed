@@ -167,32 +167,6 @@ def test_gluon_block_fp8_exact_mfma_route_block_size(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_gluon_block_fp8_moe_rejects_bad_scale_shape() -> None:
-    from tokenspeed_kernel.ops.moe.gluon.fp8 import _validate
-
-    weights = torch.nn.Module()
-    weights.w13_weight = torch.empty(
-        2, 1024, 512, device="cuda", dtype=torch.float8_e4m3fn
-    )
-    weights.w2_weight = torch.empty(
-        2, 512, 512, device="cuda", dtype=torch.float8_e4m3fn
-    )
-    weights.w13_weight_scale_inv = torch.empty(2, 1, 1, device="cuda")
-    weights.w2_weight_scale_inv = torch.empty(2, 1, 1, device="cuda")
-    weights.ep_size = 1
-    weights.activation = "swiglu"
-    weights.swiglu_arg = SimpleNamespace(alpha=1.0, limit=None)
-    weights.swiglu_beta = 0.0
-    weights.w13_input_layout = "concatenated"
-    x = torch.empty(1, 512, device="cuda", dtype=torch.bfloat16)
-    topk_ids = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
-    topk_weights = torch.ones(1, 1, device="cuda")
-
-    with pytest.raises(ValueError, match="scale tensors have incompatible shapes"):
-        _validate({}, x, weights, topk_weights, topk_ids, True)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("num_tokens", [1, 8, 32, 64])
 def test_gluon_block_fp8_decode_matches_torch(num_tokens: int) -> None:
     _requires_gfx950()

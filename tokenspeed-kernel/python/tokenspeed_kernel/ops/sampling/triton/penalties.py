@@ -53,7 +53,7 @@ def _apply_penalties_logit_bias_inplace_kernel(
     cols = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = cols < vocab_size
 
-    logits_offsets = row * logits_row_stride + cols
+    logits_offsets = row.to(tl.int64) * logits_row_stride + cols
     state_offsets = pool_idx * counts_row_stride + cols
     bias_offsets = pool_idx * bias_row_stride + cols
 
@@ -152,7 +152,8 @@ def _accumulate_counts_inplace_kernel(
     pool_idx_ptr,
     tokens_ptr,
     weights_ptr,
-    total: tl.constexpr,
+    # Per-step token count; runtime so every batch shape shares one binary.
+    total,
     counts_row_stride: tl.constexpr,
     vocab_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,

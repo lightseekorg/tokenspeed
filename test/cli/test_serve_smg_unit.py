@@ -47,6 +47,7 @@ from tokenspeed.cli.serve_smg import (
     INKLING_TOOL_CALL_PARSER,
     KIMI_K3_REASONING_PARSER,
     KIMI_K3_TOOL_CALL_PARSER,
+    _add_rl_control_port,
     _args_with_default_model_parsers,
     _free_port_avoiding_ephemeral_range,
     _gateway_args_with_default_log_level,
@@ -1140,3 +1141,18 @@ def test_run_smg_from_args_applies_deepseek_v4_parser_defaults(monkeypatch):
         "--tool-call-parser",
         DEEPSEEK_V4_TOOL_CALL_PARSER,
     ]
+
+
+def test_add_rl_control_port_allocates_when_absent(monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range", lambda: 40123
+    )
+    args, url = _add_rl_control_port(["--model", "/tmp/x"])
+    assert args == ["--model", "/tmp/x", "--rl-control-port", "40123"]
+    assert url == "http://127.0.0.1:40123"
+
+
+def test_add_rl_control_port_keeps_a_pinned_port():
+    args, url = _add_rl_control_port(["--model", "/tmp/x", "--rl-control-port", "5005"])
+    assert args == ["--model", "/tmp/x", "--rl-control-port", "5005"]
+    assert url == "http://127.0.0.1:5005"

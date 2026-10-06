@@ -333,6 +333,11 @@ jobs:
             exit 1
           fi
 
+          test "$(gh api user --jq .login)" = lightseek-bot
+          for repository in "$RELEASE_REPOSITORY" lightseekorg/tokenspeed; do
+            test "$(gh repo view "$repository" --json visibility --jq .visibility)" = PUBLIC
+          done
+
           source_note="tokenspeed-kernel-amd ${VERSION} built from ${GITHUB_REPOSITORY}@${SOURCE_SHA}"
           prerelease_args=()
           if [ "$PRERELEASE" = "true" ]; then

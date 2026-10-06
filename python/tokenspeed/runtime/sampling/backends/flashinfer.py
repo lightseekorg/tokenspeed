@@ -40,16 +40,22 @@ from tokenspeed_kernel.ops.sampling.flashinfer import (
     top_k_top_p_sampling_from_probs,
     top_p_renorm_prob,
 )
-from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
+from tokenspeed_kernel.ops.sampling.triton import (
+    gather_and_expand_scalars,
+    gumbel_sample_from_pools_generic,
+)
 from tokenspeed_kernel.platform import pdl_enabled
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
     SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
     SamplingBackend,
     SamplingBackendConfig,
+    SpeculativeSamplingPools,
 )
+from tokenspeed.runtime.sampling.backends.greedy import _verify_chain_greedy
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
     slice_dp_vocab_mask,
@@ -57,7 +63,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.utils import (
     coin_eps,
-    gather_token_logprobs_torch,
+    gather_token_logprobs,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -66,6 +72,81 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+
+
+# Greedy requests normalize to top_k=1 and ride the pool route, whose
+# stochastic kernels resolve EXACT logit ties in reduction order: run-stable,
+# not batch-invariant. Under the bitwise envelope (rl-bitwise) the helpers
+# below give greedy rows the canonical lowest-index argmax instead. Both are
+# elementwise over rows, so the graph-captured path stays one path.
+
+
+def canonical_greedy_tokens(
+    logits: torch.Tensor, top_ks: torch.Tensor, token_ids: torch.Tensor
+) -> torch.Tensor:
+    """Replace greedy rows' sampled tokens with the lowest-index argmax.
+
+    Args:
+        logits: ``[bs, vocab]`` logits the greedy choice maximizes.
+        top_ks: ``[bs]`` per-row top-k; greedy rows carry 1.
+        token_ids: ``[bs]`` tokens the pool route sampled.
+
+    Returns:
+        ``[bs]`` tokens in ``token_ids``' dtype.
+    """
+    canonical = sampling_argmax(logits)
+    return torch.where(top_ks == 1, canonical.to(token_ids.dtype), token_ids)
+
+
+def canonical_greedy_verify(
+    *,
+    logits: torch.Tensor,
+    top_ks: torch.Tensor,
+    candidates: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+) -> None:
+    """Rewrite greedy rows' verify outputs with the exact-match chain rule.
+
+    Without ties the one-hot target makes chain speculative sampling accept
+    exactly the drafts that equal the argmax, so this changes only tied rows.
+
+    Args:
+        logits: ``[bs * n, vocab]`` flat verify logits.
+        top_ks: ``[bs * n]`` per-position top-k; greedy requests carry 1.
+        candidates: ``[bs, n]`` draft chains.
+        predict: ``[bs * n]`` int32 predictions, rewritten in place.
+        accept_index: ``[bs, n]`` int32 accepted positions, rewritten in place.
+        accept_length: ``[bs]`` int32 accepted draft counts (before the bonus
+            token is added), rewritten in place.
+    """
+    bs, n = candidates.shape
+    target_predict = sampling_argmax(logits).reshape(bs, n)
+    # The CUDA chain kernel writes only the accepted prefix and the bonus
+    # slot, but every slot is read (e.g. by the logprob gather): start from
+    # the argmax, which is what an accepted greedy slot holds anyway.
+    greedy_predict = target_predict.reshape(-1).to(predict.dtype)
+    greedy_index = torch.full_like(accept_index, -1)
+    greedy_length = torch.empty_like(accept_length)
+    _verify_chain_greedy(
+        predicts=greedy_predict,
+        accept_index=greedy_index,
+        accept_token_num=greedy_length,
+        candidates=candidates.to(torch.int32),
+        target_predict=target_predict,
+        batch_size=bs,
+        num_draft_tokens=n,
+    )
+    greedy_rows = top_ks.view(bs, n)[:, 0] == 1
+    predict.copy_(
+        torch.where(greedy_rows.repeat_interleave(n), greedy_predict, predict)
+    )
+    accept_index.copy_(
+        torch.where(greedy_rows.unsqueeze(1), greedy_index, accept_index)
+    )
+    accept_length.copy_(torch.where(greedy_rows, greedy_length, accept_length))
 
 
 class FlashInferSamplingBackend(SamplingBackend):
@@ -77,6 +158,11 @@ class FlashInferSamplingBackend(SamplingBackend):
     keeping the hot path to 2 kernels. Requests asking for min_p, penalties,
     or logit_bias are silently ignored; use `flashinfer_full` if any of those
     matter for the workload.
+
+    ``config.sampling_stream == "per-request"`` swaps the single-step kernel
+    for the Gumbel-max pool route (``_sample_per_request``); verification
+    keeps the chain kernels, whose coins already come from per-slot
+    generators.
     """
 
     _HAS_POOL_STATE = True
@@ -206,6 +292,13 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._cpu_generator_per_slot: list[torch.Generator | None] = [None] * pool_rows
         self._cpu_generator_per_slot[0] = self._capture_gen
 
+    def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
+        return SpeculativeSamplingPools(
+            temperature=self._temperature_pool,
+            top_k=self._top_k_pool,
+            seed=self._seed_pool,
+        )
+
     def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:
         self._temperature_pool[pool_idx].fill_(float(sp.temperature))
         self._top_k_pool[pool_idx].fill_(int(sp.top_k))
@@ -242,10 +335,115 @@ class FlashInferSamplingBackend(SamplingBackend):
         # DP padding may need more verify rows than max_bs.
         if max_pad_bs != config.max_bs:
             self._allocate_verify_outputs(max_pad_bs, max_n)
+            self._allocate_pool_index_buffer(max_pad_bs)
 
         self._predict_local_buf: torch.Tensor | None = None
         self._accept_index_local_buf: torch.Tensor | None = None
         self._accept_length_local_buf: torch.Tensor | None = None
+
+        # Draft-prob verify gathers each row's recorded distributions out of
+        # the pool-indexed RuntimeStates.draft_probs into this batch-ordered
+        # buffer (the chain kernel reads [bs, N, V] contiguous rows). Sized
+        # for the padded graph batch; the gather is captured with the graph.
+        self._draft_probs_gather_buf: torch.Tensor | None = None
+        if config.enable_speculative_sampling:
+            if config.vocab_size <= 0:
+                raise ValueError(
+                    "enable_speculative_sampling needs vocab_size > 0 to size the "
+                    f"draft-prob gather buffer, got {config.vocab_size}"
+                )
+            self._draft_probs_gather_buf = torch.empty(
+                (max_pad_bs, max_n, config.vocab_size),
+                dtype=torch.float32,
+                device=config.device,
+            )
+
+        # The per-request stream route (``_sample_per_request``) writes its
+        # token ids into a caller-owned buffer.
+        self._per_request_out = torch.empty(
+            (max_pad_bs,), dtype=torch.int32, device=config.device
+        )
+
+    def _gather_draft_probs(
+        self,
+        draft_probs: torch.Tensor,
+        pool_indices: torch.Tensor,
+        bs: int,
+        num_tokens_per_req: int,
+    ) -> torch.Tensor:
+        """Batch-order the recorded draft distributions for this verify.
+
+        Args:
+            draft_probs: ``[pool_rows, N, V]`` fp32 ``RuntimeStates.draft_probs``.
+            pool_indices: ``[bs]`` pool slot per verify row (padding rows
+                carry slot 0; their outputs are discarded).
+            bs: Verify rows, padded under graph replay or DP sharding.
+            num_tokens_per_req: The chain width N.
+
+        Returns:
+            The ``[bs, N, V]`` leading slice of the persistent gather buffer.
+        """
+        buf = self._draft_probs_gather_buf
+        if buf is None:
+            raise RuntimeError(
+                "verify received draft_probs but the sampling backend was built "
+                "without enable_speculative_sampling"
+            )
+        if num_tokens_per_req != buf.shape[1] or draft_probs.shape[1:] != buf.shape[1:]:
+            raise RuntimeError(
+                f"draft_probs geometry {tuple(draft_probs.shape[1:])} / N="
+                f"{num_tokens_per_req} does not match the verify buffer "
+                f"{tuple(buf.shape[1:])}"
+            )
+        out = buf[:bs]
+        torch.index_select(draft_probs, 0, pool_indices, out=out)
+        return out
+
+    def _sample_per_request(
+        self,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        *,
+        min_p_pool: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample every row from its request's own Gumbel-max stream.
+
+        flashinfer's ``*_sampling_from_probs`` kernels read one seed and
+        offset and seed curand with the batch row, so a request's draw moves
+        with its co-batch. The pool kernel keys the stream by
+        ``(seed_pool[pool_idx], offsets_pool[pool_idx])`` — the request's seed
+        and cache length — so the draw is the same alone and in any batch
+        (``--sampling-stream per-request``). Temperature, top-k, top-p and
+        min-p are read from the pool rows (no expanded per-row scalars are
+        built); finite top-k is capped at the kernel's 128 candidates.
+
+        Args:
+            logits: ``[bs, vocab]`` logits (penalties already applied).
+            sampling_info: Batch info carrying the pool indices and the
+                pool-indexed cache lengths.
+            min_p_pool: Pool-indexed min-p values, or None for backends
+                without min-p.
+
+        Returns:
+            ``(token_ids, top_ks)``: the ``[bs]`` int32 token ids and each
+            row's top-k, which the bitwise envelopes' greedy overlay reads.
+        """
+        bs = logits.shape[0]
+        pool_indices = self._req_pool_indices_for_kernels(
+            sampling_info.req_pool_indices, bs
+        )
+        token_ids = gumbel_sample_from_pools_generic(
+            logits,
+            pool_indices,
+            self._temperature_pool,
+            self._top_k_pool,
+            self._top_p_pool,
+            self._seed_pool,
+            self._offsets_pool_for_kernels(sampling_info),
+            self._per_request_out[:bs],
+            min_p_pool=min_p_pool,
+        )
+        return token_ids, self._top_k_pool.index_select(0, pool_indices)
 
     def _prepare_step_hook(
         self,
@@ -303,39 +501,35 @@ class FlashInferSamplingBackend(SamplingBackend):
         # so the pool route serves them too — same path the CUDA graph
         # captures. Equivalence to argmax is pinned by
         # test_greedy_route_equivalence.py.
-        temperatures, top_ks, top_ps, _, seeds, offsets = gather_and_expand_scalars(
-            sampling_info.req_pool_indices,
-            temperature=self._temperature_pool,
-            top_k=self._top_k_pool,
-            top_p=self._top_p_pool,
-            seed=self._seed_pool,
-            offsets=sampling_info.valid_cache_lengths,
-        )
-
-        probs = softmax(
-            logits,
-            temperature=temperatures.view(-1, 1),
-        )
-        batch_next_token_ids = top_k_top_p_sampling_from_probs(
-            probs,
-            top_ks,
-            top_ps,
-            filter_apply_order="joint",
-            seed=seeds,
-            offset=offsets,
-            deterministic=True,
-        )
-        if global_server_args_dict["numerics"] == "rl-bitwise":
-            # The pool route serves greedy rows through the stochastic
-            # kernel, whose top-1 filter resolves EXACT logit ties in
-            # reduction order — run-stable but not batch-invariant. Overlay
-            # the canonical lowest-index argmax on greedy rows; elementwise,
-            # so the graph-captured path stays one path.
-            canonical = sampling_argmax(logits)
-            batch_next_token_ids = torch.where(
-                top_ks == 1,
-                canonical.to(batch_next_token_ids.dtype),
-                batch_next_token_ids,
+        if self.config.sampling_stream == "per-request":
+            batch_next_token_ids, top_ks = self._sample_per_request(
+                logits, sampling_info, min_p_pool=None
+            )
+        else:
+            temperatures, top_ks, top_ps, _, seeds, offsets = gather_and_expand_scalars(
+                sampling_info.req_pool_indices,
+                temperature=self._temperature_pool,
+                top_k=self._top_k_pool,
+                top_p=self._top_p_pool,
+                seed=self._seed_pool,
+                offsets=sampling_info.valid_cache_lengths,
+            )
+            probs = softmax(
+                logits,
+                temperature=temperatures.view(-1, 1),
+            )
+            batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                probs,
+                top_ks,
+                top_ps,
+                filter_apply_order="joint",
+                seed=seeds,
+                offset=offsets,
+                deterministic=True,
+            )
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+            batch_next_token_ids = canonical_greedy_tokens(
+                logits, top_ks, batch_next_token_ids
             )
 
         bs = logits.shape[0]
@@ -351,8 +545,8 @@ class FlashInferSamplingBackend(SamplingBackend):
         self.maybe_broadcast(sampled)
 
         if self.config.enable_output_logprobs:
-            logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                logits, sampled
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, sampled, logprob_order=self.config.logprob_order
             )
 
         return sampled, lengths
@@ -363,7 +557,13 @@ class FlashInferSamplingBackend(SamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         candidates: torch.Tensor,
+        *,
+        tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if tree is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot verify draft trees"
+            )
 
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
@@ -499,6 +699,14 @@ class FlashInferSamplingBackend(SamplingBackend):
             )
         target_probs = target_probs.reshape(bs, n, -1)
 
+        # Draft-prob rule when the drafter recorded its distributions (the
+        # DP shard gathers its own rows); target-only otherwise.
+        use_draft_prob = sampling_info.draft_probs is not None
+        draft_probs = (
+            self._gather_draft_probs(sampling_info.draft_probs, pool_indices, bs, n)
+            if use_draft_prob
+            else None
+        )
         chain_speculative_sampling_target_only(
             predicts=predict,
             accept_index=accept_index,
@@ -507,11 +715,22 @@ class FlashInferSamplingBackend(SamplingBackend):
             uniform_samples=coins[:bs, :n],
             uniform_samples_for_final_sampling=final_coins[:bs],
             target_probs=target_probs,
-            draft_probs=None,
+            draft_probs=draft_probs,
             threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
             threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
             deterministic=not dp_sampling,
+            use_draft_prob=use_draft_prob,
+            reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
         )
+        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+            canonical_greedy_verify(
+                logits=logits,
+                top_ks=top_ks,
+                candidates=candidates,
+                predict=predict,
+                accept_index=accept_index,
+                accept_length=accept_length,
+            )
 
         accept_length += 1
         logprobs_local = None
@@ -520,9 +739,9 @@ class FlashInferSamplingBackend(SamplingBackend):
             # Compute scalar logprobs for local predictions before gathering
             # predictions to full-batch shape; the non-DP writer requires
             # matching logits/token row counts.
-            logprobs_local = gather_token_logprobs_torch(logits, predict).view(
-                bs, num_tokens_per_req
-            )
+            logprobs_local = gather_token_logprobs(
+                logits, predict, logprob_order=self.config.logprob_order
+            ).view(bs, num_tokens_per_req)
 
         if dp_sampling:
             n = num_tokens_per_req
@@ -559,8 +778,8 @@ class FlashInferSamplingBackend(SamplingBackend):
             self.broadcast_verify_outputs()
 
         if self.config.enable_output_logprobs and not dp_sampling:
-            logits_output.next_token_logprobs = gather_token_logprobs_torch(
-                logits, predict
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, predict, logprob_order=self.config.logprob_order
             )
 
         return predict, accept_length

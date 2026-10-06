@@ -592,8 +592,37 @@ def test_masked_compress_stores_leave_every_other_byte_untouched(compress_ratio)
 
 @requires_cuda
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
-def test_mxfp4_sharded_index_candidates(degree):
-    from tokenspeed_kernel.ops.attention.dsv4.triton import triton_dsv4_index_candidates
+@pytest.mark.parametrize("solution", ["triton", None])
+@pytest.mark.parametrize("index_k_format", ["mxfp4", "fp8_scaled"])
+def test_sharded_index_candidates(degree, solution, index_k_format, monkeypatch):
+    from tokenspeed_kernel.ops.attention.dsv4 import dsv4_index_candidates
+
+    if solution is None and (
+        not current_platform().is_hopper_plus
+        or (index_k_format == "mxfp4" and not current_platform().is_blackwell_plus)
+    ):
+        pytest.skip("MXFP4 DeepGEMM requires Blackwell")
+
+    import tokenspeed_kernel.ops.attention.dsv4 as dsv4
+
+    select = dsv4.select_kernel
+
+    def checked_select(*args, **kwargs):
+        kernel = select(*args, **kwargs)
+        if solution is None:
+            assert kernel.name == f"deep_gemm_dsv4_{index_k_format}_index_candidates"
+        return kernel
+
+    monkeypatch.setattr(dsv4, "select_kernel", checked_select)
+
+    def index_candidates(*args, **kwargs):
+        return dsv4_index_candidates(
+            *args,
+            **kwargs,
+            softmax_scale=1.0,
+            index_k_format=index_k_format,
+            solution=solution,
+        )
 
     torch.manual_seed(943)
     device = "cuda"
@@ -620,19 +649,58 @@ def test_mxfp4_sharded_index_candidates(degree):
     keys = unpack(cache[:, : page_size * 64].reshape(pages, page_size, 64))[
         table[0].long()
     ].reshape(-1, 128)
+    if index_k_format == "fp8_scaled":
+        q = (torch.randint(0, 2, (3, heads, 128), device=device) * 2 - 1).to(
+            torch.bfloat16
+        )
+        scales = torch.empty((3, 0), device=device)
+        cache = torch.zeros((pages, page_size * 132), device=device, dtype=torch.uint8)
+        values = torch.randint(-4, 5, (pages, page_size, 128), device=device).to(
+            torch.float8_e4m3fn
+        )
+        cache[:, : page_size * 128] = values.view(torch.uint8).flatten(1)
+        cache[:, page_size * 128 :] = torch.ones(
+            (pages, page_size), device=device
+        ).view(torch.uint8)
+        query = q.float()
+        keys = values.float()[table[0].long()].reshape(-1, 128)
     reference = (
         torch.einsum("thd,sd->ths", query, keys).relu() * weights.unsqueeze(-1)
     ).sum(1)
-    reference.masked_fill_(
-        torch.arange(keys.shape[0], device=device) >= lengths[:, None], -float("inf")
-    )
+    positions = torch.arange(keys.shape[0], device=device)
+
+    def check_candidates(indices, scores, expected_logits):
+        # Top-K does not promise ordering, including across graph replay.
+        # Validate score/index correspondence and the optimal score multiset;
+        # ties at the cutoff may legitimately choose different token IDs.
+        valid = indices >= 0
+        assert ((indices == -1) | (valid & (indices < keys.shape[0]))).all()
+        assert (scores[~valid] == -float("inf")).all()
+        ordered = indices.sort(dim=-1).values
+        assert not ((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)).any()
+        torch.testing.assert_close(
+            scores[valid],
+            expected_logits.gather(1, indices.clamp_min(0).long())[valid],
+            rtol=2e-5,
+            atol=2e-3,
+        )
+        torch.testing.assert_close(
+            valid.sum(-1), torch.isfinite(expected_logits).sum(-1).clamp_max(topk)
+        )
+        torch.testing.assert_close(
+            scores.sort(dim=-1, descending=True).values,
+            expected_logits.topk(topk, dim=-1).values,
+            rtol=2e-5,
+            atol=2e-3,
+        )
+
     candidates, values = [], []
     for rank in range(degree):
         local = cache[[0] + list(range(rank + 1, pages, degree))].contiguous()
         local_table = torch.where(
             (table - 1) % degree == rank, (table - 1) // degree + 1, -1
         )
-        indices, scores = triton_dsv4_index_candidates(
+        indices, scores = index_candidates(
             (q, scales),
             weights,
             local,
@@ -642,20 +710,20 @@ def test_mxfp4_sharded_index_candidates(degree):
             page_size=page_size,
             topk=topk,
         )
-        valid = indices >= 0
-        torch.testing.assert_close(
-            scores[valid],
-            reference.gather(1, indices.clamp_min(0).long())[valid],
-            rtol=2e-5,
-            atol=2e-3,
-        )
-        assert (scores[~valid] == -float("inf")).all()
+        owned = ((table[0].repeat_interleave(page_size) - 1) % degree) == rank
+
+        def local_reference():
+            return reference.masked_fill(
+                ~owned[None, :] | (positions >= lengths[:, None]), -float("inf")
+            )
+
+        check_candidates(indices, scores, local_reference())
         candidates.append(indices)
         values.append(scores)
         # Refresh lengths in place: captured kernels must not retain old validity.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            captured_indices, captured_scores = triton_dsv4_index_candidates(
+            captured_indices, captured_scores = index_candidates(
                 (q, scales),
                 weights,
                 local,
@@ -666,11 +734,10 @@ def test_mxfp4_sharded_index_candidates(degree):
                 topk=topk,
             )
         graph.replay()
-        torch.testing.assert_close(captured_indices, indices)
-        torch.testing.assert_close(captured_scores, scores)
+        check_candidates(captured_indices, captured_scores, local_reference())
         lengths[0] = 19
         graph.replay()
-        updated_indices, updated_scores = triton_dsv4_index_candidates(
+        updated_indices, updated_scores = index_candidates(
             (q, scales),
             weights,
             local,
@@ -680,15 +747,13 @@ def test_mxfp4_sharded_index_candidates(degree):
             page_size=page_size,
             topk=topk,
         )
-        torch.testing.assert_close(captured_indices, updated_indices)
-        torch.testing.assert_close(captured_scores, updated_scores)
+        check_candidates(updated_indices, updated_scores, local_reference())
+        check_candidates(captured_indices, captured_scores, local_reference())
         lengths[0] = 0
     indices, scores = torch.cat(candidates, 1), torch.cat(values, 1)
-    selected = indices.gather(
-        1, torch.argsort(scores, descending=True, stable=True)[:, :topk]
+    order = scores.topk(topk, dim=-1).indices
+    check_candidates(
+        indices.gather(1, order),
+        scores.gather(1, order),
+        reference.masked_fill(positions >= lengths[:, None], -float("inf")),
     )
-    for row in (1, 2):
-        count = min(topk, int(lengths[row]))
-        assert set(selected[row, :count].tolist()) == set(
-            torch.argsort(reference[row], descending=True, stable=True)[:count].tolist()
-        )

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -34,6 +35,7 @@ from tokenspeed_kernel.benchmark.graph import (
     GraphTimer,
     PreparedInvocation,
 )
+from tokenspeed_kernel.benchmark.profiler import ProfilePhase
 from tokenspeed_kernel.benchmark.validation import (
     OutputValidationSpec,
     ValidationDatum,
@@ -181,16 +183,22 @@ def _load_builtin_generators() -> None:
         prepare_kpool_prefill_write,
     )
     from tokenspeed_kernel.benchmark.generators.gemm import (
+        prepare_decode_gemv,
         prepare_dense_bmm,
-        prepare_mxfp8_mm,
+        prepare_linear_attnres_partials,
+        prepare_mm,
     )
     from tokenspeed_kernel.benchmark.generators.kda import (
+        prepare_kda_fused_paged_decode,
+        prepare_kda_fused_paged_verify,
         prepare_kda_paged_decode,
         prepare_kda_paged_prefill,
+        prepare_kda_replay_commit,
     )
     from tokenspeed_kernel.benchmark.generators.mla import (
         prepare_mla_decode,
         prepare_mla_decode_projected_value,
+        prepare_mla_extend,
         prepare_mla_normalize_project_query,
         prepare_mla_prefill,
     )
@@ -200,12 +208,22 @@ def _load_builtin_generators() -> None:
         prepare_moe_apply,
         prepare_sigmoid_bias_topk,
     )
+    from tokenspeed_kernel.benchmark.generators.residual import prepare_attn_res_fwd
 
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kda_paged_decode"), prepare_kda_paged_decode
     )
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kda_paged_prefill"), prepare_kda_paged_prefill
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kda_fused_paged_decode"), prepare_kda_fused_paged_decode
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kda_fused_paged_verify"), prepare_kda_fused_paged_verify
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "kda_replay_commit"), prepare_kda_replay_commit
     )
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kpool_prefill_write"), prepare_kpool_prefill_write
@@ -233,8 +251,16 @@ def _load_builtin_generators() -> None:
         prepare_mla_decode_projected_value,
     )
     _BENCHMARK_GENERATORS.setdefault(("attention", "mla_prefill"), prepare_mla_prefill)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "mla_extend_with_kvcache"), prepare_mla_extend
+    )
+    _BENCHMARK_GENERATORS.setdefault(("residual", "attn_res_fwd"), prepare_attn_res_fwd)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
-    _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mxfp8_mm)
+    _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mm)
+    _BENCHMARK_GENERATORS.setdefault(("gemm", "decode_gemv"), prepare_decode_gemv)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("gemm", "linear_attnres_partials"), prepare_linear_attnres_partials
+    )
     _BENCHMARK_GENERATORS.setdefault(
         ("moe", "sigmoid_bias_topk"), prepare_sigmoid_bias_topk
     )
@@ -330,6 +356,9 @@ class KernelBenchmarkHarness:
         request: BenchmarkRequest,
         *,
         measurement_blocks: int,
+        profile_invocation: (
+            Callable[[ProfilePhase, int | None], AbstractContextManager[None]] | None
+        ) = None,
     ) -> KernelBenchmarkResult:
         """Run one request for the requested sample count and return its result."""
 
@@ -421,11 +450,13 @@ class KernelBenchmarkHarness:
                 )
 
         try:
-            measurement = self._timer.measure(
-                prepared.invocation,
-                cold_cache=request.cold_cache,
-                measurement_blocks=measurement_blocks,
-            )
+            measure_options: dict[str, Any] = {
+                "cold_cache": request.cold_cache,
+                "measurement_blocks": measurement_blocks,
+            }
+            if profile_invocation is not None:
+                measure_options["profile_invocation"] = profile_invocation
+            measurement = self._timer.measure(prepared.invocation, **measure_options)
         except GraphBenchmarkError as exc:
             status = _GRAPH_STATUS_BY_PHASE.get(
                 exc.phase, BenchmarkStatus.EXECUTION_FAILURE

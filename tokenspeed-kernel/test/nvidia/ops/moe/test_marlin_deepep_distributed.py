@@ -152,6 +152,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     assert plan["apply_kernel_name"] == "marlin_mxfp4_deepep_moe_apply"
     tokenspeed_kernel.moe_process_weights(plan, module)

@@ -29,7 +29,6 @@ ts serve \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --trust-remote-code \
     --attention-backend fa4 \
@@ -51,7 +50,6 @@ ts serve \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --trust-remote-code \
     --enable-prefix-caching \
@@ -78,7 +76,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --attention-backend trtllm \
     --kv-cache-dtype fp8 \
@@ -108,7 +105,6 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --max-num-seqs 16 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.95 \
     --disable-cuda-graph-padding \
     --attention-backend trtllm \
     --kv-cache-dtype fp8 \
@@ -277,6 +273,8 @@ Notes:
   and CUDA graph capture. When K3's 128-token logical cache pages feed the
   64-token TRT-LLM MLA kernel, the backend expands each logical page into its
   two physical kernel pages before draft attention.
+- K3 DSpark does not support DCP yet: its context KV injection path does not
+  translate virtual slots into shard-local addresses or mask nonowner writes.
 - A K3 DFlash2 draft declares `sliding_attention` layers, so it needs a drafter
   backend that applies per-layer sliding windows: `--drafter-attention-backend
   mla`. Those layers dispatch to the CuteDSL windowed decode on Blackwell,
@@ -328,7 +326,6 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --mm-encoder-tp-mode data \
   --ep-size 8 \
   --moe-backend flashinfer_trtllm \
-  --gpu-memory-utilization 0.94 \
   --max-num-seqs 32 \
   --disable-kvstore \
   --host 0.0.0.0 \
@@ -357,7 +354,6 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --enable-expert-parallel \
   --attention-backend mla \
   --moe-backend auto \
-  --gpu-memory-utilization 0.92 \
   --max-num-seqs 32 \
   --disable-kvstore \
   --host 0.0.0.0 \
@@ -382,6 +378,20 @@ the routed MXFP4 experts with the shared-expert down projection, then applies
 their joint reduction before the fused latent up-projection epilogue. Other
 shapes and unsupported layouts retain the ordinary composed path. The fused
 sigmoid-bias top-k route supports the full scheduled token count.
+
+For Gluon Petit MegaMoE on one node with 8x gfx950 and MXFP4 expert weights,
+use attention DP8 and EP8, with at most 1024 tokens per rank:
+
+```bash
+TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve moonshotai/Kimi-K3 \
+  --trust-remote-code --dtype bfloat16 \
+  --tensor-parallel-size 1 --data-parallel-size 8 --ep-size 8 \
+  --attention-backend mla --kv-cache-dtype fp8 \
+  --moe-backend gluon_petit --all2all-backend gluon_petit \
+  --max-model-len 8192 --max-num-seqs 32 \
+  --chunked-prefill-size 1024 --max-prefill-tokens 1024 \
+  --disable-kvstore --disable-autotune
+```
 
 ## GLM5 / GLM5.2
 
@@ -601,7 +611,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -617,7 +627,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -642,7 +652,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -660,7 +670,7 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
   --quantization fp8 --kv-cache-dtype fp8 \
   --attention-backend trtllm \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.95 --max-num-seqs 128 \
+  --max-num-seqs 128 \
   --speculative-algorithm MTP --speculative-num-steps 3 \
   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
   --reasoning-parser qwen3_thinking --tool-call-parser qwen_coder \
@@ -694,7 +704,6 @@ MTP (the draft model path points at the same checkpoint):
 tokenspeed serve Qwen/Qwen3.8-27B-FP8 \
   --served-model-name Qwen/Qwen3.8-27B-FP8 \
   --world-size 1 \
-  --gpu-memory-utilization 0.9 \
   --attention-backend trtllm \
   --moe-backend flashinfer_trtllm \
   --chunked-prefill-size 8192 \
@@ -797,6 +806,27 @@ tokenspeed serve openai/gpt-oss-120b \
   --port 8000
 ```
 
+### Gluon Petit MegaMoE on AMD CDNA4
+
+GPT-OSS 120B with MXFP4 weights supports Gluon Petit MegaMoE on one node
+with eight gfx950 GPUs:
+
+```bash
+TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve openai/gpt-oss-120b \
+  --tensor-parallel-size 1 \
+  --data-parallel-size 8 \
+  --expert-parallel-size 8 \
+  --dtype bfloat16 \
+  --moe-backend gluon_petit \
+  --all2all-backend gluon_petit \
+  --chunked-prefill-size 1024 \
+  --max-prefill-tokens 1024 \
+  --disable-autotune \
+  --disable-kvstore
+```
+
+This backend supports at most 1024 prefill or decode tokens per rank.
+
 ## DeepSeek V4-Flash / V4-Pro
 
 DeepSeek V4 uses FP8 KV cache.
@@ -824,7 +854,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --max-total-tokens 163840 \
   --chunked-prefill-size 8192 \
   --enable-mixed-batch \
-  --gpu-memory-utilization 0.9 \
   --disable-kvstore \
   --host 0.0.0.0 \
   --port 8000
@@ -843,7 +872,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Pro \
   --max-model-len 80000 \
   --max-total-tokens 2560000 \
   --chunked-prefill-size 8192 \
-  --gpu-memory-utilization 0.9 \
   --disable-kvstore \
   --host 0.0.0.0 \
   --port 8000
@@ -854,6 +882,12 @@ For the expert-parallel topology, swap `--tensor-parallel-size 8` for
 `--moe-backend flashinfer_trtllm` for `--moe-backend mega_moe`.
 
 ### AMD
+
+On eight gfx950 GPUs, DeepSeek V4 with serialized MXFP4 weights can use the
+topology and backend flags in the [Gluon Petit recipe](#gluon-petit-megamoe-on-amd-cdna4),
+alongside the V4 KV cache and indexer options. Petit ignores checkpoint
+activation clamps, which may affect accuracy; select it explicitly with
+`--moe-backend gluon_petit`.
 
 **V4-Flash** — 2× MI350-series (gfx950), tensor-parallel + MTP:
 
@@ -866,7 +900,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --max-total-tokens 16384 \
   --chunked-prefill-size 8192 \
   --prefill-graph-max-tokens 8192 \
-  --gpu-memory-utilization 0.9 \
   --disable-kvstore \
   --speculative-algorithm MTP \
   --speculative-num-steps 3 \
@@ -939,7 +972,6 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --chunked-prefill-size 8192 \
   --enable-mixed-batch \
   --enable-prefix-caching \
-  --gpu-memory-utilization 0.90 \
   --disable-kvstore \
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
   --speculative-eagle-topk 1 \
@@ -1050,8 +1082,16 @@ tokens, 621 vs 1552 at 192, 671 vs 2855 at 576, 4517 vs 7999 at an 8192-token
 prefill chunk. Two consequences:
 
 - Startup runs FlashInfer's tactic autotuner inside the kernel tuning window
-  (about five minutes for this kernel on H20). `--disable-autotune` skips it
-  and serves heuristic tactics, which is fine for bring-up.
+  (about five minutes for this kernel on H20), including each distinct draft
+  expert geometry. Decode-capable roles also traverse the shared speculative
+  path once to discover the draft model's other operators; prefill-only roles
+  skip that traversal because they do not allocate decode/verify scratch.
+  `--disable-autotune` loads a matching persistent cache and uses heuristic
+  tactics for uncovered shapes, which is fine for bring-up. Pipeline-parallel
+  launches skip tuning but can reuse a cache from a full-model run with the
+  same engine role, tensor/expert parallel layout and environment. Independent
+  prefill and decode roles keep separate caches. Cache directories are
+  created on the first successful save.
 - `--moe-mxfp4-fp8-activation` switches to the W4A8 variant (FP8 activations,
   Humming residual scales): 282/338/380/2195 µs at the same token counts,
   another 1.8x, at a few percent of relative error on the expert outputs
@@ -1110,6 +1150,47 @@ the GB300 task selects `mlx5_0,mlx5_1,mlx5_2,mlx5_3` to keep transfers on the
 InfiniBand fabric. Automatic discovery also includes Ethernet RNICs, which can
 cause incompatible RoCE/InfiniBand endpoint pairings during the RDMA handshake.
 Without `PD_SLURM=1`, the same launcher retains the single-node smoke topology.
+
+## Nemotron-3 Super
+
+`nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4` is a Nemotron-H hybrid. Its
+88 blocks are 40 Mamba2 layers, 40 latent MoE layers and 8 grouped-query
+attention layers without positional encoding. Only the Mamba2 and attention
+blocks own cache state, so the cache plans 48 layers. The routed experts use
+squared ReLU with NVFP4 weights on the FlashInfer TRT-LLM MoE, routed inside
+the kernel. Some dense projections are FP8 and the rest are BF16, as the
+checkpoint's per-layer ModelOpt config says.
+
+The checkpoint's KV cache scheme is FP8 with unit scales, which TokenSpeed does
+not detect automatically, so pass `--kv-cache-dtype fp8`. The Mamba2 SSM state
+is FP32.
+
+```bash
+tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --max-model-len 16384 \
+  --world-size 1 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+The checkpoint's multi-token prediction head serves as the draft model for
+speculative decoding. ReplaySSM is on by default: verification leaves the
+committed Mamba2 state untouched and one kernel then rebuilds every layer's
+accepted state, instead of storing a state per draft token
+(`--disable-replay-ssm` stores them).
+
+```bash
+tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --max-model-len 16384 \
+  --world-size 1 \
+  --speculative-algorithm MTP \
+  --speculative-num-steps 3 \
+  --speculative-num-draft-tokens 4
+```
 
 ## Tuning Order
 
