@@ -60,16 +60,21 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 [ -f build_swe_smith_dataset.py ] || wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
     -O build_swe_smith_dataset.py
 
-# Note: Only 71 conversations can be built
+# Note: Only 69 conversations can be built
 [ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
     --model-path moonshotai/Kimi-K3 \
-    --first-turn-length 50000 \
+    --first-turn-length 4000 \
     --subsequent-turn-length 800 \
-    --min-turns 10 \
-    --max-turns 15 \
+    --min-turns 30 \
+    --max-turns 50 \
     --number 128 \
     --output-path agentic_dataset.json \
     --num-workers 32
+
+[ -f agentic_dataset_x32.json ] || python3 duplicate_agentic_dataset.py \
+    --input agentic_dataset.json \
+    --output agentic_dataset_x32.json \
+    --replicas 32
 '
 
 server_steps() {
@@ -164,13 +169,13 @@ for CONFIG in "${CONFIGS[@]}"; do
         --url ${BASE_URL}/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
-        --dataset-path agentic_dataset.json \
+        --dataset-path agentic_dataset_x32.json \
         --max-tokens 500 \
         --multi-turn \
         --number 2 \
         --parallel 2 \
         --extra-args '{"ignore_eos": true}' \
-        --dataset-offset 68 \
+        --dataset-offset 2048 \
         --outputs-dir /tmp/outputs
 
     echo "Benchmark..."
@@ -180,11 +185,11 @@ for CONFIG in "${CONFIGS[@]}"; do
         --url ${BASE_URL}/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
-        --dataset-path agentic_dataset.json \
+        --dataset-path agentic_dataset_x32.json \
         --max-tokens 500 \
         --multi-turn \
-        --number 4 8 8 16 32 \
-        --parallel 1 2 4 8 16 \
+        --number 4 8 8 16 32 64 128 \
+        --parallel 1 2 4 8 16 32 64 \
         --extra-args '{"ignore_eos": true}' \
         --name $CONFIG \
         --outputs-dir $SWEEP_DIR \
