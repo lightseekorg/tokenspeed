@@ -867,6 +867,7 @@ def process_attention_tile_deep(
     kv_start,
     num_tiles,
     QK_VALU_GROUP_SIZE: gl.constexpr,
+    QK_DS_GROUP_STRIDE: gl.constexpr,
 ):
     """Three-tile K-ahead/V-behind schedule from dense FAv3."""
     cfg = program.cfg
@@ -908,12 +909,18 @@ def process_attention_tile_deep(
         else:
             qk = program.apply_mask(qk, cur_kv_start)
         p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
-        if QK_VALU_GROUP_SIZE > 0:
-            for _ in gl.static_range(qk_wmmas_per_wave):
+        if QK_DS_GROUP_STRIDE > 0:
+            v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=2)
+        if QK_VALU_GROUP_SIZE > 0 or QK_DS_GROUP_STRIDE > 0:
+            for group_idx in gl.static_range(qk_wmmas_per_wave):
                 sched_group("mfma", 1)
-                sched_group("valu", QK_VALU_GROUP_SIZE)
+                if QK_VALU_GROUP_SIZE > 0:
+                    sched_group("valu", QK_VALU_GROUP_SIZE)
+                if QK_DS_GROUP_STRIDE > 0 and (group_idx + 1) % QK_DS_GROUP_STRIDE == 0:
+                    sched_group("ds_read", 1)
             sched_barrier()
-        v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=2)
+        if QK_DS_GROUP_STRIDE == 0:
+            v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=2)
 
         program.tdm_load_global_to_shared_k(
             cur_kv_start + 2 * cfg.BLOCK_N,
@@ -1269,6 +1276,7 @@ def gluon_mha_prefill_gfx1250(
     WIDE_ADDRESSING: gl.constexpr,
     DISABLE_XDL_ARB_STALL: gl.constexpr,
     QK_VALU_GROUP_SIZE: gl.constexpr,
+    QK_DS_GROUP_STRIDE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     SCHED_LIBRARY_HASH: gl.constexpr,
@@ -1323,12 +1331,20 @@ def gluon_mha_prefill_gfx1250(
         if cfg.DEEP_PIPELINE:
             if not cfg.PACKED_GQA:
                 process_attention_tile_deep(
-                    program, kv_start, num_tiles, QK_VALU_GROUP_SIZE
+                    program,
+                    kv_start,
+                    num_tiles,
+                    QK_VALU_GROUP_SIZE,
+                    QK_DS_GROUP_STRIDE,
                 )
             else:
                 if num_tiles >= 3:
                     process_attention_tile_deep(
-                        program, kv_start, num_tiles, QK_VALU_GROUP_SIZE
+                        program,
+                        kv_start,
+                        num_tiles,
+                        QK_VALU_GROUP_SIZE,
+                        QK_DS_GROUP_STRIDE,
                     )
                 elif num_tiles == 1:
                     process_single_attention_tile(program, kv_start)
@@ -1592,8 +1608,43 @@ def _select_qk_valu_group_size(
     shape = (len(seqlens), max_seqlen)
     if (n_heads, n_kv_heads) == (8, 1) and shape in ((4, 4096), (2, 8192)):
         return 4
+    if (n_heads, n_kv_heads) == (8, 8) and shape == (4, 4096):
+        return 4
     if (n_heads, n_kv_heads) == (32, 1) and shape == (4, 4096):
         return 4
+    return 0
+
+
+def _select_qk_ds_group_stride(
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+    n_heads: int,
+    n_kv_heads: int,
+    seqlens: list[int],
+    max_seqlen: int,
+    window_left: int,
+    has_sink: bool,
+    has_lse: bool,
+    wide_addressing: bool,
+) -> int:
+    """Interleave independent V LDS reads into QK WMMA issue slots."""
+    if (
+        dtype != torch.bfloat16
+        or head_dim != 128
+        or window_left >= 0
+        or has_sink
+        or has_lse
+        or wide_addressing
+        or not seqlens
+        or not all(seqlen == max_seqlen for seqlen in seqlens)
+    ):
+        return 0
+    shape = (len(seqlens), max_seqlen)
+    if (n_heads, n_kv_heads) == (8, 1) and shape in ((4, 4096), (2, 8192)):
+        return 8
+    if (n_heads, n_kv_heads) == (8, 8) and shape == (4, 4096):
+        return 8
     return 0
 
 
@@ -1916,6 +1967,18 @@ def launch_gluon_mha_prefill_gfx1250(
         has_lse=return_lse,
         wide_addressing=wide_addressing,
     )
+    qk_ds_group_stride = _select_qk_ds_group_stride(
+        dtype=q.dtype,
+        head_dim=config.head_dim,
+        n_heads=config.n_heads,
+        n_kv_heads=config.n_kv_heads,
+        seqlens=seqlens,
+        max_seqlen=config.max_seqlen,
+        window_left=config.window_left,
+        has_sink=sinks is not None,
+        has_lse=return_lse,
+        wide_addressing=wide_addressing,
+    )
     wide_disable_xdl_arb_stall = (config.n_heads, config.n_kv_heads) in (
         (8, 1),
         (32, 1),
@@ -1986,6 +2049,7 @@ def launch_gluon_mha_prefill_gfx1250(
             wide_addressing,
             disable_xdl_arb_stall,
             qk_valu_group_size,
+            qk_ds_group_stride,
             config.num_warps,
             config.num_buffers,
             num_warps=config.num_warps,

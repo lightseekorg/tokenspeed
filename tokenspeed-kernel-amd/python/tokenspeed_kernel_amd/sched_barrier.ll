@@ -77,3 +77,10 @@ entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 1024, i32 2, i32 0)
   ret i32 0
 }
+
+; One LDS read.
+define i32 @__tokenspeed_sched_group_barrier_256_1() alwaysinline {
+entry:
+  call void @llvm.amdgcn.sched.group.barrier(i32 256, i32 1, i32 0)
+  ret i32 0
+}

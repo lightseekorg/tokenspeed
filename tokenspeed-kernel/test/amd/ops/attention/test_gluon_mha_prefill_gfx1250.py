@@ -397,6 +397,7 @@ def test_mha_prefill_addresses_past_four_gib():
         True,
         False,
         0,
+        0,
         4,
         2,
         num_warps=4,
@@ -670,6 +671,10 @@ def test_select_qk_valu_group_size():
         == 4
     )
     assert (
+        prefill._select_qk_valu_group_size(**(kwargs | {"n_heads": 8, "n_kv_heads": 8}))
+        == 4
+    )
+    assert (
         prefill._select_qk_valu_group_size(
             **(kwargs | {"seqlens": [8192] * 2, "max_seqlen": 8192})
         )
@@ -688,11 +693,48 @@ def test_select_qk_valu_group_size():
         assert prefill._select_qk_valu_group_size(**(kwargs | override)) == 0
 
 
+def test_select_qk_ds_group_stride():
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "head_dim": 128,
+        "n_heads": 8,
+        "n_kv_heads": 1,
+        "seqlens": [4096] * 4,
+        "max_seqlen": 4096,
+        "window_left": -1,
+        "has_sink": False,
+        "has_lse": False,
+        "wide_addressing": False,
+    }
+    assert prefill._select_qk_ds_group_stride(**kwargs) == 8
+    assert (
+        prefill._select_qk_ds_group_stride(**(kwargs | {"n_heads": 8, "n_kv_heads": 8}))
+        == 8
+    )
+    assert (
+        prefill._select_qk_ds_group_stride(
+            **(kwargs | {"seqlens": [8192] * 2, "max_seqlen": 8192})
+        )
+        == 8
+    )
+    for override in (
+        {"dtype": torch.float16},
+        {"head_dim": 64},
+        {"n_heads": 32, "n_kv_heads": 8},
+        {"seqlens": [4096, 3584, 2305, 1024]},
+        {"window_left": 512},
+        {"has_sink": True},
+        {"has_lse": True},
+        {"wide_addressing": True},
+    ):
+        assert prefill._select_qk_ds_group_stride(**(kwargs | override)) == 0
+
+
 @pytest.mark.parametrize(
     "n_q_heads,n_kv_heads,expected_block_m,expected_wpe,expected_group,expected_scheduler,expected_wide",
     [
         (8, 1, 256, 0, 4, "amdgpu-sched-strategy=coexec", False),
-        (8, 8, 256, 0, 0, "amdgpu-sched-strategy=coexec", False),
+        (8, 8, 256, 0, 4, "amdgpu-sched-strategy=coexec", False),
         (32, 8, 128, 2, 0, "amdgpu-sched-strategy=coexec", True),
         (32, 1, 128, 2, 4, "amdgpu-sched-strategy=coexec", True),
     ],
@@ -748,6 +790,7 @@ def test_mha_prefill_bf16_exact_route_config(
         assert captured["args"][20] == expected_block_m
         assert captured["args"][29] is True
         assert captured["args"][34] == expected_group
+        assert captured["args"][35] == 8
     assert captured["kwargs"]["num_warps"] == 4
     assert captured["kwargs"]["waves_per_eu"] == expected_wpe
     assert captured["kwargs"]["llvm_fn_attrs"] == expected_scheduler
