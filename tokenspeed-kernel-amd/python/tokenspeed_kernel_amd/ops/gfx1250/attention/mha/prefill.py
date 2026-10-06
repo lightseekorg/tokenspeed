@@ -35,6 +35,7 @@ from tokenspeed_kernel_amd._scheduling import (
     sched_barrier,
     sched_barrier_compile_options,
     sched_group,
+    set_wmma_issue_mode,
 )
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx1250.attention._common import (
@@ -47,7 +48,6 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention._common import (
 )
 
 cdna5 = gl.amd.cdna5
-_HAS_FUSED_TDM = hasattr(cdna5.tdm, "async_load_fused")
 
 _GFX1250_NUM_CUS = 256
 
@@ -73,7 +73,6 @@ class AttentionConfig:
     GUARDED_QUERY_ROWS: gl.constexpr
     COMPACT_RAGGED: gl.constexpr
     WIDE_ADDRESSING: gl.constexpr
-    DISABLE_XDL_ARB_STALL: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
     v_strides: InputStrides
@@ -109,7 +108,6 @@ class AttentionConfig:
         GUARDED_QUERY_ROWS,
         COMPACT_RAGGED,
         WIDE_ADDRESSING,
-        DISABLE_XDL_ARB_STALL,
         q_strides,
         k_strides,
         v_strides,
@@ -162,7 +160,6 @@ class AttentionConfig:
         self.GUARDED_QUERY_ROWS = gl.constexpr(GUARDED_QUERY_ROWS)
         self.COMPACT_RAGGED = gl.constexpr(COMPACT_RAGGED)
         self.WIDE_ADDRESSING = gl.constexpr(WIDE_ADDRESSING)
-        self.DISABLE_XDL_ARB_STALL = gl.constexpr(DISABLE_XDL_ARB_STALL)
         self.q_strides = q_strides
         self.k_strides = k_strides
         self.v_strides = v_strides
@@ -1175,29 +1172,28 @@ def _make_wide_transport_config(
     v_strides,
 ):
     return AttentionConfig(
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        sm_scale,
-        128,
-        block_n,
-        num_buffers,
-        num_warps,
-        False,
-        False,
-        False,
-        -1,
-        False,
-        True,
-        True,
-        True,
-        False,
-        False,
-        False,
-        True,
-        q_strides,
-        k_strides,
-        v_strides,
+        N_HEADS=n_heads,
+        N_KV_HEADS=n_kv_heads,
+        HEAD_DIM=head_dim,
+        SM_SCALE=sm_scale,
+        BLOCK_M=128,
+        BLOCK_N=block_n,
+        NUM_BUFFERS=num_buffers,
+        NUM_WARPS=num_warps,
+        IS_FP8=False,
+        HAS_SINK=False,
+        HAS_LSE=False,
+        WINDOW_LEFT=-1,
+        TDM_WARP_HINT=False,
+        REVERSE_Q_BLOCKS=True,
+        DEEP_PIPELINE=True,
+        PACKED_GQA=True,
+        GUARDED_QUERY_ROWS=False,
+        COMPACT_RAGGED=False,
+        WIDE_ADDRESSING=False,
+        q_strides=q_strides,
+        k_strides=k_strides,
+        v_strides=v_strides,
     )
 
 
@@ -1223,11 +1219,12 @@ def gluon_mha_prefill_gfx1250_wide_transport(
     SM_SCALE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    DISABLE_XDL_ARB_STALL: gl.constexpr,
+    WMMA_BACK_TO_BACK: gl.constexpr,
     FUSED_TDM: gl.constexpr,
+    SCHED_LIBRARY_HASH: gl.constexpr,
 ):
-    if DISABLE_XDL_ARB_STALL:
-        gl.amd.hint.disable_xdl_arb_stall()
+    if WMMA_BACK_TO_BACK:
+        set_wmma_issue_mode(True)
     q_strides = InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D)
     k_strides = InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D)
     v_strides = InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D)
@@ -1320,39 +1317,38 @@ def gluon_mha_prefill_gfx1250(
     GUARDED_QUERY_ROWS: gl.constexpr,
     COMPACT_RAGGED: gl.constexpr,
     WIDE_ADDRESSING: gl.constexpr,
-    DISABLE_XDL_ARB_STALL: gl.constexpr,
+    WMMA_BACK_TO_BACK: gl.constexpr,
     QK_VALU_GROUP_SIZE: gl.constexpr,
     QK_DS_GROUP_STRIDE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     SCHED_LIBRARY_HASH: gl.constexpr,
 ):
-    if DISABLE_XDL_ARB_STALL:
-        gl.amd.hint.disable_xdl_arb_stall()
+    if WMMA_BACK_TO_BACK:
+        set_wmma_issue_mode(True)
     cfg = AttentionConfig(
-        N_HEADS,
-        N_KV_HEADS,
-        HEAD_DIM,
-        SM_SCALE,
-        BLOCK_M,
-        BLOCK_N,
-        NUM_BUFFERS,
-        NUM_WARPS,
-        IS_FP8,
-        HAS_SINK,
-        HAS_LSE,
-        WINDOW_LEFT,
-        TDM_WARP_HINT,
-        REVERSE_Q_BLOCKS,
-        DEEP_PIPELINE,
-        PACKED_GQA,
-        GUARDED_QUERY_ROWS,
-        COMPACT_RAGGED,
-        WIDE_ADDRESSING,
-        DISABLE_XDL_ARB_STALL,
-        InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
-        InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
-        InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
+        N_HEADS=N_HEADS,
+        N_KV_HEADS=N_KV_HEADS,
+        HEAD_DIM=HEAD_DIM,
+        SM_SCALE=SM_SCALE,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        NUM_BUFFERS=NUM_BUFFERS,
+        NUM_WARPS=NUM_WARPS,
+        IS_FP8=IS_FP8,
+        HAS_SINK=HAS_SINK,
+        HAS_LSE=HAS_LSE,
+        WINDOW_LEFT=WINDOW_LEFT,
+        TDM_WARP_HINT=TDM_WARP_HINT,
+        REVERSE_Q_BLOCKS=REVERSE_Q_BLOCKS,
+        DEEP_PIPELINE=DEEP_PIPELINE,
+        PACKED_GQA=PACKED_GQA,
+        GUARDED_QUERY_ROWS=GUARDED_QUERY_ROWS,
+        COMPACT_RAGGED=COMPACT_RAGGED,
+        WIDE_ADDRESSING=WIDE_ADDRESSING,
+        q_strides=InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
+        k_strides=InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
+        v_strides=InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
     )
     program = AttentionProgram.create(
         cfg, q_ptr, k_ptr, v_ptr, output_ptr, sink_ptr, lse_ptr, cu_seqlens_ptr
@@ -1601,7 +1597,7 @@ def _select_wide_transport(
     )
 
 
-def _select_disable_xdl_arb_stall(
+def _select_wmma_back_to_back(
     *,
     dtype: torch.dtype,
     window_left: int,
@@ -1610,7 +1606,7 @@ def _select_disable_xdl_arb_stall(
     num_warps: int,
     waves_per_eu: int,
 ) -> bool:
-    """Disable the arbitration delay only for measured schedules."""
+    """Allow back-to-back WMMA issue only for measured schedules."""
     if num_warps != 4:
         return False
     if dtype == torch.bfloat16 and window_left < 0:
@@ -1842,18 +1838,6 @@ def launch_gluon_mha_prefill_gfx1250(
         seq_end - seq_start
         for seq_start, seq_end in zip(cu_seqlens_cpu, cu_seqlens_cpu[1:])
     ]
-    wide_transport = _select_wide_transport(
-        dtype=q.dtype,
-        head_dim=config.head_dim,
-        n_heads=config.n_heads,
-        n_kv_heads=config.n_kv_heads,
-        seqlens=seqlens,
-        max_seqlen=config.max_seqlen,
-        window_left=config.window_left,
-        has_sink=sinks is not None,
-        has_lse=return_lse,
-        wide_addressing=wide_addressing,
-    )
     packed_group_size = config.n_heads // config.n_kv_heads
     packed_query_span = 256 // packed_group_size
     selected_packed_gqa = _select_packed_gqa(
@@ -1873,6 +1857,18 @@ def launch_gluon_mha_prefill_gfx1250(
             + 1
         )
         * q.element_size(),
+    )
+    wide_transport = selected_packed_gqa and _select_wide_transport(
+        dtype=q.dtype,
+        head_dim=config.head_dim,
+        n_heads=config.n_heads,
+        n_kv_heads=config.n_kv_heads,
+        seqlens=seqlens,
+        max_seqlen=config.max_seqlen,
+        window_left=config.window_left,
+        has_sink=sinks is not None,
+        has_lse=return_lse,
+        wide_addressing=wide_addressing,
     )
     fast_four_wave = False
     uniform = all(seqlen == config.max_seqlen for seqlen in seqlens)
@@ -1940,7 +1936,11 @@ def launch_gluon_mha_prefill_gfx1250(
         max_seqlen=config.max_seqlen,
         block_m=config.block_m,
     )
-    compact_ragged = selected_packed_gqa and guarded_query_rows
+    # Compact task mapping is specialized for the measured four-sequence
+    # ragged batch. Other batch sizes retain the guarded rectangular mapping.
+    compact_ragged = (
+        selected_packed_gqa and guarded_query_rows and config.batch_size == 4
+    )
     if compact_ragged:
         config = config._replace(
             grid=(
@@ -1952,7 +1952,7 @@ def launch_gluon_mha_prefill_gfx1250(
                 ),
             )
         )
-    disable_xdl_arb_stall = _select_disable_xdl_arb_stall(
+    wmma_back_to_back = selected_packed_gqa and _select_wmma_back_to_back(
         dtype=q.dtype,
         window_left=config.window_left,
         uniform=uniform,
@@ -2025,48 +2025,61 @@ def launch_gluon_mha_prefill_gfx1250(
         has_lse=return_lse,
         wide_addressing=wide_addressing,
     )
-    wide_disable_xdl_arb_stall = (config.n_heads, config.n_kv_heads) in (
+    wide_wmma_back_to_back = (config.n_heads, config.n_kv_heads) in (
         (8, 1),
         (32, 1),
     )
-    wide_fused_tdm = (
-        _HAS_FUSED_TDM
-        and q.dtype == torch.bfloat16
-        and (
-            config.n_heads,
-            config.n_kv_heads,
-        )
-        == (32, 8)
-    )
+    wide_fused_tdm = q.dtype == torch.bfloat16 and (
+        config.n_heads,
+        config.n_kv_heads,
+    ) == (32, 8)
 
     if wide_transport:
+        valid_wide_contract = (
+            selected_packed_gqa
+            and config.packed_gqa
+            and q.dtype in (torch.bfloat16, torch.float16)
+            and not is_fp8
+            and config.head_dim == 128
+            and config.window_left < 0
+            and sinks is None
+            and not return_lse
+            and uniform
+            and not guarded_query_rows
+            and not compact_ragged
+            and not wide_addressing
+            and config.grid[:2] == (config.batch_size, config.n_kv_heads)
+        )
+        if not valid_wide_contract:
+            raise AssertionError("wide transport preconditions are not satisfied")
         gluon_mha_prefill_gfx1250_wide_transport[config.grid](
             q,
             k,
             v,
             cu_seqlens,
             output,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            config.sm_scale,
-            config.num_warps,
-            config.num_buffers,
-            wide_disable_xdl_arb_stall,
-            wide_fused_tdm,
+            Q_STRIDE_T=q.stride(0),
+            Q_STRIDE_H=q.stride(1),
+            Q_STRIDE_D=q.stride(2),
+            K_STRIDE_T=k.stride(0),
+            K_STRIDE_H=k.stride(1),
+            K_STRIDE_D=k.stride(2),
+            V_STRIDE_T=v.stride(0),
+            V_STRIDE_H=v.stride(1),
+            V_STRIDE_D=v.stride(2),
+            N_HEADS=config.n_heads,
+            N_KV_HEADS=config.n_kv_heads,
+            HEAD_DIM=config.head_dim,
+            SM_SCALE=config.sm_scale,
+            NUM_WARPS=config.num_warps,
+            NUM_BUFFERS=config.num_buffers,
+            WMMA_BACK_TO_BACK=wide_wmma_back_to_back,
+            FUSED_TDM=wide_fused_tdm,
             num_warps=config.num_warps,
             waves_per_eu=config.waves_per_eu,
             llvm_fn_attrs="amdgpu-sched-strategy=coexec",
             enable_fp_fusion=True,
+            **sched_barrier_compile_options(),
         )
     else:
         gluon_mha_prefill_gfx1250[config.grid](
@@ -2077,37 +2090,37 @@ def launch_gluon_mha_prefill_gfx1250(
             output,
             sink_arg,
             lse_arg,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            config.sm_scale,
-            config.block_m,
-            config.block_n,
-            is_fp8,
-            sinks is not None,
-            return_lse,
-            config.window_left,
-            tdm_warp_hint,
-            reverse_q_blocks,
-            deep_pipeline,
-            config.packed_gqa,
-            guarded_query_rows,
-            compact_ragged,
-            wide_addressing,
-            disable_xdl_arb_stall,
-            qk_valu_group_size,
-            qk_ds_group_stride,
-            config.num_warps,
-            config.num_buffers,
+            Q_STRIDE_T=q.stride(0),
+            Q_STRIDE_H=q.stride(1),
+            Q_STRIDE_D=q.stride(2),
+            K_STRIDE_T=k.stride(0),
+            K_STRIDE_H=k.stride(1),
+            K_STRIDE_D=k.stride(2),
+            V_STRIDE_T=v.stride(0),
+            V_STRIDE_H=v.stride(1),
+            V_STRIDE_D=v.stride(2),
+            N_HEADS=config.n_heads,
+            N_KV_HEADS=config.n_kv_heads,
+            HEAD_DIM=config.head_dim,
+            SM_SCALE=config.sm_scale,
+            BLOCK_M=config.block_m,
+            BLOCK_N=config.block_n,
+            IS_FP8=is_fp8,
+            HAS_SINK=sinks is not None,
+            HAS_LSE=return_lse,
+            WINDOW_LEFT=config.window_left,
+            TDM_WARP_HINT=tdm_warp_hint,
+            REVERSE_Q_BLOCKS=reverse_q_blocks,
+            DEEP_PIPELINE=deep_pipeline,
+            PACKED_GQA=config.packed_gqa,
+            GUARDED_QUERY_ROWS=guarded_query_rows,
+            COMPACT_RAGGED=compact_ragged,
+            WIDE_ADDRESSING=wide_addressing,
+            WMMA_BACK_TO_BACK=wmma_back_to_back,
+            QK_VALU_GROUP_SIZE=qk_valu_group_size,
+            QK_DS_GROUP_STRIDE=qk_ds_group_stride,
+            NUM_WARPS=config.num_warps,
+            NUM_BUFFERS=config.num_buffers,
             num_warps=config.num_warps,
             waves_per_eu=config.waves_per_eu,
             llvm_fn_attrs=llvm_fn_attrs,
