@@ -15,8 +15,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/lightseekorg/tokenspeed/tokenspeed-kernel-amd"
-Repository = "https://github.com/lightseekorg/tokenspeed/tokenspeed-kernel-amd"
+Homepage = "https://github.com/lightseekorg/tokenspeed/tree/main/tokenspeed-kernel-amd"
+Repository = "https://github.com/lightseekorg/tokenspeed"
 
 [tool.setuptools]
 license-files = ["LICENSE", "THIRDPARTYNOTICES"]

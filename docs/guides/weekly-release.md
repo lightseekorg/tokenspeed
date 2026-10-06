@@ -1,7 +1,9 @@
-# Weekly releases
+# Biweekly releases
 
-The **Weekly release** workflow starts every Sunday at 20:00 in
-`America/Los_Angeles`, including daylight saving changes. It can also be started
+The **Biweekly release** workflow starts every two weeks on Sunday at 20:00 in
+`America/Los_Angeles`, including daylight saving changes. The weekly cron checks
+the calendar-date distance from Sunday, January 2, 2000; alternate weeks finish
+successfully without publishing. It can also be started
 manually from `main`, with an optional stable TokenSpeed version. Otherwise,
 the greater of the version on `main` and the published version advances by one
 patch. A manually specified version must be greater than both. This ensures
@@ -27,7 +29,14 @@ The workflow completes these stages in order:
    The image installs and checks the exact released kernel, scheduler and MLA
    versions. Confirm both platforms are in the published manifest.
 7. Create `v<version>` at the TokenSpeed release commit with generated release
-   notes, a component version table and links to the publication runs.
+   notes, a component version table and links to PyPI, wheelhouse releases,
+   stable pip indexes, Docker and the publication runs. Notes use the previous
+   stable release tag and stay below the page size limit; the full changelog
+   link is always retained.
+8. Verify the published sources and release page, then delete this run's three
+   release branches with their expected commit leases. Tags, published assets
+   and unrelated branches remain available. Cleanup is safe to retry; a moved
+   branch stops cleanup for inspection.
 
 Configure `LIGHTSEEK_BOT_TOKEN` for the `lightseek-bot` account with repository
 and workflow access, and the existing `DOCKERHUB_USERNAME` variable and
@@ -60,7 +69,22 @@ published PyPI version. Do not start a new weekly run to resume an interrupted
 release. An ambiguous dispatch, conflicting source, edited version PR or expired
 recovery artifact requires inspection rather than guessing a new version.
 
+If a controller fix is needed after all publications succeeded, merge the fix
+and start **Biweekly release** from `main` with **resume_run_id** set to the
+original run ID and **version** empty. This uses the corrected controller and
+runs only release notes and branch cleanup. Version planning, version PRs,
+package uploads, index publication and Docker builds are skipped. The source
+run must be completed, belong to this workflow on `main`, and have successful
+stages through Docker. Its saved state must match the original run ID, and all
+recorded publishers must still match their exact source and successful result.
+Recovery and normal releases use the same concurrency group.
+
+**Re-run failed jobs** uses the controller from the original run's commit. Use
+that for repaired child publications; use **resume_run_id** when the controller
+itself changed. Recovery state artifacts are retained for 90 days.
+
 Stable pip indexes use ordinary pushes and reapply their changes on the latest
 branch after a rejected push, preserving concurrent nightly updates. Three
-rejected attempts stop the stage for manual recovery. Docker currently follows the existing NVIDIA release
-workflow; AMD kernel wheels are published in the ROCm index.
+rejected attempts stop the stage for manual recovery. Docker currently follows
+the existing NVIDIA release workflow; AMD kernel wheels are published in the
+ROCm index.

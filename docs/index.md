@@ -68,4 +68,4 @@ Large MoE deployments usually make the same decisions:
 See [Model Recipes](./recipes/models.md) for concrete examples and
 [Server Parameters](./configuration/server.md) for the parameter reference.
 
-See [Weekly Releases](./guides/weekly-release.md) for the release sequence and recovery.
+See [Biweekly Releases](./guides/weekly-release.md) for the release sequence and recovery.

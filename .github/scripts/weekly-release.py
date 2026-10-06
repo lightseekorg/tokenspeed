@@ -418,9 +418,12 @@ def index_release(root, variant, package, release):
 
 
 class Release:
-    def __init__(self, state_path, stage):
+    def __init__(self, state_path, stage, *, resume_run_id=""):
         self.path = state_path
         self.stage = stage
+        self.resume_run_id = resume_run_id
+        self.publications_verified = False
+        self.page_verified = False
         self.state = (
             json.loads(state_path.read_text())
             if state_path.exists()
@@ -431,7 +434,14 @@ class Release:
                 "versions": {},
             }
         )
-        if self.state["run_id"] != os.environ["GITHUB_RUN_ID"]:
+        if resume_run_id and (
+            not re.fullmatch(r"[1-9][0-9]*", resume_run_id) or stage != "release"
+        ):
+            raise RuntimeError(
+                "Recovery requires an original run ID and the release stage"
+            )
+        expected_run = resume_run_id or os.environ["GITHUB_RUN_ID"]
+        if self.state["run_id"] != expected_run:
             raise RuntimeError("Recovery state belongs to a different weekly run")
         self.deadline = time.monotonic() + 340 * 60
         self.phase = self.state["stages"].setdefault(stage, {})
@@ -743,6 +753,8 @@ class Release:
             )
         if command("git", "ls-remote", "origin", f"refs/heads/{ref}").split()[0] != sha:
             raise RuntimeError("Release branch readback mismatch")
+        self.state.setdefault("release_refs", {})[stage] = {"ref": ref, "sha": sha}
+        self.save()
         return ref
 
     def find_run(self, workflow, sha, ref, event):
@@ -1071,9 +1083,173 @@ class Release:
             raise RuntimeError("Docker release is missing a supported platform")
         self.phase["image"] = image
 
+    def validate_recovery(self):
+        run = api(f"actions/runs/{self.resume_run_id}")
+        if (
+            run["status"] != "completed"
+            or run["path"].split("@")[0] != ".github/workflows/weekly-release.yml"
+            or run["head_branch"] != "main"
+            or run["head_repository"]["full_name"] != REPO
+            or run["event"] not in ("schedule", "workflow_dispatch")
+        ):
+            raise RuntimeError(
+                "Recovery source must be a completed release run on main"
+            )
+        jobs = json.loads(
+            command(
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{REPO}/actions/runs/{self.resume_run_id}/jobs?filter=latest&per_page=100",
+            )
+        )
+        results = {
+            job["name"]: job["conclusion"] for page in jobs for job in page["jobs"]
+        }
+        if any(results.get(f"{stage} / stage") != "success" for stage in STAGES[:-1]):
+            raise RuntimeError(
+                "Release-only recovery requires all publication stages to have succeeded"
+            )
+        self.state["resumed_by_run_id"] = os.environ["GITHUB_RUN_ID"]
+
+    def verify_publications(self):
+        if any(
+            not self.state["stages"].get(stage, {}).get("complete")
+            for stage in STAGES[:-1]
+        ):
+            raise RuntimeError(
+                "Cannot publish release notes before all destinations succeed"
+            )
+        expected = (
+            ("release-tokenspeed-kernel-amd.yml", "amd", "workflow_dispatch"),
+            ("release-tokenspeed-kernel.yml", "kernel", "workflow_dispatch"),
+            ("release-tokenspeed-kernel-rocm.yml", "kernel", "workflow_dispatch"),
+            ("release-pypi.yml", "tokenspeed", "push"),
+            ("publish-release-docker.yml", "tokenspeed", "workflow_dispatch"),
+        )
+        if set(self.state["runs"]) != {workflow for workflow, _, _ in expected} or set(
+            self.state["versions"]
+        ) != set(PROJECTS) | {"tokenspeed-kernel"}:
+            raise RuntimeError("Recovery state has unexpected packages or publishers")
+        for workflow, stage, event in expected:
+            version = self.state["versions"][PACKAGES[stage]]
+            sha = self.state["stages"][stage]["sha"]
+            if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) or not re.fullmatch(
+                r"[0-9a-f]{40}", sha
+            ):
+                raise RuntimeError("Invalid recorded release version or source")
+            ref = "main" if event == "push" else self.branch(stage, version)
+            record = self.state["runs"][workflow]
+            if not isinstance(record.get("id"), int) or record["id"] <= 0:
+                raise RuntimeError("Invalid recorded publisher ID")
+            if (record["sha"], record["ref"], record["event"]) != (
+                sha,
+                ref,
+                event,
+            ) or not record.get("complete"):
+                raise RuntimeError("Recorded publication source mismatch")
+            run = api(f"actions/runs/{record['id']}")
+            if (
+                run["status"] != "completed"
+                or run["conclusion"] != "success"
+                or run["head_sha"] != sha
+                or run["head_branch"] != ref
+                or run["event"] != event
+                or run["actor"]["login"] != "lightseek-bot"
+                or run["path"].split("@")[0] != f".github/workflows/{workflow}"
+                or run["head_repository"]["full_name"] != REPO
+            ):
+                raise RuntimeError(
+                    "Recorded publisher is incomplete or has another source"
+                )
+        for stage, workflow in (
+            ("amd", expected[0][0]),
+            ("kernel", expected[1][0]),
+            ("tokenspeed", expected[3][0]),
+        ):
+            package = PACKAGES[stage]
+            version = self.state["versions"][package]
+            sha = self.state["stages"][stage]["sha"]
+            if source_sha(package, version, workflow) != sha:
+                raise RuntimeError("Published PyPI source mismatch")
+        versions = self.state["versions"]
+        self.wheelhouse(
+            f"tokenspeed-kernel-amd-v{versions['tokenspeed-kernel-amd']}",
+            self.state["stages"]["amd"]["sha"],
+            1,
+        )
+        self.wheelhouse(
+            f"tokenspeed-v{versions['tokenspeed']}",
+            self.state["stages"]["tokenspeed"]["sha"],
+            1,
+        )
+        for variant, count in (("cu129", 8), ("cu130", 8), ("rocm72", 4)):
+            self.wheelhouse(
+                f"tokenspeed-kernel-v{versions['tokenspeed-kernel']}-{variant}",
+                self.state["stages"]["kernel"]["sha"],
+                count,
+            )
+        # Reuse the recorded successful Docker run; never dispatch a replacement.
+        self.docker()
+        self.publications_verified = True
+
+    def notes(self, generated, previous):
+        versions = self.state["versions"]
+        tag = f"v{versions['tokenspeed']}"
+        text = "Weekly component versions\n\n| Package | Version |\n| --- | --- |\n"
+        text += "".join(
+            f"| {p} | [{v}](https://pypi.org/project/{p}/{v}/) |\n"
+            for p, v in versions.items()
+        )
+        text += f"\nDocker: [{self.state['stages']['docker']['image']}](https://hub.docker.com/r/lightseekorg/tokenspeed/tags?name={versions['tokenspeed']}) (linux/amd64, linux/arm64).\n\n"
+        text += (
+            "Stable pip indexes: "
+            + ", ".join(
+                f"[{v}](https://lightseek.org/whl/{v}/)"
+                for v in ("cu129", "cu130", "rocm7.2")
+            )
+            + ".\n\n"
+        )
+        tags = (
+            f"tokenspeed-kernel-amd-v{versions['tokenspeed-kernel-amd']}",
+            f"tokenspeed-v{versions['tokenspeed']}",
+            *(
+                f"tokenspeed-kernel-v{versions['tokenspeed-kernel']}-{v}"
+                for v in ("cu129", "cu130", "rocm72")
+            ),
+        )
+        text += "".join(
+            f"- [{t}](https://github.com/{WHL}/releases/tag/{t})\n" for t in tags
+        )
+        text += "\nPublication runs:\n\n" + "".join(
+            f"- [{workflow}](https://github.com/{REPO}/actions/runs/{run['id']})\n"
+            for workflow, run in self.state["runs"].items()
+        )
+        compare = (
+            f"https://github.com/{REPO}/compare/{previous}...{tag}"
+            if previous
+            else f"https://github.com/{REPO}/commits/{tag}"
+        )
+        footer = f"\n\n**Full Changelog**: {compare}\n"
+        omitted = "\n\nRelease notes shortened; see the full changelog for all changes."
+        budget = 100000 - len((text + footer + omitted).encode())
+        if budget < 0:
+            raise RuntimeError("Component release notes exceed the page limit")
+        lines = []
+        for line in generated.splitlines(keepends=True):
+            size = len(line.encode())
+            if size > budget:
+                break
+            lines.append(line)
+            budget -= size
+        excerpt = "".join(lines)
+        return text + excerpt + (omitted if excerpt != generated else "") + footer
+
     def release(self):
         if any(
-            not self.state["stages"][stage].get("complete") for stage in STAGES[:-1]
+            not self.state["stages"].get(stage, {}).get("complete")
+            for stage in STAGES[:-1]
         ):
             raise RuntimeError(
                 "Cannot publish release notes before all destinations succeed"
@@ -1088,19 +1264,34 @@ class Release:
             release = request(
                 f"https://api.github.com/repos/{REPO}/releases/tags/{tag}", github=True
             )
-            if "Weekly component versions" not in release["body"]:
+            if (
+                release["draft"]
+                or release["prerelease"]
+                or not existing
+                or "Weekly component versions" not in release["body"]
+            ):
                 raise RuntimeError(
                     "Existing release page does not belong to this weekly release"
                 )
+            self.page_verified = True
             return
         notes = self.path.parent / "release-notes.md"
-        text = "Weekly component versions\n\n| Package | Version |\n| --- | --- |\n"
-        text += "".join(f"| {p} | {v} |\n" for p, v in self.state["versions"].items())
-        text += f"\nDocker: `{self.state['stages']['docker']['image']}` (linux/amd64, linux/arm64).\n\n"
-        text += "".join(
-            f"- [{workflow}](https://github.com/{REPO}/actions/runs/{run['id']})\n"
-            for workflow, run in self.state["runs"].items()
-        )
+        candidates = [
+            r["tag_name"]
+            for r in api("releases?per_page=100")
+            if not r["draft"]
+            and not r["prerelease"]
+            and re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", r["tag_name"])
+            and Version(r["tag_name"][1:]) < Version(version)
+        ]
+        previous = max(candidates, key=lambda t: Version(t[1:])) if candidates else None
+        data = {"tag_name": tag, "target_commitish": sha}
+        if previous:
+            if not command("git", "ls-remote", "origin", f"refs/tags/{previous}"):
+                raise RuntimeError("Previous release tag is missing")
+            data["previous_tag_name"] = previous
+        generated = api("releases/generate-notes", data=data)["body"]
+        text = self.notes(generated, previous)
         notes.write_text(text)
         command(
             "gh",
@@ -1113,7 +1304,6 @@ class Release:
             sha,
             "--title",
             f"TokenSpeed {version}",
-            "--generate-notes",
             "--notes-file",
             str(notes),
         )
@@ -1121,14 +1311,55 @@ class Release:
             f"https://api.github.com/repos/{REPO}/releases/tags/{tag}", github=True
         )
         if (
-            text.strip() not in live["body"]
+            text.strip() != live["body"].strip()
+            or live["draft"]
+            or live["prerelease"]
             or command("git", "ls-remote", "origin", f"refs/tags/{tag}").split()[0]
             != sha
         ):
             raise RuntimeError("Release page readback mismatch")
+        self.page_verified = True
+
+    def cleanup(self):
+        if not self.publications_verified or not self.page_verified:
+            raise RuntimeError(
+                "Cleanup requires verified publications and release page"
+            )
+        # Legacy runs did not record refs separately; derive only their exact three refs.
+        refs = self.state.setdefault("release_refs", {})
+        pending = []
+        for stage, package in PACKAGES.items():
+            ref = self.branch(stage, self.state["versions"][package])
+            sha = self.state["stages"][stage]["sha"]
+            record = refs.setdefault(stage, {"ref": ref, "sha": sha})
+            if record != {"ref": ref, "sha": sha}:
+                raise RuntimeError(
+                    "Cleanup ref differs from the recorded release source"
+                )
+            current = command("git", "ls-remote", "origin", f"refs/heads/{ref}")
+            if current and current.split()[0] != sha:
+                raise RuntimeError("Cleanup refuses a release branch that moved")
+            if current:
+                pending.append((ref, sha))
+        self.save()
+        for ref, sha in pending:
+            command(
+                "git",
+                "push",
+                f"--force-with-lease=refs/heads/{ref}:{sha}",
+                "origin",
+                f":refs/heads/{ref}",
+            )
+            if command("git", "ls-remote", "origin", f"refs/heads/{ref}"):
+                raise RuntimeError("Release branch deletion readback failed")
+        self.phase["branches_cleaned"] = True
 
     def run(self, requested):
+        if self.stage == "release":
+            self.phase.pop("complete", None)
         self.guard()
+        if self.resume_run_id:
+            self.validate_recovery()
         if self.stage != "plan":
             previous = STAGES[STAGES.index(self.stage) - 1]
             if not self.state["stages"].get(previous, {}).get("complete"):
@@ -1137,10 +1368,12 @@ class Release:
             self.plan(requested)
         elif self.stage in PACKAGES:
             self.packages(self.stage)
+        elif self.stage == "release":
+            self.verify_publications()
+            self.release()
+            self.cleanup()
         else:
-            {"index": self.index, "docker": self.docker, "release": self.release}[
-                self.stage
-            ]()
+            {"index": self.index, "docker": self.docker}[self.stage]()
         self.phase["complete"] = True
         self.phase.pop("error", None)
         self.save()
@@ -1151,12 +1384,13 @@ def main():
     parser.add_argument("--stage", choices=STAGES, required=True)
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--version", default="")
+    parser.add_argument("--resume-run-id", default="")
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args()
     if args.check_only:
         print(json.dumps(preflight(), indent=2))
         return
-    release = Release(args.state, args.stage)
+    release = Release(args.state, args.stage, resume_run_id=args.resume_run_id)
     try:
         release.run(args.version)
     except Exception as error:

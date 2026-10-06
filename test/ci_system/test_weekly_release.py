@@ -332,6 +332,11 @@ def test_weekly_schedule_and_failure_resume_contract():
         {"cron": "0 20 * * 0", "timezone": "America/Los_Angeles"}
     ]
     assert workflow["concurrency"]["cancel-in-progress"] is False
+    assert workflow["jobs"]["plan"]["if"] == "needs.prepare.outputs.mode == 'normal'"
+    assert (
+        workflow["jobs"]["resume"]["if"] == "needs.prepare.outputs.mode == 'recovery'"
+    )
+    assert workflow["jobs"]["resume"]["with"]["stage"] == "release"
     for previous, stage in zip(
         ("plan", "amd", "kernel", "tokenspeed", "index", "docker"),
         ("amd", "kernel", "tokenspeed", "index", "docker", "release"),
@@ -343,6 +348,285 @@ def test_weekly_schedule_and_failure_resume_contract():
     upload = reusable["jobs"]["stage"]["steps"][-1]
     assert upload["if"] == "always()" and upload["with"]["overwrite"] is True
     assert reusable["jobs"]["stage"]["steps"][0]["with"]["persist-credentials"] is False
+
+
+@pytest.fixture
+def publication_state(release_module):
+    versions = {
+        package: "0.1.4" for package in (*release_module.PROJECTS, "tokenspeed-kernel")
+    }
+    stages = {stage: {"complete": True} for stage in release_module.STAGES[:-1]}
+    for stage, letter in zip(release_module.PACKAGES, "abc"):
+        stages[stage]["sha"] = letter * 40
+    stages["docker"]["image"] = "lightseekorg/tokenspeed:0.1.4"
+    runs = {}
+    for i, (workflow, stage, event) in enumerate(
+        (
+            ("release-tokenspeed-kernel-amd.yml", "amd", "workflow_dispatch"),
+            ("release-tokenspeed-kernel.yml", "kernel", "workflow_dispatch"),
+            ("release-tokenspeed-kernel-rocm.yml", "kernel", "workflow_dispatch"),
+            ("release-pypi.yml", "tokenspeed", "push"),
+            ("publish-release-docker.yml", "tokenspeed", "workflow_dispatch"),
+        ),
+        1,
+    ):
+        runs[workflow] = {
+            "id": i,
+            "sha": stages[stage]["sha"],
+            "ref": (
+                "main"
+                if event == "push"
+                else release_module.Release.branch(stage, "0.1.4")
+            ),
+            "event": event,
+            "complete": True,
+        }
+    return {"run_id": "123", "versions": versions, "stages": stages, "runs": runs}
+
+
+def test_oversized_generated_notes_publish_bounded_body_with_all_links(
+    release_module, publication_state, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(publication_state))
+    release = release_module.Release(path, "release")
+    generated = (
+        "- Change 中文: https://github.com/lightseekorg/tokenspeed/pull/1\n" * 3000
+    )
+    body = []
+    monkeypatch.setattr(release, "release_exists", lambda *args: False)
+
+    def api(path, *, data=None):
+        if data is None:
+            return [{"tag_name": "v0.1.3", "draft": False, "prerelease": False}]
+        assert (
+            path == "releases/generate-notes" and data["previous_tag_name"] == "v0.1.3"
+        )
+        assert data["target_commitish"] == "c" * 40
+        return {"body": generated}
+
+    def command(*args, **kwargs):
+        if args[:2] == ("git", "ls-remote"):
+            return "c" * 40 + "\t" + args[-1]
+        assert args[:3] == ("gh", "release", "create")
+        text = Path(args[args.index("--notes-file") + 1]).read_text()
+        # Model the actual API limit, including gh's server-generated notes path.
+        submitted = text + (generated if "--generate-notes" in args else "")
+        assert len(submitted) <= 125000
+        body.append(submitted)
+        return ""
+
+    monkeypatch.setattr(release_module, "api", api)
+    monkeypatch.setattr(release_module, "command", command)
+    monkeypatch.setattr(
+        release_module,
+        "request",
+        lambda *a, **kw: {"body": body[-1], "draft": False, "prerelease": False},
+    )
+    release.release()
+    assert len(body[0].encode()) <= 100000
+    assert "Weekly component versions" in body[0]
+    for package, version in publication_state["versions"].items():
+        assert f"https://pypi.org/project/{package}/{version}/" in body[0]
+    assert "tokenspeed-kernel-v0.1.4-rocm72" in body[0]
+    assert "https://lightseek.org/whl/cu130/" in body[0]
+    assert "actions/runs/5" in body[0]
+    assert body[0].endswith(
+        "**Full Changelog**: https://github.com/lightseekorg/tokenspeed/compare/v0.1.3...v0.1.4\n"
+    )
+
+
+def test_release_only_recovery_validates_origin_and_never_republishes(
+    release_module, publication_state, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(publication_state))
+    with pytest.raises(RuntimeError, match="different weekly run"):
+        release_module.Release(path, "release")
+    with pytest.raises(RuntimeError, match="release stage"):
+        release_module.Release(path, "amd", resume_run_id="123")
+    with pytest.raises(RuntimeError, match="different weekly run"):
+        release_module.Release(path, "release", resume_run_id="456")
+    release = release_module.Release(path, "release", resume_run_id="123")
+    source = {
+        "status": "completed",
+        "path": ".github/workflows/weekly-release.yml",
+        "head_branch": "main",
+        "head_repository": {"full_name": release_module.REPO},
+        "event": "workflow_dispatch",
+    }
+    jobs = [
+        {"name": f"{stage} / stage", "conclusion": "success"}
+        for stage in release_module.STAGES[:-1]
+    ]
+
+    def api(path, *, data=None):
+        assert data is None
+        if path == "actions/runs/123":
+            return source
+        record = next(
+            r
+            for r in release.state["runs"].values()
+            if path == f"actions/runs/{r['id']}"
+        )
+        workflow = next(w for w, r in release.state["runs"].items() if r is record)
+        return {
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": record["sha"],
+            "head_branch": record["ref"],
+            "event": record["event"],
+            "actor": {"login": "lightseek-bot"},
+            "path": f".github/workflows/{workflow}",
+            "head_repository": {"full_name": release_module.REPO},
+            "html_url": f"https://github.com/{release_module.REPO}/actions/runs/{record['id']}",
+        }
+
+    manifest = {
+        "manifests": [
+            {"platform": {"os": "linux", "architecture": a}} for a in ("amd64", "arm64")
+        ]
+    }
+
+    def command(*args, **kwargs):
+        if args[:2] == ("docker", "buildx"):
+            return json.dumps(manifest)
+        assert args[:2] == ("gh", "api") and "--paginate" in args
+        return json.dumps([{"jobs": jobs}])
+
+    monkeypatch.setattr(release_module, "api", api)
+    monkeypatch.setattr(release_module, "command", command)
+    monkeypatch.setattr(
+        release_module, "source_sha", lambda p, v, w: release.state["runs"][w]["sha"]
+    )
+    monkeypatch.setattr(release, "wheelhouse", lambda *a: {})
+    monkeypatch.setattr(release, "guard", lambda: None)
+    monkeypatch.setattr(
+        release, "release", lambda: setattr(release, "page_verified", True)
+    )
+    monkeypatch.setattr(release, "cleanup", lambda: None)
+    release.run("")
+    assert release.publications_verified and release.phase["complete"]
+    assert release.state["versions"] == publication_state["versions"]
+    assert release.state["resumed_by_run_id"] == "999"
+    source["status"] = "in_progress"
+    with pytest.raises(RuntimeError, match="completed release run"):
+        release.validate_recovery()
+    source["status"] = "completed"
+    jobs[-1]["conclusion"] = "failure"
+    with pytest.raises(RuntimeError, match="all publication stages"):
+        release.validate_recovery()
+    jobs[-1]["conclusion"] = "success"
+    release.state["runs"]["release-pypi.yml"]["sha"] = "d" * 40
+    with pytest.raises(RuntimeError, match="source mismatch"):
+        release.verify_publications()
+
+
+def test_cleanup_deletes_only_expected_refs_and_refuses_moved_branches(
+    release_module, publication_state, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(publication_state))
+    release = release_module.Release(path, "release")
+    refs = {
+        f"refs/heads/{release.branch(s, '0.1.4')}": publication_state["stages"][s][
+            "sha"
+        ]
+        for s in release_module.PACKAGES
+    }
+    deleted = []
+
+    def command(*args, **kwargs):
+        if args[:2] == ("git", "ls-remote"):
+            return f"{refs[args[-1]]}\t{args[-1]}" if args[-1] in refs else ""
+        ref = args[-1][1:]
+        assert (
+            args[:2] == ("git", "push")
+            and args[2] == f"--force-with-lease={ref}:{refs[ref]}"
+        )
+        deleted.append(ref)
+        del refs[ref]
+        return ""
+
+    monkeypatch.setattr(release_module, "command", command)
+    with pytest.raises(RuntimeError, match="verified publications"):
+        release.cleanup()
+    release.publications_verified = release.page_verified = True
+    moved = "refs/heads/release/kernel-0.1.4"
+    refs[moved] = "d" * 40
+    with pytest.raises(RuntimeError, match="branch that moved"):
+        release.cleanup()
+    assert not deleted
+    refs[moved] = "b" * 40
+    release.cleanup()
+    release.cleanup()
+    assert len(deleted) == 3 and not refs and release.phase["branches_cleaned"]
+
+
+def workflow_python(job):
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/weekly-release.yml").read_text()
+    )
+    script = workflow["jobs"][job]["steps"][0]["run"]
+    return script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+
+
+def test_biweekly_calendar_and_off_week_result(tmp_path, monkeypatch):
+    import datetime as dt
+
+    class Clock(dt.datetime):
+        current = dt.datetime(2026, 10, 18, 20)
+
+        @classmethod
+        def now(cls, tz):
+            return cls.current.replace(tzinfo=tz)
+
+    monkeypatch.setattr(dt, "datetime", Clock)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    monkeypatch.setenv("RESUME_RUN_ID", "")
+    monkeypatch.setenv("VERSION", "")
+    monkeypatch.setenv("EVENT", "schedule")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "output"))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary"))
+    script = workflow_python("prepare")
+    exec(compile(script, "release-mode", "exec"), {})
+    assert (tmp_path / "output").read_text().endswith("mode=normal\n")
+    Clock.current = dt.datetime(2026, 10, 25, 20)
+    exec(compile(script, "release-mode", "exec"), {})
+    assert (tmp_path / "output").read_text().endswith("mode=skip\n")
+    # The next release falls after the fall-back transition, still at local 20:00.
+    Clock.current = dt.datetime(2026, 11, 1, 20)
+    exec(compile(script, "release-mode", "exec"), {})
+    assert (tmp_path / "output").read_text().endswith("mode=normal\n")
+    monkeypatch.setenv("EVENT", "workflow_dispatch")
+    monkeypatch.setenv("RESUME_RUN_ID", "123")
+    exec(compile(script, "release-mode", "exec"), {})
+    assert (tmp_path / "output").read_text().endswith("mode=recovery\n")
+    results = {
+        stage: {"result": "skipped"}
+        for stage in (
+            "plan",
+            "amd",
+            "kernel",
+            "tokenspeed",
+            "index",
+            "docker",
+            "release",
+            "resume",
+        )
+    }
+    results["prepare"] = {"result": "success"}
+    monkeypatch.setenv("MODE", "skip")
+    monkeypatch.setenv("RESULTS", json.dumps(results))
+    exec(compile(workflow_python("result"), "release-result", "exec"), {})
+    monkeypatch.setenv("MODE", "recovery")
+    results["resume"]["result"] = "success"
+    monkeypatch.setenv("RESULTS", json.dumps(results))
+    exec(compile(workflow_python("result"), "release-result", "exec"), {})
 
 
 def test_source_tree_check_catches_unreleased_changes(

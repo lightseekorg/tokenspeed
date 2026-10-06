@@ -12,6 +12,9 @@ on:
       version:
         type: string
         default: ''
+      resume_run_id:
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -49,7 +52,26 @@ jobs:
           name: weekly-state-${{ inputs.previous }}
           path: ${{ runner.temp }}/weekly-state
 
+      - name: Download completed publication state for release-only recovery
+        if: inputs.resume_run_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+        run: |
+          if [[ ! "$RESUME_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'Invalid recovery run ID.' >&2
+            exit 1
+          fi
+          names=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RESUME_RUN_ID/artifacts" --jq '.artifacts[] | select(.expired == false) | .name')
+          artifact=weekly-state-docker
+          if grep -Fxq 'weekly-state-release' <<< "$names"; then
+            artifact=weekly-state-release
+          fi
+          gh run download "$RESUME_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$artifact" --dir "$RUNNER_TEMP/weekly-state"
+
       - name: Restore this stage on rerun
+        if: inputs.resume_run_id == ''
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           STAGE: ${{ inputs.stage }}
@@ -68,9 +90,11 @@ jobs:
           DOCKER_READY: ${{ vars.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
           STAGE: ${{ inputs.stage }}
           REQUESTED_VERSION: ${{ inputs.version }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
         run: |
           python "$RUNNER_TEMP/weekly-release.py" --stage "$STAGE" \
-            --state "$RUNNER_TEMP/weekly-state/state.json" --version "$REQUESTED_VERSION"
+            --state "$RUNNER_TEMP/weekly-state/state.json" --version "$REQUESTED_VERSION" \
+            --resume-run-id "$RESUME_RUN_ID"
 
       - name: Preserve recovery state
         if: always()
