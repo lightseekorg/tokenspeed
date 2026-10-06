@@ -9,6 +9,7 @@ from tokenspeed_kernel.ops.quantization.triton import _fp8_swizzled_scale_offset
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _FP8_E4M3_MAX = tl.constexpr(448.0)
+_FP32_MIN_NORMAL = tl.constexpr(1.1754943508222875e-38)
 
 
 @triton.jit
@@ -881,7 +882,7 @@ def _store_nvfp4(
     blocks = tl.reshape(normed, [BLOCK // 16, 16])
     vec_max = tl.max(tl.abs(blocks), axis=1).to(tl.float32)
     # Its zero test flushes too: a subnormal block amax counts as zero.
-    vec_max = tl.where(vec_max < 1.1754943508222875e-38, 0.0, vec_max)
+    vec_max = tl.where(vec_max < _FP32_MIN_NORMAL, 0.0, vec_max)
     sf = _mul_ftz(sf_scale, _mul_ftz(vec_max, rcp6)).to(tl.float8e4nv)
     out_scale = tl.where(
         vec_max != 0,
@@ -1110,7 +1111,7 @@ def add_rmsnorm(
         values, scales = out_fp4
         grid_rows = triton.cdiv(rows, 128) * 128
         if not _nvfp4_copy_possible(cols):
-            raise ValueError(f"no NVFP4 copy of N={cols} rows on this device")
+            raise ValueError(f"no NVFP4 copy for N={cols} columns on this device")
         if (
             values.shape != (rows, cols // 2)
             or values.stride(1) != 1

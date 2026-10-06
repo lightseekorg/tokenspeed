@@ -182,7 +182,23 @@ def test_nvfp4_copy_flushes_subnormal_blocks() -> None:
 
     out, values, scales = _fused(x, residual, weight, global_scale)
 
-    assert out[:, :16].float().abs().max() < 1.1754943508222875e-38
+    assert out[:, :16].float().abs().max() < torch.finfo(torch.float32).tiny
+    _assert_matches_fp4_quantize(out, values, scales, global_scale)
+
+
+def test_nvfp4_copy_saturates_block_scales() -> None:
+    # A served global scale and blocks far above the row's RMS push block scales past E4M3's 448.
+    rows, cols = 129, 5120
+    x = _rows(rows, cols, 16, seed=5)
+    residual = torch.zeros_like(x)
+    weight = (torch.randn(cols, device="cuda") * 0.3 + 1).bfloat16()
+    weight[7] = 3e38
+    global_scale = torch.tensor([1000.0], device="cuda")
+
+    out, values, scales = _fused(x, residual, weight, global_scale, gemma=False)
+
+    assert out.isinf().any()
+    assert (scales[:rows] == 0x7E).any()
     _assert_matches_fp4_quantize(out, values, scales, global_scale)
 
 
