@@ -689,6 +689,8 @@ class TestChainSpeculativeSamplingTargetOnly:
             1.0,
             deterministic,
             False,
+            use_draft_prob=False,
+            reject_draft_prob_threshold=2.0,
         )
         torch.testing.assert_close(
             predicts,
