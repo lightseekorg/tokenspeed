@@ -27,8 +27,6 @@ from typing import Protocol
 class _AttentionParallelMapping(Protocol):
     tp_size: int
     tp_rank: int
-    cp_size: int
-    cp_rank: int
     dp_size: int
     dp_rank: int
 
@@ -45,20 +43,18 @@ class PDParallelTopology:
 
     tp_size: int
     tp_rank: int
-    cp_size: int
-    cp_rank: int
     dp_size: int
     dp_rank: int
     world_size: int
     global_rank: int
-    # Prefill chunk-pipeline coordinates. tp/cp/dp are INTRA-stage; the world
-    # is pp stages of tp*cp*dp ranks each.
+    # Prefill chunk-pipeline coordinates. tp/dp are INTRA-stage; the world
+    # is pp stages of tp*dp ranks each.
     pp_size: int = 1
     pp_rank: int = 0
 
     def __post_init__(self) -> None:
         """Validate parallel sizes and rank coordinates."""
-        for name in ("tp", "cp", "dp", "pp"):
+        for name in ("tp", "dp", "pp"):
             size = getattr(self, f"{name}_size")
             rank = getattr(self, f"{name}_rank")
             if size <= 0:
@@ -66,10 +62,10 @@ class PDParallelTopology:
             if not 0 <= rank < size:
                 raise ValueError(f"{name}_rank must be in [0, {size}), got {rank}")
 
-        expected_world_size = self.tp_size * self.cp_size * self.dp_size * self.pp_size
+        expected_world_size = self.tp_size * self.dp_size * self.pp_size
         if self.world_size != expected_world_size:
             raise ValueError(
-                "world_size must equal tp_size * cp_size * dp_size * pp_size: "
+                "world_size must equal tp_size * dp_size * pp_size: "
                 f"expected {expected_world_size}, got {self.world_size}"
             )
         if not 0 <= self.global_rank < self.world_size:
@@ -83,7 +79,7 @@ class PDParallelTopology:
         """Build PD coordinates from a runtime mapping.
 
         Args:
-            mapping: Runtime mapping whose ``attn`` member exposes TP/CP/DP
+            mapping: Runtime mapping whose ``attn`` member exposes TP/DP
                 sizes and ranks.
 
         Returns:
@@ -93,8 +89,6 @@ class PDParallelTopology:
         return cls(
             tp_size=attention.tp_size,
             tp_rank=attention.tp_rank,
-            cp_size=attention.cp_size,
-            cp_rank=attention.cp_rank,
             dp_size=attention.dp_size,
             dp_rank=attention.dp_rank,
             world_size=mapping.world_size,
@@ -102,11 +96,3 @@ class PDParallelTopology:
             pp_size=getattr(mapping, "pp_size", 1),
             pp_rank=(mapping.pp_rank if getattr(mapping, "pp_size", 1) > 1 else 0),
         )
-
-    def require_cache_pd_supported(self) -> None:
-        """Reject attention topologies unsupported by cache-transfer PD."""
-        if self.cp_size != 1:
-            raise ValueError(
-                "CachePD does not support context parallelism: "
-                f"cp_size={self.cp_size}; cp_size must be 1"
-            )

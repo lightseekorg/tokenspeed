@@ -11,6 +11,27 @@ performant kernels for multi-silicon AI inference. It features:
 TokenSpeed-kernel is pip-installable on its own and can be directly used by
 others.
 
+## Nightly installation
+
+CUDA 13 nightly wheels are published daily from `main` for Linux x86_64 and
+ARM64, with Python 3.10–3.13. Versions append the UTC build date to the base
+version, for example `0.1.3.post20260929`.
+
+```bash
+pip install --upgrade tokenspeed-kernel \
+  --extra-index-url https://lightseek.org/whl/nightly
+```
+
+PyPI supplies dependencies that are absent from the nightly index. To select a
+specific nightly, use `tokenspeed-kernel==0.1.3.post20260929`. Post releases sort
+above the corresponding base release and do not require `--pre`.
+
+The `Build and Release tokenspeed-kernel` workflow also supports manual nightly
+builds from pull request branches. To publish manually, run it from `main` with
+both `nightly` and `publish_github` enabled. Same-day reruns preserve already
+published wheels.
+Historical nightlies are retained; automatic cleanup is deferred.
+
 ## Design Goals
 
 TokenSpeed-kernel is designed with the following functionality goals in mind:
@@ -126,7 +147,8 @@ iteration.
   graph replay, with raw samples, resolved registration metadata, and explicit
   failure outcomes.
 - Runtime shape capture feeds replay and tuning workflows; `kernel_scope`
-  scopes are visible in Proton/Chrome traces.
+  scopes are visible in Proton/Chrome traces. The joint BF16 `mm` fast path
+  records the same shape metadata and scopes as registry-selected kernels.
 - End-to-end serving: POST `/start_profile` with
   `{"activities": ["PROTON"]}`, run the workload, then POST `/stop_profile`.
   Each scheduler process — the process where
@@ -148,6 +170,22 @@ base and candidate revision. See the
 [benchmark documentation](benchmarks/README.md) for the harness and suite
 contract, and the [CI documentation](../test/ci/README.md#registration-level-kernel-benchmarks)
 for workflow behavior and runner requirements.
+
+### JIT compilation while serving
+
+Compile-time kernel parameters (`tl.constexpr`, `gl.constexpr`) key the
+Triton compile cache, so a per-batch value passed as one compiles a new binary
+on the forward thread for every new batch shape (100 ms to seconds each).
+`tokenspeed_kernel.compile_monitor` hooks Triton's JIT (Gluon shares it) and
+records every compilation. The runtime installs it in each scheduler process
+and marks the end of startup; after that each compilation is logged with its
+duration, what changed in the compile key, and the launching call site, and a
+compile-time parameter that keeps taking new values from one call site is
+named (`TOKENSPEED_JIT_COMPILE_CHECK=warn`, the default) or raises (`error`,
+which CI serving jobs use). Kernel tests guard batch-varying launches with
+`assert_no_triton_compile` in `test/utils.py`. JITs outside Triton, such as
+DeepGEMM's per-shape kernels, are not observed and need the same discipline
+at their call sites.
 
 ### Plugins
 

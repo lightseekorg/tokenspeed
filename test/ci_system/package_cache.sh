@@ -2,21 +2,81 @@
 
 configure_package_cache() {
     local cache_root="${CI_CACHE_ROOT:-}"
-    case "${CI_RUNNER_LABEL:-}" in
-        b200v2-*)
+    case "${RUNNER_NAME:-}:${CI_RUNNER_LABEL:-}" in
+        slurm-*:*|*:slurm-*)
+            cache_root="${cache_root:-${XDG_CACHE_HOME:-/home/runner/.cache}}"
+            ;;
+        *:b200v2-*)
             if [ -z "${cache_root}" ] && [ -n "${FLASHINFER_CACHE_DIR:-}" ]; then
                 cache_root="$(dirname "${FLASHINFER_CACHE_DIR}")"
             fi
             cache_root="${cache_root:-/raid/cache}"
             ;;
-        slurm-*) cache_root="${cache_root:-${XDG_CACHE_HOME:-/home/runner/.cache}}" ;;
         *) return 0 ;;
     esac
 
     export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${cache_root}/pip}"
     export CI_WHEEL_CACHE_DIR="${CI_WHEEL_CACHE_DIR:-${cache_root}/wheelhouse}"
+    export CI_CCACHE_DIR="${CI_CCACHE_DIR:-${cache_root}/ccache}"
     mkdir -p "${PIP_CACHE_DIR}" "${CI_WHEEL_CACHE_DIR}"
-    echo "Package cache: pip=${PIP_CACHE_DIR}, wheels=${CI_WHEEL_CACHE_DIR}"
+    echo "Package cache: pip=${PIP_CACHE_DIR}, wheels=${CI_WHEEL_CACHE_DIR}, ccache=${CI_CCACHE_DIR}"
+}
+
+configure_nvcc_cache() {
+    if [ -z "${CI_CCACHE_DIR:-}" ] || ! command -v ccache >/dev/null 2>&1; then
+        return 0
+    fi
+
+    export TOKENSPEED_KERNEL_NVCC_LAUNCHER="${TOKENSPEED_KERNEL_NVCC_LAUNCHER:-ccache}"
+    export CCACHE_DIR="${CCACHE_DIR:-${CI_CCACHE_DIR}}"
+    export CCACHE_BASEDIR="${CCACHE_BASEDIR:-${WORKSPACE:?WORKSPACE is required}}"
+    # Checkout paths are unique per matrix job. No debug flags are used for
+    # these objects, so the working directory must not split identical keys.
+    export CCACHE_NOHASHDIR="${CCACHE_NOHASHDIR:-1}"
+    export CCACHE_COMPILERTYPE="${CCACHE_COMPILERTYPE:-nvcc}"
+    export CCACHE_COMPILERCHECK="${CCACHE_COMPILERCHECK:-%compiler% --version; g++ --version}"
+    # Fresh checkouts give headers new timestamps even though their content is
+    # immutable during the build. Keep content hashing while allowing caching.
+    export CCACHE_SLOPPINESS="${CCACHE_SLOPPINESS:-include_file_ctime,include_file_mtime}"
+    export CCACHE_MAXSIZE="${CCACHE_MAXSIZE:-100G}"
+    export CCACHE_UMASK="${CCACHE_UMASK:-002}"
+    export CCACHE_TEMPDIR="${CCACHE_TEMPDIR:-${WORKSPACE}/.ccache-tmp}"
+    # Each compiler locks this log; keep concurrent writes off shared artifacts.
+    export CCACHE_STATSLOG="${CCACHE_STATSLOG:-${CCACHE_TEMPDIR}/ccache-stats.log}"
+    if [ "${TOKENSPEED_CI_FORK_PR:-false}" = "true" ]; then
+        export CCACHE_READONLY=1
+    fi
+
+    local stats_dir
+    stats_dir=$(dirname "${CCACHE_STATSLOG}")
+    if ! mkdir -p "${CCACHE_DIR}" "${CCACHE_TEMPDIR}" "${stats_dir}" \
+        || [ ! -w "${CCACHE_DIR}" ] \
+        || [ ! -w "${CCACHE_TEMPDIR}" ] \
+        || [ ! -w "${stats_dir}" ]; then
+        echo "NVCC cache directory is unavailable; continuing without ccache" >&2
+        unset CI_CCACHE_DIR TOKENSPEED_KERNEL_NVCC_LAUNCHER
+        return 0
+    fi
+    echo "NVCC cache: dir=${CCACHE_DIR}, base=${CCACHE_BASEDIR}, read_only=${CCACHE_READONLY:-0}"
+}
+
+show_nvcc_cache_stats() {
+    local phase="$1"
+    if [ -z "${CI_CCACHE_DIR:-}" ] || ! command -v ccache >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "=== NVCC cache stats (${phase}) ==="
+    ccache --show-stats || true
+    if [ "${phase}" = "after" ] && [ -s "${CCACHE_STATSLOG:-}" ]; then
+        echo "=== NVCC cache stats for this build ==="
+        ccache --show-log-stats || true
+        local artifact_dir="${WORKSPACE}/.ci-artifacts"
+        if [ "${CCACHE_STATSLOG}" != "${artifact_dir}/ccache-stats.log" ]; then
+            mkdir -p "${artifact_dir}" \
+                && cp "${CCACHE_STATSLOG}" "${artifact_dir}/ccache-stats.log" || true
+        fi
+    fi
 }
 
 cache_remote_wheel() {
@@ -62,4 +122,27 @@ cache_remote_wheel() {
     ) 9>"${cache_path}.lock"
 
     printf '%s\n' "${cache_path}"
+}
+
+# A version alone cannot identify a wheel downloaded outside the package index.
+# pip records the installed archive hash in direct_url.json (PEP 610).
+installed_wheel_matches() {
+    python3 - "$@" <<'PYTHON'
+import json
+import sys
+from importlib import metadata
+
+try:
+    dist = metadata.distribution(sys.argv[1])
+    origin = json.loads(dist.read_text("direct_url.json") or "{}")
+    archive = origin["archive_info"]
+    digest = archive.get("hashes", {}).get("sha256")
+    if digest is None:
+        legacy_hash = archive.get("hash", "")
+        digest = legacy_hash[7:] if legacy_hash.startswith("sha256=") else None
+    matches = dist.version == sys.argv[2] and digest == sys.argv[3]
+except (metadata.PackageNotFoundError, ValueError, KeyError, TypeError, AttributeError):
+    matches = False
+sys.exit(0 if matches else 1)
+PYTHON
 }

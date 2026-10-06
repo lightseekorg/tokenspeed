@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import torch
+
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -60,20 +62,50 @@ def profile_available_cache_memory_bytes(
     tp_size: int,
     gpu_memory_utilization: float,
     total_gpu_memory: int,
+    post_profile_bytes: int,
     world_group=None,
 ) -> int:
+    """The cache budget before any CUDA-graph reserve, the same on every rank.
+
+    Free memory less the utilization headroom and ``post_profile_bytes``, what
+    the node allocates after the cache is sized (the EPD receive pool); each rank
+    leaves its own out before the cross-rank minimum.
+    """
     cpu_group = (
         pg_manager.get_process_group("gloo", world_group)
         if world_group is not None
         else None
     )
-    available_gpu_memory = get_available_gpu_memory(
-        attn_config.device,
-        gpu_id,
-        distributed=tp_size > 1,
-        cpu_group=cpu_group,
-    )
+    available_gpu_memory = get_available_gpu_memory(attn_config.device, gpu_id)
+    available_gpu_memory -= post_profile_bytes / (1 << 30)
+    if tp_size > 1:
+        # Exact for any byte count, so the minimum never rounds above a rank's free memory.
+        tensor = torch.tensor(available_gpu_memory, dtype=torch.float64)
+        torch.distributed.all_reduce(
+            tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
+        )
+        available_gpu_memory = tensor.item()
     cache_memory = available_gpu_memory - total_gpu_memory * (
         1 - gpu_memory_utilization
     )
     return int(cache_memory * (1 << 30))
+
+
+def reserve_cache_budget(profiled_cache_bytes: int, graph_reserve_bytes: int) -> int:
+    """The profiled cache budget less the CUDA-graph reserve.
+
+    The utilization headroom was already left out of the profile; it funds
+    activations and fragmentation, and the reserve for the graphs comes on
+    top of it. A boot the reserve leaves with no cache fails here.
+    """
+    cache_memory = profiled_cache_bytes - graph_reserve_bytes
+    if graph_reserve_bytes and cache_memory <= 0:
+        raise ValueError(
+            f"no cache budget left: the memory profile left "
+            f"{profiled_cache_bytes / (1 << 30):.2f} GiB after the utilization "
+            f"headroom and {graph_reserve_bytes / (1 << 30):.2f} GiB is reserved "
+            "for the CUDA graphs; raise --gpu-memory-utilization, or re-run with "
+            "--disable-cudagraph-memory-reserve to size the cache from free "
+            "memory instead"
+        )
+    return cache_memory

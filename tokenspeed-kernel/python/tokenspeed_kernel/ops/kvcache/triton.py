@@ -50,6 +50,7 @@ def _use_pdl(enable_pdl: bool | None) -> bool:
 
 __all__ = [
     "HOST_CACHE_TRANSFER_CHUNK_BYTES",
+    "compact_window_rows",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
     "gather_page_table_with_padding",
@@ -69,6 +70,7 @@ __all__ = [
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
     "zero_byte_ranges",
+    "zero_page_fields",
 ]
 
 
@@ -444,6 +446,91 @@ def zero_byte_ranges(backing: torch.Tensor, ranges: list[tuple[int, int]]) -> No
     )
 
 
+@triton.jit(do_not_specialize=["num_fields"])
+def _zero_page_fields_kernel(
+    backing_ptr,
+    pages_ptr,
+    fields_ptr,
+    # Runtime: the field count follows the cache group and the page count the
+    # batch; neither may specialize the binary.
+    num_fields,
+    BLOCK_SIZE: tl.constexpr,
+):
+    entry = tl.program_id(0)
+    page = tl.load(pages_ptr + entry // num_fields).to(tl.int64)
+    field = fields_ptr + (entry % num_fields) * 3
+    range_offset = tl.load(field) + page * tl.load(field + 1)
+    range_size = tl.load(field + 2)
+    for start in range(
+        tl.program_id(1) * BLOCK_SIZE, range_size, tl.num_programs(1) * BLOCK_SIZE
+    ):
+        byte_offsets = start + tl.arange(0, BLOCK_SIZE)
+        tl.store(
+            backing_ptr + range_offset + byte_offsets,
+            0,
+            mask=byte_offsets < range_size,
+        )
+
+
+def zero_page_fields(
+    backing: torch.Tensor,
+    pages: torch.Tensor,
+    fields: torch.Tensor,
+    *,
+    max_field_bytes: int,
+) -> None:
+    """Zero every field payload of the given pages of one cache group.
+
+    The page x field expansion happens on the device: the host ships only the
+    page ids, and the group's field table is fixed once the memory plan is.
+    The expanded ranges are trusted: checking them against ``backing`` would
+    need the largest page id on the host, so the caller must guarantee that
+    every ``offset + page * stride + size`` lies within ``backing`` (the cache
+    arena asserts this once per field when it builds the table).
+
+    Args:
+        backing: Contiguous uint8 cache allocation.
+        pages: Device int32/int64 page ids within the group, ``[num_pages]``.
+        fields: Device int64 ``[num_fields, 3]`` rows of
+            ``(byte offset of page 0, page stride bytes, payload bytes)``.
+        max_field_bytes: The largest payload in ``fields``; sizes the grid.
+    """
+    if backing.dtype != torch.uint8 or not backing.is_contiguous():
+        raise ValueError("backing must be a contiguous uint8 tensor")
+    if pages.dim() != 1 or pages.dtype not in (torch.int32, torch.int64):
+        raise ValueError("pages must be a 1-D int32/int64 tensor")
+    if fields.dim() != 2 or fields.shape[1] != 3 or fields.dtype != torch.int64:
+        raise ValueError("fields must be an int64 [num_fields, 3] tensor")
+    if not (pages.is_contiguous() and fields.is_contiguous()):
+        raise ValueError("pages and fields must be contiguous")
+    # Triton keys the binary on 16-byte pointer alignment; a caller slicing a
+    # shared staging buffer must hand over aligned spans.
+    if pages.data_ptr() % 16 or fields.data_ptr() % 16:
+        raise ValueError("pages and fields must be 16-byte aligned")
+    if max_field_bytes <= 0:
+        raise ValueError("max_field_bytes must be positive")
+    num_ranges = pages.numel() * fields.shape[0]
+    if num_ranges == 0:
+        return
+
+    block_size = 1024
+    # Same CTA budget as zero_byte_ranges: bound short ranges, keep a few
+    # large ones wide enough to occupy the device.
+    tiles_per_range = max(32, triton.cdiv(1024, num_ranges))
+    grid = (
+        num_ranges,
+        min(tiles_per_range, triton.cdiv(max_field_bytes, block_size)),
+    )
+    _zero_page_fields_kernel[grid](
+        backing,
+        pages,
+        fields,
+        fields.shape[0],
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Batched state-row copies across per-layer slabs (pointer table)
 # -----------------------------------------------------------------------------
@@ -758,7 +845,7 @@ def _sf_interleaved_offset(slot, page_tokens, sf_page_stride):
 
 @triton.jit
 def _mxfp8_quantize_row(x, HEAD_DIM: tl.constexpr):
-    """Quantize one [HEAD_DIM] row to MXFP8 (flashinfer bit-parity).
+    """Quantize one [HEAD_DIM] row to MXFP8 (flashinfer bit-parity on finite inputs).
 
     Per 32-element group: amax -> ``e8m0 = clamp(ceil(log2(amax / 448)),
     -127, 127) + 127`` and ``fp8 = rn(x * 2^-exp)`` (zero groups quantize
@@ -896,6 +983,7 @@ def _set_mla_kv_buffer_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    write_mask_ptr,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
@@ -909,13 +997,15 @@ def _set_mla_kv_buffer_kernel(
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
-    pid_loc = tl.program_id(0)
+    pid_loc = tl.program_id(0).to(tl.int64)
     pid_blk = tl.program_id(1)
 
     base = pid_blk * BLOCK
     offs = base + tl.arange(0, BLOCK)
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
+    if write_mask_ptr is not None:
+        mask &= tl.load(write_mask_ptr + pid_loc)
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
@@ -961,6 +1051,7 @@ def _set_mla_kv_buffer_per_loc_kernel(
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
+    write_mask_ptr,
     n_loc,
     buffer_stride: tl.constexpr,
     nope_stride: tl.constexpr,
@@ -977,9 +1068,11 @@ def _set_mla_kv_buffer_per_loc_kernel(
         tl.extra.cuda.gdc_wait()
 
     pid = tl.program_id(0)
-    loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
+    loc_indices = (pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)).to(tl.int64)
     loc_mask = loc_indices < n_loc
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
+    if write_mask_ptr is not None:
+        loc_mask &= tl.load(write_mask_ptr + loc_indices, mask=loc_mask, other=False)
 
     nope_offs = tl.arange(0, nope_dim)
     src_nope = tl.load(
@@ -1028,6 +1121,8 @@ def set_mla_kv_buffer_triton(
     cache_k_rope: torch.Tensor,
     enable_pdl: bool | None = None,
     sanitize: bool = False,
+    *,
+    write_mask: torch.Tensor | None,
 ) -> None:
     """Scatter split MLA keys into a latent KV cache.
 
@@ -1040,6 +1135,9 @@ def set_mla_kv_buffer_triton(
         enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
             the platform policy; pass ``False`` to disable it explicitly.
         sanitize: Replace NaN and infinity values before storing.
+        write_mask: Required keyword. Boolean mask [rows] that suppresses both
+            reads of source rows and writes for false entries; explicitly None
+            writes every row. Locations for masked rows must still be safe.
 
     Returns:
         None. The cache writes are enqueued on the current device stream.
@@ -1047,6 +1145,17 @@ def set_mla_kv_buffer_triton(
     # Dispatch buckets from experiments on B200 GPUs.
     # Small batches use more CTAs per location; large batches use wider tiles.
     n_loc = loc.numel()
+    if write_mask is not None and (
+        write_mask.shape != (n_loc,)
+        or write_mask.dtype != torch.bool
+        or write_mask.device != loc.device
+        or not write_mask.is_contiguous()
+    ):
+        raise ValueError(
+            "MLA write mask must be contiguous bool [rows] on the slot device"
+        )
+    if n_loc == 0:
+        return
     nope_dim = cache_k_nope.size(-1)
     rope_dim = cache_k_rope.size(-1)
     # Clamp to a value representable by both source and destination. Bitwise
@@ -1073,6 +1182,7 @@ def set_mla_kv_buffer_triton(
             cache_k_nope,
             cache_k_rope,
             loc,
+            write_mask,
             n_loc,
             kv_buffer.stride(0),
             cache_k_nope.stride(0),
@@ -1099,6 +1209,7 @@ def set_mla_kv_buffer_triton(
             cache_k_nope,
             cache_k_rope,
             loc,
+            write_mask,
             kv_buffer.stride(0),
             cache_k_nope.stride(0),
             cache_k_rope.stride(0),
@@ -1308,7 +1419,7 @@ def _get_mla_kv_buffer_kernel(
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
-    pid_loc = tl.program_id(0)
+    pid_loc = tl.program_id(0).to(tl.int64)
     pid_blk = tl.program_id(1)
 
     base = pid_blk * BLOCK
@@ -1349,7 +1460,7 @@ def _get_mla_kv_buffer_per_loc_kernel(
         tl.extra.cuda.gdc_wait()
 
     pid = tl.program_id(0)
-    loc_indices = pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)
+    loc_indices = (pid * BLOCK_LOC + tl.arange(0, BLOCK_LOC)).to(tl.int64)
     loc_mask = loc_indices < n_loc
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
 
@@ -1480,8 +1591,8 @@ def _store_kv_cache_kernel(
     requirement is ``stride(-1) == 1`` so we can use linear addressing on
     the flattened head_dim×num_kv_heads axis.
     """
-    is_v = tl.program_id(0)
-    row = tl.program_id(1)
+    row = tl.program_id(0).to(tl.int64)
+    is_v = tl.program_id(1)
     offsets = tl.arange(0, BLOCK)
     mask = offsets < n_kv_per_token
 
@@ -1547,7 +1658,7 @@ def store_kv_cache(
     kwargs = {}
     if use_pdl:
         kwargs["launch_pdl"] = True
-    _store_kv_cache_kernel[(2, n_tokens)](
+    _store_kv_cache_kernel[(n_tokens, 2)](
         k_src,
         v_src,
         k_dst,
@@ -1577,8 +1688,6 @@ def _process_fp8_kv_tensor(
     page_offset,
     input_ptr,
     cache_ptr,
-    inv_scale,
-    use_provided_scale: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     input_stride_token: tl.constexpr,
@@ -1611,18 +1720,13 @@ def _process_fp8_kv_tensor(
         )
         block = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
 
-        if use_provided_scale:
-            block_fp8 = (block * inv_scale).to(tl.float8e4nv)
-        else:
-            block_fp8 = block.to(tl.float8e4nv)
-
         cache_offsets = (
             page_id * cache_stride_page
             + page_offset * cache_stride_offset
             + head_offsets[:, None] * cache_stride_head
             + dim_offsets[None, :] * cache_stride_dim
         )
-        tl.store(cache_ptr + cache_offsets, block_fp8, mask=mask)
+        tl.store(cache_ptr + cache_offsets, block.to(tl.float8e4nv), mask=mask)
 
 
 @triton.jit
@@ -1632,9 +1736,6 @@ def _fused_fp8_set_kv_buffer_kernel(
     k_cache_ptr,
     v_cache_ptr,
     cache_loc_ptr,
-    inv_k_scale_ptr,
-    inv_v_scale_ptr,
-    use_provided_scale: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     page_size: tl.constexpr,
@@ -1656,7 +1757,7 @@ def _fused_fp8_set_kv_buffer_kernel(
     BLOCK_DIM: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    token_id = tl.program_id(0).to(tl.int64)
     head_block_id = tl.program_id(1)
     kv_idx = tl.program_id(2)
 
@@ -1668,10 +1769,6 @@ def _fused_fp8_set_kv_buffer_kernel(
     page_offset = cache_loc % page_size
 
     if kv_idx == 0:
-        if use_provided_scale:
-            inv_scale = tl.load(inv_k_scale_ptr)
-        else:
-            inv_scale = 1.0
         _process_fp8_kv_tensor(
             token_id,
             head_block_id,
@@ -1679,8 +1776,6 @@ def _fused_fp8_set_kv_buffer_kernel(
             page_offset,
             k_ptr,
             k_cache_ptr,
-            inv_scale,
-            use_provided_scale,
             num_kv_heads,
             head_dim,
             k_stride_token,
@@ -1694,10 +1789,6 @@ def _fused_fp8_set_kv_buffer_kernel(
             BLOCK_DIM,
         )
     else:
-        if use_provided_scale:
-            inv_scale = tl.load(inv_v_scale_ptr)
-        else:
-            inv_scale = 1.0
         _process_fp8_kv_tensor(
             token_id,
             head_block_id,
@@ -1705,8 +1796,6 @@ def _fused_fp8_set_kv_buffer_kernel(
             page_offset,
             v_ptr,
             v_cache_ptr,
-            inv_scale,
-            use_provided_scale,
             num_kv_heads,
             head_dim,
             v_stride_token,
@@ -1730,8 +1819,6 @@ def fused_fp8_set_kv_buffer(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     cache_loc: torch.Tensor,
-    k_scale: float | torch.Tensor | None = None,
-    v_scale: float | torch.Tensor | None = None,
     page_size: int = 16,
     enable_pdl: bool | None = None,
 ) -> None:
@@ -1747,10 +1834,6 @@ def fused_fp8_set_kv_buffer(
         v_cache: Destination V cache with the same shape convention as
             ``k_cache``.
         cache_loc: Cache slot index for each input token.
-        k_scale: Optional scalar K scale. When provided with ``v_scale``, K is
-            divided by this scale before FP8 conversion.
-        v_scale: Optional scalar V scale. When provided with ``k_scale``, V is
-            divided by this scale before FP8 conversion.
         page_size: Number of tokens per cache page.
         enable_pdl: Whether to use Programmatic Dependent Launch. Defaults to
             the platform policy; pass ``False`` to disable it explicitly.
@@ -1815,27 +1898,10 @@ def fused_fp8_set_kv_buffer(
         v_cache_stride_head = v_cache.stride(2)
         v_cache_stride_dim = v_cache.stride(3)
 
-    use_provided_scale = k_scale is not None and v_scale is not None
-
-    block_head = min(num_kv_heads, 8)
-    block_dim = min(head_dim, 128)
+    block_head = min(triton.next_power_of_2(num_kv_heads), 8)
+    block_dim = min(triton.next_power_of_2(head_dim), 128)
     num_head_blocks = (num_kv_heads + block_head - 1) // block_head
     grid = (num_tokens, num_head_blocks, 2)
-    device = k_3d.device
-
-    def _to_tensor_scale(scale):
-        if isinstance(scale, torch.Tensor):
-            return scale.to(device=device, dtype=torch.float32)
-        return torch.tensor(float(scale), device=device, dtype=torch.float32)
-
-    if use_provided_scale:
-        k_scale_tensor = _to_tensor_scale(k_scale)
-        v_scale_tensor = _to_tensor_scale(v_scale)
-        inv_k_scale_ptr = (1.0 / k_scale_tensor).to(device=device, dtype=torch.float32)
-        inv_v_scale_ptr = (1.0 / v_scale_tensor).to(device=device, dtype=torch.float32)
-    else:
-        inv_k_scale_ptr = k_3d
-        inv_v_scale_ptr = k_3d
 
     use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
@@ -1848,9 +1914,6 @@ def fused_fp8_set_kv_buffer(
         k_cache,
         v_cache,
         cache_loc,
-        inv_k_scale_ptr,
-        inv_v_scale_ptr,
-        use_provided_scale,
         num_kv_heads,
         head_dim,
         page_size,
@@ -2547,7 +2610,7 @@ def _quantize_store_kv_mxfp8_kernel(
 
     Replaces the five-launch sequence (k/v quantize_mxfp8, store_kv_cache,
     2x store_sf_interleaved) with one launch. Bit-parity contract with
-    flashinfer's mxfp8_quantize: per 32-element group,
+    flashinfer's mxfp8_quantize on finite inputs: per 32-element group,
     ``e8m0 = clamp(ceil(log2(amax / 448)), -127, 127) + 127`` and
     ``fp8 = rn(x * 2^-exp)`` (zero rows quantize to exponent -127, data 0).
     SF layout matches _store_sf_interleaved_kernel: page-major, per-head
@@ -2555,8 +2618,8 @@ def _quantize_store_kv_mxfp8_kernel(
     row -> (row % 32) * 4 + row // 32, 4 head_dim-group bytes packed
     little-endian in one u32.
     """
-    is_v = tl.program_id(0)
-    tok = tl.program_id(1)
+    tok = tl.program_id(0).to(tl.int64)
+    is_v = tl.program_id(1)
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -2614,6 +2677,18 @@ def quantize_store_kv_mxfp8(
             the platform policy; pass ``False`` to disable it explicitly.
     """
     assert page_tokens % 128 == 0
+    if (
+        k_dst.dim() != 3
+        or k_dst.shape[-1] != 128
+        or (k.dim() == 3 and k.shape[-1] != 128)
+        or k.shape[1:].numel() != k_dst.shape[1:].numel()
+    ):
+        raise ValueError(
+            f"MXFP8 KV caches store 128-wide heads, one row per token: "
+            f"{tuple(k.shape[1:])} into {tuple(k_dst.shape[1:])}"
+        )
+    if v.shape != k.shape or v_dst.shape != k_dst.shape or v_dst.dtype != k_dst.dtype:
+        raise ValueError("MXFP8 value rows and cache must match the key rows and cache")
     t = k.shape[0]
     if t == 0:
         return
@@ -2629,7 +2704,7 @@ def quantize_store_kv_mxfp8(
     chunks_per_page = page_tokens // 128
     sf_page_stride = nheads * chunks_per_page * 128
 
-    grid = (2, t)
+    grid = (t, 2)
     use_pdl = _use_pdl(enable_pdl)
     kwargs = {}
     if use_pdl:
@@ -2729,7 +2804,9 @@ def _index_k_scatter_kernel(
     scale_buf_ptr,  # float32 flat view of buf (aliases fp8_buf_ptr)
     k_fp8_ptr,  # uint8 [tokens, HD]
     k_scale_ptr,  # float32 [tokens, NG]
-    loc_ptr,  # int [tokens] global slot index (non-negative)
+    loc_ptr,  # int [tokens] local slot index
+    write_mask_ptr,
+    HAS_WRITE_MASK: tl.constexpr,
     page_bytes,  # fp8 elements per page
     scale_page_off,  # float32 elements per page (page_bytes // 4)
     scale_base_off,  # float32 offset of the scale region ((ps*hd)//4)
@@ -2739,14 +2816,17 @@ def _index_k_scatter_kernel(
     BLOCK_HD: tl.constexpr,  # next_pow2(HD); masked so HD need not be pow2
     BLOCK_NG: tl.constexpr,  # next_pow2(NG)
 ):
-    t = tl.program_id(0)
+    t = tl.program_id(0).to(tl.int64)
     # loc >= 0 makes // and % exact.
     loc = tl.load(loc_ptr + t).to(tl.int64)
     page = loc // PAGE_SIZE
     slot = loc % PAGE_SIZE
 
     d = tl.arange(0, BLOCK_HD)
-    hd_mask = d < HD
+    owned = tl.full((), True, tl.int1)
+    if HAS_WRITE_MASK:
+        owned = tl.load(write_mask_ptr + t)
+    hd_mask = (d < HD) & owned
     fp8_dst = page * page_bytes + slot * HD + d
     tl.store(
         fp8_buf_ptr + fp8_dst,
@@ -2755,7 +2835,7 @@ def _index_k_scatter_kernel(
     )
 
     g = tl.arange(0, BLOCK_NG)
-    ng_mask = g < NG
+    ng_mask = (g < NG) & owned
     sc_dst = scale_base_off + page * scale_page_off + slot * NG + g
     tl.store(
         scale_buf_ptr + sc_dst,
@@ -2773,6 +2853,7 @@ def index_k_block_split_scatter(
     page_size: int,
     head_dim: int,
     group_size: int,
+    write_mask: torch.Tensor | None,
 ) -> None:
     """Scatter FP8 index-K rows + scales into the block-split paged buffer.
 
@@ -2788,6 +2869,8 @@ def index_k_block_split_scatter(
         index_k_scale: ``[tokens, num_groups]`` float32 scales.
         loc: ``[tokens]`` non-negative int global slot indices (any integer
             dtype).
+        write_mask: Required explicit ownership mask, or None to write all rows.
+            False entries suppress both source loads and destination writes.
         page_size, head_dim, group_size: layout; ``num_groups = head_dim //
             group_size``.
 
@@ -2795,6 +2878,12 @@ def index_k_block_split_scatter(
         None; ``buf`` is written in place.
     """
     tokens = index_k_fp8.shape[0]
+    if write_mask is not None and (
+        write_mask.shape != (tokens,)
+        or write_mask.dtype != torch.bool
+        or write_mask.device != loc.device
+    ):
+        raise ValueError("Index-K write mask must be bool [tokens] on the slot device")
     if tokens == 0:
         return
     ng = head_dim // group_size
@@ -2812,6 +2901,8 @@ def index_k_block_split_scatter(
         k_fp8,
         k_scale,
         loc.reshape(-1),
+        write_mask,
+        write_mask is not None,
         page_bytes,
         page_bytes // 4,
         (page_size * head_dim) // 4,
@@ -2820,4 +2911,71 @@ def index_k_block_split_scatter(
         NG=ng,
         BLOCK_HD=_next_power_of_two(head_dim),
         BLOCK_NG=_next_power_of_two(ng),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Draft-tree window compaction
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _compact_window_rows_kernel(
+    addresses_ptr,  # [num_buffers] int64 base address of each token-row buffer
+    locations_ptr,  # [bs * N] int32 token slot of each window row
+    path_ptr,  # [bs, N] int32 accepted window row per depth, -1 past the path
+    N: tl.constexpr,
+    ROW_I32: tl.constexpr,
+    BLOCK_I32: tl.constexpr,
+):
+    """Program (buffer, request): move the accepted path's rows to the front
+    of the request's window, one depth after another."""
+    buf = tl.cast(tl.load(addresses_ptr + tl.program_id(0)), tl.pointer_type(tl.int32))
+    req = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK_I32)
+    # The path is increasing, so row d never overwrites a later row's source.
+    for d in range(N):
+        src = tl.load(path_ptr + req * N + d)
+        if (src >= 0) & (src != d):
+            src_row = (
+                buf + tl.load(locations_ptr + req * N + src).to(tl.int64) * ROW_I32
+            )
+            dst_row = buf + tl.load(locations_ptr + req * N + d).to(tl.int64) * ROW_I32
+            for start in range(0, ROW_I32, BLOCK_I32):
+                cols = start + offsets
+                row = tl.load(src_row + cols, mask=cols < ROW_I32)
+                tl.store(dst_row + cols, row, mask=cols < ROW_I32)
+
+
+def compact_window_rows(
+    addresses: torch.Tensor,
+    locations: torch.Tensor,
+    path: torch.Tensor,
+    *,
+    row_bytes: int,
+) -> None:
+    """Pack each request's accepted draft-tree path to the front of its
+    verify window in every token-row buffer, in one launch.
+
+    Args:
+        addresses: ``[num_buffers]`` int64 base addresses of contiguous
+            token-row buffers (e.g. every layer's K and V planes) of one row
+            width; aliased buffers must appear once.
+        locations: ``[bs * N]`` int32 token slot of each window row.
+        path: ``[bs, N]`` int32 accepted window row at each depth, root
+            first, ``-1`` past the path; increasing along each row.
+        row_bytes: bytes per token row, a multiple of 4.
+    """
+    bs, n = path.shape
+    if row_bytes % 4:
+        raise ValueError(f"token rows of {row_bytes} bytes are not 4-byte words")
+    if bs == 0 or addresses.numel() == 0:
+        return
+    _compact_window_rows_kernel[(addresses.numel(), bs)](
+        addresses,
+        locations,
+        path,
+        N=n,
+        ROW_I32=row_bytes // 4,
+        BLOCK_I32=1024,
     )

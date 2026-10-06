@@ -57,6 +57,7 @@ import ctypes
 import importlib
 import json
 import os
+import shlex
 import shutil
 import site
 import subprocess
@@ -74,7 +75,7 @@ from setuptools.command.editable_wheel import editable_wheel
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
-BASE_VERSION = "0.1.3"
+BASE_VERSION = "0.1.4"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
@@ -152,6 +153,17 @@ def _git_branch() -> str:
 
 
 def _package_version() -> str:
+    if os.environ.get("TOKENSPEED_KERNEL_NIGHTLY") == "true":
+        version_date = _version_date()
+        if (
+            len(version_date) != 8
+            or not version_date.isascii()
+            or not version_date.isdigit()
+        ):
+            raise ValueError("Nightly version date must be YYYYMMDD")
+        datetime.strptime(version_date, "%Y%m%d")
+        return f"{BASE_VERSION}.post{version_date}"
+
     if _git_branch().startswith("release/"):
         return BASE_VERSION
 
@@ -366,13 +378,6 @@ KERNEL_GROUPS = [
         [],
     ),
     (
-        "minimax_m3_fused",
-        [
-            CUDA_CSRC_DIR / "fused_minimax_m3_qknorm_rope_kv_insert.cu",
-        ],
-        [],
-    ),
-    (
         "dsv3_gemm",
         [
             CUDA_CSRC_DIR / "dsv3_router_gemm_float_out.cu",
@@ -554,8 +559,10 @@ class CudaKernelBuilder:
             archs.add(self._normalize_cuda_arch(direct))
             return archs
 
-        if not archs:
-            archs.update(DEFAULT_CUDA_ARCHS)
+        archs.update(DEFAULT_CUDA_ARCHS)
+        nvcc_version = self._nvcc_toolkit_version()
+        if nvcc_version is not None and nvcc_version >= (13, 4):
+            archs.add("107a")
         return archs
 
     def _site_paths(self):
@@ -801,8 +808,10 @@ class CudaKernelBuilder:
 
     def _compile_one(self, src, obj, nvcc_flags, include_dirs, extra_cflags=()):
         include_flags = [f"-I{d}" for d in include_dirs]
+        launcher = shlex.split(os.environ.get("TOKENSPEED_KERNEL_NVCC_LAUNCHER", ""))
         cmd = (
-            [NVCC]
+            launcher
+            + [NVCC]
             + nvcc_flags
             + list(extra_cflags)
             + include_flags
@@ -1032,8 +1041,6 @@ setup(
     packages=find_packages(),
     package_data={
         "tokenspeed_kernel.ops.communication": ["_cuda/*.cu", "README.md"],
-        # Pre-swept flashinfer MoE tactic tables (see ops/tuning.py).
-        "tokenspeed_kernel.ops.moe.flashinfer": ["tactics/*.json"],
         "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.
@@ -1049,6 +1056,13 @@ setup(
             "csrc/*.h",
             "csrc/*.jinja",
             "csrc/include/*",
+        ],
+        # Petit Gluon compiles its small HIP VMM binding lazily on first use.
+        "tokenspeed_kernel.thirdparty.gluon_petit": [
+            "LICENSE.txt",
+            "README.md",
+            "lib/pybind/*.cc",
+            "lib/pybind/*.h",
         ],
     },
     cmdclass={

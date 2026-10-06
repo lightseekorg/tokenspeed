@@ -24,7 +24,7 @@ import copy
 import json
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import IntEnum, auto
 
@@ -32,16 +32,20 @@ import torch
 import yaml
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
+from tokenspeed.runtime.plugins import ensure_loaded
+from tokenspeed.runtime.plugins.registry import resolve_model_profile
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
     get_generation_config,
+    model_loader_architectures,
     resolve_architecture,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -104,6 +108,12 @@ _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
         "LongcatFlashForCausalLM",
     }
 )
+# Architectures whose config numbers only the cache-owning blocks as layers.
+_CACHE_LAYER_VIEW_ARCHITECTURES = frozenset(
+    {
+        "NemotronHForCausalLM",
+    }
+)
 
 
 class AttentionArch(IntEnum):
@@ -117,7 +127,7 @@ class AttentionArch(IntEnum):
 class _AttentionFamilySpec:
     name: str
     architectures: frozenset[str]
-    configure: Callable[[object], None]
+    configure: Callable[[object, ServerArgs], None]
     default_backend: str | None = None
     default_prefix_granularity: int | None = None
 
@@ -154,8 +164,9 @@ def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
     return resolve_architecture(config) == "DeepseekV4ForCausalLMNextN"
 
 
-def configure_deepseek_v4_attention(model_config) -> None:
+def configure_deepseek_v4_attention(model_config, server_args: ServerArgs) -> None:
     """Derive DeepSeek V4's MLA-like dimensions for runtime setup."""
+    del server_args  # the geometry follows the checkpoint alone
 
     hf_config = model_config.hf_config
     model_config.head_dim = hf_config.head_dim
@@ -174,8 +185,9 @@ def configure_deepseek_v4_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
-def configure_deepseek_v41_attention(model_config) -> None:
+def configure_deepseek_v41_attention(model_config, server_args: ServerArgs) -> None:
     """V4.1 latent dimensions; YaRN changes RoPE, not the attention scale."""
+    del server_args  # the geometry follows the checkpoint alone
     hf = model_config.hf_text_config
     model_config.head_dim = hf.head_dim
     model_config.attention_arch = AttentionArch.MLA
@@ -187,7 +199,14 @@ def configure_deepseek_v41_attention(model_config) -> None:
     model_config.scaling = hf.head_dim**-0.5
 
 
-def configure_glm_attention(model_config) -> None:
+def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
+    """Derive MLA latent plus DSA indexer geometry (GLM-DSA, DeepSeek-V3.2).
+
+    Every attention hook takes the resolved launch so a hook can key a choice
+    on it (``ModelProfile.configure_attention``); the in-tree ones plan the
+    same geometry under every launch.
+    """
+    del server_args
     mla_config = (
         model_config.hf_text_config
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
@@ -207,7 +226,7 @@ def configure_glm_attention(model_config) -> None:
     ]
     if missing_fields:
         raise ValueError(
-            "GLM attention config is missing required fields: "
+            "DSA attention config is missing required fields: "
             + ", ".join(missing_fields)
         )
 
@@ -226,6 +245,10 @@ def configure_glm_attention(model_config) -> None:
     model_config.index_n_heads = mla_config.index_n_heads
     model_config.index_kpool = getattr(mla_config, "index_kpool", None)
     model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
+    # The indexer's key plane: the FP8-with-scale rows every in-tree scoring
+    # leaf reads. A plugin hook that scores the checkpoint's bf16 keys sets
+    # "bf16" after this (layers/attention/configs/dsa.py INDEX_K_FORMATS).
+    model_config.index_k_format = "fp8_scaled"
 
     model_config.scaling = 1 / math.sqrt(
         model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
@@ -238,7 +261,8 @@ def configure_glm_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
-def configure_mla_attention(model_config) -> None:
+def configure_mla_attention(model_config, server_args: ServerArgs) -> None:
+    del server_args  # the geometry follows the checkpoint alone
     mla_config = (
         model_config.hf_text_config
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
@@ -262,7 +286,8 @@ def configure_mla_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
-def configure_minimax_m3_attention(model_config) -> None:
+def configure_minimax_m3_attention(model_config, server_args: ServerArgs) -> None:
+    del server_args  # the geometry follows the checkpoint alone
     model_config.attention_arch = AttentionArch.MSA
 
 
@@ -287,7 +312,7 @@ _ATTENTION_FAMILY_SPECS = (
     _AttentionFamilySpec(
         name="GLM",
         architectures=_DSA_ARCHITECTURES,
-        configure=configure_glm_attention,
+        configure=configure_dsa_attention,
         default_backend="dsa",
     ),
     _AttentionFamilySpec(
@@ -376,35 +401,65 @@ def _apply_block_spec_widths(
     return block_size
 
 
-def _apply_attention_family_defaults(
+def _apply_attention_defaults(
     server_args: ServerArgs,
-    spec: _AttentionFamilySpec,
+    *,
+    name: str,
+    default_backend: str | None,
+    default_prefix_granularity: int | None,
+    is_draft_worker: bool,
 ) -> None:
-    if spec.default_prefix_granularity is not None:
+    """Fill launch arguments the user left at their defaults."""
+    if default_prefix_granularity is not None:
         granularity_default = ServerArgs.__dataclass_fields__[
             "prefix_granularity"
         ].default
         if server_args.prefix_granularity == granularity_default:
             logger.info(
-                f"{spec.name!s} default prefix_granularity="
-                f"{spec.default_prefix_granularity:d}; pass --prefix-granularity "
+                f"{name!s} default prefix_granularity="
+                f"{default_prefix_granularity:d}; pass --prefix-granularity "
                 f"with a value other than {granularity_default:d} to keep that value.",
             )
-            server_args.prefix_granularity = spec.default_prefix_granularity
-    if spec.default_backend is not None and server_args.attention_backend is None:
-        server_args.attention_backend = spec.default_backend
+            server_args.prefix_granularity = default_prefix_granularity
+    if default_backend is None:
+        return
+    # A draft model's default belongs to the drafter's backend selection;
+    # writing the target field would either be discarded (already set) or
+    # hijack the target's own default.
+    if is_draft_worker:
+        if server_args.drafter_attention_backend is None:
+            server_args.drafter_attention_backend = default_backend
+        elif server_args.drafter_attention_backend != default_backend:
+            # Server-args resolution mirrors --attention-backend into the
+            # drafter before any model is known, so the two cannot be told
+            # apart here; say which one won.
+            logger.info(
+                f"{name!s} draft default attention backend {default_backend!r} "
+                f"is superseded by {server_args.drafter_attention_backend!r} "
+                "(--drafter-attention-backend, or --attention-backend mirrored "
+                "to the drafter); pass --drafter-attention-backend to choose."
+            )
+    elif server_args.attention_backend is None:
+        server_args.attention_backend = default_backend
 
 
 def _derive_num_attention_layers(
     hf_config: PretrainedConfig,
     num_hidden_layers: int,
+    model_profile: ModelProfile | None = None,
 ) -> int:
+    # A registered model declares its own attention-instance count; the
+    # architecture-name tables below stay as the in-tree seed.
+    if model_profile is not None:
+        return num_hidden_layers * model_profile.attention_instances_per_layer
     architectures = getattr(hf_config, "architectures", None) or []
     num_attention_layers = num_hidden_layers
     if is_deepseek_v4_nextn(hf_config):
         num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
     if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
         num_attention_layers = num_hidden_layers * 2
+    if any(arch in _CACHE_LAYER_VIEW_ARCHITECTURES for arch in architectures):
+        num_attention_layers = len(hf_config.cache_layer_types)
     return num_attention_layers
 
 
@@ -422,6 +477,19 @@ class ModelConfig:
         is_draft_worker: bool | None = False,
         server_args: ServerArgs = None,
     ) -> None:
+        # Plugins may register the architecture, its config class and its
+        # profile; every resolution below must see them.
+        ensure_loaded()
+        if server_args is not None and server_args.speculative_algorithm is not None:
+            # Post-discovery replacement for the CLI choices= this flag no
+            # longer carries: plugins may have added algorithms.
+            from tokenspeed.runtime.execution.drafter import (
+                require_plugin_draft_checkpoint,
+                validate_drafter_algorithm,
+            )
+
+            validate_drafter_algorithm(server_args.speculative_algorithm)
+            require_plugin_draft_checkpoint(server_args)
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
@@ -454,6 +522,20 @@ class ModelConfig:
         )
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        # A registered model states its own family facts; in-tree models
+        # without a profile still resolve through the architecture tables.
+        # Candidates are exactly the list the model loader walks, so the
+        # profile cannot come from a different architecture than the class
+        # that is built (the loader checks the pairing).
+        resolved_profile = resolve_model_profile(
+            model_loader_architectures(self.hf_config), self.hf_config
+        )
+        self.model_profile_architecture: str | None = (
+            resolved_profile[0] if resolved_profile is not None else None
+        )
+        self.model_profile: ModelProfile | None = (
+            resolved_profile[1] if resolved_profile is not None else None
+        )
         self.spec_block_size: int | None = None
         if is_draft_worker:
             self.spec_block_size = _apply_block_spec_widths(
@@ -631,17 +713,40 @@ class ModelConfig:
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
 
+        # Storage of the DSA index-key plane, one of INDEX_K_FORMATS
+        # (layers/attention/configs/dsa.py). A DSA model's configure-attention
+        # hook names it (configure_dsa_attention: "fp8_scaled"); None for a
+        # model without an indexer, and DSAConfig refuses None.
+        self.index_k_format: str | None = None
+
         # MLA/DSA families carry per-head dimension metadata that does not
         # follow the standard hidden_size / num_attention_heads derivation above.
         attention_family = _resolve_attention_family(
             self.hf_config,
             self.hf_text_config,
         )
-        if attention_family is not None:
-            _apply_attention_family_defaults(server_args, attention_family)
-            attention_family.configure(self)
+        if self.model_profile is not None:
+            _apply_attention_defaults(
+                server_args,
+                name=resolve_architecture(self.hf_config),
+                default_backend=self.model_profile.default_attention_backend,
+                default_prefix_granularity=(
+                    self.model_profile.default_prefix_granularity
+                ),
+                is_draft_worker=bool(is_draft_worker),
+            )
+            self.model_profile.configure_attention(self, server_args)
+        elif attention_family is not None:
+            _apply_attention_defaults(
+                server_args,
+                name=attention_family.name,
+                default_backend=attention_family.default_backend,
+                default_prefix_granularity=attention_family.default_prefix_granularity,
+                is_draft_worker=bool(is_draft_worker),
+            )
+            attention_family.configure(self, server_args)
         elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
-            configure_mla_attention(self)
+            configure_mla_attention(self, server_args)
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -670,6 +775,7 @@ class ModelConfig:
         self.num_attention_layers = _derive_num_attention_layers(
             self.hf_config,
             self.num_hidden_layers,
+            self.model_profile,
         )
         if is_draft_worker:
             dspark_layers = getattr(self.hf_text_config, "dspark_num_stages", None)
@@ -688,6 +794,13 @@ class ModelConfig:
 
         # Verify quantization
         self._verify_quantization()
+        if server_args is not None and not is_draft_worker:
+            # The decode TP layouts need unquantized o_proj / down_proj; judge
+            # the checkpoint's resolved method, not only --quantization.
+            server_args.validate_tp_batch_invariant_weights(
+                self.quantization,
+                getattr(self.hf_text_config, "disable_quant_module", None) or (),
+            )
 
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
@@ -695,6 +808,20 @@ class ModelConfig:
 
         if server_args is not None and server_args.load_format == "extensible":
             override_model_config(self, server_args.ext_yaml)
+
+    @property
+    def tokenizer_kwargs(self) -> Mapping[str, object]:
+        """Extra tokenizer keyword arguments the model's profile declares."""
+        if self.model_profile is None:
+            return {}
+        return self.model_profile.tokenizer_kwargs
+
+    @property
+    def requires_request_token_history(self) -> bool:
+        """Whether the model reads each request's committed token history."""
+        return (
+            self.model_profile is not None and self.model_profile.request_token_history
+        )
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)

@@ -77,8 +77,6 @@ def _hooks(
     speculative_algorithm,
     attn_tp_size,
     attn_tp_cpu_group,
-    attn_cp_size,
-    attn_cp_cpu_group,
     pp_size,
     pp_cpu_group,
 ) -> L2CacheHooks:
@@ -88,8 +86,6 @@ def _hooks(
         attn_tp_rank=0,
         attn_tp_size=attn_tp_size,
         attn_tp_cpu_group=attn_tp_cpu_group,
-        attn_cp_size=attn_cp_size,
-        attn_cp_cpu_group=attn_cp_cpu_group,
         pp_size=pp_size,
         pp_cpu_group=pp_cpu_group,
         global_rank=0,
@@ -102,8 +98,6 @@ def _single_rank_hooks(device) -> L2CacheHooks:
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
-        attn_cp_size=1,
-        attn_cp_cpu_group=None,
         pp_size=1,
         pp_cpu_group=None,
     )
@@ -197,20 +191,18 @@ def test_poll_returns_completed_events_and_settles_inflight(fake_cache_ops) -> N
     assert hooks._pending_payloads == {}
 
 
-def test_cp_peer_missing_writeback_keeps_payload_pending(
+def test_pp_peer_missing_writeback_keeps_payload_pending(
     fake_cache_ops, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     device = _Device()
-    cp_group = object()
+    pp_group = object()
     hooks = _hooks(
         device,
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
-        attn_cp_size=2,
-        attn_cp_cpu_group=cp_group,
-        pp_size=1,
-        pp_cpu_group=None,
+        pp_size=2,
+        pp_cpu_group=pp_group,
     )
     hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
     device.results = [_writeback_done_event(7)]
@@ -230,24 +222,22 @@ def test_cp_peer_missing_writeback_keeps_payload_pending(
     )
 
     assert hooks.poll_ready_events() == []
-    assert gather_groups == [cp_group]
+    assert gather_groups == [pp_group]
     assert ("WriteBackDoneEvent", 7) in hooks._pending_payloads
 
 
-def test_cp_agreed_writeback_emits_event(
+def test_pp_agreed_writeback_emits_event(
     fake_cache_ops, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     device = _Device()
-    cp_group = object()
+    pp_group = object()
     hooks = _hooks(
         device,
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
-        attn_cp_size=2,
-        attn_cp_cpu_group=cp_group,
-        pp_size=1,
-        pp_cpu_group=None,
+        pp_size=2,
+        pp_cpu_group=pp_group,
     )
     hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
     device.results = [_writeback_done_event(7)]
@@ -267,26 +257,23 @@ def test_cp_agreed_writeback_emits_event(
     )
 
     events = hooks.poll_ready_events()
-    assert gather_groups == [cp_group]
+    assert gather_groups == [pp_group]
     assert [type(e).__name__ for e in events] == ["WriteBackDoneEvent"]
     assert events[0].op_id == 7
     assert hooks._pending_payloads == {}
 
 
-def test_gather_order_is_attention_tp_then_cp_then_pp(
+def test_gather_order_is_attention_tp_then_pp(
     fake_cache_ops, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     device = _Device()
     tp_group = object()
-    cp_group = object()
     pp_group = object()
     hooks = _hooks(
         device,
         speculative_algorithm=None,
         attn_tp_size=2,
         attn_tp_cpu_group=tp_group,
-        attn_cp_size=2,
-        attn_cp_cpu_group=cp_group,
         pp_size=2,
         pp_cpu_group=pp_group,
     )
@@ -310,26 +297,23 @@ def test_gather_order_is_attention_tp_then_cp_then_pp(
     )
 
     events = hooks.poll_ready_events()
-    assert reduce_groups == [tp_group, cp_group, pp_group]
-    assert gather_groups == [tp_group, cp_group, pp_group]
+    assert reduce_groups == [tp_group, pp_group]
+    assert gather_groups == [tp_group, pp_group]
     assert [type(e).__name__ for e in events] == ["WriteBackDoneEvent"]
     assert events[0].op_id == 7
 
 
-def test_empty_tp_intersection_still_gathers_cp_and_pp(
+def test_empty_tp_intersection_still_gathers_pp(
     fake_cache_ops, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     device = _Device()
     tp_group = object()
-    cp_group = object()
     pp_group = object()
     hooks = _hooks(
         device,
         speculative_algorithm=None,
         attn_tp_size=2,
         attn_tp_cpu_group=tp_group,
-        attn_cp_size=2,
-        attn_cp_cpu_group=cp_group,
         pp_size=2,
         pp_cpu_group=pp_group,
     )
@@ -347,7 +331,7 @@ def test_empty_tp_intersection_still_gathers_cp_and_pp(
         gather_groups.append(group)
         gather_objs.append(list(obj))
         output[0] = list(obj)
-        # TP peer has not finished; CP/PP peers whose TP group already
+        # TP peer has not finished; PP peers whose TP group already
         # agreed still enter the later gathers.
         output[1] = [] if group is tp_group else peer_ready
 
@@ -356,10 +340,9 @@ def test_empty_tp_intersection_still_gathers_cp_and_pp(
     )
 
     assert hooks.poll_ready_events() == []
-    assert gather_groups == [tp_group, cp_group, pp_group]
+    assert gather_groups == [tp_group, pp_group]
     assert len(gather_objs[0]) == 1
     assert gather_objs[1] == []
-    assert gather_objs[2] == []
     assert ("WriteBackDoneEvent", 7) in hooks._pending_payloads
 
 
@@ -367,16 +350,14 @@ def test_idle_replica_max_reduces_then_gathers_when_peer_has_work(
     fake_cache_ops, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     device = _Device()
-    cp_group = object()
+    pp_group = object()
     hooks = _hooks(
         device,
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
-        attn_cp_size=2,
-        attn_cp_cpu_group=cp_group,
-        pp_size=1,
-        pp_cpu_group=None,
+        pp_size=2,
+        pp_cpu_group=pp_group,
     )
 
     reduce_groups: list = []
@@ -397,8 +378,8 @@ def test_idle_replica_max_reduces_then_gathers_when_peer_has_work(
     )
 
     assert hooks.poll_ready_events() == []
-    assert reduce_groups == [cp_group]
-    assert gather_groups == [cp_group]
+    assert reduce_groups == [pp_group]
+    assert gather_groups == [pp_group]
     assert hooks._pending_payloads == {}
 
 
@@ -406,16 +387,14 @@ def test_idle_replica_skips_gather_only_after_unanimous_max_reduce(
     fake_cache_ops, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     device = _Device()
-    cp_group = object()
+    pp_group = object()
     hooks = _hooks(
         device,
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
-        attn_cp_size=2,
-        attn_cp_cpu_group=cp_group,
-        pp_size=1,
-        pp_cpu_group=None,
+        pp_size=2,
+        pp_cpu_group=pp_group,
     )
 
     reduce_groups: list = []
@@ -433,7 +412,7 @@ def test_idle_replica_skips_gather_only_after_unanimous_max_reduce(
     )
 
     assert hooks.poll_ready_events() == []
-    assert reduce_groups == [cp_group]
+    assert reduce_groups == [pp_group]
 
 
 def test_replica_backup_failure_raises_after_poll_all_reduce(
@@ -441,16 +420,14 @@ def test_replica_backup_failure_raises_after_poll_all_reduce(
 ) -> None:
     device = _Device()
     device.backup_failed = True
-    cp_group = object()
+    pp_group = object()
     hooks = _hooks(
         device,
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
-        attn_cp_size=2,
-        attn_cp_cpu_group=cp_group,
-        pp_size=1,
-        pp_cpu_group=None,
+        pp_size=2,
+        pp_cpu_group=pp_group,
     )
     hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
 
@@ -472,7 +449,7 @@ def test_replica_backup_failure_raises_after_poll_all_reduce(
 
     with pytest.raises(RuntimeError, match="L3 backup failed on a replica rank"):
         hooks.poll_ready_events()
-    assert reduce_groups == [cp_group]
+    assert reduce_groups == [pp_group]
     assert gather_groups == []
 
 

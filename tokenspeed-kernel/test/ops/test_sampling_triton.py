@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_top_k_top_p_from_pools,
     gumbel_sample_top_k_top_p_qrita_from_pools,
     gumbel_sample_top_p_parallel_from_pools,
+    gumbel_scratch_shape,
 )
 
 # Sentinel matching tokenspeed.runtime.sampling.sampling_params._TOP_K_DISABLED.
@@ -43,11 +44,20 @@ _TOP_K_DISABLED = 1 << 30
 
 
 def _gumbel_scratch(rows: int, vocab_size: int, device: str):
-    num_blocks = (vocab_size + 1023) // 1024
-    local_ids = torch.empty((rows, num_blocks), dtype=torch.int32, device=device)
-    local_scores = torch.empty((rows, num_blocks), dtype=torch.float32, device=device)
+    shape = gumbel_scratch_shape(rows, vocab_size)
+    local_ids = torch.empty(shape, dtype=torch.int32, device=device)
+    local_scores = torch.empty(shape, dtype=torch.float32, device=device)
     out = torch.empty((rows,), dtype=torch.int32, device=device)
     return local_ids, local_scores, out
+
+
+def test_gumbel_scratch_shape_covers_the_kernel_blocks() -> None:
+    # One (id, score) per 1024-token block, rounded up for the ragged tail.
+    assert gumbel_scratch_shape(4, 1024) == (4, 1)
+    assert gumbel_scratch_shape(4, 1025) == (4, 2)
+    assert gumbel_scratch_shape(0, 129280) == (0, 127)
+    with pytest.raises(ValueError, match="vocab_size > 0"):
+        gumbel_scratch_shape(4, 0)
 
 
 def _top_k_top_p_gumbel_scratch(rows: int, vocab_size: int, device: str):
@@ -180,6 +190,32 @@ def test_gumbel_sample_from_pools_takes_tail_token(device: str) -> None:
     ).clone()
 
     torch.testing.assert_close(compact.cpu(), sampled.cpu())
+
+
+def test_gumbel_sample_from_pools_rows_beyond_int32_offsets(device: str) -> None:
+    """Verify rows x vocab past 2**31 elements (e.g. 136 requests x 64 tree nodes)."""
+    rows, vocab_size = 8704, 248320
+    assert (rows - 1) * vocab_size > 2**31
+    logits = torch.full((rows, vocab_size), -10.0, dtype=torch.bfloat16, device=device)
+    logits[:, 777] = 1.0e3
+    logits[-1, 777] = -10.0
+    logits[-1, 12345] = 1.0e3
+    req_pool_indices = torch.arange(rows, dtype=torch.int32, device=device)
+    temperature_pool = torch.ones((rows,), dtype=torch.float32, device=device)
+    seed_pool = torch.arange(rows, dtype=torch.int64, device=device)
+    offsets_pool = torch.zeros((rows,), dtype=torch.int64, device=device)
+    local_ids, local_scores, out = _gumbel_scratch(rows, vocab_size, device)
+    pools = (req_pool_indices, temperature_pool, seed_pool, offsets_pool)
+
+    sampled = gumbel_sample_from_pools(logits, *pools, local_ids, local_scores, out)
+    compact_out = torch.empty((rows,), dtype=torch.int32, device=device)
+    compact = gumbel_sample_from_pools_compact(
+        logits, *pools, compact_out, block_size=1024
+    )
+
+    for got in (sampled, compact):
+        assert int(got[0]) == 777
+        assert int(got[-1]) == 12345
 
 
 def test_gumbel_no_filter_verify_idx_mapping_matches_expanded_rows(

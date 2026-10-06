@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING
 
 import torch
@@ -31,6 +32,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     dspark_greedy_workspace,
     sample_dspark_block_greedy,
@@ -121,18 +123,23 @@ class DeepseekV4DSpark(BaseDrafter):
         )
         self.target_layer_ids = list(self.model.target_layer_ids)
         self.hidden_width = len(self.target_layer_ids) * int(self.model.hidden_size)
-        self.idle_forward_steps = 1
         self._prefill_graph: torch.cuda.CUDAGraph | None = None
         self._init_buffers()
+
+    def idle_forward_global_num_tokens(
+        self, global_num_tokens: list[int], global_bs: list[int]
+    ) -> list[list[int]]:
+        # Block drafter: one draft forward proposes the whole block.
+        del global_bs
+        return [global_num_tokens]
 
     @staticmethod
     def _validate_tp_only_mapping(mapping) -> None:
         dp_size = int(mapping.attn.dp_size)
-        cp_size = int(mapping.attn.cp_size)
-        if dp_size != 1 or cp_size != 1:
+        if dp_size != 1:
             raise ValueError(
                 "Week-0 DSPARK supports tensor parallelism only; "
-                f"got attention dp_size={dp_size}, cp_size={cp_size}."
+                f"got attention dp_size={dp_size}."
             )
 
     def _init_buffers(self) -> None:
@@ -275,8 +282,18 @@ class DeepseekV4DSpark(BaseDrafter):
             out[num_extends:].copy_(output_tokens[offsets + accepted - 1])
         return out
 
+    @property
+    def captures_prefill_graph(self) -> bool:
+        return True
+
+    def release_prefill_graph(self) -> None:
+        """Drop the graph and the private pool it holds before the arena is replaced."""
+        self._prefill_graph = None
+
     @torch.inference_mode()
-    def capture_prefill_graph(self, stream: torch.cuda.Stream) -> None:
+    def capture_prefill_graph(
+        self, stream: torch.cuda.Stream, observer: AbstractContextManager[None]
+    ) -> None:
         """Capture one request's bounded context seeding in a private graph pool."""
         window = int(self.model.window_size)
         self._prefill_hidden = torch.zeros(
@@ -317,7 +334,7 @@ class DeepseekV4DSpark(BaseDrafter):
         graph = torch.cuda.CUDAGraph()
         # Own pool: target prefill and decode graphs must not recycle these
         # intermediates, including any pointers memoized by quantized GEMMs.
-        with torch.cuda.graph(graph, stream=stream):
+        with observer, torch.cuda.graph(graph, stream=stream):
             run_once()
         graph.replay()
         torch.cuda.synchronize(self.device)
@@ -467,6 +484,7 @@ class DeepseekV4DSpark(BaseDrafter):
             token_to_kv_pool=base_ctx.token_to_kv_pool,
             bs=num_decodes,
             num_extends=0,
+            output_layout=ForwardOutputLayout(0, 0, num_decodes, self.block_size),
             input_num_tokens=num_decodes * self.block_size,
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,

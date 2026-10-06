@@ -360,7 +360,7 @@ def test_model_config_uses_nested_mla_dims_without_yarn_scale(runtime_config):
     assert model.scaling == pytest.approx(512**-0.5)
     # V4 would multiply the attention scale for this flag; V4.1 must not.
     model.hf_text_config.rope_scaling["mscale_all_dim"] = True
-    configure_deepseek_v41_attention(model)
+    configure_deepseek_v41_attention(model, ServerArgs(model="x"))
     assert model.scaling == pytest.approx(512**-0.5)
     assert model.quantization == "fp8"
     assert model.hf_text_config.quantization_config == {
@@ -400,6 +400,7 @@ def test_config_selects_flash_recipe_and_checks_geometry(runtime_config, overlap
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=256 << 20,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=overlap_depth,
     )
@@ -447,6 +448,7 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=256 << 20,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=overlap_depth,
     )

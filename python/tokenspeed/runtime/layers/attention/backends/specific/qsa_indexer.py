@@ -28,9 +28,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     reject_bounded_replay,
+    reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
@@ -117,8 +119,6 @@ class QSAIndexerBackend(AttentionBackend):
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
-        if self.cache_pool is not None and self.cache_pool is not cache_pool:
-            raise RuntimeError("QSA indexer backend cannot be rebound to another pool")
         self._table_specs_for(cache_pool)
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
@@ -173,6 +173,7 @@ class QSAIndexerBackend(AttentionBackend):
             self._table_specs,
             max_bs=max_bs,
             max_tokens_per_req=self.spec_num_tokens,
+            max_extend_tokens=0,
             device=self.device,
         )
         self._seq_lens = torch.empty(max_bs, dtype=torch.int32, device=self.device)
@@ -232,8 +233,10 @@ class QSAIndexerBackend(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
+        reject_query_shard(query_shard, "QSAIndexerBackend")
         del req_pool_indices, extend_prefix_lens
         del extend_prompt_lens_cpu, extend_with_prefix, kwargs
         reject_bounded_replay(extend_replay_lens_cpu, "QSAIndexerBackend")

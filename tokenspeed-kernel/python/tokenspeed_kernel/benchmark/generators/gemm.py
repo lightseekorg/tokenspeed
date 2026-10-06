@@ -58,7 +58,14 @@ from tokenspeed_kernel.signature import (
 # isort: split
 import tokenspeed_kernel.numerics.gemm  # noqa: F401
 
-__all__ = ["prepare_dense_bmm", "prepare_mxfp8_mm"]
+__all__ = [
+    "prepare_decode_gemv",
+    "prepare_dense_bmm",
+    "prepare_dense_mm",
+    "prepare_linear_attnres_partials",
+    "prepare_mm",
+    "prepare_mxfp8_mm",
+]
 
 
 _DTYPE_NAMES = {
@@ -260,49 +267,40 @@ def _select_reference_registration(
     )
 
 
-def prepare_dense_bmm(
+def _dense_mm_traits(
+    M: int,
+    N: int,
+    K: int,
+    out_dtype: torch.dtype,
+) -> dict[str, object]:
+    return {
+        "m": M,
+        "n": N,
+        "k": K,
+        "a_inner_stride_one": True,
+        "b_inner_stride_one": True,
+        "out_dtype": out_dtype,
+    }
+
+
+def _prepare_dense_gemm(
     request: BenchmarkRequest,
     platform: PlatformInfo,
+    *,
+    dtype: torch.dtype,
+    shape: dict[str, int],
+    traits: dict[str, object],
+    input_traits: dict[str, object],
+    out_shape: tuple[int, ...],
+    normalized_parameters: dict[str, object],
+    validation_config: dict[str, float | int] | None,
 ) -> PreparedBenchmark:
-    """Prepare a dense BF16 batched GEMM registration benchmark."""
+    """Prepare a dense GEMM benchmark whose registrations write into ``out``."""
 
-    allowed = {"batch", "M", "N", "K", "dtype", "validation"}
-    unknown = sorted(set(request.parameters) - allowed)
-    if unknown:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"Unknown dense gemm.bmm parameters: {', '.join(unknown)}",
-        )
-
-    batch = _positive_int(request.parameters.get("batch"), "batch")
-    M = _positive_int(request.parameters.get("M"), "M")
-    N = _positive_int(request.parameters.get("N"), "N")
-    K = _positive_int(request.parameters.get("K"), "K")
-    dtype = _parse_dtype(request.parameters.get("dtype", "bfloat16"))
-    validation_config = _parse_validation(
-        request.parameters.get("validation"),
-        dtype=dtype,
-        K=K,
-    )
-    normalized_parameters = {
-        "batch": batch,
-        "M": M,
-        "N": N,
-        "K": K,
-        "dtype": "bfloat16",
-        "a_layout": "BMK",
-        "b_layout": "BNK",
-        "b_n_stride_one": True,
-        "out_layout": "BMN",
-    }
-    if validation_config is not None:
-        normalized_parameters["validation"] = validation_config
-    shape = {"batch": batch, "M": M, "N": N, "K": K}
     signature = format_signature(
         a=dense_tensor_format(dtype),
         b=dense_tensor_format(dtype),
     )
-    traits = _bmm_traits(batch, M, N, K, dtype)
 
     load_builtin_kernels()
     spec, selected = _select_registration(request, platform, signature, traits, shape)
@@ -312,7 +310,7 @@ def prepare_dense_bmm(
             request.family,
             request.mode,
             dtype=dtype,
-            traits={"b_n_stride_one": frozenset({True})},
+            traits=input_traits,
             format_signature=signature,
             device="cuda",
             seed=seed,
@@ -324,7 +322,7 @@ def prepare_dense_bmm(
         kernel: Callable[..., object],
         kernel_spec: KernelSpec,
     ) -> Callable[[], torch.Tensor]:
-        out = torch.empty((batch, M, N), dtype=dtype, device=inputs["A"].device)
+        out = torch.empty(out_shape, dtype=dtype, device=inputs["A"].device)
         call_kwargs = dict(inputs)
         call_kwargs["out"] = out
 
@@ -381,6 +379,115 @@ def prepare_dense_bmm(
         ),
         parameters=normalized_parameters,
         validation=validation,
+    )
+
+
+def prepare_dense_bmm(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare a dense BF16 batched GEMM registration benchmark."""
+
+    allowed = {"batch", "M", "N", "K", "dtype", "validation"}
+    unknown = sorted(set(request.parameters) - allowed)
+    if unknown:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"Unknown dense gemm.bmm parameters: {', '.join(unknown)}",
+        )
+
+    batch = _positive_int(request.parameters.get("batch"), "batch")
+    M = _positive_int(request.parameters.get("M"), "M")
+    N = _positive_int(request.parameters.get("N"), "N")
+    K = _positive_int(request.parameters.get("K"), "K")
+    dtype = _parse_dtype(request.parameters.get("dtype", "bfloat16"))
+    validation_config = _parse_validation(
+        request.parameters.get("validation"),
+        dtype=dtype,
+        K=K,
+    )
+    normalized_parameters = {
+        "batch": batch,
+        "M": M,
+        "N": N,
+        "K": K,
+        "dtype": "bfloat16",
+        "a_layout": "BMK",
+        "b_layout": "BNK",
+        "b_n_stride_one": True,
+        "out_layout": "BMN",
+    }
+    if validation_config is not None:
+        normalized_parameters["validation"] = validation_config
+
+    return _prepare_dense_gemm(
+        request,
+        platform,
+        dtype=dtype,
+        shape={"batch": batch, "M": M, "N": N, "K": K},
+        traits=_bmm_traits(batch, M, N, K, dtype),
+        input_traits={"b_n_stride_one": frozenset({True})},
+        out_shape=(batch, M, N),
+        normalized_parameters=normalized_parameters,
+        validation_config=validation_config,
+    )
+
+
+def prepare_dense_mm(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare a dense BF16 GEMM registration benchmark.
+
+    The case computes ``A @ B.T`` from K-contiguous ``A[M, K]`` and
+    ``B[N, K]`` into a caller-owned ``out[M, N]``.
+    """
+
+    allowed = {"M", "N", "K", "quant", "dtype", "validation"}
+    unknown = sorted(set(request.parameters) - allowed)
+    if unknown:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"Unknown dense gemm.mm parameters: {', '.join(unknown)}",
+        )
+
+    M = _positive_int(request.parameters.get("M"), "M")
+    N = _positive_int(request.parameters.get("N"), "N")
+    K = _positive_int(request.parameters.get("K"), "K")
+    if request.parameters.get("quant") != "none":
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Dense gemm.mm requires quant='none'",
+        )
+    dtype = _parse_dtype(request.parameters.get("dtype"))
+    validation_config = _parse_validation(
+        request.parameters.get("validation"),
+        dtype=dtype,
+        K=K,
+    )
+    normalized_parameters: dict[str, object] = {
+        "M": M,
+        "N": N,
+        "K": K,
+        "quant": "none",
+        "dtype": "bfloat16",
+        "a_layout": "MK",
+        "b_layout": "NK",
+        "out_layout": "MN",
+    }
+    if validation_config is not None:
+        normalized_parameters["validation"] = validation_config
+
+    return _prepare_dense_gemm(
+        request,
+        platform,
+        dtype=dtype,
+        shape={"M": M, "N": N, "K": K},
+        traits=_dense_mm_traits(M, N, K, dtype),
+        input_traits={"a_layout": "MK", "b_layout": "NK"},
+        out_shape=(M, N),
+        normalized_parameters=normalized_parameters,
+        validation_config=validation_config,
     )
 
 
@@ -586,4 +693,210 @@ def prepare_mxfp8_mm(
         ),
         parameters=normalized_parameters,
         validation=validation,
+    )
+
+
+_MM_GENERATORS: dict[str, Callable[..., PreparedBenchmark]] = {
+    "mxfp8": prepare_mxfp8_mm,
+    "none": prepare_dense_mm,
+}
+
+
+def prepare_mm(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare a ``gemm.mm`` benchmark for the requested quantization.
+
+    ``quant`` is required: ``"none"`` selects dense GEMM and ``"mxfp8"``
+    selects canonical E4M3/UE8M0 MXFP8 GEMM.
+    """
+
+    quant = request.parameters.get("quant")
+    generator = _MM_GENERATORS.get(quant) if isinstance(quant, str) else None
+    if generator is None:
+        accepted = ", ".join(sorted(_MM_GENERATORS))
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"gemm.mm requires quant to be one of: {accepted}",
+        )
+    return generator(request, platform)
+
+
+def _reject_unknown_parameters(request: BenchmarkRequest, allowed: set[str]) -> None:
+    unknown = sorted(set(request.parameters) - allowed)
+    if unknown:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"Unknown gemm.{request.mode} parameters: {', '.join(unknown)}",
+        )
+
+
+def _random_tensors(
+    seed: int,
+    dtype: torch.dtype,
+    *shapes: tuple[int, ...],
+) -> list[torch.Tensor]:
+    """Return seeded standard-normal device tensors, one per shape."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    return [
+        torch.randn(shape, device="cuda", dtype=dtype, generator=generator)
+        for shape in shapes
+    ]
+
+
+def _prepared_timing(
+    spec: KernelSpec,
+    invoke: Callable[[], torch.Tensor],
+    parameters: dict[str, object],
+) -> PreparedBenchmark:
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters=parameters,
+        validation=None,
+    )
+
+
+def prepare_decode_gemv(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare a small-M dense GEMV benchmark computing ``x @ weight.T``."""
+
+    _reject_unknown_parameters(request, {"M", "N", "K", "dtype"})
+    M = _positive_int(request.parameters.get("M"), "M")
+    N = _positive_int(request.parameters.get("N"), "N")
+    K = _positive_int(request.parameters.get("K"), "K")
+    dtype = _parse_dtype(request.parameters.get("dtype"))
+    shape = {"M": M, "N": N, "K": K}
+    signature = format_signature(
+        x=dense_tensor_format(dtype),
+        weight=dense_tensor_format(dtype),
+    )
+
+    load_builtin_kernels()
+    spec, selected = _select_registration(
+        request,
+        platform,
+        signature,
+        {"m": M, "n": N, "k": K},
+        shape,
+    )
+
+    x, weight = _random_tensors(request.seed, dtype, (M, K), (N, K))
+    out = torch.empty((M, N), dtype=dtype, device=x.device)
+
+    def invoke() -> torch.Tensor:
+        return selected(x, weight, out)
+
+    return _prepared_timing(
+        spec,
+        invoke,
+        {
+            "M": M,
+            "N": N,
+            "K": K,
+            "dtype": "bfloat16",
+            "x_layout": "MK",
+            "weight_layout": "NK",
+            "out_layout": "MN",
+        },
+    )
+
+
+def prepare_linear_attnres_partials(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare a projection fused with two AttnRes block partials.
+
+    The case projects ``hidden_states[tokens, input_size]`` through
+    ``weight[output_size, input_size]`` and reduces ``num_blocks`` residual
+    blocks into two FP32 ``(max, sum, accumulator)`` scratch tuples.
+    """
+
+    _reject_unknown_parameters(
+        request,
+        {"tokens", "input_size", "output_size", "num_blocks", "dtype", "eps"},
+    )
+    tokens = _positive_int(request.parameters.get("tokens"), "tokens")
+    input_size = _positive_int(request.parameters.get("input_size"), "input_size")
+    output_size = _positive_int(request.parameters.get("output_size"), "output_size")
+    num_blocks = _positive_int(request.parameters.get("num_blocks"), "num_blocks")
+    dtype = _parse_dtype(request.parameters.get("dtype"))
+    eps = request.parameters.get("eps")
+    if not isinstance(eps, float) or not math.isfinite(eps) or eps <= 0.0:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "gemm.linear_attnres_partials parameter 'eps' must be a positive float",
+        )
+
+    shape = {
+        "tokens": tokens,
+        "input_size": input_size,
+        "output_size": output_size,
+        "num_blocks": num_blocks,
+    }
+    signature = format_signature(
+        hidden_states=dense_tensor_format(dtype),
+        weight=dense_tensor_format(dtype),
+        blocks=dense_tensor_format(dtype),
+        score_weight_a=dense_tensor_format(dtype),
+        score_weight_b=dense_tensor_format(dtype),
+        out=dense_tensor_format(dtype),
+    )
+    traits: dict[str, object] = {**shape, "inputs_contiguous": True}
+    if platform.is_cdna5:
+        # Mirror the operation's dispatch, which opts CDNA5 into its kernel.
+        traits["gfx1250_linear_attnres_enabled"] = True
+
+    load_builtin_kernels()
+    spec, selected = _select_registration(request, platform, signature, traits, shape)
+
+    hidden_states, weight, blocks, score_weight_a, score_weight_b = _random_tensors(
+        request.seed,
+        dtype,
+        (tokens, input_size),
+        (output_size, input_size),
+        (num_blocks, tokens, input_size),
+        (input_size,),
+        (input_size,),
+    )
+
+    def scratch() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (
+            torch.empty(tokens, dtype=torch.float32, device=blocks.device),
+            torch.empty(tokens, dtype=torch.float32, device=blocks.device),
+            torch.empty(
+                (tokens, input_size), dtype=torch.float32, device=blocks.device
+            ),
+        )
+
+    scratch_a = scratch()
+    scratch_b = scratch()
+    out = torch.empty((tokens, output_size), dtype=dtype, device=blocks.device)
+
+    def invoke() -> torch.Tensor:
+        return selected(
+            hidden_states=hidden_states,
+            weight=weight,
+            blocks=blocks,
+            score_weight_a=score_weight_a,
+            score_weight_b=score_weight_b,
+            scratch_a=scratch_a,
+            scratch_b=scratch_b,
+            eps=eps,
+            out=out,
+        )
+
+    return _prepared_timing(
+        spec,
+        invoke,
+        {
+            **shape,
+            "dtype": "bfloat16",
+            "eps": eps,
+            "scratch_dtype": "float32",
+        },
     )

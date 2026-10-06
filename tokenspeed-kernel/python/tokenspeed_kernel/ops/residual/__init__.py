@@ -40,7 +40,7 @@ _MAX_AMD_GLUON_TOKENS = 65536
 _MAX_N = 12
 
 
-def _select_attn_res_kernel(
+def select_attn_res_fwd_kernel(
     layer_residual,
     block_residual,
     res_weight,
@@ -53,6 +53,15 @@ def _select_attn_res_kernel(
     num_valid_blocks,
     block_write_idx,
 ):
+    """Select the kernel :func:`attn_res_fwd` runs for these inputs.
+
+    Arguments match :func:`attn_res_fwd`, with ``output_eps`` the resolved
+    output RMSNorm epsilon.
+
+    Returns:
+        ``(kernel, valid_blocks)``: the selected kernel and the number of
+        snapshots it mixes.
+    """
     tokens, hidden_size = layer_residual.shape
     valid_blocks = (
         block_residual.shape[0] if num_valid_blocks is None else int(num_valid_blocks)
@@ -174,7 +183,7 @@ def attn_res_fwd(
     output_eps = (
         eps if out_norm_weight is None or out_norm_eps is None else out_norm_eps
     )
-    kernel, valid_blocks = _select_attn_res_kernel(
+    kernel, valid_blocks = select_attn_res_fwd_kernel(
         layer_residual,
         block_residual,
         res_weight,
@@ -235,7 +244,7 @@ def attn_res_fwd_available(
         eps if out_norm_weight is None or out_norm_eps is None else out_norm_eps
     )
     try:
-        kernel, _ = _select_attn_res_kernel(
+        kernel, _ = select_attn_res_fwd_kernel(
             layer_residual,
             block_residual,
             res_weight,

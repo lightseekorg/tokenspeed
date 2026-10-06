@@ -66,6 +66,75 @@ class NGramInputs:
 
 
 @dataclass(frozen=True)
+class RequestHistorySeeds:
+    """Immutable committed prefixes that rebuild request-token history rows.
+
+    Row ``i`` restores the first ``prefix_lengths[i]`` tokens of request-pool
+    slot ``slots[i]`` from ``tokens[i]``: an extend that resumes a prefix it
+    did not compute on this slot (a prefix-cache hit, a later chunk, a PD
+    landing) must see that prefix before its own inputs are appended. No
+    request objects or device tensors cross this boundary.
+    """
+
+    slots: tuple[int, ...]
+    prefix_lengths: tuple[int, ...]
+    tokens: tuple[tuple[int, ...], ...]
+
+    def __post_init__(self) -> None:
+        if not len(self.slots) == len(self.prefix_lengths) == len(self.tokens):
+            raise ValueError("request history seed fields must have equal lengths")
+        for prefix_length, tokens in zip(self.prefix_lengths, self.tokens):
+            if len(tokens) != prefix_length:
+                raise ValueError(
+                    f"request history seed has {len(tokens)} tokens for a "
+                    f"{prefix_length}-token prefix"
+                )
+
+
+@dataclass(frozen=True)
+class InputLogprobPlan:
+    """Which prompt rows of one forward need their next-token logprob.
+
+    Built on the control plane as one ``(row_start, count, position_start)``
+    triple per extend slot and captured into the submitted closure as plain
+    tuples, so the plan stays O(slots) whatever the prompt length. The
+    forward thread expands the triples into the device row index (an
+    ``arange`` per slot) and reads each row's target -- the next prompt
+    token -- from the scheduler's shifted input ids, which every prefill
+    already lands on the device; the logits processor then gathers exactly
+    those rows out of the full ``[num_tokens, hidden]`` activations (position
+    chunked, so the ``[rows, vocab]`` logits never materialize at once). The
+    commit path slices the flat result back per slot by ``counts`` and places
+    it at ``position_starts``.
+
+    Attributes:
+        row_starts: Per extend slot, the flat input-row index of its first
+            gathered row (meaningful only where the count is non-zero).
+        counts: Per extend slot, how many consecutive rows are gathered;
+            0 for a slot that needs none.
+        position_starts: Per extend slot, the prompt position of its first
+            gathered row (meaningful only where the count is non-zero).
+    """
+
+    row_starts: tuple[int, ...]
+    counts: tuple[int, ...]
+    position_starts: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not len(self.row_starts) == len(self.counts) == len(self.position_starts):
+            raise ValueError("input logprob plan fields must have equal lengths")
+        if any(count < 0 for count in self.counts):
+            raise ValueError("input logprob plan counts must be non-negative")
+        if self.num_rows == 0:
+            raise ValueError("an input logprob plan must name at least one row")
+
+    @property
+    def num_rows(self) -> int:
+        """Rows gathered by the whole batch (the flat result's length)."""
+        return sum(self.counts)
+
+
+@dataclass(frozen=True)
 class PlannedForward:
     """One round's planned work, as the device side needs to see it.
 
@@ -87,9 +156,15 @@ class PlannedForward:
             batch is constrained. A registered exception: these are the
             control plane's live matchers, see the contract's rule 5.
         ngram_inputs: Immutable raw-token snapshots, None without Engram.
+        request_history_seeds: Immutable committed prefixes for the batch's
+            resuming extends, None for a model that reads no request-token
+            history or a batch without such extends.
         multimodal_context: Per-batch multimodal state, None for text-only.
             Its ``mm_inputs`` are shallow copies taken at gather time; the
             items inside are the other registered exception.
+        input_logprob_plan: The prompt rows whose logprobs this forward
+            gathers, None when no extend row needs any. A frozen dataclass
+            of plain tuples.
     """
 
     forward_op: Any
@@ -98,6 +173,8 @@ class PlannedForward:
     grammar_inputs: Any
     multimodal_context: Any
     ngram_inputs: NGramInputs | None
+    request_history_seeds: RequestHistorySeeds | None
+    input_logprob_plan: InputLogprobPlan | None
 
 
 @dataclass
@@ -128,6 +205,12 @@ class ModelExecutionResult:
     # Optional verify-input snapshot used by speculative diagnostics. Layout is
     # [batch, verify_width]: anchor followed by draft candidate token ids.
     spec_candidate_tokens: torch.Tensor | None = None
+    # Prompt (input) logprobs of the rows ``input_logprob_plan`` named, flat
+    # fp32 in plan order; None when the forward gathered none (no plan, or a
+    # pipeline stage without logits). The plan rides along so the commit path
+    # slices the flat tensor per request without re-deriving the rows.
+    input_token_logprobs: torch.Tensor | None = None
+    input_logprob_plan: InputLogprobPlan | None = None
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:

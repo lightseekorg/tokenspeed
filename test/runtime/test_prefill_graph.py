@@ -22,6 +22,9 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
+from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
@@ -148,9 +151,16 @@ class PrefillCaptureArgsTest(unittest.TestCase):
             global_rank=0,
             cudagraph_capture_sizes=[1, 2, 4],
             disable_cuda_graph_padding=False,
+            spec_topk=1,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
+            autotune_cache_key=None,
             prefill_only=False,
+            input_logprob_chunk_tokens=1024,
+            enable_speculative_sampling=False,
+            decode_only_attention=False,
+            query_shard_size=1,
+            query_shard_rank=0,
         )
         with self.assertRaisesRegex(TypeError, "prefill_graph_capture_batch_sizes"):
             ModelExecutorConfig(**config_args)
@@ -330,44 +340,6 @@ class SliceMhaExtendInputsTest(unittest.TestCase):
         self.assertIs(self.slice_inputs(metadata, q, None, None)[0], q)
 
 
-class TrimKvToLocsTest(unittest.TestCase):
-    """mha.trim_kv_to_locs slices padded k/v tails to the write-loc count --
-    the shared fix point every leaf's KV write calls (mha, msa, trtllm).
-    Trimming (not loc-padding) keeps the null page 0 all-zero: trtllm does
-    not scrub padded tail rows before saving KV."""
-
-    def setUp(self):
-        try:
-            import torch
-
-            from tokenspeed.runtime.layers.attention.backends.paged.mha import (
-                trim_kv_to_locs,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
-        self.torch = torch
-        self.trim = trim_kv_to_locs
-
-    def test_padded_tail_trimmed(self):
-        k = self.torch.zeros(16, 2, 8)
-        v = self.torch.zeros(16, 2, 8)
-        locs = self.torch.zeros(5, dtype=self.torch.int32)
-        k2, v2 = self.trim(locs, k, v)
-        self.assertEqual((k2.shape[0], v2.shape[0]), (5, 5))
-
-    def test_equal_rows_identity(self):
-        k = self.torch.zeros(16, 2, 8)
-        v = self.torch.zeros(16, 2, 8)
-        locs = self.torch.zeros(16, dtype=self.torch.int32)
-        k2, v2 = self.trim(locs, k, v)
-        self.assertIs(k2, k)
-        self.assertIs(v2, v)
-
-    def test_none_kv_passthrough(self):
-        locs = self.torch.zeros(4, dtype=self.torch.int32)
-        self.assertEqual(self.trim(locs, None, None), (None, None))
-
-
 class DummyGroupTablesTest(unittest.TestCase):
     """Capture-time dummy tables: every group gets a real, writable block;
     none get the reserved null block 0."""
@@ -505,8 +477,8 @@ class DummyGroupTablesTest(unittest.TestCase):
         """A state group needs one working block per request: two rows sharing
         one silently clobber each other. The runtime check is gated on
         TOKENSPEED_CACHE_DEBUG, so a regression would be silent and this test
-        is the guard. Reachable at bs>1, which ``_autotune`` produces whenever
-        the chunk budget exceeds the model context -- and ``_autotune`` runs
+        is the guard. Reachable at bs>1, which ``autotune`` produces whenever
+        the chunk budget exceeds the model context -- and ``autotune`` runs
         even with the prefill graph disabled."""
         import torch
 
@@ -575,6 +547,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             ],
             max_bs=1,
             max_tokens_per_req=1,
+            max_extend_tokens=0,
             device="cpu",
         )
         stacks.fill(1, 1, dict(tables))
@@ -604,6 +577,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             ],
             max_bs=1,
             max_tokens_per_req=1,
+            max_extend_tokens=0,
             device="cpu",
         )
         stacks.fill(1, 1, dict(tables))
@@ -630,6 +604,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         specs,
         capture_bs,
         arena_blocks=64,
+        query_shard=(1, 0),
     ):
         """Drive make_dummy_batch to the backend hand-off and record it.
 
@@ -644,6 +619,7 @@ class DummyGroupTablesTest(unittest.TestCase):
 
         import torch
 
+        from tokenspeed.runtime.execution.input_buffer import InputBuffers
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
             CacheRuntimeContract,
         )
@@ -667,23 +643,16 @@ class DummyGroupTablesTest(unittest.TestCase):
             context_len=context_len,
             physical_context_len=physical,
             world_size=1,
+            query_shard_size=query_shard[0],
+            query_shard_rank=query_shard[1],
         )
         pg.dp_size = 1
         pg.drafter = None
-        buf = lambda n, dt: torch.zeros(n, dtype=dt)  # noqa: E731
-        pg.input_buffers = SimpleNamespace(
-            dummy_kv_slot=0,
-            input_ids_buf=buf(4096, torch.int32),
-            out_cache_loc_buf=buf(4096, torch.int32),
-            positions_buf=buf(4096, torch.int64),
-            req_pool_indices_buf=buf(16, torch.int32),
-            seq_lens_buf=buf(16, torch.int32),
-            extend_seq_lens_buf=buf(16, torch.int32),
-            extend_seq_lens_cpu=buf(16, torch.int32),
-            extend_prefix_lens_buf=buf(16, torch.int32),
-            extend_prefix_lens_cpu=buf(16, torch.int32),
-            extend_replay_lens_cpu=buf(16, torch.int32),
-            extend_prompt_lens_cpu=buf(16, torch.int32),
+        pg.input_buffers = InputBuffers(
+            max_bs=16,
+            max_num_tokens=4096,
+            state_write_padding_pool_index=0,
+            device="cpu",
         )
         pg.block_table = torch.zeros(16, 64, dtype=torch.int32)
 
@@ -700,8 +669,18 @@ class DummyGroupTablesTest(unittest.TestCase):
             num_tokens,
             -(-num_tokens // context_len) if capture_bs is None else capture_bs,
         )
+        bs = ctx.bs
+        ib = pg.input_buffers
+        self.assertEqual(
+            ib.request_token_history_input_lengths_buf[:bs].tolist(),
+            ib.extend_seq_lens_cpu[:bs].tolist(),
+        )
+        self.assertEqual(ib.input_start_offsets_buf[0].item(), 0)
+        self.assertEqual(ib.input_start_offsets_buf[bs].item(), num_tokens)
+        self.assertTrue(ib.active_request_mask_buf[:bs].all().item())
         self.assertIs(ctx.attn_backend, pg.attn_backend)
         self.assertIs(ctx.token_to_kv_pool, pg.token_to_kv_pool)
+        seen["ctx"] = ctx
         return seen
 
     def test_make_dummy_batch_tables_survive_the_cache_contract(self):
@@ -752,6 +731,46 @@ class DummyGroupTablesTest(unittest.TestCase):
                         specs=(spec,),
                         capture_bs=bs,
                     )
+
+    def test_a_query_sharding_engine_shards_the_dummy_extend(self):
+        """The one extend form a query-sharding engine runs is the sharded
+        one, so the autotune's dummy carries the plan a real extend of these
+        rows would -- on the context and in the metadata hand-off -- and an
+        engine that does not shard carries none."""
+        from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+        spec = _spec("full_attention", block_granularity=64)
+        seen = self._dummy_batch_probe(
+            num_tokens=1737,
+            context_len=2048,
+            physical=2048,
+            specs=(spec,),
+            capture_bs=2,
+            query_shard=(4, 3),
+        )
+        plan = seen["ctx"].query_shard
+        self.assertEqual(
+            plan,
+            QueryShardPlan.from_forward(
+                total_tokens=1737, input_lengths=[869, 868], size=4, rank=3
+            ),
+        )
+        self.assertIs(seen["query_shard"], plan)
+        self.assertEqual(sum(plan.row_counts), 1737)
+        self.assertEqual(plan.local_rows, plan.row_counts[3])
+        # The whole span still fills the buffers and the metadata; the model
+        # takes its slice (ModelExecutor.autotune).
+        self.assertEqual(seen["num_tokens"], 1737)
+        self.assertEqual(seen["extend_seq_lens_cpu"].tolist(), [869, 868])
+        unsharded = self._dummy_batch_probe(
+            num_tokens=1737,
+            context_len=2048,
+            physical=2048,
+            specs=(spec,),
+            capture_bs=2,
+        )
+        self.assertIsNone(unsharded["ctx"].query_shard)
+        self.assertIsNone(unsharded["query_shard"])
 
     def test_real_active_page_backend_gets_positions_alongside_its_tables(self):
         """A backend that validates live-page geometry (V4) is told how many
@@ -853,6 +872,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         inner_model = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
             model=SimpleNamespace(model=inner_model),
+            model_config=SimpleNamespace(requires_request_token_history=False),
             is_generation=True,
             is_multimodal=False,
         )
@@ -879,6 +899,23 @@ class DummyGroupTablesTest(unittest.TestCase):
 
         self.assertFalse(graph.disable)
         capture.assert_not_called()
+
+        model_runner.model_config.requires_request_token_history = True
+        with (
+            mock.patch(
+                "tokenspeed.runtime.execution.prefill_graph.get_prefill_token_buckets",
+                return_value=[64],
+            ),
+            mock.patch.object(self.PrefillGraph, "capture"),
+        ):
+            graph = self.PrefillGraph(
+                model_runner=model_runner,
+                attn_backend=object(),
+                token_to_kv_pool=pool,
+                input_buffers=object(),
+                config=config,
+            )
+        self.assertTrue(graph.disable)
 
 
 class CaptureFailureIsLoudTest(unittest.TestCase):
@@ -922,7 +959,7 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
             weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
         )
 
-        def _capture_all_buckets(_decode_wrapper):
+        def _capture_all_buckets(_decode_wrapper, _entries, _observer):
             if raises is not None:
                 raise raises
 
@@ -936,18 +973,18 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
         cause = RuntimeError("backend refused the dummy batch")
         pg = self._bare(raises=cause)
         with self.assertRaises(RuntimeError) as caught:
-            pg.capture(None)
+            pg.capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
         self.assertIs(caught.exception, cause)
 
     def test_successful_capture_does_not_raise(self):
-        self._bare().capture(None)
+        self._bare().capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
 
     def test_oom_propagates(self):
         """OOM keeps its own type and message. The capture pool not fitting is
         an operator-visible sizing failure, not something to recover from."""
         pg = self._bare(raises=self.torch.cuda.OutOfMemoryError("no room"))
         with self.assertRaises(self.torch.cuda.OutOfMemoryError):
-            pg.capture(None)
+            pg.capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
 
 
 class NarrowingPrefillGraphTest(unittest.TestCase):
@@ -1028,6 +1065,7 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
             inner.embed_tokens = object()
             model_runner = SimpleNamespace(
                 model=SimpleNamespace(model=inner),
+                model_config=SimpleNamespace(requires_request_token_history=False),
                 is_generation=True,
                 is_multimodal=False,
             )
@@ -1068,6 +1106,7 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
             inner.embed_tokens = object()
             model_runner = SimpleNamespace(
                 model=SimpleNamespace(model=inner),
+                model_config=SimpleNamespace(requires_request_token_history=False),
                 is_generation=True,
                 is_multimodal=False,
             )
@@ -1136,6 +1175,7 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
             token_to_kv_pool=None,
             bs=1,
             num_extends=1,
+            output_layout=ForwardOutputLayout(1, 1, 0, 1),
             input_num_tokens=num_tokens,
             forward_mode=ForwardMode.EXTEND,
         )
@@ -1196,34 +1236,15 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
 
 
 class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
-    """trtllm under the prefill graph: the extend prewrite must not bake
-    capture-time write locs into the graph, and the break's KV write must
-    trim padded tails like mha."""
+    """trtllm leaves reach the prefill graph through the cache-group router."""
 
     def setUp(self):
         try:
-            import torch
-
-            from tokenspeed.runtime.layers.attention.backends.paged import trtllm
+            from tokenspeed.runtime.layers.attention.backends.paged import (  # noqa: F401
+                trtllm,
+            )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
-        self.torch = torch
-        self.mod = trtllm
-
-    def _bare_backend(self):
-        b = self.mod.TRTLLMMHAAttnBackend.__new__(self.mod.TRTLLMMHAAttnBackend)
-        b.kv_cache_dtype = self.torch.bfloat16
-        return b
-
-    def test_prewrite_disabled_during_breakable_capture(self):
-        from unittest import mock
-
-        b = self._bare_backend()
-        self.assertTrue(b.support_kv_cache_prewrite(None))
-        with mock.patch.object(
-            self.mod, "is_breakable_capture_active", return_value=True
-        ):
-            self.assertFalse(b.support_kv_cache_prewrite(None))
 
     def test_router_declares_history_contract_family(self):
         # The family claim moved off the leaves: the runner-facing node in
@@ -1273,10 +1294,17 @@ class PrefillRoleGraphsTest(unittest.TestCase):
             global_rank=0,
             cudagraph_capture_sizes=[1, 2, 4],
             disable_cuda_graph_padding=False,
+            spec_topk=1,
             max_cudagraph_capture_size=4,
             model_is_mrope=False,
+            autotune_cache_key=None,
             prefill_only=prefill_only,
+            input_logprob_chunk_tokens=1024,
+            decode_only_attention=False,
             prefill_graph_capture_batch_sizes=None,
+            enable_speculative_sampling=False,
+            query_shard_size=1,
+            query_shard_rank=0,
             prefill_graph_max_tokens=256,
         )
 
@@ -1299,6 +1327,7 @@ class PrefillRoleGraphsTest(unittest.TestCase):
         inner = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
             model=SimpleNamespace(model=inner),
+            model_config=SimpleNamespace(requires_request_token_history=False),
             is_generation=True,
             is_multimodal=False,
         )

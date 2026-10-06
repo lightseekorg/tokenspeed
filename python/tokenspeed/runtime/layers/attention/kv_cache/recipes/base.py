@@ -25,10 +25,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
+)
+from tokenspeed.runtime.layers.attention.configs.linear_attn import (
+    LinearAttnConfig,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import (
     configured_token_limit,
@@ -72,6 +75,9 @@ class CacheRecipe(ABC):
     # Set as a class attribute by every subclass; OrdinaryRecipe takes it per
     # instance because its four families differ by nothing else.
     family: CacheModelFamily
+    # Families whose linear backend verifies speculative rounds from paged
+    # state set this; their ``workspace_bytes`` is that backend's staging.
+    uses_paged_state_verify: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -82,6 +88,7 @@ class CacheRecipe(ABC):
         draft_model_config,
         draft_attn_config,
         cache_budget_bytes: int,
+        probe_batch_rows: int | None,
         decode_input_tokens: int,
         overlap_schedule_depth: int,
     ) -> None:
@@ -91,6 +98,8 @@ class CacheRecipe(ABC):
         self.draft_model_config = draft_model_config
         self.draft_attn_config = draft_attn_config
         self.cache_budget_bytes = cache_budget_bytes
+        # A probe sizes the arena by a block-count floor instead of by budget.
+        self.probe_batch_rows = probe_batch_rows
         self.decode_input_tokens = decode_input_tokens
         self.overlap_schedule_depth = overlap_schedule_depth
 
@@ -114,11 +123,17 @@ class CacheRecipe(ABC):
             max_padding_fraction=self.max_padding_fraction,
         )
         self.check_layout(layout)
-        num_lcm_blocks = self.num_lcm_blocks(layout)
+        # One parent block per fabricated row, and a floor, not a size.
+        num_lcm_blocks = (
+            self.num_lcm_blocks(layout)
+            if self.probe_batch_rows is None
+            else max(self.probe_batch_rows, self.parents_needed(layout, 1))
+        )
+        memory_plan = layout.bind(num_lcm_blocks)
         return CacheSetup(
             spec=CachePoolSpec(
                 family=self.family,
-                memory_plan=layout.bind(num_lcm_blocks),
+                memory_plan=memory_plan,
                 layer_types=self.layer_types,
                 # The same declarations the layout was packed from, so plan and
                 # specs cannot name different groups.
@@ -128,8 +143,13 @@ class CacheRecipe(ABC):
                 pool_options=self.pool_options(),
             ),
             num_draft_layers=self.num_draft_layers,
-            cache_budget_bytes=self.cache_budget_bytes,
+            cache_budget_bytes=(
+                self.cache_budget_bytes
+                if self.probe_batch_rows is None
+                else self.workspace_bytes() + memory_plan.arena_bytes
+            ),
             fixed_workspace_bytes=self.workspace_bytes(),
+            uses_paged_state_verify=self.uses_paged_state_verify,
         )
 
     # ------------------------------------------------------------------
@@ -323,12 +343,21 @@ class CacheRecipe(ABC):
     def scheduler_limits(self) -> SchedulerLimits:
         """The concurrency the cache has to hold at once.
 
-        The one place a recipe reads the scheduler's limits, so per-group page
-        demand and the capacity search cannot size against different numbers.
+        The one place a recipe reads them, so per-group page demand and the
+        capacity search cannot size against different numbers. Under a probe
+        the concurrency is the probe's own fabricated batch, not the
+        scheduler's -- the arena it sizes serves a capture, not requests --
+        unless verify scratch lives in the pool, which then needs a row per
+        request whatever pool is bound.
         """
         return SchedulerLimits(
             role=scheduler_role(self.server_args.disaggregation_mode),
-            max_live_requests=self.attn_config.max_bs,
+            # One live request per fabricated row; serving concurrency is elsewhere.
+            max_live_requests=(
+                self.attn_config.max_bs
+                if self.probe_batch_rows is None or self.verify_scratch_in_pool()
+                else min(self.attn_config.max_bs, self.probe_batch_rows)
+            ),
             max_scheduled_tokens=int(self.server_args.chunked_prefill_size),
             max_context_len=self.attn_config.context_len,
             decode_input_tokens=self.decode_input_tokens,
@@ -410,6 +439,47 @@ class CacheRecipe(ABC):
         """Cache-adjacent fixed allocation this family also needs."""
         return 0
 
+    def verify_scratch_in_pool(self) -> bool:
+        """Whether speculative verify stages its scratch in the bound pool.
+
+        A family that does needs a row per request at the serving concurrency
+        from whichever pool is bound, so its probe arena keeps that concurrency.
+        """
+        return False
+
     def pool_options(self) -> object | None:
         """Family-specific options the pool constructor needs."""
         return None
+
+
+def kda_verify_scratch_in_pool(server_args, attn_config) -> bool:
+    """Raw-gate KDA replay reuses the committed conv slab as verify scratch."""
+    # A PD prefill role never verifies, so it stages no verify scratch.
+    if (
+        server_args.speculative_algorithm is None
+        or server_args.disaggregation_mode == "prefill"
+    ):
+        return False
+    from tokenspeed_kernel.ops.attention.kda import (
+        kda_batched_replay_uses_raw_gate,
+        kda_recurrent_layout,
+        kda_replay_commit_supported,
+    )
+
+    linear_attn = attn_config.component(LinearAttnConfig)
+    if linear_attn is None:
+        # No linear attention, so no conv slab for verify scratch to alias.
+        return False
+
+    heads, head_dim, _ = linear_attn.temporal_state_shape
+    return bool(
+        kda_replay_commit_supported(
+            attn_config.dtype,
+            recurrent_layout=kda_recurrent_layout(),
+            num_heads=heads,
+            head_dim=head_dim,
+        )
+        and kda_batched_replay_uses_raw_gate(
+            attn_config.dtype, num_heads=heads, head_dim=head_dim
+        )
+    )

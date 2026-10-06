@@ -27,8 +27,11 @@ import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
+    TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT,
 )
+from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -44,6 +47,10 @@ from tokenspeed.runtime.layers.moe.utils import (
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
 from tokenspeed.runtime.layers.moe.weights.loaders import round_up
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
     should_ignore_quant_layer,
@@ -67,7 +74,6 @@ class MoELayer(torch.nn.Module):
         tp_size: int | None = None,
         ep_rank: int | None = None,
         ep_size: int | None = None,
-        zero_expert_type: str = "",
         zero_expert_num: int = 0,
         activation: str = "silu",
         activation_situ_beta: float | None = None,
@@ -96,7 +102,6 @@ class MoELayer(torch.nn.Module):
         self.ep_num_redundant_experts = global_server_args_dict[
             "ep_num_redundant_experts"
         ]
-        self.zero_expert_type = zero_expert_type
         # LongCat routes some top-k slots to "zero experts" that no kernel
         # computes; the model rewrites those slots to a placeholder expert id
         # with weight zero, so a token can hand the kernel the same expert id
@@ -223,7 +228,11 @@ class MoELayer(torch.nn.Module):
             )
         if self._quant_kind == "nvfp4":
             self._apply_trtllm_ispp_padding(
-                TRTLLM_NVFP4_ISPP_ALIGNMENT,
+                (
+                    TRTLLM_NVFP4_ISPP_ALIGNMENT
+                    if self._spec.gated
+                    else TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT
+                ),
                 "the flashinfer_trtllm NVFP4 weight layout accepts it",
             )
         if self._quant_kind == "mxfp4":
@@ -256,6 +265,56 @@ class MoELayer(torch.nn.Module):
         if self._internal_activation_dtype_override is not None:
             internal_activation_dtype = self._internal_activation_dtype_override
 
+        if self._spec.use_gluon_petit:
+            if internal_activation_dtype not in {"input", "mxfp4"}:
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires MXFP4 activations; "
+                    f"the requested {internal_activation_dtype} activations are unsupported"
+                )
+            # Keep Petit hardware and expert constraints here; ServerArgs checks
+            # shared backends, model dtype, and scheduling capacity.
+            if not current_platform().is_cdna4:
+                raise ValueError(
+                    "Gluon Petit MegaMoE currently requires AMD CDNA4 (gfx950)"
+                )
+            mapping = global_server_args_dict["mapping"]
+            if mapping.nnodes != 1:
+                raise ValueError("Gluon Petit MegaMoE currently supports one node only")
+            if mapping.moe.tp_size != 1 or self.tp_size != 1:
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires MoE tensor parallel size 1"
+                )
+            if mapping.world_size != 8 or mapping.moe.ep_size != 8 or self.ep_size != 8:
+                raise ValueError("Gluon Petit MegaMoE requires world_size=ep_size=8")
+            if (
+                global_server_args_dict["enable_eplb"]
+                or self.ep_num_redundant_experts
+                or global_server_args_dict["init_expert_location"]
+                not in (None, "trivial")
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires trivial expert placement "
+                    "without EPLB or redundant experts"
+                )
+            if self._quant_kind != "mxfp4" or not (
+                (
+                    isinstance(self.quant_config, Mxfp4Config)
+                    and self.quant_config.is_checkpoint_mxfp4_serialized
+                )
+                or (
+                    isinstance(self.quant_config, CompressedTensorsConfig)
+                    and self.quant_config.quant_format == "mxfp4-pack-quantized"
+                )
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires serialized MXFP4 expert weights"
+                )
+            if swiglu_beta is None and activation_alpha is not None:
+                raise ValueError(
+                    "Gluon Petit MegaMoE does not support nonstandard SiLU alpha"
+                )
+            internal_activation_dtype = "mxfp4"
+
         input_dtype = torch.get_default_dtype()
         if input_dtype not in {torch.float16, torch.bfloat16}:
             input_dtype = torch.float16
@@ -268,6 +327,8 @@ class MoELayer(torch.nn.Module):
         # Preserve the legacy CLI name; weight dtype selects the MegaMoE implementation.
         if moe_backend == "deep_gemm_mega_moe":
             moe_backend = "mega_moe"
+        if moe_backend == "gluon_petit":
+            moe_backend = "gluon"
         moe_backend = None if moe_backend == "auto" else moe_backend
         process_group = None
         deepep_mode = None
@@ -286,6 +347,16 @@ class MoELayer(torch.nn.Module):
                 "low_latency_max_num_tokens_per_gpu"
             ]
         elif moe_backend == "mega_moe":
+            mapping = global_server_args_dict["mapping"]
+            process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+        # --moe-combine-order: how a token's routed contributions meet across
+        # the MoE TP-EP group (docs/design/numerics.md, alignment.trainer).
+        # ServerArgs already refused MoE TP > 1 and DeepEP under "slot".
+        combine_order = global_server_args_dict["moe_combine_order"]
+        self.combine_order: str = combine_order
+        if combine_order == "slot" and self.ep_size > 1:
+            # The leaf folds the per-route outputs over the EP device group;
+            # it is the fold's group whatever the plan's solution.
             mapping = global_server_args_dict["mapping"]
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
         self.plan = tokenspeed_kernel.moe_plan(
@@ -313,7 +384,10 @@ class MoELayer(torch.nn.Module):
             ),
             persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
             solution=moe_backend,
-            fast_math=True,
+            # rl-bitwise promises one reduction order; fast-math epilogues
+            # trade exactly that away.
+            fast_math=global_server_args_dict["numerics"] not in BITWISE_ENVELOPES,
+            combine_order=combine_order,
         )
 
         create_layer_weights(
@@ -347,7 +421,10 @@ class MoELayer(torch.nn.Module):
                 ``ispp_alignment``).
             reason: Log fragment describing why the padding is required.
         """
-        if get_moe_backend().value != "flashinfer_trtllm":
+        backend = get_moe_backend().value
+        # Only the trtllm kernels run non-gated experts, so ``auto`` selects them.
+        trtllm_only = backend == "auto" and not self._spec.gated
+        if backend != "flashinfer_trtllm" and not trtllm_only:
             return
         ispp = self.intermediate_size // self.tp_size
         if ispp % alignment == 0:
@@ -386,17 +463,12 @@ class MoELayer(torch.nn.Module):
     def supports_deferred_finalize(self) -> bool:
         return self.plan["supports_deferred_finalize"]
 
-    def forward_zero_experts(self, topk_output):
-        zero_expert_limit = self.num_experts
-        if self.ep_num_redundant_experts is not None:
-            zero_expert_limit = zero_expert_limit - self.ep_num_redundant_experts
-
-        normal_expert_mask = topk_output.topk_ids >= zero_expert_limit
-        topk_output.topk_ids[normal_expert_mask] = -1
-        if self.zero_expert_type == "copy":
-            topk_output.topk_weights[normal_expert_mask] = 1.0
-        if self.zero_expert_type == "drop":
-            topk_output.topk_weights[normal_expert_mask] = 0.0
+    @property
+    def supports_all_to_all_ep(self) -> bool:
+        """Whether the kernel owns all-to-all dispatch, so each rank routes only
+        its own tokens. Otherwise every rank routes every token and an expert
+        placement must pick the same replica for a route on every rank."""
+        return self.plan["supports_all_to_all_ep"]
 
     def forward(
         self,

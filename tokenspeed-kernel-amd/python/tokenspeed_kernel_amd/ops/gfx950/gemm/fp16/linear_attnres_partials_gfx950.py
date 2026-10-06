@@ -237,6 +237,8 @@ def gluon_linear_attnres_partials_m4_gfx950(
             output_ptr,
             output_ptr,
             output_ptr,
+            output_ptr,
+            output_ptr,
             4,
             output_size,
             _INPUT_SIZE,
@@ -258,6 +260,8 @@ def gluon_linear_attnres_partials_m4_gfx950(
             NUM_BUFFERS=3,
             GROUP_SIZE_M=1,
             ADD3=False,
+            SPLIT_K=1,
+            NUM_XCDS=1,
             PID_OFFSET=4,
         )
     else:
@@ -390,7 +394,7 @@ def launch_gluon_linear_attnres_partials_gfx950(
         num_tokens,
         attnres_program_offset,
         output_size,
-        num_warps=_NUM_WARPS,
+        num_warps=_NUM_WARPS.value,
         num_stages=1,
         waves_per_eu=1,
     )

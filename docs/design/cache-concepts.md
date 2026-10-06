@@ -657,10 +657,14 @@ Its responsibilities:
   fails is MAX-reduced with the replica idle/work flag before the
   completion gather so every rank raises together. Every rank
   stays in every replica-group gather even when an earlier intersection
-  is empty, so a peer that is ready on CP/PP is not left unmatched. A later Host
+  is empty, so a peer that is ready on PP is not left unmatched. A later Host
   miss that is known to exist in L3 allocates
   a Host page, `batch_get_into`s it, then runs the ordinary H2D load.
-  Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c{cp_rank}`.
+  Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`;
+  the trailing `c0` is the retired context-parallel shard id, kept literal
+  (as is the `cp_size: 1` entry of the hashed namespace) so objects written
+  before its removal stay addressable until the next deliberate key-format
+  bump.
   The hashed namespace (`storage_key_prefix`) covers the loaded checkpoint
   (`model` + resolved immutable revision + `--weight-version`), the packed
   Host CacheBlock layout (dtype and field payload geometry, not device
@@ -669,9 +673,8 @@ Its responsibilities:
   `quantization_param_path` scale-file digest, and
   `--speculative-draft-model-quantization` when a draft pool is present), `--hf-overrides` as applied
   to the HF text config (rope_theta, rope_scaling, and other architecture
-  fields that change cached keys), the pipeline stage, the
-  context-parallel width (`cp_size`), the resolved attention-TP width
-  (`attn.tp_size`), the speculative
+  fields that change cached keys), the pipeline stage, the resolved
+  attention-TP width (`attn.tp_size`), the speculative
   draft checkpoint when a separate draft pool is present, the resolved target
   and draft full-attention backends (including hybrid sub-backend choices
   and MSA's dense sub-backend, represented as `msa:<dense-backend>`;
@@ -730,10 +733,7 @@ Its responsibilities:
   maps cannot share a namespace. The
   returned checkpoint id also records that load format, so two
   deployments that share a directory or commit cannot restore KV
-  produced by a different encoding. Zigzag CP assigns
-  different token blocks to the same `cp_rank` under different widths, so
-  `cp_size` is part of the namespace rather than only `c{cp_rank}` in the
-  object key. GQA with TP above the KV-head count keeps one local KV
+  produced by a different encoding. GQA with TP above the KV-head count keeps one local KV
   head per rank, so packed Host geometry is unchanged, while
   `tp_rank // num_kv_head_replicas` assigns different heads to the same
   `r{tp_rank}`; `attn_tp_size` is therefore part of the namespace. Use
@@ -777,18 +777,12 @@ Its responsibilities:
   while L3 is enabled, including requests for the current version. It cannot
   coordinate a cache flush or worker namespace change, so callers must use
   the distributed weight-update path with an explicit version and a flush.
-  `ENABLE_CP` workers share `attn_tp_rank==0`
-  and are distinguished by `c{cp_rank}` and `cp_size`. Without PP they
-  would each PULL a different ZMQ message, so only `cp_rank==0` owns
-  request I/O and load reporting, and `recv_reqs` broadcasts across the
-  CP group — the same fan-out PP uses for WORLD — before L3 exists MIN. Mooncake
-  `global_segment_size` is divided by attention TP × CP × PP; passing
-  `server_args.attn_tp_size` when `ENABLE_CP` inferred `cp_size` would
-  over-mount the store. Host eviction does
+  Mooncake `global_segment_size` is divided by attention TP × PP, using the
+  resolved `mapping.attn.tp_size`. Host eviction does
   **not** drop the L3 key. A `clear_cache` in this process group deletes
   objects under that stable prefix rather than minting a process-local
   generation, so a restarted rank still probes the same keys. Independent
-  TokenSpeed jobs that share a tenant are not in the TP/CP/PP/DP MIN: a
+  TokenSpeed jobs that share a tenant are not in the TP/PP/DP MIN: a
   fleet-wide wipe is an operator flush of every instance. A later
   `batch_exists` miss is not a lease; vanished-L3 prefetch recovers if
   another client republishes or this delete races a peer PUT.
@@ -859,7 +853,12 @@ Its responsibilities:
   resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
   the group indexes), so the scheduler keeps no residency counters of its own
   — only the token descriptor the event carries and whether that event is
-  currently out.
+  currently out. A mutation only marks its boundary for reconcile;
+  `DrainKvEvents` reconciles each marked boundary against its residency and
+  reports the net change (published exactly while fully resident), then drops
+  descriptors of boundaries with no cached child. Nothing is decided
+  mid-`Admit`, so one admission may evict a boundary's last cached copy and
+  then store the request's own copy without any ordering hazard.
 For L3 write-through, each lane carries only its own hashed Host destinations.
 Its CUDA completion starts those backups, and its scheduler ACK waits until
 those puts finish; a different lane completing cannot release its pages.
@@ -933,12 +932,17 @@ layers. Neither count means captured target taps or draft execution depth.
 `distributed/pp_stage.py::pp_stage_windows` owns the target execution-window
 calculation, shared by pipeline stages, model construction and PD topology.
 The model/cache construction boundary maps those execution windows to explicit
-`target_cache_windows`, then `CacheLayerOwnership` adds the final stage's draft
-cache window. Cache ownership consumes cache-ID windows; execution partitioning
-belongs to the distributed layer. Current PP targets K3 and V4 have one cache
-layer per execution block; non-PP ownership covers the complete cache namespace
-without assuming that equality. Resident windows, transfer filtering and
-producer-field groups all use cache-layer IDs.
+`target_cache_windows` with `pp_stage_cache_windows`: both ends of every
+window scale by the model's attention instances per decoder layer
+(`ModelProfile.attention_instances_per_layer`; one for K3 and V4, which
+declare no profile, two for LongCat's paired layer), so a block's cache layers
+stay with the stage that executes it. `CacheLayerOwnership` then adds the
+final stage's draft cache window. Cache ownership consumes cache-ID windows;
+execution partitioning belongs to the distributed layer, and non-PP ownership
+covers the complete cache namespace without any per-block arithmetic. Resident
+windows, transfer filtering and producer-field groups all use cache-layer IDs;
+PD consumes the resulting `cache_fields_by_stage` and never recomputes windows
+from layer counts.
 Cache construction resolves ownership into explicit field IDs once:
 `cache_fields_by_stage` describes residency, and `producer_fields_by_step`
 describes the local readiness barriers. These sets cover resident fields
@@ -959,10 +963,31 @@ place the four stages appear in order, and a family fills in uniformly named
 seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
 `alignment`, `max_padding_fraction`, `packing`, `check_layout`,
 `num_lcm_blocks`, `token_capacity`, `parents_needed`, `workspace_bytes`,
-`pool_options`. `groups()` itself is a seam for the two families whose groups
-are not per-layer (Inkling appends conv columns; V4 declares each group
+`pool_options`, `verify_scratch_in_pool`.
+The last answers whether speculative verify stages its scratch in the bound
+pool; a CUDA-graph memory probe arena then keeps the serving concurrency.
+`groups()` itself is a seam for the two families whose groups are not
+per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`
 (`recipes/setup.py`) is the single family → recipe map.
+
+Ordinary recipes pin one CacheBlock per group in each parent, so a group's
+stride does not shrink with its layer count or cache dtype. For example,
+equal-sized layers split into groups of one and four need a padding fraction
+of `3.0` for the smaller group. The recipe therefore opts out of the padding
+ratio limit through `max_padding_fraction`; the common packer still validates
+field geometry, strides and block-size limits, and the profiled byte budget
+still bounds capacity. Grouping, packing and allocation are unchanged.
+
+Hybrid recurrent recipes keep their groups balanced instead: every group's page
+spans the whole parent, so a parent is fully used only when every group fills
+the same planes. Qwen3.5 groups state layers by position within its fixed
+state-state-state-full period. Nemotron-H's Mamba2 runs are four or five layers
+long, so its recipe deals state layers round-robin instead and splits the
+attention layers into two KV groups whose K and V pages pack to the size of
+one SSM state; `recipes/mamba2.py` documents the layout. State pages carry no
+padding; KV pages pad only by their share of the conv planes, about 1.5% for
+Nemotron-3 Super.
 
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
@@ -1041,7 +1066,11 @@ The rows it re-feeds carry `extend_replay_lens_cpu` down the extend bundle
 
 The same backend narrows the CED decoder to each request's prompt tail
 (`decoder_view()`); the decoder's SWA rows are decode-only state and, being
-in the replayable group, are never expected from a hit either.
+in the replayable group, are never expected from a hit either. Decoder SWA
+visibility starts at that retained tail, even when the final chunk already
+contains exactly one window and no rows are dropped. Encoder metadata may be
+reused only when its visible history also starts there; equal row counts alone
+do not make the two windows interchangeable.
 
 Block drafters (DFLASH / DSPARK) write their KV at the target's cache
 locations, so their storage *is* a target-owned group whatever mask their
@@ -1062,9 +1091,13 @@ window the first decode consumes. Under PD the retained tail of the SWA group
 ships to the decode node like any sliding window, draft rows included, and
 the decode node re-feeds nothing.
 
-Capacity has exactly two shapes, both on the base class. The default is the
-flat product (`parents × tightest packing × P`). Families whose per-group
-demand decides the pool — K3's state groups riding inside MLA planes, V4's
+Capacity has three shapes, all on the base class. The default is the flat
+product (`parents × tightest packing × P`). A probe arena is the third and
+narrowest: `probe_batch_rows` says how many requests the CUDA-graph probe
+fabricates, and the pool takes one parent block per fabricated row, floored at
+what a single request needs — it binds before the memory profile has run, so
+it cannot size from a budget at all. Families whose per-group demand decides
+the pool — K3's state groups riding inside MLA planes, V4's
 SWA and compressed chains, GLM-5.3-Flash — size from `parents_needed` and get
 the inverse for free from `_capacity_from_parents`, one monotonic binary
 search shared by all. `parents_needed` itself is not a Python formula: it
@@ -1079,7 +1112,11 @@ C++, and the `Scheduler` bounds single requests against the pool with the
 same model (`docs/design/scheduler.md` §1.4). No recipe restates any of it.
 `scheduler_limits` is the single place a recipe reads the scheduler's
 concurrency, role and reserve widths, so demand and capacity cannot size
-against different numbers.
+against different numbers. Under a probe it reports the probe's fabricated
+batch instead: that arena holds a capture, not requests. `probe_batch_rows`
+sets both sides: the arena holds at least that many parent blocks (more when
+admitting one token per group needs more), and the concurrency is that many
+rows, capped at the scheduler's `max_bs`.
 
 The runtime's global `max_num_seqs` is divided across attention DP ranks to
 produce each scheduler's rank-local `max_batch_size`. These values limit
@@ -1111,9 +1148,78 @@ A recipe's group set never depends on the DCP size. Only groups whose every
 reader can attend to a shard may be sharded; a group some consumer must read
 whole stays replicated and is declared as its own group at every DCP size, so
 prefix matching, transfer and zeroing -- all keyed by group -- see one
-topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache,
-the compressor states and the indexer's K replicated; the indexer K is its own
-full-history group rather than a tenant of the compressed chain it indexes.
+topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache
+and compressor states replicated. Index-K is sharded in its own full-history
+group; its virtual IDs are independent of the compressed attention chain.
+Backend binding validates the DCP shard count for both compressed KV and
+Index-K; SWA and compressor-state groups must remain replicated.
+
+Ordinary GPU MLA and DSA use the same ownership geometry for history storage.
+MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
+Before allocating the arena, hybrid DCP validates these declared group shard
+counts rather than the recipe name or its inheritance. Plugin recipes follow
+the same storage contract as built-in recipes. Both pure MLA and MLA/KDA hybrids
+require the full-attention backend to declare `supports_mla_dcp`; only FlashMLA
+currently declares this capability.
+Decode gathers query heads, computes attention over owned history, and merges
+partials using FP32 natural-log LSE before restoring TP-local heads. MLA
+prefill reconstructs bounded history chunks with an owner-masked sum reduction;
+GPU DSA sparse prefill instead combines local sparse-attention partials.
+Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
+DCP does not make unsupported kernels portable. DCP excludes speculative
+decoding for every model on the ordinary MLA/DSA recipe, whichever dense
+kernel runs it: `OrdinaryRecipe.groups()` refuses to shard a cache that holds
+a draft group, so a CuTe MLA engine that would accept the draft kernels still
+cannot combine DCP with a draft; FlashMLA and GPU DSA `AttnConfig` additionally
+reject any speculative width, draft or target, under DCP. Only the recipes
+that declare their own groups shard with a draft present: DeepSeek V4 (its
+draft layers join the compressed-KV chains) and Kimi K3 (its draft layers join
+the sharded MLA history group), each subject to its backend's `AttnConfig`
+gate. The draft's decode steps would run the same sparse/dense DCP branches as
+the target's, but that path has not been validated for the ordinary recipe, so
+its exclusion is a gate rather than a geometry limit. All DCP paths exclude the Host KVStore: the L2
+copies address device pages by scheduler block ID with no ownership
+translation (`cache/l2/executor.py`), so a sharded engine must pass
+`--disable-kvstore`.
+
+PD transfer supports a sharded **prefill** role against an unsharded decode
+role. Manifests carry scheduler (virtual) IDs on both sides and are bounded
+by each side's virtual count, `1 + (page_count - 1) * shard_count`, never by
+the physical page count. The route planner (`pd/transfer_plan.py`) reads
+`shard_count` from the wire `group_specs`: for a sharded group it fans a
+decode rank's replica out to the whole DCP subgroup (consecutive attention-TP
+ranks), tagging every member with an owner filter `(owner_rank, owner_count)`;
+the sender keeps the manifest blocks with `(v - 1) % owner_count ==
+owner_rank`, translates them to local pages through the same
+`owned_local_pages` placement zeroing uses, and copies them to the destination
+blocks at the same manifest positions. Every rank of the subgroup therefore
+serves every decode rank and none is a control-only dummy; the decode receiver
+already counts completions from a rank set. Replicated groups keep the
+single-source route. A sharded decode cache, and a field that is both
+head-partitioned and page-sharded, are rejected by the planner.
+
+The plan records one decision per (source rank, sharded group), never by
+omission: the owner filter when the rank's fragments name the group, an
+explicit `None` when they do not -- a rank routed only for another group's
+head partition (Kimi K3's KDA state against its MLA subgroup), or a pipeline
+stage whose fields miss the group -- so that rank sends nothing for it. The
+prefill checks those decisions against its cache groups once, when the decode
+registers (`validate_rank_owner_filters`); the sender applies them as given.
+A sharded source leaves the equal-TP empty-fragment route (one predicate,
+`_uses_whole_copy_route`, decides it for routing and served-rank sets alike),
+but the sender folds every fragment with one contiguous span per page -- a
+whole field, or a head slice whose rows collapsed into one -- into its group's
+pages x fields grid, so DCP, pipeline stages and replicated fields across
+unequal TP all go through the page-gathered WRITE; only a fragment with
+several strided rows per page is emitted per page.
+
+The runtime derives compact DCP page tables and local visible lengths from
+the scheduler's virtual block tables, without introducing new scheduler-owned
+request state. To support draft length changes, the read table retains
+allocated reserve pages while per-query visibility bounds limit actual reads.
+When drafting advances or reanchors to an accepted prefix, the runtime
+translates the global visibility bounds according to page ownership; a change
+in the global token count is not the same change in the local token count.
 
 Splitting or regrouping fields can change physical packing and parent plane
 sizes. Capacity planning therefore uses the resulting physical parent byte
@@ -1131,6 +1237,23 @@ unowned rows, and zeroing filters foreign blocks through the same path at
 every DCP size. Virtual block 0 is the null block; no path writes to it, at
 any DCP size.
 
+Query context parallelism (`--prefill-context-parallel-size`,
+`docs/design/unified_path.md`) is orthogonal to placement: DCP decides who
+stores a page, QCP decides who computes a row. Allocation, prefix matching,
+zeroing, publication and the P->D route never see the query shard. The
+sharded extend arm reads the placement through the same cyclic rule — the
+history gather of a request group splits by page owner
+(`dcp/placement.py: cyclic_slot_owner`, `owned_history_rows` on the host from
+the kernel page table's mirror) and the KV write gathers the rotated rows to
+the whole span before the owner-masked store — so a replicated group
+(`shard_count` 1) is a local gather and one owner, the same path with the
+degree as a parameter. A history gather workspace of one whole history is
+reserved from the cache budget by the recipe (`workspace_bytes`) like a
+verify workspace; its index-K rows are packed in the plane's own format
+(`DSAConfig.index_k_format`: FP8 bytes with scales, or bf16 keys), so the
+recipe's bytes and the leaf's allocation follow one row width and the
+gather hands the indexer the plane's form, sharded pages or not.
+
 Consumers bind a pool's compute view and read its arena's runtime contract.
 Views sharing an arena share that contract, rather than accepting separately
 injected copies of its geometry. Batch metadata retains the same contract for
@@ -1145,12 +1268,17 @@ used to shape an arena field. Virtual null ID 0 has no owner and is filtered
 during translation.
 
 Before zeroing scheduler blocks, the runtime checks IDs against the virtual
-bound and translates each group's batch to owned local IDs through the shared
-translation API. Translation precedes dispatch to pool views; pools and the
-arena receive physical IDs and hold no context rank. The arena's
-`zero_blocks()` validates every ID against its group's local page count before
-clearing any bytes. Physical page 0 is within that range and is handled like
-any other page when explicitly requested.
+bound and translates each group's batch to owned local IDs on the host
+(`local_pages`, plain integer arithmetic over the same cyclic placement the
+device translation kernels implement). Translation precedes dispatch to pool
+views; pools and the arena receive physical IDs and hold no context rank. The
+arena's `zero_blocks()` validates every ID against its group's local page
+count before clearing any bytes. Physical page 0 is within that range and is
+handled like any other page when explicitly requested. Host work on this path
+is O(pages): the arena ships the page ids through one pinned copy and the
+kernel expands page x field byte ranges from the group's fixed field table,
+because a long prompt's admission hands out thousands of pages and per-range
+Python here stalls the forward thread while the device sits idle.
 
 The allocator receives only an integer `shard_count`, fixed when the
 coordinator registers the group in its pools. It counts
@@ -1387,7 +1515,8 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   leaves see kernel vocabulary only. The bridge's per-group table views
   (`CacheBatchMetadata`) are the router's input — block vocabulary in,
   kernel pages out, one expand launch per group. Models and the runner never
-  compute locations — `write_locations(layer, mode)` is the single accessor
+  compute locations — `write_locations(layer, mode)` is the single accessor,
+  and `forward_write_locations` composes it for the attention prologue's writes
   (`unified_path.md`, "Write locations have one owner").
   QSA's indexer reuses `GroupTableStacks` with `kernel_page_size` equal to
   each group's `block_granularity`. This ratio-one fill copies stable raw

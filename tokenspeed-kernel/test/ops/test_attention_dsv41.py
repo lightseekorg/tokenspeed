@@ -28,6 +28,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+from utils import assert_no_triton_compile
 
 _LAYOUTS = {
     "global": (512, 16, 256, 288),
@@ -1000,6 +1001,40 @@ def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
     assert not torch.any(actual[~active])
 
 
+def test_compressor_pool_token_count_does_not_recompile(device):
+    """Every prefill brings a new token count; the kernel must not key its
+    compile cache on the row count."""
+    tail = torch.randn(5, 2, 2, 512, device=device)
+
+    def run(count):
+        projection = torch.randn(count, 1024, device=device)
+        content, scores = projection[:, :512], projection[:, 512:]
+        previous = torch.arange(count, device=device) - 1
+        slots = torch.full((count,), 2, device=device, dtype=torch.int32)
+        active = torch.arange(count, device=device) % 2 == 1
+        pooled = dsv41.compressor_pool(
+            content, scores, previous, tail, slots, active, None, None, 0.0
+        )
+        # Row 0 pairs with the tail slot; every later active row pairs with
+        # its predecessor in this forward.
+        prior_content = torch.cat([tail[1, 0, 0][None], content[:-1]])
+        prior_scores = torch.cat([tail[1, 0, 1][None], scores[:-1]])
+        maximum = torch.maximum(prior_scores, scores)
+        old_exp = torch.exp(prior_scores - maximum)
+        new_exp = torch.exp(scores - maximum)
+        expected = (prior_content * old_exp + content * new_exp) / (old_exp + new_exp)
+        expected[~active] = 0
+        torch.testing.assert_close(pooled, expected, rtol=1e-6, atol=1e-6)
+
+    # Warm both integer-specialization classes (16-divisible and not); Triton
+    # still keys on those two properties for runtime scalars.
+    run(32)
+    run(33)
+    with assert_no_triton_compile(implementation._compressor_pool):
+        for count in (48, 97, 130, 1483, 4096):
+            run(count)
+
+
 def _native_available():
     from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
         is_flash_mla_v41_available,
@@ -1250,6 +1285,43 @@ def test_compressor_metadata_consecutive_requests_and_refresh(n, target):
             torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
 
 
+def test_compressor_metadata_table_width_does_not_recompile():
+    """Chunked prefill widens the tail table every chunk; the kernel must not
+    key its compile cache on the table geometry."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA/ROCm")
+
+    def run(rows, width):
+        p = torch.arange(rows, dtype=torch.int64, device="cuda")
+        r = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        table = torch.ones((3, width), dtype=torch.int32, device="cuda")
+        table[:, 5::7] = 0
+        out = tuple(
+            torch.empty(rows, dtype=dtype, device="cuda")
+            for dtype in (
+                torch.bool,
+                torch.int64,
+                torch.int32,
+                torch.int64,
+                torch.int64,
+                torch.int64,
+            )
+        )
+        implementation.compressor_metadata(p, r, table, 4, *out)
+        for got, want in zip(
+            out, _compressor_metadata_reference(p, r, table, 4), strict=True
+        ):
+            torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
+
+    # Warm both integer-specialization classes (16-divisible and not); Triton
+    # still keys on those two properties for runtime scalars.
+    run(64, 128)
+    run(64, 132)
+    with assert_no_triton_compile(implementation._compressor_metadata):
+        for rows, width in ((64, 192), (128, 196), (96, 388), (64, 1024)):
+            run(rows, width)
+
+
 @pytest.mark.parametrize("target", ["cpu", "cuda"])
 @pytest.mark.parametrize("width", [1, 3, 5, 6, 129])
 @pytest.mark.parametrize("bs", [0, 3])
@@ -1491,7 +1563,16 @@ def test_dspark_anchors_pick_last_accepted_verify_rows(device):
     positions = torch.arange(1000, 1000 + decodes * width, device=device)
     next_tokens = torch.zeros(bs, spec, device=device, dtype=torch.int32)
     start = torch.zeros(decodes, device=device, dtype=torch.int64)
-    dsv41.dspark_anchors(tokens, accept, positions, extends, width, next_tokens, start)
+    dsv41.dspark_anchors(
+        tokens,
+        accept,
+        positions,
+        extends,
+        width,
+        next_tokens,
+        start,
+        num_prefill_outputs=extends,
+    )
     # Extend rows keep their sampled token; decode rows take the token at the
     # last accepted verify row, with accept lengths clamped into 1..width.
     assert next_tokens.tolist() == [[100] * 6, [104] * 6, [107] * 6, [118] * 6]
@@ -1499,14 +1580,28 @@ def test_dspark_anchors_pick_last_accepted_verify_rows(device):
     cpu_next = torch.zeros(bs, spec, dtype=torch.int32)
     cpu_start = torch.zeros(decodes, dtype=torch.int64)
     dsv41.dspark_anchors(
-        tokens.cpu(), accept.cpu(), positions.cpu(), extends, width, cpu_next, cpu_start
+        tokens.cpu(),
+        accept.cpu(),
+        positions.cpu(),
+        extends,
+        width,
+        cpu_next,
+        cpu_start,
+        num_prefill_outputs=extends,
     )
     assert torch.equal(cpu_next, next_tokens.cpu()) and torch.equal(
         cpu_start, start.cpu()
     )
     with pytest.raises(ValueError):
         dsv41.dspark_anchors(
-            tokens[:-1], accept, positions, extends, width, next_tokens, start
+            tokens[:-1],
+            accept,
+            positions,
+            extends,
+            width,
+            next_tokens,
+            start,
+            num_prefill_outputs=extends,
         )
 
 
@@ -1554,3 +1649,36 @@ def test_dspark_block_expands_anchors_and_window_addressing(device):
         assert torch.equal(got.cpu(), reference.to(got.dtype))
     with pytest.raises(ValueError):
         dsv41.dspark_block(bonus[:2], start, history, noise, rows_per_page, hc, block)
+
+
+def test_dspark_sparse_outputs_preserve_inactive_rows_without_recompile(device):
+    extends, width = 2, 3
+    accept = torch.tensor([1, 0, 2], dtype=torch.int32, device=device)
+    positions = torch.tensor([50, 51, 52], dtype=torch.int64, device=device)
+    next_tokens = torch.full((3, width), -7, dtype=torch.int32, device=device)
+    starts = torch.empty(1, dtype=torch.int64, device=device)
+
+    def run(outputs):
+        tokens = torch.arange(
+            10, 10 + outputs + width, dtype=torch.int32, device=device
+        )
+        next_tokens.fill_(-7)
+        dsv41.dspark_anchors(
+            tokens,
+            accept,
+            positions,
+            extends,
+            width,
+            next_tokens,
+            starts,
+            num_prefill_outputs=outputs,
+        )
+        assert next_tokens[:outputs, 0].tolist() == list(range(10, 10 + outputs))
+        assert (next_tokens[outputs:extends] == -7).all()
+        assert next_tokens[extends].tolist() == [10 + outputs + 1] * width
+        assert starts.tolist() == [51]
+
+    run(1)
+    with assert_no_triton_compile(implementation._dspark_anchors_kernel):
+        run(0)
+        run(2)

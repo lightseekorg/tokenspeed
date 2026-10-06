@@ -34,6 +34,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -64,8 +65,12 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroup
 from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
     local_pages,
     local_pages_by_group,
+    owned_local_pages,
 )
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.server_args import (
+    ServerArgs,
+    validate_dcp_disaggregation_role,
+)
 
 register_cuda_ci(
     est_time=10,
@@ -136,6 +141,7 @@ def _recipe(*, dcp_size: int, fp4: bool, draft: bool) -> DeepseekV4Recipe:
         ),
         draft_attn_config=SimpleNamespace(dcp_size=dcp_size) if draft else None,
         cache_budget_bytes=8 << 30,
+        probe_batch_rows=None,
         decode_input_tokens=4,
         overlap_schedule_depth=0,
     )
@@ -204,7 +210,7 @@ class LocalPagesTest(unittest.TestCase):
                         virtual_block_count=count,
                     )
                     # Each rank owns exactly the local pages 1..6, in order.
-                    self.assertEqual(owned, list(range(1, 7)))
+                    self.assertEqual(owned.tolist(), list(range(1, 7)))
                     seen.extend(
                         block
                         for block in virtual
@@ -214,12 +220,35 @@ class LocalPagesTest(unittest.TestCase):
 
     def test_null_block_and_duplicates(self):
         self.assertEqual(
-            local_pages([0, 3, 3, 0, 1], shard_count=2, rank=0, virtual_block_count=9),
+            local_pages(
+                [0, 3, 3, 0, 1], shard_count=2, rank=0, virtual_block_count=9
+            ).tolist(),
             [2, 2, 1],
         )
         self.assertEqual(
-            local_pages([0, 0], shard_count=1, rank=0, virtual_block_count=9), []
+            local_pages([0, 0], shard_count=1, rank=0, virtual_block_count=9).tolist(),
+            [],
         )
+        # The scheduler's zero-copy export is a read-only int32 array.
+        exported = np.asarray([0, 3, 3, 0, 1], dtype=np.int32)
+        exported.setflags(write=False)
+        self.assertEqual(
+            local_pages(
+                exported, shard_count=2, rank=0, virtual_block_count=9
+            ).tolist(),
+            [2, 2, 1],
+        )
+
+    def test_owner_mask_pairs_owned_pages_with_their_input_positions(self):
+        owned, local = owned_local_pages(
+            [0, 3, 3, 0, 1, 4], shard_count=2, rank=0, virtual_block_count=9
+        )
+        self.assertEqual(owned.tolist(), [False, True, True, False, True, False])
+        self.assertEqual(local.tolist(), [2, 2, 1])
+        owned, local = owned_local_pages(
+            [], shard_count=2, rank=0, virtual_block_count=9
+        )
+        self.assertEqual((owned.tolist(), local.tolist()), ([], []))
 
     def test_out_of_range_ids_and_ranks_are_rejected(self):
         with self.assertRaises(IndexError):
@@ -239,7 +268,10 @@ class LocalPagesTest(unittest.TestCase):
             rank=1,
         )
         # Sharded: rank 1 owns virtual 2, 4, 6, 8 -> local 1, 2, 3, 4.
-        self.assertEqual(translated, {"sharded": [1, 2, 4], "replicated": [1, 4]})
+        self.assertEqual(
+            {group: pages.tolist() for group, pages in translated.items()},
+            {"sharded": [1, 2, 4], "replicated": [1, 4]},
+        )
         with self.assertRaises(IndexError):
             local_pages_by_group({"replicated": [5]}, contract=contract, rank=0)
 
@@ -284,11 +316,11 @@ class CacheMetadataTranslationTest(unittest.TestCase):
                         torch.full_like(virtual, -1),
                     )
                     self.assertTrue(torch.equal(read.long(), expected))
-                    # Only compressed groups get a read view; the indexer reads
-                    # its replicated table directly.
+                    # Compressed KV and the independent indexer group share
+                    # the placement contract, not physical page IDs.
                     self.assertEqual(
                         set(metadata.compressed_page_tables),
-                        {v4_compressed_kv_group_id(4)},
+                        {v4_compressed_kv_group_id(4), V4_INDEXER_KV_GROUP_ID},
                     )
                     table[0, 0] = 2
                     metadata.refresh_page_tables()
@@ -341,10 +373,18 @@ class CacheMetadataTranslationTest(unittest.TestCase):
                 )
                 self.assertEqual(slots.tolist(), [64, 127, 128, 192, -1])
 
-    def test_indexer_table_is_its_own_replicated_group(self):
+    def test_indexer_table_is_its_own_sharded_group(self):
         table = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
         metadata = _metadata(dcp_size=4, dcp_rank=3, table=table)
         self.assertTrue(torch.equal(metadata.indexer_block_table(), table))
+        metadata.refresh_page_tables()
+        self.assertEqual(metadata.indexer_page_table().tolist(), [[-1, -1, -1, 1]])
+        self.assertEqual(
+            metadata.local_indexer_write_slots(
+                torch.tensor([64, 128, 192, 256, -1]), 64
+            ).tolist(),
+            [-1, -1, -1, 64, -1],
+        )
         with self.assertRaisesRegex(RuntimeError, "missing cache-group block table"):
             _metadata(dcp_size=4, dcp_rank=3, table=table).compressed_block_table(128)
 
@@ -368,7 +408,7 @@ class CacheMetadataTranslationTest(unittest.TestCase):
 
 
 class RecipeDeclarationTest(unittest.TestCase):
-    def test_only_compressed_groups_are_sharded_and_the_indexer_is_separate(self):
+    def test_compressed_and_indexer_groups_are_sharded_and_states_replicated(self):
         for dcp_size in (1, 2, 4):
             with self.subTest(dcp_size=dcp_size):
                 specs = [
@@ -379,14 +419,17 @@ class RecipeDeclarationTest(unittest.TestCase):
                 ]
                 by_id = {spec.group_id: spec for spec in specs}
                 self.assertIn(V4_INDEXER_KV_GROUP_ID, by_id)
-                self.assertEqual(by_id[V4_INDEXER_KV_GROUP_ID].shard_count, 1)
+                self.assertEqual(by_id[V4_INDEXER_KV_GROUP_ID].shard_count, dcp_size)
                 self.assertEqual(
                     by_id[V4_INDEXER_KV_GROUP_ID].retention, "full_history"
                 )
                 for spec in specs:
                     expected = (
                         dcp_size
-                        if parse_v4_compressed_kv_group_id(spec.group_id)
+                        if (
+                            parse_v4_compressed_kv_group_id(spec.group_id)
+                            or spec.group_id == V4_INDEXER_KV_GROUP_ID
+                        )
                         else 1
                     )
                     self.assertEqual(spec.shard_count, expected, spec.group_id)
@@ -419,8 +462,8 @@ class RecipeDeclarationTest(unittest.TestCase):
                 capacity = recipe.token_capacity(layout, parents)
                 # Every group can hold the admitted tokens: the recipe's parent
                 # demand at token_capacity never exceeds the parents it planned,
-                # and one more token's worth would. The replicated indexer group
-                # therefore bounds capacity, not the sharded compressed chain.
+                # and one more token's worth would. Replicated SWA and state
+                # demands still constrain the shared physical budget.
                 self.assertLessEqual(recipe.parents_needed(layout, capacity), parents)
                 self.assertGreater(
                     recipe.parents_needed(layout, capacity + 256), parents
@@ -510,7 +553,7 @@ class MappingTest(unittest.TestCase):
     def test_dcp_subgroups_are_consecutive_within_attention_tp(self):
         for rank in range(8):
             mapping = AttentionLayerMapping(
-                rank=rank, world_size=8, tp_size=8, cp_size=1, dp_size=1, dcp_size=4
+                rank=rank, world_size=8, tp_size=8, dp_size=1, dcp_size=4
             )
             self.assertTrue(mapping.has_dcp)
             self.assertEqual(mapping.dcp_rank, rank % 4)
@@ -519,7 +562,7 @@ class MappingTest(unittest.TestCase):
                 mapping.dcp_group, tuple(range(rank - rank % 4, rank - rank % 4 + 4))
             )
         plain = AttentionLayerMapping(
-            rank=3, world_size=8, tp_size=8, cp_size=1, dp_size=1, dcp_size=1
+            rank=3, world_size=8, tp_size=8, dp_size=1, dcp_size=1
         )
         self.assertFalse(plain.has_dcp)
         self.assertEqual(plain.dcp_group, (3,))
@@ -527,11 +570,11 @@ class MappingTest(unittest.TestCase):
     def test_dcp_must_divide_attention_tp(self):
         with self.assertRaisesRegex(ValueError, "divisible"):
             AttentionLayerMapping(
-                rank=0, world_size=8, tp_size=8, cp_size=1, dp_size=1, dcp_size=3
+                rank=0, world_size=8, tp_size=8, dp_size=1, dcp_size=3
             )
         with self.assertRaisesRegex(ValueError, "positive"):
             AttentionLayerMapping(
-                rank=0, world_size=8, tp_size=8, cp_size=1, dp_size=1, dcp_size=0
+                rank=0, world_size=8, tp_size=8, dp_size=1, dcp_size=0
             )
 
 
@@ -601,6 +644,15 @@ class ConfigurationTest(unittest.TestCase):
         args.enable_kvstore = False
         args._handle_kvstore()
         args.validate_cache_options()
+
+    def test_dcp_allows_aggregated_and_prefill_roles_only(self):
+        for mode in ("null", "prefill"):
+            validate_dcp_disaggregation_role(has_dcp=True, disaggregation_mode=mode)
+        for mode in ("null", "prefill", "decode", "encode"):
+            validate_dcp_disaggregation_role(has_dcp=False, disaggregation_mode=mode)
+        for mode in ("decode", "encode"):
+            with self.assertRaisesRegex(ValueError, "only the prefill side"):
+                validate_dcp_disaggregation_role(has_dcp=True, disaggregation_mode=mode)
 
 
 if __name__ == "__main__":

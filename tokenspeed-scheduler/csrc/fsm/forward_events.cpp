@@ -20,7 +20,6 @@
 
 #include "fsm/forward_events.h"
 
-#include <memory>
 #include <utility>
 
 #include "scheduler/operations/cache.h"
@@ -40,7 +39,7 @@ SchedulePrefillFirstChunkEvent::scheduleFirstChunk(TokenContainer* token_contain
     ForwardResources resources{
         .token_container = token_container,
         .prefix_granularity = prefix_granularity,
-        .req_pool_index = std::make_unique<ReqPoolIndex>(req_pool_allocator_->Allocate()),
+        .req_pool_index = req_pool_allocator_->Allocate(),
         .block_tables = std::move(block_tables_),
         .cache_progress = std::move(cache_progress_),
         .results_in_flight = 0,
@@ -171,9 +170,35 @@ Finished AbortEvent::operator()(Retracted&&) {
     return Finished{};
 }
 
+namespace {
+
+// Positions whose forward results had landed when the retraction struck. A
+// prefill state's window is its latest scheduled chunk: computed when nothing
+// is in flight (a capacity victim is retracted only when quiescent), still
+// owed otherwise (a chunk whose forward was skipped after a failed cache
+// load). A decoding request has computed every token but the last landed
+// one, which is the next step's input.
+template <typename State>
+std::int32_t landedTokens(const State& state) {
+    const TokenContainer::Window& window = state.window;
+    return state.resources.results_in_flight == 0 ? window.begin + window.size : window.begin;
+}
+
+std::int32_t landedTokens(const RemotePrefilling&) {
+    // The peer computes the prompt; no forward of it has landed here.
+    return 0;
+}
+
+std::int32_t landedTokens(const Decoding& state) {
+    return state.resources.token_container->Size() - 1;
+}
+
+}  // namespace
+
 template <typename State>
 Retracted RetractEvent::retract(State&& state) {
     _assert(coordinator_ != nullptr, "RetractEvent requires a cache coordinator");
+    const std::int32_t landed_tokens = landedTokens(state);
     ForwardResources& resources = state.resources;
     resources.token_container->RebasePrefill();
     FreeRequest(*coordinator_, resources.block_tables);
@@ -181,7 +206,8 @@ Retracted RetractEvent::retract(State&& state) {
                      .prefix_granularity = resources.prefix_granularity,
                      .retraction_epoch = epoch_,
                      .has_recoverable_snapshot = has_recoverable_snapshot_,
-                     .resumes_generation = resumes_generation_};
+                     .resumes_generation = resumes_generation_,
+                     .landed_tokens = landed_tokens};
 }
 
 Retracted RetractEvent::operator()(Prefilling&& state) {

@@ -75,7 +75,13 @@ def _attn_config(family: str, pd_enabled: bool):
         kv_cache_dim=576,
     )
     if family == "dsa":
-        spec = DSAConfig(index_topk=1, index_head_dim=128, index_n_heads=1, **common)
+        spec = DSAConfig(
+            index_topk=1,
+            index_head_dim=128,
+            index_n_heads=1,
+            index_k_format="fp8_scaled",
+            **common,
+        )
     else:
         spec = MLAConfig(**common)
     return AttnConfig(
@@ -105,6 +111,7 @@ def _recipe(family: str, pd_enabled: bool = False):
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1 << 30,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     )

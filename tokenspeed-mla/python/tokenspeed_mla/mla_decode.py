@@ -22,26 +22,24 @@
 CuTe DSL MLA Decode Kernel Integration
 =======================================
 
-Wraps NVIDIA's CuTe DSL MLA decode kernels (FP16/BF16/FP8) for Blackwell SM100
+Wraps CuTe DSL MLA decode kernels (FP16/BF16/FP8) for SM100, SM103 and SM107
 and exposes them via a PyTorch API compatible with FlashInfer's MLA backend.
 """
 
 import functools
+import os
 from typing import Callable, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
-from tokenspeed_mla.mla_decode_fp8 import (
-    BlackwellMultiHeadLatentAttentionForwardFP8,
-)
-from tokenspeed_mla.mla_decode_fp16 import (
-    BlackwellMultiHeadLatentAttentionForwardFP16,
-)
+from tokenspeed_mla.mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
+from tokenspeed_mla.mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from tokenspeed_mla.mla_helpers import (
     ceil_div,
     compute_q_tile_layout,
+    get_mla_decode_arch,
     get_mla_decode_fold_sq_factor,
     select_mla_decode_tilers,
 )
@@ -51,6 +49,9 @@ from tokenspeed_mla.utils import (
     torch_to_cutlass_dtype,
 )
 
+# FP8 split-KV partials as fp16 instead of fp32: faster reductions, opt in with =1
+_FP16_PARTIALS = os.environ.get("TOKENSPEED_MLA_FP16_PARTIALS", "0") == "1"
+
 
 def _get_reducer_d_tiles(
     batch_size: int,
@@ -59,7 +60,7 @@ def _get_reducer_d_tiles(
     num_sms: int,
     split_kv: int,
 ) -> int:
-    """Return 1/2/4 D512 bands for the real output rows and split count.
+    """Return 1 or 2 D512 bands for the real output rows and split count.
 
     Adapted from FlashInfer PR #4178: minimize waves per output band, keeping
     the smaller grid on ties. Full row grids avoid duplicating LSE reduction.
@@ -67,14 +68,14 @@ def _get_reducer_d_tiles(
     rows = batch_size * seq_len_q * num_heads
     if rows <= 0 or num_sms <= 0 or rows >= num_sms or split_kv <= 1:
         return 1
-    best = 1
-    best_waves = ceil_div(rows, num_sms)
-    for bands in (2, 4):
-        if bands <= split_kv:
-            waves = ceil_div(rows * bands, num_sms)
-            if waves * best < best_waves * bands:
-                best, best_waves = bands, waves
-    return best
+    # no 4 bands: that leaves one partial element per reducer thread, and those
+    # single-element loads cost more than the band saves
+    return 2 if ceil_div(rows * 2, num_sms) < 2 * ceil_div(rows, num_sms) else 1
+
+
+def _get_reducer_max_splits(split_kv: int) -> int:
+    """Smallest power of two (at least 4) covering the split count."""
+    return max(4, 1 << (split_kv - 1).bit_length())
 
 
 @functools.cache
@@ -87,6 +88,7 @@ def _get_split_kv_and_workspace_size(
     max_seq_len: int,
     torch_dtype: torch.dtype,
     mma_qk_tiler_mn: tuple[int, int],
+    min_split_kv: int = 1,
 ) -> Tuple[int, int]:
     """Return cached split count and workspace bytes for the effective Q layout.
 
@@ -110,6 +112,7 @@ def _get_split_kv_and_workspace_size(
         split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
             B, q_len, max_active_blocks
         )
+    split_kv = max(split_kv, min_split_kv)
     if is_fp8:
         # The occupancy candidate may contain empty final partitions (e.g.
         # 32 splits for only 8 K tiles). Preserve the uniform chunk width while
@@ -120,6 +123,10 @@ def _get_split_kv_and_workspace_size(
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
         H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
     )
+    if min_split_kv > 1 and workspace_size >= 1 << 31:
+        raise ValueError(
+            "min_split_kv requires workspace beyond the Int32 offset limit"
+        )
     return split_kv, workspace_size
 
 
@@ -185,6 +192,8 @@ def _get_compiled_mla_kernel(
     is_persistent: bool,
     is_var_seq: bool,
     is_var_split_kv: bool,
+    compute_capability: tuple[int, int],
+    has_local_visible_lens: bool,
     skip_correction_threshold: float = 0.0,
     is_workspace_size_zero: bool = False,
     fold_sq_factor: int = 1,
@@ -197,16 +206,18 @@ def _get_compiled_mla_kernel(
     cp_interleave_size: int = 1,
     use_pdl: bool = False,
     return_lse: bool = False,  # DCP: enable LSE output
-    compute_capability: tuple[int, int] = (0, 0),
     reducer_d_tiles: int = 1,
     reducer_max_splits: int = 256,
     pack_q: bool = False,
+    *,
+    partial_fp16: bool,
 ) -> Callable:
     """Compile and cache an MLA decode kernel.
 
     Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
     page_table, o, lse (None to skip), workspace, split_kv_scalar, cache_seqs,
-    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
+    block_split_kvs, softmax_scale_scalar, output_scale_scalar), plus
+    local_visible_lens when supplied.
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
@@ -228,6 +239,7 @@ def _get_compiled_mla_kernel(
     cutlass_out_dtype = cutlass.BFloat16 if is_fp8 else cutlass_dtype
 
     kernel_kwargs = dict(
+        compute_capability=compute_capability,
         acc_dtype=cutlass.Float32,
         lse_dtype=cutlass.Float32,
         mma_qk_tiler_mn=mma_qk_tiler_mn,
@@ -255,6 +267,7 @@ def _get_compiled_mla_kernel(
         kernel_kwargs["cp_interleave_size"] = cp_interleave_size
         kernel_kwargs["reducer_d_tiles"] = reducer_d_tiles
         kernel_kwargs["reducer_max_splits"] = reducer_max_splits
+        kernel_kwargs["partial_fp16"] = partial_fp16
     kernel_obj = KernelClass(**kernel_kwargs)
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -390,8 +403,22 @@ def _get_compiled_mla_kernel(
         stream_fake,
         use_pdl,
     ]
+    compile_args.append(
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (sym_batch, sym_seq_q),
+            stride_order=(1, 0),
+            assumed_align=4,
+        )
+        if has_local_visible_lens
+        else None
+    )
     compiled_kernel = cute.compile(
-        *compile_args, options="--enable-tvm-ffi --opt-level 2"
+        *compile_args,
+        options=(
+            "--enable-tvm-ffi --opt-level 2 "
+            f"--gpu-arch={get_mla_decode_arch(compute_capability)}a"
+        ),
     )
 
     return compiled_kernel
@@ -421,8 +448,11 @@ def tokenspeed_mla_decode(
     cp_rank: int = 0,  # this rank's index in [0, cp_world)
     cp_interleave_size: int = 1,
     enable_packed_q: bool = False,
+    *,
+    min_split_kv: int = 1,
+    local_visible_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """CuTe DSL MLA decode kernel for Blackwell SM100.
+    """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
 
     Parameters
     ----------
@@ -508,6 +538,24 @@ def tokenspeed_mla_decode(
         M64 and token-gapped Q/output views retain that path even when True.
         Packed split-KV workspace uses ``B * 128 * ceil(H*q_len/128) *
         split_kv * (kv_lora_rank + 1) * 4`` bytes (zero for split_kv=1).
+    min_split_kv : int
+        Minimum number of KV splits used by the decode kernel, in [1, 256].
+        The effective value is capped to avoid creating empty partitions.
+        Defaults to 1, which enables automatic split selection.
+
+    local_visible_lens : torch.Tensor, optional
+        Contiguous int32 [B, q_len] tensor on the query device, supported with
+        BF16 or FP8 E4M3 Q/KV.
+        Each value is the exclusive visible prefix length in the compact local
+        page table, overriding the inferred causal bound. Callers must provide
+        0 <= local_visible_lens[b, q] <= seq_lens[b]; values are not copied to
+        the CPU for validation. None retains the standard causal/noncausal mask.
+        Page entries must preserve logical token order. Empty local rows return
+        zero output and negative-infinity LSE (base 2), with or without split-KV.
+        Lengths may be updated in place between CUDA graph replays; max_seq_len
+        remains a positive capacity bound. Compaction and cross-rank merging
+        belong to the caller. Cannot be combined with sliding windows or
+        interleaved CP metadata.
 
     Returns
     -------
@@ -515,6 +563,8 @@ def tokenspeed_mla_decode(
         Output tensor [B, q_len, H, kv_lora_rank]. When ``return_lse=True``,
         returns ``(output, lse)`` with ``lse`` of shape [B, q_len, H] (fp32).
     """
+    if type(min_split_kv) is not int or not 1 <= min_split_kv <= 256:
+        raise ValueError("min_split_kv must be an integer in [1, 256]")
     supported_dtypes = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
     assert (
         query.dtype in supported_dtypes
@@ -524,6 +574,25 @@ def tokenspeed_mla_decode(
     ), f"kv_cache dtype {kv_cache.dtype} must match query dtype {query.dtype}"
     B, q_len, H, D_qk = query.shape
     assert D_qk == kv_lora_rank + qk_rope_head_dim
+
+    if local_visible_lens is not None:
+        if query.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise ValueError("local_visible_lens requires BF16 or FP8 E4M3 Q and KV")
+        if window_left != -1 or cp_world != 1 or causal_seqs is not None:
+            raise ValueError(
+                "local_visible_lens cannot be combined with a sliding window "
+                "or interleaved context-parallel metadata"
+            )
+        if (
+            local_visible_lens.shape != (B, q_len)
+            or local_visible_lens.dtype != torch.int32
+            or local_visible_lens.device != query.device
+            or not local_visible_lens.is_contiguous()
+        ):
+            raise ValueError(
+                "local_visible_lens must be contiguous int32 [B, q_len] "
+                "on the query device"
+            )
 
     q_dtype = query.dtype
 
@@ -606,6 +675,7 @@ def tokenspeed_mla_decode(
         max_seq_len,
         q_dtype,
         mma_qk_tiler_mn,
+        min_split_kv,
     )
 
     # Prepare workspace: slice of contiguous 1D buffer is already contiguous
@@ -679,7 +749,8 @@ def tokenspeed_mla_decode(
 
     is_var_split_kv = False
     block_split_kvs = None
-    skip_correction_threshold = 0.0
+    # FP8: keep the row max while it grows by <= 8 log2 units (P <= 256 < 448).
+    skip_correction_threshold = 8.0 if is_fp8 else 0.0
 
     # For fixed-length input, set is_persistent to True; otherwise, set to False.
     is_persistent = not is_var_seq
@@ -727,10 +798,12 @@ def tokenspeed_mla_decode(
             if is_fp8
             else 1
         ),
-        # Public FP8 auto-splitting is bounded by 64 (M64) or 32 (M128).
-        # Both values are in the compile cache key, including across batches.
-        reducer_max_splits=(64 if mma_m_tile == 64 else 32) if is_fp8 else 256,
+        # reducer capacity: the power of two covering split_kv, which already
+        # includes min_split_kv (part of the compile cache key)
+        reducer_max_splits=_get_reducer_max_splits(split_kv) if is_fp8 else 256,
         pack_q=pack_q,
+        has_local_visible_lens=local_visible_lens is not None,
+        partial_fp16=_FP16_PARTIALS,
     )
 
     # DCP: allocate real LSE tensor when return_lse=True (DCP path). torch.zeros
@@ -767,6 +840,8 @@ def tokenspeed_mla_decode(
         Float32(softmax_scale),
         Float32(output_scale),
     ]
+    if local_visible_lens is not None:
+        call_args.append(local_visible_lens)
 
     with tvm_ffi.use_torch_stream():
         compiled_kernel(*call_args)

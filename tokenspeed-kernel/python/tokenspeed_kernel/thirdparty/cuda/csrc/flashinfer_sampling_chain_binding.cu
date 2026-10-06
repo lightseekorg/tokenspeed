@@ -32,7 +32,8 @@ void chain_speculative_sampling_target_only(
     TensorView predicts, TensorView accept_index, TensorView accept_token_num,
     TensorView candidates, TensorView uniform_samples, TensorView uniform_samples_for_final_sampling,
     TensorView target_probs, Optional<TensorView> draft_probs, double threshold_single,
-    double threshold_acc, bool deterministic, bool enable_pdl
+    double threshold_acc, bool deterministic, bool use_draft_prob,
+    double reject_draft_prob_threshold, bool enable_pdl
 );
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(verify_chain_greedy, verify_chain_greedy);

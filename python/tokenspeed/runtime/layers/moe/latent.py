@@ -23,14 +23,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import partial
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.communication import (
-    allreduce_lane_latent_norm_supported,
-)
 from tokenspeed_kernel.ops.moe import (
     latent_moe_expert_shared,
     native_latent_moe_available,
@@ -41,17 +38,14 @@ from torch import nn
 
 from tokenspeed.runtime.distributed.comm_backend import Group
 from tokenspeed.runtime.distributed.comm_ops import (
-    COMM_ONESHOT_MAX_BYTES,
     acquire_all_reduce_outputs,
     all_gather,
     all_gather_single,
     all_reduce,
-    all_reduce_latent_norm,
-    prepare_all_reduce_fusion,
-    prepare_all_reduce_lane,
 )
 from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 TensorReducer = Callable[[torch.Tensor], torch.Tensor]
@@ -77,103 +71,6 @@ def _marlin_moe_available() -> bool:
         and platform.arch_version >= ArchVersion(9, 0)
         and is_marlin_moe_available()
     )
-
-
-def _produced_into(
-    partials: tuple[torch.Tensor, ...],
-    destinations: tuple[torch.Tensor, ...],
-) -> bool:
-    """Whether every partial really landed in its requested destination.
-
-    The producer-direct destinations are a request, not a guarantee: a producer
-    that cannot write in place returns its own tensor instead. Comparing
-    storage addresses is what distinguishes the two, and it has to hold for
-    *both* partials -- reducing a pair where only one side was produced in
-    place would silently drop the other one's contribution.
-    """
-    return all(
-        p.data_ptr() == d.data_ptr() and p.shape == d.shape
-        for p, d in zip(partials, destinations, strict=True)
-    )
-
-
-def kimi3_join_reduce_moe(
-    routed_partial: torch.Tensor,
-    shared_partial: torch.Tensor,
-    *,
-    lane: torch.Tensor | None,
-    symm_outputs: tuple[torch.Tensor, torch.Tensor] | None = None,
-    routed_hidden: int,
-    routed_norm: nn.Module | None,
-    group: tuple[int, ...],
-    enable_lane_norm: bool,
-    max_token_num: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Join the routed/shared partials and reduce them, owning the strategy.
-
-    Four regimes, all element-wise identical:
-
-    * Symmetric hit: the partials were produced straight into the collective's
-      symmetric heap, so the pair reduces in place with no staging copy at all.
-      This is the only regime that reaches the symmetric kernel -- the backend
-      decides on the tuple operand, so a single concatenated tensor cannot get
-      there however its memory was allocated.
-    * Lane hit (decode batch=1): the partials were produced straight into the
-      persistent fused lane, one one-shot reduce with an eligible norm
-      epilogue and zero copies, but the collective stages them first.
-    * Small partials: cat into one contiguous operand and take a single
-      one-shot reduce; the copy is a couple of microseconds there.
-    * Partials past the one-shot window (prefill-sized chunks): the cat would
-      copy a few hundred MB per layer just to feed one NCCL call, while a
-      grouped NCCL launch reduces both tensors in place with the same
-      single-launch latency -- so skip the join entirely.
-    """
-
-    if symm_outputs is not None and _produced_into(
-        (routed_partial, shared_partial), symm_outputs
-    ):
-        routed_out, shared_out = all_reduce(symm_outputs, group=group)
-        if routed_norm is not None:
-            routed_out = routed_norm(routed_out)
-        return routed_out, shared_out
-
-    if lane is not None and routed_partial.data_ptr() == lane.data_ptr():
-        fused = lane
-    elif (
-        routed_partial.numel() * routed_partial.element_size() > COMM_ONESHOT_MAX_BYTES
-    ):
-        routed_out, shared_out = all_reduce(
-            (routed_partial, shared_partial),
-            group=group,
-        )
-        if routed_norm is not None:
-            routed_out = routed_norm(routed_out)
-        return routed_out, shared_out
-    else:
-        fused = torch.cat((routed_partial, shared_partial), dim=-1)
-
-    lane_norm_applied = routed_norm is not None and (
-        allreduce_lane_latent_norm_supported(
-            fused,
-            enabled=enable_lane_norm,
-        )
-    )
-    if lane_norm_applied:
-        fused = all_reduce_latent_norm(
-            fused,
-            routed_norm.weight,
-            routed_hidden,
-            group,
-            eps=routed_norm.variance_epsilon,
-            max_token_num=max_token_num,
-        )
-    else:
-        fused = all_reduce(fused, group)
-    routed_out = fused[:, :routed_hidden]
-    shared_out = fused[:, routed_hidden:]
-    if routed_norm is not None and not lane_norm_applied:
-        routed_out = routed_norm(routed_out)
-    return routed_out, shared_out
 
 
 def latent_moe_expert_shared_all_reduce(
@@ -234,15 +131,6 @@ class Kimi3MoEExecutionPlan:
     overlap_shared_experts: bool
     joint_moe_reduce: bool
     use_marlin: bool = False
-    fused_moe_ar: bool = False
-    # Whether the routed and shared partials can be reduced together at all,
-    # independent of whether a backend-owned lane is available to avoid the
-    # concatenation. ``fused_moe_ar`` implies a lane and is TRT-LLM only;
-    # ``join_moe_reduce`` only needs a grouped or concatenated all-reduce,
-    # which every backend provides, so the join is available on AMD too.
-    join_moe_reduce: bool = False
-    lane_latent_norm_ar: bool = False
-    comm_fusion_max_num_tokens: int = 0
 
     @classmethod
     def build(
@@ -253,7 +141,7 @@ class Kimi3MoEExecutionPlan:
     ) -> "Kimi3MoEExecutionPlan":
         """Select orchestration from the backend, streams, and parallel layout."""
 
-        use_mega_moe = moe_backend.value == "mega_moe"
+        use_mega_moe = moe_backend in (MoeBackend.MEGA_MOE, MoeBackend.GLUON_PETIT)
         use_native = not use_mega_moe and native_latent_moe_available()
         # Hopper (SM90) has no native FP4 tensor cores and no flashinfer SiTU
         # cubin, so K3's MXFP4 SiTU MoE runs weight-only through the Marlin
@@ -290,51 +178,6 @@ class Kimi3MoEExecutionPlan:
             ),
         )
 
-    def prepare_latent_fusion(
-        self,
-        mapping,
-        *,
-        lane_width: int,
-        has_latent_norm: bool,
-        max_token_num: int,
-        shard_up_projection: bool = False,
-    ) -> "Kimi3MoEExecutionPlan":
-        """Prepare optional communication fusions before graph capture."""
-
-        fused_moe_ar = (
-            self.use_trtllm
-            and mapping.moe.has_tp_ep
-            and prepare_all_reduce_lane(mapping.moe.tp_ep_group, lane_width)
-        )
-        lane_latent_norm_ar = (
-            fused_moe_ar
-            and has_latent_norm
-            and prepare_all_reduce_fusion(
-                mapping.moe.tp_ep_group,
-                lane_width,
-                max_token_num,
-            )
-        )
-        # The join itself needs no backend-owned lane: kimi3_join_reduce_moe
-        # falls back to a concatenated one-shot, or a grouped all-reduce when
-        # the payload exceeds COMM_ONESHOT_MAX_BYTES. Both are portable, so the
-        # tail can issue one collective per MoE layer instead of two wherever a
-        # TP x EP group exists -- not only where TRT-LLM can arm a lane.
-        #
-        # Excluded when the up projection is sharded: that tail folds the
-        # projection between two sequential all-reduces
-        # (_tail_fused_lane_ar_sharded) rather than calling the join, so the
-        # collective count is unchanged, while leaving SEPARATE_REDUCE would
-        # also give up the routed_in_fork overlap with the shared branch.
-        join_moe_reduce = mapping.moe.has_tp_ep and not shard_up_projection
-        return replace(
-            self,
-            fused_moe_ar=fused_moe_ar,
-            join_moe_reduce=join_moe_reduce,
-            lane_latent_norm_ar=lane_latent_norm_ar,
-            comm_fusion_max_num_tokens=max_token_num,
-        )
-
 
 class Kimi3LatentProjection(ReplicatedLinear):
     """Latent projection with kernel-owned specialization.
@@ -344,11 +187,9 @@ class Kimi3LatentProjection(ReplicatedLinear):
 
     With ``shard_group`` the output dimension is partitioned across the group
     (column parallel): each rank stores ``output_size / tp`` rows of the weight
-    and the ordinary projection ends with one all-gather. K3's tail paths avoid
-    that gather: the fused multicast tail consumes the shard directly, while
-    the other tiers inject each rank's column block into a reduction they
-    already run. Thus every tail retains ``(tp-1)/tp`` of the weight's memory
-    savings without adding collective wire bytes.
+    and the ordinary projection ends with one all-gather. K3 stage 2 uses the
+    weight shard directly for up-projection and multicast gather, or injects
+    this rank's output columns into the shared-expert all-reduce.
 
     With ``multicast_down`` the projection instead takes a column shard that
     publishes each rank's block into every peer's mailbox, which keeps each
@@ -962,6 +803,5 @@ __all__ = [
     "Kimi3LatentProjection",
     "Kimi3MoEExecutionPlan",
     "LatentMoELayer",
-    "kimi3_join_reduce_moe",
     "latent_moe_expert_shared_all_reduce",
 ]

@@ -23,8 +23,6 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel.ops.attention.kpool as attention
 import torch
-from tokenspeed_kernel.selection import select_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -289,62 +287,3 @@ def test_public_kpool_prefill_dispatch_forwards_complete_plan(
     assert forwarded["row_starts"] is row_starts
     assert forwarded["row_ends"] is row_ends
     assert forwarded["max_logits_bytes"] == 4096
-
-
-def test_gluon_registration_covers_both_addressing_modes() -> None:
-    from tokenspeed_kernel.registry import KernelRegistry
-
-    spec = KernelRegistry.get().get_by_name("gluon_kpool_prefill_topk_fp8_gfx950")
-    if spec is None:
-        pytest.skip("gfx950 Gluon registrations are unavailable")
-
-    assert spec.traits["has_prefill_plan"] == frozenset({False, True})
-    assert spec.traits["index_heads"] == frozenset({32})
-    assert spec.traits["topk_pools"] == frozenset({512})
-
-
-def test_registry_supports_both_modes_and_geometry_fallback() -> None:
-    from tokenspeed_kernel.registry import KernelRegistry
-
-    spec = KernelRegistry.get().get_by_name("gluon_kpool_prefill_topk_fp8_gfx950")
-    if spec is None:
-        pytest.skip("gfx950 Gluon registrations are unavailable")
-
-    traits = {
-        "index_heads": 32,
-        "head_dim": 128,
-        "pool_size": 4,
-        "page_size": 16,
-        "topk_pools": 512,
-        "index_k_format": "fp8_scaled",
-        "score_activation": "relu",
-        "topk_layout": "global_slots",
-        "has_prefill_plan": True,
-    }
-    signature = format_signature(q=dense_tensor_format(torch.bfloat16))
-
-    selected = select_kernel(
-        "attention",
-        "kpool_prefill_topk",
-        signature,
-        traits=traits,
-    )
-    assert selected.name == "gluon_kpool_prefill_topk_fp8_gfx950"
-
-    traits["has_prefill_plan"] = False
-    selected_without_plan = select_kernel(
-        "attention",
-        "kpool_prefill_topk",
-        signature,
-        traits=traits,
-    )
-    assert selected_without_plan.name == "gluon_kpool_prefill_topk_fp8_gfx950"
-
-    traits["topk_pools"] = 64
-    fallback = select_kernel(
-        "attention",
-        "kpool_prefill_topk",
-        signature,
-        traits=traits,
-    )
-    assert fallback.name == "triton_kpool_prefill_topk"

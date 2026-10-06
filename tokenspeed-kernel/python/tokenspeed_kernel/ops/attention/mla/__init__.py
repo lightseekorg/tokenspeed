@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel.ops.gemm.flashinfer import autotune_bf16_gemm
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -441,6 +442,8 @@ def mla_normalize_project_query(
             "kv_width": kv_width,
             "output_width": output_width,
         }
+        if override is None and solution is None:
+            autotune_bf16_gemm(query, projection_weight)
         ShapeCapture.get().record(
             "attention",
             "mla_normalize_project_query",
@@ -497,9 +500,17 @@ def mla_normalize_project_query(
                 )
                 is None
             ):
-                from tokenspeed_kernel.ops.gemm import mm
+                from tokenspeed_kernel.ops.gemm.triton_gemv import (
+                    decode_gemv,
+                    use_decode_gemv,
+                )
 
-                mm(query_norm, projection_weight, out=projection_out)
+                if use_decode_gemv(query_norm, projection_weight):
+                    decode_gemv(query_norm, projection_weight, out=projection_out)
+                else:
+                    from tokenspeed_kernel.ops.gemm import mm
+
+                    mm(query_norm, projection_weight, out=projection_out)
         else:
             from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
 
@@ -517,6 +528,47 @@ def mla_normalize_project_query(
         kv.copy_((kv_norm * kv_norm_weight.float()).to(kv.dtype))
         torch.mm(query_norm, projection_weight.t(), out=projection_out)
     return out, None
+
+
+def mla_prefill_traits(
+    *,
+    batch_size: int,
+    total_kv: int,
+    head_dim: int,
+    value_head_dim: int,
+    is_causal: bool,
+    logit_cap: float,
+    return_lse: bool,
+) -> dict[str, object]:
+    """Build the kernel selection traits for one mla_prefill problem.
+
+    mla_prefill selects with these traits, and callers that pre-select the
+    kernel without tensors, such as benchmark generators, must use the same
+    traits so both pick the same kernel.
+
+    Args:
+        batch_size: Number of sequences.
+        total_kv: KV tokens summed over all sequences.
+        head_dim: Query/key head dimension.
+        value_head_dim: Value head dimension.
+        is_causal: Whether a causal mask is applied.
+        logit_cap: Soft cap on attention logits; 0.0 means no cap.
+        return_lse: Whether the log-sum-exp values are returned.
+
+    Returns:
+        Traits for select_kernel("attention", "mla_prefill", ...).
+    """
+    # A downward power-of-two bucket preserves power-of-two minimum cutoffs
+    # exactly, including ragged/non-power-of-two batches, and bounds the cache.
+    avg_kv_len = total_kv // batch_size if batch_size > 0 else 0
+    return {
+        "avg_kv_len": 1 << (avg_kv_len.bit_length() - 1) if avg_kv_len else 0,
+        "head_dim": head_dim,
+        "value_head_dim": value_head_dim,
+        "is_causal": is_causal,
+        "logit_cap": logit_cap != 0.0,
+        "return_lse": return_lse,
+    }
 
 
 def mla_prefill(
@@ -578,14 +630,18 @@ def mla_prefill(
         Attention output with shape [total_q, num_q_heads, v_head_dim], or
         (output, lse) when return_lse is True.
     """
+    # Problem sizes are read from shapes so selection never syncs and also
+    # works under graph capture.
     batch_size = cu_seqlens_q.shape[0] - 1
-    traits = {
-        "head_dim": q.shape[-1],
-        "value_head_dim": v.shape[-1],
-        "is_causal": is_causal,
-        "logit_cap": logit_cap != 0.0,
-        "return_lse": return_lse,
-    }
+    traits = mla_prefill_traits(
+        batch_size=batch_size,
+        total_kv=k.shape[0],
+        head_dim=q.shape[-1],
+        value_head_dim=v.shape[-1],
+        is_causal=is_causal,
+        logit_cap=logit_cap,
+        return_lse=return_lse,
+    )
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
         "attention",
@@ -833,18 +889,20 @@ def supports_mla_decode_query_blocks(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     sliding_window: bool,
+    noncausal_block_size: int,
     solution: str | None = None,
 ) -> bool:
-    """Whether an MLA decode kernel takes a proposal block on the query axis.
+    """Whether an MLA decode kernel takes this query block on the query axis.
 
-    A block drafter can lay its proposal out two ways: one flattened row per
-    block position, each carrying the block-end cache length, or the block on
-    the query axis with one page table row per request. Both spell the same
-    mask, but a kernel serves one or the other, so the caller has to know
-    which before it builds the metadata.
+    A block can reach a kernel as one flattened row per position, each with
+    its own cache length, or on the query axis with one page-table row and
+    final cache length per request. On the query axis the kernel applies
+    either each query's causal boundary or the common end of a non-causal
+    proposal block. A kernel serves one layout or the other, so the caller
+    has to know which before it builds the metadata.
 
-    ``True`` means the selected kernel declared both this ``q_len`` and a
-    proposal block of that width. A kernel that merely omits a trait matches by
+    ``True`` means the selected kernel declared both this ``q_len`` and this
+    ``noncausal_block_size``. A kernel that merely omits a trait matches by
     omission, which is not proof, so omission answers ``False``.
 
     Args:
@@ -857,6 +915,8 @@ def supports_mla_decode_query_blocks(
         qk_rope_head_dim: RoPE width.
         sliding_window: Whether the layer bounds its history, since a kernel
             may serve one of the two masks and not the other.
+        noncausal_block_size: One for causal verification or catch-up;
+            q_len for a non-causal proposal block.
         solution: The solution the call will pin, so the answer is about the
             kernel that call will actually reach.
 
@@ -877,7 +937,7 @@ def supports_mla_decode_query_blocks(
                 "kv_lora_rank": kv_lora_rank,
                 "qk_rope_head_dim": qk_rope_head_dim,
                 "page_size": page_size,
-                "noncausal_block_size": q_len,
+                "noncausal_block_size": noncausal_block_size,
                 "block_on_query_axis": True,
                 "logit_cap": False,
                 "return_lse": False,
@@ -890,9 +950,9 @@ def supports_mla_decode_query_blocks(
     spec = KernelRegistry.get().get_by_name(kernel.name)
     if spec is None:
         return False
-    return q_len in spec.traits.get("q_len", ()) and q_len in spec.traits.get(
-        "noncausal_block_size", ()
-    )
+    return q_len in spec.traits.get(
+        "q_len", ()
+    ) and noncausal_block_size in spec.traits.get("noncausal_block_size", ())
 
 
 def mla_decode_with_kvcache(
@@ -942,6 +1002,8 @@ def mla_decode_with_kvcache(
         page_table: Page table with shape [batch, max_pages_per_seq].
         cache_seqlens: Visible KV lengths in the cache, shape [batch]. These
             lengths include current decode tokens when they were prewritten.
+            For a causal query block, query position i sees
+            cache_seqlens - q_len + i + 1 tokens.
         max_seqlen_k: Maximum visible KV length.
         qk_nope_head_dim: Original non-RoPE q/k head dim. Some backends need
             this for kernel specialization even though q stores the absorbed
@@ -954,23 +1016,24 @@ def mla_decode_with_kvcache(
             in a proposal block, or -1 for full attention. A non-causal row
             also sees the whole proposal block. DFlash2 passes the model's
             ``sliding_window - 1`` value here.
-        noncausal_block_size: Proposal rows per request. Use one for ordinary
-            causal decode. A block reaches a kernel in one of two layouts, and
-            which one this is follows from the shapes: flattened when ``q_len``
-            is 1 and the batch carries ``noncausal_block_size`` rows per
-            request, each with the block-end ``cache_seqlens``; on the query
-            axis when ``q_len`` equals it and the batch, page table and
-            ``cache_seqlens`` carry one entry per request. Ask
-            :func:`supports_mla_decode_query_blocks` before building the
-            second, since not every kernel reads it.
+        noncausal_block_size: Proposal rows sharing a non-causal boundary.
+            Use one for causal decode, including causal query blocks. A
+            non-causal block is flattened when ``q_len`` is 1 and the batch
+            carries ``noncausal_block_size`` rows per request, each with the
+            block-end ``cache_seqlens``. On the query axis, ``q_len`` equals
+            the block width and the batch, page table and ``cache_seqlens``
+            carry one entry per request. Ask
+            :func:`supports_mla_decode_query_blocks` before using the query
+            axis, with ``noncausal_block_size=1`` for causal blocks.
         return_lse: Whether to also return log-sum-exp values.
         out: Optional output tensor with shape [batch, q_len, num_q_heads,
             kv_lora_rank]. When ``value_weight`` is provided, this is required
-            and has shape [batch, num_q_heads * value_head_dim].
+            and has shape [batch * q_len, num_q_heads * value_head_dim].
         value_weight: Optional per-head value projection with shape
             [num_q_heads, kv_lora_rank, value_head_dim].
         gate: Optional raw sigmoid gate with shape
-            [batch, num_q_heads * value_head_dim]. Requires ``value_weight``.
+            [batch * q_len, num_q_heads * value_head_dim]. Requires
+            ``value_weight``.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -996,9 +1059,9 @@ def mla_decode_with_kvcache(
 
     projected_value = value_weight is not None
     if projected_value:
-        if q.ndim != 4 or q.shape[1] != 1:
+        if q.ndim != 4:
             raise ValueError(
-                "projected MLA decode requires q shape [batch,1,heads,dim]"
+                "projected MLA decode requires q shape [batch,q_len,heads,dim]"
             )
         if value_weight.ndim != 3 or value_weight.shape[:2] != (
             q.shape[2],
@@ -1009,7 +1072,10 @@ def mla_decode_with_kvcache(
             )
         if out is None:
             raise ValueError("projected MLA decode requires out")
-        expected_output = (q.shape[0], q.shape[2] * value_weight.shape[2])
+        expected_output = (
+            q.shape[0] * q.shape[1],
+            q.shape[2] * value_weight.shape[2],
+        )
         if out.shape != expected_output:
             raise ValueError(f"out must have shape {expected_output}")
         if (
@@ -1025,11 +1091,10 @@ def mla_decode_with_kvcache(
         if return_lse:
             raise ValueError("projected MLA decode does not support return_lse")
 
-    # No windowed kernel fuses the value projection, so compose the windowed
-    # latent decode with the standalone projection. Kernel choice is left to
-    # the ``sliding_window`` trait below rather than pinned here: more than one
-    # implementation applies the mask now.
-    if window_left >= 0 and projected_value:
+    # The fused projected-value kernel serves only unwindowed single-query
+    # decode. Otherwise compose latent decode with the standalone projection;
+    # kernel choice stays with the sliding_window and q_len traits.
+    if projected_value and (window_left >= 0 or q.shape[1] > 1):
         attention = mla_decode_with_kvcache(
             q=q,
             kv_cache=kv_cache,
@@ -1047,7 +1112,7 @@ def mla_decode_with_kvcache(
             solution=solution,
         )
         return mla_project_value(
-            attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
+            attention.reshape(-1, q.shape[2], kv_lora_rank),
             value_weight,
             gate=gate,
             out=out,
@@ -1067,8 +1132,10 @@ def mla_decode_with_kvcache(
         "noncausal_block_size": noncausal_block_size,
         # A proposal block reaches a kernel one of two ways: flattened to one
         # row per position on the batch axis, or whole on the query axis. A
-        # kernel reads one or the other, never both.
-        "block_on_query_axis": q.shape[1] == noncausal_block_size,
+        # kernel reads one or the other, never both. A causal block of several
+        # queries is also on the query axis.
+        "block_on_query_axis": q.shape[1] == noncausal_block_size
+        or (q.shape[1] > 1 and noncausal_block_size == 1),
         "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
         "sliding_window": window_left >= 0,
@@ -1198,8 +1265,8 @@ def mla_decode_with_kvcache(
         )
         # Forward the mask arguments only where they carry information, so a
         # kernel registered for plain decode is never handed a keyword it does
-        # not take. A block of one with no window is plain decode.
-        if window_left >= 0 or noncausal_block_size != 1:
+        # not take. Flattened full-attention rows already carry block-end lengths.
+        if window_left >= 0 or (noncausal_block_size != 1 and q.shape[1] > 1):
             kernel_kwargs.update(
                 window_left=window_left,
                 noncausal_block_size=noncausal_block_size,
@@ -1222,6 +1289,7 @@ __all__ = [
     "mla_project_value",
     "mla_normalize_project_query",
     "mla_prefill",
+    "mla_prefill_traits",
     "mla_use_absorbed_extend",
     "mla_extend_with_kvcache",
     "supports_mla_decode_query_blocks",

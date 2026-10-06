@@ -206,6 +206,11 @@ class FlashMLATileScheduleTest(_TorchCase):
         leaf.max_context_len = MAX_NUM_PAGES * flashmla.PAGE_SIZE
         leaf.kernel_page_size = flashmla.PAGE_SIZE
         leaf.device = "cpu"
+        leaf.dcp_group = (0,)
+        leaf.dcp_rank = 0
+        leaf.dcp_block_granularity = None
+        leaf.dcp_virtual_block_count = None
+        leaf.dcp_metadata = None
         leaf.forward_decode_metadata = None
         leaf._decode_tile_metadata = None
         leaf._decode_tile_metadata_keepalive = []
@@ -445,9 +450,21 @@ class LeafSignatureConformanceTest(_TorchCase):
                         extend_prefix_lens=None,
                         extend_prefix_lens_cpu=None,
                         extend_with_prefix=False,
+                        query_shard=None,
+                        page_table_cpu=None,
                     )
                 except TypeError as exc:
                     self.fail(f"{cls.__name__}.init_forward_metadata: {exc}")
+                for name in ("query_shard", "page_table_cpu"):
+                    param = sig.parameters.get(name)
+                    self.assertIsNotNone(
+                        param, f"{cls.__name__}.init_forward_metadata lacks {name}"
+                    )
+                    self.assertIs(
+                        param.default,
+                        inspect.Parameter.empty,
+                        f"{cls.__name__}.init_forward_metadata gives {name} a default",
+                    )
 
 
 class WrapperForwardsTheExtendBundleTest(_TorchCase):
@@ -477,6 +494,7 @@ class WrapperForwardsTheExtendBundleTest(_TorchCase):
             extend_replay_lens_cpu=torch.zeros_like(prefix),
             extend_prompt_lens_cpu=counts.clone(),
             extend_with_prefix=False,
+            query_shard=None,
         )
         wrapper.init_forward_metadata(
             1,
@@ -544,8 +562,9 @@ class RunnerSignatureConformanceTest(_TorchCase):
 
     def test_init_forward_metadata_binds_the_runner_call_shape(self):
         """The runner's extend call: five positionals, then block_tables with
-        its CPU mirror and the seven extend fields as required keywords (no
-        defaults anywhere), plus the model-side extras a node may ignore."""
+        its CPU mirror, the seven extend fields and the query shard as required
+        keywords (no defaults anywhere), plus the model-side extras a node may
+        ignore."""
         import importlib
         import inspect
 
@@ -574,6 +593,7 @@ class RunnerSignatureConformanceTest(_TorchCase):
                         extend_replay_lens_cpu=None,
                         extend_prompt_lens_cpu=None,
                         extend_with_prefix=False,
+                        query_shard=None,
                         positions=None,
                         global_num_tokens=None,
                         all_decode_or_idle=False,
@@ -590,6 +610,7 @@ class RunnerSignatureConformanceTest(_TorchCase):
                     "extend_replay_lens_cpu",
                     "extend_prompt_lens_cpu",
                     "extend_with_prefix",
+                    "query_shard",
                 ):
                     param = sig.parameters.get(name)
                     if param is None:

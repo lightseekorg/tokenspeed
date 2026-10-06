@@ -34,13 +34,16 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
-from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata import (  # noqa: E402
-    _checkpoint_slot_batch,
-    _clone_metadata,
-    prepare_kda_prefill_metadata,
+from tokenspeed.runtime.execution.memory_delta import (  # noqa: E402
+    NULL_MEMORY_DELTA_OBSERVER,
 )
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E402
     MambaForwardMetadata,
+)
+from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (  # noqa: E402
+    _checkpoint_slot_batch,
+    _clone_metadata,
+    prepare_capacity_prefill_metadata,
 )
 
 
@@ -260,8 +263,8 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
 def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eager_shapes():
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
-    from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata import (
-        KdaPrefillMetadata,
+    from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
+        CapacityPrefillMetadata,
     )
 
     backend = object.__new__(KdaAttnBackend)
@@ -272,7 +275,7 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
     backend.forward_metadata = original
     backend.prepare_prefill_metadata(8, 1, ForwardMode.EXTEND, capture=False)
     eager = backend.forward_metadata
-    assert isinstance(eager, KdaPrefillMetadata)
+    assert isinstance(eager, CapacityPrefillMetadata)
     assert not backend.prefill_metadata_is_capture_ready
     assert not backend._prefill_metadata
     backend.forward_metadata = original
@@ -468,8 +471,10 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         data_parallel_size=1,
         prefill_graph_capture_batch_sizes=[batch_size],
     )
+    owner.disable = False
     owner.dp_size, owner.num_warmup, owner._pool = 1, 1, None
-    owner.capture_buckets = [bucket]
+    owner.capture_buckets, owner.decoder_buckets = [bucket], []
+    owner._handoff_storage, owner._outputs = {}, None
     owner._captures = {}
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
     owner._embed_tokens = lambda ids: ids
@@ -486,7 +491,7 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         )
 
     owner.make_dummy_batch = dummy
-    owner._capture_all_buckets(None)
+    owner._capture_all_buckets(None, None, NULL_MEMORY_DELTA_OBSERVER)
     assert set(owner._captures) == {(bucket, None), (bucket, batch_size)}
     capture, captured = owner._captures[bucket, batch_size]
     output = captured.hidden_states
@@ -508,7 +513,7 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         expected_conv, expected_states = conv.clone(), states.clone()
         # Uncaptured shapes use the same builder with transient storage. Check
         # its eager output/state too, not just eager on a retained graph buffer.
-        backend.forward_metadata = prepare_kda_prefill_metadata(
+        backend.forward_metadata = prepare_capacity_prefill_metadata(
             source, bucket, 128, None
         )
         reset()
@@ -575,6 +580,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner = object.__new__(PrefillGraph)
     # KDA has no CED narrowing; the split encoder/decoder capture stays off.
     owner._narrowing = None
+    owner._expert_load_rows = None
     owner._captures = {
         (8, None): (capture("ordinary"), CapturedForward(torch.ones(8, 4), None)),
         (8, capture_bs): (
@@ -593,7 +599,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner._embed_tokens = lambda ids: torch.zeros(8, 4)
     owner._land_input_embeds = lambda *args: None
     owner._padded_to = lambda *args: nullcontext()
-    owner.config = SimpleNamespace(model_is_mrope=False)
+    owner.config = SimpleNamespace(model_is_mrope=False, world_size=1)
     owner.input_buffers = SimpleNamespace(
         input_ids_buf=torch.ones(8, dtype=torch.int64),
         positions_buf=torch.ones(8, dtype=torch.int64),
@@ -601,8 +607,12 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner.text_model = SimpleNamespace(
         lm_head=None, logits_processor=lambda ids, hidden, *args: hidden
     )
+    # global_num_tokens: replay reads every rank's live rows (None outside DP).
     ctx = SimpleNamespace(
-        input_num_tokens=num_tokens, bs=batch_size, forward_mode=ForwardMode.EXTEND
+        input_num_tokens=num_tokens,
+        bs=batch_size,
+        forward_mode=ForwardMode.EXTEND,
+        global_num_tokens=None,
     )
     with patch(
         "tokenspeed.runtime.execution.prefill_graph.LogitsMetadata.from_forward_context",
@@ -702,6 +712,7 @@ def test_outer_capture_records_one_variant_per_configured_request_count():
         data_parallel_size=1,
         prefill_graph_capture_batch_sizes=[1, 2],
     )
+    owner.disable = False
     owner.dp_size = 1
     owner.capture_buckets = [8]
     owner._captures = {}
@@ -716,19 +727,22 @@ def test_outer_capture_records_one_variant_per_configured_request_count():
         active_count = bs if capture else None
         return True
 
-    owner.attn_backend = SimpleNamespace(prepare_prefill_metadata=prepare)
+    owner.attn_backend = SimpleNamespace(
+        prepare_prefill_metadata=prepare,
+        admits_prefill_graph=lambda *_a, **_k: True,
+    )
     owner.make_dummy_batch = lambda bucket, bs: SimpleNamespace(
         bs=bs,
         capture_hidden_mode=CaptureHiddenMode.NULL,
         forward_mode=ForwardMode.EXTEND,
     )
 
-    def capture(bucket, wrapper):
+    def capture(bucket, wrapper, observer):
         label = (owner._ctx.bs, active_count)
         return label, CapturedForward(torch.ones(bucket, 1), None)
 
     owner._capture_bucket = capture
-    owner._capture_all_buckets(None)
+    owner._capture_all_buckets(None, None, NULL_MEMORY_DELTA_OBSERVER)
     assert owner._captures[8, None][0] == (1, None)
     assert set(owner._captures) == {(8, None), (8, 1), (8, 2)}
     for (_, bs), (capture, _) in owner._captures.items():
@@ -755,11 +769,12 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
 
     events = []
     mode = ForwardMode[mode]
-    ctx = SimpleNamespace(forward_mode=mode, bs=2, input_num_tokens=7)
+    ctx = SimpleNamespace(forward_mode=mode, bs=2, input_num_tokens=7, query_shard=None)
     executor = object.__new__(ModelExecutor)
     executor.config = SimpleNamespace(pp_size=1, data_parallel_size=dp_size)
     executor._active_positions_override = torch.arange(7)
     executor._active_multimodal_context = None
+    executor.runtime_states = SimpleNamespace(has_request_token_history=False)
     executor.input_buffers = SimpleNamespace(
         input_ids_buf=torch.arange(7), ngram_model_kwargs=lambda _: {}
     )

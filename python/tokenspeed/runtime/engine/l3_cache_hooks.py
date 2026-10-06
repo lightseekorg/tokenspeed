@@ -49,8 +49,6 @@ class L3CacheHooks:
         *,
         attn_tp_size: int,
         attn_tp_cpu_group,
-        attn_cp_size: int,
-        attn_cp_cpu_group,
         pp_size: int,
         pp_cpu_group,
     ) -> None:
@@ -62,7 +60,6 @@ class L3CacheHooks:
             group
             for size, group in (
                 (attn_tp_size, attn_tp_cpu_group),
-                (attn_cp_size, attn_cp_cpu_group),
                 (pp_size, pp_cpu_group),
             )
             if size > 1 and group is not None

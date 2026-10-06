@@ -29,6 +29,13 @@ from tokenspeed_kernel.ops.activation import (
     situ_and_mul,
 )
 from tokenspeed_kernel.ops.attention import attn_merge_state
+from tokenspeed_kernel.ops.communication import (
+    AllReduceFusionPattern,
+    AllReduceFusionWorkspace,
+    allreduce_fusion,
+    allreduce_fusion_supported,
+    create_allreduce_fusion_workspace,
+)
 from tokenspeed_kernel.ops.gemm import (
     bmm,
     dsv4_grouped_output_projection,
@@ -86,6 +93,11 @@ from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.selection import NoKernelFoundError
 
 __all__ = [
+    "AllReduceFusionPattern",
+    "AllReduceFusionWorkspace",
+    "allreduce_fusion",
+    "allreduce_fusion_supported",
+    "create_allreduce_fusion_workspace",
     # exceptions
     "NoKernelFoundError",
     # gemm

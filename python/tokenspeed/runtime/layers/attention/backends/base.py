@@ -51,15 +51,25 @@ import torch
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.attention.backends.support import (  # noqa: F401
     CudaGraphSupport,
+    TreeSupport,
     resolve_cuda_graph_support,
 )
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeDraftInputs,
+        TreeVerifyInputs,
+    )
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
     )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        HistoryGatherWorkspace,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
@@ -124,6 +134,10 @@ class CachePoolBinding:
         """A node's own binding work: read the old pool before super(), use the new one after."""
         self.cache_pool = cache_pool
 
+    def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
+        """Return logical-slot ownership, or None for local/replicated storage."""
+        return None
+
 
 class AttentionBackend(CachePoolBinding, ABC):
     """The runner-facing contract; see the module docstring.
@@ -135,6 +149,11 @@ class AttentionBackend(CachePoolBinding, ABC):
     # validation: every published family must have a consumer); composites
     # union their children's.
     cache_consumer_families: frozenset[str] = frozenset({"history"})
+    # Only backends whose model skips incomplete-prefill outputs opt in.
+    skips_incomplete_prefill_outputs: bool = False
+    # MLA sharded history reads/writes and global attention-partial merging,
+    # independent of whether the model also has linear-attention layers.
+    supports_mla_dcp: bool = False
     supports_mla_projected_value_decode: bool = False
     # Bound by register_step_counter (PD layerwise transfer); None otherwise.
     step_counter: StepCounter | None = None
@@ -177,9 +196,45 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Allocate static buffers the breakable prefill graphs bake.
         Default: no-op — attention stays eager at the break points."""
 
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        """Allocate the query-context-parallel history gather workspace and
+        return its bytes (the recipe reserved them from the cache budget;
+        the registry checks the two agree). Only a tree with the GPU DSA
+        sharded extend arm has one."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no sharded extend arm; query context "
+            "parallelism needs GPU DSA attention"
+        )
+
+    def history_gather_workspace(self) -> HistoryGatherWorkspace | None:
+        """The allocated history gather workspace of this tree, or ``None``
+        before :meth:`preallocate_history_gather_workspace` ran (or on a tree
+        without the sharded extend arm)."""
+        return None
+
+    def adopt_history_gather_workspace(self, workspace: HistoryGatherWorkspace) -> None:
+        """Share another tree's history gather workspace: the draft tree
+        gathers into the target's buffers, which are idle while the draft
+        runs. A leaf without the sharded extend arm ignores it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no sharded extend arm to share a history "
+            "gather workspace with"
+        )
+
     @property
     def prefill_metadata_is_capture_ready(self) -> bool:
         """Whether the current execution metadata supports a captured forward."""
+        return False
+
+    def admits_prefill_graph(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode
+    ) -> bool:
+        """Whether a captured prefill graph can include attention for this shape.
+
+        The question ``prepare_prefill_metadata`` answers on its way to doing
+        the work, asked on its own so a caller can decide before anything is
+        written. Must read no forward context and change nothing.
+        """
         return False
 
     def prepare_prefill_metadata(
@@ -188,12 +243,14 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Prepare execution metadata before eager forward or graph replay.
 
         ``capture`` only retains startup buffers at their captured addresses;
-        it must not select different computation. Return whether attention can
-        be included in the outer graph. Other backends keep their existing
-        metadata and attention breaks. Call on the consumer stream, after the
-        scheduler-derived metadata is built and before any layer consumes it.
+        it must not select different computation. Returns the same answer as
+        :meth:`admits_prefill_graph`; the prefill capture raises if an override
+        refuses a shape that query admitted. Other backends keep
+        their existing metadata and attention breaks. Call on the consumer
+        stream, after the scheduler-derived metadata is built and before any
+        layer consumes it.
         """
-        return False
+        return self.admits_prefill_graph(token_capacity, bs, forward_mode)
 
     # ------------------------------------------------------------------
     # Metadata (docs/design/unified_path.md)
@@ -231,6 +288,7 @@ class AttentionBackend(CachePoolBinding, ABC):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
         """Build metadata for an extend / mixed (or idle warmup) forward.
@@ -259,6 +317,11 @@ class AttentionBackend(CachePoolBinding, ABC):
                 prompt from an intermediate one.
             extend_with_prefix: Whether any extend row continues a cached or
                 chunked prefix (some ``extend_prefix_lens`` entry is non-zero).
+            query_shard: The rows of the extend span this rank computes under
+                query context parallelism, or ``None`` when every rank computes
+                every row. The lengths above describe the whole span on every
+                rank; a node that cannot attend a query shard calls
+                :func:`reject_query_shard`.
             **kwargs: Model-side extras (positions, capture mode, ...) a
                 node may ignore.
         """
@@ -363,9 +426,9 @@ class AttentionBackend(CachePoolBinding, ABC):
         same object whichever level of the tree they hold."""
         return self._sparse_topk
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        """Whether a narrowed draft step in a round of ``forward_mode`` can
+        attend its live rows as a DECODE dispatch (Eagle3's first step)."""
         return False
 
     # ------------------------------------------------------------------
@@ -399,15 +462,68 @@ class AttentionBackend(CachePoolBinding, ABC):
             f"{type(self).__name__} owns no draft write locations"
         )
 
+    def tree_support(self) -> TreeSupport:
+        """This node's own draft-tree capability; ``resolve_tree_support`` asks
+        every node before any bind. Nodes without a tree path keep this."""
+        name = type(self).__name__
+        return TreeSupport(
+            verify_blocker=f"{name} has no draft-tree verify path",
+            draft_blocker=f"{name} has no draft-tree lane path",
+        )
+
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        """Arm draft-tree verify (--speculative-eagle-topk > 1) on every node,
+        after ``resolve_tree_support``; leaves that verify trees keep ``inputs``."""
+        for backend in self.child_backends():
+            backend.bind_tree_verify(inputs)
+
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        """Arm draft-tree lanes on every node of the drafter's backend, after
+        ``resolve_tree_support``; leaves that draft trees keep ``inputs``."""
+        for backend in self.child_backends():
+            backend.bind_tree_draft(inputs)
+
+    def compact_verify_window(self, path: torch.Tensor) -> None:
+        """After a draft-tree verify, move each request's accepted path to the
+        front of its verify window in the cache this node owns; nodes that own
+        none forward to their children.
+
+        Args:
+            path: ``[bs, N]`` int32 accepted window row at each depth, root
+                first, ``-1`` past the path.
+        """
+        for backend in self.child_backends():
+            backend.compact_verify_window(path)
+
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        """This layer's KV write slots for the requests the forward covers —
-        the one accessor for writers outside the backend (fused RoPE
-        prewrite, model-side MLA cache writes)."""
+        """This layer's KV write slots for one mode's requests: the EXTEND span
+        or the DECODE window."""
         raise NotImplementedError(
             f"{type(self).__name__} owns no paged write locations"
         )
+
+    def forward_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        """Slots for the K/V rows a forward in ``forward_mode`` carries: the
+        attention prologue's write target."""
+        raise NotImplementedError(
+            f"{type(self).__name__} owns no paged write locations"
+        )
+
+    def padded_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode, rows: int
+    ) -> torch.Tensor:
+        """:meth:`forward_write_locations` widened to the ``rows`` a graph-padded
+        forward carries, the extra rows landing in the dummy slot 0, so the
+        prologue can be captured; a backend without a padded span serves exact
+        counts only."""
+        locations = self.forward_write_locations(layer, forward_mode)
+        if locations.numel() != rows:
+            raise ValueError(f"{locations.numel()} write slots for {rows} rows")
+        return locations
 
     # ------------------------------------------------------------------
     # PD / speculative side state
@@ -425,34 +541,40 @@ class AttentionBackend(CachePoolBinding, ABC):
         self.step_counter = step_counter
 
     def commit_speculative_state_after_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
     ) -> None:
         """Commit live acceptance after drafted decode/mixed execution or replay.
 
         ``num_extends == 0`` identifies pure decode; otherwise extend requests
-        lead the mixed batch. Stateless backends inherit this no-op.
+        lead the mixed batch. ``accepted_path`` is the ``[bs, N]`` accepted
+        draft-tree path (root first, ``-1`` past it), ``None`` for a chain.
+        Stateless backends inherit this no-op.
         """
 
     @contextmanager
     def record_pd_cache_step(
         self,
         forward_mode: ForwardMode,
-        save_kv_cache: bool,
+        writes_in_call: bool,
         record_kv_cache: bool | None,
     ):
-        """Anchor the PD layerwise cache-step record to the wrapped KV write:
-        before the attention call when the KV was pre-written
-        (``save_kv_cache=False``), after it otherwise. No-op without a step
+        """Anchor the PD layerwise cache-step record to the layer's last cache
+        write: after the wrapped call when it writes a cache field
+        (``writes_in_call``), before it otherwise. No-op without a step
         counter."""
         if record_kv_cache is None:
             record_cache = not forward_mode.is_decode() and not forward_mode.is_idle()
         else:
             record_cache = record_kv_cache
         record_cache = record_cache and self.step_counter is not None
-        if record_cache and not save_kv_cache:
+        if record_cache and not writes_in_call:
             self.step_counter.record_cache()
         yield
-        if record_cache and save_kv_cache:
+        if record_cache and writes_in_call:
             self.step_counter.record_cache()
 
     # ------------------------------------------------------------------
@@ -531,6 +653,26 @@ class AttentionBackend(CachePoolBinding, ABC):
         **kwargs,
     ):
         raise NotImplementedError()
+
+
+def reject_query_shard(query_shard: QueryShardPlan | None, node: str) -> None:
+    """Fail loud when a forward shards its query rows over a node that attends
+    every row.
+
+    Under query context parallelism the model feeds a node its shard of the
+    extend rows while the metadata describes the whole span; only a backend
+    whose extend arm gathers each request's history for its local rows may
+    accept the shard.
+
+    Args:
+        query_shard: The forward's shard plan, or ``None`` when not sharded.
+        node: Backend name for the diagnostic.
+    """
+    if query_shard is not None and query_shard.size > 1:
+        raise RuntimeError(
+            f"{node} cannot attend a query shard; query context parallelism "
+            "needs the gathered-history DSA extend arm"
+        )
 
 
 def reject_bounded_replay(extend_replay_lens_cpu: torch.Tensor, node: str) -> None:

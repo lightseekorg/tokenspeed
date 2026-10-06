@@ -10,7 +10,6 @@ same device".
 
 import os
 import sys
-import types
 import unittest
 from unittest import mock
 
@@ -43,7 +42,11 @@ class TestEagle3D2TDevice(unittest.TestCase):
         )
 
     def test_llama_eagle3_places_hot_token_id_on_the_weight_device(self):
-        model = types.SimpleNamespace(named_parameters=lambda: iter([]))
+        # A real instance (no base ``__init__``): ``load_weights`` is the
+        # session-wrapped class method and reads the session fields off
+        # ``self``, which the class-level defaults provide.
+        model = object.__new__(LlamaForCausalLMEagle3)
+        torch.nn.Module.__init__(model)
         LlamaForCausalLMEagle3.load_weights(model, [("d2t", self.D2T.to("cuda"))])
         self._assert_hot_token_id(model)
 

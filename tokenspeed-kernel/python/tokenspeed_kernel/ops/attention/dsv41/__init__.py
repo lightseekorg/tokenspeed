@@ -432,8 +432,9 @@ def index_topk(
     to powers of two and at least the score tile width (at most256 lanes).
     With replicated32 heads and compatible Blackwell pages, optional DeepGEMM
     scores packed FP4 inputs with FP32 accumulation and DeepSelect selects rows
-    and block maxima. This native accumulation differs from the portable
-    reference's intermediate BF16 rounding. Native query tiles cap logits at
+    and block maxima; on Hopper, DeepGEMM scores FP8 ``index_v4`` rows and the
+    in-tree CuTe DSL DeepSelect kernel selects. This native accumulation
+    differs from the portable reference's intermediate BF16 rounding. Native query tiles cap logits at
     32MiB for paged queries and 128MiB for a zero-row-stride request table.
     That broadcast layout gathers packed history once per call and packs Q
     once before the score tiles; no payload survives the call. For unsharded
@@ -448,7 +449,7 @@ def index_topk(
     from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
 
     # Each target scores the index rows its own cache format stores: FP4 with
-    # DeepSelect on Blackwell, FP8 with FlashInfer's selection on Hopper.
+    # DeepSelect on Blackwell, FP8 with the CuTe DSL DeepSelect kernel on Hopper.
     row_bytes = index_cache.shape[2] if index_cache.ndim == 3 else 0
     shaped = (
         index_q.is_cuda
@@ -647,23 +648,27 @@ def dspark_anchors(
     width: int,
     next_tokens: torch.Tensor,
     start_pos: torch.Tensor,
+    *,
+    num_prefill_outputs: int,
 ) -> None:
     """Fill each verify row's bonus token and each decode request's anchor.
 
-    ``output_tokens`` [num_extends + num_decodes * width] holds the extend
-    rows first and then each decode request's ``width`` verify rows;
+    ``output_tokens`` [num_prefill_outputs + num_decodes * width] holds
+    completing-prefill tokens then each decode request's verify rows.
+    ``num_prefill_outputs`` is the active prefix of ``num_extends``; the
+    remaining extend rows have no tokens and their destinations are untouched;
     ``accept_lengths`` [bs] counts accepted tokens (clamped to 1..width) and
     ``positions`` [num_decodes * width] are the decode rows' positions.
     Every column of ``next_tokens`` [bs, spec] (int32) receives its row's
     bonus token, and ``start_pos`` [num_decodes] (int64) the position of the
-    last accepted verify row. Both destinations are fully overwritten.
+    last accepted verify row. Only output-bearing request rows are written.
     """
     bs = accept_lengths.shape[0]
     num_decodes = bs - num_extends
-    if not 0 <= num_extends <= bs or width < 1:
+    if not 0 <= num_prefill_outputs <= num_extends <= bs or width < 1:
         raise ValueError("DSpark anchors need 0 <= num_extends <= bs and width >= 1")
     if (
-        output_tokens.shape != (num_extends + num_decodes * width,)
+        output_tokens.shape != (num_prefill_outputs + num_decodes * width,)
         or positions.shape != (num_decodes * width,)
         or next_tokens.shape[:1] != (bs,)
         or next_tokens.ndim != 2
@@ -679,9 +684,11 @@ def dspark_anchors(
     if not positions.is_cuda:
         rows = torch.arange(num_decodes)
         accepted = accept_lengths[num_extends:].to(torch.int64).clamp(1, width)
-        verify = num_extends + rows * width + accepted - 1
-        bonus = torch.cat((output_tokens[:num_extends], output_tokens[verify]))
-        next_tokens.copy_(bonus[:, None].expand_as(next_tokens))
+        verify = num_prefill_outputs + rows * width + accepted - 1
+        next_tokens[:num_prefill_outputs].copy_(
+            output_tokens[:num_prefill_outputs, None]
+        )
+        next_tokens[num_extends:].copy_(output_tokens[verify, None])
         start_pos.copy_(positions[rows * width + accepted - 1])
         return
     _kernel("dspark_anchors", positions)(
@@ -689,6 +696,7 @@ def dspark_anchors(
         accept_lengths,
         positions,
         num_extends,
+        num_prefill_outputs,
         width,
         next_tokens,
         start_pos,

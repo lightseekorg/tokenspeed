@@ -37,10 +37,12 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     CudaGraphSupport,
     reject_bounded_replay,
+    reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     compute_state_block_indices,
@@ -150,8 +152,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
-        if self.cache_pool is not None and self.cache_pool is not cache_pool:
-            raise RuntimeError("PLE backend cannot be rebound to another cache pool")
         self._cache_fields(cache_pool)
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
@@ -164,6 +164,10 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             self._conv_field_ids,
             self._checkpoint_granularity,
         ) = self._cache_fields(cache_pool)
+        # The commit tables point into the old arena; preallocation rebuilds them.
+        self._ple_verify_tables = None
+        self._ple_commit_rows = None
+        self._verify_commit_ctx = None
 
     def _block_rows(self, block_tables: Mapping[str, torch.Tensor]) -> torch.Tensor:
         rows = block_tables.get(QWEN4_EXP_PLE_CACHE_GROUP)
@@ -220,8 +224,10 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
+        reject_query_shard(query_shard, "Qwen4ExpPLEBackend")
         reject_bounded_replay(extend_replay_lens_cpu, "Qwen4ExpPLEBackend")
         del (
             req_pool_indices,

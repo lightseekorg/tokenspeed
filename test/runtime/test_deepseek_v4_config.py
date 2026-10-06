@@ -252,6 +252,7 @@ def _extend_kwargs(
         extend_prompt_lens_cpu=extend_prefix_lens_cpu
         + extend_seq_lens_cpu[: extend_prefix_lens_cpu.numel()],
         extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
+        query_shard=None,
     )
 
 
@@ -299,6 +300,7 @@ def _v4_recipe(
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1 << 34,
+        probe_batch_rows=None,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=0,
     )
@@ -619,6 +621,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertTrue(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -647,6 +650,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertFalse(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -679,6 +683,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertFalse(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -870,6 +875,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend = SimpleNamespace(
             is_mega_moe=lambda: False,
+            is_gluon_petit=lambda: False,
             is_flashinfer_trtllm=lambda: True,
         )
         config = SimpleNamespace(
@@ -1571,8 +1577,10 @@ class TestDeepseekV4Config(unittest.TestCase):
             server_args = SimpleNamespace(
                 mapping=None,
                 prefix_granularity=prefix_granularity,
+                speculative_algorithm=None,
                 load_format="auto",
                 ext_yaml=None,
+                validate_tp_batch_invariant_weights=lambda *args: None,
             )
             hf_config = make_hf_config()
             with (
@@ -1700,7 +1708,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(is_deepseek_v4(model_config.hf_config))
 
-        configure_deepseek_v4_attention(model_config)
+        configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
 
         self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
         self.assertEqual(model_config.head_dim, 512)
@@ -1740,7 +1748,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
-        configure_deepseek_v4_attention(model_config)
+        configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
 
         self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
         self.assertEqual(model_config.head_dim, 512)
@@ -2237,17 +2245,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         target_model.set_dspark_layers_to_capture.assert_not_called()
 
     def test_dspark_tp_only_contract_uses_resolved_mapping(self):
-        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
+        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1))
         DeepseekV4DSpark._validate_tp_only_mapping(mapping)
 
-        for field in ("dp_size", "cp_size"):
-            invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
-            setattr(invalid.attn, field, 2)
-            with (
-                self.subTest(field=field),
-                self.assertRaisesRegex(ValueError, "tensor parallelism only"),
-            ):
-                DeepseekV4DSpark._validate_tp_only_mapping(invalid)
+        invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=2))
+        with self.assertRaisesRegex(ValueError, "tensor parallelism only"):
+            DeepseekV4DSpark._validate_tp_only_mapping(invalid)
 
     def test_dspark_padding_slots_reset_before_every_graph_replay(self):
         drafter = object.__new__(DeepseekV4DSpark)
@@ -6856,6 +6859,7 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
             ),
         ),
         attn_config=SimpleNamespace(
+            dcp_size=1,
             pd_disaggregation_enabled=True,
             prefix_granularity=256,
             max_bs=2,
@@ -6864,6 +6868,7 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
         draft_model_config=None,
         draft_attn_config=None,
         cache_budget_bytes=1 << 30,
+        probe_batch_rows=None,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     ).setup()
@@ -6929,6 +6934,28 @@ def _unbound_deepseek_v4_backend():
 
 
 class DeepseekV4RebindTest(unittest.TestCase):
+    def test_indexer_cache_uses_dcp_topology_but_state_remains_replicated(self):
+        for degree in (1, 4):
+            with self.subTest(degree=degree):
+                backend = _unbound_deepseek_v4_backend()
+                backend.dcp_size = degree
+                pool = _cache_pool_with_page_counts(
+                    {"v4.c4a.indexer_kv": 16, "v4.c4a.indexer_compressor_state": 4},
+                    4,
+                    1,
+                )
+                indexer, state = pool.arena.cache_group_specs
+                indexer.shard_count = degree
+                backend.set_cache_pool(pool)
+                if degree > 1:
+                    indexer.shard_count = 1
+                    with self.assertRaisesRegex(ValueError, "topologies disagree"):
+                        backend.set_cache_pool(pool)
+                    indexer.shard_count = degree
+                    state.shard_count = degree
+                    with self.assertRaisesRegex(ValueError, "topologies disagree"):
+                        backend.set_cache_pool(pool)
+
     def test_dcp_rebind_and_runtime_configuration_retain_virtual_page_bounds(self):
         for degree in (1, 4):
             with self.subTest(degree=degree):

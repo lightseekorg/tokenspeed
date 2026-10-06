@@ -62,7 +62,7 @@ def test_deepep_accepts_stage_local_tp_dp_layout(monkeypatch, tp, dp, pp):
             config=config,
             mapping=SimpleNamespace(
                 world_size=tp * dp * pp,
-                attn=SimpleNamespace(tp_size=tp, dp_size=dp, cp_size=1),
+                attn=SimpleNamespace(tp_size=tp, dp_size=dp),
                 moe=SimpleNamespace(tp_size=1, dp_size=1, ep_size=tp * dp),
             ),
             layer_index=0,
@@ -164,6 +164,7 @@ def test_deepep_routes_unique_rows_and_joins_attention_tp(
         num_global_tokens=num_tokens * 4,
         max_num_tokens_per_gpu=num_tokens,
         ctx=ctx,
+        prefix_is_sharded=False,
     )
     assert events == ["dispatch", "combine"]
     torch.testing.assert_close(output, prefix + hidden * 6 + full_routed * 5)

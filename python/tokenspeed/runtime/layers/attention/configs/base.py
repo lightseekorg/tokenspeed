@@ -35,7 +35,7 @@ their component explicitly: ``Backend(config, spec)``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import ClassVar, TypeVar
 
 import torch
 from tokenspeed_kernel.ops.attention.dsv4 import dsv4_decode_supports_partials
@@ -100,9 +100,7 @@ def resolve_cache_layer_types(
 
 
 def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
-    if kv_cache_dtype_str == "auto":
-        return torch.bfloat16
-    elif kv_cache_dtype_str == "bfloat16":
+    if kv_cache_dtype_str == "auto" or kv_cache_dtype_str == "bfloat16":
         return torch.bfloat16
     elif kv_cache_dtype_str in ("fp8", "fp8_e4m3"):
         return torch.float8_e4m3fn
@@ -129,6 +127,8 @@ class AttnComponentSpec:
 @dataclass(kw_only=True)
 class SoftmaxAttnConfig(AttnComponentSpec):
     """Base of the softmax-attention families (MHA / MLA / DSA / MSA)."""
+
+    is_dsa: ClassVar[bool] = False
 
     num_attention_heads: int
     num_kv_heads: int
@@ -201,6 +201,11 @@ class AttnConfig:
     dcp_size: int = 1
     dcp_rank: int = 0
     dcp_group: tuple[int, ...] = (0,)
+    # Query context parallelism: the extend rows this rank computes are a
+    # contiguous shard of the chunk; the group is the attention TP group.
+    qcp_size: int = 1
+    qcp_rank: int = 0
+    qcp_group: tuple[int, ...] = (0,)
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):
@@ -212,19 +217,68 @@ class AttnConfig:
                 "AttnConfig requires exactly one softmax-family component, got "
                 f"{[type(c).__name__ for c in self.components] or 'none'}"
             )
+        if self.qcp_size > 1:
+            softmax = softmax_components[0]
+            # The gathered-history extend arm exists on the GPU DSA leaf only;
+            # every other leaf rejects a query shard at its metadata build.
+            if not (softmax.is_dsa and softmax.backend_name in (None, "dsa")):
+                raise ValueError(
+                    "query context parallelism requires GPU DSA attention; "
+                    f"got {softmax.backend_name!r}"
+                )
+            if torch.device(self.device).type != "cuda":
+                raise ValueError("GPU DSA query context parallelism requires CUDA")
+            # The sharded KV write gathers the rotated latent and stores it
+            # with latent_store, which writes native (bf16) rows only.
+            if (
+                self.kv_cache_dtype is not torch.bfloat16
+                or self.kv_cache_mxfp8
+                or self.kv_cache_quant_method != "none"
+            ):
+                raise ValueError(
+                    "query context parallelism requires a bf16 KV cache; got "
+                    f"{self.kv_cache_dtype} (mxfp8={self.kv_cache_mxfp8}, quant "
+                    f"method {self.kv_cache_quant_method!r})"
+                )
         if self.dcp_size > 1:
-            if softmax_components[0].backend_name != "deepseek_v4":
+            softmax = softmax_components[0]
+            if softmax.backend_name == "flashmla":
+                if torch.device(self.device).type != "cuda":
+                    raise ValueError("FlashMLA DCP requires CUDA")
+                if (
+                    self.speculative_num_steps > 0
+                    or self.speculative_num_draft_tokens > 1
+                    or self.is_draft
+                ):
+                    raise ValueError("FlashMLA DCP does not yet support speculation")
+            elif softmax.backend_name == "tokenspeed_mla":
+                pass
+            elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
+                if torch.device(self.device).type != "cuda":
+                    raise ValueError("GPU DSA DCP requires CUDA")
+                if (
+                    self.speculative_num_steps > 0
+                    or self.speculative_num_draft_tokens > 1
+                    or self.is_draft
+                ):
+                    raise ValueError("GPU DSA DCP does not yet support speculation")
+            elif softmax.backend_name == "hybrid_linear_attn":
+                # The registry resolves the user's full-attention leaf after
+                # composing the hybrid components, and validates it before
+                # cache allocation. The composite name is not a capability.
+                pass
+            elif softmax.backend_name != "deepseek_v4":
                 raise ValueError(
-                    "DCP currently requires the DeepSeek V4 attention backend"
+                    "DCP currently requires DeepSeek V4, GPU DSA, FlashMLA "
+                    "or CuTe MLA attention"
                 )
-            # Partials merge through a no-sink LSE; fail here rather than at the
-            # first decode's kernel selection on platforms without that kernel.
-            platform = current_platform()
-            if not dsv4_decode_supports_partials(platform):
-                raise ValueError(
-                    "DCP requires a DeepSeek V4 decode kernel that returns a "
-                    f"no-sink LSE; none is registered for {platform.device_name}"
-                )
+            else:
+                platform = current_platform()
+                if not dsv4_decode_supports_partials(platform):
+                    raise ValueError(
+                        "DCP requires a DeepSeek V4 decode kernel that returns a "
+                        f"no-sink LSE; none is registered for {platform.device_name}"
+                    )
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
         """The first component that is a ``cls``, or None.
@@ -276,6 +330,9 @@ def model_wide_kwargs(
         dcp_size=attn_mapping.dcp_size,
         dcp_rank=attn_mapping.dcp_rank,
         dcp_group=attn_mapping.dcp_group,
+        qcp_size=attn_mapping.qcp_size,
+        qcp_rank=attn_mapping.qcp_rank,
+        qcp_group=attn_mapping.qcp_group,
     )
     if server_args.speculative_algorithm is not None:
         kwargs.update(

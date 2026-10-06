@@ -35,6 +35,7 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnCo
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheGroupDeclaration,
     CacheRecipe,
+    kda_verify_scratch_in_pool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
@@ -173,6 +174,15 @@ def declare_glm53_flash_groups(
         raise TypeError("GLM-5.3-Flash draft layers require a draft attention config")
 
     target_dsa = _require_dsa_config(attn_config, "target")
+    if target_dsa.index_k_format != "fp8_scaled":
+        # The pooled index-K rows below are planned as FP8 keys plus one
+        # scale, the plane the KPool indexer leaves read; a config naming
+        # another plane must not get a budget that disagrees with its rows.
+        raise ValueError(
+            "GLM-5.3-Flash plans its pooled index-K rows as FP8 keys with "
+            "scales (index_k_format='fp8_scaled'); got "
+            f"{target_dsa.index_k_format!r}"
+        )
     target_linear = _require_linear_config(attn_config)
     target_layer_types = _target_layer_types(attn_config, num_target_layers)
     group_ids = (
@@ -335,6 +345,10 @@ class Glm53FlashRecipe(CacheRecipe):
             mla_element_size=self.attn_config.kv_cache_dtype.itemsize,
             state_group_ids=state_group_ids,
         )
+
+    @override
+    def verify_scratch_in_pool(self) -> bool:
+        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
 
     @override
     def workspace_bytes(self) -> int:

@@ -1,6 +1,13 @@
 name: Lint
 
-on: [pull_request]
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
 
 concurrency:
   group: lint-${{ github.ref }}
@@ -11,6 +18,52 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
+
+      - name: Detect scheduler C++ changes
+        id: scheduler_cpp_changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          changed_files="$RUNNER_TEMP/tokenspeed-lint-changed-files.txt"
+          scheduler_cpp_files='^tokenspeed-scheduler/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$'
+          scheduler_cpp_config='^tokenspeed-scheduler/(\.clang-(format|tidy)|(.*/)?CMakeLists\.txt|.*\.cmake)$'
+
+          list_changed_files() {
+            if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+              git fetch --no-tags --depth=1 origin "$PUSH_BEFORE" &&
+                git diff --name-only --no-renames "$PUSH_BEFORE" "$GITHUB_SHA"
+            else
+              gh api \
+                "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+                --paginate \
+                -q '.[] | .filename, (.previous_filename // empty)'
+            fi
+          }
+
+          if ! list_changed_files > "$changed_files" || [[ ! -s "$changed_files" ]]; then
+            echo "::warning::Unable to classify changed files; running scheduler C++ lint"
+            changed=true
+          elif grep -Eq \
+            -e "$scheduler_cpp_files" \
+            -e "$scheduler_cpp_config" \
+            "$changed_files"; then
+            changed=true
+          else
+            changed=false
+          fi
+
+          # CI validates merged code; branch protection is a local commit guard.
+          if [[ "$changed" == "true" ]]; then
+            pre_commit_skip=no-commit-to-branch
+          else
+            pre_commit_skip=no-commit-to-branch,clang-format
+          fi
+          {
+            echo "changed=$changed"
+            echo "pre_commit_skip=$pre_commit_skip"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -23,6 +76,8 @@ jobs:
           pre-commit install
 
       - name: Linting
+        env:
+          SKIP: ${{ steps.scheduler_cpp_changes.outputs.pre_commit_skip }}
         run: pre-commit run --all-files
 
       - name: Lint runtime Python with ruff
@@ -31,12 +86,19 @@ jobs:
             --select F401,F841,F821,F823,F811,F541,TID251,UP035,UP006,UP007,UP045 \
             python/tokenspeed/runtime
 
+      - name: Check release orchestration
+        run: |
+          python -m pip install pytest packaging cryptography pyyaml
+          python -m pytest -q test/ci_system/test_weekly_release.py
+
       - name: Install scheduler C++ lint tools
+        if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-format clang-tidy cmake ninja-build
 
       - name: Configure scheduler compile database
+        if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |
           cmake -S tokenspeed-scheduler -B tokenspeed-scheduler/build \
             -G Ninja \
@@ -74,6 +136,7 @@ jobs:
           PY
 
       - name: Lint scheduler C++
+        if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |
           cpp_files="$(git ls-files tokenspeed-scheduler | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$')"
           jobs="$(nproc)"

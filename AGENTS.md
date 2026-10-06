@@ -19,7 +19,13 @@ best people and average people is more than tenfold.
 
 ## Code changes
 
-* Add tests and update docs for the changed code.
+* Add tests for the changed code. Don't be excessive--avoid checking trivial
+  details or exceptions.
+* Update docs for the changed code. Use concise comments to explain code
+  where it might be tricky for humans to understand, and leave project/component
+  level (design) docs focusing on high-level picture. In general, put suitable
+  docs at the suitable place and avoid duplicating the same across a lot of
+  places.
 * For code comments, use common/existing terms for easy human understanding;
   avoid obsecure terms or coining unnecessary new concepts.
 * Parameters that select execution paths, algorithms, or correctness-critical
@@ -47,6 +53,17 @@ best people and average people is more than tenfold.
   committing. Always run the exact `pre-commit run --all-files` command and
   commit any formatter changes it makes.
 * When creating commits, perform sign off on behalf of the author.
+
+## Code review
+
+When Codex or Claude Code reviews code changes, consult these references for
+the languages involved:
+
+* For C++ changes, consult the
+  [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html) and
+  the [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines).
+* For Python changes, consult the
+  [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html).
 
 ## Design principles
 
@@ -78,12 +95,24 @@ change.
 * `docs/design/unified_path.md` — the unified decode path: one
   refresh-in-place metadata contract for eager and CUDA-graph decode, the
   padding contract, buffer sizing, and what stays graph-only.
+* `docs/design/attention-prologue.md` — the one entry between projections
+  and core attention: QK norm, RoPE, quantization and the KV write, the
+  numerics contract every solution meets, and who writes the cache.
+* `docs/design/tree-speculation.md` — draft-tree speculation: the tree as a
+  parameter of the chain path (compaction), position vs slot, one tree
+  attention path (trtllm-gen prefix plus window cascade), and position-keyed
+  sampled verify.
 
 ## Public pull requests
 
 * Keep PR titles, descriptions, commit messages, diffs, comments, logs, and
   artifacts limited to public information. Never include private repository
   names or links, private dates, or any other private or internal information.
+* When opening a pull request, if you have write access to this repository,
+  push the head branch to this repository rather than to a fork. Only
+  same-repository branches receive repository secrets such as `HF_TOKEN`
+  (higher Hugging Face rate limits), get the automated Claude code review, and
+  run CI jobs that skip fork pull requests.
 
 ## Dependency boundaries
 
@@ -99,7 +128,8 @@ change.
 
 * NVIDIA GPU support is currently limited to `sm90`, `sm100`, `sm103`, and
   `sm107`.
-* AMD GPU support is currently limited to `gfx950` and `gfx1250`.
+* AMD GPU support is currently limited to `gfx950`, `gfx1250`, and portable
+  kernels on `gfx1201`.
 * NPU support targets only one or two specific models. There are currently no
   plans to expand NPU model coverage.
 
@@ -156,6 +186,25 @@ Inside the root `tokenspeed-kernel/` directory:
   Tests for common infra and covering multi-vendors reside under `test/`
   directly.
 * Use tight atol/rtol in correctness comparison tests.
+* Compile-time kernel parameters (`tl.constexpr`, `gl.constexpr`,
+  `cutlass.Constexpr`) are part of the JIT cache key: a new value triggers a
+  recompilation on the forward thread and stalls serving for 100+ ms. Use it
+  for fixed static values once the server starts (e.g., model dimensions,
+  feature flags) or scalar knob specialization that matters greatly for kernel
+  performance (e.g., block size, alignment). Values that vary per batch or
+  request (e.g, token, request, row counts, sequence lengths, block-table
+  widths), and values derived from them (e.g., the strides that follow those
+  widths, split counts computed from the batch size), must be runtime
+  arguments, or be bucketed first (e.g. `next_power_of_2`) when the kernel
+  needs a compile-time bound. The same holds for template arguments of other
+  JITs such as DeepGEMM. Reviews should check every new or changed kernel
+  signature and launch site for this. Kernels should have tests to guard
+  against excessive scalar parameter specialization with
+  `assert_no_triton_compile` from `test/utils.py`; for tensor parameters no
+  need to test. At runtime `tokenspeed_kernel.compile_monitor` logs every
+  Triton compilation after startup and names a parameter that keeps taking
+  new values; CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a
+  parameter fails the model tests.
 
 ## tokenspeed-kernel-amd
 
@@ -165,6 +214,8 @@ Inside the root `tokenspeed-kernel-amd/` directory:
 * Add jit `launch_metadata` for Proton use along the Triton/Gluon kernels.
 * AMD Gluon Kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
+* The compile-time parameter rule in the `tokenspeed-kernel` section applies
+  to these kernels too.
 * For per kernel contract and algorithm details, put in
   `python/tokenspeed_kernel_amd/ops/README.md`.
 * For Triton/Gluon kernels, one name should thread the whole stack: the

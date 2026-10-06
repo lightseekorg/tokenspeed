@@ -251,21 +251,17 @@ def test_k8s_dispatch_lists_every_supported_ci_yaml():
     assert all((REPO_ROOT / choice).is_file() for choice in choices)
 
 
-def test_amd_pr_workflow_orders_kernel_benchmarks_before_model_tests():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-amd.yml")
+def test_amd_pr_workflow_runs_kernel_benchmarks_alongside_model_tests():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-tests.yml")
     jobs = workflow["jobs"]
 
     assert jobs["kernel-benchmark"]["needs"] == ["scan", "unit-test"]
-    expected_model_needs = ["scan", "unit-test", "kernel-benchmark"]
     normal_model = jobs["model-test"]
-    assert normal_model["needs"] == expected_model_needs
+    assert normal_model["needs"] == ["scan", "unit-test"]
     assert "!cancelled()" in normal_model["if"]
     assert "needs.unit-test.result == 'success'" in normal_model["if"]
     assert "needs.scan.outputs.unit_has_tasks != 'true'" in normal_model["if"]
-    assert "needs.kernel-benchmark.result == 'success'" in normal_model["if"]
-    assert (
-        "needs.scan.outputs.kernel_benchmark_has_tasks != 'true'" in normal_model["if"]
-    )
+    assert "needs.kernel-benchmark" not in normal_model["if"]
 
     eager_model = jobs["model-test-eager"]
     assert eager_model["needs"] == "scan"
@@ -296,7 +292,8 @@ def test_kernel_benchmark_task_uses_shared_ci_contract():
     assert task["type"] == "perf"
     assert task["workflow_stage"] == "kernel-benchmark"
     assert task["triggers"] == ["per-commit", "manual"]
-    assert task["runner"]["labels"] == ["amd-mi355-1gpu-bench"]
+    assert task["runner"]["labels"] == ["amd-mi350-1gpu-bench"]
+    assert task["env"]["TOKENSPEED_KERNEL_BENCHMARK_PROFILER"] == "none"
     assert ".ci-artifacts/published" in task["perf"]["command"]
     for variable in ("BASE_REF", "CANDIDATE_REF", "PR_NUMBER", "MERGE_SHA"):
         assert variable in task["perf"]["command"]
@@ -715,7 +712,7 @@ def test_kimi_k3_dflash2_gb300_uses_a_window_aware_drafter_backend():
 
 
 def test_gb300_slurm_nightly_workflow_is_scheduled_and_isolated():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-nightly.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-gb300-nightly-tests.yml")
     triggers = workflow.get("on") or workflow.get(True)
     scan = workflow["jobs"]["scan"]
     submit = workflow["jobs"]["submit"]
@@ -816,7 +813,7 @@ def test_gb300_slurm_nightly_matrix_selects_the_nightly_kimi_k3_tasks(monkeypatc
 
 
 def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-gb300-tests.yml")
     triggers = workflow.get("on") or workflow.get(True)
     submit = workflow["jobs"]["submit"]
     scan_steps = workflow["jobs"]["scan"]["steps"]
@@ -976,7 +973,7 @@ def test_nvidia_arm_model_tests_allow_runner_wait_time():
 
 
 def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-ci-task-matrix.yml")
     job = workflow["jobs"]["test"]
 
     assert job["runs-on"] == "${{ matrix.runner }}"
@@ -998,13 +995,15 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
 def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
     tmp_path, workflow_stage, task_type
 ):
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-ci-task-matrix.yml")
     steps = workflow["jobs"]["test"]["steps"]
     setup = next(step for step in steps if step["name"] == "Set work directory")
     cleanup = next(step for step in steps if step["name"] == "Cleanup work directory")
     assert cleanup["if"] == "always()"
     shared_cache = tmp_path / "shared-uv"
     shared_cache.mkdir()
+    persistent_hf_home = tmp_path / "shared-huggingface"
+    persistent_hf_home.mkdir()
     sentinel = shared_cache / "another-job"
     sentinel.touch()
     cache_variables = (
@@ -1027,7 +1026,7 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
             "github.run_id": "1234",
             "github.run_attempt": str(attempt),
             "matrix.name": "eval-cache-test",
-            "matrix.runner": "amd-mi35x-2gpu-test",
+            "matrix.runner": "model-runner",
             "matrix.workflow_stage": workflow_stage,
             "matrix.type": task_type,
         }.items():
@@ -1037,6 +1036,7 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
             env={
                 **os.environ,
                 "GITHUB_ENV": str(env_file),
+                "HF_HOME": str(persistent_hf_home),
                 **{variable: str(shared_cache) for variable in cache_variables},
             },
             check=True,
@@ -1047,7 +1047,11 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
         assert "MIOPEN_FIND_ENFORCE" not in job_env
         if workflow_stage != "model-test":
             assert all(variable not in job_env for variable in cache_variables)
+            assert "EVALSCOPE_UV_CACHE_DIR" not in job_env
             continue
+        assert job_env["EVALSCOPE_UV_CACHE_DIR"] == str(
+            persistent_hf_home / ".uv-cache" / "evalscope"
+        )
         if task_type == "perf":
             assert "TRITON_CACHE_DIR" not in job_env
         for variable in isolated_variables:
@@ -1064,7 +1068,7 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
     first, second = job_envs
     assert all(first[variable] != second[variable] for variable in isolated_variables)
     script = cleanup["run"].replace("${{ env.WORK_DIR }}", first["WORK_DIR"])
-    script = script.replace("${{ matrix.runner }}", "amd-mi35x-2gpu-test")
+    script = script.replace("${{ matrix.runner }}", "model-runner")
     subprocess.run(["bash", "-c", script], check=True)
     for variable in isolated_variables:
         assert not Path(first[variable]).exists()
@@ -1073,7 +1077,7 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
 
 
 def test_gb300_per_commit_forwards_the_tokenspeed_mla_override():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-gb300-tests.yml")
     step = next(
         step
         for step in workflow["jobs"]["submit"]["steps"]
@@ -1128,8 +1132,18 @@ def test_mi450_sim_runs_on_the_cpu_only_pool():
 
 def test_mi450_sim_uses_bounded_smoke_suite():
     task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")
+    setup_script = (REPO_ROOT / "test/ci_system/setup_mi450_sim.sh").read_text()
+    parallel_script = (
+        REPO_ROOT / "test/ci_system/run_mi450_rocjitsu_parallel.sh"
+    ).read_text()
 
     assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "600"
+    assert task["env"]["MI450_SIM_THREADS_PER_WORKER"] == "2"
+    assert 'config["cpu_thread_budget"] = thread_budget' in setup_script
+    assert 'threads_per_emulator="${MI450_SIM_THREADS_PER_WORKER:-2}"' in (
+        parallel_script
+    )
+    assert "/sys/fs/cgroup/cpu.max" in parallel_script
     assert task["env"]["MI450_SIM_TEST_ROOT"] != "tokenspeed-kernel/test"
     assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
 

@@ -72,6 +72,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         index_topk=text_config.index_topk,
         index_head_dim=text_config.index_head_dim,
         index_n_heads=text_config.index_n_heads,
+        index_k_format="fp8_scaled",
         index_kpool=text_config.index_kpool,
     )
     linear = LinearAttnConfig(
@@ -235,7 +236,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     )
     cache_k_rope = torch.empty(600, 1, 0, device="cuda", dtype=torch.bfloat16)
     layer = SimpleNamespace(layer_id=dsa_layer)
-    pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+    pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope, write_mask=None)
     actual_nope, actual_rope = pool.get_mla_kv_buffer(
         layer, loc, dst_dtype=torch.bfloat16
     )

@@ -857,15 +857,17 @@ def test_qwen4_exp_qsa_block_topk_two_stage_merge_matches_torch(device: str) -> 
         ).sum(dim=0)
         valid = block_ids < complete_blocks[row]
         scores = torch.where(valid, scores, torch.tensor(-float("inf"), device=device))
-        expected = set(
-            torch.topk(
-                scores,
-                min(block_topk, int(complete_blocks[row]), num_blocks),
-            ).indices.tolist()
+        expected = torch.topk(
+            scores,
+            min(block_topk, int(complete_blocks[row]), num_blocks),
         )
         got = [int(value) for value in actual[row] if value >= 0]
-        assert len(got) == len(expected)
-        assert set(got) == expected
+        assert len(got) == len(expected.indices)
+        assert len(set(got)) == len(got)
+        assert all(index < int(complete_blocks[row]) for index in got)
+        torch.testing.assert_close(
+            scores[got].sort(descending=True).values, expected.values, rtol=0, atol=0
+        )
 
 
 def _block_topk_reference_scores(

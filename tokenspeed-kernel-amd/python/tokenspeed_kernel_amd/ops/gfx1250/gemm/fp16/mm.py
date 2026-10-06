@@ -27,6 +27,10 @@ from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 _LARGEM_MIN_M = 512
 _LARGEM_BLOCK_M_CROSSOVER = 12288
+_LARGEM_WIDE_M = 4096
+_LARGEM_WIDE_N = 3072
+_WARP_BASES_4 = ((0, 1), (1, 0))
+_WARP_BASES_8 = ((0, 1), (1, 0), (2, 0))
 _LARGEM_SHAPES = {
     (512, 3072),
     (768, 7168),
@@ -48,7 +52,26 @@ def use_gluon_largem_gfx1250(m: int, k: int, n: int) -> bool:
     return m >= _LARGEM_MIN_M and (k, n) in _LARGEM_SHAPES
 
 
-@gluon.jit
+def _wmma_tdm_dense_m16_launch_metadata(grid, kernel, args):
+    """Report dense WMMA work and BF16 or split-K FP32 partial traffic."""
+    m = args["ACTUAL_M"]
+    n = grid[0] * args["BLOCK_N"]
+    k = args["K"]
+    split_k = args["SPLIT_K"]
+    output = args["partial_ptr"] if split_k > 1 else args["out_ptr"]
+    return {
+        "name": kernel.name,
+        "flops16": 2 * m * n * k,
+        "bytes": grid[0] * m * k * args["a_ptr"].element_size()
+        + n * k * args["b_ptr"].element_size()
+        + split_k * m * n * output.element_size(),
+    }
+
+
+@gluon.jit(
+    launch_metadata=_wmma_tdm_dense_m16_launch_metadata,
+    do_not_specialize=["ACTUAL_M", "split_stride"],
+)
 def _wmma_tdm_dense_m16_kernel(
     a_ptr,
     b_ptr,
@@ -59,26 +82,33 @@ def _wmma_tdm_dense_m16_kernel(
     stride_bk,
     stride_om,
     stride_on,
-    ACTUAL_M: gl.constexpr,
+    partial_ptr,
+    split_stride,
+    partial_row_stride,
+    ACTUAL_M,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     K: gl.constexpr,
+    SPLIT_K: gl.constexpr,
 ):
     """Fixed-M CDNA5 dense projection candidate."""
     M: gl.constexpr = 16
     pid_n = gl.program_id(0)
+    pid_split = gl.program_id(1)
 
     gl.static_assert(
-        BLOCK_N == 16 or BLOCK_N == 64,
-        "candidate supports one or four WMMA output tiles",
+        BLOCK_N == 16 or BLOCK_N == 32,
+        "candidate supports one or two WMMA output tiles",
     )
-    gl.static_assert(0 < ACTUAL_M and ACTUAL_M <= M)
-    gl.static_assert(BLOCK_K == 128, "candidate is tuned for 128-wide K tiles")
+    gl.static_assert(
+        BLOCK_K == 128 or BLOCK_K == 256, "candidate uses 128- or 256-wide K tiles"
+    )
     gl.static_assert(K % BLOCK_K == 0, "K must tile exactly into BLOCK_K")
-    gl.static_assert(NUM_BUFFERS == 3, "candidate uses a triple-buffer TDM pipeline")
+    gl.static_assert((K // BLOCK_K) % SPLIT_K == 0, "split-K must divide the K tiles")
 
-    warp_bases: gl.constexpr = [] if BLOCK_N == 16 else [[0, 1], [0, 2]]
+    # One warp per 16-column WMMA tile, laid out along N.
+    warp_bases: gl.constexpr = [] if BLOCK_N == 16 else [[0, 1]]
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
@@ -124,50 +154,159 @@ def _wmma_tdm_dense_m16_kernel(
         layout=shared_layout_b,
     )
 
-    for tile in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.cdna5.tdm.async_load(a_desc, [0, tile * BLOCK_K], a_smem.index(tile))
-        gl.amd.cdna5.tdm.async_load(b_desc, [0, tile * BLOCK_K], b_smem.index(tile))
+    num_k_tiles: gl.constexpr = K // BLOCK_K // SPLIT_K
+    k_base = pid_split * num_k_tiles
+    for tile in gl.static_range(min(NUM_BUFFERS - 1, num_k_tiles)):
+        offset = (k_base + tile) * BLOCK_K
+        gl.amd.cdna5.tdm.async_load(a_desc, [0, offset], a_smem.index(tile))
+        gl.amd.cdna5.tdm.async_load(b_desc, [0, offset], b_smem.index(tile))
 
     acc = gl.zeros((M, BLOCK_N), gl.float32, wmma_layout)
-    num_k_tiles: gl.constexpr = K // BLOCK_K
-    gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
-    for tile in gl.static_range(num_k_tiles):
-        with gl.amd.warp_pipeline_stage("tdm+lds", priority=1):
+    if num_k_tiles >= NUM_BUFFERS:
+        # Lower the wait before each tail load. A fixed wait leaves the newest
+        # A/B pairs outstanding, so the next iteration can read them early.
+        main_k_tiles: gl.constexpr = num_k_tiles - (NUM_BUFFERS - 1)
+        gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
+        for tile in gl.static_range(main_k_tiles):
+            with gl.amd.warp_pipeline_stage("tdm+lds", priority=1):
+                a = a_smem.index(tile % NUM_BUFFERS).load(layout=dot_layout_a)
+                b = (
+                    b_smem.index(tile % NUM_BUFFERS)
+                    .permute([1, 0])
+                    .load(layout=dot_layout_b)
+                )
+                prefetch_tile = tile + NUM_BUFFERS - 1
+                prefetch = (k_base + prefetch_tile) * BLOCK_K
+                gl.amd.cdna5.tdm.async_load(
+                    a_desc,
+                    [0, prefetch],
+                    a_smem.index(prefetch_tile % NUM_BUFFERS),
+                )
+                gl.amd.cdna5.tdm.async_load(
+                    b_desc,
+                    [0, prefetch],
+                    b_smem.index(prefetch_tile % NUM_BUFFERS),
+                )
+            gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
+            with gl.amd.warp_pipeline_stage("wmma", priority=0):
+                acc = gl.amd.cdna5.wmma(a, b, acc)
+        for tail in gl.static_range(NUM_BUFFERS - 1):
+            gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2 - tail))
+            tile = main_k_tiles + tail
             a = a_smem.index(tile % NUM_BUFFERS).load(layout=dot_layout_a)
             b = (
                 b_smem.index(tile % NUM_BUFFERS)
                 .permute([1, 0])
                 .load(layout=dot_layout_b)
             )
-            gl.amd.cdna5.tdm.async_load(
-                a_desc,
-                [0, (tile + NUM_BUFFERS - 1) * BLOCK_K],
-                a_smem.index((tile + NUM_BUFFERS - 1) % NUM_BUFFERS),
-                pred=tile + NUM_BUFFERS - 1 < num_k_tiles,
-            )
-            gl.amd.cdna5.tdm.async_load(
-                b_desc,
-                [0, (tile + NUM_BUFFERS - 1) * BLOCK_K],
-                b_smem.index((tile + NUM_BUFFERS - 1) % NUM_BUFFERS),
-                pred=tile + NUM_BUFFERS - 1 < num_k_tiles,
-            )
-        gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
-        with gl.amd.warp_pipeline_stage("wmma", priority=0):
+            acc = gl.amd.cdna5.wmma(a, b, acc)
+    else:
+        for tile in gl.static_range(num_k_tiles):
+            gl.amd.cdna5.tdm.async_wait(2 * (num_k_tiles - 1 - tile))
+            a = a_smem.index(tile).load(layout=dot_layout_a)
+            b = b_smem.index(tile).permute([1, 0]).load(layout=dot_layout_b)
             acc = gl.amd.cdna5.wmma(a, b, acc)
     gl.amd.cdna5.tdm.async_wait(0)
 
     offs_m = gl.arange(0, M, gl.SliceLayout(1, wmma_layout))
     offs_n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, wmma_layout))
     tile_n = pid_n * BLOCK_N + offs_n
-    output_offsets = (offs_m[:, None] * stride_om + tile_n[None, :] * stride_on).to(
-        gl.int32
-    )
+    if SPLIT_K == 1:
+        output_offsets = (offs_m[:, None] * stride_om + tile_n[None, :] * stride_on).to(
+            gl.int32
+        )
+        gl.amd.cdna5.buffer_store(
+            acc.to(gl.bfloat16),
+            out_ptr,
+            output_offsets,
+            mask=offs_m[:, None] < ACTUAL_M,
+        )
+    else:
+        partial_offsets = (
+            pid_split * split_stride
+            + offs_m[:, None] * partial_row_stride
+            + tile_n[None, :]
+        ).to(gl.int32)
+        gl.amd.cdna5.buffer_store(
+            acc,
+            partial_ptr,
+            partial_offsets,
+            mask=offs_m[:, None] < ACTUAL_M,
+        )
+
+
+def _gluon_wmma_dense_reduce_gfx1250_launch_metadata(grid, kernel, args):
+    """Report the FP32 partial reduction and BF16 store to Proton."""
+    rows = grid[0]
+    n = args["n"]
+    split_k = args["SPLIT_K"]
+    values = rows * n
+    return {
+        "name": kernel.name,
+        "flops32": values * (split_k - 1),
+        "bytes": values * split_k * args["partial_ptr"].element_size()
+        + values * args["out_ptr"].element_size(),
+    }
+
+
+@gluon.jit(launch_metadata=_gluon_wmma_dense_reduce_gfx1250_launch_metadata)
+def gluon_wmma_dense_reduce_gfx1250(
+    partial_ptr,
+    out_ptr,
+    split_stride,
+    row_stride,
+    out_stride,
+    n,
+    SPLIT_K: gl.constexpr,
+    BLOCK: gl.constexpr,
+):
+    """Sum split-K fp32 partials and store one bf16 row tile."""
+    row = gl.program_id(0)
+    tile = gl.program_id(1)
+    # 4 warps x 32 threads x 4 elements = 512 columns, one 16-byte buffer load.
+    gl.static_assert(BLOCK == 512, "vectorized reduction tile is 512 columns")
+    layout: gl.constexpr = gl.BlockedLayout([4], [32], [4], [0])
+    offs = tile * BLOCK + gl.arange(0, BLOCK, layout=layout)
+    mask = offs < n
+    acc = gl.zeros([BLOCK], gl.float32, layout)
+    base = row * row_stride
+    for split in range(0, SPLIT_K):
+        acc += gl.amd.cdna5.buffer_load(
+            partial_ptr + split * split_stride + base,
+            offs.to(gl.int32),
+            mask=mask,
+            other=0.0,
+        )
     gl.amd.cdna5.buffer_store(
         acc.to(gl.bfloat16),
-        out_ptr,
-        output_offsets,
-        mask=offs_m[:, None] < ACTUAL_M,
+        out_ptr + row * out_stride,
+        offs.to(gl.int32),
+        mask=mask,
     )
+
+
+def _dense_m16_split_k(
+    n: int,
+    block_n: int,
+    k_tiles: int,
+    num_buffers: int,
+) -> int:
+    """Return the largest split that divides the K tiles and fits on 256 CUs.
+
+    Each split keeps at least eight K tiles, and at least one full buffer pipeline.
+    This package runs on gfx1250, and that part has 256 CUs.
+    """
+
+    ctas = n // block_n
+    min_tiles = max(num_buffers, 8)
+    for split in (8, 4, 2):
+        if (
+            k_tiles % split == 0
+            and k_tiles // split >= min_tiles
+            and ctas * split <= 256
+        ):
+            return split
+    return 1
 
 
 def _launch_wmma_tdm_dense_tiles(
@@ -176,13 +315,38 @@ def _launch_wmma_tdm_dense_tiles(
     out: torch.Tensor,
     *,
     block_n: int,
+    block_k: int,
     num_warps: int,
+    split_k: int | None,
+    num_buffers: int,
 ) -> None:
-    block_k, num_buffers = 128, 3
+    k_tiles = A.shape[1] // block_k
+    if split_k is None:
+        split_k = _dense_m16_split_k(B.shape[0], block_n, k_tiles, num_buffers)
+    if split_k not in (1, 2, 4, 8):
+        raise ValueError("split_k must be one of 1, 2, 4, or 8")
+    if k_tiles % split_k != 0:
+        raise ValueError(f"split_k={split_k} must divide K/{block_k}={k_tiles}")
+    if split_k > 1 and k_tiles // split_k < 2:
+        raise ValueError(
+            "each split needs at least two K tiles for a full TDM pipeline"
+        )
+    num_buffers = max(2, min(num_buffers, k_tiles // split_k))
+    n = B.shape[0]
     for start in range(0, A.shape[0], 16):
         a_tile = A[start : start + 16]
         out_tile = out[start : start + 16]
-        _wmma_tdm_dense_m16_kernel[(B.shape[0] // block_n,)](
+        actual_m = a_tile.shape[0]
+        partial = (
+            torch.empty(
+                (split_k, actual_m, n),
+                device=A.device,
+                dtype=torch.float32,
+            )
+            if split_k > 1
+            else out_tile
+        )
+        _wmma_tdm_dense_m16_kernel[(n // block_n, split_k)](
             a_tile,
             B,
             out_tile,
@@ -192,15 +356,33 @@ def _launch_wmma_tdm_dense_tiles(
             B.stride(1),
             out_tile.stride(0),
             out_tile.stride(1),
-            ACTUAL_M=a_tile.shape[0],
+            partial,
+            partial.stride(0),
+            partial.stride(1),
+            ACTUAL_M=actual_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
             NUM_BUFFERS=num_buffers,
             K=A.shape[1],
+            SPLIT_K=split_k,
             num_warps=num_warps,
             num_stages=1,
             waves_per_eu=1,
         )
+        if split_k > 1:
+            block = 512
+            gluon_wmma_dense_reduce_gfx1250[(actual_m, triton.cdiv(n, block))](
+                partial,
+                out_tile,
+                partial.stride(0),
+                partial.stride(1),
+                out_tile.stride(0),
+                n,
+                SPLIT_K=split_k,
+                BLOCK=block,
+                num_warps=4,
+                num_stages=1,
+            )
 
 
 def use_gluon_wmma_dense_gfx1250(m: int, k: int, n: int) -> bool:
@@ -220,8 +402,19 @@ def gluon_wmma_tdm_dense_gfx1250(
     B: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
+    split_k: int | None,
 ) -> torch.Tensor:
-    """Run the CDNA5 dense projection candidate on any accepted shape."""
+    """Compute a small-M dense BF16 projection on CDNA5.
+
+    Args:
+        A: Contiguous BF16 activations shaped ``[M, K]``.
+        B: Contiguous BF16 weights shaped ``[N, K]`` on A's device.
+        out: Optional BF16 destination with contiguous columns.
+        split_k: One of 1, 2, 4, or 8 partitions, or ``None`` for CU-based selection.
+
+    Returns:
+        The BF16 ``[M, N]`` projection, using ``out`` when supplied.
+    """
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError("A and B must be 2D")
     m, k = A.shape
@@ -248,14 +441,27 @@ def gluon_wmma_tdm_dense_gfx1250(
         tuple(out.shape) != (m, n)
         or out.dtype != torch.bfloat16
         or not out.is_cuda
-        or not out.is_contiguous()
         or out.device != A.device
+        or out.stride(-1) != 1
+        or out.stride(0) < n
     ):
-        raise ValueError(f"out must be contiguous GPU BF16 ({m}, {n}) colocated with A")
+        raise ValueError(
+            f"out must be GPU BF16 ({m}, {n}) with unit row stride colocated with A"
+        )
 
     # BLOCK_N selects the WMMA warp bases, so the warp count follows from it.
-    block_n, num_warps = (64, 4) if n % 64 == 0 else (16, 1)
-    _launch_wmma_tdm_dense_tiles(A, B, out, block_n=block_n, num_warps=num_warps)
+    block_k = 256 if k % 256 == 0 else 128
+    block_n = 32 if n % 32 == 0 and n // 32 >= 192 else 16
+    _launch_wmma_tdm_dense_tiles(
+        A,
+        B,
+        out,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=block_n // 16,
+        split_k=split_k,
+        num_buffers=6,
+    )
     return out
 
 
@@ -286,8 +492,11 @@ def gluon_wmma_tdm_mla_qkv_gate_gfx1250(
         A,
         B,
         out,
-        block_n=64,
-        num_warps=4,
+        block_n=16,
+        block_k=256,
+        num_warps=1,
+        split_k=None,
+        num_buffers=6,
     )
     return out
 
@@ -333,7 +542,10 @@ def gluon_wmma_tdm_kda_qkvfab_gfx1250(
         B,
         out,
         block_n=16,
+        block_k=128,
         num_warps=1,
+        split_k=None,
+        num_buffers=7,
     )
     return out
 
@@ -364,14 +576,24 @@ def _wmma_tdm_add3_m16_kernel(
     K: gl.constexpr = 3584
     pid_n = gl.program_id(0)
 
-    gl.static_assert(BLOCK_N == 64, "candidate uses one 16x64 WMMA output tile")
-    gl.static_assert(BLOCK_K == 128, "candidate is tuned for 128-wide K tiles")
-    gl.static_assert(NUM_BUFFERS == 3, "candidate uses a triple-buffer TDM pipeline")
+    gl.static_assert(
+        BLOCK_N == 16 or BLOCK_N == 32,
+        "candidate supports one or two WMMA output tiles",
+    )
+    gl.static_assert(
+        BLOCK_K == 128 or BLOCK_K == 256, "candidate uses 128- or 256-wide K tiles"
+    )
+    gl.static_assert(
+        K % BLOCK_K == 0 and K // BLOCK_K >= NUM_BUFFERS - 1 and NUM_BUFFERS >= 2,
+        "the TDM prologue must fit inside K",
+    )
 
+    # One warp per 16-column WMMA tile, laid out along N.
+    warp_bases: gl.constexpr = [] if BLOCK_N == 16 else [[0, 1]]
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=[[0, 1], [0, 2]],
+        warp_bases=warp_bases,
         reg_bases=[],
         instr_shape=[16, 16, 32],
     )
@@ -413,7 +635,7 @@ def _wmma_tdm_add3_m16_kernel(
         layout=shared_layout_b,
     )
 
-    # Two tiles are prefetched before the steady-state issue/wait/WMMA loop.
+    # NUM_BUFFERS - 1 tiles are prefetched before the issue/wait/WMMA loop.
     for tile in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.cdna5.tdm.async_load(a_desc, [0, tile * BLOCK_K], a_smem.index(tile))
         gl.amd.cdna5.tdm.async_load(b_desc, [0, tile * BLOCK_K], b_smem.index(tile))
@@ -441,7 +663,7 @@ def _wmma_tdm_add3_m16_kernel(
                 b_smem.index((tile + NUM_BUFFERS - 1) % NUM_BUFFERS),
                 pred=tile + NUM_BUFFERS - 1 < num_k_tiles,
             )
-        # Keep one complete A/B batch in flight while consuming the oldest.
+        # Keep up to NUM_BUFFERS - 2 A/B batches in flight while consuming the oldest.
         gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
         with gl.amd.warp_pipeline_stage("wmma", priority=0):
             acc = gl.amd.cdna5.wmma(a, b, acc)
@@ -506,7 +728,7 @@ def gluon_wmma_tdm_add3_m16_gfx1250(
             )
 
     out = A.new_empty((16, 7168))
-    block_n, block_k, num_buffers = 64, 128, 3
+    block_n, block_k, num_buffers = 32, 256, 6
     _wmma_tdm_add3_m16_kernel[(7168 // block_n,)](
         A,
         B,
@@ -526,7 +748,7 @@ def gluon_wmma_tdm_add3_m16_gfx1250(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         NUM_BUFFERS=num_buffers,
-        num_warps=4,
+        num_warps=block_n // 16,
         num_stages=1,
         waves_per_eu=1,
     )
@@ -701,6 +923,7 @@ def _wmma_tdm_dense_largem_kernel(
     BLOCK_K: gl.constexpr,
     GROUP_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    WARP_BASES: gl.constexpr,
 ):
     """Dense BF16 CDNA5 TDM/WMMA GEMM for large K3 projections.
 
@@ -722,7 +945,7 @@ def _wmma_tdm_dense_largem_kernel(
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=[[0, 1], [1, 0]],
+        warp_bases=WARP_BASES,
         reg_bases=[],
         instr_shape=[16, 16, 32],
     )
@@ -733,10 +956,10 @@ def _wmma_tdm_dense_largem_kernel(
         operand_index=1, parent=wmma_layout, k_width=8
     )
     shared_layout_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+        [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
     )
     shared_layout_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+        [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
     )
 
     a_smem = gl.allocate_shared_memory(
@@ -856,18 +1079,24 @@ def gluon_mm_a16w16_largem_gfx1250(
             f"{(m, n)} on {A.device}"
         )
 
-    block_m = 128 if m < _LARGEM_BLOCK_M_CROSSOVER else 256
-    # Only the block shape has to divide evenly here. Ragged M and N edges are
-    # handled inside the kernel: its TDM descriptors are bounded by the real
-    # M and N, so the trailing partial tiles load only the rows that exist,
-    # and its stores are masked against the same bounds. Peeling those edges
-    # off into vendor calls would cost a second full pass over A plus, for a
-    # ragged N, a scratch buffer and a copy of the whole result.
-    block_n = next(
-        candidate
-        for candidate in (block_m, 128, 64, 32)
-        if (n - n % 32) % candidate == 0
-    )
+    if m >= _LARGEM_WIDE_M and n >= _LARGEM_WIDE_N:
+        block_m, block_n = 256, 256
+        warp_bases, num_warps = _WARP_BASES_8, 8
+        # A 256-wide tile already spans enough columns that grouping rows
+        # for L2 reuse costs more than it returns.
+        group_m = 1
+    else:
+        block_m = 128 if m < _LARGEM_BLOCK_M_CROSSOVER else 256
+        # Only the block shape has to divide evenly here. Ragged M and N edges
+        # are handled inside the kernel: its TDM descriptors are bounded by the
+        # real M and N, so the trailing partial tiles load only the rows that
+        # exist, and its stores are masked against the same bounds. Peeling
+        # those edges off into vendor calls would cost a second full pass over
+        # A plus, for a ragged N, a scratch buffer and a copy of the whole
+        # result.
+        block_n = block_m if n % block_m == 0 else 128
+        warp_bases, num_warps = _WARP_BASES_4, 4
+        group_m = 8
     grid = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
     _wmma_tdm_dense_largem_kernel[(grid,)](
         A,
@@ -885,9 +1114,10 @@ def gluon_mm_a16w16_largem_gfx1250(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=128,
-        GROUP_M=8,
+        GROUP_M=group_m,
         NUM_BUFFERS=2,
-        num_warps=4,
+        WARP_BASES=warp_bases,
+        num_warps=num_warps,
         num_stages=1,
     )
     return out

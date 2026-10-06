@@ -23,7 +23,6 @@
 #include <algorithm>
 #include <concepts>
 #include <cstdint>
-#include <memory>
 #include <span>
 #include <string>
 #include <utility>
@@ -107,7 +106,7 @@ private:
 struct ForwardResources {
     TokenContainer* token_container{};
     std::int32_t prefix_granularity{};
-    std::unique_ptr<ReqPoolIndex> req_pool_index;
+    ReqPoolIndex req_pool_index;
     std::vector<BlockTable> block_tables;
     CacheProgress cache_progress;
     // Forwards scheduled for this request whose results have not come back.
@@ -121,7 +120,7 @@ struct ForwardResources {
     // and the write lands on pages someone else now owns.
     std::int32_t results_in_flight{0};
 
-    std::int32_t RequestPoolIndex() const { return req_pool_index ? req_pool_index->slot_ : -1; }
+    std::int32_t RequestPoolIndex() const { return req_pool_index.valid() ? req_pool_index.slot_ : -1; }
     void TrackScheduledForward() { ++results_in_flight; }
     void ResultLanded() {
         FatalCheck(results_in_flight > 0, "a forward result landed for a request with no forward in flight");
@@ -219,12 +218,20 @@ struct Retracted {
     // A victim with generated output a client is reading resumes ahead of
     // one that had produced nothing, whatever their retraction epochs say.
     bool resumes_generation{false};
+    // Positions [0, landed_tokens) had their forward results land before the
+    // retraction, so their logits exist. The readmission probe may match this
+    // far whatever RequestSpec::max_cached_prefix_tokens says -- the request
+    // loses nothing it still needs -- but no further: beyond it a hit page
+    // (another request's, or a chunk skipped before it landed) would stand in
+    // for logits that were never produced.
+    std::int32_t landed_tokens{0};
 
     TokenContainer* TokenContainerPtr() const { return token_container; }
     std::int32_t PrefixGranularity() const { return prefix_granularity; }
     std::int64_t RetractionEpoch() const { return retraction_epoch; }
     bool HasRecoverableSnapshot() const { return has_recoverable_snapshot; }
     bool ResumesGeneration() const { return resumes_generation; }
+    std::int32_t LandedTokens() const { return landed_tokens; }
 };
 
 struct Finished {};

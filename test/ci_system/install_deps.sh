@@ -36,6 +36,8 @@ export C_INCLUDE_PATH="/usr/local/cuda/include/cccl"
 WORKSPACE=${WORKSPACE:-$(pwd)}
 CUDA_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda.txt"
 configure_package_cache
+configure_nvcc_cache
+show_nvcc_cache_stats before
 
 # Wrap pip install in a retry loop. PyPI's CDN occasionally returns a
 # bad Content-Type for /simple/<pkg>/ pages (most recently observed for
@@ -90,9 +92,9 @@ apt_install_with_retry() {
 }
 
 ensure_flashinfer_jit_cache() {
-    # GB200 and B200 runner images preinstall flashinfer-jit-cache; it must
+    # Blackwell runner images preinstall flashinfer-jit-cache; it must
     # match the flashinfer-python pin exactly or flashinfer refuses to import.
-    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != b200* && "${CI_RUNNER_LABEL:-}" != slurm-gb200-* ]]; then
+    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != gb300* && "${CI_RUNNER_LABEL:-}" != b200* && "${CI_RUNNER_LABEL:-}" != b300* && "${CI_RUNNER_LABEL:-}" != slurm-gb200-* && "${CI_RUNNER_LABEL:-}" != slurm-gb300-* && "${CI_RUNNER_LABEL:-}" != slurm-b300-* ]]; then
         return 0
     fi
 
@@ -159,9 +161,9 @@ python3 -m pip install --upgrade --ignore-installed --break-system-packages \
     pip setuptools wheel
 
 # ============================================================
-# Step 3: Sync FlashInfer JIT cache on GB200/B200
+# Step 3: Sync FlashInfer JIT cache on Blackwell runners
 # ============================================================
-echo "=== Step 3: Sync FlashInfer JIT cache on GB200/B200 ==="
+echo "=== Step 3: Sync FlashInfer JIT cache on Blackwell runners ==="
 ensure_flashinfer_jit_cache
 
 # ============================================================
@@ -188,6 +190,7 @@ cd ${WORKSPACE}
 export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu${CUINDEX}"
 TOKENSPEED_KERNEL_BACKEND=cuda FLASHINFER_CUDA_ARCH_LIST="${FI_ARCH}" \
 pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolation -v
+show_nvcc_cache_stats after
 
 # ============================================================
 # Step 5: Install TokenSpeed Scheduler (C++)
@@ -229,6 +232,8 @@ fi
 
 # ============================================================
 # Step 8: Pin critical kernel deps to exact versions
+# Published packages can be reused when their pins are already satisfied.
+# Source installs above still need rebuilding even without a version bump.
 # ============================================================
 echo "=== Step 8: Pin critical kernel deps ==="
 pin_version() {
@@ -246,9 +251,9 @@ if [ -n "${CUTLASS_DSL_SPEC}" ]; then
         "nvidia-cutlass-dsl-libs-core==${CUTLASS_DSL_VERSION}"
         "nvidia-cutlass-dsl-libs-cu${CUDA_MAJOR}==${CUTLASS_DSL_VERSION}"
     )
-    echo "Force-reinstalling pinned Cutlass DSL packages: ${CUTLASS_DSL_DEPS[*]}"
+    echo "Ensuring pinned Cutlass DSL packages: ${CUTLASS_DSL_DEPS[*]}"
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${CUTLASS_DSL_DEPS[@]}"
+        --no-deps "${CUTLASS_DSL_DEPS[@]}"
 fi
 
 FLASHINFER_PYTHON_SPEC="$(pin_version flashinfer-python)"
@@ -257,6 +262,7 @@ if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
     case "${FLASHINFER_VERSION}" in
         0.6.18) FLASHINFER_CUBIN_SHA256="2dd65c0fcfc6bc44c67f148530de5372979c2e3d260e47935730f94156d4d873" ;;
         0.7.0) FLASHINFER_CUBIN_SHA256="f1821e11ad4ea9666a09c2b04cc16b1e34f601296dc7a7b689649281c0358a9c" ;;
+        0.7.1rc2) FLASHINFER_CUBIN_SHA256="7c8e7dc24ca8d97c00bc0709fc6b0882676c8a7fd65bf2dbc8021b88f4ec3c0f" ;;
         *) echo "No SHA256 pinned for flashinfer-cubin ${FLASHINFER_VERSION}" >&2; exit 1 ;;
     esac
     # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,
@@ -269,13 +275,17 @@ if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
         FLASHINFER_RELEASE_TAG="v${FLASHINFER_VERSION}"
     fi
     FLASHINFER_CUBIN_WHEEL_URL="${FLASHINFER_RELEASE_BASE}/${FLASHINFER_RELEASE_TAG}/flashinfer_cubin-${FLASHINFER_VERSION}-py3-none-any.whl"
-    FLASHINFER_CUBIN_WHEEL_SOURCE="$(cache_remote_wheel "${FLASHINFER_CUBIN_WHEEL_URL}" "${FLASHINFER_CUBIN_SHA256}")"
-    echo "Force-reinstalling pinned FlashInfer Python: ${FLASHINFER_PYTHON_SPEC}"
+    echo "Ensuring pinned FlashInfer Python: ${FLASHINFER_PYTHON_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${FLASHINFER_PYTHON_SPEC}"
-    echo "Installing FlashInfer cubin from GitHub Release: ${FLASHINFER_CUBIN_WHEEL_URL}"
-    pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${FLASHINFER_CUBIN_WHEEL_SOURCE}"
+        --no-deps "${FLASHINFER_PYTHON_SPEC}"
+    if installed_wheel_matches flashinfer-cubin "${FLASHINFER_VERSION}" "${FLASHINFER_CUBIN_SHA256}"; then
+        echo "Pinned FlashInfer cubin is already installed; skipping reinstall."
+    else
+        FLASHINFER_CUBIN_WHEEL_SOURCE="$(cache_remote_wheel "${FLASHINFER_CUBIN_WHEEL_URL}" "${FLASHINFER_CUBIN_SHA256}")"
+        echo "Installing FlashInfer cubin from GitHub Release: ${FLASHINFER_CUBIN_WHEEL_URL}"
+        pip_install_with_retry pip3 install --break-system-packages \
+            --force-reinstall --no-deps "${FLASHINFER_CUBIN_WHEEL_SOURCE}"
+    fi
 else
     echo "No FlashInfer Python pin found in ${CUDA_REQ}; skipping FlashInfer installs."
 fi
@@ -283,9 +293,9 @@ fi
 THIRDPARTY_REQ="${WORKSPACE}/tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"
 FA4_SPEC="$(grep -E '^tokenspeed-fa4(\[[^]]+\])?==' "${THIRDPARTY_REQ}" | head -n1 | tr -d '[:space:]')"
 if [ -n "${FA4_SPEC}" ]; then
-    echo "Force-reinstalling pinned FA4: ${FA4_SPEC}"
+    echo "Ensuring pinned FA4: ${FA4_SPEC}"
     pip_install_with_retry pip3 install --break-system-packages \
-        --force-reinstall --no-deps "${FA4_SPEC}"
+        --no-deps "${FA4_SPEC}"
 else
     echo "No tokenspeed-fa4 pin found in ${THIRDPARTY_REQ}; skipping FA4 reinstall."
 fi
@@ -340,7 +350,9 @@ expected_cuda = f"{sys.argv[3][:-1]}.{sys.argv[3][-1]}"
 print(f"Torch CUDA runtime: {torch.version.cuda}", flush=True)
 if torch.version.cuda != expected_cuda:
     raise SystemExit(f"Expected Torch CUDA {expected_cuda}, got {torch.version.cuda}")
-if os.environ.get("CI_RUNNER_LABEL", "").startswith(("gb200", "b200", "slurm-gb200-")):
+if os.environ.get("CI_RUNNER_LABEL", "").startswith(
+    ("gb200", "gb300", "b200", "b300", "slurm-gb200-", "slurm-gb300-", "slurm-b300-")
+):
     url, expected, installed = install_url_if_needed(Path(sys.argv[1]), sys.argv[3])
     print(f"Installed flashinfer-jit-cache=={installed}", flush=True)
     if url is not None:
