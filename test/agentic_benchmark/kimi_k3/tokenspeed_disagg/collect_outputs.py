@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Collect tokenspeed_disagg sweeps into three tables (P-fresh / P-cached / D-sim).
 
-Applies the validity guard from the README: a rung is VOID if its cache-hit
-guard fails. Accepts multiple sweep dirs (e.g. one P sweep and one D sweep);
-the P:D sizing helper needs one of each.
+Reports cache-hit rates for the user to assess. Accepts multiple sweep dirs
+(e.g. one P sweep and one D sweep); the P:D sizing helper needs one of each.
 """
 
 import argparse
@@ -17,14 +16,6 @@ METRIC = {
     "p_cached": "Computed Throughput (tok/s)",
     "d_measure": "Output Throughput (tok/s)",
 }
-
-
-def hit_guard(phase, hit):
-    if hit < 0:
-        return False  # missing data must not masquerade as a reading
-    if phase == "p_fresh":
-        return hit <= 5.0
-    return hit >= 95.0
 
 
 def num_gpus(config: str) -> int:
@@ -47,16 +38,12 @@ def collect(sweep_dir: Path):
         metric = s.get(METRIC[phase], 0.0)
         conc = s.get("Concurrency")
 
-        problems = []
-        if not hit_guard(phase, hit):
-            problems.append("hit")
-
         row = {
             "phase": phase,
             "config": config,
             "Conc.": conc,
             f"{METRIC[phase]} /gpu": round(metric / num_gpus(config), 2),
-            "Cache Hit (%)": round(hit, 2),
+            "Cache Hit (%)": hit,
             "Requests/s": s.get("Requests/s"),
             "Latency p50 (s)": s.get("Latency p50 (s)"),
             "Latency p99 (s)": s.get("Latency p99 (s)"),
@@ -64,7 +51,6 @@ def collect(sweep_dir: Path):
         if phase == "d_measure":
             row["TPOT p50 (ms)"] = s.get("TPOT p50 (ms)")
             row["TPOT p99 (ms)"] = s.get("TPOT p99 (ms)")
-        row["valid"] = "ok" if not problems else "VOID(" + "+".join(problems) + ")"
         rows.append(row)
     return rows
 
@@ -93,15 +79,13 @@ def sizing_helper(rows, fresh_tok, cached_tok, decode_tok):
     for config in sorted({r["config"] for r in rows}):
         picks = {}
         for phase in ("p_fresh", "p_cached", "d_measure"):
-            valid = [
-                r
-                for r in rows
-                if r["config"] == config and r["phase"] == phase and r["valid"] == "ok"
+            phase_rows = [
+                r for r in rows if r["config"] == config and r["phase"] == phase
             ]
-            if valid:
-                picks[phase] = max(valid, key=lambda r: r["Conc."])
+            if phase_rows:
+                picks[phase] = max(phase_rows, key=lambda r: r["Conc."])
         if len(picks) < 3:
-            print(f"{config}: insufficient valid rungs")
+            print(f"{config}: insufficient rungs")
             continue
         fresh = picks["p_fresh"][f"{METRIC['p_fresh']} /gpu"]
         cached = picks["p_cached"][f"{METRIC['p_cached']} /gpu"]

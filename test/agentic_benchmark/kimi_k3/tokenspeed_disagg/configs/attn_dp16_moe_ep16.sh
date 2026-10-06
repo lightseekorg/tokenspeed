@@ -2,15 +2,17 @@
 
 set -euo pipefail
 
+export TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE=4
+
 exec ts serve \
     --model nvidia/Kimi-K3-NVFP4 \
     --data-parallel-size 16 \
     --ep-size 16 \
     --max-model-len 80000 \
-    --max-num-seqs 128 \
-    --max-prefill-tokens 8192 \
-    --chunked-prefill-size 8192 \
-    --gpu-memory-utilization 0.8 \
+    --max-num-seqs 512 \
+    --max-prefill-tokens 4096 \
+    --chunked-prefill-size 4096 \
+    --gpu-memory-utilization 0.9 \
     --kvstore-size 80 \
     --disable-cuda-graph-padding \
     --trust-remote-code \
