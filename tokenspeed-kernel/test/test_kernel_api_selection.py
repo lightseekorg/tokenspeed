@@ -982,11 +982,11 @@ def test_mm_non_native_out_kernel_copies_to_out(monkeypatch) -> None:
     torch.testing.assert_close(out, expected)
 
 
-def _mm_nvfp4() -> torch.Tensor:
-    a = torch.empty((4, 64), dtype=torch.uint8)
-    b = torch.empty((128, 64), dtype=torch.uint8)
-    a_scales = torch.empty((4, 1), dtype=torch.float32)
-    b_scales = torch.empty((128, 1), dtype=torch.float32)
+def _mm_nvfp4(m: int, n: int, k_packed: int) -> torch.Tensor:
+    a = torch.empty((m, k_packed), dtype=torch.uint8)
+    b = torch.empty((n, k_packed), dtype=torch.uint8)
+    a_scales = torch.empty((m, 1), dtype=torch.float32)
+    b_scales = torch.empty((n, 1), dtype=torch.float32)
     alpha = torch.empty((), dtype=torch.float32)
     return tokenspeed_kernel.mm(
         a,
@@ -5606,12 +5606,47 @@ _CASES = [
         _mm_mxfp8,
     ),
     _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "gemm",
+        "mm",
+        "flashinfer_cute_dsl_mm_nvfp4",
+        partial(_mm_nvfp4, 4, 128, 64),
+    ),
+    _case(
+        _is_blackwell_sm103,
+        "blackwell-sm103",
+        "gemm",
+        "mm",
+        "flashinfer_cute_dsl_mm_nvfp4",
+        partial(_mm_nvfp4, 4, 128, 64),
+    ),
+    _case(
         _is_blackwell_plus,
         "blackwell-plus",
         "gemm",
         "mm",
         "cublaslt_mm_nvfp4",
-        _mm_nvfp4,
+        partial(_mm_nvfp4, _gemm_flashinfer.NVFP4_CUTE_DSL_MAX_M + 1, 128, 64),
+        id_suffix="past-cute-dsl-m",
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "gemm",
+        "mm",
+        "cublaslt_mm_nvfp4",
+        partial(_mm_nvfp4, 4, 132, 64),
+        id_suffix="n-not-8-aligned",
+    ),
+    _case(
+        _is_blackwell_sm100,
+        "blackwell-sm100",
+        "gemm",
+        "mm",
+        "cublaslt_mm_nvfp4",
+        partial(_mm_nvfp4, 4, 128, _gemm_flashinfer.NVFP4_CUTE_DSL_MAX_K // 2 + 16),
+        id_suffix="past-cute-dsl-k",
     ),
     _case(
         _is_blackwell_sm100,
