@@ -59,6 +59,7 @@ def test_model_change_keeps_focused_tests_and_manual_ci(monkeypatch):
     task = next(t for t in data["catalog"] if t["config"] == config)
     assert task["triggers"] == ["manual"]
     assert task["runners"] == ["b200v2-4gpu"]
+    assert task["slurm_runners"] == {"gb200": ["b200-4gpu"], "gb300": ["b200-4gpu"]}
     assert "test_deepseek_v41_pd_1p1d.py" in task["targets"]["commands"][0]
     assert any("qwen" in t["config"] for t in data["catalog"])
     result = planner.proposal(
@@ -70,7 +71,8 @@ def test_model_change_keeps_focused_tests_and_manual_ci(monkeypatch):
                 "tasks": [
                     {
                         "config": config,
-                        "runner": "b200v2-4gpu",
+                        "runner": "b200-4gpu",
+                        "cluster": "gb200",
                         "reason": "Verify history across PD cache handoff.",
                     }
                 ],
@@ -83,6 +85,7 @@ def test_model_change_keeps_focused_tests_and_manual_ci(monkeypatch):
     assert [t["path"] for t in result["tests"]] == [test]
     assert [t["config"] for t in result["tasks"]] == [config]
     assert "qwen" not in planner.render(result)
+    assert "Slurm `gb200`" in planner.render(result)
 
 
 def test_proposal_cannot_invent_runner_or_command():
@@ -107,6 +110,7 @@ def test_proposal_cannot_invent_runner_or_command():
             {
                 "config": task["config"],
                 "runner": "arbitrary-command",
+                "cluster": "gb200",
                 "reason": "Changed caller.",
             }
         ],

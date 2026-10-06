@@ -18,9 +18,18 @@ by 1-2 existing CI tasks, choosing one suitable runner first. These are prioriti
 not an exhaustive safety checklist. Keep the summary to two short sentences and
 each reason to one short sentence naming the changed function/path, the behavior
 at risk, and what that test verifies. Do not enumerate every assertion.
-Use the existing K8s/Slurm dispatch pools: prefer the configured B200 pool for
-NVIDIA tests, AMD for AMD-specific changes, and Slurm for ARM/distributed needs.
+Use existing dispatch pools: prefer Slurm GB200 for NVIDIA; check Slurm GB300
+only when GB200 capacity is unavailable, or when the task requires GB300.
+Use K8s AMD for AMD-specific changes and B200 for B200-specific verification.
+Cross-hardware diagnosis does not establish affected-hardware correctness/performance.
 Do not prioritize a declared runner that those dispatch workflows cannot select.
+For Slurm set cluster to gb200/gb300 and choose an original declared label from
+that task's slurm_runners map; B200 logical labels can run on GB200. For K8s set
+cluster to empty and choose from runners. You have no live scheduler data: do not
+claim capacity is full or submit duplicate recommendations to both clusters.
+Use existing Slurm Dispatch with yaml=off, match=the full config path, runners=the
+single chosen label, task_types=the selected type and trigger=all to isolate one
+task; single-YAML mode can replay multiple declared labels on the same cluster.
 Do not select unrelated model families, every runner, or a broad runtime suite
 when focused tests cover the change. A shared directory alone does not justify
 full CI. Broaden only when a concrete shared caller proves additional impact.
@@ -41,6 +50,7 @@ Return only a JSON object (no Markdown fences) with exactly these keys:
 {"summary":"brief scope and coverage rationale",
  "tests":[{"path":"existing test file","reason":"code-to-test evidence"}],
  "tasks":[{"config":"catalog config path","runner":"catalog runner",
+           "cluster":"gb200, gb300, or empty for K8s",
            "reason":"changed path and behavior covered"}],
  "conflicts":"resolution guidance, or empty string when no known conflict"}.
 Do not include URLs, API details, credentials, email addresses, absolute paths

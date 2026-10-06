@@ -28,17 +28,19 @@ from pathlib import Path
 
 
 def task_key(task: dict) -> str:
-    return f"{task['config']}@{task['runner']}"
+    return f"{task['config']}@{task['runner']}@{task['cluster']}"
 
 
 def context(source: Path, head: str, base: str) -> dict:
     # Reuse task validation and target discovery, including manual-only tasks.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "test/ci_system"))
     from pipeline import (
+        GB200_RUNNER_PREFIXES,
         find_task_files,
         normalize_task,
         resolve_runner_labels,
         summarize_task_targets,
+        validate_gb300_runner_alias,
     )
 
     paths = subprocess.run(
@@ -68,12 +70,26 @@ def context(source: Path, head: str, base: str) -> dict:
     tasks = []
     for path in find_task_files(source / "test/ci"):
         task = normalize_task(path, source)
+        labels = task["runner"]["labels"]
+        slurm = {"gb200": [], "gb300": []}
+        for label in labels:
+            # Slurm Dispatch accepts original B200 labels on GB200 too.
+            if label.startswith(("b200-", *(p + "-" for p in GB200_RUNNER_PREFIXES))):
+                slurm["gb200"].append(label)
+            prefix = "slurm-" if label.startswith("slurm-") else ""
+            suffix = label.removeprefix(prefix).split("-", 1)[-1]
+            try:
+                validate_gb300_runner_alias(label, f"{prefix}gb300-{suffix}")
+            except ValueError:
+                continue
+            slurm["gb300"].append(label)
         tasks.append(
             {
                 "config": task["_source_path"],
                 "name": task["name"],
                 "type": task["type"],
-                "runners": resolve_runner_labels(task["runner"]["labels"]),
+                "runners": resolve_runner_labels(labels),
+                "slurm_runners": slurm,
                 "triggers": task["triggers"],
                 "targets": summarize_task_targets(task, source),
                 "server_command": task.get("server", {}).get("command", ""),
@@ -133,15 +149,17 @@ def proposal(raw: str, data: dict) -> dict:
             raise ValueError("Proposed test must be an existing test file.")
         tests[choice["path"]] = choice
     catalog = {
-        task_key({"config": t["config"], "runner": runner}): t
+        task_key({"config": t["config"], "runner": runner, "cluster": cluster}): t
         for t in data["catalog"]
-        for runner in t["runners"]
+        for cluster, runners in {"": t["runners"], **t.get("slurm_runners", {})}.items()
+        for runner in runners
     }
     selected = {}
     for choice in response["tasks"]:
         if not isinstance(choice, dict) or set(choice) != {
             "config",
             "runner",
+            "cluster",
             "reason",
         }:
             raise ValueError("Invalid proposed task.")
@@ -185,9 +203,17 @@ def render(plan: dict) -> str:
     if plan["tasks"]:
         lines += ["", "**Existing CI tasks, in priority order**", ""]
         for task in plan["tasks"]:
-            lines.append(
-                f"- `{task['config']}` on `{task['runner']}`: {task['reason']}"
-            )
+            target = f"`{task['runner']}`"
+            if task["cluster"]:
+                target = f"Slurm `{task['cluster']}` (logical runner {target})"
+                if task["runner"].removeprefix("slurm-").startswith("b200-"):
+                    target += "; cross-hardware validation of a B200-declared task"
+            lines.append(f"- `{task['config']}` on {target}: {task['reason']}")
+        if any(task["cluster"] == "gb200" for task in plan["tasks"]):
+            lines += [
+                "",
+                "Use GB200 first; check GB300 capacity if GB200 is full. Do not submit the same validation to both clusters.",
+            ]
     else:
         lines += [
             "",

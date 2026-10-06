@@ -131,5 +131,11 @@ Recommendations must refer to tracked test files and catalogued tasks/runners.
 This is advisory prioritization; required checks and merge policy are unchanged.
 
 Run diagnostics through the existing K8s Dispatch and Slurm Dispatch workflows.
+Prioritize Slurm GB200 for NVIDIA, check GB300 if GB200 is full, and use K8s AMD
+for AMD changes. Slurm recommendations retain declared logical runner labels;
+they name the actual cluster separately and mark B200 tasks as cross-hardware.
+For a single Slurm task use bulk mode (`yaml=off`) with its full config path as
+`match`, one declared `runners` label, its `task_types`, and `trigger=all`; this
+avoids single-YAML mode replaying multiple labels on the same physical cluster.
 Retry Failed CI Cases replays retained Slurm reports. Completion evaluation,
 automatic dispatch, source repair and merge-policy integration are separate work.
