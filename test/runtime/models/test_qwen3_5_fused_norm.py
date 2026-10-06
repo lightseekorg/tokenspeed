@@ -22,6 +22,8 @@
 
 import os
 import sys
+import weakref
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +38,8 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5TextConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers import layernorm
+from tokenspeed.runtime.layers.dense import fp8 as dense_fp8
+from tokenspeed.runtime.layers.dense import nvfp4 as dense_nvfp4
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -43,6 +47,7 @@ from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+from tokenspeed.runtime.models import qwen3_5_moe
 from tokenspeed.runtime.models.qwen3_5 import (
     Qwen3_5AttentionDecoderLayer,
     Qwen3_5LinearDecoderLayer,
@@ -50,6 +55,7 @@ from tokenspeed.runtime.models.qwen3_5 import (
     _post_attn_norm,
 )
 from tokenspeed.runtime.models.qwen3_5_moe import Qwen3_5MoeMLP
+from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5DraftAttentionDecoderLayer
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 register_cuda_ci(
@@ -151,6 +157,25 @@ def test_static_fp8_input_scale_hook(scheme: str) -> None:
         assert scale is None
 
 
+def _count_quant_launches(monkeypatch) -> Counter:
+    launches = Counter()
+    static_quant_fp8 = dense_fp8.static_quant_fp8
+    fp4_quantize = dense_nvfp4.fp4_quantize
+
+    def counting_static_quant_fp8(*args, **kwargs):
+        launches["fp8"] += 1
+        return static_quant_fp8(*args, **kwargs)
+
+    def counting_fp4_quantize(*args, **kwargs):
+        launches["nvfp4"] += 1
+        return fp4_quantize(*args, **kwargs)
+
+    monkeypatch.setattr(dense_fp8, "static_quant_fp8", counting_static_quant_fp8)
+    monkeypatch.setattr(dense_nvfp4, "fp4_quantize", counting_fp4_quantize)
+    monkeypatch.setattr(qwen3_5_moe, "fp4_quantize", counting_fp4_quantize)
+    return launches
+
+
 def _fill_nvfp4(layer, generator: torch.Generator, input_scale: float) -> None:
     layer.weight.data.copy_(
         torch.randint(
@@ -184,6 +209,7 @@ def test_mlp_takes_the_nvfp4_copy_as_its_own_quant(
     _fill_nvfp4(mlp.gate_up_proj, generator, 0.05)
     _fill_nvfp4(mlp.down_proj, generator, 0.07)
     norm = _norm()
+    launches = _count_quant_launches(monkeypatch)
 
     for rows in (0, 1, 129):
         torch.manual_seed(rows)
@@ -194,9 +220,14 @@ def test_mlp_takes_the_nvfp4_copy_as_its_own_quant(
         )
 
         assert normed_fp4 is not None
-        torch.testing.assert_close(
-            mlp.forward_prequantized(normed, normed_fp4), mlp(normed), atol=0, rtol=0
-        )
+        launches.clear()
+        prequantized = mlp.forward_prequantized(normed, normed_fp4)
+        fused_launches = launches["nvfp4"]
+        launches.clear()
+        expected = mlp(normed)
+        torch.testing.assert_close(prequantized, expected, atol=0, rtol=0)
+        # The copy stands in for gate_up_proj's own input quant.
+        assert launches["nvfp4"] - fused_launches == (1 if rows else 0)
 
 
 class _StubAttention(torch.nn.Module):
@@ -214,6 +245,10 @@ class _StubAttention(torch.nn.Module):
         k = k.reshape(rows, self.kv_heads, self.head_dim).float()
         k = k.repeat_interleave(self.heads // self.kv_heads, dim=1)
         return torch.tanh(q * 0.05 + k * 0.03).reshape(rows, -1).to(v.dtype)
+
+    def attend_live_rows(self, q, k, v, positions, ctx):
+        rows = ctx.gather_ids
+        return self.forward(q[rows], k[rows], v[rows], positions[rows], ctx)
 
 
 class _StubGDNBackend:
@@ -271,9 +306,11 @@ def _decoder_layer(kind: str, split_gdn: bool):
     quantized = {f"{prefix}.{leaf}": "FP8" for leaf in fp8_leaves}
     for leaf in ("gate_proj", "up_proj", "down_proj"):
         quantized[f"{prefix}.mlp.{leaf}"] = "NVFP4"
-    layer_cls = (
-        Qwen3_5LinearDecoderLayer if kind == "linear" else Qwen3_5AttentionDecoderLayer
-    )
+    layer_cls = {
+        "linear": Qwen3_5LinearDecoderLayer,
+        "attention": Qwen3_5AttentionDecoderLayer,
+        "draft": Qwen3_5DraftAttentionDecoderLayer,
+    }[kind]
     layer = layer_cls(
         config,
         Mapping(rank=0, world_size=1),
@@ -288,7 +325,7 @@ def _decoder_layer(kind: str, split_gdn: bool):
     # Distinct input scales, so a copy made with another projection's scale shows.
     _fill_nvfp4(layer.mlp.gate_up_proj, generator, 0.05)
     _fill_nvfp4(layer.mlp.down_proj, generator, 0.07)
-    if kind == "attention":
+    if kind != "linear":
         _fill_fp8(layer.qkv_proj, generator, 0.02)
         _fill_fp8(layer.o_proj, generator, 0.03)
         layer.attn = _StubAttention(layer.num_heads, layer.num_kv_heads, layer.head_dim)
@@ -306,9 +343,11 @@ def _decoder_layer(kind: str, split_gdn: bool):
     return layer
 
 
-def _run_layer(layer, kind: str, hidden_states, residual):
+def _run_layer(layer, kind: str, hidden_states, residual, live_rows):
     rows = hidden_states.shape[0]
     ctx = SimpleNamespace(
+        draft_narrowing=None if live_rows is None else object(),
+        gather_ids=live_rows,
         query_shard=None,
         collective_global_num_tokens=None,
         global_num_tokens=None,
@@ -329,28 +368,57 @@ def _run_layer(layer, kind: str, hidden_states, residual):
 
 @pytest.mark.skipif(not _IS_BLACKWELL, reason="NVFP4 GEMMs need Blackwell")
 @pytest.mark.parametrize(
-    "kind,split_gdn", [("attention", False), ("linear", False), ("linear", True)]
+    "kind,split_gdn,narrow",
+    [
+        ("attention", False, False),
+        ("linear", False, False),
+        ("linear", True, False),
+        ("draft", False, False),
+        ("draft", False, True),
+    ],
 )
 @torch.no_grad()
 def test_decoder_layer_hands_each_projection_its_own_quant(
-    monkeypatch, bf16_default_dtype, kind: str, split_gdn: bool
+    monkeypatch, bf16_default_dtype, kind: str, split_gdn: bool, narrow: bool
 ) -> None:
     monkeypatch.setitem(global_server_args_dict, "layer_boundary_norm", "fused")
     layer = _decoder_layer(kind, split_gdn)
     copies = []
+    fp8_copies = []
+    fp8_copy_alive = []
     add_rmsnorm = layernorm.add_rmsnorm
 
     def recording_add_rmsnorm(*args, **kwargs):
         copies.append((kwargs["out_fp8"] is not None, kwargs["out_fp4"] is not None))
+        fp8_copy_alive.append(any(copy() is not None for copy in fp8_copies))
+        if kwargs["out_fp8"] is not None:
+            fp8_copies.append(weakref.ref(kwargs["out_fp8"]))
         return add_rmsnorm(*args, **kwargs)
 
     monkeypatch.setattr(layernorm, "add_rmsnorm", recording_add_rmsnorm)
+    launches = _count_quant_launches(monkeypatch)
     torch.manual_seed(1)
     hidden_states = torch.randn(129, _HIDDEN, device="cuda") * 4
-    residual = torch.randn_like(hidden_states) * 30
+    # The single-layer MTP draft opens without a residual and may narrow to live rows.
+    residual = None if kind == "draft" else torch.randn_like(hidden_states) * 30
+    live_rows = torch.arange(0, 129, 3, device="cuda") if narrow else None
 
-    out, new_residual = _run_layer(layer, kind, hidden_states.clone(), residual.clone())
-    assert copies == [(True, False), (False, True)]
+    def run():
+        launches.clear()
+        outputs = _run_layer(
+            layer,
+            kind,
+            hidden_states.clone(),
+            None if residual is None else residual.clone(),
+            live_rows,
+        )
+        return outputs, Counter(launches)
+
+    (out, new_residual), fused_launches = run()
+    input_copy = kind != "draft"
+    assert copies == ([(True, False), (False, True)] if input_copy else [(False, True)])
+    # The FP8 copy is freed with its consumer, before the post-attention norm runs.
+    assert fp8_copy_alive == [False] * len(copies)
 
     # Without the hooks every projection quantizes the same normed rows itself.
     monkeypatch.setattr(
@@ -359,9 +427,10 @@ def test_decoder_layer_hands_each_projection_its_own_quant(
     monkeypatch.setattr(
         Nvfp4LinearMethod, "nvfp4_global_scale", lambda self, layer: None
     )
-    expected, expected_residual = _run_layer(
-        layer, kind, hidden_states.clone(), residual.clone()
-    )
-    assert copies[2:] == [(False, False), (False, False)]
+    (expected, expected_residual), own_launches = run()
+    assert not any(fp8 or fp4 for fp8, fp4 in copies[2 if input_copy else 1 :])
     assert torch.equal(new_residual, expected_residual)
     assert torch.equal(out, expected)
+    # Each copy replaces exactly its consumer's own input quant.
+    assert own_launches["fp8"] - fused_launches["fp8"] == int(input_copy)
+    assert own_launches["nvfp4"] - fused_launches["nvfp4"] == 1

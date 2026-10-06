@@ -699,6 +699,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_fp8,
                 ctx,
             )
+            # Free the copy once consumed, as the projection frees its own quant.
+            del hidden_fp8
 
             hidden_states, hidden_fp4, residual = _post_attn_norm(
                 self.comm_manager,
@@ -960,6 +962,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states=hidden_states if hidden_fp8 is None else hidden_fp8,
                 ctx=ctx,
             )
+            # Free the copy once consumed, as the projection frees its own quant.
+            del hidden_fp8
             residual = self._maybe_narrow_residual(residual, ctx)
             hidden_states, hidden_fp4, residual = _post_attn_norm(
                 self.comm_manager,

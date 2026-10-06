@@ -32,6 +32,7 @@ from ci_system.ci_register import register_cuda_ci
 from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.layers import layernorm
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 
 register_cuda_ci(
@@ -148,3 +149,22 @@ def test_add_norm_with_fp4_copies_bf16_rows_only() -> None:
 
     _assert_same_norm(normed, new_residual, expected, expected_residual)
     assert normed_fp4 is None
+
+
+def test_add_norm_makes_no_copy_on_amd(monkeypatch) -> None:
+    # GemmaRMSNorm's AMD path is plain torch, so it runs here too.
+    monkeypatch.setattr(layernorm, "_is_amd", True)
+    norm, x, residual = _norm_and_rows(14, 5120)
+    expected, expected_residual = norm(x.clone(), residual.clone())
+
+    with_fp8 = norm.add_norm_with_fp8(
+        x.clone(), residual.clone(), torch.tensor([0.02], device="cuda")
+    )
+    with_fp4 = norm.add_norm_with_fp4(
+        x.clone(), residual.clone(), torch.tensor([7.5], device="cuda")
+    )
+
+    for normed, copy, new_residual in (with_fp8, with_fp4):
+        assert copy is None
+        assert torch.equal(normed, expected)
+        assert torch.equal(new_residual, expected_residual)
