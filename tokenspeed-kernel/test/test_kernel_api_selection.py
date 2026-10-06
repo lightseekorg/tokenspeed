@@ -500,12 +500,13 @@ def _mm_dense() -> torch.Tensor:
 
 def _hadamard_transform(
     *,
-    contiguous: bool = True,
+    contiguous: bool,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
     if contiguous:
-        x = torch.empty((8_192, 32, 128), dtype=torch.bfloat16, device="meta")
+        x = torch.empty((8_192, 32, 128), dtype=dtype, device="meta")
     else:
-        x = torch.empty((8_192, 32, 256), dtype=torch.bfloat16, device="meta")[..., ::2]
+        x = torch.empty((8_192, 32, 256), dtype=dtype, device="meta")[..., ::2]
     return tokenspeed_kernel.hadamard_transform(x, scale=128**-0.5)
 
 
@@ -4624,14 +4625,14 @@ def _case(
 
 
 _CASES = [
-    # GFX950 uses Gluon for contiguous BF16; other layouts retain Triton.
+    # Only contiguous BF16 on GFX950 uses Gluon; other AMD inputs retain Triton.
     _case(
         _is_cdna4,
         "cdna4",
         "transform",
         "hadamard_transform",
         "gluon_hadamard_transform_128_gfx950",
-        _hadamard_transform,
+        partial(_hadamard_transform, contiguous=True, dtype=torch.bfloat16),
         id_suffix="bf16-contiguous",
     ),
     _case(
@@ -4640,8 +4641,29 @@ _CASES = [
         "transform",
         "hadamard_transform",
         "triton_hadamard_transform_128",
-        partial(_hadamard_transform, contiguous=False),
+        partial(_hadamard_transform, contiguous=False, dtype=torch.bfloat16),
         id_suffix="bf16-strided-fallback",
+    ),
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "transform",
+            "hadamard_transform",
+            "triton_hadamard_transform_128",
+            partial(_hadamard_transform, contiguous=True, dtype=dtype),
+            id_suffix=f"{dtype}-fallback",
+        )
+        for dtype in (torch.float16, torch.float32)
+    ],
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "transform",
+        "hadamard_transform",
+        "triton_hadamard_transform_128",
+        partial(_hadamard_transform, contiguous=True, dtype=torch.bfloat16),
+        id_suffix="bf16-architecture-fallback",
     ),
     # Attention API x architecture golden cases.
     _case(
