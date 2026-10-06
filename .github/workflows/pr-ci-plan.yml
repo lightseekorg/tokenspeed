@@ -63,10 +63,3 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: python3 .github/scripts/pr-ci-model.py publish
-
-      - name: Save coverage proposal
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr-ci-plan-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
-          path: ${{ runner.temp }}/ci-plan/plan.json
-          retention-days: 7

@@ -56,7 +56,6 @@ def test_escaped_sensitive_summary_cannot_be_published(tmp_path, monkeypatch):
         "base": "b" * 40,
         "paths": [],
         "broad_groups": [],
-        "policy_changes": [],
         "catalog": [],
         "floor": [],
     }

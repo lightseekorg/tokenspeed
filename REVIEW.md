@@ -114,7 +114,7 @@ organization. Keep the publishing token as a repository secret:
 | `KIMI_API_URL` | Organization variable | Provider API base URL, including its API version path |
 | `KIMI_MODEL` | Organization variable | Model ID accepted by that endpoint |
 | `KIMI_API_KEY` | Organization secret | API token for that endpoint |
-| `LIGHTSEEK_BOT_TOKEN` | Repository secret | Token for `lightseek-bot` with variable/artifact read, PR comment write, and workflow dispatch access |
+| `LIGHTSEEK_BOT_TOKEN` | Repository secret | Token for `lightseek-bot` with organization variable read and PR comment write access |
 
 The planner runs from a separate temporary directory with only `Read`, `Grep`, and
 `Glob` tools. GitHub authentication is available only to the configuration and
@@ -126,20 +126,10 @@ the workflow, so repository write access remains the trust boundary.
 classifier and task catalog. Shared changes retain the full affected baseline;
 vendor-owned changes can propose a focused model/performance subset after the
 unit-test floor. Directly changed per-commit task declarations remain included.
-The validated plan artifact contains only public coverage metadata.
+The task-only and benchmark-suite narrowing uses the existing `pipeline.py scan`
+entrypoint. This workflow posts a proposal; required checks and review follow the
+existing repository merge policy.
 
-[CI assistance](.github/workflows/pr-ci-assist.yml) reads completion events using
-main's tooling, skips fork and obsolete heads, and reports readiness against the
-fresh proposal. Missing or stale plans require the full existing CI. CPU checks,
-review approval, explicit plan acceptance and merge authorization remain required.
-The existing close-event workflow cancels remaining PR tests after a merge.
-
-To diagnose a failed selected task, dispatch CI assistance with `action=dispatch`,
-the PR number, its exact `config` and `runner`, and `backend=auto`, `k8s`, `gb200`
-or `gb300`. It reuses the existing dispatch workflows with an immutable source
-commit and exactly one declared runner. Duplicate requests are skipped; attempt
-2 requires a failed first attempt. A retry pass is only a possible flake, and
-another GPU family is diagnostic evidence rather than an original-hardware pass.
-Completed diagnostics are reported only after their artifacts prove the tested
-commit, task and runner; queued runs and mismatched source records never count.
-Conflict guidance is included in the proposal; source repairs are a separate step.
+Run diagnostics through the existing K8s Dispatch and Slurm Dispatch workflows.
+Retry Failed CI Cases replays retained Slurm reports. Completion evaluation,
+automatic dispatch, source repair and merge-policy integration are separate work.

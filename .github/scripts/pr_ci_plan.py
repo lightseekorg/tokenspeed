@@ -20,10 +20,12 @@
 
 """Build and validate a source-bound CI coverage proposal."""
 
+import io
 import json
 import os
 import subprocess
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -31,10 +33,9 @@ def task_key(task: dict) -> str:
     return f"{task['config']}@{task['runner']}"
 
 
-def context(source: Path, head: str, base: str) -> dict:
+def context(source: Path, head: str, base: str, changed_file: Path) -> dict:
     # Only the established task loader and path classifier determine the floor.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "test/ci_system"))
-    import yaml
     from ci_path_filter import (
         RUNNER_GROUPS,
         VENDOR_WORKFLOWS,
@@ -42,7 +43,7 @@ def context(source: Path, head: str, base: str) -> dict:
         path_vendor,
         task_runner_labels,
     )
-    from pipeline import KERNEL_BENCHMARK_SUITE_DIRECTORY, build_matrix
+    from pipeline import main as scan
 
     paths = subprocess.run(
         [
@@ -61,40 +62,7 @@ def context(source: Path, head: str, base: str) -> dict:
     tasks = {}
     floor = set()
     broad = []
-    policy_changes = []
-    for path in paths:
-        if not path.startswith("test/ci/") or not path.endswith(".yaml"):
-            continue
-        before = subprocess.run(
-            ["git", "show", f"{base}:{path}"],
-            cwd=source,
-            capture_output=True,
-            text=True,
-        )
-        old = yaml.safe_load(before.stdout) if before.returncode == 0 else {}
-        new = (
-            yaml.safe_load((source / path).read_text())
-            if (source / path).is_file()
-            else {}
-        )
-        if not isinstance(old, dict) or not isinstance(new, dict):
-            raise ValueError("Invalid task policy metadata.")
-        if any(
-            old.get(key) != new.get(key)
-            for key in (
-                "optional",
-                "triggers",
-                "runner",
-                "workflow_stage",
-                "type",
-                "slurm",
-                "score_threshold",
-                "perf_threshold",
-                "perf_reference",
-                "retries",
-            )
-        ):
-            policy_changes.append(path)
+    changed_file.write_text("\n".join(paths) + "\n")
     for group in RUNNER_GROUPS:
         if (
             group == "nvidia-gb300-slurm"
@@ -117,32 +85,29 @@ def context(source: Path, head: str, base: str) -> dict:
             os.environ["TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"] = f"h100,b300,{saved}"
         elif group.endswith("-slurm"):
             os.environ["TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"] = ""
+        args = [
+            "scan",
+            "--repo-root",
+            str(source),
+            "--changed-files",
+            str(changed_file),
+            "--trigger",
+            "per-commit",
+            "--runner-group",
+            "nvidia-arm" if group.endswith("-slurm") else group,
+            "--multi-node",
+            "only" if group == "nvidia-gb300-slurm" else "exclude",
+        ]
+        if group == "nvidia-gb300-slurm":
+            args += ["--workflow-stage", "model-test"]
+        output = io.StringIO()
         try:
-            entries = build_matrix(
-                source / "test/ci",
-                source,
-                "per-commit",
-                "nvidia-arm" if group.endswith("-slurm") else group,
-                workflow_stage="model-test" if group == "nvidia-gb300-slurm" else None,
-                multi_node="only" if group == "nvidia-gb300-slurm" else "exclude",
-            )["include"]
+            # Reuse the scanner's task-only and benchmark-suite filtering.
+            with redirect_stdout(output):
+                scan(args)
+            entries = json.loads(output.getvalue())["include"]
         finally:
             os.environ["TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS"] = saved
-        # Match pipeline scan's existing changed-task/suite-only selection.
-        suite_changed = any(
-            p.startswith(KERNEL_BENCHMARK_SUITE_DIRECTORY) for p in paths
-        )
-        if 0 < len(paths) < 300 and all(
-            (p.startswith("test/ci/") and p.endswith(".yaml"))
-            or p.startswith(KERNEL_BENCHMARK_SUITE_DIRECTORY)
-            for p in paths
-        ):
-            entries = [
-                t
-                for t in entries
-                if t["config"] in paths
-                or (suite_changed and t.get("workflow_stage") == "kernel-benchmark")
-            ]
         if group in {"nvidia-arm", "nvidia-x86"}:
             entries = [
                 t
@@ -174,14 +139,16 @@ def context(source: Path, head: str, base: str) -> dict:
         "base": base,
         "paths": paths,
         "broad_groups": broad,
-        "policy_changes": policy_changes,
         "catalog": list(tasks.values()),
         "floor": sorted(floor),
     }
 
 
 def proposal(raw: str, data: dict) -> dict:
-    response = json.loads(raw)
+    try:
+        response = json.loads(raw)
+    except json.JSONDecodeError:
+        raise ValueError("Expected one JSON object without Markdown fences.") from None
     if not isinstance(response, dict) or set(response) != {
         "summary",
         "tasks",
@@ -226,7 +193,6 @@ def proposal(raw: str, data: dict) -> dict:
         "summary": response["summary"],
         "conflicts": response["conflicts"],
         "broad_groups": data["broad_groups"],
-        "policy_changes": data.get("policy_changes", []),
         "tasks": list(selected.values()),
     }
 
@@ -239,16 +205,10 @@ def render(plan: dict) -> str:
         "",
         plan["summary"],
         "",
-        "CPU checks and review approval remain required. This coverage proposal needs explicit acceptance before any merge bypass.",
+        "This is a coverage proposal. Required checks and review follow the existing repository merge policy.",
     ]
     if plan["broad_groups"]:
         lines += ["", "Shared changes retain the full affected test baseline."]
-    if plan["policy_changes"]:
-        lines += [
-            "",
-            "Task scheduling or acceptance metadata changed. This proposal cannot establish merge readiness until those policy changes are reviewed.",
-        ]
-        lines += [f"- `{path}`" for path in plan["policy_changes"]]
     if plan["tasks"]:
         lines += ["", "<details>", "<summary>Selected GPU tasks</summary>", ""]
         for task in plan["tasks"]:
@@ -263,8 +223,4 @@ def render(plan: dict) -> str:
         ]
     if plan["conflicts"]:
         lines += ["", "### Conflict assistance", "", plan["conflicts"]]
-    lines += [
-        "",
-        "Failed selected tasks can be diagnosed with the single-task dispatch workflow at this exact commit. A retry pass is a possible flake; validation on different hardware is diagnostic evidence.",
-    ]
     return "\n".join(lines) + "\n"

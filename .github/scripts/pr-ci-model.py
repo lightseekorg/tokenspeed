@@ -100,6 +100,7 @@ capabilities = ["thinking", "tool_use"]
         Path(os.environ["GITHUB_WORKSPACE"]),
         os.environ["PR_HEAD_SHA"],
         os.environ["PR_BASE_SHA"],
+        root / "changed-files.txt",
     )
     pr = json.loads(
         _command(
@@ -204,12 +205,14 @@ def plan(root: Path) -> None:
         )
     if result.returncode:
         raise SystemExit("CI planning failed or timed out; no plan was published.")
-    plan = proposal(
-        _model_body(root), json.loads(root.joinpath("context.json").read_text())
-    )
+    raw = _model_body(root)
+    try:
+        plan = proposal(raw, json.loads(root.joinpath("context.json").read_text()))
+    except ValueError as error:
+        # The validator emits fixed messages, never the model response.
+        raise SystemExit(f"Invalid CI proposal: {error}") from None
     body = render(plan)
     _check_public_output(body, root)
-    root.joinpath("plan.json").write_text(json.dumps(plan, indent=2) + "\n")
     root.joinpath("comment.md").write_text(body)
 
 

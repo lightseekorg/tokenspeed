@@ -36,7 +36,7 @@ planner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(planner)
 
 
-def test_shared_change_cannot_drop_baseline(monkeypatch):
+def test_shared_change_cannot_drop_baseline(monkeypatch, tmp_path):
     monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
     monkeypatch.setenv("PR_NUMBER", "1")
     monkeypatch.setenv("TOKENSPEED_B200_RUNNER_LABEL", "b200v2")
@@ -49,7 +49,7 @@ def test_shared_change_cannot_drop_baseline(monkeypatch):
         "run",
         lambda *a, **k: SimpleNamespace(stdout="python/tokenspeed/__init__.py\n"),
     )
-    data = planner.context(REPO, "a" * 40, "b" * 40)
+    data = planner.context(REPO, "a" * 40, "b" * 40, tmp_path / "changed.txt")
     result = planner.proposal(
         json.dumps({"summary": "Shared runtime change.", "tasks": [], "conflicts": ""}),
         data,
