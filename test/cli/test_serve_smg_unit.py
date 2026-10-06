@@ -49,6 +49,7 @@ from tokenspeed.cli.serve_smg import (
     KIMI_K3_TOOL_CALL_PARSER,
     _add_rl_control_port,
     _args_with_default_model_parsers,
+    _declares_response_template,
     _free_port_avoiding_ephemeral_range,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
@@ -63,6 +64,8 @@ from tokenspeed.cli.serve_smg import (
     _is_kimi_k3_model,
     _prewarm_hf_tokenizer,
     _set_default_grpc_max_message_bytes,
+    _smg_selects_response_template_parsers,
+    _template_tokenizer,
     run_smg,
 )
 
@@ -1156,3 +1159,467 @@ def test_add_rl_control_port_keeps_a_pinned_port():
     args, url = _add_rl_control_port(["--model", "/tmp/x", "--rl-control-port", "5005"])
     assert args == ["--model", "/tmp/x", "--rl-control-port", "5005"]
     assert url == "http://127.0.0.1:5005"
+
+
+_RESPONSE_TEMPLATE = {
+    "fields": {"thinking": {"open": "<think>", "close": "</think>"}, "content": {}}
+}
+
+
+def _tokenizer_dir(path, tokenizer_file="tokenizer.json", **config):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "tokenizer_config.json").write_text(json.dumps(config))
+    (path / tokenizer_file).write_text("{}")
+    return str(path)
+
+
+@pytest.fixture
+def gateway_supports_templates(monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._smg_selects_response_template_parsers",
+        lambda: True,
+    )
+
+
+def test_template_tokenizer_gets_no_default_reasoning_parser(
+    tmp_path, capsys, gateway_supports_templates
+):
+    # The type is what ts serve checks; the gateway validates the rest.
+    for name, template in (("template", _RESPONSE_TEMPLATE), ("empty", {})):
+        tokenizer = _tokenizer_dir(tmp_path / name, response_template=template)
+
+        gateway_args = _gateway_args_with_default_reasoning_parser(
+            ["--model", tokenizer], tokenizer
+        )
+
+        assert gateway_args == ["--model", tokenizer]
+        lines = capsys.readouterr().out.splitlines()
+        assert len(lines) == 1
+        assert tokenizer in lines[0] and "response_template" in lines[0]
+
+
+def test_tokenizer_without_template_keeps_passthrough(
+    tmp_path, capsys, gateway_supports_templates
+):
+    tokenizers = [
+        _tokenizer_dir(tmp_path / "absent"),
+        # Not an object: the gateway refuses it.
+        *(
+            _tokenizer_dir(tmp_path / name, response_template=value)
+            for name, value in (
+                ("null", None),
+                ("string", ""),
+                ("false", False),
+                ("list", []),
+            )
+        ),
+        # tiktoken: the gateway reads no template for it.
+        _tokenizer_dir(
+            tmp_path / "tiktoken",
+            tokenizer_file="tiktoken.model",
+            response_template=_RESPONSE_TEMPLATE,
+        ),
+    ]
+    for tokenizer in tokenizers:
+        gateway_args = _gateway_args_with_default_reasoning_parser(
+            ["--model", tokenizer], tokenizer
+        )
+
+        assert gateway_args == [
+            "--model",
+            tokenizer,
+            "--reasoning-parser",
+            "passthrough",
+        ]
+    assert capsys.readouterr().out == ""
+
+
+def test_older_gateway_keeps_passthrough_with_a_template(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._smg_selects_response_template_parsers",
+        lambda: False,
+    )
+    tokenizer = _tokenizer_dir(tmp_path, response_template=_RESPONSE_TEMPLATE)
+
+    gateway_args = _gateway_args_with_default_reasoning_parser(
+        ["--model", tokenizer], tokenizer
+    )
+
+    assert gateway_args == ["--model", tokenizer, "--reasoning-parser", "passthrough"]
+    assert capsys.readouterr().out == ""
+
+
+def test_named_parsers_keep_the_default_rules_with_a_template(
+    tmp_path, capsys, gateway_supports_templates
+):
+    tokenizer = _tokenizer_dir(tmp_path, response_template=_RESPONSE_TEMPLATE)
+
+    # An explicit reasoning parser, passthrough included, is kept as is.
+    for parser in ("passthrough", "custom"):
+        args = ["--model", tokenizer, "--reasoning-parser", parser]
+        assert _gateway_args_with_default_reasoning_parser(args, tokenizer) == args
+
+    # A tool parser alone already turns the template off in the gateway, so
+    # the reasoning default still applies.
+    args = ["--model", tokenizer, "--tool-call-parser", "json"]
+    assert _gateway_args_with_default_reasoning_parser(args, tokenizer) == [
+        *args,
+        "--reasoning-parser",
+        "passthrough",
+    ]
+    assert capsys.readouterr().out == ""
+
+
+def test_unreadable_tokenizer_config_counts_as_no_template(
+    tmp_path, gateway_supports_templates
+):
+    for name, content in (
+        ("invalid", b"{not json"),
+        ("binary", b"\xff\xfe\x00{"),
+        ("list", b"[1, 2]"),
+    ):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "tokenizer_config.json").write_bytes(content)
+        (tmp_path / name / "tokenizer.json").write_text("{}")
+    (tmp_path / "dir" / "tokenizer_config.json").mkdir(parents=True)
+    (tmp_path / "dir" / "tokenizer.json").write_text("{}")
+    (tmp_path / "missing").mkdir()
+
+    for name in ("invalid", "binary", "list", "dir", "missing"):
+        assert not _declares_response_template(str(tmp_path / name))
+    for tokenizer in (None, "", str(tmp_path / "no-such-dir"), "not a repo id!"):
+        assert not _declares_response_template(tokenizer)
+    assert _gateway_args_with_default_reasoning_parser(
+        ["--model", "x"], str(tmp_path / "invalid")
+    ) == ["--model", "x", "--reasoning-parser", "passthrough"]
+
+
+def _cache_hub_tokenizer(cache, repo_id, **config):
+    repo = cache / ("models--" + repo_id.replace("/", "--"))
+    (repo / "refs").mkdir(parents=True)
+    (repo / "refs" / "main").write_text("0123abcd")
+    return _tokenizer_dir(repo / "snapshots" / "0123abcd", **config)
+
+
+def test_hub_id_is_read_from_the_local_hf_cache(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+    _cache_hub_tokenizer(
+        tmp_path, "org/with-template", response_template=_RESPONSE_TEMPLATE
+    )
+    _cache_hub_tokenizer(tmp_path, "org/without-template")
+
+    assert _declares_response_template("org/with-template")
+    assert not _declares_response_template("org/without-template")
+    # Not cached: no download, no template.
+    assert not _declares_response_template("org/not-cached")
+
+
+def test_gateway_defaults_leave_both_parsers_to_the_template(
+    tmp_path, gateway_supports_templates
+):
+    tokenizer = _tokenizer_dir(tmp_path, response_template=_RESPONSE_TEMPLATE)
+
+    gateway_args = _gateway_args_with_defaults(["--model", tokenizer], tokenizer)
+
+    assert "--reasoning-parser" not in gateway_args
+    assert "--tool-call-parser" not in gateway_args
+    assert _get_from_args(gateway_args, "--policy") == "passthrough"
+
+
+def test_family_parser_defaults_are_kept_with_a_template(
+    tmp_path, gateway_supports_templates
+):
+    model = _make_kimi_k3_model_dir(tmp_path)
+    _tokenizer_dir(tmp_path, response_template=_RESPONSE_TEMPLATE)
+
+    _, gateway_args = _args_with_default_model_parsers(
+        ["--model", model], ["--model", model]
+    )
+    gateway_args = _gateway_args_with_defaults(gateway_args, model)
+
+    assert gateway_args.count("--reasoning-parser") == 1
+    assert (
+        _get_from_args(gateway_args, "--reasoning-parser") == KIMI_K3_REASONING_PARSER
+    )
+    assert (
+        _get_from_args(gateway_args, "--tool-call-parser") == KIMI_K3_TOOL_CALL_PARSER
+    )
+
+
+def test_template_tokenizer_is_the_gateway_model():
+    assert _template_tokenizer(["--model", "m"], ["--model", "m"]) == "m"
+    assert (
+        _template_tokenizer(["--model", "m", "--tokenizer", "m"], ["--model", "m"])
+        == "m"
+    )
+    # The gateway may parse with either tokenizer, so there is no answer.
+    assert (
+        _template_tokenizer(["--model", "m", "--tokenizer", "t"], ["--model", "m"])
+        is None
+    )
+    assert _template_tokenizer([], []) is None
+
+
+def _sbom(gateway_deps, crates=(), parser_deps=()):
+    """A CycloneDX SBOM in which the ``smg`` crate depends on ``gateway_deps``
+    and the ``tool-parser`` crate on ``parser_deps``."""
+
+    def ref(name):
+        return f"path+file:///smg/{name}#{name}@1.0"
+
+    return {
+        "components": [
+            {"bom-ref": ref(name), "name": name}
+            for name in ("smg", *gateway_deps, *crates, *parser_deps)
+        ],
+        "dependencies": [
+            {"ref": ref("smg"), "dependsOn": [ref(name) for name in gateway_deps]},
+            {
+                "ref": ref("tool-parser"),
+                "dependsOn": [ref(name) for name in parser_deps],
+            },
+        ],
+    }
+
+
+# smg#2719 links the response-template crate into the gateway crate; the pinned
+# tokenspeed-smg has no such crate.
+_SBOM_WITH_TEMPLATES = _sbom(["tool-parser", "smg-response-template"])
+_SBOM_WITHOUT_TEMPLATES = _sbom(["tool-parser"])
+
+
+def _install_smg_dists(monkeypatch, root, sbom_dir="sboms", **sboms):
+    """Make ``importlib.metadata`` find only the given ``smg`` distributions.
+
+    Each keyword names a distribution (``tokenspeed_smg`` or ``smg``) and
+    gives its SBOM: a dict, raw text, or None for a wheel without one. The
+    SBOM is written under ``sbom_dir`` in the ``.dist-info`` directory.
+    """
+    import importlib.metadata as metadata
+
+    dists = {}
+    for key, sbom in sboms.items():
+        name = key.replace("_", "-")
+        info = root / name / f"{key}-1.0.dist-info"
+        info.mkdir(parents=True)
+        (info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n"
+        )
+        record = [f"{info.name}/METADATA,,"]
+        if sbom is not None:
+            (info / sbom_dir).mkdir()
+            text = sbom if isinstance(sbom, str) else json.dumps(sbom)
+            (info / sbom_dir / "smg-python.cyclonedx.json").write_text(text)
+            record.append(f"{info.name}/{sbom_dir}/smg-python.cyclonedx.json,,")
+        (info / "RECORD").write_text("\n".join(record) + "\n")
+        dists[name] = metadata.PathDistribution(info)
+
+    real_distribution = metadata.distribution
+
+    def distribution(name):
+        if name not in ("tokenspeed-smg", "smg"):
+            return real_distribution(name)
+        if name not in dists:
+            raise metadata.PackageNotFoundError(name)
+        return dists[name]
+
+    monkeypatch.setattr(metadata, "distribution", distribution)
+
+
+@pytest.mark.parametrize(
+    "sboms, supported",
+    [
+        ({"tokenspeed_smg": _SBOM_WITH_TEMPLATES}, True),
+        ({"smg": _SBOM_WITH_TEMPLATES}, True),
+        ({"tokenspeed_smg": _SBOM_WITH_TEMPLATES, "smg": _SBOM_WITH_TEMPLATES}, True),
+        ({"tokenspeed_smg": _SBOM_WITHOUT_TEMPLATES}, False),
+        # The crate alone, without the gateway using it.
+        ({"tokenspeed_smg": _sbom(["tool-parser"], ["smg-response-template"])}, False),
+        # Linked into a parser crate only, not into the gateway.
+        (
+            {
+                "tokenspeed_smg": _sbom(
+                    ["tool-parser"], parser_deps=["smg-response-template"]
+                )
+            },
+            False,
+        ),
+        (
+            {"tokenspeed_smg": _SBOM_WITHOUT_TEMPLATES, "smg": _SBOM_WITH_TEMPLATES},
+            False,
+        ),
+        ({"tokenspeed_smg": None}, False),
+        ({"tokenspeed_smg": "{not json"}, False),
+        ({"tokenspeed_smg": {"components": [1], "dependencies": []}}, False),
+        ({}, False),
+    ],
+    ids=[
+        "bundled",
+        "smg-wheel",
+        "both",
+        "pinned",
+        "crate-not-linked",
+        "parser-only",
+        "one-of-two",
+        "no-sbom",
+        "invalid-sbom",
+        "malformed-sbom",
+        "not-installed",
+    ],
+)
+def test_template_support_is_read_from_the_gateway_sbom(
+    tmp_path, monkeypatch, sboms, supported
+):
+    _install_smg_dists(monkeypatch, tmp_path, **sboms)
+
+    assert _smg_selects_response_template_parsers() is supported
+
+
+def test_template_support_reads_sboms_only(tmp_path, monkeypatch):
+    # The same crate graph in another JSON file of the wheel is not its SBOM.
+    _install_smg_dists(
+        monkeypatch, tmp_path, sbom_dir="data", tokenspeed_smg=_SBOM_WITH_TEMPLATES
+    )
+
+    assert _smg_selects_response_template_parsers() is False
+
+
+def _run_smg_from_args_with(monkeypatch, argv, prewarm):
+    captured = {}
+
+    async def fake_run_smg(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.print_logo", lambda: None)
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._check_serve_extra_installed", lambda: None
+    )
+    monkeypatch.setattr("tokenspeed.cli.serve_smg._prewarm_hf_tokenizer", prewarm)
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.run_smg", fake_run_smg)
+
+    from argparse import Namespace
+
+    from tokenspeed.cli.serve_smg import run_smg_from_args
+
+    with pytest.raises(SystemExit) as exc:
+        run_smg_from_args(Namespace(), argv)
+    assert exc.value.code == 0
+    return captured
+
+
+@pytest.mark.parametrize(
+    "sbom, passthrough",
+    [(_SBOM_WITH_TEMPLATES, False), (_SBOM_WITHOUT_TEMPLATES, True)],
+    ids=["gateway-with-templates", "older-gateway"],
+)
+def test_run_smg_from_args_checks_the_installed_gateway(
+    tmp_path, monkeypatch, capsys, sbom, passthrough
+):
+    _install_smg_dists(monkeypatch, tmp_path / "site", tokenspeed_smg=sbom)
+    model = _tokenizer_dir(tmp_path / "model", response_template=_RESPONSE_TEMPLATE)
+
+    captured = _run_smg_from_args_with(
+        monkeypatch, ["--model", model, "--node-rank", "0"], lambda _: None
+    )
+
+    expected = "passthrough" if passthrough else None
+    assert _get_from_args(captured["gateway_args"], "--reasoning-parser") == expected
+    assert ("response_template" in capsys.readouterr().out) is not passthrough
+
+
+def test_run_smg_from_args_reads_the_template_after_prewarm(
+    tmp_path, monkeypatch, gateway_supports_templates
+):
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+    prewarmed = []
+
+    def prewarm(source):
+        # Stands in for the HF cache download: the template appears only now.
+        prewarmed.append(source)
+        _cache_hub_tokenizer(tmp_path, source, response_template=_RESPONSE_TEMPLATE)
+
+    captured = _run_smg_from_args_with(
+        monkeypatch, ["--model", "org/model", "--node-rank", "0"], prewarm
+    )
+
+    assert prewarmed == ["org/model"]
+    assert "--reasoning-parser" not in captured["gateway_args"]
+    assert "--reasoning-parser" not in captured["engine_args"]
+
+
+@pytest.mark.parametrize(
+    "model_template, tokenizer_template",
+    [(False, True), (True, False), (True, True)],
+    ids=["tokenizer-only", "model-only", "both"],
+)
+def test_engine_tokenizer_other_than_the_model_keeps_passthrough(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    gateway_supports_templates,
+    model_template,
+    tokenizer_template,
+):
+    # The gateway parses with the --model tokenizer, or with the engine's
+    # --tokenizer when --model has none or a served model name is set.
+    def tokenizer_dir(name, template):
+        if template:
+            return _tokenizer_dir(tmp_path / name, response_template=_RESPONSE_TEMPLATE)
+        return _tokenizer_dir(tmp_path / name)
+
+    model = tokenizer_dir("model", model_template)
+    tokenizer = tokenizer_dir("tokenizer", tokenizer_template)
+    prewarmed = []
+
+    captured = _run_smg_from_args_with(
+        monkeypatch,
+        ["--model", model, "--tokenizer", tokenizer, "--node-rank", "0"],
+        prewarmed.append,
+    )
+
+    # The prewarm fetches what the gateway loads at startup, as before.
+    assert prewarmed == [model]
+    assert _get_from_args(captured["gateway_args"], "--reasoning-parser") == (
+        "passthrough"
+    )
+    assert "response_template" not in capsys.readouterr().out
+
+
+def test_run_smg_from_args_keeps_passthrough_without_a_template(
+    tmp_path, monkeypatch, gateway_supports_templates
+):
+    model = _tokenizer_dir(tmp_path)
+
+    captured = _run_smg_from_args_with(
+        monkeypatch, ["--model", model, "--node-rank", "0"], lambda _: None
+    )
+
+    assert _get_from_args(captured["gateway_args"], "--reasoning-parser") == (
+        "passthrough"
+    )
+
+
+def test_follower_node_does_not_read_the_template(
+    tmp_path, monkeypatch, capsys, gateway_supports_templates
+):
+    model = _tokenizer_dir(tmp_path, response_template=_RESPONSE_TEMPLATE)
+    execs = []
+
+    def fake_execv(path, argv):
+        execs.append(argv)
+        raise SystemExit(0)
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.os.execv", fake_execv)
+    _run_smg_from_args_with(
+        monkeypatch,
+        ["--model", model, "--node-rank", "1"],
+        lambda _: pytest.fail("followers do not prewarm"),
+    )
+
+    assert len(execs) == 1
+    assert "response_template" not in capsys.readouterr().out

@@ -160,8 +160,33 @@ def _gateway_args_with_default_port(gateway_args: list[str]) -> list[str]:
     return [*gateway_args, "--port", str(DEFAULT_GATEWAY_PORT)]
 
 
-def _gateway_args_with_default_reasoning_parser(gateway_args: list[str]) -> list[str]:
+def _gateway_args_with_default_reasoning_parser(
+    gateway_args: list[str], tokenizer: str | None = None
+) -> list[str]:
+    """Default smg's reasoning parser to ``passthrough`` when none is named.
+
+    Without a configured name, smg guesses a reasoning parser from the model
+    id; ``passthrough`` returns the text as generated instead. A ``tokenizer``
+    whose ``tokenizer_config.json`` declares a ``response_template`` gets no
+    default while neither parser is named, if the installed gateway selects
+    parsers from response templates (smg#2719): it then takes both parsers
+    from the template, and any configured name, this default included, turns
+    the template off. An explicit ``--reasoning-parser passthrough`` still
+    does. With an older gateway, which would guess from the model id, the
+    default stays.
+    """
     if "--reasoning-parser" in gateway_args:
+        return gateway_args
+    if (
+        "--tool-call-parser" not in gateway_args
+        and _declares_response_template(tokenizer)
+        and _smg_selects_response_template_parsers()
+    ):
+        sys.stdout.write(
+            f"ts serve: {tokenizer} declares a response_template; the gateway "
+            "takes the reasoning and tool parsers from it "
+            "(--reasoning-parser passthrough turns it off)\n"
+        )
         return gateway_args
     return [*gateway_args, "--reasoning-parser", DEFAULT_REASONING_PARSER]
 
@@ -331,19 +356,115 @@ def _gateway_args_with_default_prometheus_port(gateway_args: list[str]) -> list[
     ]
 
 
-def _load_model_config(model_id: str | None) -> dict:
-    """Best-effort read of ``<model_id>/config.json`` (empty dict on any miss)."""
+def _load_model_config(model_id: str | None, filename: str = "config.json") -> dict:
+    """Best-effort read of ``<model_id>/<filename>`` (empty dict on any miss)."""
     if not model_id:
         return {}
-    config_path = Path(model_id) / "config.json"
+    config_path = Path(model_id) / filename
     if not config_path.is_file():
         return {}
     try:
         with config_path.open() as f:
             config = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return {}
     return config if isinstance(config, dict) else {}
+
+
+def _template_tokenizer(engine_args: list[str], gateway_args: list[str]) -> str | None:
+    """The tokenizer whose ``response_template`` the gateway uses, if known.
+
+    The gateway loads the tokenizer of its ``--model`` at startup under that
+    name, and the engine's ``--tokenizer`` (default ``--model``) under the
+    served model name; smg keeps the first one loaded under a name. With an
+    engine ``--tokenizer`` other than ``--model``, which of the two serves the
+    requests depends on whether ``--model`` has a tokenizer and on the served
+    model name, so there is no answer and the default parser stays.
+    """
+    model = _get_from_args(gateway_args, "--model")
+    tokenizer = _get_from_args(engine_args, "--tokenizer")
+    if tokenizer is not None and tokenizer != model:
+        return None
+    return model
+
+
+def _declares_response_template(tokenizer: str | None) -> bool:
+    """Whether ``tokenizer``'s ``tokenizer_config.json`` sets ``response_template``.
+
+    smg reads the same key, and only for a ``tokenizer.json`` tokenizer (not
+    tiktoken), so the file must sit beside the config. A template is an
+    object; any other value is refused by smg and counts as none here. A Hub
+    id is looked up in the local HF cache only, never downloaded here
+    (``run_smg_from_args`` prewarms the cache first); any miss counts as no
+    template.
+    """
+    if not tokenizer:
+        return False
+    tokenizer_dir = tokenizer
+    if not os.path.isdir(tokenizer_dir):
+        try:
+            from huggingface_hub import try_to_load_from_cache
+
+            cached = try_to_load_from_cache(tokenizer, "tokenizer_config.json")
+        except Exception:  # noqa: BLE001 - missing package, invalid repo id
+            return False
+        if not isinstance(cached, str):
+            return False
+        tokenizer_dir = os.path.dirname(cached)
+    if not os.path.isfile(os.path.join(tokenizer_dir, "tokenizer.json")):
+        return False
+    config = _load_model_config(tokenizer_dir, "tokenizer_config.json")
+    return isinstance(config.get("response_template"), dict)
+
+
+# smg#2719 adds this crate and makes the gateway crate (``smg``) depend on it to
+# take the parsers from a response template.
+_SMG_RESPONSE_TEMPLATE_CRATE = "smg-response-template"
+# Distributions that install the ``smg`` package: the bundled build, smg's own.
+_SMG_DISTRIBUTIONS = ("tokenspeed-smg", "smg")
+
+
+def _smg_selects_response_template_parsers() -> bool:
+    """Whether the installed gateway takes its parsers from a response template.
+
+    maturin writes the crate graph of the ``smg`` wheel into a CycloneDX SBOM
+    under ``.dist-info/sboms/``; this looks there for the gateway crate's
+    dependency on the response-template crate, so it reads package metadata
+    only: no network and no gateway start. Every installed distribution of
+    ``smg`` must show it; no distribution, no SBOM, or an unreadable one
+    counts as no.
+    """
+    from importlib import metadata
+
+    found = False
+    for name in _SMG_DISTRIBUTIONS:
+        try:
+            dist = metadata.distribution(name)
+        except metadata.PackageNotFoundError:
+            continue
+        if not _sbom_gateway_depends_on(dist, _SMG_RESPONSE_TEMPLATE_CRATE):
+            return False
+        found = True
+    return found
+
+
+def _sbom_gateway_depends_on(dist, crate: str) -> bool:
+    """Whether an SBOM of ``dist`` has the ``smg`` crate depend on ``crate``."""
+    for file in dist.files or ():
+        if file.parent.name != "sboms" or file.suffix != ".json":
+            continue
+        try:
+            sbom = json.loads(file.read_text())
+            names = {c["bom-ref"]: c["name"] for c in sbom["components"]}
+            if any(
+                names.get(dep["ref"]) == "smg"
+                and any(names.get(ref) == crate for ref in dep.get("dependsOn", ()))
+                for dep in sbom["dependencies"]
+            ):
+                return True
+        except Exception:  # noqa: BLE001 - an unreadable SBOM counts as no
+            continue
+    return False
 
 
 def _is_deepseek_v41_model(model_id: str | None) -> bool:
@@ -535,9 +656,11 @@ def _prewarm_hf_tokenizer(model_id: str) -> None:
         logger.warning(f"HF tokenizer prewarm failed for {model_id!s}: {exc!s}")
 
 
-def _gateway_args_with_defaults(gateway_args: list[str]) -> list[str]:
+def _gateway_args_with_defaults(
+    gateway_args: list[str], tokenizer: str | None = None
+) -> list[str]:
     gateway_args = _gateway_args_with_default_port(gateway_args)
-    gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args)
+    gateway_args = _gateway_args_with_default_reasoning_parser(gateway_args, tokenizer)
     gateway_args = _gateway_args_with_smg_disable_defaults(gateway_args)
     gateway_args = _gateway_args_with_default_policy(gateway_args)
     gateway_args = _gateway_args_with_default_tokenizer_cache(gateway_args)
@@ -844,9 +967,6 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     engine_args, gateway_args = _args_with_default_model_parsers(
         split.engine, split.gateway
     )
-    gateway_args = _gateway_args_with_defaults(gateway_args)
-    user_host = _get_from_args(gateway_args, "--host", DEFAULT_GATEWAY_HOST)
-    user_port = int(_get_from_args(gateway_args, "--port", str(DEFAULT_GATEWAY_PORT)))
 
     node_rank = _get_from_args(engine_args, "--node-rank")
     if node_rank is None:
@@ -855,10 +975,19 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     else:
         node_rank = int(node_rank)
 
+    # Only node 0 runs the gateway. Its model is prewarmed before the gateway
+    # defaults, which read the tokenizer_config.json from the cache.
+    tokenizer = None
     if node_rank == 0:
         model_id = _get_from_args(gateway_args, "--model")
         if model_id is not None:
             _prewarm_hf_tokenizer(model_id)
+        tokenizer = _template_tokenizer(engine_args, gateway_args)
+    gateway_args = _gateway_args_with_defaults(gateway_args, tokenizer)
+    user_host = _get_from_args(gateway_args, "--host", DEFAULT_GATEWAY_HOST)
+    user_port = int(_get_from_args(gateway_args, "--port", str(DEFAULT_GATEWAY_PORT)))
+
+    if node_rank == 0:
         rc = asyncio.run(
             run_smg(
                 engine_args=engine_args,
