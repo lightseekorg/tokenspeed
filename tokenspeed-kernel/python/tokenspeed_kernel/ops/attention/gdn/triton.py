@@ -620,12 +620,13 @@ def _gdn_tree_verify_chunked_kernel(
     o_v = i_v * BV + tl.arange(0, BV)
     mask_v = o_v < V
 
-    b_A = tl.exp(tl.load(A_log + i_hv).to(tl.float32))
-    b_dt_bias = tl.load(dt_bias + i_hv).to(tl.float32)
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
         # Release successor setup; its wait still guards all dependent reads.
         tl.extra.cuda.gdc_launch_dependents()
+
+    b_A = tl.exp(tl.load(A_log + i_hv).to(tl.float32))
+    b_dt_bias = tl.load(dt_bias + i_hv).to(tl.float32)
 
     p_q = q + i_n * Q_STRIDES[0] + nodes[:, None] * Q_STRIDES[1] + i_h * Q_STRIDES[2]
     p_k = k + i_n * K_STRIDES[0] + nodes[:, None] * K_STRIDES[1] + i_h * K_STRIDES[2]

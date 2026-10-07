@@ -354,7 +354,7 @@ def test_tree_conv_waits_for_initial_windows(width, restore_pdl):
         torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("target", ["rows", "mask", "reads"])
+@pytest.mark.parametrize("target", ["rows", "mask", "reads", "A_log", "dt_bias"])
 @pytest.mark.parametrize("nodes", [8, 14])
 def test_gdn_chunked_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl):
     # The chunked ReplaySSM tree verify reads nothing the kernel right before it writes until its PDL wait.
@@ -370,9 +370,15 @@ def test_gdn_chunked_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl
     dt_bias = torch.randn(value_heads, device="cuda")
     reads = torch.arange(bs, device="cuda", dtype=torch.int32)
     chain = torch.tensor([[(2 << t) - 1 for t in range(nodes)]] * bs, device="cuda")
-    written = {"rows": projection, "mask": chain, "reads": reads}[target]
+    written = {
+        "rows": projection,
+        "mask": chain,
+        "reads": reads,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+    }[target]
     source = written.clone()
-    poison = {"rows": float("nan"), "mask": 0, "reads": -1}[target]
+    poison = {"mask": 0, "reads": -1}.get(target, float("nan"))
 
     def forward():
         _delayed_projection[(triton.cdiv(source.numel(), 1024),)](

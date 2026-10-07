@@ -1717,7 +1717,7 @@ def test_gdn_decode_mtp_chunked_tree_matches_float64_within_one_ulp(
 
 
 def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
-    """Both tree kernels key only on the bucketed node block, never on the batch."""
+    """Both tree kernels compile once per tree size, never per batch."""
     require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
     from tokenspeed_kernel.ops.attention.gdn.triton import (
         _fused_gdn_decode_update_kernel,

@@ -414,20 +414,6 @@ def gdn_decode_mtp(
         if disable_state_update:
             raise ValueError("output_state_indices requires disable_state_update=False")
 
-    if tree_ancestors is not None and output_state_indices is None:
-        if not disable_state_update:
-            raise ValueError(
-                "a draft tree without output_state_indices leaves the pool "
-                "untouched: disable_state_update must be True"
-            )
-        if gdn_tree_verify_needs_node_states(q.shape[1]) != (
-            intermediate_states_buffer is not None
-        ):
-            raise ValueError(
-                f"a ReplaySSM tree of {q.shape[1]} nodes takes an "
-                "intermediate_states_buffer exactly when "
-                "gdn_tree_verify_needs_node_states"
-            )
     if tree_ancestors is not None:
         if (
             tree_ancestors.shape != q.shape[:2]
@@ -440,6 +426,20 @@ def gdn_decode_mtp(
                 f"T <= 64, got {tree_ancestors.dtype} {tuple(tree_ancestors.shape)} "
                 f"strides {tree_ancestors.stride()}"
             )
+        if output_state_indices is None:
+            if not disable_state_update:
+                raise ValueError(
+                    "a draft tree without output_state_indices leaves the pool "
+                    "untouched: disable_state_update must be True"
+                )
+            if gdn_tree_verify_needs_node_states(q.shape[1]) != (
+                intermediate_states_buffer is not None
+            ):
+                raise ValueError(
+                    f"a ReplaySSM tree of {q.shape[1]} nodes takes an "
+                    "intermediate_states_buffer exactly when "
+                    "gdn_tree_verify_needs_node_states"
+                )
         if solution not in (None, "triton"):
             raise ValueError(
                 f"draft-tree GDN verify runs the Triton solution, got {solution}"
