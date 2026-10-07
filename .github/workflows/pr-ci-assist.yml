@@ -4,7 +4,7 @@ on:
   issue_comment:
     types: [created]
   workflow_run:
-    workflows: [PR CI Plan, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
+    workflows: [PR CI Plan, Scheduler C++ Test, Scheduler Python Test, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
     types: [completed]
   workflow_dispatch:
     inputs:

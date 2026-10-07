@@ -31,7 +31,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from pr_ci_plan import CoverageError, context, task_key, validate_test_coverage
-from pr_ci_state import BOT, BOT_ID, COMMAND, REPO, SHA, marker, record
+from pr_ci_state import BOT, BOT_ID, COMMAND, NATIVE_CHECKS, REPO, SHA, marker, record
 
 ROOT = Path(__file__).resolve().parents[2]
 WORK = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())) / "pr-ci-assist"
@@ -195,17 +195,28 @@ def publish(state: dict, message: str):
     # All editable text here is fixed, identifiers were validated against the
     # public catalog; do not copy API errors, task logs or model prose.
     body = f"**CI {state['action']}** · `{state['head'][:8]}`\n\n{message}\n"
-    if state["statuses"]:
-        body += "\n| Check | Result |\n|---|---|\n"
+    if state.get("native_checks") or state["statuses"]:
+        body += "\n| Check | Source | Result |\n|---|---|---|\n"
+        for check in state.get("native_checks", []):
+            label = NATIVE_CHECKS[check["workflow"]]["label"]
+            result = check["status"]
+            if check["run"]:
+                result = (
+                    f"[{result}](https://github.com/{REPO}/actions/runs/{check['run']})"
+                )
+            body += f"| {label} | PR `{state['head'][:8]}` | {result} |\n"
+        sha = state.get("candidate", {}).get("validation", state["head"])
         for task, status in zip(state["tasks"], state["statuses"]):
-            link = f"https://github.com/{REPO}/blob/{state['head']}/{quote(task['config'], safe='/')}"
+            link = f"https://github.com/{REPO}/blob/{sha}/{quote(task['config'], safe='/')}"
             run = state["run_ids"].get(task_key(task))
             result = (
                 f"[{status}](https://github.com/{REPO}/actions/runs/{run})"
                 if run
                 else status
             )
-            body += f"| [{Path(task['config']).stem}]({link}) | {result} |\n"
+            body += (
+                f"| [{Path(task['config']).stem}]({link}) | `{sha[:8]}` | {result} |\n"
+            )
     body += marker("assist", state)
     scanned = re.sub(
         rf"https://github\.com/{REPO}/(?:blob/[0-9a-f]{{40}}/[A-Za-z0-9_./%-]+|actions/runs/[0-9]+)",
@@ -348,6 +359,46 @@ def runs_for(state: dict) -> list[dict]:
     return sorted(
         {r["id"]: r for r in runs}.values(), key=lambda r: r["id"], reverse=True
     )
+
+
+def native_check(check: dict, state: dict, runs: list[dict]) -> dict:
+    result = dict(workflow=check["workflow"], status="waiting", run=0)
+    for run in runs:
+        if (
+            run["event"] != "pull_request"
+            or run["head_sha"] != state["head"]
+            or run["path"] != f".github/workflows/{check['workflow']}"
+            or not any(
+                p["number"] == state["pr"]
+                and p["head"]["sha"] == state["head"]
+                and p["base"]["sha"] == state["base"]
+                and p["base"]["ref"] == "main"
+                for p in run["pull_requests"]
+            )
+        ):
+            continue
+        result["run"] = run["id"]
+        if run["status"] != "completed":
+            return result
+        if run["conclusion"] == "failure":
+            return {**result, "status": "failed"}
+        jobs = pages(f"actions/runs/{run['id']}/jobs?filter=latest", "jobs")
+        jobs = [j for j in jobs if j["name"] == "test"]
+        if (
+            run["conclusion"] == "success"
+            and len(jobs) == 1
+            and jobs[0]["status"] == "completed"
+            and jobs[0]["conclusion"] == "success"
+            and any(
+                step["name"] == check["step"]
+                and step["status"] == "completed"
+                and step["conclusion"] == "success"
+                for step in jobs[0]["steps"]
+            )
+        ):
+            return {**result, "status": "passed"}
+        return {**result, "status": "missing"}
+    return result
 
 
 def download(run: dict, name: str, target: Path):
@@ -806,7 +857,7 @@ def control(number: int):
         )
         return
     replanned = state.pop("plan_refresh", None) is not None
-    if not tasks:
+    if not tasks and (state["action"] != "watch" or not data.get("native_checks")):
         state["phase"] = "manual"
         publish(
             state,
@@ -836,6 +887,20 @@ def control(number: int):
             )
         return
     runs = runs_for(state)
+    previous_checks = state.get("native_checks", [])
+    state["native_checks"] = [
+        native_check(check, state, runs)
+        for check in data.get("native_checks", [])
+        if state["action"] == "watch"
+    ]
+    cpu_statuses = [c["status"] for c in state["native_checks"]]
+    if any(s in {"failed", "missing", "blocked"} for s in cpu_statuses):
+        state["phase"] = "manual"
+        publish(
+            state,
+            "Native CPU checks need human intervention; no GPU retry or PR update.",
+        )
+        return
     requested_fix = state["action"] == "fix" and "candidate" not in state
     if requested_fix and pr["mergeable"] is False:
         state["conflicts"] = True
@@ -867,7 +932,8 @@ def control(number: int):
         )
         output("repair", "true")
         return
-    if "candidate" in state and all(s == "passed" for s in statuses):
+    combined = cpu_statuses + statuses
+    if "candidate" in state and all(s == "passed" for s in combined):
         from pr_ci_repair import promote
 
         promote(state)
@@ -877,17 +943,22 @@ def control(number: int):
             "Validated repair cherry-picked to the PR. Required CI remains in effect.",
         )
         return
-    if any(s in {"failed", "missing", "blocked"} for s in statuses):
+    if any(s in {"failed", "missing", "blocked"} for s in combined):
         state["phase"] = "manual"
-    elif all(s == "passed" for s in statuses):
+    elif all(s == "passed" for s in combined):
         state["phase"] = "done"
     else:
         state["phase"] = "validating" if "candidate" in state else "watching"
-    if initial or replanned or previous != statuses:
+    if (
+        initial
+        or replanned
+        or previous != statuses
+        or previous_checks != state["native_checks"]
+    ):
         counts = ", ".join(
-            f"{statuses.count(s)} {s}"
+            f"{combined.count(s)} {s}"
             for s in ("passed", "waiting", "failed", "missing", "blocked")
-            if s in statuses
+            if s in combined
         )
         message = f"{counts}."
         if state["phase"] == "manual":

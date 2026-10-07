@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github/scripts"))
 import pr_ci_assist as assist
 import pr_ci_repair as repair
 from ci_result_source import write_source
-from pr_ci_state import BOT, BOT_ID, REPO, marker, record
+from pr_ci_state import BOT, BOT_ID, NATIVE_CHECKS, REPO, marker, record
 
 
 @pytest.fixture
@@ -91,6 +91,106 @@ def test_state_is_typed_and_bot_owned(selected):
     assert record(comment, "assist") is None
     comment["user"]["id"] = BOT_ID
     state["extra"] = "arbitrary embedded content"
+    comment["body"] = marker("assist", state)
+    assert record(comment, "assist") is None
+
+
+def test_native_cpu_result_needs_current_source_and_executed_test(
+    monkeypatch, selected
+):
+    _, state = selected
+    workflow = "scheduler-cpp-test.yml"
+    check = {"workflow": workflow, **NATIVE_CHECKS[workflow]}
+    run = dict(
+        id=101,
+        event="pull_request",
+        head_sha=state["head"],
+        path=f".github/workflows/{workflow}",
+        pull_requests=[
+            dict(
+                number=state["pr"],
+                head={"sha": state["head"]},
+                base={"sha": state["base"], "ref": "main"},
+            )
+        ],
+        status="completed",
+        conclusion="success",
+    )
+    step = dict(name=check["step"], status="completed", conclusion="success")
+    job = dict(name="test", status="completed", conclusion="success", steps=[step])
+    monkeypatch.setattr(assist, "pages", lambda path, field: [job])
+    assert assist.native_check(check, state, [run])["status"] == "passed"
+    step["conclusion"] = "skipped"
+    assert assist.native_check(check, state, [run])["status"] == "missing"
+    newer = {**run, "id": 102, "status": "in_progress"}
+    assert assist.native_check(check, state, [newer, run]) == dict(
+        workflow=workflow, status="waiting", run=102
+    )
+    newer.update(status="completed", conclusion="failure")
+    assert assist.native_check(check, state, [newer, run])["status"] == "failed"
+    run["pull_requests"][0]["base"]["sha"] = "c" * 40
+    assert assist.native_check(check, state, [run])["run"] == 0
+    run["head_sha"] = "d" * 40
+    assert assist.native_check(check, state, [run])["run"] == 0
+
+
+def test_watch_waits_for_cpu_and_hands_off_failure_without_gpu_retry(
+    monkeypatch, tmp_path, selected
+):
+    task, state = selected
+    workflow = "scheduler-cpp-test.yml"
+    check = {"workflow": workflow, **NATIVE_CHECKS[workflow]}
+    plan = {k: state[k] for k in ("version", "repository", "pr", "head", "base")}
+    plan.update(run=55, tasks=state["tasks"], tests=[])
+    comments = [{"user": {"login": BOT, "id": BOT_ID}, "body": marker("plan", plan)}]
+    pr = dict(
+        number=state["pr"],
+        head={"sha": state["head"]},
+        base={"sha": state["base"]},
+        mergeable=True,
+    )
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "pull", lambda *args: pr)
+    monkeypatch.setattr(assist, "pages", lambda *args: comments)
+    monkeypatch.setattr(assist, "load_state", lambda *args: state)
+    monkeypatch.setattr(assist, "latest_command", lambda *args: None)
+    monkeypatch.setattr(assist, "checkout", lambda *args: tmp_path)
+    monkeypatch.setattr(assist, "context", lambda *args: {"native_checks": [check]})
+    tasks = [task]
+    monkeypatch.setattr(assist, "validate_plan", lambda *args: tasks)
+    monkeypatch.setattr(assist, "runs_for", lambda *args: [])
+    monkeypatch.setattr(
+        assist,
+        "api",
+        lambda *args: dict(
+            path=".github/workflows/pr-ci-plan.yml",
+            conclusion="success",
+            display_title=f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+        ),
+    )
+    monkeypatch.setattr(assist, "task_status", lambda *args, **kwargs: "passed")
+    monkeypatch.setattr(
+        assist, "dispatch", lambda *args: pytest.fail("CPU retried on GPU")
+    )
+    cpu = dict(workflow=workflow, status="waiting", run=101)
+    monkeypatch.setattr(assist, "native_check", lambda *args: dict(cpu))
+    messages = []
+    monkeypatch.setattr(assist, "publish", lambda *args: messages.append(args[1]))
+    assist.control(state["pr"])
+    assert state["phase"] == "watching" and "1 waiting" in messages[-1]
+    cpu["status"] = "failed"
+    assist.control(state["pr"])
+    assert state["phase"] == "manual" and "human intervention" in messages[-1]
+    # A fresh CPU-only watch can finish without inventing a GPU task.
+    state.update(phase="watching", statuses=[])
+    tasks.clear()
+    cpu["status"] = "passed"
+    assist.control(state["pr"])
+    assert state["phase"] == "done" and state["tasks"] == []
+    comment = {"user": {"login": BOT, "id": BOT_ID}, "body": marker("assist", state)}
+    assert record(comment, "assist") == state
+    state["native_checks"][0]["workflow"] = "arbitrary.yml"
     comment["body"] = marker("assist", state)
     assert record(comment, "assist") is None
 
@@ -519,6 +619,15 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
             "id": 102,
             "display_title": assist.run_title(task, "d" * 40, "gb200"),
         },
+    )
+    # Native PR CPU checks must not gate conflict repair: a conflicted PR
+    # cannot start those workflows. Candidate GPU validation remains mandatory.
+    workflow = "scheduler-cpp-test.yml"
+    data["native_checks"] = [{"workflow": workflow, **NATIVE_CHECKS[workflow]}]
+    monkeypatch.setattr(
+        assist,
+        "native_check",
+        lambda *args: pytest.fail("PR CPU result used for candidate"),
     )
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "promoted"

@@ -23,12 +23,14 @@
 import importlib.util
 import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / ".github/scripts"))
 spec = importlib.util.spec_from_file_location(
     "pr_ci_plan", REPO / ".github/scripts/pr_ci_plan.py"
 )
@@ -189,3 +191,36 @@ def test_recommended_runtime_ut_requires_its_ci_task(monkeypatch):
     result = planner.proposal(json.dumps(response), data)
     assert [t["path"] for t in result["tests"]] == [test, cpu_test]
     assert [t["config"] for t in result["tasks"]] == configs
+
+
+def test_scheduler_native_checks_precede_gpu_recommendations():
+    checks = planner.native_checks(["tokenspeed-scheduler/src/capacity_model.cpp"])
+    assert [c["workflow"] for c in checks] == [
+        "scheduler-cpp-test.yml",
+        "scheduler-python-test.yml",
+    ]
+    assert planner.native_checks(["python/tokenspeed/runtime/models/qwen3_5.py"]) == []
+    assert (
+        planner.native_checks([".github/workflows/scheduler-cpp-test.yml"])
+        == checks[:1]
+    )
+    data = dict(
+        version=1,
+        repository="lightseekorg/tokenspeed",
+        pr=1,
+        head="a" * 40,
+        base="b" * 40,
+        native_checks=checks,
+        catalog=[],
+        test_files=[],
+    )
+    plan = planner.proposal(
+        json.dumps(
+            dict(summary="Scheduler classification", tests=[], tasks=[], conflicts="")
+        ),
+        data,
+    )
+    body = planner.render(plan)
+    assert "| 1 | [Scheduler C++](" in body
+    assert "| 2 | [Scheduler Python](" in body
+    assert "Native CPU CI" in body and "no task recommended" in body

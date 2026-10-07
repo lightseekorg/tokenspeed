@@ -13,6 +13,14 @@ actual changes and their callers. Leave general code review to the existing revi
 Trace changed functions through callers to identify affected models, execution
 paths (eager/graphs, prefill/decode, speculation, distributed), and test assertions.
 Read the most relevant existing test files and CI YAMLs before choosing them.
+Native CPU checks in context.json are already selected from workflow path filters
+and appear first in the published plan. For scheduler-only changes, start with
+those C++/Python regressions; do not add a GPU eval without a changed serving path.
+When end-to-end coverage is needed, prefer the smallest existing model and bounded
+workload that exercise the same affected callers and assertions. A shared-path
+refactor does not justify a large reasoning benchmark if a smaller serving task
+covers it. Retain model-, hardware-, MTP- or replay-specific coverage when the
+actual change depends on it; smaller model size alone does not prove equivalence.
 Return a small, ordered validation set: normally 1-3 focused test files followed
 by 1-2 existing CI tasks, choosing one suitable runner first. These are priorities,
 not an exhaustive safety checklist. Write for an impatient reader:

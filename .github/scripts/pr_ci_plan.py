@@ -25,8 +25,27 @@ import os
 import re
 import subprocess
 import sys
+from fnmatch import fnmatchcase
 from pathlib import Path
 from urllib.parse import quote
+
+import yaml
+from pr_ci_state import NATIVE_CHECKS
+
+
+def native_checks(paths: list[str]) -> list[dict]:
+    """Match the existing trusted workflows' PR path filters."""
+    workflows = Path(__file__).resolve().parents[1] / "workflows"
+    checks = []
+    for workflow, details in NATIVE_CHECKS.items():
+        config = yaml.safe_load(workflows.joinpath(workflow).read_text())
+        # PyYAML's YAML 1.1 loader interprets the unquoted `on` key as True.
+        trigger = config.get("on", config.get(True))["pull_request"]
+        if "main" in trigger["branches"] and any(
+            fnmatchcase(path, pattern) for path in paths for pattern in trigger["paths"]
+        ):
+            checks.append({"workflow": workflow, **details})
+    return checks
 
 
 def source_url(data: dict, path: str = "") -> str:
@@ -144,6 +163,7 @@ def context(source: Path, head: str, base: str) -> dict:
         "head": head,
         "base": base,
         "paths": paths,
+        "native_checks": native_checks(paths),
         "test_files": tests,
         "catalog": tasks,
     }
@@ -229,6 +249,7 @@ def proposal(raw: str, data: dict) -> dict:
         "conflicts": response["conflicts"],
         "tests": list(tests.values()),
         "tasks": list(selected.values()),
+        "native_checks": data.get("native_checks", []),
     }
 
 
@@ -238,7 +259,11 @@ def render(plan: dict) -> str:
         "",
         _cell(plan["summary"]),
     ]
-    rows = [(t, t["path"], "Targeted UT") for t in plan["tests"]]
+    rows = [
+        (check, f".github/workflows/{check['workflow']}", "Native CPU CI")
+        for check in plan.get("native_checks", [])
+    ]
+    rows += [(t, t["path"], "Targeted UT") for t in plan["tests"]]
     for task in plan["tasks"]:
         if task["cluster"]:
             target = f"Slurm {task['cluster'].upper()}"
