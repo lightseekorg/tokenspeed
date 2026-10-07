@@ -21,6 +21,9 @@ from tokenspeed_kernel.ops.communication.trtllm import (
     allreduce_residual_rmsnorm as _allreduce_residual_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
+    allreduce_sandwich_rmsnorm as _allreduce_sandwich_rmsnorm,
+)
+from tokenspeed_kernel.ops.communication.trtllm import (
     reducescatter_residual_rmsnorm as _reducescatter_residual_rmsnorm,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -161,6 +164,48 @@ def allreduce_residual_rmsnorm(
     )
 
 
+def allreduce_sandwich_rmsnorm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    post_weight: torch.Tensor,
+    weight: torch.Tensor,
+    rank: int,
+    group: dist.ProcessGroup,
+    *,
+    eps: float,
+    x_scale: float | None = None,
+    residual_scale: float | None = None,
+    max_token_num: int = 2048,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """All-reduce a sublayer partial and run a pre/post ("sandwich") norm
+    boundary on the sum in one launch.
+
+    ``a = rmsnorm(all_reduce(input_tensor), post_weight, eps)``, then
+    ``rmsnorm(a, weight, eps, residual=residual, round_residual_sum_bf16=True,
+    x_scale=x_scale, residual_scale=residual_scale)``: the same operations and
+    BF16 rounding points as those unfused calls, the sums of squares reduced
+    in another order. Returns ``(norm_out, residual_out)``, or None when no
+    fused kernel serves the call (nothing is launched; the caller runs the
+    unfused calls).
+    """
+
+    if not current_platform().is_nvidia:
+        return None
+    return _allreduce_sandwich_rmsnorm(
+        input_tensor,
+        residual,
+        post_weight,
+        weight,
+        rank,
+        group,
+        eps=eps,
+        x_scale=x_scale,
+        residual_scale=residual_scale,
+        max_token_num=max_token_num,
+        launch_with_pdl=pdl_enabled(),
+    )
+
+
 def reducescatter_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -243,6 +288,7 @@ __all__ = [
     "allreduce_lane_latent_norm",
     "allreduce_lane_latent_norm_supported",
     "allreduce_residual_rmsnorm",
+    "allreduce_sandwich_rmsnorm",
     "prepare_allreduce_fusion",
     "reducescatter_residual_rmsnorm",
 ]
