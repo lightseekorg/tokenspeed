@@ -3080,7 +3080,6 @@ TEST(CacheProgressTest, PrefillBoundariesSurviveFeedbackAndFailedAdmission) {
             CompletedPages{
                 .prefix_hashes = staged.prefix_hashes,
                 .first_new_prefix_page = 0,
-                .boundary_kind = CacheBoundaryKind::kEndpoint,
                 .retained_prefix_pages = 2,  // the Endpoint at 8 is a proven checkpoint
                 .materialized_state_boundaries = staged.materialized_state_boundaries,
             },

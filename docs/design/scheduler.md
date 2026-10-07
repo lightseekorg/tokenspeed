@@ -220,7 +220,7 @@ The capacity guarantees are retention-specific:
   sparse re-shaping requires `AvailableTokens() == 0`).
 
 Finish can publish a pending prefill checkpoint, then queues existing prefill
-cache for L2 without upgrading its kind. With L2, prefill retraction may publish
+cache for L2. With L2, prefill retraction may publish
 a materialized recovery Endpoint at the completed window boundary; `Prefilling`
 and `PrefillDone` both use their actual prefill window. Decode retraction adds
 no state checkpoint. Missing cache is recomputed through ordinary prefill.

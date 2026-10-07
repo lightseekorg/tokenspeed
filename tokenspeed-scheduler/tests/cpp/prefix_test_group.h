@@ -119,13 +119,12 @@ public:
     }
 
     void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key) {
-        index_.Register(pool, block, key, ++next_access_epoch_, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+        index_.Register(pool, block, key, ++next_access_epoch_, /*logical_block_index=*/-1,
                         /*newly_cached=*/nullptr);
     }
     void RegisterCachedBlock(BlockPool& pool, CacheBlockRef& block, const CacheKey& key, std::uint64_t access_epoch,
-                             std::int32_t logical_block_index = -1,
-                             CacheBoundaryKind boundary_kind = CacheBoundaryKind::kChunk) {
-        index_.Register(pool, block, key, access_epoch, logical_block_index, boundary_kind, /*newly_cached=*/nullptr);
+                             std::int32_t logical_block_index = -1) {
+        index_.Register(pool, block, key, access_epoch, logical_block_index, /*newly_cached=*/nullptr);
     }
     void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                          std::int32_t first_slot = 0) {
@@ -134,7 +133,7 @@ public:
     void RegisterFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                             std::uint64_t access_epoch, std::int32_t first_slot = 0) {
         index_.RegisterFullBlocks(pool, allocator_.BlocksToPublish(table, first_slot, keys.size()), keys, access_epoch,
-                                  first_slot, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr);
+                                  first_slot, /*newly_cached=*/nullptr);
     }
 
     bool ContainsCachedBlock(const BlockPool& pool, const CacheKey& key) const { return index_.Contains(pool, key); }

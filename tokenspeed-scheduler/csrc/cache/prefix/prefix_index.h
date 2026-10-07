@@ -66,7 +66,6 @@ public:
     struct CachedBlockMetadata {
         std::uint64_t last_access_epoch{0};
         std::int32_t logical_block_index{-1};
-        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
         bool was_acquired{false};
     };
 
@@ -97,8 +96,7 @@ public:
     // Registers block_ref under key. If key already has a canonical block,
     // block_ref is replaced with a reference to that block.
     void Register(const BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
-                  std::int32_t logical_block_index, CacheBoundaryKind boundary_kind,
-                  std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached) {
+                  std::int32_t logical_block_index, std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached) {
         _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
         _assert(pool.BoundGroup(block_ref->Location().lcm_block_id) == group_id_,
                 "cache block must belong to the prefix index group");
@@ -107,17 +105,11 @@ public:
         CacheEntryIterator existing_it = findEntry(cache_index, block_ref->Location());
         if (existing_it != cache_index.entries.end()) {
             _assert(existing_it->key == key, "one cache block location cannot change cache key");
-            if (existing_it->boundary_kind < boundary_kind) {
-                existing_it->boundary_kind = boundary_kind;
-            }
             touchEntry(cache_index, existing_it, access_epoch);
             return;
         }
         CacheEntryIterator canonical_it = findEntry(cache_index, key);
         if (canonical_it != cache_index.entries.end()) {
-            if (canonical_it->boundary_kind < boundary_kind) {
-                canonical_it->boundary_kind = boundary_kind;
-            }
             touchEntry(cache_index, canonical_it, access_epoch);
             block_ref = canonical_it->block_ref;
             return;
@@ -128,7 +120,6 @@ public:
             .block_ref = block_ref,
             .last_access_epoch = access_epoch,
             .logical_block_index = logical_block_index,
-            .boundary_kind = boundary_kind,
         });
         CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
@@ -145,7 +136,6 @@ public:
     // first_logical_block is the logical prefix position of blocks[0].
     void RegisterFullBlocks(const BlockPool& pool, std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
                             std::uint64_t access_epoch, std::int32_t first_logical_block,
-                            CacheBoundaryKind boundary_kind,
                             std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached) {
         _assert(first_logical_block >= 0, "first_logical_block must be >= 0");
         _assert(blocks.size() == keys.size(), "one key per published block");
@@ -155,7 +145,7 @@ public:
                 continue;
             }
             Register(pool, block_ref, keys[j], access_epoch, first_logical_block + static_cast<std::int32_t>(j),
-                     boundary_kind, newly_cached);
+                     newly_cached);
         }
     }
 
@@ -356,7 +346,6 @@ private:
         // Position in the request's logical prefix. Host-only entries may not
         // have a device-table position yet.
         std::int32_t logical_block_index{-1};
-        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
         // Set only after a successful request admission acquires this entry.
         bool was_acquired{false};
     };
@@ -377,7 +366,6 @@ private:
         return CachedBlockMetadata{
             .last_access_epoch = cache_entry.last_access_epoch,
             .logical_block_index = cache_entry.logical_block_index,
-            .boundary_kind = cache_entry.boundary_kind,
             .was_acquired = cache_entry.was_acquired,
         };
     }

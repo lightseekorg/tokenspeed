@@ -52,13 +52,13 @@ inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const st
 inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
                                    std::span<const std::string> content_hashes, std::int32_t first_slot = 0) {
     coordinator.CacheFullBlocks(tables, content_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
-                                first_slot, CacheBoundaryKind::kChunk);
+                                first_slot);
 }
 
 inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
                                         std::span<const std::string> prefix_hashes, std::uint64_t access_epoch,
                                         std::int32_t first_new_prefix_page, std::int32_t num_computed_tokens,
-                                        CacheBoundaryKind boundary_kind, bool stream_completed_to_host,
+                                        bool retains_boundary, bool stream_completed_to_host,
                                         std::span<const std::int32_t> materialized_state_boundaries) {
     _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()), "tables/groups size mismatch");
     _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
@@ -68,10 +68,8 @@ inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span
             CompletedPages{
                 .prefix_hashes = prefix_hashes,
                 .first_new_prefix_page = first_new_prefix_page,
-                .boundary_kind = boundary_kind,
-                // The newest hashed boundary, as the scheduler classifies it.
-                .retained_prefix_pages =
-                    boundary_kind == CacheBoundaryKind::kChunk ? 0 : static_cast<std::int32_t>(prefix_hashes.size()),
+                // The newest hashed boundary, when the range retains one.
+                .retained_prefix_pages = retains_boundary ? static_cast<std::int32_t>(prefix_hashes.size()) : 0,
                 .stream_completed_to_host = stream_completed_to_host,
                 .materialized_state_boundaries = materialized_state_boundaries,
             },

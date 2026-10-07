@@ -36,10 +36,6 @@
 
 namespace tokenspeed {
 
-// Why a resumable cache boundary was retained. The declaration order is its
-// monotonic promotion order.
-enum class CacheBoundaryKind { kChunk, kEndpoint, kPromoted };
-
 using CacheNamespaceId = std::uint32_t;
 using ContentHash = std::string;
 
@@ -135,8 +131,6 @@ struct GroupDemand {
 struct CompletedPages {
     std::span<const std::string> prefix_hashes{};
     std::int32_t first_new_prefix_page{0};
-    // Which kind of resumable boundary the newly completed range holds.
-    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     // Prefix pages up to the range's Endpoint or Promoted boundary, the only
     // boundary groups that are not prefix-closed keep; 0 when the range holds
     // neither.
