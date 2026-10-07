@@ -163,7 +163,6 @@ TEST(ForwardCacheOpsPrefill, ChunkAcquiresAndCachesFullBlocks) {
                                      CompletedPages{
                                          .prefix_hashes = hashes2,
                                          .first_new_prefix_page = 0,
-                                         .boundary_kind = CacheBoundaryKind::kChunk,
                                      },
                                  .num_computed_tokens = 4,
                              }));
@@ -199,7 +198,6 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
                                      CompletedPages{
                                          .prefix_hashes = hashes,
                                          .first_new_prefix_page = 0,
-                                         .boundary_kind = CacheBoundaryKind::kEndpoint,
                                          .retained_prefix_pages = static_cast<std::int32_t>(hashes.size()),
                                      },
                                  .num_computed_tokens = 8,
@@ -251,7 +249,6 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowBeforeAcquire) {
                                      CompletedPages{
                                          .prefix_hashes = hashes,
                                          .first_new_prefix_page = 0,
-                                         .boundary_kind = CacheBoundaryKind::kChunk,
                                      },
                                  .num_computed_tokens = 12,
                              }));
@@ -327,7 +324,6 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
                                      CompletedPages{
                                          .prefix_hashes = hashes,
                                          .first_new_prefix_page = 2,
-                                         .boundary_kind = CacheBoundaryKind::kChunk,
                                      },
                                  .num_computed_tokens = 8,
                              }));

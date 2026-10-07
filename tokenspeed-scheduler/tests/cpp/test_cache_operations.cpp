@@ -198,7 +198,7 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt);
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
-    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
+    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0);
 
     coordinator.QueueCachedBlocksForStore(hashes);
     auto write_back = transfers.StartPendingStores(StoreSourceGuard::kStreamOrdered);
@@ -232,7 +232,7 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt);
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
-    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
+    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0);
 
     coordinator.QueueCachedBlocksForStore(hashes);
     auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
@@ -272,7 +272,6 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
         ASSERT_TRUE(block);
         coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
             .Register(device_pool, block, key, /*access_epoch=*/1, /*logical_block_index=*/-1,
-                      CacheBoundaryKind::kChunk,
                       /*newly_cached=*/nullptr);
     };
 
@@ -320,7 +319,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt);
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
-    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
+    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0);
 
     coordinator.QueueCachedBlocksForStore(hashes);
     EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck));
@@ -354,7 +353,7 @@ TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
         EXPECT_TRUE(block);
         const std::int32_t page = allocator.ResolveCacheBlockId(block->Location());
         coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
-            .Register(pool, block, key, /*access_epoch=*/1, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+            .Register(pool, block, key, /*access_epoch=*/1, /*logical_block_index=*/-1,
                       /*newly_cached=*/nullptr);
         block.reset();
         return page;
@@ -406,7 +405,7 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt);
     ASSERT_TRUE(admission);
     const std::array<std::string, 2> hashes{"h0", "h1"};
-    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
+    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0);
 
     CacheBlockRef other_request_ref = tables[0].Blocks()[1];
     EXPECT_EQ(coordinator.NumNewlyReleasableLcmBlocks(tables), 1);
@@ -479,13 +478,11 @@ TEST(CacheOperationTest, ComputedStateChunkDoesNotQueueAStoreButEndpointUsesNorm
         const std::vector<std::string> hashes{"state2"};
         const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
         std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
-        CacheCompletedBlocksForTest(coordinator, tables, hashes, 1, 0, 2, CacheBoundaryKind::kChunk, true,
-                                    std::array{2});
+        CacheCompletedBlocksForTest(coordinator, tables, hashes, 1, 0, 2, /*retains_boundary=*/false, true, 2);
         EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
         coordinator.QueueLatestSnapshotBlocksForStore(hashes);
         EXPECT_FALSE(transfers.StartPendingStores(guard));
-        CacheCompletedBlocksForTest(coordinator, tables, hashes, 2, 0, 2, CacheBoundaryKind::kEndpoint, true,
-                                    std::array{2});
+        CacheCompletedBlocksForTest(coordinator, tables, hashes, 2, 0, 2, /*retains_boundary=*/true, true, 2);
         const auto store = transfers.StartPendingStores(guard);
         ASSERT_TRUE(store);
         ASSERT_EQ(store->transfers.size(), 1u);
@@ -513,7 +510,7 @@ TEST(CacheOperationTest, HostRestoredStateChunkRemainsCachedAfterLoadAckAndWorki
     coordinator.CacheHostBlock(source, key);
     std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
     const auto location = tables[0].Blocks()[0]->Location();
-    coordinator.CacheFullBlocks(tables, hashes, 1, 0, CacheBoundaryKind::kChunk);
+    coordinator.CacheFullBlocks(tables, hashes, 1, 0);
     std::vector<BlockTransfer> pairs;
     pairs.push_back(BlockTransfer{.source = std::move(source), .destination = tables[0].Blocks()[0]});
     const auto load = transfers.StartPrefixLoad(std::move(pairs));
@@ -525,7 +522,6 @@ TEST(CacheOperationTest, HostRestoredStateChunkRemainsCachedAfterLoadAckAndWorki
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
     const auto metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
     ASSERT_TRUE(metadata);
-    EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kChunk);
     EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 2);
     EXPECT_TRUE(coordinator.ClearDeviceCache());
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);

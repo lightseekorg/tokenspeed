@@ -98,12 +98,10 @@ private:
     // Current prefix hits are protected before candidates reach this policy.
     // A request-only block with no CacheEntry is reclaimed first. Cached
     // entries then compare request access epoch, followed within one epoch by
-    // the tier order below. Position keeps the deeper unproven non-closed
-    // boundary, while a closed prefix is reclaimed from its suffix.
+    // the tier order below; a closed prefix is reclaimed from its suffix.
     enum class EvictionTier {
         kUncached,  // physically allocated, but owned only by the request table
-        kProbationaryBoundary,
-        kEstablishedBoundary,
+        kResumableBoundary,
         kClosedPrefix,
     };
 
@@ -156,27 +154,16 @@ private:
                                         const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) const {
         const std::uint64_t last_access_epoch = metadata ? metadata->last_access_epoch : 0;
         const std::int32_t logical_block_index = metadata ? metadata->logical_block_index : -1;
-        const CacheBoundaryKind boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
         const bool is_prefix_closed = groups_[group_id].Matcher().IsPrefixClosed();
-        const bool is_probationary_boundary = !is_prefix_closed && boundary_kind == CacheBoundaryKind::kChunk &&
-                                              !(metadata && metadata->was_acquired) && logical_block_index >= 0;
         const EvictionTier eviction_tier = [&] {
             if (last_access_epoch == 0) {
                 return EvictionTier::kUncached;
             }
-            if (is_probationary_boundary) {
-                return EvictionTier::kProbationaryBoundary;
-            }
-            return is_prefix_closed ? EvictionTier::kClosedPrefix : EvictionTier::kEstablishedBoundary;
+            return is_prefix_closed ? EvictionTier::kClosedPrefix : EvictionTier::kResumableBoundary;
         }();
-        std::int64_t position_rank = 0;
-        if (is_probationary_boundary) {
-            // Retain the longer unproven frontier.
-            position_rank = logical_block_index;
-        } else if (is_prefix_closed && logical_block_index >= 0) {
-            // Reclaim a closed prefix from its suffix.
-            position_rank = -static_cast<std::int64_t>(logical_block_index);
-        }
+        // Reclaim a closed prefix from its suffix.
+        const std::int64_t position_rank =
+            is_prefix_closed && logical_block_index >= 0 ? -static_cast<std::int64_t>(logical_block_index) : 0;
         return VictimCandidate{
             .group_id = group_id,
             .location = location,

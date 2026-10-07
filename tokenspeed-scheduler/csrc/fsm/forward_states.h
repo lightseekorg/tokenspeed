@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <concepts>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -38,13 +39,6 @@ namespace tokenspeed::fsm {
 
 enum class PrefillSource { kLocal, kRemote };
 
-// How a range of newly hashed prefix pages ends.
-struct CompletedBoundary {
-    CacheBoundaryKind kind{CacheBoundaryKind::kChunk};
-    // Prefix pages up to the Endpoint or Promoted boundary; 0 for a Chunk.
-    std::int32_t retained_prefix_pages{0};
-};
-
 struct CacheProgress {
     // One source of truth for both the next hash-chain seed and the cumulative
     // history needed to publish a resumable boundary across chunk edges.
@@ -52,49 +46,53 @@ struct CacheProgress {
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
-    // Aligned prefill checkpoints written but not yet hashed, in token order.
-    // Scheduled prefill windows record their materialized checkpoint;
-    // decode results keep working state only and add no reusable boundary.
-    std::vector<std::int32_t> materialized_state_boundaries;
+    // The aligned prefill checkpoint written but not yet hashed. Scheduled
+    // prefill windows record their materialized checkpoint; decode results
+    // keep working state only and add no reusable boundary. Each admission
+    // hashes the previous window before the next window records, so at most
+    // one checkpoint is pending; a later one supersedes it.
+    std::optional<std::int32_t> materialized_state_boundary;
 
     void RecordMaterializedStateBoundary(std::int32_t boundary, std::int32_t prefix_granularity) {
         if (boundary <= 0 || boundary % prefix_granularity != 0 ||
             boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size())) {
             return;
         }
-        if (materialized_state_boundaries.empty() || materialized_state_boundaries.back() < boundary) {
-            materialized_state_boundaries.push_back(boundary);
+        if (!materialized_state_boundary || *materialized_state_boundary < boundary) {
+            materialized_state_boundary = boundary;
         }
     }
 
-    // Classifies the prefix pages hashed since first_new_prefix_page. Reaching
-    // the pending promotion boundary exactly makes it Promoted (and consumes
-    // it). Otherwise the range holds an Endpoint when it covers resume_tokens
-    // rounded down to a prefix page: the prompt end, or the recovery point of
-    // a retraction. A short final tail that completes no page leaves the
-    // Endpoint in the range before it.
-    CompletedBoundary ConsumeCompletedBoundary(std::int32_t first_new_prefix_page, std::int32_t num_computed_tokens,
-                                               std::int32_t resume_tokens, std::int32_t prefix_granularity) {
+    // The resumable boundary among the prefix pages hashed since
+    // first_new_prefix_page, in prefix pages; 0 when there is none. Reaching
+    // the pending promotion boundary exactly makes it the Promoted boundary
+    // (and consumes it). Otherwise it is the Endpoint when the range covers
+    // resume_tokens rounded down to a prefix page: the prompt end, or the
+    // recovery point of a retraction. A short final tail that completes no
+    // page leaves the Endpoint in the range before it.
+    std::int32_t ConsumeRetainedPrefixPages(std::int32_t first_new_prefix_page, std::int32_t num_computed_tokens,
+                                            std::int32_t resume_tokens, std::int32_t prefix_granularity) {
         if (promotion_boundary_tokens > 0 && num_computed_tokens >= promotion_boundary_tokens) {
             const std::int32_t promotion = std::exchange(promotion_boundary_tokens, 0);
             if (num_computed_tokens == promotion) {
-                return {CacheBoundaryKind::kPromoted, promotion / prefix_granularity};
+                return promotion / prefix_granularity;
             }
         }
         const std::int32_t resume_prefix_pages = resume_tokens / prefix_granularity;
         if (first_new_prefix_page < resume_prefix_pages &&
             resume_prefix_pages <= static_cast<std::int32_t>(prefix_hashes.size())) {
-            return {CacheBoundaryKind::kEndpoint, resume_prefix_pages};
+            return resume_prefix_pages;
         }
-        return {};
+        return 0;
     }
 
-    // Only after the admission that hashed them succeeded: a failed attempt
-    // retries their publication with the same hashes.
-    void DiscardHashedStateBoundaries(std::int32_t prefix_granularity) {
-        std::erase_if(materialized_state_boundaries, [&](std::int32_t boundary) {
-            return boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size());
-        });
+    // Only after the admission that hashed it succeeded: a failed attempt
+    // retries its publication with the same hashes.
+    void DiscardHashedStateBoundary(std::int32_t prefix_granularity) {
+        if (materialized_state_boundary &&
+            *materialized_state_boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size())) {
+            materialized_state_boundary.reset();
+        }
     }
 };
 

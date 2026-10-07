@@ -232,10 +232,10 @@ and working-state retention use the exact `Request::NumComputedTokens()`
 frontier under every verify width
 ([Scheduler §5](scheduler.md#5-invariants-a-change-must-preserve)).
 
-Host restores still use `CacheFullBlocks` and may register `kChunk` entries.
+Host restores still use `CacheFullBlocks`.
 All cached checkpoints remain subject to ordinary capacity eviction; Endpoint
 does not pin storage. Allocation, reservations and transfer fences are unchanged.
-Finish queues existing prefill checkpoints for L2 without upgrading their kind.
+Finish queues existing prefill checkpoints for L2.
 With L2, prefill retraction may publish a computed recovery Endpoint; decode
 retraction uses available prefill cache and recomputes the suffix.
 
@@ -588,8 +588,8 @@ Its responsibilities:
   `RequestProgress` per
   request says what the request has done since the coordinator's previous
   transaction for it: the prefix pages it completed (`CompletedPages`, present
-  only when the newly hashed range is non-empty, so "new hashes without a
-  boundary kind" cannot be expressed) and its computed-token count for
+  only when the newly hashed range is non-empty, with the resumable boundary
+  it retains, if any) and its computed-token count for
   retention. Publication fields are request-scoped and therefore live on the
   progress, not replicated onto every group's demand.
 
@@ -617,9 +617,9 @@ Its responsibilities:
   publishes every keyed filled Device destination. Host-only L2 load-backs
   leave `BlockTransfer.key` empty and stay on the admit-time
   `CacheFullBlocks` path.
-  For Mamba-state groups, `CacheCompletedBlocks` publishes only explicitly
-  listed materialized boundaries inside the newly hashed range; an empty list
-  publishes no state snapshots (see
+  For Mamba-state groups, `CacheCompletedBlocks` publishes the retained
+  boundary only when it is the recorded materialized checkpoint; without one
+  it publishes no state snapshot (see
   [Scheduler §1.2](scheduler.md#12-state-checkpoints-one-forward)).
   Ordinary sliding-window groups publish only the window behind an Endpoint
   (the prompt's last aligned boundary, or the computed frontier of an L2
@@ -886,8 +886,8 @@ once; each cache group loads and sorts one epoch of eligible candidates at a
 time, skipping epochs whose entries are all protected or already listed for
 request reclaim. Selection compares the next candidate from each group with
 the next request-reclaimable candidate using one policy: LRU access epoch,
-then tier (uncached request-only block → probationary boundary → established
-boundary → suffix of a closed prefix). Finally, walk the selected blocks in
+then tier (uncached request-only block → resumable boundary of a group that
+is not prefix-closed → suffix of a closed prefix). Finally, walk the selected blocks in
 reverse and restore every block that is not strictly required, yielding a
 minimal eviction set in `victims`.
 
