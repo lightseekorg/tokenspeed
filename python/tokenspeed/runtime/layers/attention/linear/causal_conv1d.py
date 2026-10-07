@@ -35,7 +35,10 @@ from tokenspeed.runtime.utils.triton import tl, triton
 PAD_SLOT_ID = -1
 
 
-@triton.jit()
+@triton.jit(
+    do_not_specialize=["seqlen"],
+    do_not_specialize_on_alignment=["token_chunk_offset_ptr"],
+)
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences
@@ -63,7 +66,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_istate_token: tl.constexpr,
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
-    stride_o_token: tl.constexpr,
+    stride_o_token,
     # others
     pad_slot_id: tl.constexpr,
     # Meta-parameters
@@ -582,7 +585,7 @@ def causal_conv1d_fn(
     return out
 
 
-@triton.jit()
+@triton.jit(do_not_specialize=["batch"])
 def _causal_conv1d_update_kernel(
     # Pointers to matrices
     x_ptr,  # (batch, dim, seqlen)
