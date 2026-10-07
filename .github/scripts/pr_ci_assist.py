@@ -743,9 +743,17 @@ def control(number: int):
             and completed["id"] > state["plan_refresh"]
             and completed["conclusion"] != "success"
         ):
-            state["phase"] = "manual"
-            publish(state, "CI plan refresh failed. Human intervention required.")
-            return
+            completed = api(f"actions/runs/{completed['id']}")
+            if (
+                completed["path"] == ".github/workflows/pr-ci-plan.yml"
+                and completed["event"] == "workflow_dispatch"
+                and completed["head_branch"] == "main"
+                and completed["actor"]["login"] == BOT
+                and completed["conclusion"] != "success"
+            ):
+                state["phase"] = "manual"
+                publish(state, "CI plan refresh failed. Human intervention required.")
+                return
     source = checkout(state["head"], state["base"])
     os.environ.update(PR_NUMBER=str(number), GITHUB_REPOSITORY=REPO)
     data = context(source, state["head"], state["base"])

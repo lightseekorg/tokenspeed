@@ -230,13 +230,24 @@ def test_incomplete_old_plan_refreshes_once_and_failed_refresh_requests_help(
     monkeypatch.setattr(assist, "checkout", lambda *args: tmp_path)
     monkeypatch.setattr(assist, "context", lambda *args: data)
     title = f"CI plan #{state['pr']} | {state['head']} | {state['base']}"
+    refresh = dict(
+        path=".github/workflows/other.yml",
+        event="workflow_dispatch",
+        head_branch="main",
+        actor={"login": BOT},
+        conclusion="failure",
+    )
     monkeypatch.setattr(
         assist,
         "api",
-        lambda *args: dict(
-            path=".github/workflows/pr-ci-plan.yml",
-            conclusion="success",
-            display_title=title,
+        lambda path: (
+            refresh
+            if path.endswith("/56")
+            else dict(
+                path=".github/workflows/pr-ci-plan.yml",
+                conclusion="success",
+                display_title=title,
+            )
         ),
     )
     monkeypatch.setattr(
@@ -275,6 +286,9 @@ def test_incomplete_old_plan_refreshes_once_and_failed_refresh_requests_help(
     monkeypatch.setattr(assist, "output", lambda *args: resolved.append(args))
     assist.resolve()
     assert resolved == [("pr", str(state["pr"]))]
+    assist.control(state["pr"])
+    assert state["phase"] == "waiting-plan" and len(commands) == 1
+    refresh["path"] = ".github/workflows/pr-ci-plan.yml"
     assist.control(state["pr"])
     assert state["phase"] == "manual" and len(commands) == 1
 
