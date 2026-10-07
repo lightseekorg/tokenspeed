@@ -21,8 +21,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.gdn import (
-    GDN_TREE_VERIFY_PARALLEL_MIN_NODES,
-    GDN_TREE_VERIFY_PARALLEL_NODES,
+    GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
     gdn_chunk_prefill,
@@ -906,7 +905,7 @@ def test_gdn_decode_mtp_tree_parents_match_per_path_reference(
                 atol=3e-2,
             )
 
-    # A chain given as a tree never reloads: it matches the tree-less kernel to rounding.
+    # A chain given as parents never reloads: it matches the parent-less kernel to rounding.
     chain_pool = pool.clone()
     chain_out = gdn_decode_mtp(
         q,
@@ -1352,24 +1351,15 @@ def test_gdn_decode_mtp_replay_tree_keeps_node_states_out_of_the_pool(
     pool-row tree."""
     require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
 
-    T = GDN_TREE_VERIFY_PARALLEL_NODES + 2
-    assert gdn_tree_verify_needs_node_states(T)
+    T = 6
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
-        device=device,
-        dtype=torch.bfloat16,
-        T=T,
-        pool_size=8 + 4 * T,
-        state_dtype=state_dtype,
+        device=device, dtype=torch.bfloat16, T=T, pool_size=32, state_dtype=state_dtype
     )
-    # Each shape continues as a chain off its last node.
     parents = [
-        shape + list(range(len(shape) - 1, T - 1))
-        for shape in (
-            [-1, 0, 1, 1, 0, 4],
-            [-1, -1, 1, -1, 3, 3],
-            [-1, 0, 1, 2, 3, 4],
-            [-1, 0, 0, 0, 0, 0],
-        )
+        [-1, 0, 1, 1, 0, 4],
+        [-1, -1, 1, -1, 3, 3],
+        [-1, 0, 1, 2, 3, 4],
+        [-1, 0, 0, 0, 0, 0],
     ]
     read_idx = torch.tensor([1, 3, 5, 7], device=device, dtype=torch.int32)
     output_idx = torch.arange(8, 8 + 4 * T, device=device, dtype=torch.int32).view(4, T)
@@ -1543,15 +1533,22 @@ def _tree_verify(q, k, v, pool, parents, *, rows: bool, **common):
 
 
 @pytest.mark.parametrize("T", [7, 8, 14, 16, 17, 33, 64])
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    ("dtype", "state_dtype"),
+    [
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float16, torch.float32),
+    ],
+)
 def test_gdn_decode_mtp_random_trees_match_float64_reference(
-    device: str, T: int, state_dtype: torch.dtype, require
+    device: str, T: int, dtype: torch.dtype, state_dtype: torch.dtype, require
 ):
     """Random multi-root trees and a chain on both sides of the chunked sizes, both state modes."""
-    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
+    require("attention", "gdn_decode_mtp", "triton", dtype, "q")
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
         device=device,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         T=T,
         pool_size=4 + 4 * T,
         state_dtype=state_dtype,
@@ -1597,7 +1594,7 @@ def test_gdn_decode_mtp_chunked_tree_keeps_extreme_gates_finite(
 ):
     """Gates whose path sums overflow, or that are infinite themselves, decay to zero instead of NaN."""
     require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
-    T = GDN_TREE_VERIFY_PARALLEL_NODES
+    T = GDN_TREE_VERIFY_CHUNKED_MAX_NODES
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
         device=device, dtype=torch.bfloat16, T=T, pool_size=4, state_dtype=torch.float32
     )
@@ -1628,7 +1625,7 @@ def test_gdn_decode_mtp_chunked_tree_deep_correlated_keys_match_float64_referenc
 ):
     """Deep paths of near-parallel keys with full write strength and no decay, where the delta-rule solve is hardest."""
     require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
-    T = GDN_TREE_VERIFY_PARALLEL_NODES
+    T = GDN_TREE_VERIFY_CHUNKED_MAX_NODES
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
         device=device, dtype=torch.bfloat16, T=T, pool_size=4, state_dtype=torch.float32
     )
@@ -1658,72 +1655,12 @@ def test_gdn_decode_mtp_chunked_tree_deep_correlated_keys_match_float64_referenc
     assert ((out.double() - want).abs() <= ulp + 1e-6).all()
 
 
-def test_gdn_decode_mtp_tree_contract(device: str, require):
-    """A ReplaySSM tree takes a node-state buffer exactly outside the chunked sizes; state rows are contiguous."""
-    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
-    for T, with_buffer in (
-        (GDN_TREE_VERIFY_PARALLEL_MIN_NODES - 1, False),
-        (GDN_TREE_VERIFY_PARALLEL_MIN_NODES, True),
-        (GDN_TREE_VERIFY_PARALLEL_NODES, True),
-        (GDN_TREE_VERIFY_PARALLEL_NODES + 1, False),
-    ):
-        q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
-            device=device,
-            dtype=torch.bfloat16,
-            T=T,
-            pool_size=4,
-            state_dtype=torch.float32,
-        )
-        buffer = (
-            torch.empty(4, T, *pool.shape[1:], device=device) if with_buffer else None
-        )
-        with pytest.raises(ValueError, match="intermediate_states_buffer exactly"):
-            gdn_decode_mtp(
-                q,
-                k,
-                v,
-                A_log=A_log,
-                a=a,
-                dt_bias=dt_bias,
-                b=b,
-                initial_state=pool,
-                initial_state_indices=torch.arange(4, device=device, dtype=torch.int32),
-                intermediate_states_buffer=buffer,
-                disable_state_update=True,
-                tree_ancestors=_tree_ancestors([[t - 1 for t in range(T)]] * 4, device),
-            )
-    T = 4
-    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
-        device=device,
-        dtype=torch.bfloat16,
-        T=T,
-        pool_size=32,
-        state_dtype=torch.float32,
-    )
-    wide = torch.arange(8, 8 + 8 * T, device=device, dtype=torch.int32).view(4, 2 * T)
-    with pytest.raises(ValueError, match="output_state_indices must be contiguous"):
-        gdn_decode_mtp(
-            q,
-            k,
-            v,
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            b=b,
-            initial_state=pool,
-            initial_state_indices=torch.arange(4, device=device, dtype=torch.int32),
-            output_state_indices=wide[:, ::2],
-            disable_state_update=False,
-            tree_ancestors=None,
-        )
-
-
 def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
     """Both tree kernels key only on the bucketed node block, never on the batch."""
     require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
     from tokenspeed_kernel.ops.attention.gdn.triton import (
         _fused_gdn_decode_update_kernel,
-        _gdn_tree_verify_kernel,
+        _gdn_tree_verify_chunked_kernel,
     )
 
     def run(batch: int, T: int, rows: bool) -> None:
@@ -1755,7 +1692,7 @@ def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
         run(4, T, rows)
         run(16, T, rows)
         with assert_no_triton_compile(
-            _gdn_tree_verify_kernel, _fused_gdn_decode_update_kernel
+            _gdn_tree_verify_chunked_kernel, _fused_gdn_decode_update_kernel
         ):
             for batch in (1, 2, 3, 5, 8, 17, 33):
                 run(batch, T, rows)

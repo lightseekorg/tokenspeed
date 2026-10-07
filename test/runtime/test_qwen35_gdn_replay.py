@@ -443,16 +443,21 @@ def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
     assert bool(torch.isfinite(recurrent[torch.tensor([5, 6], device=DEVICE)]).all())
 
 
-def test_qwen_replay_tree_graph_reads_the_tree_written_after_capture():
+@pytest.mark.parametrize(
+    "parents",
+    ([[-1, 0, 0], [-1, 0, 1]], [[-1, 0, 0, 1, 1, 2, 2, 3, 5], list(range(-1, 8))]),
+)
+def test_qwen_replay_tree_graph_reads_the_tree_written_after_capture(parents):
     """A captured tree verify replays with whatever tree the executor writes into the bound buffers."""
+    tree = _tree_verify_inputs(parents)
+    n = tree.num_nodes
     conv, recurrent = _initial_pools()
     backend, pool = _make_backend(
-        conv.clone(), recurrent.clone(), replay=True, draft_tree=True
+        conv.clone(), recurrent.clone(), replay=True, draft_tree=True, draft_tokens=n
     )
-    tree = _tree_verify_inputs([[-1, 0, 0], [-1, 0, 1]])
     backend.bind_tree_verify(tree)
-    backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS)
-    inputs = _inputs(seed=41)
+    backend.preallocate_verify_workspace(BATCH, n)
+    inputs = _inputs(seed=41, draft_tokens=n)
     _prepare_verify(backend, pool, inputs)
     torch.cuda.synchronize()
 
@@ -485,13 +490,15 @@ def test_qwen_replay_tree_graph_reads_the_tree_written_after_capture():
     )
     captured_tree = _forward_verify(backend, pool, inputs)
 
-    # The next round's tree: request 0 a chain, request 1 three roots.
-    next_tree = _tree_verify_inputs([[-1, 0, 1], [-1, -1, -1]])
+    # The next round's tree: request 0 a chain, request 1 all roots.
+    next_tree = _tree_verify_inputs([list(range(-1, n - 1)), [-1] * n])
     tree.mask.copy_(next_tree.mask)
     tree.parent.copy_(next_tree.parent)
     graph.replay()
     torch.cuda.synchronize()
-    fresh, fresh_pool = _make_backend(conv, recurrent, replay=True, draft_tree=True)
+    fresh, fresh_pool = _make_backend(
+        conv, recurrent, replay=True, draft_tree=True, draft_tokens=n
+    )
     fresh.bind_tree_verify(next_tree)
     expected = _prepare_verify(fresh, fresh_pool, inputs)
     torch.cuda.synchronize()

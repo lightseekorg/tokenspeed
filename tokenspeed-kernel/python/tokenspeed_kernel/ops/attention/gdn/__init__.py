@@ -300,21 +300,20 @@ def gdn_decode_step(
         )
 
 
-# ReplaySSM draft trees of up to this many nodes verify in the chunked form, which keeps no node states.
-GDN_TREE_VERIFY_PARALLEL_NODES = 16
-# Smaller trees verify faster step by step.
-GDN_TREE_VERIFY_PARALLEL_MIN_NODES = 8
+# ReplaySSM draft trees of 8 to 16 nodes verify in the chunked form (no node states); smaller ones are faster step by step.
+GDN_TREE_VERIFY_CHUNKED_MIN_NODES = 8
+GDN_TREE_VERIFY_CHUNKED_MAX_NODES = 16
 
 
 def gdn_tree_verify_needs_node_states(num_nodes: int) -> bool:
     """Whether a ReplaySSM draft-tree ``gdn_decode_mtp`` of ``num_nodes`` nodes takes
     an ``intermediate_states_buffer``: trees outside
-    ``GDN_TREE_VERIFY_PARALLEL_MIN_NODES`` to ``GDN_TREE_VERIFY_PARALLEL_NODES``
+    ``GDN_TREE_VERIFY_CHUNKED_MIN_NODES`` to ``GDN_TREE_VERIFY_CHUNKED_MAX_NODES``
     nodes verify step by step and reload their branch points' states from it."""
     return not (
-        GDN_TREE_VERIFY_PARALLEL_MIN_NODES
+        GDN_TREE_VERIFY_CHUNKED_MIN_NODES
         <= num_nodes
-        <= GDN_TREE_VERIFY_PARALLEL_NODES
+        <= GDN_TREE_VERIFY_CHUNKED_MAX_NODES
     )
 
 
@@ -406,11 +405,6 @@ def gdn_decode_mtp(
             raise ValueError(
                 "output_state_indices must have dtype torch.int32, got "
                 f"{output_state_indices.dtype}"
-            )
-        if not output_state_indices.is_contiguous():
-            raise ValueError(
-                "output_state_indices must be contiguous, got strides "
-                f"{output_state_indices.stride()}"
             )
         if intermediate_states_buffer is not None:
             raise ValueError(
@@ -719,8 +713,8 @@ import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
 # isort: on
 
 __all__ = [
-    "GDN_TREE_VERIFY_PARALLEL_MIN_NODES",
-    "GDN_TREE_VERIFY_PARALLEL_NODES",
+    "GDN_TREE_VERIFY_CHUNKED_MIN_NODES",
+    "GDN_TREE_VERIFY_CHUNKED_MAX_NODES",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "gdn_chunk_prefill",

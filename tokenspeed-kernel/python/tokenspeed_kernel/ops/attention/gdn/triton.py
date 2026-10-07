@@ -40,7 +40,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.gdn import (
-    GDN_TREE_VERIFY_PARALLEL_NODES,
+    GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
     gdn_tree_verify_needs_node_states,
@@ -150,7 +150,7 @@ def triton_gdn_chunk_prefill(
 def _latest_ancestor(ancestors_row, step, valid):
     """Parent of ``step`` (scalar or vector) in a tree's ancestor-or-self bitmask row: the highest bit below its own."""
     above = tl.load(ancestors_row + step, mask=valid, other=0) & (
-        (tl.full([], 1, tl.int64) << tl.minimum(step, 63).to(tl.int64)) - 1
+        (tl.full([], 1, tl.int64) << step.to(tl.int64)) - 1
     )
     return 63 - libdevice.clz(above)
 
@@ -281,8 +281,6 @@ def _fused_gdn_decode_update_kernel(
     n_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
     n_b = tl.load(p_b).to(tl.float32)
     n_a = tl.load(p_a).to(tl.float32)
-    if HAS_TREE and not CACHE_INTERMEDIATE_STATES:
-        n_parent = _latest_ancestor(tree_ancestors + i_n * T, 0, T > 0)
     for step_idx in range(0, T):
         b_q = n_q
         b_k = n_k
@@ -302,14 +300,7 @@ def _fused_gdn_decode_update_kernel(
         n_b = tl.load(p_b + B_STRIDES[1], mask=has_next, other=0).to(tl.float32)
         n_a = tl.load(p_a + A_STRIDES[1], mask=has_next, other=0).to(tl.float32)
         if HAS_TREE:
-            if CACHE_INTERMEDIATE_STATES:
-                # Replay already holds every parent for its branch-point check.
-                parent = tl.sum(tl.where(nodes == step_idx, parents, 0), 0)
-            else:
-                parent = n_parent
-                n_parent = _latest_ancestor(
-                    tree_ancestors + i_n * T, step_idx + 1, has_next
-                )
+            parent = _latest_ancestor(tree_ancestors + i_n * T, step_idx, True)
             if parent != step_idx - 1:
                 # The parent's row was written by this program over the same tile.
                 tl.debug_barrier()
@@ -577,7 +568,7 @@ def triton_gdn_decode_step(
 
 
 @triton.jit(do_not_specialize=["T"])
-def _gdn_tree_verify_kernel(
+def _gdn_tree_verify_chunked_kernel(
     A_log,
     a,
     dt_bias,
@@ -642,44 +633,6 @@ def _gdn_tree_verify_kernel(
     idx = tl.load(h0_indices + i_n).to(tl.int64)
     p_h0 = h0_source + idx * HV * V * K + i_hv * V * K + o_v[:, None] * K
 
-    r_q = tl.full([T_BLOCK], 1.0, tl.float32) * scale
-    r_k = tl.full([T_BLOCK], 1.0, tl.float32)
-    if USE_QK_L2NORM_IN_KERNEL:
-        sq_q = tl.zeros([T_BLOCK], dtype=tl.float32)
-        sq_k = tl.zeros([T_BLOCK], dtype=tl.float32)
-        for kc in tl.static_range(0, K, BK):
-            o_k = kc + tl.arange(0, BK)
-            mask_qk = valid[:, None] & (o_k < K)[None, :]
-            c_q = tl.load(p_q + o_k[None, :] * Q_STRIDES[3], mask=mask_qk, other=0)
-            c_k = tl.load(p_k + o_k[None, :] * K_STRIDES[3], mask=mask_qk, other=0)
-            sq_q += tl.sum(c_q.to(tl.float32) * c_q.to(tl.float32), 1)
-            sq_k += tl.sum(c_k.to(tl.float32) * c_k.to(tl.float32), 1)
-        r_q = scale / tl.sqrt(sq_q + 1e-6)
-        r_k = 1.0 / tl.sqrt(sq_k + 1e-6)
-
-    # K-chunked so the h0 tile and the normalized rows never all sit in registers.
-    kk = tl.zeros([T_BLOCK, T_BLOCK], dtype=tl.float32)
-    qk = tl.zeros([T_BLOCK, T_BLOCK], dtype=tl.float32)
-    kh = tl.zeros([T_BLOCK, BV], dtype=tl.float32)
-    qh = tl.zeros([T_BLOCK, BV], dtype=tl.float32)
-    for kc in tl.static_range(0, K, BK):
-        o_k = kc + tl.arange(0, BK)
-        mask_qk = valid[:, None] & (o_k < K)[None, :]
-        c_q = tl.load(p_q + o_k[None, :] * Q_STRIDES[3], mask=mask_qk, other=0)
-        c_q = c_q.to(tl.float32) * r_q[:, None]
-        c_k = tl.load(p_k + o_k[None, :] * K_STRIDES[3], mask=mask_qk, other=0)
-        c_k = c_k.to(tl.float32) * r_k[:, None]
-        # The K-last pool row loads as [BV, BK] with K contiguous.
-        c_h = tl.load(
-            p_h0 + o_k[None, :],
-            mask=(idx >= 0) & mask_v[:, None] & (o_k < K)[None, :],
-            other=0,
-        ).to(tl.float32)
-        kk += tl.dot(c_k, tl.trans(c_k), input_precision=DOT_PRECISION)
-        qk += tl.dot(c_q, tl.trans(c_k), input_precision=DOT_PRECISION)
-        kh += tl.dot(c_k, tl.trans(c_h), input_precision=DOT_PRECISION)
-        qh += tl.dot(c_q, tl.trans(c_h), input_precision=DOT_PRECISION)
-
     b_v = tl.load(
         v
         + i_n * V_STRIDES[0]
@@ -699,6 +652,47 @@ def _gdn_tree_verify_kernel(
         mask=valid,
         other=0,
     ).to(tl.float32)
+    bits = tl.load(tree_ancestors + i_n * T + nodes, mask=valid, other=0)
+
+    r_q = tl.full([T_BLOCK], 1.0, tl.float32) * scale
+    r_k = tl.full([T_BLOCK], 1.0, tl.float32)
+    if USE_QK_L2NORM_IN_KERNEL:
+        sq_q = tl.zeros([T_BLOCK], dtype=tl.float32)
+        sq_k = tl.zeros([T_BLOCK], dtype=tl.float32)
+        for kc in tl.static_range(0, K, BK):
+            o_k = kc + tl.arange(0, BK)
+            mask_qk = valid[:, None] & (o_k < K)[None, :]
+            x_q = tl.load(p_q + o_k[None, :] * Q_STRIDES[3], mask=mask_qk, other=0)
+            x_k = tl.load(p_k + o_k[None, :] * K_STRIDES[3], mask=mask_qk, other=0)
+            sq_q += tl.sum(x_q.to(tl.float32) * x_q.to(tl.float32), 1)
+            sq_k += tl.sum(x_k.to(tl.float32) * x_k.to(tl.float32), 1)
+        r_q = scale / tl.sqrt(sq_q + 1e-6)
+        r_k = 1.0 / tl.sqrt(sq_k + 1e-6)
+
+    # K-chunked so the h0 tile and the normalized rows never all sit in registers.
+    kk = tl.zeros([T_BLOCK, T_BLOCK], dtype=tl.float32)
+    qk = tl.zeros([T_BLOCK, T_BLOCK], dtype=tl.float32)
+    kh = tl.zeros([T_BLOCK, BV], dtype=tl.float32)
+    qh = tl.zeros([T_BLOCK, BV], dtype=tl.float32)
+    # Pipelined: a small grid is latency-bound on the cold state rows.
+    for kc in tl.range(0, K, BK, num_stages=3):
+        o_k = kc + tl.arange(0, BK)
+        mask_qk = valid[:, None] & (o_k < K)[None, :]
+        c_q = tl.load(p_q + o_k[None, :] * Q_STRIDES[3], mask=mask_qk, other=0)
+        c_q = c_q.to(tl.float32) * r_q[:, None]
+        c_k = tl.load(p_k + o_k[None, :] * K_STRIDES[3], mask=mask_qk, other=0)
+        c_k = c_k.to(tl.float32) * r_k[:, None]
+        # The K-last pool row loads as [BV, BK] with K contiguous.
+        c_h = tl.load(
+            p_h0 + o_k[None, :],
+            mask=(idx >= 0) & mask_v[:, None] & (o_k < K)[None, :],
+            other=0,
+        ).to(tl.float32)
+        kk += tl.dot(c_k, tl.trans(c_k), input_precision=DOT_PRECISION)
+        qk += tl.dot(c_q, tl.trans(c_k), input_precision=DOT_PRECISION)
+        kh += tl.dot(c_k, tl.trans(c_h), input_precision=DOT_PRECISION)
+        qh += tl.dot(c_q, tl.trans(c_h), input_precision=DOT_PRECISION)
+
     x = b_a + b_dt_bias
     beta_x = softplus_beta * x
     softplus_x = tl.where(
@@ -710,7 +704,6 @@ def _gdn_tree_verify_kernel(
     b_g = tl.where(valid, tl.maximum(-b_A * softplus_x, -1e30), 0.0)
     b_beta = tl.where(valid, 1.0 / (1.0 + tl.exp(-b_b)), 0.0)
 
-    bits = tl.load(tree_ancestors + i_n * T + nodes, mask=valid, other=0)
     anc = ((bits[:, None] >> nodes[None, :].to(tl.int64)) & 1) != 0
     path_gates = tl.where(anc, b_g[None, :], 0.0)
     gate = tl.sum(path_gates, 1)
@@ -747,7 +740,7 @@ def _gdn_tree_verify_kernel(
     )
 
 
-def _launch_gdn_tree_verify(
+def _launch_gdn_tree_verify_chunked(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -769,7 +762,7 @@ def _launch_gdn_tree_verify(
         scale = K**-0.5
     o = q.new_empty(B, T, HV, V)
     BV = min(triton.next_power_of_2(V), 64)
-    _gdn_tree_verify_kernel[(triton.cdiv(V, BV), B * HV)](
+    _gdn_tree_verify_chunked_kernel[(triton.cdiv(V, BV), B * HV)](
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -791,8 +784,8 @@ def _launch_gdn_tree_verify(
         V=V,
         BK=min(triton.next_power_of_2(K), 32),
         BV=BV,
-        T_BLOCK=GDN_TREE_VERIFY_PARALLEL_NODES,
-        LOG2_T_BLOCK=GDN_TREE_VERIFY_PARALLEL_NODES.bit_length() - 1,
+        T_BLOCK=GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
+        LOG2_T_BLOCK=GDN_TREE_VERIFY_CHUNKED_MAX_NODES.bit_length() - 1,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm,
         # Three TF32 products per FP32 one keep FP32 accuracy on tensor cores.
         DOT_PRECISION="tf32x3" if current_platform().is_nvidia else "ieee",
@@ -849,7 +842,7 @@ def triton_gdn_decode_mtp(
         and output_state_indices is None
         and not gdn_tree_verify_needs_node_states(q.shape[1])
     ):
-        return _launch_gdn_tree_verify(
+        return _launch_gdn_tree_verify_chunked(
             q,
             k,
             v,

@@ -86,7 +86,7 @@ Draft trees use ReplaySSM like chains (on by default; staging a recurrent
 state per node and per layer grows with the tree, Qwen3.8: 3 MiB x 48 layers
 per node). Under ReplaySSM the verify
 never writes the state pool. A GDN tree of 8 to 16 nodes
-(`GDN_TREE_VERIFY_PARALLEL_MIN_NODES`, `GDN_TREE_VERIFY_PARALLEL_NODES`) is
+(`GDN_TREE_VERIFY_CHUNKED_MIN_NODES`, `GDN_TREE_VERIFY_CHUNKED_MAX_NODES`) is
 verified in the chunked form of the delta rule, every node at once with the
 ancestor mask in place of the causal one, and keeps no node states. In other
 trees the state of every branch point (a node with a child other than the next
