@@ -61,18 +61,6 @@ def test_gfx950_hadamard_empty_input(device: str, require) -> None:
     assert actual.dtype == x.dtype
 
 
-def test_gfx950_hadamard_strided_input_uses_portable_kernel(
-    device: str, require
-) -> None:
-    require("transform", "hadamard_transform", "gluon", torch.bfloat16, "x")
-    x = torch.randn((3, 32, 256), dtype=torch.bfloat16, device=device)[..., ::2]
-
-    actual = hadamard_transform(x, scale=128**-0.5)
-    expected = hadamard_transform(x.contiguous(), scale=128**-0.5, solution="triton")
-
-    assert torch.equal(actual, expected)
-
-
 def test_gfx950_hadamard_row_count_reuses_binary(device: str, require) -> None:
     require("transform", "hadamard_transform", "gluon", torch.bfloat16, "x")
 

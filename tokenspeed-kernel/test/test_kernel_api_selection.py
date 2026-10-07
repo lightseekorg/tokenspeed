@@ -31,6 +31,7 @@ import-guarded on missing optional backend packages are skipped.
 
 from __future__ import annotations
 
+import builtins
 import importlib
 import inspect
 import sys
@@ -290,6 +291,53 @@ def test_attention_api_ownership_and_result_type_identity_are_stable():
     assert _attention_pkg.__all__ == ["attn_merge_state"]
     assert _attention_gdn_pkg.GdnChunkPrefillResult is GdnChunkPrefillResult
     assert _attention_kda_pkg.KdaPrefillResult is KdaPrefillResult
+
+
+@pytest.mark.parametrize("platform_fixture", ["h100_platform", "mi350_platform"])
+def test_hadamard_gluon_registration_uses_amd_backend_only(
+    platform_fixture: str,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    host_registry = KernelRegistry.get()
+    imports = []
+    calls = []
+    real_import = builtins.__import__
+
+    def launch(x, *, scale):
+        calls.append((x, scale))
+        return x
+
+    def import_backend(name, *args, **kwargs):
+        if name == "tokenspeed_kernel_amd.ops.gfx950.transform":
+            imports.append(name)
+            assert platform.is_amd
+            return SimpleNamespace(launch_gluon_hadamard_transform_128_gfx950=launch)
+        return real_import(name, *args, **kwargs)
+
+    try:
+        Platform.override(platform)
+        KernelRegistry.reset()
+        with monkeypatch.context() as patch:
+            patch.setattr(builtins, "__import__", import_backend)
+            importlib.reload(_transform_gluon)
+            implementation = KernelRegistry.get().get_impl(
+                "gluon_hadamard_transform_128_gfx950"
+            )
+            if platform.is_amd:
+                x = torch.empty((1, 128), dtype=torch.bfloat16, device="meta")
+                assert implementation(x, scale=0.25) is x
+                assert calls == [(x, 0.25)]
+                assert imports == ["tokenspeed_kernel_amd.ops.gfx950.transform"]
+            else:
+                assert implementation is None
+                assert not imports
+    finally:
+        Platform.override(host_platform)
+        KernelRegistry._instance = host_registry
+        importlib.reload(_transform_gluon)
 
 
 def test_residual_family_exports_and_modes():

@@ -23,22 +23,18 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-try:
+if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.transform import (
         launch_gluon_hadamard_transform_128_gfx950 as _hadamard_gfx950_impl,
     )
-except ImportError as exc:
-    _IMPORT_ERROR_MESSAGE = str(exc)
-    _hadamard_gfx950_impl = None
-else:
-    _IMPORT_ERROR_MESSAGE = None
-
-
-if _IMPORT_ERROR_MESSAGE is None:
 
     @register_kernel(
         "transform",
@@ -64,18 +60,6 @@ if _IMPORT_ERROR_MESSAGE is None:
     ) -> torch.Tensor:
         """Apply a GFX950 BF16 length-128 butterfly transform."""
         return _hadamard_gfx950_impl(x, scale=scale)
-
-else:
-
-    def gluon_hadamard_transform_128_gfx950(
-        x: torch.Tensor,
-        *,
-        scale: float,
-    ) -> torch.Tensor:
-        raise ImportError(
-            "gluon_hadamard_transform_128_gfx950 requires tokenspeed-kernel-amd: "
-            f"{_IMPORT_ERROR_MESSAGE}"
-        )
 
 
 __all__ = ["gluon_hadamard_transform_128_gfx950"]

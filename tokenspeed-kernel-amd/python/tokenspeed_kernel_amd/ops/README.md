@@ -495,6 +495,10 @@ tree so the BF16 results agree exactly. The output scale is fixed for a
 compiled kernel, while the number of rows is supplied by the launch grid.
 Other dtypes, layouts, and architectures retain their existing registered
 backend.
+The AMD backend is imported and registered only on AMD platforms, matching
+the platform-specific transform registration convention. The current GLM
+Flash and DeepSeek query callers provide contiguous input; strided views
+remain supported through the portable backend's contiguous copy.
 
 ## Sampling
 
