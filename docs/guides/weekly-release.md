@@ -132,3 +132,25 @@ mismatch. Start a new pipeline only for a new release, not to recover a partial
 one. Pinned scheduler release branches remain available for recovery. If `main`
 moves after a metadata PR's base is recorded, or the PR is edited, manual
 resolution is required; a rerun does not rebase or overwrite the recorded PR.
+
+## MLA releases
+
+Run **MLA release pipeline** manually from `main`. Like the scheduler pipeline,
+its optional stable `version` must exceed both the source and PyPI versions;
+leaving it empty increments the greater version's patch. Its three stages are:
+
+1. Bump `tokenspeed-mla/pyproject.toml` through a signed metadata PR.
+2. Run the existing MLA publisher at that exact merged commit on a pinned branch.
+   Wait for publication, verify PyPI provenance and the universal wheel's hash
+   against the build artifact, and wait for the wheel to appear in the pip index.
+3. Update only `tokenspeed-mla==<version>` in
+   `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt` through a second
+   signed metadata PR; kernel and runtime versions remain unchanged.
+
+Both metadata PRs merge without waiting for main or PR CI, using the same bot
+exemption and exact-diff lease as the scheduler. The pipelines share the release
+lock, token and recovery mechanism. Source changes or a changed dependency pin
+stop the MLA pipeline. Recover failures with **re-run failed jobs**, using the
+recorded child run and `weekly-state-mla-*` artifacts; do not start a new release
+to retry publication. An interrupted MLA release can block biweekly preflight
+until the dependency stage completes. Pinned release branches remain for recovery.

@@ -48,6 +48,7 @@ WHL = "lightseekorg/whl"
 IDENTITY = "243258330+lightseek-bot@users.noreply.github.com"
 STAGES = ("plan", "amd", "kernel", "tokenspeed", "index", "docker", "release")
 SCHEDULER_STAGES = ("scheduler-version", "scheduler-publish", "scheduler-dependency")
+MLA_STAGES = ("mla-version", "mla-publish", "mla-dependency")
 PACKAGES = {
     "amd": "tokenspeed-kernel-amd",
     "kernel": "tokenspeed-kernel",
@@ -1571,7 +1572,135 @@ class Release:
         self.save()
 
 
-class SchedulerRelease(Release):
+class ComponentRelease(Release):
+    """Release one component before merging its downstream requirement."""
+
+    package: str
+    stages: tuple[str, ...]
+
+    def branch(self, stage, version):
+        return f"bot/{self.package.removeprefix('tokenspeed-')}-release-{version}"
+
+    def pr_branch(self, stage, version):
+        return f"bot/{stage}-{version}"
+
+    def pr_title(self, stage, version):
+        if stage == self.stages[2]:
+            return f"build: require {self.package} {version}"
+        return super().pr_title(stage, version)
+
+    def version_base(self, stage):
+        return self.state["stages"][stage]["base"]
+
+    def update_metadata(self, stage):
+        version = self.state["versions"][self.package]
+        replace(
+            PROJECTS[self.package],
+            r'^version = "[^"]+"$',
+            f'version = "{version}"',
+        )
+
+    def reserve(self, requested):
+        if self.state["versions"]:
+            return
+        self.checkout_main()
+        current = read_version(self.package)
+        version = next_version(current, latest_version(self.package), requested)
+        self.available(version)
+        if command(
+            "git",
+            "ls-remote",
+            "origin",
+            f"refs/heads/{self.branch(self.stage, version)}",
+        ):
+            raise RuntimeError(
+                f"{self.package} release branch already exists; inspect manually"
+            )
+        self.phase["base"] = command("git", "rev-parse", "HEAD")
+        self.state["initial_versions"] = {self.package: current}
+        self.state["versions"] = {self.package: version}
+        self.state["initial_dependency"] = str(
+            requirements(self.pr_files[self.stages[2]][0])[self.package].specifier
+        )
+        self.save()
+
+    def wait_index(self, files):
+        while True:
+            index = request(
+                f"https://pypi.org/simple/{self.package}/",
+                github=False,
+                accept="application/vnd.pypi.simple.v1+json",
+            )
+            indexed = {f["filename"]: f for f in index["files"]}
+            for name, digest in files.items():
+                if name in indexed and (
+                    indexed[name]["yanked"]
+                    or indexed[name]["hashes"].get("sha256") != digest
+                ):
+                    raise RuntimeError(
+                        f"{self.package} index files differ from the verified publication"
+                    )
+            if files.keys() <= indexed.keys():
+                return
+            self.pause()
+
+    def gate(self):
+        current = read_version(self.package)
+        version = self.state["versions"][self.package]
+        if self.stage == self.stages[2]:
+            if (
+                not self.state["stages"].get(self.stages[1], {}).get("complete")
+                or current != version
+            ):
+                raise RuntimeError(
+                    f"{self.package} dependency requires a completed publication of the current version"
+                )
+            check_tree(self.state["stages"][self.stages[0]]["sha"], self.package)
+            if self.files() != self.state["publication_files"]:
+                raise RuntimeError(
+                    f"{self.package} publication changed before the dependency merge"
+                )
+            self.wait_index(self.state["publication_files"])
+        elif current not in (
+            self.state["initial_versions"][self.package],
+            version,
+        ):
+            raise RuntimeError(f"{self.package} version changed outside this release")
+        return {self.package: current}
+
+    def fast_forward_version(self, stage, pr):
+        self.gate()
+        super().fast_forward_version(stage, pr)
+
+    def run(self, requested):
+        self.phase.pop("complete", None)
+        self.guard()
+        index = self.stages.index(self.stage)
+        if index and not self.state["stages"].get(self.stages[index - 1], {}).get(
+            "complete"
+        ):
+            raise RuntimeError(
+                f"Previous {self.package.removeprefix('tokenspeed-')} stage did not complete"
+            )
+        if self.stage == self.stages[0]:
+            self.reserve(requested)
+            self.pr(self.stage)
+        elif self.stage == self.stages[1]:
+            self.publish()
+        else:
+            self.checkout_main()
+            self.gate()
+            self.phase.setdefault("base", command("git", "rev-parse", "HEAD"))
+            self.save()
+            self.pr(self.stage)
+        self.phase["complete"] = True
+        self.phase.pop("error", None)
+        self.save()
+
+
+class SchedulerRelease(ComponentRelease):
+    package = "tokenspeed-scheduler"
+    stages = SCHEDULER_STAGES
     packages_by_stage = {
         "scheduler-version": "tokenspeed-scheduler",
         "scheduler-dependency": "tokenspeed-scheduler",
@@ -1582,42 +1711,22 @@ class SchedulerRelease(Release):
     }
     pr_body = "Keep the scheduler release ordered so TokenSpeed requires an already published version.\n"
 
-    @staticmethod
-    def branch(stage, version):
-        return f"bot/scheduler-release-{version}"
-
-    def pr_branch(self, stage, version):
-        return f"bot/{stage}-{version}"
-
-    def pr_title(self, stage, version):
-        if stage == "scheduler-dependency":
-            return f"build: require tokenspeed-scheduler {version}"
-        return super().pr_title(stage, version)
-
-    def version_base(self, stage):
-        return self.state["stages"][stage]["base"]
-
     def update_metadata(self, stage):
-        version = self.state["versions"]["tokenspeed-scheduler"]
         if stage == "scheduler-version":
-            replace(
-                PROJECTS["tokenspeed-scheduler"],
-                r'^version = "[^"]+"$',
-                f'version = "{version}"',
-            )
-        else:
-            specifier = str(
-                requirements(PROJECTS["tokenspeed"])["tokenspeed-scheduler"].specifier
-            )
-            if not re.fullmatch(r">=\d+\.\d+\.\d+", specifier) or Version(
-                specifier[2:]
-            ) > Version(version):
-                raise RuntimeError("Scheduler dependency changed outside this release")
-            replace(
-                PROJECTS["tokenspeed"],
-                r'"tokenspeed-scheduler>=[^"]+"',
-                f'"tokenspeed-scheduler>={version}"',
-            )
+            return super().update_metadata(stage)
+        version = self.state["versions"]["tokenspeed-scheduler"]
+        specifier = str(
+            requirements(PROJECTS["tokenspeed"])["tokenspeed-scheduler"].specifier
+        )
+        if not re.fullmatch(r">=\d+\.\d+\.\d+", specifier) or Version(
+            specifier[2:]
+        ) > Version(version):
+            raise RuntimeError("Scheduler dependency changed outside this release")
+        replace(
+            PROJECTS["tokenspeed"],
+            r'"tokenspeed-scheduler>=[^"]+"',
+            f'"tokenspeed-scheduler>={version}"',
+        )
 
     def available(self, version):
         tag = f"tokenspeed-scheduler-v{version}"
@@ -1639,29 +1748,6 @@ class SchedulerRelease(Release):
                 "Reserved scheduler tag already exists; inspect manually"
             )
 
-    def reserve(self, requested):
-        if self.state["versions"]:
-            return
-        self.checkout_main()
-        current = read_version("tokenspeed-scheduler")
-        version = next_version(
-            current, latest_version("tokenspeed-scheduler"), requested
-        )
-        self.available(version)
-        if command(
-            "git",
-            "ls-remote",
-            "origin",
-            f"refs/heads/{self.branch(self.stage, version)}",
-        ):
-            raise RuntimeError(
-                "Scheduler release branch already exists; inspect manually"
-            )
-        self.phase["base"] = command("git", "rev-parse", "HEAD")
-        self.state["initial_versions"] = {"tokenspeed-scheduler": current}
-        self.state["versions"] = {"tokenspeed-scheduler": version}
-        self.save()
-
     def files(self):
         version = self.state["versions"]["tokenspeed-scheduler"]
         release = pypi("tokenspeed-scheduler", version)
@@ -1681,56 +1767,6 @@ class SchedulerRelease(Release):
                 "Scheduler publication requires eight wheels and one source distribution"
             )
         return files
-
-    def wait_index(self, files):
-        while True:
-            index = request(
-                "https://pypi.org/simple/tokenspeed-scheduler/",
-                github=False,
-                accept="application/vnd.pypi.simple.v1+json",
-            )
-            indexed = {f["filename"]: f for f in index["files"]}
-            for name, digest in files.items():
-                if name in indexed and (
-                    indexed[name]["yanked"]
-                    or indexed[name]["hashes"].get("sha256") != digest
-                ):
-                    raise RuntimeError(
-                        "Scheduler index files differ from the verified publication"
-                    )
-            if files.keys() <= indexed.keys():
-                return
-            self.pause()
-
-    def gate(self):
-        current = read_version("tokenspeed-scheduler")
-        version = self.state["versions"]["tokenspeed-scheduler"]
-        if self.stage == "scheduler-dependency":
-            if (
-                not self.state["stages"].get("scheduler-publish", {}).get("complete")
-                or current != version
-            ):
-                raise RuntimeError(
-                    "Scheduler dependency requires a completed publication of the current version"
-                )
-            check_tree(
-                self.state["stages"]["scheduler-version"]["sha"], "tokenspeed-scheduler"
-            )
-            if self.files() != self.state["publication_files"]:
-                raise RuntimeError(
-                    "Scheduler publication changed before the dependency merge"
-                )
-            self.wait_index(self.state["publication_files"])
-        elif current not in (
-            self.state["initial_versions"]["tokenspeed-scheduler"],
-            version,
-        ):
-            raise RuntimeError("Scheduler version changed outside this release")
-        return {"tokenspeed-scheduler": current}
-
-    def fast_forward_version(self, stage, pr):
-        self.gate()
-        super().fast_forward_version(stage, pr)
 
     def publish(self):
         workflow = "release-tokenspeed-scheduler.yml"
@@ -1765,33 +1801,92 @@ class SchedulerRelease(Release):
         self.state["publication_files"] = files
         self.save()
 
-    def run(self, requested):
-        self.phase.pop("complete", None)
-        self.guard()
-        index = SCHEDULER_STAGES.index(self.stage)
-        if index and not self.state["stages"].get(SCHEDULER_STAGES[index - 1], {}).get(
-            "complete"
-        ):
-            raise RuntimeError("Previous scheduler stage did not complete")
-        if self.stage == "scheduler-version":
-            self.reserve(requested)
-            self.pr(self.stage)
-        elif self.stage == "scheduler-publish":
-            self.publish()
+
+class MLARelease(ComponentRelease):
+    package = "tokenspeed-mla"
+    stages = MLA_STAGES
+    packages_by_stage = {
+        "mla-version": "tokenspeed-mla",
+        "mla-dependency": "tokenspeed-mla",
+    }
+    pr_files = {
+        "mla-version": [PROJECTS["tokenspeed-mla"]],
+        "mla-dependency": ["tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"],
+    }
+    pr_body = (
+        "Publish the MLA version before updating the kernel's exact requirement.\n"
+    )
+
+    def update_metadata(self, stage):
+        if stage == "mla-version":
+            return super().update_metadata(stage)
+        version = self.state["versions"][self.package]
+        path = self.pr_files[stage][0]
+        specifier = str(requirements(path)[self.package].specifier)
+        if specifier not in (self.state["initial_dependency"], f"=={version}"):
+            raise RuntimeError("MLA dependency changed outside this release")
+        replace(path, r"^tokenspeed-mla==[^\n]+$", f"tokenspeed-mla=={version}")
+
+    def available(self, version):
+        if pypi(self.package, version) is not None:
+            raise RuntimeError(
+                "Reserved MLA version already published; inspect manually"
+            )
+
+    def files(self):
+        version = self.state["versions"][self.package]
+        release = pypi(self.package, version)
+        if not release or any(f["yanked"] for f in release["urls"]):
+            raise RuntimeError("MLA publication is missing or yanked")
+        files = {f["filename"]: f["digests"]["sha256"] for f in release["urls"]}
+        if set(files) != {f"tokenspeed_mla-{version}-py3-none-any.whl"}:
+            raise RuntimeError("MLA publication requires exactly one universal wheel")
+        return files
+
+    def publish(self):
+        workflow = "release-tokenspeed-mla.yml"
+        version = self.state["versions"][self.package]
+        sha = self.state["stages"]["mla-version"]["sha"]
+        ref = self.immutable_ref("mla-version", sha)
+        if not self.state["runs"].get(workflow, {}).get("dispatch_started"):
+            self.available(version)
+        run_id = self.child(workflow, sha, ref, {}, event="workflow_dispatch")
+        self.published(self.package, workflow, sha)
+        files = self.files()
+        if "publication_files" in self.state:
+            if files != self.state["publication_files"]:
+                raise RuntimeError(
+                    "MLA publication changed after artifact verification"
+                )
         else:
-            self.checkout_main()
-            self.gate()
-            self.phase.setdefault("base", command("git", "rev-parse", "HEAD"))
+            dist = self.path.parent / "tokenspeed-mla-dist"
+            command(
+                "gh",
+                "run",
+                "download",
+                str(run_id),
+                "--repo",
+                REPO,
+                "--name",
+                "tokenspeed-mla-dist",
+                "--dir",
+                str(dist),
+            )
+            if {
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in dist.iterdir()
+            } != files:
+                raise RuntimeError("MLA artifact differs from published PyPI files")
+            self.state["publication_files"] = files
             self.save()
-            self.pr(self.stage)
-        self.phase["complete"] = True
-        self.phase.pop("error", None)
-        self.save()
+        self.wait_index(files)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=(*STAGES, *SCHEDULER_STAGES), required=True)
+    parser.add_argument(
+        "--stage", choices=(*STAGES, *SCHEDULER_STAGES, *MLA_STAGES), required=True
+    )
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--version", default="")
     parser.add_argument("--resume-run-id", default="")
@@ -1800,7 +1895,12 @@ def main():
     if args.check_only:
         print(json.dumps(preflight(), indent=2))
         return
-    controller = SchedulerRelease if args.stage in SCHEDULER_STAGES else Release
+    if args.stage in SCHEDULER_STAGES:
+        controller = SchedulerRelease
+    elif args.stage in MLA_STAGES:
+        controller = MLARelease
+    else:
+        controller = Release
     release = controller(args.state, args.stage, resume_run_id=args.resume_run_id)
     try:
         release.run(args.version)
