@@ -106,7 +106,7 @@ capabilities = ["thinking", "tool_use"]
     home.joinpath("config.toml").write_text(config)
     shutil.copyfile(Path(__file__).with_name("pr-ci-planner.md"), root / "planner.md")
     data = context(
-        Path(os.environ["GITHUB_WORKSPACE"]),
+        Path.cwd(),
         os.environ["PR_HEAD_SHA"],
         os.environ["PR_BASE_SHA"],
     )
@@ -162,6 +162,7 @@ def _check_public_output(body: str, root: Path, *, source_links: bool = False) -
         urlparse(url).hostname,
         os.environ["RUNNER_TEMP"],
         os.environ["GITHUB_WORKSPACE"],
+        str(Path.cwd()),
     ]
     # Public task identifiers can contain the configured model's name. Allow
     # only exact catalog identifiers; free text still cannot identify it.
@@ -202,7 +203,7 @@ def _check_public_output(body: str, root: Path, *, source_links: bool = False) -
 def plan(root: Path) -> None:
     if not os.environ.get("KIMI_API_KEY"):
         raise SystemExit("Set the KIMI_API_KEY organization secret.")
-    source = os.environ["GITHUB_WORKSPACE"]
+    source = str(Path.cwd())
     # A neutral working directory avoids loading the PR's CLI/MCP configuration.
     with (
         root.joinpath("events.jsonl").open("w") as events,

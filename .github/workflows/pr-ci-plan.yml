@@ -72,7 +72,6 @@ jobs:
 
       - name: Prepare CI plan
         env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}/source
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           PR_BASE_SHA: ${{ steps.source.outputs.base }}
           PR_HEAD_SHA: ${{ steps.source.outputs.head }}
@@ -83,7 +82,6 @@ jobs:
 
       - name: Generate CI plan
         env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}/source
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           KIMI_CODE_HOME: ${{ runner.temp }}/ci-assist-home
           PR_HEAD_SHA: ${{ steps.source.outputs.head }}
@@ -92,7 +90,6 @@ jobs:
 
       - name: Publish CI plan
         env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}/source
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           PR_NUMBER: ${{ steps.source.outputs.pr }}
           PR_HEAD_SHA: ${{ steps.source.outputs.head }}

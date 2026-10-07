@@ -47,7 +47,10 @@ def test_escaped_sensitive_summary_cannot_be_published(tmp_path, monkeypatch):
     monkeypatch.setenv("KIMI_CODE_HOME", str(home))
     monkeypatch.setenv("KIMI_API_KEY", "token-q7z-key-only")
     monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
-    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path / "source"))
+    source = tmp_path / "source"
+    source.mkdir()
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    monkeypatch.chdir(source)
     data = {
         "version": 1,
         "repository": "lightseekorg/tokenspeed",
@@ -64,6 +67,7 @@ def test_escaped_sensitive_summary_cannot_be_published(tmp_path, monkeypatch):
     module._check_public_output(raw, tmp_path)
 
     def run(*args, stdout, **kwargs):
+        assert f"Source root: {source}." in args[0][-1]
         stdout.write(json.dumps({"role": "assistant", "content": raw}) + "\n")
         stdout.flush()
         return SimpleNamespace(returncode=0)
