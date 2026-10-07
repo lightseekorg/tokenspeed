@@ -1033,28 +1033,13 @@ def triton_bmm_fp8_blockscale(
     return C
 
 
-def _triton_dsv4_grouped_output_projection_weights(
-    *,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    num_groups: int,
-    output_dim: int,
-    input_dim: int,
-    block_size: tuple[int, int],
-    recipe: tuple[int, int, int],
-) -> torch.Tensor:
-    del weight, recipe
-    block_n, block_k = block_size
-    expected_shape = (
-        num_groups * (output_dim // block_n),
-        input_dim // block_k,
+_TRITON_GROUPED_OUTPUT_SIGNATURES = frozenset(
+    format_signature(
+        attention=dense_tensor_format(input_dtype),
+        weight=dense_tensor_format(_fp8_dtype),
     )
-    if tuple(weight_scale.shape) != expected_shape:
-        raise ValueError(
-            "grouped output projection scale shape mismatch: "
-            f"expected {expected_shape}, got {tuple(weight_scale.shape)}"
-        )
-    return weight_scale
+    for input_dtype in (torch.float16, torch.bfloat16)
+)
 
 
 @register_kernel(
@@ -1063,16 +1048,9 @@ def _triton_dsv4_grouped_output_projection_weights(
     name="triton_dsv4_grouped_output_projection",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
-    signatures=frozenset(
-        format_signature(
-            attention=dense_tensor_format(input_dtype),
-            weight=dense_tensor_format(_fp8_dtype),
-        )
-        for input_dtype in (torch.float16, torch.bfloat16)
-    ),
+    signatures=_TRITON_GROUPED_OUTPUT_SIGNATURES,
     traits={},
     priority=Priority.PERFORMANT + 3,
-    weight_preprocessor=_triton_dsv4_grouped_output_projection_weights,
 )
 def triton_dsv4_grouped_output_projection(
     *,
@@ -1087,13 +1065,8 @@ def triton_dsv4_grouped_output_projection(
     nope_dim: int,
     rope_dim: int,
     block_size: tuple[int, int],
-    tma_aligned_scales: bool,
-    recipe: tuple[int, int, int],
 ) -> torch.Tensor:
     """Run V4's grouped output projection with canonical scales and Triton BMM."""
-    del recipe
-    if tma_aligned_scales:
-        raise ValueError("the portable projection requires canonical scales")
     from tokenspeed_kernel.ops.attention.dsv4.triton import (
         dsv4_fused_inv_rope_fp8_quant,
     )

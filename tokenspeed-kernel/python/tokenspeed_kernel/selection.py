@@ -177,6 +177,7 @@ def _make_cache_key(
     features: frozenset[str] | None,
     traits: dict[str, Any] | None,
     solution: str | None = None,
+    ignore_layout: bool = False,
 ) -> tuple:
     """Build a hashable cache key including selection-relevant traits."""
     traits_key = tuple(sorted(traits.items())) if traits else ()
@@ -189,6 +190,7 @@ def _make_cache_key(
         mods_key,
         traits_key,
         solution,
+        ignore_layout,
     )
 
 
@@ -533,6 +535,7 @@ def select_kernel(
     traits: dict[str, Any] | None = None,
     solution: str | None = None,
     override: str | None = None,
+    ignore_layout: bool = False,
 ) -> SelectedKernel:
     """Select the best kernel for an operation.
 
@@ -553,6 +556,8 @@ def select_kernel(
         override: Force a specific kernel name or solution string, skipping
             platform, format-signature and trait matching but still refusing
             a kernel that lacks a required feature.
+        ignore_layout: Ignore only storage layouts when choosing preprocessing
+            at initialization. Execution uses the default layout-aware matching.
 
     Returns:
         A :class:`SelectedKernel` that is directly callable and also
@@ -576,6 +581,7 @@ def select_kernel(
         features,
         traits,
         solution,
+        ignore_layout,
     )
     if override is None:
         cached = registry.cache_get(cache_key)
@@ -599,6 +605,7 @@ def select_kernel(
         platform=platform,
         format_signature=format_signature,
         solution=solution,
+        ignore_layout=ignore_layout,
     )
 
     solution_clause = f" with solution {solution!r}" if solution else ""

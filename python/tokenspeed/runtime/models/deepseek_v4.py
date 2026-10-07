@@ -2992,6 +2992,7 @@ class DeepseekV4Attention(nn.Module):
             cos_sin_cache,
             self.wo_a.weight,
             self.wo_a.weight_scale_inv,
+            allow_unknown_layout=False,
         )
         out, _ = self.wo_b(z.flatten(1))
         return out
@@ -3824,7 +3825,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
     def post_quant_warmup(self) -> None:
         """Called by the weight loader after all quant process_weights_after_loading."""
         dsv4_grouped_output_projection_warmup_model(
-            self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()
+            self,
+            max_tokens=_deepseek_v4_mega_moe_max_num_tokens(),
+            allow_unknown_layout=False,
         )
         warmup_prepared_fp8_linears(
             self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()

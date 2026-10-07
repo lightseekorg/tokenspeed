@@ -24,6 +24,7 @@ import logging
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import partial
 from math import prod
 
 # Backend registration (side-effect imports)
@@ -89,6 +90,7 @@ from tokenspeed_kernel.signature import (
     format_signature,
     tensor_format,
 )
+from tokenspeed_kernel.weights import get_weight_broker
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +98,7 @@ __all__ = [
     "bmm",
     "dsv4_grouped_output_projection",
     "dsv4_grouped_output_projection_plan",
-    "dsv4_grouped_output_projection_process_weights",
+    "dsv4_grouped_output_projection_preprocessor",
     "dsv4_grouped_output_projection_warmup",
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
@@ -630,9 +632,6 @@ def warmup_prepared_fp8_linears(plans: Iterable[object], max_tokens: int) -> Non
 
 @dataclass(frozen=True)
 class _GroupedOutputProjectionPlan:
-    kernel: SelectedKernel
-    weight_preprocessor: Callable
-    warmup: Callable | None
     input_dtype: torch.dtype
     weight_dtype: torch.dtype
     weight_scale_dtype: torch.dtype
@@ -644,9 +643,6 @@ class _GroupedOutputProjectionPlan:
     output_dim: int
     block_size: tuple[int, int]
     scale_format: str | None
-    tma_aligned_scales: bool
-    preprocess_recipe: tuple[int, int, int]
-    execution_recipe: tuple[int, int, int]
 
 
 def dsv4_grouped_output_projection_plan(
@@ -662,13 +658,10 @@ def dsv4_grouped_output_projection_plan(
     output_dim: int,
     block_size: tuple[int, int] | list[int],
     scale_format: str | None = None,
-    solution: str | None = None,
 ) -> object:
     """Create an opaque plan for the DeepSeek V4 grouped output projection.
 
-    The selected implementation owns both weight-scale preprocessing and
-    execution. Callers must retain the returned object without inspecting it,
-    preprocess the loaded scales once, and use the same plan for execution.
+    The configuration records the projection geometry and source formats.
 
     Args:
         input_dtype: Attention output dtype before dynamic FP8 quantization.
@@ -682,7 +675,6 @@ def dsv4_grouped_output_projection_plan(
         output_dim: Output width of each grouped projection.
         block_size: Logical weight-scale block shape ``[block_n, block_k]``.
         scale_format: Logical checkpoint scale encoding, such as ``"ue8m0"``.
-        solution: Optional implementation family override.
 
     Returns:
         An opaque plan accepted by the related preprocess, execute, and warmup
@@ -710,37 +702,7 @@ def dsv4_grouped_output_projection_plan(
             f"rope_dim={rope_dim}, block_k={block_k}"
         )
 
-    signature = format_signature(
-        attention=dense_tensor_format(input_dtype),
-        weight=dense_tensor_format(weight_dtype),
-    )
-    traits = {
-        "block_size": (block_n, block_k),
-        "scale_format": scale_format,
-        "weight_scale_dtype": weight_scale_dtype,
-    }
-    kernel = select_kernel(
-        "gemm",
-        "dsv4_grouped_output_projection",
-        signature,
-        traits=traits,
-        solution=solution,
-    )
-    spec = KernelRegistry.get().get_by_name(kernel.name)
-    if spec is None or spec.weight_preprocessor is None:
-        raise RuntimeError(
-            f"Grouped output projection kernel {kernel.name!r} has no preprocessor"
-        )
-
-    tma_aligned_scales = (
-        spec.solution == "deep_gemm" and current_platform().is_blackwell_plus
-    )
-    preprocess_recipe = (1, block_n, block_k)
-    execution_recipe = (1, 1, block_n) if tma_aligned_scales else preprocess_recipe
     return _GroupedOutputProjectionPlan(
-        kernel=kernel,
-        weight_preprocessor=spec.weight_preprocessor,
-        warmup=getattr(kernel.impl, "_tokenspeed_warmup", None),
         input_dtype=input_dtype,
         weight_dtype=weight_dtype,
         weight_scale_dtype=weight_scale_dtype,
@@ -752,9 +714,6 @@ def dsv4_grouped_output_projection_plan(
         output_dim=output_dim,
         block_size=(block_n, block_k),
         scale_format=scale_format,
-        tma_aligned_scales=tma_aligned_scales,
-        preprocess_recipe=preprocess_recipe,
-        execution_recipe=execution_recipe,
     )
 
 
@@ -766,40 +725,81 @@ def _require_grouped_output_projection_plan(
     return plan
 
 
-def dsv4_grouped_output_projection_process_weights(
+def dsv4_grouped_output_projection_preprocessor(
     plan: object,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-) -> torch.Tensor:
-    """Prepare grouped projection scales using the implementation pinned by plan.
+    *,
+    solution: str | None = None,
+) -> tuple[tuple[str, ...], Callable] | None:
+    """Select tensor preprocessing for a grouped output projection layer.
 
     Args:
         plan: Opaque grouped output projection plan.
-        weight: Loaded FP8 weight in flattened ``[groups * output_dim, input_dim]``
-            layout.
-        weight_scale: Loaded canonical block scales.
+        solution: Optional implementation family preference for preparation.
 
     Returns:
-        The scales in the selected implementation's persistent layout.
+        Source attribute names and their transformation with geometry bound,
+        or None when the layer should enroll canonical weights. The layer runs
+        the returned preprocessor through the shared weight broker.
     """
     typed_plan = _require_grouped_output_projection_plan(plan)
-    expected_weight_shape = (
-        typed_plan.num_groups * typed_plan.output_dim,
-        typed_plan.heads_per_group * typed_plan.head_dim,
+    selected = select_kernel(
+        "gemm",
+        "dsv4_grouped_output_projection",
+        format_signature(
+            attention=dense_tensor_format(typed_plan.input_dtype),
+            weight=dense_tensor_format(typed_plan.weight_dtype),
+        ),
+        traits={
+            "block_size": typed_plan.block_size,
+            "scale_format": typed_plan.scale_format,
+            "weight_scale_dtype": typed_plan.weight_scale_dtype,
+        },
+        solution=solution,
+        ignore_layout=True,
     )
-    if tuple(weight.shape) != expected_weight_shape:
-        raise ValueError(
-            "grouped output projection weight shape mismatch: "
-            f"expected {expected_weight_shape}, got {tuple(weight.shape)}"
-        )
-    return typed_plan.weight_preprocessor(
-        weight=weight,
-        weight_scale=weight_scale,
-        num_groups=typed_plan.num_groups,
-        output_dim=typed_plan.output_dim,
-        input_dim=expected_weight_shape[1],
-        block_size=typed_plan.block_size,
-        recipe=typed_plan.preprocess_recipe,
+    spec = KernelRegistry.get().get_by_name(selected.name)
+    assert spec is not None
+    if spec.weight_preprocessor is None:
+        return None
+    names, transform = spec.weight_preprocessor
+    return names, partial(
+        transform,
+        config={
+            "num_groups": typed_plan.num_groups,
+            "output_dim": typed_plan.output_dim,
+            "input_dim": typed_plan.heads_per_group * typed_plan.head_dim,
+            "block_size": typed_plan.block_size,
+        },
+    )
+
+
+def _select_grouped_output_projection(
+    plan: _GroupedOutputProjectionPlan,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    allow_unknown_layout: bool,
+    solution: str | None,
+) -> SelectedKernel:
+    broker = get_weight_broker()
+    layouts = frozenset(
+        broker.layout(tensor, allow_unknown=allow_unknown_layout)
+        for tensor in (weight, weight_scale)
+    )
+    return select_kernel(
+        "gemm",
+        "dsv4_grouped_output_projection",
+        format_signature(
+            layouts=layouts,
+            attention=dense_tensor_format(plan.input_dtype),
+            weight=dense_tensor_format(weight.dtype),
+        ),
+        traits={
+            "block_size": plan.block_size,
+            "scale_format": plan.scale_format,
+            "weight_scale_dtype": weight_scale.dtype,
+        },
+        solution=solution,
     )
 
 
@@ -810,6 +810,9 @@ def dsv4_grouped_output_projection(
     cos_sin_cache: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
+    *,
+    allow_unknown_layout: bool,
+    solution: str | None = None,
 ) -> torch.Tensor:
     """Run inverse RoPE, FP8 quantization, and grouped ``wo_a`` projection.
 
@@ -819,7 +822,10 @@ def dsv4_grouped_output_projection(
         positions: Position index for each token.
         cos_sin_cache: Rotary embedding cache used to undo output RoPE.
         weight: Processed grouped FP8 projection weight.
-        weight_scale: Scales returned by the plan's preprocessing API.
+        weight_scale: Scales prepared by the layer.
+        allow_unknown_layout: Whether unenrolled storage may be treated as
+            canonical. Layers that preprocess weights must pass False.
+        solution: Optional implementation family preference for this call.
 
     Returns:
         Grouped BF16 output shaped ``[tokens, num_groups, output_dim]``.
@@ -852,7 +858,13 @@ def dsv4_grouped_output_projection(
         "N": typed_plan.output_dim,
         "K": typed_plan.heads_per_group * typed_plan.head_dim,
     }
-    kernel = typed_plan.kernel
+    kernel = _select_grouped_output_projection(
+        typed_plan,
+        weight,
+        weight_scale,
+        allow_unknown_layout=allow_unknown_layout,
+        solution=solution,
+    )
     ShapeCapture.get().record(
         "gemm",
         "dsv4_grouped_output_projection",
@@ -879,8 +891,6 @@ def dsv4_grouped_output_projection(
             nope_dim=typed_plan.nope_dim,
             rope_dim=typed_plan.rope_dim,
             block_size=typed_plan.block_size,
-            tma_aligned_scales=typed_plan.tma_aligned_scales,
-            recipe=typed_plan.execution_recipe,
         )
 
 
@@ -889,30 +899,42 @@ def dsv4_grouped_output_projection_warmup(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     max_tokens: int,
+    *,
+    allow_unknown_layout: bool,
+    solution: str | None = None,
 ) -> None:
-    """Warm the implementation pinned by a grouped output projection plan.
+    """Warm the implementation selected for the current prepared weights.
 
     Args:
         plan: Opaque grouped output projection plan.
         weight: Processed grouped FP8 projection weight.
-        weight_scale: Scales returned by the plan's preprocessing API.
+        weight_scale: Scales prepared by the layer.
         max_tokens: Largest token count to include in the warmup sweep.
+        allow_unknown_layout: Whether unenrolled storage may be treated as
+            canonical. Layers that preprocess weights must pass False.
+        solution: Optional implementation family preference for this call.
 
     Returns:
         None.
     """
     typed_plan = _require_grouped_output_projection_plan(plan)
-    if typed_plan.warmup is None:
+    kernel = _select_grouped_output_projection(
+        typed_plan,
+        weight,
+        weight_scale,
+        allow_unknown_layout=allow_unknown_layout,
+        solution=solution,
+    )
+    warmup = getattr(kernel.impl, "_tokenspeed_warmup", None)
+    if warmup is None:
         return
-    typed_plan.warmup(
+    warmup(
         weight=weight,
         weight_scale=weight_scale,
         num_groups=typed_plan.num_groups,
         output_dim=typed_plan.output_dim,
         input_dim=typed_plan.heads_per_group * typed_plan.head_dim,
         block_size=typed_plan.block_size,
-        tma_aligned_scales=typed_plan.tma_aligned_scales,
-        recipe=typed_plan.execution_recipe,
         max_tokens=max_tokens,
     )
 
@@ -920,30 +942,52 @@ def dsv4_grouped_output_projection_warmup(
 def dsv4_grouped_output_projection_warmup_model(
     model: torch.nn.Module,
     max_tokens: int,
+    *,
+    allow_unknown_layout: bool,
+    solution: str | None = None,
 ) -> None:
     """Warm every distinct grouped output projection plan attached to a model.
 
     Args:
         model: Model containing layers with prepared grouped projection plans.
         max_tokens: Largest token count to include in each backend warmup sweep.
+        allow_unknown_layout: Whether unenrolled storage may be treated as
+            canonical. Layers that preprocess weights must pass False.
+        solution: Optional implementation family preference for this call.
 
     Returns:
         None.
     """
-    seen: set[_GroupedOutputProjectionPlan] = set()
+    seen: set[tuple] = set()
     for module in model.modules():
         plan = getattr(module, "_dsv4_grouped_output_projection_plan", None)
         if plan is None:
             continue
         typed_plan = _require_grouped_output_projection_plan(plan)
-        if typed_plan in seen:
+        # Validate every layer even when another layer already warmed its shape.
+        kernel = _select_grouped_output_projection(
+            typed_plan,
+            module.weight,
+            module.weight_scale_inv,
+            allow_unknown_layout=allow_unknown_layout,
+            solution=solution,
+        )
+        key = (
+            typed_plan,
+            kernel.name,
+            module.weight_scale_inv.dtype,
+            module.weight.device,
+        )
+        if key in seen:
             continue
-        seen.add(typed_plan)
+        seen.add(key)
         dsv4_grouped_output_projection_warmup(
             typed_plan,
             module.weight,
             module.weight_scale_inv,
             max_tokens,
+            allow_unknown_layout=allow_unknown_layout,
+            solution=solution,
         )
 
 

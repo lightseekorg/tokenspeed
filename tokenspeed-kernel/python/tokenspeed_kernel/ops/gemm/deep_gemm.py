@@ -67,15 +67,6 @@ else:
     transform_sf_into_required_layout = None
 
 
-_DEEPSEEK_V4_GROUPED_SIGNATURES = frozenset(
-    format_signature(
-        attention=dense_tensor_format(input_dtype),
-        weight=dense_tensor_format(_fp8_dtype),
-    )
-    for input_dtype in (torch.float16, torch.bfloat16)
-)
-
-
 def _warmup_m_values(max_tokens: int) -> list[int]:
     """Return token counts covering every DeepGEMM tile reachable at runtime."""
     dense = min(max_tokens, 2048)
@@ -141,38 +132,52 @@ def _warmup_deep_gemm_fp8_linears(plans: list[object], max_tokens: int) -> None:
 def _deep_gemm_dsv4_grouped_output_projection_weights(
     *,
     weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    num_groups: int,
-    output_dim: int,
-    input_dim: int,
-    block_size: tuple[int, int],
-    recipe: tuple[int, int, int],
-) -> torch.Tensor:
+    weight_scale_inv: torch.Tensor,
+    config: dict,
+) -> dict[str, torch.Tensor]:
     """Transform grouped scales into DeepGEMM's architecture-specific layout."""
-    del weight
-    block_n, block_k = block_size
+    num_groups, output_dim, input_dim = (
+        config["num_groups"],
+        config["output_dim"],
+        config["input_dim"],
+    )
+    block_n, block_k = config["block_size"]
     expected_shape = (
         num_groups * (output_dim // block_n),
         input_dim // block_k,
     )
-    if tuple(weight_scale.shape) != expected_shape:
+    if tuple(weight_scale_inv.shape) != expected_shape:
         raise ValueError(
             "grouped output projection scale shape mismatch: "
-            f"expected {expected_shape}, got {tuple(weight_scale.shape)}"
+            f"expected {expected_shape}, got {tuple(weight_scale_inv.shape)}"
         )
-    sf = ceil_to_ue8m0(weight_scale).view(
+    sf = ceil_to_ue8m0(weight_scale_inv).view(
         num_groups,
         output_dim // block_n,
         input_dim // block_k,
     )
-    return transform_sf_into_required_layout(
+    prepared_scale = transform_sf_into_required_layout(
         sf=sf,
         mn=output_dim,
         k=input_dim,
-        recipe=recipe,
+        recipe=(1, block_n, block_k),
         num_groups=num_groups,
         is_sfa=False,
     )
+    return {
+        "weight": weight,
+        "weight_scale_inv": prepared_scale,
+    }
+
+
+_DEEPSEEK_V4_GROUPED_SIGNATURES = frozenset(
+    format_signature(
+        layouts={_deep_gemm_dsv4_grouped_output_projection_weights},
+        attention=dense_tensor_format(input_dtype),
+        weight=dense_tensor_format(_fp8_dtype),
+    )
+    for input_dtype in (torch.float16, torch.bfloat16)
+)
 
 
 def _warmup_deep_gemm_dsv4_grouped_output_projection(
@@ -183,12 +188,13 @@ def _warmup_deep_gemm_dsv4_grouped_output_projection(
     output_dim: int,
     input_dim: int,
     block_size: tuple[int, int],
-    tma_aligned_scales: bool,
-    recipe: tuple[int, int, int],
     max_tokens: int,
 ) -> None:
     if get_pdl() != pdl_enabled():
         set_pdl(pdl_enabled())
+    tma_aligned_scales = weight_scale.dtype == torch.int32
+    block_n, block_k = block_size
+    recipe = (1, 1, block_n) if tma_aligned_scales else (1, block_n, block_k)
     num_scale_blocks = input_dim // block_size[1]
     grouped_weight = weight.view(num_groups, output_dim, input_dim)
     for num_tokens in _warmup_m_values(max_tokens):
@@ -244,10 +250,13 @@ if platform.is_hopper_plus:
         traits={
             "block_size": frozenset({(128, 128)}),
             "scale_format": frozenset({"ue8m0"}),
-            "weight_scale_dtype": frozenset({torch.float32}),
+            "weight_scale_dtype": frozenset({torch.float32, torch.int32}),
         },
         priority=Priority.SPECIALIZED + 2,
-        weight_preprocessor=_deep_gemm_dsv4_grouped_output_projection_weights,
+        weight_preprocessor=(
+            ("weight", "weight_scale_inv"),
+            _deep_gemm_dsv4_grouped_output_projection_weights,
+        ),
     )
     def deep_gemm_dsv4_grouped_output_projection(
         *,
@@ -262,8 +271,6 @@ if platform.is_hopper_plus:
         nope_dim: int,
         rope_dim: int,
         block_size: tuple[int, int],
-        tma_aligned_scales: bool,
-        recipe: tuple[int, int, int],
     ) -> torch.Tensor:
         from tokenspeed_kernel.ops.attention.dsv4.triton import (
             dsv4_fused_inv_rope_fp8_quant,
@@ -271,6 +278,9 @@ if platform.is_hopper_plus:
 
         if get_pdl() != pdl_enabled():
             set_pdl(pdl_enabled())
+        tma_aligned_scales = weight_scale.dtype == torch.int32
+        block_n, block_k = block_size
+        recipe = (1, 1, block_n) if tma_aligned_scales else (1, block_n, block_k)
         values, scales = dsv4_fused_inv_rope_fp8_quant(
             attention,
             positions,

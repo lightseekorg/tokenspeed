@@ -92,6 +92,7 @@ tokenspeed_kernel/
   __init__.py            # Public API re-exports
   platform.py            # PlatformInfo, capability detection
   signature.py           # TensorFormat, ScaleFormat, FormatSignature
+  weights.py             # Weak storage-layout tracking and tensor replacement
   registry.py            # KernelRegistry, register_kernel, Priority bands
   selection.py           # select_kernel, oracles, overrides
   profiling.py           # ShapeCapture, kernel_scope, Proton bootstrap
@@ -117,6 +118,17 @@ such as `attention/mha/triton.py`. A solution is either an in-tree JIT kernel
 All of them register through the same decorator and are scored by the same
 selection logic, so adding a backend is one new file in the right family
 folder.
+
+### Weight preprocessing
+
+Some kernels need loaded weights converted into a representation suited to their
+computation. During model initialization, the layer chooses a compatible
+preprocessor. A shared weight broker installs the transformed weights and tracks
+their storage layout, making that representation visible to kernel selection.
+
+At execution, the registry matches the prepared weights to kernels that support
+their layout alongside the operation's other requirements. This lets preparation
+and execution remain separate while different kernels can share prepared weights.
 
 ### Solution choices
 

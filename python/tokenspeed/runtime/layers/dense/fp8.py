@@ -27,7 +27,7 @@ import logging
 
 import torch
 from tokenspeed_kernel.ops.gemm import (
-    dsv4_grouped_output_projection_process_weights as kernel_dsv4_grouped_output_projection_process_weights,
+    dsv4_grouped_output_projection_preprocessor as kernel_dsv4_grouped_output_projection_preprocessor,
 )
 from tokenspeed_kernel.ops.gemm import (
     fp8_linear,
@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_token_quant_fp8,
     static_quant_fp8,
 )
+from tokenspeed_kernel.weights import get_weight_broker
 from torch.nn.parameter import Parameter
 
 logger = logging.getLogger(__name__)
@@ -216,13 +217,15 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer, "_dsv4_grouped_output_projection_plan", None
             )
             if grouped_output_projection_plan is not None:
-                layer.weight_scale_inv.data = (
-                    kernel_dsv4_grouped_output_projection_process_weights(
-                        grouped_output_projection_plan,
-                        layer.weight.data,
-                        layer.weight_scale_inv.data,
-                    )
+                preprocessor = kernel_dsv4_grouped_output_projection_preprocessor(
+                    grouped_output_projection_plan
                 )
+                broker = get_weight_broker()
+                if preprocessor is None:
+                    broker.enroll(layer.weight, None)
+                    broker.enroll(layer.weight_scale_inv, None)
+                else:
+                    broker.preprocess(preprocessor, layer)
                 return
             # This opt-in applies across models, but only to the standard
             # 128x128 block-FP8 contract. Specialized/grouped projections,

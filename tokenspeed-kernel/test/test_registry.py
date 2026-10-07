@@ -20,6 +20,9 @@
 
 from __future__ import annotations
 
+import pickle
+from dataclasses import replace
+
 import pytest
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
@@ -39,6 +42,22 @@ from tokenspeed_kernel.signature import (
 from utils import dummy_impl, register_all_samples
 
 pytestmark = pytest.mark.usefixtures("fresh_registry")
+
+
+def _packed(weight):
+    return weight
+
+
+def test_signature_hash_and_pickle_include_function_layout():
+    signature = format_signature(
+        weight=dense_tensor_format(torch.bfloat16), layouts={_packed}
+    )
+    restored = pickle.loads(pickle.dumps(signature))
+    canonical = replace(signature, layouts=frozenset({None}))
+    assert restored == signature
+    assert len({signature, restored, canonical}) == 2
+    assert "_packed" in str(signature)
+    assert hash(restored) == hash(signature)
 
 
 class TestKernelSpec:

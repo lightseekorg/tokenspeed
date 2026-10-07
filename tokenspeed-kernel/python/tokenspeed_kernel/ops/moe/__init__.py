@@ -633,6 +633,7 @@ def moe_plan(
         format_signature(x=dense_tensor_format(input_dtype)),
         traits=traits,
         solution=solution,
+        ignore_layout=True,
     )
     registry = KernelRegistry.get()
     apply_spec = registry.get_by_name(kernel.name)
