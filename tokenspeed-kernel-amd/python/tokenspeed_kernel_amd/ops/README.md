@@ -759,13 +759,18 @@ updated page tables and lengths in place.
 For four BF16 residual streams, FP32 projection weights, hidden width 4096 or
 7168, and 20 Sinkhorn iterations on gfx950, calls with 1–64 token rows use the
 existing reduction kernel, 65–256 rows use the portable Triton path, and
-eligible calls above 256 rows select the Gluon projection. Other
+eligible calls above 256 rows use the complete Gluon prefill operation. Other
 configurations retain their existing registered backend.
 Inputs whose buffer offsets exceed signed 32-bit range retain the portable
 projection.
 
 The projection computes 64 token rows and 24 outputs per workgroup. Four waves
 reuse each asynchronously staged FP32 weight tile while accumulating their own
-rows with FP32 matrix instructions. The shared pre-mapping path still performs
-the following reduction, normalization, and output mixing. Token count remains
-a runtime argument to the projection, so the final partial tile is masked.
+rows with FP32 matrix instructions. A Gluon reduction kernel accumulates the
+projection partials in order, computes the pre/post sigmoid coefficients, and
+normalizes the four-by-four combination matrix with 20 Sinkhorn rounds. A
+separate Gluon kernel applies the pre coefficients to the four streams and
+optionally performs output RMS normalization, preserving the intermediate
+BF16 rounding. Token and reduction-split counts are runtime arguments in the
+mixing stage; hidden width and normalization mode are fixed model geometry.
+The final projection tile is masked for arbitrary token counts.

@@ -170,7 +170,11 @@ def _prefill_args(num_tokens: int, hidden_size: int) -> tuple[object, ...]:
 
 @pytest.mark.parametrize(
     ("num_tokens", "hidden_size"),
-    [(257, 7168), (8144, 4096), (8192, 4096)],
+    [
+        (tokens, hidden)
+        for tokens in (257, 1024, 1025, 2048, 2049, 4096, 4097, 8192, 8193)
+        for hidden in (4096, 7168)
+    ],
 )
 def test_gluon_mhc_large_prefill_matches_reference(
     num_tokens: int, hidden_size: int
@@ -260,3 +264,92 @@ def test_gluon_mhc_large_prefill_graph_replays_changed_input() -> None:
         torch.testing.assert_close(
             actual_tensor.float(), expected_tensor.float(), rtol=2e-2, atol=2e-2
         )
+
+
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("strided_weight", [False, True])
+def test_gluon_mhc_prefill_output_normalization(
+    hidden_size, weight_dtype, strided_weight
+) -> None:
+    args = _prefill_args(257, hidden_size)
+    norm_weight = torch.randn(
+        hidden_size * (2 if strided_weight else 1), dtype=weight_dtype, device="cuda"
+    )
+    if strided_weight:
+        norm_weight = norm_weight[::2]
+    actual = tokenspeed_kernel.mhc_pre(
+        *args,
+        norm_weight=norm_weight,
+        norm_eps=1e-5,
+    )
+    layer, post, comb = _reference(*args)
+    layer = F.rms_norm(layer, (hidden_size,), norm_weight, 1e-5)
+    for result, expected in zip(actual, (layer, post, comb), strict=True):
+        torch.testing.assert_close(
+            result.float(), expected.float(), rtol=2e-2, atol=2e-2
+        )
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+def test_gluon_mhc_prefill_graph_changes_all_inputs(normalize) -> None:
+    args = _prefill_args(257, 7168)
+    residual, fn, scale, bias, *_ = args
+    norm_weight = (
+        torch.ones(7168, dtype=torch.bfloat16, device="cuda") if normalize else None
+    )
+    norm_eps = 1e-5 if normalize else None
+    tokenspeed_kernel.mhc_pre(*args, norm_weight=norm_weight, norm_eps=norm_eps)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = tokenspeed_kernel.mhc_pre(
+            *args, norm_weight=norm_weight, norm_eps=norm_eps
+        )
+    residual.copy_(torch.randn_like(residual))
+    fn.mul_(0.75)
+    scale.mul_(1.2)
+    bias.add_(0.1)
+    if normalize:
+        norm_weight.mul_(0.8)
+    expected = list(_reference(*args))
+    if normalize:
+        expected[0] = F.rms_norm(expected[0], (7168,), norm_weight, norm_eps)
+    graph.replay()
+    for result, correct in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            result.float(), correct.float(), rtol=2e-2, atol=2e-2
+        )
+
+
+def test_gluon_mhc_prefill_downstream_runtime_splits_do_not_recompile() -> None:
+    from tokenspeed_kernel_amd.ops.gfx950 import mhc
+
+    def launch(tokens, splits):
+        projection = torch.randn(splits, tokens, 24, device="cuda")
+        square_sum = torch.ones(splits, tokens, device="cuda")
+        scale = torch.ones(3, device="cuda")
+        bias = torch.zeros(24, device="cuda")
+        pre = torch.empty(tokens, 4, device="cuda")
+        post = torch.empty_like(pre)
+        comb = torch.empty(tokens, 16, device="cuda")
+        mhc.launch_gluon_mhc_prefill_mix_gfx950(
+            projection,
+            square_sum,
+            scale,
+            bias,
+            pre,
+            post,
+            comb,
+            hidden_size=4096,
+            rms_eps=1e-6,
+            hc_eps=1e-6,
+            sinkhorn_iters=20,
+            n_splits=splits,
+            num_tokens=tokens,
+        )
+
+    launch(257, 8)
+    launch(273, 4)
+    with assert_no_triton_compile(mhc.gluon_mhc_prefill_mix_gfx950):
+        for tokens, splits in ((258, 1), (289, 2), (320, 4), (301, 8)):
+            launch(tokens, splits)

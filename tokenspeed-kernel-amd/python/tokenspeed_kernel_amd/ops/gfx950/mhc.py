@@ -44,6 +44,7 @@ _PREFILL_OUTPUTS_GL = gl.constexpr(_PREFILL_OUTPUTS)
 
 __all__ = [
     "gluon_mhc_pre_reduce_apply_gfx950",
+    "launch_gluon_mhc_prefill_gfx950",
     "launch_gluon_mhc_prefill_project_gfx950",
 ]
 
@@ -309,6 +310,293 @@ def launch_gluon_mhc_prefill_project_gfx950(
         num_warps=_PREFILL_NUM_WARPS,
         num_stages=1,
         waves_per_eu=1,
+    )
+
+
+def _mhc_prefill_mix_metadata(grid, kernel, args):
+    return {
+        "name": kernel.name,
+        "bytes": args["num_tokens"] * (args["n_splits"] * 25 + 24) * 4,
+    }
+
+
+@gluon.jit(launch_metadata=_mhc_prefill_mix_metadata)
+def gluon_mhc_prefill_mix_gfx950(
+    projection,
+    square_sum,
+    hc_scale,
+    hc_base,
+    pre_mix,
+    post_mix,
+    comb_mix,
+    num_tokens,
+    n_splits,
+    HIDDEN_SIZE: gl.constexpr,
+    RMS_EPS: gl.constexpr,
+    HC_EPS: gl.constexpr,
+    SINKHORN_ITERS: gl.constexpr,
+):
+    token = gl.program_id(0)
+    vector_layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+    pre_post_offsets = gl.arange(0, 8, layout=vector_layout)
+    pre_post_values = gl.zeros([8], gl.float32, layout=vector_layout)
+    matrix_layout: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [1, 1], [1, 0])
+    rows = gl.arange(0, 4, layout=gl.SliceLayout(1, matrix_layout))
+    cols = gl.arange(0, 16, layout=gl.SliceLayout(0, matrix_layout))
+    active = cols[None, :] < 4
+    comb_offsets = rows[:, None] * 4 + cols[None, :]
+    comb_values = gl.zeros([4, 16], gl.float32, layout=matrix_layout)
+    rms_sum = 0.0
+    # Keep batch-dependent split counts out of the compilation key and retain
+    # the sequential partial-sum order used by the portable implementation.
+    for split in range(n_splits):
+        split_base = split * num_tokens * 24 + token * 24
+        pre_post_values += gl.load(projection + split_base + pre_post_offsets)
+        comb_values += gl.load(
+            projection + split_base + 8 + comb_offsets,
+            mask=active,
+            other=0.0,
+        )
+        rms_sum += gl.load(square_sum + split * num_tokens + token)
+
+    inverse_rms = gl.rsqrt(rms_sum / (4 * HIDDEN_SIZE) + RMS_EPS)
+    pre_post_scale = gl.where(
+        pre_post_offsets < 4, gl.load(hc_scale), gl.load(hc_scale + 1)
+    )
+    pre_post_values = 1.0 / (
+        1.0
+        + gl.exp(
+            -(
+                pre_post_values * inverse_rms * pre_post_scale
+                + gl.load(hc_base + pre_post_offsets)
+            )
+        )
+    )
+    gl.store(
+        pre_mix + token * 4 + pre_post_offsets,
+        pre_post_values + HC_EPS,
+        mask=pre_post_offsets < 4,
+    )
+    gl.store(
+        post_mix + token * 4 + pre_post_offsets - 4,
+        pre_post_values * 2.0,
+        mask=pre_post_offsets >= 4,
+    )
+    comb = comb_values * inverse_rms * gl.load(hc_scale + 2) + gl.load(
+        hc_base + 8 + comb_offsets, mask=active, other=0.0
+    )
+    row_max = gl.max(gl.where(active, comb, -float("inf")), axis=1)
+    comb = gl.where(active, gl.exp(comb - row_max[:, None]), 0.0)
+    row_sum = gl.sum(comb, axis=1)
+    comb = gl.where(active, comb / row_sum[:, None] + HC_EPS, 0.0)
+    col_sum = gl.sum(comb, axis=0)
+    comb = gl.where(active, comb / (col_sum[None, :] + HC_EPS), 0.0)
+    for _ in gl.static_range(1, SINKHORN_ITERS):
+        row_sum = gl.sum(comb, axis=1)
+        comb = gl.where(active, comb / (row_sum[:, None] + HC_EPS), 0.0)
+        col_sum = gl.sum(comb, axis=0)
+        comb = gl.where(active, comb / (col_sum[None, :] + HC_EPS), 0.0)
+    gl.store(comb_mix + token * 16 + comb_offsets, comb, mask=active)
+
+
+def launch_gluon_mhc_prefill_mix_gfx950(
+    projection: torch.Tensor,
+    square_sum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    pre_mix: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    *,
+    hidden_size: int,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    n_splits: int,
+    num_tokens: int,
+) -> None:
+    """Reduce FP32 projection partials and write all four-stream mix tensors."""
+    gluon_mhc_prefill_mix_gfx950[(num_tokens,)](
+        projection,
+        square_sum,
+        hc_scale,
+        hc_base,
+        pre_mix,
+        post_mix,
+        comb_mix,
+        num_tokens,
+        n_splits,
+        HIDDEN_SIZE=hidden_size,
+        RMS_EPS=rms_eps,
+        HC_EPS=hc_eps,
+        SINKHORN_ITERS=sinkhorn_iters,
+        num_warps=1,
+    )
+
+
+def _mhc_prefill_apply_metadata(grid, kernel, args):
+    tokens = args["residual"].numel() // (4 * args["HIDDEN_SIZE"])
+    norm_bytes = args["norm_weight"].element_size() if args["NORM"] else 0
+    return {
+        "name": kernel.name,
+        "bytes": tokens * args["HIDDEN_SIZE"] * (10 + norm_bytes),
+        "flops32": tokens * (args["HIDDEN_SIZE"] * (12 if args["NORM"] else 8)),
+    }
+
+
+@gluon.jit(launch_metadata=_mhc_prefill_apply_metadata)
+def gluon_mhc_prefill_apply_gfx950(
+    pre_mix,
+    residual,
+    layer_input,
+    norm_weight,
+    norm_weight_stride,
+    HIDDEN_SIZE: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    NORM: gl.constexpr,
+    NORM_EPS: gl.constexpr,
+):
+    token = gl.program_id(0)
+    block = gl.program_id(1)
+    layout: gl.constexpr = gl.BlockedLayout([4], [64], [4], [0])
+    hidden = block * BLOCK_H + gl.arange(0, BLOCK_H, layout=layout)
+    mask = hidden < HIDDEN_SIZE
+    accumulator = gl.zeros([BLOCK_H], gl.float32, layout=layout)
+    for stream in gl.static_range(4):
+        coefficient = gl.load(pre_mix + token * 4 + stream)
+        value = gl.load(
+            residual + (token * 4 + stream) * HIDDEN_SIZE + hidden,
+            mask=mask,
+            other=0.0,
+        ).to(gl.float32)
+        accumulator += coefficient * value
+    # The public operation rounds the unnormalized layer input to BF16 before
+    # optional RMS normalization; preserve that rounding when fusing the stage.
+    rounded = accumulator.to(gl.bfloat16)
+    if NORM:
+        values = rounded.to(gl.float32)
+        sum_square = gl.sum(gl.where(mask, values * values, 0.0), axis=0)
+        inverse_rms = gl.rsqrt(sum_square / HIDDEN_SIZE + NORM_EPS)
+        weight = gl.load(
+            norm_weight + hidden * norm_weight_stride, mask=mask, other=0.0
+        ).to(gl.float32)
+        rounded = (values * inverse_rms * weight).to(gl.bfloat16)
+    gl.store(layer_input + token * HIDDEN_SIZE + hidden, rounded, mask=mask)
+
+
+def launch_gluon_mhc_prefill_apply_gfx950(
+    pre_mix: torch.Tensor,
+    residual: torch.Tensor,
+    layer_input: torch.Tensor,
+    *,
+    hidden_size: int,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+) -> None:
+    """Mix four BF16 streams, with optional RMS normalization after rounding."""
+    block_h = 1 << (hidden_size - 1).bit_length() if norm_weight is not None else 1024
+    gluon_mhc_prefill_apply_gfx950[
+        (residual.shape[0], (hidden_size + block_h - 1) // block_h)
+    ](
+        pre_mix,
+        residual,
+        layer_input,
+        norm_weight if norm_weight is not None else layer_input,
+        norm_weight.stride(0) if norm_weight is not None else 1,
+        HIDDEN_SIZE=hidden_size,
+        BLOCK_H=block_h,
+        NORM=norm_weight is not None,
+        NORM_EPS=norm_eps if norm_eps is not None else 0.0,
+        num_warps=4,
+    )
+
+
+def launch_gluon_mhc_prefill_gfx950(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    *,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute complete four-stream BF16 mHC prefill on gfx950.
+
+    The projection, split reduction, Sinkhorn mapping, output mixing and
+    optional output normalization are all Gluon kernels. Outputs preserve the
+    residual's leading dimensions and have BF16/FP32/FP32 storage respectively.
+    """
+    outer_shape = residual.shape[:-2]
+    hidden_size = residual.shape[-1]
+    residual_flat = residual.view(-1, 4, hidden_size)
+    num_tokens = residual_flat.shape[0]
+    if num_tokens == 0:
+        return (
+            residual.new_empty(*outer_shape, hidden_size),
+            torch.empty(
+                *outer_shape, 4, 1, dtype=torch.float32, device=residual.device
+            ),
+            torch.empty(
+                *outer_shape, 4, 4, dtype=torch.float32, device=residual.device
+            ),
+        )
+    # These bounded split choices retain the projection's tuned geometry.
+    n_splits = (
+        8
+        if num_tokens <= 2048
+        else 4 if num_tokens <= 4096 else 2 if num_tokens <= 8192 else 1
+    )
+    projection = torch.empty(
+        n_splits, num_tokens, 24, dtype=torch.float32, device=residual.device
+    )
+    square_sum = torch.empty(
+        n_splits, num_tokens, dtype=torch.float32, device=residual.device
+    )
+    pre_mix = torch.empty(num_tokens, 4, dtype=torch.float32, device=residual.device)
+    post_mix = torch.empty_like(pre_mix)
+    comb_mix = torch.empty(num_tokens, 16, dtype=torch.float32, device=residual.device)
+    layer_input = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
+    )
+    launch_gluon_mhc_prefill_project_gfx950(
+        residual_flat,
+        fn,
+        projection,
+        square_sum,
+        n_splits=n_splits,
+        block_m=_PREFILL_BLOCK_M,
+        block_k=_PREFILL_BLOCK_K,
+    )
+    launch_gluon_mhc_prefill_mix_gfx950(
+        projection,
+        square_sum,
+        hc_scale,
+        hc_base,
+        pre_mix,
+        post_mix,
+        comb_mix,
+        hidden_size=hidden_size,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        n_splits=n_splits,
+        num_tokens=num_tokens,
+    )
+    launch_gluon_mhc_prefill_apply_gfx950(
+        pre_mix,
+        residual_flat,
+        layer_input,
+        hidden_size=hidden_size,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+    return (
+        layer_input.view(*outer_shape, hidden_size),
+        post_mix.view(*outer_shape, 4, 1),
+        comb_mix.view(*outer_shape, 4, 4),
     )
 
 
