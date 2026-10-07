@@ -117,7 +117,7 @@ def resolve():
             r"CI plan #([1-9][0-9]*) \| [0-9a-f]{40} \| [0-9a-f]{40}",
             run["display_title"],
         )
-        if plan and run["name"] == "PR CI Plan":
+        if plan:
             candidates.add(int(plan[1]))
         if not candidates:
             match = re.match(r"(?:Slurm|K8s) ([0-9a-f]{40}) \|", run["display_title"])
@@ -737,8 +737,7 @@ def control(number: int):
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         completed = event["workflow_run"]
         if (
-            completed["name"] == "PR CI Plan"
-            and completed["display_title"]
+            completed["display_title"]
             == f"CI plan #{number} | {state['head']} | {state['base']}"
             and completed["id"] > state["plan_refresh"]
             and completed["conclusion"] != "success"

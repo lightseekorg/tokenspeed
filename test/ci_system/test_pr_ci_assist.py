@@ -274,7 +274,7 @@ def test_incomplete_old_plan_refreshes_once_and_failed_refresh_requests_help(
     assert len(commands) == 1 and len(published) == 1
     run = dict(
         id=56,
-        name="PR CI Plan",
+        name=title,
         display_title=title,
         conclusion="failure",
         pull_requests=[],
