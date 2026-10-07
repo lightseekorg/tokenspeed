@@ -1087,10 +1087,16 @@ def test_component_metadata_prs_replay_exact_diffs_without_downstream_version_bu
     )
     if component == "mla":
         path = Path(dependency_path)
+        # Verification restores the base, whose pin can lag the package version.
         path.write_text(
             path.read_text().replace(
-                f"tokenspeed-mla=={current}", "tokenspeed-mla==0.0.0"
+                f"tokenspeed-mla{dependency.state['initial_dependency']}",
+                "tokenspeed-mla==0.0.0",
             )
+        )
+        assert (
+            str(release_module.requirements(dependency_path)[package].specifier)
+            == "==0.0.0"
         )
         with pytest.raises(RuntimeError, match="dependency changed outside"):
             dependency.update_metadata(dependency.stage)
