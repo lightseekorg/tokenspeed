@@ -29,9 +29,11 @@ and the service refuses tree drafting for them.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
-__all__ = ["TreeDraftInputs", "TreeVerifyInputs"]
+__all__ = ["TreeCascadeRows", "TreeDraftInputs", "TreeVerifyInputs"]
 
 
 class TreeVerifyInputs:
@@ -82,3 +84,17 @@ class TreeDraftInputs:
     def set_frontier(self, bs: int, frontier: torch.Tensor) -> None:
         self.frontier[:bs].copy_(frontier[:bs])
         torch.add(self.frontier[:bs], self.num_slots, out=self.window_seq_lens[:bs])
+
+
+@dataclass(frozen=True)
+class TreeCascadeRows:
+    """One decode forward's draft-tree attention (verify nodes or drafting lanes):
+    ``rows`` query rows per request over its committed prefix and a
+    ``window``-key tree window at the end of its keys."""
+
+    page_table: torch.Tensor  # [bs, max_pages] kernel pages
+    seq_lens: torch.Tensor  # [bs] keys per request, the window included
+    prefix_lens: torch.Tensor  # [bs] committed keys before the window
+    mask: torch.Tensor  # [bs * rows] int64 window visibility per row
+    rows: int
+    window: int
