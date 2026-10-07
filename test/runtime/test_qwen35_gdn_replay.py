@@ -302,7 +302,8 @@ def test_qwen_replay_tree_matches_staged_tree(state_dtype):
     replay_out = _prepare_verify(replay_backend, replay_pool, inputs)
     staged_out = _prepare_verify(staged_backend, staged_pool, inputs)
     torch.cuda.synchronize()
-    torch.testing.assert_close(replay_out, staged_out, atol=0.0, rtol=0.0)
+    # The chunked ReplaySSM verify and the step-by-step staged one round differently.
+    torch.testing.assert_close(replay_out, staged_out, atol=1e-4, rtol=2**-7)
     torch.testing.assert_close(
         replay_pool.get_component(0, "recurrent_state"), before, atol=0.0, rtol=0.0
     )
@@ -391,6 +392,64 @@ def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
     assert not torch.equal(payload[:, :KEY_DIM], captured_key)
     assert bool(torch.isfinite(output).all())
     assert bool(torch.isfinite(recurrent[torch.tensor([5, 6], device=DEVICE)]).all())
+
+
+def test_qwen_replay_tree_graph_reads_the_tree_written_after_capture():
+    """A captured tree verify replays with whatever tree the executor writes into the bound buffers."""
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeVerifyInputs,
+    )
+
+    conv, recurrent = _initial_pools()
+    backend, pool = _make_backend(conv, recurrent, replay=True, draft_tree=True)
+    ancestors = torch.tensor([1, 3, 5, 1, 3, 7], dtype=torch.int64, device=DEVICE)
+    parents = torch.tensor([[-1, 0, 0], [-1, 0, 1]], dtype=torch.int32, device=DEVICE)
+    backend.bind_tree_verify(TreeVerifyInputs(ancestors, DRAFT_TOKENS, parent=parents))
+    backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS)
+    inputs = _inputs(seed=41)
+    _prepare_verify(backend, pool, inputs)
+    torch.cuda.synchronize()
+
+    req_pool_indices = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
+    seq_lens = torch.tensor([7, 7], dtype=torch.int32, device=DEVICE)
+    backend.init_forward_metadata_capture_cuda_graph(
+        BATCH, req_pool_indices, seq_lens, ForwardMode.DECODE
+    )
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        _forward_verify(backend, pool, inputs)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = _forward_verify(backend, pool, inputs)
+    backend.refresh_decode_metadata(
+        BATCH,
+        BATCH,
+        req_pool_indices,
+        seq_lens,
+        forward_mode=ForwardMode.DECODE,
+        for_graph_replay=True,
+        block_tables={
+            "linear_attention": torch.tensor(
+                [[1, 5], [2, 6]], dtype=torch.int32, device=DEVICE
+            )
+        },
+    )
+    captured_tree = _forward_verify(backend, pool, inputs)
+
+    # The next round's tree: request 0 a chain, request 1 three roots.
+    ancestors.copy_(torch.tensor([1, 3, 7, 1, 2, 4], dtype=torch.int64))
+    parents.copy_(torch.tensor([[-1, 0, 1], [-1, -1, -1]], dtype=torch.int32))
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = output.clone()
+    expected = _forward_verify(backend, pool, inputs)
+    torch.cuda.synchronize()
+
+    assert not torch.equal(expected, captured_tree)
+    torch.testing.assert_close(replayed, expected, atol=0.0, rtol=0.0)
 
 
 def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):

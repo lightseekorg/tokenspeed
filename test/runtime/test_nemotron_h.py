@@ -1066,6 +1066,9 @@ def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype, tree
         backend.commit_verified_state(
             accepted.cuda(), accepted_path=path if tree else None
         )
+        if tree:
+            # Branches replay their ancestors; no node-state workspace exists.
+            assert backend._tree_node_states is None
         pools.append(pool)
     torch.cuda.synchronize()
 

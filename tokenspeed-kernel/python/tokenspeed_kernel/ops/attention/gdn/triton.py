@@ -40,8 +40,10 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.gdn import (
+    GDN_TREE_VERIFY_PARALLEL_NODES,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+    gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
     CAUSAL_CONV1D_BLOCK_M,
@@ -144,6 +146,19 @@ def triton_gdn_chunk_prefill(
 # ===-----------------------------------------------------------------------===#
 
 
+@triton.jit
+def _latest_ancestor(ancestors_row, step, valid):
+    """Parent of ``step`` (scalar or vector) in a tree's ancestor-or-self bitmask row: the highest bit below its own."""
+    above = tl.load(ancestors_row + step, mask=valid, other=0) & (
+        (tl.full([], 1, tl.int64) << tl.minimum(step, 63).to(tl.int64)) - 1
+    )
+    parent = tl.where(above != 0, 0, -1)
+    for shift in tl.static_range(5, -1, -1):
+        hit = (above >> (tl.maximum(parent, 0) + (1 << shift)).to(tl.int64)) != 0
+        parent = tl.where(hit, parent + (1 << shift), parent)
+    return parent
+
+
 @triton.jit(do_not_specialize=["T"])
 def _fused_gdn_decode_update_kernel(
     A_log,
@@ -161,6 +176,7 @@ def _fused_gdn_decode_update_kernel(
     output_state_indices,
     intermediate_states_buffer,
     per_token_output_state_indices,
+    tree_ancestors,
     scale,
     T,
     H: tl.constexpr,
@@ -174,6 +190,8 @@ def _fused_gdn_decode_update_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr,
     HAS_OUTPUT_STATE_INDICES: tl.constexpr,
     HAS_PER_TOKEN_OUTPUT_STATE_INDICES: tl.constexpr,
+    HAS_TREE: tl.constexpr,
+    T_BLOCK: tl.constexpr,
     Q_STRIDES: tl.constexpr,
     K_STRIDES: tl.constexpr,
     V_STRIDES: tl.constexpr,
@@ -196,7 +214,8 @@ def _fused_gdn_decode_update_kernel(
     - HAS_OUTPUT_STATE_INDICES: after the LAST processed step, write to the
       single row ``output_state_indices[i_n]`` (``[B]``-shaped; T=1 decode's
       dual-index paging remap).
-    - CACHE_INTERMEDIATE_STATES: after EVERY step, write to the batch-scoped
+    - CACHE_INTERMEDIATE_STATES: after EVERY step (every branch point under
+      HAS_TREE), write to the batch-scoped
       ``intermediate_states_buffer[i_n, step]`` (``[B, T, HV, V, K]``,
       K-last -- matches flashinfer's MTP intermediate-state-buffer convention).
     - HAS_PER_TOKEN_OUTPUT_STATE_INDICES: after EVERY step, write directly to
@@ -204,6 +223,14 @@ def _fused_gdn_decode_update_kernel(
       matching FlashInfer 0.6.15's ``ssm_state_indices`` contract.
     DISABLE_STATE_UPDATE additionally gates a final write-back to
     ``h0_indices[i_n]`` (the read row) when neither of the above applies.
+
+    HAS_TREE (draft trees, with per-token output rows or the intermediate
+    buffer): step t continues from the state after its parent, its latest
+    ancestor in ``tree_ancestors[i_n, t]`` (the initial state for a root),
+    instead of step t - 1, reloading it from that step's output row or
+    intermediate-buffer entry when the parent is not t - 1. The intermediate buffer then receives
+    only the branch points' states (steps with a child other than the next
+    step), the only entries a later step reloads.
     """
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -246,6 +273,10 @@ def _fused_gdn_decode_update_kernel(
         )
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
+    if HAS_TREE and CACHE_INTERMEDIATE_STATES:
+        nodes = tl.arange(0, T_BLOCK)
+        parents = _latest_ancestor(tree_ancestors + i_n * T, nodes, nodes < T)
+
     # Prefetch the next step's operands to overlap the current state update.
     b_A_log = tl.load(p_A_log).to(tl.float32)
     b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
@@ -254,6 +285,8 @@ def _fused_gdn_decode_update_kernel(
     n_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
     n_b = tl.load(p_b).to(tl.float32)
     n_a = tl.load(p_a).to(tl.float32)
+    if HAS_TREE and not CACHE_INTERMEDIATE_STATES:
+        n_parent = _latest_ancestor(tree_ancestors + i_n * T, 0, T > 0)
     for step_idx in range(0, T):
         b_q = n_q
         b_k = n_k
@@ -272,6 +305,59 @@ def _fused_gdn_decode_update_kernel(
         )
         n_b = tl.load(p_b + B_STRIDES[1], mask=has_next, other=0).to(tl.float32)
         n_a = tl.load(p_a + A_STRIDES[1], mask=has_next, other=0).to(tl.float32)
+        if HAS_TREE:
+            if CACHE_INTERMEDIATE_STATES:
+                # Replay already holds every parent for its branch-point check.
+                parent = tl.sum(tl.where(nodes == step_idx, parents, 0), 0)
+            else:
+                parent = n_parent
+                n_parent = _latest_ancestor(
+                    tree_ancestors + i_n * T, step_idx + 1, has_next
+                )
+            if parent != step_idx - 1:
+                # The parent's row was written by this program over the same tile.
+                tl.debug_barrier()
+                if CACHE_INTERMEDIATE_STATES:
+                    # Replay verify: node states live in the intermediate buffer only.
+                    if parent < 0:
+                        p_parent = (
+                            h0_source
+                            + idx * HV * V * K
+                            + i_hv * V * K
+                            + o_v[None, :] * K
+                            + o_k[:, None]
+                        )
+                        b_h = tl.load(p_parent, mask=mask_h & (idx >= 0), other=0).to(
+                            tl.float32
+                        )
+                    else:
+                        p_parent = (
+                            intermediate_states_buffer
+                            + ((i_n * T + parent).to(tl.int64) * HV + i_hv) * V * K
+                            + o_v[None, :] * K
+                            + o_k[:, None]
+                        )
+                        b_h = tl.load(p_parent, mask=mask_h, other=0).to(tl.float32)
+                else:
+                    row = tl.where(
+                        parent < 0,
+                        idx,
+                        tl.load(
+                            per_token_output_state_indices
+                            + i_n * T
+                            + tl.maximum(parent, 0)
+                        ).to(tl.int64),
+                    )
+                    p_parent = (
+                        h0_source
+                        + row * HV * V * K
+                        + i_hv * V * K
+                        + o_v[None, :] * K
+                        + o_k[:, None]
+                    )
+                    b_h = tl.load(p_parent, mask=mask_h & (row >= 0), other=0).to(
+                        tl.float32
+                    )
         x = b_a + b_dt_bias
         beta_x = softplus_beta * x
         softplus_x = tl.where(
@@ -302,7 +388,12 @@ def _fused_gdn_decode_update_kernel(
                 + o_v[None, :] * K
                 + o_k[:, None]
             )
-            tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
+            if HAS_TREE:
+                child = (parents == step_idx) & (nodes > step_idx + 1)
+                if tl.max(child.to(tl.int32), axis=0) != 0:
+                    tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
+            else:
+                tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
         if HAS_PER_TOKEN_OUTPUT_STATE_INDICES:
             out_idx = tl.load(per_token_output_state_indices + i_n * T + step_idx).to(
@@ -369,6 +460,7 @@ def _launch_fused_gdn_decode_update(
     output_state_indices: torch.Tensor | None,
     intermediate_states_buffer: torch.Tensor | None,
     per_token_output_state_indices: torch.Tensor | None,
+    tree_ancestors: torch.Tensor | None,
 ) -> torch.Tensor:
     """Shared launcher for the ``gdn_decode_step`` (T=1) / ``gdn_decode_mtp``
     (T>1) Triton fallback kernels. q/k: [B, T, H, K]; v: [B, T, HV, V]; a/b:
@@ -384,7 +476,10 @@ def _launch_fused_gdn_decode_update(
 
     o = q.new_empty(B, T, HV, V)
 
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
+    # Serial tree verify needs narrow V tiles for parallelism; chains keep BV=32.
+    BK, BV = triton.next_power_of_2(K), min(
+        triton.next_power_of_2(V), 8 if tree_ancestors is not None else 32
+    )
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
 
@@ -405,6 +500,7 @@ def _launch_fused_gdn_decode_update(
         output_state_indices=output_state_indices,
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=per_token_output_state_indices,
+        tree_ancestors=tree_ancestors,
         scale=scale,
         T=T,
         H=H,
@@ -418,6 +514,8 @@ def _launch_fused_gdn_decode_update(
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
         HAS_PER_TOKEN_OUTPUT_STATE_INDICES=(per_token_output_state_indices is not None),
+        HAS_TREE=tree_ancestors is not None,
+        T_BLOCK=1 if tree_ancestors is None else triton.next_power_of_2(T),
         Q_STRIDES=q.stride(),
         K_STRIDES=k.stride(),
         V_STRIDES=v.stride(),
@@ -478,6 +576,7 @@ def triton_gdn_decode_step(
         output_state_indices=output_state_indices,
         intermediate_states_buffer=None,
         per_token_output_state_indices=None,
+        tree_ancestors=None,
     )
 
 
@@ -495,7 +594,6 @@ def _gdn_tree_verify_kernel(
     o,
     h0_source,
     h0_indices,
-    output_state_indices,
     tree_ancestors,
     scale,
     T,
@@ -508,7 +606,6 @@ def _gdn_tree_verify_kernel(
     T_BLOCK: tl.constexpr,
     LOG2_T_BLOCK: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
-    HAS_OUTPUT_STATE_INDICES: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
     Q_STRIDES: tl.constexpr,
     K_STRIDES: tl.constexpr,
@@ -517,17 +614,17 @@ def _gdn_tree_verify_kernel(
     B_STRIDES: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    """Draft-tree GDN verify for all ``T`` nodes at once, in the chunked form.
+    """ReplaySSM draft-tree GDN verify of up to ``T_BLOCK`` nodes at once, in the chunked form.
 
-    Same tensors as ``_fused_gdn_decode_update_kernel``; ``tree_ancestors`` is
-    the ``[B, T]`` int64 ancestor-or-self bitmask. With ``G_t`` the gate summed
-    over node t's root path, ``D[t, s] = exp(G_t - G_s)`` for each ancestor s,
-    and ``U`` the beta-scaled delta updates solving
-    ``(I + beta * D_strict * k k^T) U = beta * (v - exp(G) * k h0)``, node t's
-    output is ``exp(G_t) q_t h0 + sum_s D[t, s] (q_t . k_s) U_s``: the
-    recurrence along that path, without its serial steps. With
-    ``HAS_OUTPUT_STATE_INDICES`` every node's state ``exp(G_t) h0 + sum_s
-    D[t, s] k_s U_s`` goes to its pool row; otherwise the pool is untouched.
+    q, k, v, a, b, o and the K-last state pool are as in
+    ``_fused_gdn_decode_update_kernel``; ``tree_ancestors`` is the ``[B, T]``
+    int64 ancestor-or-self bitmask. With ``G_t`` the gate summed over node t's
+    root path, ``D[t, s] = exp(G_t - G_s)`` for each ancestor s (summed over
+    the path segment, not subtracted), and ``U`` the beta-scaled delta updates
+    solving ``(I + beta * D_strict * k k^T) U = beta * (v - exp(G) * k h0)``,
+    node t's output is ``exp(G_t) q_t h0 + sum_s D[t, s] (q_t . k_s) U_s``:
+    the recurrence along that path, without its serial steps. The pool is left
+    untouched.
     """
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -613,13 +710,19 @@ def _gdn_tree_verify_kernel(
         (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
         x,
     )
-    b_g = tl.where(valid, -b_A * softplus_x, 0.0)
+    # A finite floor keeps an infinite gate's zero decay out of 0 * inf below.
+    b_g = tl.where(valid, tl.maximum(-b_A * softplus_x, -1e30), 0.0)
     b_beta = tl.where(valid, 1.0 / (1.0 + tl.exp(-b_b)), 0.0)
 
     bits = tl.load(tree_ancestors + i_n * T + nodes, mask=valid, other=0)
     anc = ((bits[:, None] >> nodes[None, :].to(tl.int64)) & 1) != 0
-    gate = tl.sum(tl.where(anc, b_g[None, :], 0.0), 1)
-    decay = tl.where(anc, tl.exp(gate[:, None] - gate[None, :]), 0.0)
+    path_gates = tl.where(anc, b_g[None, :], 0.0)
+    gate = tl.sum(path_gates, 1)
+    # Sum each segment's gates exactly: the gates on t's path off s's path.
+    segment = tl.dot(
+        path_gates, tl.trans(tl.where(anc, 0.0, 1.0)), input_precision="ieee"
+    )
+    decay = tl.where(anc, tl.exp(segment), 0.0)
     m = tl.where(
         anc & (nodes[:, None] != nodes[None, :]), b_beta[:, None] * decay * kk, 0.0
     )
@@ -643,34 +746,6 @@ def _gdn_tree_verify_kernel(
         mask=valid[:, None] & mask_v[None, :],
     )
 
-    if HAS_OUTPUT_STATE_INDICES:
-        for t in range(T):
-            row = tl.load(output_state_indices + i_n * T + t).to(tl.int64)
-            if row >= 0:
-                sel = nodes == t
-                w = u * tl.sum(tl.where(sel[:, None], decay, 0.0), 0)[:, None]
-                decay_t = tl.sum(tl.where(sel, decay_h0, 0.0), 0)
-                p_out = h0_source + row * HV * V * K + i_hv * V * K + o_v[:, None] * K
-                for kc in tl.static_range(0, K, BK):
-                    o_k = kc + tl.arange(0, BK)
-                    mask_qk = valid[:, None] & (o_k < K)[None, :]
-                    mask_h = mask_v[:, None] & (o_k < K)[None, :]
-                    c_k = tl.load(
-                        p_k + o_k[None, :] * K_STRIDES[3], mask=mask_qk, other=0
-                    )
-                    c_k = c_k.to(tl.float32) * r_k[:, None]
-                    c_h = tl.load(
-                        p_h0 + o_k[None, :], mask=(idx >= 0) & mask_h, other=0
-                    ).to(tl.float32)
-                    state = decay_t * c_h + tl.dot(
-                        tl.trans(w), c_k, input_precision=DOT_PRECISION
-                    )
-                    tl.store(
-                        p_out + o_k[None, :],
-                        state.to(p_out.dtype.element_ty),
-                        mask=mask_h,
-                    )
-
 
 def _launch_gdn_tree_verify(
     q: torch.Tensor,
@@ -685,7 +760,6 @@ def _launch_gdn_tree_verify(
     initial_state_indices: torch.Tensor,
     scale: float | None,
     use_qk_l2norm: bool,
-    output_state_indices: torch.Tensor | None,
     tree_ancestors: torch.Tensor,
 ) -> torch.Tensor:
     enable_pdl = pdl_enabled()
@@ -694,8 +768,7 @@ def _launch_gdn_tree_verify(
     if scale is None:
         scale = K**-0.5
     o = q.new_empty(B, T, HV, V)
-    t_block = max(16, triton.next_power_of_2(T))
-    BV = min(triton.next_power_of_2(V), 64 if t_block <= 16 else 32)
+    BV = min(triton.next_power_of_2(V), 64)
     _gdn_tree_verify_kernel[(triton.cdiv(V, BV), B * HV)](
         A_log=A_log,
         a=a,
@@ -709,7 +782,6 @@ def _launch_gdn_tree_verify(
         o=o,
         h0_source=initial_state,
         h0_indices=initial_state_indices,
-        output_state_indices=output_state_indices,
         tree_ancestors=tree_ancestors,
         scale=scale,
         T=T,
@@ -719,10 +791,9 @@ def _launch_gdn_tree_verify(
         V=V,
         BK=min(triton.next_power_of_2(K), 32),
         BV=BV,
-        T_BLOCK=t_block,
-        LOG2_T_BLOCK=t_block.bit_length() - 1,
+        T_BLOCK=GDN_TREE_VERIFY_PARALLEL_NODES,
+        LOG2_T_BLOCK=GDN_TREE_VERIFY_PARALLEL_NODES.bit_length() - 1,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm,
-        HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
         # Three TF32 products per FP32 one keep FP32 accuracy on tensor cores.
         DOT_PRECISION="tf32x3" if current_platform().is_nvidia else "ieee",
         Q_STRIDES=q.stride(),
@@ -769,9 +840,20 @@ def triton_gdn_decode_mtp(
     """Portable Triton fallback for ``gdn_decode_mtp`` (see
     ``flashinfer/gated_delta_rule.py`` for the shared contract). Supports both
     batch-scoped intermediate-state caching and direct per-token pool scatter
-    through ``output_state_indices``, and draft trees.
+    through ``output_state_indices``, and draft trees: ReplaySSM trees of up to
+    ``GDN_TREE_VERIFY_PARALLEL_NODES`` nodes in the chunked form, the others
+    step by step.
     """
-    if tree_ancestors is not None:
+    if (
+        tree_ancestors is not None
+        and output_state_indices is None
+        and not gdn_tree_verify_needs_node_states(q.shape[1])
+    ):
+        if intermediate_states_buffer is not None or not disable_state_update:
+            raise ValueError(
+                "a chunked tree verify writes no state: no "
+                "intermediate_states_buffer, disable_state_update=True"
+            )
         return _launch_gdn_tree_verify(
             q,
             k,
@@ -784,7 +866,6 @@ def triton_gdn_decode_mtp(
             initial_state_indices=initial_state_indices,
             scale=scale,
             use_qk_l2norm=use_qk_l2norm,
-            output_state_indices=output_state_indices,
             tree_ancestors=tree_ancestors,
         )
     return _launch_fused_gdn_decode_update(
@@ -803,6 +884,7 @@ def triton_gdn_decode_mtp(
         output_state_indices=None,
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=output_state_indices,
+        tree_ancestors=tree_ancestors,
     )
 
 

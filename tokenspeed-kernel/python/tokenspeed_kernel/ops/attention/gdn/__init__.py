@@ -300,6 +300,18 @@ def gdn_decode_step(
         )
 
 
+# ReplaySSM draft trees of up to this many nodes verify in the chunked form, which keeps no node states.
+GDN_TREE_VERIFY_PARALLEL_NODES = 16
+
+
+def gdn_tree_verify_needs_node_states(num_nodes: int) -> bool:
+    """Whether a ReplaySSM draft-tree ``gdn_decode_mtp`` of ``num_nodes`` nodes takes
+    an ``intermediate_states_buffer``: trees larger than
+    ``GDN_TREE_VERIFY_PARALLEL_NODES`` verify step by step and reload their
+    branch points' states from it."""
+    return num_nodes > GDN_TREE_VERIFY_PARALLEL_NODES
+
+
 def gdn_decode_mtp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -349,7 +361,8 @@ def gdn_decode_mtp(
         intermediate_states_buffer: Optional batch-scoped ``[B, T,
             num_v_heads, head_v_dim, head_dim]`` (K-last, same dtype as
             ``initial_state``) buffer that receives every step's post-update
-            state at ``buffer[i_n, step]``.
+            state at ``buffer[i_n, step]`` (for a ReplaySSM tree, only the
+            branch points' states).
         output_state_indices: Optional per-token state-pool destinations shaped
             ``[B, T]`` with dtype ``torch.int32``. When provided, each
             post-update state ``h_{t+1}`` is written directly to
@@ -366,9 +379,9 @@ def gdn_decode_mtp(
             state (the initial state for a root) instead of step ``t - 1``.
             With ``output_state_indices`` every node's state goes to the pool;
             without it (ReplaySSM verify) the pool is left untouched, which
-            needs ``disable_state_update``. Takes no
-            ``intermediate_states_buffer`` and runs the Triton solution;
-            ``None`` is a chain.
+            needs ``disable_state_update``, and an ``intermediate_states_buffer``
+            is given exactly when ``gdn_tree_verify_needs_node_states(T)``.
+            Runs the Triton solution; ``None`` is a chain.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -388,6 +401,11 @@ def gdn_decode_mtp(
                 "output_state_indices must have dtype torch.int32, got "
                 f"{output_state_indices.dtype}"
             )
+        if not output_state_indices.is_contiguous():
+            raise ValueError(
+                "output_state_indices must be contiguous, got strides "
+                f"{output_state_indices.stride()}"
+            )
         if intermediate_states_buffer is not None:
             raise ValueError(
                 "output_state_indices and intermediate_states_buffer are "
@@ -396,14 +414,21 @@ def gdn_decode_mtp(
         if disable_state_update:
             raise ValueError("output_state_indices requires disable_state_update=False")
 
-    if tree_ancestors is not None:
-        if intermediate_states_buffer is not None:
-            raise ValueError("a draft-tree verify keeps no intermediate states")
-        if output_state_indices is None and not disable_state_update:
+    if tree_ancestors is not None and output_state_indices is None:
+        if not disable_state_update:
             raise ValueError(
                 "a draft tree without output_state_indices leaves the pool "
                 "untouched: disable_state_update must be True"
             )
+        if gdn_tree_verify_needs_node_states(q.shape[1]) != (
+            intermediate_states_buffer is not None
+        ):
+            raise ValueError(
+                f"a ReplaySSM tree of {q.shape[1]} nodes takes an "
+                "intermediate_states_buffer exactly when "
+                "gdn_tree_verify_needs_node_states"
+            )
+    if tree_ancestors is not None:
         if (
             tree_ancestors.shape != q.shape[:2]
             or tree_ancestors.dtype != torch.int64
@@ -688,6 +713,7 @@ import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
 # isort: on
 
 __all__ = [
+    "GDN_TREE_VERIFY_PARALLEL_NODES",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "gdn_chunk_prefill",
@@ -695,5 +721,6 @@ __all__ = [
     "gdn_decode_mtp",
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
+    "gdn_tree_verify_needs_node_states",
     "validate_replay_commit_args",
 ]

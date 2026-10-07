@@ -340,17 +340,24 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
 
 
 @pytest.mark.parametrize(
-    ("replay_enabled", "replay_supported", "topk", "expected_workspace_bytes"),
+    (
+        "replay_enabled",
+        "replay_supported",
+        "topk",
+        "tree_node_states",
+        "expected_workspace_bytes",
+    ),
     # Non-replay stages conv+ssm for 8 verify rows: 8 * (8 + 8). Replay: 64
     # conv staging bytes plus the captured payload (6 rows of 7 bf16
     # channels) and the fp32 A_log/dt_bias pairs -- 64 + 84 + 16.
-    # A replayed draft tree (topk 2) adds one 8-byte ssm state per draft position: 2 * 3 * 8.
+    # A replayed draft tree (topk 2) verified step by step adds one 8-byte ssm state per draft position: 2 * 3 * 8.
     (
-        (False, True, 1, 128),
-        (True, False, 1, 128),
-        (True, True, 1, 164),
-        (False, True, 2, 128),
-        (True, True, 2, 212),
+        (False, True, 1, False, 128),
+        (True, False, 1, False, 128),
+        (True, True, 1, False, 164),
+        (False, True, 2, False, 128),
+        (True, True, 2, False, 164),
+        (True, True, 2, True, 212),
     ),
 )
 def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
@@ -358,11 +365,16 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     replay_enabled: bool,
     replay_supported: bool,
     topk: int,
+    tree_node_states: bool,
     expected_workspace_bytes: int,
 ) -> None:
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.gdn.gdn_replay_commit_supported",
         lambda dtype: replay_supported,
+    )
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.gdn.gdn_tree_verify_needs_node_states",
+        lambda num_nodes: tree_node_states,
     )
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(text_config=SimpleNamespace()),

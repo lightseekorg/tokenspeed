@@ -74,10 +74,9 @@ window's FP8 K/V to its dtype after loading them.
 Linear-attention (GDN and Mamba2) layers keep one conv window and one recurrent
 state per verify node in the backend's verify scratch. Node `t` starts from the
 state after its parent, not after node `t - 1`: `mamba2_verify_scan` takes
-`parent_indices` and reloads the parent's state at branch points (a chain never
-reloads); `gdn_decode_mtp` takes the tree's ancestor mask (the one tree attention
-reads) and computes every node at once in the chunked form of the delta rule,
-with that mask in place of the causal one; `causal_conv1d_update` with `parent_indices` rebuilds each node's
+`parent_indices` and `gdn_decode_mtp` the tree's ancestor mask (the one tree
+attention reads), and both reload the parent's state at branch points (a chain
+never reloads); `causal_conv1d_update` with `parent_indices` rebuilds each node's
 window from its ancestors' inputs and the initial window. The commit copies the scratch row of the
 last accepted node, `1 + path[accept_len - 1]`, which for a chain is the
 familiar `accept_len`. The fused KDA verify kernel follows a chain and refuses
@@ -86,8 +85,13 @@ trees.
 Draft trees use ReplaySSM like chains (on by default; staging a recurrent
 state per node and per layer grows with the tree, Qwen3.8: 3 MiB x 48 layers
 per node). Under ReplaySSM the verify
-never writes the state pool and keeps no node states: the GDN verify computes
-each node from the read state and its ancestors' inputs, and Mamba2's
+never writes the state pool. A GDN tree of at most 16 nodes
+(`GDN_TREE_VERIFY_PARALLEL_NODES`) is verified in the chunked form of the delta
+rule, every node at once with the ancestor mask in place of the causal one, and
+keeps no node states. In a larger tree the state of every branch point (a node
+with a child other than the next node) goes to one workspace shared by all
+layers (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per
+node), and a branch reloads its parent from there. Mamba2 has no such workspace: its
 elementwise update lets a branch replay the parent's ancestors over the read
 state, cheaper than storing and reloading a 4 MiB state. The commit packs the
 accepted path's replay payload rows to the window's front (`compact_window_rows`)
@@ -186,7 +190,8 @@ an attribute of the candidate block `future_input_map` already carries on the
 executor side. Lane K/V are round-local: they live in the request's draft
 window until the next verify overwrites it (never prefix-matched,
 transferred or freed with blocks), and the per-node GDN states live in
-verify-time workspaces (the verify scratch), so nothing here is a cache group for the C++ scheduler to own.
+verify-time workspaces (the verify scratch, or the ReplaySSM node-state
+workspace), so nothing here is a cache group for the C++ scheduler to own.
 
 ## Intended direction
 
