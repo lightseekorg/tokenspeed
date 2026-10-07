@@ -1181,6 +1181,7 @@ def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
         get_for_operator=Mock(return_value=[spec]),
         get_impl=Mock(return_value=impl),
     )
+    signature = object()
     api = _functions(
         KERNEL / "ops/gemm/triton_gemv.py",
         None,
@@ -1192,15 +1193,23 @@ def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
             spec_matches_traits=spec_matches_traits,
             spec_matches_shape_traits=spec_matches_shape_traits,
             torch_decode_gemv=fallback,
+            _SIGNATURES={(torch.bfloat16, torch.bfloat16): signature},
         ),
     )
-    assert api._select(m, n, k, on_cuda) is (impl if expected else fallback)
+    selected = api._select(m, n, k, on_cuda, torch.bfloat16, torch.bfloat16, False)
+    assert selected is (impl if expected else fallback)
     if on_cuda:
         registry.get_for_operator.assert_called_once_with(
-            "gemm", "decode_gemv", platform=platform
+            "gemm", "decode_gemv", platform=platform, format_signature=signature
         )
     else:
         registry.get_for_operator.assert_not_called()
+    # A dtype pair without a registry signature never reaches the registry.
+    registry.get_for_operator.reset_mock()
+    assert api._select(m, n, k, on_cuda, torch.float16, torch.float16, False) is (
+        fallback
+    )
+    registry.get_for_operator.assert_not_called()
 
 
 @pytest.mark.parametrize(
