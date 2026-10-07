@@ -602,6 +602,7 @@ class ServerArgs:
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
     mapping: Mapping | None = None
+    emulate_rank_zero: bool = False
 
     mla_chunk_multiplier: int = 4
     mm_attention_backend: str | None = None
@@ -1295,6 +1296,7 @@ class ServerArgs:
         platform = current_platform()
         if (
             not self.enable_allreduce_fusion
+            and not self.emulate_rank_zero
             and (current_platform().is_hopper_plus or platform.is_amd)
             and self.mapping.nnodes == 1
             and self.mapping.has_attn_tp
@@ -1704,6 +1706,47 @@ class ServerArgs:
                     "than 1024"
                 )
 
+    def validate_rank_emulation(self):
+        """Reject layouts ``--emulate-rank-zero`` cannot stand in for.
+
+        The emulated rank replaces collectives through the comm backend and
+        one-member process groups. Paths that exchange per-rank state outside
+        them, or that keep their own peer communicators, need real peers.
+        """
+        if not self.emulate_rank_zero:
+            return
+        if not current_platform().is_amd:
+            raise ValueError("--emulate-rank-zero is supported on AMD GPUs only")
+        if self.mapping.world_size == 1:
+            raise ValueError(
+                "--emulate-rank-zero needs a parallel layout of more than one rank"
+            )
+        unsupported = []
+        if self.mapping.nnodes != 1:
+            unsupported.append(f"--nnodes {self.mapping.nnodes}")
+        if self.mapping.has_pp:
+            unsupported.append("pipeline parallelism")
+        if self.mapping.attn.has_qcp:
+            unsupported.append("query context parallelism")
+        if self.mapping.has_attn_dp:
+            unsupported.append("attention data parallelism")
+        if self.mapping.moe.tp_ep_size != self.mapping.attn.tp_size:
+            unsupported.append("an MoE TP x EP size other than the attention TP size")
+        if self.mm_encoder_tp_mode == "data":
+            unsupported.append("--mm-encoder-tp-mode data")
+        if self.disaggregation_mode != "null":
+            unsupported.append(f"--disaggregation-mode {self.disaggregation_mode}")
+        if self.all2all_backend != "none":
+            unsupported.append(f"--all2all-backend {self.all2all_backend}")
+        if self.enable_allreduce_fusion:
+            unsupported.append("--enable-allreduce-fusion")
+        if self.enable_eplb:
+            unsupported.append("--enable-eplb")
+        if unsupported:
+            raise ValueError(
+                f"--emulate-rank-zero does not support {', '.join(unsupported)}"
+            )
+
     def validate_expert_placement_options(self):
         """Check the expert placement flags (redundant experts, recorded load).
 
@@ -1821,6 +1864,7 @@ class ServerArgs:
                 raise ValueError("NPU execution requires --disable-pdl")
 
         self.validate_petit_moe_options()
+        self.validate_rank_emulation()
 
         if (
             self.max_num_seqs is not None
@@ -3132,6 +3176,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.world_size,
             help="Total number of processes across all nodes.",
+        )
+        parser.add_argument(
+            "--emulate-rank-zero",
+            action="store_true",
+            help="Run only global rank 0 of the configured parallel layout, "
+            "on one GPU. Collectives become local stand-ins that keep the "
+            "real shapes but not the values, so kernels, weight shards and "
+            "cache sizing match rank 0 of the full deployment while outputs "
+            "are meaningless. AMD GPUs only; requires one node and no "
+            "pipeline, context or attention data parallelism.",
         )
         parser.add_argument(
             "--force-deterministic-rsag",

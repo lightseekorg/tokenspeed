@@ -586,8 +586,8 @@ protected:
         SchedulerConfig cfg = MambaStateCheckpointSuite::MakeConfig();
         cfg.role = Role::kP;
         for (CacheGroupConfig& group : cfg.cache_groups) {
-            group.transfer_policy =
-                group.IsSnapshotStateGroup() ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
+            group.transfer_policy = group.Kind() == AttnKind::kMambaState ? CacheTransferPolicy::LatestSnapshot
+                                                                          : CacheTransferPolicy::FullSuffix;
         }
         return cfg;
     }

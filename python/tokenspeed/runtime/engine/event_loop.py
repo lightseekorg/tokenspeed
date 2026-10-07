@@ -282,6 +282,9 @@ class EventLoop:
             self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
             self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
         num_host_pages = specs.num_host_pages
+        # The cache hooks gather over the TP CPU group, so the gather is sized
+        # by that group, which --emulate-rank-zero backs with this process alone.
+        cache_replica_tp_size = self.attn_tp_cpu_group.size()
         # L2 cache-op accounting + rank-synced completion tracking (see
         # cache_hooks.py); a no-op shell when kvstore is disabled. The hooks
         # get the handle, not the L2 executor: polling goes through it.
@@ -289,7 +292,7 @@ class EventLoop:
             self._device if server_args.enable_kvstore else None,
             speculative_algorithm=server_args.speculative_algorithm,
             attn_tp_rank=attn_tp_rank,
-            attn_tp_size=self.attn_tp_size,
+            attn_tp_size=cache_replica_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
             pp_size=self.pp_size,
             pp_cpu_group=self.pp_cpu_group,
@@ -377,7 +380,7 @@ class EventLoop:
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
             self._device if scheduler_cfg.enable_l3_storage else None,
-            attn_tp_size=self.attn_tp_size,
+            attn_tp_size=cache_replica_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
             pp_size=self.pp_size,
             pp_cpu_group=self.pp_cpu_group,

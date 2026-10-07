@@ -27,6 +27,8 @@ jobs:
             group: gb200-slurm-per-commit
           - name: NVIDIA GB300 Tests
             group: gb300-slurm-per-commit
+          - name: PR Review
+            group: claude-review
     concurrency:
       group: ${{ matrix.group }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true

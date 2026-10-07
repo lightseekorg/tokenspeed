@@ -13,14 +13,22 @@ actual changes and their callers. Leave general code review to the existing revi
 Trace changed functions through callers to identify affected models, execution
 paths (eager/graphs, prefill/decode, speculation, distributed), and test assertions.
 Read the most relevant existing test files and CI YAMLs before choosing them.
-Native CPU checks in context.json are already selected from workflow path filters
-and appear first in the published plan. For scheduler-only changes, start with
-those C++/Python regressions; do not add a GPU eval without a changed serving path.
+Native CPU and GPU checks in context.json are already selected from workflow path
+filters and appear first in the published plan, even when manual dispatch cannot
+select their hardware. Do not omit native GPU UT coverage for that reason.
+For scheduler-only changes, start with those C++/Python regressions; do not add
+a GPU eval without a changed serving path.
 When end-to-end coverage is needed, prefer the smallest existing model and bounded
 workload that exercise the same affected callers and assertions. A shared-path
 refactor does not justify a large reasoning benchmark if a smaller serving task
 covers it. Retain model-, hardware-, MTP- or replay-specific coverage when the
 actual change depends on it; smaller model size alone does not prove equivalence.
+For in-tree MLA Python changes, include a real serving task that explicitly uses
+tokenspeed_mla in its target or drafter attention backend. Read the serving
+callers and distinguish which backend it exercises; kernel parity UTs alone are
+insufficient. Use the smallest existing compatible serving workload. Unreleased
+MLA changes require INSTALL_TOKENSPEED_MLA_FROM_SOURCE=1 in the task's dispatch
+installation; a pinned wheel does not validate the changed kernels.
 Return a small, ordered validation set: normally 1-3 focused test files followed
 by 1-2 existing CI tasks, choosing one suitable runner first. These are priorities,
 not an exhaustive safety checklist. Write for an impatient reader:
@@ -38,7 +46,7 @@ Use existing dispatch pools: prefer Slurm GB200 for NVIDIA; check Slurm GB300
 only when GB200 capacity is unavailable, or when the task requires GB300.
 Use K8s AMD for AMD-specific changes and B200 for B200-specific verification.
 Cross-hardware diagnosis does not establish affected-hardware correctness/performance.
-Do not prioritize a declared runner that those dispatch workflows cannot select.
+For additional dispatch tasks, do not select a runner those workflows cannot use.
 For Slurm set cluster to gb200/gb300 and choose an original declared label from
 that task's slurm_runners map; B200 logical labels can run on GB200. For K8s set
 cluster to empty and choose from runners. You have no live scheduler data: do not
