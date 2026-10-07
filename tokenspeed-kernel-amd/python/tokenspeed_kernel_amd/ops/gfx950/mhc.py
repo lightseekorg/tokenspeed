@@ -340,7 +340,7 @@ def gluon_mhc_prefill_mix_gfx950(
     vector_layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
     pre_post_offsets = gl.arange(0, 8, layout=vector_layout)
     pre_post_values = gl.zeros([8], gl.float32, layout=vector_layout)
-    matrix_layout: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [1, 1], [1, 0])
+    matrix_layout: gl.constexpr = gl.BlockedLayout([1, 1], [16, 4], [1, 1], [1, 0])
     rows = gl.arange(0, 4, layout=gl.SliceLayout(1, matrix_layout))
     cols = gl.arange(0, 4, layout=gl.SliceLayout(0, matrix_layout))
     comb_offsets = rows[:, None] * 4 + cols[None, :]
