@@ -733,6 +733,12 @@ For workflows with one case per GitHub job, use **Re-run failed jobs**.
 On an open same-repository PR into `main`, a repository writer can comment
 `@lightseek-bot watch` or `@lightseek-bot fix`.
 
+Completion triggers exclude `main`; its push CI creates no assistance runs.
+`PR CI Assist Dispatch` handles planner and validation dispatches whose controller
+runs on `main`. Closed PRs and PRs without an active authorized watch/fix skip
+the control job. Other PR completions and comments can still create lightweight
+runs, but ordinary comments skip all jobs and inactive callbacks stop at resolve.
+
 - `watch` follows the current CI plan's selected tasks. Failed tasks get one
   focused reproduction: NVIDIA uses Slurm GB200, then compatible GB300 only if
   GB200 reports no capacity before submission; AMD uses K8s AMD. A repeated

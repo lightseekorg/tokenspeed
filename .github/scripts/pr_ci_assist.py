@@ -35,6 +35,7 @@ from pr_ci_state import BOT, BOT_ID, COMMAND, NATIVE_CHECKS, REPO, SHA, marker, 
 
 ROOT = Path(__file__).resolve().parents[2]
 WORK = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())) / "pr-ci-assist"
+FINISHED_PHASES = {"done", "manual", "stale", "promoted"}
 
 
 def command(*args: str, cwd: Path = ROOT) -> str:
@@ -66,8 +67,7 @@ def output(key: str, value: str):
         stream.write(f"{key}={value}\n")
 
 
-def pull(number: int) -> dict:
-    pr = api(f"pulls/{number}")
+def _require_open_pr(pr: dict) -> dict:
     if (
         pr["state"] != "open"
         or not pr["head"]["repo"]
@@ -76,6 +76,10 @@ def pull(number: int) -> dict:
     ):
         raise ValueError("An open same-repository PR into main is required.")
     return pr
+
+
+def pull(number: int) -> dict:
+    return _require_open_pr(api(f"pulls/{number}"))
 
 
 def permitted(comment: dict) -> str | None:
@@ -112,6 +116,9 @@ def resolve():
             number = int(value)
     elif name == "workflow_run" and event["action"] == "completed":
         run = event["workflow_run"]
+        if run["event"] not in {"pull_request", "workflow_dispatch"}:
+            print("Non-PR CI completion; skipping CI assistance.")
+            return
         candidates = {p["number"] for p in run["pull_requests"]}
         plan = re.fullmatch(
             r"CI plan #([1-9][0-9]*) \| [0-9a-f]{40} \| [0-9a-f]{40}",
@@ -142,7 +149,19 @@ def resolve():
         if len(candidates) == 1:
             number = candidates.pop()
     if number:
-        pull(number)
+        pr = api(f"pulls/{number}")
+        if name == "workflow_run" and pr["state"] != "open":
+            print("PR is closed or merged; skipping CI assistance.")
+            return
+        _require_open_pr(pr)
+        if name == "workflow_run":
+            comments = pages(f"issues/{number}/comments", None)
+            state = load_state(comments, pr)
+            comment = latest_command(comments)
+            initial = bool(comment and (not state or comment["id"] > state["command"]))
+            if not initial and (not state or state["phase"] in FINISHED_PHASES):
+                print("No active watch/fix command; skipping CI assistance.")
+                return
         output("pr", str(number))
 
 
@@ -164,12 +183,7 @@ def plan_source():
     if pr["state"] != "open":
         print("PR is closed or merged; skipping the CI plan.")
         return
-    if (
-        not pr["head"]["repo"]
-        or pr["head"]["repo"]["full_name"] != REPO
-        or pr["base"]["ref"] != "main"
-    ):
-        raise ValueError("An open same-repository PR into main is required.")
+    _require_open_pr(pr)
     if name == "pull_request" and (
         event["pull_request"]["head"]["sha"] != pr["head"]["sha"]
         or event["pull_request"]["base"]["sha"] != pr["base"]["sha"]
@@ -803,7 +817,7 @@ def control(number: int):
                 if t.startswith((f"Slurm {state['head']} |", f"K8s {state['head']} |"))
             ]
             state["since"] = prior["since"]
-    if not state or state["phase"] in {"done", "manual", "stale", "promoted"}:
+    if not state or state["phase"] in FINISHED_PHASES:
         return
     if state["head"] != pr["head"]["sha"] or state["base"] != pr["base"]["sha"]:
         state["phase"] = "stale"

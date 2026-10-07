@@ -4,8 +4,10 @@ on:
   issue_comment:
     types: [created]
   workflow_run:
-    workflows: [PR CI Plan, 'Scheduler C\+\+ Test', Scheduler Python Test, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
+    workflows: [PR CI Plan, 'Scheduler C\+\+ Test', Scheduler Python Test, NVIDIA Kernel Library Tests, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
     types: [completed]
+    branches-ignore: [main]
+  workflow_call:
   workflow_dispatch:
     inputs:
       pr:
@@ -18,7 +20,16 @@ permissions:
 
 jobs:
   resolve:
-    if: github.repository == 'lightseekorg/tokenspeed'
+    if: >-
+      github.repository == 'lightseekorg/tokenspeed' &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.pull_request &&
+        contains(github.event.comment.body, '@lightseek-bot') &&
+        (contains(github.event.comment.body, 'watch') ||
+         contains(github.event.comment.body, 'fix')))) &&
+      (github.event_name != 'workflow_run' ||
+       github.event.workflow_run.event == 'pull_request' ||
+       github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
