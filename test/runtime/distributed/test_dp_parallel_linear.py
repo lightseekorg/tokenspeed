@@ -248,14 +248,14 @@ def _worker(rank, size, tp_size, rendezvous, backend_name):
     dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("size", [2, 4], ids=["tp2", "tp4"])
+@pytest.mark.parametrize("size", [2, 4, 8], ids=["tp2", "tp4", "tp8"])
 @pytest.mark.parametrize("backend_name", ["nccl", "auto"])
 def test_dp_linears(size, backend_name, tmp_path):
     if not torch.cuda.is_available() or torch.cuda.device_count() < size:
         pytest.skip(f"requires {size} GPUs")
     # With four GPUs, TP2 also exercises two isolated subgroups. The
     # one-active-owner case leaves a whole subgroup idle.
-    world_size = 4 if torch.cuda.device_count() >= 4 else 2
+    world_size = max(size, 4 if torch.cuda.device_count() >= 4 else 2)
     mp.spawn(
         _worker,
         args=(world_size, size, f"file://{tmp_path / 'rendezvous'}", backend_name),
@@ -264,7 +264,7 @@ def test_dp_linears(size, backend_name, tmp_path):
     )
 
 
-def _fp8_worker(rank, rendezvous):
+def _fp8_worker(rank, size, rendezvous):
     from tokenspeed_kernel.ops.gemm.fp8_utils import per_block_quant_fp8
 
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
@@ -283,12 +283,12 @@ def _fp8_worker(rank, rendezvous):
         "nccl",
         init_method=rendezvous,
         rank=rank,
-        world_size=4,
+        world_size=size,
         timeout=timedelta(seconds=240),
         device_id=device,
     )
-    # TP4 projection over four independent token owners, not attention TP4.
-    parallel = DenseLayerMapping(rank=rank, world_size=4, tp_size=4, dp_size=1)
+    # Projection TP spans independent token owners, not attention TP.
+    parallel = DenseLayerMapping(rank=rank, world_size=size, tp_size=size, dp_size=1)
     config = Fp8Config(
         is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
@@ -299,7 +299,13 @@ def _fp8_worker(rank, rendezvous):
     # Production KDA widths, without a checkpoint, attention or KV cache.
     for kind, k, n in (("column", 7168, 66048), ("row", 16384, 7168)):
         torch.manual_seed(19)
-        weight = torch.randn(n, k, device=device, dtype=torch.bfloat16) / k**0.5
+        stored_n = (
+            (n + 128 * size - 1) // (128 * size) * (128 * size)
+            if kind == "column"
+            else n
+        )
+        weight = torch.randn(stored_n, k, device=device, dtype=torch.bfloat16) / k**0.5
+        weight[n:] = 0
         quantized, scales = per_block_quant_fp8(weight, (128, 128), 1e-10)
         with torch.device(device):
 
@@ -311,7 +317,9 @@ def _fp8_worker(rank, rendezvous):
                     prefix="projection",
                 )
                 if kind == "column":
-                    return DPColumnParallelLinear(k, n, padded_output_size=n, **kwargs)
+                    return DPColumnParallelLinear(
+                        k, n, padded_output_size=stored_n, **kwargs
+                    )
                 return DPRowParallelLinear(k, n, **kwargs)
 
             baseline, optimized = make_linear(), make_linear()
@@ -320,14 +328,14 @@ def _fp8_worker(rank, rendezvous):
             linear.weight_scale_inv.weight_loader(linear.weight_scale_inv, scales)
             linear.quant_method.process_weights_after_loading(linear)
             prepare_dp_linear_communication(linear, 128, torch.bfloat16, backend)
-        for counts in ([32] * 4, [0, 64, 32, 1], [128] * 4):
+        for counts in ([1] * size, [32] * size, [0] + [64] * (size - 1), [128] * size):
             torch.manual_seed(20 + rank)
             x = torch.randn(counts[rank], k, device=device, dtype=torch.bfloat16)
             ctx = _context(rank, counts)
             expected, _ = baseline(x, ctx=ctx)
             actual, _ = optimized(x, ctx=ctx)
             if x.numel():
-                reference = x.float() @ weight.float().T
+                reference = x.float() @ weight[:n].float().T
                 # Quantization error is not a redistribution error. NCCL and
                 # Lamport may round row partials differently; both must stay
                 # within the much smaller BF16 accumulation error budget.
@@ -352,15 +360,16 @@ def _fp8_worker(rank, rendezvous):
     dist.destroy_process_group()
 
 
-def test_dp_linears_fp8(tmp_path):
+@pytest.mark.parametrize("size", [2, 4, 8], ids=["tp2", "tp4", "tp8"])
+def test_dp_linears_fp8(size, tmp_path):
     from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_fp8_blockscale
 
-    if torch.cuda.device_count() < 4 or not has_flashinfer_fp8_blockscale():
-        pytest.skip("requires four Blackwell GPUs and FlashInfer block-FP8 GEMM")
+    if torch.cuda.device_count() < size or not has_flashinfer_fp8_blockscale():
+        pytest.skip(f"requires {size} Blackwell GPUs and FlashInfer block-FP8 GEMM")
     mp.spawn(
         _fp8_worker,
-        args=(f"file://{tmp_path / 'fp8-rendezvous'}",),
-        nprocs=4,
+        args=(size, f"file://{tmp_path / 'fp8-rendezvous'}"),
+        nprocs=size,
         join=True,
     )
 
