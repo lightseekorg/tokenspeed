@@ -32,6 +32,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from pr_ci_plan import context, proposal, render, source_url
+from pr_ci_state import marker
 
 
 def _command(*args: str) -> str:
@@ -232,7 +233,16 @@ def plan(root: Path) -> None:
     _check_public_output("\n".join(editorial), root)
     body = render(plan)
     _check_public_output(body, root, source_links=True)
-    root.joinpath("comment.md").write_text(body)
+    data = json.loads(root.joinpath("context.json").read_text())
+    metadata = {k: data[k] for k in ("version", "repository", "pr", "head", "base")}
+    metadata.update(
+        run=int(os.environ["GITHUB_RUN_ID"]),
+        tests=[t["path"] for t in plan["tests"]],
+        tasks=[
+            {k: t[k] for k in ("config", "runner", "cluster")} for t in plan["tasks"]
+        ],
+    )
+    root.joinpath("comment.md").write_text(body + marker("plan", metadata))
 
 
 def publish(root: Path) -> None:
@@ -258,7 +268,12 @@ def publish(root: Path) -> None:
         "--jq",
         ".headRefOid",
     ).strip()
-    if head != os.environ["PR_HEAD_SHA"]:
+    live = json.loads(_command("gh", "api", f"repos/{repo}/pulls/{number}"))
+    if (
+        head != os.environ["PR_HEAD_SHA"]
+        or live["base"]["sha"]
+        != json.loads(root.joinpath("context.json").read_text())["base"]
+    ):
         print("PR head changed; skipping the obsolete plan.")
         return
     comment_url = _command(
