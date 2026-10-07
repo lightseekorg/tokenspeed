@@ -1588,12 +1588,11 @@ def test_gdn_decode_mtp_random_trees_match_float64_reference(
     # The ReplaySSM verify writes nothing, within two bf16 ulps of the float64 recurrence.
     torch.testing.assert_close(replay_out.double(), want_out, rtol=2**-7, atol=1e-4)
     assert torch.equal(replay_pool, pool)
-    # The pool-row tree reloads a branch's parent state rounded to the pool dtype.
-    rows_tol = dict(rtol=2**-7, atol=1e-4)
+    torch.testing.assert_close(out.double(), want_out, rtol=2**-7, atol=1e-4)
     state_tol = dict(rtol=1e-4, atol=1e-4)
     if state_dtype == torch.bfloat16:
-        rows_tol = state_tol = dict(rtol=2e-2, atol=3e-2)
-    torch.testing.assert_close(out.double(), want_out, **rows_tol)
+        # The pool-row tree stores every node's state rounded to the pool dtype.
+        state_tol = dict(rtol=2**-7, atol=4e-3)
     torch.testing.assert_close(
         rows_pool[out_idx.long()].double(), want_states, **state_tol
     )
