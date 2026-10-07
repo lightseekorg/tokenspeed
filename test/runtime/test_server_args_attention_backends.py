@@ -122,7 +122,6 @@ class TestAttentionBackendChoices(unittest.TestCase):
                 layer_ids=(0,),
                 replay_ssm=False,
                 draft_tree=False,
-                tree_node_state_workspace=True,
             ),
         }
         config = SimpleNamespace(

@@ -316,7 +316,7 @@ def gdn_decode_mtp(
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
-    parent_indices: torch.Tensor | None,
+    tree_ancestors: torch.Tensor | None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -349,8 +349,7 @@ def gdn_decode_mtp(
         intermediate_states_buffer: Optional batch-scoped ``[B, T,
             num_v_heads, head_v_dim, head_dim]`` (K-last, same dtype as
             ``initial_state``) buffer that receives every step's post-update
-            state at ``buffer[i_n, step]`` (with ``parent_indices``, only the
-            branch points' states).
+            state at ``buffer[i_n, step]``.
         output_state_indices: Optional per-token state-pool destinations shaped
             ``[B, T]`` with dtype ``torch.int32``. When provided, each
             post-update state ``h_{t+1}`` is written directly to
@@ -360,14 +359,16 @@ def gdn_decode_mtp(
             non-negative. This is mutually exclusive with
             ``intermediate_states_buffer`` and requires
             ``disable_state_update=False``.
-        parent_indices: Optional contiguous int32 ``[B, T]`` draft-tree parents: step
-            ``t`` continues from the state after step ``parent_indices[i, t]``
-            (the initial state when negative) instead of step ``t - 1``.
-            Needs exactly one of ``output_state_indices`` (node states in the
-            pool) or ``intermediate_states_buffer`` (ReplaySSM verify: the
-            pool left untouched, and the buffer receives only the branch
-            points' states, steps with a child other than the next step), and
-            runs the Triton solution; ``None`` is a chain.
+        tree_ancestors: Optional contiguous int64 ``[B, T]`` draft-tree
+            ancestor-or-self bitmask, ``T <= 64``: bit ``s`` of row ``t`` is
+            set when step ``s`` is ``t`` or one of its ancestors, and ancestors
+            precede their descendants. Step ``t`` continues from its parent's
+            state (the initial state for a root) instead of step ``t - 1``.
+            With ``output_state_indices`` every node's state goes to the pool;
+            without it (ReplaySSM verify) the pool is left untouched, which
+            needs ``disable_state_update``. Takes no
+            ``intermediate_states_buffer`` and runs the Triton solution;
+            ``None`` is a chain.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -395,21 +396,24 @@ def gdn_decode_mtp(
         if disable_state_update:
             raise ValueError("output_state_indices requires disable_state_update=False")
 
-    if parent_indices is not None:
-        if (output_state_indices is None) == (intermediate_states_buffer is None):
+    if tree_ancestors is not None:
+        if intermediate_states_buffer is not None:
+            raise ValueError("a draft-tree verify keeps no intermediate states")
+        if output_state_indices is None and not disable_state_update:
             raise ValueError(
-                "parent_indices needs exactly one of output_state_indices (states in "
-                "the pool) or intermediate_states_buffer (ReplaySSM verify)"
+                "a draft tree without output_state_indices leaves the pool "
+                "untouched: disable_state_update must be True"
             )
         if (
-            parent_indices.shape != q.shape[:2]
-            or parent_indices.dtype != torch.int32
-            or not parent_indices.is_contiguous()
+            tree_ancestors.shape != q.shape[:2]
+            or tree_ancestors.dtype != torch.int64
+            or not tree_ancestors.is_contiguous()
+            or q.shape[1] > 64
         ):
             raise ValueError(
-                f"parent_indices must be contiguous int32 {tuple(q.shape[:2])}, got "
-                f"{parent_indices.dtype} {tuple(parent_indices.shape)} "
-                f"strides {parent_indices.stride()}"
+                f"tree_ancestors must be contiguous int64 {tuple(q.shape[:2])} with "
+                f"T <= 64, got {tree_ancestors.dtype} {tuple(tree_ancestors.shape)} "
+                f"strides {tree_ancestors.stride()}"
             )
         if solution not in (None, "triton"):
             raise ValueError(
@@ -453,7 +457,7 @@ def gdn_decode_mtp(
             use_qk_l2norm=use_qk_l2norm,
             intermediate_states_buffer=intermediate_states_buffer,
             output_state_indices=output_state_indices,
-            parent_indices=parent_indices,
+            tree_ancestors=tree_ancestors,
         )
 
 

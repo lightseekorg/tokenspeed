@@ -290,13 +290,11 @@ def test_qwen_replay_tree_matches_staged_tree(state_dtype):
         conv.clone(), recurrent.clone(), replay=False
     )
     parents = torch.tensor([[-1, 0, 0], [-1, 0, 1]], dtype=torch.int32, device=DEVICE)
+    # Ancestor-or-self bits of those parents.
+    ancestors = torch.tensor([1, 3, 5, 1, 3, 7], dtype=torch.int64, device=DEVICE)
     for backend in (replay_backend, staged_backend):
         backend.bind_tree_verify(
-            TreeVerifyInputs(
-                torch.zeros(BATCH * DRAFT_TOKENS, dtype=torch.int64, device=DEVICE),
-                DRAFT_TOKENS,
-                parent=parents,
-            )
+            TreeVerifyInputs(ancestors, DRAFT_TOKENS, parent=parents)
         )
     inputs = _inputs()
     before = replay_pool.get_component(0, "recurrent_state").clone()

@@ -748,7 +748,7 @@ def test_gdn_decode_mtp_intermediate_states_buffer_matches_reference(
         use_qk_l2norm=True,
         intermediate_states_buffer=scratch,
         solution=solution,
-        parent_indices=None,
+        tree_ancestors=None,
     )
 
     # disable_state_update=True: the read rows must never be mutated.
@@ -811,7 +811,7 @@ def test_gdn_decode_mtp_output_state_indices_scatter_matches_reference(
         disable_state_update=False,
         use_qk_l2norm=True,
         solution=solution,
-        parent_indices=None,
+        tree_ancestors=None,
     )
 
     ref_out, ref_states = _torch_gdn_decode_reference(
@@ -848,7 +848,6 @@ def test_gdn_decode_mtp_tree_parents_match_per_path_reference(
         [-1, 0, 1, 2, 3, 4],  # a chain
         [-1, 0, 0, 0, 0, 0],  # one level, five siblings
     ]
-    parent_idx = torch.tensor(parents, device=device, dtype=torch.int32)
     read_idx = torch.tensor([1, 3, 5, 7], device=device, dtype=torch.int32)
     output_idx = torch.arange(8, 8 + 4 * T, device=device, dtype=torch.int32).view(4, T)
     scale = q.shape[-1] ** -0.5
@@ -865,7 +864,7 @@ def test_gdn_decode_mtp_tree_parents_match_per_path_reference(
         initial_state=pool_copy,
         initial_state_indices=read_idx,
         output_state_indices=output_idx,
-        parent_indices=parent_idx,
+        tree_ancestors=_tree_ancestors(parents, device),
         scale=scale,
         disable_state_update=False,
         use_qk_l2norm=True,
@@ -903,7 +902,7 @@ def test_gdn_decode_mtp_tree_parents_match_per_path_reference(
                 atol=3e-2,
             )
 
-    # A chain given as parents never reloads: it matches the parent-less kernel to rounding.
+    # A chain given as a tree matches the chain kernel to FP32 rounding.
     chain_pool = pool.clone()
     chain_out = gdn_decode_mtp(
         q,
@@ -920,11 +919,14 @@ def test_gdn_decode_mtp_tree_parents_match_per_path_reference(
         disable_state_update=False,
         use_qk_l2norm=True,
         solution="triton",
-        parent_indices=None,
+        tree_ancestors=None,
     )
-    torch.testing.assert_close(out[2], chain_out[2])
+    torch.testing.assert_close(out[2], chain_out[2], rtol=2**-7, atol=1e-5)
     rows = output_idx[2].long()
-    torch.testing.assert_close(pool_copy[rows], chain_pool[rows])
+    state_rtol = 2**-7 if state_dtype == torch.bfloat16 else 1e-4
+    torch.testing.assert_close(
+        pool_copy[rows], chain_pool[rows], rtol=state_rtol, atol=1e-5
+    )
 
 
 @pytest.mark.parametrize(
@@ -972,7 +974,7 @@ def test_gdn_decode_mtp_padding_indices_skip_state_writes(
         disable_state_update=False,
         use_qk_l2norm=True,
         solution=solution,
-        parent_indices=None,
+        tree_ancestors=None,
     )
 
     valid_batch = torch.tensor([0, 2, 3], device=device)
@@ -1040,7 +1042,7 @@ def test_gdn_decode_mtp_disable_state_update_false_writes_back(
         disable_state_update=False,
         use_qk_l2norm=True,
         solution=solution,
-        parent_indices=None,
+        tree_ancestors=None,
     )
 
     _, ref_states = _torch_gdn_decode_reference(
@@ -1208,7 +1210,7 @@ def test_flashinfer_mtp_preserves_fp16_output_dtype(device: str, require) -> Non
         **kwargs,
         A_log=A_log,
         dt_bias=dt_bias,
-        parent_indices=None,
+        tree_ancestors=None,
         override=None,
         solution="flashinfer",
     )
@@ -1276,7 +1278,7 @@ def test_triton_gdn_packed_decode_inputs(
         output_state_indices=None,
         solution="triton",
         override=None,
-        parent_indices=None,
+        tree_ancestors=None,
     )
     torch.testing.assert_close(
         actual.float(), expected.to(actual.dtype).float(), rtol=2e-2, atol=2e-2
@@ -1286,8 +1288,8 @@ def test_triton_gdn_packed_decode_inputs(
     )
 
 
-def test_gdn_decode_mtp_rejects_strided_tree_parents(device: str, require):
-    """The kernel reads parents as a contiguous [B, T] block; a strided view is refused."""
+def test_gdn_decode_mtp_rejects_strided_tree_ancestors(device: str, require):
+    """The kernel reads ancestors as a contiguous [B, T] block; a strided view is refused."""
     require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
     T = 4
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
@@ -1297,9 +1299,9 @@ def test_gdn_decode_mtp_rejects_strided_tree_parents(device: str, require):
         pool_size=32,
         state_dtype=torch.float32,
     )
-    wide = torch.full((q.shape[0], 2 * T), -1, device=device, dtype=torch.int32)
+    wide = torch.ones((q.shape[0], 2 * T), device=device, dtype=torch.int64)
     output_idx = torch.arange(8, 8 + q.shape[0] * T, device=device, dtype=torch.int32)
-    with pytest.raises(ValueError, match="contiguous int32"):
+    with pytest.raises(ValueError, match="contiguous int64"):
         gdn_decode_mtp(
             q,
             k,
@@ -1313,40 +1315,82 @@ def test_gdn_decode_mtp_rejects_strided_tree_parents(device: str, require):
                 q.shape[0], device=device, dtype=torch.int32
             ),
             output_state_indices=output_idx.view(q.shape[0], T),
-            parent_indices=wide[:, ::2],
+            tree_ancestors=wide[:, ::2],
             scale=q.shape[-1] ** -0.5,
             disable_state_update=False,
             use_qk_l2norm=True,
         )
 
 
-def _branch_points(parents: list[int]) -> set[int]:
-    """Steps with a child other than the next step: the states a tree reloads."""
-    return {p for t, p in enumerate(parents) if p >= 0 and t != p + 1}
+def _tree_ancestors(parents: list[list[int]], device: str) -> torch.Tensor:
+    """Ancestor-or-self bitmask rows for parent lists: bit s of row t marks s on t's root path."""
+    rows = []
+    for par in parents:
+        row = []
+        for t in range(len(par)):
+            bits, node = 0, t
+            while node >= 0:
+                bits |= 1 << node
+                node = par[node]
+            row.append(bits - (1 << 64) if bits >= 1 << 63 else bits)
+        rows.append(row)
+    return torch.tensor(rows, device=device, dtype=torch.int64)
 
 
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-def test_gdn_decode_mtp_replay_tree_keeps_node_states_out_of_the_pool(
-    device: str, state_dtype: torch.dtype, require
+def _random_tree(T: int, gen: torch.Generator) -> list[int]:
+    """A tree in DFS order: each node hangs off an earlier node or the initial state."""
+    return [int(torch.randint(-1, t, (1,), generator=gen)) for t in range(T)]
+
+
+def _torch_gdn_tree_reference(
+    q, k, v, a, b, A_log, dt_bias, state_klast, scale, parents
 ):
-    """ReplaySSM tree verify: branch-point states go to the intermediate buffer,
-    children reload from it, the pool is untouched, and outputs match the
-    pool-row tree."""
-    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
-
-    T = 6
-    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
-        device=device, dtype=torch.bfloat16, T=T, pool_size=32, state_dtype=state_dtype
+    """Float64 per-node recurrence from each node's parent: outputs and K-last states."""
+    B, T, H, K = q.shape
+    HV = v.shape[2]
+    q, k = (x.double().repeat_interleave(HV // H, dim=2) for x in (q, k))
+    q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) * scale
+    k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    v = v.double()
+    g = -torch.exp(A_log.double()) * torch.nn.functional.softplus(
+        a.double() + dt_bias.double()
     )
-    parents = [
-        [-1, 0, 1, 1, 0, 4],
-        [-1, -1, 1, -1, 3, 3],
-        [-1, 0, 1, 2, 3, 4],
-        [-1, 0, 0, 0, 0, 0],
-    ]
-    parent_idx = torch.tensor(parents, device=device, dtype=torch.int32)
-    read_idx = torch.tensor([1, 3, 5, 7], device=device, dtype=torch.int32)
-    output_idx = torch.arange(8, 8 + 4 * T, device=device, dtype=torch.int32).view(4, T)
+    beta = torch.sigmoid(b.double())
+    start = state_klast.double().transpose(-2, -1)  # [B, HV, K, V]
+    out = torch.empty(B, T, HV, v.shape[-1], dtype=torch.float64, device=q.device)
+    states = torch.empty(B, T, *start.shape[1:], dtype=torch.float64, device=q.device)
+    for bi in range(B):
+        for t in range(T):
+            p = parents[bi][t]
+            h = (start[bi] if p < 0 else states[bi, p]) * torch.exp(g[bi, t])[
+                :, None, None
+            ]
+            delta = beta[bi, t][:, None] * (
+                v[bi, t] - torch.einsum("hk,hkv->hv", k[bi, t], h)
+            )
+            states[bi, t] = h + k[bi, t][:, :, None] * delta[:, None, :]
+            out[bi, t] = torch.einsum("hk,hkv->hv", q[bi, t], states[bi, t])
+    return out, states.transpose(-2, -1)
+
+
+@pytest.mark.parametrize("T", [6, 14, 16, 33, 64])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_gdn_decode_mtp_random_trees_match_float64_reference(
+    device: str, T: int, state_dtype: torch.dtype, require
+):
+    """Random multi-root trees, every padded node-block size, both state modes."""
+    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=T,
+        pool_size=4 + 4 * T,
+        state_dtype=state_dtype,
+    )
+    gen = torch.Generator().manual_seed(T)
+    parents = [_random_tree(T, gen) for _ in range(4)]
+    read_idx = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32)
+    output_idx = torch.arange(4, 4 + 4 * T, device=device, dtype=torch.int32).view(4, T)
     scale = q.shape[-1] ** -0.5
     common = dict(
         A_log=A_log,
@@ -1354,54 +1398,46 @@ def test_gdn_decode_mtp_replay_tree_keeps_node_states_out_of_the_pool(
         dt_bias=dt_bias,
         b=b,
         initial_state_indices=read_idx,
-        parent_indices=parent_idx,
+        tree_ancestors=_tree_ancestors(parents, device),
         scale=scale,
         use_qk_l2norm=True,
     )
+    want_out, want_states = _torch_gdn_tree_reference(
+        q, k, v, a, b, A_log, dt_bias, pool[read_idx.long()], scale, parents
+    )
 
-    pool_rows = pool.clone()
-    want = gdn_decode_mtp(
+    rows_pool = pool.clone()
+    out = gdn_decode_mtp(
         q,
         k,
         v,
-        initial_state=pool_rows,
+        initial_state=rows_pool,
         output_state_indices=output_idx,
         disable_state_update=False,
         **common,
     )
     replay_pool = pool.clone()
-    states = torch.full(
-        (4, T, *pool.shape[1:]), float("nan"), device=device, dtype=state_dtype
-    )
-    got = gdn_decode_mtp(
-        q,
-        k,
-        v,
-        initial_state=replay_pool,
-        intermediate_states_buffer=states,
-        disable_state_update=True,
-        **common,
+    replay_out = gdn_decode_mtp(
+        q, k, v, initial_state=replay_pool, disable_state_update=True, **common
     )
 
+    # Bf16 outputs within two ulps of the float64 recurrence; the replay verify writes nothing.
+    torch.testing.assert_close(out.double(), want_out, rtol=2**-7, atol=1e-4)
+    assert torch.equal(replay_out, out)
     assert torch.equal(replay_pool, pool)
-    assert torch.equal(got, want)
-    for bi in range(4):
-        branch_points = _branch_points(parents[bi])
-        for t in range(T):
-            if t in branch_points:
-                assert torch.equal(states[bi, t], pool_rows[int(output_idx[bi, t])])
-            else:
-                assert states[bi, t].isnan().all(), (bi, t)
+    state_rtol = 2**-7 if state_dtype == torch.bfloat16 else 1e-4
+    torch.testing.assert_close(
+        rows_pool[output_idx.long()].double(), want_states, rtol=state_rtol, atol=1e-4
+    )
 
 
-def test_gdn_decode_mtp_replay_tree_node_states_beyond_int32_offsets(
-    device: str, require
-):
-    """A 64-node ReplaySSM tree batch at the Qwen3.8 TP1 GDN shape spans more than
-    2**31 node-state elements; the last request still matches running it alone."""
+def test_gdn_decode_mtp_tree_pool_rows_beyond_int32_offsets(device: str, require):
+    """64-node trees at the Qwen3.8 TP1 GDN shape write pool rows past 2**31 elements;
+    the last request still matches running it alone."""
     require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
     B, T, H, HV, K, V = 44, 64, 16, 48, 128, 128
-    assert B * T * HV * V * K > 2**31
+    rows = 1 + B + B * T
+    assert rows * HV * V * K > 2**31
     gen = torch.Generator(device=device).manual_seed(0)
     q = torch.randn(B, T, H, K, generator=gen, device=device).bfloat16()
     k = torch.randn(B, T, H, K, generator=gen, device=device).bfloat16()
@@ -1410,34 +1446,31 @@ def test_gdn_decode_mtp_replay_tree_node_states_beyond_int32_offsets(
     b = torch.randn(B, T, HV, generator=gen, device=device).bfloat16()
     A_log = torch.rand(HV, generator=gen, device=device) * 2 - 1
     dt_bias = torch.randn(HV, generator=gen, device=device).bfloat16()
-    pool = (torch.randn(B + 1, HV, V, K, generator=gen, device=device) * 0.1).bfloat16()
+    pool = torch.zeros(rows, HV, V, K, device=device, dtype=torch.bfloat16)
+    pool[1 : B + 1] = torch.randn(B, HV, V, K, generator=gen, device=device) * 0.1
     read_idx = torch.arange(1, B + 1, dtype=torch.int32, device=device)
-    parents = torch.tensor(
-        [[-1] + [t // 2 for t in range(1, T)]] * B, dtype=torch.int32, device=device
-    )
+    out_idx = torch.arange(1 + B, rows, dtype=torch.int32, device=device).view(B, T)
+    ancestors = _tree_ancestors([[-1] + [t // 2 for t in range(1, T)]] * B, device)
 
-    def run(rows: slice) -> tuple[torch.Tensor, torch.Tensor]:
-        n = len(range(B)[rows])
-        states = torch.empty((n, T, HV, V, K), device=device, dtype=torch.bfloat16)
-        out = gdn_decode_mtp(
-            q[rows],
-            k[rows],
-            v[rows],
+    def run(batch: slice) -> torch.Tensor:
+        return gdn_decode_mtp(
+            q[batch],
+            k[batch],
+            v[batch],
             A_log=A_log,
-            a=a[rows],
+            a=a[batch],
             dt_bias=dt_bias,
-            b=b[rows],
+            b=b[batch],
             initial_state=pool,
-            initial_state_indices=read_idx[rows],
-            parent_indices=parents[rows],
-            intermediate_states_buffer=states,
+            initial_state_indices=read_idx[batch],
+            output_state_indices=out_idx[batch],
+            tree_ancestors=ancestors[batch],
             use_qk_l2norm=True,
-            disable_state_update=True,
+            disable_state_update=False,
         )
-        return out, states
 
-    out, states = run(slice(0, B))
-    alone_out, alone_states = run(slice(B - 1, B))
-    assert torch.equal(out[B - 1], alone_out[0])
-    kept = sorted(_branch_points(parents[B - 1].tolist()))
-    assert torch.equal(states[B - 1, kept], alone_states[0, kept])
+    out = run(slice(0, B))
+    last_rows = pool[out_idx[B - 1].long()].clone()
+    alone = run(slice(B - 1, B))
+    assert torch.equal(out[B - 1], alone[0])
+    assert torch.equal(pool[out_idx[B - 1].long()], last_rows)

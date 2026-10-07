@@ -258,7 +258,7 @@ def test_gdn_chain_pdl_toggle(
                 disable_state_update=False,
                 output_state_indices=writes,
                 intermediate_states_buffer=None,
-                parent_indices=None,
+                tree_ancestors=None,
             )
         return rmsnorm_fn(
             out.reshape(-1, dim),
