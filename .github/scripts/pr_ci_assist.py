@@ -30,7 +30,7 @@ import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
-from pr_ci_plan import context, task_key
+from pr_ci_plan import CoverageError, context, task_key, validate_test_coverage
 from pr_ci_state import BOT, BOT_ID, COMMAND, REPO, SHA, marker, record
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -113,6 +113,12 @@ def resolve():
     elif name == "workflow_run" and event["action"] == "completed":
         run = event["workflow_run"]
         candidates = {p["number"] for p in run["pull_requests"]}
+        plan = re.fullmatch(
+            r"CI plan #([1-9][0-9]*) \| [0-9a-f]{40} \| [0-9a-f]{40}",
+            run["display_title"],
+        )
+        if plan:
+            candidates.add(int(plan[1]))
         if not candidates:
             match = re.match(r"(?:Slurm|K8s) ([0-9a-f]{40}) \|", run["display_title"])
             source = match[1] if match else run["head_sha"]
@@ -284,6 +290,7 @@ def validate_plan(plan: dict, data: dict) -> list[dict]:
         t not in data["test_files"] for t in plan["tests"]
     ):
         raise ValueError("Invalid selected coverage.")
+    validate_test_coverage(plan["tests"], tasks, data["catalog"])
     return tasks
 
 
@@ -526,6 +533,7 @@ def native_result(run: dict, task: dict, state: dict, job: dict) -> str:
 def original_status(runs: list[dict], task: dict, state: dict) -> str:
     # Native PR matrices may use a different physical NVIDIA label; match the
     # declared task name only within a workflow tied to this exact PR source.
+    pending = "absent"
     for run in runs:
         if (
             run["event"] != "pull_request"
@@ -541,6 +549,10 @@ def original_status(runs: list[dict], task: dict, state: dict) -> str:
         ):
             continue
         jobs = pages(f"actions/runs/{run['id']}/jobs?filter=latest", "jobs")
+        dispatch_queued = bool(task["cluster"]) and run["name"] not in {
+            "NVIDIA GB200 Tests",
+            "NVIDIA GB300 Tests",
+        }
         labels = {
             r
             for r in task["native_runners"]
@@ -560,9 +572,15 @@ def original_status(runs: list[dict], task: dict, state: dict) -> str:
             if "per-commit" in task["triggers"] and any(
                 j["name"] == "scan" and j["status"] != "completed" for j in jobs
             ):
+                if dispatch_queued:
+                    pending = "queued"
+                    continue
                 return "waiting"
             continue
         job = matches[0]
+        if job["status"] == "queued" and dispatch_queued:
+            pending = "queued"
+            continue
         state["run_ids"][task_key(task)] = run["id"]
         if job["status"] != "completed":
             return "waiting"
@@ -580,7 +598,7 @@ def original_status(runs: list[dict], task: dict, state: dict) -> str:
             ):
                 return "missing"
         return "missing"
-    return "absent"
+    return pending
 
 
 def task_status(task: dict, state: dict, runs: list[dict], *, submit: bool) -> str:
@@ -612,16 +630,17 @@ def task_status(task: dict, state: dict, runs: list[dict], *, submit: bool) -> s
             if status == "unavailable":
                 continue
             return status
+        title = run_title(task, sha, cluster)
+        if title in state["submitted"]:
+            # The dispatch owns this check, even before its run becomes visible.
+            return "waiting"
         if "candidate" not in state and cluster == clusters[0]:
             status = original_status(runs, task, state)
             if status == "failed" and state["action"] == "fix":
                 return status
-            if status not in {"failed", "absent", "missing"} or not submit:
+            if status not in {"failed", "absent", "missing", "queued"} or not submit:
                 return status
         if submit:
-            title = run_title(task, sha, cluster)
-            if title in state["submitted"]:
-                return "waiting"
             state["submitted"].append(title)
             publish(
                 state,
@@ -652,6 +671,27 @@ def load_state(comments: list[dict], pr: dict) -> dict | None:
                 raise ValueError("Command is no longer authorized.")
             return state
     return None
+
+
+def refresh_plan(state: dict, message: str):
+    state["phase"] = "waiting-plan"
+    publish(state, message)
+    command(
+        "gh",
+        "workflow",
+        "run",
+        "pr-ci-plan.yml",
+        "--repo",
+        REPO,
+        "--ref",
+        "main",
+        "-f",
+        f"pr={state['pr']}",
+        "-f",
+        f"head={state['head']}",
+        "-f",
+        f"base={state['base']}",
+    )
 
 
 def control(number: int):
@@ -693,6 +733,26 @@ def control(number: int):
         state["phase"] = "stale"
         publish(state, "PR or main changed. Request a new plan and command.")
         return
+    if "plan_refresh" in state and os.environ["GITHUB_EVENT_NAME"] == "workflow_run":
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+        completed = event["workflow_run"]
+        if (
+            completed["display_title"]
+            == f"CI plan #{number} | {state['head']} | {state['base']}"
+            and completed["id"] > state["plan_refresh"]
+            and completed["conclusion"] != "success"
+        ):
+            completed = api(f"actions/runs/{completed['id']}")
+            if (
+                completed["path"] == ".github/workflows/pr-ci-plan.yml"
+                and completed["event"] == "workflow_dispatch"
+                and completed["head_branch"] == "main"
+                and completed["actor"]["login"] == BOT
+                and completed["conclusion"] != "success"
+            ):
+                state["phase"] = "manual"
+                publish(state, "CI plan refresh failed. Human intervention required.")
+                return
     source = checkout(state["head"], state["base"])
     os.environ.update(PR_NUMBER=str(number), GITHUB_REPOSITORY=REPO)
     data = context(source, state["head"], state["base"])
@@ -706,26 +766,9 @@ def control(number: int):
     ]
     if not plans:
         if initial:
-            state["phase"] = "waiting-plan"
-            publish(
+            refresh_plan(
                 state,
                 "Refreshing the CI plan for this head and base; only its selected tasks will be watched.",
-            )
-            command(
-                "gh",
-                "workflow",
-                "run",
-                "pr-ci-plan.yml",
-                "--repo",
-                REPO,
-                "--ref",
-                "main",
-                "-f",
-                f"pr={number}",
-                "-f",
-                f"head={state['head']}",
-                "-f",
-                f"base={state['base']}",
             )
         return
     plan = plans[0]
@@ -742,6 +785,19 @@ def control(number: int):
         return
     try:
         tasks = validate_plan(plan, data)
+    except CoverageError:
+        if "plan_refresh" not in state:
+            state["plan_refresh"] = plan["run"]
+            refresh_plan(
+                state, "CI plan omits a selected UT's task; refreshing coverage."
+            )
+        elif plan["run"] > state["plan_refresh"]:
+            state["phase"] = "manual"
+            publish(
+                state,
+                "Refreshed CI plan still omits selected UT coverage. Human intervention required.",
+            )
+        return
     except ValueError:
         state["phase"] = "manual"
         publish(
@@ -749,6 +805,7 @@ def control(number: int):
             "Some planned tasks have no supported GPU route. Human intervention required.",
         )
         return
+    replanned = state.pop("plan_refresh", None) is not None
     if not tasks:
         state["phase"] = "manual"
         publish(
@@ -826,7 +883,7 @@ def control(number: int):
         state["phase"] = "done"
     else:
         state["phase"] = "validating" if "candidate" in state else "watching"
-    if initial or previous != statuses:
+    if initial or replanned or previous != statuses:
         counts = ", ".join(
             f"{statuses.count(s)} {s}"
             for s in ("passed", "waiting", "failed", "missing", "blocked")

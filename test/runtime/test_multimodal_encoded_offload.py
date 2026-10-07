@@ -80,11 +80,13 @@ def _ctx(
     items_per_request: list[list[MultimodalDataItem]],
     prefixes: list[int],
     seqs: list[int],
+    max_encoder_tokens: int = 8192,
 ) -> MultimodalForwardContext:
     return MultimodalForwardContext(
         mm_inputs=[MultimodalInputs(mm_items=items) for items in items_per_request],
         extend_prefix_lens=prefixes,
         extend_seq_lens=seqs,
+        max_encoder_tokens=max_encoder_tokens,
     )
 
 
@@ -96,12 +98,13 @@ def _apply(
     ids: list[int],
     calls: list[int],
     deepstack: bool = False,
+    max_encoder_tokens: int = 8192,
 ) -> tuple[torch.Tensor | None, dict[str, Any]]:
     text = nn.Embedding(8, DIM).cuda()
     out = embedder.apply(
         torch.tensor(ids, device="cuda"),
         text,
-        _ctx(items_per_request, prefixes, seqs),
+        _ctx(items_per_request, prefixes, seqs, max_encoder_tokens),
         _encoders(calls, deepstack),
         _model(),
     )
@@ -121,6 +124,61 @@ def _image(h: int, start: int, end: int) -> MultimodalDataItem:
 def _device_bytes(item: MultimodalDataItem) -> int:
     tensors = [item.encoded, item.encoded_deepstack]
     return sum(t.numel() * t.element_size() for t in tensors if t is not None)
+
+
+def test_encoder_calls_pack_items_in_order_under_the_bound() -> None:
+    def rows(item: MultimodalDataItem, first: int, last: int) -> torch.Tensor:
+        r = torch.arange(first, last + 1, dtype=torch.float32)
+        h = torch.full_like(r, float(item.hash))
+        return torch.stack([h, r, h, r], dim=1)
+
+    # Prefix hits end inside both images: their 8 encoded rows exceed a bound of 4.
+    calls: list[int] = []
+    images = [_image(5, 0, 3), _image(6, 0, 3)]
+    embeds, _ = _apply(
+        MultimodalEmbedder(),
+        [[images[0]], [images[1]]],
+        [2, 2],
+        [2, 2],
+        [PLACEHOLDER] * 4,
+        calls,
+        max_encoder_tokens=4,
+    )
+    assert calls == [1, 1]
+    torch.testing.assert_close(
+        embeds.cpu(), torch.cat([rows(images[0], 2, 3), rows(images[1], 2, 3)])
+    )
+
+    # The bound, not the forward's own 4 tokens, decides: 8 rows fit one call.
+    calls = []
+    _apply(
+        MultimodalEmbedder(),
+        [[_image(7, 0, 3)], [_image(8, 0, 3)]],
+        [2, 2],
+        [2, 2],
+        [PLACEHOLDER] * 4,
+        calls,
+        max_encoder_tokens=8,
+    )
+    assert calls == [2]
+
+    # In order: an item larger than the bound runs alone, unequal items share a call.
+    calls = []
+    images = [_image(10, 0, 1), _image(9, 2, 7), _image(11, 8, 8), _image(12, 9, 11)]
+    embeds, _ = _apply(
+        MultimodalEmbedder(),
+        [images],
+        [0],
+        [12],
+        [PLACEHOLDER] * 12,
+        calls,
+        max_encoder_tokens=4,
+    )
+    assert calls == [1, 1, 2]
+    torch.testing.assert_close(
+        embeds.cpu(),
+        torch.cat([rows(image, 0, n - 1) for image, n in zip(images, [2, 6, 1, 3])]),
+    )
 
 
 @pytest.mark.parametrize("deepstack", [False, True])
