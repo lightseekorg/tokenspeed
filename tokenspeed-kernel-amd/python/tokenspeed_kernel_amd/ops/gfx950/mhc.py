@@ -342,21 +342,16 @@ def gluon_mhc_prefill_mix_gfx950(
     pre_post_values = gl.zeros([8], gl.float32, layout=vector_layout)
     matrix_layout: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [1, 1], [1, 0])
     rows = gl.arange(0, 4, layout=gl.SliceLayout(1, matrix_layout))
-    cols = gl.arange(0, 16, layout=gl.SliceLayout(0, matrix_layout))
-    active = cols[None, :] < 4
+    cols = gl.arange(0, 4, layout=gl.SliceLayout(0, matrix_layout))
     comb_offsets = rows[:, None] * 4 + cols[None, :]
-    comb_values = gl.zeros([4, 16], gl.float32, layout=matrix_layout)
+    comb_values = gl.zeros([4, 4], gl.float32, layout=matrix_layout)
     rms_sum = 0.0
     # Keep batch-dependent split counts out of the compilation key and retain
     # the sequential partial-sum order used by the portable implementation.
     for split in range(n_splits):
         split_base = split * num_tokens * 24 + token * 24
         pre_post_values += gl.load(projection + split_base + pre_post_offsets)
-        comb_values += gl.load(
-            projection + split_base + 8 + comb_offsets,
-            mask=active,
-            other=0.0,
-        )
+        comb_values += gl.load(projection + split_base + 8 + comb_offsets)
         rms_sum += gl.load(square_sum + split * num_tokens + token)
 
     inverse_rms = gl.rsqrt(rms_sum / (4 * HIDDEN_SIZE) + RMS_EPS)
@@ -383,20 +378,20 @@ def gluon_mhc_prefill_mix_gfx950(
         mask=pre_post_offsets >= 4,
     )
     comb = comb_values * inverse_rms * gl.load(hc_scale + 2) + gl.load(
-        hc_base + 8 + comb_offsets, mask=active, other=0.0
+        hc_base + 8 + comb_offsets
     )
-    row_max = gl.max(gl.where(active, comb, -float("inf")), axis=1)
-    comb = gl.where(active, gl.exp(comb - row_max[:, None]), 0.0)
+    row_max = gl.max(comb, axis=1)
+    comb = gl.exp(comb - row_max[:, None])
     row_sum = gl.sum(comb, axis=1)
-    comb = gl.where(active, comb / row_sum[:, None] + HC_EPS, 0.0)
+    comb = comb / row_sum[:, None] + HC_EPS
     col_sum = gl.sum(comb, axis=0)
-    comb = gl.where(active, comb / (col_sum[None, :] + HC_EPS), 0.0)
+    comb = comb / (col_sum[None, :] + HC_EPS)
     for _ in gl.static_range(1, SINKHORN_ITERS):
         row_sum = gl.sum(comb, axis=1)
-        comb = gl.where(active, comb / (row_sum[:, None] + HC_EPS), 0.0)
+        comb = comb / (row_sum[:, None] + HC_EPS)
         col_sum = gl.sum(comb, axis=0)
-        comb = gl.where(active, comb / (col_sum[None, :] + HC_EPS), 0.0)
-    gl.store(comb_mix + token * 16 + comb_offsets, comb, mask=active)
+        comb = comb / (col_sum[None, :] + HC_EPS)
+    gl.store(comb_mix + token * 16 + comb_offsets, comb)
 
 
 def launch_gluon_mhc_prefill_mix_gfx950(
