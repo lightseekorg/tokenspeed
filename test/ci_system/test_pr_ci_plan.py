@@ -145,3 +145,47 @@ def test_proposal_cannot_invent_runner_or_command():
     ]
     with pytest.raises(ValueError, match="existing test file"):
         planner.proposal(json.dumps(response), data)
+
+
+def test_recommended_runtime_ut_requires_its_ci_task(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
+    monkeypatch.setenv("PR_NUMBER", "1")
+    test = "test/runtime/test_multimodal_encoded_offload.py"
+    cpu_test = "test/ci_system/test_pr_ci_plan.py"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda args, **k: SimpleNamespace(stdout=f"{test}\n{cpu_test}\n"),
+    )
+    data = planner.context(REPO, "a" * 40, "b" * 40)
+    configs = [
+        "test/ci/ut/ut-runtime-2gpu.yaml",
+        "test/ci/ut/ut-runtime-1gpu.yaml",
+    ]
+    choices = []
+    for config in configs:
+        task = next(t for t in data["catalog"] if t["config"] == config)
+        choices.append(
+            dict(
+                config=config,
+                runner=task["slurm_runners"]["gb200"][0],
+                cluster="gb200",
+                label="Runtime regression",
+                reason="Bounded encoder calls preserve packed item order.",
+            )
+        )
+    response = dict(
+        summary="Multimodal encoder packing respects the forward token bound.",
+        tests=[
+            dict(path=path, label="Regression", reason="Verify selected behavior.")
+            for path in (test, cpu_test)
+        ],
+        tasks=choices[:1],
+        conflicts="",
+    )
+    with pytest.raises(planner.CoverageError, match="test_multimodal_encoded_offload"):
+        planner.proposal(json.dumps(response), data)
+    response["tasks"] = choices
+    result = planner.proposal(json.dumps(response), data)
+    assert [t["path"] for t in result["tests"]] == [test, cpu_test]
+    assert [t["config"] for t in result["tasks"]] == configs

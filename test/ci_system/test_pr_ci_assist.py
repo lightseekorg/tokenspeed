@@ -128,6 +128,157 @@ def test_failed_task_retries_once_and_falls_back_only_before_submission(
     assert not dispatched
 
 
+def test_queued_nvidia_uses_slurm_once_and_keeps_dispatch_authoritative(
+    monkeypatch, selected
+):
+    task, state = selected
+    run = dict(
+        id=100,
+        event="pull_request",
+        head_sha=state["head"],
+        name="NVIDIA B200 Tests",
+    )
+    job = dict(name="unit-test / runtime (b200v2-1gpu)", status="queued")
+    monkeypatch.setattr(assist, "pages", lambda *args: [job])
+    monkeypatch.setattr(assist, "publish", lambda *args: None)
+    dispatched = []
+    monkeypatch.setattr(assist, "dispatch", lambda *args: dispatched.append(args))
+    assert assist.task_status(task, state, [run], submit=True) == "waiting"
+    assert dispatched == [(task, state["head"], "gb200")]
+    job.update(status="completed", conclusion="success")
+    monkeypatch.setattr(
+        assist, "native_result", lambda *args: pytest.fail("dispatch lost ownership")
+    )
+    assert assist.task_status(task, state, [run], submit=True) == "waiting"
+    assert len(dispatched) == 1
+
+
+def test_active_native_work_and_queued_slurm_or_amd_are_reused(monkeypatch, selected):
+    task, state = selected
+    run = dict(
+        id=100,
+        event="pull_request",
+        head_sha=state["head"],
+        name="NVIDIA B200 Tests",
+    )
+    queued = dict(name="unit-test / runtime (b200v2-1gpu)", status="queued")
+    active = {**queued, "status": "in_progress"}
+    monkeypatch.setattr(
+        assist, "pages", lambda path, field: [queued if "/100/" in path else active]
+    )
+    monkeypatch.setattr(
+        assist, "dispatch", lambda *args: pytest.fail("existing work duplicated")
+    )
+    runs = [run, {**run, "id": 101}]
+    assert assist.task_status(task, state, runs, submit=True) == "waiting"
+    assert state["run_ids"][assist.task_key(task)] == 101
+    monkeypatch.setattr(assist, "pages", lambda *args: [queued])
+    run["name"] = "NVIDIA GB200 Tests"
+    assert assist.task_status(task, state, [run], submit=True) == "waiting"
+    task.update(cluster="", runner="amd-1gpu", native_runners=["amd-1gpu"])
+    run["name"] = "AMD Tests"
+    queued["name"] = "unit-test / runtime (amd-1gpu)"
+    assert assist.task_status(task, state, [run], submit=True) == "waiting"
+
+
+def test_incomplete_old_plan_refreshes_once_and_failed_refresh_requests_help(
+    monkeypatch, tmp_path, selected
+):
+    task, state = selected
+    test = "test/runtime/test_multimodal_encoded_offload.py"
+    data = {
+        **{k: state[k] for k in ("repository", "pr", "head", "base")},
+        "test_files": [test],
+        "catalog": [
+            {
+                **task,
+                "runners": task["native_runners"],
+                "slurm_runners": {"gb200": [task["runner"]]},
+                "targets": {"test_files": [test]},
+            },
+            {
+                **task,
+                "config": "test/ci/ut/other.yaml",
+                "runners": task["native_runners"],
+                "slurm_runners": {"gb200": [task["runner"]]},
+                "targets": {"test_files": []},
+            },
+        ],
+    }
+    plan = {
+        **{k: state[k] for k in ("version", "repository", "pr", "head", "base")},
+        "run": 55,
+        "tests": [test],
+        "tasks": [
+            dict(config="test/ci/ut/other.yaml", runner=task["runner"], cluster="gb200")
+        ],
+    }
+    with pytest.raises(assist.CoverageError):
+        assist.validate_plan(plan, data)
+    comments = [{"user": {"login": BOT, "id": BOT_ID}, "body": marker("plan", plan)}]
+    pr = dict(
+        number=state["pr"], head={"sha": state["head"]}, base={"sha": state["base"]}
+    )
+    event = tmp_path / "event.json"
+    event.write_text("{}")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "pull", lambda *args: pr)
+    monkeypatch.setattr(assist, "load_state", lambda *args: state)
+    monkeypatch.setattr(assist, "pages", lambda *args: comments)
+    monkeypatch.setattr(assist, "checkout", lambda *args: tmp_path)
+    monkeypatch.setattr(assist, "context", lambda *args: data)
+    title = f"CI plan #{state['pr']} | {state['head']} | {state['base']}"
+    monkeypatch.setattr(
+        assist,
+        "api",
+        lambda *args: dict(
+            path=".github/workflows/pr-ci-plan.yml",
+            conclusion="success",
+            display_title=title,
+        ),
+    )
+    monkeypatch.setattr(
+        assist, "dispatch", lambda *args: pytest.fail("incomplete coverage dispatched")
+    )
+    published, commands = [], []
+    monkeypatch.setattr(assist, "publish", lambda *args: published.append(args))
+    monkeypatch.setattr(assist, "command", lambda *args: commands.append(args))
+    assist.control(state["pr"])
+    assert state["phase"] == "waiting-plan" and state["plan_refresh"] == 55
+    assert len(commands) == 1
+    assert (
+        f"head={state['head']}" in commands[0]
+        and f"base={state['base']}" in commands[0]
+    )
+    assert (
+        record(
+            {"user": {"login": BOT, "id": BOT_ID}, "body": marker("assist", state)},
+            "assist",
+        )
+        == state
+    )
+    assist.control(state["pr"])
+    assert len(commands) == 1 and len(published) == 1
+    run = dict(
+        id=56,
+        name="PR CI Plan",
+        display_title=title,
+        conclusion="failure",
+        pull_requests=[],
+        head_sha=state["base"],
+    )
+    event.write_text(json.dumps(dict(action="completed", workflow_run=run)))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    resolved = []
+    monkeypatch.setattr(assist, "output", lambda *args: resolved.append(args))
+    assist.resolve()
+    assert resolved == [("pr", str(state["pr"]))]
+    assist.control(state["pr"])
+    assert state["phase"] == "manual" and len(commands) == 1
+
+
 def test_promotion_needs_nonempty_matching_task_result(selected):
     task, state = selected
     result = dict(

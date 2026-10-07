@@ -87,7 +87,7 @@ def record(comment: dict, kind: str) -> dict | None:
         }
         if (
             not required.issubset(data)
-            or set(data) - required - {"candidate", "repair_run"}
+            or set(data) - required - {"candidate", "repair_run", "plan_refresh"}
             or type(data.get("command")) is not int
             or data.get("action") not in {"watch", "fix"}
             or data.get("phase")
@@ -101,6 +101,10 @@ def record(comment: dict, kind: str) -> dict | None:
                 "stale",
                 "promoted",
             }
+        ):
+            return None
+        if "plan_refresh" in data and (
+            type(data["plan_refresh"]) is not int or data["plan_refresh"] < 1
         ):
             return None
         if (

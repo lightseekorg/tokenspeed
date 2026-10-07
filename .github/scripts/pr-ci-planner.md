@@ -46,7 +46,10 @@ and cache tests plus its serving CI, not every other model's accuracy checks.
 For CI-only changes, prioritize relevant CI-system tests without GPU model tasks.
 Select test files only from context.json's test_files and tasks/runners only from
 its catalog, including manual tasks when they offer the best coverage. Read task
-targets/commands and model flags; name matching alone is insufficient. Explain
+targets/commands and model flags; name matching alone is insufficient. Every
+selected test listed in a task's targets.test_files must have a covering task
+in the selected CI set. Use the smallest such set, even when it needs more than
+two tasks; an eval does not replace the UT suite that runs a regression. Explain
 missing coverage in the summary rather than inventing tests or falling back to
 the entire catalog. Never add unrelated checks merely to look comprehensive.
 When mergeable is false, describe the smallest conflict resolution to preserve

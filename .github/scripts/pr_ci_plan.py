@@ -54,6 +54,25 @@ def task_key(task: dict) -> str:
     return f"{task['config']}@{task['runner']}@{task['cluster']}"
 
 
+class CoverageError(ValueError):
+    """A selected test's known CI task was omitted from the plan."""
+
+
+def validate_test_coverage(tests: list[str], tasks: list[dict], catalog: list[dict]):
+    selected = {task["config"] for task in tasks}
+    mapped, covered = set(), set()
+    for task in catalog:
+        files = task.get("targets", {}).get("test_files", [])
+        mapped.update(files)
+        if task["config"] in selected:
+            covered.update(files)
+    missing = sorted(set(tests).intersection(mapped) - covered)
+    if missing:
+        raise CoverageError(
+            f"Select a CI task covering each recommended test: {', '.join(missing)}"
+        )
+
+
 def context(source: Path, head: str, base: str) -> dict:
     # Reuse task validation and target discovery, including manual-only tasks.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "test/ci_system"))
@@ -199,6 +218,7 @@ def proposal(raw: str, data: dict) -> dict:
         ):
             raise ValueError("Proposed task must belong to the coverage catalog.")
         selected[key] = {**catalog[key], **choice}
+    validate_test_coverage(list(tests), list(selected.values()), data["catalog"])
     return {
         "version": data["version"],
         "repository": data["repository"],
