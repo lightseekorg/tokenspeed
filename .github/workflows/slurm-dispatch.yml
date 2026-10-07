@@ -1,4 +1,5 @@
 name: Slurm Dispatch
+run-name: "Slurm ${{ inputs.commit || inputs.pr || github.sha }} | ${{ inputs.match }} | ${{ inputs.runners }} | ${{ inputs.cluster }}"
 
 on:
   workflow_dispatch:
@@ -8,6 +9,16 @@ on:
         required: false
         default: ""
         type: string
+      commit:
+        description: "Optional full commit SHA, mutually exclusive with pr; tested without merging"
+        required: false
+        default: ""
+        type: string
+      require_idle:
+        description: "Report unavailable without submitting when selected tasks cannot start now"
+        required: true
+        default: false
+        type: boolean
       container_image:
         description: "Optional immutable ghcr.io/lightseekorg/tokenspeed-runner image override"
         required: false
@@ -104,7 +115,7 @@ on:
           - slurm
 
 concurrency:
-  group: slurm-dispatch-${{ inputs.cluster }}-${{ github.ref }}-${{ inputs.pr || 'checkout' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}-${{ inputs.container_image || 'default-image' }}
+  group: slurm-dispatch-${{ inputs.cluster }}-${{ github.ref }}-${{ inputs.commit || inputs.pr || 'checkout' }}-${{ inputs.yaml }}-${{ inputs.runners }}-${{ inputs.match }}-${{ inputs.container_image || 'default-image' }}
   cancel-in-progress: false
 
 jobs:
@@ -127,10 +138,12 @@ jobs:
 
       - name: Submit and wait for Slurm tasks
         env:
+          COMMIT: ${{ inputs.commit }}
+          REQUIRE_IDLE: ${{ inputs.require_idle }}
           PR: ${{ inputs.pr }}
           # A dispatched pull request may carry unmerged tokenspeed-mla changes,
           # and the Slurm coordinator has no gh to narrow that to its diff.
-          INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.pr && '1' || '0' }}
+          INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ (inputs.pr || inputs.commit) && '1' || '0' }}
           CONTAINER_IMAGE: ${{ inputs.container_image }}
           CLUSTER: ${{ inputs.cluster }}
           YAML_SELECTION: ${{ inputs.yaml }}
@@ -148,8 +161,12 @@ jobs:
             }
             export TS_CI_CONTAINER_IMAGE="$CONTAINER_IMAGE"
           fi
+          COMMIT=${COMMIT:-}
+          REQUIRE_IDLE=${REQUIRE_IDLE:-false}
           args=(--wait --report-dir "$RUNNER_TEMP/slurm-report")
           [ -z "$PR" ] || args+=(--pr "$PR")
+          [ -z "$COMMIT" ] || args+=(--commit "$COMMIT")
+          [ "$REQUIRE_IDLE" != true ] || args+=(--require-idle)
 
           case "$CLUSTER" in
             gb200)
@@ -190,19 +207,24 @@ jobs:
           if [ "$YAML_SELECTION" != off ]; then
             args+=(--config "$YAML_SELECTION")
             yaml_metadata_output=$(
-              python3 - "$YAML_SELECTION" "$CLUSTER" "$PR" <<'PY'
+              python3 - "$YAML_SELECTION" "$CLUSTER" "$PR" "$COMMIT" <<'PY'
           import sys
           from pathlib import Path
 
           sys.path.insert(0, "test/ci_system")
           from pipeline import normalize_task
           from slurm_submit import pr_worktree
+          from slurm_submit import commit_worktree
 
           repo = Path.cwd()
           selection = Path(sys.argv[1])
           pr = sys.argv[3]
+          commit = sys.argv[4]
           if pr:
               with pr_worktree(repo, pr) as checkout:
+                  task = normalize_task(checkout / selection, checkout)
+          elif commit:
+              with commit_worktree(repo, commit) as checkout:
                   task = normalize_task(checkout / selection, checkout)
           else:
               task = normalize_task(repo / selection, repo)

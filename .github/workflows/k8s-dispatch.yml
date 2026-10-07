@@ -1,4 +1,5 @@
 name: K8s Dispatch
+run-name: "K8s ${{ inputs.commit || inputs.pr || github.sha }} | ${{ inputs.match }} | ${{ inputs.runner }}"
 
 on:
   workflow_dispatch:
@@ -80,6 +81,11 @@ on:
           - gb200
           - b300
           - all
+      runner:
+        description: "Optional exact runner label within the selected pool"
+        required: false
+        default: ""
+        type: string
       task_types:
         description: "Comma-separated task types"
         required: true
@@ -108,7 +114,7 @@ on:
           - per-commit
 
 concurrency:
-  group: k8s-dispatch-${{ inputs.commit || inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runner_pool }}-${{ inputs.match }}
+  group: k8s-dispatch-${{ inputs.commit || inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runner_pool }}-${{ inputs.runner }}-${{ inputs.match }}
   cancel-in-progress: false
 
 jobs:
@@ -230,6 +236,7 @@ jobs:
         id: matrix
         env:
           YAML_SELECTION: ${{ inputs.yaml }}
+          EXACT_RUNNER: ${{ inputs.runner }}
           RUNNER_POOL: ${{ inputs.runner_pool }}
           TASK_TYPES: ${{ inputs.task_types }}
           MATCH: ${{ inputs.match }}
@@ -278,6 +285,8 @@ jobs:
               searchable = f"{task['name']} {task['config']}".lower()
               runner = task["runner"]
               if runner.startswith("slurm-"):
+                  continue
+              if os.environ["EXACT_RUNNER"] and runner != os.environ["EXACT_RUNNER"]:
                   continue
               pool = os.environ["RUNNER_POOL"]
               runner_families = {

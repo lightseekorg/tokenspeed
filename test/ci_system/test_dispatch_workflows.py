@@ -1135,7 +1135,7 @@ def test_slurm_dispatch_takes_a_dispatched_pr_from_its_own_tree():
     )
 
     assert step["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == (
-        "${{ inputs.pr && '1' || '0' }}"
+        "${{ (inputs.pr || inputs.commit) && '1' || '0' }}"
     )
 
 

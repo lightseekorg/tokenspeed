@@ -727,3 +727,27 @@ cache, a 120-second socket timeout, and at most three installation attempts
 dependency download handling; retained files, source commit, image and test
 configuration stay unchanged.
 For workflows with one case per GitHub job, use **Re-run failed jobs**.
+
+## PR commands
+
+On an open same-repository PR into `main`, a repository writer can comment
+`@lightseek-bot watch` or `@lightseek-bot fix`.
+
+- `watch` follows the current CI plan's selected tasks. Failed tasks get one
+  focused reproduction: NVIDIA uses Slurm GB200, then compatible GB300 only if
+  GB200 reports no capacity before submission; AMD uses K8s AMD. A repeated
+  failure or missing result requests human intervention. Queued runs are reused.
+- `fix` resolves conflicts first, or attempts a focused source repair for an
+  already failed selected task. A separate branch receives the candidate;
+  required pre-commit checks and all selected GPU tasks must pass before the
+  repair is cherry-picked back. Conflict repairs also record the validated
+  merge with `main` so the PR becomes mergeable. A changed head or base stops
+  promotion.
+
+Only explicit writer commands start repairs. The bot does not edit tests,
+workflow/configuration files or task thresholds automatically, and does not
+merge PRs or bypass required checks. Comments contain a short status table;
+versioned hidden records preserve the selected tasks and immutable source.
+`PR CI Assist` can be manually dispatched with a PR number to reconcile an
+existing command. The workflows must be present on `main` for comment and
+completion events to activate them.
