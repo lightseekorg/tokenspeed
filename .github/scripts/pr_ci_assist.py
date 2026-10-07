@@ -320,7 +320,7 @@ def validate_plan(plan: dict, data: dict) -> list[dict]:
         t not in data["test_files"] for t in plan["tests"]
     ):
         raise ValueError("Invalid selected coverage.")
-    validate_test_coverage(plan["tests"], tasks, data["catalog"])
+    validate_test_coverage(plan["tests"], tasks, data["catalog"], data.get("paths", []))
     return tasks
 
 
@@ -402,7 +402,13 @@ def native_check(check: dict, state: dict, runs: list[dict]) -> dict:
         if run["conclusion"] == "failure":
             return {**result, "status": "failed"}
         jobs = pages(f"actions/runs/{run['id']}/jobs?filter=latest", "jobs")
-        jobs = [j for j in jobs if j["name"] == "test"]
+        jobs = [j for j in jobs if j["name"] == check["job"]]
+        if (
+            run["conclusion"] == "success"
+            and len(jobs) == 1
+            and jobs[0]["conclusion"] == "skipped"
+        ):
+            return result
         if (
             run["conclusion"] == "success"
             and len(jobs) == 1
@@ -859,13 +865,13 @@ def control(number: int):
         if "plan_refresh" not in state:
             state["plan_refresh"] = plan["run"]
             refresh_plan(
-                state, "CI plan omits a selected UT's task; refreshing coverage."
+                state, "CI plan omits required validation; refreshing coverage."
             )
         elif plan["run"] > state["plan_refresh"]:
             state["phase"] = "manual"
             publish(
                 state,
-                "Refreshed CI plan still omits selected UT coverage. Human intervention required.",
+                "Refreshed CI plan still omits required validation. Human intervention required.",
             )
         return
     except ValueError:
@@ -912,12 +918,12 @@ def control(number: int):
         for check in data.get("native_checks", [])
         if state["action"] == "watch"
     ]
-    cpu_statuses = [c["status"] for c in state["native_checks"]]
-    if any(s in {"failed", "missing", "blocked"} for s in cpu_statuses):
+    native_statuses = [c["status"] for c in state["native_checks"]]
+    if any(s in {"failed", "missing", "blocked"} for s in native_statuses):
         state["phase"] = "manual"
         publish(
             state,
-            "Native CPU checks need human intervention; no GPU retry or PR update.",
+            "Native checks need human intervention; no dispatch retry or PR update.",
         )
         return
     requested_fix = state["action"] == "fix" and "candidate" not in state
@@ -951,7 +957,7 @@ def control(number: int):
         )
         output("repair", "true")
         return
-    combined = cpu_statuses + statuses
+    combined = native_statuses + statuses
     if "candidate" in state and all(s == "passed" for s in combined):
         from pr_ci_repair import promote
 

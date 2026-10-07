@@ -34,11 +34,20 @@ NATIVE_CHECKS = {
         "label": "Scheduler C++",
         "reason": "Cache classification, capacity and admission regressions",
         "step": "Run scheduler C++ tests",
+        "job": "test",
     },
     "scheduler-python-test.yml": {
         "label": "Scheduler Python",
         "reason": "Python bindings, cache capacity and admission regressions",
         "step": "Run scheduler Python tests",
+        "job": "test",
+    },
+    "nvidia-kernel-library-tests.yml": {
+        "label": "NVIDIA kernel libraries",
+        "reason": "Native MLA numerics, CUDA Graph replay and kernel regressions",
+        "step": "Run native library unit tests",
+        "job": "native-libraries",
+        "target": "Native GPU CI",
     },
 }
 STATUSES = {"passed", "waiting", "failed", "missing", "blocked"}

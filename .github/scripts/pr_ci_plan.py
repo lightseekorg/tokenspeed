@@ -33,6 +33,15 @@ import yaml
 from pr_ci_state import NATIVE_CHECKS
 
 
+def _matches_path(path: str, patterns: list[str]) -> bool:
+    matched = False
+    # GitHub applies exclusions and subsequent inclusions in declaration order.
+    for pattern in patterns:
+        if fnmatchcase(path, pattern.removeprefix("!")):
+            matched = not pattern.startswith("!")
+    return matched
+
+
 def native_checks(paths: list[str]) -> list[dict]:
     """Match the existing trusted workflows' PR path filters."""
     workflows = Path(__file__).resolve().parents[1] / "workflows"
@@ -42,7 +51,7 @@ def native_checks(paths: list[str]) -> list[dict]:
         # PyYAML's YAML 1.1 loader interprets the unquoted `on` key as True.
         trigger = config.get("on", config.get(True))["pull_request"]
         if "main" in trigger["branches"] and any(
-            fnmatchcase(path, pattern) for path in paths for pattern in trigger["paths"]
+            _matches_path(path, trigger["paths"]) for path in paths
         ):
             checks.append({"workflow": workflow, **details})
     return checks
@@ -74,10 +83,12 @@ def task_key(task: dict) -> str:
 
 
 class CoverageError(ValueError):
-    """A selected test's known CI task was omitted from the plan."""
+    """Required test or serving coverage was omitted from the plan."""
 
 
-def validate_test_coverage(tests: list[str], tasks: list[dict], catalog: list[dict]):
+def validate_test_coverage(
+    tests: list[str], tasks: list[dict], catalog: list[dict], paths: list[str]
+):
     selected = {task["config"] for task in tasks}
     mapped, covered = set(), set()
     for task in catalog:
@@ -89,6 +100,21 @@ def validate_test_coverage(tests: list[str], tasks: list[dict], catalog: list[di
     if missing:
         raise CoverageError(
             f"Select a CI task covering each recommended test: {', '.join(missing)}"
+        )
+    if any(
+        path.startswith("tokenspeed-mla/python/tokenspeed_mla/")
+        and path.endswith(".py")
+        for path in paths
+    ) and not any(
+        task["config"] in selected
+        and re.search(
+            r"--(?:drafter-)?attention-backend(?:=|\s+)tokenspeed_mla(?:\s|$)",
+            task.get("server_command", ""),
+        )
+        for task in catalog
+    ):
+        raise CoverageError(
+            "Select a serving CI task explicitly using tokenspeed_mla for in-tree MLA changes."
         )
 
 
@@ -238,7 +264,9 @@ def proposal(raw: str, data: dict) -> dict:
         ):
             raise ValueError("Proposed task must belong to the coverage catalog.")
         selected[key] = {**catalog[key], **choice}
-    validate_test_coverage(list(tests), list(selected.values()), data["catalog"])
+    validate_test_coverage(
+        list(tests), list(selected.values()), data["catalog"], data.get("paths", [])
+    )
     return {
         "version": data["version"],
         "repository": data["repository"],
@@ -260,7 +288,11 @@ def render(plan: dict) -> str:
         _cell(plan["summary"]),
     ]
     rows = [
-        (check, f".github/workflows/{check['workflow']}", "Native CPU CI")
+        (
+            check,
+            f".github/workflows/{check['workflow']}",
+            check.get("target", "Native CPU CI"),
+        )
         for check in plan.get("native_checks", [])
     ]
     rows += [(t, t["path"], "Targeted UT") for t in plan["tests"]]
@@ -287,7 +319,7 @@ def render(plan: dict) -> str:
                 f"| {order} | {label} | {_cell(item['reason'])} | {_cell(target)} |"
             )
     if not plan["tasks"]:
-        lines += ["", "**GPU:** no task recommended."]
+        lines += ["", "**Dispatch:** no task recommended."]
     if any(t["cluster"] == "gb200" for t in plan["tasks"]):
         lines += ["", "**Routing:** GB200 first; GB300 if full. One cluster per task."]
     if any(

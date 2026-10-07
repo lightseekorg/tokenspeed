@@ -146,11 +146,13 @@ def test_state_is_typed_and_bot_owned(selected):
     assert record(comment, "assist") is None
 
 
-def test_native_cpu_result_needs_current_source_and_executed_test(
-    monkeypatch, selected
+@pytest.mark.parametrize(
+    "workflow", ["scheduler-cpp-test.yml", "nvidia-kernel-library-tests.yml"]
+)
+def test_native_result_needs_current_source_and_executed_test(
+    monkeypatch, selected, workflow
 ):
     _, state = selected
-    workflow = "scheduler-cpp-test.yml"
     check = {"workflow": workflow, **NATIVE_CHECKS[workflow]}
     run = dict(
         id=101,
@@ -168,9 +170,14 @@ def test_native_cpu_result_needs_current_source_and_executed_test(
         conclusion="success",
     )
     step = dict(name=check["step"], status="completed", conclusion="success")
-    job = dict(name="test", status="completed", conclusion="success", steps=[step])
+    job = dict(
+        name=check["job"], status="completed", conclusion="success", steps=[step]
+    )
     monkeypatch.setattr(assist, "pages", lambda path, field: [job])
     assert assist.native_check(check, state, [run])["status"] == "passed"
+    job["conclusion"] = "skipped"
+    assert assist.native_check(check, state, [run])["status"] == "waiting"
+    job["conclusion"] = "success"
     step["conclusion"] = "skipped"
     assert assist.native_check(check, state, [run])["status"] == "missing"
     newer = {**run, "id": 102, "status": "in_progress"}
@@ -366,6 +373,12 @@ def test_incomplete_old_plan_refreshes_once_and_failed_refresh_requests_help(
     }
     with pytest.raises(assist.CoverageError):
         assist.validate_plan(plan, data)
+    data["paths"] = ["tokenspeed-mla/python/tokenspeed_mla/mla_decode_fp8.py"]
+    plan["tests"] = []
+    with pytest.raises(assist.CoverageError, match="serving CI task"):
+        assist.validate_plan(plan, data)
+    data["paths"] = []
+    plan["tests"] = [test]
     comments = [{"user": {"login": BOT, "id": BOT_ID}, "body": marker("plan", plan)}]
     pr = dict(
         number=state["pr"], head={"sha": state["head"]}, base={"sha": state["base"]}
