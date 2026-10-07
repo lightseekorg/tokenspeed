@@ -32,10 +32,19 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from pr_ci_plan import context, proposal, render, source_url
+from pr_ci_state import marker
 
 
 def _command(*args: str) -> str:
-    return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+    try:
+        return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+    except subprocess.CalledProcessError as error:
+        # Keep provider configuration and API response bodies out of public logs.
+        status = re.search(r"HTTP [0-9]{3}", error.stderr or "")
+        detail = status[0] if status else f"exit {error.returncode}"
+        raise SystemExit(
+            f"CI planning command failed: {' '.join(args[:2])} ({detail})."
+        ) from None
 
 
 def _check_bot() -> None:
@@ -97,7 +106,7 @@ capabilities = ["thinking", "tool_use"]
     home.joinpath("config.toml").write_text(config)
     shutil.copyfile(Path(__file__).with_name("pr-ci-planner.md"), root / "planner.md")
     data = context(
-        Path(os.environ["GITHUB_WORKSPACE"]),
+        Path.cwd(),
         os.environ["PR_HEAD_SHA"],
         os.environ["PR_BASE_SHA"],
     )
@@ -153,6 +162,7 @@ def _check_public_output(body: str, root: Path, *, source_links: bool = False) -
         urlparse(url).hostname,
         os.environ["RUNNER_TEMP"],
         os.environ["GITHUB_WORKSPACE"],
+        str(Path.cwd()),
     ]
     # Public task identifiers can contain the configured model's name. Allow
     # only exact catalog identifiers; free text still cannot identify it.
@@ -190,10 +200,7 @@ def _check_public_output(body: str, root: Path, *, source_links: bool = False) -
         raise SystemExit("CI plan exceeds the comment size limit.")
 
 
-def plan(root: Path) -> None:
-    if not os.environ.get("KIMI_API_KEY"):
-        raise SystemExit("Set the KIMI_API_KEY organization secret.")
-    source = os.environ["GITHUB_WORKSPACE"]
+def _generate(root: Path, source: str, correction: str = "") -> str:
     # A neutral working directory avoids loading the PR's CLI/MCP configuration.
     with (
         root.joinpath("events.jsonl").open("w") as events,
@@ -202,7 +209,7 @@ def plan(root: Path) -> None:
         result = subprocess.run(
             [
                 "timeout",
-                "600",
+                "120" if correction else "600",
                 "kimi",
                 "--agent-file",
                 str(root / "planner.md"),
@@ -211,7 +218,7 @@ def plan(root: Path) -> None:
                 "-p",
                 f"Plan CI coverage using {root}/context.json and {root}/pr.diff. "
                 f"Source root: {source}. Read relevant callers and CI task specs. "
-                "Return only the JSON schema in your instructions.",
+                "Return only the JSON schema in your instructions. " + correction,
             ],
             cwd=root,
             stdout=events,
@@ -219,12 +226,31 @@ def plan(root: Path) -> None:
         )
     if result.returncode:
         raise SystemExit("CI planning failed or timed out; no plan was published.")
-    raw = _model_body(root)
-    try:
-        plan = proposal(raw, json.loads(root.joinpath("context.json").read_text()))
-    except ValueError as error:
-        # The validator emits fixed messages, never the model response.
-        raise SystemExit(f"Invalid CI proposal: {error}") from None
+    return _model_body(root)
+
+
+def plan(root: Path) -> None:
+    if not os.environ.get("KIMI_API_KEY"):
+        raise SystemExit("Set the KIMI_API_KEY organization secret.")
+    source = str(Path.cwd())
+    data = json.loads(root.joinpath("context.json").read_text())
+    raw = _generate(root, source)
+    for attempt in range(2):
+        try:
+            plan = proposal(raw, data)
+            break
+        except ValueError as error:
+            if attempt:
+                # Validation errors are fixed text, never raw model content.
+                raise SystemExit(f"Invalid CI proposal: {error}") from None
+            root.joinpath("previous-response.txt").write_text(raw)
+            raw = _generate(
+                root,
+                source,
+                f"The previous response in {root}/previous-response.txt failed validation: {error}. "
+                "Correct its JSON once. Use a summary under 200 characters, labels under 60, "
+                "reasons under 120, and no @ mentions. Preserve the selected scope and use only catalog identifiers.",
+            )
     # Check decoded text before presentation escaping can change its spelling.
     editorial = [plan["summary"], plan["conflicts"]]
     for item in [*plan["tests"], *plan["tasks"]]:
@@ -232,7 +258,16 @@ def plan(root: Path) -> None:
     _check_public_output("\n".join(editorial), root)
     body = render(plan)
     _check_public_output(body, root, source_links=True)
-    root.joinpath("comment.md").write_text(body)
+    data = json.loads(root.joinpath("context.json").read_text())
+    metadata = {k: data[k] for k in ("version", "repository", "pr", "head", "base")}
+    metadata.update(
+        run=int(os.environ["GITHUB_RUN_ID"]),
+        tests=[t["path"] for t in plan["tests"]],
+        tasks=[
+            {k: t[k] for k in ("config", "runner", "cluster")} for t in plan["tasks"]
+        ],
+    )
+    root.joinpath("comment.md").write_text(body + marker("plan", metadata))
 
 
 def publish(root: Path) -> None:
@@ -258,7 +293,12 @@ def publish(root: Path) -> None:
         "--jq",
         ".headRefOid",
     ).strip()
-    if head != os.environ["PR_HEAD_SHA"]:
+    live = json.loads(_command("gh", "api", f"repos/{repo}/pulls/{number}"))
+    if (
+        head != os.environ["PR_HEAD_SHA"]
+        or live["base"]["sha"]
+        != json.loads(root.joinpath("context.json").read_text())["base"]
+    ):
         print("PR head changed; skipping the obsolete plan.")
         return
     comment_url = _command(
