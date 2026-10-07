@@ -205,22 +205,32 @@ The following slime paths are not yet supported end to end:
   `--rollout-top-p 1.0` until TokenSpeed returns that metadata;
 - rollout routing replay (`--use-rollout-routing-replay`).
 
-`POST /update_weights_from_disk` and `POST /update_weights_from_tensor` stay on
-the router for slime-compatible clients, but answer `501 Not Implemented` with
+`POST /update_weights_from_disk` reloads the weights in place from a checkpoint
+directory (`{"model_path": ..., "load_format": ...}`; `load_format` defaults to
+the server's). It takes the same scheduler path as the distributed and
+Mooncake updates: the `weight_version` checks, the attention-DP same-round gate,
+a cache flush before the load, and the replica-wide result. The reply counts
+the checkpoint tensors actually read, and a checkpoint that yields none is a
+failure. Load formats that do not read checkpoint files (for example `dummy`)
+are refused.
+
+`POST /update_weights_from_tensor` stays on the router for slime-compatible
+clients, but answers `501 Not Implemented` with
 `{"success": false, "message": "..."}` before anything reaches the scheduler:
-TokenSpeed's scheduler implements neither the disk load path nor the CUDA-IPC
-receive path and would answer such a request with `success=false` ("not
-supported on this engine"). Use `POST /update_weights_from_distributed` or the
-Mooncake update described below. For the same reason the engine advertises
-`rl.update_from = "distributed,mooncake"`, so a gateway never routes a disk
-or tensor update here.
+TokenSpeed's scheduler does not implement the CUDA-IPC receive path. Use
+`POST /update_weights_from_distributed`, `POST /update_weights_from_disk`, or
+the Mooncake update described below. For the same reason the engine advertises
+`rl.update_from = "disk,distributed,mooncake"`, so a gateway never routes a
+tensor update here.
 
 ### Weight Updates Under Attention DP
 
 With `--data-parallel-size > 1`, `init_weights_update_group`,
 `update_weights_from_distributed`, `update_weights_from_mooncake`, and
 `destroy_weights_update_group` are sent to every attention-DP worker and the
-frontend ANDs the replies (distinct messages are joined with ` | `). Each
+frontend ANDs the replies (distinct messages are joined with ` | `).
+`update_weights_from_disk` is sent to every worker the same way; its frontend
+ANDs the replies and joins every message with ` | `. Each
 scheduler queues the op and completes it only in a round where every DP rank
 holds the same kind of op at the head of its queue, decided on the per-round
 DP all-reduce that already carries flush intent; one op completes per round.
@@ -229,10 +239,11 @@ weight version is published, so a failure on one rank fails the update
 everywhere. A rank whose peer never receives the op waits indefinitely, as
 with `/flush_cache`. The design rationale is in `docs/design/event-loop.md`.
 
-Only the two loads take the frontend's model-update writer lock (generation
-is kept out while parameters are rewritten); `init_weights_update_group` and
-`destroy_weights_update_group` rewrite nothing and do not wait for in-flight
-generation, so the trainer's rendezvous is not held up by long requests.
+Only the three loads (distributed, Mooncake and disk) take the frontend's
+model-update writer lock (generation is kept out while parameters are
+rewritten); `init_weights_update_group` and `destroy_weights_update_group`
+rewrite nothing and do not wait for in-flight generation, so the trainer's
+rendezvous is not held up by long requests.
 
 ### Mooncake Weight Updates
 
