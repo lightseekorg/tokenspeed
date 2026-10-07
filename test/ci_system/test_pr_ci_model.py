@@ -87,3 +87,51 @@ def test_escaped_sensitive_summary_cannot_be_published(tmp_path, monkeypatch):
     for text in (f"[CI]({link}) example.com", f"[CI]({link}?extra=1)"):
         with pytest.raises(SystemExit, match="public-output check"):
             module._check_public_output(text, tmp_path, source_links=True)
+
+
+def test_invalid_proposal_gets_one_bounded_correction(tmp_path, monkeypatch):
+    scripts = REPO_ROOT / ".github/scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location(
+        "pr_ci_model", scripts / "pr-ci-model.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setenv("KIMI_API_KEY", "test-key")
+    monkeypatch.setenv("GITHUB_RUN_ID", "55")
+    data = dict(
+        version=1,
+        repository="lightseekorg/tokenspeed",
+        pr=123,
+        head="a" * 40,
+        base="b" * 40,
+        catalog=[],
+        test_files=[],
+    )
+    tmp_path.joinpath("context.json").write_text(json.dumps(data))
+    responses = [
+        json.dumps(dict(summary="x" * 201, conflicts="", tests=[], tasks=[])),
+        json.dumps(
+            dict(summary="Prioritized CI checks", conflicts="", tests=[], tasks=[])
+        ),
+    ]
+    corrections = []
+
+    def generate(root, source, correction=""):
+        corrections.append(correction)
+        return responses.pop(0)
+
+    monkeypatch.setattr(module, "_generate", generate)
+    monkeypatch.setattr(module, "_check_public_output", lambda *args, **kwargs: None)
+    module.plan(tmp_path)
+    assert len(corrections) == 2 and "Invalid proposal summary" in corrections[1]
+    assert "Prioritized CI checks" in tmp_path.joinpath("comment.md").read_text()
+    # A second invalid response stops rather than publishing or looping.
+    tmp_path.joinpath("comment.md").unlink()
+    responses.extend(
+        [json.dumps(dict(summary="x" * 201, conflicts="", tests=[], tasks=[]))] * 2
+    )
+    corrections.clear()
+    with pytest.raises(SystemExit, match="Invalid CI proposal"):
+        module.plan(tmp_path)
+    assert len(corrections) == 2 and not tmp_path.joinpath("comment.md").exists()
