@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.transform import hadamard_transform
-from tokenspeed_kernel_amd.ops.gfx950.transform import (
+from tokenspeed_kernel_amd.ops.gfx950.transform.hadamard import (
     gluon_hadamard_transform_128_gfx950,
 )
 from utils import assert_no_triton_compile

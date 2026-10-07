@@ -299,6 +299,8 @@ def test_hadamard_gluon_registration_uses_amd_backend_only(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert _transform_gluon.__file__.endswith("/transform/gluon.py")
+    assert _transform_triton.__file__.endswith("/transform/triton.py")
     platform = request.getfixturevalue(platform_fixture)
     host_platform = Platform.get()
     host_registry = KernelRegistry.get()
@@ -311,7 +313,7 @@ def test_hadamard_gluon_registration_uses_amd_backend_only(
         return x
 
     def import_backend(name, *args, **kwargs):
-        if name == "tokenspeed_kernel_amd.ops.gfx950.transform":
+        if name == "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard":
             imports.append(name)
             assert platform.is_amd
             return SimpleNamespace(launch_gluon_hadamard_transform_128_gfx950=launch)
@@ -330,7 +332,9 @@ def test_hadamard_gluon_registration_uses_amd_backend_only(
                 x = torch.empty((1, 128), dtype=torch.bfloat16, device="meta")
                 assert implementation(x, scale=0.25) is x
                 assert calls == [(x, 0.25)]
-                assert imports == ["tokenspeed_kernel_amd.ops.gfx950.transform"]
+                assert imports == [
+                    "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard"
+                ]
             else:
                 assert implementation is None
                 assert not imports

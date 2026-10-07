@@ -488,17 +488,14 @@ those keys score `-inf`.
 
 ### GFX950 Hadamard query transform
 
-The GLM-5.3-Flash query transform uses a one-wave Gluon kernel for contiguous
-BF16 rows of width 128. Each lane keeps two FP32 values while seven butterfly
-stages apply the transform; the stage order matches the portable reduction
-tree so the BF16 results agree exactly. The output scale is fixed for a
-compiled kernel, while the number of rows is supplied by the launch grid.
-Other dtypes, layouts, and architectures retain their existing registered
-backend.
-The AMD backend is imported and registered only on AMD platforms, matching
-the platform-specific transform registration convention. The current GLM
-Flash and DeepSeek query callers provide contiguous input; strided views
-remain supported through the portable backend's contiguous copy.
+The operation applies a length-128 Hadamard transform with an explicit output
+scale to contiguous BF16 query rows on gfx950, returning the same shape and
+dtype. Empty inputs return an empty output of the same shape.
+
+One 64-lane wave handles each row, keeping two FP32 values per lane during
+seven add/subtract butterfly stages. Their order matches the portable
+reduction tree so the BF16 results agree exactly. The output scale is fixed
+for a compiled kernel; the number of rows is supplied by the launch grid.
 
 ## Sampling
 

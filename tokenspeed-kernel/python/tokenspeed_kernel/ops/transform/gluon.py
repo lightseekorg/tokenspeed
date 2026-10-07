@@ -32,7 +32,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 if current_platform().is_amd:
-    from tokenspeed_kernel_amd.ops.gfx950.transform import (
+    from tokenspeed_kernel_amd.ops.gfx950.transform.hadamard import (
         launch_gluon_hadamard_transform_128_gfx950 as _hadamard_gfx950_impl,
     )
 
