@@ -224,3 +224,56 @@ def test_scheduler_native_checks_precede_gpu_recommendations():
     assert "| 1 | [Scheduler C++](" in body
     assert "| 2 | [Scheduler Python](" in body
     assert "Native CPU CI" in body and "no task recommended" in body
+
+
+def test_mla_plan_includes_native_gpu_ci_and_requires_serving(monkeypatch):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
+    monkeypatch.setenv("PR_NUMBER", "2048")
+    source = "tokenspeed-mla/python/tokenspeed_mla/mla_decode_fp8.py"
+    test = "tokenspeed-mla/tests/test_mla_decode.py"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda args, **kwargs: SimpleNamespace(
+            stdout=f"{test}\n" if args[1] == "ls-files" else f"{source}\n"
+        ),
+    )
+    data = planner.context(REPO, "a" * 40, "b" * 40)
+    assert [c["workflow"] for c in data["native_checks"]] == [
+        "nvidia-kernel-library-tests.yml"
+    ]
+    assert planner.native_checks(["tokenspeed-kernel/test/amd/test_mla.py"]) == []
+    assert planner._matches_path(
+        "test/amd/test_mla.py", ["test/**", "!test/amd/**", "test/amd/test_mla.py"]
+    )
+    response = dict(
+        summary="MLA decode compilation and serving compatibility",
+        tests=[
+            dict(path=test, label="MLA GPU UT", reason="Numerics and CUDA Graph replay")
+        ],
+        tasks=[],
+        conflicts="",
+    )
+    with pytest.raises(planner.CoverageError, match="serving CI task"):
+        planner.proposal(json.dumps(response), data)
+    config = (
+        "test/ci/eval/kimi-k3-nvfp4-dp16-four-node-evalscope-aime26-gb300-slurm.yaml"
+    )
+    task = next(t for t in data["catalog"] if t["config"] == config)
+    response["tasks"] = [
+        dict(
+            config=config,
+            runner=task["slurm_runners"]["gb300"][0],
+            cluster="gb300",
+            label="K3 serving e2e",
+            reason="Target and drafter MLA decode with FP8 KV and EAGLE3",
+        )
+    ]
+    plan = planner.proposal(json.dumps(response), data)
+    body = planner.render(plan)
+    assert "| 1 | [NVIDIA kernel libraries](" in body
+    assert "Native GPU CI" in body and "K3 serving e2e" in body
+    # Documentation still triggers native CI, without forcing model serving.
+    data["paths"] = ["tokenspeed-mla/README.md"]
+    response["tasks"] = []
+    planner.proposal(json.dumps(response), data)
