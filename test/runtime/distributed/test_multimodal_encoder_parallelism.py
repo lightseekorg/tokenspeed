@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -27,6 +29,13 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=60, suite="runtime-2gpu")
 
 
 def _mapping_from_cli(
@@ -91,6 +100,7 @@ def test_multimodal_encoder_weight_tp() -> None:
         torch.device("cpu"),
         2,
         torch.float32,
+        max_tokens=1 << 20,
     )
 
     assert calls == [[10, 20]]
@@ -127,10 +137,32 @@ def _run_item_dp_case(rank: int, device: torch.device, mapping: Mapping) -> None
         device,
         2,
         torch.float32,
+        max_tokens=1 << 20,
     )
 
     assert calls == [owned_hashes_by_rank[rank]]
     for item in items:
+        expected = _encoded_rows(item, 4, device)
+        torch.testing.assert_close(item.encoded, expected[:, :2])
+        torch.testing.assert_close(item.encoded_deepstack, expected[:, 2:])
+
+    # Bound 4: rank 1 packs rows [3, 1, 1] greedily in order; rank 0's 5 rows run alone.
+    calls.clear()
+    bounded_items = [_item(41, 3), _item(42, 1), _item(43, 1), _item(44, 5)]
+    embedder._encode(
+        EncodePlan(misses_by_modality={Modality.IMAGE: bounded_items}),
+        {Modality.IMAGE: EncoderSpec(encoder, deepstack=True)},
+        model,
+        device,
+        2,
+        torch.float32,
+        max_tokens=4,
+    )
+    # Every rank checks every rank's calls, so a mismatch fails both instead of hanging one.
+    calls_by_rank: list[list[list[int]] | None] = [None, None]
+    dist.all_gather_object(calls_by_rank, calls)
+    assert calls_by_rank == [[[44]], [[41, 42], [43]]]
+    for item in bounded_items:
         expected = _encoded_rows(item, 4, device)
         torch.testing.assert_close(item.encoded, expected[:, :2])
         torch.testing.assert_close(item.encoded_deepstack, expected[:, 2:])
@@ -152,6 +184,7 @@ def _run_item_dp_case(rank: int, device: torch.device, mapping: Mapping) -> None
         device,
         2,
         torch.float32,
+        max_tokens=1 << 20,
     )
     assert idle_calls == (1 if rank == 0 else 0)
     torch.testing.assert_close(idle_item.encoded, _encoded_rows(idle_item, 2, device))
@@ -172,6 +205,7 @@ def _run_item_dp_case(rank: int, device: torch.device, mapping: Mapping) -> None
         device,
         2,
         torch.float32,
+        max_tokens=1 << 20,
     )
     assert equal_calls == [[50] if rank == 0 else [60]]
     for item in equal_items:
@@ -227,3 +261,7 @@ def test_multimodal_encoder_item_dp() -> None:
         nprocs=world_size,
         join=True,
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

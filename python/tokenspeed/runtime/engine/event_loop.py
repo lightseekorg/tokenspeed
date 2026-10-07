@@ -257,6 +257,8 @@ class EventLoop:
         cache_groups = specs.cache_groups
         # The builder may have lowered this to the cache-group checkpoint grain.
         max_scheduled_tokens = server_args.chunked_prefill_size
+        # The forward token bound also caps each multimodal encoder call.
+        self._max_encoder_tokens = max_scheduled_tokens
 
         self.attn_tp_size = server_args.attn_tp_size or mapping.attn.tp_size
         self.world_size = server_args.world_size or mapping.world_size
@@ -280,6 +282,9 @@ class EventLoop:
             self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
             self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
         num_host_pages = specs.num_host_pages
+        # The cache hooks gather over the TP CPU group, so the gather is sized
+        # by that group, which --emulate-rank-zero backs with this process alone.
+        cache_replica_tp_size = self.attn_tp_cpu_group.size()
         # L2 cache-op accounting + rank-synced completion tracking (see
         # cache_hooks.py); a no-op shell when kvstore is disabled. The hooks
         # get the handle, not the L2 executor: polling goes through it.
@@ -287,7 +292,7 @@ class EventLoop:
             self._device if server_args.enable_kvstore else None,
             speculative_algorithm=server_args.speculative_algorithm,
             attn_tp_rank=attn_tp_rank,
-            attn_tp_size=self.attn_tp_size,
+            attn_tp_size=cache_replica_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
             pp_size=self.pp_size,
             pp_cpu_group=self.pp_cpu_group,
@@ -375,7 +380,7 @@ class EventLoop:
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
             self._device if scheduler_cfg.enable_l3_storage else None,
-            attn_tp_size=self.attn_tp_size,
+            attn_tp_size=cache_replica_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
             pp_size=self.pp_size,
             pp_cpu_group=self.pp_cpu_group,
@@ -1170,7 +1175,9 @@ class EventLoop:
                             input_logprob_plan=input_logprob_plan,
                             multimodal_context=(
                                 multimodal_context_for_forward(
-                                    forward_op, self.output_processor.rid_to_state
+                                    forward_op,
+                                    self.output_processor.rid_to_state,
+                                    self._max_encoder_tokens,
                                 )
                                 if self.model_config.is_multimodal_active
                                 else None

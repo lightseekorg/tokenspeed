@@ -59,7 +59,7 @@ HQ, HKV, D = 16, 4, 128
 
 
 def _backend(
-    num_draft_tokens: int, max_bs: int, is_draft: bool
+    num_draft_tokens: int, max_bs: int, is_draft: bool, kv_dtype: torch.dtype
 ) -> TRTLLMMHAAttnBackend:
     spec = MHAConfig(
         backend_name="trtllm",
@@ -71,7 +71,7 @@ def _backend(
     cfg = AttnConfig(
         device="cuda",
         dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype=kv_dtype,
         prefix_granularity=PAGE,
         kernel_page_size=PAGE,
         context_len=2048,
@@ -99,16 +99,21 @@ def _layer():
     )
 
 
-def _problem(seq_lens, rows, window, max_pages, gen, poison=None):
+def _problem(seq_lens, rows, window, max_pages, gen, kv_dtype, poison=None):
     """Paged K/V rows for every request's keys, queries, window masks, and the
-    fp32 reference: row r sees the prefix and window key j when bit j is set."""
+    fp32 reference: row r sees the prefix and window key j when bit j is set.
+    Under an FP8 cache, K/V hold FP8 values and the keys trtllm-gen's causal
+    prefix covers (row r: the first ``prefix - rows + 1 + r``) see the query
+    cast to FP8, as that decode does; the window kernel sees it unquantized."""
     bs = len(seq_lens)
     pages = (max(seq_lens) + PAGE - 1) // PAGE
     table = torch.zeros(bs, max_pages, dtype=torch.int32)
     table[:, :pages] = (torch.randperm(bs * pages, generator=gen) + 1).view(bs, pages)
-    k_rows = torch.randn((bs * pages + 1) * PAGE, HKV, D, generator=gen).bfloat16()
-    v_rows = torch.randn_like(k_rows)
+    rows_shape = ((bs * pages + 1) * PAGE, HKV, D)
+    k_rows = torch.randn(rows_shape, generator=gen).to(kv_dtype).bfloat16()
+    v_rows = torch.randn(rows_shape, generator=gen).to(kv_dtype).bfloat16()
     q = torch.randn(bs * rows, HQ, D, generator=gen).bfloat16()
+    q_prefix = q.to(kv_dtype).float()
     bits = torch.randint(0, 1 << 62, (bs * rows,), generator=gen)
     # With a poison, rows only see step 1's slots (later lane steps unwritten yet).
     seen_width = window if poison is None else rows
@@ -128,8 +133,13 @@ def _problem(seq_lens, rows, window, max_pages, gen, poison=None):
                     for j in range(length)
                 ]
             )
-            s = torch.einsum("hd,xhd->hx", q[b * rows + i].float(), kk) * D**-0.5
-            s = s.masked_fill(~vis[None], float("-inf"))
+            covered = torch.arange(length) < prefix - rows + 1 + i
+            s = torch.where(
+                covered[None],
+                torch.einsum("hd,xhd->hx", q_prefix[b * rows + i], kk),
+                torch.einsum("hd,xhd->hx", q[b * rows + i].float(), kk),
+            )
+            s = (s * D**-0.5).masked_fill(~vis[None], float("-inf"))
             ref[b * rows + i] = torch.einsum("hx,xhd->hd", torch.softmax(s, -1), vv)
     if poison is not None:
         # Window slots no row of the request sees get a non-finite V after the reference.
@@ -143,19 +153,26 @@ def _problem(seq_lens, rows, window, max_pages, gen, poison=None):
                 pos = prefix + j
                 if not (seen >> j) & 1 and pos // PAGE > (prefix - 1) // PAGE:
                     v_rows[int(table[b, pos // PAGE]) * PAGE + pos % PAGE] = poison
-    pool = SimpleNamespace(get_kv_buffer=lambda _: (k_rows.cuda(), v_rows.cuda()))
+    k_rows, v_rows = k_rows.cuda().to(kv_dtype), v_rows.cuda().to(kv_dtype)
+    pool = SimpleNamespace(get_kv_buffer=lambda _: (k_rows, v_rows))
     return table.cuda(), q.cuda(), bits.cuda(), pool, ref
 
 
+KV_DTYPES = [torch.bfloat16, torch.float8_e4m3fn]
+# trtllm-gen's FP8 decode alone errs up to 0.07 over a few keys (bf16: within 0.02).
+ATOL = {torch.bfloat16: 2e-2, torch.float8_e4m3fn: 8e-2}
+
+
+@pytest.mark.parametrize("kv_dtype", KV_DTYPES)
 @pytest.mark.parametrize("nodes", [4, 16, 64])
-def test_tree_verify_matches_reference(nodes):
+def test_tree_verify_matches_reference(nodes, kv_dtype):
     gen = torch.Generator().manual_seed(nodes)
     # Long and short committed prefixes, including ones shorter than the window.
     committed = [700, 1, nodes - 2, 130]
     seq_lens = [c + nodes for c in committed]
-    backend = _backend(nodes, max_bs=8, is_draft=False)
+    backend = _backend(nodes, max_bs=8, is_draft=False, kv_dtype=kv_dtype)
     table, q, bits, pool, ref = _problem(
-        seq_lens, nodes, nodes, backend.max_num_pages, gen
+        seq_lens, nodes, nodes, backend.max_num_pages, gen, kv_dtype
     )
     mask = torch.zeros(8 * nodes, dtype=torch.int64, device="cuda")
     mask[: len(seq_lens) * nodes] = bits
@@ -168,20 +185,21 @@ def test_tree_verify_matches_reference(nodes):
     )
     out = backend.forward_decode(q, None, None, _layer(), None, pool, bs)
     torch.testing.assert_close(
-        out.view(-1, HQ, D).float().cpu(), ref, atol=2e-2, rtol=2e-2
+        out.view(-1, HQ, D).float().cpu(), ref, atol=ATOL[kv_dtype], rtol=2e-2
     )
 
 
+@pytest.mark.parametrize("kv_dtype", KV_DTYPES)
 @pytest.mark.parametrize("poison", [None, float("nan")])
 @pytest.mark.parametrize("topk,steps", [(2, 7), (4, 4), (8, 5)])
-def test_tree_lanes_match_reference(topk, steps, poison):
+def test_tree_lanes_match_reference(topk, steps, poison, kv_dtype):
     gen = torch.Generator().manual_seed(topk * 10 + steps)
     window = (steps - 1) * topk
     frontier = [700, 1, 3, 130]
     seq_lens = [f + window for f in frontier]
-    backend = _backend(window, max_bs=8, is_draft=True)
+    backend = _backend(window, max_bs=8, is_draft=True, kv_dtype=kv_dtype)
     table, q, bits, pool, ref = _problem(
-        seq_lens, topk, window, backend.max_num_pages, gen, poison
+        seq_lens, topk, window, backend.max_num_pages, gen, kv_dtype, poison
     )
     lanes = TreeDraftInputs(topk, steps, 8, torch.device("cuda"))
     backend.bind_tree_draft(lanes)
@@ -195,5 +213,5 @@ def test_tree_lanes_match_reference(topk, steps, poison):
     out = backend.forward_decode(q, None, None, _layer(), None, pool, bs)
     lanes.active = False
     torch.testing.assert_close(
-        out.view(-1, HQ, D).float().cpu(), ref, atol=2e-2, rtol=2e-2
+        out.view(-1, HQ, D).float().cpu(), ref, atol=ATOL[kv_dtype], rtol=2e-2
     )

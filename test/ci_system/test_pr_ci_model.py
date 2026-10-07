@@ -84,6 +84,13 @@ def test_escaped_sensitive_summary_cannot_be_published(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="public-output check"):
         module._check_public_output(link, tmp_path)
     module._check_public_output(f"[CI]({link})", tmp_path, source_links=True)
+    data["native_checks"] = [{"workflow": "scheduler-cpp-test.yml"}]
+    tmp_path.joinpath("context.json").write_text(json.dumps(data))
+    module._check_public_output(
+        module.source_url(data, ".github/workflows/scheduler-cpp-test.yml"),
+        tmp_path,
+        source_links=True,
+    )
     for text in (f"[CI]({link}) example.com", f"[CI]({link}?extra=1)"):
         with pytest.raises(SystemExit, match="public-output check"):
             module._check_public_output(text, tmp_path, source_links=True)

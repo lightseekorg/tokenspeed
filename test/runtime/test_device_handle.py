@@ -507,13 +507,16 @@ def test_gathered_context_does_not_see_later_control_plane_edits():
         maybe_extend_multimodal_mrope_positions=lambda: None,
     )
 
-    ctx = multimodal_context_for_forward(_forward_op(), {"r0": state})
+    ctx = multimodal_context_for_forward(
+        _forward_op(), {"r0": state}, max_encoder_tokens=1234
+    )
 
     # The next round's gather extends the live struct's table; a forward
     # already dispatched with the previous context must not observe it.
     mm.mrope_positions = torch.zeros(3, 8, dtype=torch.int64)
     assert ctx.mm_inputs[0] is not mm
     assert torch.equal(ctx.mm_inputs[0].mrope_positions, positions)
+    assert ctx.max_encoder_tokens == 1234
 
 
 def test_gather_resolves_the_decode_delta_on_the_live_struct():
@@ -523,7 +526,9 @@ def test_gather_resolves_the_decode_delta_on_the_live_struct():
         maybe_extend_multimodal_mrope_positions=lambda: None,
     )
 
-    ctx = multimodal_context_for_forward(_forward_op(num_extends=0), {"r0": state})
+    ctx = multimodal_context_for_forward(
+        _forward_op(num_extends=0), {"r0": state}, max_encoder_tokens=8192
+    )
 
     # Resolved on the control plane, so the forward only reads — and resolved
     # on the LIVE struct, so the next round's snapshot inherits it instead of

@@ -30,6 +30,7 @@ import subprocess
 import sys
 import textwrap
 import traceback
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -508,7 +509,7 @@ class TestCompile:
             path for path in (str(source), env.get("PYTHONPATH", "")) if path
         )
         result = subprocess.run(
-            [sys.executable, "-c", script],
+            [sys.executable, "-W", "error", "-c", script],
             env=env,
             capture_output=True,
             text=True,
@@ -519,6 +520,7 @@ class TestCompile:
             f"Decode compilation failed for {capability} / {dtype}:\n"
             f"{result.stdout}\n{result.stderr}"
         )
+        assert "Warning:" not in result.stderr, result.stderr
 
     def test_sm107_fp8_out_causal_masks(self):
         script = textwrap.dedent("""
@@ -1179,8 +1181,14 @@ def _check_sm107_fp8_out_empty_rows_gpu(heads, min_split_kv, fp16_softmax):
 def _gpu_worker(check, arguments, send):
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
-        check(*arguments)
-        send.send(None)
+        with warnings.catch_warnings(record=True) as observed:
+            warnings.simplefilter("always")
+            check(*arguments)
+        send.send(
+            "\n".join(str(warning.message) for warning in observed)
+            if observed
+            else None
+        )
     except Exception:
         send.send(traceback.format_exc())
     finally:

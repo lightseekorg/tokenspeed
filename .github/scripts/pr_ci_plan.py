@@ -25,8 +25,36 @@ import os
 import re
 import subprocess
 import sys
+from fnmatch import fnmatchcase
 from pathlib import Path
 from urllib.parse import quote
+
+import yaml
+from pr_ci_state import NATIVE_CHECKS
+
+
+def _matches_path(path: str, patterns: list[str]) -> bool:
+    matched = False
+    # GitHub applies exclusions and subsequent inclusions in declaration order.
+    for pattern in patterns:
+        if fnmatchcase(path, pattern.removeprefix("!")):
+            matched = not pattern.startswith("!")
+    return matched
+
+
+def native_checks(paths: list[str]) -> list[dict]:
+    """Match the existing trusted workflows' PR path filters."""
+    workflows = Path(__file__).resolve().parents[1] / "workflows"
+    checks = []
+    for workflow, details in NATIVE_CHECKS.items():
+        config = yaml.safe_load(workflows.joinpath(workflow).read_text())
+        # PyYAML's YAML 1.1 loader interprets the unquoted `on` key as True.
+        trigger = config.get("on", config.get(True))["pull_request"]
+        if "main" in trigger["branches"] and any(
+            _matches_path(path, trigger["paths"]) for path in paths
+        ):
+            checks.append({"workflow": workflow, **details})
+    return checks
 
 
 def source_url(data: dict, path: str = "") -> str:
@@ -52,6 +80,42 @@ def _cell(value: str) -> str:
 
 def task_key(task: dict) -> str:
     return f"{task['config']}@{task['runner']}@{task['cluster']}"
+
+
+class CoverageError(ValueError):
+    """Required test or serving coverage was omitted from the plan."""
+
+
+def validate_test_coverage(
+    tests: list[str], tasks: list[dict], catalog: list[dict], paths: list[str]
+):
+    selected = {task["config"] for task in tasks}
+    mapped, covered = set(), set()
+    for task in catalog:
+        files = task.get("targets", {}).get("test_files", [])
+        mapped.update(files)
+        if task["config"] in selected:
+            covered.update(files)
+    missing = sorted(set(tests).intersection(mapped) - covered)
+    if missing:
+        raise CoverageError(
+            f"Select a CI task covering each recommended test: {', '.join(missing)}"
+        )
+    if any(
+        path.startswith("tokenspeed-mla/python/tokenspeed_mla/")
+        and path.endswith(".py")
+        for path in paths
+    ) and not any(
+        task["config"] in selected
+        and re.search(
+            r"--(?:drafter-)?attention-backend(?:=|\s+)tokenspeed_mla(?:\s|$)",
+            task.get("server_command", ""),
+        )
+        for task in catalog
+    ):
+        raise CoverageError(
+            "Select a serving CI task explicitly using tokenspeed_mla for in-tree MLA changes."
+        )
 
 
 def context(source: Path, head: str, base: str) -> dict:
@@ -125,6 +189,7 @@ def context(source: Path, head: str, base: str) -> dict:
         "head": head,
         "base": base,
         "paths": paths,
+        "native_checks": native_checks(paths),
         "test_files": tests,
         "catalog": tasks,
     }
@@ -199,6 +264,9 @@ def proposal(raw: str, data: dict) -> dict:
         ):
             raise ValueError("Proposed task must belong to the coverage catalog.")
         selected[key] = {**catalog[key], **choice}
+    validate_test_coverage(
+        list(tests), list(selected.values()), data["catalog"], data.get("paths", [])
+    )
     return {
         "version": data["version"],
         "repository": data["repository"],
@@ -209,6 +277,7 @@ def proposal(raw: str, data: dict) -> dict:
         "conflicts": response["conflicts"],
         "tests": list(tests.values()),
         "tasks": list(selected.values()),
+        "native_checks": data.get("native_checks", []),
     }
 
 
@@ -218,7 +287,15 @@ def render(plan: dict) -> str:
         "",
         _cell(plan["summary"]),
     ]
-    rows = [(t, t["path"], "Targeted UT") for t in plan["tests"]]
+    rows = [
+        (
+            check,
+            f".github/workflows/{check['workflow']}",
+            check.get("target", "Native CPU CI"),
+        )
+        for check in plan.get("native_checks", [])
+    ]
+    rows += [(t, t["path"], "Targeted UT") for t in plan["tests"]]
     for task in plan["tasks"]:
         if task["cluster"]:
             target = f"Slurm {task['cluster'].upper()}"
@@ -242,7 +319,7 @@ def render(plan: dict) -> str:
                 f"| {order} | {label} | {_cell(item['reason'])} | {_cell(target)} |"
             )
     if not plan["tasks"]:
-        lines += ["", "**GPU:** no task recommended."]
+        lines += ["", "**Dispatch:** no task recommended."]
     if any(t["cluster"] == "gb200" for t in plan["tasks"]):
         lines += ["", "**Routing:** GB200 first; GB300 if full. One cluster per task."]
     if any(

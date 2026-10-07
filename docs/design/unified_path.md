@@ -161,16 +161,30 @@ from one first bound to that pool:
   a reserve takes it -- minus the projection. The reserve covers the bytes
   inside the capture windows as projected -- what a boot without a probe
   captures there, one-time bytes the first captures take included; the
-  probe releases them and the serving capture pays them again. The
+  probe releases them and the serving capture pays them again. On CUDA, what
+  executor init and kernel tuning keep resident between the probe build and
+  the probe -- buffers, and on a cold tuning cache the kernels of every tactic
+  tried, though not the stack limit they raised, which is restored after
+  tuning -- is measured the same way, including the free space a kept block
+  pins in an allocator segment, and this startup residue joins each rank's
+  projection before the MAX; its net is floored at zero. Off CUDA it stays on
+  the headroom, as on a boot without a reserve; on ROCm, ROCr keeps the
+  scratch memory tuning grows assigned to its queues, and reclaims it when a
+  device allocation fails. The
   utilization headroom covers everything else: activations, fragmentation,
-  the warmups and workspaces a capture allocates around its windows, and any
-  shortfall of the projection, as it covers every graph on a boot without a
+  the warmups and workspaces a capture allocates around its windows, the
+  local memory a kept kernel reserves when it raises the stack limit again
+  after tuning (a driver allocation that first drains the device, and the
+  launch fails if it does not fit), and any shortfall of the projection, as
+  it covers every graph and all of startup on a boot without a
   reserve. Profiling again after the probe would charge the cache a second
-  time for what tuning and the probe left allocated. The deltas read the
+  time for what startup and the probe left allocated. The deltas read the
   whole device, so the probe assumes no other process allocates on it during
   startup. Not covered: a ladder every one of whose sampled marginals was
   served from slack, which is priced at nothing and says so in the
-  log. The EPD receive pool, which a multimodal prefill node allocates after
+  log; and what the probe build allocates after its profile, such as
+  attention backend workspaces, which the headroom funds.
+  The EPD receive pool, which a multimodal prefill node allocates after
   its cache is sized, is left out of the profile instead, by each rank before
   the cross-rank minimum.
 

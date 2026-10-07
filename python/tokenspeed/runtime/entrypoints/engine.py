@@ -602,6 +602,14 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
+def _scheduler_ranks(server_args: ServerArgs) -> range:
+    """Global ranks of the scheduler processes this node launches."""
+    if server_args.emulate_rank_zero:
+        return range(1)
+    rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
+    return range(rank_start, rank_start + server_args.mapping.nprocs_per_node)
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: PortArgs | None = None
 ) -> tuple[AsyncLLM, None, dict]:
@@ -630,9 +638,7 @@ def _launch_subprocesses(
         )
 
         scheduler_pipe_readers = []
-        rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
-        rank_end = rank_start + server_args.mapping.nprocs_per_node
-        for rank in range(rank_start, rank_end):
+        for rank in _scheduler_ranks(server_args):
             # Create per-rank server_args with rank-initialized mapping
             rank_server_args = copy.copy(server_args)
             rank_server_args.mapping = copy.deepcopy(server_args.mapping)
@@ -788,9 +794,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
-        rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
-        rank_end = rank_start + server_args.mapping.nprocs_per_node
-        for rank in range(rank_start, rank_end):
+        for rank in _scheduler_ranks(server_args):
             rank_server_args = copy.copy(server_args)
             rank_server_args.mapping = copy.deepcopy(server_args.mapping)
             rank_server_args.mapping.rank = rank

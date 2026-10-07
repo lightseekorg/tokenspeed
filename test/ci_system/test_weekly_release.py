@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import base64
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -352,6 +353,23 @@ def test_weekly_schedule_and_failure_resume_contract():
     upload = reusable["jobs"]["stage"]["steps"][-1]
     assert upload["if"] == "always()" and upload["with"]["overwrite"] is True
     assert reusable["jobs"]["stage"]["steps"][0]["with"]["persist-credentials"] is False
+    for component in ("scheduler", "mla"):
+        pipeline = yaml.safe_load(
+            (ROOT / f".github/workflows/{component}-release.yml").read_text()
+        )
+        assert set(pipeline.get("on") or pipeline.get(True)) == {"workflow_dispatch"}
+        assert pipeline["concurrency"] == workflow["concurrency"]
+        for job, previous in (
+            ("version", ""),
+            ("publish", f"{component}-version"),
+            ("dependency", f"{component}-publish"),
+        ):
+            stage = pipeline["jobs"][job]
+            assert stage["uses"] == "./.github/workflows/weekly-release-stage.yml"
+            assert stage["with"]["stage"] == f"{component}-{job}"
+            assert stage["with"]["previous"] == previous
+        assert pipeline["jobs"]["publish"]["needs"] == "version"
+        assert pipeline["jobs"]["dependency"]["needs"] == "publish"
 
 
 @pytest.fixture
@@ -826,7 +844,12 @@ def test_merge_policy_requires_explicit_existing_bot_exemption(
 def version_repository(release_module, tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
-    for name in set(sum(release_module.PR_FILES.values(), [])):
+    for name in {
+        *sum(release_module.PR_FILES.values(), []),
+        release_module.PROJECTS["tokenspeed-scheduler"],
+        release_module.PROJECTS["tokenspeed-mla"],
+        "tokenspeed-kernel/python/requirements/cuda-thirdparty.txt",
+    }:
         path = source / name
         path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / name, path)
@@ -1009,3 +1032,291 @@ def test_version_fast_forward_refuses_main_race(
     with pytest.raises(release_module.subprocess.CalledProcessError):
         controller.fast_forward_version("amd", pr)
     assert command("git", "ls-remote", "origin", "refs/heads/main").split()[0] == other
+
+
+@pytest.mark.parametrize("component", ["scheduler", "mla"])
+def test_component_metadata_prs_replay_exact_diffs_without_downstream_version_bump(
+    release_module, version_repository, tmp_path, monkeypatch, component
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    command = release_module.command
+    base = command("git", "rev-parse", "HEAD")
+    controller_type = {
+        "scheduler": release_module.SchedulerRelease,
+        "mla": release_module.MLARelease,
+    }[component]
+    package = f"tokenspeed-{component}"
+    current = release_module.read_version(package)
+    version = release_module.next_version(current, current, "")
+    runtime = release_module.read_version("tokenspeed")
+    kernel = release_module.read_version("tokenspeed-kernel")
+    controller = controller_type(tmp_path / "state.json", f"{component}-version")
+    dependency_path = controller.pr_files[f"{component}-dependency"][0]
+    controller.state.update(
+        versions={package: version},
+        initial_versions={package: current},
+        initial_dependency=str(
+            release_module.requirements(dependency_path)[package].specifier
+        ),
+    )
+    controller.phase["base"] = base
+    controller.update_metadata(controller.stage)
+    assert command("git", "diff", "--name-only").splitlines() == [
+        release_module.PROJECTS[package]
+    ]
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "component version")
+    head = command("git", "rev-parse", "HEAD")
+    controller.verify_version_diff(controller.stage, base, head)
+    command("git", "checkout", "--detach", head)
+    controller.save()
+    dependency = controller_type(controller.path, f"{component}-dependency")
+    dependency.phase["base"] = head
+    dependency.update_metadata(dependency.stage)
+    assert command("git", "diff", "--name-only").splitlines() == [dependency_path]
+    assert (
+        str(release_module.requirements(dependency_path)[package].specifier)
+        == f"{'>=' if component == 'scheduler' else '=='}{version}"
+    )
+    assert release_module.read_version("tokenspeed") == runtime
+    assert release_module.read_version("tokenspeed-kernel") == kernel
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "component dependency")
+    dependency.verify_version_diff(
+        dependency.stage, head, command("git", "rev-parse", "HEAD")
+    )
+    if component == "mla":
+        path = Path(dependency_path)
+        # Verification restores the base, whose pin can lag the package version.
+        path.write_text(
+            path.read_text().replace(
+                f"tokenspeed-mla{dependency.state['initial_dependency']}",
+                "tokenspeed-mla==0.0.0",
+            )
+        )
+        assert (
+            str(release_module.requirements(dependency_path)[package].specifier)
+            == "==0.0.0"
+        )
+        with pytest.raises(RuntimeError, match="dependency changed outside"):
+            dependency.update_metadata(dependency.stage)
+
+
+@pytest.mark.parametrize("component", ["scheduler", "mla"])
+def test_component_failed_publication_blocks_dependency_and_resumes_same_run(
+    release_module, version_repository, tmp_path, monkeypatch, component
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    command = release_module.command
+    sha = command("git", "rev-parse", "HEAD")
+    controller_type = {
+        "scheduler": release_module.SchedulerRelease,
+        "mla": release_module.MLARelease,
+    }[component]
+    package = f"tokenspeed-{component}"
+    version = release_module.read_version(package)
+    controller = controller_type(tmp_path / "state.json", f"{component}-publish")
+    controller.state.update(
+        versions={package: version},
+        initial_versions={package: version},
+    )
+    controller.state["stages"][f"{component}-version"] = {"complete": True, "sha": sha}
+    controller.save()
+    files = {
+        f"scheduler-cp{python}-{arch}.whl": "a" * 64
+        for python in range(310, 314)
+        for arch in ("x86_64", "aarch64")
+    }
+    files["scheduler.tar.gz"] = "b" * 64
+    wheel = b"MLA universal wheel"
+    if component == "mla":
+        files = {
+            f"tokenspeed_mla-{version}-py3-none-any.whl": hashlib.sha256(
+                wheel
+            ).hexdigest()
+        }
+    ref = controller.branch(f"{component}-version", version)
+    workflow = f"release-{package}.yml"
+    run = {
+        "head_sha": sha,
+        "head_branch": ref,
+        "event": "workflow_dispatch",
+        "path": f".github/workflows/{workflow}",
+        "status": "in_progress",
+        "html_url": f"https://github.com/{release_module.REPO}/actions/runs/456",
+    }
+    dispatched = []
+    paused = []
+    indexed = False
+    artifact_downloads = []
+    corrupt_artifact = True
+
+    def artifact_command(*args, **kwargs):
+        if args[:3] == ("gh", "run", "download"):
+            assert (
+                args[3] == "456"
+                and args[args.index("--repo") + 1] == release_module.REPO
+            )
+            dist = Path(args[args.index("--dir") + 1])
+            dist.mkdir(parents=True, exist_ok=True)
+            (dist / next(iter(files))).write_bytes(
+                b"corrupt" if corrupt_artifact else wheel
+            )
+            artifact_downloads.append(args)
+            return ""
+        return command(*args, **kwargs)
+
+    def api(path, *, data=None):
+        if data is not None:
+            dispatched.append(data)
+            return {"workflow_run_id": 456}
+        return run
+
+    def pause(self):
+        nonlocal indexed
+        paused.append(self.stage)
+        if run["status"] != "completed":
+            run.update(status="completed", conclusion="failure")
+        else:
+            indexed = True
+
+    def request(url, *, github, **kwargs):
+        if github:
+            return {
+                "draft": False,
+                "prerelease": False,
+                "assets": [
+                    {"name": name, "digest": f"sha256:{digest}"}
+                    for name, digest in files.items()
+                ],
+            }
+        assert kwargs["accept"] == "application/vnd.pypi.simple.v1+json"
+        return {
+            "files": (
+                [
+                    {"filename": name, "hashes": {"sha256": digest}, "yanked": False}
+                    for name, digest in files.items()
+                ]
+                if indexed
+                else []
+            )
+        }
+
+    monkeypatch.setattr(controller_type, "guard", lambda self: None)
+    monkeypatch.setattr(
+        controller_type,
+        "immutable_ref",
+        lambda self, stage, source: ref,
+    )
+    monkeypatch.setattr(controller_type, "available", lambda self, value: None)
+    monkeypatch.setattr(controller_type, "pause", pause)
+    monkeypatch.setattr(release_module, "command", artifact_command)
+    monkeypatch.setattr(release_module, "api", api)
+    monkeypatch.setattr(release_module, "request", request)
+    monkeypatch.setattr(
+        release_module,
+        "pypi",
+        lambda *args: {
+            "urls": [
+                {"filename": name, "digests": {"sha256": digest}, "yanked": False}
+                for name, digest in files.items()
+            ]
+        },
+    )
+    monkeypatch.setattr(release_module, "source_sha", lambda *args: sha)
+    with pytest.raises(RuntimeError, match="Child workflow failed"):
+        controller.run("")
+    assert not controller.phase.get("complete")
+    dependency = controller_type(controller.path, f"{component}-dependency")
+    with pytest.raises(RuntimeError, match=f"Previous {component} stage"):
+        dependency.run("")
+    run["conclusion"] = "success"
+    resumed = controller_type(controller.path, f"{component}-publish")
+    if component == "mla":
+        with pytest.raises(RuntimeError, match="artifact differs"):
+            resumed.run("")
+        assert "publication_files" not in resumed.state
+    corrupt_artifact = False
+    resumed.run("")
+    assert resumed.phase["complete"] and resumed.state["publication_files"] == files
+    assert len(dispatched) == 1 and paused == [
+        f"{component}-publish",
+        f"{component}-publish",
+    ]
+    assert dispatched[0]["ref"] == ref and resumed.state["runs"][workflow]["id"] == 456
+    if component == "mla":
+        assert dispatched[0]["inputs"] == {} and len(artifact_downloads) == 2
+        resumed.run("")
+        assert len(dispatched) == 1 and len(artifact_downloads) == 2
+    bare = tmp_path / "origin.git"
+    command("git", "clone", "--bare", str(version_repository), str(bare))
+    command("git", "remote", "add", "origin", str(bare))
+    dependency = controller_type(controller.path, f"{component}-dependency")
+    dependency.gate()
+    if component == "mla":
+        publisher = yaml.safe_load(
+            (ROOT / ".github/workflows/release-tokenspeed-mla.yml").read_text()
+        )
+        source_gate = next(
+            step["run"]
+            for step in publisher["jobs"]["build"]["steps"]
+            if step.get("name") == "Require main or a pinned release"
+        )
+        gate_env = dict(release_module.os.environ, SOURCE_REF=f"refs/heads/{ref}")
+        assert (
+            release_module.subprocess.run(
+                ["bash", "-e", "-c", source_gate], env=gate_env, capture_output=True
+            ).returncode
+            == 0
+        )
+    source_path = Path(release_module.PROJECTS[package])
+    source_path.write_text(
+        source_path.read_text() + "\n# unpublished component change\n"
+    )
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "component source update")
+    with pytest.raises(RuntimeError, match="Unreleased changes"):
+        dependency.gate()
+    if component == "mla":
+        assert (
+            release_module.subprocess.run(
+                ["bash", "-e", "-c", source_gate], env=gate_env, capture_output=True
+            ).returncode
+            != 0
+        )
+
+
+@pytest.mark.parametrize("component", ["scheduler", "mla"])
+def test_component_version_rerun_keeps_reservation(
+    release_module, version_repository, tmp_path, monkeypatch, component
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    command = release_module.command
+    bare = tmp_path / "origin.git"
+    command("git", "clone", "--bare", str(version_repository), str(bare))
+    command("git", "remote", "add", "origin", str(bare))
+    controller_type = {
+        "scheduler": release_module.SchedulerRelease,
+        "mla": release_module.MLARelease,
+    }[component]
+    package = f"tokenspeed-{component}"
+    current = release_module.read_version(package)
+    expected = release_module.next_version(current, current, "")
+    reserved = []
+    monkeypatch.setattr(controller_type, "guard", lambda self: None)
+    monkeypatch.setattr(
+        controller_type,
+        "available",
+        lambda self, value: reserved.append(value),
+    )
+    monkeypatch.setattr(
+        controller_type,
+        "pr",
+        lambda self, stage: self.state["versions"][package],
+    )
+    monkeypatch.setattr(release_module, "latest_version", lambda package: current)
+    controller = controller_type(tmp_path / "state.json", f"{component}-version")
+    controller.run("")
+    resumed = controller_type(controller.path, f"{component}-version")
+    resumed.run("")
+    assert reserved == [expected] and resumed.state["versions"] == {package: expected}

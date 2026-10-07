@@ -32,6 +32,10 @@ from tokenspeed_kernel.signature import format_signatures
 _SIGNATURES = format_signatures(("x",), "dense", {torch.bfloat16})
 # Small tiles keep more states in flight in the latency-bound verify and replay loops.
 _SPEC_BLOCK_M, _SPEC_NUM_WARPS = 16, 2
+# Verify alone runs one warp per 8-row tile: fastest on GB300 for chains and trees at 1-64 requests.
+_VERIFY_BLOCK_M, _VERIFY_NUM_WARPS = 8, 1
+# Trees fit 96 registers without spilling; uncapped, ptxas takes 146 and fewer warps fit per SM.
+_VERIFY_TREE_MAX_REGISTERS = 96
 _LOG2E = tl.constexpr(1.4426950408889634)
 # Prefill launch shapes, tuned on GB300 at Nemotron-3 Super geometry.
 _STATE_PASS_BLOCK = 1024
@@ -55,6 +59,43 @@ def _softplus(x):
 @triton.jit
 def _exp(x):
     return tl.math.exp2(_LOG2E * x)
+
+
+@triton.jit
+def _ssm_step(h, dA, dB, x):
+    # One fused multiply-add, spelled out: verify, decode and replay must round alike at any tile shape.
+    return tl.fma(h, dA, dB * x[:, None])
+
+
+@triton.jit
+def _lane_xor(v, LANE_BIT: tl.constexpr):
+    return tl.inline_asm_elementwise(
+        "shfl.sync.bfly.b32 $0, $1, $2, 31, -1;",
+        "=r,r,r",
+        [v, tl.full(v.shape, LANE_BIT, tl.int32)],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _trade_halves(q, lane, LANE_BIT: tl.constexpr):
+    # Lanes with LANE_BIT set keep the upper half of the rows and send the lower half across it.
+    lo, hi = tl.split(tl.permute(tl.reshape(q, (2, q.shape[0] // 2, 32)), (1, 2, 0)))
+    up = (lane & LANE_BIT) != 0
+    return tl.where(up, hi, lo) + _lane_xor(tl.where(up, lo, hi), LANE_BIT)
+
+
+@triton.jit
+def _warp_row_sums(q):
+    # q[r, l] is lane l's share of row r; lane l ends with row l // 4 in 9 shuffles instead of 40.
+    tl.static_assert(q.shape[0] == 8 and q.shape[1] == 32)
+    lane = tl.arange(0, 32)[None, :]
+    q = _trade_halves(_trade_halves(q, lane, 16), lane, 8)
+    q = tl.reshape(_trade_halves(q, lane, 4), (32,))
+    q = q + _lane_xor(q, 2)
+    return q + _lane_xor(q, 1)
 
 
 @triton.jit
@@ -581,6 +622,7 @@ def _mamba2_verify_scan_kernel(
     HAS_PARENT_INDICES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    LANE_ROW_SUMS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     # has_dst is a runtime flag: one binary for both modes keeps their arithmetic identical.
@@ -612,6 +654,12 @@ def _mamba2_verify_scan_kernel(
     B_row = B + pid_b * stride_B_batch + group * stride_B_group + offs_n
     C_row = C + pid_b * stride_C_batch + group * stride_C_group + offs_n
     out_row = out + pid_b * stride_out_batch + pid_h * stride_out_head + offs_m
+    if LANE_ROW_SUMS:
+        lane = tl.arange(0, 32)
+        lane_row = pid_m * BLOCK_M + lane // 4
+        lane_mask = lane_row < HEAD_DIM
+        x_lane = x + pid_b * stride_x_batch + pid_h * stride_x_head + lane_row
+        out_lane = out + pid_b * stride_out_batch + pid_h * stride_out_head + lane_row
     # Token t + 1's inputs are in flight while token t computes.
     x_next = tl.load(x_row, mask=mask_m, other=0.0)
     dt_next = tl.load(dt_row)
@@ -667,12 +715,12 @@ def _mamba2_verify_scan_kernel(
                     step_j = _softplus(dt_j + bias)
                     dA_j = _exp(A * step_j)
                     dB_j = Bj.to(tl.float32) * step_j
-                    h = h * dA_j + dB_j * xj.to(tl.float32)[:, None]
+                    h = _ssm_step(h, dA_j, dB_j, xj.to(tl.float32))
                     h = h.to(state.dtype.element_ty).to(tl.float32)
         step = _softplus(dt_t + bias)
         dA = _exp(A * step)
         dB = Bv * step
-        h = h * dA + dB * xv[:, None]
+        h = _ssm_step(h, dA, dB, xv)
         if has_dst != 0:
             dst = tl.load(dst_state_indices + pid_b * stride_dst_batch + t).to(tl.int64)
             if dst != null_slot:
@@ -681,9 +729,16 @@ def _mamba2_verify_scan_kernel(
                     h.to(state.dtype.element_ty),
                     mask=mask,
                 )
-        y = tl.sum(h * Cv[None, :], axis=1)
-        y += xv * skip
-        tl.store(out_row + t * stride_out_t, y, mask=mask_m)
+        if LANE_ROW_SUMS:
+            # Each lane holds every row's 4-column share; lanes trade rows instead of reducing each row.
+            share = tl.sum(tl.reshape(h * Cv[None, :], (BLOCK_M, 32, 4)), axis=2)
+            x_t = tl.load(x_lane + t * stride_x_t, mask=lane_mask, other=0.0)
+            y = _warp_row_sums(share) + x_t.to(tl.float32) * skip
+            tl.store(out_lane + t * stride_out_t, y, mask=lane_mask & (lane % 4 == 0))
+        else:
+            y = tl.sum(h * Cv[None, :], axis=1)
+            y += xv * skip
+            tl.store(out_row + t * stride_out_t, y, mask=mask_m)
         # Decode reloads the stored state for its next token.
         h = h.to(state.dtype.element_ty).to(tl.float32)
 
@@ -719,7 +774,15 @@ def triton_mamba2_verify_scan(
             f"{batch} requests exceed the {_MAX_GRID_Y} the verify grid holds per launch"
         )
     d_state = state.shape[-1]
-    block_m, num_warps = _SPEC_BLOCK_M, _SPEC_NUM_WARPS
+    block_m, num_warps = _VERIFY_BLOCK_M, _VERIFY_NUM_WARPS
+    block_n = triton.next_power_of_2(d_state)
+    # Lanes trade rows only where Triton gives each lane 4 consecutive columns: 16-aligned fp32 rows of 128.
+    lane_row_sums = (
+        (block_m, block_n, num_warps) == (8, 128, 1)
+        and state.dtype == torch.float32
+        and state.data_ptr() % 16 == 0
+        and all(stride % 16 == 0 for stride in state.stride()[:3])
+    )
     enable_pdl = pdl_enabled()
     _mamba2_verify_scan_kernel[(triton.cdiv(head_dim, block_m), batch, num_heads)](
         state,
@@ -760,10 +823,16 @@ def triton_mamba2_verify_scan(
         HEADS_PER_GROUP=num_heads // B.shape[2],
         HAS_PARENT_INDICES=parent_indices is not None,
         BLOCK_M=block_m,
-        BLOCK_N=triton.next_power_of_2(d_state),
+        BLOCK_N=block_n,
+        LANE_ROW_SUMS=lane_row_sums,
         ENABLE_PDL=enable_pdl,
         num_warps=num_warps,
         **({"launch_pdl": True} if enable_pdl else {}),
+        **(
+            {"maxnreg": _VERIFY_TREE_MAX_REGISTERS}
+            if parent_indices is not None
+            else {}
+        ),
     )
 
 
@@ -861,7 +930,7 @@ def _mamba2_replay_commit_kernel(
             dA = _exp(A * step)
             Bv = tl.sum(tl.where(here[:, None], Bs, 0.0), axis=0)
             dB = Bv * step
-            h = h * dA + dB * xv[:, None]
+            h = _ssm_step(h, dA, dB, xv)
             h = h.to(state_pool.dtype.element_ty).to(tl.float32)
 
     write_idx = tl.load(write_indices + layer_request).to(tl.int64)

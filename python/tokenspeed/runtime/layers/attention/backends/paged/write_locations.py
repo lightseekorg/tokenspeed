@@ -80,7 +80,7 @@ def _decode_locs_kernel(
     tl.store(out_ptr + g * out_stride_g + tok, loc.to(tl.int32), mask=mask)
 
 
-@triton.jit(do_not_specialize=["max_num_pages"])
+@triton.jit(do_not_specialize=["max_num_pages", "out_stride_g"])
 def _extend_locs_kernel(
     tables_ptr,  # [G, max_bs, max_num_pages] int32
     page_sizes_ptr,  # [G] int32

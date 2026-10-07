@@ -85,6 +85,13 @@ decode's reload does, and the destination write is a runtime branch, so
 decode, verify and replay produce bit-identical states and verify outputs
 match decode outputs bit for bit, for fp32 and bf16 state pools alike.
 
+The verify kernel is bound by instruction issue, and at `d_state` 128 half of
+each token's instructions went to the output's per-row sums across the warp.
+For a 16-byte-aligned fp32 pool, where each lane loads 4 consecutive columns
+of every row, lanes instead trade halves of their rows: 9 shuffles per 8 rows
+rather than 40, pairing lanes as the warp reduction does, so the outputs keep
+their bits. Other pools keep the warp reduction.
+
 With `parent_indices` the window is a draft tree: token `t` continues from the
 state after its parent token rather than token `t - 1`. At such a branch a
 staged verify reloads the parent's destination row; without one the kernel
@@ -104,5 +111,6 @@ fp64 recurrence. It covers single-token and multi-chunk sequences, nonzero
 initial states, resuming a split scan, padded update rows, and decode steps
 that continue a prefill, checks verify and replay bit for bit against
 consecutive decode updates, checks tree windows against chain verifies of each
-token's root path, and guards every kernel against recompiling when
+token's root path, checks verify outputs against the recurrence for fp32,
+misaligned and bf16 pools, and guards every kernel against recompiling when
 the batch shape changes.

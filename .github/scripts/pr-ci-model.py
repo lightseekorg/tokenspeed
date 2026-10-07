@@ -176,7 +176,14 @@ def _check_public_output(body: str, root: Path, *, source_links: bool = False) -
     if source_links:
         allowed = {source_url(data)} | {
             source_url(data, path)
-            for path in [*data["test_files"], *(t["config"] for t in data["catalog"])]
+            for path in [
+                *data["test_files"],
+                *(t["config"] for t in data["catalog"]),
+                *(
+                    f".github/workflows/{c['workflow']}"
+                    for c in data.get("native_checks", [])
+                ),
+            ]
         }
         links = re.sub(
             r"https?://[^\s)<>]+",

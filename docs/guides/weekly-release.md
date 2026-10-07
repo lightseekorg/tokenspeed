@@ -104,3 +104,53 @@ branch after a rejected push, preserving concurrent nightly updates. Three
 rejected attempts stop the stage for manual recovery. Docker currently follows
 the existing NVIDIA release workflow; AMD kernel wheels are published in the
 ROCm index.
+
+## Scheduler releases
+
+Run **Scheduler release pipeline** manually from `main`. Its optional `version`
+must be a stable version greater than both the scheduler source and PyPI versions;
+leave it empty to increment the greater version's patch. The three stages are:
+
+1. Bump `tokenspeed-scheduler/pyproject.toml` through a signed metadata PR.
+2. Run the existing scheduler publisher at that exact commit on a pinned branch.
+   Wait for wheel builds, GitHub release and PyPI publication. Check PyPI source
+   provenance, matching distribution hashes and availability in the pip index.
+3. Update only `tokenspeed-scheduler>=<version>` in `python/pyproject.toml` through
+   a second signed metadata PR; TokenSpeed's own version remains unchanged.
+
+Both metadata PRs merge immediately using the same bot exemption and exact-diff
+lease as biweekly releases, without waiting for main or PR CI. Publication checks
+remain mandatory. Source changes in the scheduler before the dependency merge
+stop the pipeline; unrelated changes can be included in the dependency PR's base.
+The two pipelines share a concurrency group and the existing token and publisher.
+
+If publication fails, repair its recorded child run and **re-run failed jobs** here.
+The `weekly-state-scheduler-*` artifacts retain the reserved version, PRs, pinned
+source and publisher run; a rerun never dispatches the publisher again. Until the
+dependency stage succeeds, biweekly preflight can stop on the scheduler version
+mismatch. Start a new pipeline only for a new release, not to recover a partial
+one. Pinned scheduler release branches remain available for recovery. If `main`
+moves after a metadata PR's base is recorded, or the PR is edited, manual
+resolution is required; a rerun does not rebase or overwrite the recorded PR.
+
+## MLA releases
+
+Run **MLA release pipeline** manually from `main`. Like the scheduler pipeline,
+its optional stable `version` must exceed both the source and PyPI versions;
+leaving it empty increments the greater version's patch. Its three stages are:
+
+1. Bump `tokenspeed-mla/pyproject.toml` through a signed metadata PR.
+2. Run the existing MLA publisher at that exact merged commit on a pinned branch.
+   Wait for publication, verify PyPI provenance and the universal wheel's hash
+   against the build artifact, and wait for the wheel to appear in the pip index.
+3. Update only `tokenspeed-mla==<version>` in
+   `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt` through a second
+   signed metadata PR; kernel and runtime versions remain unchanged.
+
+Both metadata PRs merge without waiting for main or PR CI, using the same bot
+exemption and exact-diff lease as the scheduler. The pipelines share the release
+lock, token and recovery mechanism. Source changes or a changed dependency pin
+stop the MLA pipeline. Recover failures with **re-run failed jobs**, using the
+recorded child run and `weekly-state-mla-*` artifacts; do not start a new release
+to retry publication. An interrupted MLA release can block biweekly preflight
+until the dependency stage completes. Pinned release branches remain for recovery.
