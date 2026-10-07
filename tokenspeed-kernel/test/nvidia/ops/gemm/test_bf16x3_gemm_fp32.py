@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.gemm.triton_gemv import (
     decode_gemv_weight_split,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import KernelRegistry
 from utils import (
     assert_no_triton_compile,
     int_specialization_class,
@@ -48,6 +49,24 @@ pytestmark = pytest.mark.skipif(
 )
 
 U = 2.0**-24
+
+
+@pytest.fixture(autouse=True)
+def _split_kernel_alone():
+    """Set aside the FP32 CUDA-core kernel registered ahead of the split kernel
+    for rows 17 to 96 of weights up to 256 rows with K a multiple of 512 up to
+    8192, so that decode_gemv() runs the split kernel over its whole
+    registration here.
+    test_decode_gemv_fp32_simt.py checks the two together."""
+    reg = KernelRegistry.get()
+    name = "gluon_simt_gemm_fp32"
+    spec, impl = reg.get_by_name(name), reg.get_impl(name)
+    assert spec is not None
+    reg._unregister(name)
+    _select.cache_clear()
+    yield
+    reg.register(spec, impl)
+    _select.cache_clear()
 
 
 def _problem(m, n, k, seed):

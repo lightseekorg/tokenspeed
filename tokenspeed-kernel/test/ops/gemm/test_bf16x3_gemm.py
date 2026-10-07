@@ -302,11 +302,22 @@ def test_kernel_is_launched_with_the_drain_and_without_fp_fusion(monkeypatch, m)
 
 @pytest.fixture
 def select_on(monkeypatch):
+    # These tests read the split kernel's own registration. The FP32 CUDA-core
+    # kernel registered ahead of it for rows 17 to 96 of weights up to 256
+    # rows is set aside here; test_decode_gemv_fp32_simt.py checks the two
+    # together.
+    reg = KernelRegistry.get()
+    name = "gluon_simt_gemm_fp32"
+    spec, impl = reg.get_by_name(name), reg.get_impl(name)
+    assert spec is not None
+    reg._unregister(name)
+
     def use(platform):
         monkeypatch.setattr(triton_gemv, "current_platform", lambda: platform)
         triton_gemv._select.cache_clear()
 
     yield use
+    reg.register(spec, impl)
     triton_gemv._select.cache_clear()
 
 

@@ -20,8 +20,11 @@
 
 """CUDA graph benchmark of BF16 rows against an FP32 weight.
 
-Compares ``decode_gemv(x, w, weight_split=...)`` with the FP32 Torch product
-``x.float() @ w.T`` at IEEE precision, per call and against FP64. Run with
+Compares the BF16x3 split kernel with the FP32 Torch product ``x.float() @
+w.T`` at IEEE precision, per call and against FP64. Where
+``decode_gemv(x, w, weight_split=...)`` selects another kernel (the FP32
+CUDA-core kernel for rows 17 to 96 of weights up to 256 rows with K a multiple
+of 512 up to 8192), that call is timed too. Run with
 PYTHONPATH=tokenspeed-kernel/python from the repository root, for example::
 
     python tokenspeed-kernel/test/nvidia/ops/gemm/bench_bf16x3_gemm_fp32.py \
@@ -35,7 +38,12 @@ import json
 import statistics
 
 import torch
-from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, decode_gemv_weight_split
+from tokenspeed_kernel.ops.gemm.triton_bf16x3 import triton_bf16x3_gemm_fp32
+from tokenspeed_kernel.ops.gemm.triton_gemv import (
+    _select,
+    decode_gemv,
+    decode_gemv_weight_split,
+)
 
 
 def _graph_us(fn, calls: int, repeats: int) -> float:
@@ -88,11 +96,23 @@ def main() -> None:
         out = torch.empty(m, args.n, device="cuda")
         exact = x.double() @ weight.double().t()
         split_us = _graph_us(
-            lambda: decode_gemv(x, weight, out, weight_split=pieces),
+            lambda: triton_bf16x3_gemm_fp32(x, pieces, out),
             args.calls,
             args.repeats,
         )
         split_ulp = _ulp_row(out, exact)
+        selected = _select(m, args.n, args.k, True, x.dtype, weight.dtype, True)
+        routed = {"decode_gemv": selected.__name__}
+        if selected is not triton_bf16x3_gemm_fp32:
+            routed["decode_gemv_us"] = round(
+                _graph_us(
+                    lambda: decode_gemv(x, weight, out, weight_split=pieces),
+                    args.calls,
+                    args.repeats,
+                ),
+                2,
+            )
+            routed["decode_gemv_max_ulp_row"] = round(_ulp_row(out, exact), 2)
         torch_us = _graph_us(
             lambda: torch.mm(x.float(), weight.t(), out=out), args.calls, args.repeats
         )
@@ -107,6 +127,7 @@ def main() -> None:
                     "fp32_torch_us": round(torch_us, 2),
                     "bf16x3_max_ulp_row": round(split_ulp, 2),
                     "fp32_torch_max_ulp_row": round(torch_ulp, 2),
+                    **routed,
                 }
             )
         )

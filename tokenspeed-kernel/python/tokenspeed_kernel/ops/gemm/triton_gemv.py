@@ -28,7 +28,10 @@ BF16 activations against an FP32 weight give an FP32 result. Torch widens the
 activations first. A layer that keeps the weight split from
 :func:`decode_gemv_weight_split` passes it to :func:`decode_gemv`, and the
 registry can then run the product on BF16 tensor cores
-(``triton_bf16x3_gemm_fp32``).
+(``triton_bf16x3_gemm_fp32``). From 17 to 96 rows, for weights of up to 256
+rows (a multiple of 4) with K a multiple of 512 up to 8192, the registry runs
+it on CUDA cores from the FP32 weight instead, with or without the split
+(``gluon_simt_gemm_fp32``).
 """
 
 from __future__ import annotations
@@ -146,6 +149,14 @@ _BF16_SIG = frozenset(
         )
     }
 )
+_FP32_SIG = frozenset(
+    {
+        format_signature(
+            x=dense_tensor_format(torch.float32),
+            weight=dense_tensor_format(torch.float32),
+        )
+    }
+)
 # BF16 activations against an FP32 weight, with an FP32 result.
 _BF16_FP32_SIG = frozenset(
     {
@@ -158,6 +169,7 @@ _BF16_FP32_SIG = frozenset(
 # Registry signature of each served (x dtype, weight dtype) pair.
 _SIGNATURES = {
     (torch.bfloat16, torch.bfloat16): next(iter(_BF16_SIG)),
+    (torch.float32, torch.float32): next(iter(_FP32_SIG)),
     (torch.bfloat16, torch.float32): next(iter(_BF16_FP32_SIG)),
 }
 
@@ -247,7 +259,7 @@ def gluon_wmma_dense_gemv_gfx1250(
     "decode_gemv",
     name="torch_decode_gemv",
     solution="torch",
-    signatures=_BF16_SIG | _BF16_FP32_SIG,
+    signatures=_BF16_SIG | _FP32_SIG | _BF16_FP32_SIG,
     traits={},
     priority=Priority.PORTABLE,
 )
@@ -344,8 +356,9 @@ def decode_gemv(
     """``x @ weight.T`` through joint FI tuning or the ordinary registry fallback.
 
     FlashInfer owns runner/tactic selection on the supported BF16 range.
-    The registry retains other architectures and unsupported input layouts,
-    and BF16 activations against an FP32 weight, which return FP32.
+    The registry retains other architectures, unsupported input layouts and
+    FP32 weights, which also take BF16 activations and return FP32.
+    Noncontiguous inputs and other dtypes take Torch.
 
     Args:
         x: ``[M, K]`` activations.
