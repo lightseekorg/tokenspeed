@@ -1346,3 +1346,76 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
         expected["override"] = "aok"
     mm.assert_called_once_with(x, weight, **expected)
     shortcut.assert_not_called()
+
+
+@pytest.mark.parametrize("serving", [False, True])
+def test_serving_sends_joint_bf16_rows_to_a_gemm_that_never_compiles(serving):
+    """Once serving, FI's rows skip both FI and the registry's possibly cold Triton GEMV."""
+    joint, fallback, select = Mock(), Mock(), Mock()
+    api = _functions(
+        KERNEL / "ops/gemm/triton_gemv.py",
+        None,
+        ("use_decode_gemv", "decode_gemv"),
+        dict(
+            torch=torch,
+            BF16_GEMM_MAX_M=32,
+            autotune_bf16_gemm=lambda *args: None,
+            flashinfer_joint_bf16_supported=lambda *args: True,
+            flashinfer_bf16_gemm=joint,
+            is_serving=lambda: serving,
+            torch_decode_gemv=fallback,
+            _select=select,
+        ),
+    )
+    x = torch.ones(1, 128, dtype=torch.bfloat16)
+    w = torch.ones(32, 128, dtype=torch.bfloat16)
+    assert api.use_decode_gemv(x, w) is not serving
+    used, idle = (fallback, joint) if serving else (joint, fallback)
+    assert api.decode_gemv(x, w) is used.return_value
+    used.assert_called_once_with(x, w, None)
+    idle.assert_not_called()
+    select.assert_not_called()
+
+
+@pytest.mark.parametrize("serving", [False, True])
+def test_mm_runs_the_joint_bf16_gemm_only_before_serving(serving):
+    joint = Mock(side_effect=lambda a, b, out: torch.mm(a, b.T, out=out))
+
+    def generic(a, b, a_scales, b_scales, out_dtype, *, alpha, block_size, out):
+        return out.copy_(torch.mm(a, b.T).to(out_dtype))
+
+    generic.name = "test_mm"
+    api = _functions(
+        KERNEL / "ops/gemm/__init__.py",
+        None,
+        ("mm", "_validate_gemm_out", "_as_2d_tensor_scale"),
+        dict(
+            torch=torch,
+            autotune_bf16_gemm=lambda *args: None,
+            flashinfer_bf16_gemm=joint,
+            flashinfer_joint_bf16_supported=lambda *args: True,
+            is_serving=lambda: serving,
+            BF16_GEMM_MAX_M=32,
+            resolve_kernel_override=lambda family, mode, explicit: None,
+            pdl_enabled=lambda: False,
+            Platform=SimpleNamespace(
+                get=lambda: SimpleNamespace(is_blackwell_plus=True)
+            ),
+            _gemm_format_signature=lambda *args: SimpleNamespace(
+                storage_dtype_for=lambda name: torch.bfloat16
+            ),
+            select_kernel=lambda *args, **kwargs: generic,
+            _KERNELS_WITH_FUSED_BIAS=set(),
+            _KERNELS_WITH_PDL=set(),
+            ShapeCapture=SimpleNamespace(
+                get=lambda: SimpleNamespace(record=lambda *args: None)
+            ),
+            kernel_scope=lambda *args, **kwargs: nullcontext(),
+        ),
+    )
+    x = torch.randn(3, 4, dtype=torch.bfloat16)
+    w = torch.randn(8, 4, dtype=torch.bfloat16)
+    out = torch.empty(3, 8, dtype=torch.bfloat16)
+    assert api.mm(x, w, out=out) is out
+    torch.testing.assert_close(out, x @ w.T)
+    assert joint.called is not serving

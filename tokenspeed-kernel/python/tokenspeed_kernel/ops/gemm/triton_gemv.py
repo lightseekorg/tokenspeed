@@ -31,6 +31,7 @@ import functools
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.compile_monitor import is_serving
 from tokenspeed_kernel.ops.gemm.flashinfer import (
     BF16_GEMM_MAX_M,
     autotune_bf16_gemm,
@@ -264,7 +265,8 @@ def use_decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
         flashinfer_joint_bf16_supported(x, weight, None)
         and x.shape[0] <= BF16_GEMM_MAX_M
     ):
-        return True
+        # FI compiles per row count; serving's eager rows take the caller's GEMM.
+        return not is_serving()
     if (
         not x.is_cuda
         or x.ndim != 2
@@ -312,6 +314,9 @@ def decode_gemv(
         flashinfer_joint_bf16_supported(x, weight, out)
         and x.shape[0] <= BF16_GEMM_MAX_M
     ):
+        # Serving never compiles: FI keys runners on the row count, rowcta may be cold.
+        if is_serving():
+            return torch_decode_gemv(x, weight, out)
         return flashinfer_bf16_gemm(x, weight, out)
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         return torch_decode_gemv(x, weight, out)

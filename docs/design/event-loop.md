@@ -187,6 +187,13 @@ from the per-round metrics call, and a compile-time kernel parameter that
 keeps taking new values from one call site -- a per-batch value passed as
 `tl.constexpr` -- is reported by name. `TOKENSPEED_JIT_COMPILE_CHECK=error`
 raises there instead, and CI serving jobs run with it.
+The same mark closes the kernel package's compile switch
+(`compile_monitor.is_serving()`), installed monitor or not. A kernel whose
+library compiles once per batch shape outside Triton -- FlashInfer's joint BF16
+GEMM and the ll_bf16 router's dot-product kernel compile once per exact row
+count -- runs only before it:
+graph capture records it, and eager calls after it take a GEMM that never
+compiles instead of compiling on the forward thread.
 
 ### The capture contract
 
