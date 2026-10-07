@@ -47,6 +47,7 @@ REPO = "lightseekorg/tokenspeed"
 WHL = "lightseekorg/whl"
 IDENTITY = "243258330+lightseek-bot@users.noreply.github.com"
 STAGES = ("plan", "amd", "kernel", "tokenspeed", "index", "docker", "release")
+SCHEDULER_STAGES = ("scheduler-version", "scheduler-publish", "scheduler-dependency")
 PACKAGES = {
     "amd": "tokenspeed-kernel-amd",
     "kernel": "tokenspeed-kernel",
@@ -72,8 +73,8 @@ def command(*args, cwd=None, env=None):
     return subprocess.check_output(args, text=True, cwd=cwd, env=env).strip()
 
 
-def request(url, *, github, data=None):
-    headers = {"Accept": "application/vnd.github+json"} if github else {}
+def request(url, *, github, data=None, accept="application/json"):
+    headers = {"Accept": "application/vnd.github+json" if github else accept}
     if github:
         if not url.startswith("https://api.github.com/"):
             raise ValueError("Unexpected GitHub API destination")
@@ -430,6 +431,10 @@ def index_release(root, variant, package, release):
 
 
 class Release:
+    packages_by_stage = PACKAGES
+    pr_files = PR_FILES
+    pr_body = "Keep the weekly release ordered so downstream packages require already published component versions.\n"
+
     def __init__(self, state_path, stage, *, resume_run_id=""):
         self.path = state_path
         self.stage = stage
@@ -609,6 +614,15 @@ class Release:
         previous = {"kernel": "amd", "tokenspeed": "kernel"}.get(stage)
         return self.state["stages"][previous]["sha"] if previous else ci["sha"]
 
+    def update_metadata(self, stage):
+        update_metadata(stage, self.state["versions"])
+
+    def pr_branch(self, stage, version):
+        return f"bot/weekly-{self.packages_by_stage[stage]}-{version}"
+
+    def pr_title(self, stage, version):
+        return f"build: release {self.packages_by_stage[stage]} {version}"
+
     def verify_version_diff(self, stage, base, head):
         parents = command("git", "rev-list", "--parents", "-n", "1", head).split()
         if parents != [head, base]:
@@ -618,7 +632,7 @@ class Release:
         command("git", "checkout", "--detach", base)
         options = ("--binary", "--full-index", "--no-ext-diff", "--no-renames")
         try:
-            update_metadata(stage, self.state["versions"])
+            self.update_metadata(stage)
             expected = command("git", "diff", *options, base)
         finally:
             command("git", "reset", "--hard", base)
@@ -734,7 +748,7 @@ class Release:
             command("git", "fetch", "--no-tags", "origin", phase["sha"])
             command("git", "checkout", "--detach", phase["sha"])
             self.gate()
-            update_metadata(stage, self.state["versions"])
+            self.update_metadata(stage)
             if command("git", "diff", "--name-only"):
                 raise RuntimeError("Recorded release source has unexpected metadata")
             return phase["sha"]
@@ -748,9 +762,9 @@ class Release:
         if phase.setdefault("base", base) != base:
             raise RuntimeError("Recorded version PR base changed")
         self.save()
-        package = PACKAGES[stage]
+        package = self.packages_by_stage[stage]
         version = self.state["versions"][package]
-        branch = f"bot/weekly-{package}-{version}"
+        branch = self.pr_branch(stage, version)
         prs = json.loads(
             command(
                 "gh",
@@ -770,7 +784,7 @@ class Release:
             current = read_version(package)
             if current not in (self.state["initial_versions"][package], version):
                 raise RuntimeError("Main package version changed outside this release")
-            title = f"build: release {package} {version}"
+            title = self.pr_title(stage, version)
             existing = command("git", "ls-remote", "origin", f"refs/heads/{branch}")
             if existing:
                 if existing.split()[0] != phase.get("head"):
@@ -779,7 +793,7 @@ class Release:
                 command("git", "checkout", "--detach", "FETCH_HEAD")
             else:
                 command("git", "switch", "-c", branch)
-                update_metadata(stage, self.state["versions"])
+                self.update_metadata(stage)
                 if not command("git", "diff", "--name-only"):
                     raise RuntimeError(
                         "Reserved metadata already on main without this run's PR; inspect manually"
@@ -792,11 +806,11 @@ class Release:
                 if result.returncode:
                     command("pre-commit", "run", "--all-files", env=hook_env)
                 changed = set(command("git", "diff", "--name-only").splitlines())
-                if not changed <= set(PR_FILES[stage]):
+                if not changed <= set(self.pr_files[stage]):
                     raise RuntimeError(
                         "Pre-commit changed files outside the version update"
                     )
-                command("git", "add", "--", *PR_FILES[stage])
+                command("git", "add", "--", *self.pr_files[stage])
                 command("git", "diff", "--cached", "--check")
                 command("git", "diff", "--cached")
                 command("git", "commit", "-s", "-m", title)
@@ -818,9 +832,7 @@ class Release:
                 ):
                     raise RuntimeError("Version branch remote readback mismatch")
             body = self.path.parent / "pr-body.txt"
-            body.write_text(
-                "Keep the weekly release ordered so downstream packages require already published component versions.\n"
-            )
+            body.write_text(self.pr_body)
             command(
                 "gh",
                 "pr",
@@ -899,7 +911,7 @@ class Release:
                 command("git", "checkout", "--detach", phase["sha"])
                 self.gate()
                 # Check the merged metadata, including both TokenSpeed version sources.
-                update_metadata(stage, self.state["versions"])
+                self.update_metadata(stage)
                 if command("git", "diff", "--name-only"):
                     raise RuntimeError("Merged release PR has unexpected metadata")
                 return phase["sha"]
@@ -913,7 +925,7 @@ class Release:
                 self.pause()
 
     def immutable_ref(self, stage, sha):
-        ref = self.branch(stage, self.state["versions"][PACKAGES[stage]])
+        ref = self.branch(stage, self.state["versions"][self.packages_by_stage[stage]])
         command("git", "fetch", "--no-tags", "origin", "main")
         command("git", "merge-base", "--is-ancestor", sha, "origin/main")
         existing = command("git", "ls-remote", "origin", f"refs/heads/{ref}")
@@ -1559,9 +1571,227 @@ class Release:
         self.save()
 
 
+class SchedulerRelease(Release):
+    packages_by_stage = {
+        "scheduler-version": "tokenspeed-scheduler",
+        "scheduler-dependency": "tokenspeed-scheduler",
+    }
+    pr_files = {
+        "scheduler-version": [PROJECTS["tokenspeed-scheduler"]],
+        "scheduler-dependency": [PROJECTS["tokenspeed"]],
+    }
+    pr_body = "Keep the scheduler release ordered so TokenSpeed requires an already published version.\n"
+
+    @staticmethod
+    def branch(stage, version):
+        return f"bot/scheduler-release-{version}"
+
+    def pr_branch(self, stage, version):
+        return f"bot/{stage}-{version}"
+
+    def pr_title(self, stage, version):
+        if stage == "scheduler-dependency":
+            return f"build: require tokenspeed-scheduler {version}"
+        return super().pr_title(stage, version)
+
+    def version_base(self, stage):
+        return self.state["stages"][stage]["base"]
+
+    def update_metadata(self, stage):
+        version = self.state["versions"]["tokenspeed-scheduler"]
+        if stage == "scheduler-version":
+            replace(
+                PROJECTS["tokenspeed-scheduler"],
+                r'^version = "[^"]+"$',
+                f'version = "{version}"',
+            )
+        else:
+            specifier = str(
+                requirements(PROJECTS["tokenspeed"])["tokenspeed-scheduler"].specifier
+            )
+            if not re.fullmatch(r">=\d+\.\d+\.\d+", specifier) or Version(
+                specifier[2:]
+            ) > Version(version):
+                raise RuntimeError("Scheduler dependency changed outside this release")
+            replace(
+                PROJECTS["tokenspeed"],
+                r'"tokenspeed-scheduler>=[^"]+"',
+                f'"tokenspeed-scheduler>={version}"',
+            )
+
+    def available(self, version):
+        tag = f"tokenspeed-scheduler-v{version}"
+        if pypi("tokenspeed-scheduler", version) is not None or self.release_exists(
+            WHL, tag
+        ):
+            raise RuntimeError(
+                "Reserved scheduler version already published; inspect manually"
+            )
+        try:
+            request(
+                f"https://api.github.com/repos/{WHL}/git/ref/tags/{tag}", github=True
+            )
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+        else:
+            raise RuntimeError(
+                "Reserved scheduler tag already exists; inspect manually"
+            )
+
+    def reserve(self, requested):
+        if self.state["versions"]:
+            return
+        self.checkout_main()
+        current = read_version("tokenspeed-scheduler")
+        version = next_version(
+            current, latest_version("tokenspeed-scheduler"), requested
+        )
+        self.available(version)
+        if command(
+            "git",
+            "ls-remote",
+            "origin",
+            f"refs/heads/{self.branch(self.stage, version)}",
+        ):
+            raise RuntimeError(
+                "Scheduler release branch already exists; inspect manually"
+            )
+        self.phase["base"] = command("git", "rev-parse", "HEAD")
+        self.state["initial_versions"] = {"tokenspeed-scheduler": current}
+        self.state["versions"] = {"tokenspeed-scheduler": version}
+        self.save()
+
+    def files(self):
+        version = self.state["versions"]["tokenspeed-scheduler"]
+        release = pypi("tokenspeed-scheduler", version)
+        if (
+            not release
+            or not release["urls"]
+            or any(f["yanked"] for f in release["urls"])
+        ):
+            raise RuntimeError("Scheduler publication is missing or yanked")
+        files = {f["filename"]: f["digests"]["sha256"] for f in release["urls"]}
+        if (
+            len(files) != 9
+            or sum(name.endswith(".whl") for name in files) != 8
+            or sum(name.endswith(".tar.gz") for name in files) != 1
+        ):
+            raise RuntimeError(
+                "Scheduler publication requires eight wheels and one source distribution"
+            )
+        return files
+
+    def wait_index(self, files):
+        while True:
+            index = request(
+                "https://pypi.org/simple/tokenspeed-scheduler/",
+                github=False,
+                accept="application/vnd.pypi.simple.v1+json",
+            )
+            indexed = {f["filename"]: f for f in index["files"]}
+            for name, digest in files.items():
+                if name in indexed and (
+                    indexed[name]["yanked"]
+                    or indexed[name]["hashes"].get("sha256") != digest
+                ):
+                    raise RuntimeError(
+                        "Scheduler index files differ from the verified publication"
+                    )
+            if files.keys() <= indexed.keys():
+                return
+            self.pause()
+
+    def gate(self):
+        current = read_version("tokenspeed-scheduler")
+        version = self.state["versions"]["tokenspeed-scheduler"]
+        if self.stage == "scheduler-dependency":
+            if (
+                not self.state["stages"].get("scheduler-publish", {}).get("complete")
+                or current != version
+            ):
+                raise RuntimeError(
+                    "Scheduler dependency requires a completed publication of the current version"
+                )
+            check_tree(
+                self.state["stages"]["scheduler-version"]["sha"], "tokenspeed-scheduler"
+            )
+            if self.files() != self.state["publication_files"]:
+                raise RuntimeError(
+                    "Scheduler publication changed before the dependency merge"
+                )
+            self.wait_index(self.state["publication_files"])
+        elif current not in (
+            self.state["initial_versions"]["tokenspeed-scheduler"],
+            version,
+        ):
+            raise RuntimeError("Scheduler version changed outside this release")
+        return {"tokenspeed-scheduler": current}
+
+    def fast_forward_version(self, stage, pr):
+        self.gate()
+        super().fast_forward_version(stage, pr)
+
+    def publish(self):
+        workflow = "release-tokenspeed-scheduler.yml"
+        version = self.state["versions"]["tokenspeed-scheduler"]
+        sha = self.state["stages"]["scheduler-version"]["sha"]
+        ref = self.immutable_ref("scheduler-version", sha)
+        if not self.state["runs"].get(workflow, {}).get("dispatch_started"):
+            self.available(version)
+        self.child(
+            workflow,
+            sha,
+            ref,
+            {"tag_name": f"tokenspeed-scheduler-v{version}", "prerelease": False},
+            event="workflow_dispatch",
+        )
+        self.published("tokenspeed-scheduler", workflow, sha)
+        files = self.files()
+        release = request(
+            f"https://api.github.com/repos/{WHL}/releases/tags/tokenspeed-scheduler-v{version}",
+            github=True,
+        )
+        if (
+            release["draft"]
+            or release["prerelease"]
+            or {a["name"]: a["digest"] for a in release["assets"]}
+            != {name: f"sha256:{digest}" for name, digest in files.items()}
+        ):
+            raise RuntimeError(
+                "Scheduler wheelhouse files differ from the verified PyPI publication"
+            )
+        self.wait_index(files)
+        self.state["publication_files"] = files
+        self.save()
+
+    def run(self, requested):
+        self.phase.pop("complete", None)
+        self.guard()
+        index = SCHEDULER_STAGES.index(self.stage)
+        if index and not self.state["stages"].get(SCHEDULER_STAGES[index - 1], {}).get(
+            "complete"
+        ):
+            raise RuntimeError("Previous scheduler stage did not complete")
+        if self.stage == "scheduler-version":
+            self.reserve(requested)
+            self.pr(self.stage)
+        elif self.stage == "scheduler-publish":
+            self.publish()
+        else:
+            self.checkout_main()
+            self.gate()
+            self.phase.setdefault("base", command("git", "rev-parse", "HEAD"))
+            self.save()
+            self.pr(self.stage)
+        self.phase["complete"] = True
+        self.phase.pop("error", None)
+        self.save()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=STAGES, required=True)
+    parser.add_argument("--stage", choices=(*STAGES, *SCHEDULER_STAGES), required=True)
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--version", default="")
     parser.add_argument("--resume-run-id", default="")
@@ -1570,7 +1800,8 @@ def main():
     if args.check_only:
         print(json.dumps(preflight(), indent=2))
         return
-    release = Release(args.state, args.stage, resume_run_id=args.resume_run_id)
+    controller = SchedulerRelease if args.stage in SCHEDULER_STAGES else Release
+    release = controller(args.state, args.stage, resume_run_id=args.resume_run_id)
     try:
         release.run(args.version)
     except Exception as error:

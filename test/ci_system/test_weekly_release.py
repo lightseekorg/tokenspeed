@@ -826,7 +826,10 @@ def test_merge_policy_requires_explicit_existing_bot_exemption(
 def version_repository(release_module, tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
-    for name in set(sum(release_module.PR_FILES.values(), [])):
+    for name in {
+        *sum(release_module.PR_FILES.values(), []),
+        release_module.PROJECTS["tokenspeed-scheduler"],
+    }:
         path = source / name
         path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / name, path)
@@ -1009,3 +1012,214 @@ def test_version_fast_forward_refuses_main_race(
     with pytest.raises(release_module.subprocess.CalledProcessError):
         controller.fast_forward_version("amd", pr)
     assert command("git", "ls-remote", "origin", "refs/heads/main").split()[0] == other
+
+
+def test_scheduler_metadata_prs_replay_exact_diffs_without_runtime_version_bump(
+    release_module, version_repository, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    command = release_module.command
+    base = command("git", "rev-parse", "HEAD")
+    current = release_module.read_version("tokenspeed-scheduler")
+    version = release_module.next_version(current, current, "")
+    runtime = release_module.read_version("tokenspeed")
+    controller = release_module.SchedulerRelease(
+        tmp_path / "state.json", "scheduler-version"
+    )
+    controller.state.update(
+        versions={"tokenspeed-scheduler": version},
+        initial_versions={"tokenspeed-scheduler": current},
+    )
+    controller.phase["base"] = base
+    controller.update_metadata(controller.stage)
+    assert command("git", "diff", "--name-only").splitlines() == [
+        "tokenspeed-scheduler/pyproject.toml"
+    ]
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "scheduler version")
+    head = command("git", "rev-parse", "HEAD")
+    controller.verify_version_diff(controller.stage, base, head)
+    command("git", "checkout", "--detach", head)
+    controller.save()
+    dependency = release_module.SchedulerRelease(
+        controller.path, "scheduler-dependency"
+    )
+    dependency.phase["base"] = head
+    dependency.update_metadata(dependency.stage)
+    assert command("git", "diff", "--name-only").splitlines() == [
+        "python/pyproject.toml"
+    ]
+    assert (
+        str(
+            release_module.requirements("python/pyproject.toml")[
+                "tokenspeed-scheduler"
+            ].specifier
+        )
+        == f">={version}"
+    )
+    assert release_module.read_version("tokenspeed") == runtime
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "scheduler dependency")
+    dependency.verify_version_diff(
+        dependency.stage, head, command("git", "rev-parse", "HEAD")
+    )
+
+
+def test_scheduler_failed_publication_blocks_dependency_and_resumes_same_run(
+    release_module, version_repository, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    command = release_module.command
+    sha = command("git", "rev-parse", "HEAD")
+    version = release_module.read_version("tokenspeed-scheduler")
+    controller = release_module.SchedulerRelease(
+        tmp_path / "state.json", "scheduler-publish"
+    )
+    controller.state.update(
+        versions={"tokenspeed-scheduler": version},
+        initial_versions={"tokenspeed-scheduler": version},
+    )
+    controller.state["stages"]["scheduler-version"] = {"complete": True, "sha": sha}
+    controller.save()
+    files = {
+        f"scheduler-cp{python}-{arch}.whl": "a" * 64
+        for python in range(310, 314)
+        for arch in ("x86_64", "aarch64")
+    }
+    files["scheduler.tar.gz"] = "b" * 64
+    ref = controller.branch("scheduler-version", version)
+    workflow = "release-tokenspeed-scheduler.yml"
+    run = {
+        "head_sha": sha,
+        "head_branch": ref,
+        "event": "workflow_dispatch",
+        "path": f".github/workflows/{workflow}",
+        "status": "in_progress",
+        "html_url": f"https://github.com/{release_module.REPO}/actions/runs/456",
+    }
+    dispatched = []
+    paused = []
+    indexed = False
+
+    def api(path, *, data=None):
+        if data is not None:
+            dispatched.append(data)
+            return {"workflow_run_id": 456}
+        return run
+
+    def pause(self):
+        nonlocal indexed
+        paused.append(self.stage)
+        if run["status"] != "completed":
+            run.update(status="completed", conclusion="failure")
+        else:
+            indexed = True
+
+    def request(url, *, github, **kwargs):
+        if github:
+            return {
+                "draft": False,
+                "prerelease": False,
+                "assets": [
+                    {"name": name, "digest": f"sha256:{digest}"}
+                    for name, digest in files.items()
+                ],
+            }
+        assert kwargs["accept"] == "application/vnd.pypi.simple.v1+json"
+        return {
+            "files": (
+                [
+                    {"filename": name, "hashes": {"sha256": digest}, "yanked": False}
+                    for name, digest in files.items()
+                ]
+                if indexed
+                else []
+            )
+        }
+
+    monkeypatch.setattr(release_module.SchedulerRelease, "guard", lambda self: None)
+    monkeypatch.setattr(
+        release_module.SchedulerRelease,
+        "immutable_ref",
+        lambda self, stage, source: ref,
+    )
+    monkeypatch.setattr(
+        release_module.SchedulerRelease, "available", lambda self, value: None
+    )
+    monkeypatch.setattr(release_module.SchedulerRelease, "pause", pause)
+    monkeypatch.setattr(release_module, "api", api)
+    monkeypatch.setattr(release_module, "request", request)
+    monkeypatch.setattr(
+        release_module,
+        "pypi",
+        lambda *args: {
+            "urls": [
+                {"filename": name, "digests": {"sha256": digest}, "yanked": False}
+                for name, digest in files.items()
+            ]
+        },
+    )
+    monkeypatch.setattr(release_module, "source_sha", lambda *args: sha)
+    with pytest.raises(RuntimeError, match="Child workflow failed"):
+        controller.run("")
+    assert not controller.phase.get("complete")
+    dependency = release_module.SchedulerRelease(
+        controller.path, "scheduler-dependency"
+    )
+    with pytest.raises(RuntimeError, match="Previous scheduler stage"):
+        dependency.run("")
+    run["conclusion"] = "success"
+    resumed = release_module.SchedulerRelease(controller.path, "scheduler-publish")
+    resumed.run("")
+    assert resumed.phase["complete"] and resumed.state["publication_files"] == files
+    assert len(dispatched) == 1 and paused == ["scheduler-publish", "scheduler-publish"]
+    assert dispatched[0]["ref"] == ref and resumed.state["runs"][workflow]["id"] == 456
+    bare = tmp_path / "origin.git"
+    command("git", "clone", "--bare", str(version_repository), str(bare))
+    command("git", "remote", "add", "origin", str(bare))
+    dependency = release_module.SchedulerRelease(
+        controller.path, "scheduler-dependency"
+    )
+    dependency.gate()
+    Path("tokenspeed-scheduler/pyproject.toml").write_text(
+        Path("tokenspeed-scheduler/pyproject.toml").read_text()
+        + "\n# unpublished scheduler change\n"
+    )
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "scheduler source update")
+    with pytest.raises(RuntimeError, match="Unreleased changes"):
+        dependency.gate()
+
+
+def test_scheduler_version_rerun_keeps_reservation(
+    release_module, version_repository, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    command = release_module.command
+    bare = tmp_path / "origin.git"
+    command("git", "clone", "--bare", str(version_repository), str(bare))
+    command("git", "remote", "add", "origin", str(bare))
+    current = release_module.read_version("tokenspeed-scheduler")
+    expected = release_module.next_version(current, current, "")
+    reserved = []
+    monkeypatch.setattr(release_module.SchedulerRelease, "guard", lambda self: None)
+    monkeypatch.setattr(
+        release_module.SchedulerRelease,
+        "available",
+        lambda self, value: reserved.append(value),
+    )
+    monkeypatch.setattr(
+        release_module.SchedulerRelease,
+        "pr",
+        lambda self, stage: self.state["versions"]["tokenspeed-scheduler"],
+    )
+    monkeypatch.setattr(release_module, "latest_version", lambda package: current)
+    controller = release_module.SchedulerRelease(
+        tmp_path / "state.json", "scheduler-version"
+    )
+    controller.run("")
+    resumed = release_module.SchedulerRelease(controller.path, "scheduler-version")
+    resumed.run("")
+    assert reserved == [expected] and resumed.state["versions"] == {
+        "tokenspeed-scheduler": expected
+    }
