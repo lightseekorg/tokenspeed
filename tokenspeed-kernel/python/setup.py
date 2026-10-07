@@ -508,6 +508,7 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
             CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_mnnvl_allreduce_fusion.cu",
+            CUDA_CSRC_DIR / "trtllm_mnnvl_sandwich_norm.cu",
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
         ],
