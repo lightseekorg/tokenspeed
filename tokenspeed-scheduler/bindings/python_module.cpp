@@ -157,6 +157,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
+        .def_rw("enable_cache_trace", &tokenspeed::SchedulerConfig::enable_cache_trace)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens);
@@ -371,6 +372,33 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             "next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
+        .def("drain_cache_trace",
+             [](tokenspeed::Scheduler& s) {
+                 nb::list result;
+                 for (const auto& event : s.DrainCacheTrace()) {
+                     nb::dict item;
+                     item["sequence"] = event.sequence;
+                     item["timestamp_ns"] = event.timestamp_ns;
+                     item["kind"] = event.kind;
+                     item["request_id"] = event.request_id;
+                     item["tier"] = event.tier;
+                     item["reason"] = event.reason;
+                     item["prefix_hashes"] = event.prefix_hashes;
+                     item["hash_count"] = event.hash_count;
+                     item["group_id"] = event.group_id;
+                     item["page_offset"] = event.page_offset;
+                     item["prompt_tokens"] = event.prompt_tokens;
+                     item["cacheable_tokens"] = event.cacheable_tokens;
+                     item["device_match_tokens"] = event.device_match_tokens;
+                     item["host_match_tokens"] = event.host_match_tokens;
+                     item["admitted_tokens"] = event.admitted_tokens;
+                     item["replay_tokens"] = event.replay_tokens;
+                     item["readmission"] = event.readmission;
+                     item["dropped_events"] = event.dropped_events;
+                     result.append(std::move(item));
+                 }
+                 return result;
+             })
         .def("drain_kv_events",
              [](tokenspeed::Scheduler& s) {
                  nb::list result;

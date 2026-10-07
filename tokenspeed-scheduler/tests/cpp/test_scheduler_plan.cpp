@@ -78,6 +78,46 @@ TEST_F(LoadBackViaCacheTestSuite, LoadBack_TriggeredAfterPrefetchPopulatesHostCa
         << "host cache hit should trigger LoadBack inline or r1 should be in forward";
 }
 
+class CacheTraceTestSuite : public LoadBackViaCacheTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto config = LoadBackViaCacheTestSuite::MakeConfig();
+        config.enable_cache_trace = true;
+        return config;
+    }
+};
+
+TEST_F(CacheTraceTestSuite, L1RemovalDoesNotHideHostReuse) {
+    SetupHostCache();
+    const auto history = scheduler_->DrainCacheTrace();
+    EXPECT_TRUE(
+        std::ranges::any_of(history, [](const auto& event) { return event.kind == "stored" && event.tier == "L2"; }));
+    EXPECT_TRUE(
+        std::ranges::any_of(history, [](const auto& event) { return event.kind == "removed" && event.tier == "L1"; }));
+    Submit(MakeRequestSpec("reuse", 2, 1));
+    PlanOnce();
+    const auto events = scheduler_->DrainCacheTrace();
+    const auto admitted = std::ranges::find_if(
+        events, [](const auto& event) { return event.kind == "admitted" && event.request_id == "reuse"; });
+    ASSERT_NE(admitted, events.end());
+    EXPECT_GT(admitted->host_match_tokens, 0);
+    EXPECT_LE(admitted->admitted_tokens, admitted->cacheable_tokens);
+    EXPECT_FALSE(admitted->readmission);
+    EXPECT_EQ(admitted->hash_count, admitted->prefix_hashes.size());
+}
+
+TEST_F(CacheTraceTestSuite, OverflowIsExplicitAndDrainRecovers) {
+    for (int i = 0; i < 4200; ++i) {
+        Submit(MakeRequestSpec("queued_" + std::to_string(i), 1));
+    }
+    const auto events = scheduler_->DrainCacheTrace();
+    ASSERT_EQ(events.size(), 4097);
+    EXPECT_EQ(events.back().kind, "gap");
+    EXPECT_GT(events.back().dropped_events, 0);
+    EXPECT_GT(events.back().sequence, events[events.size() - 2].sequence + 1);
+    EXPECT_TRUE(scheduler_->DrainCacheTrace().empty());
+}
+
 TEST_F(SchedulerTestSuite, LoadBack_NotTriggeredWithoutHostCacheHit) {
     Submit(MakeRequestSpec("r1", 4));
     auto plan = PlanOnce();

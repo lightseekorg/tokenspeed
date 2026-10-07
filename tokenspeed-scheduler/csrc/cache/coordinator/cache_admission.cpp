@@ -447,7 +447,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     // retry the blocks whose request reference has just been released.
     for (const auto& victim : plan.victims) {
         const auto& [group_id, location] = victim;
-        if (!evictCachedBlock(group_id, location)) {
+        if (!evictCachedBlock(group_id, location, "capacity")) {
             prospective_victims.push_back(victim);
         }
     }
@@ -462,7 +462,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         }
     }
     for (const auto& [group_id, location] : prospective_victims) {
-        if (!evictCachedBlock(group_id, location)) {
+        if (!evictCachedBlock(group_id, location, "capacity")) {
             FatalCheck(!pool_.IsOccupied(location), "admission victim changed before acquisition");
         }
     }

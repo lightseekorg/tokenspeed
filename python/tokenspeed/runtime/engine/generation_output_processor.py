@@ -448,6 +448,7 @@ class OutputProcesser:
         *,
         metrics: EngineMetrics,
         defer_to_device=None,
+        cache_trace=None,
     ) -> None:
         # BatchTokenIDOut is pushed directly to
         # ``send_to_tokenizer`` (AsyncLLM's input socket). The
@@ -470,6 +471,7 @@ class OutputProcesser:
         self.physical_context_len = physical_context_len
         self.stream_interval = stream_interval
         self.metrics = metrics
+        self.cache_trace = cache_trace
         self.enable_log_request_stats = enable_log_request_stats
         # previous forward step ts, for host-side preempt timing
         self._last_step_ts: float = 0.0
@@ -736,7 +738,21 @@ class OutputProcesser:
             rids, extend_prefix_lens, extend_replay_lens
         ):
             if rs := self.rid_to_state.get(rid):
-                rs.cached_tokens += max(0, prefix_len + replay_len - rs.computed_length)
+                credited = max(0, prefix_len + replay_len - rs.computed_length)
+                rs.cached_tokens += credited
+                if self.cache_trace is not None and credited:
+                    self.cache_trace.publish(
+                        [
+                            {
+                                "kind": "cache_accounting",
+                                "request_id": rid,
+                                "cached_tokens_delta": credited,
+                                "cached_tokens": rs.cached_tokens,
+                                "computed_tokens_before": rs.computed_length,
+                                "matched_end_tokens": prefix_len + replay_len,
+                            }
+                        ]
+                    )
 
     def post_process_forward_op(
         self,

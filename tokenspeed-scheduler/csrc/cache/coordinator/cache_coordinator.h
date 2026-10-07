@@ -58,6 +58,7 @@ class CacheCoordinator {
 public:
     enum class CacheMutation { kStored, kRemoved };
     using CacheMutationSink = std::function<void(const CacheKey&, CacheMutation)>;
+    using CacheTraceSink = std::function<void(const CacheKey&, CacheTier, CacheMutation, const char*)>;
 
     // The Host pool is available to explicit tier operations. Streaming controls
     // whether ordinary Device prefix publication also feeds the Host tier.
@@ -264,6 +265,7 @@ public:
     // Reports real device-cache entry insertions and removals. The scheduler
     // folds the per-group mutations into one externally visible prefix event.
     void SetCacheMutationSink(CacheMutationSink sink) { cache_mutation_sink_ = std::move(sink); }
+    void SetCacheTraceSink(CacheTraceSink sink) { cache_trace_sink_ = std::move(sink); }
     // Device residency of one scheduler-level prefix boundary: the child
     // entries every group holds for that content hash (one per group page
     // within the prefix granularity). The boundary key's group and offset are
@@ -308,7 +310,7 @@ private:
                                       std::uint64_t access_epoch);
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
                                             std::uint64_t access_epoch);
-    bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
+    bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location, const char* reason);
     bool deviceCacheIsClearable() const;
     bool hostCacheIsClearable() const;
     static void validateProgress(const RequestProgress& progress);
@@ -334,6 +336,7 @@ private:
     std::deque<CacheKey> storage_key_order_;
     std::size_t storage_key_limit_{0};
     CacheMutationSink cache_mutation_sink_;
+    CacheTraceSink cache_trace_sink_;
 };
 
 // The prefix-match policy of one spec: full attention is prefix-closed with

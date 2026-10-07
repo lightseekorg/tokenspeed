@@ -21,6 +21,7 @@
 #include "scheduler/scheduler.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -101,6 +102,19 @@ Scheduler::Scheduler(SchedulerConfig config)
         });
     }
 
+    if (config_.enable_cache_trace) {
+        coordinator_.SetCacheTraceSink(
+            [this](const CacheKey& key, CacheTier tier, CacheCoordinator::CacheMutation mutation, const char* reason) {
+                recordCacheTrace({.kind = mutation == CacheCoordinator::CacheMutation::kStored ? "stored" : "removed",
+                                  .tier = tier == CacheTier::kDevice ? "L1" : "L2",
+                                  .reason = reason,
+                                  .prefix_hashes = {key.content_hash},
+                                  .group_id = static_cast<std::int32_t>(key.group_id),
+                                  .page_offset = key.page_offset});
+            });
+        recordCacheTrace({.kind = "start", .reason = config_.enable_l3_storage ? "l3_history_unknown" : "empty"});
+    }
+
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
     }
@@ -109,6 +123,36 @@ Scheduler::Scheduler(SchedulerConfig config)
 Request* Scheduler::findRequest(const std::string& request_id) {
     const auto it = requests_by_id_.find(request_id);
     return it == requests_by_id_.end() ? nullptr : it->second;
+}
+
+void Scheduler::recordCacheTrace(CacheTraceEvent event) {
+    if (!config_.enable_cache_trace) {
+        return;
+    }
+    event.sequence = ++cache_trace_sequence_;
+    if (cache_trace_events_.size() >= 4096) {
+        ++cache_trace_dropped_;
+        return;
+    }
+    event.timestamp_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    event.hash_count = static_cast<std::int32_t>(event.prefix_hashes.size());
+    if (event.prefix_hashes.size() > 256) {
+        event.prefix_hashes.resize(256);
+    }
+    cache_trace_events_.push_back(std::move(event));
+}
+
+std::vector<Scheduler::CacheTraceEvent> Scheduler::DrainCacheTrace() {
+    std::vector<CacheTraceEvent> events = std::exchange(cache_trace_events_, {});
+    if (cache_trace_dropped_ != 0) {
+        recordCacheTrace(
+            {.kind = "gap", .reason = "native_buffer_full", .dropped_events = std::exchange(cache_trace_dropped_, 0)});
+        auto gaps = std::exchange(cache_trace_events_, {});
+        events.insert(events.end(), std::make_move_iterator(gaps.begin()), std::make_move_iterator(gaps.end()));
+    }
+    return events;
 }
 
 bool Scheduler::pdTransferInFlight(const Request& request) const {
@@ -219,6 +263,7 @@ bool Scheduler::clearCache(bool include_host) {
         return false;
     }
     spdlog::info("[Scheduler] flush {}cache completed", include_host ? "" : "L1 ");
+    recordCacheTrace({.kind = "clear", .tier = include_host ? "L1+L2" : "L1", .reason = "explicit_clear"});
     return true;
 }
 
@@ -305,6 +350,11 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         const bool inserted = requests_by_id_.emplace(request_specs[i].request_id, pending_requests[i].get()).second;
         FatalCheck(inserted, "validated request id became duplicate before insertion");
         requests_.push_back(std::move(pending_requests[i]));
+        if (config_.enable_cache_trace) {
+            recordCacheTrace({.kind = "submitted",
+                              .request_id = request_specs[i].request_id,
+                              .prompt_tokens = static_cast<std::int32_t>(request_specs[i].tokens.size())});
+        }
     }
 }
 
@@ -450,6 +500,9 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             return false;
         }
         kv_event_hash_progress_.erase(request->Id());
+        if (config_.enable_cache_trace) {
+            recordCacheTrace({.kind = "finished", .request_id = request->Id()});
+        }
         requests_by_id_.erase(request->Id());
         return true;
     });

@@ -248,6 +248,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         std::min(hashes.size(), static_cast<std::size_t>(probe_prefix_pages)));
 
     AdmissionMatch match;
+    match.cacheable_tokens = probe_prefix_pages * prefix_granularity;
     match.candidate_prefix_hashes = hashes;
     // Retraction recovery may reuse its own L2 snapshot even when ordinary
     // request-to-request prefix reuse is disabled.
@@ -296,8 +297,15 @@ bool Scheduler::admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback&
                                                    ? progress.completed_pages->first_new_prefix_page
                                                    : static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     registerKvEventPrefixPages(request, cache_progress.prefix_hashes, first_new_prefix_page);
-    return admit(plan, feedback, coordinator_.ProbePrefix({}), demands, progress, cache_progress.access_epoch)
-        .has_value();
+    const bool admitted =
+        admit(plan, feedback, coordinator_.ProbePrefix({}), demands, progress, cache_progress.access_epoch).has_value();
+    if (admitted && config_.enable_cache_trace && progress.completed_pages) {
+        recordCacheTrace({.kind = "checkpoint",
+                          .request_id = request.Id(),
+                          .reason = "computed_not_joint_readability",
+                          .prefix_hashes = cache_progress.prefix_hashes});
+    }
+    return admitted;
 }
 
 std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
@@ -308,6 +316,16 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     AdmissionMatch match = matchPrefixAtAdmission(request);
+    if (config_.enable_cache_trace) {
+        recordCacheTrace({.kind = "probe",
+                          .request_id = request->Id(),
+                          .prefix_hashes = match.candidate_prefix_hashes,
+                          .prompt_tokens = request->PrefillSize(),
+                          .cacheable_tokens = match.cacheable_tokens,
+                          .device_match_tokens = match.probe.device.num_common_tokens,
+                          .host_match_tokens = match.probe.host.num_common_tokens,
+                          .readmission = request->Is<fsm::Retracted>()});
+    }
     const fsm::PrefillSource source = config_.role == Role::kD && request->Is<fsm::Submitted>()
                                           ? fsm::PrefillSource::kRemote
                                           : fsm::PrefillSource::kLocal;
@@ -440,6 +458,19 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     _assert(admission.has_value(), "first-chunk admission must produce a result");
+    if (config_.enable_cache_trace) {
+        recordCacheTrace({.kind = "admitted",
+                          .request_id = request->Id(),
+                          .reason = source == fsm::PrefillSource::kRemote ? "remote" : "local",
+                          .prefix_hashes = match.candidate_prefix_hashes,
+                          .prompt_tokens = request->PrefillSize(),
+                          .cacheable_tokens = match.cacheable_tokens,
+                          .device_match_tokens = admission->device_prefix_tokens,
+                          .host_match_tokens = admission->host_prefix_tokens,
+                          .admitted_tokens = hit_tokens,
+                          .replay_tokens = coordinator_.ReplayTokens(hit_tokens),
+                          .readmission = request->Is<fsm::Retracted>()});
+    }
     _assert(admission->promotion_boundary_tokens == promotion_boundary_tokens,
             "promotion boundary changed between probe and admission");
     _assert(admission->new_page_ids.size() == cache_group_ids_.size(),

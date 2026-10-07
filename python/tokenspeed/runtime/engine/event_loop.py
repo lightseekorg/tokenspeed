@@ -40,6 +40,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.engine.batch_log import BatchLogger
 from tokenspeed.runtime.engine.cache_hooks import L2CacheHooks
+from tokenspeed.runtime.engine.cache_trace import CacheTraceWriter
 from tokenspeed.runtime.engine.eplb_hooks import (
     EplbHooks,
     make_expert_rebalance_controller,
@@ -303,6 +304,33 @@ class EventLoop:
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
             and attn_tp_rank == 0
         )
+        self._cache_trace = (
+            CacheTraceWriter(
+                server_args.cache_trace_path,
+                {
+                    "global_rank": global_rank,
+                    "attn_tp_rank": attn_tp_rank,
+                    "attn_tp_size": cache_replica_tp_size,
+                    "prefix_granularity": geometry.prefix_granularity,
+                    "l2_enabled": server_args.enable_kvstore,
+                    "l3_enabled": server_args.kvstore_storage_backend is not None,
+                    "role": server_args.disaggregation_mode,
+                    "groups": [
+                        {
+                            "group_id": group.group_id,
+                            "block_granularity": group.block_granularity,
+                            "retention": str(group.retention),
+                            "family": str(group.family),
+                            "sliding_window_tokens": group.sliding_window_tokens,
+                            "replayable": group.replayable,
+                        }
+                        for group in cache_groups
+                    ],
+                },
+            )
+            if server_args.cache_trace_path is not None
+            else None
+        )
 
         # Encode nodes never build an EventLoop (they run the LM-free encode
         # loop), so here "disaggregation is on" means the cache-transfer PD
@@ -362,6 +390,8 @@ class EventLoop:
             cache_groups=cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
+        if self._cache_trace is not None:
+            scheduler_cfg.enable_cache_trace = True
         logger.info(
             f"Scheduler config: prefix_granularity={scheduler_cfg.prefix_granularity!s}"
             f" num_device_pages={scheduler_cfg.num_device_pages!s} "
@@ -528,6 +558,7 @@ class EventLoop:
         )
 
         self.output_processor = OutputProcesser(
+            cache_trace=self._cache_trace,
             send_to_tokenizer=self.send_to_tokenizer,
             attn_tp_rank=attn_tp_rank,
             spec_algorithm=self.server_args.speculative_algorithm,
@@ -1234,6 +1265,8 @@ class EventLoop:
                     advance_scheduler(self.scheduler, request_changes)
 
                 self._publish_scheduler_kv_events()
+                if self._cache_trace is not None:
+                    self._cache_trace.publish(self.scheduler.drain_cache_trace())
 
                 if self._pause.forward_blocked:
                     # Frozen rounds take no planning sample of their own; the

@@ -1617,3 +1617,31 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 Verified end to end for this round: DeepSeek V3.2, R1 and V4-Flash, each
 × {CUDA graph, eager} × {spec, no spec}, against pre-refactor baselines
 (accuracy equal or better; speculative accept length within noise).
+
+
+## Diagnostic capture
+
+`--cache-trace-path` enables a private JSONL capture, with a separate epoch and
+file per rank. It is independent of the routing KV-event publisher and disabled
+by default. Admission records read the existing native probe and successful
+admission result; no additional hash pass or cache probe runs. Cache accounting
+records the same deduplicated increments used by response usage.
+
+Ordered `stored` and `removed` records describe individual group entries in L1
+or L2, including transfer completion, capacity removal and explicit clearing.
+They do **not** establish joint checkpoint readability: a resumable prefix still
+requires every group's matching policy and dependencies. `checkpoint` identifies
+the producing request's computed prefix, rather than claiming it is reusable.
+L3 history is not captured. Readmission records must not be added to initial
+prompt hits. Root IDs must be joined through the router's explicit dispatch and
+servicer child-ID mapping, never by parsing engine IDs.
+
+The native buffer holds at most 4,096 events and each hash list at most 256
+entries (`hash_count` reports its original length). The writer holds at most
+16 batches and stops at 256 MiB per file. Overflow emits `gap`; missing shutdown
+markers, truncated hash lists, L3 state and missing sources prevent a complete
+history claim. Unknown history cannot prove cold, eviction or routing loss.
+Captures contain content hashes and request IDs but no prompt text or token IDs.
+Keep them in private storage and compare trace-on/off overhead before enabling
+them for a serving workload. Native API changes require a scheduler release
+before the runtime can enable capture with a published wheel.
