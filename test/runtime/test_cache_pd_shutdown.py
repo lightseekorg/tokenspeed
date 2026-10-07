@@ -64,6 +64,7 @@ class _EventLoopHarness:
 
     def __init__(self, *, pre_set: bool) -> None:
         self.trace: list[str] = []
+        self._cache_trace = None
         self.shutdown_event = threading.Event()
         if pre_set:
             self.shutdown_event.set()

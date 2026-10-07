@@ -300,10 +300,8 @@ bool Scheduler::admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback&
     const bool admitted =
         admit(plan, feedback, coordinator_.ProbePrefix({}), demands, progress, cache_progress.access_epoch).has_value();
     if (admitted && config_.enable_cache_trace && progress.completed_pages) {
-        recordCacheTrace({.kind = "checkpoint",
-                          .request_id = request.Id(),
-                          .reason = "computed_not_joint_readability",
-                          .prefix_hashes = cache_progress.prefix_hashes});
+        recordCacheTrace({.kind = "checkpoint", .request_id = request.Id(), .reason = "computed_not_joint_readability"},
+                         cache_progress.prefix_hashes);
     }
     return admitted;
 }
@@ -319,12 +317,12 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     if (config_.enable_cache_trace) {
         recordCacheTrace({.kind = "probe",
                           .request_id = request->Id(),
-                          .prefix_hashes = match.candidate_prefix_hashes,
                           .prompt_tokens = request->PrefillSize(),
                           .cacheable_tokens = match.cacheable_tokens,
                           .device_match_tokens = match.probe.device.num_common_tokens,
                           .host_match_tokens = match.probe.host.num_common_tokens,
-                          .readmission = request->Is<fsm::Retracted>()});
+                          .readmission = request->Is<fsm::Retracted>()},
+                         match.candidate_prefix_hashes);
     }
     const fsm::PrefillSource source = config_.role == Role::kD && request->Is<fsm::Submitted>()
                                           ? fsm::PrefillSource::kRemote
@@ -462,14 +460,14 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         recordCacheTrace({.kind = "admitted",
                           .request_id = request->Id(),
                           .reason = source == fsm::PrefillSource::kRemote ? "remote" : "local",
-                          .prefix_hashes = match.candidate_prefix_hashes,
                           .prompt_tokens = request->PrefillSize(),
                           .cacheable_tokens = match.cacheable_tokens,
                           .device_match_tokens = admission->device_prefix_tokens,
                           .host_match_tokens = admission->host_prefix_tokens,
                           .admitted_tokens = hit_tokens,
                           .replay_tokens = coordinator_.ReplayTokens(hit_tokens),
-                          .readmission = request->Is<fsm::Retracted>()});
+                          .readmission = request->Is<fsm::Retracted>()},
+                         match.candidate_prefix_hashes);
     }
     _assert(admission->promotion_boundary_tokens == promotion_boundary_tokens,
             "promotion boundary changed between probe and admission");
@@ -703,6 +701,12 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
             classifyCompletedStateBoundaries(*progress.completed_pages, num_computed_tokens,
                                              coordinator_.PrefixGranularity());
             coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
+            if (config_.enable_cache_trace) {
+                recordCacheTrace({.kind = "checkpoint",
+                                  .request_id = victim.Id(),
+                                  .reason = "retraction_computed_not_joint_readability"},
+                                 cache_progress.prefix_hashes);
+            }
         }
         coordinator_.QueueCachedBlocksForStore(cache_progress.prefix_hashes);
         // Recover from a prefill checkpoint and recompute the generated suffix.

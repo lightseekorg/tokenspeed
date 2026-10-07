@@ -108,9 +108,9 @@ Scheduler::Scheduler(SchedulerConfig config)
                 recordCacheTrace({.kind = mutation == CacheCoordinator::CacheMutation::kStored ? "stored" : "removed",
                                   .tier = tier == CacheTier::kDevice ? "L1" : "L2",
                                   .reason = reason,
-                                  .prefix_hashes = {key.content_hash},
                                   .group_id = static_cast<std::int32_t>(key.group_id),
-                                  .page_offset = key.page_offset});
+                                  .page_offset = key.page_offset},
+                                 {&key.content_hash, 1});
             });
         recordCacheTrace({.kind = "start", .reason = config_.enable_l3_storage ? "l3_history_unknown" : "empty"});
     }
@@ -125,7 +125,7 @@ Request* Scheduler::findRequest(const std::string& request_id) {
     return it == requests_by_id_.end() ? nullptr : it->second;
 }
 
-void Scheduler::recordCacheTrace(CacheTraceEvent event) {
+void Scheduler::recordCacheTrace(CacheTraceEvent event, std::span<const std::string> prefix_hashes) {
     if (!config_.enable_cache_trace) {
         return;
     }
@@ -137,10 +137,9 @@ void Scheduler::recordCacheTrace(CacheTraceEvent event) {
     event.timestamp_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
             .count();
-    event.hash_count = static_cast<std::int32_t>(event.prefix_hashes.size());
-    if (event.prefix_hashes.size() > 256) {
-        event.prefix_hashes.resize(256);
-    }
+    event.hash_count = static_cast<std::int32_t>(prefix_hashes.size());
+    const auto retained = prefix_hashes.first(std::min(prefix_hashes.size(), std::size_t{256}));
+    event.prefix_hashes.assign(retained.begin(), retained.end());
     cache_trace_events_.push_back(std::move(event));
 }
 

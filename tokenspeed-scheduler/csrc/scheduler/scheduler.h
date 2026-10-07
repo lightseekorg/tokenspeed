@@ -328,7 +328,7 @@ private:
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
-    void recordCacheTrace(CacheTraceEvent event);
+    void recordCacheTrace(CacheTraceEvent event, std::span<const std::string> prefix_hashes = {});
     std::vector<CacheTraceEvent> cache_trace_events_;
     std::uint64_t cache_trace_sequence_{0};
     std::uint64_t cache_trace_dropped_{0};

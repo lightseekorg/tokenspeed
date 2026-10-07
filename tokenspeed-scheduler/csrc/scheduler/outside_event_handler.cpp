@@ -123,6 +123,11 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
                 .num_computed_tokens = request.TokenSize() - 1,
             },
             progress.access_epoch);
+        if (config_.enable_cache_trace) {
+            recordCacheTrace(
+                {.kind = "checkpoint", .request_id = request.Id(), .reason = "finish_computed_not_joint_readability"},
+                progress.prefix_hashes);
+        }
     }
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
