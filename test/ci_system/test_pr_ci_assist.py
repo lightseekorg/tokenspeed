@@ -292,7 +292,8 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
         "api",
         lambda path: (
             {
-                "name": "PR CI Plan",
+                "name": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+                "path": ".github/workflows/pr-ci-plan.yml",
                 "conclusion": "success",
                 "display_title": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
             }
@@ -386,7 +387,8 @@ def test_cancelled_repair_is_recovered_on_next_reconciliation(
             {"status": "completed", "conclusion": "cancelled"}
             if path.endswith("/201")
             else {
-                "name": "PR CI Plan",
+                "name": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+                "path": ".github/workflows/pr-ci-plan.yml",
                 "conclusion": "success",
                 "display_title": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
             }

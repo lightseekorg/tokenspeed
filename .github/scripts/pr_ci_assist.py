@@ -731,7 +731,7 @@ def control(number: int):
     plan = plans[0]
     plan_run = api(f"actions/runs/{plan['run']}")
     if (
-        plan_run["name"] != "PR CI Plan"
+        plan_run["path"] != ".github/workflows/pr-ci-plan.yml"
         or plan_run["conclusion"] != "success"
         or plan_run["display_title"]
         != f"CI plan #{number} | {state['head']} | {state['base']}"

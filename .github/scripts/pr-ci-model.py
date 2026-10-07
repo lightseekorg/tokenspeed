@@ -36,7 +36,15 @@ from pr_ci_state import marker
 
 
 def _command(*args: str) -> str:
-    return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+    try:
+        return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+    except subprocess.CalledProcessError as error:
+        # Keep provider configuration and API response bodies out of public logs.
+        status = re.search(r"HTTP [0-9]{3}", error.stderr or "")
+        detail = status[0] if status else f"exit {error.returncode}"
+        raise SystemExit(
+            f"CI planning command failed: {' '.join(args[:2])} ({detail})."
+        ) from None
 
 
 def _check_bot() -> None:
