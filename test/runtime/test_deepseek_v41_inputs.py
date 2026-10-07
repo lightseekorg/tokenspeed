@@ -954,6 +954,9 @@ def test_execute_idle_forward_passes_empty_engram_views(buffers):
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = ib.device
+    executor.device_module = torch.get_device_module(executor.device)
+    executor.default_stream = executor.device_module.current_stream()
+    executor.execution_stream = executor.device_module.Stream()
     executor.input_buffers = ib
     executor.runtime_states = runtime
     executor.attn_backend = SimpleNamespace()

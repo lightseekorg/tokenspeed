@@ -158,6 +158,9 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
     target_calls: list[ForwardMode] = []
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cpu"
+    executor.device_module = torch.get_device_module(executor.device)
+    executor.default_stream = executor.device_module.current_stream()
+    executor.execution_stream = executor.device_module.Stream()
     executor.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.zeros(4, dtype=torch.int64)
     )

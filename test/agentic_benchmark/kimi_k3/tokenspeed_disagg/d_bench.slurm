@@ -12,6 +12,7 @@ set -euo pipefail
 
 CONFIGS=(
     attn_dp16_moe_ep16
+    attn_dp32_moe_ep32
 )
 
 # Passing this file to sbatch directly runs a spool copy and loses this
