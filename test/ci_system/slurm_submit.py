@@ -411,7 +411,7 @@ def render_script(
         "--container-remap-root",
         "--container-env=SLURM_JOB_ID,RUNNER_NAME,HF_TOKEN,"
         "HUGGING_FACE_HUB_TOKEN,HF_HOME,XDG_CACHE_HOME,"
-        "INSTALL_TOKENSPEED_MLA_FROM_SOURCE,"
+        "INSTALL_TOKENSPEED_MLA_FROM_SOURCE,TOKENSPEED_CI_SOURCE_SHA,"
         "SLURM_STEP_ID,SLURM_STEP_NUM_NODES,SLURM_STEP_NODELIST,SLURM_NODEID,"
         "SLURM_PROCID,SLURM_LOCALID",
     ]
@@ -468,6 +468,7 @@ done
 set -euo pipefail
 
 export RUNNER_NAME="slurm-${{SLURM_JOB_ID}}"
+export TOKENSPEED_CI_SOURCE_SHA={shlex.quote(source.stem)}
 export HF_HOME=/home/runner/.cache/huggingface
 export XDG_CACHE_HOME=/home/runner/.cache
 unset GITHUB_STEP_SUMMARY GITHUB_OUTPUT GITHUB_ENV GITHUB_PATH GITHUB_STATE \
@@ -1102,6 +1103,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "--source-pr",
         help="PR number or GitHub pull request URL for the current checkout.",
     )
+    pull_request.add_argument("--commit", help="Exact full commit SHA; no merge.")
+    parser.add_argument("--require-idle", action="store_true")
     parser.add_argument("--list", action="store_true", help="List matching tasks only.")
     parser.add_argument(
         "--trigger", choices=("per-commit", "manual", "nightly", "debug", "slurm")
@@ -1124,6 +1127,73 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+@contextlib.contextmanager
+def commit_worktree(repo: Path, commit: str):
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("commit must be a full lowercase SHA")
+    git(repo, "fetch", "origin", commit)
+    if git(repo, "rev-parse", "FETCH_HEAD") != commit:
+        raise ValueError("resolved source differs from commit")
+    with tempfile.TemporaryDirectory(prefix="tokenspeed-slurm-sha-") as directory:
+        checkout = Path(directory) / "source"
+        git(repo, "worktree", "add", "--detach", str(checkout), commit)
+        try:
+            yield checkout
+        finally:
+            git(repo, "worktree", "remove", "--force", str(checkout))
+
+
+def capacity_available(tasks: list[Task], args: argparse.Namespace) -> bool:
+    # Deduplicate nodes repeated across partitions. A scheduler probe also checks
+    # account/QOS/reservations without allocating or submitting a real job.
+    rows = subprocess.run(
+        ["sinfo", "-N", "-h", "-p", args.partition, "-o", "%N|%t|%G"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    idle = {}
+    for row in rows:
+        node, state, gres = row.split("|", 2)
+        counts = re.findall(r"gpu(?::[^,:()]+)?:([0-9]+)", gres)
+        if (
+            state == "idle"
+            and counts
+            and (not args.nodelist or node in args.nodelist.split(","))
+        ):
+            idle[node] = sum(map(int, counts))
+    for task in tasks:
+        suitable = [n for n, gpus in idle.items() if gpus >= task.gpus]
+        if len(suitable) < task.nodes:
+            return False
+        probe = subprocess.run(
+            [
+                "sbatch",
+                "--test-only",
+                f"--partition={args.partition}",
+                f"--nodes={task.nodes}",
+                f"--gres=gpu:{task.gpus}",
+                "--exclusive",
+                f"--time={args.time}",
+                "--wrap=true",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode:
+            return False
+        start = re.search(r"to start at (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", probe.stderr)
+        if (
+            not start
+            or time.mktime(time.strptime(start[1], "%Y-%m-%dT%H:%M:%S"))
+            > time.time() + 60
+        ):
+            return False
+        for node in suitable[: task.nodes]:
+            del idle[node]
+    return True
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     try:
         args = parse_args(argv)
@@ -1132,6 +1202,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         cache = Path(args.cache_dir).expanduser().resolve()
         if args.pr:
             with pr_worktree(repo, args.pr) as checkout:
+                return run(args, checkout, artifact_root, cache)
+        if args.commit:
+            with commit_worktree(repo, args.commit) as checkout:
                 return run(args, checkout, artifact_root, cache)
         return run(args, repo, artifact_root, cache)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
@@ -1146,6 +1219,22 @@ def run(args: argparse.Namespace, repo: Path, artifact_root: Path, cache: Path) 
         return 0
     commit = git(repo, "rev-parse", "HEAD")
     source_pr = args.pr or args.source_pr
+    report_dir = Path(args.report_dir).resolve() if args.report_dir else None
+    if report_dir:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        provenance = {"source_sha": commit}
+        if args.pr:
+            provenance.update(
+                head=git(repo, "rev-parse", "HEAD^2"),
+                base=git(repo, "rev-parse", "HEAD^1"),
+            )
+        report_dir.joinpath("source.json").write_text(json.dumps(provenance))
+    if args.require_idle and not capacity_available(tasks, args):
+        if report_dir:
+            report_dir.joinpath("availability.json").write_text(
+                json.dumps({"source_sha": commit, "availability": "unavailable"})
+            )
+        return 0
     print_target(repo, source_pr, commit)
     print(f"Selected tasks: {len(tasks)}", flush=True)
     for task in tasks:

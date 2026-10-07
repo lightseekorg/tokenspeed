@@ -31,11 +31,10 @@
 #include <vector>
 
 #include "cache/core/block_table.h"
+#include "cache/core/cache_config.h"
 #include "utils.h"
 
 namespace tokenspeed {
-
-enum class AttnKind { kFull, kSlidingWindow, kMambaState };
 
 // Why a resumable cache boundary was retained. The declaration order is its
 // monotonic promotion order.

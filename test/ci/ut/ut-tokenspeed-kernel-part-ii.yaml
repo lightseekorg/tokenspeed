@@ -1,0 +1,23 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-tokenspeed-kernel-part-ii
+type: ut
+workflow_stage: unit-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - h100-1gpu
+    - b200-1gpu
+    - gb200-1gpu
+    - b300-1gpu
+    - amd-mi35x-1gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 -m pytest tokenspeed-kernel/test/ops/ -v
+report:
+  github_step_summary: true

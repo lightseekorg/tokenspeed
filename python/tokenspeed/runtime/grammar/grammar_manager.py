@@ -84,7 +84,9 @@ class GrammarManager:
 
         if len(attn_group) > 1 and pg_manager.has_process_group("gloo", attn_group):
             self.grammar_sync_group = pg_manager.get_process_group("gloo", attn_group)
-            self.grammar_sync_size = len(attn_group)
+            # Sized by the process group: --emulate-rank-zero backs the logical
+            # group with this process alone.
+            self.grammar_sync_size = self.grammar_sync_group.size()
 
         else:
             self.grammar_sync_group = None

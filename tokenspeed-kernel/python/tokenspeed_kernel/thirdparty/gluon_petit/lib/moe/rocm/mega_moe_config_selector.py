@@ -44,6 +44,18 @@ kMegaMoETwoStageMxFp4KimiSituSolutionId = FusedMoESolutionId.MakeMegaBase(
 )
 
 
+kMegaMoETwoStageMxFp4ClampedSiluSolutionId = FusedMoESolutionId.MakeMegaBase(
+    FusedMoEDataType.kMxFp4,
+    FusedMoEDataType.kMxFp4,
+    FusedMoEDataType.kNone,
+    FusedMoEWeightOrdering.kNativeMxFp4,
+    FusedMoEMfmaShape.kMfmaScaleFp4MxFp4,
+    FusedMoEStages.kTwoStage,
+    FusedMoEActivationFunction.kClampedSiluDot,
+    FusedMoEStage1Buffering.kDoubleBuffer,
+)
+
+
 from lib.moe.rocm.fused_moe import MegaMoETileShape
 from lib.moe.rocm.mem.bias import (
     Bf16BiasLayout,
@@ -54,7 +66,12 @@ from lib.moe.rocm.mem.bias import (
 from lib.moe.rocm.mem.input_mxfp4_packed import MxFp4InputPacked
 from lib.moe.rocm.mem.weight_mxfp4 import MxFp4Weights
 from lib.moe.rocm.memory_ops import BufferResource, MxFp4TileShape
-from lib.moe.rocm.ops.activation import KimiSituOp, OpenAISwiGLUOp, SiluDotOp
+from lib.moe.rocm.ops.activation import (
+    ClampedSiluDotOp,
+    KimiSituOp,
+    OpenAISwiGLUOp,
+    SiluDotOp,
+)
 from lib.moe.rocm.ops.op_stages import (
     OnestageFusedMoEStage1DoubleBufferOp,
     OnestageFusedMoEStage1SingleBufferOp,
@@ -120,6 +137,7 @@ class MegaMoEConfigSelector(DeviceTemplate):
         assert self.kTopK <= self.kNumExperts and self.kInterDim % 512 == 0
         self.ActivationOp = {
             FusedMoEActivationFunction.kSiluDot: SiluDotOp,
+            FusedMoEActivationFunction.kClampedSiluDot: ClampedSiluDotOp,
             FusedMoEActivationFunction.kOpenAISwiGLU: OpenAISwiGLUOp,
             FusedMoEActivationFunction.kKimiSitu: KimiSituOp,
         }[Solution.activation]

@@ -797,6 +797,7 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
             gpu_memory=0,
             draft_model_config=draft,
             graph_reserve_bytes=0,
+            post_profile_bytes=0,
             probe_batch_rows=None,
             profiled_cache_bytes=None,
             reuse_target_backend=None,
@@ -1104,6 +1105,7 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
             gpu_memory=0,
             draft_model_config=draft,
             graph_reserve_bytes=0,
+            post_profile_bytes=0,
             probe_batch_rows=None,
             profiled_cache_bytes=None,
             reuse_target_backend=None,
@@ -1139,6 +1141,250 @@ def test_kimi_dspark_rejects_sharded_context_writes(degree):
     else:
         registry._apply_backend_overrides(args, target, draft)
         assert args.drafter_attention_backend == "tokenspeed_mla"
+
+
+class _Sized(Exception):
+    pass
+
+
+def _fake_around_the_budget(monkeypatch, free):
+    """Fake what surrounds the real factory, profile and free-memory read.
+
+    ``free`` gives this rank's free bytes; the factory stops where it would
+    plan the cache and raises the budget it would plan with.
+    """
+    from tokenspeed.runtime.layers.attention import registry
+    from tokenspeed.runtime.utils import common
+
+    gpu = SimpleNamespace(
+        device_count=lambda: 1,
+        current_device=lambda: 0,
+        empty_cache=lambda: None,
+        mem_get_info=lambda gpu_id: (free(), 200 << 30),
+    )
+    monkeypatch.setattr(common.torch, "get_device_module", lambda device: gpu)
+    side = SimpleNamespace(
+        is_deepseek_v4=False,
+        is_hybrid_linear=False,
+        is_dspark=False,
+        requested_backend=None,
+    )
+    monkeypatch.setattr(registry, "_resolve_attn_side", lambda *a: side)
+    monkeypatch.setattr(registry, "_check_pd_support", lambda *a, **k: None)
+    monkeypatch.setattr(registry, "_apply_backend_overrides", lambda *a, **k: None)
+    config = SimpleNamespace(
+        component=lambda cls: SimpleNamespace(), dcp_size=1, device="cuda"
+    )
+    monkeypatch.setattr(registry, "_create_attn_config", lambda *a, **k: config)
+    monkeypatch.setattr(registry, "_resolve_cache_family", lambda *a: "mha")
+    monkeypatch.setattr(
+        registry, "_resolve_full_attn_backend_name", lambda *a, **k: "fake"
+    )
+    monkeypatch.setattr(
+        registry, "_resolve_heterogeneous_draft_family", lambda *a, **k: None
+    )
+
+    def prepare(*, cache_budget_bytes, probe_batch_rows, **kwargs):
+        raise _Sized(cache_budget_bytes, probe_batch_rows)
+
+    monkeypatch.setattr(registry, "prepare_cache_setup", prepare)
+    return registry
+
+
+def _receive_pool_env(monkeypatch, slots, slot_mb):
+    from tokenspeed.runtime.epd import prefill_admission
+
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", str(slots))
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOT_MB", str(slot_mb))
+    monkeypatch.setattr(prefill_admission, "_POOLS", {})
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("probe", [False, True])
+@pytest.mark.parametrize(
+    "mode, active, pool",
+    [
+        ("prefill", True, 4 << 30),
+        ("prefill", False, 0),
+        ("decode", True, 0),
+        ("null", True, 0),
+    ],
+)
+def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
+    monkeypatch, rank, probe, mode, active, pool
+) -> None:
+    from tokenspeed.runtime.execution import device, factory
+
+    _receive_pool_env(monkeypatch, 16, 256)
+    _fake_around_the_budget(monkeypatch, lambda: 60 << 30)
+    target = SimpleNamespace(
+        model=object(),
+        prepare_multimodal_runtime=lambda: None,
+        prepare_communication_runtime=lambda tokens: None,
+    )
+    monkeypatch.setattr(factory, "create_model_runner", lambda *a: (target, None))
+    monkeypatch.setattr(device, "probe_arena_floor", lambda *a: 8)
+    server_args = SimpleNamespace(
+        disaggregation_mode=mode,
+        chunked_prefill_size=8192,
+        attention_backend=None,
+        drafter_attention_backend=None,
+        disable_cudagraph_memory_reserve=not probe,
+        enforce_eager=False,
+        enable_memory_saver=False,
+        gpu_memory_utilization=0.9,
+        mapping=SimpleNamespace(world_size=1, world_group=None),
+    )
+    with pytest.raises(_Sized) as sized:
+        device.build_device_side(
+            server_args=server_args,
+            model_config=SimpleNamespace(
+                is_multimodal=True, is_multimodal_active=active
+            ),
+            draft_model_config=None,
+            gpu_id=0,
+            global_rank=rank,
+            attn_tp_rank=rank,
+            min_per_gpu_mem=100.0,
+            overlap_schedule_depth=0,
+            decode_input_tokens=1,
+            max_batch_size=8,
+        )
+    budget, rows = sized.value.args
+    assert (rows is not None) == probe
+    # 60 GiB free, 100 GiB at startup, 0.9 utilization: 10 GiB of headroom.
+    assert abs(budget - ((50 << 30) - pool)) < (1 << 20)
+
+
+def test_each_rank_leaves_its_own_pool_out_before_the_minimum(monkeypatch) -> None:
+    import threading
+
+    from tokenspeed.runtime.utils import common
+
+    local = threading.local()
+    registry = _fake_around_the_budget(monkeypatch, lambda: local.free)
+    # One rank: just over 60 GiB free and a 4 GiB pool; its peer: 58 GiB free, no pool.
+    ranks = [((60 << 30) + 4095, 4 << 30), (58 << 30, 0)]
+    barrier, seen = threading.Barrier(len(ranks), timeout=10), []
+
+    def all_reduce(tensor, op, group):
+        seen.append(tensor.item())
+        barrier.wait()
+        tensor.fill_(min(seen))
+
+    monkeypatch.setattr(common.torch.distributed, "all_reduce", all_reduce)
+    args = SimpleNamespace(
+        attention_backend=None,
+        drafter_attention_backend=None,
+        gpu_memory_utilization=0.75,
+        mapping=SimpleNamespace(world_size=len(ranks), world_group=None),
+    )
+    budgets = [None] * len(ranks)
+
+    def rank(index, free, pool):
+        local.free = free
+        with pytest.raises(_Sized) as sized:
+            registry.create_attn_components(
+                args,
+                SimpleNamespace(),
+                0,
+                0,
+                100.0,
+                graph_reserve_bytes=0,
+                post_profile_bytes=pool,
+                probe_batch_rows=None,
+                profiled_cache_bytes=None,
+                reuse_target_backend=None,
+                reuse_draft_backend=None,
+            )
+        budgets[index] = sized.value.args[0]
+
+    threads = [
+        threading.Thread(target=rank, args=(index, *spec))
+        for index, spec in enumerate(ranks)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    # 100 GiB at startup at 0.75 utilization leaves 25 GiB of headroom.
+    exact = (56 << 30) + 4095 - (25 << 30)
+    assert budgets == [exact, exact]
+
+
+@pytest.mark.parametrize("slots, slot_mb", [(2, 1), (0, 1), (-1, 1), (2, 0), (2, -1)])
+@pytest.mark.parametrize("num_deepstack", [0, 3])
+def test_the_admission_builds_the_pool_the_budget_left_out(
+    monkeypatch, slots, slot_mb, num_deepstack
+) -> None:
+    from tokenspeed.runtime.epd import prefill_admission, recv_pool
+
+    _receive_pool_env(monkeypatch, slots, slot_mb)
+    registered = []
+    engine = SimpleNamespace(register=lambda ptr, size: registered.append(size))
+    prefill_admission.EpdPrefillAdmission(
+        manager=SimpleNamespace(engine=engine),
+        device="cpu",
+        hidden=16,
+        num_deepstack=num_deepstack,
+        dtype=torch.bfloat16,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_tp_cpu_group=None,
+        attn_tp_group=[0],
+        pg_manager=None,
+    )
+    prefill = SimpleNamespace(disaggregation_mode="prefill")
+    assert sum(registered) == recv_pool.recv_pool_bytes(prefill, True)
+    pool = slots * slot_mb << 20 if slots > 0 and slot_mb > 0 else 0
+    assert sum(registered) == pool
+
+
+@pytest.mark.parametrize(
+    "mode, active",
+    [
+        ("prefill", True),
+        ("prefill", False),
+        ("decode", True),
+        ("null", True),
+        ("encode", True),
+    ],
+)
+def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
+    monkeypatch, mode, active
+) -> None:
+    from tokenspeed.runtime.epd import prefill_admission, recv_pool
+    from tokenspeed.runtime.epd.mooncake import prefill as mooncake_prefill
+
+    _receive_pool_env(monkeypatch, 2, 1)
+    registered = []
+    engine = SimpleNamespace(register=lambda ptr, size: registered.append(size))
+    monkeypatch.setattr(
+        mooncake_prefill,
+        "MooncakeEmbeddingManagerPrefill",
+        lambda *args: SimpleNamespace(engine=engine),
+    )
+    server_args = SimpleNamespace(
+        disaggregation_mode=mode,
+        disaggregation_bootstrap_port=0,
+        disaggregation_ib_device=None,
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1)),
+    )
+    facts = SimpleNamespace(device="cpu", hidden=16, num_deepstack=0, dtype=None)
+    prefill_admission.make_epd_prefill_admission(
+        server_args,
+        0,
+        model_config=SimpleNamespace(is_multimodal=True, is_multimodal_active=active),
+        encoder_model_facts=lambda: facts,
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=[0])),
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_tp_cpu_group=None,
+        pg_manager=None,
+    )
+    left_out = recv_pool.recv_pool_bytes(server_args, active)
+    assert sum(registered) == left_out
+    assert (left_out > 0) == (mode == "prefill" and active)
 
 
 if __name__ == "__main__":

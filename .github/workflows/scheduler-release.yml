@@ -1,0 +1,44 @@
+name: Scheduler release pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional stable scheduler version; otherwise increment the patch.'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: weekly-release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Bump scheduler version
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: scheduler-version
+      previous: ''
+      version: ${{ inputs.version || '' }}
+    secrets: inherit
+
+  publish:
+    name: Publish scheduler
+    needs: version
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: scheduler-publish
+      previous: scheduler-version
+    secrets: inherit
+
+  dependency:
+    name: Update TokenSpeed dependency
+    needs: publish
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: scheduler-dependency
+      previous: scheduler-publish
+    secrets: inherit

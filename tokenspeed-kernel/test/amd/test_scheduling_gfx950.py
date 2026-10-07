@@ -90,10 +90,6 @@ def _check_phase_boundary_bits():
     return compiled
 
 
-def test_phase_fence_preserves_accumulator_bits():
-    _check_phase_boundary_bits()
-
-
 def test_scheduler_content_changes_compiled_kernel_key(monkeypatch, tmp_path):
     from tokenspeed_kernel_amd import _scheduling as _schedule
 

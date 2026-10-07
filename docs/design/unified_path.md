@@ -170,7 +170,9 @@ from one first bound to that pool:
   whole device, so the probe assumes no other process allocates on it during
   startup. Not covered: a ladder every one of whose sampled marginals was
   served from slack, which is priced at nothing and says so in the
-  log.
+  log. The EPD receive pool, which a multimodal prefill node allocates after
+  its cache is sized, is left out of the profile instead, by each rank before
+  the cross-rank minimum.
 
 ### Padding contract
 

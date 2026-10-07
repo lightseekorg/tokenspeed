@@ -1344,7 +1344,13 @@ def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
             token_to_kv_pool=backend.cache_pool,
             bs=1,
             num_extends=1,
-            output_layout=ForwardOutputLayout(1, 1, 0, 1),
+            output_layout=ForwardOutputLayout.from_prefill(
+                prefix_lengths=[start],
+                input_lengths=[count],
+                prompt_lengths=[prompt_len],
+                num_decodes=0,
+                decode_width=1,
+            ),
             input_num_tokens=count,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -1368,7 +1374,8 @@ def _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables):
     assert view.metadata.positions.numel() == 0
     assert view.logits_rows.numel() == 0
     chunked, view = run(0, tables, 72, length - 72, 0, length)
-    assert view.keep_rows is None and view.logits_rows is None
+    assert view.keep_rows.tolist() == list(range(length - 72))
+    assert view.logits_rows.tolist() == [length - 72 - 1]
     assert view.metadata.positions.tolist() == list(range(72, length))
     # Request 1 hits request 0's global rows [0, hit) and replays the window
     # before the hit into its own SWA/tail pages; the rows above the hit get
@@ -1440,13 +1447,13 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         mask_buf[:n].fill_(True)
         mask_buf[n:].fill_(False)
 
-    def context(tokens, bs, gather_ids):
+    def context(tokens, bs, gather_ids, num_prefill_outputs):
         return ForwardContext(
             attn_backend=backend,
             token_to_kv_pool=backend.cache_pool,
             bs=bs,
             num_extends=bs,
-            output_layout=ForwardOutputLayout(bs, bs, 0, 1),
+            output_layout=ForwardOutputLayout(bs, num_prefill_outputs, 0, 1),
             input_num_tokens=tokens,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.FULL,
@@ -1472,7 +1479,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         backend.query_metadata(ForwardMode.EXTEND).positions,
         torch.full((bucket, 3), -1, dtype=torch.int64, device=device),
     )
-    ctx = context(bucket, 1, [bucket - 1])
+    ctx = context(bucket, 1, [bucket - 1], 1)
     with active_forward(ctx):
         for _ in range(2):
             encoder(ctx)
@@ -1494,7 +1501,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         backend.query_metadata(ForwardMode.EXTEND).positions,
         torch.full((decoder_bucket, 3), -1, dtype=torch.int64, device=device),
     )
-    ctx = context(decoder_bucket, 2, [half - 1, decoder_bucket - 1])
+    ctx = context(decoder_bucket, 2, [half - 1, decoder_bucket - 1], 2)
     assert model.decoder_rows(ctx) == decoder_bucket
     with active_forward(ctx):
         encoded = model.encoder_forward(
@@ -1550,7 +1557,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
             rows = slice(start, start + count)
             _extend(backend, tables, [count], [start], [0], [length])
             positions = backend.query_metadata(ForwardMode.EXTEND).positions
-            ctx = context(count, 1, [count - 1])
+            ctx = context(count, 1, [count - 1], int(start + count == length))
             mask = torch.ones(count, dtype=torch.bool, device=device)
             if route == "eager":
                 logits = adapter(
@@ -1594,15 +1601,16 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         return outputs, reports
 
     expected, expected_reports = run("eager")
-    # The open chunk has no decoder rows; the final chunk's view is the identity.
+    # Both chunks report their decoder rows, including an empty open chunk.
     assert expected_reports[0].prefill_spans == ((0, 0),)
     assert expected_reports[0].positions.numel() == 0
-    assert expected_reports[1] is None
+    assert expected_reports[1].prefill_spans == ((0, length - first),)
+    assert expected_reports[1].positions.tolist() == list(range(first, length))
     for route in ("decoder graph", "decoder eager"):
         actual, reports = run(route)
-        assert reports[1] is None
-        assert reports[0].prefill_spans == expected_reports[0].prefill_spans
-        assert torch.equal(reports[0].positions, expected_reports[0].positions)
+        for report, expected_report in zip(reports, expected_reports, strict=True):
+            assert report.prefill_spans == expected_report.prefill_spans
+            assert torch.equal(report.positions, expected_report.positions)
         for (start, count), logits, reference in zip(
             chunks, actual, expected, strict=True
         ):
@@ -1811,7 +1819,7 @@ def _loader_config():
     return config
 
 
-def _mock_loader_hardware(monkeypatch):
+def _mock_loader_hardware(monkeypatch, mapping):
     # Keep standard MXFP4 allocation and per-expert loading; only hardware
     # planning and processing are mocked in CPU/meta checkpoint tests.
     monkeypatch.setattr(v4, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
@@ -1832,15 +1840,17 @@ def _mock_loader_hardware(monkeypatch):
     monkeypatch.setattr(pg_manager, "get_device_process_group", lambda group: None)
     monkeypatch.setattr(MoELayer, "process_weights_after_loading", Mock())
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
 
 
 def _loader_model(monkeypatch, config, rank, device):
-    _mock_loader_hardware(monkeypatch)
+    mapping = _mapping(rank, 4, 4)
+    _mock_loader_hardware(monkeypatch, mapping)
     wrapper = SimpleNamespace(text_config=config)
     with torch.device(device):
         return DeepseekV41ForCausalLM(
             wrapper,
-            _mapping(rank, 4, 4),
+            mapping,
             _quant(),
             is_multimodal_active=False,
             mm_attention_backend=None,
@@ -1960,7 +1970,8 @@ def _checkpoint(config):
     "active,encoder_only", [(True, False), (False, False), (True, True)]
 )
 def test_multimodal_checkpoint_load(monkeypatch, tmp_path, active, encoder_only):
-    _mock_loader_hardware(monkeypatch)
+    mapping = _mapping(0, 4, 4)
+    _mock_loader_hardware(monkeypatch, mapping)
     text_config = _loader_config()
     config = SimpleNamespace(
         text_config=text_config,
@@ -1978,7 +1989,7 @@ def test_multimodal_checkpoint_load(monkeypatch, tmp_path, active, encoder_only)
     with set_default_torch_dtype(torch.bfloat16):
         model = v41.DeepseekV41ForCausalLM(
             config=config,
-            mapping=_mapping(0, 4, 4),
+            mapping=mapping,
             quant_config=_quant(),
             is_multimodal_active=active,
             mm_attention_backend="triton_attn",
@@ -2362,8 +2373,9 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
     expected_ids = (expected_scores + expected_bias).topk(topk, dim=-1).indices
     expected_weights = expected_scores.gather(1, expected_ids)
     if topk > 1:
-        expected_weights /= expected_weights.sum(-1, keepdim=True) + 1e-20
-    torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
+        # Even tiny positive scores normalize to unit sum, without an additive eps.
+        expected_weights /= expected_weights.sum(-1, keepdim=True)
+    torch.testing.assert_close(ids, expected_ids.to(torch.int32), rtol=0, atol=0)
     torch.testing.assert_close(weights, expected_weights, rtol=0, atol=0)
 
 

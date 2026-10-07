@@ -218,7 +218,12 @@ With `--moe-backend flashinfer_trtllm`, NVFP4 expert shards are automatically
 padded to a multiple of 64 along their per-rank intermediate dimension. The
 packed weights and block scales in the padded tail are zero-filled, so the
 extra dimensions do not change the MoE result. For example, a 640-wide expert
-under MoE TP4 is padded from 160 to 192 values per rank.
+under MoE TP4 is padded from 160 to 192 values per rank. BF16 SiLU/SwiGLU
+expert shards are zero-padded the same way to a multiple of 64 (128 when the
+installed FlashInfer launcher cannot be adapted, or when FlashInfer's JIT cannot
+build the adapted one, for example without nvcc). For example, Qwen3-30B-A3B's
+768-wide experts need no padding under MoE TP4 (192 per rank), while a 96-wide
+shard is padded to 128.
 
 On Hopper, MXFP4 routed experts with a SiLU/SwiGLU activation and dense EP
 (`--all2all-backend none`) default to the FlashInfer CUTLASS mixed-input
@@ -702,6 +707,39 @@ Rules:
 Apply the same NCCL transport and channel settings on every node as well. In
 particular, do not mix IB and Socket selection or different
 `NCCL_MIN_NCHANNELS` / `NCCL_MAX_NCHANNELS` values across ranks.
+
+## Emulating Rank 0 on One GPU
+
+`--emulate-rank-zero` runs only global rank 0 of the configured layout, so the
+per-rank work of a multi-GPU deployment can be profiled on a single GPU:
+
+```bash
+tokenspeed serve <model> --tp 8 --emulate-rank-zero --load-format dummy
+```
+
+The layout resolves as usual (TP8 here), so the rank builds the weight shards,
+kernels and cache sizing rank 0 of the full deployment would. Its collectives
+are local stand-ins that return the real shapes and dtypes, filled from this
+rank's operand alone.
+
+Compared with the real rank:
+
+- Communication takes no time, and the fused all-reduce paths are off because
+  they need peers; their epilogues run as separate kernels.
+- Values after a reduction are this rank's partial results, so outputs are not
+  meaningful and data-dependent work such as MoE routing follows the emulated
+  values.
+
+The flag is often combined with `--load-format dummy`, which reads only the
+model's config and tokenizer, not its weights. With dummy weights, also set
+`TOKENSPEED_MOE_ROUTING_SIMULATION=uniform` so tokens spread over experts
+instead of all picking the same ones, and, with speculative decoding, set
+`TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN` to the `avg_accept_len` of a real run.
+
+The flag is currently supported on AMD GPUs, on one node, without pipeline,
+context or attention data parallelism, an MoE TP x EP size other than the
+attention TP size, `--mm-encoder-tp-mode data`, PD disaggregation, fused
+all-reduce or an `--all2all-backend` transport.
 
 ## Runtime Notes
 

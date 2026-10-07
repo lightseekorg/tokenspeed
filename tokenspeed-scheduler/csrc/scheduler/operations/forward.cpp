@@ -401,7 +401,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                         .extent_tokens = request->PrefillSize(),
                         .first_block = (request->PrefillSize() - 1) / block_granularity,
                     };
-                } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
+                } else if (group.Kind() == AttnKind::kSlidingWindow) {
                     const std::int32_t retained_begin =
                         std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
                     demands[i].extent = SparseSuffix{

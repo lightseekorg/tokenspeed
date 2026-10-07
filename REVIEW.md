@@ -91,3 +91,53 @@ Mention `@claude` in a new issue/PR conversation comment or inline PR review
 comment to request a reply. Both jobs load the official `pr-review-toolkit`
 plugin. This CPU runner reviews source and CI evidence; GPU tests remain in
 the repository's existing CI workflows.
+
+## CI workflow setup and operation
+
+[The CI planning workflow](.github/workflows/pr-ci-plan.yml) handles same-repository
+branch PRs on `opened`, `synchronize`, and `reopened`, including drafts. Fork PRs
+and runs triggered by `dependabot[bot]` are skipped. It uses a GitHub-hosted CPU
+runner and posts a coverage proposal for the exact head and base commits; a newer
+push cancels the previous run. General code review remains with the existing
+reviewer. It does not approve PRs, change required checks, or merge automatically.
+
+The workflow calls [the planning script](.github/scripts/pr-ci-model.py) with
+`prepare`, `plan`, and `publish` stages. Maintain the planner instructions in
+[the agent prompt](.github/scripts/pr-ci-planner.md).
+
+The API must implement the OpenAI-compatible protocol. Configure these organization
+Actions variables and secrets with `all` repository access to share them across the
+organization. Keep the publishing token as a repository secret:
+
+| Setting | Kind | Value |
+| --- | --- | --- |
+| `KIMI_API_URL` | Organization variable | Provider API base URL, including its API version path |
+| `KIMI_MODEL` | Organization variable | Model ID accepted by that endpoint |
+| `KIMI_API_KEY` | Organization secret | API token for that endpoint |
+| `LIGHTSEEK_BOT_TOKEN` | Repository secret | Token for `lightseek-bot` with organization variable read and PR comment write access |
+
+The planner runs from a separate temporary directory with only `Read`, `Grep`, and
+`Glob` tools. GitHub authentication is available only to the configuration and
+publishing steps. Failed, empty, oversized, or sensitive output is not published;
+raw CLI events and logs are not uploaded. Same-repository contributors can edit
+the workflow, so repository write access remains the trust boundary.
+
+[The coverage validator](.github/scripts/pr_ci_plan.py) reuses the existing task
+loader and UT target discovery, including manual tasks. The planner verifies PR
+title/body hints against changed code, callers and test assertions, then orders a
+small set of focused test files and model CI tasks with code-to-coverage reasons.
+Comments use one scope sentence, a priority table with short source-linked names,
+and a status line; runner routing and material coverage limits stay explicit.
+It does not append a full baseline merely because a shared directory changed.
+Recommendations must refer to tracked test files and catalogued tasks/runners.
+This is advisory prioritization; required checks and merge policy are unchanged.
+
+Run diagnostics through the existing K8s Dispatch and Slurm Dispatch workflows.
+Prioritize Slurm GB200 for NVIDIA, check GB300 if GB200 is full, and use K8s AMD
+for AMD changes. Slurm recommendations retain declared logical runner labels;
+they name the actual cluster separately and mark B200 tasks as cross-hardware.
+For a single Slurm task use bulk mode (`yaml=off`) with its full config path as
+`match`, one declared `runners` label, its `task_types`, and `trigger=all`; this
+avoids single-YAML mode replaying multiple labels on the same physical cluster.
+Retry Failed CI Cases replays retained Slurm reports. Completion evaluation,
+automatic dispatch, source repair and merge-policy integration are separate work.

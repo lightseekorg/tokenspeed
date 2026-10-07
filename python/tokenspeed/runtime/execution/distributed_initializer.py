@@ -22,6 +22,8 @@ from dataclasses import dataclass
 
 import torch
 
+from tokenspeed.runtime.distributed.comm_backend import set_global_backend
+from tokenspeed.runtime.distributed.comm_backend.emulated import EmulatedRankBackend
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -72,6 +74,11 @@ class DistributedConfig:
 
     # Network configuration
     nccl_port: int
+
+    # Run this rank alone, with local stand-ins for its collectives
+    # (--emulate-rank-zero).
+    emulate_rank_zero: bool
+
     dist_init_addr: str | None = None
     distributed_timeout_seconds: int = 1800
 
@@ -116,6 +123,7 @@ class DistributedConfig:
             moe_ep_size=mapping.moe.ep_size,
             moe_ep_rank=mapping.moe.ep_rank,
             nccl_port=port_args.nccl_port,
+            emulate_rank_zero=server_args.emulate_rank_zero,
             dist_init_addr=port_args.dist_init_addr,
             distributed_timeout_seconds=(
                 server_args.distributed_timeout_seconds
@@ -164,14 +172,23 @@ class DistributedInitializer:
             None if backend == "hccl" else torch.device(config.device, config.gpu_id)
         )
 
-        # Initialize distributed via the mapping-based process group manager
-        pg_manager.init_distributed(
-            config.mapping,
-            backend=backend,
-            distributed_init_method=dist_init_method,
-            timeout=config.distributed_timeout_seconds,
-            device_id=device_id,
-        )
+        if config.emulate_rank_zero:
+            pg_manager.init_emulated_rank_zero(
+                backend=backend,
+                distributed_init_method=dist_init_method,
+                timeout=config.distributed_timeout_seconds,
+                device_id=device_id,
+            )
+            set_global_backend(EmulatedRankBackend(rank=config.mapping.rank))
+        else:
+            # Initialize distributed via the mapping-based process group manager
+            pg_manager.init_distributed(
+                config.mapping,
+                backend=backend,
+                distributed_init_method=dist_init_method,
+                timeout=config.distributed_timeout_seconds,
+                device_id=device_id,
+            )
         pg_manager.init_process_group(config.mapping.world_group)
         pg_manager.init_process_group(config.mapping.attn.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)

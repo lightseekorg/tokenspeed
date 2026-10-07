@@ -126,6 +126,25 @@ class LLBf16Router:
             )
         )
 
+    @staticmethod
+    def uses_dotprod(m: int, k: int) -> bool:
+        """Whether ``[M, K]`` runs the dot-product kernel, compiled once per exact M.
+
+        Every split-K cluster rank must own at least one K tile. Router
+        projections are normally wide enough, but low-rank consumers (for
+        example a padded rank-320 hyperconnection up projection) are not, so
+        they take the CTA-local dot-product kernel instead of launching a
+        cluster whose idle ranks can never complete.
+
+        Args:
+            m: Token count; k: reduction width.
+
+        Returns:
+            True for the dot-product kernel, False for split-K.
+        """
+        split_k, _ = splitk_config_for(m)
+        return m <= MAX_M_DOTPROD or k < split_k * _SPLITK_TILE_K
+
     def _compile_dotprod(
         self,
         m: int,
@@ -284,15 +303,8 @@ class LLBf16Router:
         device = a.device
         stream = self._stream(device)
         enable_pdl = pdl_enabled() and torch.cuda.get_device_capability(device)[0] >= 9
-        # Every split-K cluster rank must own at least one K tile. Router
-        # projections are normally wide enough, but low-rank consumers (for
-        # example a padded rank-320 hyperconnection up projection) are not.
-        # Route those shapes through the CTA-local dot-product kernel instead
-        # of launching a cluster whose idle ranks can never complete.
         config = splitk_config_for(m)
-        split_k, _ = config
-        use_dotprod = m <= MAX_M_DOTPROD or k < split_k * _SPLITK_TILE_K
-        if use_dotprod:
+        if self.uses_dotprod(m, k):
             if block_size is None:
                 block_size = block_size_for(m)
             key = (
