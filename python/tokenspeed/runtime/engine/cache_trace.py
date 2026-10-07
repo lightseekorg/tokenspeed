@@ -80,7 +80,12 @@ class CacheTraceWriter:
         try:
             self._write({"kind": "capture_start", "history_complete": False})
             while True:
-                batch = self._queue.get()
+                try:
+                    batch = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    if not self._closed:
+                        continue
+                    batch = None
                 if batch is None:
                     if self._dropped:
                         self._write(
@@ -113,5 +118,4 @@ class CacheTraceWriter:
             self._queue.put(None, timeout=1)
         except queue.Full:
             logger.warning("Cache diagnostic capture ended with an undrained queue")
-            return
         self._thread.join(timeout=1)

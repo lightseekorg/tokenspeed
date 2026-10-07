@@ -734,25 +734,26 @@ class OutputProcesser:
     ) -> None:
         # Replayed rows re-feed cached positions: the hit reaches to the end of
         # the replay window, not to where the model input starts.
+        trace_events = [] if self.cache_trace is not None else None
         for rid, prefix_len, replay_len in zip(
             rids, extend_prefix_lens, extend_replay_lens
         ):
             if rs := self.rid_to_state.get(rid):
                 credited = max(0, prefix_len + replay_len - rs.computed_length)
                 rs.cached_tokens += credited
-                if self.cache_trace is not None and credited:
-                    self.cache_trace.publish(
-                        [
-                            {
-                                "kind": "cache_accounting",
-                                "request_id": rid,
-                                "cached_tokens_delta": credited,
-                                "cached_tokens": rs.cached_tokens,
-                                "computed_tokens_before": rs.computed_length,
-                                "matched_end_tokens": prefix_len + replay_len,
-                            }
-                        ]
+                if trace_events is not None and credited:
+                    trace_events.append(
+                        {
+                            "kind": "cache_accounting",
+                            "request_id": rid,
+                            "cached_tokens_delta": credited,
+                            "cached_tokens": rs.cached_tokens,
+                            "computed_tokens_before": rs.computed_length,
+                            "matched_end_tokens": prefix_len + replay_len,
+                        }
                     )
+        if trace_events:
+            self.cache_trace.publish(trace_events)
 
     def post_process_forward_op(
         self,
