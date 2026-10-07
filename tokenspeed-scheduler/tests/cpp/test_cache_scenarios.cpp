@@ -3047,8 +3047,8 @@ TEST(CacheProgressTest, PrefillBoundariesSurviveFeedbackAndFailedAdmission) {
     TokenContainer tokens{{1, 1, 1}};
     fsm::ForwardResources resources{.token_container = &tokens, .prefix_granularity = 4};
     // Only scheduled prefill provenance supplies reusable boundaries.
-    // Exercise duplicate and unaligned rejection independently of feedback.
-    for (const std::int32_t boundary : {4, 4, 8, 13, 16}) {
+    // Exercise duplicate, older and unaligned rejection independently of feedback.
+    for (const std::int32_t boundary : {4, 8, 8, 4, 13}) {
         resources.cache_progress.RecordMaterializedStateBoundary(boundary, 4);
     }
     // Back-to-back results land at 4, 8, 13 and 16, but must neither add
@@ -3056,9 +3056,9 @@ TEST(CacheProgressTest, PrefillBoundariesSurviveFeedbackAndFailedAdmission) {
     for (const std::int32_t count : {1, 1, 4, 5, 3, 0}) {
         resources.ExtendTokens(std::vector<std::int32_t>(count, 2));
     }
-    EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{4, 8, 16}));
+    EXPECT_EQ(resources.cache_progress.materialized_state_boundary, 8);
     resources.ExtendTokens(std::vector<std::int32_t>(4, 2));  // aligned decode endpoint 20
-    EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{4, 8, 16}));
+    EXPECT_EQ(resources.cache_progress.materialized_state_boundary, 8);
 
     // Two state pages per prefix interval: only the interval's endpoint page
     // is a snapshot slot.
@@ -3081,7 +3081,7 @@ TEST(CacheProgressTest, PrefillBoundariesSurviveFeedbackAndFailedAdmission) {
                 .prefix_hashes = staged.prefix_hashes,
                 .first_new_prefix_page = 0,
                 .retained_prefix_pages = 2,  // the Endpoint at 8 is a proven checkpoint
-                .materialized_state_boundaries = staged.materialized_state_boundaries,
+                .materialized_state_boundary = staged.materialized_state_boundary,
             },
         .num_computed_tokens = 13,
     };
@@ -3089,14 +3089,14 @@ TEST(CacheProgressTest, PrefillBoundariesSurviveFeedbackAndFailedAdmission) {
         coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, progress, admission->access_epoch));
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
     EXPECT_TRUE(resources.cache_progress.prefix_hashes.empty());
-    EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{4, 8, 16}));
+    EXPECT_EQ(resources.cache_progress.materialized_state_boundary, 8);
 
     demand.extent = DenseGrowth{0};
     ASSERT_TRUE(
         coordinator.Admit(coordinator.ProbePrefix({}), std::span{&demand, 1}, progress, admission->access_epoch));
-    staged.DiscardHashedStateBoundaries(4);
+    staged.DiscardHashedStateBoundary(4);
     resources.cache_progress = std::move(staged);
-    EXPECT_EQ(resources.cache_progress.materialized_state_boundaries, (std::vector<std::int32_t>{16}));
+    EXPECT_FALSE(resources.cache_progress.materialized_state_boundary);
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 1);
     for (std::int32_t page = 0; page < 3; ++page) {
         for (std::int32_t offset = 0; offset < 2; ++offset) {

@@ -59,7 +59,7 @@ inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span
                                         std::span<const std::string> prefix_hashes, std::uint64_t access_epoch,
                                         std::int32_t first_new_prefix_page, std::int32_t num_computed_tokens,
                                         bool retains_boundary, bool stream_completed_to_host,
-                                        std::span<const std::int32_t> materialized_state_boundaries) {
+                                        std::optional<std::int32_t> materialized_state_boundary) {
     _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()), "tables/groups size mismatch");
     _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
             "completed page range must be non-empty");
@@ -71,7 +71,7 @@ inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span
                 // The newest hashed boundary, when the range retains one.
                 .retained_prefix_pages = retains_boundary ? static_cast<std::int32_t>(prefix_hashes.size()) : 0,
                 .stream_completed_to_host = stream_completed_to_host,
-                .materialized_state_boundaries = materialized_state_boundaries,
+                .materialized_state_boundary = materialized_state_boundary,
             },
         .num_computed_tokens = num_computed_tokens,
     };

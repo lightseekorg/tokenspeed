@@ -170,13 +170,13 @@ An aligned endpoint is itself the checkpoint; an extent crossing no boundary
 needs only its final output. Only materialized aligned checkpoints are cached;
 an off-boundary endpoint is never keyed as a complete prefix.
 
-`CacheProgress::materialized_state_boundaries` records the aligned checkpoints
-produced by admitted prefill windows: local prefill records its last aligned
+`CacheProgress::materialized_state_boundary` records the aligned checkpoint
+produced by an admitted prefill window: local prefill records its last aligned
 boundary, and a remote landing records only an aligned endpoint. Publication
-uses the preceding window's record before the next prefill advances it.
-Only recorded boundaries within the newly hashed range are eligible. A
-successful admission discards the covered records; a failed one leaves them
-for retry.
+uses the preceding window's record before the next prefill advances it, so at
+most one record is pending. State publishes the retained boundary only when it
+is the recorded one. A successful admission discards the covered record; a
+failed one leaves it for retry.
 
 Only materialized State Endpoint/Promoted boundaries are published; ordinary
 Chunks remain request-owned. For newly completed prefix hashes, the last aligned

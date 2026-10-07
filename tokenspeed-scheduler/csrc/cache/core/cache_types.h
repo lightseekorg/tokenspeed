@@ -139,8 +139,8 @@ struct CompletedPages {
     // Decode leaves this false.
     bool stream_completed_to_host{false};
     // Exact prefill checkpoint provenance. Allocation and token progress are
-    // not proof. An empty span disables state publication for this range.
-    std::span<const std::int32_t> materialized_state_boundaries{};
+    // not proof. Without one, state publishes nothing for this range.
+    std::optional<std::int32_t> materialized_state_boundary{};
 };
 
 // Per-request facts about the past that ride along with one admission:

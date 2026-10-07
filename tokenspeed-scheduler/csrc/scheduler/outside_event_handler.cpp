@@ -121,7 +121,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
                         .first_new_prefix_page = first_new_prefix_page,
                         .retained_prefix_pages = retained_prefix_pages,
                         .stream_completed_to_host = false,
-                        .materialized_state_boundaries = progress.materialized_state_boundaries,
+                        .materialized_state_boundary = progress.materialized_state_boundary,
                     },
                 .num_computed_tokens = num_computed_tokens,
             },

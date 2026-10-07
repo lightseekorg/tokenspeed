@@ -617,9 +617,9 @@ Its responsibilities:
   publishes every keyed filled Device destination. Host-only L2 load-backs
   leave `BlockTransfer.key` empty and stay on the admit-time
   `CacheFullBlocks` path.
-  For Mamba-state groups, `CacheCompletedBlocks` publishes only explicitly
-  listed materialized boundaries inside the newly hashed range; an empty list
-  publishes no state snapshots (see
+  For Mamba-state groups, `CacheCompletedBlocks` publishes the retained
+  boundary only when it is the recorded materialized checkpoint; without one
+  it publishes no state snapshot (see
   [Scheduler §1.2](scheduler.md#12-state-checkpoints-one-forward)).
   Ordinary sliding-window groups publish only the window behind an Endpoint
   (the prompt's last aligned boundary, or the computed frontier of an L2

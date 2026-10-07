@@ -478,13 +478,11 @@ TEST(CacheOperationTest, ComputedStateChunkDoesNotQueueAStoreButEndpointUsesNorm
         const std::vector<std::string> hashes{"state2"};
         const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
         std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
-        CacheCompletedBlocksForTest(coordinator, tables, hashes, 1, 0, 2, /*retains_boundary=*/false, true,
-                                    std::array{2});
+        CacheCompletedBlocksForTest(coordinator, tables, hashes, 1, 0, 2, /*retains_boundary=*/false, true, 2);
         EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
         coordinator.QueueLatestSnapshotBlocksForStore(hashes);
         EXPECT_FALSE(transfers.StartPendingStores(guard));
-        CacheCompletedBlocksForTest(coordinator, tables, hashes, 2, 0, 2, /*retains_boundary=*/true, true,
-                                    std::array{2});
+        CacheCompletedBlocksForTest(coordinator, tables, hashes, 2, 0, 2, /*retains_boundary=*/true, true, 2);
         const auto store = transfers.StartPendingStores(guard);
         ASSERT_TRUE(store);
         ASSERT_EQ(store->transfers.size(), 1u);
