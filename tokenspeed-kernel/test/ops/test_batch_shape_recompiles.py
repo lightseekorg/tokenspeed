@@ -692,9 +692,15 @@ def test_merge_prefill_checkpoint_outputs_token_counts():
     def run(body_tokens, tail_tokens, extent):
         body = torch.randn(body_tokens, 3, 4, device=DEVICE).transpose(-1, -2)
         tail = torch.randn(tail_tokens, 3, 4, device=DEVICE).transpose(-1, -2)
-        order = torch.randperm(extent, device=DEVICE)
-        body_indices = order[:body_tokens].clone()
-        tail_indices = order[body_tokens : body_tokens + tail_tokens].clone()
+        # Index views start one element in, off 16-byte alignment, as batch slices do.
+        order = torch.cat(
+            [
+                torch.zeros(1, device=DEVICE, dtype=torch.int64),
+                torch.randperm(extent, device=DEVICE),
+            ]
+        )[1:]
+        body_indices = order[:body_tokens]
+        tail_indices = order[body_tokens : body_tokens + tail_tokens]
         body_indices[::5] = -1
         expected = torch.zeros(extent, 4, 3, device=DEVICE)
         for source, indices in ((body, body_indices), (tail, tail_indices)):
@@ -705,7 +711,7 @@ def test_merge_prefill_checkpoint_outputs_token_counts():
         )
         torch.testing.assert_close(merged, expected, rtol=0, atol=0)
 
-        sources = torch.full((extent,), -1, dtype=torch.int64, device=DEVICE)
+        sources = torch.full((extent + 1,), -1, dtype=torch.int64, device=DEVICE)[1:]
         concat = torch.cat((body_indices, tail_indices))
         live = concat >= 0
         sources[concat[live]] = torch.arange(concat.numel(), device=DEVICE)[live]
@@ -715,12 +721,14 @@ def test_merge_prefill_checkpoint_outputs_token_counts():
         torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
 
     run(16, 16, 40)
-    run(9, 7, 21)
     with assert_no_triton_compile(
         ckpt._scatter_checkpoint_output_kernel, ckpt._gather_checkpoint_output_kernel
     ):
         for body_tokens, tail_tokens, extent in (
+            (9, 7, 21),
+            (1, 1, 2),
             (11, 5, 19),
+            (32, 16, 48),
             (37, 13, 60),
             (70, 3, 90),
         ):

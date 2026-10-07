@@ -122,22 +122,22 @@ def build_causal_conv1d_capacity_metadata(
     return metadata
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["chunk_offsets"])
 def _build_causal_conv1d_metadata_kernel(
     query_start_loc,
     batch_indices,
     chunk_offsets,
-    num_requests,
     BLOCK_M: tl.constexpr,
     REQUEST_BLOCK: tl.constexpr,
     STORE_BLOCK: tl.constexpr,
 ):
     request = tl.program_id(0)
-    rows = tl.arange(0, REQUEST_BLOCK)
-    starts = tl.load(query_start_loc + rows, mask=rows < num_requests, other=0)
-    ends = tl.load(query_start_loc + rows + 1, mask=rows < num_requests, other=0)
-    chunks = tl.cdiv(ends - starts, BLOCK_M)
-    first_chunk = tl.sum(tl.where(rows < request, chunks, 0))
+    first_chunk = tl.zeros((), query_start_loc.dtype.element_ty)
+    for base in range(0, request, REQUEST_BLOCK):
+        rows = base + tl.arange(0, REQUEST_BLOCK)
+        starts = tl.load(query_start_loc + rows, mask=rows < request, other=0)
+        ends = tl.load(query_start_loc + rows + 1, mask=rows < request, other=0)
+        first_chunk += tl.sum(tl.cdiv(ends - starts, BLOCK_M))
     start = tl.load(query_start_loc + request)
     end = tl.load(query_start_loc + request + 1)
     count = tl.cdiv(end - start, BLOCK_M)
@@ -204,9 +204,8 @@ def build_causal_conv1d_prefill_metadata(
             query_start_loc,
             metadata.batch_indices,
             metadata.chunk_offsets,
-            len(lengths),
             BLOCK_M=block_m,
-            REQUEST_BLOCK=triton.next_power_of_2(len(lengths)),
+            REQUEST_BLOCK=128,
             STORE_BLOCK=256,
         )
     else:
