@@ -22,6 +22,7 @@ better tile utilization; remaining query groups are scheduled across the query
 sequence dimension.
 
 SM107 support requires CuTe DSL 4.8.0 or newer and a compatible CUDA toolkit.
+Decode compilation and GPU regression tests also reject CuTe DSL warnings.
 
 ## Performance Numbers
 

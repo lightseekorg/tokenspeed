@@ -273,8 +273,8 @@ def aligned_max_scheduled_tokens(
 ) -> int:
     """Floor ``max_scheduled_tokens`` to the state-snapshot grain, if any.
 
-    Recurrent-state groups (family=State, the C++ ``IsSnapshotStateGroup``
-    criterion) register their state snapshot only when a prefill chunk ends
+    Recurrent-state groups (family=State, the C++ ``AttnKind::kMambaState``
+    kind) register their state snapshot only when a prefill chunk ends
     exactly on a CacheBlock boundary (``RegistersAlignedFinalPageOnly``);
     interior boundaries never received a state write. A chunk size that is
     not a multiple of every such group's CacheBlock token span therefore

@@ -22,8 +22,10 @@ import copy
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github/scripts"))
 import pr_ci_assist as assist
@@ -83,6 +85,135 @@ def test_only_actual_writer_can_issue_command(monkeypatch):
         assist.pull(123)
 
 
+def test_plan_source_only_activates_for_current_open_pr(monkeypatch, tmp_path):
+    pr = dict(
+        number=123,
+        state="open",
+        head={"sha": "a" * 40, "repo": {"full_name": REPO}},
+        base={"sha": "b" * 40, "ref": "main"},
+    )
+    event = tmp_path / "event.json"
+    result = tmp_path / "output"
+    event.write_text(json.dumps({"pull_request": pr}))
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(result))
+    monkeypatch.setattr(assist, "api", lambda path: pr)
+    assist.plan_source()
+    assert dict(line.split("=", 1) for line in result.read_text().splitlines()) == {
+        "active": "true",
+        "pr": "123",
+        "head": "a" * 40,
+        "base": "b" * 40,
+    }
+    result.write_text("")
+    pr["state"] = "closed"
+    assist.plan_source()
+    assert result.read_text() == "active=false\n"
+    result.write_text("")
+    pr.update(state="open", head={**pr["head"], "sha": "c" * 40})
+    assist.plan_source()
+    assert result.read_text() == "active=false\n"
+    result.write_text("")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+    event.write_text(json.dumps({"ref": "refs/heads/main"}))
+    monkeypatch.setattr(
+        assist, "api", lambda path: pytest.fail("Main pushes must not resolve a PR")
+    )
+    assist.plan_source()
+    assert result.read_text() == "active=false\n"
+    workflow = yaml.safe_load(
+        (assist.ROOT / ".github/workflows/pr-ci-plan.yml").read_text()
+    )
+    triggers = workflow.get("on", workflow.get(True))
+    assert set(triggers) == {"pull_request", "workflow_dispatch"}
+    steps = workflow["jobs"]["plan"]["steps"]
+    source = next(i for i, step in enumerate(steps) if step.get("id") == "source")
+    assert all(
+        step["if"] == "steps.source.outputs.active == 'true'"
+        for step in steps[source + 1 :]
+    )
+
+
+def test_main_ci_completion_skips_before_resolving_pr(monkeypatch, tmp_path):
+    event = tmp_path / "event.json"
+    event.write_text(
+        json.dumps(
+            dict(
+                action="completed",
+                workflow_run=dict(
+                    event="push",
+                    head_branch="main",
+                    head_sha="a" * 40,
+                    pull_requests=[],
+                    display_title="Main CI",
+                ),
+            )
+        )
+    )
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    monkeypatch.setattr(
+        assist, "api", lambda *args: pytest.fail("Main CI looked up a PR")
+    )
+    monkeypatch.setattr(
+        assist, "pages", lambda *args: pytest.fail("Main CI looked up commits")
+    )
+    emitted = []
+    monkeypatch.setattr(assist, "output", lambda *args: emitted.append(args))
+    assist.resolve()
+    assert not emitted
+    workflow = yaml.safe_load(
+        (assist.ROOT / ".github/workflows/pr-ci-assist.yml").read_text()
+    )
+    assert "NVIDIA Kernel Library Tests" in workflow[True]["workflow_run"]["workflows"]
+    assert workflow[True]["workflow_run"]["branches-ignore"] == ["main"]
+    assert "workflow_call" in workflow[True]
+    dispatcher = yaml.safe_load(
+        (assist.ROOT / ".github/workflows/pr-ci-assist-dispatch.yml").read_text()
+    )
+    assert dispatcher[True]["workflow_run"]["branches"] == ["main"]
+    assert dispatcher[True]["workflow_run"]["workflows"] == [
+        "PR CI Plan",
+        "Slurm Dispatch",
+        "K8s Dispatch",
+    ]
+    assert (
+        dispatcher["jobs"]["assist"]["uses"] == "./.github/workflows/pr-ci-assist.yml"
+    )
+    assert dispatcher["jobs"]["assist"]["secrets"] == "inherit"
+    condition = (
+        workflow["jobs"]["resolve"]["if"]
+        .replace("\n", " ")
+        .replace("&&", "and")
+        .replace("||", "or")
+    )
+    github = SimpleNamespace(
+        repository=REPO,
+        event_name="workflow_run",
+        event=SimpleNamespace(
+            workflow_run=SimpleNamespace(event="push"),
+            issue=SimpleNamespace(pull_request=True),
+            comment=SimpleNamespace(body="Ordinary PR comment"),
+        ),
+    )
+    context = {
+        "github": github,
+        "contains": lambda text, part: part.lower() in text.lower(),
+    }
+    assert not eval(condition, {"__builtins__": {}}, context)
+    github.event.workflow_run.event = "pull_request"
+    assert eval(condition, {"__builtins__": {}}, context)
+    github.event.workflow_run.event = "workflow_dispatch"
+    assert eval(condition, {"__builtins__": {}}, context)
+    github.event_name = "issue_comment"
+    assert not eval(condition, {"__builtins__": {}}, context)
+    github.event.comment.body = "@LIGHTSEEK-BOT\tWATCH"
+    assert eval(condition, {"__builtins__": {}}, context)
+    github.event.issue.pull_request = False
+    assert not eval(condition, {"__builtins__": {}}, context)
+
+
 def test_state_is_typed_and_bot_owned(selected):
     _, state = selected
     comment = {"user": {"login": BOT, "id": BOT_ID}, "body": marker("assist", state)}
@@ -95,11 +226,13 @@ def test_state_is_typed_and_bot_owned(selected):
     assert record(comment, "assist") is None
 
 
-def test_native_cpu_result_needs_current_source_and_executed_test(
-    monkeypatch, selected
+@pytest.mark.parametrize(
+    "workflow", ["scheduler-cpp-test.yml", "nvidia-kernel-library-tests.yml"]
+)
+def test_native_result_needs_current_source_and_executed_test(
+    monkeypatch, selected, workflow
 ):
     _, state = selected
-    workflow = "scheduler-cpp-test.yml"
     check = {"workflow": workflow, **NATIVE_CHECKS[workflow]}
     run = dict(
         id=101,
@@ -117,9 +250,14 @@ def test_native_cpu_result_needs_current_source_and_executed_test(
         conclusion="success",
     )
     step = dict(name=check["step"], status="completed", conclusion="success")
-    job = dict(name="test", status="completed", conclusion="success", steps=[step])
+    job = dict(
+        name=check["job"], status="completed", conclusion="success", steps=[step]
+    )
     monkeypatch.setattr(assist, "pages", lambda path, field: [job])
     assert assist.native_check(check, state, [run])["status"] == "passed"
+    job["conclusion"] = "skipped"
+    assert assist.native_check(check, state, [run])["status"] == "waiting"
+    job["conclusion"] = "success"
     step["conclusion"] = "skipped"
     assert assist.native_check(check, state, [run])["status"] == "missing"
     newer = {**run, "id": 102, "status": "in_progress"}
@@ -315,9 +453,18 @@ def test_incomplete_old_plan_refreshes_once_and_failed_refresh_requests_help(
     }
     with pytest.raises(assist.CoverageError):
         assist.validate_plan(plan, data)
+    data["paths"] = ["tokenspeed-mla/python/tokenspeed_mla/mla_decode_fp8.py"]
+    plan["tests"] = []
+    with pytest.raises(assist.CoverageError, match="serving CI task"):
+        assist.validate_plan(plan, data)
+    data["paths"] = []
+    plan["tests"] = [test]
     comments = [{"user": {"login": BOT, "id": BOT_ID}, "body": marker("plan", plan)}]
     pr = dict(
-        number=state["pr"], head={"sha": state["head"]}, base={"sha": state["base"]}
+        number=state["pr"],
+        state="open",
+        head={"sha": state["head"], "repo": {"full_name": REPO}},
+        base={"sha": state["base"], "ref": "main"},
     )
     event = tmp_path / "event.json"
     event.write_text("{}")
@@ -341,12 +488,16 @@ def test_incomplete_old_plan_refreshes_once_and_failed_refresh_requests_help(
         assist,
         "api",
         lambda path: (
-            refresh
-            if path.endswith("/56")
-            else dict(
-                path=".github/workflows/pr-ci-plan.yml",
-                conclusion="success",
-                display_title=title,
+            pr
+            if path == f"pulls/{state['pr']}"
+            else (
+                refresh
+                if path.endswith("/56")
+                else dict(
+                    path=".github/workflows/pr-ci-plan.yml",
+                    conclusion="success",
+                    display_title=title,
+                )
             )
         ),
     )
@@ -374,6 +525,7 @@ def test_incomplete_old_plan_refreshes_once_and_failed_refresh_requests_help(
     assert len(commands) == 1 and len(published) == 1
     run = dict(
         id=56,
+        event="workflow_dispatch",
         name=title,
         display_title=title,
         conclusion="failure",
@@ -677,7 +829,9 @@ def test_cancelled_repair_is_recovered_on_next_reconciliation(
     assert state["phase"] == "manual" and len(messages) == 1
 
 
-def test_dispatch_event_uses_tested_source_not_main_controller(monkeypatch, tmp_path):
+def test_dispatch_event_uses_tested_source_not_main_controller(
+    monkeypatch, tmp_path, selected
+):
     event = tmp_path / "event.json"
     tested, controller = "c" * 40, "b" * 40
     event.write_text(
@@ -685,6 +839,7 @@ def test_dispatch_event_uses_tested_source_not_main_controller(monkeypatch, tmp_
             {
                 "action": "completed",
                 "workflow_run": {
+                    "event": "workflow_dispatch",
                     "pull_requests": [],
                     "head_sha": controller,
                     "display_title": f"Slurm {tested} | test/ci/ut/example.yaml | b200-1gpu | gb200",
@@ -694,8 +849,19 @@ def test_dispatch_event_uses_tested_source_not_main_controller(monkeypatch, tmp_
     )
     monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
     monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    _, state = selected
+    state["head"] = tested
+    command_comment = dict(
+        id=state["command"],
+        body="@lightseek-bot watch",
+        user={"login": "example"},
+        issue_url=f"https://api.github.com/repos/{REPO}/issues/123",
+    )
+    comments = []
 
     def pages(path, field):
+        if path == "issues/123/comments":
+            return comments
         if path == f"commits/{tested}/pulls":
             return [
                 {"number": 999, "state": "closed"},
@@ -718,8 +884,47 @@ def test_dispatch_event_uses_tested_source_not_main_controller(monkeypatch, tmp_
 
     monkeypatch.setattr(assist, "pages", pages)
     resolved = []
-    monkeypatch.setattr(assist, "pull", lambda number: resolved.append(number))
+    pr = dict(
+        number=123,
+        state="open",
+        head={"repo": {"full_name": REPO}},
+        base={"ref": "main"},
+    )
+
+    def api(path):
+        if path == "collaborators/example/permission":
+            return {"permission": "write"}
+        if path == f"issues/comments/{state['command']}":
+            return command_comment
+        assert path == "pulls/123"
+        resolved.append(123)
+        return pr
+
+    monkeypatch.setattr(assist, "api", api)
     emitted = []
     monkeypatch.setattr(assist, "output", lambda *args: emitted.append(args))
     assist.resolve()
-    assert resolved == [123] and emitted == [("pr", "123")]
+    assert resolved == [123] and not emitted
+    comments.append(command_comment)
+    assist.resolve()
+    assert resolved == [123, 123] and emitted == [("pr", "123")]
+    comments.append(
+        {"user": {"login": BOT, "id": BOT_ID}, "body": marker("assist", state)}
+    )
+    emitted.clear()
+    assist.resolve()
+    assert emitted == [("pr", "123")]
+    state["phase"] = "done"
+    comments[-1]["body"] = marker("assist", state)
+    emitted.clear()
+    assist.resolve()
+    assert not emitted
+    comments.append({**command_comment, "id": state["command"] + 2})
+    assist.resolve()
+    assert emitted == [("pr", "123")]
+    pr["state"] = "closed"
+    emitted.clear()
+    assist.resolve()
+    assert not emitted
+    with pytest.raises(ValueError, match="open same-repository"):
+        assist.pull(123)

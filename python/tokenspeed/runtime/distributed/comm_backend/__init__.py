@@ -22,6 +22,7 @@ from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 from tokenspeed.runtime.distributed.comm_backend.registry import (
     get_global_backend,
     initialize_comm_backend,
+    set_global_backend,
 )
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "Group",
     "get_global_backend",
     "initialize_comm_backend",
+    "set_global_backend",
 ]

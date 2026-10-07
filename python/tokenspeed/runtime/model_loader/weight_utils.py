@@ -941,6 +941,28 @@ def initialize_dummy_weights(
                 param.uniform_(low, high, generator=generator)
 
 
+def initialize_dummy_integer_weights(model: torch.nn.Module, seed: int = 1234) -> None:
+    """Give integer parameters valid values in place of checkpoint data.
+
+    Integer parameters hold packed weights, E8M0 scale bytes and index tables,
+    where uninitialized memory can decode to inf or NaN or index out of range.
+    They are zeroed, which is valid for all three. A parameter can set
+    ``dummy_initializer(param, generator)`` when zero is valid but
+    unrepresentative, such as an expert-id table that would send every token
+    to one expert.
+    """
+    for param in model.parameters():
+        if torch.is_floating_point(param):
+            continue
+        initializer = getattr(param, "dummy_initializer", None)
+        if initializer is None:
+            param.data.zero_()
+            continue
+        generator = torch.Generator(device=param.data.device)
+        generator.manual_seed(seed)
+        initializer(param, generator)
+
+
 def record_non_unit_kv_scales(
     weights: Iterable[tuple[str, torch.Tensor]], rejected: list[str]
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
