@@ -52,7 +52,7 @@ The two shifts must cancel for any `depth_buf`, including graph warmup, which
 replays the forward without the step prep: `depth_buf` and `mask_buf` start as
 the chain the initial parents describe (`test_fresh_spec_is_the_chain`).
 
-### One tree attention: trtllm-gen for the prefix, a small kernel for the tree
+### One tree attention: the leaf's decode for the prefix, a small kernel for the tree
 
 Every row sees the committed prefix, and the 64-bit ancestor mask applies only
 to the last `W` keys (`W = N` for verify). The prefix is where the time goes at
@@ -68,6 +68,15 @@ An FP8 KV cache (E4M3, unscaled like every FP8 KV cache here) changes no
 structure: trtllm-gen takes the query cast to FP8 as it does for any decode,
 and `tree_window_attention` takes the unquantized query and widens the
 window's FP8 K/V to its dtype after loading them.
+
+MLA runs the same cascade over its latent cache. The prefix half is the leaf's
+own MLA decode with its base-2 log-sum-exp: trtllm-gen's MLA decode for
+`trtllm_mla`, the CuTe MLA decode (causal) for `tokenspeed_mla`. The window
+kernel reads each token's latent row once: its `kv_lora_rank` leading channels
+are both the key's latent part and the value, and the rotary channels after
+them add a second score product (`ROPE_DIM`; zero for GQA). The absorbed query
+the prologue returns is FP8 under an FP8 cache; the window kernel takes it
+widened back to the model dtype, which is exact.
 
 ### Recurrent state follows the parent
 
@@ -164,7 +173,8 @@ executor refuses tree drafting with them at startup.
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
 drafter refuses trees at startup); `greedy` and `triton` sampling backends; the `trtllm`
-attention backend with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
+attention backend, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
+decode context parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,
 no mixed batches, no pipeline parallelism, no prefill/decode disaggregation, no
 attention data parallelism, no sliding window or attention sinks in the target
@@ -177,7 +187,8 @@ Each attention backend node declares its own part through `tree_support()`
 through `child_backends()` once at startup, before any bind, and reports every
 blocker together. Composites never forward the question, so a new composite
 cannot silently skip a child. Sliding window and attention sinks are the named
-exception: they are per layer and per call, so the trtllm forward refuses them.
+exception: they are per layer and per call, so the trtllm and tokenspeed_mla
+forwards refuse them (trtllm_mla takes no sliding window at all).
 
 ## Not scheduler or cache state
 
@@ -203,11 +214,13 @@ workspace), so nothing here is a cache group for the C++ scheduler to own.
   64 nodes, short prefixes, non-finite unseen slots), tree verify and KV-row
   compaction (`test_compact_window_rows_moves_every_buffer`, bf16 and fp8).
 * `test/runtime/test_tree_attention_cascade.py` — verify and lanes through the
-  trtllm leaf (trtllm-gen prefix plus window kernel) against fp32.
+  trtllm, trtllm_mla and tokenspeed_mla leaves (each leaf's prefix decode plus
+  the window kernel) against fp32.
 * `test/runtime/test_draft_tree.py` — tree construction against a per-request
   EAGLE-2 reference, depth-first order, strided roots, NaN scores.
 * `test/runtime/test_tree_spec.py` — hidden-row and position compaction; the
-  fresh-spec chain; per-group router compaction over aliased layer buffers.
+  fresh-spec chain; per-group router compaction over aliased layer buffers and
+  over MLA latent rows (the value view moves with its key row).
 * `test/runtime/test_tree_support_resolution.py` — backend capability
   resolution: supported trees, linear-attention layers, each named blocker.
 * `test/runtime/test_cli_config_compat.py` — tree options and every startup refusal.

@@ -476,7 +476,7 @@ must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 
 they draft a tree instead, and `--speculative-num-draft-tokens` is its node
 budget (root included) and must be given explicitly: topk 1..16, steps 1..10,
 `(steps - 1) * topk` lane slots within the node budget, and at most 64 nodes. Trees need the `trtllm`
-attention backends and the `greedy` or `triton` sampling backend; see
+attention backends (`trtllm_mla` or `tokenspeed_mla` for MLA models) and the `greedy` or `triton` sampling backend; see
 [draft-tree speculation](../design/tree-speculation.md) for the full scope.
 
 `MTP` serves two head shapes under one flag. An Eagle-like head (one MTP
