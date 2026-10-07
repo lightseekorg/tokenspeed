@@ -300,7 +300,7 @@ def gdn_decode_step(
         )
 
 
-# ReplaySSM draft trees of these sizes verify fastest in the chunked form, which keeps no node states.
+# ReplaySSM draft trees of these sizes verify in the chunked form, which keeps no node states.
 GDN_TREE_VERIFY_CHUNKED_MIN_NODES = 8
 GDN_TREE_VERIFY_CHUNKED_MAX_NODES = 16
 

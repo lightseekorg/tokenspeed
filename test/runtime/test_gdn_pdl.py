@@ -354,26 +354,29 @@ def test_tree_conv_waits_for_initial_windows(width, restore_pdl):
         torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("target", ["rows", "mask", "reads"])
 @pytest.mark.parametrize("nodes", [8, 14])
-def test_gdn_chunked_tree_verify_waits_for_its_inputs(nodes, restore_pdl):
-    # The chunked ReplaySSM tree verify reads q/k/v/a/b the projection kernel right before it writes.
+def test_gdn_chunked_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl):
+    # The chunked ReplaySSM tree verify reads nothing the kernel right before it writes until its PDL wait.
     torch.manual_seed(nodes)
     bs, heads, value_heads, dim = 2, 4, 12, 128
     qk_width = heads * dim
     v_end = 2 * qk_width + value_heads * dim
-    source = torch.randn(
+    projection = torch.randn(
         bs * nodes, v_end + 2 * value_heads, device="cuda", dtype=torch.bfloat16
     )
-    projection = torch.empty_like(source)
     state = torch.randn(bs, value_heads, dim, dim, device="cuda") * 0.02
     A_log = torch.randn(value_heads, device="cuda")
     dt_bias = torch.randn(value_heads, device="cuda")
     reads = torch.arange(bs, device="cuda", dtype=torch.int32)
     chain = torch.tensor([[(2 << t) - 1 for t in range(nodes)]] * bs, device="cuda")
+    written = {"rows": projection, "mask": chain, "reads": reads}[target]
+    source = written.clone()
+    poison = {"rows": float("nan"), "mask": 0, "reads": -1}[target]
 
     def forward():
         _delayed_projection[(triton.cdiv(source.numel(), 1024),)](
-            source, projection, N=source.numel(), BLOCK=1024, launch_pdl=True
+            source, written, N=source.numel(), BLOCK=1024, launch_pdl=True
         )
         rows = projection.view(bs, nodes, -1)
         return gdn_decode_mtp(
@@ -404,10 +407,11 @@ def test_gdn_chunked_tree_verify_waits_for_its_inputs(nodes, restore_pdl):
     _, edges = _graph_kernel_edges(graph)
     assert edges == [("_delayed_projection", "_gdn_tree_verify_chunked_kernel", 1)]
     for _ in range(2):
-        source.normal_()
+        if target == "rows":
+            source.normal_()
         pdl_enabled(False)
         expected = forward().clone()
-        projection.fill_(float("nan"))
+        written.fill_(poison)
         graph.replay()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 

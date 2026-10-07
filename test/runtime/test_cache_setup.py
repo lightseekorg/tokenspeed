@@ -351,7 +351,6 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
     # conv staging bytes plus the captured payload (6 rows of 7 bf16
     # channels) and the fp32 A_log/dt_bias pairs -- 64 + 84 + 16.
     # A replayed draft tree (topk 2) adds one 8-byte ssm state per draft position: 2 * 3 * 8.
-    # Trees of 8 to 16 nodes verify in the chunked form and add none (8 nodes: 144 + 224 + 16).
     (
         (False, True, 1, 3, 128),
         (True, False, 1, 3, 128),
