@@ -913,24 +913,14 @@ def _causal_conv1d_tree_update_kernel(
     """One (request x token, feature block) per program: a width-W causal conv
     needs only the token's last W - 1 ancestors (or the initial window when
     the path is shallower), so tree tokens run in parallel."""
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
     idx_seq = tl.program_id(0) // seqlen
     token = tl.program_id(0) % seqlen
     feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = feats < dim
 
+    # Ahead of the PDL wait only weights and the step's parent and row tables, all written before the previous kernel.
     init_row = tl.load(conv_state_indices_ptr + idx_seq).to(tl.int64)
-    if init_row == PAD_SLOT:
-        # not processing as this is not the actual sequence
-        return
-    init = (
-        conv_state_ptr
-        + init_row * stride_conv_state_seq
-        + feats * stride_conv_state_dim
-    )
-    x_row = x_ptr + idx_seq * stride_x_seq + feats * stride_x_dim
+    live = init_row != PAD_SLOT
     parents = parent_indices_ptr + idx_seq * stride_parent_seq
 
     if HAS_BIAS:
@@ -943,35 +933,66 @@ def _causal_conv1d_tree_update_kernel(
     out_base = (
         conv_state_ptr + out_row * stride_conv_state_seq + feats * stride_conv_state_dim
     )
+    nodes, past_roots, weights = (), (), ()
     for c in tl.static_range(KERNEL_WIDTH):
         # Ancestor distance for this column, and how far past the root it lands.
         node = token
         past_root = 0
         for j in tl.static_range(KERNEL_WIDTH - 1):
             if j + c < KERNEL_WIDTH - 1:
-                parent = tl.load(parents + tl.maximum(node, 0) * stride_parent_step)
+                parent = tl.load(
+                    parents + tl.maximum(node, 0) * stride_parent_step,
+                    mask=live,
+                    other=-1,
+                )
                 past_root += (node < 0).to(tl.int32) + ((node >= 0) & (parent < 0)).to(
                     tl.int32
                 )
                 node = tl.where(node >= 0, parent, node)
+        weight = tl.load(
+            w_ptr + feats * stride_w_dim + c * stride_w_width, mask=mask, other=0.0
+        )
+        nodes, past_roots, weights = (
+            nodes + (node,),
+            past_roots + (past_root,),
+            weights + (weight,),
+        )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    # Padded programs still wait, so this grid never completes before its predecessor.
+    if init_row == PAD_SLOT:
+        # not processing as this is not the actual sequence
+        return
+    init = (
+        conv_state_ptr
+        + init_row * stride_conv_state_seq
+        + feats * stride_conv_state_dim
+    )
+    x_row = x_ptr + idx_seq * stride_x_seq + feats * stride_x_dim
+    # Every load before any store, which the compiler cannot move loads past.
+    values = ()
+    for c in tl.static_range(KERNEL_WIDTH):
+        node = nodes[c]
         from_x = tl.load(
             x_row + tl.maximum(node, 0) * stride_x_token,
             mask=mask & (node >= 0),
             other=0.0,
         )
-        init_col = KERNEL_WIDTH - 1 - past_root
+        init_col = KERNEL_WIDTH - 1 - past_roots[c]
         from_init = tl.load(
             init + tl.maximum(init_col, 0) * stride_conv_state_tok,
             mask=mask & (node < 0),
             other=0.0,
         )
-        value = tl.where(node >= 0, from_x, from_init)
-        acc += value * tl.load(
-            w_ptr + feats * stride_w_dim + c * stride_w_width, mask=mask, other=0.0
-        )
+        values = values + (tl.where(node >= 0, from_x, from_init),)
+    for c in tl.static_range(KERNEL_WIDTH):
+        acc += values[c] * weights[c]
         if c > 0:
             if out_row >= 0:
-                tl.store(out_base + (c - 1) * stride_conv_state_tok, value, mask=mask)
+                tl.store(
+                    out_base + (c - 1) * stride_conv_state_tok, values[c], mask=mask
+                )
     if SILU_ACTIVATION:
         acc = acc / (1 + tl.exp(-acc))
     tl.store(

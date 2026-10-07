@@ -92,8 +92,11 @@ def _hybrid(full, linear):
     return hybrid
 
 
-def test_trtllm_router_supports_verify_and_lanes():
-    resolve_tree_support(_router(_trtllm()), _router(_trtllm()))
+@pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_trtllm_router_supports_verify_and_lanes(kv_cache_dtype):
+    resolve_tree_support(
+        _router(_trtllm(kv_cache_dtype)), _router(_trtllm(kv_cache_dtype))
+    )
 
 
 def test_full_history_cache_groups_verify_and_draft_trees():
@@ -127,7 +130,7 @@ def test_draft_with_linear_layers_is_refused():
     "target, blocker",
     [
         (lambda: _router(MHAAttnBackend.__new__(MHAAttnBackend)), "MHAAttnBackend"),
-        (lambda: _router(_trtllm(torch.float8_e4m3fn)), "kv_cache_dtype"),
+        (lambda: _router(_trtllm(torch.float8_e5m2)), "kv_cache_dtype"),
         (
             lambda: _router(_trtllm(), _trtllm(), retention="sliding_window"),
             "one row per token; 0, 1 slide",
@@ -147,7 +150,7 @@ def test_unsupported_target_nodes_are_named(target, blocker):
 def test_every_blocker_is_reported_at_once():
     with pytest.raises(NotImplementedError) as err:
         resolve_tree_support(
-            _router(_trtllm(torch.float8_e4m3fn)),
+            _router(_trtllm(torch.float8_e5m2)),
             _hybrid(_router(_trtllm()), _mamba()),
         )
     assert "verify: " in str(err.value) and "draft: " in str(err.value)

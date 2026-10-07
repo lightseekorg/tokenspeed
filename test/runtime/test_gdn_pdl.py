@@ -303,6 +303,57 @@ def test_gdn_chain_pdl_toggle(
             torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("width", [2, 4])
+def test_tree_conv_waits_for_initial_windows(width, restore_pdl):
+    # Under ReplaySSM the seed copy writes the initial windows right before the first layer's tree conv.
+    torch.manual_seed(width)
+    bs, dim, t = 4, 1024, 6
+    x = torch.randn(bs, t, dim, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    weight = torch.randn(dim, width, device="cuda", dtype=x.dtype)
+    conv = torch.zeros(1 + bs * (t + 1), dim, width - 1, device="cuda", dtype=x.dtype)
+    windows = torch.empty(bs, dim, width - 1, device="cuda", dtype=x.dtype)
+    base = torch.arange(1, bs + 1, device="cuda", dtype=torch.int32)
+    out_rows = torch.arange(
+        bs + 1, conv.shape[0], device="cuda", dtype=torch.int32
+    ).view(bs, t)
+    parents = torch.tensor(
+        [[-1, 0, 0, 1, -1, 4]] * bs, device="cuda", dtype=torch.int32
+    )
+
+    def forward():
+        _delayed_projection[(triton.cdiv(windows.numel(), 1024),)](
+            windows, conv[1 : bs + 1], N=windows.numel(), BLOCK=1024, launch_pdl=True
+        )
+        return causal_conv1d_update(
+            x,
+            conv,
+            weight,
+            bias=None,
+            activation="silu",
+            conv_state_indices=base,
+            output_state_indices=out_rows,
+            parent_indices=parents,
+        )
+
+    pdl_enabled(True)
+    forward()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        actual = forward()
+    _, edges = _graph_kernel_edges(graph)
+    assert [kind for _, target, kind in edges if "causal_conv1d" in target] == [1]
+    for _ in range(4):
+        windows.normal_()
+        conv.zero_()
+        pdl_enabled(False)
+        expected = forward().clone()
+        expected_conv = conv.clone()
+        conv.zero_()
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])
 @pytest.mark.parametrize("heads,value_heads", [(4, 8), (16, 32), (16, 64)])
 def test_gdn_prefill_pdl_toggle(

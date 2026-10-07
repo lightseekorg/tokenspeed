@@ -64,6 +64,11 @@ prefix tail it missed and its masked window) and merges both in one Triton
 kernel. Verify runs it with `R = W = N`; draft lanes with `R = K` over the
 `(S - 1) * K`-key lane window (below). There is no size-dependent second path.
 
+An FP8 KV cache (E4M3, unscaled like every FP8 KV cache here) changes no
+structure: trtllm-gen takes the query cast to FP8 as it does for any decode,
+and `tree_window_attention` takes the unquantized query and widens the
+window's FP8 K/V to its dtype after loading them.
+
 ### Recurrent state follows the parent
 
 Linear-attention (GDN and Mamba2) layers keep one conv window and one recurrent
@@ -159,7 +164,7 @@ executor refuses tree drafting with them at startup.
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
 drafter refuses trees at startup); `greedy` and `triton` sampling backends; the `trtllm`
-attention backend with bf16 KV in full-history KV cache groups, alone or inside the
+attention backend with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,
 no mixed batches, no pipeline parallelism, no prefill/decode disaggregation, no
 attention data parallelism, no sliding window or attention sinks in the target

@@ -32,6 +32,8 @@ from tokenspeed_kernel.signature import format_signatures
 _SIGNATURES = format_signatures(("x",), "dense", {torch.bfloat16})
 # Small tiles keep more states in flight in the latency-bound verify and replay loops.
 _SPEC_BLOCK_M, _SPEC_NUM_WARPS = 16, 2
+# Verify alone runs one warp per 8-row tile: fastest on GB300 for chains and trees at 1-64 requests.
+_VERIFY_BLOCK_M, _VERIFY_NUM_WARPS = 8, 1
 _LOG2E = tl.constexpr(1.4426950408889634)
 # Prefill launch shapes, tuned on GB300 at Nemotron-3 Super geometry.
 _STATE_PASS_BLOCK = 1024
@@ -55,6 +57,12 @@ def _softplus(x):
 @triton.jit
 def _exp(x):
     return tl.math.exp2(_LOG2E * x)
+
+
+@triton.jit
+def _ssm_step(h, dA, dB, x):
+    # One fused multiply-add, spelled out: verify, decode and replay must round alike at any tile shape.
+    return tl.fma(h, dA, dB * x[:, None])
 
 
 @triton.jit
@@ -667,12 +675,12 @@ def _mamba2_verify_scan_kernel(
                     step_j = _softplus(dt_j + bias)
                     dA_j = _exp(A * step_j)
                     dB_j = Bj.to(tl.float32) * step_j
-                    h = h * dA_j + dB_j * xj.to(tl.float32)[:, None]
+                    h = _ssm_step(h, dA_j, dB_j, xj.to(tl.float32))
                     h = h.to(state.dtype.element_ty).to(tl.float32)
         step = _softplus(dt_t + bias)
         dA = _exp(A * step)
         dB = Bv * step
-        h = h * dA + dB * xv[:, None]
+        h = _ssm_step(h, dA, dB, xv)
         if has_dst != 0:
             dst = tl.load(dst_state_indices + pid_b * stride_dst_batch + t).to(tl.int64)
             if dst != null_slot:
@@ -719,7 +727,7 @@ def triton_mamba2_verify_scan(
             f"{batch} requests exceed the {_MAX_GRID_Y} the verify grid holds per launch"
         )
     d_state = state.shape[-1]
-    block_m, num_warps = _SPEC_BLOCK_M, _SPEC_NUM_WARPS
+    block_m, num_warps = _VERIFY_BLOCK_M, _VERIFY_NUM_WARPS
     enable_pdl = pdl_enabled()
     _mamba2_verify_scan_kernel[(triton.cdiv(head_dim, block_m), batch, num_heads)](
         state,
@@ -861,7 +869,7 @@ def _mamba2_replay_commit_kernel(
             dA = _exp(A * step)
             Bv = tl.sum(tl.where(here[:, None], Bs, 0.0), axis=0)
             dB = Bv * step
-            h = h * dA + dB * xv[:, None]
+            h = _ssm_step(h, dA, dB, xv)
             h = h.to(state_pool.dtype.element_ty).to(tl.float32)
 
     write_idx = tl.load(write_indices + layer_request).to(tl.int64)
