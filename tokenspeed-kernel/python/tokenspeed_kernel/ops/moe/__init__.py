@@ -501,6 +501,7 @@ def _select_moe_apply(
         format_signature(x=dense_tensor_format(input_dtype)),
         traits=traits,
         solution=solution,
+        ignore_layout=True,
     )
     apply_spec = KernelRegistry.get().get_by_name(kernel.name)
     if apply_spec is None:

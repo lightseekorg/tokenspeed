@@ -57,10 +57,16 @@ def _normalize_roles(roles: str | Iterable[str]) -> tuple[str, ...]:
 
 
 def _validate_weight_preprocessor(
-    weight_preprocessor: Callable | None,
-) -> Callable | None:
-    if weight_preprocessor is not None and not callable(weight_preprocessor):
-        raise TypeError("weight preprocessor must be callable")
+    weight_preprocessor: Callable | tuple[tuple[str, ...], Callable] | None,
+) -> Callable | tuple[tuple[str, ...], Callable] | None:
+    if weight_preprocessor is not None:
+        fn = (
+            weight_preprocessor[1]
+            if isinstance(weight_preprocessor, tuple)
+            else weight_preprocessor
+        )
+        if not callable(fn):
+            raise TypeError("weight preprocessor must be callable")
     return weight_preprocessor
 
 
@@ -177,7 +183,7 @@ class KernelSpec:
     # places unannotated kernels in PERFORMANT so they win against PORTABLE but
     # lose to SPECIALIZED. Selection scoring clamps out-of-range values.
     priority: int = int(Priority.PERFORMANT) + 2
-    weight_preprocessor: Callable | None = None
+    weight_preprocessor: Callable | tuple[tuple[str, ...], Callable] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -186,8 +192,18 @@ class KernelSpec:
             _validate_weight_preprocessor(self.weight_preprocessor),
         )
 
-    def supports_format_signature(self, format_signature: FormatSignature) -> bool:
-        return format_signature in self.format_signatures
+    def supports_format_signature(
+        self, format_signature: FormatSignature, *, ignore_layout: bool = False
+    ) -> bool:
+        # Unmigrated preprocessors still require their pinned execution path;
+        # their implicit canonical signatures do not describe prepared storage.
+        if not ignore_layout and callable(self.weight_preprocessor):
+            return False
+        return any(
+            signature.roles == format_signature.roles
+            and (ignore_layout or format_signature.layouts.issubset(signature.layouts))
+            for signature in self.format_signatures
+        )
 
     def format_signatures_for_storage_dtype(
         self,
@@ -309,6 +325,7 @@ class KernelRegistry:
         platform: PlatformInfo | None = None,
         format_signature: FormatSignature | None = None,
         solution: str | None = None,
+        ignore_layout: bool = False,
     ) -> list[KernelSpec]:
         """Get all kernels for an operator, optionally filtered."""
         specs = list(self._by_operator.get((family, mode), []))
@@ -318,7 +335,13 @@ class KernelRegistry:
         if platform:
             specs = [s for s in specs if s.capability.satisfied_by(platform)]
         if format_signature:
-            specs = [s for s in specs if s.supports_format_signature(format_signature)]
+            specs = [
+                s
+                for s in specs
+                if s.supports_format_signature(
+                    format_signature, ignore_layout=ignore_layout
+                )
+            ]
         if solution:
             specs = [s for s in specs if s.solution == solution]
 
@@ -377,7 +400,7 @@ def register_kernel(
     signatures: set[FormatSignature] | frozenset[FormatSignature],
     traits: dict[str, frozenset[Any]] | None = None,
     priority: Priority | int = Priority.PERFORMANT + 2,
-    weight_preprocessor: Callable | None = None,
+    weight_preprocessor: Callable | tuple[tuple[str, ...], Callable] | None = None,
 ) -> Callable:
     """Decorator to register a kernel function or stateful kernel class.
 
@@ -388,6 +411,10 @@ def register_kernel(
     in ``[0, 20)``. Within a band, add a small offset for relative preference,
     e.g. ``Priority.SPECIALIZED + 2``. See :class:`Priority` for the meaning of
     each band and how to choose between them.
+
+    ``weight_preprocessor`` is a pair of source attribute names and a function
+    accepting those tensors and returning the transformed tensors. Plain
+    layer-mutating callbacks remain supported until their backends migrate.
 
     Example::
 
@@ -458,9 +485,12 @@ def describe_kernel(name: str) -> str:
     if spec.weight_preprocessor is None:
         lines.append("  Weight preprocessor: none")
     else:
-        lines.append(
-            f"  Weight preprocessor: {_callable_name(spec.weight_preprocessor)}"
+        fn = (
+            spec.weight_preprocessor[1]
+            if isinstance(spec.weight_preprocessor, tuple)
+            else spec.weight_preprocessor
         )
+        lines.append(f"  Weight preprocessor: {_callable_name(fn)}")
     return "\n".join(lines)
 
 

@@ -2890,6 +2890,9 @@ class DeepseekV4Attention(nn.Module):
             block_size=wo_a_quant_config.weight_block_size,
             scale_format=getattr(wo_a_quant_config, "scale_fmt", None),
         )
+        self.wo_a._dsv4_grouped_output_projection_plan = (
+            self._wo_a_output_projection_plan
+        )
         self.wo_b = RowParallelLinear(
             self.o_groups * self.o_lora_rank,
             config.hidden_size,
@@ -2998,6 +3001,7 @@ class DeepseekV4Attention(nn.Module):
             cos_sin_cache,
             self.wo_a.weight,
             self.wo_a.weight_scale_inv,
+            allow_unknown_layout=False,
         )
         out, _ = self.wo_b(z.flatten(1))
         return out
@@ -3830,7 +3834,9 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
     def post_quant_warmup(self) -> None:
         """Called by the weight loader after all quant process_weights_after_loading."""
         dsv4_grouped_output_projection_warmup_model(
-            self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()
+            self,
+            max_tokens=_deepseek_v4_mega_moe_max_num_tokens(),
+            allow_unknown_layout=False,
         )
 
     @classmethod
