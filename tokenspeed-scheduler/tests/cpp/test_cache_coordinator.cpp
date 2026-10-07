@@ -283,7 +283,7 @@ TEST(CacheCoordinatorTest, ExpandsOneLogicalHashIntoPerGroupCacheBlocks) {
 
     const std::vector<std::string> hashes = ContentHashes({std::vector<std::int32_t>(8, 7)});
     CacheCompletedBlocksForTest(coordinator, tables, hashes, NextTestAccessEpoch(), /*first_new_prefix_page=*/0,
-                                /*num_computed_tokens=*/8, CacheBoundaryKind::kChunk,
+                                /*num_computed_tokens=*/8, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*materialized_state_boundaries=*/{});
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[0], 1, 0)));
@@ -720,6 +720,7 @@ TEST(CacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
                 .prefix_hashes = hashes,
                 .first_new_prefix_page = 2,
                 .boundary_kind = CacheBoundaryKind::kEndpoint,
+                .retained_prefix_pages = static_cast<std::int32_t>(hashes.size()),
             },
         .num_computed_tokens = 16,
     };
@@ -1542,6 +1543,7 @@ TEST(CacheCoordinatorAdmissionTest, QwenScaleChunkLifecyclePublishesOnlyTheFinal
                 .prefix_hashes = hashes,
                 .first_new_prefix_page = kPromptPages - kChunkPages,
                 .boundary_kind = CacheBoundaryKind::kEndpoint,
+                .retained_prefix_pages = static_cast<std::int32_t>(hashes.size()),
                 .materialized_state_boundaries = materialized,
             },
         .num_computed_tokens = kPromptPages * kBlockTokens,
@@ -1715,7 +1717,8 @@ TEST(CacheCoordinatorAdmissionTest, EvictsProspectiveVictimCachedDuringCommit) {
             CompletedPages{
                 .prefix_hashes = hashes,
                 .first_new_prefix_page = 0,
-                .boundary_kind = CacheBoundaryKind::kChunk,
+                .boundary_kind = CacheBoundaryKind::kEndpoint,
+                .retained_prefix_pages = static_cast<std::int32_t>(hashes.size()),
             },
         .num_computed_tokens = 8,
     };
@@ -2808,10 +2811,17 @@ TEST(CacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
     std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
 
-    CacheFullBlocksForTest(coordinator, tables, hashes, /*first_slot=*/0);
+    // A prefill Endpoint streams both groups: the full-attention pages and the
+    // sliding window behind the boundary (two pages at W = 4).
+    auto publish = [&] {
+        CacheCompletedBlocksForTest(coordinator, tables, hashes, NextTestAccessEpoch(), /*first_new_prefix_page=*/0,
+                                    /*num_computed_tokens=*/4, CacheBoundaryKind::kEndpoint,
+                                    /*stream_completed_to_host=*/true, /*materialized_state_boundaries=*/{});
+    };
+    publish();
     std::vector<CacheCoordinator::StoreCandidate> pending = coordinator.TakePendingStores();
 
-    ASSERT_EQ(pending.size(), 2u);  // sliding-window group only; full-attention deferred
+    ASSERT_EQ(pending.size(), 4u);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before);
     for (const BlockTable& table : tables) {
         for (const CacheBlockRef& block_ref : table.Blocks()) {
@@ -2821,13 +2831,14 @@ TEST(CacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
     // Typed keys keep the group distinct without changing the content hash.
     std::unordered_set<CacheKey, CacheKeyHash> keys;
     for (const auto& c : pending) keys.insert(c.key);
-    EXPECT_EQ(keys.size(), 2u);
+    EXPECT_EQ(keys.size(), 4u);
     for (std::size_t i = 0; i < pending.size(); ++i) {
-        EXPECT_EQ(pending[i].key, Key(hashes[i], /*group_id=*/1)) << "candidate " << i;
+        EXPECT_EQ(pending[i].key, Key(hashes[i % 2], /*group_id=*/static_cast<std::uint32_t>(i / 2)))
+            << "candidate " << i;
     }
 
     // Re-registering the same hashes yields nothing new (IsCached skip).
-    CacheFullBlocksForTest(coordinator, tables, hashes, 0);
+    publish();
     EXPECT_TRUE(coordinator.TakePendingStores().empty());
 
     coordinator.Free(tables);
@@ -2854,7 +2865,7 @@ TEST(CacheCoordinatorStoreCandidates, DisabledByDefaultCollectsNothing) {
     coordinator.Free(tables);
 }
 
-TEST(CacheCoordinatorStoreCandidates, PrefillChunkStreamsHistoryButNotState) {
+TEST(CacheCoordinatorStoreCandidates, ChunkStreamsHistoryButNotWindowOrState) {
     BlockPool pool(24, {1, 1, 1});
     BlockPool host_pool(24, {1, 1, 1});
     std::vector<CacheGroupSpec> specs{
@@ -2888,11 +2899,11 @@ TEST(CacheCoordinatorStoreCandidates, PrefillChunkStreamsHistoryButNotState) {
                                 /*stream_completed_to_host=*/true,
                                 /*materialized_state_boundaries=*/std::array{4});
     std::vector<CacheCoordinator::StoreCandidate> prefill = coordinator.TakePendingStores();
-    ASSERT_EQ(prefill.size(), 4u);
+    ASSERT_EQ(prefill.size(), 2u);
     EXPECT_EQ(prefill[0].key, Key(hashes[0], /*group_id=*/0));
     EXPECT_EQ(prefill[1].key, Key(hashes[1], /*group_id=*/0));
-    EXPECT_EQ(prefill[2].key, Key(hashes[0], /*group_id=*/1));
-    EXPECT_EQ(prefill[3].key, Key(hashes[1], /*group_id=*/1));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1)))
+        << "an ordinary window chunk remains request-local";
     EXPECT_FALSE(coordinator.GroupPrefixIndex(2).Contains(pool, Key(hashes[1], 2)))
         << "an ordinary state chunk remains request-local";
 
@@ -2903,21 +2914,17 @@ TEST(CacheCoordinatorStoreCandidates, PrefillChunkStreamsHistoryButNotState) {
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
                                 /*first_new_prefix_page=*/2, /*num_computed_tokens=*/6, CacheBoundaryKind::kChunk,
                                 /*stream_completed_to_host=*/false, /*materialized_state_boundaries=*/{});
-    std::vector<CacheCoordinator::StoreCandidate> decode = coordinator.TakePendingStores();
-    ASSERT_EQ(decode.size(), 1u);
-    EXPECT_EQ(decode[0].key, Key(decode_hashes[2], /*group_id=*/1));
+    EXPECT_TRUE(coordinator.TakePendingStores().empty()) << "decode publishes no window and streams no history";
 
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(decode_hashes[2], 1)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(2).Contains(pool, Key(decode_hashes[2], 2)));
     coordinator.QueueCachedBlocksForStore(decode_hashes);
     coordinator.QueueLatestSnapshotBlocksForStore(decode_hashes);
     std::vector<CacheCoordinator::StoreCandidate> finish = coordinator.TakePendingStores();
-    ASSERT_EQ(finish.size(), 6u);
+    ASSERT_EQ(finish.size(), 3u);
     EXPECT_EQ(finish[0].key, Key(decode_hashes[0], /*group_id=*/0));
     EXPECT_EQ(finish[1].key, Key(decode_hashes[1], /*group_id=*/0));
     EXPECT_EQ(finish[2].key, Key(decode_hashes[2], /*group_id=*/0));
-    EXPECT_EQ(finish[3].key, Key(decode_hashes[0], /*group_id=*/1));
-    EXPECT_EQ(finish[4].key, Key(decode_hashes[1], /*group_id=*/1));
-    EXPECT_EQ(finish[5].key, Key(decode_hashes[2], /*group_id=*/1));
     coordinator.Free(tables);
 }
 
@@ -3899,6 +3906,7 @@ TEST(MambaStateRegistrationTest, MambaPublishesAlignedEndpoint) {
                 .prefix_hashes = ch,
                 .first_new_prefix_page = 0,
                 .boundary_kind = CacheBoundaryKind::kEndpoint,
+                .retained_prefix_pages = static_cast<std::int32_t>(ch.size()),
                 .materialized_state_boundaries = materialized,
             },
         .num_computed_tokens = 12,
@@ -3931,6 +3939,7 @@ TEST(MambaStateRegistrationTest, MambaPublishesAlignedCheckpointBeforeUnalignedE
                 .prefix_hashes = ch,
                 .first_new_prefix_page = 0,
                 .boundary_kind = CacheBoundaryKind::kEndpoint,
+                .retained_prefix_pages = static_cast<std::int32_t>(ch.size()),
                 .materialized_state_boundaries = materialized,
             },
         .num_computed_tokens = 10,
@@ -3941,7 +3950,9 @@ TEST(MambaStateRegistrationTest, MambaPublishesAlignedCheckpointBeforeUnalignedE
     coord.Free(tables);
 }
 
-TEST(MambaStateRegistrationTest, PublishesOnlyProvenBoundariesCoveredByHashes) {
+// Only the retained boundary (8) is kept, and only where a checkpoint was
+// written; an earlier proven checkpoint in the range is an ordinary chunk.
+TEST(MambaStateRegistrationTest, PublishesTheRetainedBoundaryOnlyWhereProven) {
     for (const bool direct : {false, true}) {
         for (const auto& pending : std::vector<std::vector<std::int32_t>>{{}, {4}, {8}, {4, 8}, {4, 12}}) {
             SCOPED_TRACE(::testing::Message()
@@ -3968,6 +3979,7 @@ TEST(MambaStateRegistrationTest, PublishesOnlyProvenBoundariesCoveredByHashes) {
                         .prefix_hashes = hashes,
                         .first_new_prefix_page = 0,
                         .boundary_kind = CacheBoundaryKind::kEndpoint,
+                        .retained_prefix_pages = static_cast<std::int32_t>(hashes.size()),
                         .materialized_state_boundaries = pending,
                     },
                 .num_computed_tokens = 10,
@@ -3980,10 +3992,9 @@ TEST(MambaStateRegistrationTest, PublishesOnlyProvenBoundariesCoveredByHashes) {
                 ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands, progress, std::nullopt));
             }
             EXPECT_EQ(boundary_was_published, std::ranges::find(pending, 8) != pending.end());
-            for (std::int32_t page = 0; page < 2; ++page) {
-                EXPECT_EQ(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[page], 0)),
-                          std::ranges::find(pending, (page + 1) * 4) != pending.end());
-            }
+            EXPECT_FALSE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
+            EXPECT_EQ(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)),
+                      std::ranges::find(pending, 8) != pending.end());
             coord.Free(tables);
         }
     }
@@ -4163,7 +4174,8 @@ TEST(SwaRegistrationTest, SwaBoundaryRequiresTrailingWindow) {
                 .prefix_hashes = ch,
                 // Only page 3 is new; the two-page resume tail crosses the prior chunk.
                 .first_new_prefix_page = 3,
-                .boundary_kind = CacheBoundaryKind::kChunk,
+                .boundary_kind = CacheBoundaryKind::kEndpoint,
+                .retained_prefix_pages = static_cast<std::int32_t>(ch.size()),
             },
         .num_computed_tokens = 16,
     };
@@ -4193,6 +4205,7 @@ TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
                 .prefix_hashes = hashes,
                 .first_new_prefix_page = 0,
                 .boundary_kind = CacheBoundaryKind::kEndpoint,
+                .retained_prefix_pages = static_cast<std::int32_t>(hashes.size()),
             },
         .num_computed_tokens = 14,
     };
@@ -4242,6 +4255,7 @@ TEST(MambaStateRegistrationTest, ComputedChunksStayRequestLocalAndRetainedBounda
                         CompletedPages{
                             .prefix_hashes = hashes,
                             .boundary_kind = kind,
+                            .retained_prefix_pages = kind == CacheBoundaryKind::kChunk ? 0 : 1,
                             .materialized_state_boundaries = materialized,
                         },
                     .num_computed_tokens = 4,

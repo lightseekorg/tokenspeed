@@ -621,6 +621,12 @@ Its responsibilities:
   listed materialized boundaries inside the newly hashed range; an empty list
   publishes no state snapshots (see
   [Scheduler §1.2](scheduler.md#12-state-checkpoints-one-forward)).
+  Ordinary sliding-window groups publish only the window behind an Endpoint
+  (the prompt's last aligned boundary, or the computed frontier of an L2
+  retraction) or a Promoted boundary. Prompt chunks
+  and generated pages keep only their working references, slide out through
+  retention and never stream to Host; a later turn recomputes the previous
+  reply from the prompt Endpoint.
   Replayable groups are outside `match_order_` and skip publication on both
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the
@@ -632,14 +638,13 @@ Its responsibilities:
   `pending_stores_` queue drives D2H transfers, alongside Host-side
   acquire/contains/pin queries. During prefill, each completed scheduling
   boundary queues all newly published full-attention pages and any published
-  Endpoint/Promoted state checkpoints; the candidates are merged into a batched
+  Endpoint/Promoted sliding-window or state boundaries; the candidates are merged into a batched
   writeback. The first decode admission from `PrefillDone` applies the same
-  policy to the final prompt boundary. Ordinary decode publishes history-cache
-  Device entries but no state entries; full-attention pages do not stream to
+  policy to the final prompt boundary. Ordinary decode publishes full-attention
+  Device entries but no sliding-window or state entries; full-attention pages do not stream to
   Host during decode. At finish or retraction, eligible non-state Device pages
   and the newest existing prefill checkpoint per state group are queued
-  before request ownership is released. Ordinary sliding-window entries
-  always stream when published. The queue is drained by
+  before request ownership is released. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`: every store but a
   retraction's snapshot pins its Device sources until the ACK; the snapshot
   store is stream-ordered instead, because its sources are re-granted in the

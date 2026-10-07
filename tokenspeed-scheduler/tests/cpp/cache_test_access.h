@@ -69,6 +69,9 @@ inline void CacheCompletedBlocksForTest(CacheCoordinator& coordinator, std::span
                 .prefix_hashes = prefix_hashes,
                 .first_new_prefix_page = first_new_prefix_page,
                 .boundary_kind = boundary_kind,
+                // The newest hashed boundary, as the scheduler classifies it.
+                .retained_prefix_pages =
+                    boundary_kind == CacheBoundaryKind::kChunk ? 0 : static_cast<std::int32_t>(prefix_hashes.size()),
                 .stream_completed_to_host = stream_completed_to_host,
                 .materialized_state_boundaries = materialized_state_boundaries,
             },
