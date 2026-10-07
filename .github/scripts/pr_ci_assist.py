@@ -147,26 +147,45 @@ def resolve():
 
 
 def plan_source():
+    """Resolve an open PR at its requested source; skip obsolete events."""
+    output("active", "false")
+    name = os.environ["GITHUB_EVENT_NAME"]
+    if name not in {"pull_request", "workflow_dispatch"}:
+        print("CI plans require a PR event or a refresh for a specific PR; skipping.")
+        return
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     number = (
         int(event["inputs"]["pr"])
-        if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+        if name == "workflow_dispatch"
         else event["pull_request"]["number"]
     )
-    pr = pull(number)
-    if os.environ["GITHUB_EVENT_NAME"] == "pull_request" and (
+    pr = api(f"pulls/{number}")
+    # Fast merges can close the PR before its queued planner starts.
+    if pr["state"] != "open":
+        print("PR is closed or merged; skipping the CI plan.")
+        return
+    if (
+        not pr["head"]["repo"]
+        or pr["head"]["repo"]["full_name"] != REPO
+        or pr["base"]["ref"] != "main"
+    ):
+        raise ValueError("An open same-repository PR into main is required.")
+    if name == "pull_request" and (
         event["pull_request"]["head"]["sha"] != pr["head"]["sha"]
         or event["pull_request"]["base"]["sha"] != pr["base"]["sha"]
     ):
-        raise ValueError("PR event source changed.")
-    if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch" and (
+        print("PR event source changed; skipping the obsolete CI plan.")
+        return
+    if name == "workflow_dispatch" and (
         event["inputs"]["head"] != pr["head"]["sha"]
         or event["inputs"]["base"] != pr["base"]["sha"]
     ):
-        raise ValueError("Plan request source changed.")
+        print("Plan request source changed; skipping the obsolete CI plan.")
+        return
     output("pr", str(number))
     output("head", pr["head"]["sha"])
     output("base", pr["base"]["sha"])
+    output("active", "true")
 
 
 def public_gate():

@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github/scripts"))
 import pr_ci_assist as assist
@@ -81,6 +82,56 @@ def test_only_actual_writer_can_issue_command(monkeypatch):
     )
     with pytest.raises(ValueError, match="same-repository"):
         assist.pull(123)
+
+
+def test_plan_source_only_activates_for_current_open_pr(monkeypatch, tmp_path):
+    pr = dict(
+        number=123,
+        state="open",
+        head={"sha": "a" * 40, "repo": {"full_name": REPO}},
+        base={"sha": "b" * 40, "ref": "main"},
+    )
+    event = tmp_path / "event.json"
+    result = tmp_path / "output"
+    event.write_text(json.dumps({"pull_request": pr}))
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "pull_request")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(result))
+    monkeypatch.setattr(assist, "api", lambda path: pr)
+    assist.plan_source()
+    assert dict(line.split("=", 1) for line in result.read_text().splitlines()) == {
+        "active": "true",
+        "pr": "123",
+        "head": "a" * 40,
+        "base": "b" * 40,
+    }
+    result.write_text("")
+    pr["state"] = "closed"
+    assist.plan_source()
+    assert result.read_text() == "active=false\n"
+    result.write_text("")
+    pr.update(state="open", head={**pr["head"], "sha": "c" * 40})
+    assist.plan_source()
+    assert result.read_text() == "active=false\n"
+    result.write_text("")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+    event.write_text(json.dumps({"ref": "refs/heads/main"}))
+    monkeypatch.setattr(
+        assist, "api", lambda path: pytest.fail("Main pushes must not resolve a PR")
+    )
+    assist.plan_source()
+    assert result.read_text() == "active=false\n"
+    workflow = yaml.safe_load(
+        (assist.ROOT / ".github/workflows/pr-ci-plan.yml").read_text()
+    )
+    triggers = workflow.get("on", workflow.get(True))
+    assert set(triggers) == {"pull_request", "workflow_dispatch"}
+    steps = workflow["jobs"]["plan"]["steps"]
+    source = next(i for i, step in enumerate(steps) if step.get("id") == "source")
+    assert all(
+        step["if"] == "steps.source.outputs.active == 'true'"
+        for step in steps[source + 1 :]
+    )
 
 
 def test_state_is_typed_and_bot_owned(selected):
