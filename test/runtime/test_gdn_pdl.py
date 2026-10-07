@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
+    gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import fused_qkv_split_gdn_prefill
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -355,9 +356,9 @@ def test_tree_conv_waits_for_initial_windows(width, restore_pdl):
 
 
 @pytest.mark.parametrize("target", ["rows", "mask", "reads", "A_log", "dt_bias"])
-@pytest.mark.parametrize("nodes", [8, 14])
-def test_gdn_chunked_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl):
-    # The chunked ReplaySSM tree verify reads nothing the kernel right before it writes until its PDL wait.
+@pytest.mark.parametrize("nodes", [7, 14])
+def test_gdn_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl):
+    # A ReplaySSM tree verify, step by step at 7 nodes and chunked at 14, reads nothing the kernel before it writes until its PDL wait.
     torch.manual_seed(nodes)
     bs, heads, value_heads, dim = 2, 4, 12, 128
     qk_width = heads * dim
@@ -370,6 +371,9 @@ def test_gdn_chunked_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl
     dt_bias = torch.randn(value_heads, device="cuda")
     reads = torch.arange(bs, device="cuda", dtype=torch.int32)
     chain = torch.tensor([[(2 << t) - 1 for t in range(nodes)]] * bs, device="cuda")
+    states = None
+    if gdn_tree_verify_needs_node_states(nodes):
+        states = torch.empty(bs, nodes, value_heads, dim, dim, device="cuda")
     written = {
         "rows": projection,
         "mask": chain,
@@ -398,7 +402,7 @@ def test_gdn_chunked_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl
             scale=dim**-0.5,
             use_qk_l2norm=True,
             disable_state_update=True,
-            intermediate_states_buffer=None,
+            intermediate_states_buffer=states,
             output_state_indices=None,
             tree_ancestors=chain,
             solution="triton",
@@ -411,7 +415,10 @@ def test_gdn_chunked_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl
     with torch.cuda.graph(graph):
         actual = forward()
     _, edges = _graph_kernel_edges(graph)
-    assert edges == [("_delayed_projection", "_gdn_tree_verify_chunked_kernel", 1)]
+    verify = "_gdn_tree_verify_chunked_kernel"
+    if states is not None:
+        verify = "_fused_gdn_decode_update_kernel"
+    assert edges == [("_delayed_projection", verify, 1)]
     for _ in range(2):
         if target == "rows":
             source.normal_()

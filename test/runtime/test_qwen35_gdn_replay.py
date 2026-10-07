@@ -385,6 +385,20 @@ def test_qwen_replay_tree_matches_staged_tree(state_dtype, parents, paths):
     )
 
 
+@pytest.mark.parametrize(
+    ("draft_tokens", "node_states"), [(7, True), (8, False), (16, False), (17, True)]
+)
+def test_qwen_replay_tree_keeps_node_states_only_outside_the_chunked_sizes(
+    draft_tokens, node_states
+):
+    conv, recurrent = _initial_pools()
+    backend, _ = _make_backend(
+        conv, recurrent, replay=True, draft_tree=True, draft_tokens=draft_tokens
+    )
+    backend.preallocate_verify_workspace(BATCH, draft_tokens)
+    assert (backend._tree_node_states is not None) == node_states
+
+
 def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
     conv, recurrent = _initial_pools()
     backend, pool = _make_backend(conv, recurrent, replay=True)
