@@ -170,11 +170,13 @@ def _forward_verify(backend, pool, inputs, *, layer_id=0):
 
 def _prepare_verify(backend, pool, inputs):
     tables = torch.tensor([[1, 5], [2, 6]], dtype=torch.int32, device=DEVICE)
+    # Four committed tokens ahead of the verify window.
+    seq_len = 4 + inputs["mixed_qkv"].shape[0] // BATCH
     backend.refresh_decode_metadata(
         BATCH,
         BATCH,
         torch.tensor([0, 1], dtype=torch.int32, device=DEVICE),
-        torch.tensor([7, 7], dtype=torch.int32, device=DEVICE),
+        torch.tensor([seq_len, seq_len], dtype=torch.int32, device=DEVICE),
         forward_mode=ForwardMode.DECODE,
         block_tables={"linear_attention": tables},
     )
@@ -462,7 +464,7 @@ def test_qwen_replay_tree_graph_reads_the_tree_written_after_capture(parents):
     torch.cuda.synchronize()
 
     req_pool_indices = torch.tensor([0, 1], dtype=torch.int32, device=DEVICE)
-    seq_lens = torch.tensor([7, 7], dtype=torch.int32, device=DEVICE)
+    seq_lens = torch.tensor([4 + n, 4 + n], dtype=torch.int32, device=DEVICE)
     backend.init_forward_metadata_capture_cuda_graph(
         BATCH, req_pool_indices, seq_lens, ForwardMode.DECODE
     )

@@ -1466,14 +1466,16 @@ def _random_tree(T: int, gen: torch.Generator) -> list[int]:
 
 
 def _torch_gdn_tree_reference(
-    q, k, v, a, b, A_log, dt_bias, state_klast, scale, parents
+    q, k, v, a, b, A_log, dt_bias, state_klast, scale, parents, *, use_qk_l2norm
 ):
     """Float64 per-node recurrence from each node's parent: outputs and K-last states."""
     B, T, H, K = q.shape
     HV = v.shape[2]
     q, k = (x.double().repeat_interleave(HV // H, dim=2) for x in (q, k))
-    q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) * scale
-    k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    if use_qk_l2norm:
+        q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6)
+        k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    q = q * scale
     v = v.double()
     g = -torch.exp(A_log.double()) * F.softplus(a.double() + dt_bias.double())
     beta = torch.sigmoid(b.double())
@@ -1496,9 +1498,7 @@ def _torch_gdn_tree_reference(
 def _tree_verify(q, k, v, pool, parents, *, rows: bool, **common):
     """Both tree modes: pool rows (step by step), or ReplaySSM with a node-state buffer when the tree needs one."""
     B, T = q.shape[:2]
-    common.update(
-        tree_ancestors=_tree_ancestors(parents, q.device.type), use_qk_l2norm=True
-    )
+    common.update(tree_ancestors=_tree_ancestors(parents, q.device.type))
     if rows:
         out_idx = torch.arange(B, B + B * T, device=q.device, dtype=torch.int32).view(
             B, T
@@ -1564,9 +1564,20 @@ def test_gdn_decode_mtp_random_trees_match_float64_reference(
         b=b,
         initial_state_indices=read_idx,
         scale=scale,
+        use_qk_l2norm=True,
     )
     want_out, want_states = _torch_gdn_tree_reference(
-        q, k, v, a, b, A_log, dt_bias, pool[read_idx.long()], scale, parents
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        pool[read_idx.long()],
+        scale,
+        parents,
+        use_qk_l2norm=True,
     )
 
     rows_pool = pool.clone()
@@ -1588,17 +1599,21 @@ def test_gdn_decode_mtp_random_trees_match_float64_reference(
     )
 
 
-@pytest.mark.parametrize("A_log_value", [88.0, 89.0])
+@pytest.mark.parametrize(
+    ("A_log_value", "state_value"), [(88.0, None), (89.0, None), (10.0, 3e38)]
+)
 def test_gdn_decode_mtp_chunked_tree_keeps_extreme_gates_finite(
-    device: str, A_log_value: float, require
+    device: str, A_log_value: float, state_value: float | None, require
 ):
-    """Gates whose path sums overflow, or that are infinite themselves, decay to zero instead of NaN."""
+    """Gates whose path sums overflow, or that are infinite themselves, decay to zero instead of NaN, even over a near-overflow state."""
     require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
     T = GDN_TREE_VERIFY_CHUNKED_MAX_NODES
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
         device=device, dtype=torch.bfloat16, T=T, pool_size=4, state_dtype=torch.float32
     )
     A_log = torch.full_like(A_log, A_log_value)
+    if state_value is not None:
+        pool.fill_(state_value)
     parents = [[t - 1 for t in range(T)]] * 4
     read_idx = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32)
     scale = q.shape[-1] ** -0.5
@@ -1609,33 +1624,68 @@ def test_gdn_decode_mtp_chunked_tree_keeps_extreme_gates_finite(
         b=b,
         initial_state_indices=read_idx,
         scale=scale,
+        use_qk_l2norm=True,
     )
 
     out, _ = _tree_verify(q, k, v, pool, parents, rows=False, **common)
 
     want, _ = _torch_gdn_tree_reference(
-        q, k, v, a, b, A_log, dt_bias, pool[read_idx.long()], scale, parents
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        pool[read_idx.long()],
+        scale,
+        parents,
+        use_qk_l2norm=True,
     )
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out.double(), want, rtol=2**-7, atol=1e-4)
 
 
-def test_gdn_decode_mtp_chunked_tree_deep_correlated_keys_match_float64_reference(
-    device: str, require
+@pytest.mark.parametrize("regime", ["correlated_keys", "mixed_gates", "raw_qk"])
+def test_gdn_decode_mtp_chunked_tree_matches_float64_within_one_ulp(
+    device: str, regime: str, require
 ):
-    """Deep paths of near-parallel keys with full write strength and no decay, where the delta-rule solve is hardest."""
+    """Hard regimes for the chunked form: near-parallel keys at full write strength
+    and no decay (the solve), large root-path gates over O(1) segments (the decays),
+    and q/k taken without the in-kernel L2 norm; Qwen3.8's 3 value heads per key head.
+    """
     require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
     T = GDN_TREE_VERIFY_CHUNKED_MAX_NODES
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
-        device=device, dtype=torch.bfloat16, T=T, pool_size=4, state_dtype=torch.float32
+        device=device,
+        dtype=torch.bfloat16,
+        T=T,
+        num_v_heads=12,
+        pool_size=4,
+        state_dtype=torch.float32,
     )
-    k = (k[:, :1] + 0.01 * k).to(k.dtype)
-    v = 4 * v
-    b = torch.full_like(b, 9.0)
-    A_log = torch.full_like(A_log, -14.0)
+    use_qk_l2norm = True
+    if regime == "correlated_keys":
+        k = (k[:, :1] + 0.01 * k).to(k.dtype)
+        v = 4 * v
+        b = torch.full_like(b, 9.0)
+        A_log = torch.full_like(A_log, -14.0)
+    elif regime == "mixed_gates":
+        A_log = torch.full_like(A_log, 7.0)
+        dt_bias = torch.full_like(dt_bias, -10.0)
+        a = torch.full_like(a, 2.0)
+        a[:, :4] = 40.0
+    else:
+        q, k = ((x / x.shape[-1] ** 0.5).to(x.dtype) for x in (q, k))
+        use_qk_l2norm = False
+    # Read row -1 is the zero state; the row before the pool holds NaN.
+    backing = torch.full((5, *pool.shape[1:]), float("nan"), device=device)
+    backing[1:] = pool
+    pool = backing[1:]
+    read_idx = torch.tensor([0, -1, 2, 3], device=device, dtype=torch.int32)
+    start = torch.where(read_idx[:, None, None, None] >= 0, pool[read_idx.long()], 0.0)
     parents = [[t - 1 for t in range(T)], [-1, 0, 0] + list(range(2, T - 1))] * 2
-    read_idx = torch.tensor([0, 1, 2, 3], device=device, dtype=torch.int32)
-    scale = q.shape[-1] ** -0.5
+    scale = 0.05
     common = dict(
         A_log=A_log,
         a=a,
@@ -1643,12 +1693,23 @@ def test_gdn_decode_mtp_chunked_tree_deep_correlated_keys_match_float64_referenc
         b=b,
         initial_state_indices=read_idx,
         scale=scale,
+        use_qk_l2norm=use_qk_l2norm,
     )
 
     out, _ = _tree_verify(q, k, v, pool, parents, rows=False, **common)
 
     want, _ = _torch_gdn_tree_reference(
-        q, k, v, a, b, A_log, dt_bias, pool[read_idx.long()], scale, parents
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        start,
+        scale,
+        parents,
+        use_qk_l2norm=use_qk_l2norm,
     )
     # Within one bf16 ulp of the float64 recurrence.
     ulp = 2.0 ** (torch.floor(torch.log2(want.abs())) - 7)
@@ -1686,6 +1747,7 @@ def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
             dt_bias=dt_bias,
             b=b,
             initial_state_indices=torch.arange(batch, device=device, dtype=torch.int32),
+            use_qk_l2norm=True,
         )
 
     for T, rows in ((14, False), (24, False), (14, True)):

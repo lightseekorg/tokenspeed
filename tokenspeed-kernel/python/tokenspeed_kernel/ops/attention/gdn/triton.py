@@ -726,13 +726,12 @@ def _gdn_tree_verify_chunked_kernel(
             input_precision=DOT_PRECISION,
         )
 
-    decay_h0 = tl.exp(gate)
-    u = tl.dot(
-        inv,
-        b_beta[:, None] * (b_v - decay_h0[:, None] * kh),
-        input_precision=DOT_PRECISION,
-    )
-    b_o = decay_h0[:, None] * qh + tl.dot(decay * qk, u, input_precision=DOT_PRECISION)
+    decay_h0 = tl.exp(gate)[:, None]
+    # A vanished decay drops the h0 terms even where an extreme state overflowed them.
+    kh = tl.where(decay_h0 > 0, decay_h0 * kh, 0.0)
+    qh = tl.where(decay_h0 > 0, decay_h0 * qh, 0.0)
+    u = tl.dot(inv, b_beta[:, None] * (b_v - kh), input_precision=DOT_PRECISION)
+    b_o = qh + tl.dot(decay * qk, u, input_precision=DOT_PRECISION)
     tl.store(
         o + ((i_n * T + nodes[:, None]) * HV + i_hv) * V + o_v[None, :],
         b_o.to(o.dtype.element_ty),
@@ -762,6 +761,7 @@ def _launch_gdn_tree_verify_chunked(
         scale = K**-0.5
     o = q.new_empty(B, T, HV, V)
     BV = min(triton.next_power_of_2(V), 64)
+    T_BLOCK = triton.next_power_of_2(GDN_TREE_VERIFY_CHUNKED_MAX_NODES)
     _gdn_tree_verify_chunked_kernel[(triton.cdiv(V, BV), B * HV)](
         A_log=A_log,
         a=a,
@@ -784,8 +784,8 @@ def _launch_gdn_tree_verify_chunked(
         V=V,
         BK=min(triton.next_power_of_2(K), 32),
         BV=BV,
-        T_BLOCK=GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
-        LOG2_T_BLOCK=GDN_TREE_VERIFY_CHUNKED_MAX_NODES.bit_length() - 1,
+        T_BLOCK=T_BLOCK,
+        LOG2_T_BLOCK=T_BLOCK.bit_length() - 1,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm,
         # Three TF32 products per FP32 one keep FP32 accuracy on tensor cores.
         DOT_PRECISION="tf32x3" if current_platform().is_nvidia else "ieee",
