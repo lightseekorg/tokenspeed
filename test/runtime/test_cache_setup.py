@@ -344,20 +344,24 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         "replay_enabled",
         "replay_supported",
         "topk",
-        "tree_node_states",
+        "draft_tokens",
         "expected_workspace_bytes",
     ),
     # Non-replay stages conv+ssm for 8 verify rows: 8 * (8 + 8). Replay: 64
     # conv staging bytes plus the captured payload (6 rows of 7 bf16
     # channels) and the fp32 A_log/dt_bias pairs -- 64 + 84 + 16.
-    # A replayed draft tree (topk 2) verified step by step adds one 8-byte ssm state per draft position: 2 * 3 * 8.
+    # A replayed draft tree (topk 2) adds one 8-byte ssm state per draft position: 2 * 3 * 8.
+    # Trees of 8 to 16 nodes verify in the chunked form and add none (8 nodes: 144 + 224 + 16).
     (
-        (False, True, 1, False, 128),
-        (True, False, 1, False, 128),
-        (True, True, 1, False, 164),
-        (False, True, 2, False, 128),
-        (True, True, 2, False, 164),
-        (True, True, 2, True, 212),
+        (False, True, 1, 3, 128),
+        (True, False, 1, 3, 128),
+        (True, True, 1, 3, 164),
+        (False, True, 2, 3, 128),
+        (True, True, 2, 3, 212),
+        (True, True, 2, 7, 452),
+        (True, True, 2, 8, 384),
+        (True, True, 2, 16, 736),
+        (True, True, 2, 17, 1052),
     ),
 )
 def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
@@ -365,16 +369,12 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     replay_enabled: bool,
     replay_supported: bool,
     topk: int,
-    tree_node_states: bool,
+    draft_tokens: int,
     expected_workspace_bytes: int,
 ) -> None:
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.gdn.gdn_replay_commit_supported",
         lambda dtype: replay_supported,
-    )
-    monkeypatch.setattr(
-        "tokenspeed_kernel.ops.attention.gdn.gdn_tree_verify_needs_node_states",
-        lambda num_nodes: tree_node_states,
     )
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(text_config=SimpleNamespace()),
@@ -398,7 +398,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     server_args = SimpleNamespace(
         block_size=64,
         max_total_tokens=None,
-        speculative_num_draft_tokens=3,
+        speculative_num_draft_tokens=draft_tokens,
         speculative_eagle_topk=topk,
         enable_replay_ssm=replay_enabled,
     )

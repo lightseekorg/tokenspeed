@@ -38,7 +38,7 @@ expensive here).
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_PARALLEL_NODES,
     GdnCheckpointLayout,
@@ -152,11 +152,7 @@ def _latest_ancestor(ancestors_row, step, valid):
     above = tl.load(ancestors_row + step, mask=valid, other=0) & (
         (tl.full([], 1, tl.int64) << tl.minimum(step, 63).to(tl.int64)) - 1
     )
-    parent = tl.where(above != 0, 0, -1)
-    for shift in tl.static_range(5, -1, -1):
-        hit = (above >> (tl.maximum(parent, 0) + (1 << shift)).to(tl.int64)) != 0
-        parent = tl.where(hit, parent + (1 << shift), parent)
-    return parent
+    return 63 - libdevice.clz(above)
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -726,12 +722,16 @@ def _gdn_tree_verify_kernel(
     m = tl.where(
         anc & (nodes[:, None] != nodes[None, :]), b_beta[:, None] * decay * kk, 0.0
     )
-    # (I + m)^-1 = (I - m)(I + m^2)(I + m^4)...: ancestors come first, so m is nilpotent.
-    inv = (nodes[:, None] == nodes[None, :]).to(tl.float32) - m
-    power = tl.dot(m, m, input_precision=DOT_PRECISION)
-    for _ in tl.static_range(LOG2_T_BLOCK - 1):
-        inv += tl.dot(inv, power, input_precision=DOT_PRECISION)
-        power = tl.dot(power, power, input_precision=DOT_PRECISION)
+    # (I + m)^-1 by doubling diagonal blocks: [[A, 0], [C, B]]^-1 = [[A^-1, 0], [-B^-1 C A^-1, B^-1]].
+    block = nodes[:, None] ^ nodes[None, :]
+    inv = (block == 0).to(tl.float32) - tl.where(block == 1, m, 0.0)
+    for level in tl.static_range(1, LOG2_T_BLOCK):
+        c = tl.where((block >> level) == 1, m, 0.0)
+        inv -= tl.dot(
+            inv,
+            tl.dot(c, inv, input_precision=DOT_PRECISION),
+            input_precision=DOT_PRECISION,
+        )
 
     decay_h0 = tl.exp(gate)
     u = tl.dot(
@@ -840,20 +840,15 @@ def triton_gdn_decode_mtp(
     """Portable Triton fallback for ``gdn_decode_mtp`` (see
     ``flashinfer/gated_delta_rule.py`` for the shared contract). Supports both
     batch-scoped intermediate-state caching and direct per-token pool scatter
-    through ``output_state_indices``, and draft trees: ReplaySSM trees of up to
-    ``GDN_TREE_VERIFY_PARALLEL_NODES`` nodes in the chunked form, the others
-    step by step.
+    through ``output_state_indices``, and draft trees: ReplaySSM trees that
+    ``gdn_tree_verify_needs_node_states`` exempts in the chunked form, the
+    others step by step.
     """
     if (
         tree_ancestors is not None
         and output_state_indices is None
         and not gdn_tree_verify_needs_node_states(q.shape[1])
     ):
-        if intermediate_states_buffer is not None or not disable_state_update:
-            raise ValueError(
-                "a chunked tree verify writes no state: no "
-                "intermediate_states_buffer, disable_state_update=True"
-            )
         return _launch_gdn_tree_verify(
             q,
             k,

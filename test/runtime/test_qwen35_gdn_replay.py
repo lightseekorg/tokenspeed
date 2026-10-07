@@ -48,7 +48,10 @@ from test.runtime.test_gdn_state_paging import (
     _mamba_config_pair,
 )
 
-from tokenspeed_kernel.ops.attention.gdn import gdn_replay_commit_supported
+from tokenspeed_kernel.ops.attention.gdn import (
+    gdn_replay_commit_supported,
+    gdn_tree_verify_needs_node_states,
+)
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
@@ -68,27 +71,36 @@ CONV_DIM = 2 * KEY_DIM + VALUE_DIM
 DEVICE = "cuda"
 
 
-def _config(*, replay: bool, draft_tree: bool = False):
+def _config(*, replay: bool, draft_tree: bool = False, draft_tokens=DRAFT_TOKENS):
     """(AttnConfig, primary spec) with replay_ssm on the linear component."""
     return _mamba_config_pair(
         torch,
         heads=NUM_K_HEADS,
         head_dim=HEAD_K_DIM,
-        spec_tokens=DRAFT_TOKENS,
+        spec_tokens=draft_tokens,
         device=DEVICE,
         replay_ssm=replay,
         draft_tree=draft_tree,
     )
 
 
-def _make_backend(conv_state, recurrent_state, *, replay: bool, draft_tree=False):
+def _make_backend(
+    conv_state,
+    recurrent_state,
+    *,
+    replay: bool,
+    draft_tree=False,
+    draft_tokens=DRAFT_TOKENS,
+):
     if replay and not gdn_replay_commit_supported(torch.bfloat16):
         pytest.skip("GDN ReplaySSM kernel unavailable on this platform")
     pool = _ContractPool(
         4,
         {0: ("linear_attention", conv_state, recurrent_state)},
     )
-    backend = MambaAttnBackend(*_config(replay=replay, draft_tree=draft_tree))
+    backend = MambaAttnBackend(
+        *_config(replay=replay, draft_tree=draft_tree, draft_tokens=draft_tokens)
+    )
     backend.set_kv_pool(pool)
     # The persistent decode buffers exist from construction, as at the
     # wrapper (the verify refresh writes into them).
@@ -96,23 +108,23 @@ def _make_backend(conv_state, recurrent_state, *, replay: bool, draft_tree=False
     return backend, pool
 
 
-def _inputs(seed=11):
+def _inputs(seed=11, draft_tokens=DRAFT_TOKENS):
     torch.manual_seed(seed)
     return dict(
         mixed_qkv=torch.randn(
-            BATCH * DRAFT_TOKENS,
+            BATCH * draft_tokens,
             CONV_DIM,
             device=DEVICE,
             dtype=torch.bfloat16,
         ),
         a=torch.randn(
-            BATCH * DRAFT_TOKENS,
+            BATCH * draft_tokens,
             NUM_V_HEADS,
             device=DEVICE,
             dtype=torch.bfloat16,
         ),
         b=torch.randn(
-            BATCH * DRAFT_TOKENS,
+            BATCH * draft_tokens,
             NUM_V_HEADS,
             device=DEVICE,
             dtype=torch.bfloat16,
@@ -152,7 +164,7 @@ def _forward_verify(backend, pool, inputs, *, layer_id=0):
         A_log=inputs["A_log"],
         dt_bias=inputs["dt_bias"],
         layer_id=layer_id,
-        seq_len=BATCH * DRAFT_TOKENS,
+        seq_len=inputs["mixed_qkv"].shape[0],
     )
 
 
@@ -193,6 +205,26 @@ def _initial_pools(seed=23, state_dtype=torch.float32):
         * 0.02
     )
     return conv, recurrent
+
+
+def _tree_verify_inputs(parents: list[list[int]]):
+    """TreeVerifyInputs of per-request parent lists, with their ancestor-or-self bits."""
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeVerifyInputs,
+    )
+
+    bits = []
+    for tree in parents:
+        for node in range(len(tree)):
+            bits.append(0)
+            while node >= 0:
+                bits[-1] |= 1 << node
+                node = tree[node]
+    return TreeVerifyInputs(
+        torch.tensor(bits, dtype=torch.int64, device=DEVICE),
+        len(parents[0]),
+        parent=torch.tensor(parents, dtype=torch.int32, device=DEVICE),
+    )
 
 
 def test_qwen_verify_caches_kv_without_draft_recurrent_states():
@@ -274,43 +306,60 @@ def test_qwen_replay_commit_matches_per_position_scratch_fallback(state_dtype):
     assert replay_backend._verify_commit_ctx is None
 
 
+@pytest.mark.parametrize(
+    ("parents", "paths"),
+    (
+        # Request 0 accepts the branch 0 -> 2; request 1 the whole chain 0 -> 1 -> 2.
+        ([[-1, 0, 0], [-1, 0, 1]], [[0, 2], [0, 1, 2]]),
+        # Verified in the chunked form: the branch 0 -> 2 -> 5 -> 8, and a whole chain.
+        (
+            [[-1, 0, 0, 1, 1, 2, 2, 3, 5], list(range(-1, 8))],
+            [[0, 2, 5, 8], list(range(9))],
+        ),
+    ),
+)
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-def test_qwen_replay_tree_matches_staged_tree(state_dtype):
+def test_qwen_replay_tree_matches_staged_tree(state_dtype, parents, paths):
     """A ReplaySSM draft tree verifies like the per-node staged tree, never
     writes the pool during verify, and commits the accepted path's state."""
-    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
-        TreeVerifyInputs,
-    )
-
+    tree = _tree_verify_inputs(parents)
     conv, recurrent = _initial_pools(state_dtype=state_dtype)
     replay_backend, replay_pool = _make_backend(
-        conv.clone(), recurrent.clone(), replay=True, draft_tree=True
+        conv.clone(),
+        recurrent.clone(),
+        replay=True,
+        draft_tree=True,
+        draft_tokens=tree.num_nodes,
     )
     staged_backend, staged_pool = _make_backend(
-        conv.clone(), recurrent.clone(), replay=False
+        conv.clone(), recurrent.clone(), replay=False, draft_tokens=tree.num_nodes
     )
-    parents = torch.tensor([[-1, 0, 0], [-1, 0, 1]], dtype=torch.int32, device=DEVICE)
-    # Ancestor-or-self bits of those parents.
-    ancestors = torch.tensor([1, 3, 5, 1, 3, 7], dtype=torch.int64, device=DEVICE)
     for backend in (replay_backend, staged_backend):
-        backend.bind_tree_verify(
-            TreeVerifyInputs(ancestors, DRAFT_TOKENS, parent=parents)
-        )
-    inputs = _inputs()
+        backend.bind_tree_verify(tree)
+    inputs = _inputs(draft_tokens=tree.num_nodes)
     before = replay_pool.get_component(0, "recurrent_state").clone()
 
     replay_out = _prepare_verify(replay_backend, replay_pool, inputs)
     staged_out = _prepare_verify(staged_backend, staged_pool, inputs)
     torch.cuda.synchronize()
-    # The chunked ReplaySSM verify and the step-by-step staged one round differently.
-    torch.testing.assert_close(replay_out, staged_out, atol=1e-4, rtol=2**-7)
+    assert (replay_backend._tree_node_states is not None) == (
+        gdn_tree_verify_needs_node_states(tree.num_nodes)
+    )
+    tol = dict(atol=0.0, rtol=0.0)
+    if not gdn_tree_verify_needs_node_states(tree.num_nodes):
+        # The chunked ReplaySSM verify and the step-by-step staged one round differently.
+        tol = dict(atol=1e-4, rtol=2**-7)
+    torch.testing.assert_close(replay_out, staged_out, **tol)
     torch.testing.assert_close(
         replay_pool.get_component(0, "recurrent_state"), before, atol=0.0, rtol=0.0
     )
 
-    # Request 0 accepts the branch 0 -> 2; request 1 the whole chain 0 -> 1 -> 2.
-    path = torch.tensor([[0, 2, -1], [0, 1, 2]], dtype=torch.int32, device=DEVICE)
-    accepted = torch.tensor([2, 3], dtype=torch.int32, device=DEVICE)
+    path = torch.full((BATCH, tree.num_nodes), -1, dtype=torch.int32, device=DEVICE)
+    for row, nodes in zip(path, paths):
+        row[: len(nodes)] = torch.tensor(nodes, dtype=torch.int32)
+    accepted = torch.tensor(
+        [len(nodes) for nodes in paths], dtype=torch.int32, device=DEVICE
+    )
     replay_backend.commit_verified_state(accepted, accepted_path=path)
     staged_backend.commit_verified_state(accepted, accepted_path=path)
     torch.cuda.synchronize()
@@ -396,15 +445,12 @@ def test_qwen_replay_payload_and_commit_survive_cuda_graph_replay():
 
 def test_qwen_replay_tree_graph_reads_the_tree_written_after_capture():
     """A captured tree verify replays with whatever tree the executor writes into the bound buffers."""
-    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
-        TreeVerifyInputs,
-    )
-
     conv, recurrent = _initial_pools()
-    backend, pool = _make_backend(conv, recurrent, replay=True, draft_tree=True)
-    ancestors = torch.tensor([1, 3, 5, 1, 3, 7], dtype=torch.int64, device=DEVICE)
-    parents = torch.tensor([[-1, 0, 0], [-1, 0, 1]], dtype=torch.int32, device=DEVICE)
-    backend.bind_tree_verify(TreeVerifyInputs(ancestors, DRAFT_TOKENS, parent=parents))
+    backend, pool = _make_backend(
+        conv.clone(), recurrent.clone(), replay=True, draft_tree=True
+    )
+    tree = _tree_verify_inputs([[-1, 0, 0], [-1, 0, 1]])
+    backend.bind_tree_verify(tree)
     backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS)
     inputs = _inputs(seed=41)
     _prepare_verify(backend, pool, inputs)
@@ -440,16 +486,18 @@ def test_qwen_replay_tree_graph_reads_the_tree_written_after_capture():
     captured_tree = _forward_verify(backend, pool, inputs)
 
     # The next round's tree: request 0 a chain, request 1 three roots.
-    ancestors.copy_(torch.tensor([1, 3, 7, 1, 2, 4], dtype=torch.int64))
-    parents.copy_(torch.tensor([[-1, 0, 1], [-1, -1, -1]], dtype=torch.int32))
+    next_tree = _tree_verify_inputs([[-1, 0, 1], [-1, -1, -1]])
+    tree.mask.copy_(next_tree.mask)
+    tree.parent.copy_(next_tree.parent)
     graph.replay()
     torch.cuda.synchronize()
-    replayed = output.clone()
-    expected = _forward_verify(backend, pool, inputs)
+    fresh, fresh_pool = _make_backend(conv, recurrent, replay=True, draft_tree=True)
+    fresh.bind_tree_verify(next_tree)
+    expected = _prepare_verify(fresh, fresh_pool, inputs)
     torch.cuda.synchronize()
 
     assert not torch.equal(expected, captured_tree)
-    torch.testing.assert_close(replayed, expected, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(output, expected, atol=0.0, rtol=0.0)
 
 
 def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
