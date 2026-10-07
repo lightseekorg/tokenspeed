@@ -43,7 +43,6 @@ from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
-    gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
     CAUSAL_CONV1D_BLOCK_M,
@@ -148,7 +147,7 @@ def triton_gdn_chunk_prefill(
 
 @triton.jit
 def _latest_ancestor(ancestors_row, step, valid):
-    """Parent of ``step`` (scalar or vector) in a tree's ancestor-or-self bitmask row: the highest bit below its own."""
+    """Parent of ``step`` (scalar or vector) in a tree's ancestor-or-self bitmask row: the highest bit below its own, -1 for a root."""
     above = tl.load(ancestors_row + step, mask=valid, other=0) & (
         (tl.full([], 1, tl.int64) << step.to(tl.int64)) - 1
     )
@@ -701,8 +700,8 @@ def _gdn_tree_verify_chunked_kernel(
         x,
     )
     # A finite floor keeps an infinite gate's zero decay out of 0 * inf below.
-    b_g = tl.where(valid, tl.maximum(-b_A * softplus_x, -1e30), 0.0)
-    b_beta = tl.where(valid, 1.0 / (1.0 + tl.exp(-b_b)), 0.0)
+    b_g = tl.maximum(-b_A * softplus_x, -1e30)
+    b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
     anc = ((bits[:, None] >> nodes[None, :].to(tl.int64)) & 1) != 0
     path_gates = tl.where(anc, b_g[None, :], 0.0)
@@ -833,14 +832,13 @@ def triton_gdn_decode_mtp(
     """Portable Triton fallback for ``gdn_decode_mtp`` (see
     ``flashinfer/gated_delta_rule.py`` for the shared contract). Supports both
     batch-scoped intermediate-state caching and direct per-token pool scatter
-    through ``output_state_indices``, and draft trees: ReplaySSM trees that
-    ``gdn_tree_verify_needs_node_states`` exempts in the chunked form, the
-    others step by step.
+    through ``output_state_indices``, and draft trees: ReplaySSM trees given no
+    ``intermediate_states_buffer`` in the chunked form, the others step by step.
     """
     if (
         tree_ancestors is not None
         and output_state_indices is None
-        and not gdn_tree_verify_needs_node_states(q.shape[1])
+        and intermediate_states_buffer is None
     ):
         return _launch_gdn_tree_verify_chunked(
             q,
