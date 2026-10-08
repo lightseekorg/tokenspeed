@@ -19,6 +19,7 @@ from test.runtime.conftest import make_kimi_pool as _make_kimi_pool
 from types import MethodType, SimpleNamespace  # noqa: E402
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
@@ -552,7 +553,11 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
     assert planned_bytes == allocated_bytes
     server_args = SimpleNamespace(speculative_num_draft_tokens=T)
     config = SimpleNamespace(max_bs=8, qcp_size=1)
-    backend = SimpleNamespace(linear_attn_backend=harness.backend)
+    backend = HybridLinearAttnBackend(
+        AttentionBackend(harness.config, harness.config.components[0]),
+        harness.backend,
+        [],
+    )
 
     _prepare_fixed_workspaces(
         server_args=server_args,

@@ -139,8 +139,8 @@ class SoftmaxAttnConfig(AttnComponentSpec):
     # the cache recipes; empty -> single full-history group. A layer's
     # compute mask lives on its PagedAttention (sliding_window_size).
     cache_layer_types: tuple[str, ...] = ()
-    # Retention window; families narrow the type (per-layer tuple on MHA,
-    # DeepSeek V4's int on MLA, None on MSA).
+    # Retention window for per-layer cache recipes. Families that declare
+    # whole groups, such as DeepSeek V4, put their windows on those groups.
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
 
     @classmethod
