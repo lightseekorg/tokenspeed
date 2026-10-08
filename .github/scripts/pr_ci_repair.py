@@ -479,6 +479,22 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
         )
     if result.returncode:
         print(f"Repair process exited with status {result.returncode}.", flush=True)
+        stderr = (plan_root / "cli.stderr").read_text(errors="replace")
+        signatures = {
+            "EACCES": "File access denied.",
+            "ENOENT": "A required file or executable is missing.",
+            "Cannot find module": "A required module is missing.",
+            "Invalid agent file": "The agent configuration was rejected.",
+            "AuthenticationError": "Provider authentication failed.",
+            "PermissionDeniedError": "Provider access was denied.",
+            "BadRequestError": "The provider rejected the request.",
+            "APIConnectionError": "The provider connection failed.",
+            "NotFoundError": "The provider resource was not found.",
+            "RateLimitError": "The provider rate limit was reached.",
+        }
+        for signature, message in signatures.items():
+            if signature in stderr:
+                print(f"Repair failure category: {message}", flush=True)
         raise ValueError("Repair failed or timed out.")
     print("Repair: checking proposed patch.", flush=True)
     no_symlinks(source)

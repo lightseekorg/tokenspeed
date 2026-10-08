@@ -883,6 +883,19 @@ def control(number: int):
     state = load_state(comments, pr)
     comment = latest_command(comments)
     initial = bool(comment and (not state or comment["id"] > state["command"]))
+    if (
+        not initial
+        and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        and state
+        and comment
+        and comment["id"] == state["command"]
+        and state["action"] == "fix"
+        and state["phase"] == "manual"
+        and "candidate" not in state
+        and "repair_run" in state
+        and api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
+    ):
+        initial = True
     if initial:
         action = permitted(comment)
         prior = state

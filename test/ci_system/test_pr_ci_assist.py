@@ -988,6 +988,7 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
                 "path": ".github/workflows/pr-ci-plan.yml",
                 "conclusion": "success",
                 "display_title": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+                "status": "completed",
             }
             if "actions/runs" in path
             else author
@@ -1022,6 +1023,18 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
     assert tmp_path.joinpath("request.json").is_file()
     assert live[0]["repair_run"] == 200
+    # A failed repair waits for an explicit dispatch before trying again with
+    # the existing authorized fix; completion events must not create retries.
+    live[0]["phase"] = "manual"
+    emitted.clear()
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "manual" and not emitted
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "201")
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
+    assert live[0]["command"] == 43 and live[0]["repair_run"] == 201
     # The validation branch has a different immutable source; an old head pass
     # must not authorize promotion of that candidate.
     live[0].update(
