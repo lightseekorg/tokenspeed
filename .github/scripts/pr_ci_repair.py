@@ -94,19 +94,27 @@ class RepairRejected(ValueError):
     def __init__(self, category: str, *, path: str = "", details=None):
         super().__init__(REPAIR_FEEDBACK[category])
         self.category = category
-        self.feedback = dict(reason=str(self), path=path, details=details)
+        self.feedback = dict(
+            category=category, reason=str(self), path=path, details=details
+        )
 
 
 def repair_with_feedback(request: dict, run_model, proposal, feedback: Path):
     """Give rejected patches bounded corrective turns within the original hour."""
-    for attempt in range(3):
+    for attempt in range(8):
         remaining_time(request)
         run_model(attempt)
         try:
             return proposal()
         except RepairRejected as error:
             print(f"Repair patch rejected: {error.category}.", flush=True)
-            if error.category == "public-output" or attempt == 2:
+            for issue in error.feedback.get("issues", [error.feedback]):
+                if issue["path"] in request.get("data", {}).get("paths", []):
+                    print(
+                        f"Repair issue: {issue['category']} in {issue['path']}.",
+                        flush=True,
+                    )
+            if error.category == "public-output" or attempt == 7:
                 raise
             feedback.write_text(json.dumps(error.feedback))
             print("Repair: returning patch feedback to the model.", flush=True)
@@ -252,16 +260,16 @@ def scan(diff: str, *, additions: str | None = None):
 
 
 def guard_test_assertions(source: Path, head: str, base: str, path: str):
+    snippets = {}
+
     def assertions(content: str) -> Counter:
         try:
             nodes = ast.walk(ast.parse(content))
         except SyntaxError:
             raise RepairRejected("test-syntax", path=path) from None
-        return Counter(
-            ast.dump(node, include_attributes=False)
-            for node in nodes
-            if isinstance(node, ast.Assert)
-            or (
+        found = Counter()
+        for node in nodes:
+            if isinstance(node, ast.Assert) or (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
                 and (
@@ -272,8 +280,11 @@ def guard_test_assertions(source: Path, head: str, base: str, path: str):
                         and node.func.attr == "raises"
                     )
                 )
-            )
-        )
+            ):
+                key = ast.dump(node, include_attributes=False)
+                found[key] += 1
+                snippets[key] = ast.unparse(node)
+        return found
 
     required = Counter()
     for ref in (head, base):
@@ -284,8 +295,36 @@ def guard_test_assertions(source: Path, head: str, base: str, path: str):
     missing = required - assertions(source.joinpath(path).read_text())
     if missing:
         raise RepairRejected(
-            "test-assertions", path=path, details=list(missing.elements())
+            "test-assertions",
+            path=path,
+            details=[snippets[key] for key in missing.elements()],
         )
+
+
+def guard_file(source: Path, head: str, p: str, validation_base: str | None):
+    if p == NATIVE_CONFIG:
+        # Keep current main's trusted test commands when the PR is older.
+        guard_native_task(source, validation_base or head)
+    elif {"test", "tests"}.intersection(Path(p).parts[:-1]):
+        if validation_base is None:
+            raise ValueError("Test resolution requires a pinned main commit.")
+        guard_test_assertions(source, head, validation_base, p)
+    file = source / p
+    if not file.is_file() or file.stat().st_size > 1000000:
+        raise RepairRejected("file-size", path=p)
+    if file.suffix == ".py" and not {"test", "tests"}.intersection(file.parts[:-1]):
+        try:
+            ast.parse(file.read_text())
+        except SyntaxError as error:
+            raise RepairRejected(
+                "source-syntax",
+                path=p,
+                details={"line": error.lineno, "reason": error.msg},
+            ) from None
+    # Reject executable/type changes; regular source edits only.
+    status = command("git", "diff", "--raw", "--no-renames", head, "--", p, cwd=source)
+    if any(row.split()[0][1:] != row.split()[1] for row in status.splitlines()):
+        raise RepairRejected("file-mode", path=p)
 
 
 def guard(
@@ -299,32 +338,24 @@ def guard(
         p not in allowed or (p != NATIVE_CONFIG and not safe_path(p)) for p in names
     ):
         raise RepairRejected("scope")
-    for p in names:
-        if p == NATIVE_CONFIG:
-            # Keep current main's trusted test commands when the PR is older.
-            guard_native_task(source, validation_base or head)
-        elif {"test", "tests"}.intersection(Path(p).parts[:-1]):
-            if validation_base is None:
-                raise ValueError("Test resolution requires a pinned main commit.")
-            guard_test_assertions(source, head, validation_base, p)
-        file = source / p
-        if not file.is_file() or file.stat().st_size > 1000000:
-            raise RepairRejected("file-size", path=p)
-        if file.suffix == ".py" and not {"test", "tests"}.intersection(file.parts[:-1]):
-            try:
-                ast.parse(file.read_text())
-            except SyntaxError as error:
-                raise RepairRejected(
-                    "source-syntax",
-                    path=p,
-                    details={"line": error.lineno, "reason": error.msg},
-                ) from None
-        # Reject executable/type changes; regular source edits only.
-        status = command(
-            "git", "diff", "--raw", "--no-renames", head, "--", p, cwd=source
-        )
-        if any(row.split()[0][1:] != row.split()[1] for row in status.splitlines()):
-            raise RepairRejected("file-mode", path=p)
+    # Allowed tests are actual conflicts. Choosing the head verbatim must not
+    # bypass main's assertions merely because it leaves no textual diff.
+    checked = set(names) | {
+        p
+        for p in allowed
+        if Path(p).suffix == ".py"
+        and {"test", "tests"}.intersection(Path(p).parts[:-1])
+    }
+    issues = []
+    for p in sorted(checked):
+        try:
+            guard_file(source, head, p, validation_base)
+        except RepairRejected as error:
+            issues.append(error)
+    if issues:
+        first = issues[0]
+        first.feedback = {**first.feedback, "issues": [e.feedback for e in issues]}
+        raise first
     diff = command("git", "diff", "--binary", "--no-ext-diff", head, cwd=source)
     scan(
         diff,
@@ -350,12 +381,23 @@ def merge(source: Path, base: str, *, commit: bool):
     ).splitlines()
 
 
-def effective_merge(source: Path, base: str, head: str) -> str:
+def effective_merge(
+    source: Path, base: str, head: str, *, resolved_tests: set[str]
+) -> str:
     # An ordinary resolution patch can still produce a three-way conflict.
     # Keep its reviewed file contents while merging every nonconflicting base
     # change normally; never use an "ours" merge that drops base changes.
-    changed = command("git", "diff", "--name-only", head, cwd=source).splitlines()
-    contents = {p: source.joinpath(p).read_bytes() for p in changed}
+    if any(
+        not safe_path(p)
+        or Path(p).suffix != ".py"
+        or not {"test", "tests"}.intersection(Path(p).parts[:-1])
+        for p in resolved_tests
+    ):
+        raise ValueError("Invalid test conflict resolution scope.")
+    changed = set(command("git", "diff", "--name-only", head, cwd=source).splitlines())
+    # A checked modify/delete resolution can retain the head verbatim. Its
+    # unchanged bytes still need to be staged as a merge resolution.
+    contents = {p: source.joinpath(p).read_bytes() for p in changed | resolved_tests}
     conflicts = merge(source, base, commit=False)
     if not set(conflicts).issubset(contents):
         raise ValueError("Merge conflicts extend beyond the reviewed patch.")
@@ -709,7 +751,7 @@ assertions, thresholds and coverage; do not weaken or skip tests.
 Apply the repair with Edit or Write. Describing a proposed change without editing
 the allowed source does not complete this task.
 """)
-    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Complete read-only conflict parents: {parents}/head/<relative path> and {parents}/main/<relative path>; an absent file does not exist on that parent. Read these paired snapshots to preserve assertions and deliberate removals. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Finish the smallest substantiated repair promptly to leave time for dispatch and validation. Start with the actual failed step in diagnostics.txt and its CI specification. Check whether pinned main already fixes that failure, and preserve those fixes while resolving conflicts. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
+    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Complete read-only conflict parents: {parents}/head/<relative path> and {parents}/main/<relative path>; an absent file does not exist on that parent. Read these paired snapshots to preserve assertions and deliberate removals. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Try to complete source edits within 15 minutes to reserve time for required checks, GPU queues and validation. Finish the smallest substantiated repair promptly. Start with the actual failed step in diagnostics.txt and its CI specification. Check whether pinned main already fixes that failure, and preserve those fixes while resolving conflicts. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     guard_root = WORK / "guard"
     guard_root.mkdir()
@@ -744,7 +786,7 @@ the allowed source does not complete this task.
         if attempt:
             turn_prompt = (
                 ("" if session else prompt + "\n")
-                + f"The proposed patch was rejected. Read feedback.json and correct only the identified issue in the existing source edits. Preserve both merge parents' supported behavior. {remaining_time(request)} seconds remain in the original one-hour repair and validation budget. Apply the correction promptly to leave time for required checks and GPU dispatch."
+                + f"The proposed patch was rejected. Read feedback.json and correct all listed issues together in the existing source edits. The supplied assertion snippets must all remain with their original behavior and thresholds. Preserve both merge parents' supported behavior. {remaining_time(request)} seconds remain in the original one-hour repair and validation budget. Apply the correction promptly to leave time for required checks and GPU dispatch."
             )
         # Restore trusted provider settings before each process starts.
         (home / "config.toml").write_bytes(
@@ -840,7 +882,7 @@ def refresh_validation_base(source: Path, request: dict, base: str):
     command("git", "fetch", "origin", base, cwd=source)
     selected = set(
         command("git", "diff", "--name-only", state["head"], cwd=source).splitlines()
-    )
+    ) | set(request.get("conflicted_tests", []))
     changed = set(
         command(
             "git", "diff", "--name-only", "--no-renames", prior, base, cwd=source
@@ -938,7 +980,12 @@ def check():
         cwd=source,
     )
     patch_tree = command("git", "rev-parse", "HEAD^{tree}", cwd=source)
-    merged_tree = effective_merge(source, base, state["head"])
+    merged_tree = effective_merge(
+        source,
+        base,
+        state["head"],
+        resolved_tests=set(request.get("conflicted_tests", [])),
+    )
     result = subprocess.run(
         ["pre-commit", "run", "--all-files"],
         cwd=source,
@@ -1099,7 +1146,15 @@ def stage():
         cwd=source,
     )
     patch = command("git", "rev-parse", "HEAD", cwd=source)
-    if effective_merge(source, base, state["head"]) != proof["merge_tree"]:
+    if (
+        effective_merge(
+            source,
+            base,
+            state["head"],
+            resolved_tests=set(request.get("conflicted_tests", [])),
+        )
+        != proof["merge_tree"]
+    ):
         raise ValueError("Effective merge differs from checked tree.")
     commit_merge(source, "ci: prepare validation snapshot")
     validation = command("git", "rev-parse", "HEAD", cwd=source)
@@ -1232,8 +1287,20 @@ def promote(state: dict):
         cwd=source,
     )
     promoted = command("git", "rev-parse", "HEAD", cwd=source)
+    original_paths = command(
+        "git", "diff", "--name-only", f"{state['base']}...{state['head']}", cwd=source
+    ).splitlines()
+    resolved_tests = {
+        p
+        for p in original_paths
+        if safe_path(p)
+        and Path(p).suffix == ".py"
+        and {"test", "tests"}.intersection(Path(p).parts[:-1])
+        and source.joinpath(p).is_file()
+    }
     if (
-        effective_merge(source, base, state["head"]) != candidate["tree"]
+        effective_merge(source, base, state["head"], resolved_tests=resolved_tests)
+        != candidate["tree"]
         or command(
             "git", "rev-parse", f"{candidate['validation']}^{{tree}}", cwd=source
         )

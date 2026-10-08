@@ -600,12 +600,16 @@ def test_conflicted_test_resolution_preserves_both_sides_assertions(tmp_path, se
     file = tmp_path / path
     file.parent.mkdir(parents=True)
     file.write_text("def test_result():\n    assert value == 1\n")
+    other_path = "test/runtime/test_other.py"
+    other = tmp_path / other_path
+    other.write_text("assert other_value == 3\n")
     git("add", ".")
     git("commit", "-s", "-m", "initial")
     head = git("rev-parse", "HEAD")
     file.write_text(
         "def test_result():\n    torch.testing.assert_close(actual, expected, atol=0)\n"
     )
+    other.write_text("assert other_value == 3\nassert other_value == 5\n")
     git("add", ".")
     git("commit", "-s", "-m", "base")
     base = git("rev-parse", "HEAD")
@@ -626,8 +630,15 @@ def test_conflicted_test_resolution_preserves_both_sides_assertions(tmp_path, se
     with pytest.raises(ValueError, match="test assertions"):
         repair.guard_test_assertions(tmp_path, head, base, path)
     file.write_text(candidate.replace("    assert value == 1\n", ""))
-    with pytest.raises(ValueError, match="test assertions"):
+    with pytest.raises(repair.RepairRejected, match="test assertions") as rejection:
         repair.guard_test_assertions(tmp_path, head, base, path)
+    assert rejection.value.feedback["details"] == ["assert value == 1"]
+    other.write_text("assert other_value == 3\n")
+    with pytest.raises(repair.RepairRejected) as rejection:
+        repair.guard(tmp_path, head, {path, other_path}, validation_base=base)
+    issues = rejection.value.feedback["issues"]
+    assert {issue["path"] for issue in issues} == {path, other_path}
+    assert issues[1]["details"] == ["assert other_value == 5"]
 
 
 def test_source_screen_retains_public_parents_and_rejects_new_private_text(tmp_path):
@@ -1007,10 +1018,15 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     repair.identity(tmp_path)
     file = tmp_path / "model.py"
     file.write_text("value = 1\n")
+    test_path = "test/test_model.py"
+    resolved = tmp_path / test_path
+    resolved.parent.mkdir()
+    resolved.write_text("assert value == 1\n")
     git("add", ".")
     git("commit", "-s", "-m", "initial")
     common = git("rev-parse", "HEAD")
     file.write_text("value = 2\n")
+    resolved.unlink()
     other = tmp_path / "base.py"
     other.write_text("base_only = True\n")
     git("add", ".")
@@ -1018,10 +1034,11 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     base = git("rev-parse", "HEAD")
     git("checkout", "-b", "bot/test", common)
     file.write_text("value = 3\n")
+    resolved.write_text("assert value == 1\nassert value == 3\n")
     git("add", ".")
     git("commit", "-s", "-m", "head")
     head = git("rev-parse", "HEAD")
-    assert repair.merge(tmp_path, base, commit=False) == ["model.py"]
+    assert repair.merge(tmp_path, base, commit=False) == ["model.py", test_path]
     file.write_text("value = 4\n")
     repair.restore_patch(tmp_path, head, {"model.py"})
     assert not other.exists()  # no wholesale main changes in the PR patch
@@ -1029,19 +1046,25 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     with pytest.raises(repair.RepairRejected, match="not valid Python"):
         repair.guard(tmp_path, head, {"model.py"})
     file.write_text("value = 4\n")
-    repair.guard(tmp_path, head, {"model.py"})
+    repair.guard(tmp_path, head, {"model.py", test_path}, validation_base=base)
     git("add", ".")
     git("commit", "-s", "-m", "repair")
     patch = git("rev-parse", "HEAD")
-    tree = repair.effective_merge(tmp_path, base, head)
+    with pytest.raises(ValueError, match="beyond the reviewed patch"):
+        repair.effective_merge(tmp_path, base, head, resolved_tests=set())
+    git("merge", "--abort")
+    tree = repair.effective_merge(tmp_path, base, head, resolved_tests={test_path})
     assert other.read_text() == "base_only = True\n"
     assert file.read_text() == "value = 4\n"
+    assert resolved.read_text() == "assert value == 1\nassert value == 3\n"
     repair.commit_merge(tmp_path, "validation")
     assert git("rev-parse", "HEAD^{tree}") == tree
     git("checkout", "--detach", head)
     git("cherry-pick", "--signoff", patch)
     assert git("rev-parse", "HEAD^1") == head
-    assert repair.effective_merge(tmp_path, base, head) == tree
+    assert (
+        repair.effective_merge(tmp_path, base, head, resolved_tests={test_path}) == tree
+    )
     repair.commit_merge(tmp_path, "reconcile main")
     assert git("rev-parse", "HEAD^2") == base
     assert git("rev-parse", "HEAD^{tree}") == tree
@@ -1061,7 +1084,10 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     updated = git("rev-parse", "HEAD")
     git("checkout", "--detach", head)
     file.write_text("value = 4\n")
-    request = {"state": {"head": head, "base": common, "validation_base": base}}
+    request = {
+        "state": {"head": head, "base": common, "validation_base": base},
+        "conflicted_tests": [test_path],
+    }
     repair.refresh_validation_base(tmp_path, request, updated)
     assert file.read_text() == "value = 4\n" and not other.exists()
     assert request["state"]["validation_base"] == updated
@@ -1376,7 +1402,7 @@ def test_validation_poll_does_not_consume_a_new_repair_command(monkeypatch, sele
 def test_rejected_patch_receives_feedback_within_the_original_budget(
     monkeypatch, tmp_path, capsys
 ):
-    request = {"deadline": 100}
+    request = {"deadline": 100, "data": {"paths": ["test/example.py"]}}
     now = [40]
     monkeypatch.setattr(repair.time, "time", lambda: now[0])
     feedback = tmp_path / "feedback.json"
@@ -1392,7 +1418,7 @@ def test_rejected_patch_receives_feedback_within_the_original_budget(
         now[0] += 10
 
     def proposal():
-        if len(turns) == 1:
+        if len(turns) < 4:
             raise repair.RepairRejected(
                 "test-assertions",
                 path="test/example.py",
@@ -1404,9 +1430,9 @@ def test_rejected_patch_receives_feedback_within_the_original_budget(
         repair.repair_with_feedback(request, run_model, proposal, feedback)
         == "accepted patch"
     )
-    assert turns == [60, 50] and request["deadline"] == 100
+    assert turns == [60, 50, 40, 30] and request["deadline"] == 100
     output = capsys.readouterr().out
-    assert "test-assertions" in output and "private diagnostic" not in output
+    assert "test/example.py" in output and "private diagnostic" not in output
     turns.clear()
 
     def rejected():
@@ -1416,7 +1442,15 @@ def test_rejected_patch_receives_feedback_within_the_original_budget(
         repair.repair_with_feedback(
             request, lambda attempt: turns.append(attempt), rejected, feedback
         )
-    assert turns == [0, 1, 2]
+    assert turns == list(range(8))
+    now[0] = request["deadline"]
+    with pytest.raises(ValueError, match="budget expired"):
+        repair.repair_with_feedback(
+            request,
+            lambda attempt: pytest.fail("Started an expired turn"),
+            rejected,
+            feedback,
+        )
 
 
 def test_dispatch_event_uses_tested_source_not_main_controller(
