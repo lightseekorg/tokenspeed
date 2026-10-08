@@ -555,6 +555,7 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
 # Kernels that accept an ``enable_pdl`` kwarg for Programmatic Dependent Launch.
 _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     {
+        "flashinfer_cute_dsl_mm_nvfp4",
         "flashinfer_cute_dsl_mm_nvfp4_a16",
         "flashinfer_mm_nvfp4",
     }
