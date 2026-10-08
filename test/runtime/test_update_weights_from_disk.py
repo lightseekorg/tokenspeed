@@ -32,6 +32,7 @@ that ``load_weights`` saw nothing, not only that the request failed.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import sys
@@ -105,6 +106,7 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
     runner.device = "cpu"
     runner.gpu_id = 0
     runner.checkpoint_load_group = None
+    runner._disk_reload_shapes = None
     runner.model_config = SimpleNamespace(model_path=str(booted_from))
     runner.server_args = SimpleNamespace(
         load_format="auto",
@@ -423,6 +425,17 @@ def _quantized(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
+class _SkippingModel(_TinyModel):
+    """Skips checkpoint names it has no parameter for, as model loaders do."""
+
+    def load_weights(self, weights) -> None:
+        params = dict(self.named_parameters())
+        for name, tensor in weights:
+            self.seen.append(name)
+            if name in params:
+                params[name].data.copy_(tensor)
+
+
 class TestPostLoadTransforms(unittest.TestCase):
     def _transformed(self, **modules) -> list[str]:
         model = torch.nn.Module()
@@ -529,6 +542,140 @@ class TestReloadRefusals(unittest.TestCase):
 
         self.assertTrue(ok, message)
         torch.testing.assert_close(model.w.data, updated["w"])
+
+    def test_shape_mismatch_is_refused_before_anything_is_written(self):
+        _write_checkpoint(self.root / "step-0", scale=1.0)
+        wrong = self.root / "wrong"
+        wrong.mkdir()
+        # "b" is read before "w": a load without the check writes "b" and
+        # then fails on "w", leaving a half-written model.
+        save_file(
+            {"b": torch.ones(4), "w": torch.ones(5, 3)},
+            str(wrong / "model.safetensors"),
+        )
+        model = _TinyModel()
+        runner = _runner(model, self.root / "step-0")
+
+        ok, message = self._load(runner, wrong)
+
+        self.assertEqual(model.seen, [])
+        self.assertTrue(torch.equal(model.b.data, torch.zeros(4)))
+        self.assertFalse(ok)
+        self.assertIn("'w' has shape [5, 3], but [4, 3]", message)
+        self.assertIn("nothing was written", message)
+
+    def test_truncated_shard_is_refused_before_anything_is_written(self):
+        _write_checkpoint(self.root / "step-0", scale=1.0)
+        partial = self.root / "partial"
+        partial.mkdir()
+        save_file(
+            {"b": torch.ones(4)}, str(partial / "model-00001-of-00002.safetensors")
+        )
+        last = partial / "model-00002-of-00002.safetensors"
+        save_file({"w": torch.ones(4, 3)}, str(last))
+        last.write_bytes(last.read_bytes()[:-8])  # still being written
+        model = _TinyModel()
+        runner = _runner(model, self.root / "step-0")
+        real_glob = glob.glob
+
+        # Read the shards in name order, so a load without the check writes
+        # the first one before it fails on the second.
+        with mock.patch.object(
+            glob, "glob", side_effect=lambda *a, **k: sorted(real_glob(*a, **k))
+        ):
+            ok, message = self._load(runner, partial)
+
+        self.assertEqual(model.seen, [])
+        self.assertFalse(ok)
+        self.assertIn("model-00002-of-00002.safetensors", message)
+        self.assertIn("nothing was written", message)
+
+    def test_shapes_of_the_last_reload_survive_its_directory_being_deleted(self):
+        # Trainers rotate checkpoint directories; the check must not depend on
+        # the previous one still being on disk.
+        _write_checkpoint(self.root / "step-0", scale=1.0)
+        loaded = _write_checkpoint(self.root / "step-1", scale=2.0)
+        model = _TinyModel()
+        runner = _runner(model, self.root / "step-0")
+        ok, message = self._load(runner, self.root / "step-1")
+        self.assertTrue(ok, message)
+        for step in ("step-0", "step-1"):
+            for shard in (self.root / step).iterdir():
+                shard.unlink()
+            (self.root / step).rmdir()
+        wrong = self.root / "wrong"
+        wrong.mkdir()
+        save_file(
+            {"b": torch.ones(4), "w": torch.ones(5, 3)},
+            str(wrong / "model.safetensors"),
+        )
+
+        ok, message = self._load(runner, wrong)
+
+        self.assertFalse(ok)
+        self.assertIn("'w' has shape [5, 3], but [4, 3]", message)
+        torch.testing.assert_close(model.b.data, loaded["b"])
+
+    def test_names_the_held_checkpoint_lacks_are_left_to_the_model(self):
+        _write_checkpoint(self.root / "step-0", scale=1.0)
+        extra = self.root / "extra"
+        extra.mkdir()
+        save_file(
+            {"w": torch.ones(4, 3), "b": torch.ones(4), "mtp.weight": torch.ones(9)},
+            str(extra / "model.safetensors"),
+        )
+        model = _SkippingModel()
+        runner = _runner(model, self.root / "step-0")
+
+        ok, message = self._load(runner, extra)
+
+        self.assertTrue(ok, message)
+        self.assertTrue(torch.equal(model.w.data, torch.ones(4, 3)))
+
+    def test_one_element_tensors_match_whatever_their_shape(self):
+        # The default weight loader fills a one-element parameter from any
+        # one-element tensor, so [] and [1] are the same load.
+        held = self.root / "step-0"
+        held.mkdir()
+        save_file({"s": torch.tensor(1.0)}, str(held / "model.safetensors"))
+        update = self.root / "step-1"
+        update.mkdir()
+        save_file({"s": torch.full((1,), 3.0)}, str(update / "model.safetensors"))
+        model = _TinyModel()
+        model.s = torch.nn.Parameter(torch.zeros(1))
+        runner = _runner(model, held)
+
+        ok, message = self._load(runner, update)
+
+        self.assertTrue(ok, message)
+        self.assertEqual(model.s.item(), 3.0)
+
+    def test_failure_after_tensors_reached_the_model_reports_a_partial_update(self):
+        _write_checkpoint(self.root / "step-1", scale=7.0)
+        model = _TinyModel()
+
+        def load_then_fail(weights):
+            for name, tensor in weights:
+                dict(model.named_parameters())[name].data.copy_(tensor)
+                raise RuntimeError("device lost")
+
+        model.load_weights = load_then_fail
+        runner = _runner(model, self.root / "step-1")
+
+        ok, message = self._load(runner, self.root / "step-1")
+
+        self.assertFalse(ok)
+        self.assertIn("device lost", message)
+        self.assertIn("may now mix the old and new checkpoints", message)
+        self.assertIn("restart the engine", message)
+
+    def test_failure_before_any_tensor_reports_no_partial_update(self):
+        runner = _runner(_TinyModel(), self.root / "step-0")
+
+        ok, message = self._load(runner, self.root / "absent")
+
+        self.assertFalse(ok)
+        self.assertNotIn("may now mix", message)
 
 
 class TestReloadMatchesStartupLoad(unittest.TestCase):
