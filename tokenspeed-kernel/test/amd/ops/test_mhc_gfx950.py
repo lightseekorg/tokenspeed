@@ -180,7 +180,7 @@ def test_gluon_mhc_large_prefill_matches_reference(
     num_tokens: int, hidden_size: int
 ) -> None:
     args = _prefill_args(num_tokens, hidden_size)
-    actual = tokenspeed_kernel.mhc_pre(*args, norm_weight=None, norm_eps=None)
+    actual = kernel_mhc_pre(*args, norm_weight=None, norm_eps=None)
     expected = _reference(*args)
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         torch.testing.assert_close(
@@ -257,7 +257,7 @@ def test_gluon_mhc_prefill_output_normalization(
     )
     if strided_weight:
         norm_weight = norm_weight[::2]
-    actual = tokenspeed_kernel.mhc_pre(
+    actual = kernel_mhc_pre(
         *args,
         norm_weight=norm_weight,
         norm_eps=1e-5,
@@ -278,12 +278,10 @@ def test_gluon_mhc_prefill_graph_changes_all_inputs(normalize) -> None:
         torch.ones(7168, dtype=torch.bfloat16, device="cuda") if normalize else None
     )
     norm_eps = 1e-5 if normalize else None
-    tokenspeed_kernel.mhc_pre(*args, norm_weight=norm_weight, norm_eps=norm_eps)
+    kernel_mhc_pre(*args, norm_weight=norm_weight, norm_eps=norm_eps)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = tokenspeed_kernel.mhc_pre(
-            *args, norm_weight=norm_weight, norm_eps=norm_eps
-        )
+        actual = kernel_mhc_pre(*args, norm_weight=norm_weight, norm_eps=norm_eps)
     residual.copy_(torch.randn_like(residual))
     fn.mul_(0.75)
     scale.mul_(1.2)
