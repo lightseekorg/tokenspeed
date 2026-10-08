@@ -22,6 +22,7 @@
 """Bounded, opt-in diagnostic capture. No prompt text or token IDs are written."""
 
 import atexit
+import hashlib
 import json
 import logging
 import os
@@ -36,7 +37,34 @@ logger = logging.getLogger(__name__)
 class CacheTraceWriter:
     def __init__(self, path: str, metadata: dict):
         self.epoch = uuid.uuid4().hex
-        self.metadata = {"schema": 1, "epoch": self.epoch, **metadata}
+        compatibility = metadata.get("compatibility")
+        metadata = {
+            key: value for key, value in metadata.items() if key != "compatibility"
+        }
+        self.metadata = {
+            "schema": 2,
+            "epoch": self.epoch,
+            "clock": "unix_ns",
+            "compatibility_fingerprint": (
+                hashlib.sha256(
+                    json.dumps(
+                        {
+                            "model_config": compatibility,
+                            "prefix_granularity": metadata.get("prefix_granularity"),
+                            "groups": metadata.get("groups"),
+                        },
+                        sort_keys=True,
+                    ).encode()
+                ).hexdigest()
+                if compatibility is not None
+                else None
+            ),
+            "compatibility_scope": "configuration_only",
+            **metadata,
+        }
+        self._history_complete = False
+        self._history_lost = False
+        self._last_sequence = 0
         self.path = f"{path}.{metadata['global_rank']}.{self.epoch}.jsonl"
         self._queue = queue.Queue(maxsize=16)
         self._dropped = 0
@@ -70,7 +98,19 @@ class CacheTraceWriter:
             self._dropped = 0
 
     def _write(self, event: dict) -> None:
-        record = {**self.metadata, **event}
+        # The native start, not capture_start, certifies an empty index. Gaps
+        # permanently invalidate this epoch, even if subsequent events resume.
+        sequence = event.get("sequence")
+        if sequence is not None:
+            if sequence != self._last_sequence + 1:
+                self._history_lost = True
+            self._last_sequence = sequence
+        if event.get("kind") == "gap":
+            self._history_lost = True
+        if event.get("kind") == "start":
+            self._history_complete = event.get("reason") == "empty" and sequence == 1
+        self._history_complete = self._history_complete and not self._history_lost
+        record = {**self.metadata, "history_complete": self._history_complete, **event}
         record.setdefault("timestamp_ns", time.time_ns())
         line = json.dumps(record, separators=(",", ":")) + "\n"
         self._file.write(line)

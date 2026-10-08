@@ -311,6 +311,18 @@ class EventLoop:
                     "global_rank": global_rank,
                     "attn_tp_rank": attn_tp_rank,
                     "attn_tp_size": cache_replica_tp_size,
+                    "pp_rank": mapping.pp_rank,
+                    "pp_size": self.pp_size,
+                    "num_device_pages": geometry.num_device_pages,
+                    "num_host_pages": num_host_pages,
+                    "eviction_policy": "request_access_epoch",
+                    "compatibility": {
+                        "model": server_args.model,
+                        "revision": server_args.revision,
+                        "config": self.model_config.hf_config.to_dict(),
+                        "dtype": str(server_args.dtype),
+                        "kv_cache_dtype": str(server_args.kv_cache_dtype),
+                    },
                     "prefix_granularity": geometry.prefix_granularity,
                     "l2_enabled": server_args.enable_kvstore,
                     "l3_enabled": server_args.kvstore_storage_backend is not None,
@@ -392,6 +404,7 @@ class EventLoop:
         )
         if self._cache_trace is not None:
             scheduler_cfg.enable_cache_trace = True
+            scheduler_cfg.enable_cache_trace_frontiers = True
         logger.info(
             f"Scheduler config: prefix_granularity={scheduler_cfg.prefix_granularity!s}"
             f" num_device_pages={scheduler_cfg.num_device_pages!s} "

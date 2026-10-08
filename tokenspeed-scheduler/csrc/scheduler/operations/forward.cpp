@@ -297,8 +297,10 @@ bool Scheduler::admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback&
                                                    ? progress.completed_pages->first_new_prefix_page
                                                    : static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     registerKvEventPrefixPages(request, cache_progress.prefix_hashes, first_new_prefix_page);
+    beginCacheTracePublication(request, progress);
     const bool admitted =
         admit(plan, feedback, coordinator_.ProbePrefix({}), demands, progress, cache_progress.access_epoch).has_value();
+    endCacheTracePublication();
     if (admitted && config_.enable_cache_trace && progress.completed_pages) {
         recordCacheTrace({.kind = "checkpoint", .request_id = request.Id(), .reason = "computed_not_joint_readability"},
                          cache_progress.prefix_hashes);
@@ -700,7 +702,9 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
         if (progress.completed_pages) {
             classifyCompletedStateBoundaries(*progress.completed_pages, num_computed_tokens,
                                              coordinator_.PrefixGranularity());
+            beginCacheTracePublication(victim, progress);
             coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
+            endCacheTracePublication();
             if (config_.enable_cache_trace) {
                 recordCacheTrace({.kind = "checkpoint",
                                   .request_id = victim.Id(),

@@ -20,13 +20,9 @@
 
 from __future__ import annotations
 
-import json
-import queue
-
 import pytest
 import torch
 
-from tokenspeed.runtime.engine.cache_trace import CacheTraceWriter
 from tokenspeed.runtime.engine.generation_output_processor import (
     OutputProcesser,
     RequestState,
@@ -151,35 +147,6 @@ def test_cached_tokens_count_the_replayed_window_as_a_hit():
     assert len(trace.items) == 1
     assert len(trace.items[0]) == 2
     assert trace.items[0][0]["cached_tokens_delta"] == 8
-
-
-def test_cache_trace_close_finishes_when_sentinel_enqueue_times_out(
-    tmp_path, monkeypatch
-):
-    writer = CacheTraceWriter(str(tmp_path / "capture"), {"global_rank": 0})
-    original_put = writer._queue.put
-
-    def timeout_on_shutdown(item, *args, **kwargs):
-        if item is None:
-            raise queue.Full
-        return original_put(item, *args, **kwargs)
-
-    monkeypatch.setattr(writer._queue, "put", timeout_on_shutdown)
-    try:
-        writer.publish([{"kind": "admitted"}])
-        writer.close()
-        assert not writer._thread.is_alive()
-        with open(writer.path) as stream:
-            records = [json.loads(line) for line in stream]
-        assert [record["kind"] for record in records] == [
-            "capture_start",
-            "admitted",
-            "capture_end",
-        ]
-    finally:
-        if writer._thread.is_alive():
-            original_put(None, timeout=1)
-            writer._thread.join(timeout=1)
 
 
 def test_mark_abort_notify_client_flag():

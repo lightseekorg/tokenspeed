@@ -65,6 +65,11 @@ public:
         std::string reason;
         std::vector<std::string> prefix_hashes;
         std::int32_t hash_count{0};
+        std::uint64_t prefix_ref{0};
+        std::uint64_t parent_ref{0};
+        CacheNamespaceId namespace_id{kDefaultCacheNamespaceId};
+        std::string boundary_kind;
+        std::int32_t computed_tokens{-1};
         std::int32_t group_id{-1};
         std::int32_t page_offset{-1};
         std::int32_t prompt_tokens{-1};
@@ -75,6 +80,18 @@ public:
         std::int32_t replay_tokens{-1};
         std::uint64_t dropped_events{0};
         bool readmission{false};
+        std::int32_t device_total_blocks{-1};
+        std::int32_t device_empty_blocks{-1};
+        std::int32_t device_active_blocks{-1};
+        std::int32_t host_free_blocks{-1};
+        std::int32_t host_pinned_blocks{-1};
+        std::int32_t waiting_requests{-1};
+        std::int32_t running_requests{-1};
+        std::int32_t pd_transfer_requests{-1};
+        std::int32_t block_granularity{-1};
+        std::int32_t lookback_pages{-1};
+        bool prefix_closed{false};
+        bool group_replayable{false};
     };
     std::vector<CacheTraceEvent> DrainCacheTrace();
     // Testing/control-plane operation. A successful return means the complete
@@ -332,6 +349,17 @@ private:
     std::vector<CacheTraceEvent> cache_trace_events_;
     std::uint64_t cache_trace_sequence_{0};
     std::uint64_t cache_trace_dropped_{0};
+    std::size_t cache_trace_bytes_{0};
+    std::unordered_map<std::string, std::uint64_t> cache_trace_prefixes_;
+    bool cache_trace_dictionary_exhausted_{false};
+    std::unordered_map<std::string, std::vector<std::string>> cache_trace_computed_prefixes_;
+    std::string cache_trace_producer_id_;
+    std::int32_t cache_trace_computed_tokens_{-1};
+    std::string cache_trace_boundary_kind_;
+    void beginCacheTracePublication(const Request& request, const RequestProgress& progress);
+    void endCacheTracePublication();
+    void recordCacheTraceComputed(const Request& request);
+    void recordCacheTraceFrontier(const Request& request, std::span<const std::string> hashes);
     ReqPoolAllocator req_pool_allocator_;
 
     // Pools outlive every CacheBlockRef stored below.

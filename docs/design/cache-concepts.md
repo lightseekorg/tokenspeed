@@ -1645,3 +1645,19 @@ Captures contain content hashes and request IDs but no prompt text or token IDs.
 Keep them in private storage and compare trace-on/off overhead before enabling
 them for a serving workload. Native API changes require a scheduler release
 before the runtime can enable capture with a published wheel.
+
+### Diagnostic cache history
+
+Opt-in cache traces identify cumulative prefixes using a bounded parent-linked
+dictionary per scheduler lifetime; later events carry a tip and page count.
+Namespace, group, child offset, producer and computed boundary provenance stay
+separate from cache hit predictions. A native empty start certifies initialization;
+any dropped event, exhausted dictionary or retention limit invalidates subsequent
+history. L3 starts remain unknown without an initial inventory.
+
+Final-publication frontier probes are separately gated and read-only. They record
+Device and Host matches per rank using the role's admission matcher, without
+pinning pages or allocating storage. Host matches still require transfer. A single
+rank's frontier or an Attention-group store cannot certify replica-wide readiness.
+Capacity observations accompany diagnostic drains; they describe actual execution,
+not a counterfactual scheduler or an achievable whole-workload cache optimum.

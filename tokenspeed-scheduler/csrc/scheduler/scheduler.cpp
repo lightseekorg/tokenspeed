@@ -106,13 +106,25 @@ Scheduler::Scheduler(SchedulerConfig config)
         coordinator_.SetCacheTraceSink(
             [this](const CacheKey& key, CacheTier tier, CacheCoordinator::CacheMutation mutation, const char* reason) {
                 recordCacheTrace({.kind = mutation == CacheCoordinator::CacheMutation::kStored ? "stored" : "removed",
+                                  .request_id = cache_trace_producer_id_,
                                   .tier = tier == CacheTier::kDevice ? "L1" : "L2",
                                   .reason = reason,
+                                  .namespace_id = key.namespace_id,
+                                  .boundary_kind = cache_trace_boundary_kind_,
+                                  .computed_tokens = cache_trace_computed_tokens_,
                                   .group_id = static_cast<std::int32_t>(key.group_id),
                                   .page_offset = key.page_offset},
                                  {&key.content_hash, 1});
             });
         recordCacheTrace({.kind = "start", .reason = config_.enable_l3_storage ? "l3_history_unknown" : "empty"});
+        for (std::int32_t group = 0; group < coordinator_.NumGroups(); ++group) {
+            recordCacheTrace({.kind = "group",
+                              .group_id = group,
+                              .block_granularity = coordinator_.GroupBlockGranularity(group),
+                              .lookback_pages = coordinator_.GroupBoundaryLookbackPages(group),
+                              .prefix_closed = coordinator_.GroupIsPrefixClosed(group),
+                              .group_replayable = coordinator_.GroupIsReplayable(group)});
+        }
     }
 
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
@@ -129,29 +141,131 @@ void Scheduler::recordCacheTrace(CacheTraceEvent event, std::span<const std::str
     if (!config_.enable_cache_trace) {
         return;
     }
+    // Prefix identity is emitted once per scheduler lifetime. References are
+    // invalid after any gap, including a dropped dictionary entry.
+    if (event.kind != "stored" && event.kind != "removed" && event.kind != "prefix") {
+        std::uint64_t parent = 0;
+        std::size_t first_new = prefix_hashes.size();
+        // A cumulative hash identifies its entire parent chain. Most decode
+        // steps only look up the known tip; walk and emit newly added pages.
+        if (!cache_trace_dictionary_exhausted_) {
+            while (first_new > 0) {
+                const auto key = std::to_string(event.namespace_id) + ":" + prefix_hashes[first_new - 1];
+                const auto found = cache_trace_prefixes_.find(key);
+                if (found != cache_trace_prefixes_.end()) {
+                    parent = found->second;
+                    break;
+                }
+                --first_new;
+            }
+            for (const auto& hash : prefix_hashes.subspan(first_new)) {
+                if (cache_trace_prefixes_.size() >= 131072) {
+                    cache_trace_dictionary_exhausted_ = true;
+                    recordCacheTrace({.kind = "gap", .reason = "prefix_dictionary_full"});
+                    parent = 0;
+                    break;
+                }
+                const auto reference = cache_trace_prefixes_.size() + 1;
+                cache_trace_prefixes_.emplace(std::to_string(event.namespace_id) + ":" + hash, reference);
+                recordCacheTrace({.kind = "prefix",
+                                  .prefix_hashes = {hash},
+                                  .hash_count = 1,
+                                  .prefix_ref = reference,
+                                  .parent_ref = parent,
+                                  .namespace_id = event.namespace_id});
+                parent = reference;
+            }
+        }
+        event.prefix_ref = parent;
+    } else if (event.kind == "stored" || event.kind == "removed") {
+        event.prefix_hashes.assign(prefix_hashes.begin(), prefix_hashes.end());
+    }
+    if (event.kind != "prefix") {
+        event.hash_count = static_cast<std::int32_t>(prefix_hashes.size());
+    }
     event.sequence = ++cache_trace_sequence_;
-    if (cache_trace_events_.size() >= 4096) {
+    std::size_t bytes = sizeof(CacheTraceEvent) + event.request_id.size() + event.reason.size();
+    for (const auto& hash : event.prefix_hashes) {
+        bytes += hash.size() + sizeof(std::string);
+    }
+    if (cache_trace_events_.size() >= 16384 || cache_trace_bytes_ + bytes > 16 * 1024 * 1024) {
         ++cache_trace_dropped_;
         return;
     }
     event.timestamp_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
             .count();
-    event.hash_count = static_cast<std::int32_t>(prefix_hashes.size());
-    const auto retained = prefix_hashes.first(std::min(prefix_hashes.size(), std::size_t{256}));
-    event.prefix_hashes.assign(retained.begin(), retained.end());
+    cache_trace_bytes_ += bytes;
     cache_trace_events_.push_back(std::move(event));
 }
 
 std::vector<Scheduler::CacheTraceEvent> Scheduler::DrainCacheTrace() {
+    if (config_.enable_cache_trace && config_.enable_cache_trace_frontiers && !cache_trace_events_.empty()) {
+        recordCacheTrace({.kind = "capacity",
+                          .device_total_blocks = coordinator_.TotalLcmBlocks(),
+                          .device_empty_blocks = EmptyLcmBlocks(),
+                          .device_active_blocks = ActiveLcmBlocks(),
+                          .host_free_blocks = HostPoolFreeBlocks(),
+                          .host_pinned_blocks = HostPoolPinnedBlocks(),
+                          .waiting_requests = static_cast<std::int32_t>(WaitingSize()),
+                          .running_requests = static_cast<std::int32_t>(PrefillSize() + DecodingSize()),
+                          .pd_transfer_requests = static_cast<std::int32_t>(PdTransferSize())});
+    }
     std::vector<CacheTraceEvent> events = std::exchange(cache_trace_events_, {});
+    cache_trace_bytes_ = 0;
     if (cache_trace_dropped_ != 0) {
         recordCacheTrace(
             {.kind = "gap", .reason = "native_buffer_full", .dropped_events = std::exchange(cache_trace_dropped_, 0)});
         auto gaps = std::exchange(cache_trace_events_, {});
+        cache_trace_bytes_ = 0;
         events.insert(events.end(), std::make_move_iterator(gaps.begin()), std::make_move_iterator(gaps.end()));
     }
     return events;
+}
+
+void Scheduler::beginCacheTracePublication(const Request& request, const RequestProgress& progress) {
+    if (!config_.enable_cache_trace) {
+        return;
+    }
+    cache_trace_producer_id_ = request.Id();
+    cache_trace_computed_tokens_ = progress.num_computed_tokens.value_or(-1);
+    if (progress.completed_pages) {
+        switch (progress.completed_pages->boundary_kind) {
+            case CacheBoundaryKind::kChunk:
+                cache_trace_boundary_kind_ = "chunk";
+                break;
+            case CacheBoundaryKind::kEndpoint:
+                cache_trace_boundary_kind_ = "endpoint";
+                break;
+            case CacheBoundaryKind::kPromoted:
+                cache_trace_boundary_kind_ = "promoted";
+                break;
+        }
+    }
+}
+
+void Scheduler::endCacheTracePublication() {
+    if (config_.enable_cache_trace) {
+        cache_trace_producer_id_.clear();
+        cache_trace_computed_tokens_ = -1;
+        cache_trace_boundary_kind_.clear();
+    }
+}
+
+void Scheduler::recordCacheTraceFrontier(const Request& request, std::span<const std::string> hashes) {
+    if (!config_.enable_cache_trace || !config_.enable_cache_trace_frontiers) {
+        return;
+    }
+    // Final publication only: never probe mid-commit or on every decode chunk.
+    const auto probe =
+        config_.role == Role::kD ? coordinator_.ProbeDecodeDevicePrefix(hashes) : coordinator_.ProbePrefix(hashes);
+    recordCacheTrace({.kind = "readable",
+                      .request_id = request.Id(),
+                      .reason = "rank_local_final_publication",
+                      .computed_tokens = request.NumComputedTokens(),
+                      .device_match_tokens = probe.device.num_common_tokens,
+                      .host_match_tokens = probe.host.num_common_tokens},
+                     hashes);
 }
 
 bool Scheduler::pdTransferInFlight(const Request& request) const {
@@ -352,7 +466,8 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         if (config_.enable_cache_trace) {
             recordCacheTrace({.kind = "submitted",
                               .request_id = request_specs[i].request_id,
-                              .prompt_tokens = static_cast<std::int32_t>(request_specs[i].tokens.size())});
+                              .prompt_tokens = static_cast<std::int32_t>(request_specs[i].tokens.size())},
+                             PrefixHashesForTokens(request_specs[i].tokens));
         }
     }
 }
@@ -501,6 +616,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         kv_event_hash_progress_.erase(request->Id());
         if (config_.enable_cache_trace) {
             recordCacheTrace({.kind = "finished", .request_id = request->Id()});
+            cache_trace_computed_prefixes_.erase(request->Id());
         }
         requests_by_id_.erase(request->Id());
         return true;

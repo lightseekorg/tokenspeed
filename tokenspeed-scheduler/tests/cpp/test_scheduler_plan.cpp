@@ -103,19 +103,74 @@ TEST_F(CacheTraceTestSuite, L1RemovalDoesNotHideHostReuse) {
     EXPECT_GT(admitted->host_match_tokens, 0);
     EXPECT_LE(admitted->admitted_tokens, admitted->cacheable_tokens);
     EXPECT_FALSE(admitted->readmission);
-    EXPECT_EQ(admitted->hash_count, admitted->prefix_hashes.size());
+    EXPECT_GT(admitted->prefix_ref, 0);
+    EXPECT_GT(admitted->hash_count, 0);
 }
 
 TEST_F(CacheTraceTestSuite, OverflowIsExplicitAndDrainRecovers) {
-    for (int i = 0; i < 4200; ++i) {
+    for (int i = 0; i < 16500; ++i) {
         Submit(MakeRequestSpec("queued_" + std::to_string(i), 1));
     }
     const auto events = scheduler_->DrainCacheTrace();
-    ASSERT_EQ(events.size(), 4097);
+    ASSERT_EQ(events.size(), 16385);
     EXPECT_EQ(events.back().kind, "gap");
     EXPECT_GT(events.back().dropped_events, 0);
     EXPECT_GT(events.back().sequence, events[events.size() - 2].sequence + 1);
     EXPECT_TRUE(scheduler_->DrainCacheTrace().empty());
+}
+
+TEST_F(CacheTraceTestSuite, ComputedAndFinalFrontiersCarryProducerEvidence) {
+    config_.enable_cache_trace_frontiers = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    SetupHostCache();
+    const auto events = scheduler_->DrainCacheTrace();
+    EXPECT_TRUE(std::ranges::any_of(events, [](const auto& event) {
+        return event.kind == "computed" && event.computed_tokens > 0 && event.prefix_ref > 0;
+    }));
+    EXPECT_TRUE(std::ranges::any_of(events, [](const auto& event) {
+        return event.kind == "stored" && event.request_id == "r_seed" && event.computed_tokens > 0 &&
+               !event.boundary_kind.empty();
+    }));
+    EXPECT_TRUE(std::ranges::any_of(events, [](const auto& event) {
+        return event.kind == "readable" && (event.device_match_tokens > 0 || event.host_match_tokens > 0);
+    }));
+    EXPECT_EQ(events.back().kind, "capacity");
+    EXPECT_GE(events.back().device_empty_blocks, 0);
+    EXPECT_GE(events.back().host_pinned_blocks, 0);
+}
+
+TEST_F(CacheTraceTestSuite, LongPrefixDictionaryIsCompleteAndReused) {
+    auto config = MakeConfig();
+    config.device_allocator.total_pages = 1024;
+    config.cache_groups[0].total_pages = 1024;
+    Scheduler scheduler{config};
+    const auto first = MakeRequestSpec("long_first", 300);
+    scheduler.SubmitRequests({first});
+    const auto events = scheduler.DrainCacheTrace();
+    const auto submitted = std::ranges::find_if(events, [](const auto& event) { return event.kind == "submitted"; });
+    ASSERT_NE(submitted, events.end());
+    EXPECT_GT(submitted->hash_count, 256);
+    std::unordered_map<std::uint64_t, const Scheduler::CacheTraceEvent*> dictionary;
+    for (const auto& event : events) {
+        if (event.kind == "prefix") {
+            ASSERT_EQ(event.prefix_hashes.size(), 1);
+            dictionary.emplace(event.prefix_ref, &event);
+        }
+    }
+    auto reference = submitted->prefix_ref;
+    int pages = 0;
+    while (reference != 0) {
+        ASSERT_TRUE(dictionary.contains(reference));
+        reference = dictionary.at(reference)->parent_ref;
+        ++pages;
+    }
+    EXPECT_EQ(pages, submitted->hash_count);
+    auto second = first;
+    second.request_id = "long_second";
+    scheduler.SubmitRequests({second});
+    const auto reused = scheduler.DrainCacheTrace();
+    ASSERT_EQ(reused.size(), 1);
+    EXPECT_EQ(reused.front().prefix_ref, submitted->prefix_ref);
 }
 
 TEST_F(SchedulerTestSuite, LoadBack_NotTriggeredWithoutHostCacheHit) {

@@ -58,6 +58,7 @@ struct SchedulerConfig {
     bool enable_kv_cache_events{false};
     // Diagnostic capture is independent of the routing KV-event publisher.
     bool enable_cache_trace{false};
+    bool enable_cache_trace_frontiers{false};
     bool enable_mixed_prefill_decode{false};
 
     // The P and D roles ARE the cache-transfer PD protocol: there is no

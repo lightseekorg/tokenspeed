@@ -158,6 +158,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_cache_trace", &tokenspeed::SchedulerConfig::enable_cache_trace)
+        .def_rw("enable_cache_trace_frontiers", &tokenspeed::SchedulerConfig::enable_cache_trace_frontiers)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens);
@@ -385,6 +386,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                      item["reason"] = event.reason;
                      item["prefix_hashes"] = event.prefix_hashes;
                      item["hash_count"] = event.hash_count;
+                     item["prefix_ref"] = event.prefix_ref;
+                     item["parent_ref"] = event.parent_ref;
+                     item["namespace_id"] = event.namespace_id;
+                     item["boundary_kind"] = event.boundary_kind;
+                     item["computed_tokens"] = event.computed_tokens;
                      item["group_id"] = event.group_id;
                      item["page_offset"] = event.page_offset;
                      item["prompt_tokens"] = event.prompt_tokens;
@@ -395,6 +401,22 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                      item["replay_tokens"] = event.replay_tokens;
                      item["readmission"] = event.readmission;
                      item["dropped_events"] = event.dropped_events;
+                     if (event.kind == "group") {
+                         item["block_granularity"] = event.block_granularity;
+                         item["lookback_pages"] = event.lookback_pages;
+                         item["prefix_closed"] = event.prefix_closed;
+                         item["group_replayable"] = event.group_replayable;
+                     }
+                     if (event.kind == "capacity") {
+                         item["device_total_blocks"] = event.device_total_blocks;
+                         item["device_empty_blocks"] = event.device_empty_blocks;
+                         item["device_active_blocks"] = event.device_active_blocks;
+                         item["host_free_blocks"] = event.host_free_blocks;
+                         item["host_pinned_blocks"] = event.host_pinned_blocks;
+                         item["waiting_requests"] = event.waiting_requests;
+                         item["running_requests"] = event.running_requests;
+                         item["pd_transfer_requests"] = event.pd_transfer_requests;
+                     }
                      result.append(std::move(item));
                  }
                  return result;
