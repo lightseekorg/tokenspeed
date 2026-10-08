@@ -804,18 +804,19 @@ def test_spec_decode_metrics_count_mixed_rounds_and_proposed_drafts():
 
 
 @pytest.mark.parametrize(
-    "local_hits,remote_hits,expected",
-    [(0, 1280, 1280), (256, 1280, 1280), (1280, 256, 1280)],
+    "local_hits,prefill_hits",
+    [(0, 1280), (256, 1280), (1280, 256), (1280, 0)],
 )
-def test_remote_prefill_usage_merges_overlapping_prefixes(
-    local_hits, remote_hits, expected
-):
-    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+def test_remote_prefill_usage_reports_prefill_hits(local_hits, prefill_hits):
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
     state = _state(list(range(2048)), computed_length=2048)
+    state.sampling_params.max_new_tokens = 1
     state.cached_tokens = local_hits
     processor.rid_to_state["decode"] = state
-    processor.on_remote_prefill_done("decode", 101, remote_hits, None)
-    assert state.cached_tokens == expected
+    processor.on_remote_prefill_done("decode", 101, prefill_hits, None)
+    processor.finish_remote_prefill_only_request("decode")
+    assert sender.items[0].cached_tokens == [prefill_hits]
 
 
 def test_non_pd_cached_tokens_reach_output():
