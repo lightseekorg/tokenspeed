@@ -38,9 +38,17 @@ __all__ = [
 def _make_wmma_layout(
     NUM_WARPS: gl.constexpr,
     Q_IS_FP8: gl.constexpr,
+    IS_KPOOL: gl.constexpr,
 ):
-    """Map Wave32 workgroups over 32 scoring heads and candidate columns."""
-    if NUM_WARPS == 2:
+    """Map Wave32 workgroups over 32 scoring heads and candidate columns.
+
+    KPool warps split only columns, so each warp folds all 32 heads of its
+    columns in registers. Standard scoring splits heads first, which measured
+    faster for its 64-head prefill.
+    """
+    if IS_KPOOL:
+        warp_bases = [[0, 1 << i] for i in range(NUM_WARPS.bit_length() - 1)]
+    elif NUM_WARPS == 2:
         warp_bases = [[1, 0]]
     elif NUM_WARPS == 4:
         warp_bases = [[1, 0], [0, 1]]
@@ -373,7 +381,7 @@ def _standard_cache_logits_body(
         candidate_end = gl.minimum(candidate_end, split_start + split_cols)
         candidate_end = gl.maximum(candidate_end, candidate_start)
 
-    wmma_layout: gl.constexpr = _make_wmma_layout(NUM_WARPS, Q_IS_FP8)
+    wmma_layout: gl.constexpr = _make_wmma_layout(NUM_WARPS, Q_IS_FP8, IS_KPOOL)
     k_width: gl.constexpr = 16 if Q_IS_FP8 else 8
     q_dot_layout: gl.constexpr = gl.DotOperandLayout(
         0,

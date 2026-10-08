@@ -950,6 +950,54 @@ def test_dsa_prefill_topk_keeps_late_values_above_threshold() -> None:
     torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
 
 
+@pytest.mark.parametrize("cols", (16384, 40960))
+def test_dsa_prefill_topk_selects_largest_values_on_ragged_rows(cols: int) -> None:
+    topk = 2048
+    gen = _generator("cuda", cols)
+    noise = torch.randn((4, cols), device="cuda", generator=gen)
+    logits = torch.stack(
+        (
+            noise[0],
+            noise[1],
+            torch.round(noise[2] * 4) / 4,
+            1.0 + 0.01 * noise[3],
+            noise[0].flip(0),
+        )
+    ).contiguous()
+    row_starts = torch.tensor([0, 1000, 0, 7, 5], device="cuda", dtype=torch.int32)
+    row_ends = torch.tensor(
+        [cols, cols - 77, cols, cols, 5 + topk + 1], device="cuda", dtype=torch.int32
+    )
+    rows = logits.shape[0]
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_backend._dsa_topk_indices(
+        logits,
+        row_starts,
+        row_ends,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    torch.testing.assert_close(
+        lens_out.cpu(), torch.full((rows,), topk, dtype=torch.int32)
+    )
+    for row in range(rows):
+        start, end = int(row_starts[row]), int(row_ends[row])
+        selected = out[row].long()
+        assert torch.unique(selected).numel() == topk
+        assert ((selected >= start) & (selected < end)).all()
+        expected = torch.topk(logits[row, start:end], topk).values
+        torch.testing.assert_close(
+            torch.sort(logits[row, selected], descending=True).values,
+            expected,
+            rtol=0.0,
+            atol=0.0,
+        )
+
+
 def test_dsa_decode_topk_keeps_late_values_above_threshold() -> None:
     page_size = 64
     cols = 16384
@@ -1486,6 +1534,79 @@ def test_dsa_dense_fp8_glm52_production_shape(
     torch.testing.assert_close(
         empty_out, torch.zeros_like(empty_out), rtol=0.0, atol=0.0
     )
+    torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize(
+    "api",
+    [
+        pytest.param(gluon_dsa_decode, id="decode"),
+        pytest.param(gluon_dsa_prefill, id="prefill"),
+    ],
+)
+def test_dsa_dense_fp8_ignores_poisoned_unselected_rows(api) -> None:
+    device = "cuda"
+    valid_lengths = (0, 1, 65, 1000, 2048)
+    tokens = len(valid_lengths)
+    num_heads = 8
+    num_slots = 4160
+    topk = 2048
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 192
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    gen = _generator(device, 409)
+
+    q = _randn_bf16(
+        (tokens, num_heads, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=gen,
+    ).to(torch.float8_e4m3fn)
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=gen,
+    )
+    poisoned = torch.arange(0, num_slots, 7, device=device, dtype=torch.int32)
+    kv_cache[poisoned.long()] = float("nan")
+    kv_cache = kv_cache.to(torch.float8_e4m3fn)
+    is_clean = torch.ones(num_slots, device=device, dtype=torch.bool)
+    is_clean[poisoned.long()] = False
+    clean = torch.nonzero(is_clean).flatten().to(torch.int32)
+
+    topk_slots = poisoned[torch.arange(topk, device=device) % poisoned.numel()]
+    topk_slots = topk_slots.repeat(tokens, 1).contiguous()
+    topk_lens = torch.tensor(valid_lengths, device=device, dtype=torch.int32)
+    for token, count in enumerate(valid_lengths):
+        perm = torch.randperm(clean.numel(), device=device, generator=gen)[:count]
+        topk_slots[token, :count] = clean[perm]
+    topk_slots[3, 100:900:9] = -1
+
+    out = api(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=num_slots,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        softmax_scale=softmax_scale,
+        page_size=64,
+        q_len_per_req=1,
+    )
+
+    ref = _dsa_reference(
+        q,
+        kv_cache[:, :kv_lora_rank],
+        kv_cache[:, kv_lora_rank:],
+        topk_slots,
+        topk_lens,
+        softmax_scale,
+    )
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out[0], torch.zeros_like(out[0]), rtol=0.0, atol=0.0)
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 

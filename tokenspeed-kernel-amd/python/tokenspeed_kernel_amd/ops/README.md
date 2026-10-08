@@ -284,11 +284,14 @@ and V4.1, with portable fallback outside the tuned domain.
 #### Contract
 
 - The operation computes `A @ B.T` from K-contiguous E4M3 matrices shaped
-  `[M, K]` and `[N, K]`, with `1 <= M <= 16` and `N` divisible by 16.
+  `[M, K]` and `[N, K]`, with `N` divisible by 16.
 - DeepSeek V4.1 uses row-major uint8 UE8M0 scales shaped `[M, K/32]` and
-  `[N, K/32]`, with `K >= 256` divisible by 32.
+  `[N, K/32]`, with `1 <= M <= 16` and `K >= 256` divisible by 32.
 - DeepSeek V4 uses row-major FP32 activation scales `[M, K/128]` and canonical
-  weight scales `[N/128, K/128]`, with `N` and `K` divisible by 128.
+  weight scales `[N/128, K/128]`, with `1 <= M <= 64` and `N` and `K`
+  divisible by 128. The row count is a runtime argument; a full 16- or
+  64-row tile compiles without row masks, so all batch sizes share two
+  binaries per projection shape and route.
 - Output is BF16. A caller-owned output may have a padded row stride, but all
   input, scale, and output inner strides must be one.
 
@@ -297,7 +300,9 @@ and V4.1, with portable fallback outside the tuned domain.
 The direct path assigns one wave32 to an output tile of up to `16 x 16`.
 Native TDM stages values, and for V4.1 scales, into padded triple-buffered LDS.
 V4.1 uses scaled WMMA directly; V4 applies one FP32 scale pair to each
-128-wide raw-WMMA partial before accumulation.
+128-wide raw-WMMA partial before accumulation. V4 batches of 17 to 64 rows
+run as one 64-row tile of four waves, so each weight tile streams once for
+the whole batch.
 
 Measured long-K shapes use the same producers in split-K mode and a separate
 FP32-to-BF16 reduction. One V4 Pro route combines adjacent output tiles in a
@@ -507,7 +512,9 @@ A program owns one query row and a span of its candidate columns. It loads
 the row's queries once, per 32-head group, in the WMMA A-operand layout, with
 the weights already multiplied by the query scales. It then walks the span in
 column tiles: 256 columns on eight waves for DSA prefill, 128 on four waves
-for KPool, and one 64-column tile on four waves per decode program.
+for KPool, and two 32-column tiles on one wave per 64-column decode program.
+DSA prefill waves split the 32 heads before the columns; KPool waves split
+only the columns, so each wave holds all heads of its columns.
 
 For each tile, the program looks up the candidates' cache slots, from the
 workspace or plan slots or through the block table, and loads their keys.
@@ -1054,6 +1061,27 @@ seven add/subtract butterfly stages. Their order matches the portable
 reduction tree so the BF16 results agree exactly. The output scale is fixed
 for a compiled kernel; the launch grid supplies the number of rows.
 
+### gfx1250 length-128 Hadamard
+
+`gluon_hadamard_transform_128_gfx1250` applies the Sylvester Hadamard along
+the last dimension for BF16, FP16, and FP32.
+
+#### Contract
+
+- The last dimension is 128. Leading dimensions flatten into rows.
+- Fewer than 256 rows use `triton_hadamard_transform_128`. Larger row counts
+  use the WMMA kernel. The row count and output scale are runtime arguments,
+  so those larger shapes share one binary per input dtype.
+- BF16 products are a single BF16 WMMA. FP16 and FP32 values split into a
+  BF16 rounding and two BF16 remainders, so the products match the FP32
+  value up to WMMA accumulation order.
+
+#### Algorithm
+
+One wave owns 16 rows and 16 of the 128 outputs. The contraction steps
+through K in four 32-wide tiles. Signs are `(-1) ** popcount(k & n)` and are
+exact `+-1` in BF16.
+
 ## Sampling
 
 ### Argmax
@@ -1460,6 +1488,29 @@ scans multiply probabilities by 256 before the E4M3 cast to preserve small
 weights, and divide out that factor at normalization. The projected-value API
 applies the existing value projection to the latent output. Graph replay reads
 updated page tables and lengths in place.
+
+### gfx1250 general biased-sigmoid top-k
+
+`gluon_sigmoid_bias_topk_route_gfx1250` selects experts for shapes outside
+the Kimi K3 specialists: FP16, BF16, or FP32, 1 to 1024 experts, and top-k
+1 to 16.
+
+#### Contract
+
+- Logits are `[tokens, experts]` with a unit expert stride. The bias is a
+  contiguous `[experts]` vector on the same device.
+- Selection scores are FP32 `sigmoid(logit) + bias`. NaN scores are excluded.
+  Equal scores take the lowest expert id.
+- Route weights are the FP32 sigmoid of the selected logits, optionally
+  divided by their sum, then multiplied by the routed scaling factor.
+- It stays below the single-token decode kernel, the packed 896-expert K3
+  kernel, and `gluon_sigmoid_bias_topk_gfx1250`, which keep those shapes.
+
+#### Algorithm
+
+One program handles one token with four warps. It walks the expert vector
+once per selected route, keeps the maximum finite score, and breaks ties by
+the minimum expert id. The weight is the sigmoid captured for that expert.
 
 ## Residual
 
