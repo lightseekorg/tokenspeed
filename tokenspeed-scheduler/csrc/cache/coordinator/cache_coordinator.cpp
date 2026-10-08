@@ -74,6 +74,8 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
             match_order_.push_back(i);
         }
     }
+    has_matched_non_closed_group_ =
+        std::ranges::any_of(match_order_, [&](std::size_t i) { return !groups_[i].Matcher().IsPrefixClosed(); });
     if (enable_l3_storage_ && host_pool_ != nullptr) {
         std::size_t capacity = 0;
         for (const CacheGroup& group : groups_) {

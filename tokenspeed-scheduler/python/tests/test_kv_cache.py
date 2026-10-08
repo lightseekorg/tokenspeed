@@ -444,9 +444,10 @@ def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
     assert scheduler.active_lcm_blocks() == 21
     assert scheduler.available_lcm_blocks() == 11
     # Retracting a drops five History refs and three working State refs.
-    # Four published History blocks remain cache-only; the unpublished final
-    # History block and working State blocks return to the pool (3 + 4 empty).
-    assert scheduler.empty_lcm_blocks() == 7
+    # Only its prompt History block was published (hashing stops at the
+    # prompt while state bounds every hit); the four generated History blocks
+    # and the working State blocks return to the pool (3 + 7 empty).
+    assert scheduler.empty_lcm_blocks() == 10
     assert scheduler.waiting_size() == 1
     assert scheduler.decoding_size() == 3
     return pre_retract_pages
@@ -467,20 +468,21 @@ def test_k3_readmit_recomputes_missing_checkpoint_and_restores_pages() -> None:
     assert scheduler.available_lcm_blocks() == before
 
     # The original prefill checkpoint was evicted under pressure. Decode
-    # created no replacement. History published through token 8 cannot resume
-    # alone, but supplies the promotion boundary ending the recovery body.
+    # created no replacement. History published through the prompt (token 2)
+    # cannot resume alone, but supplies the promotion boundary ending the
+    # recovery body.
     body_plan = scheduler.next_execution_plan()
     body = _find_forward_op(body_plan)
     assert body is not None
     assert tuple(body.request_ids) == ("a",)
     assert tuple(body.prefill_lengths) == (11,)
     assert tuple(body.extend_prefix_lens) == (0,)
-    assert tuple(body.input_lengths) == (8,)
+    assert tuple(body.input_lengths) == (2,)
     body_tables = dict(body.block_tables)
     assert tuple(body_tables) == K3_GROUP_IDS
     prefix_granularity = cfg.prefix_granularity
     prefix_slots = body.input_lengths[0] // prefix_granularity
-    assert prefix_slots == 4
+    assert prefix_slots == 1
     rebuilt_rows = {}
     rebuilt_pages = []
     body_zero = dict(body_plan.pages_to_zero)
@@ -498,9 +500,9 @@ def test_k3_readmit_recomputes_missing_checkpoint_and_restores_pages() -> None:
         rebuilt_rows[group_id] = row
         rebuilt_pages.extend(positive)
     assert len(set(rebuilt_pages)) == len(rebuilt_pages)
-    assert len(rebuilt_pages) == 7
-    assert scheduler.active_lcm_blocks() == 7
-    assert scheduler.available_lcm_blocks() == before - 7
+    assert len(rebuilt_pages) == 4
+    assert scheduler.active_lcm_blocks() == 4
+    assert scheduler.available_lcm_blocks() == before - 4
 
     # An intermediate prefill acknowledges completion without producing a
     # token. The next forward continues from the checkpoint just rebuilt.
@@ -511,8 +513,8 @@ def test_k3_readmit_recomputes_missing_checkpoint_and_restores_pages() -> None:
     assert tail is not None
     assert tuple(tail.request_ids) == ("a",)
     assert tuple(tail.prefill_lengths) == (11,)
-    assert tuple(tail.extend_prefix_lens) == (8,)
-    assert tuple(tail.input_lengths) == (3,)
+    assert tuple(tail.extend_prefix_lens) == (2,)
+    assert tuple(tail.input_lengths) == (9,)
     tables = dict(tail.block_tables)
     assert tuple(tables) == K3_GROUP_IDS
     assert tail.extend_prefix_lens[0] % prefix_granularity == 0
@@ -545,19 +547,24 @@ def test_k3_readmit_recomputes_missing_checkpoint_and_restores_pages() -> None:
         else:
             assert row[:prefix_slots] == rebuilt_rows[group_id]
         suffix = row[prefix_slots:]
-        assert len(suffix) == 2 + growth_slots
-        group_tail = _positive_pages(suffix)
-        # One forward materializes the aligned checkpoint and endpoint;
-        # state groups also own the following growth block.
-        assert all(page > 0 for page in suffix)
-        assert len(group_tail) == 2 + growth_slots
+        if group_id == K3_GROUP_IDS[0]:
+            # History computes every page past the hit.
+            group_tail = suffix
+        else:
+            # One forward materializes the aligned checkpoint and endpoint
+            # and owns the following growth block; the checkpoints it skips
+            # stay holes.
+            holes = len(suffix) - 2 - growth_slots
+            assert suffix[:holes] == (0,) * holes
+            group_tail = suffix[holes:]
+        assert all(page > 0 for page in group_tail)
         assert set(tail_zero[group_id]) == set(group_tail)
         fresh_tail_entries.extend(group_tail)
 
     assert len(set(all_positive_entries)) == len(all_positive_entries)
     assert len(set(fresh_tail_entries)) == len(fresh_tail_entries)
     assert set(fresh_tail_entries).isdisjoint(rebuilt_pages)
-    assert len(fresh_tail_entries) == 11
+    assert len(fresh_tail_entries) == 14
     assert scheduler.active_lcm_blocks() == 18
     assert scheduler.available_lcm_blocks() == before - 18
 

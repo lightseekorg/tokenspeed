@@ -640,8 +640,11 @@ Its responsibilities:
   boundary queues all newly published full-attention pages and any published
   Endpoint/Promoted sliding-window or state boundaries; the candidates are merged into a batched
   writeback. The first decode admission from `PrefillDone` applies the same
-  policy to the final prompt boundary. Ordinary decode publishes full-attention
-  Device entries but no sliding-window or state entries; full-attention pages do not stream to
+  policy to the final prompt boundary. Decode publishes no sliding-window or
+  state entries, and when such a group takes part in matching, prefix hashing
+  stops at the resume point, so decode publishes no full-attention entries
+  either: no later request could hit them. Otherwise ordinary decode publishes
+  full-attention Device entries; full-attention pages do not stream to
   Host during decode. At finish or retraction, eligible non-state Device pages
   and the newest existing prefill checkpoint per state group are queued
   before request ownership is released. The queue is drained by

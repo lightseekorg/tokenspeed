@@ -98,9 +98,15 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     const std::vector<std::span<const std::int32_t>> stable_prefix_pages = request.FullPrefixPages(true);
     fsm::CacheProgress progress = request.CacheProgress();
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(progress.prefix_hashes.size());
-    const std::int32_t num_stable_prefix_pages = static_cast<std::int32_t>(stable_prefix_pages.size());
-    _assert(first_new_prefix_page <= num_stable_prefix_pages, "cache progress exceeds completed request pages");
-    if (first_new_prefix_page != num_stable_prefix_pages) {
+    _assert(first_new_prefix_page <= static_cast<std::int32_t>(stable_prefix_pages.size()),
+            "cache progress exceeds completed request pages");
+    // Only pages a later hit can reach are hashed and published. With only
+    // prefix-closed groups matched the bound is TokenSize, which never limits
+    // the stable pages; otherwise it is the prompt end.
+    const std::int32_t num_stable_prefix_pages = std::min(
+        static_cast<std::int32_t>(stable_prefix_pages.size()),
+        coordinator_.PublishableTokens(request.TokenSize(), request.PrefillSize()) / coordinator_.PrefixGranularity());
+    if (first_new_prefix_page < num_stable_prefix_pages) {
         const std::string previous_hash =
             progress.prefix_hashes.empty() ? std::string{} : progress.prefix_hashes.back();
         std::vector<std::string> new_hashes =

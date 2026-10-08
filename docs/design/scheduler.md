@@ -656,9 +656,11 @@ no victim and nothing could free that page.
   (1.2), and the admission headroom (4) — which only full-history groups hold.
   A replayable group's private suffix starts at the replay window, which is
   inside the forward's input, not beyond it (1.3).
-- Full-history groups publish every completed page, because every hit needs
-  their whole prefix; groups that are not prefix-closed publish only Endpoint
-  (the prompt's last aligned boundary) and Promoted boundaries.
+- Full-history groups publish every completed page a hit can reach, because
+  every hit needs their whole prefix; groups that are not prefix-closed publish
+  only Endpoint (the prompt's last aligned boundary) and Promoted boundaries.
+  When such a group takes part in matching, no hit reaches past the resume
+  point, so prefix hashing stops there and decode pages stay unpublished.
 - A replayable group is never matched, published or streamed (1.3); its
   re-fed rows are forward input that debits the token budget but never
   advances `num_computed_tokens`; only a hit's first chunk re-feeds, and no

@@ -127,13 +127,16 @@ void recordPrefillStateCheckpoint(fsm::CacheProgress& cache_progress, fsm::Prefi
 // Hashes the prefix pages that num_computed_tokens has filled since the
 // previous admission and states the request's progress for the coordinator.
 // resume_tokens is where a later request resumes: the prompt end, or the
-// computed frontier of a retraction. The returned spans view cache_progress,
-// which must outlive their use.
+// computed frontier of a retraction. Pages the coordinator says no hit can
+// reach are not hashed, so they are never published, streamed or reported.
+// The returned spans view cache_progress, which must outlive their use.
 RequestProgress advanceRequestProgress(Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t resume_tokens,
-                                       std::int32_t prefix_granularity, bool stream_completed_to_host) {
+                                       const CacheCoordinator& coordinator, bool stream_completed_to_host) {
+    const std::int32_t prefix_granularity = coordinator.PrefixGranularity();
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
-    const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
+    const std::int32_t filled_prefix_pages =
+        coordinator.PublishableTokens(num_computed_tokens, resume_tokens) / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
         appendCompletedPrefixHashes(cache_progress.prefix_hashes, request.FullPrefixPages(false), filled_prefix_pages);
     }
@@ -488,7 +491,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     };
     const RequestProgress progress =
         advanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), request->PrefillSize(),
-                               coordinator_.PrefixGranularity(), config_.StreamsDeviceCacheToHost());
+                               coordinator_, config_.StreamsDeviceCacheToHost());
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{prefill_tokens}});
@@ -511,9 +514,9 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     fsm::CacheProgress cache_progress = request->CacheProgress();
     const std::int32_t num_computed_tokens = request->NumComputedTokens();
-    const RequestProgress progress = advanceRequestProgress(
-        *request, cache_progress, num_computed_tokens, request->PrefillSize(), coordinator_.PrefixGranularity(),
-        config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>());
+    const RequestProgress progress =
+        advanceRequestProgress(*request, cache_progress, num_computed_tokens, request->PrefillSize(), coordinator_,
+                               config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>());
 
     if (!progress.completed_pages &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
@@ -642,10 +645,9 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
         // computed.
         const std::int32_t num_computed_tokens = victim.NumComputedTokens();
         // The computed frontier is the readmission's recovery point.
-        RequestProgress progress =
-            advanceRequestProgress(victim, cache_progress, num_computed_tokens,
-                                   /*resume_tokens=*/num_computed_tokens, coordinator_.PrefixGranularity(),
-                                   /*stream_completed_to_host=*/false);
+        RequestProgress progress = advanceRequestProgress(victim, cache_progress, num_computed_tokens,
+                                                          /*resume_tokens=*/num_computed_tokens, coordinator_,
+                                                          /*stream_completed_to_host=*/false);
         if (progress.completed_pages) {
             coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
         }
