@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Projection TP kernel correctness at TP4 with C128 per rank."""
+"""Projection exchange correctness for TP2/4/8 at KDA channel widths."""
 
 from datetime import timedelta
 
@@ -38,6 +38,9 @@ from tokenspeed_kernel.ops.communication.trtllm import (
     TrtllmAllGatherQuantState,
     trtllm_allgather_fp8_quantize,
 )
+from tokenspeed_kernel.ops.gemm.flashinfer import (
+    flashinfer_fp8_blockscale_quantize_prepacked,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 ROWS = 128
@@ -52,45 +55,94 @@ def _check_quantized(actual, expected):
     torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
 
 
-def _check_pack(device):
+def _check_pack(device, size):
     inputs = torch.randn(ROWS, KDA_WIDTH, dtype=torch.bfloat16, device=device)
     workspace = torch.empty(
-        (4, ROWS, KDA_WIDTH // 4), dtype=inputs.dtype, device=device
+        (size, ROWS, KDA_WIDTH // size), dtype=inputs.dtype, device=device
     )
     packed = triton_pack_channel_shards_for_a2a(inputs, workspace)
-    expected = inputs.view(ROWS, 4, KDA_WIDTH // 4).transpose(0, 1).contiguous()
+    expected = inputs.view(ROWS, size, KDA_WIDTH // size).transpose(0, 1).contiguous()
     torch.testing.assert_close(packed.view_as(expected), expected, rtol=0, atol=0)
 
 
-def _check_a2a_quant(rank, device):
+def _check_a2a(rank, device, size):
     state = TokenSpeedA2ALamportState(
         dist.group.WORLD,
-        ROWS,
+        257,
         KDA_WIDTH,
         device,
         min(128, torch.cuda.get_device_properties(device).multi_processor_count),
     )
     state.prepare_fp8_quantization()
-    inputs = torch.randn(ROWS, KDA_WIDTH, dtype=torch.bfloat16, device=device)
-
-    def reference():
-        exchanged = tokenspeed_a2a_lamport(state, inputs, inverse=False, out=None)
-        values, scales = quantize_fp8(
-            exchanged, granularity="token_group", group_size=128, solution="trtllm"
+    state.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
+    # Small packets, the paired-packet launch, chunk exchange, then back to
+    # packets. Odd M also exercises TP2's prepared-FP8 row padding.
+    for rows in (1, 128, 257, 1):
+        inputs = torch.empty(rows, KDA_WIDTH, dtype=torch.bfloat16, device=device)
+        gathered = torch.empty(
+            size * rows, KDA_WIDTH, dtype=inputs.dtype, device=device
         )
-        return values, scales.t().contiguous()
+        shard = torch.empty(
+            size * rows, KDA_WIDTH // size, dtype=inputs.dtype, device=device
+        )
+        restored = torch.empty_like(inputs)
 
-    _check_quantized(tokenspeed_a2a_lamport_fp8_quantize(state, inputs), reference())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = tokenspeed_a2a_lamport_fp8_quantize(state, inputs)
-    inputs.mul_(0.75).add_((rank + 1) * 0.03125)
-    expected = reference()
-    graph.replay()
-    _check_quantized(actual, expected)
+        def exchange():
+            tokenspeed_a2a_lamport(state, inputs, inverse=False, out=shard)
+            tokenspeed_a2a_lamport(state, shard, inverse=True, out=restored)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            exchange()
+        for capture in (False, True):
+            # Include signed zero, infinities and NaN payloads, not just finite
+            # numbers. Compare integers so all BF16 bit patterns are checked.
+            inputs.view(torch.int16).random_(-32768, 32768)
+            dist.all_gather_into_tensor(gathered, inputs)
+            expected = gathered[
+                :, rank * (KDA_WIDTH // size) : (rank + 1) * (KDA_WIDTH // size)
+            ]
+            if capture:
+                graph.replay()
+            else:
+                exchange()
+            torch.testing.assert_close(
+                shard.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                restored.view(torch.int16), inputs.view(torch.int16), rtol=0, atol=0
+            )
+        del graph
+
+        retained = restored.clone()
+        inputs.normal_()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = tokenspeed_a2a_lamport_fp8_quantize(state, inputs)
+        for capture in (False, True):
+            inputs.mul_(0.75).add_((rank + 1) * 0.03125)
+            inputs[:, :128] = 0
+            dist.all_gather_into_tensor(gathered, inputs)
+            exchanged = gathered[
+                :, rank * (KDA_WIDTH // size) : (rank + 1) * (KDA_WIDTH // size)
+            ].contiguous()
+            # The fused kernel pads the gathered shard to a multiple of four
+            # rows with zero/one padding; the prepacked reference reproduces
+            # that layout exactly, including for TP2's odd row counts.
+            expected = flashinfer_fp8_blockscale_quantize_prepacked(exchanged, 128)
+            if capture:
+                graph.replay()
+            else:
+                actual = tokenspeed_a2a_lamport_fp8_quantize(state, inputs)
+            _check_quantized(actual, expected)
+            # Fused/borrowed calls must not overwrite caller-owned BF16 output.
+            torch.testing.assert_close(
+                restored.view(torch.int16), retained.view(torch.int16), rtol=0, atol=0
+            )
+        del graph
     torch.cuda.synchronize(device)
     dist.barrier()
-    del graph, state
+    del state
 
 
 def _check_allgather_quant(rank, device):
@@ -122,26 +174,31 @@ def _check_allgather_quant(rank, device):
     state.close()
 
 
-def _worker(rank, rendezvous):
+def _worker(rank, size, rendezvous):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dist.init_process_group(
         "nccl",
         init_method=rendezvous,
         rank=rank,
-        world_size=4,
+        world_size=size,
         timeout=timedelta(seconds=600),
         device_id=device,
     )
     torch.manual_seed(120 + rank)
-    _check_pack(device)
-    _check_a2a_quant(rank, device)
+    _check_pack(device, size)
+    _check_a2a(rank, device, size)
     _check_allgather_quant(rank, device)
     dist.destroy_process_group()
 
 
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 4, reason="Four NVLink CUDA GPUs required"
-)
-def test_projection_tp(tmp_path):
-    mp.spawn(_worker, args=(f"file://{tmp_path / 'rendezvous'}",), nprocs=4, join=True)
+@pytest.mark.parametrize("size", [2, 4, 8], ids=["tp2", "tp4", "tp8"])
+def test_projection_tp(size, tmp_path):
+    if torch.cuda.device_count() < size:
+        pytest.skip(f"requires {size} NVLink CUDA GPUs on one host")
+    mp.spawn(
+        _worker,
+        args=(size, f"file://{tmp_path / 'rendezvous'}"),
+        nprocs=size,
+        join=True,
+    )

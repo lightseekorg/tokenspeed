@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
+    quantize_fp8_with_scale,
     quantize_mxfp4,
     quantize_mxfp8,
     quantize_nvfp4,
@@ -344,6 +345,67 @@ def test_fp8_quantize_rejects_e4m3fnuz(device: str) -> None:
     x = torch.empty(1, device=device, dtype=torch.bfloat16)
     with pytest.raises(AssertionError, match="unsupported fp8 dtype"):
         fp8_quantize(x, fp8_dtype=torch.float8_e4m3fnuz)
+
+
+@pytest.mark.parametrize("solution", ["trtllm"])
+@pytest.mark.parametrize("granularity", ["tensor", "token"])
+def test_quantize_fp8_with_scale_tensor_and_token(
+    device: str,
+    solution: str,
+    granularity: str,
+    require,
+) -> None:
+    torch.manual_seed(4)
+    dtype = torch.bfloat16
+    require("quantization", "fp8_with_scale", solution, dtype, "x")
+
+    x = torch.randn(16, 128, device=device, dtype=dtype) * 10
+    out, scale = quantize_fp8_with_scale(
+        x,
+        granularity=granularity,
+        solution=solution,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == x.shape
+    assert out.dtype == _FP8_DTYPE
+    assert scale.dtype == torch.float32
+    if granularity == "tensor":
+        assert scale.shape == (1,)
+    else:
+        assert scale.shape == (x.shape[0], 1)
+
+
+@pytest.mark.parametrize(
+    "solution,group_size",
+    [("trtllm", 128), ("triton", 128), ("triton", 32)],
+)
+def test_quantize_fp8_with_scale_token_group(
+    device: str,
+    solution: str,
+    group_size: int,
+    require,
+) -> None:
+    torch.manual_seed(5)
+    dtype = torch.bfloat16
+    require("quantization", "fp8_with_scale", solution, dtype, "x")
+
+    x = torch.randn(16, 256, device=device, dtype=dtype) * 10
+    out, scale = quantize_fp8_with_scale(
+        x,
+        granularity="token_group",
+        group_size=group_size,
+        solution=solution,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == x.shape
+    assert out.dtype == _FP8_DTYPE
+    assert scale.dtype == torch.float32
+    expected_num_scales = x.shape[0] * (x.shape[1] // group_size)
+    assert scale.numel() == expected_num_scales
+    if solution == "triton":
+        assert scale.shape == (x.shape[0], x.shape[1] // group_size)
 
 
 @pytest.mark.parametrize("solution", [None, "trtllm", "triton"])

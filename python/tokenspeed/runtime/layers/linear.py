@@ -148,7 +148,7 @@ class LinearBase(torch.nn.Module):
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
         override_kernel_name: Optional kernel name passed down to the
-            quant method's underlying ``tokenspeed_kernel.mm`` dispatch
+            quant method's underlying ``tokenspeed_kernel.ops.gemm.mm`` dispatch
             (e.g. ``"cublaslt_mm_nvfp4"``). Lets the model force a
             specific kernel for a particular layer.
         interleave_linear_and_gate: If true, quantized post-load processing

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import mm
-from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8
+from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8, mm
 from tokenspeed_kernel.ops.gemm.flashinfer import swizzle_mxfp8_scale
 from tokenspeed_kernel.platform import current_platform
 
@@ -11,6 +10,63 @@ pytestmark = pytest.mark.skipif(
     not current_platform().is_nvidia,
     reason="MiniMax-M3 MXFP8 checkpoint support targets NVIDIA GPUs.",
 )
+
+
+@pytest.mark.skipif(
+    not current_platform().is_blackwell_plus,
+    reason="Packed UE8M0 activation scales are consumed on Blackwell.",
+)
+@pytest.mark.parametrize("m,k", [(1, 128), (5, 384), (7, 640)])
+def test_packed_ue8m0_quant_pdl_matches_reference(device: str, m: int, k: int) -> None:
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+
+    torch.manual_seed(0)
+    x = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+
+    def quantize_packed_ue8m0(enable_pdl: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        q, scales = quantize_fp8(
+            x,
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="ue8m0",
+            enable_pdl=enable_pdl,
+        )
+        # Repack the canonical [m, k // 128] UE8M0 exponents into the
+        # four-exponents-per-word layout, zero-filling tail bytes.
+        if scales.dtype != torch.uint8:
+            scales = (torch.log2(scales) + 127).to(torch.uint8)
+        packs = (k // 128 + 3) // 4
+        padded = torch.zeros((m, packs * 4), dtype=torch.uint8, device=device)
+        padded[:, : k // 128] = scales
+        return q, padded.view(torch.int32)
+
+    outputs = [quantize_packed_ue8m0(enable_pdl) for enable_pdl in (False, True)]
+
+    q, packed_scales = outputs[0]
+    torch.cuda.synchronize()
+    assert torch.equal(outputs[1][0], q)
+    assert torch.equal(outputs[1][1], packed_scales)
+
+    groups = x.float().view(m, k // 128, 128)
+    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    absmax = groups.abs().amax(dim=-1)
+    exponent = torch.ceil(torch.log2(torch.clamp(absmax / fp8_info.max, min=1e-10)))
+    expected_q = torch.clamp(
+        groups / torch.exp2(exponent).unsqueeze(-1),
+        fp8_info.min,
+        fp8_info.max,
+    ).to(torch.float8_e4m3fn)
+    assert torch.equal(q, expected_q.view(m, k))
+
+    packs = (k // 128 + 3) // 4
+    expected_bytes = torch.zeros((m, packs, 4), device=device, dtype=torch.int64)
+    biased_exponents = torch.clamp(exponent + 127, 0, 255).to(torch.int64)
+    expected_bytes.view(m, -1)[:, : k // 128] = biased_exponents
+    actual_bytes = torch.stack(
+        [(packed_scales.to(torch.int64) >> shift) & 0xFF for shift in (0, 8, 16, 24)],
+        dim=-1,
+    )
+    assert torch.equal(actual_bytes, expected_bytes)
 
 
 @pytest.mark.parametrize("override", [None, "triton_mm_fp8_blockscale"])

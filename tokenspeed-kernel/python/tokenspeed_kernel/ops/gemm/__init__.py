@@ -39,9 +39,13 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (
     BF16_GEMM_MAX_M,
     autotune_bf16_gemm,
     flashinfer_bf16_gemm,
+    flashinfer_fp8_blockscale_quantize_prepacked,
     flashinfer_joint_bf16_supported,
+    gemm_fp8_nt_groupwise,
     has_flashinfer_cute_dsl_nvfp4_a16,
+    prepare_flashinfer_fp8_blockscale_weight_scales,
     prepare_nvfp4_a16_weights,
+    use_flashinfer_fp8_blockscale_prepacked,
 )
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_latent_projection,
@@ -82,6 +86,9 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup",
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
+    "fp8_linear",
+    "fp8_linear_into",
+    "fp8_linear_prepacked",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
     "linear_attnres_partials_available",
@@ -93,6 +100,7 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
+    "prepare_fp8_linear",
     "prepare_nvfp4_a16_weights",
 ]
 
@@ -741,6 +749,7 @@ def mm(
     quant: str | None = None,
     override: str | None = None,
     solution: str | None = None,
+    prepacked_scales: bool = False,
 ) -> torch.Tensor:
     """Dense matrix multiply with automatic kernel selection.
 
@@ -791,6 +800,37 @@ def mm(
         K = A.shape[-1]
         b_layout = "KN" if B.shape[0] == K else "NK"
         N = B.shape[-1] if b_layout == "KN" else B.shape[0]
+
+    if prepacked_scales:
+        if quant != "mxfp8" or block_size is None:
+            raise ValueError(
+                "mm(prepacked_scales=True) requires quant='mxfp8' with block_size"
+            )
+        if B_scales is None or tuple(B_scales.shape) != (
+            K // block_size[1],
+            B.shape[0] // block_size[0],
+        ):
+            raise ValueError(
+                "mm(prepacked_scales=True) requires prepacked weight scales in "
+                "the MN-major layout from "
+                "prepare_flashinfer_fp8_blockscale_weight_scales"
+            )
+        M = A.shape[0]
+        values, activation_scales = flashinfer_fp8_blockscale_quantize_prepacked(
+            A, block_size[1]
+        )
+        result = gemm_fp8_nt_groupwise(
+            values,
+            B,
+            activation_scales,
+            B_scales,
+            scale_major_mode="MN",
+            out_dtype=out_dtype,
+        )[:M]
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
 
     if out is not None:
         _validate_gemm_out(
@@ -1078,3 +1118,120 @@ def bmm(
         else:
             output = output + bias_view
     return output
+
+
+# ---------------------------------------------------------------------------
+# Prepared FP8 block-scale linear (prepacked FlashInfer path)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _PreparedFp8LinearPlan:
+    block_size: list[int]
+    prepared_weight_scales: torch.Tensor
+
+
+def prepare_fp8_linear(
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    block_size: list[int],
+) -> _PreparedFp8LinearPlan:
+    """Prepare an FP8 block-scale weight for the prepacked FlashInfer path.
+
+    Converts canonical ``[N // 128, K // 128]`` weight scales into the
+    prepacked MN-major layout once so per-token calls can reuse them.
+    """
+    return _PreparedFp8LinearPlan(
+        block_size=list(block_size),
+        prepared_weight_scales=prepare_flashinfer_fp8_blockscale_weight_scales(
+            weight_scales
+        ),
+    )
+
+
+def fp8_linear(
+    plan: _PreparedFp8LinearPlan,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    *,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Run a prepared FP8 block-scale linear layer.
+
+    Routes through the prepacked MN-major-scale path when padding the token
+    count is cheap, the canonical FlashInfer kernel otherwise. The prepacked
+    path also covers 17 <= M <= 32, whose activation scales FlashInfer's
+    K-major mode mis-reads on SM10x.
+    """
+    m = x.shape[0]
+    if use_flashinfer_fp8_blockscale_prepacked(m):
+        return mm(
+            x,
+            weight,
+            B_scales=plan.prepared_weight_scales,
+            out_dtype=out_dtype,
+            quant="mxfp8",
+            block_size=plan.block_size,
+            override="flashinfer_mm_fp8_blockscale",
+            prepacked_scales=True,
+        )
+    return mm(
+        x,
+        weight,
+        B_scales=weight_scales,
+        out_dtype=out_dtype,
+        quant="mxfp8",
+        block_size=plan.block_size,
+        override="flashinfer_mm_fp8_blockscale",
+    )
+
+
+def fp8_linear_prepacked(
+    plan: _PreparedFp8LinearPlan,
+    values: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    num_tokens: int,
+    out_dtype: torch.dtype,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the prepacked path with pre-quantized activations.
+
+    ``values``/``scales`` must come from
+    ``flashinfer_fp8_blockscale_quantize_prepacked``; only the first
+    ``num_tokens`` rows of the padded result are real.
+    """
+    result = gemm_fp8_nt_groupwise(
+        values,
+        weight,
+        scales,
+        plan.prepared_weight_scales,
+        scale_major_mode="MN",
+        out=out if out is not None and out.is_contiguous() else None,
+        out_dtype=out_dtype,
+    )[:num_tokens]
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def fp8_linear_into(
+    plan: _PreparedFp8LinearPlan,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    *,
+    input_scales: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """``fp8_linear`` writing into a caller-owned destination."""
+    result = fp8_linear(plan, x, weight, weight_scales, out_dtype=out_dtype)
+    if bias is not None:
+        result = result + bias
+    out.copy_(result)
+    return out

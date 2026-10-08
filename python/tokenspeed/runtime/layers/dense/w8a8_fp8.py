@@ -20,8 +20,8 @@
 
 from __future__ import annotations
 
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from torch.nn.parameter import Parameter
 
@@ -50,8 +50,9 @@ def w8a8_fp8_per_channel_mm(
     Returns:
         ``[M, N]`` output in ``out_dtype``.
     """
+    # One quantization group spanning the row is per-token scaling.
     qinput, x_scale = quantize_fp8(x, granularity="token")
-    return tokenspeed_kernel.mm(
+    return mm(
         qinput,
         weight_kn,
         A_scales=x_scale,

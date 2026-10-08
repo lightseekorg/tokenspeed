@@ -25,6 +25,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "quantize_fp8",
+    "quantize_fp8_with_scale",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
@@ -297,6 +298,44 @@ def _quantize_fp8_dynamic(
         if block_size is not None:
             kernel_args["block_size"] = tuple(block_size)
         return kernel(x, **kernel_args)
+
+
+def quantize_fp8_with_scale(
+    x: torch.Tensor,
+    *,
+    granularity: Literal["tensor", "token", "token_group"] = "token",
+    group_size: int | None = None,
+    solution: str | None = None,
+    override: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize ``x`` to FP8 and return dynamically computed float32 scales.
+
+    Args:
+        x: Input tensor.
+        granularity: ``"tensor"`` computes a single whole-tensor scale returned
+            with shape ``(1,)``; ``"token"`` returns one scale per row with
+            shape ``[M, 1]``; ``"token_group"`` returns one scale per contiguous
+            group of ``group_size`` values along the last dimension.
+        group_size: Values per scale group; required for ``"token_group"``.
+        solution: Optional restriction to a registered backend family.
+        override: Optional exact registered kernel override.
+
+    Returns:
+        Quantized FP8 values and their float32 scales.
+    """
+    if granularity == "tensor":
+        fp8_info = torch.finfo(torch.float8_e4m3fn)
+        scale = (x.float().abs().amax() / fp8_info.max).reshape(1).to(torch.float32)
+        values, _ = quantize_fp8(x, scale=scale, override=override)
+        return values, scale
+    return quantize_fp8(
+        x,
+        granularity=granularity,
+        group_size=group_size,
+        scale_encoding="float32",
+        solution=solution,
+        override=override,
+    )
 
 
 def quantize_mxfp8(
