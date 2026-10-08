@@ -394,6 +394,41 @@ def edit_sandbox(
     ]
 
 
+def repair_progress(line: str, seen: set[str]):
+    """Report fixed progress labels, never model text, tool arguments or errors."""
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(event, dict):
+        return
+    labels = []
+    if event.get("type") == "system.version":
+        labels.append("CLI initialized")
+    if event.get("type") == "turn.step.retrying":
+        labels.append("model request retry")
+        name = event.get("error_name")
+        if name in {
+            "APIConnectionError",
+            "AuthenticationError",
+            "PermissionDeniedError",
+            "BadRequestError",
+            "NotFoundError",
+            "RateLimitError",
+        }:
+            labels.append(name)
+    if event.get("role") == "assistant":
+        labels.append("model response received")
+        for call in event.get("tool_calls") or []:
+            name = call.get("function", {}).get("name")
+            if name in {"Read", "Grep", "Glob", "Edit", "Write"}:
+                labels.append(f"tool requested: {name}")
+    for label in labels:
+        if label not in seen:
+            seen.add(label)
+            print(f"Repair process: {label}.", flush=True)
+
+
 def model():
     request = json.loads(WORK.joinpath("request.json").read_text())
     state = request["state"]
@@ -453,7 +488,7 @@ every command, test and assertion. Do not use external paths or symlinks.
 Do not copy diagnostic paths, hosts, credentials or environment identifiers into source.
 Do not perform unrelated cleanup. Stop if the cause is uncertain.
 """)
-    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. Read diagnostics.txt for actual failure evidence and the selected CI specifications. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
+    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. You have a hard 20-minute limit. Start with the actual failed step in diagnostics.txt and its CI specification. Keep investigation focused, avoid repeated broad reads, and return promptly once the smallest substantiated repair is ready. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     guard_root = WORK / "guard"
     guard_root.mkdir()
@@ -478,11 +513,12 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
                 print(f"Repair input access denied: {label}.", flush=True)
                 raise ValueError("Repair inputs are inaccessible.")
         print("Repair: starting repair process.", flush=True)
-        result = subprocess.run(
+        result = subprocess.Popen(
             [
                 *sandbox,
                 "timeout",
-                "600",
+                "--kill-after=10s",
+                "1200",
                 "kimi",
                 "--agent-file",
                 str(agent),
@@ -497,9 +533,16 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
             ],
             cwd=plan_root,
             env=env,
-            stdout=events,
+            stdout=subprocess.PIPE,
             stderr=errors,
+            text=True,
+            errors="replace",
         )
+        seen = set()
+        for line in result.stdout:
+            events.write(line)
+            repair_progress(line, seen)
+        result.wait()
     if result.returncode:
         print(f"Repair process exited with status {result.returncode}.", flush=True)
         stderr = (plan_root / "cli.stderr").read_text(errors="replace")

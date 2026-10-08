@@ -78,7 +78,7 @@ jobs:
     needs: control
     if: needs.control.outputs.repair == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:

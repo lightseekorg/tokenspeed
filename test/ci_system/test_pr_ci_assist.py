@@ -465,6 +465,35 @@ def test_native_dispatch_reservation_prevents_duplicate_submission(
     assert record(comment, "assist") == state
 
 
+def test_repair_progress_withholds_model_text_arguments_and_errors(capsys):
+    seen = set()
+    repair.repair_progress(
+        json.dumps(
+            dict(
+                type="turn.step.retrying",
+                error_name="APIConnectionError",
+                error_message="OUTBOUND_SENTINEL",
+            )
+        ),
+        seen,
+    )
+    repair.repair_progress(
+        json.dumps(
+            dict(
+                role="assistant",
+                content="OUTBOUND_SENTINEL",
+                tool_calls=[
+                    dict(function=dict(name="Read", arguments="OUTBOUND_SENTINEL"))
+                ],
+            )
+        ),
+        seen,
+    )
+    output = capsys.readouterr().out
+    assert "OUTBOUND_SENTINEL" not in output
+    assert "APIConnectionError" in output and "tool requested: Read" in output
+
+
 def test_native_task_repair_preserves_commands_and_protected_controls(tmp_path):
     def git(*args):
         return assist.command(
