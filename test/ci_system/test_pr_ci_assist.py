@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import copy
+import io
 import json
 import sys
 from pathlib import Path
@@ -224,6 +225,98 @@ def test_state_is_typed_and_bot_owned(selected):
     state["extra"] = "arbitrary embedded content"
     comment["body"] = marker("assist", state)
     assert record(comment, "assist") is None
+
+
+@pytest.fixture
+def published_comments(monkeypatch, tmp_path):
+    comments = []
+
+    def get_comment(path):
+        return next(c for c in comments if path == f"issues/comments/{c['id']}")
+
+    def command(*args):
+        if args == ("gh", "auth", "token", "--hostname", "github.com"):
+            return "test-token"
+        assert args[:3] == ("gh", "pr", "comment")
+        assert args[4:6] == ("--repo", REPO)
+        comment = dict(
+            id=len(comments) + 1,
+            user={"login": BOT, "id": BOT_ID},
+            body=Path(args[-1]).read_text(),
+        )
+        comments.append(comment)
+        return f"https://github.com/{REPO}/pull/123#issuecomment-{comment['id']}"
+
+    def patch(request, *, timeout):
+        assert request.method == "PATCH" and timeout == 30
+        assert request.get_header("Authorization") == "Bearer test-token"
+        prefix = f"https://api.github.com/repos/{REPO}/"
+        assert request.full_url.startswith(prefix)
+        get_comment(request.full_url.removeprefix(prefix))["body"] = json.loads(
+            request.data
+        )["body"]
+        return io.BytesIO()
+
+    monkeypatch.setattr(assist, "WORK", tmp_path)
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "pages", lambda *args: comments)
+    monkeypatch.setattr(assist, "api", get_comment)
+    monkeypatch.setattr(assist, "command", command)
+    monkeypatch.setattr(assist, "urlopen", patch)
+    return comments
+
+
+def test_publish_saves_progress_without_new_comments(selected, published_comments):
+    task, state = selected
+    assist.publish(state, "Watching selected tasks.")
+    initial = published_comments[0]["body"].split("<!--")[0]
+    # A newer bot comment must not redirect edits away from the state record.
+    unrelated = dict(id=2, user={"login": BOT, "id": BOT_ID}, body="Other update.")
+    published_comments.append(unrelated)
+
+    state["submitted"].append(assist.run_title(task, state["head"], "gb200"))
+    assist.publish(state, "Selected task dispatch requested.")
+    state["statuses"] = ["waiting"]
+    state["run_ids"][assist.task_key(task)] = 101
+    assist.publish(state, "1 waiting.")
+    assert len(published_comments) == 2
+    assert unrelated["body"] == "Other update."
+    assert published_comments[0]["body"].split("<!--")[0] == initial
+    assert record(published_comments[0], "assist") == state
+
+    state.update(phase="done", statuses=["passed"])
+    assist.publish(state, "1 passed.")
+    assert len(published_comments) == 3
+    assert "1 passed." in published_comments[-1]["body"]
+    assert "| Check | Source | Result |" in published_comments[-1]["body"]
+    assist.publish(state, "1 passed.")
+    assert len(published_comments) == 3
+
+
+def test_publish_keeps_latest_record_readable(selected, published_comments):
+    _, state = selected
+    assist.publish(state, "Started.")
+    first = published_comments[0]["body"]
+    newer = {**state, "command": 43}
+    assist.publish(newer, "Started.")
+    assert len(published_comments) == 2
+    second = published_comments[1]["body"]
+    state["statuses"] = ["waiting"]
+    assist.publish(state, "1 waiting.")
+    assert len(published_comments) == 3
+    assert [c["body"] for c in published_comments[:2]] == [first, second]
+    latest = assist.latest_state_comment(published_comments, state["pr"])
+    assert record(latest, "assist") == state
+
+
+def test_publish_verifies_edited_state(monkeypatch, selected, published_comments):
+    _, state = selected
+    assist.publish(state, "Started.")
+    stale = copy.deepcopy(published_comments[0])
+    state["statuses"] = ["waiting"]
+    monkeypatch.setattr(assist, "api", lambda path: stale)
+    with pytest.raises(ValueError, match="Published state differs"):
+        assist.publish(state, "1 waiting.")
 
 
 @pytest.mark.parametrize(

@@ -30,6 +30,7 @@ import tempfile
 import time
 from pathlib import Path
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from pr_ci_plan import CoverageError, context, task_key, validate_test_coverage
 from pr_ci_state import BOT, BOT_ID, COMMAND, NATIVE_CHECKS, REPO, SHA, marker, record
@@ -217,6 +218,7 @@ def public_gate():
 
 
 def publish(state: dict, message: str):
+    """Save every state update, but only notify on starts and final outcomes."""
     public_gate()
     if (
         record(
@@ -226,10 +228,28 @@ def publish(state: dict, message: str):
         != state
     ):
         raise ValueError("Invalid outbound state.")
+    previous = latest_state_comment(
+        pages(f"issues/{state['pr']}/comments", None), state["pr"]
+    )
+    prior = record(previous, "assist") if previous else None
+    same_request = prior and all(
+        prior[k] == state[k] for k in ("command", "action", "head", "base")
+    )
+    notify = not same_request or (
+        prior["phase"] != state["phase"]
+        and (prior["phase"] in FINISHED_PHASES or state["phase"] in FINISHED_PHASES)
+    )
+    finished = state["phase"] in FINISHED_PHASES
+    if not finished:
+        message = (
+            "Monitoring the selected checks. Results or blockers will be reported here."
+            if state["action"] == "watch"
+            else "Repair and validation are in progress. Results or blockers will be reported here."
+        )
     # All editable text here is fixed, identifiers were validated against the
     # public catalog; do not copy API errors, task logs or model prose.
     body = f"**CI {state['action']}** · `{state['head'][:8]}`\n\n{message}\n"
-    if state.get("native_checks") or state["statuses"]:
+    if finished and (state.get("native_checks") or state["statuses"]):
         body += "\n| Check | Source | Result |\n|---|---|---|\n"
         for check in state.get("native_checks", []):
             label = NATIVE_CHECKS[check["workflow"]]["label"]
@@ -265,17 +285,36 @@ def publish(state: dict, message: str):
     WORK.mkdir(parents=True, exist_ok=True)
     file = WORK / "comment.md"
     file.write_text(body)
-    url = command(
-        "gh",
-        "pr",
-        "comment",
-        str(state["pr"]),
-        "--repo",
-        REPO,
-        "--body-file",
-        str(file),
-    )
-    live = api(f"issues/comments/{url.rsplit('issuecomment-', 1)[-1]}")
+    if notify:
+        url = command(
+            "gh",
+            "pr",
+            "comment",
+            str(state["pr"]),
+            "--repo",
+            REPO,
+            "--body-file",
+            str(file),
+        )
+        comment_id = int(url.rsplit("issuecomment-", 1)[-1])
+    else:
+        # Other bot comments may follow this one; never use --edit-last.
+        comment_id = previous["id"]
+        token = command("gh", "auth", "token", "--hostname", "github.com")
+        request = Request(
+            f"https://api.github.com/repos/{REPO}/issues/comments/{comment_id}",
+            data=json.dumps({"body": file.read_text()}).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "X-GitHub-Api-Version": "2026-03-10",
+            },
+            method="PATCH",
+        )
+        with urlopen(request, timeout=30) as response:
+            response.read()
+    live = api(f"issues/comments/{comment_id}")
     if live["body"].rstrip() != body.rstrip() or record(live, "assist") != state:
         raise ValueError("Published state differs from reviewed content.")
 
@@ -843,18 +882,26 @@ def task_status(task: dict, state: dict, runs: list[dict], *, submit: bool) -> s
     return "blocked"
 
 
-def load_state(comments: list[dict], pr: dict) -> dict | None:
+def latest_state_comment(comments: list[dict], number: int) -> dict | None:
     for comment in reversed(comments):
         state = record(comment, "assist")
-        if state and state["pr"] == pr["number"]:
-            command_comment = api(f"issues/comments/{state['command']}")
-            if (
-                command_comment["issue_url"].rsplit("/", 1)[-1] != str(pr["number"])
-                or permitted(command_comment) != state["action"]
-            ):
-                raise ValueError("Command is no longer authorized.")
-            return state
+        if state and state["pr"] == number:
+            return comment
     return None
+
+
+def load_state(comments: list[dict], pr: dict) -> dict | None:
+    comment = latest_state_comment(comments, pr["number"])
+    if not comment:
+        return None
+    state = record(comment, "assist")
+    command_comment = api(f"issues/comments/{state['command']}")
+    if (
+        command_comment["issue_url"].rsplit("/", 1)[-1] != str(pr["number"])
+        or permitted(command_comment) != state["action"]
+    ):
+        raise ValueError("Command is no longer authorized.")
+    return state
 
 
 def refresh_plan(state: dict, message: str):
