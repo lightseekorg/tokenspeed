@@ -1238,13 +1238,13 @@ extension to the native wrapper is required.
 These preparation changes modify neither the native scan, its gate math, nor
 GEMM arithmetic.
 
-## Recurrent prefill subgraphs (KDA, Mamba2)
+## Recurrent prefill subgraphs (KDA, Mamba2, GDN)
 
 ### Capturing recurrent layers in the outer graph
 
 `CapacityPrefillBackend` (`state/prefill_capacity.py`) owns this contract for
-KDA and Mamba2; each subclass only states which forwards it admits and whether
-uncaptured shapes also run the capacity layout. GDN does not capture its layers.
+KDA, Mamba2 and GDN; each subclass only states which forwards it admits and whether
+uncaptured shapes also run the capacity layout.
 Supported pure-extend forwards use `prepare_prefill_metadata` before eager
 execution, startup capture and replay. This consumer-stream seam builds or
 refreshes `CapacityPrefillMetadata` with the selected token and request capacities.
@@ -1266,6 +1266,13 @@ the preparation seam rewrites both in place, in one pinned upload, before each
 use. Mamba2 chunks align to the packed token axis, so when one-token dummy tails
 shift a later request's tail, a multi-request capture matches eager within
 rounding rather than bit for bit; a one-request capture matches exactly.
+
+GDN admits capacity prefills only when the selected chunk-prefill kernel sizes
+its launch from the sequence count and reads the bounds on device
+(`gdn_chunk_prefill_capturable`); otherwise its layers keep their breaks. Like
+Mamba2, uncaptured shapes keep the scheduler metadata. The scan chunks each
+sequence from its own start, so captures of any request count match eager bit
+for bit.
 
 For retained shapes, the hybrid wrapper can omit the KDA attention break and
 capture neighboring projections, KDA kernels and post-attention compute together.
