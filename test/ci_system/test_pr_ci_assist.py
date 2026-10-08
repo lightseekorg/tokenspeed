@@ -599,13 +599,20 @@ def test_conflicted_test_resolution_preserves_both_sides_assertions(tmp_path, se
     path = "test/runtime/test_model.py"
     file = tmp_path / path
     file.parent.mkdir(parents=True)
-    file.write_text("def test_result():\n    assert value == 1\n")
+    file.write_text("def test_result():\n    assert value == 0\n")
     other_path = "test/runtime/test_other.py"
     other = tmp_path / other_path
     other.write_text("assert other_value == 3\n")
     git("add", ".")
     git("commit", "-s", "-m", "initial")
+    ancestor = git("rev-parse", "HEAD")
+    file.write_text(
+        "def test_result():\n    assert value == 0\n    assert value == 1\n"
+    )
+    git("add", ".")
+    git("commit", "-s", "-m", "head")
     head = git("rev-parse", "HEAD")
+    git("checkout", "--detach", ancestor)
     file.write_text(
         "def test_result():\n    torch.testing.assert_close(actual, expected, atol=0)\n"
     )
@@ -613,6 +620,7 @@ def test_conflicted_test_resolution_preserves_both_sides_assertions(tmp_path, se
     git("add", ".")
     git("commit", "-s", "-m", "base")
     base = git("rev-parse", "HEAD")
+    git("checkout", "--detach", head)
     _, state = selected
     state.update(action="fix", validation_base=base, repair_run=201)
     request = dict(
@@ -651,19 +659,35 @@ def test_source_screen_retains_public_parents_and_rejects_new_private_text(tmp_p
     repair.identity(tmp_path)
     file = tmp_path / "model.py"
     file.write_text("# head https://example.com/v1\nvalue = 1\n")
+    root_api = tmp_path / repair.ROOT_API
+    root_api.parent.mkdir(parents=True)
+    old_exports = 'from package.ops import mm\n__all__ = ["mm"]\n'
+    bootstrap = "from package import bootstrap as _bootstrap\n_bootstrap()\n"
+    root_api.write_text(old_exports)
     git("add", ".")
     git("commit", "-s", "-m", "initial")
     head = git("rev-parse", "HEAD")
     file.write_text("# main https://example.com/v1\nvalue = 2\n")
+    root_api.write_text(bootstrap)
     git("add", ".")
     git("commit", "-s", "-m", "base")
     base = git("rev-parse", "HEAD")
     file.write_text("# main https://example.com/v1\nvalue = 3\n")
-    assert repair.guard(tmp_path, head, {"model.py"}, validation_base=base)
+    assert repair.guard(
+        tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
+    )
+    root_api.write_text(old_exports)
+    with pytest.raises(repair.RepairRejected, match="removed root operator exports"):
+        repair.guard(
+            tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
+        )
+    root_api.write_text(bootstrap)
     assert repair.new_source_text(tmp_path, head, base, {"model.py"}) == "value = 3"
     file.write_text("# new https://example.com/v1\nvalue = 3\n")
     with pytest.raises(repair.RepairRejected, match="public-output"):
-        repair.guard(tmp_path, head, {"model.py"}, validation_base=base)
+        repair.guard(
+            tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
+        )
 
 
 def test_native_dispatch_rejects_changed_workflow_controls(

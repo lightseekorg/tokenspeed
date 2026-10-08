@@ -74,11 +74,13 @@ CONFIG_NAMES = {
     ".clang-tidy",
 }
 NATIVE_CONFIG = NATIVE_CHECKS["nvidia-kernel-library-tests.yml"]["config"]
+ROOT_API = "tokenspeed-kernel/python/tokenspeed_kernel/__init__.py"
 REPAIR_FEEDBACK = {
     "native-task": "Native repair must retain the original tests and every original byte except appending ${PYTHONPATH:+:$PYTHONPATH} inside an existing quoted PYTHONPATH prefix.",
     "test-syntax": "Test conflict resolution is not valid Python.",
     "source-syntax": "Source conflict resolution is not valid Python. Correct the supplied syntax error before validation.",
-    "test-assertions": "Conflict resolution removed or changed test assertions. Preserve the supplied assertions from both parents.",
+    "test-assertions": "Conflict resolution removed or changed test assertions. Preserve current main and PR-added assertions with their original behavior and thresholds.",
+    "retired-api": "Main deliberately removed root operator exports. Preserve that removal and migrate callers to operator modules instead of restoring the exports.",
     "scope": "Repair changes files outside its scope.",
     "file-size": "Repair deletes a file or exceeds the size limit.",
     "file-mode": "Repair changes file type or mode.",
@@ -286,12 +288,18 @@ def guard_test_assertions(source: Path, head: str, base: str, path: str):
                 snippets[key] = ast.unparse(node)
         return found
 
-    required = Counter()
-    for ref in (head, base):
+    def parent_assertions(ref):
         if not command("git", "ls-tree", "--name-only", ref, "--", path, cwd=source):
             # A renamed test may exist only on one side of the merge.
-            continue
-        required |= assertions(command("git", "show", f"{ref}:{path}", cwd=source))
+            return Counter()
+        return assertions(command("git", "show", f"{ref}:{path}", cwd=source))
+
+    ancestor = parent_assertions(command("git", "merge-base", head, base, cwd=source))
+    current = parent_assertions(base)
+    ours = parent_assertions(head)
+    # Keep main's supported contract plus assertions introduced by the PR.
+    # An ancestor assertion deliberately replaced on main is not a PR addition.
+    required = current + (ours - (ancestor | current))
     missing = required - assertions(source.joinpath(path).read_text())
     if missing:
         raise RepairRejected(
@@ -299,6 +307,48 @@ def guard_test_assertions(source: Path, head: str, base: str, path: str):
             path=path,
             details=[snippets[key] for key in missing.elements()],
         )
+
+
+def guard_retired_exports(source: Path, head: str, base: str):
+    def exports(content):
+        names = set()
+        for node in ast.parse(content).body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names.update(
+                    alias.asname or alias.name.split(".")[0] for alias in node.names
+                )
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                names.update(
+                    target.id for target in node.targets if isinstance(target, ast.Name)
+                )
+                if any(
+                    isinstance(target, ast.Name) and target.id == "__all__"
+                    for target in node.targets
+                ):
+                    names.update(
+                        item.value
+                        for item in ast.walk(node.value)
+                        if isinstance(item, ast.Constant)
+                        and isinstance(item.value, str)
+                    )
+        return {name for name in names if not name.startswith("_")}
+
+    parents = []
+    for ref in (command("git", "merge-base", head, base, cwd=source), head, base):
+        if not command(
+            "git", "ls-tree", "--name-only", ref, "--", ROOT_API, cwd=source
+        ):
+            return
+        parents.append(exports(command("git", "show", f"{ref}:{ROOT_API}", cwd=source)))
+    restored = (parents[0] & parents[1] - parents[2]) & exports(
+        source.joinpath(ROOT_API).read_text()
+    )
+    if restored:
+        raise RepairRejected("retired-api", path=ROOT_API, details=sorted(restored))
 
 
 def guard_file(source: Path, head: str, p: str, validation_base: str | None):
@@ -346,7 +396,12 @@ def guard_file(source: Path, head: str, p: str, validation_base: str | None):
 
 
 def guard(
-    source: Path, head: str, allowed: set[str], *, validation_base: str | None = None
+    source: Path,
+    head: str,
+    allowed: set[str],
+    *,
+    validation_base: str | None = None,
+    check_retired_exports: bool = True,
 ):
     no_symlinks(source)
     names = command(
@@ -364,10 +419,14 @@ def guard(
         if Path(p).suffix == ".py"
         and {"test", "tests"}.intersection(Path(p).parts[:-1])
     }
+    if ROOT_API in allowed:
+        checked.add(ROOT_API)
     issues = []
     for p in sorted(checked):
         try:
             guard_file(source, head, p, validation_base)
+            if p == ROOT_API and validation_base and check_retired_exports:
+                guard_retired_exports(source, head, validation_base)
         except RepairRejected as error:
             issues.append(error)
     if issues:
@@ -737,7 +796,15 @@ def seed_repair(source: Path, request: dict, allowed: set[str], conflicts: set[s
             )
             if not names.issubset(allowed):
                 raise RepairRejected("scope")
-            guard(review, state["head"], names, validation_base=base)
+            # Prior accepted edits seed a new model turn that can correct
+            # restored exports. Every completed proposal still enforces removal.
+            guard(
+                review,
+                state["head"],
+                names,
+                validation_base=base,
+                check_retired_exports=False,
+            )
             for path in names | conflicts:
                 parent = review / path
                 if parent.is_file():
@@ -819,6 +886,11 @@ def model():
                 )
     feedback = plan_root / "feedback.json"
     feedback.write_text("{}")
+    if resumed and ROOT_API in allowed:
+        try:
+            guard_retired_exports(source, state["head"], base)
+        except RepairRejected as error:
+            feedback.write_text(json.dumps(error.feedback))
     # Corrective turns must reuse a trusted tool definition. The model can read
     # this runner-owned file, but cannot replace it through its writable inputs.
     agent = sandbox_root / "repair.md"
@@ -838,14 +910,16 @@ every command, test and assertion. Do not use external paths or symlinks.
 Do not copy diagnostic paths, hosts, credentials or environment identifiers into source.
 Do not perform unrelated cleanup. Stop if the cause is uncertain.
 Respect deliberate removals from main; do not restore retired interfaces.
-Allowed test files are merge-conflict resolutions only. Preserve both sides'
-assertions, thresholds and coverage; do not weaken or skip tests.
+Allowed test files are merge-conflict resolutions only. Preserve current main
+assertions and the PR's added assertions, thresholds and coverage;
+do not weaken or skip tests. Do not resurrect ancestor checks for interfaces
+deliberately removed on main. Migrate their callers to supported operator modules.
 Apply the repair with Edit or Write. Describing a proposed change without editing
 the allowed source does not complete this task.
 """)
     prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Complete read-only conflict parents: {parents}/head/<relative path> and {parents}/main/<relative path>; an absent file does not exist on that parent. Read these paired snapshots to preserve assertions and deliberate removals. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Try to complete source edits within 15 minutes to reserve time for required checks, GPU queues and validation. Finish the smallest substantiated repair promptly. Start with the actual failed step in diagnostics.txt and its CI specification. Check whether pinned main already fixes that failure, and preserve those fixes while resolving conflicts. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
     if resumed:
-        prompt += " The existing source contains the previous accepted edits. Complete their verification against current main and correct the remaining conflict resolutions. A retained test missing from the prior patch still has its main-side contents; migrate its imports or calls only if required by the PR's supported API. Preserve already completed edits and avoid restarting the broad investigation."
+        prompt += " The existing source contains the previous accepted edits. Read feedback.json first for known material issues in those edits, and correct them before proposing a patch. Complete their verification against current main and correct the remaining conflict resolutions. A retained test missing from the prior patch still has its main-side contents; migrate its imports or calls only if required by the PR's supported API. Preserve already completed edits and avoid restarting the broad investigation."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     guard_root = WORK / "guard"
     guard_root.mkdir()
