@@ -893,6 +893,9 @@ def control(number: int, *, expected_command: int | None = None):
     state = load_state(comments, pr)
     comment = latest_command(comments)
     resume_run = os.environ.get("REPAIR_RUN", "")
+    check_only = os.environ.get("REPAIR_CHECK_ONLY") == "true"
+    if check_only and not resume_run:
+        raise ValueError("Rechecking requires an authorized previous repair.")
     if resume_run and (
         os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
         or not resume_run.isdecimal()
@@ -1130,6 +1133,7 @@ def control(number: int, *, expected_command: int | None = None):
                     "conflicts": pr["mergeable"] is False,
                     "deadline": repair_deadline(state),
                     "resume_run": int(resume_run) if resume_run else None,
+                    "check_only": check_only,
                 }
             )
         )

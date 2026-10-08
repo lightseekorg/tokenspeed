@@ -400,22 +400,17 @@ def merge(source: Path, base: str, *, commit: bool):
 
 
 def effective_merge(
-    source: Path, base: str, head: str, *, resolved_tests: set[str]
+    source: Path, base: str, head: str, *, resolved_paths: set[str]
 ) -> str:
     # An ordinary resolution patch can still produce a three-way conflict.
     # Keep its reviewed file contents while merging every nonconflicting base
     # change normally; never use an "ours" merge that drops base changes.
-    if any(
-        not safe_path(p)
-        or Path(p).suffix != ".py"
-        or not {"test", "tests"}.intersection(Path(p).parts[:-1])
-        for p in resolved_tests
-    ):
-        raise ValueError("Invalid test conflict resolution scope.")
+    if any(not safe_path(p) for p in resolved_paths):
+        raise ValueError("Invalid conflict resolution scope.")
     changed = set(command("git", "diff", "--name-only", head, cwd=source).splitlines())
-    # A checked modify/delete resolution can retain the head verbatim. Its
-    # unchanged bytes still need to be staged as a merge resolution.
-    contents = {p: source.joinpath(p).read_bytes() for p in changed | resolved_tests}
+    # A checked resolution can retain the head verbatim. Its unchanged bytes
+    # still need to be staged as a merge resolution, including production files.
+    contents = {p: source.joinpath(p).read_bytes() for p in changed | resolved_paths}
     conflicts = merge(source, base, commit=False)
     if not set(conflicts).issubset(contents):
         raise ValueError("Merge conflicts extend beyond the reviewed patch.")
@@ -682,9 +677,9 @@ def proposed_patch(source, request, allowed, conflicts, before, planner, guard_r
             command("git", "worktree", "remove", "--force", str(review), cwd=ROOT)
 
 
-def seed_repair(source: Path, request: dict, allowed: set[str], conflicts: set[str]):
+def previous_repair(request: dict):
     if not request.get("resume_run"):
-        return False
+        raise ValueError("No previous repair was authorized.")
     previous = WORK / "previous-repair"
     old = json.loads(previous.joinpath("request.json").read_text())
     state = request["state"]
@@ -697,9 +692,37 @@ def seed_repair(source: Path, request: dict, allowed: set[str], conflicts: set[s
     base = prior.get("validation_base", prior["base"])
     if not SHA.fullmatch(base):
         raise ValueError("Invalid previous repair base.")
-    command("git", "fetch", "origin", base, cwd=source)
     if previous.joinpath("patch.diff").stat().st_size > 200000:
         raise RepairRejected("patch-size")
+    return old
+
+
+def reuse():
+    request = json.loads(WORK.joinpath("request.json").read_text())
+    remaining_time(request)
+    if not request.get("check_only"):
+        raise ValueError("Source recheck was not requested.")
+    old = previous_repair(request)
+    request["conflicted_tests"] = old.get("conflicted_tests", [])
+    WORK.joinpath("patch.diff").write_bytes(
+        WORK.joinpath("previous-repair/patch.diff").read_bytes()
+    )
+    WORK.joinpath("request.json").write_text(json.dumps(request))
+    print(
+        "Repair: accepted patch reused; all source checks and validation must run again.",
+        flush=True,
+    )
+
+
+def seed_repair(source: Path, request: dict, allowed: set[str], conflicts: set[str]):
+    if not request.get("resume_run"):
+        return False
+    old = previous_repair(request)
+    previous = WORK / "previous-repair"
+    state = request["state"]
+    prior = old["state"]
+    base = prior.get("validation_base", prior["base"])
+    command("git", "fetch", "origin", base, cwd=source)
     with tempfile.TemporaryDirectory(prefix="repair-seed-", dir=WORK) as work:
         review = Path(work) / "source"
         command(
@@ -748,6 +771,7 @@ def model():
     if any(p.startswith(PROTECTED) or Path(p).name in CONFIG_NAMES for p in changed):
         raise ValueError("Control/config changes require manual repair.")
     conflicts = set(merge(source, base, commit=False))
+    request["conflicted_paths"] = sorted(conflicts)
     request["conflicted_tests"] = sorted(
         p for p in conflicts if {"test", "tests"}.intersection(Path(p).parts[:-1])
     )
@@ -952,7 +976,7 @@ def refresh_validation_base(source: Path, request: dict, base: str):
     command("git", "fetch", "origin", base, cwd=source)
     selected = set(
         command("git", "diff", "--name-only", state["head"], cwd=source).splitlines()
-    ) | set(request.get("conflicted_tests", []))
+    ) | set(request.get("conflicted_paths", request.get("conflicted_tests", [])))
     changed = set(
         command(
             "git", "diff", "--name-only", "--no-renames", prior, base, cwd=source
@@ -972,6 +996,7 @@ def refresh_validation_base(source: Path, request: dict, base: str):
     for path, content in contents.items():
         source.joinpath(path).write_bytes(content)
     restore_patch(source, state["head"], selected)
+    request["conflicted_paths"] = sorted(conflicts)
     request["conflicted_tests"] = sorted(
         p for p in conflicts if {"test", "tests"}.intersection(Path(p).parts[:-1])
     )
@@ -990,6 +1015,11 @@ def check():
     base = state.get("validation_base", state["base"])
     source = checkout(state["head"], base)
     identity(source)
+    conflicts = set(merge(source, base, commit=False))
+    if not conflicts.issubset(allowed_paths(request)):
+        raise ValueError("Conflict resolution is outside the allowed repair scope.")
+    request["conflicted_paths"] = sorted(conflicts)
+    restore_patch(source, state["head"], set())
     command("git", "apply", "--index", str(WORK / "patch.diff"), cwd=source)
     allowed = allowed_paths(request)
     guard(source, state["head"], allowed, validation_base=base)
@@ -1054,7 +1084,7 @@ def check():
         source,
         base,
         state["head"],
-        resolved_tests=set(request.get("conflicted_tests", [])),
+        resolved_paths=conflicts,
     )
     result = subprocess.run(
         ["pre-commit", "run", "--all-files"],
@@ -1188,6 +1218,8 @@ def stage():
     validate_plan(request["plan"], data)
     request["data"] = data
     conflicts = merge(source, base, commit=False)
+    if request.get("conflicted_paths") != sorted(conflicts):
+        raise ValueError("Resolutions differ from actual merge conflicts.")
     expected_tests = sorted(
         p for p in conflicts if {"test", "tests"}.intersection(Path(p).parts[:-1])
     )
@@ -1221,7 +1253,7 @@ def stage():
             source,
             base,
             state["head"],
-            resolved_tests=set(request.get("conflicted_tests", [])),
+            resolved_paths=set(conflicts),
         )
         != proof["merge_tree"]
     ):
@@ -1360,16 +1392,11 @@ def promote(state: dict):
     original_paths = command(
         "git", "diff", "--name-only", f"{state['base']}...{state['head']}", cwd=source
     ).splitlines()
-    resolved_tests = {
-        p
-        for p in original_paths
-        if safe_path(p)
-        and Path(p).suffix == ".py"
-        and {"test", "tests"}.intersection(Path(p).parts[:-1])
-        and source.joinpath(p).is_file()
+    resolved_paths = {
+        p for p in original_paths if safe_path(p) and source.joinpath(p).is_file()
     }
     if (
-        effective_merge(source, base, state["head"], resolved_tests=resolved_tests)
+        effective_merge(source, base, state["head"], resolved_paths=resolved_paths)
         != candidate["tree"]
         or command(
             "git", "rev-parse", f"{candidate['validation']}^{{tree}}", cwd=source
@@ -1400,7 +1427,7 @@ def promote(state: dict):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "stage", choices=("configure", "model", "check", "stage", "failed")
+        "stage", choices=("configure", "model", "reuse", "check", "stage", "failed")
     )
     args = parser.parse_args()
     try:
@@ -1420,9 +1447,13 @@ if __name__ == "__main__":
                 "Repair or pre-commit checks failed. Human intervention required; PR unchanged.",
             )
         else:
-            {"configure": configure, "model": model, "check": check, "stage": stage}[
-                args.stage
-            ]()
+            {
+                "configure": configure,
+                "model": model,
+                "reuse": reuse,
+                "check": check,
+                "stage": stage,
+            }[args.stage]()
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         raise SystemExit(
             "Repair stopped; raw diagnostics withheld and PR unchanged."
