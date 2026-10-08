@@ -628,7 +628,7 @@ def _scatter_checkpoint_output_kernel(
 
 
 @triton.jit(
-    do_not_specialize=["body_tokens", "tail_tokens", "num_tokens"],
+    do_not_specialize=["BODY_TOKENS", "TAIL_TOKENS", "TOKENS"],
     do_not_specialize_on_alignment=["sources"],
 )
 def _gather_checkpoint_output_kernel(
@@ -641,23 +641,23 @@ def _gather_checkpoint_output_kernel(
     FEATURES: tl.constexpr,
     # Token counts follow the batch; runtime so every batch shape shares one
     # binary. The feature geometry is fixed per layer.
-    body_tokens,
-    tail_tokens,
-    num_tokens,
+    BODY_TOKENS,
+    TAIL_TOKENS,
+    TOKENS,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     token, feature = offset // WIDTH, offset % WIDTH
-    source = tl.load(sources + token, token < num_tokens, -1)
-    is_body = (token < num_tokens) & (source >= 0) & (source < body_tokens)
+    source = tl.load(sources + token, token < TOKENS, -1)
+    is_body = (token < TOKENS) & (source >= 0) & (source < BODY_TOKENS)
     is_tail = (
-        (token < num_tokens)
-        & (source >= body_tokens)
-        & (source < body_tokens + tail_tokens)
+        (token < TOKENS)
+        & (source >= BODY_TOKENS)
+        & (source < BODY_TOKENS + TAIL_TOKENS)
     )
     body_offset = source * BODY_STRIDES[0]
-    tail_offset = (source - body_tokens) * TAIL_STRIDES[0]
+    tail_offset = (source - BODY_TOKENS) * TAIL_STRIDES[0]
     for dim in tl.static_range(len(FEATURES) - 1, -1, -1):
         component = feature % FEATURES[dim]
         feature //= FEATURES[dim]
@@ -665,9 +665,7 @@ def _gather_checkpoint_output_kernel(
         tail_offset += component * TAIL_STRIDES[dim + 1]
     body_value = tl.load(body + body_offset, is_body, 0)
     tail_value = tl.load(tail + tail_offset, is_tail, 0)
-    tl.store(
-        output + offset, tl.where(is_body, body_value, tail_value), token < num_tokens
-    )
+    tl.store(output + offset, tl.where(is_body, body_value, tail_value), token < TOKENS)
 
 
 def merge_prefill_checkpoint_outputs(
@@ -726,9 +724,9 @@ def merge_prefill_checkpoint_outputs(
             BODY_STRIDES=body.stride()[token_dim:],
             TAIL_STRIDES=tail.stride()[token_dim:],
             FEATURES=body.shape[token_dim + 1 :],
-            body_tokens=body.shape[token_dim],
-            tail_tokens=tail.shape[token_dim],
-            num_tokens=token_extent,
+            BODY_TOKENS=body.shape[token_dim],
+            TAIL_TOKENS=tail.shape[token_dim],
+            TOKENS=token_extent,
             WIDTH=width,
             BLOCK=1024,
         )
