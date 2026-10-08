@@ -659,6 +659,11 @@ the allowed source does not complete this task.
     )
     print("Repair: preparing edit sandbox.", flush=True)
     sandbox = edit_sandbox(source, allowed, [plan_root, home], home=home)
+    # The controller refreshes this file between turns; the restricted CLI only
+    # reads it. Retain its controller ownership after preparing writable state.
+    command(
+        "sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", str(home / "config.toml")
+    )
     for path, label in (
         (agent, "agent definition"),
         (plan_root / "diagnostics.txt", "failure evidence"),
