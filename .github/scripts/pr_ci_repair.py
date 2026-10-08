@@ -387,6 +387,8 @@ def edit_sandbox(source: Path, allowed: set[str], directories: list[Path]) -> li
         "--reuid=nobody",
         "--regid=nogroup",
         "--clear-groups",
+        "env",
+        f"HOME={os.environ['KIMI_CODE_HOME']}",
     ]
 
 
@@ -454,6 +456,17 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
         sandbox = edit_sandbox(
             source, allowed, [plan_root, Path(os.environ["KIMI_CODE_HOME"])]
         )
+        for path, label in (
+            (agent, "agent definition"),
+            (plan_root / "diagnostics.txt", "failure evidence"),
+            (
+                Path(os.environ["KIMI_CODE_HOME"]) / "config.toml",
+                "provider configuration",
+            ),
+        ):
+            if subprocess.run([*sandbox, "test", "-r", str(path)]).returncode:
+                print(f"Repair input access denied: {label}.", flush=True)
+                raise ValueError("Repair inputs are inaccessible.")
         print("Repair: starting repair process.", flush=True)
         result = subprocess.run(
             [
