@@ -188,6 +188,39 @@ from one first bound to that pool:
   its cache is sized, is left out of the profile instead, by each rank before
   the cross-rank minimum.
 
+### DP projection communication
+
+`DPColumnParallelLinear` and `DPRowParallelLinear` accept full input channels
+for each rank's own tokens and return complete outputs in the same local token
+order. Their parallel mapping describes projection weight sharding, independently
+of attention's token ownership. For example, attention DP4 can use one TP4
+projection group with projection `dp_size=1`; this does not mean the attention
+inputs are replicated.
+
+Both eager and CUDA-graph execution require explicit physical row counts indexed
+by global rank in `ForwardContext`: `collective_global_num_tokens` from
+`report_collective_sizing` takes precedence over `global_num_tokens`. The counts
+include any graph padding and match the input rows on each owner. Empty owners
+participate when another rank in their subgroup has work. Missing counts are an
+error, not an instruction to assume equal counts across ranks. Ordinary TP with
+replicated token rows uses the existing `ColumnParallelLinear` and
+`RowParallelLinear` contracts instead.
+
+The model runner prepares fixed-capacity communication workspaces before
+cache-memory profiling and graph capture.
+Preparation binds each Linear and its workspace to the selected communication
+backend; forward operations dispatch through that same backend.
+Generic projection operations use the backend's ordinary collectives.
+`AutoBackend` composes the optimized projection dispatcher and reuses those
+generic operations for fallback.
+Sequential layers share model-private scratch on one stream, sized for the
+largest projection; matching configurations also share native resources.
+Concurrent streams or models use separate workspaces. Intermediate tensors
+borrow storage only for the current projection, so consumers finish before
+another projection reuses it. Final outputs belong to the caller and
+remain valid across later forwards. Graphs referencing a workspace are destroyed
+before it is released.
+
 ### Padding contract
 
 `bs` is the request count being prepared (the padded graph batch under
@@ -754,10 +787,10 @@ model alone is not a reason to introduce a bespoke backend.
 the ordinary router, wrapped by the existing `HybridLinearAttnBackend` only
 when this view owns GDN layers. Forward dispatch and PD step recording stay
 with that child; the root broadcasts cache and metadata lifecycle calls.
-Registry construction selects the attention child first, then composes the
-Qwen4-Exp consumers once, regardless of whether this view has GDN layers.
-The factory reads the pool view to choose these consumers and leaves binding
-to the common validation and publication path after construction.
+Registry construction selects the attention child; the Qwen4-Exp composite
+selects its consumers from the pool view's local fields, regardless of whether
+this view has GDN layers. Binding stays with the common validation and
+publication path after construction.
 The root initializes the common `AttentionBackend` attributes from its own
 `AttnConfig`, including draft status, verify width, dtype and head geometry;
 these attributes do not depend on an attention child's wrapper shape.
@@ -846,9 +879,12 @@ of the persistent request caches.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
-before sizing the arena. The Qwen4-Exp root's `preallocate_verify_workspace`
-selects its GDN/PLE/QSA consumers, allocates each once and returns their total
-bytes; registry only invokes this operation and checks the recipe budget.
+before sizing the arena. `preallocate_verify_workspace` is called on the
+backend root and returns its verify buffers' bytes. The hybrid delegates to
+its recurrent child; Qwen4-Exp invokes its attention child, PLE and QSA.
+Registry retains the recipe's preparation conditions and budget check,
+without opening the recurrent child. Inkling ring accounting and QCP
+history-gather allocation and sharing remain separate from verify preparation.
 Draft roots allocate no target verify workspace. Qwen4-Exp reserves no
 verify workspace when the target width is one, even with a draft model
 attached; this includes the inherited GDN/PLE staging budget and PLE commit

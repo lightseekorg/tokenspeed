@@ -1,7 +1,8 @@
 # TokenSpeed Lamport A2A
 
-`tokenspeed_a2a_lamport` is a TP4 BF16, intra-node NVLink exchange. It exchanges
-channel shards directly between `[M, K]` and `[4*M, K/4]`, including the inverse
+`tokenspeed_a2a_lamport` is a BF16, intra-node NVLink exchange for TP2, TP4 and
+TP8. For a group of `P` GPUs, it exchanges channel shards directly between
+`[M, K]` and `[P*M, K/P]`, including the inverse
 mapping, without a separate pack or output-restoration kernel. Runtime backend
 selection remains outside this kernel API.
 
@@ -30,14 +31,15 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
 ## Contract and limits
 
 - The public Python entry point lives in `cuda.py`; its private implementation
-  lives under `_cuda/`. Both packet and chunk exchange require **exactly four
-  GPUs per process group on one host**,
-  not necessarily four GPUs in the entire job. Peer indexing and scratch
-  layouts are specialized for four peers; other group sizes are rejected.
+  lives under `_cuda/`. Both packet and chunk exchange require **2, 4 or 8
+  peer-accessible GPUs per process group on one host**, independently of the
+  total job size. Peer indexing specializes for `P`; token counts and channel
+  widths remain runtime arguments. Other group sizes are rejected.
 - Prepare `TokenSpeedA2ALamportState(group, max_rows, channels, device, blocks)` on all
-  four peers before capture. This creates symmetric scratch and compiles the
+  peers before capture. This creates symmetric scratch and compiles the
   kernel. All peers must agree on the physical shape and direction of each call.
-- Inputs are contiguous, 16-byte-aligned BF16 matrices; `K` is a positive multiple of eight.
+- Inputs are contiguous, 16-byte-aligned BF16 matrices; each channel shard
+  contains a multiple of two BF16 values (`K % (2*P) == 0`).
   Uneven/empty logical owners must be padded to the same positive physical `M`.
 - Serialize this communicator and its consumers on one CUDA stream. Pass
   `out=None` to borrow persistent **local output**, valid until the next call.
@@ -55,8 +57,8 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
 - Packet storage is twice the payload size; three generations cost `6*S`
   scratch plus `S` output bytes per GPU, excluding metadata. Payload expansion
   also increases link traffic. This is a **low-latency**, not a large-message
-  bandwidth optimization. Only four NVLink-connected GB300 GPUs have been
-  measured; no cross-node or other-dtype claim is made.
+  bandwidth optimization. Launch tuning was measured on four NVLink-connected
+  GB300 GPUs; it does not establish performance for other group sizes.
 - The kernel itself has no implicit NCCL fallback. Its runtime caller owns
   admission, padding and fallback selection.
 
@@ -72,13 +74,13 @@ The `tokenspeed_a2a_lamport(state, inputs, inverse, out)` entry point then choos
 packet exchange below the threshold and chunk exchange at/above it. Both use
 the same layout contract and write the selected local output buffer. Peers must
 agree on physical shapes, direction and threshold. Chunk exchange additionally
-requires channels divisible by 32. The original packet-only behavior remains
+requires eight-BF16-aligned channel shards (`K % (8*P) == 0`). Packet-only behavior remains
 available by not preparing chunk exchange.
 
 The chunk kernel moves raw payload with 128-bit loads/stores rather than
 doubling each 32-bit payload word with a tag. Each CTA owns a striped portion
 of every peer's payload. Every writing thread executes a system fence, then a
-CTA barrier. Four lanes publish per-peer readiness with system-release stores
+CTA barrier. `P` lanes publish per-peer readiness with system-release stores
 and wait on system-acquire loads; a second CTA barrier precedes vectorized
 local reads/output restoration. Three generations protect scratch reuse.
 This does **not** omit required synchronization or normalize special values.
@@ -90,7 +92,7 @@ kernel; interaction with concurrent GEMMs has not been benchmarked.
 Packet and chunk exchange have **separate scratch and generation counters**.
 Sharing raw chunk payload with packet scratch could make arbitrary data appear
 to be a valid packet tag after a size transition. Preparation adds `3*S`
-payload scratch and `3*4*blocks*8` flag bytes per GPU to the original workspace,
+payload scratch and `3*P*blocks*8` flag bytes per GPU to the original workspace,
 so combined scratch plus output is approximately `10*S`. No allocation or
 host synchronization is performed by the forward call or graph replay.
 
@@ -98,42 +100,47 @@ The recommended threshold keeps exactly 8 MiB on the tuned packet kernel and
 uses chunk exchange above it. An explicitly supplied threshold still takes
 precedence; supplying 8 MiB selects chunk exchange at exactly 8 MiB.
 Choose the threshold for your hardware and workload.
-Correctness tests exercise both directions, repeated transitions between
-packet/chunk sizes, delayed peers, arbitrary payload bits and graph replay.
+Correctness tests exercise both directions, transitions between packet/chunk
+sizes, arbitrary payload bits and changing-input graph replay.
 
 ### Medium-message packet tuning
 
 For 4 through 8 MiB inclusive, packet exchange uses 1024 threads/CTA, writes
 self-owned data directly to output, rotates peer publication order, and polls
-three remote owners together. Other packet sizes retain the original launch.
+the `P-1` remote owners together. Other packet sizes retain the original launch.
 Both variants use the same packet layout and full 32-bit generation IDs;
 switching sizes needs neither additional scratch nor a new barrier. This
 increases GPU occupancy; concurrent compute performance is not established.
 
-The medium kernel additionally specializes each TP4 rank at compile time to
+The medium kernel additionally specializes each rank at compile time to
 remove dynamic peer indexing and self-owner branches in its unrolled loops.
 Packet format, generation checks, workspace size, and dispatch thresholds are
-unchanged; four rank variants increase compiled code size. GPU tests cover all
+unchanged; rank variants increase compiled code size. GPU tests cover all
 ranks, both directions, and transitions across the packet/chunk boundary.
 
 ## Fused FP8 receive-side quantization
 
 Call `state.prepare_fp8_quantization()` before capture, then
 `tokenspeed_a2a_lamport_fp8_quantize(state, inputs)` for the forward exchange.
-Input width must be divisible by 512: each TP4 channel shard contains whole
-128-element quantization groups. The kernel returns borrowed E4M3 values
-`[4*M,K/4]` and contiguous MN-major FP32 scales `[K/512,4*M]`.
+Input width must be divisible by `128*P`: each channel shard contains whole
+128-element quantization groups. With `R = round_up(P*M, 4)`, the kernel returns
+borrowed E4M3 values `[R,K/P]` and contiguous MN-major FP32 scales `[K/(128*P),R]`.
+Padding is determined by `P*M != R`, which also selects the prepared quantizer's
+rounding behavior. For supported TP sizes, TP2 with odd `M` needs two padding
+rows. The same kernel writes zero values and unit scales for those rows;
+the consumer GEMM receives the valid count `P*M`.
 
 Packet polling or chunk acquire fences establish readiness before quantization.
 Both variants share their existing rings and generations with ordinary BF16
-A2A; there is no separate consumer-readiness protocol. The BF16 epsilon clamp,
-round-to-nearest divisions and FP8 conversion match the prepared FlashInfer
-quantizer. A following GEMM uses normal stream ordering and must finish reading
+A2A; there is no separate consumer-readiness protocol. Quantization matches the
+prepared quantizer: its native TRT-LLM path for unpadded rows, and its Triton
+path for padded rows, including their different rounding and zero-group rules.
+A following GEMM uses normal stream ordering and must finish reading
 the borrowed buffers before the next quantized call.
 
 Communication still carries BF16 data. The fusion removes local BF16 output
 materialization and a quantization launch, not link bytes. Persistent FP8 and
-scale outputs add `M*K + 4*M*K/128` bytes at the configured maximum M.
+scale outputs add `R*(K/P) + 4*R*K/(128*P)` bytes at the configured maximum `M`.
 The existing BF16 output remains available, and inverse exchange is unchanged.
 
 ## Validation and measurement methodology
@@ -145,13 +152,20 @@ python -m pytest -q \
   tokenspeed-kernel/test/nvidia/ops/communication/test_projection_tp.py
 ```
 
-The test spawns its own workers; do not launch pytest with torchrun. It skips
-when four NVIDIA GPUs, full peer access, or optional FlashInfer dependencies
-are unavailable. The focused correctness case compares TP4 C128, K=16384
-fused FP8 values and scales against ordinary Lamport exchange followed by the
-native quantizer, in eager execution and CUDA Graph replay. The existing
-runtime collective test covers bit-exact BF16 exchange through the
-compatibility API.
+The test spawns its own workers; do not launch pytest with torchrun. TP2, TP4
+and TP8 cases skip when the required GPU count is unavailable. Use a host with
+full peer access and the CUDA/FlashInfer dependencies above. At `K=16384`, the
+test checks exact BF16 payloads in both directions and fused FP8 values/scales
+against independently gathered inputs followed by the prepared quantizer.
+Rows 1, 128 and 257 cover small packets, the medium packet launch, chunk
+exchange and TP2 padding, in eager execution and CUDA Graph replay.
+
+The runtime integration test additionally covers uneven and empty owners,
+independent TP2 subgroups, sharded weights, and BF16/FP8 Linear outputs:
+
+```bash
+python -m pytest -q test/runtime/distributed/test_dp_parallel_linear.py
+```
 
 Benchmark timings exclude startup/JIT. After 20 warmups, each sample times
 10 replays of a graph containing 100 exchanges using CUDA events, takes the
