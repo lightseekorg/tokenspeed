@@ -630,6 +630,31 @@ def test_conflicted_test_resolution_preserves_both_sides_assertions(tmp_path, se
         repair.guard_test_assertions(tmp_path, head, base, path)
 
 
+def test_source_screen_retains_public_parents_and_rejects_new_private_text(tmp_path):
+    def git(*args):
+        return assist.command(
+            "git", "-c", "core.hooksPath=/dev/null", *args, cwd=tmp_path
+        )
+
+    git("init", "-b", "main")
+    repair.identity(tmp_path)
+    file = tmp_path / "model.py"
+    file.write_text("# head https://example.com/v1\nvalue = 1\n")
+    git("add", ".")
+    git("commit", "-s", "-m", "initial")
+    head = git("rev-parse", "HEAD")
+    file.write_text("# main https://example.com/v1\nvalue = 2\n")
+    git("add", ".")
+    git("commit", "-s", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    file.write_text("# main https://example.com/v1\nvalue = 3\n")
+    assert repair.guard(tmp_path, head, {"model.py"}, validation_base=base)
+    assert repair.new_source_text(tmp_path, head, base, {"model.py"}) == "value = 3"
+    file.write_text("# new https://example.com/v1\nvalue = 3\n")
+    with pytest.raises(repair.RepairRejected, match="public-output"):
+        repair.guard(tmp_path, head, {"model.py"}, validation_base=base)
+
+
 def test_native_dispatch_rejects_changed_workflow_controls(
     monkeypatch, tmp_path, selected
 ):

@@ -205,17 +205,42 @@ def public_source_diff(source: Path, head: str, names: set[str]) -> str:
     )
 
 
+def new_source_text(source: Path, head: str, base: str, names: set[str]) -> str:
+    """Screen novel additions, retaining source already public in either parent."""
+    added = []
+    for path in sorted(names - {NATIVE_CONFIG}):
+        public = set()
+        for ref in (head, base):
+            if command("git", "ls-tree", "--name-only", ref, "--", path, cwd=source):
+                public.update(
+                    command("git", "show", f"{ref}:{path}", cwd=source).splitlines()
+                )
+        diff = public_source_diff(source, head, {path})
+        added.extend(
+            line[1:]
+            for line in diff.splitlines()
+            if line.startswith("+")
+            and not line.startswith("+++")
+            and line[1:] not in public
+        )
+    return "\n".join(added)
+
+
 def no_symlinks(source: Path):
     entries = command("git", "ls-files", "--stage", cwd=source).splitlines()
     if any(line.startswith(("120000", "160000")) for line in entries):
         raise ValueError("Symlinks and submodules require manual repair.")
 
 
-def scan(diff: str):
-    added = "\n".join(
-        line[1:]
-        for line in diff.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
+def scan(diff: str, *, additions: str | None = None):
+    added = (
+        additions
+        if additions is not None
+        else "\n".join(
+            line[1:]
+            for line in diff.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
     )
     if re.search(
         r"https?://|\bwww\.|\b(?:sk-|ghp_|gho_|github_pat_)|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|/(?:home|tmp|root|proc)/",
@@ -301,7 +326,10 @@ def guard(
         if any(row.split()[0][1:] != row.split()[1] for row in status.splitlines()):
             raise RepairRejected("file-mode", path=p)
     diff = command("git", "diff", "--binary", "--no-ext-diff", head, cwd=source)
-    scan(public_source_diff(source, head, set(names)))
+    scan(
+        diff,
+        additions=new_source_text(source, head, validation_base or head, set(names)),
+    )
     return diff
 
 
@@ -580,7 +608,9 @@ def proposed_patch(source, request, allowed, conflicts, before, planner, guard_r
             os.environ["KIMI_CODE_HOME"] = str(guard_root)
             try:
                 planner._check_public_output(
-                    public_source_diff(review, state["head"], selected), guard_root
+                    new_source_text(review, state["head"], base, selected),
+                    guard_root,
+                    max_length=200000,
                 )
             except SystemExit:
                 raise RepairRejected("public-output") from None
@@ -636,6 +666,23 @@ def model():
         Path(os.environ["KIMI_CODE_HOME"]) / "config.toml", home / "config.toml"
     )
     plan_root.joinpath("context.json").write_text(json.dumps(request["data"]))
+    # Read-only parent snapshots avoid requiring Git tools or reconstructing
+    # complete files from conflict markers during the bounded repair.
+    parents = sandbox_root / "parents"
+    parents.mkdir()
+    for name, ref in (("head", state["head"]), ("main", base)):
+        for path in sorted(conflicts):
+            if command("git", "ls-tree", "--name-only", ref, "--", path, cwd=source):
+                target = parents / name / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(
+                    subprocess.run(
+                        ["git", "show", f"{ref}:{path}"],
+                        cwd=source,
+                        check=True,
+                        capture_output=True,
+                    ).stdout
+                )
     feedback = plan_root / "feedback.json"
     feedback.write_text("{}")
     # Corrective turns must reuse a trusted tool definition. The model can read
@@ -662,7 +709,7 @@ assertions, thresholds and coverage; do not weaken or skip tests.
 Apply the repair with Edit or Write. Describing a proposed change without editing
 the allowed source does not complete this task.
 """)
-    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Finish the smallest substantiated repair promptly to leave time for dispatch and validation. Start with the actual failed step in diagnostics.txt and its CI specification. Check whether pinned main already fixes that failure, and preserve those fixes while resolving conflicts. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
+    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Complete read-only conflict parents: {parents}/head/<relative path> and {parents}/main/<relative path>; an absent file does not exist on that parent. Read these paired snapshots to preserve assertions and deliberate removals. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Finish the smallest substantiated repair promptly to leave time for dispatch and validation. Start with the actual failed step in diagnostics.txt and its CI specification. Check whether pinned main already fixes that failure, and preserve those fixes while resolving conflicts. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     guard_root = WORK / "guard"
     guard_root.mkdir()
@@ -717,6 +764,8 @@ the allowed source does not complete this task.
                     *(["-r", session[0]] if session else ["--agent-file", str(agent)]),
                     "--add-dir",
                     str(source),
+                    "--add-dir",
+                    str(parents),
                     "--skills-dir",
                     str(plan_root),
                     "--output-format",
