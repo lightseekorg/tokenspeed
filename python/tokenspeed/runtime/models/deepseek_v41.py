@@ -154,20 +154,13 @@ logger = logging.getLogger(__name__)
 _ROPE_TABLES = WeakValueDictionary()
 
 
-# Kernels implementing the reference 1x32 rounding below, bit for bit.
-_V41_FP8_QUANTIZER = (
-    "gluon_quantize_fp8_group32_ue8m0_gfx950"
-    if current_platform().is_cdna4
-    else "triton_quantize_fp8_group32_ue8m0"
-)
-
-
 def v41_quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Return FP8 codes and uint8 E8M0 scales using reference 1x32 quantization.
 
     The reference rounds the FP32 product ``max(amax, 1e-4) * (1/448)`` by
     inspecting its exponent/mantissa. Generic MXFP8 quantizers differ at zero,
-    tiny activations, and power-of-two boundaries, so do not substitute one.
+    tiny activations, and power-of-two boundaries, so only kernels that
+    reproduce it bit for bit register the ``token_group_32``/``ue8m0`` traits.
     """
     if x.shape[-1] % 32:
         raise ValueError(
@@ -180,7 +173,7 @@ def v41_quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             group_size=32,
             scale_encoding="ue8m0",
             enable_pdl=False,
-            override=_V41_FP8_QUANTIZER,
+            override=None,
             solution=None,
         )
     grouped = x.float().unflatten(-1, (-1, 32))
