@@ -1638,7 +1638,7 @@ servicer child-ID mapping, never by parsing engine IDs.
 
 The native buffer holds at most 4,096 events and each hash list at most 256
 entries (`hash_count` reports its original length). The writer holds at most
-16 batches and stops at 256 MiB per file. Overflow emits `gap`; missing shutdown
+16 batches and stops at 2 GiB per file. Overflow emits `gap`; missing shutdown
 markers, truncated hash lists, L3 state and missing sources prevent a complete
 history claim. Unknown history cannot prove cold, eviction or routing loss.
 Captures contain content hashes and request IDs but no prompt text or token IDs.

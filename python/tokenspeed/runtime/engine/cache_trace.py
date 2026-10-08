@@ -138,7 +138,7 @@ class CacheTraceWriter:
                     self._write({"kind": "capture_end"})
                     break
                 for event in batch:
-                    if self._bytes >= 256 * 1024 * 1024:
+                    if self._bytes >= 2 * 1024 * 1024 * 1024:
                         self._write({"kind": "gap", "reason": "retention_limit"})
                         self._failed = True
                         return
