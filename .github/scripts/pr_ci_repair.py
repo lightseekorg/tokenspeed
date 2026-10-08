@@ -302,6 +302,9 @@ def guard_test_assertions(source: Path, head: str, base: str, path: str):
 
 
 def guard_file(source: Path, head: str, p: str, validation_base: str | None):
+    file = source / p
+    if not file.is_file():
+        raise RepairRejected("missing-file", path=p)
     if p == NATIVE_CONFIG:
         # Keep current main's trusted test commands when the PR is older.
         guard_native_task(source, validation_base or head)
@@ -309,8 +312,7 @@ def guard_file(source: Path, head: str, p: str, validation_base: str | None):
         if validation_base is None:
             raise ValueError("Test resolution requires a pinned main commit.")
         guard_test_assertions(source, head, validation_base, p)
-    file = source / p
-    if not file.is_file() or file.stat().st_size > 1000000:
+    if file.stat().st_size > 1000000:
         raise RepairRejected("file-size", path=p)
     if file.suffix == ".py" and not {"test", "tests"}.intersection(file.parts[:-1]):
         try:
@@ -323,8 +325,24 @@ def guard_file(source: Path, head: str, p: str, validation_base: str | None):
             ) from None
     # Reject executable/type changes; regular source edits only.
     status = command("git", "diff", "--raw", "--no-renames", head, "--", p, cwd=source)
-    if any(row.split()[0][1:] != row.split()[1] for row in status.splitlines()):
-        raise RepairRejected("file-mode", path=p)
+    for row in status.splitlines():
+        old_mode, new_mode = row.split()[:2]
+        if old_mode[1:] == new_mode:
+            continue
+        # A rename/delete conflict can retain a test that exists only on main.
+        parent = (
+            command("git", "ls-tree", validation_base, "--", p, cwd=source)
+            if validation_base
+            and Path(p).suffix == ".py"
+            and {"test", "tests"}.intersection(Path(p).parts[:-1])
+            else ""
+        )
+        if not (
+            old_mode == ":000000"
+            and new_mode == "100644"
+            and parent.startswith("100644 blob ")
+        ):
+            raise RepairRejected("file-mode", path=p)
 
 
 def guard(
@@ -439,6 +457,8 @@ def restore_patch(source: Path, head: str, selected: set[str]):
     command("git", "reset", "--hard", head, cwd=source)
     for p, content in contents.items():
         source.joinpath(p).write_bytes(content)
+    if selected:
+        command("git", "add", "--", *sorted(selected), cwd=source)
 
 
 def configure():
@@ -646,6 +666,7 @@ def proposed_patch(source, request, allowed, conflicts, before, planner, guard_r
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(source.joinpath(path).read_bytes())
                 shutil.copymode(source / path, target)
+            command("git", "add", "--", *sorted(selected), cwd=review)
             diff = guard(review, state["head"], allowed, validation_base=base)
             os.environ["KIMI_CODE_HOME"] = str(guard_root)
             try:
@@ -659,6 +680,52 @@ def proposed_patch(source, request, allowed, conflicts, before, planner, guard_r
             return diff
         finally:
             command("git", "worktree", "remove", "--force", str(review), cwd=ROOT)
+
+
+def seed_repair(source: Path, request: dict, allowed: set[str], conflicts: set[str]):
+    if not request.get("resume_run"):
+        return False
+    previous = WORK / "previous-repair"
+    old = json.loads(previous.joinpath("request.json").read_text())
+    state = request["state"]
+    prior = old["state"]
+    if prior.get("repair_run") != request["resume_run"] or any(
+        prior[key] != state[key]
+        for key in ("repository", "pr", "head", "base", "command")
+    ):
+        raise ValueError("Previous repair source differs from the authorized PR.")
+    base = prior.get("validation_base", prior["base"])
+    if not SHA.fullmatch(base):
+        raise ValueError("Invalid previous repair base.")
+    command("git", "fetch", "origin", base, cwd=source)
+    if previous.joinpath("patch.diff").stat().st_size > 200000:
+        raise RepairRejected("patch-size")
+    with tempfile.TemporaryDirectory(prefix="repair-seed-", dir=WORK) as work:
+        review = Path(work) / "source"
+        command(
+            "git", "worktree", "add", "--detach", str(review), state["head"], cwd=ROOT
+        )
+        try:
+            command("git", "apply", "--index", str(previous / "patch.diff"), cwd=review)
+            names = set(
+                command(
+                    "git", "diff", "--name-only", state["head"], cwd=review
+                ).splitlines()
+            )
+            if not names.issubset(allowed):
+                raise RepairRejected("scope")
+            guard(review, state["head"], names, validation_base=base)
+            for path in names | conflicts:
+                parent = review / path
+                if parent.is_file():
+                    source.joinpath(path).write_bytes(parent.read_bytes())
+        finally:
+            command("git", "worktree", "remove", "--force", str(review), cwd=ROOT)
+    print(
+        "Repair: continuing accepted source edits; current main and checks still required.",
+        flush=True,
+    )
+    return True
 
 
 def model():
@@ -693,6 +760,7 @@ def model():
         for p in allowed
         if source.joinpath(p).is_file()
     }
+    resumed = seed_repair(source, request, allowed, conflicts)
     # Reuse provider configuration and output screening, without a GitHub token.
     spec = importlib.util.spec_from_file_location(
         "pr_ci_model", ROOT / ".github/scripts/pr-ci-model.py"
@@ -752,6 +820,8 @@ Apply the repair with Edit or Write. Describing a proposed change without editin
 the allowed source does not complete this task.
 """)
     prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Complete read-only conflict parents: {parents}/head/<relative path> and {parents}/main/<relative path>; an absent file does not exist on that parent. Read these paired snapshots to preserve assertions and deliberate removals. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Try to complete source edits within 15 minutes to reserve time for required checks, GPU queues and validation. Finish the smallest substantiated repair promptly. Start with the actual failed step in diagnostics.txt and its CI specification. Check whether pinned main already fixes that failure, and preserve those fixes while resolving conflicts. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
+    if resumed:
+        prompt += " The existing source contains the previous accepted edits. Complete their verification against current main and correct the remaining conflict resolutions. A retained test missing from the prior patch still has its main-side contents; migrate its imports or calls only if required by the PR's supported API. Preserve already completed edits and avoid restarting the broad investigation."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     guard_root = WORK / "guard"
     guard_root.mkdir()
@@ -920,7 +990,7 @@ def check():
     base = state.get("validation_base", state["base"])
     source = checkout(state["head"], base)
     identity(source)
-    command("git", "apply", str(WORK / "patch.diff"), cwd=source)
+    command("git", "apply", "--index", str(WORK / "patch.diff"), cwd=source)
     allowed = allowed_paths(request)
     guard(source, state["head"], allowed, validation_base=base)
     latest_base = command(
@@ -1124,7 +1194,7 @@ def stage():
     if request.get("conflicted_tests", []) != expected_tests:
         raise ValueError("Test resolutions differ from actual merge conflicts.")
     restore_patch(source, state["head"], set())
-    command("git", "apply", str(WORK / "patch.diff"), cwd=source)
+    command("git", "apply", "--index", str(WORK / "patch.diff"), cwd=source)
     guard(source, state["head"], allowed_paths(request), validation_base=base)
     proof = json.loads(WORK.joinpath("checked.json").read_text())
     if (

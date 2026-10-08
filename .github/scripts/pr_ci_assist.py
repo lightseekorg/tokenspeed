@@ -892,6 +892,21 @@ def control(number: int, *, expected_command: int | None = None):
     comments = pages(f"issues/{number}/comments", None)
     state = load_state(comments, pr)
     comment = latest_command(comments)
+    resume_run = os.environ.get("REPAIR_RUN", "")
+    if resume_run and (
+        os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+        or not resume_run.isdecimal()
+        or not state
+        or not comment
+        or state.get("repair_run") != int(resume_run)
+        or state["command"] != comment["id"]
+        or state["action"] != "fix"
+        or state["phase"] not in {"manual", "stale", "repairing"}
+        or "candidate" in state
+        or (state["head"], state["base"]) != (pr["head"]["sha"], pr["base"]["sha"])
+        or api(f"actions/runs/{resume_run}")["status"] != "completed"
+    ):
+        raise ValueError("Previous repair is not an authorized retry source.")
     if expected_command is not None and (
         not state
         or not comment
@@ -1114,6 +1129,7 @@ def control(number: int, *, expected_command: int | None = None):
                     "data": data,
                     "conflicts": pr["mergeable"] is False,
                     "deadline": repair_deadline(state),
+                    "resume_run": int(resume_run) if resume_run else None,
                 }
             )
         )

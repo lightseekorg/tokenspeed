@@ -1008,7 +1008,7 @@ def test_promotion_needs_nonempty_matching_task_result(selected):
     )
 
 
-def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
+def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path, monkeypatch):
     def git(*args):
         return assist.command(
             "git", "-c", "core.hooksPath=/dev/null", *args, cwd=tmp_path
@@ -1022,11 +1022,17 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     resolved = tmp_path / test_path
     resolved.parent.mkdir()
     resolved.write_text("assert value == 1\n")
+    legacy = tmp_path / "test/test_legacy.py"
+    legacy.write_text("# preserved\n" * 8 + "assert value == 1\n")
+    renamed_path = "test/test_retained.py"
+    retained = tmp_path / renamed_path
     git("add", ".")
     git("commit", "-s", "-m", "initial")
     common = git("rev-parse", "HEAD")
     file.write_text("value = 2\n")
     resolved.unlink()
+    legacy.rename(retained)
+    retained.write_text(retained.read_text() + "assert value == 2\n")
     other = tmp_path / "base.py"
     other.write_text("base_only = True\n")
     git("add", ".")
@@ -1035,25 +1041,69 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     git("checkout", "-b", "bot/test", common)
     file.write_text("value = 3\n")
     resolved.write_text("assert value == 1\nassert value == 3\n")
+    legacy.unlink()
     git("add", ".")
     git("commit", "-s", "-m", "head")
     head = git("rev-parse", "HEAD")
-    assert repair.merge(tmp_path, base, commit=False) == ["model.py", test_path]
+    conflicts = {"model.py", test_path, renamed_path}
+    assert set(repair.merge(tmp_path, base, commit=False)) == conflicts
     file.write_text("value = 4\n")
-    repair.restore_patch(tmp_path, head, {"model.py"})
+    repair.restore_patch(tmp_path, head, {"model.py", renamed_path})
     assert not other.exists()  # no wholesale main changes in the PR patch
     file.write_text("value =\n")
     with pytest.raises(repair.RepairRejected, match="not valid Python"):
-        repair.guard(tmp_path, head, {"model.py"})
+        repair.guard(tmp_path, head, {"model.py", renamed_path}, validation_base=base)
     file.write_text("value = 4\n")
-    repair.guard(tmp_path, head, {"model.py", test_path}, validation_base=base)
+    allowed = {"model.py", test_path, renamed_path}
+    diff = repair.guard(tmp_path, head, allowed, validation_base=base)
+    assert f"b/{renamed_path}" in diff
+    retained.chmod(0o755)
+    with pytest.raises(repair.RepairRejected, match="file type or mode"):
+        repair.guard(tmp_path, head, allowed, validation_base=base)
+    retained.chmod(0o644)
+    seed_work = tmp_path.parent / (tmp_path.name + "-seed")
+    previous = seed_work / "previous-repair"
+    previous.mkdir(parents=True)
+    previous.joinpath("patch.diff").write_text(diff + "\n")
+    state = dict(
+        repository=REPO,
+        pr=123,
+        head=head,
+        base=common,
+        command=43,
+        validation_base=base,
+        repair_run=201,
+    )
+    previous.joinpath("request.json").write_text(json.dumps({"state": state}))
+    request = dict(state={**state, "repair_run": 202}, resume_run=201)
+    monkeypatch.setattr(repair, "ROOT", tmp_path)
+    monkeypatch.setattr(repair, "WORK", seed_work)
+    git("remote", "add", "origin", str(tmp_path))
+    git("reset", "--hard", head)
+    assert not retained.exists()
+    git("apply", "--index", str(previous / "patch.diff"))
+    assert repair.guard(tmp_path, head, allowed, validation_base=base) == diff
+    git("reset", "--hard", head)
+    repair.merge(tmp_path, base, commit=False)
+    previous.joinpath("request.json").write_text(
+        json.dumps({"state": {**state, "command": 42}})
+    )
+    with pytest.raises(ValueError, match="authorized PR"):
+        repair.seed_repair(tmp_path, request, allowed, conflicts)
+    previous.joinpath("request.json").write_text(json.dumps({"state": state}))
+    assert repair.seed_repair(tmp_path, request, allowed, conflicts)
+    repair.restore_patch(tmp_path, head, allowed)
+    assert file.read_text() == "value = 4\n"
+    assert retained.read_text().endswith("assert value == 2\n")
+    repair.guard(tmp_path, head, allowed, validation_base=base)
     git("add", ".")
     git("commit", "-s", "-m", "repair")
     patch = git("rev-parse", "HEAD")
     with pytest.raises(ValueError, match="beyond the reviewed patch"):
         repair.effective_merge(tmp_path, base, head, resolved_tests=set())
     git("merge", "--abort")
-    tree = repair.effective_merge(tmp_path, base, head, resolved_tests={test_path})
+    resolved_tests = {test_path, renamed_path}
+    tree = repair.effective_merge(tmp_path, base, head, resolved_tests=resolved_tests)
     assert other.read_text() == "base_only = True\n"
     assert file.read_text() == "value = 4\n"
     assert resolved.read_text() == "assert value == 1\nassert value == 3\n"
@@ -1063,7 +1113,8 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     git("cherry-pick", "--signoff", patch)
     assert git("rev-parse", "HEAD^1") == head
     assert (
-        repair.effective_merge(tmp_path, base, head, resolved_tests={test_path}) == tree
+        repair.effective_merge(tmp_path, base, head, resolved_tests=resolved_tests)
+        == tree
     )
     repair.commit_merge(tmp_path, "reconcile main")
     assert git("rev-parse", "HEAD^2") == base
@@ -1076,7 +1127,6 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
 
     # A main update outside the model's patch can refresh checks while keeping
     # the resolved source; an overlapping change needs a fresh model repair.
-    git("remote", "add", "origin", str(tmp_path))
     git("checkout", "--detach", base)
     other.write_text("base_only = False\n")
     git("add", "--", "base.py")
@@ -1086,13 +1136,15 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     file.write_text("value = 4\n")
     request = {
         "state": {"head": head, "base": common, "validation_base": base},
-        "conflicted_tests": [test_path],
+        "conflicted_tests": sorted(resolved_tests),
     }
+    retained.write_text(git("show", f"{base}:{renamed_path}") + "\n")
+    git("add", "--", renamed_path)
     repair.refresh_validation_base(tmp_path, request, updated)
     assert file.read_text() == "value = 4\n" and not other.exists()
     assert request["state"]["validation_base"] == updated
     assert request["repair_base"] == base
-    assert repair.guard(tmp_path, head, {"model.py"}, validation_base=updated)
+    assert repair.guard(tmp_path, head, allowed, validation_base=updated)
     git("reset", "--hard", head)
     git("checkout", "--detach", updated)
     file.write_text("value = 5\n")
@@ -1250,9 +1302,17 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     pr["head"]["sha"] = state["head"]
     # An explicit retry may refresh main while retaining the authorized PR head.
     live[0].update(phase="stale", validation_base="f" * 40)
+    monkeypatch.setenv("REPAIR_RUN", "199")
+    with pytest.raises(ValueError, match="authorized retry"):
+        assist.control(state["pr"])
+    monkeypatch.setenv("REPAIR_RUN", "200")
     assist.control(state["pr"])
     assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
     assert live[0]["command"] == 43 and live[0]["repair_run"] == 201
+    assert (
+        json.loads(tmp_path.joinpath("request.json").read_text())["resume_run"] == 200
+    )
+    monkeypatch.delenv("REPAIR_RUN")
     # The validation branch has a different immutable source; an old head pass
     # must not authorize promotion of that candidate.
     live[0].update(

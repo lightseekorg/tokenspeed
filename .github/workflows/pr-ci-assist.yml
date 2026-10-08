@@ -14,6 +14,10 @@ on:
         description: "PR whose existing authorized watch/fix should be reconciled"
         required: true
         type: string
+      repair_run:
+        description: "Completed repair run whose accepted source edits should seed this retry"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -65,6 +69,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr }}
+          REPAIR_RUN: ${{ inputs.repair_run }}
           TOKENSPEED_B200_RUNNER_LABEL: b200v2
         run: python3 .github/scripts/pr_ci_assist.py control --pr "$PR_NUMBER"
       - if: steps.control.outputs.repair == 'true'
@@ -89,6 +94,13 @@ jobs:
         with:
           name: repair-request
           path: ${{ runner.temp }}/pr-ci-assist
+      - if: inputs.repair_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: repair-patch
+          run-id: ${{ inputs.repair_run }}
+          github-token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          path: ${{ runner.temp }}/pr-ci-assist/previous-repair
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
