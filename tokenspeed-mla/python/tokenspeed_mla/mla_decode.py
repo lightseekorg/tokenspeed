@@ -56,9 +56,8 @@ from tokenspeed_mla.utils import (
 
 # FP8 split-KV partials as fp16 instead of fp32: faster reductions, opt in with =1
 _FP16_PARTIALS = os.environ.get("TOKENSPEED_MLA_FP16_PARTIALS", "0") == "1"
-# SM107 FP8-output decode computes exp2 and row sums in packed FP16, the
-# configuration that kernel is tuned for.
-_SM107_FP16_SOFTMAX = True
+# Keep SM107 FP8-output exp2 and row sums in FP32 to preserve softmax precision.
+_SM107_FP16_SOFTMAX = False
 
 
 def _get_reducer_d_tiles(

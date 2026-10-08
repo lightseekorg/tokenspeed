@@ -138,12 +138,19 @@ The kernel packs query/head rows into M256 tiles and uses 4-CTA clusters
 to separate QK/softmax from PV, with a 2-CTA fallback. BF16 output keeps
 using the shared kernel.
 
+The public wrapper uses FP32 for softmax exponentials and row sums. Packed
+FP16 softmax remains an explicit option for direct kernel construction.
+
 FP8 output supports up to four M256 tiles per request. By default, `H` must
 divide 256 and `q_len` must be a multiple of `256 / H`;
 `enable_packed_q=True` accepts other shapes such as H96 and partial tiles.
 Causal/non-causal attention, split-KV, LSE, PDL and CUDA graphs are supported;
 sliding windows, DCP and `local_visible_lens` are unsupported. Rows with no
 visible keys produce zero output and `-inf` LSE.
+
+SM107 FP8-output compilation and GPU regression tests reject CuTe DSL warnings.
+The mixed-cluster kernel issues CLC queries directly and owns its unswizzled
+grid and response decoding, avoiding the deprecated example scheduler classes.
 
 H96/Q4 fills 75% of M256 tiles; H96/Q8 fills them completely. M128 packing
 fills three and six tiles respectively, so relative performance depends on

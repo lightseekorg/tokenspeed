@@ -105,14 +105,7 @@ from cutlass.cute.arch import Arch
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cutlass_dsl import BaseDSL, if_generate
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from tokenspeed_mla.mla_helpers import (
-    LOG2_E,
-    MAX_SPLITS,
-    MLAStaticTileScheduler,
-    MLAStaticTileSchedulerParams,
-    ceil_div,
-    create_mla_static_tile_scheduler_params,
-)
+from tokenspeed_mla.mla_helpers import LOG2_E, MAX_SPLITS, ceil_div
 from tokenspeed_mla.mla_helpers_sm107 import (
     add_packed_f16x2_u32,
     pack_f16x2,
@@ -127,7 +120,7 @@ SM107_MLA_M_TILE = 256
 @cute.jit
 def decode_work_y(y, logical_q, work_q_fdd):
     """Decode the unchanged packed CLC coordinate; divisor is prepared on host."""
-    if cutlass.const_expr(isinstance(work_q_fdd, cute.FastDivmodDivisor)):
+    if cutlass.const_expr(isinstance(work_q_fdd, cute.FastDivmodDivisorV2)):
         batch_idx, query_idx = divmod(y, work_q_fdd)
     else:
         batch_idx = y // logical_q
@@ -1836,40 +1829,6 @@ class _Sm107FallbackBlackwellBase:
                 return f
         return 1
 
-    @staticmethod
-    def _compute_grid(
-        o: cute.Tensor,
-        split_kv: cutlass.Int32,
-        cluster_shape_mnk: Tuple[int, int, int],
-        max_active_clusters: int,
-        is_persistent: bool,
-    ) -> Tuple[MLAStaticTileSchedulerParams, Tuple[int, int, int]]:
-        """Compute grid shape for the output tensor C.
-
-        :param c: The output tensor C
-        :type c: cute.Tensor
-        :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
-        :type cta_tile_shape_mnk: tuple[int, int, int]
-        :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
-        :type cluster_shape_mn: tuple[int, int]
-
-        :return: Tile scheduler parameters and grid shape.
-        :rtype: tuple[MLAStaticTileSchedulerParams, tuple[int, int, int]]
-        """
-        o_shape = o.shape
-        tile_sched_params = create_mla_static_tile_scheduler_params(
-            is_persistent,
-            cute.size(o_shape[3]),
-            cute.size(o_shape[2]),
-            cluster_shape_mnk,
-            split_kv,
-        )
-        grid = MLAStaticTileScheduler.get_grid_shape(
-            tile_sched_params, max_active_clusters
-        )
-
-        return tile_sched_params, grid
-
 
 class Sm107MultiHeadLatentAttentionForwardFP8:
     def __init__(
@@ -2739,14 +2698,8 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         self.corr_rows = self.mma_qk_tiler[0] // self.cta_pair_size  # 128
         self.cor_tx_bytes = self.corr_rows * self.corr_words_per_row * 4
 
-        tile_sched_params, grid = self._compute_grid(
-            o,
-            split_kv,
-            self.cluster_shape_mnk,
-            self.max_active_clusters,
-            self.is_persistent,
-            self.pv_n_splits,
-        )
+        assert self.pv_n_splits == 1, "CLC scheduler requires unsplit PV-N in mixed MLA"
+        grid = self._compute_grid(o, split_kv, self.cluster_shape_mnk)
 
         # Two role-specific storage structs sharing an IDENTICAL mbarrier header
         # (same field sequence => same offsets). Every CTA constructs both views
@@ -2933,15 +2886,13 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
             kc_rope_smem_layout_for_tma,
             vc_smem_layout_for_tma,
             cta_layout_vmnk,
-            tile_sched_params,
             SplitKVKernelSharedStorageQK,
             SplitKVKernelSharedStoragePV,
             smem_size_bytes,
             *_fb_core,
-            tile_sched_params,
             _fb_shared_storage,
             (
-                cute.fast_divmod_create_divisor(cute.size(o.shape[2]))
+                cute.fast_divmod_create_divisor_v2(cute.size(o.shape[2]))
                 if cutlass.const_expr(self.force_branch == "auto")
                 else 0
             ),
@@ -3014,7 +2965,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         kc_rope_smem_layout_for_tma: Optional[cute.ComposedLayout],
         vc_smem_layout_for_tma: Optional[cute.ComposedLayout],
         cta_layout_vmnk: cute.Layout,
-        tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
         SharedStorageQK: cutlass.Constexpr,
         SharedStoragePV: cutlass.Constexpr,
         smem_size_bytes: cutlass.Constexpr,
@@ -3050,7 +3000,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         fb_kc_rope_smem_layout_for_tma: Optional[cute.ComposedLayout],
         fb_vc_smem_layout_for_tma: Optional[cute.ComposedLayout],
         fb_cta_layout_vmnk: cute.Layout,
-        fb_tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
         fb_SharedStorage: cutlass.Constexpr,
         work_q_fdd,
     ):
@@ -3102,7 +3051,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                 kc_rope_smem_layout_for_tma,
                 vc_smem_layout_for_tma,
                 cta_layout_vmnk,
-                tile_sched_params,
                 SharedStorageQK,
                 SharedStoragePV,
                 smem_size_bytes,
@@ -3142,7 +3090,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                 fb_kc_rope_smem_layout_for_tma,
                 fb_vc_smem_layout_for_tma,
                 fb_cta_layout_vmnk,
-                fb_tile_sched_params,
                 fb_SharedStorage,
                 work_q_fdd,
             )
@@ -3187,7 +3134,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                     kc_rope_smem_layout_for_tma,
                     vc_smem_layout_for_tma,
                     cta_layout_vmnk,
-                    tile_sched_params,
                     SharedStorageQK,
                     SharedStoragePV,
                     smem_size_bytes,
@@ -3227,7 +3173,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                     fb_kc_rope_smem_layout_for_tma,
                     fb_vc_smem_layout_for_tma,
                     fb_cta_layout_vmnk,
-                    fb_tile_sched_params,
                     fb_SharedStorage,
                     work_q_fdd,
                 )
@@ -3314,7 +3259,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         kc_rope_smem_layout_for_tma: Optional[cute.ComposedLayout],
         vc_smem_layout_for_tma: Optional[cute.ComposedLayout],
         cta_layout_vmnk: cute.Layout,
-        tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
         SharedStorageQK: cutlass.Constexpr,
         SharedStoragePV: cutlass.Constexpr,
         smem_size_bytes: cutlass.Constexpr,
@@ -3390,8 +3334,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         :type vc_smem_layout_staged: cute.ComposedLayout
         :param cta_layout_vmnk: Layout for compute threads
         :type cta_layout_vmnk: cute.Layout
-        :param tile_sched_params: Scheduling parameters for work distribution
-        :type tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams
         :param SharedStorage: Shared storage for the kernel
         :type SharedStorage: cutlass.Constexpr
         """
@@ -3625,7 +3567,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                 if scheduler_rank == 0:
                     self.preferred_clc_producer(
                         shared_clc_pipeline,
-                        tile_sched_params,
                         clc_response_ptr,
                     )
 
@@ -3663,12 +3604,6 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                             shared_clc_pipeline,
                         )
                     )
-                    tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
-                        tile_sched_params,
-                        cute.arch.block_idx(),
-                        cute.arch.grid_dim(),
-                        clc_response_ptr,
-                    )
                     clc_producer_state = pipeline.make_pipeline_state(
                         pipeline.PipelineUserType.ProducerConsumer, self.num_clc_stage
                     )
@@ -3681,7 +3616,10 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                             mbarrier_addr = clc_pipeline.producer_get_barrier(
                                 clc_producer_state
                             )
-                            tile_sched.advance_to_next_work(mbarrier_addr)
+                            with cute.arch.elect_one():
+                                cute.arch.issue_clc_query(
+                                    mbarrier_addr, clc_response_ptr
+                                )
                             clc_producer_state.advance()
                         _raw = work_tile.tile_idx
                         # CLC coordinates are (cluster-rank, batch, split-kv).
@@ -6144,7 +6082,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         arch = BaseDSL._get_dsl().get_arch_enum()
         if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
-            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+            for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                 if is_last_tile:
                     q_tok = (
                         common_params.blk_coord[2] * SM107_MLA_M_TILE
@@ -6198,7 +6136,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
 
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
             if is_last_tile:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                     q_tok = (
                         common_params.blk_coord[2] * SM107_MLA_M_TILE
                         + common_params.blk_coord[0] * cta_qk_tiler[0]
@@ -6217,7 +6155,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                         )
                         else -self.acc_dtype.inf
                     )
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                     row_max_new = cute.arch.fmax(row_max_new, tTR_rAcc[i], nan=True)
             else:
                 for _mi in cutlass.range_constexpr(cute.size(tTR_rMax)):
@@ -6392,7 +6330,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         else:
             # FP32 row_sum: `add_packed_f32x2` reduces the instruction count
             row_sum_vec = (0.0, 0.0)
-            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+            for i in cutlass.range(0, cute.size(tTR_rAcc), 2, unroll_full=True):
                 row_sum_vec = cute.arch.add_packed_f32x2(
                     row_sum_vec, (tTR_rAcc[i], tTR_rAcc[i + 1])
                 )
@@ -7242,18 +7180,11 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
     def preferred_clc_producer(
         self,
         clc_pipeline,
-        tile_sched_params,
         clc_response_ptr,
     ):
         """CTA0/W12 produces and consumes responses without blocking Q/K TMA."""
         clc_pipeline, work_tile, consumer_state = self.make_clc_consumer(
             clc_pipeline,
-        )
-        tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
-            tile_sched_params,
-            cute.arch.block_idx(),
-            cute.arch.grid_dim(),
-            clc_response_ptr,
         )
         producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.ProducerConsumer, self.num_clc_stage
@@ -7261,7 +7192,8 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         while work_tile.is_valid_tile:
             clc_pipeline.producer_acquire(producer_state)
             barrier = clc_pipeline.producer_get_barrier(producer_state)
-            tile_sched.advance_to_next_work(barrier)
+            with cute.arch.elect_one():
+                cute.arch.issue_clc_query(barrier, clc_response_ptr)
             producer_state.advance()
             clc_pipeline.consumer_wait(consumer_state)
             work_tile = self.get_clc_work(clc_response_ptr)
@@ -7311,37 +7243,20 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         o: cute.Tensor,
         split_kv: cutlass.Int32,
         cluster_shape_mnk: Tuple[int, int, int],
-        max_active_clusters: int,
-        is_persistent: bool,
-        pv_n_splits: int = 1,
-    ) -> Tuple[utils.ClcDynamicPersistentTileSchedulerParams, Tuple[int, int, int]]:
-        """Compute grid shape for the output tensor C.
+    ) -> Tuple[int, int, int]:
+        """Return the unswizzled CLC grid: CTA rank, batch/query tile, KV split.
 
-        :param c: The output tensor C
-        :type c: cute.Tensor
-        :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
-        :type cta_tile_shape_mnk: tuple[int, int, int]
-        :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
-        :type cluster_shape_mn: tuple[int, int]
-
-        :return: Tile scheduler parameters and grid shape.
-        :rtype: tuple[ClcDynamicPersistentTileSchedulerParams, tuple[int, int, int]]
+        The grid is aligned to the preferred cluster. A fallback pair covers
+        half of its M rows; both cluster sizes use the same CLC coordinates.
         """
-        o_shape = o.shape
-        assert pv_n_splits == 1, "CLC scheduler requires unsplit PV-N in mixed MLA"
-        problem_shape_ntile_mnl = (
-            cluster_shape_mnk[0],
-            cute.size(o_shape[3]) * cute.size(o_shape[2]),
-            split_kv,
-        )
-        tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
-            problem_shape_ntile_mnl,
+        return cute.round_up(
+            (
+                cluster_shape_mnk[0],
+                cute.size(o.shape[3]) * cute.size(o.shape[2]),
+                split_kv,
+            ),
             cluster_shape_mnk,
-            fallback_cluster_shape_mnk=(2, 1, 1),
         )
-        grid = tile_sched_params.get_grid_shape()
-
-        return tile_sched_params, grid
 
     @staticmethod
     def get_workspace_size(
@@ -7831,7 +7746,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         arch = BaseDSL._get_dsl().get_arch_enum()
         if cutlass.const_expr(arch >= Arch.sm_100 and arch <= Arch.sm_100f):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
-            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+            for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                 if apply_mask:
                     # This independent mixed copy always uses original-query causality.
                     # Fallback s enumerates half-M row blocks, not query tokens.
@@ -7885,7 +7800,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
             )
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
             if apply_mask:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                     # This independent mixed copy always uses original-query causality.
                     # Fallback s enumerates half-M row blocks, not query tokens.
                     q_tok = (
@@ -8072,7 +7987,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         # up this group's freshly written row_sum from TMEM corr.
         row_sum = row_sum * correction_factor
         row_sum_vec = (0.0, 0.0)
-        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+        for i in cutlass.range(0, cute.size(tTR_rAcc), 2, unroll_full=True):
             row_sum_vec = cute.arch.add_packed_f32x2(
                 row_sum_vec, (tTR_rAcc[i], tTR_rAcc[i + 1])
             )
@@ -8235,7 +8150,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
         # exchange row_sum between warps (0, 1) and (2, 3)
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_sum
-            self.epilogue_exchange_sync_bar.wait()
+            self.epilogue_exchange_sync_bar.arrive_and_wait()
             # (64, 2)
             row_sum = (
                 row_sum
@@ -8974,14 +8889,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         self.tma_copy_kc_bytes = kc_latent_copy_size + kc_rope_copy_size
         self.tma_copy_vc_bytes = vc_copy_size
 
-        tile_sched_params, grid = self._compute_grid(
-            o,
-            split_kv,
-            self.cluster_shape_mnk,
-            self.max_active_clusters,
-            self.is_persistent,
-        )
-
         @cute.struct
         class SplitKVKernelSharedStorage:
             # Pipeline barriers
@@ -9119,7 +9026,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         kc_rope_smem_layout_for_tma: Optional[cute.ComposedLayout],
         vc_smem_layout_for_tma: Optional[cute.ComposedLayout],
         cta_layout_vmnk: cute.Layout,
-        tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
         SharedStorage: cutlass.Constexpr,
         work_q_fdd,
     ):
@@ -9193,8 +9099,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
         :type vc_smem_layout_staged: cute.ComposedLayout
         :param cta_layout_vmnk: Layout for compute threads
         :type cta_layout_vmnk: cute.Layout
-        :param tile_sched_params: Scheduling parameters for work distribution
-        :type tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams
         :param SharedStorage: Shared storage for the kernel
         :type SharedStorage: cutlass.Constexpr
         """
@@ -9343,12 +9247,6 @@ class _MixedFallbackPrep(_MixedFallbackBase):
             clc_pipeline, work_tile, clc_consumer_state = self.make_clc_consumer(
                 shared_clc_pipeline,
             )
-            tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
-                tile_sched_params,
-                cute.arch.block_idx(),
-                cute.arch.grid_dim(),
-                clc_response_ptr,
-            )
             clc_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.ProducerConsumer, 1
             )
@@ -9358,7 +9256,8 @@ class _MixedFallbackPrep(_MixedFallbackBase):
                     mbarrier_addr = clc_pipeline.producer_get_barrier(
                         clc_producer_state
                     )
-                    tile_sched.advance_to_next_work(mbarrier_addr)
+                    with cute.arch.elect_one():
+                        cute.arch.issue_clc_query(mbarrier_addr, clc_response_ptr)
                     clc_producer_state.advance()
                 # CLC's M coordinate spans four logical rows. A fallback pair
                 # maps rows 0/1 to s=0 and rows 2/3 to s=1; M parity is the

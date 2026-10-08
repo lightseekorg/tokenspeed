@@ -30,6 +30,7 @@ import subprocess
 import sys
 import textwrap
 import traceback
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -520,10 +521,13 @@ class TestCompile:
             f"{result.stdout}\n{result.stderr}"
         )
 
-    def test_sm107_fp8_out_causal_masks(self):
-        script = textwrap.dedent("""
+    @pytest.mark.parametrize("fp16_softmax", [True, False])
+    def test_sm107_fp8_out_causal_masks(self, fp16_softmax):
+        script = textwrap.dedent(f"""
+            import warnings
             import tokenspeed_mla.mla_decode as decode
 
+            warnings.simplefilter("error")
             decode.get_max_active_clusters = lambda cluster_size: 1
             for causal_mask in (False, True):
                 compiled = decode._get_compiled_sm107_mla_kernel(
@@ -534,7 +538,7 @@ class TestCompile:
                     causal_mask=causal_mask,
                     is_workspace_size_zero=False,
                     use_pdl=True,
-                    use_fp16_softmax=True,
+                    use_fp16_softmax={fp16_softmax},
                     reducer_max_splits=32,
                 )
                 assert compiled is not None
@@ -559,6 +563,7 @@ class TestCompile:
         assert (
             result.returncode == 0
         ), f"SM107 decode compilation failed:\n{result.stdout}\n{result.stderr}"
+        assert "Warning:" not in result.stderr, result.stderr
 
 
 def _check_decode_gpu(case, variable_kv, dtype, partial_fp16):
@@ -953,7 +958,11 @@ def _check_sm107_fp8_out_gpu(
     import tokenspeed_mla.mla_decode as decode
     from tokenspeed_mla import tokenspeed_mla_decode
 
-    decode._SM107_FP16_SOFTMAX = fp16_softmax
+    # Each GPU check has its own process; compiler/runtime warnings must fail it.
+    warnings.simplefilter("error")
+    # None exercises the public default with the FP32 accuracy tolerances.
+    if fp16_softmax is not None:
+        decode._SM107_FP16_SOFTMAX = fp16_softmax
 
     q, kv, tables, lengths = _make_inputs(case, "fp8", variable_kv, "cuda")
     workspace = torch.zeros(256 * 1024**2, dtype=torch.int8, device="cuda")
@@ -1035,6 +1044,7 @@ def _check_sm107_fp8_out_gpu(
 def _check_sm107_retained_max_gpu(min_split_kv, fp16_softmax):
     import tokenspeed_mla.mla_decode as decode
 
+    warnings.simplefilter("error")
     decode._SM107_FP16_SOFTMAX = fp16_softmax
     batch, q_len, heads, k_len = 64, 4, 96, 512
     q = torch.zeros((batch, q_len, heads, 576), device="cuda")
@@ -1111,6 +1121,7 @@ def _check_sm107_fp8_out_empty_rows_gpu(heads, min_split_kv, fp16_softmax):
     import tokenspeed_mla.mla_decode as decode
     from tokenspeed_mla import tokenspeed_mla_decode
 
+    warnings.simplefilter("error")
     decode._SM107_FP16_SOFTMAX = fp16_softmax
 
     # 64 requests also run 2-CTA fallback clusters. K = 0 rows and K < q_len
@@ -1201,13 +1212,27 @@ def _run_gpu_check(check, arguments, timeout):
     send.close()
     try:
         assert receive.poll(timeout), f"{check.__name__} timed out after {timeout}s"
-        assert (error := receive.recv()) is None, error
+        # Pytest assertion rewriting can re-evaluate a walrus expression on failure.
+        error = receive.recv()
+        assert error is None, error
     finally:
         receive.close()
         process.join(timeout=1)
         if process.is_alive():
             process.kill()
             process.join()
+
+
+def _raise_gpu_worker_error():
+    raise RuntimeError("GPU worker error must reach the parent")
+
+
+def test_gpu_worker_reports_original_error(monkeypatch):
+    # Exercise the real process/pipe protocol without requiring a GPU.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 7))
+    with pytest.raises(AssertionError, match="GPU worker error must reach the parent"):
+        _run_gpu_check(_raise_gpu_worker_error, (), 30)
 
 
 @pytest.mark.parametrize(
@@ -1431,6 +1456,18 @@ class TestGPU:
     @pytest.mark.parametrize("partial_fp16", [False, True])
     def test_reducer_bands_preserve_output_lse_and_pdl(self, partial_fp16):
         _run_gpu_check(_check_reducer_variants, (partial_fp16,), 240)
+
+    def test_sm107_default_softmax_accuracy_and_cuda_graph(self):
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
+            10,
+            7,
+        ):
+            pytest.skip("Requires SM107")
+        _run_gpu_check(
+            _check_sm107_fp8_out_gpu,
+            (_Case(64, 513, 96, 4), True, True, 1, None, True),
+            300,
+        )
 
     @pytest.mark.parametrize("fp16_softmax", [True, False])
     @pytest.mark.parametrize(
