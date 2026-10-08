@@ -21,16 +21,22 @@
 """Prepare a bounded repair, check it without secrets, and validate before promotion."""
 
 import argparse
+import ast
 import hashlib
 import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
+from collections import Counter
 from pathlib import Path
 
+import yaml
 from pr_ci_assist import (
     REPO,
     ROOT,
@@ -47,6 +53,7 @@ from pr_ci_assist import (
     public_gate,
     publish,
     pull,
+    repair_deadline,
     runs_for,
     task_status,
     validate_plan,
@@ -69,6 +76,57 @@ CONFIG_NAMES = {
     ".clang-tidy",
 }
 NATIVE_CONFIG = NATIVE_CHECKS["nvidia-kernel-library-tests.yml"]["config"]
+ROOT_API = "tokenspeed-kernel/python/tokenspeed_kernel/__init__.py"
+FP8_API = "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/flashinfer.py"
+FP8_REFERENCE = "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/fp8_utils.py"
+REPAIR_FEEDBACK = {
+    "runtime-lint": "Required runtime Ruff checks failed. Correct the supplied source diagnostics without changing the lint policy.",
+    "native-task": "Native repair must retain the original tests and every original byte except appending ${PYTHONPATH:+:$PYTHONPATH} inside an existing quoted PYTHONPATH prefix.",
+    "test-syntax": "Test conflict resolution is not valid Python.",
+    "source-syntax": "Source conflict resolution is not valid Python. Correct the supplied syntax error before validation.",
+    "test-assertions": "Conflict resolution removed or changed test assertions. Preserve current main and PR-added assertions with their original behavior and thresholds.",
+    "retired-api": "Main deliberately removed root operator exports. Preserve that removal and migrate callers to operator modules instead of restoring the exports.",
+    "quantization-reference": "Reuse main's prepacked quantizer from ops/gemm/fp8_utils.py instead of reconstructing it in ops/gemm/flashinfer.py. Its native/Triton rounding, zero-group scales and padding are part of the supported contract; migrate callers to the existing implementation.",
+    "missing-reference": "The merged source has no ops/gemm/fp8_utils.py module. Preserve the PR's refactor and adapt consumers through available registered backends. Read the main-side reference snapshot for native/Triton rounding, zero-group scales and padding; do not import a deleted module or reconstruct quantization with plain division.",
+    "scope": "Repair changes files outside its scope.",
+    "file-size": "Repair deletes a file or exceeds the size limit.",
+    "file-mode": "Repair changes file type or mode.",
+    "missing-file": "An allowed resolution file is missing. Restore its supported contents without weakening tests.",
+    "untracked": "Repair introduced untracked files.",
+    "no-edits": "Repair returned without an editable patch. Apply the substantiated fix using Edit or Write.",
+    "public-output": "Repair needs manual public-output review.",
+    "patch-size": "Repair exceeds the patch limit.",
+}
+
+
+class RepairRejected(ValueError):
+    def __init__(self, category: str, *, path: str = "", details=None):
+        super().__init__(REPAIR_FEEDBACK[category])
+        self.category = category
+        self.feedback = dict(
+            category=category, reason=str(self), path=path, details=details
+        )
+
+
+def repair_with_feedback(request: dict, run_model, proposal, feedback: Path):
+    """Give rejected patches bounded corrective turns within the original hour."""
+    for attempt in range(8):
+        remaining_time(request)
+        run_model(attempt)
+        try:
+            return proposal()
+        except RepairRejected as error:
+            print(f"Repair patch rejected: {error.category}.", flush=True)
+            for issue in error.feedback.get("issues", [error.feedback]):
+                if issue["path"] in request.get("data", {}).get("paths", []):
+                    print(
+                        f"Repair issue: {issue['category']} in {issue['path']}.",
+                        flush=True,
+                    )
+            if error.category == "public-output" or attempt == 7:
+                raise
+            feedback.write_text(json.dumps(error.feedback))
+            print("Repair: returning patch feedback to the model.", flush=True)
 
 
 def safe_path(path: str) -> bool:
@@ -107,6 +165,15 @@ def allowed_paths(request: dict) -> set[str]:
         for c in request["state"].get("native_checks", [])
     ):
         allowed.add(NATIVE_CONFIG)
+    if request.get("conflicts") and "validation_base" in request["state"]:
+        allowed.update(
+            p
+            for p in request.get("conflicted_tests", [])
+            if p in request["data"]["paths"]
+            and safe_path(p)
+            and Path(p).suffix == ".py"
+            and {"test", "tests"}.intersection(Path(p).parts[:-1])
+        )
     return allowed
 
 
@@ -123,7 +190,7 @@ def guard_native_task(source: Path, head: str):
         keepends=True
     )
     if len(old_lines) != len(new_lines):
-        raise ValueError("Native repair changes test configuration.")
+        raise RepairRejected("native-task", path=NATIVE_CONFIG)
     for old, new in zip(old_lines, new_lines):
         if old == new:
             continue
@@ -132,9 +199,7 @@ def guard_native_task(source: Path, head: str):
             not match
             or new != f"{match[1]}{match[2]}${{PYTHONPATH:+:$PYTHONPATH}}{match[3]}"
         ):
-            raise ValueError(
-                "Native repair must retain the original tests and only preserve PYTHONPATH."
-            )
+            raise RepairRejected("native-task", path=NATIVE_CONFIG)
 
 
 def public_source_diff(source: Path, head: str, names: set[str]) -> str:
@@ -157,28 +222,234 @@ def public_source_diff(source: Path, head: str, names: set[str]) -> str:
     )
 
 
+def new_source_text(source: Path, head: str, base: str, names: set[str]) -> str:
+    """Screen novel additions, retaining source already public in either parent."""
+    added = []
+    for path in sorted(names - {NATIVE_CONFIG}):
+        public = set()
+        for ref in (head, base):
+            if command("git", "ls-tree", "--name-only", ref, "--", path, cwd=source):
+                public.update(
+                    command("git", "show", f"{ref}:{path}", cwd=source).splitlines()
+                )
+        diff = public_source_diff(source, head, {path})
+        added.extend(
+            line[1:]
+            for line in diff.splitlines()
+            if line.startswith("+")
+            and not line.startswith("+++")
+            and line[1:] not in public
+        )
+    return "\n".join(added)
+
+
 def no_symlinks(source: Path):
     entries = command("git", "ls-files", "--stage", cwd=source).splitlines()
     if any(line.startswith(("120000", "160000")) for line in entries):
         raise ValueError("Symlinks and submodules require manual repair.")
 
 
-def scan(diff: str):
-    added = "\n".join(
-        line[1:]
-        for line in diff.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
+def scan(diff: str, *, additions: str | None = None):
+    added = (
+        additions
+        if additions is not None
+        else "\n".join(
+            line[1:]
+            for line in diff.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
     )
     if re.search(
         r"https?://|\bwww\.|\b(?:sk-|ghp_|gho_|github_pat_)|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|/(?:home|tmp|root|proc)/",
         added,
     ):
-        raise ValueError("Repair needs manual public-output review.")
+        raise RepairRejected("public-output")
     if len(diff.encode()) > 200000:
-        raise ValueError("Repair exceeds the patch limit.")
+        raise RepairRejected("patch-size")
 
 
-def guard(source: Path, head: str, allowed: set[str]):
+def guard_test_assertions(source: Path, head: str, base: str, path: str):
+    snippets = {}
+
+    def assertions(content: str) -> Counter:
+        try:
+            nodes = ast.walk(ast.parse(content))
+        except SyntaxError:
+            raise RepairRejected("test-syntax", path=path) from None
+        found = Counter()
+        for node in nodes:
+            if isinstance(node, ast.Assert) or (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and (
+                    node.func.attr.startswith("assert")
+                    or (
+                        isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "pytest"
+                        and node.func.attr == "raises"
+                    )
+                )
+            ):
+                key = ast.dump(node, include_attributes=False)
+                found[key] += 1
+                snippets[key] = ast.unparse(node)
+        return found
+
+    def parent_assertions(ref):
+        if not command("git", "ls-tree", "--name-only", ref, "--", path, cwd=source):
+            # A renamed test may exist only on one side of the merge.
+            return Counter()
+        return assertions(command("git", "show", f"{ref}:{path}", cwd=source))
+
+    ancestor = parent_assertions(command("git", "merge-base", head, base, cwd=source))
+    current = parent_assertions(base)
+    ours = parent_assertions(head)
+    # Keep main's supported contract plus assertions introduced by the PR.
+    # An ancestor assertion deliberately replaced on main is not a PR addition.
+    required = current + (ours - (ancestor | current))
+    missing = required - assertions(source.joinpath(path).read_text())
+    if missing:
+        raise RepairRejected(
+            "test-assertions",
+            path=path,
+            details=[snippets[key] for key in missing.elements()],
+        )
+
+
+def guard_retired_exports(source: Path, head: str, base: str):
+    def exports(content):
+        names = set()
+        for node in ast.parse(content).body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names.update(
+                    alias.asname or alias.name.split(".")[0] for alias in node.names
+                )
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                names.add(node.name)
+            elif isinstance(node, ast.Assign):
+                names.update(
+                    target.id for target in node.targets if isinstance(target, ast.Name)
+                )
+                if any(
+                    isinstance(target, ast.Name) and target.id == "__all__"
+                    for target in node.targets
+                ):
+                    names.update(
+                        item.value
+                        for item in ast.walk(node.value)
+                        if isinstance(item, ast.Constant)
+                        and isinstance(item.value, str)
+                    )
+        return {name for name in names if not name.startswith("_")}
+
+    parents = []
+    for ref in (command("git", "merge-base", head, base, cwd=source), head, base):
+        if not command(
+            "git", "ls-tree", "--name-only", ref, "--", ROOT_API, cwd=source
+        ):
+            return
+        parents.append(exports(command("git", "show", f"{ref}:{ROOT_API}", cwd=source)))
+    restored = (parents[0] & parents[1] - parents[2]) & exports(
+        source.joinpath(ROOT_API).read_text()
+    )
+    if restored:
+        raise RepairRejected("retired-api", path=ROOT_API, details=sorted(restored))
+
+
+def guard_prepacked_reference(source: Path, head: str, base: str, path: str = FP8_API):
+    symbol = "flashinfer_fp8_blockscale_quantize_prepacked"
+    if not source.joinpath(FP8_REFERENCE).is_file():
+        if any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "tokenspeed_kernel.ops.gemm.fp8_utils"
+            for node in ast.walk(ast.parse(source.joinpath(path).read_text()))
+        ):
+            raise RepairRejected(
+                "missing-reference", path=path, details=dict(reference=FP8_REFERENCE)
+            )
+        return
+    if path != FP8_API:
+        return
+
+    def defines(content):
+        return any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == symbol
+            for node in ast.parse(content).body
+        )
+
+    if not defines(source.joinpath(FP8_API).read_text()):
+        return
+    if defines(command("git", "show", f"{head}:{FP8_API}", cwd=source)):
+        return
+    if not command(
+        "git", "ls-tree", "--name-only", base, "--", FP8_REFERENCE, cwd=source
+    ):
+        return
+    if defines(
+        command("git", "show", f"{base}:{FP8_REFERENCE}", cwd=source)
+    ) and not defines(command("git", "show", f"{base}:{FP8_API}", cwd=source)):
+        raise RepairRejected(
+            "quantization-reference",
+            path=FP8_API,
+            details=dict(symbol=symbol, reference=FP8_REFERENCE),
+        )
+
+
+def guard_file(source: Path, head: str, p: str, validation_base: str | None):
+    file = source / p
+    if not file.is_file():
+        raise RepairRejected("missing-file", path=p)
+    if p == NATIVE_CONFIG:
+        # Keep current main's trusted test commands when the PR is older.
+        guard_native_task(source, validation_base or head)
+    elif {"test", "tests"}.intersection(Path(p).parts[:-1]):
+        if validation_base is None:
+            raise ValueError("Test resolution requires a pinned main commit.")
+        guard_test_assertions(source, head, validation_base, p)
+    if file.stat().st_size > 1000000:
+        raise RepairRejected("file-size", path=p)
+    if file.suffix == ".py" and not {"test", "tests"}.intersection(file.parts[:-1]):
+        try:
+            ast.parse(file.read_text())
+        except SyntaxError as error:
+            raise RepairRejected(
+                "source-syntax",
+                path=p,
+                details={"line": error.lineno, "reason": error.msg},
+            ) from None
+    # Reject executable/type changes; regular source edits only.
+    status = command("git", "diff", "--raw", "--no-renames", head, "--", p, cwd=source)
+    for row in status.splitlines():
+        old_mode, new_mode = row.split()[:2]
+        if old_mode[1:] == new_mode:
+            continue
+        # A rename/delete conflict can retain a test that exists only on main.
+        parent = (
+            command("git", "ls-tree", validation_base, "--", p, cwd=source)
+            if validation_base
+            and Path(p).suffix == ".py"
+            and {"test", "tests"}.intersection(Path(p).parts[:-1])
+            else ""
+        )
+        if not (
+            old_mode == ":000000"
+            and new_mode == "100644"
+            and parent.startswith("100644 blob ")
+        ):
+            raise RepairRejected("file-mode", path=p)
+
+
+def guard(
+    source: Path,
+    head: str,
+    allowed: set[str],
+    *,
+    validation_base: str | None = None,
+    check_main_contracts: bool = True,
+):
     no_symlinks(source)
     names = command(
         "git", "diff", "--name-only", "--no-renames", head, cwd=source
@@ -186,21 +457,38 @@ def guard(source: Path, head: str, allowed: set[str]):
     if not names or any(
         p not in allowed or (p != NATIVE_CONFIG and not safe_path(p)) for p in names
     ):
-        raise ValueError("Repair changes files outside its scope.")
-    for p in names:
-        if p == NATIVE_CONFIG:
-            guard_native_task(source, head)
-        file = source / p
-        if not file.is_file() or file.stat().st_size > 1000000:
-            raise ValueError("Repair deletes a file or exceeds the size limit.")
-        # Reject executable/type changes; regular source edits only.
-        status = command(
-            "git", "diff", "--raw", "--no-renames", head, "--", p, cwd=source
-        )
-        if any(row.split()[0][1:] != row.split()[1] for row in status.splitlines()):
-            raise ValueError("Repair changes file type or mode.")
+        raise RepairRejected("scope")
+    # Allowed tests are actual conflicts. Choosing the head verbatim must not
+    # bypass main's assertions merely because it leaves no textual diff.
+    checked = set(names) | {
+        p
+        for p in allowed
+        if Path(p).suffix == ".py"
+        and {"test", "tests"}.intersection(Path(p).parts[:-1])
+    }
+    if ROOT_API in allowed:
+        checked.add(ROOT_API)
+    if FP8_API in allowed:
+        checked.add(FP8_API)
+    issues = []
+    for p in sorted(checked):
+        try:
+            guard_file(source, head, p, validation_base)
+            if p == ROOT_API and validation_base and check_main_contracts:
+                guard_retired_exports(source, head, validation_base)
+            if Path(p).suffix == ".py" and validation_base and check_main_contracts:
+                guard_prepacked_reference(source, head, validation_base, p)
+        except RepairRejected as error:
+            issues.append(error)
+    if issues:
+        first = issues[0]
+        first.feedback = {**first.feedback, "issues": [e.feedback for e in issues]}
+        raise first
     diff = command("git", "diff", "--binary", "--no-ext-diff", head, cwd=source)
-    scan(public_source_diff(source, head, set(names)))
+    scan(
+        diff,
+        additions=new_source_text(source, head, validation_base or head, set(names)),
+    )
     return diff
 
 
@@ -221,12 +509,18 @@ def merge(source: Path, base: str, *, commit: bool):
     ).splitlines()
 
 
-def effective_merge(source: Path, base: str, head: str) -> str:
+def effective_merge(
+    source: Path, base: str, head: str, *, resolved_paths: set[str]
+) -> str:
     # An ordinary resolution patch can still produce a three-way conflict.
     # Keep its reviewed file contents while merging every nonconflicting base
     # change normally; never use an "ours" merge that drops base changes.
-    changed = command("git", "diff", "--name-only", head, cwd=source).splitlines()
-    contents = {p: source.joinpath(p).read_bytes() for p in changed}
+    if any(not safe_path(p) for p in resolved_paths):
+        raise ValueError("Invalid conflict resolution scope.")
+    changed = set(command("git", "diff", "--name-only", head, cwd=source).splitlines())
+    # A checked resolution can retain the head verbatim. Its unchanged bytes
+    # still need to be staged as a merge resolution, including production files.
+    contents = {p: source.joinpath(p).read_bytes() for p in changed | resolved_paths}
     conflicts = merge(source, base, commit=False)
     if not set(conflicts).issubset(contents):
         raise ValueError("Merge conflicts extend beyond the reviewed patch.")
@@ -268,6 +562,8 @@ def restore_patch(source: Path, head: str, selected: set[str]):
     command("git", "reset", "--hard", head, cwd=source)
     for p, content in contents.items():
         source.joinpath(p).write_bytes(content)
+    if selected:
+        command("git", "add", "--", *sorted(selected), cwd=source)
 
 
 def configure():
@@ -286,17 +582,29 @@ def configure():
     WORK.joinpath("model").mkdir(parents=True, exist_ok=True)
     request = json.loads(WORK.joinpath("request.json").read_text())
     diagnostics = []
+    evidence = request.get("diagnostics")
+    if evidence is None and request.get("resume_run"):
+        evidence = previous_repair(request).get("diagnostics")
+        if evidence is not None:
+            request["diagnostics"] = evidence
+            WORK.joinpath("request.json").write_text(json.dumps(request))
+    if evidence is None:
+        evidence = request["state"]
     native = {
         c["run"]: NATIVE_CHECKS[c["workflow"]]
-        for c in request["state"].get("native_checks", [])
+        for c in evidence.get("native_checks", [])
         if c["status"] == "failed" and c["run"]
     }
-    run_ids = set(request["state"]["run_ids"].values()) | set(native)
+    run_ids = set(evidence["run_ids"].values()) | set(native)
+    if request.get("lint_run"):
+        run_ids.add(request["lint_run"])
     for run_id in run_ids:
         jobs = pages(f"actions/runs/{run_id}/jobs?filter=latest", "jobs")
         names = {t["name"] for t in validate_plan(request["plan"], request["data"])}
         if run_id in native:
             names.add(native[run_id]["job"])
+        if run_id == request.get("lint_run"):
+            names.add("lint")
         for job in jobs:
             if job["conclusion"] == "failure" and any(
                 job["name"] == n or f"{n} (" in job["name"] for n in names
@@ -369,14 +677,15 @@ capabilities = ["thinking", "tool_use"]
 """)
 
 
-def edit_sandbox(source: Path, allowed: set[str], directories: list[Path]) -> list[str]:
+def edit_sandbox(
+    source: Path, allowed: set[str], directories: list[Path], *, home: Path
+) -> list[str]:
     # The CLI can write only existing, allowed source files. Git metadata,
     # trusted controller code and all other repository files remain runner-owned.
     paths = [str(source / p) for p in allowed if source.joinpath(p).is_file()]
     for directory in directories:
         directory.chmod(0o755)
         command("sudo", "-n", "chown", "-R", "nobody:nogroup", str(directory))
-    WORK.chmod(0o755)
     if paths:
         command("sudo", "-n", "chown", "nobody:nogroup", "--", *paths)
     return [
@@ -387,14 +696,239 @@ def edit_sandbox(source: Path, allowed: set[str], directories: list[Path]) -> li
         "--reuid=nobody",
         "--regid=nogroup",
         "--clear-groups",
+        "env",
+        f"HOME={home}",
+        f"KIMI_CODE_HOME={home}",
     ]
+
+
+def repair_progress(line: str, seen: set[str]):
+    """Report fixed progress labels, never model text, tool arguments or errors."""
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(event, dict):
+        return
+    labels = []
+    if event.get("type") == "system.version":
+        labels.append("CLI initialized")
+    if event.get("type") == "turn.step.retrying":
+        labels.append("model request retry")
+        name = event.get("error_name")
+        if name in {
+            "APIConnectionError",
+            "AuthenticationError",
+            "PermissionDeniedError",
+            "BadRequestError",
+            "NotFoundError",
+            "RateLimitError",
+        }:
+            labels.append(name)
+    if event.get("role") == "assistant":
+        labels.append("model response received")
+        for call in event.get("tool_calls") or []:
+            name = call.get("function", {}).get("name")
+            if name in {"Read", "Grep", "Glob", "Edit", "Write"}:
+                labels.append(f"tool requested: {name}")
+    if event.get("role") == "tool":
+        labels.append("tool result received")
+        try:
+            result = json.loads(event.get("content", ""))
+        except (ValueError, TypeError):
+            result = None
+        if isinstance(result, dict) and result.get("type") == "error":
+            labels.append("tool reported an error")
+    for label in labels:
+        if label not in seen:
+            seen.add(label)
+            print(f"Repair process: {label}.", flush=True)
+
+
+def remaining_time(request: dict) -> int:
+    remaining = int(request["deadline"] - time.time())
+    if remaining <= 0:
+        raise ValueError("The one-hour repair and validation budget expired.")
+    return remaining
+
+
+def runtime_lint(source: Path, request: dict):
+    workflow = yaml.safe_load(ROOT.joinpath(".github/workflows/lint.yml").read_text())
+    step = next(
+        s
+        for s in workflow["jobs"]["lint"]["steps"]
+        if s.get("name") == "Lint runtime Python with ruff"
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            step["run"]
+            .strip()
+            .replace("python -m ruff", f"{shlex.quote(sys.executable)} -I -m ruff", 1)
+            + " --output-format=json",
+        ],
+        cwd=source,
+        capture_output=True,
+        text=True,
+        timeout=remaining_time(request),
+    )
+    if result.returncode == 0:
+        return
+    if result.returncode != 1:
+        raise ValueError("Required runtime lint could not run.")
+    issues = [
+        dict(
+            code=i["code"],
+            message=i["message"],
+            path=str(Path(i["filename"]).relative_to(source)),
+            line=i["location"]["row"],
+        )
+        for i in json.loads(result.stdout)
+    ]
+    raise RepairRejected("runtime-lint", path=issues[0]["path"], details=issues)
+
+
+def proposed_patch(source, request, allowed, conflicts, before, planner, guard_root):
+    state = request["state"]
+    base = state.get("validation_base", state["base"])
+    print("Repair: checking proposed patch.", flush=True)
+    no_symlinks(source)
+    for path in conflicts | before.keys():
+        if not source.joinpath(path).is_file():
+            raise RepairRejected("missing-file", path=path)
+    selected = conflicts | {
+        p for p, content in before.items() if source.joinpath(p).read_bytes() != content
+    }
+    if not selected:
+        raise RepairRejected("no-edits")
+    if command("git", "ls-files", "--others", "--exclude-standard", cwd=source):
+        raise RepairRejected("untracked")
+    unstaged = set(command("git", "diff", "--name-only", cwd=source).splitlines())
+    if not unstaged.issubset(allowed):
+        raise RepairRejected("scope")
+    # Inspect a private copy at the original head. Leave the model's merged
+    # working tree intact so a corrective turn can continue its actual edits.
+    with tempfile.TemporaryDirectory(prefix="patch-review-", dir=WORK) as work:
+        review = Path(work) / "source"
+        command(
+            "git", "worktree", "add", "--detach", str(review), state["head"], cwd=ROOT
+        )
+        try:
+            for path in selected:
+                target = review / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.joinpath(path).read_bytes())
+                shutil.copymode(source / path, target)
+            command("git", "add", "--", *sorted(selected), cwd=review)
+            diff = guard(review, state["head"], allowed, validation_base=base)
+            runtime_lint(source, request)
+            os.environ["KIMI_CODE_HOME"] = str(guard_root)
+            try:
+                planner._check_public_output(
+                    new_source_text(review, state["head"], base, selected),
+                    guard_root,
+                    max_length=200000,
+                )
+            except SystemExit:
+                raise RepairRejected("public-output") from None
+            return diff
+        finally:
+            command("git", "worktree", "remove", "--force", str(review), cwd=ROOT)
+
+
+def previous_repair(request: dict):
+    if not request.get("resume_run"):
+        raise ValueError("No previous repair was authorized.")
+    previous = WORK / "previous-repair"
+    old = json.loads(previous.joinpath("request.json").read_text())
+    state = request["state"]
+    prior = old["state"]
+    if prior.get("repair_run") != request["resume_run"] or any(
+        prior[key] != state[key]
+        for key in ("repository", "pr", "head", "base", "command")
+    ):
+        raise ValueError("Previous repair source differs from the authorized PR.")
+    base = prior.get("validation_base", prior["base"])
+    if not SHA.fullmatch(base):
+        raise ValueError("Invalid previous repair base.")
+    if previous.joinpath("patch.diff").stat().st_size > 200000:
+        raise RepairRejected("patch-size")
+    return old
+
+
+def reuse():
+    request = json.loads(WORK.joinpath("request.json").read_text())
+    remaining_time(request)
+    if not request.get("check_only"):
+        raise ValueError("Source recheck was not requested.")
+    old = previous_repair(request)
+    request["conflicted_tests"] = old.get("conflicted_tests", [])
+    WORK.joinpath("patch.diff").write_bytes(
+        WORK.joinpath("previous-repair/patch.diff").read_bytes()
+    )
+    WORK.joinpath("request.json").write_text(json.dumps(request))
+    print(
+        "Repair: accepted patch reused; all source checks and validation must run again.",
+        flush=True,
+    )
+
+
+def seed_repair(source: Path, request: dict, allowed: set[str], conflicts: set[str]):
+    if not request.get("resume_run"):
+        return False
+    old = previous_repair(request)
+    previous = WORK / "previous-repair"
+    state = request["state"]
+    prior = old["state"]
+    base = prior.get("validation_base", prior["base"])
+    command("git", "fetch", "origin", base, cwd=source)
+    with tempfile.TemporaryDirectory(prefix="repair-seed-", dir=WORK) as work:
+        review = Path(work) / "source"
+        command(
+            "git", "worktree", "add", "--detach", str(review), state["head"], cwd=ROOT
+        )
+        try:
+            command("git", "apply", "--index", str(previous / "patch.diff"), cwd=review)
+            names = set(
+                command(
+                    "git", "diff", "--name-only", state["head"], cwd=review
+                ).splitlines()
+            )
+            if not names.issubset(allowed):
+                raise RepairRejected("scope")
+            # Prior accepted edits seed a new model turn that can correct
+            # restored exports. Every completed proposal still enforces removal.
+            guard(
+                review,
+                state["head"],
+                names,
+                validation_base=base,
+                check_main_contracts=False,
+            )
+            for path in names | conflicts:
+                parent = review / path
+                if parent.is_file():
+                    source.joinpath(path).write_bytes(parent.read_bytes())
+        finally:
+            command("git", "worktree", "remove", "--force", str(review), cwd=ROOT)
+    print(
+        "Repair: continuing accepted source edits; current main and checks still required.",
+        flush=True,
+    )
+    return True
 
 
 def model():
     request = json.loads(WORK.joinpath("request.json").read_text())
     state = request["state"]
+    base = state.get("validation_base", state["base"])
+    # The runner's artifact directory may have private ancestors. Keep only
+    # model inputs in a separate directory the restricted process can traverse.
+    sandbox_root = Path(tempfile.mkdtemp(prefix="pr-ci-repair-", dir="/tmp"))
+    sandbox_root.chmod(0o755)
     print("Repair: preparing source checkout.", flush=True)
-    source = checkout(state["head"], state["base"])
+    source = checkout(state["head"], base, work=sandbox_root)
     print("Repair: checking source scope.", flush=True)
     no_symlinks(source)
     identity(source)
@@ -402,27 +936,82 @@ def model():
     changed = command(
         "git", "diff", "--name-only", f"{state['base']}...{state['head']}", cwd=source
     ).splitlines()
-    if any(p.startswith(PROTECTED) or Path(p).name in CONFIG_NAMES for p in changed):
+    if NATIVE_CONFIG in changed:
+        guard_native_task(source, base)
+    if any(
+        (p.startswith(PROTECTED) and p != NATIVE_CONFIG) or Path(p).name in CONFIG_NAMES
+        for p in changed
+    ):
         raise ValueError("Control/config changes require manual repair.")
+    conflicts = set(merge(source, base, commit=False))
+    request["conflicted_paths"] = sorted(conflicts)
+    request["conflicted_tests"] = sorted(
+        p for p in conflicts if {"test", "tests"}.intersection(Path(p).parts[:-1])
+    )
     allowed = allowed_paths(request)
-    conflicts = set(merge(source, state["base"], commit=False))
     if not conflicts.issubset(allowed):
         raise ValueError("Conflict resolution is outside the allowed repair scope.")
+    WORK.joinpath("request.json").write_text(json.dumps(request))
     before = {
         p: source.joinpath(p).read_bytes()
         for p in allowed
         if source.joinpath(p).is_file()
     }
+    resumed = seed_repair(source, request, allowed, conflicts)
     # Reuse provider configuration and output screening, without a GitHub token.
     spec = importlib.util.spec_from_file_location(
         "pr_ci_model", ROOT / ".github/scripts/pr-ci-model.py"
     )
     planner = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(planner)
-    plan_root = WORK / "model"
+    plan_root = sandbox_root / "model"
     plan_root.mkdir(exist_ok=True)
+    shutil.copyfile(WORK / "model/diagnostics.txt", plan_root / "diagnostics.txt")
+    home = sandbox_root / "home"
+    home.mkdir()
+    shutil.copyfile(
+        Path(os.environ["KIMI_CODE_HOME"]) / "config.toml", home / "config.toml"
+    )
     plan_root.joinpath("context.json").write_text(json.dumps(request["data"]))
-    agent = plan_root / "repair.md"
+    # Read-only parent snapshots avoid requiring Git tools or reconstructing
+    # complete files from conflict markers during the bounded repair.
+    parents = sandbox_root / "parents"
+    parents.mkdir()
+    for name, ref in (("head", state["head"]), ("main", base)):
+        for path in sorted(
+            conflicts | ({FP8_REFERENCE} if FP8_API in allowed else set())
+        ):
+            if command("git", "ls-tree", "--name-only", ref, "--", path, cwd=source):
+                target = parents / name / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(
+                    subprocess.run(
+                        ["git", "show", f"{ref}:{path}"],
+                        cwd=source,
+                        check=True,
+                        capture_output=True,
+                    ).stdout
+                )
+    feedback = plan_root / "feedback.json"
+    feedback.write_text("{}")
+    if resumed:
+        issues = []
+        if ROOT_API in allowed:
+            try:
+                guard_retired_exports(source, state["head"], base)
+            except RepairRejected as error:
+                issues.append(error.feedback)
+        for path in sorted(allowed):
+            if Path(path).suffix == ".py" and source.joinpath(path).is_file():
+                try:
+                    guard_prepacked_reference(source, state["head"], base, path)
+                except RepairRejected as error:
+                    issues.append(error.feedback)
+        if issues:
+            feedback.write_text(json.dumps({**issues[0], "issues": issues}))
+    # Corrective turns must reuse a trusted tool definition. The model can read
+    # this runner-owned file, but cannot replace it through its writable inputs.
+    agent = sandbox_root / "repair.md"
     agent.write_text("""---
 name: ci-repair
 description: Focused source repair
@@ -438,8 +1027,21 @@ assignment with ${PYTHONPATH:+:$PYTHONPATH}; retain all other bytes, including
 every command, test and assertion. Do not use external paths or symlinks.
 Do not copy diagnostic paths, hosts, credentials or environment identifiers into source.
 Do not perform unrelated cleanup. Stop if the cause is uncertain.
+Respect deliberate removals from main; do not restore retired interfaces.
+Allowed test files are merge-conflict resolutions only. Preserve current main
+assertions and the PR's added assertions, thresholds and coverage;
+do not weaken or skip tests. Do not resurrect ancestor checks for interfaces
+deliberately removed on main. Migrate their callers to supported operator modules.
+Apply the repair with Edit or Write. Describing a proposed change without editing
+the allowed source does not complete this task.
 """)
-    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. Read diagnostics.txt for actual failure evidence and the selected CI specifications. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
+    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Complete read-only conflict parents: {parents}/head/<relative path> and {parents}/main/<relative path>; an absent file does not exist on that parent. Read these paired snapshots to preserve assertions and deliberate removals. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Try to complete source edits within 15 minutes to reserve time for required checks, GPU queues and validation. Finish the smallest substantiated repair promptly. Start with the actual failed step in diagnostics.txt and its CI specification. Check whether pinned main already fixes that failure, and preserve those fixes while resolving conflicts. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
+    if resumed:
+        prompt += " The existing source contains the previous accepted edits. Read feedback.json first for known material issues in those edits, and correct them before proposing a patch. Complete their verification against current main and correct the remaining conflict resolutions. A retained test missing from the prior patch still has its main-side contents; migrate its imports or calls only if required by the PR's supported API. Preserve already completed edits and avoid restarting the broad investigation."
+    if "diagnostics" in request:
+        prompt += " The diagnostics now describe validation of the previous accepted candidate. Repair that observed failure while preserving the accepted edits; passing original-head checks do not resolve this candidate failure."
+    if FP8_API in allowed and parents.joinpath("main", FP8_REFERENCE).is_file():
+        prompt += f" The PR may remove a module that exists on main. Read {parents}/main/{FP8_REFERENCE} for authoritative prepacked FP8 behavior, but check actual merged-source module availability before importing it. Preserve the PR's refactor and adapt callers to available registered/native/Triton backends. Zero-group scales, padding and backend rounding must match that reference; ad hoc tensor arithmetic is not an equivalent implementation."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     guard_root = WORK / "guard"
     guard_root.mkdir()
@@ -447,71 +1049,184 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
     guard_root.joinpath("config.toml").write_bytes(
         Path(os.environ["KIMI_CODE_HOME"], "config.toml").read_bytes()
     )
-    with (plan_root / "events.jsonl").open("w") as events, (
-        plan_root / "cli.stderr"
-    ).open("w") as errors:
-        print("Repair: preparing edit sandbox.", flush=True)
-        sandbox = edit_sandbox(
-            source, allowed, [plan_root, Path(os.environ["KIMI_CODE_HOME"])]
+    print("Repair: preparing edit sandbox.", flush=True)
+    sandbox = edit_sandbox(source, allowed, [plan_root, home], home=home)
+    # The controller refreshes this file between turns; the restricted CLI only
+    # reads it. Retain its controller ownership after preparing writable state.
+    command(
+        "sudo",
+        "-n",
+        "chown",
+        f"{os.getuid()}:{os.getgid()}",
+        str(home / "config.toml"),
+        str(feedback),
+    )
+    for path, label in (
+        (agent, "agent definition"),
+        (plan_root / "diagnostics.txt", "failure evidence"),
+        (home / "config.toml", "provider configuration"),
+    ):
+        if subprocess.run([*sandbox, "test", "-r", str(path)]).returncode:
+            print(f"Repair input access denied: {label}.", flush=True)
+            raise ValueError("Repair inputs are inaccessible.")
+    session = []
+
+    def run_model(attempt):
+        turn_prompt = prompt
+        if attempt:
+            turn_prompt = (
+                ("" if session else prompt + "\n")
+                + f"The proposed patch was rejected. Read feedback.json and correct all listed issues together in the existing source edits. The supplied assertion snippets must all remain with their original behavior and thresholds. Preserve both merge parents' supported behavior. {remaining_time(request)} seconds remain in the original one-hour repair and validation budget. Apply the correction promptly to leave time for required checks and GPU dispatch."
+            )
+        # Restore trusted provider settings before each process starts.
+        (home / "config.toml").write_bytes(
+            guard_root.joinpath("config.toml").read_bytes()
         )
-        print("Repair: starting repair process.", flush=True)
-        result = subprocess.run(
-            [
-                *sandbox,
-                "timeout",
-                "600",
-                "kimi",
-                "--agent-file",
-                str(agent),
-                "--add-dir",
-                str(source),
-                "--skills-dir",
-                str(plan_root),
-                "--output-format",
-                "stream-json",
-                "-p",
-                prompt,
-            ],
-            cwd=plan_root,
-            env=env,
-            stdout=events,
-            stderr=errors,
-        )
-    if result.returncode:
+        print(f"Repair: starting model turn {attempt + 1}.", flush=True)
+        with (guard_root / f"events-{attempt}.jsonl").open("w") as events, (
+            guard_root / "cli.stderr"
+        ).open("w") as errors:
+            result = subprocess.Popen(
+                [
+                    *sandbox,
+                    "timeout",
+                    "--kill-after=10s",
+                    str(remaining_time(request)),
+                    "kimi",
+                    *(["-r", session[0]] if session else ["--agent-file", str(agent)]),
+                    "--add-dir",
+                    str(source),
+                    "--add-dir",
+                    str(parents),
+                    "--skills-dir",
+                    str(plan_root),
+                    "--output-format",
+                    "stream-json",
+                    "-p",
+                    turn_prompt,
+                ],
+                cwd=plan_root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=errors,
+                text=True,
+                errors="replace",
+            )
+            seen = set()
+            for line in result.stdout:
+                events.write(line)
+                repair_progress(line, seen)
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "session.resume_hint"
+                ):
+                    identifier = event.get("session_id", "")
+                    if isinstance(identifier, str) and re.fullmatch(
+                        r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", identifier
+                    ):
+                        session[:] = [identifier]
+            result.wait()
+        if not result.returncode:
+            return
         print(f"Repair process exited with status {result.returncode}.", flush=True)
+        stderr = (guard_root / "cli.stderr").read_text(errors="replace")
+        signatures = {
+            "EACCES": "File access denied.",
+            "ENOENT": "A required file or executable is missing.",
+            "Cannot find module": "A required module is missing.",
+            "Invalid agent file": "The agent configuration was rejected.",
+            "AuthenticationError": "Provider authentication failed.",
+            "PermissionDeniedError": "Provider access was denied.",
+            "BadRequestError": "The provider rejected the request.",
+            "APIConnectionError": "The provider connection failed.",
+            "NotFoundError": "The provider resource was not found.",
+            "RateLimitError": "The provider rate limit was reached.",
+        }
+        for signature, message in signatures.items():
+            if signature in stderr:
+                print(f"Repair failure category: {message}", flush=True)
         raise ValueError("Repair failed or timed out.")
-    print("Repair: checking proposed patch.", flush=True)
-    no_symlinks(source)
-    # Compare against the pre-model merge, then keep only the edited/conflicted
-    # files when returning to the original head (never copy all of main).
-    selected = conflicts | {
-        p for p, content in before.items() if source.joinpath(p).read_bytes() != content
-    }
-    dirty = command("git", "status", "--porcelain", cwd=source)
-    if command("git", "ls-files", "--others", "--exclude-standard", cwd=source):
-        raise ValueError("Repair introduced untracked files.")
-    # Check every allowed file, and ensure other merged files retain their
-    # staged version. Unmerged entries must all be selected resolution files.
-    unstaged = set(command("git", "diff", "--name-only", cwd=source).splitlines())
-    if not unstaged.issubset(allowed) or not dirty:
-        raise ValueError("Repair edits escaped the allowlist.")
-    restore_patch(source, state["head"], selected)
-    diff = guard(source, state["head"], allowed)
-    os.environ["KIMI_CODE_HOME"] = str(guard_root)
-    planner._check_public_output(
-        public_source_diff(source, state["head"], selected), guard_root
+
+    diff = repair_with_feedback(
+        request,
+        run_model,
+        lambda: proposed_patch(
+            source, request, allowed, conflicts, before, planner, guard_root
+        ),
+        feedback,
     )
     WORK.joinpath("patch.diff").write_text(diff + "\n")
 
 
+def refresh_validation_base(source: Path, request: dict, base: str):
+    state = request["state"]
+    prior = state.get("validation_base", state["base"])
+    if base == prior:
+        return
+    if not SHA.fullmatch(base):
+        raise ValueError("Invalid validation base.")
+    command("git", "fetch", "origin", base, cwd=source)
+    selected = set(
+        command("git", "diff", "--name-only", state["head"], cwd=source).splitlines()
+    ) | set(request.get("conflicted_paths", request.get("conflicted_tests", [])))
+    changed = set(
+        command(
+            "git", "diff", "--name-only", "--no-renames", prior, base, cwd=source
+        ).splitlines()
+    )
+    if selected & changed:
+        raise ValueError(
+            "Main changed repaired files; a fresh source repair is required."
+        )
+    contents = {p: source.joinpath(p).read_bytes() for p in selected}
+    command("git", "reset", "--hard", state["head"], cwd=source)
+    conflicts = merge(source, base, commit=False)
+    if not set(conflicts).issubset(selected):
+        raise ValueError(
+            "Main introduced new conflicts; a fresh source repair is required."
+        )
+    for path, content in contents.items():
+        source.joinpath(path).write_bytes(content)
+    restore_patch(source, state["head"], selected)
+    request["conflicted_paths"] = sorted(conflicts)
+    request["conflicted_tests"] = sorted(
+        p for p in conflicts if {"test", "tests"}.intersection(Path(p).parts[:-1])
+    )
+    request["repair_base"] = prior
+    state["validation_base"] = base
+    print(
+        "Repair: refreshing checks on an updated main with unchanged repaired files.",
+        flush=True,
+    )
+
+
 def check():
     request = json.loads(WORK.joinpath("request.json").read_text())
+    remaining_time(request)
     state = request["state"]
-    source = checkout(state["head"], state["base"])
+    base = state.get("validation_base", state["base"])
+    source = checkout(state["head"], base)
     identity(source)
-    command("git", "apply", str(WORK / "patch.diff"), cwd=source)
+    conflicts = set(merge(source, base, commit=False))
+    if not conflicts.issubset(allowed_paths(request)):
+        raise ValueError("Conflict resolution is outside the allowed repair scope.")
+    request["conflicted_paths"] = sorted(conflicts)
+    restore_patch(source, state["head"], set())
+    command("git", "apply", "--index", str(WORK / "patch.diff"), cwd=source)
     allowed = allowed_paths(request)
-    guard(source, state["head"], allowed)
+    guard(source, state["head"], allowed, validation_base=base)
+    latest_base = command(
+        "git", "ls-remote", "origin", "refs/heads/main", cwd=source
+    ).partition("\t")[0]
+    refresh_validation_base(source, request, latest_base)
+    base = state.get("validation_base", state["base"])
+    allowed = allowed_paths(request)
+    guard(source, state["head"], allowed, validation_base=base)
+    WORK.joinpath("request.json").write_text(json.dumps(request))
     command("git", "add", "--all", cwd=source)
     env = dict(os.environ)
     names = command("git", "diff", "--name-only", "--cached", cwd=source).splitlines()
@@ -531,6 +1246,7 @@ def check():
             cwd=source,
             env=env,
             capture_output=True,
+            timeout=remaining_time(request),
         )
         if result.returncode == 0:
             break
@@ -546,7 +1262,8 @@ def check():
         ".pre-commit-config.yaml",
         cwd=source,
     )
-    diff = guard(source, state["head"], allowed)
+    diff = guard(source, state["head"], allowed, validation_base=base)
+    runtime_lint(source, request)
     WORK.joinpath("patch.diff").write_text(diff + "\n")
     command("git", "add", "--all", cwd=source)
     command(
@@ -560,12 +1277,22 @@ def check():
         cwd=source,
     )
     patch_tree = command("git", "rev-parse", "HEAD^{tree}", cwd=source)
-    merged_tree = effective_merge(source, state["base"], state["head"])
+    merged_tree = effective_merge(
+        source,
+        base,
+        state["head"],
+        resolved_paths=conflicts,
+    )
     result = subprocess.run(
-        ["pre-commit", "run", "--all-files"], cwd=source, env=env, capture_output=True
+        ["pre-commit", "run", "--all-files"],
+        cwd=source,
+        env=env,
+        capture_output=True,
+        timeout=remaining_time(request),
     )
     if result.returncode or command("git", "diff", "--name-only", cwd=source):
         raise ValueError("Merged repair failed required pre-commit checks.")
+    runtime_lint(source, request)
     WORK.joinpath("checked.json").write_text(
         json.dumps(
             {
@@ -579,14 +1306,41 @@ def check():
     )
 
 
-def current_request(request: dict) -> dict:
+def current_request(request: dict, *, check_base: bool = True) -> dict:
     state = request["state"]
+    remaining_time(request)
+    if request["deadline"] != repair_deadline(state):
+        raise ValueError("Repair deadline changed.")
+    if (
+        check_base
+        and "validation_base" in state
+        and state["validation_base"] != api("git/ref/heads/main")["object"]["sha"]
+    ):
+        raise ValueError("Main changed before validation.")
     pr = pull(state["pr"])
     comments = pages(f"issues/{state['pr']}/comments", None)
     live = load_state(comments, pr)
     latest = latest_command(comments)
     if not latest or latest["id"] != state["command"]:
         raise ValueError("A newer command superseded this repair.")
+    if (
+        live
+        and live["phase"] == "manual"
+        and "repair_run" not in live
+        and "candidate" not in live
+        and state["repair_run"] == int(os.environ["GITHUB_RUN_ID"])
+        and all(
+            live[k] == state[k] for k in ("pr", "command", "head", "base", "action")
+        )
+        and state["phase"] == "repairing"
+        and state["action"] == "fix"
+        and state["head"] == pr["head"]["sha"]
+        and state["base"] == pr["base"]["sha"]
+    ):
+        publish(
+            state, "Continuing the authorized repair after an unowned monitor update."
+        )
+        live = state
     if (
         not live
         or live != state
@@ -599,7 +1353,7 @@ def current_request(request: dict) -> dict:
     return pr
 
 
-def push(source: Path, branch: str):
+def push(source: Path, branch: str, *, deadline: int | None = None):
     public_gate()
     remote = command("git", "remote", "get-url", "--push", "origin", cwd=source)
     if remote not in {
@@ -608,6 +1362,8 @@ def push(source: Path, branch: str):
         f"git@github.com:{REPO}.git",
     }:
         raise ValueError("Unexpected push destination.")
+    if deadline is not None and time.time() >= deadline:
+        raise ValueError("The one-hour repair and validation budget expired.")
     command(
         "git",
         "-c",
@@ -637,7 +1393,7 @@ def guard_native_dispatch(state: dict):
         "git",
         "diff",
         "--name-only",
-        state["base"],
+        state.get("validation_base", state["base"]),
         candidate["validation"],
         "--",
         ".github",
@@ -652,17 +1408,42 @@ def guard_native_dispatch(state: dict):
 def stage():
     public_gate()
     request = json.loads(WORK.joinpath("request.json").read_text())
+    if "repair_base" in request:
+        original = {
+            **request,
+            "state": {**request["state"], "validation_base": request["repair_base"]},
+        }
+        current_request(original, check_base=False)
+        if (
+            request["state"]["validation_base"]
+            != api("git/ref/heads/main")["object"]["sha"]
+        ):
+            raise ValueError("Main changed after the refreshed checks.")
+        publish(
+            request["state"],
+            "Repair checks refreshed on current main; validation remains required.",
+        )
     current_request(request)
     state = request["state"]
-    source = checkout(state["head"], state["base"])
+    base = state.get("validation_base", state["base"])
+    source = checkout(state["head"], base)
     identity(source)
     os.environ.update(PR_NUMBER=str(state["pr"]), GITHUB_REPOSITORY=REPO)
     # Rebuild public context ourselves, instead of trusting the checks artifact.
     data = context(source, state["head"], state["base"])
     validate_plan(request["plan"], data)
     request["data"] = data
-    command("git", "apply", str(WORK / "patch.diff"), cwd=source)
-    guard(source, state["head"], allowed_paths(request))
+    conflicts = merge(source, base, commit=False)
+    if request.get("conflicted_paths") != sorted(conflicts):
+        raise ValueError("Resolutions differ from actual merge conflicts.")
+    expected_tests = sorted(
+        p for p in conflicts if {"test", "tests"}.intersection(Path(p).parts[:-1])
+    )
+    if request.get("conflicted_tests", []) != expected_tests:
+        raise ValueError("Test resolutions differ from actual merge conflicts.")
+    restore_patch(source, state["head"], set())
+    command("git", "apply", "--index", str(WORK / "patch.diff"), cwd=source)
+    guard(source, state["head"], allowed_paths(request), validation_base=base)
     proof = json.loads(WORK.joinpath("checked.json").read_text())
     if (
         hashlib.sha256(WORK.joinpath("patch.diff").read_bytes()).hexdigest()
@@ -683,13 +1464,21 @@ def stage():
         cwd=source,
     )
     patch = command("git", "rev-parse", "HEAD", cwd=source)
-    if effective_merge(source, state["base"], state["head"]) != proof["merge_tree"]:
+    if (
+        effective_merge(
+            source,
+            base,
+            state["head"],
+            resolved_paths=set(conflicts),
+        )
+        != proof["merge_tree"]
+    ):
         raise ValueError("Effective merge differs from checked tree.")
     commit_merge(source, "ci: prepare validation snapshot")
     validation = command("git", "rev-parse", "HEAD", cwd=source)
-    branch = f"bot/pr-ci-assist-{state['pr']}-{state['command']}"
+    branch = f"bot/pr-ci-assist-{state['pr']}-{state['command']}-{state['repair_run']}"
     current_request(request)
-    push(source, branch)
+    push(source, branch, deadline=request["deadline"])
     state["candidate"] = dict(
         patch=patch,
         validation=validation,
@@ -714,10 +1503,72 @@ def stage():
     dispatch_native_checks(state)
     for task in validate_plan(request["plan"], data):
         task_status(task, state, runs, submit=True)
+    wait_for_validation(request)
+
+
+def wait_for_validation(request: dict):
+    """Reconcile queued dispatches with the pinned controller until the deadline."""
+    state = request["state"]
+    while time.time() < request["deadline"]:
+        with tempfile.TemporaryDirectory(prefix="pr-ci-validation-") as work:
+            env = dict(os.environ, RUNNER_TEMP=work)
+            try:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / ".github/scripts/pr_ci_assist.py"),
+                        "control",
+                        "--pr",
+                        str(state["pr"]),
+                        "--command",
+                        str(state["command"]),
+                    ],
+                    env=env,
+                    check=True,
+                    timeout=remaining_time(request),
+                )
+            except subprocess.TimeoutExpired:
+                break
+        pr = pull(state["pr"])
+        comments = pages(f"issues/{state['pr']}/comments", None)
+        live = load_state(comments, pr)
+        latest = latest_command(comments)
+        if (
+            not live
+            or not latest
+            or latest["id"] != state["command"]
+            or live["command"] != state["command"]
+            or live["phase"] != "validating"
+        ):
+            return
+        time.sleep(max(0, min(60, request["deadline"] - time.time())))
+    pr = pull(state["pr"])
+    comments = pages(f"issues/{state['pr']}/comments", None)
+    live = load_state(comments, pr)
+    latest = latest_command(comments)
+    if (
+        live
+        and latest
+        and latest["id"] == state["command"]
+        and live["phase"] == "validating"
+    ):
+        live["phase"] = "manual"
+        publish(
+            live, "The one-hour repair and validation budget expired; PR unchanged."
+        )
 
 
 def promote(state: dict):
     public_gate()
+    deadline = repair_deadline(state)
+    base = state.get("validation_base", state["base"])
+    if (
+        "validation_base" in state
+        and base != api("git/ref/heads/main")["object"]["sha"]
+    ):
+        raise ValueError("Main changed before promotion.")
+    if time.time() >= deadline:
+        raise ValueError("The one-hour repair and validation budget expired.")
     pr = pull(state["pr"])
     if (pr["head"]["sha"], pr["base"]["sha"]) != (state["head"], state["base"]):
         raise ValueError("PR or main moved before promotion.")
@@ -725,11 +1576,10 @@ def promote(state: dict):
     if not latest or latest["id"] != state["command"]:
         raise ValueError("Repair was superseded before promotion.")
     candidate = state["candidate"]
-    if candidate[
-        "branch"
-    ] != f"bot/pr-ci-assist-{state['pr']}-{state['command']}" or not all(
-        SHA.fullmatch(candidate[k]) for k in ("patch", "validation", "tree")
-    ):
+    if candidate["branch"] not in {
+        f"bot/pr-ci-assist-{state['pr']}-{state['command']}",
+        f"bot/pr-ci-assist-{state['pr']}-{state['command']}-{state['repair_run']}",
+    } or not all(SHA.fullmatch(candidate[k]) for k in ("patch", "validation", "tree")):
         raise ValueError("Invalid candidate record.")
     if (
         api(f"git/ref/heads/{candidate['branch']}")["object"]["sha"]
@@ -754,8 +1604,15 @@ def promote(state: dict):
         cwd=source,
     )
     promoted = command("git", "rev-parse", "HEAD", cwd=source)
+    original_paths = command(
+        "git", "diff", "--name-only", f"{state['base']}...{state['head']}", cwd=source
+    ).splitlines()
+    resolved_paths = {
+        p for p in original_paths if safe_path(p) and source.joinpath(p).is_file()
+    }
     if (
-        effective_merge(source, state["base"], state["head"]) != candidate["tree"]
+        effective_merge(source, base, state["head"], resolved_paths=resolved_paths)
+        != candidate["tree"]
         or command(
             "git", "rev-parse", f"{candidate['validation']}^{{tree}}", cwd=source
         )
@@ -774,13 +1631,18 @@ def promote(state: dict):
         state["base"],
     ):
         raise ValueError("PR or main moved during promotion.")
-    push(source, pr["head"]["ref"])
+    if (
+        "validation_base" in state
+        and base != api("git/ref/heads/main")["object"]["sha"]
+    ):
+        raise ValueError("Main changed during promotion.")
+    push(source, pr["head"]["ref"], deadline=deadline)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "stage", choices=("configure", "model", "check", "stage", "failed")
+        "stage", choices=("configure", "model", "reuse", "check", "stage", "failed")
     )
     args = parser.parse_args()
     try:
@@ -800,10 +1662,14 @@ if __name__ == "__main__":
                 "Repair or pre-commit checks failed. Human intervention required; PR unchanged.",
             )
         else:
-            {"configure": configure, "model": model, "check": check, "stage": stage}[
-                args.stage
-            ]()
-    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+            {
+                "configure": configure,
+                "model": model,
+                "reuse": reuse,
+                "check": check,
+                "stage": stage,
+            }[args.stage]()
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         raise SystemExit(
             "Repair stopped; raw diagnostics withheld and PR unchanged."
         ) from None

@@ -117,6 +117,7 @@ def record(comment: dict, kind: str) -> dict | None:
             - {
                 "candidate",
                 "repair_run",
+                "validation_base",
                 "plan_refresh",
                 "native_checks",
                 "native_submitted",
@@ -138,6 +139,13 @@ def record(comment: dict, kind: str) -> dict | None:
             return None
         if "plan_refresh" in data and (
             type(data["plan_refresh"]) is not int or data["plan_refresh"] < 1
+        ):
+            return None
+        if "validation_base" in data and (
+            not isinstance(data["validation_base"], str)
+            or not SHA.fullmatch(data["validation_base"])
+            or "repair_run" not in data
+            or data["action"] != "fix"
         ):
             return None
         if (
@@ -194,7 +202,11 @@ def record(comment: dict, kind: str) -> dict | None:
                     isinstance(c[k], str) and SHA.fullmatch(c[k])
                     for k in ("patch", "validation", "tree")
                 )
-                or c["branch"] != f"bot/pr-ci-assist-{data['pr']}-{data['command']}"
+                or c["branch"]
+                not in {
+                    f"bot/pr-ci-assist-{data['pr']}-{data['command']}",
+                    f"bot/pr-ci-assist-{data['pr']}-{data['command']}-{data.get('repair_run')}",
+                }
             ):
                 return None
     else:

@@ -38,9 +38,10 @@ from tokenspeed_kernel.ops.communication.trtllm import (
     TrtllmAllGatherQuantState,
     trtllm_allgather_fp8_quantize,
 )
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
+from tokenspeed_kernel.ops.gemm.flashinfer import (
     flashinfer_fp8_blockscale_quantize_prepacked,
 )
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 ROWS = 128
 HIDDEN = 7168
@@ -125,6 +126,9 @@ def _check_a2a(rank, device, size):
             exchanged = gathered[
                 :, rank * (KDA_WIDTH // size) : (rank + 1) * (KDA_WIDTH // size)
             ].contiguous()
+            # The fused kernel pads the gathered shard to a multiple of four
+            # rows with zero/one padding; the prepacked reference reproduces
+            # that layout exactly, including for TP2's odd row counts.
             expected = flashinfer_fp8_blockscale_quantize_prepacked(exchanged, 128)
             if capture:
                 graph.replay()
@@ -153,7 +157,10 @@ def _check_allgather_quant(rank, device):
 
     def reference():
         gathered = state.gather(inputs)
-        return flashinfer_fp8_blockscale_quantize_prepacked(gathered, 128)
+        values, scales = quantize_fp8(
+            gathered, granularity="token_group", group_size=128, solution="trtllm"
+        )
+        return values, scales.t().contiguous()
 
     _check_quantized(trtllm_allgather_fp8_quantize(state, inputs), reference())
     graph = torch.cuda.CUDAGraph()
