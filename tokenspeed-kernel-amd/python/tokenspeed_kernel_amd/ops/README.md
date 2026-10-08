@@ -664,6 +664,42 @@ Both GEMMs overlap loads with matrix computation using double-buffered shared
 memory. Phased operand loading and scheduling barriers limit live registers;
 compiler-inserted shared-memory barriers provide inter-wave synchronization.
 
+### gfx1250 persistent A8W4 decode
+
+The gfx1250 precomputed-top-k A8W4 path uses a persistent down projection when
+the routed batch averages at most two rows per expert and the down-projection
+output width is divisible by 128. Other widths use the regular kernel. The plan
+must explicitly specify its activation. Dispatch keeps the common
+small-M decode kernel, while combine uses a fixed worker grid so each workgroup
+can process multiple logical expert/output tiles. SiLU, SwiGLU, and SiTU share
+this path. The gate/up epilogue scales and casts directly to E4M3, matching
+the regular path without an intermediate BF16/FP16 rounding step.
+The shared `gluon_mxfp4_a8w4_persistent_combine_gfx1250` kernel and its
+`launch_` entry serve both registered SiTU and standard apply operations.
+Row counts stay runtime arguments; a warmup-and-sweep test checks compilation
+reuse across batch sizes for both the gate/up and persistent combine kernels.
+
+#### Contract
+
+- Activations are contiguous E4M3 rows and weights are gfx1250-preprocessed
+  packed MXFP4 tensors with preshuffled E8M0 scales.
+- Routed rows use M-ragged metadata and an int32 scatter index. The output width
+  must be divisible by 128.
+- The production tile is `16 x 128 x 512` with eight wave32s and two TDM
+  buffers. The launch creates 12 workgroups per available CU and pins
+  output-column work to routed-M tiles.
+- The kernel supports an optional FP32 expert bias and BF16 or FP16 output.
+
+#### Algorithm
+
+Each persistent workgroup obtains a routed-M tile and iterates over its assigned
+output-column tiles. The M-pinned mapping retains the activation, expert, and
+base weight descriptors across that loop, updating only the weight and scale N
+offsets. E4M3 activations and packed E2M1 weights are staged through TDM into
+double-buffered LDS and accumulated with scaled wave32 WMMA. The epilogue adds
+the expert bias, converts to the requested output type, and scatters each route
+row back to its token/slot position for the existing weighted top-k reduction.
+
 ### gfx1250 MXFP4 Experts
 
 On gfx1250, the MoE API selects Gluon kernels with FP8 activations and MXFP4

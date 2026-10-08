@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from kimi3_reference import dequantize_mxfp4
 from utils import (
+    assert_no_triton_compile,
     is_amd,
     is_cdna4,
     is_cdna5,
@@ -32,6 +33,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # no
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (  # noqa: E402
     fused as gfx1250_fused,
+)
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import (
+    persistent_decode as gfx1250_persistent,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
     _resolve_block_m,
@@ -74,9 +78,7 @@ def _fp8_mxfp4_swiglu_moe_reference(
             gate = gate_up[0::2].clamp(max=7.0)
             linear = gate_up[1::2].clamp(-7.0, 7.0)
             intermediate = gate * torch.sigmoid(1.702 * gate) * (linear + 1.0)
-            intermediate_fp8 = (
-                intermediate.to(torch.bfloat16).to(torch.float8_e4m3fn).float()
-            )
+            intermediate_fp8 = intermediate.to(torch.float8_e4m3fn).float()
             partial = F.linear(intermediate_fp8, w2[expert], w2_bias[expert]).to(
                 torch.bfloat16
             )
@@ -837,3 +839,141 @@ def test_gfx1250_epilogue_fp8_matches_fp32_result(
     assert fused.shape == staged.shape
     assert torch.count_nonzero(as_fp32).item() > 0
     torch.testing.assert_close(fused.float(), staged.float(), rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4])
+@pytest.mark.parametrize("hidden_size", [128, 384])
+def test_persistent_static_fp8_activation_moe_gfx1250(
+    num_tokens: int, hidden_size: int
+) -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 persistent A8W4 MoE kernel")
+
+    generator = torch.Generator(device="cuda").manual_seed(20260921)
+    intermediate_size = 128
+    num_experts = 4
+    top_k = 2
+    raw = make_mxfp4_moe_weights(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        generator,
+    )
+    w13_bias = (
+        torch.randn(
+            (num_experts, 2 * intermediate_size),
+            dtype=torch.float32,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.05
+    )
+    w2_bias = (
+        torch.randn(
+            (num_experts, hidden_size),
+            dtype=torch.float32,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.05
+    )
+    module = _make_static_fp8_moe_module(
+        raw,
+        preprocess_gluon_mxfp4_gfx1250_moe_weights,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+    )
+
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(
+        num_tokens,
+        num_experts,
+        top_k,
+    )
+    actual = gfx1250_persistent.launch_gluon_mxfp4_a8w4_persistent_decode_gfx1250(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_bias=module.w13_weight_bias,
+        w2_bias=module.w2_weight_bias,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        out_dtype=torch.bfloat16,
+        activation="swiglu",
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+        swiglu_beta=1.0,
+    )
+    expected = _fp8_mxfp4_swiglu_moe_reference(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        w13_bias,
+        raw["w2_weight"],
+        raw["w2_scale"],
+        w2_bias,
+        topk_ids,
+        topk_weights,
+    )
+
+    torch.cuda.synchronize()
+    assert actual.shape == hidden_states.shape
+    assert torch.count_nonzero(expected).item() > 0
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_persistent_decode_batch_sizes_reuse_compilation_gfx1250() -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for persistent A8W4 MoE")
+
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    num_experts, hidden_size, intermediate_size, top_k = 32, 128, 128, 2
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    module = _make_static_fp8_moe_module(
+        raw, preprocess_gluon_mxfp4_gfx1250_moe_weights
+    )
+    counts = (1, 8, 9, 16, 32, 2, 3, 7, 15, 17, 24, 31)
+    cases = {}
+    for count in counts:
+        hidden = torch.randn(
+            count, hidden_size, dtype=torch.bfloat16, device="cuda", generator=generator
+        )
+        weights, ids = make_round_robin_topk(count, num_experts, top_k)
+        cases[count] = hidden, weights, ids
+
+    def run(count: int) -> None:
+        hidden, weights, ids = cases[count]
+        output = gfx1250_persistent.launch_gluon_mxfp4_a8w4_persistent_decode_gfx1250(
+            hidden,
+            weights,
+            ids,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            activation="silu",
+        )
+        assert output.shape == hidden.shape
+        assert torch.isfinite(output).all()
+
+    # Warm the existing gate/up kernel's integer specialization classes and
+    # both routing regimes. Every count stays within two routes per expert.
+    for count in counts[:5]:
+        run(count)
+    with (
+        assert_no_triton_compile(gfx1250_fused._matmul_decode),
+        assert_no_triton_compile(
+            gfx1250_persistent.gluon_mxfp4_a8w4_persistent_combine_gfx1250
+        ),
+    ):
+        for count in counts[5:]:
+            run(count)
+    torch.cuda.synchronize()
