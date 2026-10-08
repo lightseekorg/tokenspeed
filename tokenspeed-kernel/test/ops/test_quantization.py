@@ -317,6 +317,32 @@ def test_quantize_fp8_scale_tensor(
     assert _bitwise_equal(out, ref)
 
 
+@pytest.mark.parametrize(("m", "n"), [(17, 5120), (2049, 6144), (16385, 2048)])
+def test_quantize_fp8_scale_tensor_wide_rows(
+    device: str,
+    m: int,
+    n: int,
+    require,
+) -> None:
+    # Wide rows take one to eight rows per program, so odd row counts leave a tail.
+    torch.manual_seed(4)
+    dtype = torch.bfloat16
+    require("quantization", "fp8", "triton", dtype, "x")
+
+    x = torch.randn(m, n, device=device, dtype=dtype) * 100
+    scale = torch.tensor([0.125], device=device, dtype=torch.float32)
+    ref = (
+        (x.to(torch.float32) * (1.0 / scale).reshape(()))
+        .clamp(min=_FP8_FINFO.min, max=_FP8_FINFO.max)
+        .to(_FP8_DTYPE)
+    )
+
+    out, _ = quantize_fp8(x, scale=scale, solution="triton")
+    torch.cuda.synchronize()
+
+    assert _bitwise_equal(out, ref)
+
+
 @pytest.mark.parametrize(
     "n",
     [

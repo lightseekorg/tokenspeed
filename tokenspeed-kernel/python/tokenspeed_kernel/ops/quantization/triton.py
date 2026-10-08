@@ -167,13 +167,15 @@ def fp8_quantize(
         block_m = 16
     else:
         block_m = 32
-    num_warps = 4
     num_stages = 2
-
-    grid = (triton.cdiv(M, block_m),)
 
     block_n = max(1, triton.next_power_of_2(N))
     even_n = block_n == N
+    # Wide rows spill registers at those tiles: cap elements per program, add warps.
+    block_m = max(1, min(block_m, 16384 // block_n))
+    num_warps = 8 if block_n >= 2048 else 4
+
+    grid = (triton.cdiv(M, block_m),)
 
     # ``launch_pdl`` is a NVIDIA-only Triton runtime kwarg (Hopper+ Programmatic
     # Dependent Launch). The HIP backend rejects unknown kwargs, so only forward
