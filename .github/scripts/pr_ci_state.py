@@ -27,7 +27,12 @@ import re
 BOT = "lightseek-bot"
 BOT_ID = 243258330
 REPO = "lightseekorg/tokenspeed"
-COMMAND = re.compile(r"\s*@lightseek-bot[ \t]+(watch|fix)\s*", re.IGNORECASE)
+COMMAND = re.compile(
+    rf"\s*@lightseek-bot[ \t]+(watch|fix)"
+    rf"(?:[ \t]+https://github\.com/{re.escape(REPO)}/actions/runs/"
+    r"(?P<run>[1-9][0-9]*)/job/(?P<job>[1-9][0-9]*)(?:\?pr=(?P<pr>[1-9][0-9]*))?)?\s*",
+    re.IGNORECASE,
+)
 SHA = re.compile(r"[0-9a-f]{40}")
 NATIVE_CHECKS = {
     "scheduler-cpp-test.yml": {
@@ -121,6 +126,7 @@ def record(comment: dict, kind: str) -> dict | None:
                 "plan_refresh",
                 "native_checks",
                 "native_submitted",
+                "target",
             }
             or type(data.get("command")) is not int
             or data.get("action") not in {"watch", "fix"}
@@ -135,6 +141,13 @@ def record(comment: dict, kind: str) -> dict | None:
                 "stale",
                 "promoted",
             }
+        ):
+            return None
+        if "target" in data and (
+            data["action"] != "fix"
+            or not isinstance(data["target"], dict)
+            or set(data["target"]) != {"run", "job"}
+            or any(type(v) is not int or v < 1 for v in data["target"].values())
         ):
             return None
         if "plan_refresh" in data and (
