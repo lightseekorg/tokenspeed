@@ -478,6 +478,13 @@ def test_native_dispatch_reservation_prevents_duplicate_submission(
     assert published[0]["native_submitted"] == [workflow]
     comment = dict(user=dict(login=BOT, id=BOT_ID), body=marker("assist", state))
     assert record(comment, "assist") == state
+    state["repair_run"] = 201
+    state["candidate"]["branch"] += "-201"
+    comment["body"] = marker("assist", state)
+    assert record(comment, "assist") == state
+    state["repair_run"] = 202
+    comment["body"] = marker("assist", state)
+    assert record(comment, "assist") is None
 
 
 def test_repair_progress_withholds_model_text_arguments_and_errors(capsys):
@@ -792,6 +799,19 @@ def test_native_failure_diagnostics_include_slurm_artifact(monkeypatch, tmp_path
     diagnostics = tmp_path.joinpath("model/diagnostics.txt").read_text()
     assert "native job failure evidence" in diagnostics
     assert "native Slurm failure evidence" in diagnostics
+    request["diagnostics"] = {
+        "run_ids": {},
+        "native_checks": [
+            dict(workflow="nvidia-kernel-library-tests.yml", status="failed", run=102)
+        ],
+    }
+    tmp_path.joinpath("request.json").write_text(json.dumps(request))
+    requested = []
+    monkeypatch.setattr(
+        repair, "api", lambda path: requested.append(path) or dict(run_attempt=1)
+    )
+    repair.configure()
+    assert requested == ["actions/runs/102"]
 
 
 def test_failed_task_retries_once_and_falls_back_only_before_submission(
@@ -1415,6 +1435,25 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     monkeypatch.setattr(assist.time, "time", lambda: 1893459599)
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "promoted"
+    # Explicitly continue a failed candidate from its owning repair artifact.
+    # Old candidate diagnostics survive, but none of its passes authorize the
+    # fresh candidate or skip the model turn.
+    failed = dict(workflow=workflow, status="failed", run=103)
+    live[0].update(phase="manual", native_checks=[failed])
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "202")
+    monkeypatch.setenv("REPAIR_RUN", "201")
+    monkeypatch.setenv("REPAIR_CHECK_ONLY", "true")
+    with pytest.raises(ValueError, match="authorized retry"):
+        assist.control(state["pr"])
+    monkeypatch.delenv("REPAIR_CHECK_ONLY")
+    emitted.clear()
+    assist.control(state["pr"])
+    retry = json.loads(tmp_path.joinpath("request.json").read_text())
+    assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
+    assert retry["resume_run"] == 201 and retry["state"]["repair_run"] == 202
+    assert retry["diagnostics"]["native_checks"] == [failed]
+    assert "candidate" not in retry["state"] and not retry["check_only"]
 
 
 def test_cancelled_repair_is_recovered_on_next_reconciliation(

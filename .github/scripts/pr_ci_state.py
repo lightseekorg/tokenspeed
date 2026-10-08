@@ -202,7 +202,11 @@ def record(comment: dict, kind: str) -> dict | None:
                     isinstance(c[k], str) and SHA.fullmatch(c[k])
                     for k in ("patch", "validation", "tree")
                 )
-                or c["branch"] != f"bot/pr-ci-assist-{data['pr']}-{data['command']}"
+                or c["branch"]
+                not in {
+                    f"bot/pr-ci-assist-{data['pr']}-{data['command']}",
+                    f"bot/pr-ci-assist-{data['pr']}-{data['command']}-{data.get('repair_run')}",
+                }
             ):
                 return None
     else:

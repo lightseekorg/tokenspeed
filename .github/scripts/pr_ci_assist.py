@@ -905,7 +905,7 @@ def control(number: int, *, expected_command: int | None = None):
         or state["command"] != comment["id"]
         or state["action"] != "fix"
         or state["phase"] not in {"manual", "stale", "repairing"}
-        or "candidate" in state
+        or (check_only and "candidate" in state)
         or (state["head"], state["base"]) != (pr["head"]["sha"], pr["base"]["sha"])
         or api(f"actions/runs/{resume_run}")["status"] != "completed"
     ):
@@ -926,12 +926,17 @@ def control(number: int, *, expected_command: int | None = None):
         and comment["id"] == state["command"]
         and state["action"] == "fix"
         and state["phase"] in {"manual", "stale", "repairing"}
-        and "candidate" not in state
+        and ("candidate" not in state or resume_run)
         and "repair_run" in state
         and (state["head"], state["base"]) == (pr["head"]["sha"], pr["base"]["sha"])
         and api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
     ):
         initial = True
+    diagnostics = (
+        {k: state[k] for k in ("native_checks", "run_ids") if k in state}
+        if resume_run and state and "candidate" in state
+        else None
+    )
     if initial:
         action = permitted(comment)
         prior = state
@@ -1111,7 +1116,10 @@ def control(number: int, *, expected_command: int | None = None):
     previous = state["statuses"]
     state["statuses"] = statuses
     if requested_fix and (
-        pr["mergeable"] is False or "failed" in statuses or "failed" in native_statuses
+        resume_run
+        or pr["mergeable"] is False
+        or "failed" in statuses
+        or "failed" in native_statuses
     ):
         state["phase"] = "repairing"
         state["repair_run"] = int(os.environ["GITHUB_RUN_ID"])
@@ -1134,6 +1142,7 @@ def control(number: int, *, expected_command: int | None = None):
                     "deadline": repair_deadline(state),
                     "resume_run": int(resume_run) if resume_run else None,
                     "check_only": check_only,
+                    **({"diagnostics": diagnostics} if diagnostics is not None else {}),
                 }
             )
         )

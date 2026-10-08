@@ -531,12 +531,13 @@ def configure():
     WORK.joinpath("model").mkdir(parents=True, exist_ok=True)
     request = json.loads(WORK.joinpath("request.json").read_text())
     diagnostics = []
+    evidence = request.get("diagnostics", request["state"])
     native = {
         c["run"]: NATIVE_CHECKS[c["workflow"]]
-        for c in request["state"].get("native_checks", [])
+        for c in evidence.get("native_checks", [])
         if c["status"] == "failed" and c["run"]
     }
-    run_ids = set(request["state"]["run_ids"].values()) | set(native)
+    run_ids = set(evidence["run_ids"].values()) | set(native)
     for run_id in run_ids:
         jobs = pages(f"actions/runs/{run_id}/jobs?filter=latest", "jobs")
         names = {t["name"] for t in validate_plan(request["plan"], request["data"])}
@@ -920,6 +921,8 @@ the allowed source does not complete this task.
     prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Complete read-only conflict parents: {parents}/head/<relative path> and {parents}/main/<relative path>; an absent file does not exist on that parent. Read these paired snapshots to preserve assertions and deliberate removals. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Try to complete source edits within 15 minutes to reserve time for required checks, GPU queues and validation. Finish the smallest substantiated repair promptly. Start with the actual failed step in diagnostics.txt and its CI specification. Check whether pinned main already fixes that failure, and preserve those fixes while resolving conflicts. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
     if resumed:
         prompt += " The existing source contains the previous accepted edits. Read feedback.json first for known material issues in those edits, and correct them before proposing a patch. Complete their verification against current main and correct the remaining conflict resolutions. A retained test missing from the prior patch still has its main-side contents; migrate its imports or calls only if required by the PR's supported API. Preserve already completed edits and avoid restarting the broad investigation."
+    if "diagnostics" in request:
+        prompt += " The diagnostics now describe validation of the previous accepted candidate. Repair that observed failure while preserving the accepted edits; passing original-head checks do not resolve this candidate failure."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     guard_root = WORK / "guard"
     guard_root.mkdir()
@@ -1334,7 +1337,7 @@ def stage():
         raise ValueError("Effective merge differs from checked tree.")
     commit_merge(source, "ci: prepare validation snapshot")
     validation = command("git", "rev-parse", "HEAD", cwd=source)
-    branch = f"bot/pr-ci-assist-{state['pr']}-{state['command']}"
+    branch = f"bot/pr-ci-assist-{state['pr']}-{state['command']}-{state['repair_run']}"
     current_request(request)
     push(source, branch, deadline=request["deadline"])
     state["candidate"] = dict(
