@@ -339,11 +339,11 @@ def test_v1_native_prediction_mxfp8(window_left) -> None:
     _skip_unless_supported()
     import math as _math
 
-    from tokenspeed_kernel import quantize_mxfp8
     from tokenspeed_kernel.ops.attention.rmha._cute_dsl.rel_decode import (
         rel_mha_decode_tsmha,
     )
     from tokenspeed_kernel.ops.kvcache.triton import store_sf_interleaved
+    from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
     device = torch.device("cuda")
     page, extent, k_new = 128, 512, 4

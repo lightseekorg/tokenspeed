@@ -419,8 +419,8 @@ def test_petit_layer_constraints(
             expert_module, "get_moe_backend", return_value=MoeBackend.GLUON_PETIT
         ),
         mock.patch.object(
-            expert_module.tokenspeed_kernel,
-            "moe_plan",
+            expert_module,
+            "kernel_moe_plan",
             return_value={"solution": "gluon"},
         ) as plan,
         mock.patch.object(expert_module, "create_layer_weights") as weights,

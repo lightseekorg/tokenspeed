@@ -393,7 +393,9 @@ def edit_sandbox(source: Path, allowed: set[str], directories: list[Path]) -> li
 def model():
     request = json.loads(WORK.joinpath("request.json").read_text())
     state = request["state"]
+    print("Repair: preparing source checkout.", flush=True)
     source = checkout(state["head"], state["base"])
+    print("Repair: checking source scope.", flush=True)
     no_symlinks(source)
     identity(source)
     # A validation branch must not introduce new push workflows or hook config.
@@ -445,12 +447,14 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
     guard_root.joinpath("config.toml").write_bytes(
         Path(os.environ["KIMI_CODE_HOME"], "config.toml").read_bytes()
     )
-    sandbox = edit_sandbox(
-        source, allowed, [plan_root, Path(os.environ["KIMI_CODE_HOME"])]
-    )
     with (plan_root / "events.jsonl").open("w") as events, (
         plan_root / "cli.stderr"
     ).open("w") as errors:
+        print("Repair: preparing edit sandbox.", flush=True)
+        sandbox = edit_sandbox(
+            source, allowed, [plan_root, Path(os.environ["KIMI_CODE_HOME"])]
+        )
+        print("Repair: starting repair process.", flush=True)
         result = subprocess.run(
             [
                 *sandbox,
@@ -474,7 +478,9 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
             stderr=errors,
         )
     if result.returncode:
+        print(f"Repair process exited with status {result.returncode}.", flush=True)
         raise ValueError("Repair failed or timed out.")
+    print("Repair: checking proposed patch.", flush=True)
     no_symlinks(source)
     # Compare against the pre-model merge, then keep only the edited/conflicted
     # files when returning to the original head (never copy all of main).

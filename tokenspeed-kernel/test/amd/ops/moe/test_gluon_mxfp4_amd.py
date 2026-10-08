@@ -2,10 +2,10 @@ from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
-import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
 from kimi3_reference import dequantize_mxfp4
+from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from utils import (
     is_amd,
     is_cdna4,
@@ -45,9 +45,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (  # n
 
 
 def _dequantize_dynamic_mxfp4(x: torch.Tensor) -> torch.Tensor:
-    packed, scale = tokenspeed_kernel.quantize_mxfp4(
-        x, scale_layout="linear", solution="triton"
-    )
+    packed, scale = kernel_quantize_mxfp4(x, scale_layout="linear", solution="triton")
     return dequantize_mxfp4(packed, scale).to(torch.bfloat16)
 
 

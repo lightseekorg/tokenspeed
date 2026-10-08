@@ -25,8 +25,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import Callable
 
 import pytest
+import tokenspeed_kernel.plugins as plugins_mod
 import torch
-from tokenspeed_kernel import plugins as plugins_mod
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.plugins import (
     DISABLE_ENV_VAR,

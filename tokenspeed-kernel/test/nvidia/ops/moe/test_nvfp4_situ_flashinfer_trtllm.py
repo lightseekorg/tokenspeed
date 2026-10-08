@@ -38,6 +38,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 
 NUM_EXPERTS = 16
 TOP_K = 10  # scaled-down test shape (real Kimi-K3 num_experts_per_token=16)
@@ -295,7 +297,6 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
     expected = _reference_moe(hidden_states, raw, topk_ids, topk_weights, situ=True)
     situ_err = _rel_l2(actual, expected)
 
-    import tokenspeed_kernel
     from flashinfer import fp4_quantize
 
     prequantized = fp4_quantize(
@@ -304,7 +305,7 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
         is_sf_swizzled_layout=False,
         enable_pdl=False,
     )
-    quantized_result = tokenspeed_kernel.moe_apply(
+    quantized_result = kernel_moe_apply(
         {
             "apply_kernel_name": "flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
             "a2a_backend": "none",
@@ -373,9 +374,8 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
 def test_moe_plan_selects_nvfp4_situ_routed_kernel(
     routing_mode: str | None,
 ) -> None:
-    import tokenspeed_kernel
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="situ",

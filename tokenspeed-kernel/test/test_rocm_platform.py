@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from tokenspeed_kernel import platform as platform_module
+import tokenspeed_kernel.platform as platform_module
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 
 

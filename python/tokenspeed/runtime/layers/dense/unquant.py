@@ -19,8 +19,8 @@
 # SOFTWARE.
 
 
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.selection import resolve_kernel_override
 from torch.nn.parameter import Parameter
@@ -71,7 +71,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             # GEMV and large-M fast paths below switch kernels by shape, which
             # is exactly the row-result drift the envelope forbids. A missing
             # "aok" leaf fails selection loudly rather than falling back.
-            return tokenspeed_kernel.mm(
+            return kernel_mm(
                 x,
                 layer.weight,
                 bias=bias,
@@ -79,7 +79,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
 
         if resolve_kernel_override("gemm", "mm", None) is not None:
-            return tokenspeed_kernel.mm(x, layer.weight, bias=bias)
+            return kernel_mm(x, layer.weight, bias=bias)
 
         if bias is None and use_decode_gemv(x, layer.weight):
             return decode_gemv(x, layer.weight)
@@ -89,7 +89,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             largem = _try_gluon_largem_gfx1250(x, layer.weight)
             if largem is not None:
                 return largem
-        return tokenspeed_kernel.mm(
+        return kernel_mm(
             x,
             layer.weight,
             bias=bias,

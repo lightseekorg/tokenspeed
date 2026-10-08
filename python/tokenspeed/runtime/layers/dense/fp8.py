@@ -25,9 +25,21 @@
 
 import logging
 
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel import fp8_linear, fp8_linear_into, prepare_fp8_linear
+from tokenspeed_kernel.ops.gemm import (
+    dsv4_grouped_output_projection_process_weights as kernel_dsv4_grouped_output_projection_process_weights,
+)
+from tokenspeed_kernel.ops.gemm import (
+    fp8_linear,
+    fp8_linear_into,
+)
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.gemm import (
+    prepare_fp8_linear,
+)
+from tokenspeed_kernel.ops.gemm import (
+    prepare_trtllm_cutedsl_fp8_linear as kernel_prepare_trtllm_cutedsl_fp8_linear,
+)
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_block_quant_fp8,
     per_token_group_quant_fp8,
@@ -205,7 +217,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             if grouped_output_projection_plan is not None:
                 layer.weight_scale_inv.data = (
-                    tokenspeed_kernel.dsv4_grouped_output_projection_process_weights(
+                    kernel_dsv4_grouped_output_projection_process_weights(
                         grouped_output_projection_plan,
                         layer.weight.data,
                         layer.weight_scale_inv.data,
@@ -219,12 +231,10 @@ class Fp8LinearMethod(LinearMethodBase):
             if backend == "trtllm_cutedsl" and tuple(
                 self.quant_config.weight_block_size
             ) == (128, 128):
-                layer._prepared_fp8_linear = (
-                    tokenspeed_kernel.prepare_trtllm_cutedsl_fp8_linear(
-                        layer.weight.data,
-                        layer.weight_scale_inv.data,
-                        self.quant_config.weight_block_size,
-                    )
+                layer._prepared_fp8_linear = kernel_prepare_trtllm_cutedsl_fp8_linear(
+                    layer.weight.data,
+                    layer.weight_scale_inv.data,
+                    self.quant_config.weight_block_size,
                 )
                 return
             layer._prepared_fp8_linear = prepare_fp8_linear(
@@ -310,7 +320,7 @@ class Fp8LinearMethod(LinearMethodBase):
         destination = out.view(-1, layer.weight.shape[0]) if out is not None else None
         plan = self.prepared_linear_plan(layer)
         if plan is None:
-            output = tokenspeed_kernel.mm(
+            output = kernel_mm(
                 input_2d,
                 layer.weight,
                 A_scales=block_scale,
@@ -385,7 +395,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
             qinput = qinput.view(-1, qinput.shape[-1])
 
-            output = tokenspeed_kernel.mm(
+            output = kernel_mm(
                 qinput,
                 weight,
                 A_scales=x_scale,

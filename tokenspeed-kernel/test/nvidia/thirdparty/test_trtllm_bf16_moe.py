@@ -27,6 +27,9 @@ import logging
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.thirdparty.flashinfer import trtllm_bf16_moe as adapter
 
 _LAUNCHER = """
@@ -265,7 +268,6 @@ def test_unbuildable_private_module_keeps_trtllm_at_128(
     b200_platform, flashinfer_jit, monkeypatch, routing_mode
 ):
     """Without nvcc, only multiples of 128 select TRT-LLM."""
-    import tokenspeed_kernel
     from tokenspeed_kernel.platform import Platform
     from tokenspeed_kernel.registry import KernelRegistry
     from tokenspeed_kernel.selection import NoKernelFoundError
@@ -278,7 +280,7 @@ def test_unbuildable_private_module_keeps_trtllm_at_128(
         pytest.skip("flashinfer_trtllm unquant MoE kernels are not registered")
 
     def planned(ispp, **kwargs):
-        return tokenspeed_kernel.moe_plan(
+        return kernel_moe_plan(
             "unquant",
             input_dtype=torch.bfloat16,
             activation="silu",
@@ -379,7 +381,6 @@ def test_entrypoints_require_private_dispatch(monkeypatch):
 def test_trtllm_unquant_admits_gated_sizes_the_launcher_accepts(
     b200_platform, ispp, routing_mode
 ):
-    import tokenspeed_kernel
     from tokenspeed_kernel.platform import ArchVersion, Platform
     from tokenspeed_kernel.registry import KernelRegistry
 
@@ -401,7 +402,7 @@ def test_trtllm_unquant_admits_gated_sizes_the_launcher_accepts(
     try:
         Platform.override(b200_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "unquant",
             input_dtype=torch.bfloat16,
             activation="silu",
@@ -450,7 +451,6 @@ def test_64_aligned_outputs_match_128_padded(
         (10, 3),
     ):
         pytest.skip("TRT-LLM BF16 MoE kernels need SM100 or SM103")
-    import tokenspeed_kernel
     from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as unquant
 
     if unquant.TRTLLM_UNQUANT_ISPP_ALIGNMENT != adapter.GATED_ISPP_ALIGNMENT:
@@ -502,7 +502,7 @@ def test_64_aligned_outputs_match_128_padded(
         )
 
     def run(ispp):
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "unquant",
             input_dtype=torch.bfloat16,
             activation="silu",
@@ -536,8 +536,8 @@ def test_64_aligned_outputs_match_128_padded(
         w.tp_size = 1
         w.ep_rank = 0
         w.routing_config = routing_config
-        tokenspeed_kernel.moe_process_weights(plan, w)
-        return tokenspeed_kernel.moe_apply(
+        kernel_moe_process_weights(plan, w)
+        return kernel_moe_apply(
             plan,
             x,
             w,

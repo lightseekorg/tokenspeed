@@ -26,7 +26,10 @@
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel import fp8_linear_accepts_prepacked_input, fp8_linear_prepacked
+from tokenspeed_kernel.ops.gemm import (
+    fp8_linear_accepts_prepacked_input,
+    fp8_linear_prepacked,
+)
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.distributed.comm_backend import CommBackend, get_global_backend
@@ -106,7 +109,7 @@ def warmup_prepared_fp8_linears(model: torch.nn.Module, max_tokens: int) -> None
         if plan is not None:
             plans.append(plan)
 
-    from tokenspeed_kernel import warmup_prepared_fp8_linears as warmup
+    from tokenspeed_kernel.ops.gemm import warmup_prepared_fp8_linears as warmup
 
     warmup(plans, max_tokens)
 
@@ -168,7 +171,7 @@ class LinearBase(torch.nn.Module):
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
         override_kernel_name: Optional kernel name passed down to the
-            quant method's underlying ``tokenspeed_kernel.mm`` dispatch
+            quant method's underlying ``tokenspeed_kernel.ops.gemm.mm`` dispatch
             (e.g. ``"cublaslt_mm_nvfp4"``). Lets the model force a
             specific kernel for a particular layer.
         interleave_linear_and_gate: If true, quantized post-load processing

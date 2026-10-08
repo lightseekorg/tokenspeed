@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import fp8_quantize_dequantize
 from tokenspeed_kernel.ops.layernorm import grouped_rmsnorm as kernel_grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm import rmsnorm as kernel_rmsnorm
+from tokenspeed_kernel.ops.quantization import fp8_quantize_dequantize
 
 
 def dspark_fp8_quant_dequant(
