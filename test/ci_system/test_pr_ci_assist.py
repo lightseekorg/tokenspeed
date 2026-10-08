@@ -319,6 +319,7 @@ def test_native_check_waits_and_hands_off_failure_without_gpu_retry(
             path=".github/workflows/pr-ci-plan.yml",
             conclusion="success",
             display_title=f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+            run_started_at="2030-01-01T00:00:00Z",
         ),
     )
     monkeypatch.setattr(assist, "task_status", lambda *args, **kwargs: "passed")
@@ -485,6 +486,15 @@ def test_repair_progress_withholds_model_text_arguments_and_errors(capsys):
                 tool_calls=[
                     dict(function=dict(name="Read", arguments="OUTBOUND_SENTINEL"))
                 ],
+            )
+        ),
+        seen,
+    )
+    repair.repair_progress(
+        json.dumps(
+            dict(
+                role="tool",
+                content=json.dumps(dict(type="error", message="OUTBOUND_SENTINEL")),
             )
         ),
         seen,
@@ -1018,6 +1028,7 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
                 "conclusion": "success",
                 "display_title": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
                 "status": "completed",
+                "run_started_at": "2030-01-01T00:00:00Z",
             }
             if "actions/runs" in path
             else author
@@ -1052,6 +1063,10 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
     assert tmp_path.joinpath("request.json").is_file()
     assert live[0]["repair_run"] == 200
+    assert (
+        json.loads(tmp_path.joinpath("request.json").read_text())["deadline"]
+        == 1893459600
+    )
     # A failed repair waits for an explicit dispatch before trying again with
     # the existing authorized fix; completion events must not create retries.
     live[0]["phase"] = "manual"
@@ -1104,6 +1119,13 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
         "native_check",
         lambda *args: dict(workflow=workflow, status="passed", run=103),
     )
+    # Completed checks cannot authorize a late promotion after queueing consumed
+    # the shared hour; the same candidate can promote inside its original budget.
+    monkeypatch.setattr(assist.time, "time", lambda: 1893459600)
+    assist.control(state["pr"])
+    assert not promoted and live[0]["phase"] == "manual"
+    live[0]["phase"] = "validating"
+    monkeypatch.setattr(assist.time, "time", lambda: 1893459599)
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "promoted"
 
@@ -1133,7 +1155,11 @@ def test_cancelled_repair_is_recovered_on_next_reconciliation(
         assist,
         "api",
         lambda path: (
-            {"status": "completed", "conclusion": "cancelled"}
+            {
+                "status": "completed",
+                "conclusion": "cancelled",
+                "run_started_at": "2030-01-01T00:00:00Z",
+            }
             if path.endswith("/201")
             else {
                 "name": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
@@ -1150,6 +1176,35 @@ def test_cancelled_repair_is_recovered_on_next_reconciliation(
     )
     assist.control(state["pr"])
     assert state["phase"] == "manual" and len(messages) == 1
+
+
+def test_queued_validation_expires_without_a_completion_event(monkeypatch, selected):
+    _, state = selected
+    state.update(action="fix", phase="validating")
+    request = {"state": state, "deadline": 100}
+    now = [40]
+    monkeypatch.setattr(repair.time, "time", lambda: now[0])
+    monkeypatch.setattr(
+        repair.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds)
+    )
+    reconciled = []
+    monkeypatch.setattr(
+        repair.subprocess,
+        "run",
+        lambda args, **kwargs: reconciled.append((args, kwargs)),
+    )
+    monkeypatch.setattr(repair, "pull", lambda number: {})
+    monkeypatch.setattr(repair, "pages", lambda *args: [])
+    monkeypatch.setattr(repair, "load_state", lambda *args: state)
+    monkeypatch.setattr(
+        repair, "latest_command", lambda *args: {"id": state["command"]}
+    )
+    messages = []
+    monkeypatch.setattr(repair, "publish", lambda *args: messages.append(args[1]))
+    repair.wait_for_validation(request)
+    assert len(reconciled) == 1 and reconciled[0][1]["timeout"] == 60
+    assert reconciled[0][0][1] == str(repair.ROOT / ".github/scripts/pr_ci_assist.py")
+    assert state["phase"] == "manual" and "one-hour" in messages[0]
 
 
 def test_dispatch_event_uses_tested_source_not_main_controller(

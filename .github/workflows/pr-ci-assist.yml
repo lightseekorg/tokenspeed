@@ -78,7 +78,7 @@ jobs:
     needs: control
     if: needs.control.outputs.repair == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -115,7 +115,7 @@ jobs:
   check:
     needs: repair
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
@@ -145,7 +145,7 @@ jobs:
     needs: [resolve, control, check]
     if: needs.check.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     concurrency:
       group: pr-ci-assist-${{ needs.resolve.outputs.pr }}
       cancel-in-progress: false

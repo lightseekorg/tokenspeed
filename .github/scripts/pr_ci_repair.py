@@ -28,7 +28,9 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 
 from pr_ci_assist import (
@@ -47,6 +49,7 @@ from pr_ci_assist import (
     public_gate,
     publish,
     pull,
+    repair_deadline,
     runs_for,
     task_status,
     validate_plan,
@@ -423,10 +426,25 @@ def repair_progress(line: str, seen: set[str]):
             name = call.get("function", {}).get("name")
             if name in {"Read", "Grep", "Glob", "Edit", "Write"}:
                 labels.append(f"tool requested: {name}")
+    if event.get("role") == "tool":
+        labels.append("tool result received")
+        try:
+            result = json.loads(event.get("content", ""))
+        except (ValueError, TypeError):
+            result = None
+        if isinstance(result, dict) and result.get("type") == "error":
+            labels.append("tool reported an error")
     for label in labels:
         if label not in seen:
             seen.add(label)
             print(f"Repair process: {label}.", flush=True)
+
+
+def remaining_time(request: dict) -> int:
+    remaining = int(request["deadline"] - time.time())
+    if remaining <= 0:
+        raise ValueError("The one-hour repair and validation budget expired.")
+    return remaining
 
 
 def model():
@@ -487,8 +505,10 @@ assignment with ${PYTHONPATH:+:$PYTHONPATH}; retain all other bytes, including
 every command, test and assertion. Do not use external paths or symlinks.
 Do not copy diagnostic paths, hosts, credentials or environment identifiers into source.
 Do not perform unrelated cleanup. Stop if the cause is uncertain.
+Apply the repair with Edit or Write. Describing a proposed change without editing
+the allowed source does not complete this task.
 """)
-    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. You have a hard 20-minute limit. Start with the actual failed step in diagnostics.txt and its CI specification. Keep investigation focused, avoid repeated broad reads, and return promptly once the smallest substantiated repair is ready. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
+    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Finish the smallest substantiated repair promptly to leave time for dispatch and validation. Start with the actual failed step in diagnostics.txt and its CI specification. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     guard_root = WORK / "guard"
     guard_root.mkdir()
@@ -518,7 +538,7 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
                 *sandbox,
                 "timeout",
                 "--kill-after=10s",
-                "1200",
+                str(remaining_time(request)),
                 "kimi",
                 "--agent-file",
                 str(agent),
@@ -569,6 +589,9 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
     selected = conflicts | {
         p for p, content in before.items() if source.joinpath(p).read_bytes() != content
     }
+    if not selected:
+        print("Repair: no source edits proposed.", flush=True)
+        raise ValueError("Repair returned without an editable patch.")
     dirty = command("git", "status", "--porcelain", cwd=source)
     if command("git", "ls-files", "--others", "--exclude-standard", cwd=source):
         raise ValueError("Repair introduced untracked files.")
@@ -588,6 +611,7 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
 
 def check():
     request = json.loads(WORK.joinpath("request.json").read_text())
+    remaining_time(request)
     state = request["state"]
     source = checkout(state["head"], state["base"])
     identity(source)
@@ -613,6 +637,7 @@ def check():
             cwd=source,
             env=env,
             capture_output=True,
+            timeout=remaining_time(request),
         )
         if result.returncode == 0:
             break
@@ -644,7 +669,11 @@ def check():
     patch_tree = command("git", "rev-parse", "HEAD^{tree}", cwd=source)
     merged_tree = effective_merge(source, state["base"], state["head"])
     result = subprocess.run(
-        ["pre-commit", "run", "--all-files"], cwd=source, env=env, capture_output=True
+        ["pre-commit", "run", "--all-files"],
+        cwd=source,
+        env=env,
+        capture_output=True,
+        timeout=remaining_time(request),
     )
     if result.returncode or command("git", "diff", "--name-only", cwd=source):
         raise ValueError("Merged repair failed required pre-commit checks.")
@@ -663,6 +692,9 @@ def check():
 
 def current_request(request: dict) -> dict:
     state = request["state"]
+    remaining_time(request)
+    if request["deadline"] != repair_deadline(state):
+        raise ValueError("Repair deadline changed.")
     pr = pull(state["pr"])
     comments = pages(f"issues/{state['pr']}/comments", None)
     live = load_state(comments, pr)
@@ -681,7 +713,7 @@ def current_request(request: dict) -> dict:
     return pr
 
 
-def push(source: Path, branch: str):
+def push(source: Path, branch: str, *, deadline: int | None = None):
     public_gate()
     remote = command("git", "remote", "get-url", "--push", "origin", cwd=source)
     if remote not in {
@@ -690,6 +722,8 @@ def push(source: Path, branch: str):
         f"git@github.com:{REPO}.git",
     }:
         raise ValueError("Unexpected push destination.")
+    if deadline is not None and time.time() >= deadline:
+        raise ValueError("The one-hour repair and validation budget expired.")
     command(
         "git",
         "-c",
@@ -771,7 +805,7 @@ def stage():
     validation = command("git", "rev-parse", "HEAD", cwd=source)
     branch = f"bot/pr-ci-assist-{state['pr']}-{state['command']}"
     current_request(request)
-    push(source, branch)
+    push(source, branch, deadline=request["deadline"])
     state["candidate"] = dict(
         patch=patch,
         validation=validation,
@@ -796,10 +830,60 @@ def stage():
     dispatch_native_checks(state)
     for task in validate_plan(request["plan"], data):
         task_status(task, state, runs, submit=True)
+    wait_for_validation(request)
+
+
+def wait_for_validation(request: dict):
+    """Reconcile queued dispatches with the pinned controller until the deadline."""
+    state = request["state"]
+    while time.time() < request["deadline"]:
+        with tempfile.TemporaryDirectory(prefix="pr-ci-validation-") as work:
+            env = dict(os.environ, RUNNER_TEMP=work)
+            try:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / ".github/scripts/pr_ci_assist.py"),
+                        "control",
+                        "--pr",
+                        str(state["pr"]),
+                    ],
+                    env=env,
+                    check=True,
+                    timeout=remaining_time(request),
+                )
+            except subprocess.TimeoutExpired:
+                break
+        pr = pull(state["pr"])
+        live = load_state(pages(f"issues/{state['pr']}/comments", None), pr)
+        if (
+            not live
+            or live["command"] != state["command"]
+            or live["phase"] != "validating"
+        ):
+            return
+        time.sleep(max(0, min(60, request["deadline"] - time.time())))
+    pr = pull(state["pr"])
+    comments = pages(f"issues/{state['pr']}/comments", None)
+    live = load_state(comments, pr)
+    latest = latest_command(comments)
+    if (
+        live
+        and latest
+        and latest["id"] == state["command"]
+        and live["phase"] == "validating"
+    ):
+        live["phase"] = "manual"
+        publish(
+            live, "The one-hour repair and validation budget expired; PR unchanged."
+        )
 
 
 def promote(state: dict):
     public_gate()
+    deadline = repair_deadline(state)
+    if time.time() >= deadline:
+        raise ValueError("The one-hour repair and validation budget expired.")
     pr = pull(state["pr"])
     if (pr["head"]["sha"], pr["base"]["sha"]) != (state["head"], state["base"]):
         raise ValueError("PR or main moved before promotion.")
@@ -856,7 +940,7 @@ def promote(state: dict):
         state["base"],
     ):
         raise ValueError("PR or main moved during promotion.")
-    push(source, pr["head"]["ref"])
+    push(source, pr["head"]["ref"], deadline=deadline)
 
 
 if __name__ == "__main__":
@@ -885,7 +969,7 @@ if __name__ == "__main__":
             {"configure": configure, "model": model, "check": check, "stage": stage}[
                 args.stage
             ]()
-    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         raise SystemExit(
             "Repair stopped; raw diagnostics withheld and PR unchanged."
         ) from None

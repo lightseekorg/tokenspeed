@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -877,6 +878,14 @@ def refresh_plan(state: dict, message: str):
     )
 
 
+def repair_deadline(state: dict) -> int:
+    started = api(f"actions/runs/{state['repair_run']}")["run_started_at"]
+    return (
+        int(datetime.datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp())
+        + 3600
+    )
+
+
 def control(number: int):
     public_gate()
     pr = pull(number)
@@ -928,6 +937,16 @@ def control(number: int):
     if state["head"] != pr["head"]["sha"] or state["base"] != pr["base"]["sha"]:
         state["phase"] = "stale"
         publish(state, "PR or main changed. Request a new plan and command.")
+        return
+    if (
+        state["phase"] in {"repairing", "validating"}
+        and "repair_run" in state
+        and time.time() >= repair_deadline(state)
+    ):
+        state["phase"] = "manual"
+        publish(
+            state, "The one-hour repair and validation budget expired; PR unchanged."
+        )
         return
     if "plan_refresh" in state and os.environ["GITHUB_EVENT_NAME"] == "workflow_run":
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
@@ -1085,6 +1104,7 @@ def control(number: int):
                     "plan": plan,
                     "data": data,
                     "conflicts": pr["mergeable"] is False,
+                    "deadline": repair_deadline(state),
                 }
             )
         )
