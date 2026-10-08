@@ -24,6 +24,14 @@ and reclaims inside the same `Admit` (`advanceRequestProgress` in
 and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
 for why publication rides with admission).
 
+Decode-role remote admission covers the complete unmatched prompt in one
+landing window. Local prefill chunk limits and prefix-promotion boundaries do
+not shorten it: the peer transfers the full prompt's cache and endpoint state.
+The window must reach `PrefillSize()` so the first decode consumes its reserved
+input width. A truncated remote window would leave that reserve at zero and
+delay later cache growth even though the device has committed the full prompt.
+Local recovery on the decode role still follows ordinary prefill chunking.
+
 When L3 Host prefetch cannot allocate every probed page, `Admit` shortens
 `host_prefix_tokens` and rounds that length down to `prefix_granularity`
 (the identity boundary every group's `block_granularity` divides).
