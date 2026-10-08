@@ -20,13 +20,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import logging
 import math
 import os
 import site
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -237,6 +238,28 @@ class PlatformInfo:
         if self.is_amd and tensor.device.type == "cpu" and tensor.numel() > 0:
             return _hip_host_get_device_pointer(ptr)
         return ptr
+
+    @contextlib.contextmanager
+    def restore_stack_limit(self) -> Iterator[None]:
+        """Restore, when the block exits normally, the stack limit its kernels raised.
+
+        CUDA raises the current context's limit to fit each kernel at launch and
+        keeps local memory reserved for it on every SM until the limit is set
+        lower again. A no-op on other vendors.
+        """
+        if not self.is_nvidia:
+            yield
+            return
+        from cuda.bindings import driver
+
+        stack = driver.CUlimit.CU_LIMIT_STACK_SIZE
+        error, limit = driver.cuCtxGetLimit(stack)
+        if error != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuCtxGetLimit failed with {error!s}")
+        yield
+        (error,) = driver.cuCtxSetLimit(stack, limit)
+        if error != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuCtxSetLimit failed with {error!s}")
 
     @property
     def generation_name(self) -> str:

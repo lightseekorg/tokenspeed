@@ -27,7 +27,7 @@ import logging
 
 import tokenspeed_kernel
 import torch
-from tokenspeed_kernel import fp8_linear, prepare_fp8_linear
+from tokenspeed_kernel import fp8_linear, fp8_linear_into, prepare_fp8_linear
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_block_quant_fp8,
     per_token_group_quant_fp8,
@@ -284,6 +284,70 @@ class Fp8LinearMethod(LinearMethodBase):
                     layer.input_scale = Parameter(
                         layer.input_scale.max(), requires_grad=False
                     )
+                    # Shards sharing one scale stay per-tensor, which cuBLASLt FP8 GEMMs take.
+                    if bool((weight_scale == weight_scale[0]).all()):
+                        layer.weight_scale = Parameter(
+                            weight_scale[0].clone(), requires_grad=False
+                        )
+
+    def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
+        """Let a prepared block-FP8 GEMM write directly into communication scratch."""
+        if self.block_quant:
+            if (
+                out.shape != (*x.shape[:-1], layer.weight.shape[0])
+                or out.dtype != output_dtype
+                or out.device != x.device
+                or not out.is_contiguous()
+            ):
+                raise ValueError("Incompatible block-FP8 output destination")
+            return self._apply_block(layer, x, bias, block_scale, output_dtype, out)
+        return super().apply_into(layer, x, bias, block_scale, output_dtype, out)
+
+    def _apply_block(self, layer, x, bias, block_scale, output_dtype, out):
+        input_2d = x.view(-1, x.shape[-1])
+        output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+        output_dtype = output_dtype or x.dtype
+        destination = out.view(-1, layer.weight.shape[0]) if out is not None else None
+        plan = self.prepared_linear_plan(layer)
+        if plan is None:
+            output = tokenspeed_kernel.mm(
+                input_2d,
+                layer.weight,
+                A_scales=block_scale,
+                B_scales=layer.weight_scale_inv,
+                bias=bias,
+                out_dtype=output_dtype,
+                quant="mxfp8",
+                block_size=self.quant_config.weight_block_size,
+                out=destination,
+            )
+        elif destination is None:
+            output = fp8_linear(
+                plan,
+                input_2d,
+                layer.weight,
+                layer.weight_scale_inv,
+                input_scales=block_scale,
+                bias=bias,
+                out_dtype=output_dtype,
+            )
+        else:
+            output = fp8_linear_into(
+                plan,
+                input_2d,
+                layer.weight,
+                layer.weight_scale_inv,
+                input_scales=block_scale,
+                bias=bias,
+                out_dtype=output_dtype,
+                out=destination,
+            )
+        # Preserve caller identity: destination is a view, not a second output.
+        return (
+            out
+            if out is not None
+            else output.to(dtype=output_dtype).view(*output_shape)
+        )
 
     def apply(
         self,
@@ -295,32 +359,7 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if self.block_quant:
-            input_2d = x.view(-1, x.shape[-1])
-            output_shape = [*x.shape[:-1], layer.weight.shape[0]]
-            output_dtype = output_dtype or x.dtype
-            plan = getattr(layer, "_prepared_fp8_linear", None)
-            if plan is None:
-                output = tokenspeed_kernel.mm(
-                    input_2d,
-                    layer.weight,
-                    A_scales=block_scale,
-                    B_scales=layer.weight_scale_inv,
-                    bias=bias,
-                    out_dtype=output_dtype,
-                    quant="mxfp8",
-                    block_size=self.quant_config.weight_block_size,
-                )
-            else:
-                output = fp8_linear(
-                    plan,
-                    input_2d,
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    input_scales=block_scale,
-                    bias=bias,
-                    out_dtype=output_dtype,
-                )
-            return output.to(dtype=output_dtype).view(*output_shape)
+            return self._apply_block(layer, x, bias, block_scale, output_dtype, None)
         else:
             input = x
             weight = layer.weight
@@ -336,7 +375,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     raise ValueError(
                         f"input_scale must contain exactly one value, got {input_scale.numel()}."
                     )
-                qinput, x_scale = static_quant_fp8(input_2d, input_scale)
+                if input_2d.dtype == torch.float8_e4m3fn:
+                    # Its producer already quantized it with this layer's scale.
+                    qinput, x_scale = input_2d, input_scale
+                else:
+                    qinput, x_scale = static_quant_fp8(input_2d, input_scale)
             else:
                 qinput, x_scale = per_token_quant_fp8(input_2d)
 
@@ -347,7 +390,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight,
                 A_scales=x_scale,
                 B_scales=weight_scale,
-                out_dtype=input.dtype,
+                out_dtype=(
+                    layer.orig_dtype
+                    if input.dtype == torch.float8_e4m3fn
+                    else input.dtype
+                ),
                 quant="fp8",
             )
             if bias is not None:

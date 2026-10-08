@@ -37,6 +37,10 @@ from typing_extensions import override
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
 )
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    DSAConfig,
+    dsa_history_gather_workspace_bytes,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
 )
@@ -107,10 +111,44 @@ class OrdinaryRecipe(CacheRecipe):
         if self.family not in ("mla", "dsa") or self.attn_config.dcp_size == 1:
             return groups
         if self.draft_attn_config is not None:
-            raise ValueError("Sharded MLA/DSA cache does not support a draft model")
+            # The draft group would shard like the target's, but the draft's
+            # DCP decode steps are unvalidated and AttnConfig already rejects
+            # speculation under FlashMLA/GPU DSA DCP (docs/design/cache-concepts.md).
+            raise ValueError(
+                "Sharded MLA/DSA cache does not yet support a draft model; "
+                "run DCP without speculative decoding"
+            )
         return tuple(
             (replace(spec, shard_count=self.attn_config.dcp_size), fields)
             for spec, fields in groups
+        )
+
+    @override
+    def workspace_bytes(self) -> int:
+        """The query-context-parallel history gather workspace of GPU DSA:
+        one whole history of latent rows plus index-K rows packed in the
+        plane's format, reserved before the arena is sized
+        (``AttnConfig.__post_init__`` has already pinned the family to GPU DSA
+        for ``qcp_size > 1``). One workspace serves the target and the draft
+        (the draft gathers into the target's buffers), so the two must pack
+        index-K rows in the same format; a draft naming another is refused
+        here, where both configs are visible."""
+        if self.attn_config.qcp_size == 1:
+            return 0
+        target = self.attn_config.component(DSAConfig)
+        if self.draft_attn_config is not None and target is not None:
+            draft = self.draft_attn_config.component(DSAConfig)
+            draft_format = None if draft is None else draft.index_k_format
+            if draft_format != target.index_k_format:
+                raise ValueError(
+                    "query context parallelism shares one history gather "
+                    "workspace between the target and the draft, so both must "
+                    "store index keys in one format; the target's "
+                    f"index_k_format is {target.index_k_format!r}, the draft's "
+                    f"{draft_format!r}"
+                )
+        return dsa_history_gather_workspace_bytes(
+            self.attn_config, max_model_len=self.attn_config.context_len
         )
 
     @override
@@ -339,15 +377,28 @@ def _index_k_field(config, layer_id: int) -> CacheFieldSpec:
     from tokenspeed.runtime.layers.attention.configs.dsa import (
         DSAConfig,
         dsa_index_k_row_bytes,
+        index_k_plane_dtype,
     )
 
     spec = config.component(SoftmaxAttnConfig)
     if isinstance(spec, DSAConfig):
+        # One plane layout per index_k_format: FP8 keys plus scales as uint8
+        # bytes, or the bf16 keys unquantized (configs/dsa.py).
+        if spec.index_k_format == "fp8_scaled":
+            return CacheFieldSpec(
+                f"layer.{layer_id}.index_k",
+                f"layer.{layer_id}.index_k",
+                (
+                    config.prefix_granularity,
+                    dsa_index_k_row_bytes(spec.index_head_dim),
+                ),
+                "uint8",
+            )
         return CacheFieldSpec(
             f"layer.{layer_id}.index_k",
             f"layer.{layer_id}.index_k",
-            (config.prefix_granularity, dsa_index_k_row_bytes(spec.index_head_dim)),
-            "uint8",
+            (config.prefix_granularity, spec.index_head_dim),
+            cache_dtype_name(index_k_plane_dtype(spec.index_k_format)),
         )
     return CacheFieldSpec(
         f"layer.{layer_id}.index_k",

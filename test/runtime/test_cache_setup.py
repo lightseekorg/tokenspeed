@@ -2,6 +2,7 @@ import os
 import sys
 from dataclasses import fields, replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -48,7 +49,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     LINEAR_ATTENTION,
     CacheGroupSpec,
 )
-from tokenspeed.runtime.layers.attention.registry import _prepare_verify_workspace
+from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
 
 register_cuda_ci(
     est_time=10,
@@ -70,6 +71,91 @@ def _pool_over_new_arena(spec, config, *, num_layers: int, rank: int = 0):
         num_layers=num_layers,
         rank=rank,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [1, 3])
+def test_glm_workspace_budget_includes_kda_and_shared_kpool_tails(width):
+    from test.runtime.test_glm53_flash_cache_spec import _recipe
+
+    from tokenspeed.runtime.layers.attention import registry
+
+    recipe = _recipe(
+        tp_size=8,
+        mla_cache_dtype=torch.float8_e4m3fn,
+        draft_layers=int(width > 1),
+    )
+    config = replace(recipe.attn_config, device="cuda", max_bs=2)
+    recipe.attn_config = config
+    if recipe.draft_attn_config is not None:
+        recipe.draft_attn_config = replace(
+            recipe.draft_attn_config, device="cuda", max_bs=2
+        )
+    recipe.probe_batch_rows = 4
+    recipe.server_args.disable_kda_prefill_graph = True
+    recipe.server_args.kda_backend = "auto"
+    linear = config.component(LinearAttnConfig)
+    num_layers = recipe.model_config.num_attention_layers
+    model = SimpleNamespace(
+        num_attention_layers=num_layers,
+        attention_arch=registry.AttentionArch.DSA,
+        hf_config=SimpleNamespace(
+            architectures=["Glm53FlashForConditionalGeneration"],
+            full_attention_layer_ids=[
+                layer for layer in range(num_layers) if layer not in linear.layer_ids
+            ],
+        ),
+    )
+    setup = recipe.setup()
+    arena = create_cache_arena(
+        setup.spec, device=config.device, enable_memory_saver=False
+    )
+    backend, pool = registry._create_target_components(
+        server_args=recipe.server_args,
+        model_config=model,
+        config=config,
+        cache_spec=setup.spec.layer_view(first_layer=0, num_layers=num_layers),
+        arena=arena,
+        rank=0,
+        full_attn_backend_name="dsa",
+        linear_attention="kda",
+        is_inkling=False,
+        backend=None,
+    )
+    backend.set_cache_pool(pool)
+    # The tail allocation is shared by target/draft views; count its storage
+    # once, together with the verify buffers owned by the target backend.
+    tail_bytes = pool._kpool_tail_workspace.storage.nbytes
+    verify_bytes = (
+        backend.preallocate_verify_workspace(config.max_bs, width) if width > 1 else 0
+    )
+    assert setup.fixed_workspace_bytes == tail_bytes + verify_bytes
+
+
+@pytest.mark.parametrize(
+    "uses_paged_state_verify,expected_bytes",
+    [(True, 128), (True, 0), (False, 128)],
+)
+def test_verify_preparation_calls_root_with_existing_budget_gate(
+    uses_paged_state_verify, expected_bytes
+):
+    backend = Mock(spec=AttentionBackend)
+    backend.preallocate_verify_workspace.return_value = 128
+    draft_backend = Mock(spec=AttentionBackend)
+    kwargs = dict(
+        server_args=SimpleNamespace(speculative_num_draft_tokens=3),
+        config=SimpleNamespace(max_bs=4, qcp_size=1),
+        backend=backend,
+        draft_backend=draft_backend,
+        uses_paged_state_verify=uses_paged_state_verify,
+        is_inkling=False,
+    )
+    _prepare_fixed_workspaces(**kwargs, expected_bytes=expected_bytes)
+    if uses_paged_state_verify and expected_bytes:
+        backend.preallocate_verify_workspace.assert_called_once_with(4, 3)
+    else:
+        backend.preallocate_verify_workspace.assert_not_called()
+    draft_backend.preallocate_verify_workspace.assert_not_called()
 
 
 def _model_wide_kwargs(**overrides) -> dict:
@@ -99,6 +185,126 @@ def _mha_config() -> AttnConfig:
         cache_layer_types=(),
     )
     return AttnConfig(components=(spec,), **_model_wide_kwargs())
+
+
+def test_deepseek_v4_mtp_reads_window_from_cache_group():
+    from tokenspeed.runtime.layers.attention import registry
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    args = ServerArgs(
+        model="x",
+        device="cpu",
+        prefix_granularity=256,
+        max_num_seqs=2,
+        chunked_prefill_size=256,
+        speculative_algorithm="EAGLE",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        attention_use_fp4_indexer_cache=False,
+    )
+    args.mapping.rank = 0
+    model_fields = dict(
+        model_profile=None,
+        attention_arch=registry.AttentionArch.MLA,
+        dtype=torch.bfloat16,
+        context_len=512,
+        num_attention_heads=64,
+        num_key_value_heads=1,
+        head_dim=512,
+        kv_lora_rank=512,
+        qk_nope_head_dim=448,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+        scaling=512**-0.5,
+    )
+    hf_fields = dict(
+        compress_ratios=(1, 4, 1),
+        head_dim=512,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
+        sliding_window=256,
+    )
+    target = SimpleNamespace(
+        **model_fields,
+        num_attention_layers=2,
+        hf_config=SimpleNamespace(**hf_fields, architectures=["DeepseekV4ForCausalLM"]),
+    )
+    draft = SimpleNamespace(
+        **model_fields,
+        num_attention_layers=1,
+        hf_config=SimpleNamespace(
+            **hf_fields, architectures=["DeepseekV4ForCausalLMNextN"]
+        ),
+    )
+    build = registry.create_attn_components(
+        args,
+        target,
+        gpu_id=0,
+        rank=0,
+        gpu_memory=0,
+        draft_model_config=draft,
+        graph_reserve_bytes=0,
+        post_profile_bytes=0,
+        probe_batch_rows=1,
+        profiled_cache_bytes=32 << 20,
+        reuse_target_backend=None,
+        reuse_draft_backend=None,
+    )
+    assert build.attn_backend._swa_window_tokens() == 256
+    assert build.draft_attn_backend._swa_window_tokens() == 256
+
+
+@pytest.mark.parametrize(
+    "is_draft,width,num_layers,layerwise,ring_rows",
+    [(False, 1, 3, True, 4), (True, 4, 1, False, 7)],
+)
+def test_inkling_construction_matches_ring_reservation(
+    is_draft, width, num_layers, layerwise, ring_rows
+):
+    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+        InklingAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
+        _conv_ring_bytes,
+    )
+
+    config = _mha_config()
+    spec = replace(
+        config.component(MHAConfig),
+        num_attention_heads=4,
+        num_kv_heads=4,
+        attn_tp_size=2,
+    )
+    config = replace(
+        config,
+        components=(spec,),
+        is_draft=is_draft,
+        speculative_num_draft_tokens=width,
+    )
+    text = SimpleNamespace(
+        sconv_kernel_size=4,
+        num_key_value_heads=4,
+        head_dim=2,
+        hidden_size=8,
+    )
+    inner = AttentionBackend(config, spec)
+    backend = InklingAttnBackend.from_config(
+        inner,
+        text,
+        config,
+        num_layers=num_layers,
+        is_draft=is_draft,
+        enable_layerwise_cache_ready=layerwise,
+    )
+    assert backend.conv_pool.conv_state.shape == (num_layers, 4, ring_rows, 24)
+    assert backend.conv_spec_num_tokens == width
+    assert backend.enable_layerwise_cache_ready is layerwise
+    assert backend.fixed_workspace_bytes() == _conv_ring_bytes(
+        text_config=text,
+        attn_config=config,
+        num_layers=num_layers,
+        spec_tokens=width,
+    )
 
 
 def _mla_config() -> AttnConfig:
@@ -300,6 +506,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         prefix_granularity=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
+        speculative_eagle_topk=1,
     )
 
     setup = prepare_cache_setup(
@@ -339,16 +546,35 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
 
 
 @pytest.mark.parametrize(
-    ("replay_enabled", "replay_supported", "expected_workspace_bytes"),
+    (
+        "replay_enabled",
+        "replay_supported",
+        "topk",
+        "draft_tokens",
+        "expected_workspace_bytes",
+    ),
     # Non-replay stages conv+ssm for 8 verify rows: 8 * (8 + 8). Replay: 64
     # conv staging bytes plus the captured payload (6 rows of 7 bf16
     # channels) and the fp32 A_log/dt_bias pairs -- 64 + 84 + 16.
-    ((False, True, 128), (True, False, 128), (True, True, 164)),
+    # A replayed draft tree (topk 2) adds one 8-byte ssm state per draft position: 2 * 3 * 8.
+    (
+        (False, True, 1, 3, 128),
+        (True, False, 1, 3, 128),
+        (True, True, 1, 3, 164),
+        (False, True, 2, 3, 128),
+        (True, True, 2, 3, 212),
+        (True, True, 2, 7, 452),
+        (True, True, 2, 8, 384),
+        (True, True, 2, 16, 736),
+        (True, True, 2, 17, 1052),
+    ),
 )
 def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     monkeypatch,
     replay_enabled: bool,
     replay_supported: bool,
+    topk: int,
+    draft_tokens: int,
     expected_workspace_bytes: int,
 ) -> None:
     monkeypatch.setattr(
@@ -377,7 +603,8 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     server_args = SimpleNamespace(
         block_size=64,
         max_total_tokens=None,
-        speculative_num_draft_tokens=3,
+        speculative_num_draft_tokens=draft_tokens,
+        speculative_eagle_topk=topk,
         enable_replay_ssm=replay_enabled,
     )
 
@@ -398,6 +625,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     linear_attn = attn_config.component(LinearAttnConfig)
     assert linear_attn is not None
     assert linear_attn.replay_ssm is (replay_enabled and replay_supported)
+    assert linear_attn.draft_tree is (topk > 1)
 
 
 @pytest.mark.parametrize("speculative,width", [(False, 1), (True, 1), (True, 3)])
@@ -441,6 +669,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=width,
+        speculative_eagle_topk=1,
         enable_replay_ssm=False,
     )
     setup = prepare_cache_setup(
@@ -478,7 +707,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         root = Qwen4ExpBackend(
             attn_config, AttentionBackend(attn_config, target_spec), backend, None
         )
-        _prepare_verify_workspace(
+        _prepare_fixed_workspaces(
             server_args=server_args,
             config=attn_config,
             backend=root,
@@ -785,6 +1014,7 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
             gpu_memory=0,
             draft_model_config=draft,
             graph_reserve_bytes=0,
+            post_profile_bytes=0,
             probe_batch_rows=None,
             profiled_cache_bytes=None,
             reuse_target_backend=None,
@@ -1092,6 +1322,7 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
             gpu_memory=0,
             draft_model_config=draft,
             graph_reserve_bytes=0,
+            post_profile_bytes=0,
             probe_batch_rows=None,
             profiled_cache_bytes=None,
             reuse_target_backend=None,
@@ -1127,6 +1358,250 @@ def test_kimi_dspark_rejects_sharded_context_writes(degree):
     else:
         registry._apply_backend_overrides(args, target, draft)
         assert args.drafter_attention_backend == "tokenspeed_mla"
+
+
+class _Sized(Exception):
+    pass
+
+
+def _fake_around_the_budget(monkeypatch, free):
+    """Fake what surrounds the real factory, profile and free-memory read.
+
+    ``free`` gives this rank's free bytes; the factory stops where it would
+    plan the cache and raises the budget it would plan with.
+    """
+    from tokenspeed.runtime.layers.attention import registry
+    from tokenspeed.runtime.utils import common
+
+    gpu = SimpleNamespace(
+        device_count=lambda: 1,
+        current_device=lambda: 0,
+        empty_cache=lambda: None,
+        mem_get_info=lambda gpu_id: (free(), 200 << 30),
+    )
+    monkeypatch.setattr(common.torch, "get_device_module", lambda device: gpu)
+    side = SimpleNamespace(
+        is_deepseek_v4=False,
+        is_hybrid_linear=False,
+        is_dspark=False,
+        requested_backend=None,
+    )
+    monkeypatch.setattr(registry, "_resolve_attn_side", lambda *a: side)
+    monkeypatch.setattr(registry, "_check_pd_support", lambda *a, **k: None)
+    monkeypatch.setattr(registry, "_apply_backend_overrides", lambda *a, **k: None)
+    config = SimpleNamespace(
+        component=lambda cls: SimpleNamespace(), dcp_size=1, device="cuda"
+    )
+    monkeypatch.setattr(registry, "_create_attn_config", lambda *a, **k: config)
+    monkeypatch.setattr(registry, "_resolve_cache_family", lambda *a: "mha")
+    monkeypatch.setattr(
+        registry, "_resolve_full_attn_backend_name", lambda *a, **k: "fake"
+    )
+    monkeypatch.setattr(
+        registry, "_resolve_heterogeneous_draft_family", lambda *a, **k: None
+    )
+
+    def prepare(*, cache_budget_bytes, probe_batch_rows, **kwargs):
+        raise _Sized(cache_budget_bytes, probe_batch_rows)
+
+    monkeypatch.setattr(registry, "prepare_cache_setup", prepare)
+    return registry
+
+
+def _receive_pool_env(monkeypatch, slots, slot_mb):
+    from tokenspeed.runtime.epd import prefill_admission
+
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", str(slots))
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOT_MB", str(slot_mb))
+    monkeypatch.setattr(prefill_admission, "_POOLS", {})
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("probe", [False, True])
+@pytest.mark.parametrize(
+    "mode, active, pool",
+    [
+        ("prefill", True, 4 << 30),
+        ("prefill", False, 0),
+        ("decode", True, 0),
+        ("null", True, 0),
+    ],
+)
+def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
+    monkeypatch, rank, probe, mode, active, pool
+) -> None:
+    from tokenspeed.runtime.execution import device, factory
+
+    _receive_pool_env(monkeypatch, 16, 256)
+    _fake_around_the_budget(monkeypatch, lambda: 60 << 30)
+    target = SimpleNamespace(
+        model=object(),
+        prepare_multimodal_runtime=lambda: None,
+        prepare_communication_runtime=lambda tokens: None,
+    )
+    monkeypatch.setattr(factory, "create_model_runner", lambda *a: (target, None))
+    monkeypatch.setattr(device, "probe_arena_floor", lambda *a, **k: 8)
+    server_args = SimpleNamespace(
+        disaggregation_mode=mode,
+        chunked_prefill_size=8192,
+        attention_backend=None,
+        drafter_attention_backend=None,
+        disable_cudagraph_memory_reserve=not probe,
+        enforce_eager=False,
+        enable_memory_saver=False,
+        gpu_memory_utilization=0.9,
+        mapping=SimpleNamespace(world_size=1, world_group=None),
+    )
+    with pytest.raises(_Sized) as sized:
+        device.build_device_side(
+            server_args=server_args,
+            model_config=SimpleNamespace(
+                is_multimodal=True, is_multimodal_active=active
+            ),
+            draft_model_config=None,
+            gpu_id=0,
+            global_rank=rank,
+            attn_tp_rank=rank,
+            min_per_gpu_mem=100.0,
+            overlap_schedule_depth=0,
+            decode_input_tokens=1,
+            max_batch_size=8,
+        )
+    budget, rows = sized.value.args
+    assert (rows is not None) == probe
+    # 60 GiB free, 100 GiB at startup, 0.9 utilization: 10 GiB of headroom.
+    assert abs(budget - ((50 << 30) - pool)) < (1 << 20)
+
+
+def test_each_rank_leaves_its_own_pool_out_before_the_minimum(monkeypatch) -> None:
+    import threading
+
+    from tokenspeed.runtime.utils import common
+
+    local = threading.local()
+    registry = _fake_around_the_budget(monkeypatch, lambda: local.free)
+    # One rank: just over 60 GiB free and a 4 GiB pool; its peer: 58 GiB free, no pool.
+    ranks = [((60 << 30) + 4095, 4 << 30), (58 << 30, 0)]
+    barrier, seen = threading.Barrier(len(ranks), timeout=10), []
+
+    def all_reduce(tensor, op, group):
+        seen.append(tensor.item())
+        barrier.wait()
+        tensor.fill_(min(seen))
+
+    monkeypatch.setattr(common.torch.distributed, "all_reduce", all_reduce)
+    args = SimpleNamespace(
+        attention_backend=None,
+        drafter_attention_backend=None,
+        gpu_memory_utilization=0.75,
+        mapping=SimpleNamespace(world_size=len(ranks), world_group=None),
+    )
+    budgets = [None] * len(ranks)
+
+    def rank(index, free, pool):
+        local.free = free
+        with pytest.raises(_Sized) as sized:
+            registry.create_attn_components(
+                args,
+                SimpleNamespace(),
+                0,
+                0,
+                100.0,
+                graph_reserve_bytes=0,
+                post_profile_bytes=pool,
+                probe_batch_rows=None,
+                profiled_cache_bytes=None,
+                reuse_target_backend=None,
+                reuse_draft_backend=None,
+            )
+        budgets[index] = sized.value.args[0]
+
+    threads = [
+        threading.Thread(target=rank, args=(index, *spec))
+        for index, spec in enumerate(ranks)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    # 100 GiB at startup at 0.75 utilization leaves 25 GiB of headroom.
+    exact = (56 << 30) + 4095 - (25 << 30)
+    assert budgets == [exact, exact]
+
+
+@pytest.mark.parametrize("slots, slot_mb", [(2, 1), (0, 1), (-1, 1), (2, 0), (2, -1)])
+@pytest.mark.parametrize("num_deepstack", [0, 3])
+def test_the_admission_builds_the_pool_the_budget_left_out(
+    monkeypatch, slots, slot_mb, num_deepstack
+) -> None:
+    from tokenspeed.runtime.epd import prefill_admission, recv_pool
+
+    _receive_pool_env(monkeypatch, slots, slot_mb)
+    registered = []
+    engine = SimpleNamespace(register=lambda ptr, size: registered.append(size))
+    prefill_admission.EpdPrefillAdmission(
+        manager=SimpleNamespace(engine=engine),
+        device="cpu",
+        hidden=16,
+        num_deepstack=num_deepstack,
+        dtype=torch.bfloat16,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_tp_cpu_group=None,
+        attn_tp_group=[0],
+        pg_manager=None,
+    )
+    prefill = SimpleNamespace(disaggregation_mode="prefill")
+    assert sum(registered) == recv_pool.recv_pool_bytes(prefill, True)
+    pool = slots * slot_mb << 20 if slots > 0 and slot_mb > 0 else 0
+    assert sum(registered) == pool
+
+
+@pytest.mark.parametrize(
+    "mode, active",
+    [
+        ("prefill", True),
+        ("prefill", False),
+        ("decode", True),
+        ("null", True),
+        ("encode", True),
+    ],
+)
+def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
+    monkeypatch, mode, active
+) -> None:
+    from tokenspeed.runtime.epd import prefill_admission, recv_pool
+    from tokenspeed.runtime.epd.mooncake import prefill as mooncake_prefill
+
+    _receive_pool_env(monkeypatch, 2, 1)
+    registered = []
+    engine = SimpleNamespace(register=lambda ptr, size: registered.append(size))
+    monkeypatch.setattr(
+        mooncake_prefill,
+        "MooncakeEmbeddingManagerPrefill",
+        lambda *args: SimpleNamespace(engine=engine),
+    )
+    server_args = SimpleNamespace(
+        disaggregation_mode=mode,
+        disaggregation_bootstrap_port=0,
+        disaggregation_ib_device=None,
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1)),
+    )
+    facts = SimpleNamespace(device="cpu", hidden=16, num_deepstack=0, dtype=None)
+    prefill_admission.make_epd_prefill_admission(
+        server_args,
+        0,
+        model_config=SimpleNamespace(is_multimodal=True, is_multimodal_active=active),
+        encoder_model_facts=lambda: facts,
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=[0])),
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_tp_cpu_group=None,
+        pg_manager=None,
+    )
+    left_out = recv_pool.recv_pool_bytes(server_args, active)
+    assert sum(registered) == left_out
+    assert (left_out > 0) == (mode == "prefill" and active)
 
 
 if __name__ == "__main__":

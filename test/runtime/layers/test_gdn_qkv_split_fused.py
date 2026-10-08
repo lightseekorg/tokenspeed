@@ -97,7 +97,7 @@ def test_split_l2norm_correctness(nq, nv, hq, hv, T, dtype):
 
 @pytest.mark.parametrize("nq,nv,hq,hv,T", CONFIGS[:2])
 def test_strided_input(nq, nv, hq, hv, T):
-    """Strided input must produce same result as contiguous (b3 fallback)."""
+    """Row-strided input is read in place and matches the contiguous split."""
     nk = nq
     hk = hq
     dtype = torch.bfloat16
@@ -115,6 +115,79 @@ def test_strided_input(nq, nv, hq, hv, T):
     assert torch.max(torch.abs(q.float() - q_ref.float())) < 1e-5
     assert torch.max(torch.abs(k.float() - k_ref.float())) < 1e-5
     assert torch.max(torch.abs(v.float() - v_ref.float())) < 1e-5
+
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        fused_qkv_split_gdn_prefill(strided, nq, nk, nv, hq, hk, hv)
+        torch.cuda.synchronize()
+    kernels = [
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert kernels == ["_fused_qkv_split_kernel"]
+
+    # A transposed layout still takes the contiguous copy.
+    transposed = strided.t().contiguous().t()
+    for got, ref in zip(
+        fused_qkv_split_gdn_prefill(transposed, nq, nk, nv, hq, hk, hv),
+        (q_ref, k_ref, v_ref),
+        strict=True,
+    ):
+        assert torch.equal(got, ref)
+
+
+def test_row_stride_does_not_key_a_binary():
+    """Projection slices arrive with different row widths; that must not key a binary."""
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
+        _fused_qkv_split_kernel,
+    )
+
+    nq = nk = 4
+    nv, head = 8, 128
+    width = (nq + nk + nv) * head
+
+    def run(tokens, pad):
+        mixed = torch.randn(tokens, width + pad, dtype=torch.bfloat16, device="cuda")
+        mixed = mixed[:, :width]
+        q, k, v = fused_qkv_split_gdn_prefill(
+            mixed, nq, nk, nv, head, head, head, fuse_l2norm=False
+        )
+        expected = _ref_split(mixed.contiguous(), nq, nk, nv, head, head, head)
+        for got, ref in zip((q, k, v), expected, strict=True):
+            assert torch.equal(got, ref)
+
+    run(64, 0)
+    jit = _fused_qkv_split_kernel.fn
+    with patch.object(jit, "_do_compile", wraps=jit._do_compile) as compiles:
+        for tokens, pad in ((1, 0), (17, 128), (33, 2048), (100, 64)):
+            run(tokens, pad)
+    assert compiles.call_count == 0
+
+
+def test_column_slice_past_int32_offsets_is_copied_first():
+    """Rows whose strided span passes int32 offsets split exactly, via a copy."""
+    nq, nk, nv, hq, hk, hv = 2, 2, 4, 32, 32, 24
+    width = nq * hq + nk * hk + nv * hv
+    # Each row offset fits int32; the last row's (row index times stride) does not.
+    rows, row_stride = 2049, 2**20
+    storage = torch.zeros(
+        (rows - 1) * row_stride + width, dtype=torch.bfloat16, device="cuda"
+    )
+    strided = storage.as_strided((rows, width), (row_stride, 1))
+    strided.copy_(torch.randn(rows, width, dtype=torch.bfloat16, device="cuda"))
+
+    q_ref, k_ref, v_ref = _ref_split(strided.contiguous(), nq, nk, nv, hq, hk, hv)
+    q, k, v = fused_qkv_split_gdn_prefill(
+        strided, nq, nk, nv, hq, hk, hv, fuse_l2norm=False
+    )
+
+    assert torch.equal(q, q_ref)
+    assert torch.equal(k, k_ref)
+    assert torch.equal(v, v_ref)
 
 
 @pytest.mark.parametrize("fuse_l2norm", [False, True])

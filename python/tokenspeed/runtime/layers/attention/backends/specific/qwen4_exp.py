@@ -42,6 +42,7 @@ if TYPE_CHECKING:
         Qwen4ExpPLEBackend,
     )
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
 
@@ -68,6 +69,70 @@ class Qwen4ExpBackend(AttentionBackend):
         self.ple_backend = ple_backend
         self.indexer_backend = indexer_backend
 
+    @classmethod
+    def from_cache_view(
+        cls,
+        config: AttnConfig,
+        pool: CachePool,
+        attention_backend: AttentionBackend,
+    ) -> Qwen4ExpBackend:
+        """Build the consumers whose fields belong to this cache view.
+
+        Args:
+            config: This side's attention configuration.
+            pool: The target or draft view defining the local layer window.
+            attention_backend: The existing full-attention router, optionally
+                wrapped by a hybrid backend for this view's GDN layers.
+
+        Returns:
+            The complete composite, left unbound for the common pool-binding
+            lifecycle after construction.
+
+        Raises:
+            ValueError: The view contains only one of the QSA cache groups.
+        """
+        from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
+            QSAIndexerBackend,
+        )
+        from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
+            Qwen4ExpPLEBackend,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
+            QWEN4_EXP_PLE_CACHE_GROUP,
+            QWEN4_EXP_QSA_CACHE_GROUP,
+            QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+            cache_field_layer_id,
+        )
+
+        local_groups = {
+            field.group_id
+            for field in pool.arena.plan.fields
+            if cache_field_layer_id(field.field_id) in pool.field_layer_range
+        }
+        ple = (
+            Qwen4ExpPLEBackend(config, config.component(SoftmaxAttnConfig))
+            if QWEN4_EXP_PLE_CACHE_GROUP in local_groups
+            else None
+        )
+        qsa_groups = {QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP}
+        if local_groups & qsa_groups and not qsa_groups <= local_groups:
+            raise ValueError(
+                "QSA consumer requires both compressed and recent cache groups"
+            )
+        full_attn_backend = (
+            attention_backend.full_attn_backend
+            if isinstance(attention_backend, HybridLinearAttnBackend)
+            else attention_backend
+        )
+        indexer = (
+            QSAIndexerBackend(config, full_attn_backend)
+            if qsa_groups <= local_groups
+            else None
+        )
+        return cls(config, attention_backend, ple, indexer)
+
     def child_backends(self) -> tuple[AttentionBackend, ...]:
         return (self.attention_backend,) + tuple(
             backend
@@ -85,14 +150,13 @@ class Qwen4ExpBackend(AttentionBackend):
         """Preallocate target verify consumers and return their total byte count."""
         if self.is_draft or self.spec_num_tokens <= 1:
             return 0
-        gdn = (
-            self.attention_backend.linear_attn_backend
-            if isinstance(self.attention_backend, HybridLinearAttnBackend)
-            else None
-        )
         return sum(
             consumer.preallocate_verify_workspace(max_bs, draft_token_num)
-            for consumer in (gdn, self.ple_backend, self.indexer_backend)
+            for consumer in (
+                self.attention_backend,
+                self.ple_backend,
+                self.indexer_backend,
+            )
             if consumer is not None
         )
 
@@ -183,27 +247,32 @@ class Qwen4ExpBackend(AttentionBackend):
             return self.attention_backend.full_attn_backend
         return self.attention_backend
 
+    # Drafter length-edit hooks fan out to the attention child (a hybrid
+    # composite forwards them to its full-attention router) and the indexer.
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
-        self._full_attn_backend.advance_draft_forward_metadata(seq_lens)
+        self.attention_backend.advance_draft_forward_metadata(seq_lens)
         if self.indexer_backend is not None:
             self.indexer_backend.advance_draft_forward_metadata(seq_lens)
 
     def update_draft_forward_metadata(self, frontier: torch.Tensor) -> None:
-        # Hybrid's base implementation is a no-op; publish to the router itself.
-        self._full_attn_backend.update_draft_forward_metadata(frontier)
+        self.attention_backend.update_draft_forward_metadata(frontier)
         if self.indexer_backend is not None:
             self.indexer_backend.update_draft_forward_metadata(frontier)
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
-        self._full_attn_backend.fill_block_decode_seq_lens(bs, block_seq_lens)
+        self.attention_backend.fill_block_decode_seq_lens(bs, block_seq_lens)
         if self.indexer_backend is not None:
             self.indexer_backend.fill_block_decode_seq_lens(bs, block_seq_lens)
 
     def commit_speculative_state_after_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
     ) -> None:
         self.attention_backend.commit_speculative_state_after_verify(
-            accepted_lengths, num_extends=num_extends
+            accepted_lengths, num_extends=num_extends, accepted_path=accepted_path
         )
         if num_extends == 0 and self.ple_backend is not None:
             self.ple_backend.commit_verified_state(accepted_lengths)

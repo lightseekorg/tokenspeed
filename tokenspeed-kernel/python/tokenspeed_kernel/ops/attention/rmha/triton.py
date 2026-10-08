@@ -30,6 +30,20 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 _MIN_BLOCK_KV = 32
+_LOG2E: tl.constexpr = tl.constexpr(1.4426950408889634)
+_LN2: tl.constexpr = tl.constexpr(0.6931471805599453)
+# Position offset for padded rows/keys; distances stay within int32.
+_FAR_POSITION: tl.constexpr = tl.constexpr(1 << 29)
+
+
+@triton.jit
+def _load_kv_tile(ptrs, col_mask, MASK_COLS: tl.constexpr):
+    # Rows are always in bounds; only a non-power-of-two head dim needs masking.
+    if MASK_COLS:
+        tile = tl.load(ptrs, mask=col_mask, other=0.0)
+    else:
+        tile = tl.load(ptrs)
+    return tile
 
 
 @triton.jit
@@ -100,8 +114,14 @@ def _rel_mha_prefill_kernel(
 
     q_local = cur_block_m * BLOCK_M + offs_m
     q_global = cur_seq_extend_start_idx + q_local
-    query_positions = cur_q_start + q_local[:, None]
     mask_m = q_local < cur_seq_len_extend
+    # Padded query rows sit far before every key so their distance is negative.
+    query_positions = tl.where(mask_m, cur_q_start + q_local, -_FAR_POSITION)
+    # One unsigned compare per score covers causal, window and padding masks.
+    if WINDOW_LEFT >= 0:
+        attend_limit = WINDOW_LEFT
+    else:
+        attend_limit = 0x7FFFFFFF
     mask_d = offs_d < Lq
     mask_dv = offs_dv < Lv
 
@@ -112,101 +132,103 @@ def _rel_mha_prefill_kernel(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, cur_seq_len, BLOCK_N):
+    # Visit only KV tiles that some query row of this block can attend to:
+    # keys past the block's last query are causally masked, and keys more
+    # than WINDOW_LEFT before its first query fall outside the window. Blocks
+    # past a shorter sequence's end (the grid follows the longest) skip the loop.
+    block_q_end = cur_q_start + tl.minimum(
+        (cur_block_m + 1) * BLOCK_M, cur_seq_len_extend
+    )
+    kv_end = tl.minimum(cur_seq_len, block_q_end)
+    kv_end = tl.where(cur_block_m * BLOCK_M < cur_seq_len_extend, kv_end, 0)
+    kv_start = 0
+    if WINDOW_LEFT >= 0:
+        kv_start = tl.maximum(cur_q_start + cur_block_m * BLOCK_M - WINDOW_LEFT, 0)
+        kv_start = kv_start // BLOCK_N * BLOCK_N
+
+    for start_n in range(kv_start, kv_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
-        key_positions = start_n + offs_n[None, :]
         mask_n = (start_n + offs_n) < cur_seq_len
-        rel_dist = query_positions - key_positions
-        final_mask = mask_m[:, None] & mask_n[None, :] & (rel_dist >= 0)
-        if WINDOW_LEFT >= 0:
-            final_mask &= rel_dist <= WINDOW_LEFT
-
-        skip_tile = False
-        if WINDOW_LEFT >= 0:
-            skip_tile = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
-
-        if not skip_tile:
-            if HAS_KV_CACHE:
-                cache_token_indices = start_n + offs_n
-                page_indices = cache_token_indices // PAGE_SIZE
-                page_offsets = cache_token_indices - page_indices * PAGE_SIZE
-                physical_pages = tl.load(
-                    page_table + cur_seq * page_table_stride_b + page_indices,
-                    mask=mask_n,
-                    other=0,
-                )
-                kv_loc = physical_pages.to(tl.int64) * PAGE_SIZE + page_offsets
-                offs_k = (
-                    kv_loc[None, :] * stride_buf_kbs
-                    + cur_kv_head * stride_buf_kh
-                    + offs_d[:, None]
-                )
-                k = tl.load(
-                    K_Buffer + offs_k,
-                    mask=mask_n[None, :] & mask_d[:, None],
-                    other=0.0,
-                )
-            else:
-                offs_k = (
-                    (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
-                    + cur_kv_head * stride_kh
-                    + offs_d[:, None]
-                )
-                k = tl.load(
-                    K_Extend + offs_k,
-                    mask=mask_n[None, :] & mask_d[:, None],
-                    other=0.0,
-                )
-
-            qk = tl.dot(q.to(k.dtype), k) * sm_scale
-
-            rel_valid = (rel_dist >= 0) & (rel_dist < REL_EXTENT)
-            rel_idx = tl.maximum(rel_dist, 0)
-            rel_idx = tl.minimum(rel_idx, REL_EXTENT - 1)
-            rel_offsets = (
-                q_global[:, None] * stride_rel_t
-                + cur_head * stride_rel_h
-                + rel_idx * stride_rel_e
+        # Keys past the sequence sit far after every query (negative distance).
+        key_positions = tl.where(mask_n, start_n + offs_n, _FAR_POSITION)
+        # Negative distances wrap to large unsigned values and fail both
+        # `< REL_EXTENT` and `<= attend_limit`.
+        rel_dist = (query_positions[:, None] - key_positions[None, :]).to(
+            tl.uint32, bitcast=True
+        )
+        # Clamp instead of masking K/V rows: tail keys reread the last valid
+        # token, whose finite values the -inf scores then drop.
+        kv_idx = tl.minimum(start_n + offs_n, cur_seq_len - 1)
+        if HAS_KV_CACHE:
+            # A tile is exactly one page, so one page-table entry covers it.
+            tl.static_assert(PAGE_SIZE == BLOCK_N)
+            page = tl.load(
+                page_table + cur_seq * page_table_stride_b + start_n // PAGE_SIZE
             )
-            rel_bias = tl.load(
-                Rel_Logits + rel_offsets,
-                mask=mask_m[:, None] & rel_valid,
-                other=0.0,
-            ).to(tl.float32)
-            qk += rel_bias
-            qk = tl.where(final_mask, qk, float("-inf"))
+            kv_rows = page.to(tl.int64) * PAGE_SIZE + (kv_idx - start_n)
+            k = _load_kv_tile(
+                K_Buffer
+                + kv_rows[None, :] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+                + offs_d[:, None],
+                mask_d[:, None],
+                Lq != BLOCK_DMODEL,
+            )
+        else:
+            kv_rows = cur_seq_extend_start_idx + kv_idx
+            k = _load_kv_tile(
+                K_Extend
+                + kv_rows[None, :] * stride_kbs
+                + cur_kv_head * stride_kh
+                + offs_d[:, None],
+                mask_d[:, None],
+                Lq != BLOCK_DMODEL,
+            )
 
-            row_max = tl.max(qk, 1)
-            row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
-            n_e_max = tl.maximum(row_max_fixed, e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
-            deno = deno * re_scale + tl.sum(p, 1)
+        # Softmax runs in the log2 domain: exp2 skips exp's denormal fix-up.
+        qk = tl.dot(q.to(k.dtype), k) * (sm_scale * _LOG2E)
 
-            if HAS_KV_CACHE:
-                offs_v = (
-                    kv_loc[:, None] * stride_buf_vbs
-                    + cur_kv_head * stride_buf_vh
-                    + offs_dv[None, :]
-                )
-                v = tl.load(
-                    V_Buffer + offs_v,
-                    mask=mask_n[:, None] & mask_dv[None, :],
-                    other=0.0,
-                )
-            else:
-                offs_v = (
-                    (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
-                    + cur_kv_head * stride_vh
-                    + offs_dv[None, :]
-                )
-                v = tl.load(
-                    V_Extend + offs_v,
-                    mask=mask_n[:, None] & mask_dv[None, :],
-                    other=0.0,
-                )
-            acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v)
-            e_max = n_e_max
+        rel_idx = tl.minimum(rel_dist, REL_EXTENT - 1).to(tl.int32, bitcast=True)
+        rel_offsets = (
+            q_global[:, None] * stride_rel_t
+            + cur_head * stride_rel_h
+            + rel_idx * stride_rel_e
+        )
+        rel_bias = tl.load(
+            Rel_Logits + rel_offsets,
+            mask=rel_dist < REL_EXTENT,
+            other=0.0,
+        ).to(tl.float32)
+        qk += rel_bias * _LOG2E
+        qk = tl.where(rel_dist <= attend_limit, qk, float("-inf"))
+
+        row_max = tl.max(qk, 1)
+        row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+        n_e_max = tl.maximum(row_max_fixed, e_max)
+        re_scale = tl.exp2(e_max - n_e_max)
+        p = tl.exp2(qk - n_e_max[:, None])
+        deno = deno * re_scale + tl.sum(p, 1)
+
+        if HAS_KV_CACHE:
+            v = _load_kv_tile(
+                V_Buffer
+                + kv_rows[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + offs_dv[None, :],
+                mask_dv[None, :],
+                Lv != BLOCK_DV,
+            )
+        else:
+            v = _load_kv_tile(
+                V_Extend
+                + kv_rows[:, None] * stride_vbs
+                + cur_kv_head * stride_vh
+                + offs_dv[None, :],
+                mask_dv[None, :],
+                Lv != BLOCK_DV,
+            )
+        acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v)
+        e_max = n_e_max
 
     safe_deno = tl.where(deno > 0.0, deno, 1.0)
     offs_o = q_global[:, None] * stride_obs + cur_head * stride_oh + offs_dv[None, :]
@@ -225,7 +247,7 @@ def _rel_mha_prefill_kernel(
 
     if HAS_LSE:
         offs_lse = q_global * stride_lse_bs + cur_head * stride_lse_h
-        lse = tl.where(deno > 0.0, tl.log(deno) + e_max, float("-inf"))
+        lse = tl.where(deno > 0.0, (tl.log2(deno) + e_max) * _LN2, float("-inf"))
         tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 
 

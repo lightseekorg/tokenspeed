@@ -192,6 +192,55 @@ def _rope_quantize(
     )
 
 
+def composite_latent_store(
+    latent: torch.Tensor, *, kv_lora_rank: int, cache: LatentKVCache, enable_pdl: bool
+) -> None:
+    """Store rotated latent rows into a native latent cache.
+
+    The composite prologue's own store step, for rows ``mla_prologue(cache=None)``
+    rotated (and a caller may have gathered from other ranks since): the
+    leading ``cache.slots.numel()`` rows land at their slots, split at
+    ``kv_lora_rank`` into the latent and RoPE parts the store kernel takes.
+    """
+    rows = cache.slots.numel()
+    latent_rows = latent[:rows].unsqueeze(1)
+    _write_latent(
+        cache,
+        latent_rows[..., :kv_lora_rank],
+        latent_rows[..., kv_lora_rank:],
+        enable_pdl,
+    )
+
+
+def _rotate_absorbed(
+    query: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    rotary: Rotary | None,
+    q_nope_dim: int,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Assemble the query's RoPE channels from ``q_pe`` and rotate them with
+    the key RoPE rows in the activation dtype; returns the rotated key rows
+    (``k_pe`` itself when the kernel rotated in place)."""
+    q_rope = query[..., q_nope_dim:]
+    if q_pe.data_ptr() != q_rope.data_ptr():
+        q_rope.copy_(q_pe)
+    if rotary is None:
+        return k_pe
+    q_rot, k_rot = apply_rope(
+        rotary.positions,
+        q_rope,
+        k_pe,
+        rope_dim,
+        rotary.cos_sin_cache,
+        is_neox=rotary.style is RopeStyle.NEOX,
+    )
+    if q_rot.data_ptr() != q_rope.data_ptr():
+        q_rope.copy_(q_rot)
+    return k_rot
+
+
 def _write_latent(
     cache: LatentKVCache, k_nope: torch.Tensor, k_rope: torch.Tensor, enable_pdl: bool
 ) -> None:
@@ -235,6 +284,7 @@ def _write_latent(
         "kv_convert": BOOLS,
         "rope_style": ROPE_STYLES,
         "sanitize": BOOLS,
+        "store": BOOLS,
     },
 )
 def composite_mla_prologue(
@@ -244,16 +294,25 @@ def composite_mla_prologue(
     latent_cache: torch.Tensor,
     expanded: MLAExpandedKV | None,
     rotary: Rotary | None,
-    cache: LatentKVCache,
+    cache: LatentKVCache | None,
     enable_pdl: bool,
 ) -> MLAPrologueOutput:
-    rows = cache.slots.numel()
     num_heads, rope_dim = q_pe.shape[1:]
     q_nope_dim = query.shape[-1] - rope_dim
     rank = latent_cache.shape[-1] - rope_dim
     latent = latent_cache.unsqueeze(1)
     k_nope, k_pe = latent[..., :rank], latent[..., rank:]
     key = value = None
+    if cache is None:
+        # The store-less form: the native arm's rotation with the rotated
+        # key rows left in the latent for ``latent_store`` -- the same bytes
+        # the native-cache path below writes, since both round the rotation
+        # once.
+        k_rot = _rotate_absorbed(query, q_pe, k_pe, rotary, q_nope_dim, rope_dim)
+        if k_rot.data_ptr() != k_pe.data_ptr():
+            k_pe.copy_(k_rot)
+        return MLAPrologueOutput(query=query, key=None, value=None, latent=latent_cache)
+    rows = cache.slots.numel()
     if cache.format is KVCacheFormat.FP8:
         if expanded is None:
             query, latent = _rope_quantize(
@@ -272,20 +331,7 @@ def composite_mla_prologue(
         if expanded is not None:
             # Fresh outputs: a graph segment runs this ahead of a break that reads the inputs.
             query, k_pe = query.clone(), k_pe.clone()
-        q_rope = query[..., q_nope_dim:]
-        if q_pe.data_ptr() != q_rope.data_ptr():
-            q_rope.copy_(q_pe)
-        if rotary is not None:
-            q_rot, k_pe = apply_rope(
-                rotary.positions,
-                q_rope,
-                k_pe,
-                rope_dim,
-                rotary.cos_sin_cache,
-                is_neox=rotary.style is RopeStyle.NEOX,
-            )
-            if q_rot.data_ptr() != q_rope.data_ptr():
-                q_rope.copy_(q_rot)
+        k_pe = _rotate_absorbed(query, q_pe, k_pe, rotary, q_nope_dim, rope_dim)
         if expanded is not None:
             key = torch.cat((expanded.k_nope, k_pe.expand(-1, num_heads, -1)), dim=-1)
             value = expanded.value

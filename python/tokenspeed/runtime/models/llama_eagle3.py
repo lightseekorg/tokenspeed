@@ -565,17 +565,25 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
 
         self.load_lm_head_from_target = False
         if self.config.tie_word_embeddings:
+            if mapping.attn.has_dp and mapping.lm_head.has_tp:
+                raise ValueError(
+                    "--lm-head-tp-size > 1 vocab-shards the LM head, but this "
+                    "draft ties it to its replicated embedding (tie_word_embeddings)"
+                )
             self.lm_head = self.model.embed_tokens
         else:
             if getattr(config, "draft_vocab_size", None) is None:
                 self.load_lm_head_from_target = True
+            # The draft's head follows the target's LM-head layout
+            # (mapping.lm_head): the shared target head arrives in that
+            # layout, and a draft-vocab head shards the same way.
             self.lm_head = ParallelLMHead(
                 getattr(config, "draft_vocab_size", None) or config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                tp_rank=mapping.attn.tp_rank,
-                tp_size=mapping.attn.tp_size,
-                tp_group=mapping.attn.tp_group,
+                tp_rank=mapping.lm_head.tp_rank,
+                tp_size=mapping.lm_head.tp_size,
+                tp_group=mapping.lm_head.tp_group,
                 prefix=add_prefix("lm_head", prefix),
             )
 
@@ -583,9 +591,10 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             config,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
+            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
         self.capture_aux_hidden_states = True
         self.hot_token_id = None

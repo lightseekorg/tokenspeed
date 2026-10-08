@@ -449,6 +449,13 @@ class InputBuffers:
                 runtime_states.future_input_map[decode_req_pool_indices, 1:] = (
                     torch.where(force_single_token.unsqueeze(1), dummy_tail, tail)
                 )
+            if runtime_states.future_parent_map is not None:
+                parents = runtime_states.future_parent_map[decode_req_pool_indices]
+                runtime_states.future_parent_map[decode_req_pool_indices] = torch.where(
+                    force_single_token.unsqueeze(1),
+                    runtime_states.chain_parents,
+                    parents,
+                )
             self.force_single_token_verify_buf[
                 row_offset : row_offset + expected_count
             ] = force_single_token

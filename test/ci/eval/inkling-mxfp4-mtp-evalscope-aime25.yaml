@@ -13,16 +13,17 @@ env:
 install:
   - bash test/ci_system/install_deps_rocm.sh
 server:
+  # AIME25 has 30 problems. Admit them all at once (32 seqs) so the run is
+  # bounded by the longest single answer rather than by a late second wave.
   command: >-
     ts serve
     --model lightseekorg/Inkling-MXFP4
     --attn-tp-size 4
     --moe-tp-size 4
     --max-model-len 102400
-    --max-num-seqs 16
+    --max-num-seqs 32
     --max-prefill-tokens 8192
     --chunked-prefill-size 8192
-    --gpu-memory-utilization 0.95
     --disable-cuda-graph-padding
     --trust-remote-code
     --enable-prefix-caching
@@ -50,7 +51,7 @@ eval:
     --datasets aime25
     --dataset-hub huggingface
     --dataset-args '{"aime25":{"dataset_id":"math-ai/aime25"}}'
-    --eval-batch-size 16
+    --eval-batch-size 32
     --stream
     --generation-config '{"do_sample":true,"temperature":1.0,"top_p":0.95,"max_tokens":81920,"timeout":1800}'
 report:

@@ -468,7 +468,6 @@ def main():
         rank=rank,
         world_size=world_size,
         attn_tp_size=world_size,
-        attn_cp_size=1,
         attn_dp_size=1,
         attn_dcp_size=args.dcp_size,
     )

@@ -173,6 +173,63 @@ def test_fused_advance_without_ngram_history_only_moves_cache_lengths():
         )
 
 
+def test_fused_advance_compiles_once_across_batch_shapes():
+    """Batch, extend and token counts change every round; none may key a new binary."""
+    from tokenspeed_kernel.ops.metadata.accepted_frontier import (
+        _advance_accepted_frontier_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    # The pool and its padding slot are fixed for a server's lifetime.
+    pool = 512
+
+    def run(batch, num_extends, history):
+        tokens = max(256, batch * 6) + batch % 2
+        slots, inputs, accepts, valid, tail, previous, mask, ids = _batch(
+            batch, num_extends, pool, tokens, 3, 0, seed=batch
+        )
+        expected = valid.clone()
+        _eager_reference(
+            slots,
+            inputs,
+            accepts,
+            expected,
+            num_extends,
+            pool - 1,
+            None,
+            None,
+            None,
+            None,
+        )
+        advance_accepted_frontier(
+            slots,
+            inputs,
+            accepts,
+            valid,
+            num_extends,
+            pool - 1,
+            ngram_tail=tail if history else None,
+            ngram_previous_tokens=previous if history else None,
+            ngram_token_mask=mask if history else None,
+            input_ids=ids if history else None,
+        )
+        assert torch.equal(valid, expected)
+
+    for history in (False, True):
+        run(7, 3, history)
+    with assert_no_triton_compile(_advance_accepted_frontier_kernel):
+        for batch, num_extends in (
+            (1, 0),
+            (1, 1),
+            (16, 16),
+            (17, 1),
+            (64, 5),
+            (300, 33),
+        ):
+            for history in (False, True):
+                run(batch, num_extends, history)
+
+
 def test_advance_runs_on_cpu_tensors_as_tensor_ops():
     """Devices without the kernel (NPU, CPU tests) take the tensor path."""
     pool = 16

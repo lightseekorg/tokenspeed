@@ -192,6 +192,38 @@ def test_mha_prefill_packed_gqa(dtype, group_size):
     torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
 
 
+@pytest.mark.parametrize(
+    "seqlens,window_left",
+    [([256, 256], -1), ([300, 77], -1), ([640], 512)],
+    ids=["full-tiles", "guarded-rows", "window512"],
+)
+def test_mha_prefill_selected_packed_gqa(seqlens, window_left):
+    """Run the packed GQA schedule that _select_packed_gqa enables.
+
+    Selection only accepts multi-thousand-token batches, so force it on small
+    ones. Unlike the forced packed config above, this takes the selected path:
+    reversed query blocks, the deep pipeline for causal attention, the 32-wide
+    KV tile for the 512 window, and guarded query rows for ragged lengths.
+    """
+    device, dtype = "cuda", torch.bfloat16
+    n_q_heads, n_kv_heads, head_dim = 8, 1, 128
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+
+    original_selector = prefill._select_packed_gqa
+    prefill._select_packed_gqa = lambda **_kwargs: True
+    try:
+        out = prefill.launch_gluon_mha_prefill_gfx1250(
+            q, k, v, cu, cu_cpu, max_seqlen, window_left=window_left
+        )
+    finally:
+        prefill._select_packed_gqa = original_selector
+
+    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim, window_left)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
 def test_mha_prefill_addresses_past_four_gib():
     """Sequence and head bases must not wrap through 32-bit buffer offsets."""
     device, dtype = "cuda", torch.bfloat16
@@ -369,12 +401,22 @@ def test_select_packed_gqa():
             }
         )
     )
+    assert prefill._select_packed_gqa(
+        **(kwargs | {"seqlens": [4096] * 4, "max_seqlen": 4096})
+    )
+    assert prefill._select_packed_gqa(
+        **(kwargs | {"seqlens": [8192] * 2, "max_seqlen": 8192})
+    )
 
     for override in (
         {"dtype": torch.float8_e4m3fn},
         {"head_dim": 64},
         {"n_heads": 32, "n_kv_heads": 8},
-        {"seqlens": [4096] * 4, "max_seqlen": 4096},
+        {
+            "dtype": torch.float16,
+            "seqlens": [4096] * 4,
+            "max_seqlen": 4096,
+        },
         {"has_sink": True},
         {"packed_q_block_bytes": 2**32 + 1},
     ):
@@ -445,9 +487,11 @@ def test_mha_prefill_reverse_counts_live_ragged_workgroups():
     assert not torch.isnan(out).any()
 
 
-def test_mha_prefill_tdm_warp_hint_remainder():
+# The two-head case is the same schedule at a size the MI450 simulator affords.
+@pytest.mark.parametrize("n_q_heads,n_kv_heads", [(8, 2), (2, 1)], ids=["gqa4", "sim"])
+def test_mha_prefill_tdm_warp_hint_remainder(n_q_heads, n_kv_heads):
     device, dtype = "cuda", torch.bfloat16
-    n_q_heads, n_kv_heads, head_dim = 8, 2, 128
+    head_dim = 128
     q, k, v, cu, cu_cpu, max_seqlen = _inputs(
         [300, 513], n_q_heads, n_kv_heads, head_dim, device, dtype
     )
@@ -484,9 +528,11 @@ def test_mha_prefill_tdm_warp_hint_remainder():
     torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
 
 
-def test_mha_prefill_reverse_q_blocks_ragged():
+# The two-head case is the same schedule at a size the MI450 simulator affords.
+@pytest.mark.parametrize("n_q_heads,n_kv_heads", [(8, 2), (2, 1)], ids=["gqa4", "sim"])
+def test_mha_prefill_reverse_q_blocks_ragged(n_q_heads, n_kv_heads):
     device, dtype = "cuda", torch.bfloat16
-    n_q_heads, n_kv_heads, head_dim = 8, 2, 128
+    head_dim = 128
     q, k, v, cu, cu_cpu, max_seqlen = _inputs(
         [300, 513], n_q_heads, n_kv_heads, head_dim, device, dtype
     )

@@ -47,6 +47,7 @@ def _recipe(
     draft_layers: int = 0,
     linear_tp_size: int | None = None,
     pd_disaggregation_enabled: bool = False,
+    index_k_format: str = "fp8_scaled",
 ) -> Glm53FlashRecipe:
     linear_tp_size = linear_tp_size or tp_size
     dsa = DSAConfig(
@@ -65,6 +66,7 @@ def _recipe(
         index_topk=2048,
         index_head_dim=128,
         index_n_heads=32,
+        index_k_format=index_k_format,
         index_kpool=4,
     )
     linear = LinearAttnConfig(
@@ -240,6 +242,14 @@ def test_disaggregated_serving_requires_private_tail_transfer_bridge() -> None:
         pd_disaggregation_enabled=True,
     )
     with pytest.raises(NotImplementedError, match="request-local KPool tail"):
+        recipe.groups()
+
+
+def test_pooled_index_rows_are_planned_for_the_fp8_plane_only() -> None:
+    # The recipe sizes the pooled index-K rows as FP8 keys plus a scale; a
+    # config naming the bf16 plane must be refused, not silently misbudgeted.
+    recipe = _recipe(tp_size=4, mla_cache_dtype=torch.bfloat16, index_k_format="bf16")
+    with pytest.raises(ValueError, match="fp8_scaled"):
         recipe.groups()
 
 

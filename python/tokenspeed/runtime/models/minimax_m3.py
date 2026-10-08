@@ -88,7 +88,6 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
@@ -202,10 +201,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
         }
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=(
-                config.num_local_experts
-                + global_server_args_dict["ep_num_redundant_experts"]
-            ),
+            num_experts=config.num_local_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
@@ -724,8 +720,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
             prev_is_moe=previous_is_moe_layer,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(

@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.layernorm.triton import (
+    add_rmsnorm,
+)
+from tokenspeed_kernel.ops.layernorm.triton import (
     gated_residual_combine_norm as _gated_residual_combine_norm,
 )
 from tokenspeed_kernel.ops.layernorm.triton import (
@@ -214,6 +217,7 @@ def gated_residual_combine_norm(
 
 
 __all__ = [
+    "add_rmsnorm",
     "gated_residual_combine_norm",
     "grouped_gemma_rmsnorm",
     "grouped_rmsnorm",

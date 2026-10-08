@@ -430,7 +430,6 @@ def test_qwen4_exp_qsa_backend_resolution_pins_sparse_dispatch() -> None:
             is_kda=False,
             is_dsa=False,
             is_qsa=True,
-            has_cache_plan=True,
         )
         == "qsa"
     )
@@ -440,7 +439,6 @@ def test_qwen4_exp_qsa_backend_resolution_pins_sparse_dispatch() -> None:
             is_kda=False,
             is_dsa=False,
             is_qsa=True,
-            has_cache_plan=True,
         )
         == "qsa"
     )
@@ -583,6 +581,8 @@ def _qsa_extend_round(router: CacheGroupRouter, block_tables: dict, seq_lens) ->
         extend_replay_lens_cpu=torch.zeros_like(seq_lens - 1),
         extend_prompt_lens_cpu=seq_lens - 1 + ones,
         extend_with_prefix=True,
+        query_shard=None,
+        block_tables_cpu={},
     )
 
 

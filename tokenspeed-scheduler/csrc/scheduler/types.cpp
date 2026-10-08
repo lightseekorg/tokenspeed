@@ -40,7 +40,7 @@ void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroup
     // A group's transfer policy is dictated by the destination layout the
     // scheduler builds for it, so it cannot be chosen independently.
     const CacheTransferPolicy expected =
-        group.IsSnapshotStateGroup() ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
+        group.Kind() == AttnKind::kMambaState ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
     if (group.transfer_policy == CacheTransferPolicy::Unspecified) {
         throw std::invalid_argument(where + "PD cache requires an explicit transfer_policy");
     }
@@ -94,7 +94,7 @@ void SchedulerConfig::ValidateCapacityInputs() const {
         validateGroupCapacityInputs(*this, group);
         // A recurrent state advances one whole checkpoint at a time, so a chunk
         // must be able to cover one cache block.
-        if (group.IsSnapshotStateGroup() && max_scheduled_tokens < prefix_granularity) {
+        if (group.Kind() == AttnKind::kMambaState && max_scheduled_tokens < prefix_granularity) {
             throw std::invalid_argument("Scheduler: Mamba max_scheduled_tokens must cover one cache block");
         }
         if (group.replayable) {
@@ -113,7 +113,7 @@ void SchedulerConfig::ValidateCapacityInputs() const {
         // The final-chunk window rule and the state-checkpoint chunk alignment
         // would each reshape the other's chunk; no model needs both.
         for (const CacheGroupConfig& group : cache_groups) {
-            if (group.IsSnapshotStateGroup()) {
+            if (group.Kind() == AttnKind::kMambaState) {
                 throw std::invalid_argument(
                     "Scheduler: bounded-replay cache groups cannot be combined with snapshot-state groups");
             }

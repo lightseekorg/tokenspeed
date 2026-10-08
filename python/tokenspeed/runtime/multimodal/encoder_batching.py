@@ -70,3 +70,25 @@ def pack_encoder_batches(
     if group:
         groups.append(group)
     return groups
+
+
+def pack_encoder_batches_in_order(
+    token_counts: Sequence[int], *, max_tokens: int
+) -> list[list[int]]:
+    """Return consecutive groups of item indices of at most ``max_tokens``.
+
+    Unlike :func:`pack_encoder_batches` the groups keep the original order, so
+    their outputs concatenate into the items' own. An item exceeding the
+    budget is returned alone.
+    """
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+    groups: list[list[int]] = []
+    tokens = 0
+    for index, count in enumerate(token_counts):
+        if not groups or tokens + count > max_tokens:
+            groups.append([])
+            tokens = 0
+        groups[-1].append(index)
+        tokens += count
+    return groups

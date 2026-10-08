@@ -38,6 +38,8 @@ from tokenspeed_kernel.ops.attention.mla.cuda import (
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -312,8 +314,12 @@ class FlashMLABackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
         **kwargs,
     ):
+        reject_query_shard(query_shard, "FlashMLABackend")
+        del page_table_cpu
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "FlashMLA decode metadata goes through refresh_decode_metadata; "
@@ -778,6 +784,7 @@ class FlashMLABackend(PagedAttentionBackend):
                 group=self.dcp_group,
                 rank=self.dcp_rank,
                 sink=None,
+                keep_all_heads=False,
             ).unsqueeze(1)
             # The combine reduce-scatters weighted partials; no LSE for the
             # merged TP-local heads survives it, and the pre-merge local LSE

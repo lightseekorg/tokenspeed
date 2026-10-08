@@ -192,6 +192,13 @@ def _validate_flashinfer_fp8_blockscale_prepacked(
 
     expected_a_scales = (A.shape[1] // 128, A.shape[0])
     expected_b_scales = (B.shape[1] // 128, B.shape[0] // 128)
+    if (
+        A_scales.dtype != torch.float32
+        or B_scales.dtype != torch.float32
+        or A_scales.device != A.device
+        or B_scales.device != B.device
+    ):
+        raise ValueError("Prepacked scales must be FP32 on their operand's device")
     if tuple(A_scales.shape) != expected_a_scales or not A_scales.is_contiguous():
         raise ValueError(
             "prepacked activation scales must be contiguous with shape "
@@ -260,16 +267,26 @@ if gemm_fp8_nt_groupwise is not error_fn:
                 orig_m,
                 block_size,
             )
+            # A padded GEMM must not write past the caller's unpadded output.
+            # Aligned projection batches can write straight into communication
+            # scratch; strided or padded destinations retain the copy fallback.
+            direct_out = (
+                out is not None
+                and out.is_contiguous()
+                and out.shape == (A.shape[0], B.shape[0])
+                and orig_m == A.shape[0]
+            )
             output = gemm_fp8_nt_groupwise(
                 A,
                 B,
                 A_scales,
                 B_scales,
                 scale_major_mode="MN",
+                out=out if direct_out else None,
                 out_dtype=out_dtype,
             )
             output = output[:orig_m] if output.shape[0] != orig_m else output
-            if out is not None:
+            if out is not None and not direct_out:
                 out.copy_(output)
                 return out
             return output
@@ -312,7 +329,7 @@ mm_mxfp8 = error_fn
 
 if platform.is_nvidia and platform.is_blackwell:
     try:
-        from flashinfer.gemm import mm_mxfp8
+        from tokenspeed_kernel.thirdparty.flashinfer.mxfp8 import mm_mxfp8
     except ImportError:
         pass
 
@@ -439,6 +456,92 @@ if mm_mxfp8 is not error_fn:
         return output
 
 
+# ---- FlashInfer per-tensor FP8 (cuBLASLt) -------------------------------
+
+_FP8_TENSOR_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
+cublas_fp8_gemm = error_fn
+
+if platform.is_nvidia and platform.is_blackwell:
+    try:
+        from tokenspeed_kernel.thirdparty.flashinfer.fp8_gemm import cublas_fp8_gemm
+    except ImportError:
+        pass
+
+if cublas_fp8_gemm is not error_fn:
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="flashinfer_mm_fp8_tensor_scaled",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("a", "b"), "scaled-fp8", {_fp8_dtype}, scale=_FP8_TENSOR_SCALE
+        ),
+        # cuBLASLt reads B column-major: a transposed [N, K] weight.
+        traits={
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({False}),
+        },
+        priority=Priority.PERFORMANT + 3,
+    )
+    def flashinfer_mm_fp8_tensor_scaled(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Per-tensor scaled FP8 GEMM on FlashInfer's cuBLASLt backend.
+
+        Args:
+            A: ``[M, K]`` row-major FP8 activations.
+            B: ``[K, N]`` column-major FP8 weights (a transposed ``[N, K]``).
+            A_scales: One-element FP32 activation dequant scale.
+            B_scales: One-element FP32 weight dequant scale.
+            out_dtype: BF16 or FP16 output dtype.
+            alpha: Must be None; the per-tensor scales carry the dequant.
+            block_size: Must be None; the scales are per tensor.
+            out: Optional ``[M, N]`` output buffer.
+
+        Returns:
+            ``[M, N]`` output, ``out`` when given.
+        """
+        if alpha is not None or block_size is not None:
+            raise ValueError("per-tensor FP8 GEMM takes no alpha or block_size")
+        if out_dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(
+                f"per-tensor FP8 GEMM writes BF16 or FP16, not {out_dtype}"
+            )
+        # cuBLASLt reads dense operands: row-major A and column-major B.
+        A = A.contiguous()
+        B = B.t().contiguous().t()
+        direct = out is not None and out.is_contiguous()
+        result = (
+            out
+            if direct
+            else torch.empty(A.shape[0], B.shape[1], dtype=out_dtype, device=A.device)
+        )
+        cublas_fp8_gemm(
+            A.unsqueeze(0),
+            B.unsqueeze(0),
+            A_scales,
+            B_scales,
+            result.unsqueeze(0),
+        )
+        if out is None or direct:
+            return result
+        # cuBLASLt writes dense rows; a strided view gets a copy.
+        return out.copy_(result)
+
+
 # ---- FlashInfer FP4 -----------------------------------------------------
 
 mm_fp4 = error_fn
@@ -491,6 +594,123 @@ if mm_fp4 is not error_fn:
             out.copy_(output)
             return out
         return output
+
+
+# ---- FlashInfer FP4, cute-dsl backend, decode-sized M --------------------
+
+# Up to this M the CuTe-DSL kernel beat cuBLASLt on every measured SM100 shape; larger M stays on cuBLASLt.
+NVFP4_CUTE_DSL_MAX_M = 128
+# From K = 26624 on GB200, cuBLASLt splits K at small M and its bits stop matching this kernel's in-order sum.
+NVFP4_CUTE_DSL_MAX_K = 18432
+
+if mm_fp4 is not error_fn:
+    from flashinfer.gemm.gemm_base import (
+        _cute_dsl_gemm_fp4_runner,
+        _select_sm100_mm_fp4_cute_dsl_tactic,
+    )
+    from flashinfer.utils import get_device_sm_count
+
+    _nvfp4_cute_dsl_runner = functools.cache(_cute_dsl_gemm_fp4_runner)
+
+    def _aligned_copy(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
+        """``tensor`` itself, or a same-strided copy when its data is not ``alignment``-byte aligned."""
+        if tensor.data_ptr() % alignment == 0:
+            return tensor
+        copy = torch.empty_strided(
+            tensor.shape, tensor.stride(), dtype=tensor.dtype, device=tensor.device
+        )
+        return copy.copy_(tensor)
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="flashinfer_cute_dsl_mm_nvfp4",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 7),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=_NVFP4_FORMAT_SIGNATURES,
+        # mm's k for NVFP4 is the packed width, K // 2.
+        traits={
+            "m_max": frozenset({NVFP4_CUTE_DSL_MAX_M}),
+            "n_align": frozenset({8}),
+            "k_align": frozenset({16}),
+            "k_max": frozenset({NVFP4_CUTE_DSL_MAX_K // 2}),
+            "out_dtype": frozenset({torch.bfloat16, torch.float16}),
+        },
+        priority=Priority.SPECIALIZED + 4,
+    )
+    def flashinfer_cute_dsl_mm_nvfp4(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor,
+        B_scales: torch.Tensor,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor,
+        block_size: list[int] | None = None,
+        enable_pdl: bool,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """NVFP4 GEMM for decode-sized M, bit-identical to ``cublaslt_mm_nvfp4``.
+
+        cuBLASLt launches too few CTAs at small M to stream the weight at full
+        bandwidth; FlashInfer's persistent CuTe-DSL kernel does, summing K in
+        the same order up to :data:`NVFP4_CUTE_DSL_MAX_K`.
+
+        Args:
+            A: Packed FP4 activations ``[M, K // 2]``.
+            B: Packed FP4 weight as a ``[K // 2, N]`` view of ``[N, K // 2]``.
+            A_scales: Activation block-16 scales in the 128x4 swizzled layout.
+            B_scales: Weight block-16 scales, transposed like ``B``.
+            out_dtype: ``torch.bfloat16`` or ``torch.float16``.
+            alpha: One-element float32 global scale.
+            block_size: Scale block shape; only ``[16]`` is supported.
+            enable_pdl: Whether to enable Programmatic Dependent Launch.
+            out: Optional ``[M, N]`` output buffer.
+
+        Returns:
+            The ``[M, N]`` product, in ``out`` when supplied.
+        """
+        if block_size is not None and tuple(block_size) != (16,):
+            raise ValueError(f"NVFP4 scales use 16-element blocks, got {block_size}")
+        if alpha is None or alpha.numel() != 1:
+            raise ValueError("NVFP4 GEMM takes a one-element global alpha")
+        m, n, k = A.shape[0], B.shape[1], A.shape[1] * 2
+        direct = out is not None and out.is_contiguous() and out.data_ptr() % 16 == 0
+        result = (
+            out if direct else torch.empty((m, n), dtype=out_dtype, device=A.device)
+        )
+        # mm_fp4's own selector may pick split-K, which reorders the K sum; this one never does.
+        tactic = _select_sm100_mm_fp4_cute_dsl_tactic(
+            m, n, k, get_device_sm_count(A.device), 16
+        )
+        runner = _nvfp4_cute_dsl_runner(
+            platform.arch_version.major,
+            platform.arch_version.minor,
+            enable_pdl,
+            out_dtype,
+            True,
+        )
+        # mm_fp4's input order with uint8 FP4 storage; the runner never reads the workspace slot.
+        inputs = [
+            _aligned_copy(A.view(torch.uint8), 32),
+            _aligned_copy(B.view(torch.uint8), 32),
+            A_scales,
+            B_scales,
+            alpha,
+            out_dtype,
+            result,
+            16,
+            True,
+            None,
+        ]
+        runner(inputs=inputs, tactic=tactic)
+        if out is not None and not direct:
+            return out.copy_(result)
+        return result
 
 
 _CUTE_DSL_BACKEND = "cute-dsl"
@@ -754,6 +974,14 @@ def flashinfer_joint_bf16_supported(
     )
 
 
+def _canonical_bf16_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Normalize singleton strides of an already-contiguous matrix without copying."""
+    strides = (tensor.shape[1], 1)
+    if tensor.stride() != strides:
+        return tensor.as_strided(tensor.shape, strides)
+    return tensor
+
+
 def flashinfer_bf16_gemm(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
@@ -776,12 +1004,14 @@ def flashinfer_bf16_gemm(
     # WAR: the public auto heuristic excludes cute-dsl. Reuse the existing FI
     # dispatcher so eligible families enter one choose_one, including cache
     # lookup. A backend that cannot handle K must not exclude the other one.
+    # Contiguous singleton rows can retain a sliced tensor's larger row stride;
+    # FI's dynamic-M kernels require the canonical compact stride even at M=1.
     _fi_gemm.bf16_gemm_sm100(
-        a=x.detach(),
+        a=_canonical_bf16_view(x.detach()),
         b=weight.detach().t(),
         bias=None,
         pdl=pdl_enabled(),
-        out=out,
+        out=_canonical_bf16_view(out),
         workspace_buffer=workspace,
         runner_names=_bf16_gemm_runner_names(weight.shape[1]),
     )

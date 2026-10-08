@@ -39,7 +39,7 @@ DECODE1_DIST_PORT=${DECODE1_DIST_PORT:-33000}
 LB_HOST=${LB_HOST:-0.0.0.0}
 LB_PORT=${LB_PORT:-19345}
 PROMETHEUS_PORT=${PROMETHEUS_PORT:-29080}
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
 QUANTIZATION=${QUANTIZATION:-nvfp4}
@@ -147,7 +147,6 @@ COMMON_ARGS=(
   --model "$MODEL"
   --served-model-name "$SERVED_MODEL_NAME"
   --host 0.0.0.0
-  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --trust-remote-code
   --moe-backend "$MOE_BACKEND"
   --attention-backend "$ATTENTION_BACKEND"
@@ -161,6 +160,9 @@ COMMON_ARGS=(
   --disaggregation-transfer-backend mooncake
   --disaggregation-layerwise-interval 0
 )
+if [[ -n "$GPU_MEMORY_UTILIZATION" ]]; then
+  COMMON_ARGS+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
+fi
 
 MTP_ARGS=()
 if [[ "$ENABLE_MTP" == "1" ]]; then

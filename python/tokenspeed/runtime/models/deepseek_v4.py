@@ -27,6 +27,7 @@ until the HCA/CSA cache kernels are wired into TokenSpeed.
 
 from __future__ import annotations
 
+import functools
 import gc
 import re
 from collections.abc import Iterable
@@ -125,7 +126,12 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
-from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopK, TopKOutput
+from tokenspeed.runtime.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutput,
+    simulated_router_logits,
+)
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
     get_all2all_backend,
@@ -1558,6 +1564,16 @@ class DeepseekV4MLP(nn.Module):
         return out
 
 
+def _random_expert_ids(
+    param: torch.Tensor, generator: torch.Generator, num_experts: int
+) -> None:
+    """Give each token distinct experts, chosen uniformly at random."""
+    scores = torch.rand(
+        param.shape[0], num_experts, generator=generator, device=param.device
+    )
+    param.data.copy_(scores.topk(param.shape[1], dim=1).indices)
+
+
 class DeepseekV4MoEGate(nn.Module):
     def __init__(
         self,
@@ -1578,6 +1594,9 @@ class DeepseekV4MoEGate(nn.Module):
                     dtype=hash_indices_dtype,
                 ),
                 requires_grad=False,
+            )
+            self.tid2eid.dummy_initializer = functools.partial(
+                _random_expert_ids, num_experts=config.n_routed_experts
             )
             self.e_score_correction_bias = None
         elif getattr(config, "topk_method", None) == "noaux_tc":
@@ -1627,6 +1646,8 @@ class DeepseekV4TopK(TopK):
             if routing_correction_bias is None
             else routing_correction_bias
         )
+        if self.simulate_routing:
+            router_logits = simulated_router_logits(router_logits)
         topk_weights, topk_ids = moe_topk(
             router_logits,
             self.topk_config.top_k,
@@ -1777,8 +1798,7 @@ class DeepseekV4MoE(nn.Module):
         )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=config.n_routed_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=routed_quant_config,
@@ -2350,6 +2370,7 @@ class DeepseekV4Indexer(nn.Module):
                 page_size=indexer_block_size,
                 max_logits_bytes=max_logits_mb * 1024 * 1024,
                 out=topk_out[token_slice],
+                slot_order=global_server_args_dict["dsa_slot_order"],
             )
             selected_i64 = selected.to(torch.int64)
             row_starts_i64 = row_starts.to(torch.int64)
@@ -2383,6 +2404,7 @@ class DeepseekV4Indexer(nn.Module):
             index_k_cache=indexer_cache,
             topk_layout="logical_offsets",
             out=topk_out[decode_slice],
+            slot_order=global_server_args_dict["dsa_slot_order"],
         )
         return topk_out
 
@@ -3239,6 +3261,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=True,
             prev_is_moe=True,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

@@ -2153,7 +2153,7 @@ def test_prologue_kernels_constrain_only_traits_the_entries_state(monkeypatch):
 
 @pytest.mark.parametrize("mrope", [None, MRope((16, 8, 8), False)])
 def test_gqa_token_count_reuses_compiled_tiles(mrope):
-    """Warm each tile size and runtime integer class before varying batch sizes."""
+    """Warm each tile size once; token counts and index offsets then reuse it."""
     from tokenspeed_kernel.ops.attention.prologue.triton import _gqa_prologue_kernel
     from utils import assert_no_triton_compile
 
@@ -2162,9 +2162,10 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
     norm = head_norm(dim, 1.0, seed=201)
     k_cache, v_cache = gqa_cache(2048, hkv, dim, BF16)
 
-    def run(count):
+    def run(count, offset):
         q, k, v = split(qkv(count, hq, hkv, dim, seed=202), hq, hkv, dim)
-        positions = torch.arange(count, device="cuda")
+        # An offset leaves the index vectors off 16-byte alignment, as slices of a batch do.
+        positions = torch.arange(-offset, count, device="cuda")
         if mrope is not None:
             positions = positions.repeat(3, 1)
         out = gqa_prologue(
@@ -2172,9 +2173,12 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
             k,
             v,
             norm=norm,
-            rotary=Rotary(table, positions, RopeStyle.NEOX, mrope),
+            rotary=Rotary(table, positions[..., offset:], RopeStyle.NEOX, mrope),
             cache=HeadKVCache(
-                k_cache, v_cache, None, torch.arange(count, device="cuda")
+                k_cache,
+                v_cache,
+                None,
+                torch.arange(-offset, count, device="cuda")[offset:],
             ),
             return_kv=True,
             solution="triton",
@@ -2183,11 +2187,12 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
         assert bytes_equal(k_cache[:count].flatten(1), out.k)
         assert bytes_equal(v_cache[:count].flatten(1), v)
 
-    for count in (1, 32, 33, 128, 129, 512, 513):
-        run(count)
+    for count in (32, 128, 512):
+        run(count, 0)
     with assert_no_triton_compile(_gqa_prologue_kernel):
-        for count in (7, 48, 63, 97, 192, 255, 320, 777, 1024):
-            run(count)
+        for count in (1, 7, 33, 48, 63, 97, 129, 192, 255, 320, 513, 777, 1024):
+            for offset in (0, 1):
+                run(count, offset)
 
 
 def test_mla_token_count_reuses_compiled_tiles():
@@ -2221,3 +2226,96 @@ def test_mla_token_count_reuses_compiled_tiles():
     with assert_no_triton_compile(_mla_rope_set_kv_buffer_kernel):
         for count in (7, 48, 97, 320, 333, 512, 555, 768, 777, 960, 999, 1280, 1483):
             run(count)
+
+
+@pytest.mark.parametrize("fused", ["composite", "triton"])
+@pytest.mark.parametrize("masked", [False, True])
+def test_the_storeless_prologue_and_latent_store_write_the_fused_bytes(masked, fused):
+    """``mla_prologue(cache=None)`` rotates and returns the latent for
+    ``latent_store``; rotation then store (the query-context-parallel write,
+    where other ranks' rows are gathered in between) must leave the query and
+    every stored row byte-equal to the fused one-launch write -- the
+    composite's and the production Triton kernel's, which agree with each
+    other -- including the rows an owner mask skips."""
+    from tokenspeed_kernel.ops.attention.prologue import latent_store
+
+    heads, rank, rope, tokens, total = 4, 512, 64, 96, 128
+    g = torch.Generator(device="cuda").manual_seed(11)
+    positions = torch.randint(0, 4096, (tokens,), device="cuda", generator=g)
+    rotary = Rotary(cos_sin_cache(rope), positions, RopeStyle.NEOX, None)
+    row_slots = slots(tokens, total, seed=12)
+    write_mask = (
+        torch.rand(tokens, device="cuda", generator=g) < 0.5 if masked else None
+    )
+    outputs = []
+    for store in (True, False):
+        q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=13)
+        query = mla_query(q_nope, rope)
+        cache = poisoned_latent(total, rank + rope, BF16)
+        target = latent_target(cache, row_slots, write_mask=write_mask)
+        if store:
+            out = mla_prologue(
+                query,
+                q_pe,
+                latent,
+                expanded=None,
+                rotary=rotary,
+                cache=target,
+                solution=fused,
+                override=None,
+            )
+            assert out.latent is None
+        else:
+            out = mla_prologue(
+                query,
+                q_pe,
+                latent,
+                expanded=None,
+                rotary=rotary,
+                cache=None,
+                solution=None,
+                override=None,
+            )
+            assert out.latent is not None and out.latent.shape == (tokens, rank + rope)
+            latent_store(out.latent, kv_lora_rank=rank, cache=target)
+        outputs.append((out.query.clone(), cache.clone()))
+    (fused_q, fused_cache), (split_q, split_cache) = outputs
+    assert bytes_equal(fused_q, split_q)
+    assert bytes_equal(fused_cache, split_cache)
+    written = torch.zeros(total, dtype=torch.bool, device="cuda")
+    written[row_slots[write_mask] if masked else row_slots] = True
+    assert not bytes_equal(
+        split_cache[written], poisoned_latent(total, rank + rope, BF16)[written]
+    )
+    assert bytes_equal(
+        split_cache[~written], poisoned_latent(total, rank + rope, BF16)[~written]
+    )
+
+
+def test_the_fused_kernel_declines_the_storeless_form():
+    """Only the composite returns the latent; the fused write must not be
+    admitted for ``cache=None``."""
+    heads, rank, rope, tokens = 4, 512, 64, 8
+    q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=14)
+    with pytest.raises(ValueError):
+        mla_prologue(
+            mla_query(q_nope, rope),
+            q_pe,
+            latent,
+            expanded=None,
+            rotary=None,
+            cache=None,
+            solution=None,
+            override="triton_mla_prologue",
+        )
+    with pytest.raises(ValueError, match="native latent caches"):
+        from tokenspeed_kernel.ops.attention.prologue import latent_store
+
+        latent_store(
+            latent,
+            kv_lora_rank=rank,
+            cache=latent_target(
+                poisoned_latent(16, rank + rope, FP8),
+                torch.arange(tokens, device="cuda"),
+            ),
+        )

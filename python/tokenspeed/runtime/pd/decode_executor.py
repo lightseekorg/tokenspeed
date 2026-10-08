@@ -42,6 +42,7 @@ class DisaggDecodeExecutor:
         self._admissions: dict[str, tuple[int, int]] = {}
         self._remote_cache_slots: dict[str, int] = {}
         self._remote_cached_tokens: dict[str, int] = {}
+        self._remote_bootstrap_logprobs: dict[str, float | None] = {}
         self._remote_spec_candidate_ids: dict[str, tuple[int, list[int]]] = {}
 
     def _bootstrap(self, request_id, info):
@@ -143,14 +144,18 @@ class DisaggDecodeExecutor:
                 # which is the key used in MooncakeKVReceiver.
                 self._local_states[req_id] = TransferPoll.Success
                 bootstrap_room = self.receivers[req_id].bootstrap_room
-                bootstrap_token, spec_candidate_ids, cached_tokens = (
-                    self.kv_manager.pop_prefill_metadata(bootstrap_room)
-                )
+                (
+                    bootstrap_token,
+                    spec_candidate_ids,
+                    cached_tokens,
+                    bootstrap_logprob,
+                ) = self.kv_manager.pop_prefill_metadata(bootstrap_room)
                 request_pool_index, local_cached_tokens = self._admissions[req_id]
                 self._remote_cache_slots[req_id] = request_pool_index
                 self._remote_cached_tokens[req_id] = max(
                     local_cached_tokens, cached_tokens
                 )
+                self._remote_bootstrap_logprobs[req_id] = bootstrap_logprob
                 if spec_candidate_ids is not None:
                     self._remote_spec_candidate_ids[req_id] = (
                         request_pool_index,
@@ -184,6 +189,10 @@ class DisaggDecodeExecutor:
 
     def pop_remote_cached_tokens(self, request_id: str) -> int:
         return self._remote_cached_tokens.pop(request_id)
+
+    def pop_remote_bootstrap_logprob(self, request_id: str) -> float | None:
+        """The prefill node's logprob of the bootstrap token, None if it sent none."""
+        return self._remote_bootstrap_logprobs.pop(request_id, None)
 
     def pop_remote_cache_slot(self, request_id: str) -> int | None:
         return self._remote_cache_slots.pop(request_id, None)

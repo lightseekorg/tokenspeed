@@ -18,7 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlashInfer LL/BT public API and native-H3584 HT behind one workspace."""
+"""FlashInfer LL/BT/HT behind one workspace.
+
+The pinned FlashInfer version includes the H3584 HT kernel and tuning presets.
+Keep LL/BT capacity capped at 1024; only HT needs the full serving capacity.
+"""
 
 from __future__ import annotations
 
@@ -43,11 +47,17 @@ def allreduce_fusion_support_error(group, hidden_size, top_k, max_num_tokens, dt
         import torch.distributed._symmetric_memory as symm_mem
         from flashinfer.comm import allreduce_fusion
         from flashinfer.comm.mnnvl import is_multicast_supported
+        from flashinfer.comm.mnnvl_cutedsl.kernel_ht import protocol as ht_protocol
         from flashinfer.comm.mnnvl_cutedsl.kernel_ll.protocol import LLAllReduceTuning
         from flashinfer.comm.mnnvl_cutedsl_ar import (
             MNNVLCuteDSLAllReduceFusionWorkspace,
         )
-        from tokenspeed_kernel.thirdparty.cute_dsl.mnnvl_k3_ht import K3H3584HTProtocol
+
+        if not all(
+            hasattr(ht_protocol, name)
+            for name in ("HT_FINALIZE_GB300_H3584_K16", "HT_ALL_REDUCE_GB300_H3584")
+        ):
+            return "FlashInfer H3584 HT presets are unavailable"
 
         if symm_mem.get_backend(device) is None or not is_multicast_supported(
             device.index
@@ -59,7 +69,7 @@ def allreduce_fusion_support_error(group, hidden_size, top_k, max_num_tokens, dt
                 allreduce_fusion,
                 MNNVLCuteDSLAllReduceFusionWorkspace,
                 LLAllReduceTuning,
-                K3H3584HTProtocol,
+                ht_protocol.HTProtocol,
             )
         ):
             return "FlashInfer allreduce fusion interfaces are unavailable"
@@ -86,6 +96,11 @@ class MNNVLAllReduceFusionBackend:
             BTCollectiveTuning,
             BTFinalizeTuning,
         )
+        from flashinfer.comm.mnnvl_cutedsl.kernel_ht.protocol import (
+            HT_ALL_REDUCE_GB300_H3584,
+            HT_FINALIZE_GB300_H3584_K16,
+            HTProtocol,
+        )
         from flashinfer.comm.mnnvl_cutedsl.kernel_ll.protocol import (
             LLAllReduceTuning,
             LLCollectiveTuning,
@@ -93,11 +108,6 @@ class MNNVLAllReduceFusionBackend:
         )
         from flashinfer.comm.mnnvl_cutedsl_ar import (
             MNNVLCuteDSLAllReduceFusionWorkspace,
-        )
-        from tokenspeed_kernel.thirdparty.cute_dsl.mnnvl_k3_ht import (
-            K3_HT_ALL_REDUCE_GB300_H3584,
-            K3_HT_FINALIZE_GB300_H3584_K16,
-            K3H3584HTProtocol,
         )
 
         self._allreduce_fusion = allreduce_fusion
@@ -178,10 +188,10 @@ class MNNVLAllReduceFusionBackend:
             config=MNNVLCuteDSLConfig(profiles=(profile,)),
         )
         self._ht = None
-        self._ht_finalize_tuning = K3_HT_FINALIZE_GB300_H3584_K16
-        self._ht_allreduce_tuning = K3_HT_ALL_REDUCE_GB300_H3584
+        self._ht_finalize_tuning = HT_FINALIZE_GB300_H3584_K16
+        self._ht_allreduce_tuning = HT_ALL_REDUCE_GB300_H3584
         if max_num_tokens > 1024:
-            self._ht = K3H3584HTProtocol(
+            self._ht = HTProtocol(
                 hidden_size=hidden_size,
                 top_k=top_k,
                 tp_size=group.size(),

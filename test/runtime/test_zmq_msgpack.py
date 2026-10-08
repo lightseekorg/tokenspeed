@@ -395,7 +395,12 @@ def test_recv_socket_aborts_request_with_invalid_sampling_params():
     # and OutputProcesser streams as a terminal "abort" output.
     bad = _add_frames("bad", SamplingParams(top_k=0))
     good = _add_frames("good", SamplingParams(top_k=-1))
-    recv = zmq_msgpack.MsgpackRecvSocket(_FakeInputSocket([bad, good]), vocab_size=32)
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket([bad, good]),
+        vocab_size=32,
+        enable_output_logprobs=False,
+        supports_prompt_logprobs=True,
+    )
 
     io_bad = recv.recv_pyobj()
     assert io_bad.rid == "bad"
@@ -427,6 +432,7 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         _FakeInputSocket([_logprob_frames("r1")]),
         vocab_size=32,
         enable_output_logprobs=False,
+        supports_prompt_logprobs=True,
     )
     io = recv_off.recv_pyobj()
     assert io.rid == "r1"
@@ -436,8 +442,70 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         _FakeInputSocket([_logprob_frames("r2")]),
         vocab_size=32,
         enable_output_logprobs=True,
+        supports_prompt_logprobs=True,
     )
-    assert recv_on.recv_pyobj().validation_error is None
+    io = recv_on.recv_pyobj()
+    assert io.validation_error is None
+    # -1 resolves to the last prompt token, as on the pickle path.
+    assert io.logprob_start_len == 2
+
+
+@pytest.mark.parametrize(
+    ("overrides", "needle"),
+    [
+        ({"logprob_start_len": 0}, "msgpack output wire"),
+        ({"logprob_start_len": 1}, "msgpack output wire"),
+        ({"logprob_start_len": 3}, "smaller than the prompt length"),
+        ({"logprob_start_len": -2}, "must be -1 or >= 0"),
+        ({"top_logprobs_num": 2}, "top_logprobs_num"),
+        ({"token_ids_logprob": [1]}, "token_ids_logprob"),
+    ],
+)
+def test_recv_socket_mirrors_the_sglang_logprob_gate(overrides, needle):
+    # The slim per-step output has no prompt-logprob columns, so a start that
+    # would produce them is refused loudly instead of computed and dropped.
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket(
+            [_add_frames("r1", SamplingParams(), return_logprob=True, **overrides)]
+        ),
+        vocab_size=32,
+        enable_output_logprobs=True,
+        supports_prompt_logprobs=True,
+    )
+    io = recv.recv_pyobj()
+    assert io.validation_error and needle in io.validation_error
+
+    # The same knobs are inert without return_logprob (vLLM dialect).
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket([_add_frames("r2", SamplingParams(), **overrides)]),
+        vocab_size=32,
+        enable_output_logprobs=True,
+        supports_prompt_logprobs=True,
+    )
+    assert recv.recv_pyobj().validation_error is None
+
+
+def test_recv_socket_names_the_engine_capability_before_the_wire_limit():
+    # An engine that cannot score prompt rows (narrowing model, pipeline
+    # split) says so; the wire limit is the reason only once it could.
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket(
+            [
+                _add_frames(
+                    "r1", SamplingParams(), return_logprob=True, logprob_start_len=0
+                ),
+                _add_frames(
+                    "r2", SamplingParams(), return_logprob=True, logprob_start_len=-1
+                ),
+            ]
+        ),
+        vocab_size=32,
+        enable_output_logprobs=True,
+        supports_prompt_logprobs=False,
+    )
+    io = recv.recv_pyobj()
+    assert io.validation_error and "not supported by this engine" in io.validation_error
+    assert recv.recv_pyobj().validation_error is None
 
 
 def test_recv_socket_drops_malformed_message_and_keeps_draining():
@@ -447,7 +515,10 @@ def test_recv_socket_drops_malformed_message_and_keeps_draining():
     short = [b"\x07"]  # unknown type byte AND too few frames
     good = _add_frames("good", SamplingParams())
     recv = zmq_msgpack.MsgpackRecvSocket(
-        _FakeInputSocket([malformed, short, good]), vocab_size=32
+        _FakeInputSocket([malformed, short, good]),
+        vocab_size=32,
+        enable_output_logprobs=False,
+        supports_prompt_logprobs=True,
     )
     io = recv.recv_pyobj()
     assert io.rid == "good"
@@ -457,7 +528,12 @@ def test_recv_socket_drops_malformed_message_and_keeps_draining():
 
 def test_recv_socket_verify_does_not_apply_to_abort():
     abort = [zmq_wire.REQ_TYPE_ABORT, msgspec.msgpack.encode(["a", "b"])]
-    recv = zmq_msgpack.MsgpackRecvSocket(_FakeInputSocket([abort]), vocab_size=32)
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket([abort]),
+        vocab_size=32,
+        enable_output_logprobs=False,
+        supports_prompt_logprobs=True,
+    )
     a1 = recv.recv_pyobj()
     a2 = recv.recv_pyobj()
     assert {a1.rid, a2.rid} == {"a", "b"}
@@ -688,6 +764,8 @@ def test_connect_and_data_plane_roundtrip():
                     max_model_len=4096, dtype="bfloat16", vllm_version="tokenspeed-test"
                 ),
                 vocab_size=32000,
+                enable_output_logprobs=False,
+                supports_prompt_logprobs=True,
             )
             engine_holder["recv"] = recv
             engine_holder["send"] = send
@@ -772,6 +850,8 @@ def test_two_dp_ranks_connect_with_distinct_identities():
                     data_parallel_rank=index,
                 ),
                 vocab_size=32000,
+                enable_output_logprobs=False,
+                supports_prompt_logprobs=True,
             )
         except Exception as exc:
             errors[index] = exc

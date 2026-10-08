@@ -105,7 +105,6 @@ class DeepseekV41DSpark(BaseDrafter):
         )
         self.target_layer_ids = list(self.model.target_layer_ids)
         self.hidden_width = len(self.target_layer_ids) * int(self.model.hidden_size)
-        self.idle_forward_steps = 1
         max_bs = int(self.input_buffers.max_bs)
         self.next_tokens_buf = torch.empty(
             (max_bs, self.spec_num_tokens), dtype=torch.int32, device=self.device
@@ -122,6 +121,13 @@ class DeepseekV41DSpark(BaseDrafter):
             int(self.draft_model.lm_head.num_embeddings_per_partition),
             self.device,
         )
+
+    def idle_forward_global_num_tokens(
+        self, global_num_tokens: list[int], global_bs: list[int]
+    ) -> list[list[int]]:
+        # Block drafter: one draft forward proposes the whole block.
+        del global_bs
+        return [global_num_tokens]
 
     def wire_target(self, target_model) -> None:
         """Bind execution resources; model setup already configured capture."""

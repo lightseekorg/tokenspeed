@@ -48,6 +48,7 @@ from tokenspeed.runtime.pd.base.status import TransferPoll  # noqa: E402
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
     CachePDLayerwiseBlockSelection,
     CachePDLayerwiseGroupSelection,
+    CacheProducerSchedule,
     CacheTransferContract,
     build_cache_layerwise_block_selection,
 )
@@ -374,7 +375,44 @@ def _draft_final_layout() -> CacheTransferContract:
     )
 
 
-def test_draft_final_reservation_stays_aligned_across_forwards() -> None:
+def _stage_producer_schedule(
+    stage: int, target_cache_windows: tuple[tuple[int, int], ...]
+) -> CacheProducerSchedule:
+    """One stage's schedule over ``_draft_final_group``: two target cache
+    layers (``layer.0``, ``layer.1``) and two draft layers (``layer.2``,
+    ``layer.3``) that the final stage finalizes in one trailing step."""
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+        pipeline_cache_ownership,
+    )
+
+    owner = pipeline_cache_ownership(
+        num_target_cache_layers=2,
+        num_draft_cache_layers=2,
+        target_cache_windows=target_cache_windows,
+    )[stage]
+    return CacheProducerSchedule(
+        tuple(
+            tuple(f"layer.{layer}.kv" for layer in step)
+            for step in owner.producer_cache_layers
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "stage,target_cache_windows,target_steps,draft_final",
+    [
+        # One stage owns everything: two target steps and the draft-final step.
+        (0, ((0, 2),), 2, True),
+        # A pipeline's first stage owns one target layer and no draft fields;
+        # its readiness needs no draft-final event.
+        (0, ((0, 1), (1, 2)), 1, False),
+        # The last stage owns its target layer plus the trailing draft step.
+        (1, ((0, 1), (1, 2)), 1, True),
+    ],
+)
+def test_draft_final_reservation_stays_aligned_across_forwards(
+    stage, target_cache_windows, target_steps, draft_final
+) -> None:
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     class _Counter:
@@ -389,24 +427,30 @@ def test_draft_final_reservation_stays_aligned_across_forwards() -> None:
             assert delta_aux_step == 0
             self.reserved += delta_cache_step
 
+    schedule = _stage_producer_schedule(stage, target_cache_windows)
+    if stage == 0 and len(target_cache_windows) == 1:
+        assert schedule == make_producer_schedule(_draft_final_group(), steps=3)
+    steps_per_forward = target_steps + int(draft_final)
+    assert schedule.step_count == steps_per_forward
+
     counter = _Counter()
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.kv_args = SimpleNamespace(
-        cache_layout=_draft_final_layout(),
-        cache_producer_schedule=make_producer_schedule(_draft_final_group(), steps=3),
+        cache_layout=_draft_final_layout(), cache_producer_schedule=schedule
     )
     manager.register_layerwise_step_counter(counter, interval=1)
 
-    for expected_begin in (0, 3):
+    for expected_begin in (0, steps_per_forward):
         begin = manager.reserve_layerwise_cache_steps()
         assert begin == expected_begin
-        counter.ready += 2  # target layers
+        counter.ready += target_steps  # target layers
         final_target = begin + manager.producer_step_count - 1
-        assert not StepCounter.is_step_ready(counter.ready, final_target)
-        counter.ready += 1  # one synthetic draft-final event
-        assert StepCounter.is_step_ready(counter.ready, final_target)
+        assert StepCounter.is_step_ready(counter.ready, final_target) is not draft_final
+        if draft_final:
+            counter.ready += 1  # one synthetic draft-final event
+            assert StepCounter.is_step_ready(counter.ready, final_target)
 
-    assert counter.reserved == counter.ready == 6
+    assert counter.reserved == counter.ready == 2 * steps_per_forward
 
 
 def _single_history_selection() -> CachePDLayerwiseBlockSelection:
@@ -490,6 +534,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
                 src_block_manifest=None,
                 dst_block_manifest=destination_block_manifest,
                 transfer_fragments=rank_one_fragments,
+                owner_filters={},
                 dst_cache_layout=destination_layout,
                 block_selection=selection,
                 field_ids=schedule.fields_in_range(begin, end),
@@ -528,6 +573,7 @@ def _layerwise_fanout_context():
             dst_port=9000 + rank,
             peer_cache_layout=layout,
             transfer_fragments=(),
+            transfer_owner_filters={},
         )
         for rank, request in enumerate(requests)
     }
@@ -670,6 +716,10 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
     backend.qk_rope_head_dim = 0
     backend.kernel_page_size = 64
     backend.kernel_solution = None
+    backend.slot_order = "selection"
+    backend.num_local_heads = 1
+    backend.num_attention_heads = 1
+    backend.query_shard_metadata = None
     backend.step_counter = SimpleNamespace(record_cache=lambda: events.append("ready"))
 
     def fake_dsa_prefill(**_kwargs):

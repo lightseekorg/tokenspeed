@@ -18,6 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include "a2a_fp8.cuh"
 #include "tvm_ffi_utils.h"
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -66,10 +67,11 @@ __device__ __forceinline__ uint64_t acquire_flag(const uint64_t *p) {
                : "memory");
   return value;
 }
-template <bool Inverse>
+template <bool Inverse, bool Quantize>
 __global__ __launch_bounds__(1024, 1) void chunk_a2a(
-    const uint4 *input, uint4 *output, uint64_t **peers, uint64_t **flag_peers,
-    uint32_t *control, int capacity, int rows, int channels, int rank) {
+    const uint4 *input, uint4 *output, float *scales, uint64_t **peers,
+    uint64_t **flag_peers, uint32_t *control, int capacity, int rows,
+    int channels, int rank) {
   const uint32_t epoch = begin_epoch(control);
   const int ring = epoch % 3, width = channels / 32, count = rows * width;
   uint4 *buffers[4];
@@ -116,7 +118,14 @@ __global__ __launch_bounds__(1024, 1) void chunk_a2a(
     for (int p = 0; p < 4; ++p) {
       const int dst =
           Inverse ? row * 4 * width + p * width + col : p * count + i;
-      output[dst] = read4(buffers[rank] + dst);
+      const uint4 value = read4(buffers[rank] + dst);
+      if constexpr (Quantize) {
+        const uint32_t words[4] = {value.x, value.y, value.z, value.w};
+        quantize_a2a_group(words, reinterpret_cast<uint32_t *>(output), scales,
+                           4 * dst, 4 * rows, channels / 4);
+      } else {
+        output[dst] = value;
+      }
     }
   }
   end_epoch(control, epoch);
@@ -150,9 +159,9 @@ void exchange_chunk(TensorView flags, TensorView input, TensorView output,
                  control.numel() == 2);
   auto stream = get_stream(input.device());
 #define CHUNK(INVERSE)                                                         \
-  chunk_a2a<INVERSE><<<blocks, 1024, 0, stream>>>(                             \
+  chunk_a2a<INVERSE, false><<<blocks, 1024, 0, stream>>>(                      \
       static_cast<const uint4 *>(input.data_ptr()),                            \
-      static_cast<uint4 *>(output.data_ptr()),                                 \
+      static_cast<uint4 *>(output.data_ptr()), nullptr,                        \
       static_cast<uint64_t **>(peers.data_ptr()),                              \
       static_cast<uint64_t **>(flags.data_ptr()),                              \
       static_cast<uint32_t *>(control.data_ptr()), capacity, rows, channels,   \
@@ -167,3 +176,43 @@ void exchange_chunk(TensorView flags, TensorView input, TensorView output,
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exchange_chunk, exchange_chunk);
+
+void exchange_chunk_fp8(TensorView flags, TensorView input, TensorView output,
+                        TensorView scales, TensorView peers, TensorView control,
+                        int64_t capacity, int64_t rows, int64_t channels,
+                        int64_t rank, int64_t blocks) {
+  ffi::CUDADeviceGuard guard(input.device().device_id);
+  CHECK_INPUT(input);
+  CHECK_INPUT(output);
+  CHECK_INPUT(scales);
+  CHECK_INPUT(peers);
+  CHECK_INPUT(control);
+  CHECK_INPUT(flags);
+  TVM_FFI_ICHECK_EQ(input.dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(output.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(scales.dtype(), dl_float32);
+  TVM_FFI_ICHECK(channels > 0 && channels % 512 == 0 && rows > 0);
+  TVM_FFI_ICHECK_EQ(input.numel(), rows * channels);
+  TVM_FFI_ICHECK_EQ(output.numel(), input.numel());
+  TVM_FFI_ICHECK_EQ(scales.numel(), rows * channels / 128);
+  TVM_FFI_ICHECK(rank >= 0 && rank < 4 && blocks > 0);
+  TVM_FFI_ICHECK(capacity >= rows * channels / 4 && capacity <= INT32_MAX / 3);
+  TVM_FFI_ICHECK_EQ(peers.dtype(), dl_int64);
+  TVM_FFI_ICHECK_EQ(peers.numel(), 4);
+  TVM_FFI_ICHECK_EQ(flags.dtype(), dl_int64);
+  TVM_FFI_ICHECK_EQ(flags.numel(), 4);
+  TVM_FFI_ICHECK_EQ(control.dtype(), dl_int32);
+  TVM_FFI_ICHECK_EQ(control.numel(), 2);
+  for (auto tensor : {output, scales, peers, flags, control})
+    TVM_FFI_ICHECK_EQ(input.device().device_id, tensor.device().device_id);
+  chunk_a2a<false, true><<<blocks, 1024, 0, get_stream(input.device())>>>(
+      static_cast<const uint4 *>(input.data_ptr()),
+      static_cast<uint4 *>(output.data_ptr()),
+      static_cast<float *>(scales.data_ptr()),
+      static_cast<uint64_t **>(peers.data_ptr()),
+      static_cast<uint64_t **>(flags.data_ptr()),
+      static_cast<uint32_t *>(control.data_ptr()), capacity, rows, channels,
+      rank);
+  TVM_FFI_ICHECK(cudaGetLastError() == cudaSuccess);
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exchange_chunk_fp8, exchange_chunk_fp8);

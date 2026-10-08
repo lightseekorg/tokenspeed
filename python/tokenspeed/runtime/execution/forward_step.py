@@ -52,6 +52,10 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     compute_max_logical_pages_for_capture,
 )
+from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
+from tokenspeed.runtime.moe.expert_location import (
+    get_global_expert_location_metadata,
+)
 from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import (
@@ -310,6 +314,13 @@ class ForwardStepRunner:
 
         self._forward_func: Callable | None = forward_func
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
+        # The expert load counters' live-row mask (None without load
+        # recording): a padded replay marks its filler rows before the graph
+        # runs and clears the mark after, so the router counts real rows only.
+        placement = get_global_expert_location_metadata()
+        self._expert_load_rows: ExpertLoadRowMask | None = (
+            placement.load_rows if placement is not None else None
+        )
         # The capture side stream. Created here, not in capture(): the
         # prefill graph shares it (PrefillGraph._capture_bucket reads
         # decode_wrapper.stream), and a backend may declare
@@ -555,6 +566,11 @@ class ForwardStepRunner:
                 if self.runtime_states is not None
                 else None
             ),
+            draft_probs=(
+                self.runtime_states.draft_probs
+                if self.runtime_states is not None
+                else None
+            ),
             vocab_size=self.vocab_size,
             device=self.device,
         )
@@ -717,6 +733,11 @@ class ForwardStepRunner:
                     req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
                     valid_cache_lengths=(
                         self.runtime_states.valid_cache_lengths
+                        if self.runtime_states is not None
+                        else None
+                    ),
+                    draft_probs=(
+                        self.runtime_states.draft_probs
                         if self.runtime_states is not None
                         else None
                     ),
@@ -1003,9 +1024,9 @@ class ForwardStepRunner:
         extend_seq_lens_cpu: torch.Tensor,
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
+        block_tables_cpu: dict,
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
-        block_tables_cpu: dict | None = None,
     ):
         """
         Unified forward entry point.
@@ -1020,8 +1041,13 @@ class ForwardStepRunner:
         The ``extend_*`` lengths are the ``[:num_extends]`` slices of the
         input buffers on every call — empty for a pure decode or the idle
         replay, which never read them. ``block_tables_cpu`` mirrors
-        ``block_tables`` on the host for backends that plan an extend from
-        the tables without waiting on the device.
+        ``block_tables`` on the host (the same group keys; empty at bs 0) for
+        backends that plan an extend from the tables without waiting on the
+        device.
+
+        Returns ``(output_tokens, output_lengths, output_logprobs,
+        input_token_logprobs)``; the last is the prompt-logprob gather of an
+        extend/mixed forward (``ctx.input_logprob_rows``) and None otherwise.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1098,6 +1124,7 @@ class ForwardStepRunner:
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 extend_replay_lens_cpu=extend_replay_lens_cpu,
                 extend_prompt_lens_cpu=extend_prompt_lens_cpu,
+                query_shard=ctx.query_shard,
                 positions=positions,
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,
@@ -1123,13 +1150,30 @@ class ForwardStepRunner:
                         {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
                     ]
                 )
+            if self._expert_load_rows is not None:
+                # Every rank replays the same padded batch; the live rows are
+                # the DP-gathered live counts (this rank's own without DP).
+                self._expert_load_rows.mark_padded(
+                    padded_global_num_tokens=[padded_bs * self.max_tokens_per_req]
+                    * self.world_size,
+                    live_global_num_tokens=(
+                        ctx.global_num_tokens
+                        if ctx.global_num_tokens is not None
+                        else [ctx.input_num_tokens] * self.world_size
+                    ),
+                )
             with nvtx_range("graph_replay", color="red"):
                 graph.replay()
+            if self._expert_load_rows is not None:
+                self._expert_load_rows.clear()
 
+            # A decode graph never gathers prompt logprobs (its captured
+            # fourth output is None).
             (
                 output_tokens,
                 output_lengths,
                 output_logprobs,
+                _input_token_logprobs,
             ) = self.output_buffers[graph_key]
 
             result = (
@@ -1140,6 +1184,7 @@ class ForwardStepRunner:
                     if output_logprobs is not None
                     else None
                 ),
+                None,
             )
         else:
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
@@ -1154,6 +1199,11 @@ class ForwardStepRunner:
             self.attn_backend.commit_speculative_state_after_verify(
                 result[1],
                 num_extends=ctx.num_extends,
+                accepted_path=(
+                    self.sampling_backend.accepted_path(bs, self.config.spec_num_tokens)
+                    if self.config.spec_topk > 1 and ctx.num_extends == 0
+                    else None
+                ),
             )
 
         return result

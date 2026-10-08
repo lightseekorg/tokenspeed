@@ -59,17 +59,23 @@ from tokenspeed_kernel.ops.attention.rmha import (
 )
 from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
 
+from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     scrub_padding_tail,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     reject_bounded_replay,
+    reject_query_shard,
 )
+from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.configs.inkling_config import InklingModelConfig
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 logger = logging.getLogger(__name__)
@@ -205,6 +211,50 @@ class InklingAttnBackend(AttentionBackend):
     arguments the dense path already receives, so the scheduler and executor
     are unaware anything beyond dense attention exists.
     """
+
+    @classmethod
+    def from_config(
+        cls,
+        inner: AttentionBackend,
+        text_config: InklingModelConfig,
+        attn_config: AttnConfig,
+        *,
+        num_layers: int,
+        is_draft: bool,
+        enable_layerwise_cache_ready: bool,
+    ) -> InklingAttnBackend:
+        """Construct the wrapper and its ring before the common pool binding.
+
+        The configs provide convolution geometry, TP and serving capacity;
+        ``num_layers`` is this view's layer count. ``is_draft`` labels the
+        allocation log. ``enable_layerwise_cache_ready`` selects layerwise
+        transfer notification and is passed through to the wrapper.
+        """
+        spec_tokens = attn_config.speculative_num_draft_tokens
+        # Keep pre-chunk taps and chunk writes disjoint modulo the ring size.
+        ring_size = text_config.sconv_kernel_size - 1 + spec_tokens
+        conv_pool = InklingConvStatePool(
+            num_layers=num_layers,
+            # Row 0 is reserved; the additional slot covers padding.
+            num_slots=attn_config.max_bs + 2,
+            conv_dim=inkling_conv_total_dim(
+                text_config, attn_config.component(SoftmaxAttnConfig).attn_tp_size
+            ),
+            ring_size=ring_size,
+            dtype=torch.bfloat16,
+            device=attn_config.device,
+        )
+        logger.info(
+            f"Inkling {('draft ' if is_draft else '')!s}conv state pool: {num_layers:d} "
+            f"layers x {attn_config.max_bs + 2:d} slots, "
+            f"{conv_pool.mem_usage_bytes() / (1 << 20):.1f} MiB",
+        )
+        return cls(
+            inner,
+            conv_pool,
+            spec_num_tokens=spec_tokens,
+            enable_layerwise_cache_ready=enable_layerwise_cache_ready,
+        )
 
     def __init__(
         self,
@@ -490,9 +540,11 @@ class InklingAttnBackend(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ):
         reject_bounded_replay(extend_replay_lens_cpu, "InklingAttentionBackend")
+        reject_query_shard(query_shard, "InklingAttentionBackend")
         if forward_mode.is_mixed():
             raise RuntimeError(
                 "Inkling sconv does not support MIXED batches: the prefill "
@@ -544,6 +596,7 @@ class InklingAttnBackend(AttentionBackend):
             extend_replay_lens_cpu=extend_replay_lens_cpu,
             extend_prompt_lens_cpu=extend_prompt_lens_cpu,
             extend_with_prefix=extend_with_prefix,
+            query_shard=query_shard,
             **kwargs,
         )
 

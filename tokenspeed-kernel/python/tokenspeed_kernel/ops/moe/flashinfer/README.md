@@ -17,7 +17,9 @@ buffer is needed.
 `thirdparty/flashinfer/trtllm_moe.py` builds a source-keyed private JIT module.
 The adapter ships as a Python package in both source distributions and wheels;
 it does not require a source checkout on `PYTHONPATH`.
-It adds a checked `cudaMemsetAsync` after the named map allocation and retains
+It adds a checked fill-kernel launch after the named map allocation; the kernel
+waits on and releases programmatic dependents, so the routing chain keeps PDL
+where a memset graph node would cost about 4 us per MoE layer. It retains
 FlashInfer's routing and GEMM implementations and Python API signatures. The
 small-batch tactic policy below narrows the tuner's candidates for one model.
 The installed package and stock JIT modules are unchanged. The first warmup
@@ -33,6 +35,34 @@ partitions, PDL on/off, changing routing within one captured shape, graph replay
 after workspace corruption, and output equality with the upstream operator.
 Expert-partition tests retain the loader's global activation input scales while
 sharding expert weights, and select SiTU through FlashInfer's activation enum.
+
+## BF16 intermediate sizes that are multiples of 64
+
+FlashInfer's BF16 TRT-LLM launcher (`Bf16MoeLauncher::check_moe`) rejects an
+intermediate size per partition that is not a multiple of 128. Its BF16 cubins
+need only 64 for gated activations: GEMM1's rows, twice the intermediate size,
+are tiled by 128, and GEMM2 reads its K, the intermediate size, in 128-byte
+blocks of 64 elements. Non-gated activations still need 128.
+
+`thirdparty/flashinfer/trtllm_bf16_moe.py` builds a private copy of the
+installed launcher in which only that check requires 64 for gated and 128 for
+non-gated activations. Like the NVFP4 adapter, it uses a source-keyed JIT
+module, private operator names and cloned entry points, and refuses a launcher
+whose check it does not find exactly once. `trtllm_unquant.py`'s SiLU/SwiGLU
+kernels declare `ispp_alignment` 64 when the adapter applies to the installed
+FlashInfer and FlashInfer's JIT can compile the private module, and 128
+otherwise, with a warning that names the reason. The ReLU2 kernels in that file
+keep 128. The private module is not in FlashInfer's AOT jit-cache, and ninja
+rebuilds a module left in the JIT workspace whenever the build changes, so this
+needs `FLASHINFER_DISABLE_JIT` unset and FlashInfer's nvcc (`FLASHINFER_NVCC`,
+else `bin/nvcc` under its CUDA home). This is decided once per process at
+import, without compiling, so kernel selection and layer padding agree. Only
+sizes that are not multiples of 128 run on the private launcher; the first such
+layer JIT-compiles the whole private TRT-LLM MoE module during warmup. Other
+sizes keep FlashInfer's stock module. The NVFP4 routing-map initialization is
+not added: the routing workspace does not depend on the intermediate size, so
+these layers keep FlashInfer's BF16 routing behavior. Remove the adapter once
+the minimum supported FlashInfer accepts these sizes.
 
 ## Qwen3.8 low-batch tactic
 
@@ -63,3 +93,35 @@ GEMMs. On the measured BS1 MTP3 graph, FlashInfer 0.7's isolated-kernel tuner
 selected tile 8, leaving an idle interval before routing. This policy keeps
 tile 32 available for that shape while retaining upstream routing and GEMM
 implementations.
+
+## NVFP4 squared ReLU
+
+Nemotron-H experts use a non-gated `relu(x)**2` activation. GEMM1 holds only
+the up projection, so `w13` is `[E, I, H]` rather than `[E, 2I, H]`. The weight
+preprocessor skips the gate/up half swap and permutes with
+`is_gated_act_gemm=False`. FlashInfer tiles non-gated GEMM1 rows by 128, so
+the kernels declare an `ispp_alignment` of 128 instead of 64.
+
+The kernel applies `output1_scale_gate_scalar` to the GEMM1 accumulator before
+squaring and `output1_scale_scalar` after. Squaring is not linear, so the
+GEMM1 dequant `a13 * w13_scale_2` must go in the first scale and the second
+scale carries only the GEMM2-input requant `1 / a2`. This is the SiTU recipe.
+The SwiGLU recipe folds the up-half dequant into the second scale, which would
+be wrong here. The kernel test checks non-unit input scales against a
+dequantized reference, and checks in-kernel sigmoid-plus-bias routing with 512
+experts and top-22.
+
+## Unquantized CUTLASS MoE workspace
+
+`flashinfer_cutlass_unquant_moe_apply` hands `cutlass_fused_moe` one
+persistent scratch buffer per device (`cutlass_unquant_moe_workspace`),
+sized through `cutlass_fused_moe_workspace_size`, zero-filled when it is
+allocated or grown, and reused across layers and calls. Left to allocate its
+own scratch per call, the SM90 chain read bytes it never wrote: for some
+(EP rank, routing) combinations the rank's routed output was NaN for finite
+inputs, reproducibly for that call, while the identical call with any
+caller-provided buffer matched the fp32 reference. Consecutive MoE layers are
+stream-ordered through their activations, so one buffer per device is never
+in use by two calls at once; a model that overlapped two MoE calls on
+separate streams would need one buffer per stream. PDL stays off in this
+chain for the race described in `cutlass_unquant.py`.

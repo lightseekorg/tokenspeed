@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.layernorm import grouped_rmsnorm
-from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm, rmsnorm
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
+from tokenspeed_kernel.ops.layernorm import add_rmsnorm, grouped_rmsnorm
+from tokenspeed_kernel.ops.layernorm.triton import (
+    _add_rmsnorm_kernel,
+    _rmsnorm_kernel,
+    qk_rmsnorm,
+    rmsnorm,
+)
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from utils import assert_no_triton_compile
 
 platform = current_platform()
 torch.manual_seed(42)
@@ -50,6 +57,86 @@ def test_rmsnorm_with_residual(
     ref = (x_float * torch.rsqrt(variance + eps) * weight).to(dtype)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(residual_out, ref_residual, atol=2e-2, rtol=2e-2)
+
+
+# BF16 bit patterns whose pairwise sums and scaled products cover signed zeros,
+# exact cancellation, subnormals and round-to-nearest-even ties.
+_BF16_EDGE_BITS = [0x0000, 0x8000, 0x0001, 0x8001, 0x007F, 0x0080]
+_BF16_EDGE_BITS += [0x3B80, 0x3F80, 0x3F81, 0xBF80, 0xBF81, 0x4000]
+
+
+def _residual_inputs(
+    num_tokens: int, hidden_size: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random BF16 rows; the last row starts with every pair of edge values."""
+    x = (torch.randn(num_tokens, hidden_size, device=device) * 4).bfloat16()
+    residual = (torch.randn(num_tokens, hidden_size, device=device) * 4).bfloat16()
+    edges = torch.tensor(_BF16_EDGE_BITS, dtype=torch.int32, device=device)
+    edges = edges.to(torch.int16).view(torch.bfloat16)
+    pairs = edges.numel() ** 2
+    x[-1, :pairs] = edges.repeat_interleave(edges.numel())
+    residual[-1, :pairs] = edges.repeat(edges.numel())
+    return x, residual
+
+
+@pytest.mark.parametrize(
+    "x_scale,residual_scale", [(None, None), (0.3, 0.7), (1.0, 1.7), (0.21, None)]
+)
+@pytest.mark.parametrize("hidden_size", [2048, 4096, 7168])
+@pytest.mark.parametrize("num_tokens", [1, 33])
+def test_rmsnorm_rounded_residual_sum_matches_eager_bf16(
+    num_tokens: int,
+    hidden_size: int,
+    x_scale: float | None,
+    residual_scale: float | None,
+    device: str,
+) -> None:
+    """The fused call equals the eager BF16 multiplies and add followed by
+    ``rmsnorm`` of the sum, bit for bit."""
+    if x_scale is not None and not platform.is_nvidia:
+        pytest.skip("x_scale and residual_scale need an NVIDIA GPU")
+    eps = 1e-6
+    x, residual = _residual_inputs(num_tokens, hidden_size, device)
+    weight = (torch.rand(hidden_size, device=device) + 0.5).bfloat16()
+    scaled_x = x if x_scale is None else x * x_scale
+    scaled_residual = residual if residual_scale is None else residual * residual_scale
+    eager_sum = scaled_x + scaled_residual
+    expected = rmsnorm(eager_sum, weight, eps)
+
+    out, residual_sum = rmsnorm(
+        x,
+        weight,
+        eps,
+        residual=residual,
+        round_residual_sum_bf16=True,
+        x_scale=x_scale,
+        residual_scale=residual_scale,
+    )
+
+    assert torch.equal(residual_sum.view(torch.int16), eager_sum.view(torch.int16))
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(not platform.is_nvidia, reason="scales need an NVIDIA GPU")
+def test_rmsnorm_new_scales_do_not_recompile(device: str) -> None:
+    x, residual = _residual_inputs(4, 4096, device)
+    weight = torch.ones(4096, device=device, dtype=torch.bfloat16)
+
+    def run(x_scale: float, residual_scale: float) -> None:
+        rmsnorm(
+            x,
+            weight,
+            1e-6,
+            residual=residual,
+            round_residual_sum_bf16=True,
+            x_scale=x_scale,
+            residual_scale=residual_scale,
+        )
+
+    run(0.5, 2.0)
+    with assert_no_triton_compile(_rmsnorm_kernel):
+        for x_scale, residual_scale in ((0.3, 0.7), (1.0, 1.0), (1.7, 0.25)):
+            run(x_scale, residual_scale)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -235,3 +322,131 @@ def test_reference_rmsnorm_matches_eager_cast_order(
         reference_rmsnorm(x.t(), weight, eps, None)
     with pytest.raises(ValueError):
         reference_rmsnorm(x, weight[:-1], eps, None)
+
+
+@pytest.mark.parametrize("hidden_size", [128, 4096])
+@pytest.mark.parametrize("with_x2", [False, True])
+@pytest.mark.parametrize("with_fp8", [False, True])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_add_rmsnorm_matches_unfused_reference(
+    hidden_size: int, with_x2: bool, with_fp8: bool, pdl: bool, device: str
+) -> None:
+    if with_fp8 and not platform.is_nvidia:
+        pytest.skip("requires float8_e4m3fn CUDA")
+    if pdl and not platform.is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA SM90+")
+    previous = pdl_enabled()
+    pdl_enabled(overwrite=pdl)
+    eps = 1e-5
+    rows = 33
+    x = torch.randn(rows, hidden_size, device=device, dtype=torch.bfloat16)
+    x2 = torch.randn_like(x) if with_x2 else None
+    residual = torch.randn_like(x)
+    weight = torch.rand(hidden_size, device=device, dtype=torch.bfloat16) + 0.5
+    scale = torch.tensor([4.0 / 448.0], device=device)
+    # The two addends meet in BF16, as an all-reduce input would.
+    total = (x + x2 if with_x2 else x).float() + residual.float()
+    ref = (
+        total * torch.rsqrt(total.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
+    )
+
+    out = torch.empty_like(x)
+    out_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn) if with_fp8 else None
+    try:
+        add_rmsnorm(
+            x,
+            residual,
+            weight,
+            eps,
+            x2=x2,
+            out=out,
+            out_fp8=out_fp8,
+            fp8_scale=scale if with_fp8 else None,
+        )
+        torch.cuda.synchronize()
+    finally:
+        pdl_enabled(overwrite=previous)
+
+    assert torch.equal(residual, total.to(torch.bfloat16))
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+    if with_fp8:
+        expected, _ = static_quant_fp8(out, scale)
+        assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_add_rmsnorm_writes_in_place_from_strided_rows(device: str) -> None:
+    eps = 1e-6
+    wide = torch.randn(5, 2 * 256, device=device, dtype=torch.bfloat16)
+    x = wide[:, :256]
+    residual = torch.randn(5, 256, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(256, device=device, dtype=torch.bfloat16)
+    total = x.float() + residual.float()
+    ref = (
+        total * torch.rsqrt(total.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
+    )
+    untouched = wide[:, 256:].clone()
+
+    add_rmsnorm(x, residual, weight, eps, x2=None, out=x, out_fp8=None, fp8_scale=None)
+
+    torch.testing.assert_close(x.float(), ref, atol=2e-2, rtol=2e-2)
+    assert torch.equal(wide[:, 256:], untouched)
+
+
+def test_add_rmsnorm_compiles_once_across_batch_sizes(device: str) -> None:
+    x = torch.randn(300, 1024, device=device, dtype=torch.bfloat16)
+    weight = torch.ones(1024, device=device, dtype=torch.bfloat16)
+
+    def run(rows: int) -> None:
+        add_rmsnorm(
+            x[:rows].clone(),
+            x[:rows].clone(),
+            weight,
+            1e-6,
+            x2=x[:rows],
+            out=torch.empty_like(x[:rows]),
+            out_fp8=None,
+            fp8_scale=None,
+        )
+
+    run(3)
+    with assert_no_triton_compile(_add_rmsnorm_kernel):
+        for rows in (1, 16, 37, 300):
+            run(rows)
+
+
+def test_add_rmsnorm_contract(device: str) -> None:
+    x = torch.randn(4, 64, device=device, dtype=torch.bfloat16)
+    weight = torch.ones(64, device=device, dtype=torch.bfloat16)
+    empty = x[:0]
+    add_rmsnorm(
+        empty,
+        empty.clone(),
+        weight,
+        1e-6,
+        x2=None,
+        out=empty,
+        out_fp8=None,
+        fp8_scale=None,
+    )
+    with pytest.raises(ValueError, match="together"):
+        add_rmsnorm(
+            x,
+            x.clone(),
+            weight,
+            1e-6,
+            x2=None,
+            out=x,
+            out_fp8=torch.empty_like(x, dtype=torch.float8_e4m3fn),
+            fp8_scale=None,
+        )
+    with pytest.raises(ValueError, match="dense columns"):
+        add_rmsnorm(
+            x.t(),
+            x.t().clone(),
+            weight,
+            1e-6,
+            x2=None,
+            out=x.t(),
+            out_fp8=None,
+            fp8_scale=None,
+        )

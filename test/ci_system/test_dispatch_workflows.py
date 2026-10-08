@@ -1,5 +1,7 @@
 import os
+import shlex
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -251,21 +253,49 @@ def test_k8s_dispatch_lists_every_supported_ci_yaml():
     assert all((REPO_ROOT / choice).is_file() for choice in choices)
 
 
-def test_amd_pr_workflow_orders_kernel_benchmarks_before_model_tests():
+def test_kernel_ut_parts_cover_every_test_once():
+    root = REPO_ROOT / "tokenspeed-kernel/test"
+    files = {
+        path
+        for path in root.rglob("*.py")
+        if path.name.startswith("test_") or path.name.endswith("_test.py")
+    }
+    assert files
+    executions = Counter()
+    for part in ("i", "ii"):
+        task = load_yaml(
+            REPO_ROOT / f"test/ci/ut/ut-tokenspeed-kernel-part-{part}.yaml"
+        )
+        for command in task["ut"]["commands"]:
+            tokens = shlex.split(command)
+            arguments = tokens[tokens.index("pytest") + 1 :]
+            targets = [REPO_ROOT / arg for arg in arguments if not arg.startswith("-")]
+            ignores = [
+                REPO_ROOT / arg.removeprefix("--ignore=")
+                for arg in arguments
+                if arg.startswith("--ignore=")
+            ]
+            executions.update(
+                path
+                for path in files
+                if any(path.is_relative_to(target) for target in targets)
+                and not any(path.is_relative_to(ignore) for ignore in ignores)
+            )
+
+    assert executions == Counter({path: 1 for path in files})
+
+
+def test_amd_pr_workflow_runs_kernel_benchmarks_alongside_model_tests():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-tests.yml")
     jobs = workflow["jobs"]
 
     assert jobs["kernel-benchmark"]["needs"] == ["scan", "unit-test"]
-    expected_model_needs = ["scan", "unit-test", "kernel-benchmark"]
     normal_model = jobs["model-test"]
-    assert normal_model["needs"] == expected_model_needs
+    assert normal_model["needs"] == ["scan", "unit-test"]
     assert "!cancelled()" in normal_model["if"]
     assert "needs.unit-test.result == 'success'" in normal_model["if"]
     assert "needs.scan.outputs.unit_has_tasks != 'true'" in normal_model["if"]
-    assert "needs.kernel-benchmark.result == 'success'" in normal_model["if"]
-    assert (
-        "needs.scan.outputs.kernel_benchmark_has_tasks != 'true'" in normal_model["if"]
-    )
+    assert "needs.kernel-benchmark" not in normal_model["if"]
 
     eager_model = jobs["model-test-eager"]
     assert eager_model["needs"] == "scan"
@@ -563,7 +593,7 @@ def test_slurm_dispatch_maps_b200_yaml_to_gb300_runners(tmp_path):
     result = run_slurm_dispatch_script(
         tmp_path,
         CLUSTER="gb300",
-        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel.yaml",
+        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel-part-i.yaml",
     )
 
     assert result.returncode == 0, result.stderr
@@ -631,7 +661,7 @@ def test_slurm_dispatch_rejects_mismatched_or_multiple_gb300_runners(
 
 
 def test_slurm_dispatch_accepts_multiple_native_gb300_runners(tmp_path):
-    task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel.yaml")
+    task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-part-i.yaml")
     task["runner"]["labels"] = ["gb300-1gpu", "gb300-4gpu"]
     config = tmp_path / "ambiguous.yaml"
     config.write_text(yaml.safe_dump(task))
@@ -1105,7 +1135,7 @@ def test_slurm_dispatch_takes_a_dispatched_pr_from_its_own_tree():
     )
 
     assert step["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == (
-        "${{ inputs.pr && '1' || '0' }}"
+        "${{ (inputs.pr || inputs.commit) && '1' || '0' }}"
     )
 
 

@@ -438,6 +438,7 @@ def _prepare_routed_weights(
         internal_activation_dtype=internal_activation_dtype,
         with_bias=False,
         fast_math=False,
+        combine_order="rank",
         solution=None,
     )
     if weight_dtype_name == "fp8":

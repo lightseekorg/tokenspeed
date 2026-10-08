@@ -48,6 +48,9 @@ class ProcessGroupManager:
         self._process_groups: dict[str, dict[Group, dist.ProcessGroup]] = {}
         self._pg_timeout: timedelta | None = None
         self._device_backend = "nccl"
+        # Set by init_emulated_rank_zero: one group per backend holding only
+        # this process, standing in for every logical group.
+        self._emulated_rank_groups: dict[str, dist.ProcessGroup] | None = None
 
     def init_distributed(
         self,
@@ -57,7 +60,53 @@ class ProcessGroupManager:
         timeout: int | None = None,
         device_id: "torch.device | None" = None,
     ) -> None:
+        self._init_world(
+            world_size=mapping.world_size,
+            rank=mapping.rank,
+            distributed_init_method=distributed_init_method,
+            backend=backend,
+            timeout=timeout,
+            device_id=device_id,
+        )
 
+    def init_emulated_rank_zero(
+        self,
+        distributed_init_method: str,
+        backend: str,
+        timeout: int | None,
+        device_id: "torch.device | None",
+    ) -> None:
+        """Start a one-process world for ``--emulate-rank-zero``.
+
+        Every group later passed to ``init_process_group`` is backed by a group
+        holding only this process, so torch.distributed calls on any logical
+        group complete locally.
+        """
+        if dist.is_initialized():
+            raise RuntimeError(
+                "rank emulation needs its own one-process world, but "
+                "torch.distributed is already initialized"
+            )
+        self._init_world(
+            world_size=1,
+            rank=0,
+            distributed_init_method=distributed_init_method,
+            backend=backend,
+            timeout=timeout,
+            device_id=device_id,
+        )
+        self._emulated_rank_groups = {}
+
+    def _init_world(
+        self,
+        *,
+        world_size: int,
+        rank: int,
+        distributed_init_method: str,
+        backend: str,
+        timeout: int | None,
+        device_id: "torch.device | None",
+    ) -> None:
         if not dist.is_initialized():
             if distributed_init_method is None:
                 raise ValueError(
@@ -77,8 +126,8 @@ class ProcessGroupManager:
             dist.init_process_group(
                 backend=backend,
                 init_method=distributed_init_method,
-                world_size=mapping.world_size,
-                rank=mapping.rank,
+                world_size=world_size,
+                rank=rank,
                 timeout=timeout,
                 device_id=device_id,
             )
@@ -114,6 +163,15 @@ class ProcessGroupManager:
 
         for backend in backends:
             if self.has_process_group(backend, group):
+                continue
+            if self._emulated_rank_groups is not None:
+                if backend not in self._emulated_rank_groups:
+                    self._emulated_rank_groups[backend] = dist.new_group(
+                        [0], backend=backend, timeout=self._pg_timeout
+                    )
+                self.register_process_group(
+                    backend, group, self._emulated_rank_groups[backend]
+                )
                 continue
             for g in _make_all_groups(group):
                 pg = dist.new_group(g, backend=backend, timeout=self._pg_timeout)

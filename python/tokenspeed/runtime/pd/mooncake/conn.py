@@ -45,7 +45,6 @@ class MooncakeKVManagerBase(DisaggManagerBase):
     ):
         self.kv_args = kv_args
         self.topology = args.topology
-        self.topology.require_cache_pd_supported()
         self.disaggregation_mode = disaggregation_mode
         self.bootstrap_port = args.bootstrap_port
         self.dist_init_addr = args.dist_init_addr

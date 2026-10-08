@@ -44,6 +44,35 @@ _ROUTE_ALLOCATION = re.compile(
     r"alloc_tensor\(\{max_num_padded_tokens(?:\s*\+\s*1)?\},\s*"
     r"dl_int32,\s*hidden_states\.device\(\)\);"
 )
+_FIRST_NAMESPACE = re.compile(r"(?m)^namespace flashinfer \{$")
+# A kernel keeps the routing chain programmatic; a memset graph node costs ~4 us.
+_FILL_ROUTE_MAP = """
+__global__ void tokenspeed_fill_route_map(int32_t* map, int64_t n) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+  int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += stride) {
+    map[i] = -1;
+  }
+}
+
+static void tokenspeed_launch_fill_route_map(int32_t* map, int64_t n, cudaStream_t stream) {
+  cudaLaunchConfig_t config{};
+  config.gridDim = dim3(static_cast<unsigned>(std::min<int64_t>((n + 255) / 256, 1024)));
+  config.blockDim = dim3(256);
+  config.stream = stream;
+  cudaLaunchAttribute attribute{};
+  attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attribute.val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = &attribute;
+  config.numAttrs = 1;
+  CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, tokenspeed_fill_route_map, map, n));
+}
+
+"""
 
 
 def _initialize_routing_map(source: str) -> str:
@@ -54,20 +83,35 @@ def _initialize_routing_map(source: str) -> str:
             "one permuted_idx_to_token_idx allocation; review the native adapter."
         )
     match = matches[0]
+    namespace = _FIRST_NAMESPACE.search(source, 0, match.start())
+    if namespace is None:
+        raise RuntimeError(
+            "Unsupported FlashInfer TRT-LLM launcher: no flashinfer namespace "
+            "before the routing workspace; review the native adapter."
+        )
     indent = match["indent"]
     lines = (
         "// Initialize tile padding and any guard entry before routing writes live rows.",
         "// Graph-pool reuse can overwrite this storage: initialization must replay.",
-        "CHECK_CUDA_ERROR(cudaMemsetAsync(",
-        "    permuted_idx_to_token_idx.data_ptr(), 0xff,",
-        "    static_cast<size_t>(permuted_idx_to_token_idx.numel()) * sizeof(int32_t),",
-        "    get_stream(hidden_states.device())));",
+        "tokenspeed_launch_fill_route_map(",
+        "    static_cast<int32_t*>(permuted_idx_to_token_idx.data_ptr()),",
+        "    permuted_idx_to_token_idx.numel(), get_stream(hidden_states.device()));",
     )
     initialization = "\n" + "\n".join(indent + line for line in lines)
-    return source[: match.end()] + initialization + source[match.end() :]
+    return (
+        source[: namespace.start()]
+        + _FILL_ROUTE_MAP
+        + source[namespace.start() : match.end()]
+        + initialization
+        + source[match.end() :]
+    )
 
 
-def _routing_initialized_spec(*args, **kwargs):
+def _patched_launcher_spec(transform, tag: str, *args, **kwargs):
+    """Stock TRT-LLM MoE JIT spec whose launcher source is ``transform``-ed.
+
+    The module is named after ``tag`` and the transformed source's digest.
+    """
     from filelock import FileLock
     from flashinfer.jit import env as jit_env
     from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
@@ -80,9 +124,9 @@ def _routing_initialized_spec(*args, **kwargs):
     ]
     if len(launchers) != 1:
         raise RuntimeError("Unsupported FlashInfer TRT-LLM JIT source list")
-    source = _initialize_routing_map(launchers[0].read_text())
+    source = transform(launchers[0].read_text())
     digest = hashlib.sha256(source.encode()).hexdigest()[:16]
-    name = f"tokenspeed_{spec.name}_route_init_{digest}"
+    name = f"tokenspeed_{spec.name}_{tag}_{digest}"
     directory = jit_env.FLASHINFER_GEN_SRC_DIR / name
     directory.mkdir(parents=True, exist_ok=True)
     launcher = directory / launchers[0].name
@@ -92,13 +136,19 @@ def _routing_initialized_spec(*args, **kwargs):
         if not launcher.exists():
             launcher.write_text(source)
         elif launcher.read_text() != source:
-            raise RuntimeError("FlashInfer routing adapter source-cache mismatch")
+            raise RuntimeError(f"FlashInfer {tag} adapter source-cache mismatch")
     return replace(
         spec,
         name=name,
         sources=[
             launcher if Path(path) == launchers[0] else path for path in spec.sources
         ],
+    )
+
+
+def _routing_initialized_spec(*args, **kwargs):
+    return _patched_launcher_spec(
+        _initialize_routing_map, "route_init", *args, **kwargs
     )
 
 
@@ -113,11 +163,13 @@ def _clone(function, namespace):
     return clone
 
 
-def _register_private(register, name, *args, **kwargs):
+def _register_private(
+    register, name, *args, prefix="tokenspeed_flashinfer_route_init", **kwargs
+):
     namespace, separator, operator = name.partition("::")
     if namespace != "flashinfer" or not separator:
         raise RuntimeError(f"Unexpected FlashInfer operator name: {name}")
-    return register(f"tokenspeed_flashinfer_route_init::{operator}", *args, **kwargs)
+    return register(f"{prefix}::{operator}", *args, **kwargs)
 
 
 def _is_qwen38_decode_shape(

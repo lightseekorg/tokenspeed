@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -52,8 +53,6 @@ def _topology(
     return PDParallelTopology(
         tp_size=tp_size,
         tp_rank=tp_rank,
-        cp_size=1,
-        cp_rank=0,
         dp_size=dp_size,
         dp_rank=dp_rank,
         world_size=world_size or tp_size * dp_size,
@@ -220,6 +219,7 @@ def _transfer_cache(
             src_block_manifest=src_block_manifest,
             dst_block_manifest=dst_block_manifest,
             transfer_fragments=transfer_fragments,
+            owner_filters={},
             dst_cache_layout=dst_cache_layout,
         ),
         packer,
@@ -439,12 +439,16 @@ def test_failed_room_fanout_never_restores_state(
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     layout = _layout()
-    registration = _registration(
-        layout,
-        session="session",
-        endpoint="127.0.0.1",
-        pointer=0x1000,
-        expected_decode_ranks=(0,),
+    # A registration the table holds has had its route planned.
+    registration = replace(
+        _registration(
+            layout,
+            session="session",
+            endpoint="127.0.0.1",
+            pointer=0x1000,
+            expected_decode_ranks=(0,),
+        ),
+        transfer_owner_filters={},
     )
     manager = object.__new__(MooncakeKVManagerPrefill)
     manager.decode_kv_args_table = {"session": registration}
@@ -543,8 +547,10 @@ def test_terminal_events_clear_transport_room_state(
         bootstrap_token_table={9: 42},
         spec_candidate_ids_table={9: [1]},
         cached_tokens_table={9: remote_hits},
+        bootstrap_logprob_table={9: -0.25},
         _pending_bootstrap_token_table={},
         _pending_spec_candidate_ids_table={},
+        _pending_bootstrap_logprob_table={},
         connection_lock=nullcontext(),
         addr_to_rooms_tracker={"bootstrap": {9}},
     )
@@ -566,6 +572,7 @@ def test_terminal_events_clear_transport_room_state(
     decode._admissions = {}
     decode._remote_cache_slots = {}
     decode._remote_cached_tokens = {}
+    decode._remote_bootstrap_logprobs = {}
     decode._remote_spec_candidate_ids = {}
     decode.cache_layout = _layout()
     admission = _op()
@@ -575,12 +582,15 @@ def test_terminal_events_clear_transport_room_state(
     assert len(decode.generate_events()) == 1
     assert decode.pop_remote_cache_slot("request") == 7
     assert decode.pop_remote_cached_tokens("request") == max(2, remote_hits)
+    assert decode.pop_remote_bootstrap_logprob("request") == -0.25
     assert decode.pop_remote_spec_candidate_ids("request") == (7, [1])
     assert decode._admissions == {}
     assert decode._remote_cache_slots == {}
     assert decode._remote_cached_tokens == {}
+    assert decode._remote_bootstrap_logprobs == {}
     assert decode._remote_spec_candidate_ids == {}
     assert decode_manager.cached_tokens_table == {}
+    assert decode_manager.bootstrap_logprob_table == {}
     assert decode.receivers == {}
     assert decode_manager.request_status == {}
     assert decode_manager.expected_prefill_ranks_table == {}
@@ -597,6 +607,7 @@ def test_terminal_cleanup_wakes_prefill_metadata_waiter() -> None:
     manager.bootstrap_token_cond = threading.Condition()
     manager.prefill_metadata = {}
     manager.cached_tokens = {}
+    manager.bootstrap_logprobs = {}
     manager.transfer_infos = {9: {}}
     manager.request_status = {9: TransferPoll.WaitingForInput}
     result = []
@@ -722,6 +733,27 @@ def test_layerwise_final_preserves_speculative_candidates() -> None:
     assert metadata_calls == [(9, 42, [7, 8])]
 
 
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_every_pipeline_stage_reports_under_its_stage_major_rank(pp_rank) -> None:
+    """On a prefill pipeline every stage publishes the same broadcast bootstrap
+    payload (the executor path above is stage-agnostic); each manager reports
+    it under the stage-major prefill rank Decode counts completions by."""
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.topology = PDParallelTopology(
+        tp_size=2,
+        tp_rank=1,
+        dp_size=1,
+        dp_rank=0,
+        world_size=4,
+        global_rank=pp_rank * 2 + 1,
+        pp_size=2,
+        pp_rank=pp_rank,
+    )
+    assert manager._status_prefill_rank == pp_rank * 2 + 1
+
+
 def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
     source_segment = make_segment(
         "layer.0.k",
@@ -823,6 +855,7 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
             dst_ptr=0x2000,
             src_block_manifest=source_manifest,
             dst_block_manifest=destination_manifest,
+            owner_filters={},
             dst_cache_layout=destination_layout,
         )
     )
@@ -852,6 +885,7 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
             src_block_manifest=source_manifest,
             dst_block_manifest=destination_manifest,
             transfer_fragments=(fragment,),
+            owner_filters={},
             dst_cache_layout=destination_layout,
         )
     )
@@ -1406,8 +1440,10 @@ def test_decode_accepts_only_the_planned_prefill_rank_completion_set() -> None:
         value.bootstrap_token_table = {}
         value.spec_candidate_ids_table = {}
         value.cached_tokens_table = {}
+        value.bootstrap_logprob_table = {}
         value._pending_bootstrap_token_table = {}
         value._pending_spec_candidate_ids_table = {}
+        value._pending_bootstrap_logprob_table = {}
         value.failure_records = {}
         value.record_failure = lambda room, reason: value.failure_records.__setitem__(
             room, reason
@@ -1415,19 +1451,22 @@ def test_decode_accepts_only_the_planned_prefill_rank_completion_set() -> None:
         return value
 
     complete = manager()
-    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280)
+    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280, -0.5)
     assert complete.request_status[9] == TransferPoll.WaitingForInput
-    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280)
+    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280, -0.5)
     assert complete.cached_tokens_table[9] == 1280
-    complete._handle_prefill_status(9, TransferPoll.Success, 2, -1, None, 1280)
+    # The rank completing last carries no bootstrap metadata; the first valid
+    # token and logprob seen are kept.
+    complete._handle_prefill_status(9, TransferPoll.Success, 2, -1, None, 1280, None)
     assert complete.request_status[9] == TransferPoll.Success
     assert complete.bootstrap_token_table[9] == 42
-    assert complete.pop_prefill_metadata(9) == (42, None, 1280)
+    assert complete.pop_prefill_metadata(9) == (42, None, 1280, -0.5)
     assert complete.cached_tokens_table == {}
+    assert complete.bootstrap_logprob_table == {}
 
     wrong_rank = manager()
-    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 0, -1, None, 1280)
-    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 1, -1, None, 1280)
+    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 0, -1, None, 1280, None)
+    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 1, -1, None, 1280, None)
     assert wrong_rank.request_status[9] == TransferPoll.Failed
     assert wrong_rank.prefill_response_tracker[9] == {0}
     assert "unexpected Prefill TP rank" in wrong_rank.failure_records[9]
@@ -1503,12 +1542,14 @@ def test_prefill_usage_status_wire_roundtrip():
     manager.request_status = {9: TransferPoll.Bootstrapped}
     manager.prefill_metadata = {}
     manager.cached_tokens = {}
+    manager.bootstrap_logprobs = {}
     messages = []
     manager._connect = lambda endpoint: (
         SimpleNamespace(send_multipart=messages.append),
         nullcontext(),
     )
     manager.record_cached_tokens(9, 1280)
+    manager.record_bootstrap_logprob(9, -0.123456789012345678)
     manager.sync_status_to_decode_endpoint(
         "127.0.0.1",
         1234,
@@ -1519,12 +1560,31 @@ def test_prefill_usage_status_wire_roundtrip():
         spec_candidate_ids=[5, 6],
     )
     parsed = parse_prefill_status_message(messages[0])
-    assert parsed == (9, TransferPoll.Success, 0, 42, [5, 6], 1280)
-    # Older senders lack the optional trailing usage frame.
-    assert parse_prefill_status_message(messages[0][:-1])[-1] == 0
+    # The logprob frame is an IEEE double: exact, not a decimal rendering.
+    assert parsed == (
+        9,
+        TransferPoll.Success,
+        0,
+        42,
+        [5, 6],
+        1280,
+        -0.123456789012345678,
+    )
+    # Older senders lack the optional trailing frames: no logprob, then no usage.
+    assert parse_prefill_status_message(messages[0][:-1])[-2:] == (1280, None)
+    assert parse_prefill_status_message(messages[0][:-2])[-2:] == (0, None)
     manager.begin_room(9)
     assert manager.prefill_metadata == {}
     assert manager.cached_tokens == {}
+    assert manager.bootstrap_logprobs == {}
+
+    # A request without logprobs ships an empty logprob frame.
+    manager.request_status = {9: TransferPoll.Bootstrapped}
+    manager.sync_status_to_decode_endpoint(
+        "127.0.0.1", 1234, 9, TransferPoll.Success, 0, bootstrap_token=42
+    )
+    assert messages[1][-1] == b""
+    assert parse_prefill_status_message(messages[1])[-1] is None
 
 
 def test_usage_alone_does_not_release_layerwise_bootstrap_waiter():
@@ -1538,7 +1598,9 @@ def test_usage_alone_does_not_release_layerwise_bootstrap_waiter():
     manager.request_status = {9: TransferPoll.WaitingForInput}
     manager.prefill_metadata = {}
     manager.cached_tokens = {}
+    manager.bootstrap_logprobs = {}
     manager.record_cached_tokens(9, 1280)
+    manager.record_bootstrap_logprob(9, -1.5)
     done = threading.Event()
     result = []
 
@@ -1557,7 +1619,254 @@ def test_usage_alone_does_not_release_layerwise_bootstrap_waiter():
     assert result == [(42, [5, 6])]
     assert manager.prefill_metadata[9] == (42, [5, 6])
     assert manager.cached_tokens[9] == 1280
+    assert manager.bootstrap_logprobs[9] == -1.5
 
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---- DCP page-sharded prefill: owner filtering in the sender ----
+
+
+def _sharded_history_layout(shard_count: int) -> CacheTransferContract:
+    return make_layout(
+        make_group(
+            "history",
+            make_segment("layer.0.kv", dtype="bfloat16", shape=(8,), stride=32),
+            shard_count=shard_count,
+        ),
+        capacity=16,
+        page_bytes=32,
+    )
+
+
+def test_transfer_blocks_keep_only_owned_pages_translated_to_local() -> None:
+    from tokenspeed.runtime.pd.transfer_plan import CachePageOwnerFilter
+
+    source_layout = _sharded_history_layout(2)
+    destination_layout = _sharded_history_layout(1)
+    # Virtual IDs 1..6 are dealt to two owners; rank 1 holds only the blocks
+    # whose (v - 1) % 2 == 1, that is 2, 4, 6, in its local pages 1, 2, 3.
+    # The destination holds every block, so its entries stay at the same
+    # manifest positions.
+    source_manifest = _single_group_block_manifest("history", (1, 2, 3, 4, 5, 6))
+    destination_manifest = _single_group_block_manifest(
+        "history", (10, 11, 12, 13, 14, 15)
+    )
+    owner_filters = {"history": CachePageOwnerFilter(1, 2)}
+    manager, _ = _recording_transfer_manager(source_layout, 0x1000)
+
+    (item,) = manager._cache_transfer_blocks(
+        dst_ptr=0x2000,
+        src_block_manifest=source_manifest,
+        dst_block_manifest=destination_manifest,
+        owner_filters=owner_filters,
+        dst_cache_layout=destination_layout,
+    )
+    assert isinstance(item, PageFieldCopies)
+    assert item.src_pages.tolist() == [1, 2, 3]
+    assert item.dst_pages.tolist() == [11, 13, 15]
+
+    # The fragment route (what the planner emits for a sharded source) lands
+    # on the same page-gathered WRITE: a whole-field fragment is one row of
+    # the group's pages x fields grid, not a descriptor per page.
+    fragment = CacheTransferFragment(
+        group_id="history",
+        field_id="layer.0.kv",
+        src_byte_offset=0,
+        dst_byte_offset=0,
+        src_row_stride_bytes=16,
+        dst_row_stride_bytes=16,
+        bytes_per_row=16,
+        rows_per_page=1,
+    )
+    (item,) = manager._cache_transfer_blocks(
+        dst_ptr=0x2000,
+        src_block_manifest=source_manifest,
+        dst_block_manifest=destination_manifest,
+        transfer_fragments=(fragment,),
+        owner_filters=owner_filters,
+        dst_cache_layout=destination_layout,
+    )
+    assert isinstance(item, PageFieldCopies)
+    assert _expand_page_fields(item.src_pages, item.dst_pages, item.fields) == [
+        (0x1000 + local * 32, 0x2000 + remote * 32, 16)
+        for local, remote in ((1, 11), (2, 13), (3, 15))
+    ]
+
+    # The other owner sends the complementary subsequence.
+    (item,) = manager._cache_transfer_blocks(
+        dst_ptr=0x2000,
+        src_block_manifest=source_manifest,
+        dst_block_manifest=destination_manifest,
+        owner_filters={"history": CachePageOwnerFilter(0, 2)},
+        dst_cache_layout=destination_layout,
+    )
+    assert item.src_pages.tolist() == [1, 2, 3]
+    assert item.dst_pages.tolist() == [10, 12, 14]
+
+
+def test_transfer_blocks_apply_owner_filter_to_layerwise_selection() -> None:
+    from tokenspeed.runtime.pd.cache_protocol import (
+        CachePDLayerwiseBlockSelection,
+        CachePDLayerwiseGroupSelection,
+    )
+    from tokenspeed.runtime.pd.transfer_plan import CachePageOwnerFilter
+
+    manager, _ = _recording_transfer_manager(_sharded_history_layout(2), 0x1000)
+    destination_manifest = _single_group_block_manifest("history", (10, 11, 12, 13))
+    selection = CachePDLayerwiseBlockSelection(
+        groups=(CachePDLayerwiseGroupSelection((3, 4), (2, 3)),),
+    )
+
+    def blocks(owner_rank):
+        return list(
+            manager._cache_transfer_blocks(
+                dst_ptr=0x2000,
+                src_block_manifest=None,
+                dst_block_manifest=destination_manifest,
+                owner_filters={"history": CachePageOwnerFilter(owner_rank, 2)},
+                dst_cache_layout=_sharded_history_layout(1),
+                block_selection=selection,
+            )
+        )
+
+    (item,) = blocks(0)
+    assert item.src_pages.tolist() == [2] and item.dst_pages.tolist() == [12]
+    (item,) = blocks(1)
+    assert item.src_pages.tolist() == [2] and item.dst_pages.tolist() == [13]
+
+
+def test_transfer_blocks_send_nothing_for_a_sharded_group_decided_none() -> None:
+    """A None decision skips the group; the sender never infers from absence."""
+    manager, _ = _recording_transfer_manager(_sharded_history_layout(2), 0x1000)
+    manifest = _single_group_block_manifest("history", (1, 2))
+
+    assert (
+        list(
+            manager._cache_transfer_blocks(
+                dst_ptr=0x2000,
+                src_block_manifest=manifest,
+                dst_block_manifest=manifest,
+                owner_filters={"history": None},
+                dst_cache_layout=_sharded_history_layout(1),
+            )
+        )
+        == []
+    )
+    with pytest.raises(KeyError):
+        list(
+            manager._cache_transfer_blocks(
+                dst_ptr=0x2000,
+                src_block_manifest=manifest,
+                dst_block_manifest=manifest,
+                owner_filters={},
+                dst_cache_layout=_sharded_history_layout(1),
+            )
+        )
+
+
+def test_transfer_blocks_reject_an_out_of_range_virtual_block() -> None:
+    from tokenspeed.runtime.pd.transfer_plan import CachePageOwnerFilter
+
+    manager, _ = _recording_transfer_manager(_sharded_history_layout(2), 0x1000)
+    # A virtual ID past the group's virtual count never reaches the wire.
+    with pytest.raises(IndexError):
+        list(
+            manager._cache_transfer_blocks(
+                dst_ptr=0x2000,
+                src_block_manifest=_single_group_block_manifest("history", (31,)),
+                dst_block_manifest=_single_group_block_manifest("history", (1,)),
+                owner_filters={"history": CachePageOwnerFilter(0, 2)},
+                dst_cache_layout=_sharded_history_layout(1),
+            )
+        )
+
+
+def test_registration_validates_owner_filter_decisions_once() -> None:
+    from tokenspeed.runtime.pd.transfer_plan import (
+        CachePageOwnerFilter,
+        validate_rank_owner_filters,
+    )
+
+    group_specs = make_layout(
+        make_group(
+            "history",
+            make_segment("layer.0.kv", dtype="bfloat16", shape=(8,), stride=32),
+            shard_count=2,
+        ),
+        make_group(
+            "state",
+            make_segment("layer.1.state", dtype="bfloat16", shape=(8,), stride=32),
+        ),
+        capacity=16,
+        page_bytes=64,
+    ).group_specs
+    history = CacheTransferFragment(
+        group_id="history",
+        field_id="layer.0.kv",
+        src_byte_offset=0,
+        dst_byte_offset=0,
+        src_row_stride_bytes=16,
+        dst_row_stride_bytes=16,
+        bytes_per_row=16,
+        rows_per_page=1,
+    )
+    state = replace(history, group_id="state", field_id="layer.1.state")
+
+    def check(fragments, owner_filters):
+        validate_rank_owner_filters(
+            group_specs=group_specs, fragments=fragments, owner_filters=owner_filters
+        )
+
+    check((history, state), {"history": CachePageOwnerFilter(1, 2)})
+    check((state,), {"history": None})
+    with pytest.raises(ValueError, match="no owner-filter decision"):
+        check((history,), {})
+    with pytest.raises(ValueError, match="disagrees with its shard count"):
+        check((history,), {"history": CachePageOwnerFilter(0, 4)})
+    with pytest.raises(ValueError, match="but no owner filter"):
+        check((history,), {"history": None})
+    with pytest.raises(ValueError, match="carries no fragment of it"):
+        check((state,), {"history": CachePageOwnerFilter(0, 2)})
+    with pytest.raises(ValueError, match="which is not sharded"):
+        check((state,), {"history": None, "state": CachePageOwnerFilter(0, 2)})
+
+
+def test_every_sharded_prefill_rank_serves_every_decode_rank() -> None:
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+    from tokenspeed.runtime.pd.transfer_plan import CachePageOwnerFilter
+
+    source_layout = _sharded_history_layout(4)
+    destination_layout = _sharded_history_layout(1)
+    registrations = []
+    for tp_rank in range(4):
+        manager = object.__new__(MooncakeKVManagerPrefill)
+        manager.kv_args = SimpleNamespace(
+            cache_layout=source_layout,
+            kv_data_ptr=0x1000,
+            cache_fields_by_stage=(("layer.0.kv",),),
+        )
+        manager.topology = _topology(tp_size=4, tp_rank=tp_rank)
+        registration = manager._prepare_decode_registration(
+            _registration(destination_layout, rank=0, decode_tp_size=1)
+        )
+        registrations.append(registration)
+        assert not registration.is_dummy
+        assert registration.expected_decode_ranks == frozenset({0})
+        assert registration.transfer_owner_filters == {
+            "history": CachePageOwnerFilter(tp_rank, 4)
+        }
+        assert [f.field_id for f in registration.transfer_fragments] == ["layer.0.kv"]
+        manager.decode_kv_args_table = {registration.mooncake_session_id: registration}
+        # One decode rank completes this rank's fan-out.
+        manager._validate_cache_room_fanout(
+            (
+                TransferInfo(
+                    9,
+                    registration.mooncake_session_id,
+                    _single_group_block_manifest("history", (2,)),
+                ),
+            )
+        )
