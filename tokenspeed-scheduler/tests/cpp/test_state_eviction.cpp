@@ -254,16 +254,16 @@ TEST_F(StatePublicationSuite, DecodeAndFinishKeepOnlyThePrefillStateBoundary) {
         SendForwardDone("source", {token});
         PlanOnce();
     }
-    // The last schedule has already hashed the completed prefix pages;
-    // Finish adds no hash and must not supplement a state snapshot.
+    // Hashing stops at the prompt: decode and Finish keep neither generated
+    // history nor a state snapshot, only the prompt page and its checkpoint.
     SendFinish("source");
     PlanOnce();
-    EXPECT_EQ(ResidentBlocks(), 3 + 3);
+    EXPECT_EQ(ResidentBlocks(), 1 + 3);
     ExpectReplay("old_boundary", ConversationPrefix(8), 4);
     ExpectReplay("generated_boundary", ConversationPrefix(12), 4);
 }
 
-TEST_F(StatePublicationSuite, FinishAddsHistoryButNoDecodeStateToHost) {
+TEST_F(StatePublicationSuite, FinishAddsNoGeneratedHistoryOrStateToHost) {
     Reset(true, 1, 0);
     std::vector<ExecutionPlan> plans;
     Prefill(RequestWithTokens("source", MakeTokens(4, 1)), plans);
@@ -280,7 +280,7 @@ TEST_F(StatePublicationSuite, FinishAddsHistoryButNoDecodeStateToHost) {
     const ExecutionPlan finish = PlanOnce();
     EXPECT_EQ(StateStoreCount(finish), 0) << "finish does not create a decode Endpoint";
     AckWriteBacks(finish);
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6) << "three history pages plus the prefill state";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4) << "the prompt page plus the prefill state";
     ASSERT_TRUE(scheduler_->ClearL1Cache());
     ExpectReplay("old_host_boundary", ConversationPrefix(8), 4);
     ExpectReplay("generated_host_boundary", ConversationPrefix(12), 4);
@@ -836,9 +836,11 @@ TEST_F(SwaPublicationSuite, DecodeAndFinishKeepOnlyThePromptWindow) {
         SendForwardDone("source", {token});
         PlanOnce();
     }
-    // Finish hashes the last generated page, which is no resume point either.
+    // Hashing stops at the prompt: decode and Finish publish neither a window
+    // nor full-attention pages, only the prompt page in each group.
     SendFinish("source");
     PlanOnce();
+    EXPECT_EQ(ResidentBlocks(), 1 + 1);
     ExpectReplay("generated_boundary", ConversationPrefix(12), 4);
 }
 

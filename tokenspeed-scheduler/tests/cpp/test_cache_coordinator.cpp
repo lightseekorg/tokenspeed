@@ -4193,6 +4193,29 @@ TEST(BoundedReplayCoordinator, MakeCoordinatorRejectsReplayOnFullOrStateGroups) 
                  std::runtime_error);
 }
 
+// A matched group that keeps only resumable boundaries (an ordinary sliding
+// window or state group) caps the publishable tokens at the resume point. A
+// replayable window does not take part in matching, so it leaves them free.
+TEST(CacheCoordinatorTest, PublishableTokensStopAtResumeOnlyWithAMatchedNonClosedGroup) {
+    const CacheGroupSpec full{
+        .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4};
+    const CacheGroupSpec swa{
+        .kind = AttnKind::kSlidingWindow, .sliding_window = 8, .cache_blocks_per_lcm_block = 1, .block_granularity = 4};
+    const CacheGroupSpec state{
+        .kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4};
+    // Resumable at token 6.
+    const auto publishable = [](const std::vector<CacheGroupSpec>& specs, std::int32_t num_computed_tokens) {
+        BlockPool pool(8, std::vector<std::int32_t>(specs.size(), 1));
+        return MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, nullptr, false)
+            .PublishableTokens(num_computed_tokens, /*resume_tokens=*/6);
+    };
+    EXPECT_EQ(publishable({full}, 10), 10);
+    EXPECT_EQ(publishable({full, swa}, 10), 6);
+    EXPECT_EQ(publishable({full, state}, 10), 6);
+    EXPECT_EQ(publishable(ReplaySpecs(), 10), 10);
+    EXPECT_EQ(publishable({full, state}, 4), 4) << "never beyond what was computed";
+}
+
 TEST(BoundedReplayCoordinator, ReplayableGroupNeverConstrainsTheCommonBoundary) {
     BlockPool pool(16, {1, 1});
     CacheCoordinator coord = MakeCoordinator(ReplaySpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr, false);

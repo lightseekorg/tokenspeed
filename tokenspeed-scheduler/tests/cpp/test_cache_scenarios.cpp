@@ -305,9 +305,10 @@ TEST(MambaStateCheckpointTest, KeepsAlignedDecodeEndpointWorkingOnlyUnderWideVer
             finish.With(forward::Finish{.request_id = "parent"});
             scheduler.Advance(std::move(finish));
             scheduler.NextExecutionPlan();
-            EXPECT_EQ(scheduler.EmptyLcmBlocks(),
-                      initially_empty - (static_cast<std::int32_t>(tokens.size()) - 1) / cfg.prefix_granularity)
-                << "Finish retains complete history pages, but no generated state";
+            // The 124-token prompt completes no page, and generated pages are
+            // never hashed while a state group bounds every hit.
+            EXPECT_EQ(scheduler.EmptyLcmBlocks(), initially_empty - 124 / cfg.prefix_granularity)
+                << "Finish retains prompt history pages, but no generated history or state";
             tokens.insert(tokens.end(), 11, 4);
             scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
             const ExecutionPlan resumed = scheduler.NextExecutionPlan();
@@ -380,9 +381,10 @@ TEST(MambaStateCheckpointTest, ReclaimsWorkingStateAtExactAcceptedFrontier) {
                     ExpectDecodeWorkingState(scheduler, *current, static_cast<std::int32_t>(tokens.size()) - 1,
                                              cfg.prefix_granularity, cfg.device_allocator.NumUsableBlocks());
                 } else {
+                    // Only prompt pages are retained: the 3-token prompt
+                    // completes none, and generated pages are never hashed.
                     EXPECT_EQ(scheduler.EmptyLcmBlocks(),
-                              cfg.device_allocator.NumUsableBlocks() -
-                                  (static_cast<std::int32_t>(tokens.size()) - 1) / cfg.prefix_granularity);
+                              cfg.device_allocator.NumUsableBlocks() - 3 / cfg.prefix_granularity);
                 }
                 // Diverge immediately after the boundary under test: reusing
                 // the whole prefix could hide its loss behind a newer hit.
@@ -5575,6 +5577,35 @@ TEST_F(BoundedReplaySuite, FirstChunkAfterHitReplaysWindow) {
     SendFinish("r2");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
+}
+
+TEST_F(BoundedReplaySuite, DecodePagesArePublishedForTheNextTurn) {
+    // Replayable windows take no part in matching, so prefix hashing does not
+    // stop at the prompt end: the reply's full-attention page is published and
+    // the next turn hits through it.
+    const RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);  // 32 tokens
+    Submit(r1);
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    std::vector<std::int32_t> reply;
+    for (std::int32_t token = 9001; token <= 9009; ++token) {
+        reply.push_back(token);
+        SendForwardDone("r1", {token});
+        PlanOnce();
+    }
+    SendFinish("r1");
+    PlanOnce();
+
+    std::vector<std::int32_t> tokens = r1.tokens;
+    tokens.insert(tokens.end(), reply.begin(), reply.begin() + 8);  // through the reply page [32, 40)
+    const std::vector<std::int32_t> tail = MakeTokens(/*count=*/8, /*start=*/901);
+    tokens.insert(tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", tokens));
+
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r2"});
+    EXPECT_EQ(op->extend_prefix_lens.at(0) + op->extend_replay_lens.at(0), 40);
 }
 
 TEST_F(BoundedReplaySuite, HitShorterThanWindowReplaysWholePrefix) {

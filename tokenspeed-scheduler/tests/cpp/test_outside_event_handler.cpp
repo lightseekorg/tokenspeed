@@ -135,7 +135,7 @@ protected:
     }
 };
 
-TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresDecodeMlaPagesWithoutNewKdaSnapshot) {
+TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresNoDecodeMlaPagesOrKdaSnapshot) {
     Submit(MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1));
     const ExecutionPlan prefill = PlanOnce();
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(prefill).empty());
@@ -158,14 +158,9 @@ TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresDecodeMlaPagesWithoutNewK
         << "ordinary decode must not stream the new MLA page or KDA snapshots";
     SendForwardDone("r0", {45});
     SendFinish("r0");
-    const std::vector<CacheOperation> finish_stores = ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce());
-    ASSERT_EQ(finish_stores.size(), 1u);
-    const auto& finish_write_back = std::get<WriteBackBatch>(finish_stores.front());
-    ASSERT_EQ(finish_write_back.group_ids.size(), 1u);
-    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0}))
-        << "finish writes decode MLA pages but no decode KDA snapshot";
-    SendWriteBackDone(finish_write_back.op_ids.front());
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty())
+        << "no later request can hit past the prompt, so finish writes no decode MLA page or KDA snapshot";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 5);
 }
 
 class LoadBackDoneTestSuite : public SchedulerTestSuite {
