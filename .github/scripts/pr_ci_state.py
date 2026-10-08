@@ -29,6 +29,28 @@ BOT_ID = 243258330
 REPO = "lightseekorg/tokenspeed"
 COMMAND = re.compile(r"\s*@lightseek-bot[ \t]+(watch|fix)\s*", re.IGNORECASE)
 SHA = re.compile(r"[0-9a-f]{40}")
+NATIVE_CHECKS = {
+    "scheduler-cpp-test.yml": {
+        "label": "Scheduler C++",
+        "reason": "Cache classification, capacity and admission regressions",
+        "step": "Run scheduler C++ tests",
+        "job": "test",
+    },
+    "scheduler-python-test.yml": {
+        "label": "Scheduler Python",
+        "reason": "Python bindings, cache capacity and admission regressions",
+        "step": "Run scheduler Python tests",
+        "job": "test",
+    },
+    "nvidia-kernel-library-tests.yml": {
+        "label": "NVIDIA kernel libraries",
+        "reason": "Native MLA numerics, CUDA Graph replay and kernel regressions",
+        "step": "Run native library unit tests",
+        "job": "native-libraries",
+        "target": "Native GPU CI",
+    },
+}
+STATUSES = {"passed", "waiting", "failed", "missing", "blocked"}
 
 
 def marker(kind: str, data: dict) -> str:
@@ -87,7 +109,9 @@ def record(comment: dict, kind: str) -> dict | None:
         }
         if (
             not required.issubset(data)
-            or set(data) - required - {"candidate", "repair_run"}
+            or set(data)
+            - required
+            - {"candidate", "repair_run", "plan_refresh", "native_checks"}
             or type(data.get("command")) is not int
             or data.get("action") not in {"watch", "fix"}
             or data.get("phase")
@@ -103,14 +127,32 @@ def record(comment: dict, kind: str) -> dict | None:
             }
         ):
             return None
+        if "plan_refresh" in data and (
+            type(data["plan_refresh"]) is not int or data["plan_refresh"] < 1
+        ):
+            return None
         if (
             type(data["conflicts"]) is not bool
             or not isinstance(data["statuses"], list)
-            or any(
-                s not in {"passed", "waiting", "failed", "missing", "blocked"}
-                for s in data["statuses"]
-            )
+            or any(s not in STATUSES for s in data["statuses"])
         ):
+            return None
+        checks = data.get("native_checks", [])
+        if not isinstance(checks, list) or len(checks) > len(NATIVE_CHECKS):
+            return None
+        for check in checks:
+            if (
+                not isinstance(check, dict)
+                or set(check) != {"workflow", "status", "run"}
+                or not isinstance(check["workflow"], str)
+                or check["workflow"] not in NATIVE_CHECKS
+                or not isinstance(check["status"], str)
+                or check["status"] not in STATUSES
+                or type(check["run"]) is not int
+                or check["run"] < 0
+            ):
+                return None
+        if len({c["workflow"] for c in checks}) != len(checks):
             return None
         if (
             type(data["since"]) is not int

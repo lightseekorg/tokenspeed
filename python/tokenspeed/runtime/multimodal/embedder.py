@@ -28,7 +28,8 @@ Three sequential phases:
      position in ``input_ids`` that should be filled from an encoder token,
      along with the source range inside the owning item's encoded tensor.
 
-  2. ``_encode`` invokes the model-supplied encoder once per modality, then
+  2. ``_encode`` invokes the model-supplied encoder per modality, in calls of
+     at most the forward token bound (an item larger than that alone), then
      writes each item's output back onto the item itself (``item.encoded`` /
      ``item.encoded_deepstack``). In weight-TP mode every rank encodes the
      full miss list together. In item-DP mode each rank encodes a deterministic
@@ -70,6 +71,9 @@ from torch import nn
 from tokenspeed.runtime.distributed.mapping import VisionTowerMapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager,
+)
+from tokenspeed.runtime.multimodal.encoder_batching import (
+    pack_encoder_batches_in_order,
 )
 from tokenspeed.runtime.multimodal.encoder_feature_transport import (
     EncoderFeatureTransport,
@@ -377,6 +381,7 @@ class MultimodalEmbedder:
             input_ids.device,
             text_embedding.embedding_dim,
             text_embedding.weight.dtype,
+            max_tokens=ctx.max_encoder_tokens,
         )
         if LOG_MM_TIMING:
             if encode_events is not None:
@@ -524,6 +529,8 @@ class MultimodalEmbedder:
         device: torch.device,
         embedding_width: int,
         embedding_dtype: torch.dtype,
+        *,
+        max_tokens: int,
     ) -> None:
         for modality, items in plan.misses_by_modality.items():
             if not items:
@@ -544,12 +551,19 @@ class MultimodalEmbedder:
                     device,
                     output_width,
                     embedding_dtype,
+                    max_tokens=max_tokens,
                 )
             else:
-                output = self._run_encoder(items, spec, device)
                 per_item_lens = [_item_token_count(it) for it in items]
-                output = output.reshape(-1, output.shape[-1])
-                per_item_embs = list(torch.split(output, per_item_lens, dim=0))
+                per_item_embs = []
+                for group in pack_encoder_batches_in_order(
+                    per_item_lens, max_tokens=max_tokens
+                ):
+                    output = self._run_encoder([items[i] for i in group], spec, device)
+                    output = output.reshape(-1, output.shape[-1])
+                    per_item_embs.extend(
+                        torch.split(output, [per_item_lens[i] for i in group], dim=0)
+                    )
 
             self._store_encoder_outputs(items, per_item_embs, spec, multimodal_model)
 
@@ -569,6 +583,8 @@ class MultimodalEmbedder:
         device: torch.device,
         output_width: int,
         output_dtype: torch.dtype,
+        *,
+        max_tokens: int,
     ) -> list[torch.Tensor]:
         assert self._encoder_dp_group is not None
         per_item_lens = tuple(_item_token_count(item) for item in items)
@@ -580,12 +596,25 @@ class MultimodalEmbedder:
         local_items = [items[index] for index in local_indices]
         local_rows = assignment.token_counts_by_rank[self._encoder_dp_rank]
 
-        local_output = torch.empty((0, output_width), dtype=output_dtype, device=device)
-        if local_items:
+        local_lens = [per_item_lens[index] for index in local_indices]
+        groups = pack_encoder_batches_in_order(local_lens, max_tokens=max_tokens)
+        if len(groups) == 1:
             local_output = self._run_encoder(local_items, spec, device)
             local_output = local_output.reshape(local_rows, output_width).to(
                 device=device, dtype=output_dtype
             )
+        else:
+            # Zero or several calls fill one buffer, so the gather sends one tensor.
+            local_output = torch.empty(
+                (local_rows, output_width), dtype=output_dtype, device=device
+            )
+            row = 0
+            for group in groups:
+                rows = sum(local_lens[i] for i in group)
+                local_output[row : row + rows] = self._run_encoder(
+                    [local_items[i] for i in group], spec, device
+                ).reshape(rows, output_width)
+                row += rows
 
         gathered = self._gather_encoder_outputs(
             local_output, assignment.token_counts_by_rank

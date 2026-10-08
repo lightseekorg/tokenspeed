@@ -733,21 +733,47 @@ For workflows with one case per GitHub job, use **Re-run failed jobs**.
 On an open same-repository PR into `main`, a repository writer can comment
 `@lightseek-bot watch` or `@lightseek-bot fix`.
 
+Completion triggers exclude `main`; its push CI creates no assistance runs.
+`PR CI Assist Dispatch` handles planner and validation dispatches whose controller
+runs on `main`. Closed PRs and PRs without an active authorized watch/fix skip
+the control job. Other PR completions and comments can still create lightweight
+runs, but ordinary comments skip all jobs and inactive callbacks stop at resolve.
+
 - `watch` follows the current CI plan's selected tasks. Failed tasks get one
   focused reproduction: NVIDIA uses Slurm GB200, then compatible GB300 only if
   GB200 reports no capacity before submission; AMD uses K8s AMD. A repeated
-  failure or missing result requests human intervention. Queued runs are reused.
+  failure or missing result requests human intervention. Running native checks
+  are reused. Queued NVIDIA checks can use the selected Slurm route; queued
+  Slurm allocations and AMD checks are reused. A dispatched check remains the
+  watch's source of results even if native CI starts later.
+  Scheduler changes also watch the existing C++ and Python CPU workflows first;
+  NVIDIA library changes include the native GPU library workflow. Each is matched
+  by its PR path filters, independently of manual dispatch support. Completion
+  requires successful test execution on the current PR head and base. Skipped
+  jobs wait for an eligible run; failures or skipped test steps request human
+  intervention rather than a dispatch retry. CPU-only plans need no GPU task.
+  In-tree MLA Python changes also require a serving task with an explicit
+  `tokenspeed_mla` target or drafter backend; a kernel UT alone is insufficient.
 - `fix` resolves conflicts first, or attempts a focused source repair for an
   already failed selected task. A separate branch receives the candidate;
   required pre-commit checks and all selected GPU tasks must pass before the
   repair is cherry-picked back. Conflict repairs also record the validated
   merge with `main` so the PR becomes mergeable. A changed head or base stops
   promotion.
+  Native workflow tracking is limited to `watch`; PR results cannot validate a repair
+  candidate, and conflicted PRs cannot start native PR workflows. `fix` retains
+  selected GPU validation before cherry-pick and required CI on the updated PR.
 
 Only explicit writer commands start repairs. The bot does not edit tests,
 workflow/configuration files or task thresholds automatically, and does not
 merge PRs or bypass required checks. Comments contain a short status table;
 versioned hidden records preserve the selected tasks and immutable source.
+Selected UT files with a known task mapping must be covered by the selected CI
+tasks. Older plans missing that coverage are refreshed once before watching;
+a failed or incomplete refresh requests human intervention.
+For shared serving paths, prioritize the smallest existing model and bounded
+workload with equivalent coverage. Keep larger or model-specific checks when
+changed flags or callers require them.
 `PR CI Assist` can be manually dispatched with a PR number to reconcile an
 existing command. The workflows must be present on `main` for comment and
 completion events to activate them.

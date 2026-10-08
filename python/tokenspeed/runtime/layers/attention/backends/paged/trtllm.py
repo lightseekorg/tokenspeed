@@ -416,7 +416,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         if self.tree_lane_step_active:
             lanes = self.tree_draft
             return self._tree_cascade(
-                self._prepare_q(q, layer),
+                q,
                 layer,
                 token_to_kv_pool,
                 page_table=self.page_table_buf[:bs],
@@ -443,7 +443,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 else self.forward_decode_metadata
             )
 
-        q = self._prepare_q(q, layer)
         if self.tree_verify is not None and metadata.max_seq_len_q > 1:
             nodes = self.tree_verify.num_nodes
             return self._tree_cascade(
@@ -458,6 +457,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 window=nodes,
                 sinks=kwargs.get("sinks"),
             )
+        q = self._prepare_q(q, layer)
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
 
         attention_sink = kwargs.get("sinks", None)
@@ -484,13 +484,13 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def tree_support(self) -> TreeSupport:
-        if self.kv_cache_dtype == self.dtype:
+        if self.kv_cache_dtype in (self.dtype, torch.float8_e4m3fn):
             return TreeSupport(verify_blocker=None, draft_blocker=None)
         return TreeSupport(
-            verify_blocker=f"{type(self).__name__} reads the verify window K/V back "
-            f"unquantized; kv_cache_dtype {self.kv_cache_dtype} is not supported yet",
-            draft_blocker=f"{type(self).__name__} reads the lane window K/V back "
-            f"unquantized; kv_cache_dtype {self.kv_cache_dtype} is not supported yet",
+            verify_blocker=f"{type(self).__name__} reads the verify window K/V in the "
+            f"model dtype or FP8 E4M3; kv_cache_dtype {self.kv_cache_dtype} is not supported",
+            draft_blocker=f"{type(self).__name__} reads the lane window K/V in the "
+            f"model dtype or FP8 E4M3; kv_cache_dtype {self.kv_cache_dtype} is not supported",
         )
 
     def _tree_cascade(
@@ -509,7 +509,10 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     ) -> torch.Tensor:
         """Draft-tree attention (verify nodes or drafting lanes): trtllm-gen's causal
         ``rows``-token decode over the committed prefix, then the tree window
-        and the prefix tail merged into it (``tree_window_attention``)."""
+        and the prefix tail merged into it (``tree_window_attention``).
+
+        ``q`` is unquantized: trtllm-gen takes it cast like any decode query,
+        and the window kernel takes it as is, widening an FP8 cache's K/V."""
         if layer.sliding_window_size >= 0 or sinks is not None:
             raise NotImplementedError(
                 "draft trees have no sliding-window or attention-sink path yet"
@@ -517,7 +520,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
         # trtllm-gen also loads the key right after the prefix: the window's first slot, written this forward.
         prefix_out, prefix_lse = trtllm_batch_decode_with_kv_cache(
-            query=q,
+            query=self._prepare_q(q, layer),
             kv_cache=(k_cache, v_cache),
             workspace_buffer=self.workspace_buffer,
             block_tables=page_table,
@@ -532,7 +535,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         kv_heads, dim = layer.tp_k_head_num, layer.head_dim
         k_rows, v_rows = token_to_kv_pool.get_kv_buffer(layer.layer_id)
         out = tree_window_attention(
-            q,
+            q.contiguous().view(-1, layer.tp_q_head_num, dim),
             k_rows.view(-1, kv_heads, dim),
             v_rows.view(-1, kv_heads, dim),
             page_table,

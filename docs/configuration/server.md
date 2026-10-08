@@ -325,7 +325,7 @@ are not advertised as control URLs; use a concrete address for gateway discovery
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
 | `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
-| `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration. Defaults to `8192`. Set `-1` to disable chunked prefill. |
+| `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--block-size` | KV cache block size. |
@@ -333,7 +333,7 @@ are not advertised as control URLs; use a concrete address for gateway discovery
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
-| `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost. |
+| `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost and, on CUDA, what startup keeps resident. |
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
@@ -380,6 +380,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--nnodes` | Number of nodes. |
 | `--node-rank` | Rank of the current node. |
 | `--dist-init-addr` | Distributed initialization address. |
+| `--emulate-rank-zero` | Run only global rank 0 of the configured layout on one GPU, with local stand-ins for its collectives. For single-GPU performance work; outputs are not meaningful. See [Emulating Rank 0 on One GPU](../serving/parallelism.md#emulating-rank-0-on-one-gpu). |
 
 Use `--tensor-parallel-size` for simple launches. Use the
 TokenSpeed-specific split knobs when attention, dense, and MoE layers need
@@ -547,8 +548,9 @@ Memory: the recorded distributions take
 (`--speculative-num-draft-tokens` fp32 rows per request-pool slot), plus a
 batch-ordered gather buffer of `max_num_seqs x num_draft_tokens x vocab_size x
 4` bytes on the verifier; 80 requests at 4 draft tokens over a 129K vocabulary
-cost about 330 MB in total. Both come out of the `--gpu-memory-utilization`
-headroom, not the KV-cache budget.
+cost about 330 MB in total. On CUDA, when the CUDA-graph memory reserve is on,
+both are charged to it as startup residue, out of the KV-cache budget;
+otherwise they come out of the `--gpu-memory-utilization` headroom.
 
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.

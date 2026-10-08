@@ -31,12 +31,14 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.testing as testing
+import cutlass.memory
 import cutlass.pipeline as pipeline
+import cutlass.tensor_utils
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.enums import Arch
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int8, Int32, Int64
@@ -444,10 +446,16 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.cta_tiler,
             self.is_persistent,
         )
-        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
-        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
-        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
-        self.o_layout = utils.LayoutEnum.from_tensor(o)
+        self.q_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            q
+        ).mma_major_mode()
+        self.k_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            k
+        ).mma_major_mode()
+        self.v_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            v
+        ).mma_major_mode()
+        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(o)
 
         if cutlass.const_expr(self.q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
@@ -469,6 +477,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         p_major_mode = OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
+            self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.qk_acc_dtype,
@@ -476,6 +485,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.qk_mma_tiler[:2],
         )
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
@@ -729,7 +739,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(
@@ -839,8 +849,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_storage=storage.s1_p0_inplace_barrier_ptr.data_ptr(),
             defer_sync=True,
         ).make_participants()
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = cutlass.memory.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             # Correction warp is the last one that accesses tmem
             allocator_warp_id=self.correction_warp_ids[0],

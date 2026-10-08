@@ -76,12 +76,11 @@ def validate_shared_expert_settings(mapping, value):
     """
     if dist.is_initialized() and mapping.world_size > 1:
         pg_manager.init_process_group(mapping.world_group, backend="gloo")
-        values = [None] * mapping.world_size
-        dist.all_gather_object(
-            values,
-            value,
-            group=pg_manager.get_process_group("gloo", mapping.world_group),
-        )
+        group = pg_manager.get_process_group("gloo", mapping.world_group)
+        # Sized by the process group: --emulate-rank-zero backs the logical
+        # world with this process alone.
+        values = [None] * group.size()
+        dist.all_gather_object(values, value, group=group)
         if len(set(values)) != 1:
             raise ValueError(f"Shared-expert TP settings differ across ranks: {values}")
     return shared_expert_mapping(mapping, value)

@@ -30,11 +30,12 @@ import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
-from pr_ci_plan import context, task_key
-from pr_ci_state import BOT, BOT_ID, COMMAND, REPO, SHA, marker, record
+from pr_ci_plan import CoverageError, context, task_key, validate_test_coverage
+from pr_ci_state import BOT, BOT_ID, COMMAND, NATIVE_CHECKS, REPO, SHA, marker, record
 
 ROOT = Path(__file__).resolve().parents[2]
 WORK = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())) / "pr-ci-assist"
+FINISHED_PHASES = {"done", "manual", "stale", "promoted"}
 
 
 def command(*args: str, cwd: Path = ROOT) -> str:
@@ -66,8 +67,7 @@ def output(key: str, value: str):
         stream.write(f"{key}={value}\n")
 
 
-def pull(number: int) -> dict:
-    pr = api(f"pulls/{number}")
+def _require_open_pr(pr: dict) -> dict:
     if (
         pr["state"] != "open"
         or not pr["head"]["repo"]
@@ -76,6 +76,10 @@ def pull(number: int) -> dict:
     ):
         raise ValueError("An open same-repository PR into main is required.")
     return pr
+
+
+def pull(number: int) -> dict:
+    return _require_open_pr(api(f"pulls/{number}"))
 
 
 def permitted(comment: dict) -> str | None:
@@ -112,7 +116,16 @@ def resolve():
             number = int(value)
     elif name == "workflow_run" and event["action"] == "completed":
         run = event["workflow_run"]
+        if run["event"] not in {"pull_request", "workflow_dispatch"}:
+            print("Non-PR CI completion; skipping CI assistance.")
+            return
         candidates = {p["number"] for p in run["pull_requests"]}
+        plan = re.fullmatch(
+            r"CI plan #([1-9][0-9]*) \| [0-9a-f]{40} \| [0-9a-f]{40}",
+            run["display_title"],
+        )
+        if plan:
+            candidates.add(int(plan[1]))
         if not candidates:
             match = re.match(r"(?:Slurm|K8s) ([0-9a-f]{40}) \|", run["display_title"])
             source = match[1] if match else run["head_sha"]
@@ -136,31 +149,57 @@ def resolve():
         if len(candidates) == 1:
             number = candidates.pop()
     if number:
-        pull(number)
+        pr = api(f"pulls/{number}")
+        if name == "workflow_run" and pr["state"] != "open":
+            print("PR is closed or merged; skipping CI assistance.")
+            return
+        _require_open_pr(pr)
+        if name == "workflow_run":
+            comments = pages(f"issues/{number}/comments", None)
+            state = load_state(comments, pr)
+            comment = latest_command(comments)
+            initial = bool(comment and (not state or comment["id"] > state["command"]))
+            if not initial and (not state or state["phase"] in FINISHED_PHASES):
+                print("No active watch/fix command; skipping CI assistance.")
+                return
         output("pr", str(number))
 
 
 def plan_source():
+    """Resolve an open PR at its requested source; skip obsolete events."""
+    output("active", "false")
+    name = os.environ["GITHUB_EVENT_NAME"]
+    if name not in {"pull_request", "workflow_dispatch"}:
+        print("CI plans require a PR event or a refresh for a specific PR; skipping.")
+        return
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     number = (
         int(event["inputs"]["pr"])
-        if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+        if name == "workflow_dispatch"
         else event["pull_request"]["number"]
     )
-    pr = pull(number)
-    if os.environ["GITHUB_EVENT_NAME"] == "pull_request" and (
+    pr = api(f"pulls/{number}")
+    # Fast merges can close the PR before its queued planner starts.
+    if pr["state"] != "open":
+        print("PR is closed or merged; skipping the CI plan.")
+        return
+    _require_open_pr(pr)
+    if name == "pull_request" and (
         event["pull_request"]["head"]["sha"] != pr["head"]["sha"]
         or event["pull_request"]["base"]["sha"] != pr["base"]["sha"]
     ):
-        raise ValueError("PR event source changed.")
-    if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch" and (
+        print("PR event source changed; skipping the obsolete CI plan.")
+        return
+    if name == "workflow_dispatch" and (
         event["inputs"]["head"] != pr["head"]["sha"]
         or event["inputs"]["base"] != pr["base"]["sha"]
     ):
-        raise ValueError("Plan request source changed.")
+        print("Plan request source changed; skipping the obsolete CI plan.")
+        return
     output("pr", str(number))
     output("head", pr["head"]["sha"])
     output("base", pr["base"]["sha"])
+    output("active", "true")
 
 
 def public_gate():
@@ -189,17 +228,28 @@ def publish(state: dict, message: str):
     # All editable text here is fixed, identifiers were validated against the
     # public catalog; do not copy API errors, task logs or model prose.
     body = f"**CI {state['action']}** · `{state['head'][:8]}`\n\n{message}\n"
-    if state["statuses"]:
-        body += "\n| Check | Result |\n|---|---|\n"
+    if state.get("native_checks") or state["statuses"]:
+        body += "\n| Check | Source | Result |\n|---|---|---|\n"
+        for check in state.get("native_checks", []):
+            label = NATIVE_CHECKS[check["workflow"]]["label"]
+            result = check["status"]
+            if check["run"]:
+                result = (
+                    f"[{result}](https://github.com/{REPO}/actions/runs/{check['run']})"
+                )
+            body += f"| {label} | PR `{state['head'][:8]}` | {result} |\n"
+        sha = state.get("candidate", {}).get("validation", state["head"])
         for task, status in zip(state["tasks"], state["statuses"]):
-            link = f"https://github.com/{REPO}/blob/{state['head']}/{quote(task['config'], safe='/')}"
+            link = f"https://github.com/{REPO}/blob/{sha}/{quote(task['config'], safe='/')}"
             run = state["run_ids"].get(task_key(task))
             result = (
                 f"[{status}](https://github.com/{REPO}/actions/runs/{run})"
                 if run
                 else status
             )
-            body += f"| [{Path(task['config']).stem}]({link}) | {result} |\n"
+            body += (
+                f"| [{Path(task['config']).stem}]({link}) | `{sha[:8]}` | {result} |\n"
+            )
     body += marker("assist", state)
     scanned = re.sub(
         rf"https://github\.com/{REPO}/(?:blob/[0-9a-f]{{40}}/[A-Za-z0-9_./%-]+|actions/runs/[0-9]+)",
@@ -284,6 +334,7 @@ def validate_plan(plan: dict, data: dict) -> list[dict]:
         t not in data["test_files"] for t in plan["tests"]
     ):
         raise ValueError("Invalid selected coverage.")
+    validate_test_coverage(plan["tests"], tasks, data["catalog"], data.get("paths", []))
     return tasks
 
 
@@ -341,6 +392,52 @@ def runs_for(state: dict) -> list[dict]:
     return sorted(
         {r["id"]: r for r in runs}.values(), key=lambda r: r["id"], reverse=True
     )
+
+
+def native_check(check: dict, state: dict, runs: list[dict]) -> dict:
+    result = dict(workflow=check["workflow"], status="waiting", run=0)
+    for run in runs:
+        if (
+            run["event"] != "pull_request"
+            or run["head_sha"] != state["head"]
+            or run["path"] != f".github/workflows/{check['workflow']}"
+            or not any(
+                p["number"] == state["pr"]
+                and p["head"]["sha"] == state["head"]
+                and p["base"]["sha"] == state["base"]
+                and p["base"]["ref"] == "main"
+                for p in run["pull_requests"]
+            )
+        ):
+            continue
+        result["run"] = run["id"]
+        if run["status"] != "completed":
+            return result
+        if run["conclusion"] == "failure":
+            return {**result, "status": "failed"}
+        jobs = pages(f"actions/runs/{run['id']}/jobs?filter=latest", "jobs")
+        jobs = [j for j in jobs if j["name"] == check["job"]]
+        if (
+            run["conclusion"] == "success"
+            and len(jobs) == 1
+            and jobs[0]["conclusion"] == "skipped"
+        ):
+            return result
+        if (
+            run["conclusion"] == "success"
+            and len(jobs) == 1
+            and jobs[0]["status"] == "completed"
+            and jobs[0]["conclusion"] == "success"
+            and any(
+                step["name"] == check["step"]
+                and step["status"] == "completed"
+                and step["conclusion"] == "success"
+                for step in jobs[0]["steps"]
+            )
+        ):
+            return {**result, "status": "passed"}
+        return {**result, "status": "missing"}
+    return result
 
 
 def download(run: dict, name: str, target: Path):
@@ -526,6 +623,7 @@ def native_result(run: dict, task: dict, state: dict, job: dict) -> str:
 def original_status(runs: list[dict], task: dict, state: dict) -> str:
     # Native PR matrices may use a different physical NVIDIA label; match the
     # declared task name only within a workflow tied to this exact PR source.
+    pending = "absent"
     for run in runs:
         if (
             run["event"] != "pull_request"
@@ -541,6 +639,10 @@ def original_status(runs: list[dict], task: dict, state: dict) -> str:
         ):
             continue
         jobs = pages(f"actions/runs/{run['id']}/jobs?filter=latest", "jobs")
+        dispatch_queued = bool(task["cluster"]) and run["name"] not in {
+            "NVIDIA GB200 Tests",
+            "NVIDIA GB300 Tests",
+        }
         labels = {
             r
             for r in task["native_runners"]
@@ -560,9 +662,15 @@ def original_status(runs: list[dict], task: dict, state: dict) -> str:
             if "per-commit" in task["triggers"] and any(
                 j["name"] == "scan" and j["status"] != "completed" for j in jobs
             ):
+                if dispatch_queued:
+                    pending = "queued"
+                    continue
                 return "waiting"
             continue
         job = matches[0]
+        if job["status"] == "queued" and dispatch_queued:
+            pending = "queued"
+            continue
         state["run_ids"][task_key(task)] = run["id"]
         if job["status"] != "completed":
             return "waiting"
@@ -580,7 +688,7 @@ def original_status(runs: list[dict], task: dict, state: dict) -> str:
             ):
                 return "missing"
         return "missing"
-    return "absent"
+    return pending
 
 
 def task_status(task: dict, state: dict, runs: list[dict], *, submit: bool) -> str:
@@ -612,16 +720,17 @@ def task_status(task: dict, state: dict, runs: list[dict], *, submit: bool) -> s
             if status == "unavailable":
                 continue
             return status
+        title = run_title(task, sha, cluster)
+        if title in state["submitted"]:
+            # The dispatch owns this check, even before its run becomes visible.
+            return "waiting"
         if "candidate" not in state and cluster == clusters[0]:
             status = original_status(runs, task, state)
             if status == "failed" and state["action"] == "fix":
                 return status
-            if status not in {"failed", "absent", "missing"} or not submit:
+            if status not in {"failed", "absent", "missing", "queued"} or not submit:
                 return status
         if submit:
-            title = run_title(task, sha, cluster)
-            if title in state["submitted"]:
-                return "waiting"
             state["submitted"].append(title)
             publish(
                 state,
@@ -652,6 +761,27 @@ def load_state(comments: list[dict], pr: dict) -> dict | None:
                 raise ValueError("Command is no longer authorized.")
             return state
     return None
+
+
+def refresh_plan(state: dict, message: str):
+    state["phase"] = "waiting-plan"
+    publish(state, message)
+    command(
+        "gh",
+        "workflow",
+        "run",
+        "pr-ci-plan.yml",
+        "--repo",
+        REPO,
+        "--ref",
+        "main",
+        "-f",
+        f"pr={state['pr']}",
+        "-f",
+        f"head={state['head']}",
+        "-f",
+        f"base={state['base']}",
+    )
 
 
 def control(number: int):
@@ -687,12 +817,32 @@ def control(number: int):
                 if t.startswith((f"Slurm {state['head']} |", f"K8s {state['head']} |"))
             ]
             state["since"] = prior["since"]
-    if not state or state["phase"] in {"done", "manual", "stale", "promoted"}:
+    if not state or state["phase"] in FINISHED_PHASES:
         return
     if state["head"] != pr["head"]["sha"] or state["base"] != pr["base"]["sha"]:
         state["phase"] = "stale"
         publish(state, "PR or main changed. Request a new plan and command.")
         return
+    if "plan_refresh" in state and os.environ["GITHUB_EVENT_NAME"] == "workflow_run":
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+        completed = event["workflow_run"]
+        if (
+            completed["display_title"]
+            == f"CI plan #{number} | {state['head']} | {state['base']}"
+            and completed["id"] > state["plan_refresh"]
+            and completed["conclusion"] != "success"
+        ):
+            completed = api(f"actions/runs/{completed['id']}")
+            if (
+                completed["path"] == ".github/workflows/pr-ci-plan.yml"
+                and completed["event"] == "workflow_dispatch"
+                and completed["head_branch"] == "main"
+                and completed["actor"]["login"] == BOT
+                and completed["conclusion"] != "success"
+            ):
+                state["phase"] = "manual"
+                publish(state, "CI plan refresh failed. Human intervention required.")
+                return
     source = checkout(state["head"], state["base"])
     os.environ.update(PR_NUMBER=str(number), GITHUB_REPOSITORY=REPO)
     data = context(source, state["head"], state["base"])
@@ -706,26 +856,9 @@ def control(number: int):
     ]
     if not plans:
         if initial:
-            state["phase"] = "waiting-plan"
-            publish(
+            refresh_plan(
                 state,
                 "Refreshing the CI plan for this head and base; only its selected tasks will be watched.",
-            )
-            command(
-                "gh",
-                "workflow",
-                "run",
-                "pr-ci-plan.yml",
-                "--repo",
-                REPO,
-                "--ref",
-                "main",
-                "-f",
-                f"pr={number}",
-                "-f",
-                f"head={state['head']}",
-                "-f",
-                f"base={state['base']}",
             )
         return
     plan = plans[0]
@@ -742,6 +875,19 @@ def control(number: int):
         return
     try:
         tasks = validate_plan(plan, data)
+    except CoverageError:
+        if "plan_refresh" not in state:
+            state["plan_refresh"] = plan["run"]
+            refresh_plan(
+                state, "CI plan omits required validation; refreshing coverage."
+            )
+        elif plan["run"] > state["plan_refresh"]:
+            state["phase"] = "manual"
+            publish(
+                state,
+                "Refreshed CI plan still omits required validation. Human intervention required.",
+            )
+        return
     except ValueError:
         state["phase"] = "manual"
         publish(
@@ -749,7 +895,8 @@ def control(number: int):
             "Some planned tasks have no supported GPU route. Human intervention required.",
         )
         return
-    if not tasks:
+    replanned = state.pop("plan_refresh", None) is not None
+    if not tasks and (state["action"] != "watch" or not data.get("native_checks")):
         state["phase"] = "manual"
         publish(
             state,
@@ -779,6 +926,20 @@ def control(number: int):
             )
         return
     runs = runs_for(state)
+    previous_checks = state.get("native_checks", [])
+    state["native_checks"] = [
+        native_check(check, state, runs)
+        for check in data.get("native_checks", [])
+        if state["action"] == "watch"
+    ]
+    native_statuses = [c["status"] for c in state["native_checks"]]
+    if any(s in {"failed", "missing", "blocked"} for s in native_statuses):
+        state["phase"] = "manual"
+        publish(
+            state,
+            "Native checks need human intervention; no dispatch retry or PR update.",
+        )
+        return
     requested_fix = state["action"] == "fix" and "candidate" not in state
     if requested_fix and pr["mergeable"] is False:
         state["conflicts"] = True
@@ -810,7 +971,8 @@ def control(number: int):
         )
         output("repair", "true")
         return
-    if "candidate" in state and all(s == "passed" for s in statuses):
+    combined = native_statuses + statuses
+    if "candidate" in state and all(s == "passed" for s in combined):
         from pr_ci_repair import promote
 
         promote(state)
@@ -820,17 +982,22 @@ def control(number: int):
             "Validated repair cherry-picked to the PR. Required CI remains in effect.",
         )
         return
-    if any(s in {"failed", "missing", "blocked"} for s in statuses):
+    if any(s in {"failed", "missing", "blocked"} for s in combined):
         state["phase"] = "manual"
-    elif all(s == "passed" for s in statuses):
+    elif all(s == "passed" for s in combined):
         state["phase"] = "done"
     else:
         state["phase"] = "validating" if "candidate" in state else "watching"
-    if initial or previous != statuses:
+    if (
+        initial
+        or replanned
+        or previous != statuses
+        or previous_checks != state["native_checks"]
+    ):
         counts = ", ".join(
-            f"{statuses.count(s)} {s}"
+            f"{combined.count(s)} {s}"
             for s in ("passed", "waiting", "failed", "missing", "blocked")
-            if s in statuses
+            if s in combined
         )
         message = f"{counts}."
         if state["phase"] == "manual":
