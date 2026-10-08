@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 # Decode-node simulation as a Slurm sweep: dataset prep, the server and
-# pd_client run as job steps (attention-DP 16 spans 4 nodes of 4 GPUs).
+# pd_client run as job steps (DP16 uses the first 4 nodes; DP32 uses 8).
 #
 #   sbatch -N 4 --gres=gpu:4 --time=12:00:00 [-A <account> -p <partition>] \
 #       --export=ALL,CONTAINER_IMAGE=<sqsh-or-ref> \
@@ -18,12 +18,10 @@ CONFIGS=(
 # Passing this file to sbatch directly runs a spool copy and loses this
 # directory; the usage above wraps it so the real path is used in both modes.
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-MODEL=nvidia/Kimi-K3-NVFP4
-DATASET="${SCRIPT_DIR}/agentic_dataset_x32.json"
 SERVER_PID=
 SERVER_LOG=
 STEP_NAME=disagg_server
-# A prime runs one cold 50K prefill per DP rank.
+# Prime the concatenated user-turn prompts at low concurrency.
 PRIME_PARALLEL=16
 
 JOBID="${SLURM_JOB_ID:?run via sbatch, or export SLURM_JOB_ID=<id> of a held allocation}"
@@ -54,7 +52,7 @@ SRUN_ARGS=(
 
 # Prepare dataset: the 71-conversation build, then 32 cache-bust replicas
 # (the duplicator's default); the 128-wide rung replays 128 distinct prefixes.
-"${SRUN[@]}" --nodes=1 --ntasks=1 "${SRUN_ARGS[@]}" bash -c '
+"${SRUN[@]}" --nodes=1 --ntasks=1 --nodelist="$HEAD" "${SRUN_ARGS[@]}" bash -c '
 set -euo pipefail
 
 EVALSCOPE_COMMIT=acd09b44384d53174768bb1063f675420f76fae9
@@ -63,20 +61,21 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 [ -f build_swe_smith_dataset.py ] || wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
     -O build_swe_smith_dataset.py
 
-# Note: Only 71 conversations can be built
+# Note: Only 69 conversations can be built
 [ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
     --model-path moonshotai/Kimi-K3 \
-    --first-turn-length 50000 \
+    --first-turn-length 4000 \
     --subsequent-turn-length 800 \
-    --min-turns 10 \
-    --max-turns 15 \
+    --min-turns 30 \
+    --max-turns 50 \
     --number 128 \
     --output-path agentic_dataset.json \
     --num-workers 32
 
 [ -f agentic_dataset_x32.json ] || python3 duplicate_agentic_dataset.py \
     --input agentic_dataset.json \
-    --output agentic_dataset_x32.json
+    --output agentic_dataset_x32.json \
+    --replicas 32
 '
 
 server_steps() {
@@ -86,9 +85,27 @@ server_steps() {
 
 launch_server() {
     local config=$1
+    local node_count
+    case "$config" in
+        attn_dp16_moe_ep16) node_count=4 ;;
+        attn_dp32_moe_ep32) node_count=8 ;;
+        *) echo "Unsupported config: $config" >&2; return 1 ;;
+    esac
+
+    if (( NNODES < node_count )); then
+        echo "$config requires $node_count nodes; allocation has $NNODES" >&2
+        return 1
+    fi
+
+    local node_list
+    printf -v node_list '%s,' "${NODES[@]:0:node_count}"
+    node_list="${node_list%,}"
+
     SERVER_LOG=/tmp/tokenspeed_server_disagg_${config}_${SWEEP_TS}.log
     "${SRUN[@]}" --job-name="$STEP_NAME" \
-        --nodes="$NNODES" --ntasks-per-node=1 --mpi=pmix "${SRUN_ARGS[@]}" \
+        --nodes="$node_count" --ntasks="$node_count" \
+        --ntasks-per-node=1 --nodelist="$node_list" \
+        --mpi=pmix "${SRUN_ARGS[@]}" \
         "${SCRIPT_DIR}/configs/${config}.sh" > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 }
@@ -148,9 +165,9 @@ wait_for_port_free() {
 
 # One pd_client phase as a single-task step; phase flags are passed through.
 client() {
-    "${SRUN[@]}" --nodes=1 --ntasks=1 "${SRUN_ARGS[@]}" \
-        python3 "${SCRIPT_DIR}/pd_client.py" --url "$URL" --model "$MODEL" \
-        --dataset "$DATASET" "$@"
+    "${SRUN[@]}" --nodes=1 --ntasks=1 --nodelist="$HEAD" "${SRUN_ARGS[@]}" \
+        python3 "${SCRIPT_DIR}/pd_client.py" --url "$URL" --model nvidia/Kimi-K3-NVFP4 \
+        --dataset agentic_dataset_x32.json "$@"
 }
 
 trap stop_server EXIT  # safety net for Ctrl-C / errors

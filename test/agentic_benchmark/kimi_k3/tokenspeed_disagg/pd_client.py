@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
-"""Phased client for the PD-disaggregation simulation bench.
+"""Prefill conversation replay and cached-prompt decode simulation.
 
-evalscope's swe_smith plugin has no prime/measure phase control, so the
-prime waves, the P-cached turn replay, and the measured waves all run
-through this thin client. It replays the duplicated agentic dataset,
-drives a fixed concurrency with rolling admission, and emits a
-benchmark_summary.json consumed by collect_outputs.py in this directory.
+p-measure replays every user turn with one generated token, inserting prepared
+500-token synthetic assistant messages between turns. Each worker advances one
+conversation sequentially, then takes the next conversation from the pool.
+d-prime and d-measure replay the same concatenated user-turn prompt.
 
-Phases (--phase):
-  p-fresh   unique first turns, max_tokens 1        -> prefill tok/s
-  p-cached  turn-1 prime (500) then turn-2 measure  -> computed tok/s
-  d-prime   first turns, max_tokens 1, low parallel  (no summary emitted)
-  d-measure resend first turns, max_tokens N        -> output tok/s
-
-Every request carries rid=pdsim-conv-<index> (index into the deduplicated
-conversation list), so a gateway running sticky sessions keeps a
-conversation on the DP rank that primed it across phases.
+Every request carries rid=pdsim-conv-<index>, so a gateway configured with
+sticky sessions keeps a conversation on the same attention-DP rank.
 """
 
 import argparse
 import concurrent.futures as cf
 import json
+import random
 import statistics
 import sys
 import threading
 import time
 import urllib.request
+
+TARGET_RESPONSE_TOKENS = 500
 
 
 def parse_args():
@@ -36,23 +31,26 @@ def parse_args():
     p.add_argument(
         "--phase",
         required=True,
-        choices=["p-fresh", "p-cached", "d-prime", "d-measure"],
+        choices=["p-measure", "d-prime", "d-measure"],
     )
     p.add_argument("--parallel", type=int, required=True)
     p.add_argument(
         "--number",
         type=int,
         required=True,
-        help="requests to issue (conversations consumed)",
+        help="conversations to replay",
     )
     p.add_argument(
         "--offset", type=int, default=0, help="first conversation index to use"
     )
-    p.add_argument("--max-tokens", type=int, default=1)
+    p.add_argument("--max-tokens", type=int, required=True)
     p.add_argument("--timeout", type=int, default=3600)
     p.add_argument("--name", default="run", help="label for the output dir")
     p.add_argument("--outputs-dir", default="outputs")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.phase == "p-measure" and args.max_tokens != 1:
+        p.error("p-measure requires --max-tokens 1")
+    return args
 
 
 def first_turn_messages(conv):
@@ -77,14 +75,7 @@ def request_body(model, messages, max_tokens, rid):
 
 
 def unique_first_turn_conversations(convs):
-    """Drop conversations whose first turn duplicates an earlier one.
-
-    The 71-conversation build contains exact duplicate first-turn pairs (7
-    pairs, 64 unique); the cache-bust replicas are distinct by construction.
-    P-fresh's <=5% hit guard assumes every ladder rung prefills content never
-    seen before, so --offset/--number index into this deduplicated,
-    order-preserving list for ALL phases.
-    """
+    """Deduplicate first-turn prefixes while preserving conversation order."""
     seen = set()
     out = []
     for conv in convs:
@@ -99,6 +90,7 @@ class Runner:
     def __init__(self, args):
         self.args = args
         self.lock = threading.Lock()
+        self.stop_event = threading.Event()
         self.results = []
 
     def request(self, messages, max_tokens, rid):
@@ -125,42 +117,73 @@ class Runner:
             "reasoning_content": msg.get("reasoning_content"),
         }
 
-    def prime_item(self, item):
-        # P-cached prime: turn 1 with up to 500 generated tokens builds a
-        # realistic prefix (50K prompt + completion). Excluded from timing.
-        # BOTH reasoning_content and content are passed back verbatim: K3's
-        # chat template renders them into the think/response channels, so the
-        # re-rendered assistant turn retokenizes onto the cached token stream
-        # instead of diverging at the <think> open tag.
-        index, conv = item
-        if len(conv) < 2:
-            raise SystemExit(f"conversation {index} has no second turn")
-        t1_msgs = list(first_turn_messages(conv))
-        prime = self.request(t1_msgs, 500, conv_rid(index))
-        assistant = {"role": "assistant", "content": prime["content"] or ""}
-        if prime.get("reasoning_content"):
-            assistant["reasoning_content"] = prime["reasoning_content"]
-        return index, t1_msgs + [assistant] + list(conv[1]["messages"])
+    def prepare_prefill(self, items):
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.args.model, trust_remote_code=True, local_files_only=True
+        )
+        vocab = sorted(
+            set(tokenizer.get_vocab().values()) - set(tokenizer.all_special_ids)
+        )
+        prepared = []
+        for index, conv in items:
+            rng = random.Random(index)
+            responses = []
+            for _ in range(len(conv) - 1):
+                for _ in range(10):
+                    text = tokenizer.decode(
+                        rng.choices(vocab, k=2 * TARGET_RESPONSE_TOKENS)
+                    )
+                    tokens = tokenizer(text, add_special_tokens=False)["input_ids"]
+                    text = tokenizer.decode(tokens[:TARGET_RESPONSE_TOKENS])
+                    if (
+                        len(tokenizer(text, add_special_tokens=False)["input_ids"])
+                        == TARGET_RESPONSE_TOKENS
+                    ):
+                        break
+                else:
+                    raise RuntimeError(
+                        f"Could not prepare a {TARGET_RESPONSE_TOKENS}-token fake response"
+                    )
+                responses.append({"role": "assistant", "content": text})
+            prepared.append((index, (conv, responses)))
+        return prepared
 
     def one_item(self, item):
         a = self.args
         index, payload = item
-        if a.phase == "p-cached":
-            msgs = payload  # pre-assembled turn-2 message list
+        if self.stop_event.is_set():
+            return
+        rid = conv_rid(index)
+        if a.phase == "p-measure":
+            conv, responses = payload
+            messages = []
+            for turn_index, turn in enumerate(conv):
+                if self.stop_event.is_set():
+                    return
+                messages.extend(turn["messages"])
+                res = self.request(messages, a.max_tokens, rid)
+                with self.lock:
+                    self.results.append(res)
+                if turn_index < len(responses):
+                    messages.append(responses[turn_index])
         else:
-            msgs = list(first_turn_messages(payload))
-        res = self.request(msgs, a.max_tokens, conv_rid(index))
-        with self.lock:
-            self.results.append(res)
-        return res
+            messages = [message for turn in payload for message in turn["messages"]]
+            res = self.request(messages, a.max_tokens, rid)
+            with self.lock:
+                self.results.append(res)
 
     def _map(self, fn, items):
         # A failed request raises; cancel the queued ones so the run stops
         # after the in-flight requests instead of sending the rest.
         with cf.ThreadPoolExecutor(max_workers=self.args.parallel) as ex:
+            futures = [ex.submit(fn, item) for item in items]
             try:
-                return list(ex.map(fn, items))
+                for future in cf.as_completed(futures):
+                    future.result()
             except BaseException:
+                self.stop_event.set()
                 ex.shutdown(cancel_futures=True)
                 raise
 
@@ -175,12 +198,8 @@ class Runner:
         # Items carry the conversation's absolute index so every phase sends
         # the same rid for the same conversation.
         items = list(enumerate(picked, start=a.offset))
-        if a.phase == "p-cached":
-            # Phase 1 (untimed): prime every conversation's turn-1 prefix.
-            payloads = self._map(self.prime_item, items)
-        else:
-            payloads = items
-        # Phase 2 (timed): only the measured requests count toward wall time.
+        payloads = self.prepare_prefill(items) if a.phase == "p-measure" else items
+        # Tokenization and synthetic response generation are outside the timed run.
         t0 = time.monotonic()
         self._map(self.one_item, payloads)
         wall = time.monotonic() - t0
@@ -189,8 +208,8 @@ class Runner:
 
 BOUNDARIES = (
     "no KV-transfer cost modeled; prime-as-transfer is the core "
-    "approximation; single machine; TTFT approximated by "
-    "full-request latency at max_tokens 1; TPOT amortizes the "
+    "approximation; single deployment; P request latency includes queueing "
+    "at max_tokens 1; TPOT amortizes the "
     "cache-hit KV load into per-token time"
 )
 
@@ -218,6 +237,8 @@ def summarize(args, results, wall_s):
         "Phase": args.phase,
         "Concurrency": args.parallel,
         "Requests": n,
+        "Conversations": args.number,
+        "Target Response Tokens": TARGET_RESPONSE_TOKENS,
         "Wall (s)": round(wall_s, 3),
         "Prompt Tokens": prompt,
         "Cached Tokens": cached,
@@ -228,6 +249,7 @@ def summarize(args, results, wall_s):
         "Computed Throughput (tok/s)": round(computed / wall_s, 4),
         "Output Throughput (tok/s)": round(output / wall_s, 4),
         "Requests/s": round(n / wall_s, 4),
+        "Latency mean (s)": round(statistics.mean(lat), 4) if lat else 0.0,
         "Latency p50 (s)": round(_nearest_rank(lat, 0.50), 4),
         "Latency p99 (s)": round(_nearest_rank(lat, 0.99), 4),
         "Boundaries": BOUNDARIES,
