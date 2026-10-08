@@ -308,7 +308,9 @@ def test_native_check_waits_and_hands_off_failure_without_gpu_retry(
     monkeypatch.setattr(assist, "load_state", lambda *args: state)
     monkeypatch.setattr(assist, "latest_command", lambda *args: None)
     monkeypatch.setattr(assist, "checkout", lambda *args: tmp_path)
-    monkeypatch.setattr(assist, "context", lambda *args: {"native_checks": [check]})
+    monkeypatch.setattr(
+        assist, "context", lambda *args: {"native_checks": [check], "paths": []}
+    )
     tasks = [task]
     monkeypatch.setattr(assist, "validate_plan", lambda *args: tasks)
     monkeypatch.setattr(assist, "runs_for", lambda *args: [])
@@ -320,6 +322,7 @@ def test_native_check_waits_and_hands_off_failure_without_gpu_retry(
             conclusion="success",
             display_title=f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
             run_started_at="2030-01-01T00:00:00Z",
+            object={"sha": "c" * 40},
         ),
     )
     monkeypatch.setattr(assist, "task_status", lambda *args, **kwargs: "passed")
@@ -333,6 +336,8 @@ def test_native_check_waits_and_hands_off_failure_without_gpu_retry(
     assist.control(state["pr"])
     assert state["phase"] == "watching" and "1 waiting" in messages[-1]
     cpu["status"] = "failed"
+    if action == "fix":
+        pr["mergeable"] = False
     emitted = []
     monkeypatch.setattr(assist, "output", lambda *args: emitted.append(args))
     assist.control(state["pr"])
@@ -340,7 +345,16 @@ def test_native_check_waits_and_hands_off_failure_without_gpu_retry(
         assert state["phase"] == "repairing" and emitted == [("repair", "true")]
         request = json.loads(tmp_path.joinpath("request.json").read_text())
         assert request["state"]["native_checks"] == [cpu]
-        assert request["state"]["statuses"] == ["passed"]
+        assert request["state"]["statuses"] == ["waiting"]
+        assert request["state"]["validation_base"] == "c" * 40
+        assert repair.NATIVE_CONFIG in repair.allowed_paths(request)
+        assert (
+            record(
+                {"user": {"login": BOT, "id": BOT_ID}, "body": marker("assist", state)},
+                "assist",
+            )
+            == state
+        )
         return
     assert state["phase"] == "manual" and "human intervention" in messages[-1]
     # A fresh CPU-only watch can finish without inventing a GPU task.
@@ -549,6 +563,48 @@ def test_native_task_repair_preserves_commands_and_protected_controls(tmp_path):
         repair.guard(tmp_path, head, allowed)
     request["state"]["native_checks"][0]["status"] = "passed"
     assert repair.NATIVE_CONFIG not in repair.allowed_paths(request)
+
+
+def test_conflicted_test_resolution_preserves_both_sides_assertions(tmp_path, selected):
+    def git(*args):
+        return assist.command(
+            "git", "-c", "core.hooksPath=/dev/null", *args, cwd=tmp_path
+        )
+
+    git("init", "-b", "main")
+    repair.identity(tmp_path)
+    path = "test/runtime/test_model.py"
+    file = tmp_path / path
+    file.parent.mkdir(parents=True)
+    file.write_text("def test_result():\n    assert value == 1\n")
+    git("add", ".")
+    git("commit", "-s", "-m", "initial")
+    head = git("rev-parse", "HEAD")
+    file.write_text(
+        "def test_result():\n    torch.testing.assert_close(actual, expected, atol=0)\n"
+    )
+    git("add", ".")
+    git("commit", "-s", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    _, state = selected
+    state.update(action="fix", validation_base=base, repair_run=201)
+    request = dict(
+        state=state,
+        data=dict(paths=[path, "test/runtime/test_other.py"]),
+        conflicts=True,
+    )
+    assert path not in repair.allowed_paths(request)
+    request["conflicted_tests"] = [path]
+    assert repair.allowed_paths(request) == {path}
+    candidate = "def test_result():\n    assert value == 1\n    torch.testing.assert_close(actual, expected, atol=0)\n"
+    file.write_text(candidate)
+    repair.guard_test_assertions(tmp_path, head, base, path)
+    file.write_text(candidate.replace("atol=0", "atol=1"))
+    with pytest.raises(ValueError, match="test assertions"):
+        repair.guard_test_assertions(tmp_path, head, base, path)
+    file.write_text(candidate.replace("    assert value == 1\n", ""))
+    with pytest.raises(ValueError, match="test assertions"):
+        repair.guard_test_assertions(tmp_path, head, base, path)
 
 
 def test_native_dispatch_rejects_changed_workflow_controls(
@@ -1029,9 +1085,14 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
                 "display_title": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
                 "status": "completed",
                 "run_started_at": "2030-01-01T00:00:00Z",
+                "object": {"sha": state["base"]},
             }
             if "actions/runs" in path
-            else author
+            else (
+                {"object": {"sha": state["base"]}}
+                if path == "git/ref/heads/main"
+                else author
+            )
         ),
     )
     runs = []
@@ -1076,6 +1137,10 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assert live[0]["phase"] == "manual" and not emitted
     monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
     monkeypatch.setenv("GITHUB_RUN_ID", "201")
+    pr["head"]["sha"] = "f" * 40
+    assist.control(state["pr"])
+    assert not emitted and live[0]["phase"] == "manual"
+    pr["head"]["sha"] = state["head"]
     assist.control(state["pr"])
     assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
     assert live[0]["command"] == 43 and live[0]["repair_run"] == 201

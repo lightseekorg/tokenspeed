@@ -903,6 +903,11 @@ def control(number: int):
         and state["phase"] == "manual"
         and "candidate" not in state
         and "repair_run" in state
+        and (state["head"], state["base"]) == (pr["head"]["sha"], pr["base"]["sha"])
+        and (
+            "validation_base" not in state
+            or state["validation_base"] == api("git/ref/heads/main")["object"]["sha"]
+        )
         and api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
     ):
         initial = True
@@ -934,7 +939,14 @@ def control(number: int):
             state["since"] = prior["since"]
     if not state or state["phase"] in FINISHED_PHASES:
         return
-    if state["head"] != pr["head"]["sha"] or state["base"] != pr["base"]["sha"]:
+    if (
+        state["head"] != pr["head"]["sha"]
+        or state["base"] != pr["base"]["sha"]
+        or (
+            "validation_base" in state
+            and state["validation_base"] != api("git/ref/heads/main")["object"]["sha"]
+        )
+    ):
         state["phase"] = "stale"
         publish(state, "PR or main changed. Request a new plan and command.")
         return
@@ -1052,16 +1064,9 @@ def control(number: int):
         return
     runs = runs_for(state)
     previous_checks = state.get("native_checks", [])
-    # Conflicts are repaired first; candidates need their own native results.
-    track_native = (
-        "candidate" in state
-        or state["action"] == "watch"
-        or pr["mergeable"] is not False
-    )
+    # Preserve failed-check evidence while resolving merge conflicts.
     state["native_checks"] = [
-        native_check(check, state, runs)
-        for check in data.get("native_checks", [])
-        if track_native
+        native_check(check, state, runs) for check in data.get("native_checks", [])
     ]
     native_statuses = [c["status"] for c in state["native_checks"]]
     if "candidate" in state:
@@ -1089,6 +1094,7 @@ def control(number: int):
     ):
         state["phase"] = "repairing"
         state["repair_run"] = int(os.environ["GITHUB_RUN_ID"])
+        state["validation_base"] = api("git/ref/heads/main")["object"]["sha"]
         publish(
             state,
             (
