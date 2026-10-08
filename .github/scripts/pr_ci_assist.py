@@ -279,9 +279,10 @@ def publish(state: dict, message: str):
         raise ValueError("Published state differs from reviewed content.")
 
 
-def checkout(head: str, base: str) -> Path:
-    WORK.mkdir(parents=True, exist_ok=True)
-    target = WORK / "source"
+def checkout(head: str, base: str, *, work: Path | None = None) -> Path:
+    work = WORK if work is None else work
+    work.mkdir(parents=True, exist_ok=True)
+    target = work / "source"
     for sha in (head, base):
         if not SHA.fullmatch(sha):
             raise ValueError("Invalid source SHA.")

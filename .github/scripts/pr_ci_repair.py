@@ -369,14 +369,15 @@ capabilities = ["thinking", "tool_use"]
 """)
 
 
-def edit_sandbox(source: Path, allowed: set[str], directories: list[Path]) -> list[str]:
+def edit_sandbox(
+    source: Path, allowed: set[str], directories: list[Path], *, home: Path
+) -> list[str]:
     # The CLI can write only existing, allowed source files. Git metadata,
     # trusted controller code and all other repository files remain runner-owned.
     paths = [str(source / p) for p in allowed if source.joinpath(p).is_file()]
     for directory in directories:
         directory.chmod(0o755)
         command("sudo", "-n", "chown", "-R", "nobody:nogroup", str(directory))
-    WORK.chmod(0o755)
     if paths:
         command("sudo", "-n", "chown", "nobody:nogroup", "--", *paths)
     return [
@@ -388,15 +389,20 @@ def edit_sandbox(source: Path, allowed: set[str], directories: list[Path]) -> li
         "--regid=nogroup",
         "--clear-groups",
         "env",
-        f"HOME={os.environ['KIMI_CODE_HOME']}",
+        f"HOME={home}",
+        f"KIMI_CODE_HOME={home}",
     ]
 
 
 def model():
     request = json.loads(WORK.joinpath("request.json").read_text())
     state = request["state"]
+    # The runner's artifact directory may have private ancestors. Keep only
+    # model inputs in a separate directory the restricted process can traverse.
+    sandbox_root = Path(tempfile.mkdtemp(prefix="pr-ci-repair-", dir="/tmp"))
+    sandbox_root.chmod(0o755)
     print("Repair: preparing source checkout.", flush=True)
-    source = checkout(state["head"], state["base"])
+    source = checkout(state["head"], state["base"], work=sandbox_root)
     print("Repair: checking source scope.", flush=True)
     no_symlinks(source)
     identity(source)
@@ -421,8 +427,14 @@ def model():
     )
     planner = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(planner)
-    plan_root = WORK / "model"
+    plan_root = sandbox_root / "model"
     plan_root.mkdir(exist_ok=True)
+    shutil.copyfile(WORK / "model/diagnostics.txt", plan_root / "diagnostics.txt")
+    home = sandbox_root / "home"
+    home.mkdir()
+    shutil.copyfile(
+        Path(os.environ["KIMI_CODE_HOME"]) / "config.toml", home / "config.toml"
+    )
     plan_root.joinpath("context.json").write_text(json.dumps(request["data"]))
     agent = plan_root / "repair.md"
     agent.write_text("""---
@@ -453,14 +465,12 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
         plan_root / "cli.stderr"
     ).open("w") as errors:
         print("Repair: preparing edit sandbox.", flush=True)
-        sandbox = edit_sandbox(
-            source, allowed, [plan_root, Path(os.environ["KIMI_CODE_HOME"])]
-        )
+        sandbox = edit_sandbox(source, allowed, [plan_root, home], home=home)
         for path, label in (
             (agent, "agent definition"),
             (plan_root / "diagnostics.txt", "failure evidence"),
             (
-                Path(os.environ["KIMI_CODE_HOME"]) / "config.toml",
+                home / "config.toml",
                 "provider configuration",
             ),
         ):
