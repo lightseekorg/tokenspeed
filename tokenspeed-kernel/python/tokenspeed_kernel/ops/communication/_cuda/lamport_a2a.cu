@@ -82,6 +82,8 @@ __global__ __launch_bounds__(Threads, 1) void lamport_a2a(
   if constexpr (Quantize) {
     // Each half-warp polls a complete 128-element group before its scale.
     // The tagged payload and three-generation ring are shared with BF16 A2A.
+    const int valid_rows = NRanks * rows;
+    const int padded_rows = (valid_rows + 3) / 4 * 4;
     for (int i = 4 * tid; i < NRanks * count; i += 4 * stride) {
       uint64_t packets[4];
       bool ready;
@@ -95,9 +97,8 @@ __global__ __launch_bounds__(Threads, 1) void lamport_a2a(
       } while (!ready);
       const uint32_t words[4] = {uint32_t(packets[0]), uint32_t(packets[1]),
                                  uint32_t(packets[2]), uint32_t(packets[3])};
-      quantize_a2a_group(words, output, scales, i,
-                         NRanks == 2 ? (2 * rows + 3) / 4 * 4 : NRanks * rows,
-                         channels / NRanks, NRanks == 2 && rows % 2 != 0);
+      quantize_a2a_group(words, output, scales, i, padded_rows,
+                         channels / NRanks, valid_rows != padded_rows);
     }
     pad_a2a_fp8<NRanks>(output, scales, rows, channels);
   } else {

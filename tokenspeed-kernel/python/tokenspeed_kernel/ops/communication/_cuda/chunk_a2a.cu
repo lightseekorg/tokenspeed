@@ -75,6 +75,8 @@ __global__ __launch_bounds__(1024, 1) void chunk_a2a(
   const uint32_t epoch = begin_epoch(control);
   const int ring = epoch % 3, width = channels / (8 * NRanks),
             count = rows * width;
+  const int valid_rows = NRanks * rows;
+  const int padded_rows = (valid_rows + 3) / 4 * 4;
   uint4 *buffers[NRanks];
 #pragma unroll
   for (int p = 0; p < NRanks; ++p)
@@ -123,9 +125,8 @@ __global__ __launch_bounds__(1024, 1) void chunk_a2a(
       if constexpr (Quantize) {
         const uint32_t words[4] = {value.x, value.y, value.z, value.w};
         quantize_a2a_group(words, reinterpret_cast<uint32_t *>(output), scales,
-                           4 * dst,
-                           NRanks == 2 ? (2 * rows + 3) / 4 * 4 : NRanks * rows,
-                           channels / NRanks, NRanks == 2 && rows % 2 != 0);
+                           4 * dst, padded_rows, channels / NRanks,
+                           valid_rows != padded_rows);
       } else {
         output[dst] = value;
       }

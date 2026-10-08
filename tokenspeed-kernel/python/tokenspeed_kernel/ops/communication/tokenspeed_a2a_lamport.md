@@ -125,8 +125,10 @@ Call `state.prepare_fp8_quantization()` before capture, then
 Input width must be divisible by `128*P`: each channel shard contains whole
 128-element quantization groups. With `R = round_up(P*M, 4)`, the kernel returns
 borrowed E4M3 values `[R,K/P]` and contiguous MN-major FP32 scales `[K/(128*P),R]`.
-TP2 with odd `M` needs two padding rows. The same kernel writes zero values and
-unit scales for those rows; the consumer GEMM receives the valid count `P*M`.
+Padding is determined by `P*M != R`, which also selects the prepared quantizer's
+rounding behavior. For supported TP sizes, TP2 with odd `M` needs two padding
+rows. The same kernel writes zero values and unit scales for those rows;
+the consumer GEMM receives the valid count `P*M`.
 
 Packet polling or chunk acquire fences establish readiness before quantization.
 Both variants share their existing rings and generations with ordinary BF16

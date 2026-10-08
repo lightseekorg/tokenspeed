@@ -328,7 +328,10 @@ def _fp8_worker(rank, size, rendezvous):
             linear.weight_scale_inv.weight_loader(linear.weight_scale_inv, scales)
             linear.quant_method.process_weights_after_loading(linear)
             prepare_dp_linear_communication(linear, 128, torch.bfloat16, backend)
-        for counts in ([1] * size, [32] * size, [0] + [64] * (size - 1), [128] * size):
+        # Preserve unequal nonempty owners as well as an empty owner when
+        # extending the original TP4 case to other subgroup sizes.
+        mixed_counts = [0, 64, 32, 1][:size] + [1] * max(0, size - 4)
+        for counts in ([1] * size, [32] * size, mixed_counts, [128] * size):
             torch.manual_seed(20 + rank)
             x = torch.randn(counts[rank], k, device=device, dtype=torch.bfloat16)
             ctx = _context(rank, counts)

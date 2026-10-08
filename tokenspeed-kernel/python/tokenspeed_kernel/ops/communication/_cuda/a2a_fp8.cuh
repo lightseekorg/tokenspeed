@@ -62,14 +62,14 @@ quantize_a2a_group(const uint32_t (&words)[4], uint32_t *output, float *scales,
   }
 }
 
-// Prepared FP8 GEMMs require M divisible by four. Only TP2 with odd local M
-// needs tail rows; they are local padding, never part of the exchange protocol.
+// Prepared FP8 GEMMs require the gathered row count divisible by four. Tail
+// rows are local padding, never part of the exchange protocol.
 template <int NRanks>
 __device__ __forceinline__ void pad_a2a_fp8(uint32_t *output, float *scales,
                                             int rows, int channels) {
-  if constexpr (NRanks == 2) {
-    const int valid_rows = NRanks * rows;
-    const int padded_rows = (valid_rows + 3) / 4 * 4;
+  const int valid_rows = NRanks * rows;
+  const int padded_rows = (valid_rows + 3) / 4 * 4;
+  if (valid_rows != padded_rows) {
     const int shard = channels / NRanks;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = gridDim.x * blockDim.x;
