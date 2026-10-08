@@ -22,6 +22,7 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import (
 )
 from tokenspeed.runtime.layers.attention.registry import _LINEAR_ATTN_CLS
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 _NUM_LAYERS = 45
 _NUM_KDA = 34
@@ -59,7 +60,7 @@ class Glm53FlashConfigTests(unittest.TestCase):
             hf_config=SimpleNamespace(),
         )
 
-        configure_dsa_attention(model_config)
+        configure_dsa_attention(model_config, ServerArgs(model="x"))
 
         self.assertEqual(model_config.attention_arch, AttentionArch.DSA)
         self.assertEqual(model_config.index_kpool, 4)

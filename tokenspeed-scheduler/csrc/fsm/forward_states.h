@@ -218,12 +218,20 @@ struct Retracted {
     // A victim with generated output a client is reading resumes ahead of
     // one that had produced nothing, whatever their retraction epochs say.
     bool resumes_generation{false};
+    // Positions [0, landed_tokens) had their forward results land before the
+    // retraction, so their logits exist. The readmission probe may match this
+    // far whatever RequestSpec::max_cached_prefix_tokens says -- the request
+    // loses nothing it still needs -- but no further: beyond it a hit page
+    // (another request's, or a chunk skipped before it landed) would stand in
+    // for logits that were never produced.
+    std::int32_t landed_tokens{0};
 
     TokenContainer* TokenContainerPtr() const { return token_container; }
     std::int32_t PrefixGranularity() const { return prefix_granularity; }
     std::int64_t RetractionEpoch() const { return retraction_epoch; }
     bool HasRecoverableSnapshot() const { return has_recoverable_snapshot; }
     bool ResumesGeneration() const { return resumes_generation; }
+    std::int32_t LandedTokens() const { return landed_tokens; }
 };
 
 struct Finished {};

@@ -24,6 +24,77 @@ the online softmax; unused entries remain `-1`.
 Portable Triton implementations remain the fallback for trait combinations
 without a matching native registration.
 
+## Index-K plane formats
+
+`dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key
+plane off its dtype and pass it to selection as the `index_k_format` and
+`index_k_layout` traits; a top-k leaf declares the planes it scores and is
+never handed another one. One layout per dtype, and the facades never
+convert a plane:
+
+| dtype | `index_k_format` | `index_k_layout` | row |
+| --- | --- | --- | --- |
+| `uint8` | `fp8_scaled` | `packed` | `[slots, head_dim + 4 * head_dim / 128]`: FP8 E4M3 keys followed by one fp32 scale per 128 elements |
+| `uint8` | `fp8_scaled` | `page_planar` | any other uint8 shape: per-page planes of keys and scales, the outer page stride possibly padded |
+| `bfloat16` | `bf16` | `packed` | `[slots, head_dim]`: the keys as the indexer produced them, no scale plane |
+
+The in-tree DeepGEMM, Triton and Gluon leaves score `fp8_scaled` planes; a
+leaf scoring the checkpoint's bf16 keys (an indexer in the RL trainer's
+order) registers `index_k_format={"bf16"}`, `index_k_layout={"packed"}` and
+the `batch_invariant` and `forced_initial_local` features, so a bf16 plane
+selects it and nothing else. A plane of any other dtype is a `TypeError`.
+
+`dsa_prefill_topk` also takes the index keys as rows already in
+workspace-row order instead of a plane (the query-context-parallel history
+gather over page-sharded caches assembles them): `index_k_fp8` +
+`index_k_scale` are the rows of an `fp8_scaled` plane (`[workspace_rows,
+head_dim]` uint8 or float8_e4m3fn, `[workspace_rows, head_dim / 128]` fp32),
+`index_k_bf16` the rows of a `bf16` one (`[workspace_rows, head_dim]` bf16),
+each one row per entry of `kv_workspace_slots` and selecting with that
+`index_k_format` and `index_k_layout="packed"`, never together and never with
+`index_k_cache`; a call with neither a plane nor rows is a `ValueError`.
+Rows additionally REQUIRE the `index_k_workspace_rows` feature
+(`dsa.INDEX_K_WORKSPACE_ROWS_FEATURE`): a leaf declares it exactly when its
+launcher takes the row keywords for its format (DeepGEMM does, for the FP8
+pair; a bf16 leaf declares it and takes the `index_k_bf16` keyword), the
+facade hands the keywords to declaring leaves only, and a leaf that only
+reads planes -- the portable Triton leaf, the Gluon wrappers -- is never
+selected for rows, not by ranking and not by a kernel override (an override
+skips traits but not required features). The failure is a
+`NoKernelFoundError` at selection; a host whose sharded prefill will hand
+rows probes that selection at construction with
+`dsa.select_dsa_prefill_topk_for_rows(index_k_format=, ...)`, which makes a
+platform without a declaring leaf a startup error.
+
+A `dsa_decode_topk` leaf bounds every query row itself: row `j` of a request
+scored with `q_len_per_req` rows (spec verify, a multi-depth draft's k-row
+window) selects over the first `seq_lens[req] - (q_len_per_req - 1) + j`
+positions, derived from `seq_lens`. The `seq_lens_2d` rows the facade hands
+every leaf (`[tokens, 1]`, each carrying the request's full length) are the
+scoring extent the `plan` was built from, not per-row bounds; a leaf that read
+them as bounds would let a verify or draft row select its window's later
+rows, and a sparse core that trusts the selection for causality (`kv_seq_lens`
+is optional on `dsa_decode`) would attend them.
+
+`candidate_lens_cpu` (the CPU mirror of each prefill token's candidate count)
+goes to every selected leaf registered with the `candidate_lens_cpu` feature
+(`dsa.CANDIDATE_LENS_CPU_FEATURE`) and to no other: a leaf that can size its
+launches from it declares the feature alongside the keyword, and the facade
+reads the registration rather than probing call signatures, so a
+`*args, **kwargs` wrapper never receives a keyword its launcher cannot take.
+
+## Slot order of the sparse cores
+
+`dsa_decode` and `dsa_prefill` take a required `slot_order` in
+`SLOT_ORDERS = ("selection", "sorted")`, passed to selection as the
+`slot_order` trait: `selection` reduces a token's selected slots in the order
+the top-k leaf emitted them and is what every core does by default (a core
+need not declare the trait); `sorted` reduces them in ascending slot order,
+so the reduction is batch-invariant whenever the selected set is, and is
+served only by cores declaring `slot_order={"sorted", ...}`, which receive
+the choice as the `slot_order` keyword. Asking a silent core for `sorted`
+is a `ValueError`, not a silent fallback.
+
 ## Row top-k selection in CuTe DSL (`_cute_dsl/deep_select.py`)
 
 `deepselect_topk(scores, ends, topk, capacity=..., cluster_size=...)` selects

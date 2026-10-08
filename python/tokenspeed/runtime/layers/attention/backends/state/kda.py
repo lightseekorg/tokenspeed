@@ -50,16 +50,15 @@ from tokenspeed_kernel.ops.attention.kda.triton import capture_replay_payload
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_metadata import (
-    KdaPrefillMetadata,
-    prepare_kda_prefill_metadata,
-)
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-    MambaAttnBackend,
     _reject_skip_term,
     logger,
 )
+from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
+    CapacityPrefillBackend,
+    CapacityPrefillMetadata,
+)
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 if TYPE_CHECKING:
@@ -91,7 +90,7 @@ def _slice_kda_prefill_inputs(
     )
 
 
-class KdaAttnBackend(MambaAttnBackend):
+class KdaAttnBackend(CapacityPrefillBackend):
     """Attention backend for KDA linear attention layers (Kimi-K3).
 
     Everything generic to linear attention -- state paging and cache groups --
@@ -106,6 +105,8 @@ class KdaAttnBackend(MambaAttnBackend):
 
     _verify_reads_committed_recurrent_state = True
     _verify_packed_qkv_views = True
+    # Eager forwards keep the same metadata contract as replay.
+    _capacity_layout_when_uncaptured = True
 
     def __init__(
         self,
@@ -117,8 +118,6 @@ class KdaAttnBackend(MambaAttnBackend):
     ) -> None:
         super().__init__(config, spec)
         self._prefill_graph_enabled = enable_prefill_graph
-        self._prefill_metadata: dict[tuple[int, int], KdaPrefillMetadata] = {}
-        self._prefill_metadata_pool = None
         self.max_bs = config.max_bs
         # The platform layout; the workspace planner probes the same one.
         self.kda_recurrent_layout = kda_recurrent_layout_default()
@@ -138,65 +137,8 @@ class KdaAttnBackend(MambaAttnBackend):
             "platform-selected kernels",
         )
 
-    def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
-        # The orchestrator releases old graphs before recapture or pool rebind.
-        # These are execution buffers, never backend-owned request state pages.
-        self._prefill_metadata.clear()
-        self._prefill_metadata_pool = None
-
-    @property
-    def prefill_metadata_is_capture_ready(self) -> bool:
-        metadata = self.forward_metadata
-        return (
-            isinstance(metadata, KdaPrefillMetadata)
-            and self._prefill_metadata.get(
-                (metadata.capacity.token_capacity, metadata.capacity.num_sequences)
-            )
-            is metadata
-        )
-
-    def admits_prefill_graph(
-        self, token_capacity: int, bs: int, forward_mode: ForwardMode
-    ) -> bool:
-        return (
-            self._prefill_graph_enabled
-            and self.kda_backend == "cutedsl_kda"
-            and self.step_counter is None
-            and forward_mode.is_extend()
-        )
-
-    def prepare_prefill_metadata(
-        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
-    ) -> bool:
-        if not self.admits_prefill_graph(token_capacity, bs, forward_mode):
-            return False
-        if (
-            self._prefill_metadata_pool is not None
-            and self._prefill_metadata_pool is not self.cache_pool
-        ):
-            raise RuntimeError("KDA cache pool changed without graph release/recapture")
-        source = self.forward_metadata
-        key = (token_capacity, bs)
-        actual_bs = source.extend_seq_lens_cpu.numel()
-        if actual_bs > bs or (
-            actual_bs != bs and (capture or key not in self._prefill_metadata)
-        ):
-            raise ValueError(
-                "KDA request padding requires an existing captured capacity"
-            )
-        target = prepare_kda_prefill_metadata(
-            source,
-            token_capacity,
-            self._prefix_granularity,
-            self._prefill_metadata.get(key),
-        )
-        if capture:
-            # Only startup grows retained storage. Uncaptured shapes use fresh
-            # metadata through this same builder and never capture during serving.
-            self._prefill_metadata[key] = target
-            self._prefill_metadata_pool = self.cache_pool
-        self.forward_metadata = target
-        return True
+    def _admits_capacity_prefill(self) -> bool:
+        return self._prefill_graph_enabled and self.kda_backend == "cutedsl_kda"
 
     def forward_extend(
         self,
@@ -222,7 +164,7 @@ class KdaAttnBackend(MambaAttnBackend):
             save_kv_cache=save_kv_cache,
             **kwargs,
         )
-        if isinstance(self.forward_metadata, KdaPrefillMetadata):
+        if isinstance(self.forward_metadata, CapacityPrefillMetadata):
             checkpoint = self.forward_metadata.prefill_checkpoint_batch
             if checkpoint is not None and checkpoint.output_sources is not None:
                 # The fused gather writes the complete output, including padding.
@@ -293,8 +235,6 @@ class KdaAttnBackend(MambaAttnBackend):
     @override
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
-        self._prefill_metadata.clear()
-        self._prefill_metadata_pool = None
         self._reset_replay_state()
         shape = self._replay_shape(cache_pool)
         self._replay_active = kda_replay_commit_supported(
@@ -698,6 +638,11 @@ class KdaAttnBackend(MambaAttnBackend):
         return core_attn_out.squeeze(0)
 
     @override
+    def tree_support(self) -> TreeSupport:
+        blocker = "the fused KDA verify kernel follows a chain; no draft trees yet"
+        return TreeSupport(verify_blocker=blocker, draft_blocker=blocker)
+
+    @override
     def _verify(
         self,
         mixed_qkv: torch.Tensor,
@@ -920,10 +865,15 @@ class KdaAttnBackend(MambaAttnBackend):
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     @override
-    def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
-        """Replay and eagerly commit this round's accepted KDA prefix."""
+    def commit_verified_state(
+        self, accepted_length: torch.Tensor, *, accepted_path: torch.Tensor | None
+    ) -> None:
+        """Replay and eagerly commit this round's accepted KDA prefix (a chain:
+        KDA refuses draft trees)."""
         if not self._replay_active:
-            return super().commit_verified_state(accepted_length)
+            return super().commit_verified_state(
+                accepted_length, accepted_path=accepted_path
+            )
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
@@ -1065,7 +1015,7 @@ class KdaAttnBackend(MambaAttnBackend):
             inputs_packed=inputs_packed,
             capacity=(
                 KdaPrefillCapacity(seq_len, query_start_loc.numel() - 1)
-                if isinstance(self.forward_metadata, KdaPrefillMetadata)
+                if isinstance(self.forward_metadata, CapacityPrefillMetadata)
                 else None
             ),
             lower_bound=lower_bound,

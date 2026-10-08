@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.sampling import vocab_parallel_logprobs
 
+from tokenspeed.runtime.configs.numerics import MEGATRON_VOCAB_BLOCK
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -64,18 +66,40 @@ def gather_token_logprobs_torch(
     logits: torch.Tensor,
     tokens: torch.Tensor,
 ) -> torch.Tensor:
-    """Return the selected token's log probability for each logits row."""
-    raw_logprobs = torch.log_softmax(logits.float(), dim=-1)
+    """Return the selected token's log probability for each logits row.
+
+    The one logprob arithmetic for sampled and prompt rows (see
+    ``docs/design/numerics.md``): an fp32 log-softmax over the row, gathered
+    at the token. ``dtype=torch.float32`` converts bf16 logits inside the
+    kernel (an exact widening) instead of materializing an fp32 copy of the
+    ``[rows, vocab]`` tensor first. Both consumers call this function, so a
+    token's prompt and output logprobs are the same number by construction.
+    """
+    raw_logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float32)
     return raw_logprobs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
 
 
-def top_p_normalize_probs_torch(
-    probs: torch.Tensor,
-    top_ps: torch.Tensor,
+def gather_token_logprobs(
+    logits: torch.Tensor,
+    tokens: torch.Tensor,
+    *,
+    logprob_order: str,
 ) -> torch.Tensor:
-    """Pure-torch nucleus renorm — used by the prefill-logprob path."""
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
-    return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+    """Return each row's log probability of ``tokens`` in the launch's order.
+
+    Args:
+        logits: ``[rows, vocab]`` logits.
+        tokens: ``[rows]`` integer token ids.
+        logprob_order: ``"torch"`` for ``torch.log_softmax``; ``"megatron"``
+            for the trainer's vocab-parallel cross-entropy order over fixed
+            32768-wide vocab blocks (``--logprob-order``, validated by
+            ServerArgs).
+
+    Returns:
+        ``[rows]`` fp32 log probabilities.
+    """
+    if logprob_order == "megatron":
+        return vocab_parallel_logprobs(
+            logits, tokens.to(torch.int64), vocab_block=MEGATRON_VOCAB_BLOCK
+        )
+    return gather_token_logprobs_torch(logits, tokens)

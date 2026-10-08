@@ -162,7 +162,10 @@ def _gqa_store_tile(
     tl.store(dst[:, None] + i2[None, :], o2.to(dtype), mask=pair_mask)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_rows", "positions_stride"],
+    do_not_specialize_on_alignment=["positions_ptr", "slots_ptr"],
+)
 def _gqa_prologue_kernel(
     q_ptr,
     k_ptr,
@@ -314,9 +317,7 @@ def _gqa_prologue_kernel(
         offs = tl.arange(0, BLOCK)
         mask = write_mask[:, None] & (offs < head_dim)[None, :]
         value = tl.load(
-            v_ptr[:, None]
-            + (tokens * v_stride_t + kv_head * head_dim)[:, None]
-            + offs[None, :],
+            v_ptr + (tokens * v_stride_t + kv_head * head_dim)[:, None] + offs[None, :],
             mask=mask,
         )
         dst = (
@@ -455,6 +456,9 @@ def triton_gqa_prologue(
         "kv_convert": BOOLS,
         "rope_style": ROPE_STYLES,
         "sanitize": BOOLS,
+        # The fused kernel writes the cache; the store-less form is the
+        # composite's.
+        "store": frozenset({True}),
     },
 )
 def triton_mla_prologue(

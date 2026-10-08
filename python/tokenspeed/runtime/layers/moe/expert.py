@@ -29,8 +29,12 @@ from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
     TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT,
 )
+from tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant import (
+    TRTLLM_UNQUANT_ISPP_ALIGNMENT,
+)
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -73,7 +77,6 @@ class MoELayer(torch.nn.Module):
         tp_size: int | None = None,
         ep_rank: int | None = None,
         ep_size: int | None = None,
-        zero_expert_type: str = "",
         zero_expert_num: int = 0,
         activation: str = "silu",
         activation_situ_beta: float | None = None,
@@ -102,7 +105,6 @@ class MoELayer(torch.nn.Module):
         self.ep_num_redundant_experts = global_server_args_dict[
             "ep_num_redundant_experts"
         ]
-        self.zero_expert_type = zero_expert_type
         # LongCat routes some top-k slots to "zero experts" that no kernel
         # computes; the model rewrites those slots to a placeholder expert id
         # with weight zero, so a token can hand the kernel the same expert id
@@ -217,15 +219,21 @@ class MoELayer(torch.nn.Module):
                 fp8_scale_block_shape[0], "FP8 block scales tile it"
             )
         if self._quant_kind == "unquant":
-            # The flashinfer_trtllm unquant kernel declares
-            # ispp_alignment={128} (ops/moe/flashinfer/trtllm_unquant.py);
-            # without padding a misaligned intermediate size silently
-            # deselects it during moe_plan and the layer falls back to the
-            # triton bf16 path. The padded tail rows/columns stay zero
-            # (create_dense_weight_pair zero-initializes) and contribute
-            # nothing to the MoE output.
+            # The flashinfer_trtllm unquant kernels (SiLU/SwiGLU) declare
+            # ispp_alignment={TRTLLM_UNQUANT_ISPP_ALIGNMENT}: 64, or 128 when
+            # the installed FlashInfer launcher cannot be relaxed or built
+            # (ops/moe/flashinfer/trtllm_unquant.py); without padding
+            # moe_plan does not select them for a misaligned intermediate
+            # size. Other activations keep 128. The padded tail rows/columns
+            # stay zero (create_dense_weight_pair zero-initializes) and
+            # contribute nothing to the MoE output.
             self._apply_trtllm_ispp_padding(
-                128, "the flashinfer_trtllm unquant kernel accepts it"
+                (
+                    TRTLLM_UNQUANT_ISPP_ALIGNMENT
+                    if activation in ("silu", "swiglu")
+                    else 128
+                ),
+                "the flashinfer_trtllm unquant kernel accepts it",
             )
         if self._quant_kind == "nvfp4":
             self._apply_trtllm_ispp_padding(
@@ -350,6 +358,16 @@ class MoELayer(torch.nn.Module):
         elif moe_backend == "mega_moe":
             mapping = global_server_args_dict["mapping"]
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+        # --moe-combine-order: how a token's routed contributions meet across
+        # the MoE TP-EP group (docs/design/numerics.md, alignment.trainer).
+        # ServerArgs already refused MoE TP > 1 and DeepEP under "slot".
+        combine_order = global_server_args_dict["moe_combine_order"]
+        self.combine_order: str = combine_order
+        if combine_order == "slot" and self.ep_size > 1:
+            # The leaf folds the per-route outputs over the EP device group;
+            # it is the fold's group whatever the plan's solution.
+            mapping = global_server_args_dict["mapping"]
+            process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
         self.plan = tokenspeed_kernel.moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,
@@ -377,7 +395,8 @@ class MoELayer(torch.nn.Module):
             solution=moe_backend,
             # rl-bitwise promises one reduction order; fast-math epilogues
             # trade exactly that away.
-            fast_math=global_server_args_dict["numerics"] != "rl-bitwise",
+            fast_math=global_server_args_dict["numerics"] not in BITWISE_ENVELOPES,
+            combine_order=combine_order,
         )
 
         create_layer_weights(
@@ -453,17 +472,12 @@ class MoELayer(torch.nn.Module):
     def supports_deferred_finalize(self) -> bool:
         return self.plan["supports_deferred_finalize"]
 
-    def forward_zero_experts(self, topk_output):
-        zero_expert_limit = self.num_experts
-        if self.ep_num_redundant_experts is not None:
-            zero_expert_limit = zero_expert_limit - self.ep_num_redundant_experts
-
-        normal_expert_mask = topk_output.topk_ids >= zero_expert_limit
-        topk_output.topk_ids[normal_expert_mask] = -1
-        if self.zero_expert_type == "copy":
-            topk_output.topk_weights[normal_expert_mask] = 1.0
-        if self.zero_expert_type == "drop":
-            topk_output.topk_weights[normal_expert_mask] = 0.0
+    @property
+    def supports_all_to_all_ep(self) -> bool:
+        """Whether the kernel owns all-to-all dispatch, so each rank routes only
+        its own tokens. Otherwise every rank routes every token and an expert
+        placement must pick the same replica for a route on every rank."""
+        return self.plan["supports_all_to_all_ep"]
 
     def forward(
         self,

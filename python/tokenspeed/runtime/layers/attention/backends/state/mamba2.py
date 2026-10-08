@@ -35,10 +35,12 @@ from tokenspeed_kernel.ops.attention.mamba2 import (
     mamba2_verify_scan,
 )
 
-from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-    MambaAttnBackend,
+from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
+    CapacityPrefillBackend,
+    CapacityPrefillMetadata,
 )
 from tokenspeed.runtime.layers.attention.configs.linear_attn import Mamba2Config
+from tokenspeed.runtime.utils.tensor import upload_packed
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.configs.base import (
@@ -75,7 +77,7 @@ def _require_mamba2_inputs(
     return D
 
 
-class Mamba2AttnBackend(MambaAttnBackend):
+class Mamba2AttnBackend(CapacityPrefillBackend):
     """Mamba2 SSD layers, e.g. Nemotron-H, on the shared recurrent-state flow.
 
     The model packs the conv channels as ``[C | B | x]``, so the shared split
@@ -87,6 +89,8 @@ class Mamba2AttnBackend(MambaAttnBackend):
 
     # The conv update and the state update both read the projection view by stride.
     _decode_packed_qkv_views = True
+    # Chunk plans need only live bounds, so packing would add work to eager forwards.
+    _capacity_layout_when_uncaptured = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -102,6 +106,68 @@ class Mamba2AttnBackend(MambaAttnBackend):
         self._chunk_plans: deque[tuple[torch.Tensor, Mamba2ChunkMetadata]] = deque(
             maxlen=3
         )
+        # Retained body/tail bounds are rewritten in place, so their plans are too.
+        self._capacity_plans: list[tuple[torch.Tensor, Mamba2ChunkMetadata]] = []
+
+    def _admits_capacity_prefill(self) -> bool:
+        return True
+
+    def _reset_prefill_metadata(self) -> None:
+        super()._reset_prefill_metadata()
+        self._capacity_plans.clear()
+
+    def _refresh_captured_prefill(self, metadata: CapacityPrefillMetadata) -> None:
+        """Rewrite the body and tail chunk plans of a retained shape in one upload.
+
+        Each plan reserves ``extent // chunk_size + num_seqs`` chunks; the
+        unused tail repeats the last offset, so those chunks are empty.
+        """
+        batch = metadata.prefill_checkpoint_batch
+        device = metadata.query_start_loc.device
+        parts: list[torch.Tensor] = []
+        plans: list[Mamba2ChunkMetadata] = []
+        for bounds, extent in (
+            (batch.body_cu_seqlens_cpu, batch.body_token_indices.numel()),
+            (batch.tail_cu_seqlens_cpu, batch.tail_token_indices.numel()),
+        ):
+            plan = self._capacity_plan(bounds, extent, device)
+            live = build_mamba2_chunk_metadata(
+                bounds, self._chunk_size, torch.device("cpu")
+            )
+            pad = plan.seq_idx.numel() - live.seq_idx.numel()
+            parts += [
+                torch.cat(
+                    (live.cu_chunk_seqlens, live.cu_chunk_seqlens[-1:].expand(pad))
+                ),
+                torch.cat((live.seq_idx, live.seq_idx[-1:].expand(pad))),
+                live.last_chunk_indices,
+            ]
+            plans.append(plan)
+        uploaded = upload_packed(tuple(parts), device)
+        for i, plan in enumerate(plans):
+            targets = (plan.cu_chunk_seqlens, plan.seq_idx, plan.last_chunk_indices)
+            for target, source in zip(targets, uploaded[3 * i : 3 * i + 3]):
+                target.copy_(source)
+
+    def _capacity_plan(
+        self, bounds: torch.Tensor, extent: int, device: torch.device
+    ) -> Mamba2ChunkMetadata:
+        """The persistent plan of one retained bounds tensor, allocated on first use."""
+        for known, plan in self._capacity_plans:
+            if known is bounds:
+                return plan
+        num_seqs = bounds.numel() - 1
+        max_chunks = extent // self._chunk_size + num_seqs
+        plan = Mamba2ChunkMetadata(
+            chunk_size=self._chunk_size,
+            cu_chunk_seqlens=torch.zeros(
+                max_chunks + 1, dtype=torch.int32, device=device
+            ),
+            last_chunk_indices=torch.zeros(num_seqs, dtype=torch.int32, device=device),
+            seq_idx=torch.zeros(max_chunks, dtype=torch.int32, device=device),
+        )
+        self._capacity_plans.append((bounds, plan))
+        return plan
 
     def _prefill_scan(
         self,
@@ -163,7 +229,11 @@ class Mamba2AttnBackend(MambaAttnBackend):
         The metadata builder makes the host bounds fresh per batch and never
         writes them in place, so tensor identity names one forward's bounds.
         A forward uses at most three (whole batch, checkpoint body and tail).
+        Retained capacity bounds are refreshed in place and keep their own plans.
         """
+        for bounds, plan in self._capacity_plans:
+            if bounds is cu_seqlens_cpu:
+                return plan
         for bounds, plan in self._chunk_plans:
             if bounds is cu_seqlens_cpu:
                 return plan
@@ -225,6 +295,7 @@ class Mamba2AttnBackend(MambaAttnBackend):
             dt_bias,
             state_indices=reads,
             dst_state_indices=writes,
+            parent_indices=self._tree_parents(batch_size),
             null_slot=self.pad_slot_id,
             out=out,
         )

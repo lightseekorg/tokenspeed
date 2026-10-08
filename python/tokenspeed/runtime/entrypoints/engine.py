@@ -61,6 +61,7 @@ from tokenspeed.runtime.cache.l3.backend import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     resolve_l3_weight_version,
 )
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.engine.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -70,13 +71,16 @@ from tokenspeed.runtime.engine.io_struct import (
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromMooncakeReqInput,
     UpdateWeightsFromTensorReqInput,
+    mooncake_load_weight_version,
 )
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
 from tokenspeed.runtime.utils import (
@@ -316,19 +320,12 @@ class Engine(EngineBase):
     def stop_profile(self):
         self.llm.run(self.tokenizer_manager.stop_profile())
 
-    def start_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.start_expert_distribution_record())
-
-    def stop_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.stop_expert_distribution_record())
-
-    def dump_expert_distribution_record(self):
-        self.llm.run(self.tokenizer_manager.dump_expert_distribution_record())
-
     def get_server_info(self):
         internal_states = self.llm.run(self.tokenizer_manager.get_internal_state())
+        server_args = dataclasses.asdict(self.tokenizer_manager.server_args)
+        server_args.pop("rl_control_api_key", None)
         return {
-            **dataclasses.asdict(self.tokenizer_manager.server_args),
+            **server_args,
             **self.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,
@@ -406,6 +403,49 @@ class Engine(EngineBase):
         if success and weight_version is not None:
             self.server_args.weight_version = str(weight_version)
         return result
+
+    def update_weights_from_mooncake(
+        self,
+        version: int,
+        *,
+        flush_cache: bool,
+        weight_version: str | None,
+    ):
+        """Load one committed Model Updater SDK version on every worker.
+
+        ``flush_cache`` selects whether the KV caches are dropped and a new
+        weight namespace published, so it is explicit here; only the HTTP
+        route defaults it, for the reference engine's trainer clients.
+        ``weight_version`` is required. Pass ``None`` to publish
+        ``str(version)`` on a flushed load, or to keep the current namespace
+        on an intermediate (unflushed) one (``mooncake_load_weight_version``).
+        """
+        weight_version = resolve_l3_weight_version(
+            self.server_args.weight_version,
+            mooncake_load_weight_version(
+                version=version,
+                flush_cache=flush_cache,
+                weight_version=weight_version,
+            ),
+            flush_cache=flush_cache,
+            storage_backend=self.server_args.kvstore_storage_backend,
+        )
+        obj = UpdateWeightsFromMooncakeReqInput(
+            version=version,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
+        result = self.llm.run(self.tokenizer_manager.update_weights_from_mooncake(obj))
+        success = result[0] if isinstance(result, tuple) else bool(result)
+        if success and weight_version is not None:
+            self.server_args.weight_version = str(weight_version)
+        return result
+
+    def rebalance_experts(self) -> tuple[bool, str]:
+        """Start one online expert rebalance now (``--enable-eplb``)."""
+        return self.llm.run(
+            self.tokenizer_manager.rebalance_experts(RebalanceExpertsReqInput())
+        )
 
     def update_weights_from_tensor(
         self,
@@ -518,8 +558,8 @@ def _set_envs_and_config(server_args: ServerArgs):
         # explicit env wins; --disable-tf32 is the documented opt-out.
         os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "1")
         os.environ.setdefault("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
-    if server_args.numerics == "rl-bitwise":
-        # Bitwise envelope: no TF32 anywhere, and pin NCCL to one
+    if server_args.numerics in BITWISE_ENVELOPES:
+        # Bitwise envelopes: no TF32 anywhere, and pin NCCL to one
         # algorithm/protocol so the reduction association order cannot switch
         # with message size. The envelope's promise beats ambient
         # environment: a conflicting value is replaced, loudly, instead of
@@ -532,7 +572,8 @@ def _set_envs_and_config(server_args: ServerArgs):
             prior = os.environ.get(key)
             if prior is not None and prior != value:
                 logger.warning(
-                    f"--numerics rl-bitwise replaces {key}={prior} with {value}"
+                    f"--numerics {server_args.numerics} replaces {key}={prior} "
+                    f"with {value}"
                 )
             os.environ[key] = value
 
@@ -559,6 +600,14 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+
+
+def _scheduler_ranks(server_args: ServerArgs) -> range:
+    """Global ranks of the scheduler processes this node launches."""
+    if server_args.emulate_rank_zero:
+        return range(1)
+    rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
+    return range(rank_start, rank_start + server_args.mapping.nprocs_per_node)
 
 
 def _launch_subprocesses(
@@ -589,9 +638,7 @@ def _launch_subprocesses(
         )
 
         scheduler_pipe_readers = []
-        rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
-        rank_end = rank_start + server_args.mapping.nprocs_per_node
-        for rank in range(rank_start, rank_end):
+        for rank in _scheduler_ranks(server_args):
             # Create per-rank server_args with rank-initialized mapping
             rank_server_args = copy.copy(server_args)
             rank_server_args.mapping = copy.deepcopy(server_args.mapping)
@@ -680,6 +727,9 @@ def _launch_subprocesses(
         "max_single_request_tokens"
     ]
     tokenizer_manager.context_len = scheduler_info["max_model_len"]
+    tokenizer_manager.supports_prompt_logprobs = scheduler_info[
+        "supports_prompt_logprobs"
+    ]
     return tokenizer_manager, None, scheduler_info
 
 
@@ -744,9 +794,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver
         )
-        rank_start = server_args.mapping.nprocs_per_node * server_args.node_rank
-        rank_end = rank_start + server_args.mapping.nprocs_per_node
-        for rank in range(rank_start, rank_end):
+        for rank in _scheduler_ranks(server_args):
             rank_server_args = copy.copy(server_args)
             rank_server_args.mapping = copy.deepcopy(server_args.mapping)
             rank_server_args.mapping.rank = rank

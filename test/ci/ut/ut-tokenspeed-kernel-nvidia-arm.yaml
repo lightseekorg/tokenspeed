@@ -68,5 +68,6 @@ ut:
     - python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_comm.py -v --junitxml=/tmp/kernel-trtllm-comm.xml
     - PYTHONPATH="python${PYTHONPATH:+:$PYTHONPATH}" python3 -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py -v --junitxml=/tmp/kernel-cuda.xml
     - bash test/ci_system/run_kernel_gpu_ut.sh
+    - PYTHONPATH="python:tokenspeed-kernel/python" python3 -m pytest test/runtime/distributed/test_dp_parallel_linear.py -v --junitxml=/tmp/dp-parallel-linear.xml
 report:
   github_step_summary: true

@@ -72,6 +72,7 @@ def _mamba_config_pair(
     max_bs=8,
     device="cpu",
     replay_ssm=False,
+    draft_tree=False,
 ):
     """(AttnConfig, softmax spec) for MambaAttnBackend: model-wide facts live on
     the config, softmax geometry on the softmax spec, and the GDN geometry plus
@@ -97,6 +98,7 @@ def _mamba_config_pair(
         layer_ids=(0,),
         tp_size=1,
         replay_ssm=replay_ssm,
+        draft_tree=draft_tree,
     )
     config = AttnConfig(
         device=device,
@@ -122,6 +124,7 @@ def _extend_kwargs(torch, extend_seq_lens_cpu, extend_prefix_lens_cpu, device):
         extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens_cpu),
         extend_prompt_lens_cpu=extend_prefix_lens_cpu + extend_seq_lens_cpu,
         extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
+        query_shard=None,
     )
 
 
@@ -1101,7 +1104,7 @@ class VerifyMetadataTest(unittest.TestCase):
             patch.object(mamba_module, "copy_state_rows", recorded_copy),
             patch.object(mamba_module, "state_verify_commit_rows", reference_rows),
         ):
-            self.backend.commit_verified_state(accepted)
+            self.backend.commit_verified_state(accepted, accepted_path=None)
 
         self.assertEqual(len(resolve_calls), 2)
         self.assertEqual(
@@ -1212,7 +1215,9 @@ class VerifyCommitGPUTest(unittest.TestCase):
                                 torch.profiler.ProfilerActivity.CUDA,
                             ]
                         ) as profile:
-                            backend.commit_verified_state(accepted[:live_bs])
+                            backend.commit_verified_state(
+                                accepted[:live_bs], accepted_path=None
+                            )
                             torch.cuda.synchronize()
                     events = profile.events()
                     gpu_kernels = [
@@ -1277,7 +1282,9 @@ class VerifyCommitGPUTest(unittest.TestCase):
                         )
                         torch.testing.assert_close(
                             kwargs["read_indices"],
-                            torch.stack([read_pages[g] for g in layer_groups.values()]),
+                            torch.stack(
+                                [read_pages[g][:live_bs] for g in layer_groups.values()]
+                            ),
                         )
                     else:
                         replay.assert_not_called()
@@ -1699,6 +1706,106 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         self.assertTrue(torch.equal(ssm_slab[2], ssm_page2_after_prefill))
         self.assertGreater(ssm_slab[2].abs().max().item(), 0.0)
         self.assertGreater(ssm_slab[3].abs().max().item(), 0.0)
+
+
+class ReplayStateTapeGPUTest(unittest.TestCase):
+    """Decode replay refresh over many state groups and more rows than one tape block."""
+
+    P = 4
+
+    def _backend(self, num_groups, bs):
+        import torch
+
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            MambaAttnBackend,
+        )
+
+        backend = MambaAttnBackend(
+            *_mamba_config_pair(torch, heads=2, head_dim=2, max_bs=bs, device="cuda")
+        )
+        backend.set_kv_pool(
+            _ContractPool(
+                self.P,
+                {
+                    layer_id: (
+                        f"state_{layer_id}",
+                        torch.zeros(2, 3, device="cuda"),
+                        torch.zeros(2, 5, device="cuda"),
+                    )
+                    for layer_id in range(num_groups)
+                },
+            )
+        )
+        backend.init_cuda_graph_state(max_bs=bs)
+        return backend
+
+    def _refresh(self, backend, num_groups, bs, real_bs):
+        import torch
+
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        slots = 7
+        seq_lens = torch.randint(
+            1, slots * self.P + 1, (bs,), dtype=torch.int32, device="cuda"
+        )
+        seq_lens[:4] = torch.tensor([1, 2, self.P, self.P + 1], dtype=torch.int32)
+        tables = {
+            f"state_{g}": torch.randint(
+                1, 1000, (real_bs, slots), dtype=torch.int32, device="cuda"
+            )
+            for g in range(num_groups)
+        }
+        backend.refresh_decode_metadata(
+            bs,
+            real_bs,
+            torch.arange(bs, dtype=torch.int32, device="cuda"),
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=True,
+            block_tables=tables,
+        )
+        torch.cuda.synchronize()
+        after = seq_lens[:real_bs].long()
+        before = after - 1
+        in_slot = torch.div(before - 1, self.P, rounding_mode="floor").clamp(min=0)
+        out_slot = torch.div(after - 1, self.P, rounding_mode="floor").clamp(
+            min=0, max=slots - 1
+        )
+        md = backend.forward_metadata
+        for gid, rows in tables.items():
+            ref_in = rows.gather(1, in_slot[:, None]).squeeze(1)
+            ref_in = torch.where(before > 0, ref_in, torch.zeros_like(ref_in))
+            ref_out = rows.gather(1, out_slot[:, None]).squeeze(1)
+            state_in = md.state_in_blocks_by_group[gid]
+            state_out = md.state_out_blocks_by_group[gid]
+            self.assertTrue(torch.equal(state_in[:real_bs], ref_in.int()), gid)
+            self.assertTrue(torch.equal(state_out[:real_bs], ref_out.int()), gid)
+            self.assertTrue((state_in[real_bs:] == -1).all(), gid)
+            self.assertTrue((state_out[real_bs:] == -1).all(), gid)
+
+    def test_tape_and_eager_fallback_match_the_dual_index_reference(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("GPU required")
+        torch.manual_seed(0)
+        for num_groups, taped in ((1, True), (5, True), (8, True), (9, False)):
+            backend = self._backend(num_groups, bs=160)
+            self._refresh(backend, num_groups, bs=160, real_bs=150)
+            self.assertEqual(bool(backend._replay_state_tapes), taped, num_groups)
+
+    def test_rebuilt_graph_state_drops_tapes_bound_to_the_old_buffers(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("GPU required")
+        torch.manual_seed(1)
+        backend = self._backend(5, bs=8)
+        self._refresh(backend, 5, bs=8, real_bs=6)
+        backend.init_cuda_graph_state(max_bs=8)
+        self.assertFalse(backend._replay_state_tapes)
+        # The refresh must write the rebuilt buffers a recaptured graph reads.
+        self._refresh(backend, 5, bs=8, real_bs=6)
 
 
 class TritonCheckpointContinuationTest(unittest.TestCase):

@@ -34,6 +34,7 @@ from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.utils.tensor import prepare_padded_rows
 
 
 def shared_expert_mapping(mapping, value):
@@ -76,12 +77,11 @@ def validate_shared_expert_settings(mapping, value):
     """
     if dist.is_initialized() and mapping.world_size > 1:
         pg_manager.init_process_group(mapping.world_group, backend="gloo")
-        values = [None] * mapping.world_size
-        dist.all_gather_object(
-            values,
-            value,
-            group=pg_manager.get_process_group("gloo", mapping.world_group),
-        )
+        group = pg_manager.get_process_group("gloo", mapping.world_group)
+        # Sized by the process group: --emulate-rank-zero backs the logical
+        # world with this process alone.
+        values = [None] * group.size()
+        dist.all_gather_object(values, value, group=group)
         if len(set(values)) != 1:
             raise ValueError(f"Shared-expert TP settings differ across ranks: {values}")
     return shared_expert_mapping(mapping, value)
@@ -149,13 +149,7 @@ class SharedExpertCommunication:
             raise ValueError("Shared-expert TP exceeds prepared capacity")
         if rows == 0:
             return inputs.new_empty((0, self.hidden))
-        local_rows = inputs.shape[0]
-        if local_rows == rows and inputs.is_contiguous():
-            send = inputs
-        else:
-            send = self.send[:rows]
-            send.zero_()
-            send[:local_rows].copy_(inputs)
+        send = prepare_padded_rows(inputs, rows, self.send, alignment_bytes=1)
         if self.gather is not None and rows <= 128:
             gathered = trtllm_allgather(self.gather, send)
         else:

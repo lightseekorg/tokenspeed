@@ -252,11 +252,18 @@ class InklingForConditionalGenerationNextN(nn.Module):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
 
     def get_hot_token_id(self):
         # MTP drafts over the full vocab (EAGLE3-only optimization).
         return None
+
+    @property
+    def num_mtp_layers(self) -> int:
+        """Depth layers built (the multi-depth drafter's contract attribute:
+        step ``d`` runs ``layers[d % num_mtp_layers]``)."""
+        return self.model.num_mtp_layers
 
     def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model.embed_tokens.weight, self.lm_head.weight

@@ -77,6 +77,7 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
+    bind_or_copy,
     default_weight_loader,
     sharded_weight_loader,
 )
@@ -105,7 +106,6 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 # ===----------------------------------------------------------------------=== #
 # Multimodal vision path
@@ -474,10 +474,7 @@ class Glm53FlashMoE(DeepseekV3MoE):
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=(
-                config.n_routed_experts
-                + global_server_args_dict["ep_num_redundant_experts"]
-            ),
+            num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -685,14 +682,19 @@ class Glm53FlashKDA(nn.Module):
         )
 
     def fuse_conv_weights(self) -> None:
-        self.conv_weights = torch.cat(
-            (
-                self.q_conv1d_weight,
-                self.k_conv1d_weight,
-                self.v_conv1d_weight,
-            ),
-            dim=0,
-        ).squeeze(1)
+        # Written in place on a re-run (live weight update): captured CUDA
+        # graphs hold the bank's address.
+        self.conv_weights = bind_or_copy(
+            self.conv_weights,
+            torch.cat(
+                (
+                    self.q_conv1d_weight,
+                    self.k_conv1d_weight,
+                    self.v_conv1d_weight,
+                ),
+                dim=0,
+            ).squeeze(1),
+        )
         self._conv_weight_versions = (
             self.q_conv1d_weight._version,
             self.k_conv1d_weight._version,
@@ -1318,8 +1320,10 @@ class Glm53FlashDecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
             prev_is_moe=prev_is_moe,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
         if self.mhc:

@@ -69,6 +69,8 @@ class _TestCacheGroup:
     sliding_window_tokens: int | None
     fields: tuple[_TestCacheField, ...]
     cache_blocks_per_lcm_block: int
+    # DCP owners the group's virtual blocks are dealt to; 1 is replicated.
+    shard_count: int
 
     @property
     def transfer_policy(self) -> str:
@@ -120,8 +122,11 @@ def group(
     retention: str = "full_history",
     window: int | None = None,
     packing: int = 1,
+    shard_count: int = 1,
 ) -> _TestCacheGroup:
-    return _TestCacheGroup(group_id, family, q, retention, window, segments, packing)
+    return _TestCacheGroup(
+        group_id, family, q, retention, window, segments, packing, shard_count
+    )
 
 
 def layout(
@@ -148,6 +153,7 @@ def layout(
                 transfer_policy=entry.transfer_policy,
                 checkpoint_granularity=entry.prefix_granularity,
                 replayable=False,
+                shard_count=entry.shard_count,
             )
             if entry.family == "state" and entry.retention == "full_history"
             else CacheGroupSpec(
@@ -159,6 +165,7 @@ def layout(
                 family=entry.family,
                 transfer_policy=entry.transfer_policy,
                 replayable=False,
+                shard_count=entry.shard_count,
             )
         )
         for entry in groups

@@ -22,6 +22,7 @@
 
 import pytest
 import torch
+from tokenspeed_kernel import compile_monitor
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     KIMI3_HIDDEN_SIZE,
     KIMI3_ROUTER_SIZE,
@@ -129,3 +130,21 @@ def test_bf16_epilogue_rounds_once(m: int) -> None:
         ll_bf16_router(a, b, bias=bias, out_dtype=torch.bfloat16),
         (fp32 + bias.float()).to(torch.bfloat16),
     )
+
+
+def test_serving_declines_only_the_per_row_count_dot_product(monkeypatch) -> None:
+    """The dot-product kernel compiles once per exact M; serving hands those rows on."""
+    monkeypatch.setattr(compile_monitor, "_hooks", None)
+    monkeypatch.setattr(compile_monitor, "_serving", False)
+    a, b = _inputs(32)
+    # Too narrow for every split-K rank to own a K tile, so the dot product at any M.
+    narrow_a, narrow_b = a[:, :320].contiguous(), b[:, :320].contiguous()
+    cases = {"dot product": (a[:3], b), "narrow": (narrow_a[:24], narrow_b)}
+    split_k = {m: (a[:m], b) for m in (8, 24)}
+    for x, w in [*cases.values(), *split_k.values()]:
+        assert ll_bf16_router_supported(x, w, x.shape[0])
+    compile_monitor.mark_serving()
+    for x, w in cases.values():
+        assert not ll_bf16_router_supported(x, w, x.shape[0])
+    for x, w in split_k.values():
+        assert ll_bf16_router_supported(x, w, x.shape[0])

@@ -65,7 +65,6 @@ from tokenspeed.runtime.models.base import (
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
@@ -276,9 +275,7 @@ class GptOssSparseMoeBlock(nn.Module):
         self.activation = config.hidden_act
         self.activation_alpha = getattr(config, "hidden_act_alpha", 1.702)
         self.swiglu_limit = config.swiglu_limit
-        self.num_experts = (
-            num_experts + global_server_args_dict["ep_num_redundant_experts"]
-        )
+        self.num_experts = num_experts
         self.quant_config = quant_config
         if self.tp_size > config.num_local_experts:
             raise ValueError(
@@ -360,8 +357,8 @@ class GptOssSparseMoeBlock(nn.Module):
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
         )
 
-    def get_moe_weights(self) -> list[torch.Tensor]:
-
+    def get_moe_routed_weights(self) -> list[torch.Tensor]:
+        """The routed experts' slot tensors, ``[num_local, ...]`` each."""
         return [
             x.data
             for name, x in self.experts.named_parameters()
@@ -483,6 +480,14 @@ class GptOssForCausalLM(BaseCausalLM):
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
+
+    @property
+    def routed_experts_weights_of_layer(self) -> dict[int, list[torch.Tensor]]:
+        # Every GPT-OSS layer is a MoE layer.
+        return {
+            layer_id: layer.mlp.get_moe_routed_weights()
+            for layer_id, layer in enumerate(self.model.layers)
+        }
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -668,11 +673,6 @@ class GptOssForCausalLM(BaseCausalLM):
                 raise RuntimeError(f"Not all parameters loaded: {not_loaded_params=}")
             else:
                 logger.info("All parameters loaded successfully.")
-
-        self.routed_experts_weights_of_layer = {
-            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-            for layer_id in range(len(self.model.layers))
-        }
 
     def _load_mxfp4_weights(self, weights, weight_name_mapping: dict):
         # Stream experts; buffering them pins most of the checkpoint on the GPU.

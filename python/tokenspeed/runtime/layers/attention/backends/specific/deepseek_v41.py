@@ -50,7 +50,11 @@ import torch
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    reject_query_shard,
+)
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
@@ -546,8 +550,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
+        reject_query_shard(query_shard, "DeepseekV41AttentionBackend")
         del extend_with_prefix
         if forward_mode.is_decode():
             raise ValueError("V4.1 decode metadata must use refresh_decode_metadata")

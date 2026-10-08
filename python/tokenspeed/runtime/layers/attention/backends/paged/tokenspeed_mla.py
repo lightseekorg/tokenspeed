@@ -44,7 +44,9 @@ from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.workspace import workspace_pool
+from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -343,8 +345,12 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
         **kwargs,
     ):
+        reject_query_shard(query_shard, "CuteDSLMLABackend")
+        del page_table_cpu
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "tokenspeed_mla decode metadata goes through "
@@ -739,6 +745,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 group=self.dcp_group,
                 rank=self.dcp_rank,
                 sink=None,
+                keep_all_heads=False,
             )
 
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)

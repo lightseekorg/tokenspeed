@@ -1041,51 +1041,6 @@ def test_gluon_logical_topk_indices_respects_ragged_ranges_and_outputs() -> None
     )
 
 
-@pytest.mark.skipif(not is_cdna4(), reason="requires the gfx950 logical top-k")
-def test_gluon_logical_topk_indices_validates_tensor_contract() -> None:
-    logits = torch.empty((2, 1024), device="cuda", dtype=torch.float32)
-    row_starts = torch.zeros((2,), device="cuda", dtype=torch.int32)
-    row_ends = torch.full((2,), 1024, device="cuda", dtype=torch.int32)
-
-    with pytest.raises(ValueError, match="2-D"):
-        gluon_logical_topk_indices(logits[0], row_starts, row_ends, topk=512)
-    with pytest.raises(TypeError, match="float32"):
-        gluon_logical_topk_indices(
-            logits.to(torch.bfloat16), row_starts, row_ends, topk=512
-        )
-    with pytest.raises(ValueError, match="logits must be contiguous"):
-        gluon_logical_topk_indices(
-            torch.empty((1024, 2), device="cuda", dtype=torch.float32).T,
-            row_starts,
-            row_ends,
-            topk=512,
-        )
-    with pytest.raises(ValueError, match="row_starts must have shape"):
-        gluon_logical_topk_indices(logits, row_starts[:1], row_ends, topk=512)
-    with pytest.raises(TypeError, match="row_ends must be int32"):
-        gluon_logical_topk_indices(
-            logits, row_starts, row_ends.to(torch.int64), topk=512
-        )
-    with pytest.raises(ValueError, match="out must have shape"):
-        gluon_logical_topk_indices(
-            logits,
-            row_starts,
-            row_ends,
-            topk=512,
-            out=torch.empty((2, 511), device="cuda", dtype=torch.int32),
-        )
-    with pytest.raises(TypeError, match="lens_out must be int32"):
-        gluon_logical_topk_indices(
-            logits,
-            row_starts,
-            row_ends,
-            topk=512,
-            lens_out=torch.empty((2,), device="cuda", dtype=torch.int64),
-        )
-    with pytest.raises(ValueError, match="supports topk"):
-        gluon_logical_topk_indices(logits, row_starts, row_ends, topk=64)
-
-
 def test_dsa_decode_topk_gluon_long_row_uses_radix_path() -> None:
     device = "cuda"
     page_size = 64

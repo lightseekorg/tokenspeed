@@ -275,9 +275,20 @@ class TritonAllReduceBackend(CommBackend):
         return self._fallback.reduce_scatter(tensor, group)
 
     def all_to_all_single(
-        self, output: torch.Tensor, input: torch.Tensor, group: Group
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: Group,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
     ) -> None:
-        return self._fallback.all_to_all_single(output, input, group)
+        return self._fallback.all_to_all_single(
+            output,
+            input,
+            group,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+        )
 
     def token_all_gather(
         self,

@@ -300,6 +300,23 @@ def gdn_decode_step(
         )
 
 
+# ReplaySSM draft trees of these sizes verify in the chunked form, which keeps no node states.
+GDN_TREE_VERIFY_CHUNKED_MIN_NODES = 8
+GDN_TREE_VERIFY_CHUNKED_MAX_NODES = 16
+
+
+def gdn_tree_verify_needs_node_states(num_nodes: int) -> bool:
+    """Whether a ReplaySSM draft-tree ``gdn_decode_mtp`` of ``num_nodes`` nodes takes
+    an ``intermediate_states_buffer``: trees outside
+    ``GDN_TREE_VERIFY_CHUNKED_MIN_NODES`` to ``GDN_TREE_VERIFY_CHUNKED_MAX_NODES``
+    nodes verify step by step and reload their branch points' states from it."""
+    return not (
+        GDN_TREE_VERIFY_CHUNKED_MIN_NODES
+        <= num_nodes
+        <= GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+    )
+
+
 def gdn_decode_mtp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -316,6 +333,7 @@ def gdn_decode_mtp(
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
+    tree_ancestors: torch.Tensor | None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -348,7 +366,8 @@ def gdn_decode_mtp(
         intermediate_states_buffer: Optional batch-scoped ``[B, T,
             num_v_heads, head_v_dim, head_dim]`` (K-last, same dtype as
             ``initial_state``) buffer that receives every step's post-update
-            state at ``buffer[i_n, step]``.
+            state at ``buffer[i_n, step]`` (for a ReplaySSM tree, only the
+            branch points' states).
         output_state_indices: Optional per-token state-pool destinations shaped
             ``[B, T]`` with dtype ``torch.int32``. When provided, each
             post-update state ``h_{t+1}`` is written directly to
@@ -358,6 +377,16 @@ def gdn_decode_mtp(
             non-negative. This is mutually exclusive with
             ``intermediate_states_buffer`` and requires
             ``disable_state_update=False``.
+        tree_ancestors: Optional contiguous int64 ``[B, T]`` draft-tree
+            ancestor-or-self bitmask, ``T <= 64``: bit ``s`` of row ``t`` is
+            set when step ``s`` is ``t`` or one of its ancestors, and ancestors
+            precede their descendants. Step ``t`` continues from its parent's
+            state (the initial state for a root) instead of step ``t - 1``.
+            With ``output_state_indices`` every node's state goes to the pool;
+            without it (ReplaySSM verify) the pool is left untouched, which
+            needs ``disable_state_update``, and an ``intermediate_states_buffer``
+            is given exactly when ``gdn_tree_verify_needs_node_states(T)``.
+            Runs the Triton solution; ``None`` is a chain.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -384,6 +413,38 @@ def gdn_decode_mtp(
             )
         if disable_state_update:
             raise ValueError("output_state_indices requires disable_state_update=False")
+
+    if tree_ancestors is not None:
+        if (
+            tree_ancestors.shape != q.shape[:2]
+            or tree_ancestors.dtype != torch.int64
+            or not tree_ancestors.is_contiguous()
+            or q.shape[1] > 64
+        ):
+            raise ValueError(
+                f"tree_ancestors must be contiguous int64 {tuple(q.shape[:2])} with "
+                f"T <= 64, got {tree_ancestors.dtype} {tuple(tree_ancestors.shape)} "
+                f"strides {tree_ancestors.stride()}"
+            )
+        if output_state_indices is None:
+            if not disable_state_update:
+                raise ValueError(
+                    "a draft tree without output_state_indices leaves the pool "
+                    "untouched: disable_state_update must be True"
+                )
+            if gdn_tree_verify_needs_node_states(q.shape[1]) != (
+                intermediate_states_buffer is not None
+            ):
+                raise ValueError(
+                    f"a ReplaySSM tree of {q.shape[1]} nodes takes an "
+                    "intermediate_states_buffer exactly when "
+                    "gdn_tree_verify_needs_node_states"
+                )
+        if solution not in (None, "triton"):
+            raise ValueError(
+                f"draft-tree GDN verify runs the Triton solution, got {solution}"
+            )
+        solution = "triton"
 
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
@@ -421,6 +482,7 @@ def gdn_decode_mtp(
             use_qk_l2norm=use_qk_l2norm,
             intermediate_states_buffer=intermediate_states_buffer,
             output_state_indices=output_state_indices,
+            tree_ancestors=tree_ancestors,
         )
 
 
@@ -651,6 +713,8 @@ import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
 # isort: on
 
 __all__ = [
+    "GDN_TREE_VERIFY_CHUNKED_MIN_NODES",
+    "GDN_TREE_VERIFY_CHUNKED_MAX_NODES",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "gdn_chunk_prefill",
@@ -658,5 +722,6 @@ __all__ = [
     "gdn_decode_mtp",
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
+    "gdn_tree_verify_needs_node_states",
     "validate_replay_commit_args",
 ]

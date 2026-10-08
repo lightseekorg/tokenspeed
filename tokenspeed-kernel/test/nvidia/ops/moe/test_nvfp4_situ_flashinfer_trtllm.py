@@ -388,6 +388,7 @@ def test_moe_plan_selects_nvfp4_situ_routed_kernel(
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_nvfp4_situ_routed_moe_apply"
     assert plan["support_routing"] is False

@@ -235,6 +235,58 @@ class Fp8LinearMethod(LinearMethodBase):
                             weight_scale[0].clone(), requires_grad=False
                         )
 
+    def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
+        if not self.block_quant:
+            return super().apply_into(layer, x, bias, block_scale, output_dtype, out)
+        if (
+            out.shape != (*x.shape[:-1], layer.weight.shape[0])
+            or out.dtype != output_dtype
+            or out.device != x.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError("Incompatible block-FP8 output destination")
+        return self._apply_block(layer, x, bias, block_scale, output_dtype, out)
+
+    def _apply_block(self, layer, x, bias, block_scale, output_dtype, out):
+        input_2d = x.view(-1, x.shape[-1])
+        output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+        output_dtype = output_dtype or x.dtype
+        if block_scale is None:
+            scale_encoding = (
+                "ue8m0" if layer.weight_scale_inv.dtype == torch.uint8 else "float32"
+            )
+            input_2d, block_scale = quantize_fp8(
+                input_2d,
+                granularity="token_group",
+                group_size=self.quant_config.weight_block_size[1],
+                scale_encoding=scale_encoding,
+            )
+        solution = None
+        if global_server_args_dict["dense_gemm_backend"] == "trtllm_cutedsl" and tuple(
+            self.quant_config.weight_block_size
+        ) == (
+            128,
+            128,
+        ):
+            solution = "trtllm_cutedsl"
+        output = mm(
+            input_2d,
+            layer.weight,
+            A_scales=block_scale,
+            B_scales=layer.weight_scale_inv,
+            bias=bias,
+            out_dtype=output_dtype,
+            quant="mxfp8",
+            block_size=self.quant_config.weight_block_size,
+            solution=solution,
+            out=out.view(-1, layer.weight.shape[0]) if out is not None else None,
+        )
+        return (
+            out
+            if out is not None
+            else output.to(dtype=output_dtype).view(*output_shape)
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -243,43 +295,8 @@ class Fp8LinearMethod(LinearMethodBase):
         block_scale: torch.Tensor | None = None,
         output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-
         if self.block_quant:
-            input_2d = x.view(-1, x.shape[-1])
-            output_shape = [*x.shape[:-1], layer.weight.shape[0]]
-            output_dtype = output_dtype or x.dtype
-            if block_scale is None:
-                scale_encoding = (
-                    "ue8m0"
-                    if layer.weight_scale_inv.dtype == torch.uint8
-                    else "float32"
-                )
-                input_2d, block_scale = quantize_fp8(
-                    input_2d,
-                    granularity="token_group",
-                    group_size=self.quant_config.weight_block_size[1],
-                    scale_encoding=scale_encoding,
-                )
-            solution = None
-            if global_server_args_dict[
-                "dense_gemm_backend"
-            ] == "trtllm_cutedsl" and tuple(self.quant_config.weight_block_size) == (
-                128,
-                128,
-            ):
-                solution = "trtllm_cutedsl"
-            output = mm(
-                input_2d,
-                layer.weight,
-                A_scales=block_scale,
-                B_scales=layer.weight_scale_inv,
-                bias=bias,
-                out_dtype=output_dtype,
-                quant="mxfp8",
-                block_size=self.quant_config.weight_block_size,
-                solution=solution,
-            )
-            return output.to(dtype=output_dtype).view(*output_shape)
+            return self._apply_block(layer, x, bias, block_scale, output_dtype, None)
         else:
             input = x
             weight = layer.weight

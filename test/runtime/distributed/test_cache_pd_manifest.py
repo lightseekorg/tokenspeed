@@ -41,6 +41,7 @@ from tokenspeed.runtime.pd.cache_protocol import (
     _logical_slots,
     build_cache_block_manifest,
     build_cache_fields_by_producer_step,
+    build_cache_layerwise_block_selection,
     build_cache_transfer_contract,
 )
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
@@ -60,6 +61,7 @@ def _group_spec(
     prefix_granularity: int = 4,
     retention: str = "full_history",
     sliding_window_tokens: int | None = None,
+    shard_count: int = 1,
 ) -> CacheGroupSpec:
     # A state group is one checkpoint per block; a history group is rows.
     if family == "state":
@@ -71,6 +73,7 @@ def _group_spec(
             transfer_policy=policy,
             checkpoint_granularity=prefix_granularity,
             replayable=False,
+            shard_count=shard_count,
         )
     return CacheGroupSpec(
         group_id=group_id,
@@ -81,6 +84,7 @@ def _group_spec(
         family=family,
         transfer_policy=policy,
         replayable=False,
+        shard_count=shard_count,
     )
 
 
@@ -300,6 +304,64 @@ def test_manifest_accepts_reordered_mapping_but_rejects_wrong_keys() -> None:
                 prefix_len=4,
                 prompt_len=14,
             )
+
+
+def _sharded_layout(shard_count: int, capacity: int = 64) -> CacheTransferContract:
+    return _contract(
+        (_group_spec("attention", "history", "full_suffix", shard_count=shard_count),),
+        (_field("attention", "attention.k"),),
+        capacity=capacity,
+    )
+
+
+def test_sharded_manifest_is_bounded_by_the_virtual_block_count() -> None:
+    # 64 physical pages (null included) dealt to 4 owners: 1 + 63 * 4 virtual IDs.
+    layout = _sharded_layout(4)
+    assert layout.plan.group("attention").page_count == 64
+    assert layout.virtual_block_count("attention") == 253
+    assert _sharded_layout(1).virtual_block_count("attention") == 64
+
+    def op(last_block: int) -> SimpleNamespace:
+        table = np.array([[1, 100, 200, last_block, -1]], dtype=np.int32)
+        return SimpleNamespace(block_tables_arrays=lambda: {"attention": table})
+
+    # Remote-owner IDs above the physical page count are valid scheduler IDs.
+    manifest = build_cache_block_manifest(
+        op(252), layout=layout, request_row=0, prefix_len=4, prompt_len=14
+    )
+    assert manifest.groups[0].block_ids == (100, 200, 252)
+    validate_cache_manifest(manifest, layout=layout, peer="source")
+    selection = build_cache_layerwise_block_selection(
+        op(252),
+        layout=layout,
+        request_row=0,
+        prefix_len=4,
+        prompt_len=14,
+        chunk_start=4,
+        chunk_end=14,
+    )
+    assert selection.groups[0].source_block_ids == (100, 200, 252)
+
+    # The virtual bound is exclusive; the physical bound alone would reject 100.
+    with pytest.raises(CacheContractError, match="invalid block ID"):
+        build_cache_block_manifest(
+            op(253), layout=layout, request_row=0, prefix_len=4, prompt_len=14
+        )
+    with pytest.raises(CacheContractError, match="out-of-bounds"):
+        validate_cache_manifest(
+            replace(
+                manifest,
+                groups=(CachePDGroupBlocks("attention", (100, 200, 253)),),
+            ),
+            layout=layout,
+            peer="source",
+        )
+    with pytest.raises(CacheContractError, match="out-of-bounds"):
+        validate_cache_manifest(manifest, layout=_sharded_layout(1), peer="source")
+
+
+def test_peer_layout_allows_differing_shard_counts() -> None:
+    validate_cache_peer_layout(_sharded_layout(4), _sharded_layout(1))
 
 
 def test_contract_and_manifest_wire_round_trip_has_no_version_field() -> None:
@@ -635,7 +697,13 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
             kv_cache_dim=8,
         )
     if family == "dsa":
-        extras.update(index_topk=4, index_head_dim=128, index_n_heads=1)
+        # fp8_scaled: the (16, 132) uint8 index plane asserted below.
+        extras.update(
+            index_topk=4,
+            index_head_dim=128,
+            index_n_heads=1,
+            index_k_format="fp8_scaled",
+        )
     spec = classes[family](
         **common,
         **extras,

@@ -70,6 +70,12 @@ _STREAM_CHUNK_SIZE = 8192
 # inactivity (a genuinely hung/stalled upstream) without killing a legitimately
 # long but actively-streaming request.
 _PROXY_TIMEOUT = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=600)
+# A Mooncake weight load replies only once every worker has read its shard of
+# the checkpoint, which for a large model is minutes of silence on the
+# upstream socket; the default inactivity bound would abort a healthy load.
+_WEIGHT_LOAD_PROXY_TIMEOUT = aiohttp.ClientTimeout(
+    total=None, sock_connect=30, sock_read=3600
+)
 
 
 def _stub() -> pb_grpc.TokenSpeedSchedulerStub:
@@ -111,9 +117,40 @@ async def _grpc_call(coro) -> JSONResponse:
     return JSONResponse(MessageToDict(resp, preserving_proto_field_name=True))
 
 
+def flatten_server_info(info: dict) -> dict:
+    """Merge the nested ``server_args`` of a ``GetServerInfo`` dict into the top level.
+
+    TokenSpeed's gRPC ``GetServerInfoResponse`` nests engine flags under a
+    ``server_args`` key. RL trainers read ``/get_server_info`` flat: slime's
+    external-engine discovery and its post-launch sanity check look up engine
+    flags as top-level keys (e.g. ``info["enable_memory_saver"]``) and abort
+    when one is missing. Copy ``server_args`` to the top level for them while
+    keeping the nested ``server_args`` key for existing consumers. Top-level
+    fields win over server-arg keys on collision (there are none today).
+    The control API key is omitted from both shapes.
+    """
+    info = {k: v for k, v in info.items() if k != "rl_control_api_key"}
+    server_args = info.get("server_args")
+    if not isinstance(server_args, dict):
+        return info
+    server_args = {k: v for k, v in server_args.items() if k != "rl_control_api_key"}
+    shaped: dict = dict(server_args)
+    shaped.update({k: v for k, v in info.items() if k != "server_args"})
+    shaped["server_args"] = server_args
+    return shaped
+
+
 @app.get("/get_server_info")
 async def get_server_info():
-    return await _grpc_call(_stub().GetServerInfo(pb.GetServerInfoRequest()))
+    try:
+        resp = await _stub().GetServerInfo(pb.GetServerInfoRequest())
+    except grpc.aio.AioRpcError as exc:
+        return JSONResponse(
+            {"error": "engine unavailable", "detail": exc.details()},
+            status_code=503,
+        )
+    info = MessageToDict(resp, preserving_proto_field_name=True)
+    return JSONResponse(flatten_server_info(info))
 
 
 @app.get("/get_model_info")
@@ -148,6 +185,7 @@ async def _proxy_request(
     request: Request,
     base_url: str | None = None,
     body_override: bytes | None = None,
+    timeout: aiohttp.ClientTimeout = _PROXY_TIMEOUT,
 ) -> StreamingResponse | Response:
     base_url = base_url if base_url is not None else _gateway_url
     url = f"{base_url.rstrip('/')}{request.url.path}"
@@ -172,7 +210,7 @@ async def _proxy_request(
             url=url,
             headers=headers,
             data=body,
-            timeout=_PROXY_TIMEOUT,
+            timeout=timeout,
         )
     except Exception:
         await session.close()
@@ -393,13 +431,15 @@ async def stop_profile(request: Request):
 # ---------------------------------------------------------------------------
 
 
-async def _proxy_to_rl_control(request: Request) -> StreamingResponse | Response:
+async def _proxy_to_rl_control(
+    request: Request, timeout: aiohttp.ClientTimeout = _PROXY_TIMEOUT
+) -> StreamingResponse | Response:
     if not _rl_control_url:
         return JSONResponse(
             {"error": "weight-sync control plane is unavailable on this server"},
             status_code=503,
         )
-    return await _proxy_request(request, base_url=_rl_control_url)
+    return await _proxy_request(request, base_url=_rl_control_url, timeout=timeout)
 
 
 @app.post("/init_weights_update_group")
@@ -417,8 +457,18 @@ async def update_weights_from_distributed(request: Request):
     return await _proxy_to_rl_control(request)
 
 
+@app.post("/update_weights_from_mooncake")
+async def update_weights_from_mooncake(request: Request):
+    return await _proxy_to_rl_control(request, timeout=_WEIGHT_LOAD_PROXY_TIMEOUT)
+
+
 @app.post("/update_weights_from_tensor")
 async def update_weights_from_tensor(request: Request):
+    return await _proxy_to_rl_control(request)
+
+
+@app.post("/rebalance_experts")
+async def rebalance_experts(request: Request):
     return await _proxy_to_rl_control(request)
 
 

@@ -35,7 +35,14 @@ class TestNumericsMode(unittest.TestCase):
 
     def test_rl_bitwise_tightens_every_switch(self):
         args = ServerArgs(model="x", numerics="rl-bitwise")
-        self.assertTrue(args.force_deterministic_rsag)
+        # The envelope routes reductions itself (batch_invariant_collectives);
+        # the NCCL-only knob stays the user's.
+        self.assertFalse(args.force_deterministic_rsag)
+        self.assertTrue(
+            ServerArgs(
+                model="x", numerics="rl-bitwise", force_deterministic_rsag=True
+            ).force_deterministic_rsag
+        )
         self.assertTrue(args.disable_autotune)
         self.assertTrue(args.disable_tf32)
         self.assertTrue(args.disable_pdl)
@@ -72,6 +79,119 @@ class TestNumericsMode(unittest.TestCase):
     def test_unknown_mode_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "rl-bitwise"):
             ServerArgs(model="x", numerics="bitwise")
+
+    def test_rl_bitwise_folds_the_per_request_sampling_stream(self):
+        self.assertEqual(ServerArgs(model="x").sampling_stream, "batch")
+        args = ServerArgs(model="x", numerics="rl-bitwise")
+        self.assertEqual(args.sampling_stream, "per-request")
+        args = ServerArgs(model="x", sampling_stream="per-request")
+        self.assertEqual(args.sampling_stream, "per-request")
+        with self.assertRaisesRegex(ValueError, "--sampling-stream"):
+            ServerArgs(model="x", sampling_stream="philox")
+
+    def test_rl_bitwise_computes_the_yarn_ramp_on_cpu(self):
+        self.assertEqual(ServerArgs(model="x").yarn_ramp_mask_device, "cuda")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").yarn_ramp_mask_device, "cpu"
+        )
+        with self.assertRaisesRegex(ValueError, "--yarn-ramp-mask-device"):
+            ServerArgs(model="x", yarn_ramp_mask_device="npu")
+
+    def test_rl_bitwise_applies_the_mla_lora_scale_at_runtime(self):
+        self.assertEqual(ServerArgs(model="x").mla_lora_scale, "folded")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").mla_lora_scale, "runtime"
+        )
+        with self.assertRaisesRegex(ValueError, "--mla-lora-scale"):
+            ServerArgs(model="x", mla_lora_scale="both")
+
+    def test_rl_bitwise_unfuses_the_layer_boundary_norm(self):
+        self.assertEqual(ServerArgs(model="x").layer_boundary_norm, "fused")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm,
+            "unfused",
+        )
+        # On its own, under auto, it still vetoes the fused all-reduce+norm.
+        args = ServerArgs(
+            model="x", layer_boundary_norm="unfused", enable_allreduce_fusion=True
+        )
+        self.assertFalse(args.enable_allreduce_fusion)
+        with self.assertRaisesRegex(ValueError, "--layer-boundary-norm"):
+            ServerArgs(model="x", layer_boundary_norm="half")
+
+    def test_rl_bitwise_routes_with_the_torch_router_topk(self):
+        self.assertEqual(ServerArgs(model="x").router_topk, "fused")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").router_topk, "torch"
+        )
+        with self.assertRaisesRegex(ValueError, "--router-topk"):
+            ServerArgs(model="x", router_topk="cuda")
+
+    def test_rl_bitwise_reports_megatron_order_logprobs(self):
+        self.assertEqual(ServerArgs(model="x").logprob_order, "torch")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").logprob_order, "megatron"
+        )
+        with self.assertRaisesRegex(ValueError, "--logprob-order"):
+            ServerArgs(model="x", logprob_order="apex")
+
+    def test_rl_bitwise_reduces_dsa_slots_sorted(self):
+        self.assertEqual(ServerArgs(model="x").dsa_slot_order, "selection")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").dsa_slot_order, "sorted"
+        )
+        with self.assertRaisesRegex(ValueError, "--dsa-slot-order"):
+            ServerArgs(model="x", dsa_slot_order="shuffled")
+
+    def test_rl_bitwise_combines_moe_slots_in_the_leaf(self):
+        self.assertEqual(ServerArgs(model="x").moe_combine_order, "rank")
+        self.assertEqual(
+            ServerArgs(model="x", numerics="rl-bitwise").moe_combine_order, "slot"
+        )
+        # The leaf returns complete rows, so a fused all-reduce+norm at the
+        # next layer boundary would sum them again: vetoed under auto too.
+        args = ServerArgs(
+            model="x", moe_combine_order="slot", enable_allreduce_fusion=True
+        )
+        self.assertFalse(args.enable_allreduce_fusion)
+        with self.assertRaisesRegex(ValueError, "--moe-combine-order"):
+            ServerArgs(model="x", moe_combine_order="tree")
+
+    def test_slot_combine_is_validated_against_the_launch_at_startup(self):
+        # The slot fold runs over the EP group inside the leaf: a K-split down
+        # projection would need a second fold, and DeepEP owns the exchange.
+        ServerArgs(model="x", moe_combine_order="slot", world_size=2, ep_size=2)
+        # MoE TP defaults to the stage world over EP, so world_size=2 alone
+        # is MoE TP 2.
+        with self.assertRaisesRegex(ValueError, "needs MoE TP 1"):
+            ServerArgs(model="x", moe_combine_order="slot", world_size=2)
+        with self.assertRaisesRegex(ValueError, "--all2all-backend deepep"):
+            ServerArgs(
+                model="x",
+                moe_combine_order="slot",
+                world_size=2,
+                ep_size=2,
+                all2all_backend="deepep",
+            )
+        # The envelope inherits both refusals: rl-bitwise needs MoE TP 1.
+        with self.assertRaisesRegex(ValueError, "needs MoE TP 1"):
+            ServerArgs(model="x", numerics="rl-bitwise", world_size=2)
+        ServerArgs(model="x", numerics="rl-bitwise", world_size=2, ep_size=2)
+
+    def test_rl_bitwise_is_the_one_bitwise_envelope(self):
+        from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES
+
+        self.assertEqual(NUMERICS_ENVELOPES, ("auto", "rl-bitwise"))
+        with self.assertRaisesRegex(ValueError, "rl-bitwise"):
+            ServerArgs(model="x", numerics="trainer-aligned")
+
+    def test_bitwise_envelopes_cover_every_pinning_envelope(self):
+        from tokenspeed.runtime.configs.numerics import (
+            BITWISE_ENVELOPES,
+            NUMERICS_ENVELOPES,
+        )
+
+        self.assertEqual(BITWISE_ENVELOPES, set(NUMERICS_ENVELOPES) - {"auto"})
 
     def test_ordered_fold_matches_the_sum_and_only_depends_on_rank_order(self):
         import torch
@@ -156,15 +276,26 @@ class TestModelVerificationGate(unittest.TestCase):
         from tokenspeed.runtime.configs.numerics import require_verified_numerics
 
         require_verified_numerics(
-            "auto", model_profile=None, architecture="X", quantization="fp8"
+            "auto",
+            model_profile=None,
+            architecture="X",
+            quantization="fp8",
+            vocab_size=1000,
         )
 
     def test_rl_bitwise_requires_a_verified_unquantized_model(self):
-        from tokenspeed.runtime.configs.numerics import require_verified_numerics
+        from tokenspeed.runtime.configs.numerics import (
+            MEGATRON_VOCAB_BLOCK,
+            require_verified_numerics,
+        )
 
         with self.assertRaisesRegex(ValueError, "has not been verified"):
             require_verified_numerics(
-                "rl-bitwise", model_profile=None, architecture="X", quantization=None
+                "rl-bitwise",
+                model_profile=None,
+                architecture="X",
+                quantization=None,
+                vocab_size=MEGATRON_VOCAB_BLOCK,
             )
         with self.assertRaisesRegex(ValueError, "has not been verified"):
             require_verified_numerics(
@@ -172,6 +303,7 @@ class TestModelVerificationGate(unittest.TestCase):
                 model_profile=self._profile({"auto"}),
                 architecture="X",
                 quantization=None,
+                vocab_size=MEGATRON_VOCAB_BLOCK,
             )
         verified = self._profile({"auto", "rl-bitwise"})
         with self.assertRaisesRegex(ValueError, "fp8-quantized"):
@@ -180,16 +312,42 @@ class TestModelVerificationGate(unittest.TestCase):
                 model_profile=verified,
                 architecture="X",
                 quantization="fp8",
+                vocab_size=MEGATRON_VOCAB_BLOCK,
             )
         require_verified_numerics(
-            "rl-bitwise", model_profile=verified, architecture="X", quantization=None
+            "rl-bitwise",
+            model_profile=verified,
+            architecture="X",
+            quantization=None,
+            vocab_size=4 * MEGATRON_VOCAB_BLOCK,
         )
+
+    def test_rl_bitwise_needs_a_whole_number_of_megatron_vocab_blocks(self):
+        # The envelope folds --logprob-order megatron, whose sum(exp) runs
+        # over fixed vocab blocks; a model whose vocabulary cannot be cut into
+        # them is refused at startup with that reason.
+        from tokenspeed.runtime.configs.numerics import (
+            MEGATRON_VOCAB_BLOCK,
+            require_verified_numerics,
+        )
+
+        with self.assertRaisesRegex(ValueError, "vocab_size 32000, not a multiple"):
+            require_verified_numerics(
+                "rl-bitwise",
+                model_profile=self._profile({"auto", "rl-bitwise"}),
+                architecture="X",
+                quantization=None,
+                vocab_size=32000,
+            )
+        self.assertEqual(MEGATRON_VOCAB_BLOCK, 32768)
 
     def test_profile_envelopes_are_validated(self):
         with self.assertRaisesRegex(ValueError, "must include 'auto'"):
             self._profile({"rl-bitwise"})
         with self.assertRaisesRegex(ValueError, "must include 'auto'"):
             self._profile({"auto", "bitwise"})
+        with self.assertRaisesRegex(ValueError, "must include 'auto'"):
+            self._profile({"auto", "trainer-aligned"})
         self.assertIsInstance(self._profile(["auto"]).numerics_envelopes, frozenset)
 
 

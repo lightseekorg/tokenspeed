@@ -26,10 +26,10 @@ import torch
 from torch import nn
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
-from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce, token_all_gather
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.query_shard import scatter_count
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.latent import (
@@ -75,13 +75,12 @@ class KimiLinearMoEDeepEP(nn.Module):
         plan = Kimi3MoEExecutionPlan.build(mapping, get_moe_backend(), alt_stream)
         if (
             not plan.use_marlin
-            or mapping.attn.cp_size != 1
             or mapping.moe.tp_size != 1
             or mapping.moe.dp_size != 1
             or mapping.moe.ep_size != mapping.attn.tp_size * mapping.attn.dp_size
         ):
             raise ValueError(
-                "Kimi-K3 DeepEP requires Marlin, attention CP=1, MoE TP=1/DP=1, "
+                "Kimi-K3 DeepEP requires Marlin, MoE TP=1/DP=1, "
                 "and expert EP == attention TP*DP inside each pipeline stage."
             )
         self.mapping = mapping
@@ -199,7 +198,7 @@ class KimiLinearMoEDeepEP(nn.Module):
             raise RuntimeError("Kimi-K3 DeepEP requires a ForwardContext")
         tp = self.mapping.attn
         num_tokens = hidden_states.shape[0]
-        counts = CommManager._scatter_count(num_tokens, tp.tp_size)
+        counts = scatter_count(num_tokens, tp.tp_size)
         start = sum(counts[: tp.tp_rank])
         source = hidden_states.narrow(0, start, counts[tp.tp_rank])
         logits = (

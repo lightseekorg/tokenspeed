@@ -32,8 +32,8 @@ if not is_cdna4():
 
 
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
-    _supports_largem_shape,
     launch_gluon_mm_a16w16_prefill_gfx950,
+    supports_gluon_mm_a16w16_prefill_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _choose_mfma_lds_mediumm_config,
@@ -41,16 +41,16 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _get_splitk_counters,
     _supports_mfma_lds_smallm,
     _use_mfma_lds_largem,
-    _use_mfma_lds_mediumm,
-    _use_mfma_lds_smallm,
     _use_warp_reduce_smallm,
     gluon_mm_a16w16_gfx950,
     gluon_mm_a16w16_medium_gfx950,
     launch_gluon_bmm_a16w16_gfx950,
+    launch_gluon_mm_a16w16_decode_add3_gfx950,
     launch_gluon_mm_a16w16_decode_gfx950,
     launch_gluon_mm_a16w16_medium_gfx950,
     launch_gluon_mm_a16w16_splitk_gfx950,
     launch_gluon_mm_a16w16_warp_gfx950,
+    supports_gluon_mm_a16w16_decode_add3_gfx950,
     supports_gluon_mm_a16w16_decode_gfx950,
 )
 
@@ -189,14 +189,6 @@ def test_supports_splitk_rejects_non_target_shapes() -> None:
     assert not _supports_mfma_lds_smallm(8, 8192, 4096)
 
 
-def test_use_splitk_is_disabled_for_default_routing() -> None:
-    assert not _use_mfma_lds_smallm(1, 4096, 4096)
-    assert not _use_mfma_lds_smallm(4, 2560, 2048)
-    assert not _use_mfma_lds_smallm(1, 2560, 2048)
-    assert not _use_mfma_lds_smallm(2, 2560, 2048)
-    assert not _use_mfma_lds_smallm(4, 1280, 1024)
-
-
 def test_dispatcher_falls_back_for_splitk_shapes() -> None:
     dtype = torch.bfloat16
     a = torch.empty((1, 4096), device="cuda", dtype=dtype)
@@ -287,29 +279,47 @@ def test_choose_mfma_lds_mediumm_config_falls_back_for_slow_shapes() -> None:
     assert _choose_mfma_lds_mediumm_config(576, 7168, 3584) is None
 
 
-def test_use_mediumm_routes_configured_shapes() -> None:
-    assert _use_mfma_lds_mediumm(8, 1280, 1024)
-    assert _use_mfma_lds_mediumm(64, 1280, 2880)
-    assert _use_mfma_lds_mediumm(128, 4096, 4096)
-    assert _use_mfma_lds_mediumm(768, 3584, 7168)
-    assert _use_mfma_lds_mediumm(512, 7168, 3584)
-    assert not _use_mfma_lds_mediumm(4, 1280, 1024)
-    assert not _use_mfma_lds_mediumm(256, 1280, 1024)
-    assert not _use_mfma_lds_mediumm(640, 3584, 7168)
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((300, 6288, 7168), id="qkvfab-ragged-mn"),
+        pytest.param((77, 100, 512), id="sub-tile"),
+        pytest.param((3001, 7168, 4224), id="odd-k-pairs"),
+    ],
+)
+def test_largem_masks_partial_tiles(shape: tuple[int, int, int]) -> None:
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    m, n, k = shape
+    a = torch.randn((m, k), device="cuda", dtype=dtype) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=dtype) * 0.25
+    # A sentinel-filled padded row stride catches stores past column N.
+    backing = torch.full((m, n + 16), 7.0, device="cuda", dtype=dtype)
+    out = backing[:, :n]
+
+    launch_gluon_mm_a16w16_prefill_gfx950(a, b, dtype, out=out)
+
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=_ATOL, rtol=_RTOL)
+    assert torch.all(backing[:, n:] == 7.0)
 
 
-def test_supports_largem_shape_covers_aligned_prefill_tiles() -> None:
-    assert _supports_largem_shape(256, 256, 256)
-    assert _supports_largem_shape(2048, 8192, 8192)
-
-
-def test_supports_largem_shape_rejects_unaligned_or_medium_shapes() -> None:
-    assert not _supports_largem_shape(128, 4096, 4096)
-    assert not _supports_largem_shape(256, 128, 256)
-    assert not _supports_largem_shape(256, 256, 128)
-    assert not _supports_largem_shape(256, 1280, 2880)
-    assert not _supports_largem_shape(384, 4096, 4096)
-    assert not _supports_largem_shape(512, 3968, 4096)
+def test_prefill_routes_k3_shapes_with_busy_cus() -> None:
+    # qkvfab spans 25 workgroups across N. 4096 tokens launch 400 workgroups,
+    # busying 78% of 256 CUs over two rounds; 3072 tokens launch 300, which
+    # leaves most CUs idle in the second round.
+    assert supports_gluon_mm_a16w16_prefill_gfx950(4096, 6288, 7168)
+    assert supports_gluon_mm_a16w16_prefill_gfx950(4000, 6288, 7168)
+    assert not supports_gluon_mm_a16w16_prefill_gfx950(3072, 6288, 7168)
+    assert not supports_gluon_mm_a16w16_prefill_gfx950(1024, 6288, 7168)
+    # Past two rounds the long qkvfab reduction needs nearly every CU busy:
+    # 8192 tokens busy 78% over four rounds, 12288 tokens 94% over five. The
+    # short attention output reduction keeps the base rule.
+    assert not supports_gluon_mm_a16w16_prefill_gfx950(8192, 6288, 7168)
+    assert supports_gluon_mm_a16w16_prefill_gfx950(12288, 6288, 7168)
+    assert supports_gluon_mm_a16w16_prefill_gfx950(8192, 7168, 1536)
+    # Unmeasured or losing shapes keep hipBLASLt at any token count.
+    assert not supports_gluon_mm_a16w16_prefill_gfx950(4096, 4096, 4096)
+    assert not supports_gluon_mm_a16w16_prefill_gfx950(7168, 2304, 1536)
 
 
 def test_use_largem_routes_only_dispatch_target_shapes() -> None:
@@ -427,4 +437,51 @@ def test_decode_gemm_row_count_does_not_recompile() -> None:
         run(rows)
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
+            run(rows)
+
+
+@pytest.mark.parametrize("m", [2, 4, 7, 8, 16, 24, 32])
+def test_decode_add3_matches_single_rounding_reference(m: int) -> None:
+    torch.manual_seed(0)
+    n, k = 7168, 3584
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    addend_a = torch.randn((m, n), device="cuda", dtype=torch.bfloat16)
+    # A column slice of a wider lane, as the K3 shared-expert output arrives.
+    lane = torch.randn((m, n + 3584), device="cuda", dtype=torch.bfloat16)
+    addend_b = lane[:, 3584:]
+
+    out = launch_gluon_mm_a16w16_decode_add3_gfx950(a, b, addend_a, addend_b)
+
+    expected = (a.float() @ b.float().T + addend_a.float() + addend_b.float()).to(
+        torch.bfloat16
+    )
+    torch.testing.assert_close(out, expected, atol=1e-4, rtol=_RTOL)
+
+
+def test_decode_add3_supports_only_single_pass_buckets() -> None:
+    assert supports_gluon_mm_a16w16_decode_add3_gfx950(2, 7168, 3584)
+    assert supports_gluon_mm_a16w16_decode_add3_gfx950(32, 7168, 3584)
+    # lat_up has no M=64 bucket; split-K shapes cannot fuse the addends.
+    assert not supports_gluon_mm_a16w16_decode_add3_gfx950(33, 7168, 3584)
+    assert not supports_gluon_mm_a16w16_decode_add3_gfx950(16, 3584, 7168)
+    assert not supports_gluon_mm_a16w16_decode_add3_gfx950(1, 7168, 3584)
+
+
+def test_decode_add3_row_count_does_not_recompile() -> None:
+    torch.manual_seed(0)
+    n, k = 7168, 3584
+    a = torch.randn((32, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    addend = torch.randn((32, n), device="cuda", dtype=torch.bfloat16)
+
+    def run(rows):
+        launch_gluon_mm_a16w16_decode_add3_gfx950(
+            a[:rows], b, addend[:rows], addend[:rows]
+        )
+
+    for rows in (3, 4, 5, 8, 9, 16, 17, 32):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (2, 6, 7, 12, 14, 20, 27, 31):
             run(rows)

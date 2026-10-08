@@ -91,7 +91,9 @@ def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
     per-batch quantity passed as a constexpr recompiles the kernel on every new
     shape. Warm the kernels before entering, covering each integer
     specialization class Triton still keys on for runtime scalars (divisible by
-    16 or not), then launch them with shapes that vary the way serving does.
+    16 or not), then launch them with shapes that vary the way serving does. A
+    serving-path kernel that opts out of those classes (``do_not_specialize``,
+    ``do_not_specialize_on_alignment``) warms once and sweeps across them.
     """
     with ExitStack() as stack:
         compiles = [
@@ -106,6 +108,15 @@ def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
             f"{kernel.fn.__name__} compiled {compile_calls.call_count} new "
             "specialization(s); a per-batch value is likely passed as tl.constexpr"
         )
+
+
+def compiled_kernels(kernel: Any) -> list[Any]:
+    """Every binary this process has compiled for a Triton ``kernel``, from its JIT cache."""
+    return [
+        binary
+        for cache in kernel.device_caches.values()
+        for binary in cache[0].values()
+    ]
 
 
 def int_specialization_class(value: int) -> str:

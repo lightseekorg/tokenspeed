@@ -147,6 +147,10 @@ class SelectionPolicy:
 _policy = SelectionPolicy()
 _oracles: dict[str, SelectionOracle] = {}
 _global_overrides: dict[tuple[str, str], str] = {}
+# (family, mode, kernel name) triples whose override selection has already been
+# logged in this process. The override path bypasses the selection cache, so
+# without this the verbose log would repeat on every call.
+_logged_overrides: set[tuple[str, str, str]] = set()
 
 
 def set_selection_policy(policy: SelectionPolicy) -> None:
@@ -413,21 +417,38 @@ def _resolve_override(
     format_signature: object,
     override: str,
     platform: PlatformInfo,
+    features: frozenset[str] | None,
 ) -> SelectedKernel:
-    impl = registry.get_impl(override)
-    if impl is not None:
-        return SelectedKernel(name=override, impl=impl)
+    """Resolve a kernel name or solution forced by ``override``.
 
-    specs = registry.get_for_operator(family, mode, solution=override)
-    if specs:
-        kernel_name = specs[0].name
-        impl = registry.get_impl(kernel_name)
-        if impl is not None:
-            return SelectedKernel(name=kernel_name, impl=impl)
-
-    raise NoKernelFoundError(
-        f"Override '{override}' not found for {family}.{mode} ({format_signature})"
-    )
+    An override skips platform, format-signature and trait matching, but not
+    the operator's required ``features``: a feature names a keyword or
+    behaviour the facade relies on (the kernel's launcher takes it), so a
+    kernel without it would fail inside the leaf, not at selection. A kernel
+    lacking one is refused here with the feature named.
+    """
+    spec = registry.get_by_name(override)
+    if spec is None:
+        candidates = registry.get_for_operator(family, mode, solution=override)
+        if not candidates:
+            raise NoKernelFoundError(
+                f"Override '{override}' not found for {family}.{mode} "
+                f"({format_signature})"
+            )
+        # The solution's highest-priority kernel declaring every required
+        # feature; without one, its first kernel names the refusal below.
+        spec = next(
+            (s for s in candidates if features is None or features <= s.features),
+            candidates[0],
+        )
+    if features is not None and not features <= spec.features:
+        missing = sorted(features - spec.features)
+        raise NoKernelFoundError(
+            f"Override '{override}' resolves to {spec.name!r} for {family}.{mode} "
+            f"({format_signature}), which does not declare the required "
+            f"feature(s) {missing}"
+        )
+    return SelectedKernel(name=spec.name, impl=registry.get_impl(spec.name))
 
 
 def _log_selection(
@@ -455,14 +476,51 @@ def _log_selection(
         )
 
 
+def _log_override_selection(
+    family: str,
+    mode: str,
+    format_signature: object,
+    selected: SelectedKernel,
+    override: str,
+    platform: PlatformInfo,
+) -> None:
+    """Log an override-resolved selection if verbose mode is enabled, once per
+    (family, mode, kernel) per process."""
+    if not os.environ.get("TOKENSPEED_KERNEL_VERBOSE"):
+        return
+    key = (family, mode, selected.name)
+    if key in _logged_overrides:
+        return
+    _logged_overrides.add(key)
+    logger.info(
+        f"[tokenspeed_kernel] {family!s}.{mode!s}({format_signature!s}) -> "
+        f"{selected.name!s} (override {override!s}, {platform.arch!s})",
+    )
+
+
+def _override_env_key(family: str, mode: str) -> str:
+    return f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
+
+
 def resolve_kernel_override(family: str, mode: str, override: str | None) -> str | None:
     """Resolve the effective kernel name for family/mode, or return None.
 
     The environment takes precedence over the context manager and call-site
     override. Dispatch shortcuts must use this before consulting tuned routes.
     """
-    env_key = f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
+    env_key = _override_env_key(family, mode)
     return os.environ.get(env_key) or _global_overrides.get((family, mode)) or override
+
+
+def _override_origin(family: str, mode: str) -> str:
+    """Name the source :func:`resolve_kernel_override` takes its target from,
+    following the same precedence; call only when that target is set."""
+    env_key = _override_env_key(family, mode)
+    if os.environ.get(env_key):
+        return f"env {env_key}"
+    if _global_overrides.get((family, mode)):
+        return "kernel_override()"
+    return "explicit override= argument"
 
 
 def select_kernel(
@@ -492,11 +550,17 @@ def select_kernel(
                (e.g., {"head_dim": 128, "num_kv_heads": 8})
         solution: Restrict selection to a registered solution while preserving
             normal platform, format signature, and trait filtering.
-        override: Force a specific kernel name or solution string
+        override: Force a specific kernel name or solution string, skipping
+            platform, format-signature and trait matching but still refusing
+            a kernel that lacks a required feature.
 
     Returns:
         A :class:`SelectedKernel` that is directly callable and also
         exposes the winning kernel's ``name``.
+
+    Under ``TOKENSPEED_KERNEL_VERBOSE`` a ranked selection is logged on each
+    cache miss and an override selection once per (family, mode, kernel) per
+    process.
     """
     platform = platform or current_platform()
 
@@ -519,9 +583,13 @@ def select_kernel(
             return cached
 
     if override:
-        return _resolve_override(
-            registry, family, mode, format_signature, override, platform
+        selected = _resolve_override(
+            registry, family, mode, format_signature, override, platform, features
         )
+        _log_override_selection(
+            family, mode, format_signature, selected, override, platform
+        )
+        return selected
 
     # Get candidates (same filtering for both strategies)
     candidates = registry.get_for_operator(
@@ -623,13 +691,26 @@ def explain_selection(
     platform: PlatformInfo | None = None,
     traits: dict[str, Any] | None = None,
     solution: str | None = None,
+    override: str | None = None,
 ) -> str:
     """Return a human-readable explanation of kernel selection.
+
+    The ``Override`` line reports what :func:`select_kernel` would honour for
+    this operator right now -- the ``TOKENSPEED_KERNEL_OVERRIDE_*`` environment
+    variable, an enclosing :func:`kernel_override`, or the explicit
+    ``override`` argument, in that precedence -- and the overridden kernel is
+    marked ``[SELECTED (override)]`` instead of the ranking's first entry.
+
+    Args:
+        override: Explicit override target, as a caller would pass to
+            :func:`select_kernel`; ``None`` reports only the ambient override.
 
     Example output::
 
         Op: attention.decode (bfloat16)
         Platform: NVIDIA H100 (sm_90)
+        Solution: any
+        Override: none
         Ranking: lex (oracle, priority); higher wins
 
         Candidates (3 matched, 5 registered):
@@ -643,6 +724,23 @@ def explain_selection(
     """
     platform = platform or current_platform()
     registry = KernelRegistry.get()
+
+    active_override = resolve_kernel_override(family, mode, override)
+    override_name: str | None = None
+    override_error: str | None = None
+    if active_override:
+        try:
+            override_name = _resolve_override(
+                registry,
+                family,
+                mode,
+                format_signature,
+                active_override,
+                platform,
+                features,
+            ).name
+        except NoKernelFoundError as exc:
+            override_error = str(exc)
 
     all_specs = registry.list_kernels(family=family, mode=mode)
     candidates = registry.get_for_operator(
@@ -666,15 +764,34 @@ def explain_selection(
         f"Op: {family}.{mode} ({format_signature})",
         f"Platform: {platform.device_name} ({platform.arch})",
         f"Solution: {solution or 'any'}",
+        (
+            f"Override: {active_override} ({_override_origin(family, mode)})"
+            if active_override
+            else "Override: none"
+        ),
         "Ranking: lex (oracle, priority); higher wins",
         "",
         f"Candidates ({len(scored)} matched, {len(all_specs)} registered):",
     ]
 
     for i, (spec, breakdown) in enumerate(scored):
-        marker = "  [SELECTED]" if i == 0 else ""
+        if active_override:
+            marker = "  [SELECTED (override)]" if spec.name == override_name else ""
+        else:
+            marker = "  [SELECTED]" if i == 0 else ""
         lines.append(f"  {i + 1}. {spec.name}{marker}")
         lines.append(f"     {breakdown}")
+
+    if override_error:
+        lines.append("")
+        lines.append(f"Override does not resolve: {override_error}")
+    elif override_name and override_name not in filtered_names:
+        lines.append("")
+        lines.append(
+            f"Override selects {override_name}, which is not among the matched "
+            "candidates: overrides bypass platform, format-signature, solution "
+            "and trait filtering."
+        )
 
     if filtered_out:
         lines.append("")
