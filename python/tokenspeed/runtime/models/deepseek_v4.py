@@ -35,18 +35,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import (
-    dsv4_grouped_output_projection,
-    dsv4_grouped_output_projection_plan,
-    dsv4_grouped_output_projection_warmup_model,
-    dsv4_linear_fp32,
-)
-from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
-from tokenspeed_kernel import mhc_post as fast_mhc_post
-from tokenspeed_kernel import mhc_pre as fast_mhc_pre
-from tokenspeed_kernel import (
-    moe_topk,
-)
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
 from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode_topk,
@@ -61,6 +49,16 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_group_slot_mapping,
     dsv4_indexer_decode_metadata_compute,
 )
+from tokenspeed_kernel.ops.gemm import (
+    dsv4_grouped_output_projection,
+    dsv4_grouped_output_projection_plan,
+    dsv4_grouped_output_projection_warmup_model,
+    dsv4_linear_fp32,
+)
+from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.residual import mhc_fused_hc as fast_mhc_fused_hc
+from tokenspeed_kernel.ops.residual import mhc_post as fast_mhc_post
+from tokenspeed_kernel.ops.residual import mhc_pre as fast_mhc_pre
 from torch import nn
 from transformers import PretrainedConfig
 

@@ -20,8 +20,14 @@
 
 import logging
 
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm import (
+    has_flashinfer_cute_dsl_nvfp4_a16 as kernel_has_flashinfer_cute_dsl_nvfp4_a16,
+)
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.gemm import (
+    prepare_nvfp4_a16_weights as kernel_prepare_nvfp4_a16_weights,
+)
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from torch.nn.parameter import Parameter
 
@@ -188,7 +194,7 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             output_dtype = x.dtype
 
         kernel_override = layer.override_kernel_name
-        out = tokenspeed_kernel.mm(
+        out = kernel_mm(
             x_fp4,
             layer.weight.T,
             A_scales=x_scale,
@@ -208,7 +214,7 @@ class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
     ignored_checkpoint_params = frozenset({"input_scale"})
 
     def __init__(self, quant_config):
-        if not tokenspeed_kernel.has_flashinfer_cute_dsl_nvfp4_a16():
+        if not kernel_has_flashinfer_cute_dsl_nvfp4_a16():
             raise RuntimeError(
                 "NVFP4 W4A16 requires SM100/SM103 and compatible FlashInfer"
             )
@@ -279,7 +285,7 @@ class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
             )
 
         alpha = layer.weight_scale_2.max().to(torch.float32)
-        weight, weight_scale, alpha = tokenspeed_kernel.prepare_nvfp4_a16_weights(
+        weight, weight_scale, alpha = kernel_prepare_nvfp4_a16_weights(
             layer.weight,
             swizzle_blockscale_2d(layer.weight_scale),
             alpha,
@@ -294,7 +300,7 @@ class Nvfp4W4A16LinearMethod(QuantizeMethodBase):
             raise ValueError(
                 f"FlashInfer CuTe-DSL W4A16 requires BF16 input, got {x.dtype}"
             )
-        return tokenspeed_kernel.mm(
+        return kernel_mm(
             x,
             layer.weight,
             A_scales=None,

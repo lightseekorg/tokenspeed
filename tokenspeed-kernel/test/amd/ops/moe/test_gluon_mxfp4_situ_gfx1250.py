@@ -31,8 +31,12 @@ if not is_cdna5():
         allow_module_level=True,
     )
 
-import tokenspeed_kernel  # noqa: E402
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import fused  # noqa: E402
+
+# noqa: E402
 
 _KERNEL_NAME = "gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply"
 
@@ -110,7 +114,7 @@ def _make_case(
 
 
 def _make_plan() -> dict:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -140,9 +144,9 @@ def test_kimi_k3_tp_situ_matches_a8w4_reference_gfx1250(
         num_tokens
     )
     plan = _make_plan()
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
 
-    actual = tokenspeed_kernel.moe_apply(
+    actual = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -179,10 +183,10 @@ def test_kimi_k3_tp_situ_compiles_and_matches_with_upcast_indices_gfx1250(
         num_tokens
     )
     plan = _make_plan()
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
 
     def apply() -> torch.Tensor:
-        return tokenspeed_kernel.moe_apply(
+        return kernel_moe_apply(
             plan,
             hidden_states,
             module,
@@ -222,7 +226,7 @@ def _situ_apply_recording_kernels(
 
     monkeypatch.setattr(fused, "matmul", recording_matmul)
     try:
-        result = tokenspeed_kernel.moe_apply(
+        result = kernel_moe_apply(
             plan,
             hidden_states,
             module,
@@ -249,7 +253,7 @@ def test_kimi_k3_tp_situ_partial_tdm_matches_whole_warp_loads_gfx1250(
         num_tokens
     )
     plan = _make_plan()
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
 
     control, control_kernels = _situ_apply_recording_kernels(
         monkeypatch,
@@ -284,9 +288,9 @@ def test_kimi_k3_tp_situ_partial_tdm_matches_whole_warp_loads_gfx1250(
 def test_kimi_k3_tp_situ_is_cuda_graph_capturable_gfx1250() -> None:
     module, _, hidden_states, topk_weights, topk_ids, router_logits = _make_case(1)
     plan = _make_plan()
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
 
-    expected = tokenspeed_kernel.moe_apply(
+    expected = kernel_moe_apply(
         plan,
         hidden_states,
         module,
@@ -298,7 +302,7 @@ def test_kimi_k3_tp_situ_is_cuda_graph_capturable_gfx1250() -> None:
     module._situ_output_buffer = output
 
     def apply() -> torch.Tensor:
-        result = tokenspeed_kernel.moe_apply(
+        result = kernel_moe_apply(
             plan,
             hidden_states,
             module,

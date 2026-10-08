@@ -26,12 +26,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from kimi3_reference import dequantize_mxfp4
-from tokenspeed_kernel import (
-    moe_apply,
-    moe_plan,
-    moe_process_weights,
-    moe_topk,
-)
+from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights, moe_topk
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

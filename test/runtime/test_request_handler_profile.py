@@ -3,8 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import tokenspeed_kernel.profiling as profiling
 import torch
-from tokenspeed_kernel import profiling
 
 from tokenspeed.runtime.engine import request_handler as request_handler_mod
 from tokenspeed.runtime.engine.io_struct import ProfileReq, ProfileReqType

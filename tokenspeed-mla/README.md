@@ -133,6 +133,30 @@ wrapper selects the architecture from `query.device` and includes it in the
 compile cache key and compiler target. Direct kernel construction requires
 an explicit `compute_capability=(10, 0)`, `(10, 3)` or `(10, 7)`.
 
+On SM107, an `out` tensor with dtype `torch.float8_e4m3fn` selects
+[`mla_decode_fp8_sm107.py`](python/tokenspeed_mla/mla_decode_fp8_sm107.py).
+The kernel packs query/head rows into M256 tiles and uses 4-CTA clusters
+to separate QK/softmax from PV, with a 2-CTA fallback. BF16 output keeps
+using the shared kernel.
+
+The public wrapper uses FP32 for softmax exponentials and row sums. Packed
+FP16 softmax remains an explicit option for direct kernel construction.
+
+FP8 output supports up to four M256 tiles per request. By default, `H` must
+divide 256 and `q_len` must be a multiple of `256 / H`;
+`enable_packed_q=True` accepts other shapes such as H96 and partial tiles.
+Causal/non-causal attention, split-KV, LSE, PDL and CUDA graphs are supported;
+sliding windows, DCP and `local_visible_lens` are unsupported. Rows with no
+visible keys produce zero output and `-inf` LSE.
+
+SM107 FP8-output compilation and GPU regression tests reject CuTe DSL warnings.
+The mixed-cluster kernel issues CLC queries directly and owns its unswizzled
+grid and response decoding, avoiding the deprecated example scheduler classes.
+
+H96/Q4 fills 75% of M256 tiles; H96/Q8 fills them completely. M128 packing
+fills three and six tiles respectively, so relative performance depends on
+tile utilization as well as batch size and split-KV scheduling.
+
 Other optimizations include:
 
 - FP8 split-KV candidates are normalized to nonempty K partitions before
@@ -199,7 +223,8 @@ What it supports:
   - 3D: `[num_pages, page_size, D_total]`
   - 4D accepted and normalized internally
 - Auto `split_kv` + workspace sizing and caching
-- Supports FP16/BF16/FP8; FP8 path writes BF16 output.
+- Supports FP16/BF16/FP8; FP8 path writes BF16 output, or FP8 output on
+  SM107 when `out` is FP8 (see [SM107 decode](#sm107-decode)).
 - Supports `H <= 128` and `1 <= q_len <= 4`; for example,
   `H=64, q_len=4` is supported.
 - `split_kv` and `workspace_size` are computed and cached from runtime shape/device info.

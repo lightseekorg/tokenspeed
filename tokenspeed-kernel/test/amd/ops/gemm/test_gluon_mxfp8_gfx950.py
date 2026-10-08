@@ -32,13 +32,15 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-import tokenspeed_kernel  # noqa: E402
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.profiling import ShapeCapture  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (  # noqa: E402
     _mxfp8_launch_metadata,
     launch_gluon_mm_mxfp8_gfx950,
     supports_mxfp8_gemm_shape,
 )
+
+# noqa: E402
 
 
 def _inputs(
@@ -167,7 +169,7 @@ def test_mxfp8_gemm_public_api_selects_measured_prefill_shapes(
     capture = ShapeCapture.get()
     capture.enabled = True
     try:
-        tokenspeed_kernel.mm(
+        kernel_mm(
             a,
             b,
             A_scales=a_scales,

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
+from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from tokenspeed_kernel.platform import current_platform
 
 
@@ -41,7 +44,7 @@ def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
     weights.w13_input_layout = "concatenated"
     weights.activation_situ_beta = 4.0
     weights.activation_situ_linear_beta = 25.0
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation=activation,
@@ -56,8 +59,8 @@ def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
         fast_math=True,
         combine_order="rank",
     )
-    tokenspeed_kernel.moe_process_weights(plan, weights)
-    actual = tokenspeed_kernel.moe_apply(
+    kernel_moe_process_weights(plan, weights)
+    actual = kernel_moe_apply(
         plan,
         x,
         weights,
@@ -72,7 +75,7 @@ def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
         dtype=torch.float32,
     )
 
-    x_packed, x_scale = tokenspeed_kernel.quantize_mxfp4(
+    x_packed, x_scale = kernel_quantize_mxfp4(
         x, scale_layout="linear", solution="triton"
     )
     x_codes = torch.stack((x_packed & 0xF, x_packed >> 4), dim=-1).flatten(-2)
@@ -105,7 +108,7 @@ def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
             intermediate = (gate * up).to(torch.bfloat16)
         else:
             intermediate = (F.silu(gate) * up).to(torch.bfloat16)
-        intermediate_packed, intermediate_scale = tokenspeed_kernel.quantize_mxfp4(
+        intermediate_packed, intermediate_scale = kernel_quantize_mxfp4(
             intermediate, scale_layout="linear", solution="triton"
         )
         intermediate_codes = torch.stack(

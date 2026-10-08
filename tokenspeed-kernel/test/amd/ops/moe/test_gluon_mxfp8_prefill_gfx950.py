@@ -30,12 +30,14 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
-import tokenspeed_kernel  # noqa: E402
 from test_gluon_mxfp4_situ_gfx950 import _make_mxfp4_module  # noqa: E402
 from tokenspeed_kernel.ops.moe import (  # noqa: E402
     latent_moe_decode_pipeline_available,
     latent_moe_expert_shared,
 )
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel_amd._scheduling import (  # noqa: E402
     sched_barrier_compile_options,
 )
@@ -85,6 +87,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E4
     gluon_a16w4_situ_warp_decode_ep_gfx950,
 )
 
+# noqa: E402
+
 _NAMES = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
 _RAW_NAMES = ("w13_weight", "w13_scale", "w2_weight", "w2_scale")
 _A8 = "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"
@@ -106,7 +110,7 @@ def _module(e: int, d: int, i: int, topk: int):
 
 
 def _plan(policy: str):
-    return tokenspeed_kernel.moe_plan(
+    return kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -931,7 +935,7 @@ def test_public_prefill_strides_duplicates_empty_and_input_preservation(
     module, raw = _module(2, 3584, 3072, 16)
     plan = _plan(policy)
     assert plan["apply_kernel_name"] == _A8
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
     arena = torch.empty((m, 3 * 3584), dtype=torch.bfloat16, device="cuda")
     x, output = arena[:, :3584], arena[:, 3584 : 2 * 3584]
     x.normal_(std=0.1)
@@ -955,7 +959,7 @@ def test_public_prefill_strides_duplicates_empty_and_input_preservation(
 
         monkeypatch.setattr(prefill_mxfp8, "sort_expert_slots", fail)
         monkeypatch.setattr(prefill_mxfp8, "quantize_mxfp8", fail)
-    result = tokenspeed_kernel.moe_apply(
+    result = kernel_moe_apply(
         plan,
         x,
         module,
@@ -980,7 +984,7 @@ def test_public_prefill_reuses_compiled_handles_across_rows(
     module, raw = _module(2, 3584, 3072, 16)
     plan = _plan(policy)
     assert plan["apply_kernel_name"] == _A8
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
     calls = _record_compiled_calls(
         monkeypatch,
         (
@@ -1043,7 +1047,7 @@ def test_public_prefill_reuses_compiled_handles_across_rows(
         weights.fill_(1 / 16)
         saved = [t.clone() for t in (x, ids, weights)]
         module._situ_output_buffer = output
-        result = tokenspeed_kernel.moe_apply(
+        result = kernel_moe_apply(
             plan,
             x,
             module,
@@ -1088,7 +1092,7 @@ def test_public_prefill_reuses_compiled_handles_across_rows(
 def test_public_prefill_graph_replay_changed_routes_and_values(m):
     module, raw = _module(2, 3584, 3072, 16)
     plan = _plan("input")
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
     x = torch.randn((m, 3584), device="cuda", dtype=torch.bfloat16) * 0.1
     ids = torch.full((m, 16), 2, device="cuda", dtype=torch.int32)
     weights = torch.full((m, 16), 1 / 16, device="cuda", dtype=torch.float32)
@@ -1096,7 +1100,7 @@ def test_public_prefill_graph_replay_changed_routes_and_values(m):
     module._situ_output_buffer = torch.empty_like(x)
 
     def apply():
-        return tokenspeed_kernel.moe_apply(
+        return kernel_moe_apply(
             plan, x, module, logits, topk_ids=ids, topk_weights=weights
         )
 
@@ -1192,7 +1196,7 @@ def joint_bank(request):
                     requires_grad=False,
                 ),
             )
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
     assert latent_moe_decode_pipeline_available(
         *projections,
         *_bank(module),
@@ -1376,7 +1380,7 @@ def test_public_a16_reuses_compiled_handles_across_rows(
         saved = [t.clone() for t in (x, ids, weights)]
         with monkeypatch.context() as context:
             calls = _record_compiled_calls(context, (_stage2_a16w4_warp_gemv_combine,))
-            result = tokenspeed_kernel.moe_apply(
+            result = kernel_moe_apply(
                 plan,
                 x,
                 module,
@@ -1400,12 +1404,12 @@ def test_explicit_fp8_rejects_unclamped_and_unprepared_banks():
     module, _ = _module(2, 3584, 3072, 16)
     module.activation_situ_linear_beta = None
     with pytest.raises(ValueError, match="explicit FP8"):
-        tokenspeed_kernel.moe_process_weights(_plan("fp8"), module)
+        kernel_moe_process_weights(_plan("fp8"), module)
     module.activation_situ_linear_beta = 25.0
     x = torch.empty((1, 3584), dtype=torch.bfloat16, device="cuda")
     ids = torch.zeros((1, 16), dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match="rank-6"):
-        tokenspeed_kernel.moe_apply(
+        kernel_moe_apply(
             _plan("input"),
             x,
             module,

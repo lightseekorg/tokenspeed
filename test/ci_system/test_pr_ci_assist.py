@@ -268,15 +268,27 @@ def test_native_result_needs_current_source_and_executed_test(
     assert assist.native_check(check, state, [newer, run])["status"] == "failed"
     run["pull_requests"][0]["base"]["sha"] = "c" * 40
     assert assist.native_check(check, state, [run])["run"] == 0
+    state["action"] = "fix"
+    run["conclusion"] = "failure"
+    assert assist.native_check(check, state, [run])["status"] == "failed"
+    run["conclusion"] = "success"
+    assert assist.native_check(check, state, [run])["run"] == 0
     run["head_sha"] = "d" * 40
     assert assist.native_check(check, state, [run])["run"] == 0
 
 
-def test_watch_waits_for_cpu_and_hands_off_failure_without_gpu_retry(
-    monkeypatch, tmp_path, selected
+@pytest.mark.parametrize(
+    ("action", "workflow"),
+    [
+        ("watch", "scheduler-cpp-test.yml"),
+        ("fix", "nvidia-kernel-library-tests.yml"),
+    ],
+)
+def test_native_check_waits_and_hands_off_failure_without_gpu_retry(
+    monkeypatch, tmp_path, selected, action, workflow
 ):
     task, state = selected
-    workflow = "scheduler-cpp-test.yml"
+    state["action"] = action
     check = {"workflow": workflow, **NATIVE_CHECKS[workflow]}
     plan = {k: state[k] for k in ("version", "repository", "pr", "head", "base")}
     plan.update(run=55, tasks=state["tasks"], tests=[])
@@ -288,6 +300,8 @@ def test_watch_waits_for_cpu_and_hands_off_failure_without_gpu_retry(
         mergeable=True,
     )
     monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "200")
+    monkeypatch.setattr(assist, "WORK", tmp_path)
     monkeypatch.setattr(assist, "public_gate", lambda: None)
     monkeypatch.setattr(assist, "pull", lambda *args: pr)
     monkeypatch.setattr(assist, "pages", lambda *args: comments)
@@ -318,7 +332,15 @@ def test_watch_waits_for_cpu_and_hands_off_failure_without_gpu_retry(
     assist.control(state["pr"])
     assert state["phase"] == "watching" and "1 waiting" in messages[-1]
     cpu["status"] = "failed"
+    emitted = []
+    monkeypatch.setattr(assist, "output", lambda *args: emitted.append(args))
     assist.control(state["pr"])
+    if action == "fix":
+        assert state["phase"] == "repairing" and emitted == [("repair", "true")]
+        request = json.loads(tmp_path.joinpath("request.json").read_text())
+        assert request["state"]["native_checks"] == [cpu]
+        assert request["state"]["statuses"] == ["passed"]
+        return
     assert state["phase"] == "manual" and "human intervention" in messages[-1]
     # A fresh CPU-only watch can finish without inventing a GPU task.
     state.update(phase="watching", statuses=[])
@@ -331,6 +353,259 @@ def test_watch_waits_for_cpu_and_hands_off_failure_without_gpu_retry(
     state["native_checks"][0]["workflow"] = "arbitrary.yml"
     comment["body"] = marker("assist", state)
     assert record(comment, "assist") is None
+
+
+def test_candidate_native_run_requires_matching_source_and_executed_ut(
+    monkeypatch, tmp_path, selected
+):
+    _, state = selected
+    workflow = "nvidia-kernel-library-tests.yml"
+    check = dict(workflow=workflow, **NATIVE_CHECKS[workflow])
+    state["candidate"] = dict(
+        patch="c" * 40,
+        validation="d" * 40,
+        tree="e" * 40,
+        branch="bot/pr-ci-assist-123-42",
+    )
+    run = dict(
+        id=102,
+        path=f".github/workflows/{workflow}",
+        event="workflow_dispatch",
+        head_sha="d" * 40,
+        head_branch=state["candidate"]["branch"],
+        actor={"login": BOT},
+        status="completed",
+        conclusion="success",
+    )
+    job = dict(
+        name=check["job"],
+        status="completed",
+        conclusion="success",
+        steps=[dict(name=check["step"], status="completed", conclusion="success")],
+    )
+    monkeypatch.setattr(assist, "WORK", tmp_path)
+    monkeypatch.setattr(
+        assist,
+        "pages",
+        lambda path, field: (
+            [job] if "/jobs" in path else [dict(name=check["artifact"], expired=False)]
+        ),
+    )
+    proof = dict(
+        source_sha="d" * 40,
+        config=check["config"],
+        runner=check["runner"],
+        ok=True,
+        executed_stages=["install", "ut"],
+    )
+
+    def download(run, name, target):
+        target.joinpath("source.json").write_text(
+            json.dumps({"source_sha": proof["source_sha"]})
+        )
+        target.joinpath("manifest.json").write_text(
+            json.dumps(
+                [
+                    dict(
+                        job_id="123",
+                        task=dict(config=check["config"], runner=check["runner"]),
+                        state="COMPLETED",
+                        exit_code="0:0",
+                    ),
+                ]
+            )
+        )
+        target.joinpath("123-result.json").write_text(json.dumps(proof))
+
+    monkeypatch.setattr(assist, "download", download)
+    assert assist.native_check(check, state, [run])["status"] == "passed"
+    proof["executed_stages"] = ["install"]
+    assert assist.native_check(check, state, [run])["status"] == "missing"
+    proof["source_sha"] = state["head"]
+    assert assist.native_check(check, state, [run])["status"] == "missing"
+    for wrong in (
+        dict(head_sha=state["head"]),
+        dict(head_branch="main"),
+        dict(actor={"login": "example"}),
+        dict(event="pull_request"),
+    ):
+        assert assist.native_check(check, state, [{**run, **wrong}])["run"] == 0
+    run.update(status="in_progress", conclusion=None)
+    assert assist.native_check(check, state, [run])["status"] == "waiting"
+
+
+def test_native_dispatch_reservation_prevents_duplicate_submission(
+    monkeypatch, selected
+):
+    _, state = selected
+    workflow = "nvidia-kernel-library-tests.yml"
+    state.update(
+        candidate=dict(
+            patch="c" * 40,
+            validation="d" * 40,
+            tree="e" * 40,
+            branch="bot/pr-ci-assist-123-42",
+        ),
+        native_checks=[dict(workflow=workflow, status="waiting", run=0)],
+    )
+    monkeypatch.setattr(repair, "guard_native_dispatch", lambda state: None)
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "api", lambda path: {"object": {"sha": "d" * 40}})
+    published, dispatched = [], []
+    monkeypatch.setattr(
+        assist, "publish", lambda state, message: published.append(copy.deepcopy(state))
+    )
+    monkeypatch.setattr(assist, "command", lambda *args: dispatched.append(args))
+    assist.dispatch_native_checks(state)
+    assist.dispatch_native_checks(state)
+    assert len(dispatched) == 1
+    assert dispatched[0][-2:] == ("--ref", state["candidate"]["branch"])
+    assert published[0]["native_submitted"] == [workflow]
+    comment = dict(user=dict(login=BOT, id=BOT_ID), body=marker("assist", state))
+    assert record(comment, "assist") == state
+
+
+def test_native_task_repair_preserves_commands_and_protected_controls(tmp_path):
+    def git(*args):
+        return assist.command(
+            "git", "-c", "core.hooksPath=/dev/null", *args, cwd=tmp_path
+        )
+
+    git("init", "-b", "main")
+    repair.identity(tmp_path)
+    task = tmp_path / repair.NATIVE_CONFIG
+    task.parent.mkdir(parents=True)
+    original = assist.ROOT.joinpath(repair.NATIVE_CONFIG).read_text()
+    task.write_text(original)
+    git("add", ".")
+    git("commit", "-s", "-m", "initial")
+    head = git("rev-parse", "HEAD")
+    request = dict(
+        data=dict(
+            paths=["model.py", repair.NATIVE_CONFIG, ".github/workflows/test.yml"]
+        ),
+        state=dict(
+            native_checks=[
+                dict(
+                    workflow="nvidia-kernel-library-tests.yml", status="failed", run=101
+                ),
+            ]
+        ),
+    )
+    allowed = repair.allowed_paths(request)
+    assert allowed == {"model.py", repair.NATIVE_CONFIG}
+    prefix = 'PYTHONPATH="python:tokenspeed-kernel/python"'
+    suffix = "$" + "{PYTHONPATH:+:$PYTHONPATH}"
+    candidate = original.replace(prefix, prefix[:-1] + suffix + '"')
+    task.write_text(candidate)
+    assert repair.guard(tmp_path, head, allowed)
+    assert repair.public_source_diff(tmp_path, head, {repair.NATIVE_CONFIG}) == ""
+    task.write_text(
+        candidate.replace(" -v --junitxml", " --collect-only -v --junitxml")
+    )
+    with pytest.raises(ValueError, match="retain the original tests"):
+        repair.guard(tmp_path, head, allowed)
+    task.write_text(candidate.replace(suffix, ":$PYTHONPATH"))
+    with pytest.raises(ValueError, match="retain the original tests"):
+        repair.guard(tmp_path, head, allowed)
+    request["state"]["native_checks"][0]["status"] = "passed"
+    assert repair.NATIVE_CONFIG not in repair.allowed_paths(request)
+
+
+def test_native_dispatch_rejects_changed_workflow_controls(
+    monkeypatch, tmp_path, selected
+):
+    _, state = selected
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def git(*args):
+        return assist.command(
+            "git", "-c", "core.hooksPath=/dev/null", *args, cwd=source
+        )
+
+    git("init", "-b", "main")
+    repair.identity(source)
+    control = source / ".github/workflows/native.yml"
+    control.parent.mkdir(parents=True)
+    control.write_text("trusted\n")
+    git("add", ".")
+    git("commit", "-s", "-m", "initial")
+    state["base"] = git("rev-parse", "HEAD")
+    state["candidate"] = dict(validation=state["base"])
+    pr = dict(draft=False, head=dict(repo=dict(full_name=REPO)))
+    monkeypatch.setattr(repair, "WORK", tmp_path)
+    monkeypatch.setattr(repair, "pull", lambda number: pr)
+    command = repair.command
+    monkeypatch.setattr(
+        repair,
+        "command",
+        lambda *args, **kwargs: (
+            "" if args[:2] == ("git", "fetch") else command(*args, **kwargs)
+        ),
+    )
+    repair.guard_native_dispatch(state)
+    control.write_text("changed\n")
+    git("add", ".")
+    git("commit", "-s", "-m", "change controls")
+    state["candidate"]["validation"] = git("rev-parse", "HEAD")
+    with pytest.raises(ValueError, match="trusted native workflow"):
+        repair.guard_native_dispatch(state)
+    pr["draft"] = True
+    with pytest.raises(ValueError, match="active same-repository"):
+        repair.guard_native_dispatch(state)
+
+
+def test_native_failure_diagnostics_include_slurm_artifact(monkeypatch, tmp_path):
+    check = NATIVE_CHECKS["nvidia-kernel-library-tests.yml"]
+    request = dict(
+        state=dict(
+            run_ids={},
+            native_checks=[
+                dict(
+                    workflow="nvidia-kernel-library-tests.yml", status="failed", run=101
+                ),
+            ],
+        ),
+        plan=dict(tasks=[]),
+        data={},
+    )
+    tmp_path.joinpath("request.json").write_text(json.dumps(request))
+    monkeypatch.setattr(repair, "WORK", tmp_path)
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "provider"))
+    monkeypatch.setattr(repair, "validate_plan", lambda *args: [])
+    monkeypatch.setattr(repair, "api", lambda path: dict(run_attempt=1))
+
+    def pages(path, field):
+        if "organization-variables" in path:
+            return [
+                dict(name="KIMI_API_URL", value="provider"),
+                dict(name="KIMI_MODEL", value="planner"),
+            ]
+        if "/jobs" in path:
+            return [dict(name=check["job"], conclusion="failure", id=201)]
+        return [dict(name=check["artifact"], expired=False)]
+
+    def command(*args):
+        if "download" in args:
+            target = Path(args[-1])
+            target.joinpath("manifest.json").write_text(
+                json.dumps(
+                    [
+                        dict(job_id="123", task=dict(config=check["config"])),
+                    ]
+                )
+            )
+            target.joinpath("123.log").write_text("native Slurm failure evidence")
+            return ""
+        return "native job failure evidence"
+
+    monkeypatch.setattr(repair, "pages", pages)
+    monkeypatch.setattr(repair, "command", command)
+    repair.configure()
+    diagnostics = tmp_path.joinpath("model/diagnostics.txt").read_text()
+    assert "native job failure evidence" in diagnostics
+    assert "native Slurm failure evidence" in diagnostics
 
 
 def test_failed_task_retries_once_and_falls_back_only_before_submission(
@@ -772,14 +1047,20 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
             "display_title": assist.run_title(task, "d" * 40, "gb200"),
         },
     )
-    # Native PR CPU checks must not gate conflict repair: a conflicted PR
-    # cannot start those workflows. Candidate GPU validation remains mandatory.
+    # Candidate native results must also pass; old PR results cannot promote it.
     workflow = "scheduler-cpp-test.yml"
     data["native_checks"] = [{"workflow": workflow, **NATIVE_CHECKS[workflow]}]
     monkeypatch.setattr(
         assist,
         "native_check",
-        lambda *args: pytest.fail("PR CPU result used for candidate"),
+        lambda *args: dict(workflow=workflow, status="waiting", run=103),
+    )
+    assist.control(state["pr"])
+    assert not promoted and live[0]["phase"] == "validating"
+    monkeypatch.setattr(
+        assist,
+        "native_check",
+        lambda *args: dict(workflow=workflow, status="passed", run=103),
     )
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "promoted"

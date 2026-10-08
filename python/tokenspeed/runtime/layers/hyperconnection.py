@@ -26,12 +26,11 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import (
-    gated_residual_combine,
+from tokenspeed_kernel.ops.layernorm import (
     gated_residual_combine_norm,
-    gated_residual_mix,
     grouped_gemma_rmsnorm,
 )
+from tokenspeed_kernel.ops.residual import gated_residual_combine, gated_residual_mix
 from torch import nn
 
 

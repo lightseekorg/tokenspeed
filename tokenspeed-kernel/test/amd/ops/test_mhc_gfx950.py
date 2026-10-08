@@ -21,9 +21,9 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -91,7 +91,7 @@ def test_gluon_mhc_pre_multitoken_matches_reference(
     )
     args = (residual, fn, hc_scale, hc_base, 1e-6, 1e-6, 20)
 
-    actual = tokenspeed_kernel.mhc_pre(*args, norm_weight=None, norm_eps=None)
+    actual = kernel_mhc_pre(*args, norm_weight=None, norm_eps=None)
     expected = _reference(*args)
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
@@ -126,11 +126,11 @@ def test_glm5_next_mhc_pre_graph_shape_replays_changed_input() -> None:
     )
     args = (residual, fn, hc_scale, hc_base, 1e-6, 1e-6, 20)
 
-    tokenspeed_kernel.mhc_pre(*args, norm_weight=None, norm_eps=None)
+    kernel_mhc_pre(*args, norm_weight=None, norm_eps=None)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        graph_output = tokenspeed_kernel.mhc_pre(*args, norm_weight=None, norm_eps=None)
+        graph_output = kernel_mhc_pre(*args, norm_weight=None, norm_eps=None)
 
     residual.copy_(torch.randn(residual.shape, device="cuda", dtype=residual.dtype))
     expected = _reference(*args)
