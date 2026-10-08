@@ -1544,6 +1544,25 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assist.control(state["pr"])
     retry = json.loads(tmp_path.joinpath("request.json").read_text())
     assert "diagnostics" not in retry
+    # A native failure arriving after the old deadline replaces stale inputs.
+    live[0].update(
+        phase="manual",
+        native_checks=[dict(workflow=workflow, status="waiting", run=105)],
+        candidate=dict(
+            patch="c" * 40,
+            validation="d" * 40,
+            tree="e" * 40,
+            branch="bot/pr-ci-assist-123-43-203",
+        ),
+    )
+    late = dict(workflow=workflow, status="failed", run=105)
+    monkeypatch.setattr(assist, "native_check", lambda *args: late)
+    monkeypatch.setenv("REPAIR_RUN", "203")
+    monkeypatch.setenv("GITHUB_RUN_ID", "204")
+    assist.control(state["pr"])
+    retry = json.loads(tmp_path.joinpath("request.json").read_text())
+    assert retry["diagnostics"]["native_checks"] == [late]
+    assert retry["resume_run"] == 203 and not retry["check_only"]
 
 
 def test_cancelled_repair_is_recovered_on_next_reconciliation(

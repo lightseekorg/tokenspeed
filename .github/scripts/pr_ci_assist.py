@@ -917,6 +917,22 @@ def control(number: int, *, expected_command: int | None = None):
         or comment["id"] != expected_command
     ):
         return
+    if resume_run and "candidate" in state:
+        # A queued native check may finish after the previous hour ends.
+        # Refresh its source-bound result before choosing the next failure input.
+        runs = runs_for(state)
+        state["native_checks"] = [
+            (
+                native_check(
+                    {"workflow": c["workflow"], **NATIVE_CHECKS[c["workflow"]]},
+                    state,
+                    runs,
+                )
+                if c["status"] == "waiting"
+                else c
+            )
+            for c in state.get("native_checks", [])
+        ]
     initial = bool(comment and (not state or comment["id"] > state["command"]))
     if (
         not initial
